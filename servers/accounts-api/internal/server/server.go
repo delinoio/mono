@@ -4,17 +4,64 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
 )
 
+// maxOptionsBodyBytes bounds the body read for a server-wide "OPTIONS *"
+// request, matching net/http's built-in handler.
+const maxOptionsBodyBytes = 4 << 10
+
 // NewHandler returns the root HTTP handler with request logging applied.
+//
+// The handler answers a server-wide "OPTIONS *" request itself, inside the
+// request logger. net/http answers that request before it consults the
+// configured Handler unless http.Server.DisableGeneralOptionsHandler is set, so
+// the production server must set it (see newServer in cmd/accounts-api);
+// otherwise the request is neither routed here nor logged.
 func NewHandler(logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz(logger))
-	return logRequests(logger, mux)
+	return logRequests(logger, withGeneralOptions(mux))
+}
+
+// withGeneralOptions answers "OPTIONS *" and passes every other request to
+// next. It reproduces net/http's built-in handler: 200 with Content-Length 0,
+// reading at most maxOptionsBodyBytes of request body.
+func withGeneralOptions(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodOptions || r.RequestURI != "*" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		w.Header().Set("Content-Length", "0")
+		if r.ContentLength != 0 {
+			// http.MaxBytesReader tells the server to close the connection
+			// after an oversized body through an unexported method of the
+			// ResponseWriter that net/http created. Wrappers such as
+			// statusRecorder only embed the http.ResponseWriter interface and
+			// do not promote that method, so the reader must be given the
+			// unwrapped writer or the connection would be kept alive.
+			body := http.MaxBytesReader(unwrapResponseWriter(w), r.Body, maxOptionsBodyBytes)
+			_, _ = io.Copy(io.Discard, body)
+		}
+	})
+}
+
+// unwrapResponseWriter returns the innermost writer reachable through Unwrap
+// methods, which is the one net/http created for the request.
+func unwrapResponseWriter(w http.ResponseWriter) http.ResponseWriter {
+	for {
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return w
+		}
+		w = u.Unwrap()
+	}
 }
 
 type healthResponse struct {
@@ -34,12 +81,16 @@ func handleHealthz(logger *slog.Logger) http.HandlerFunc {
 // statusRecorder captures the status code and body size for request logs.
 // status is the first committed status, matching what net/http sends to the
 // client; wroteHeader reports whether a header has been committed, either by
-// the first WriteHeader call or by the first implicit Write.
+// the first WriteHeader call or by the first implicit Write. bytes counts the
+// response body bytes net/http transmits; noBody marks a response that has no
+// body on the wire (a HEAD response), so body bytes the handler writes are
+// discarded by net/http and must not be counted.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	bytes       int
 	wroteHeader bool
+	noBody      bool
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
@@ -56,7 +107,9 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	// An implicit WriteHeader(200) commits the default status.
 	r.wroteHeader = true
 	n, err := r.ResponseWriter.Write(body)
-	r.bytes += n
+	if !r.noBody {
+		r.bytes += n
+	}
 	return n, err
 }
 
@@ -68,7 +121,19 @@ func (r *statusRecorder) Unwrap() http.ResponseWriter {
 func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		// Tell the connection observer that net/http dispatched a request, so it
+		// can tell it from one that net/http rejects before the handler.
+		if obs := observerFrom(r.Context()); obs != nil {
+			obs.handlerStarted()
+			defer obs.handlerFinished()
+		}
+		recorder := &statusRecorder{
+			ResponseWriter: w,
+			status:         http.StatusOK,
+			// net/http reports a HEAD body write as successful but never sends
+			// the bytes, so the log must not count them as transmitted.
+			noBody: r.Method == http.MethodHead,
+		}
 		// The record is written from a defer so a panicking handler is logged
 		// too. The panic is deliberately not recovered here: net/http keeps its
 		// connection-level recovery (including http.ErrAbortHandler handling)
@@ -81,15 +146,22 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 				// net/http will not send a response; record it as a failure.
 				status = http.StatusInternalServerError
 			}
-			logger.InfoContext(r.Context(), "http_request",
-				slog.String("method", r.Method),
-				slog.String("path", r.URL.Path),
-				slog.Int("status", status),
-				slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-				slog.Int("bytes", recorder.bytes),
-			)
+			logRequest(r.Context(), logger, r.Method, r.URL.Path, status, time.Since(start), recorder.bytes)
 		}()
 		next.ServeHTTP(recorder, r)
 		returned = true
 	})
+}
+
+// logRequest writes the http_request record. It is the only place that defines
+// the record shape, shared by the request logger and by the observer that logs
+// requests net/http rejects before the handler runs.
+func logRequest(ctx context.Context, logger *slog.Logger, method, path string, status int, duration time.Duration, bytes int) {
+	logger.InfoContext(ctx, "http_request",
+		slog.String("method", method),
+		slog.String("path", path),
+		slog.Int("status", status),
+		slog.Int64("duration_ms", duration.Milliseconds()),
+		slog.Int("bytes", bytes),
+	)
 }

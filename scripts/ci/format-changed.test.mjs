@@ -29,10 +29,30 @@ import {
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
 const lefthook = require("lefthook/get-exe.js").getExePath();
-function fixture(t, initialCommit = true) {
+
+// A developer's global or system Git configuration (core.hooksPath,
+// commit.gpgsign, ...) and the GIT_* variables of an enclosing Git hook
+// invocation (GIT_DIR, GIT_INDEX_FILE, ...) must not change how the fixture
+// repositories behave. Mutates and returns `env`.
+function isolateGitEnvironment(env) {
+  for (const name of Object.keys(env)) {
+    if (name.startsWith("GIT_") || name === "LEFTHOOK_CONFIG") {
+      delete env[name];
+    }
+  }
+  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
+  env.GIT_CONFIG_NOSYSTEM = "1";
+  return env;
+}
+
+// The exported selectors run git without an explicit environment, so they
+// inherit this process's environment; isolate it before any test runs.
+isolateGitEnvironment(process.env);
+
+function fixture(t, initialCommit = true, parentEnv = process.env) {
   const cwd = mkdtempSync(join(tmpdir(), "rstack-format-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
-  const env = { ...process.env, LEFTHOOK_BIN: lefthook };
+  const env = isolateGitEnvironment({ ...parentEnv, LEFTHOOK_BIN: lefthook });
   delete env.CI;
   delete env.TURBO_SCM_BASE;
   delete env.TURBO_SCM_HEAD;
@@ -83,6 +103,35 @@ function fixture(t, initialCommit = true) {
     base: initialCommit ? commit() : null,
   };
 }
+
+test("fixture ignores hostile global Git configuration and GIT_* variables", (t) => {
+  const hostile = mkdtempSync(join(tmpdir(), "rstack-hostile-"));
+  t.after(() => rmSync(hostile, { recursive: true, force: true }));
+  const globalConfig = join(hostile, "gitconfig");
+  writeFileSync(
+    globalConfig,
+    `[core]\n\thooksPath = ${join(hostile, "hooks")}\n[commit]\n\tgpgsign = true\n`,
+  );
+  const bare = join(hostile, "bare.git");
+  execFileSync("git", ["init", "--quiet", "--bare", bare], {
+    env: isolateGitEnvironment({ PATH: process.env.PATH }),
+  });
+  const f = fixture(t, true, {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: globalConfig,
+    GIT_DIR: bare,
+    GIT_INDEX_FILE: join(hostile, "index"),
+    GIT_WORK_TREE: hostile,
+  });
+  f.installHook();
+  f.write("hostile.ts", "const value={answer:42}\n");
+  f.git("add", "hostile.ts");
+  f.git("commit", "--quiet", "-m", "hostile environment");
+  assert.equal(
+    f.git("show", "HEAD:hostile.ts"),
+    "const value = { answer: 42 };",
+  );
+});
 
 test("pre-commit formats and stages initial-commit files with literal paths", (t) => {
   const f = fixture(t, false);
@@ -258,7 +307,7 @@ test("pre-commit rejects parser errors without creating a commit", (t) => {
 });
 
 test(
-  "staged selection skips symlinks and unstaged deletions",
+  "staged selection skips symlinks and fails for a staged file removed from the worktree",
   { skip: process.platform === "win32" },
   (t) => {
     const f = fixture(t);
@@ -267,9 +316,329 @@ test(
     f.git("add", "target.ts", "linked.ts");
     assert.deepEqual(stagedFormatFiles(f.cwd), ["target.ts"]);
     rmSync(join(f.cwd, "target.ts"));
-    assert.deepEqual(stagedFormatFiles(f.cwd), []);
+    assert.throws(() => stagedFormatFiles(f.cwd), /ENOENT.*target\.ts/u);
   },
 );
+
+test(
+  "staged symlinks stay exempt when their worktree entry is missing, and a staged type change is judged by its new mode",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("target.ts", "const value = 1;\n");
+    f.write("retyped.ts", "const value = 2;\n");
+    f.commit();
+    symlinkSync("target.ts", join(f.cwd, "linked.ts"));
+    // Replace a tracked regular file with a symlink: a staged type change.
+    rmSync(join(f.cwd, "retyped.ts"));
+    symlinkSync("target.ts", join(f.cwd, "retyped.ts"));
+    f.git("add", "linked.ts", "retyped.ts");
+    assert.deepEqual(stagedFormatFiles(f.cwd), []);
+    // Remove the placeholders, as a sparse checkout or `rm` after `git add`
+    // would: a staged symlink is never formatted, so it needs no worktree file.
+    rmSync(join(f.cwd, "linked.ts"));
+    rmSync(join(f.cwd, "retyped.ts"));
+    assert.deepEqual(stagedFormatFiles(f.cwd), []);
+    // A missing regular file is still reported next to the exempt symlinks.
+    f.write("added.ts", "const   value = 3;\n");
+    f.git("add", "added.ts");
+    rmSync(join(f.cwd, "added.ts"));
+    assert.throws(() => stagedFormatFiles(f.cwd), /added\.ts/u);
+    // A staged type change from a symlink back to a regular file is formatted.
+    f.git("rm", "--cached", "--quiet", "--", "added.ts");
+    f.git("commit", "--quiet", "-m", "symlinks");
+    f.write("retyped.ts", "const   value = 4;\n");
+    f.git("add", "retyped.ts");
+    assert.deepEqual(stagedFormatFiles(f.cwd), ["retyped.ts"]);
+  },
+);
+
+test("staged selection fails naming each kind of staged path missing from the worktree", (t) => {
+  const f = fixture(t);
+  f.write("modified.ts", "const value = 1;\n");
+  f.write("renamed.ts", "const value = 2;\n");
+  f.commit();
+  f.write("modified.ts", "const value = 3;\n");
+  f.write("added.ts", "const   value = 4;\n");
+  f.git("mv", "renamed.ts", "moved.ts");
+  f.git("add", "modified.ts", "added.ts");
+  assert.deepEqual(stagedFormatFiles(f.cwd), [
+    "added.ts",
+    "modified.ts",
+    "moved.ts",
+  ]);
+  for (const name of ["added.ts", "modified.ts", "moved.ts"]) {
+    rmSync(join(f.cwd, name));
+    assert.throws(
+      () => stagedFormatFiles(f.cwd),
+      (error) => {
+        assert.match(error.message, /missing from the working tree/u);
+        assert.ok(error.message.includes(name), error.message);
+        return true;
+      },
+    );
+    // Restoring the file lets the selection succeed again.
+    f.git("checkout-index", "--force", "--", name);
+  }
+  assert.equal(stagedFormatFiles(f.cwd).length, 3);
+});
+
+test("staged deletions and unsupported missing paths do not fail the selection", (t) => {
+  const f = fixture(t);
+  f.write("removed.ts", "const value = 1;\n");
+  f.write("notes.txt", "plain text\n");
+  f.write("kept.ts", "const value = 2;\n");
+  f.commit();
+  f.git("rm", "removed.ts");
+  f.write("notes.txt", "changed text\n");
+  f.write("new-notes.txt", "new text\n");
+  f.git("add", "notes.txt", "new-notes.txt");
+  rmSync(join(f.cwd, "new-notes.txt"));
+  assert.deepEqual(stagedFormatFiles(f.cwd), []);
+  f.write("kept.ts", "const   value = 3;\n");
+  f.git("add", "kept.ts");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
+});
+
+// Same list as `extensions` in format-changed.mjs; the exclusion probe must work
+// for each of them, so a missing extension here would hide a broken probe.
+const formatExtensions = [
+  ".js",
+  ".jsx",
+  ".mjs",
+  ".cjs",
+  ".ts",
+  ".tsx",
+  ".mts",
+  ".cts",
+  ".css",
+  ".json",
+  ".jsonc",
+  ".json5",
+  ".yaml",
+  ".yml",
+  ".md",
+  ".mdx",
+];
+
+// Staged paths that the shared rstack.config.ts exclusions skip even when they
+// are present. Their missing worktree file must not fail the selection.
+const excludedStagedPaths = [
+  "pnpm-lock.yaml",
+  "apps/web/pnpm-lock.yaml",
+  "package-lock.json",
+  "vendor/lib.ts",
+  "packages/a/third-party/lib.js",
+  "src/schema.generated.ts",
+  "protos/gen/api.json",
+  ".agents/skills/example/SKILL.md",
+];
+
+test("staged selection skips paths excluded by the shared configuration when they are missing from the worktree", (t) => {
+  const f = fixture(t);
+  for (const name of excludedStagedPaths) f.write(name, "a:   1\n");
+  f.write("kept.ts", "const value = 1;\n");
+  f.commit();
+  for (const name of excludedStagedPaths) f.write(name, "a:    2\n");
+  f.write("kept.ts", "const   value = 2;\n");
+  f.git("add", ".");
+  // Present excluded paths are selected and left to Rstack, as before.
+  assert.deepEqual(
+    stagedFormatFiles(f.cwd),
+    [...excludedStagedPaths, "kept.ts"].sort(),
+  );
+  for (const name of excludedStagedPaths) rmSync(join(f.cwd, name));
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
+  // An excluded missing path never hides a missing path Rstack would format.
+  rmSync(join(f.cwd, "kept.ts"));
+  assert.throws(
+    () => stagedFormatFiles(f.cwd),
+    /missing from the working tree.*kept\.ts/u,
+  );
+  // A path excluded by its name is still excluded behind a replaced parent.
+  f.git("checkout-index", "--force", "--", "kept.ts");
+  rmSync(join(f.cwd, "vendor"), { recursive: true, force: true });
+  f.write("vendor", "not a directory\n");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
+});
+
+test("the exclusion probe covers every supported extension", (t) => {
+  const f = fixture(t);
+  for (const extension of formatExtensions) {
+    f.write(`vendor/probe${extension}`, "x\n");
+    f.write(`probe${extension}`, "x\n");
+  }
+  f.git("add", ".");
+  for (const extension of formatExtensions) {
+    // The excluded path alone is missing: nothing fails, the present path stays.
+    rmSync(join(f.cwd, `vendor/probe${extension}`));
+    assert.ok(
+      stagedFormatFiles(f.cwd).includes(`probe${extension}`),
+      extension,
+    );
+    rmSync(join(f.cwd, `probe${extension}`));
+    assert.throws(
+      () => stagedFormatFiles(f.cwd),
+      (error) => {
+        // Only the formattable path fails; the excluded sibling is skipped.
+        assert.ok(
+          error.message.includes(`cannot be formatted: probe${extension}.`),
+          error.message,
+        );
+        assert.ok(!error.message.includes("vendor/"), error.message);
+        return true;
+      },
+      extension,
+    );
+    f.git("checkout-index", "--force", "--", `probe${extension}`);
+  }
+});
+
+test(
+  "staged selection applies every exemption before the missing-file failure, like the unstaged selectors",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("target.ts", "const value = 1;\n");
+    f.write("renamed.ts", "const value = 2;\n");
+    f.write("removed.ts", "const value = 3;\n");
+    f.write("pnpm-lock.yaml", "a:   1\n");
+    const head = f.commit();
+    symlinkSync("target.ts", join(f.cwd, "linked.ts"));
+    f.write("target.ts", "const   value = 5;\n");
+    f.write("notes.txt", "plain\n");
+    f.write("vendor/lib.ts", "const   value = 4;\n");
+    f.write("pnpm-lock.yaml", "a:    2\n");
+    f.git("mv", "renamed.ts", "vendor/renamed.ts");
+    f.git("rm", "--quiet", "removed.ts");
+    f.git("add", ".");
+    for (const name of [
+      "linked.ts",
+      "notes.txt",
+      "vendor/lib.ts",
+      "vendor/renamed.ts",
+      "pnpm-lock.yaml",
+    ]) {
+      rmSync(join(f.cwd, name), { force: true });
+    }
+    // Symlink, unsupported extension, shared exclusions, rename into an excluded
+    // directory and a staged deletion are all exempt although nothing is on disk.
+    assert.deepEqual(stagedFormatFiles(f.cwd), ["target.ts"]);
+    // The unstaged selectors treat the same missing paths identically.
+    assert.ok(!allFormatFiles(f.cwd).includes("vendor/lib.ts"));
+    assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), [
+      "target.ts",
+    ]);
+    // Only a missing path that Rstack would format fails.
+    rmSync(join(f.cwd, "target.ts"));
+    assert.throws(
+      () => stagedFormatFiles(f.cwd),
+      /missing from the working tree.*target\.ts/u,
+    );
+    assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), []);
+  },
+);
+
+test("CLI --staged accepts a staged excluded file missing from the worktree", (t) => {
+  const f = fixture(t);
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  f.write("pnpm-lock.yaml", "a:   1\n");
+  f.git("add", "pnpm-lock.yaml");
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  for (const args of [["--staged"], ["--staged", "--write"]]) {
+    const result = spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+    const output = `${args.join(" ")}: ${result.stdout}${result.stderr}`;
+    assert.equal(result.status, 0, output);
+    assert.doesNotMatch(result.stderr, /ci_format_error/u, output);
+    assert.match(result.stdout, /"candidates":0/u, output);
+  }
+});
+
+test("CLI --staged exits 2 naming a staged file removed from the worktree", (t) => {
+  const f = fixture(t);
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  f.write("b.ts", "const   value = 1;\n");
+  f.git("add", "b.ts");
+  rmSync(join(f.cwd, "b.ts"));
+  for (const args of [["--staged"], ["--staged", "--write"]]) {
+    const result = spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+    const output = `${args.join(" ")}: ${result.stdout}${result.stderr}`;
+    assert.equal(result.status, 2, output);
+    assert.match(result.stderr, /ci_format_error/u, output);
+    assert.match(result.stderr, /b\.ts/u, output);
+  }
+});
+
+// Lefthook hides unstaged changes (including a plain `rm` after `git add`) by
+// restoring the staged content before the hook runs, so the hook only sees a
+// staged path missing from the worktree when Git itself omits it from the
+// unstaged diff. A skip-worktree entry, as in a sparse checkout, does that.
+test("pre-commit rejects a staged skip-worktree file missing from the worktree and keeps deletions working", (t) => {
+  const f = fixture(t);
+  f.write("tracked.ts", "const value = 1;\n");
+  f.write("sparse.ts", "const value = 1;\n");
+  const head = f.commit();
+  f.installHook();
+  const commit = () =>
+    spawnSync("git", ["commit", "--quiet", "-m", "x"], {
+      cwd: f.cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  f.write("sparse.ts", "const   value = 2;\n");
+  f.git("add", "sparse.ts");
+  f.git("update-index", "--skip-worktree", "sparse.ts");
+  rmSync(join(f.cwd, "sparse.ts"));
+  const rejected = commit();
+  const output = rejected.stdout + rejected.stderr;
+  assert.notEqual(rejected.status, 0, output);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.match(output, /ci_format_error/u);
+  assert.match(output, /sparse\.ts/u);
+  assert.equal(f.git("show", ":sparse.ts"), "const   value = 2;");
+  // Restoring the staged state of the path and deleting another file works.
+  f.git("update-index", "--no-skip-worktree", "sparse.ts");
+  f.git("reset", "--quiet", "--", "sparse.ts");
+  f.git("checkout", "--quiet", "--", "sparse.ts");
+  f.git("rm", "--quiet", "tracked.ts");
+  const accepted = commit();
+  assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr);
+  assert.notEqual(f.git("rev-parse", "HEAD"), head);
+});
+
+test("pre-commit accepts a staged skip-worktree lockfile missing from the worktree", (t) => {
+  const f = fixture(t);
+  f.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
+  f.write("tracked.ts", "const value = 1;\n");
+  const head = f.commit();
+  f.installHook();
+  f.write("pnpm-lock.yaml", "lockfileVersion:   '9.1'\n");
+  f.git("add", "pnpm-lock.yaml");
+  f.git("update-index", "--skip-worktree", "pnpm-lock.yaml");
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  const accepted = spawnSync("git", ["commit", "--quiet", "-m", "lockfile"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+  });
+  const output = accepted.stdout + accepted.stderr;
+  assert.equal(accepted.status, 0, output);
+  assert.doesNotMatch(output, /ci_format_error/u);
+  assert.notEqual(f.git("rev-parse", "HEAD"), head);
+  // Rstack never rewrites an excluded lockfile.
+  assert.equal(
+    f.git("show", "HEAD:pnpm-lock.yaml"),
+    "lockfileVersion:   '9.1'",
+  );
+});
 
 test("real Rstack checks whole changed files without rewriting, then fixes them", async (t) => {
   const f = fixture(t);
@@ -312,6 +681,330 @@ test("deletions, renames, empty ranges, local edits and invalid comparisons", as
   ]);
   assert.throws(() => changedFormatFiles(f.cwd, "", head), /comparison SHA/);
   assert.throws(() => changedFormatFiles(f.cwd, "a".repeat(40), head));
+});
+
+// A path staged with new content whose working tree was then restored to the
+// HEAD bytes ("MM" in `git status`) differs from HEAD only in the index.
+function stageThenRevert(f, name, committed, staged) {
+  f.write(name, staged);
+  f.git("add", name);
+  f.write(name, committed);
+}
+
+test("default local selection includes a path that differs from HEAD only in the index", (t) => {
+  const f = fixture(t);
+  f.write("f.ts", "const value = 1;\n");
+  f.write("kept.ts", "const kept = 1;\n");
+  f.write("gone.ts", "const gone = 1;\n");
+  const head = f.commit();
+  stageThenRevert(f, "f.ts", "const value = 1;\n", "const   value = 2;\n");
+  assert.equal(f.git("status", "--porcelain", "--", "f.ts"), "MM f.ts");
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), ["f.ts"]);
+  // Staged deletions, unsupported paths and unchanged files stay unselected.
+  f.git("rm", "--quiet", "gone.ts");
+  f.write("notes.txt", "plain\n");
+  f.git("add", "notes.txt");
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), ["f.ts"]);
+});
+
+test("default local selection still includes worktree edits and untracked paths", (t) => {
+  const f = fixture(t);
+  f.write("staged.ts", "const staged = 1;\n");
+  f.write("edited.ts", "const edited = 1;\n");
+  const head = f.commit();
+  stageThenRevert(
+    f,
+    "staged.ts",
+    "const staged = 1;\n",
+    "const   staged = 2;\n",
+  );
+  f.write("edited.ts", "const edited = 2;\n");
+  f.write("untracked.md", "# Untracked\n");
+  f.write("added.ts", "const added = 1;\n");
+  f.git("add", "added.ts");
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), [
+    "added.ts",
+    "edited.ts",
+    "staged.ts",
+    "untracked.md",
+  ]);
+});
+
+test("explicit comparisons exclude paths that differ from HEAD only in the index", (t) => {
+  const f = fixture(t);
+  f.write("f.ts", "const value = 1;\n");
+  const head = f.commit();
+  stageThenRevert(f, "f.ts", "const value = 1;\n", "const   value = 2;\n");
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head), []);
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, false), []);
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (args, env) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env,
+      encoding: "utf8",
+    });
+  for (const [args, env] of [
+    [["--base", head, "--head", head], f.env],
+    [[], { ...f.env, CI: "true", TURBO_SCM_BASE: head, TURBO_SCM_HEAD: head }],
+  ]) {
+    const result = run(args, env);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /"candidates":0/u, result.stdout);
+    assert.match(result.stdout, /"local":false/u, result.stdout);
+  }
+});
+
+test("--staged selection keeps reporting an index-only path", (t) => {
+  const f = fixture(t);
+  f.write("f.ts", "const value = 1;\n");
+  f.commit();
+  stageThenRevert(f, "f.ts", "const value = 1;\n", "const   value = 2;\n");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["f.ts"]);
+});
+
+test("CLI default local run selects an index-only path and format:check fails on unformatted bytes", (t) => {
+  const f = fixture(t);
+  f.write("f.ts", "const value = 1;\n");
+  const head = f.commit();
+  // The default local comparison needs an origin/main ref to find the merge base.
+  f.git("update-ref", "refs/remotes/origin/main", head);
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = () =>
+    spawnSync(process.execPath, [script], {
+      cwd: f.cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  stageThenRevert(f, "f.ts", "const value = 1;\n", "const   value = 2;\n");
+  // The formatter checks working-tree bytes, not the staged blob, so formatted
+  // working-tree bytes pass even though the path is now selected.
+  const formatted = run();
+  assert.equal(formatted.status, 0, formatted.stdout + formatted.stderr);
+  assert.match(formatted.stdout, /"candidates":1/u, formatted.stdout);
+  assert.match(formatted.stdout, /"local":true/u, formatted.stdout);
+  // Unformatted working-tree bytes in the same MM-selected path fail the check.
+  f.write("f.ts", "const   value = 3;\n");
+  const unformatted = run();
+  assert.equal(unformatted.status, 1, unformatted.stdout + unformatted.stderr);
+  assert.match(unformatted.stdout, /"candidates":1/u, unformatted.stdout);
+});
+
+// A checkout without symlink support (Windows without privileges, or
+// `core.symlinks=false`) materializes a symlink the index records with mode
+// 120000 as a regular file holding the link target. Build exactly that state
+// without a native symlink, so the fixtures also run where symlinks need
+// privileges. The placeholder is a parse error as TypeScript, so a selector that
+// let it reach Rstack would fail the check and the write flow.
+const SymlinkPlaceholder = "../target.ts";
+
+function recordSymlink(f, name, placeholder = SymlinkPlaceholder) {
+  f.git("config", "core.symlinks", "false");
+  const blob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+    input: placeholder,
+  }).trim();
+  f.git("update-index", "--add", "--cacheinfo", `120000,${blob},${name}`);
+  f.write(name, placeholder);
+}
+
+const indexMode = (f, name) =>
+  f.git("ls-files", "--stage", "--", name).split(" ")[0];
+
+test("every selector skips an index-recorded symlink checked out as a regular file", (t) => {
+  const f = fixture(t);
+  f.write("regular.ts", "const regular = 1;\n");
+  recordSymlink(f, "linked.ts");
+  recordSymlink(f, "dir/linked.md", "../README.md");
+  recordSymlink(f, "tab\tname.json", "../x.json");
+  const head = f.commit();
+  assert.equal(indexMode(f, "linked.ts"), "120000");
+  assert.equal(indexMode(f, "regular.ts"), "100644");
+  // Local edits and an explicit range that both cover the placeholders.
+  f.write("regular.ts", "const regular = 2;\n");
+  f.write("untracked.ts", "const untracked = 1;\n");
+  const all = allFormatFiles(f.cwd);
+  assert.ok(all.includes("regular.ts"), all.join(","));
+  assert.ok(
+    !all.some((name) => /linked|tab/u.test(name)),
+    `all selection kept a symlink: ${all.join(",")}`,
+  );
+  assert.deepEqual(changedFormatFiles(f.cwd, f.base, head), ["regular.ts"]);
+  assert.deepEqual(changedFormatFiles(f.cwd, f.base, head, true), [
+    "regular.ts",
+    "untracked.ts",
+  ]);
+  // Git keeps the recorded symlink type when `core.symlinks=false` re-adds the
+  // placeholder, so the selection stays correct after `git add`.
+  f.write("linked.ts", "../other.ts");
+  f.git("add", "linked.ts");
+  assert.equal(indexMode(f, "linked.ts"), "120000");
+  assert.ok(!allFormatFiles(f.cwd).includes("linked.ts"));
+});
+
+test("--staged selection skips a recorded symlink, including before the first commit", (t) => {
+  const f = fixture(t, false);
+  f.write("regular.ts", "const   regular = 1;\n");
+  recordSymlink(f, "linked.ts");
+  recordSymlink(f, "gone.ts");
+  rmSync(join(f.cwd, "gone.ts"));
+  f.git("add", "regular.ts");
+  // HEAD is unborn, and the missing placeholder of a recorded symlink does not
+  // fail the selection that rejects other missing staged paths.
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["regular.ts"]);
+});
+
+test("--staged selection skips a path whose type changed to a recorded symlink", (t) => {
+  const f = fixture(t);
+  f.write("changed.ts", "const changed = 1;\n");
+  f.write("kept.ts", "const kept = 1;\n");
+  f.commit();
+  recordSymlink(f, "changed.ts");
+  f.write("kept.ts", "const   kept = 2;\n");
+  f.git("add", "kept.ts");
+  assert.match(
+    f.git("diff", "--cached", "--raw", "--", "changed.ts"),
+    /\sT\tchanged\.ts$/u,
+  );
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
+});
+
+test("explicit comparisons use the validation index, not the comparison head", (t) => {
+  const f = fixture(t);
+  f.write("was-link.ts", "const was = 1;\n");
+  f.write("now-link.ts", "const now = 1;\n");
+  f.write("other.ts", "const other = 1;\n");
+  const base = f.commit();
+  // The comparison head records `was-link.ts` as a symlink and `now-link.ts`
+  // as a regular file; the checked-out validation tree records the reverse.
+  recordSymlink(f, "was-link.ts");
+  f.write("now-link.ts", "const now = 2;\n");
+  f.write("other.ts", "const other = 2;\n");
+  f.git("add", "-A", ".");
+  f.git("commit", "--quiet", "-m", "head");
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), [
+    "now-link.ts",
+    "other.ts",
+  ]);
+  // Validation tree: swap the recorded types in the index only.
+  f.git("rm", "--cached", "--quiet", "was-link.ts");
+  f.write("was-link.ts", "const was = 3;\n");
+  f.git("add", "was-link.ts");
+  recordSymlink(f, "now-link.ts");
+  assert.equal(indexMode(f, "was-link.ts"), "100644");
+  assert.equal(indexMode(f, "now-link.ts"), "120000");
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), [
+    "other.ts",
+    "was-link.ts",
+  ]);
+});
+
+test("local selection keeps untracked regular files and skips native symlinks", (t) => {
+  const f = fixture(t);
+  f.write("tracked.ts", "const tracked = 1;\n");
+  const head = f.commit();
+  recordSymlink(f, "linked.ts");
+  f.write("untracked.ts", "const untracked = 1;\n");
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), [
+    "untracked.ts",
+  ]);
+  if (process.platform !== "win32") {
+    symlinkSync("tracked.ts", join(f.cwd, "native.ts"));
+    assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), [
+      "untracked.ts",
+    ]);
+    f.git("add", "native.ts");
+    assert.equal(indexMode(f, "native.ts"), "120000");
+    assert.deepEqual(stagedFormatFiles(f.cwd), []);
+  }
+});
+
+test("CLI selectors never hand a recorded symlink to Rstack and keep its bytes and mode", async (t) => {
+  const f = fixture(t);
+  f.write("regular.ts", "const regular = 1;\n");
+  const head = f.commit();
+  f.git("update-ref", "refs/remotes/origin/main", head);
+  recordSymlink(f, "linked.ts");
+  f.write("regular.ts", "const   regular = 2;\n");
+  f.git("add", "regular.ts");
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (args, env = f.env) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env,
+      encoding: "utf8",
+    });
+  const stageBefore = f.git("ls-files", "--stage");
+  // The placeholder would be a parse error (status 2) if Rstack received it.
+  const candidates = {
+    "": 1,
+    "--all": allFormatFiles(f.cwd).length,
+    "--staged": 1,
+  };
+  assert.ok(!allFormatFiles(f.cwd).includes("linked.ts"));
+  for (const args of [[], ["--all"], ["--staged"]]) {
+    const result = run(args);
+    const output = `${args.join(" ")}: ${result.stdout}${result.stderr}`;
+    assert.match(
+      result.stdout,
+      new RegExp(`"candidates":${candidates[args.join(" ")]}[,}]`, "u"),
+      output,
+    );
+    assert.equal(result.status, 1, output);
+  }
+  for (const args of [[], ["--all"], ["--staged"]]) {
+    const result = run([...args, "--write"]);
+    assert.equal(
+      result.status,
+      0,
+      `${args.join(" ")}: ${result.stdout}${result.stderr}`,
+    );
+  }
+  assert.equal(
+    readFileSync(join(f.cwd, "linked.ts"), "utf8"),
+    SymlinkPlaceholder,
+  );
+  assert.equal(
+    readFileSync(join(f.cwd, "regular.ts"), "utf8"),
+    "const regular = 2;\n",
+  );
+  assert.equal(indexMode(f, "linked.ts"), "120000");
+  assert.equal(
+    f.git("ls-files", "--stage", "--", "linked.ts"),
+    stageBefore.split("\n").find((line) => line.endsWith("\tlinked.ts")),
+  );
+});
+
+test("pre-commit leaves a recorded symlink placeholder and its index mode untouched", (t) => {
+  const f = fixture(t, false);
+  f.installHook();
+  f.write("regular.ts", "const   regular = {answer:42}\n");
+  recordSymlink(f, "linked.ts");
+  f.git("add", "regular.ts");
+  const linkedEntry = f.git("ls-files", "--stage", "--", "linked.ts");
+  const result = spawnSync("git", ["commit", "--quiet", "-m", "initial"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /"candidates":1/u);
+  assert.equal(
+    f.git("show", "HEAD:regular.ts"),
+    "const regular = { answer: 42 };",
+  );
+  assert.equal(
+    f.git("ls-tree", "HEAD", "--", "linked.ts").split(" ")[0],
+    "120000",
+  );
+  assert.equal(f.git("ls-files", "--stage", "--", "linked.ts"), linkedEntry);
+  assert.equal(
+    readFileSync(join(f.cwd, "linked.ts"), "utf8"),
+    SymlinkPlaceholder,
+  );
 });
 
 test("all-file selection skips unstaged deletions and retains existing files", async (t) => {
@@ -572,13 +1265,17 @@ for (const { name, skip, breakParent } of brokenParents) {
   };
 
   test(
-    `selectors skip tracked paths whose parent raises ${name}`,
+    `unstaged selectors skip tracked paths whose parent raises ${name}; staged selection fails`,
     { skip },
     (t) => {
       const { f, head } = setup(t);
       assert.doesNotMatch(allFormatFiles(f.cwd).join("\n"), /^a\/b\.ts$/mu);
-      assert.deepEqual(stagedFormatFiles(f.cwd), []);
       assert.deepEqual(changedFormatFiles(f.cwd, f.base, head, true), []);
+      // A staged blob that cannot be formatted must block the commit.
+      assert.throws(
+        () => stagedFormatFiles(f.cwd),
+        new RegExp(`${name}.*a/b\\.ts`, "u"),
+      );
     },
   );
 
@@ -595,22 +1292,27 @@ for (const { name, skip, breakParent } of brokenParents) {
   );
 
   test(
-    `--staged --write and --all exit 0 when a parent raises ${name}`,
+    `--all does not crash and --staged --write exits 2 naming the path when a parent raises ${name}`,
     { skip },
     (t) => {
       const { f } = setup(t);
       const script = join(root, "scripts/ci/format-changed.mjs");
-      for (const args of [["--staged", "--write"], ["--all"]]) {
-        const result = spawnSync(process.execPath, [script, ...args], {
+      const run = (args) =>
+        spawnSync(process.execPath, [script, ...args], {
           cwd: f.cwd,
           env: f.env,
           encoding: "utf8",
         });
-        // `--all` may exit 1 for unrelated fixture files; 2 is the crash code.
-        const output = `${args.join(" ")}: ${result.stdout}${result.stderr}`;
-        assert.notEqual(result.status, 2, output);
-        assert.doesNotMatch(output, /ci_format_error/u);
-      }
+      // `--all` may exit 1 for unrelated fixture files; 2 is the crash code.
+      const all = run(["--all"]);
+      const allOutput = `--all: ${all.stdout}${all.stderr}`;
+      assert.notEqual(all.status, 2, allOutput);
+      assert.doesNotMatch(allOutput, /ci_format_error/u);
+      const staged = run(["--staged", "--write"]);
+      const stagedOutput = `--staged --write: ${staged.stdout}${staged.stderr}`;
+      assert.equal(staged.status, 2, stagedOutput);
+      assert.match(staged.stderr, /ci_format_error/u, stagedOutput);
+      assert.match(staged.stderr, /a\/b\.ts/u, stagedOutput);
     },
   );
 }

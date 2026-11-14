@@ -62,16 +62,96 @@ function isRegularFile(cwd, name, skipGone = true) {
   }
 }
 
+// Git index mode of a tracked symbolic link.
+const SymlinkMode = "120000";
+
+// Paths recorded as symbolic links in the current index. A checkout without
+// symlink support (Windows without privileges, `core.symlinks=false`) writes
+// such a path as a regular file holding the link target, so the worktree file
+// type alone cannot identify it; formatting would rewrite the placeholder and
+// change what Git records. `git ls-files --stage` reads the index that Git
+// resolves from the environment (honoring GIT_INDEX_FILE inside hooks), so it
+// is the validation index, works before the first commit and never consults the
+// comparison head. Each entry is `<mode> <object> <stage>\t<path>`; the path
+// follows the first tab and may itself contain tabs or newlines.
+function recordedSymlinks(cwd) {
+  const symlinks = new Set();
+  for (const entry of git(cwd, "ls-files", "--stage", "-z").split("\0")) {
+    const tab = entry.indexOf("\t");
+    if (tab === -1) continue;
+    if (entry.slice(0, tab).split(" ")[0] === SymlinkMode) {
+      symlinks.add(entry.slice(tab + 1));
+    }
+  }
+  return symlinks;
+}
+
 export function allFormatFiles(cwd) {
+  const symlinks = recordedSymlinks(cwd);
   return git(cwd, "ls-files", "-z")
     .split("\0")
     .filter((name) => {
-      if (!extensions.has(extname(name))) return false;
+      if (!extensions.has(extname(name)) || symlinks.has(name)) return false;
       return isRegularFile(cwd, name);
     });
 }
 
+function rstackEntry() {
+  const manifestPath = require.resolve("rstack/package.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  return resolve(dirname(manifestPath), manifest.bin.rs);
+}
+
+// Content that every supported extension formats to an empty file but that an
+// excluded path leaves untouched (verified for each entry of `extensions`).
+const ExclusionProbe = "\n\n\n";
+
+// Whether the shared Rstack configuration (`rstack.config.ts` ignorePatterns
+// and Rstack's own ignore handling) excludes the path from formatting. Rstack
+// is the single owner of those exclusions and only evaluates them for paths it
+// is given, so ask it through `--stdin-filepath`, which applies the same
+// matching to a path that does not exist on disk. A probe that cannot run
+// reports "not excluded", which keeps the missing-file failure in force.
+function excludedByRstack(cwd, name) {
+  try {
+    const output = execFileSync(
+      process.execPath,
+      [rstackEntry(), "fmt", "--stdin-filepath", `./${name}`],
+      {
+        cwd,
+        input: ExclusionProbe,
+        encoding: "utf8",
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    return output === ExclusionProbe;
+  } catch {
+    return false;
+  }
+}
+
+// Staged deletions are excluded by --diff-filter, so every selected path is a
+// staged addition, modification, rename or type change. Such a path that is
+// missing from the working tree (removed after `git add`, or outside a sparse
+// checkout) has a staged blob that `--write` would never format. Fail naming the
+// path instead of silently skipping it, so the commit cannot bypass formatting.
+// A path that the shared exclusions skip is never formatted even when present,
+// so its absence is irrelevant and, like the unstaged selectors, it is skipped.
+function stagedRegularFile(cwd, name) {
+  try {
+    return isRegularFile(cwd, name, false);
+  } catch (error) {
+    if (!goneCodes.has(error.code)) throw error;
+    if (excludedByRstack(cwd, name)) return false;
+    throw new Error(
+      `Staged path is missing from the working tree (${error.code}) and cannot be formatted: ${name}. Restore the file, or unstage it with "git restore --staged -- <path>" (or "git rm --cached -- <path>" to commit its deletion), then commit again.`,
+      { cause: error },
+    );
+  }
+}
+
 export function stagedFormatFiles(cwd) {
+  const symlinks = recordedSymlinks(cwd);
   return git(
     cwd,
     "diff",
@@ -84,8 +164,12 @@ export function stagedFormatFiles(cwd) {
   )
     .split("\0")
     .filter((name) => {
-      if (!extensions.has(extname(name))) return false;
-      return isRegularFile(cwd, name);
+      // Every exemption runs before the worktree is consulted, so none of them
+      // can hit the missing-file failure: an unsupported extension, a path the
+      // index records as a symlink, and, inside stagedRegularFile, a path
+      // excluded by the shared Rstack configuration.
+      if (!extensions.has(extname(name)) || symlinks.has(name)) return false;
+      return stagedRegularFile(cwd, name);
     })
     .sort();
 }
@@ -104,17 +188,16 @@ export function changedFormatFiles(cwd, base, head, local = false) {
     "--",
   ).split("\0");
   if (local) {
-    names.push(
-      ...git(
-        cwd,
-        "diff",
-        "--name-only",
-        "--no-renames",
-        "-z",
-        head,
-        "--",
-      ).split("\0"),
-    );
+    // `git diff <head>` compares the tree with the working tree, so a path whose
+    // index differs from HEAD but whose working tree equals HEAD (for example
+    // after `git add` and a later revert) is invisible to it. Add the staged
+    // delta explicitly so such paths are still selected.
+    for (const extra of [
+      ["diff", "--name-only", "--no-renames", "-z", head, "--"],
+      ["diff", "--cached", "--name-only", "--no-renames", "-z", head, "--"],
+    ]) {
+      names.push(...git(cwd, ...extra).split("\0"));
+    }
     names.push(
       ...git(cwd, "ls-files", "--others", "--exclude-standard", "-z").split(
         "\0",
@@ -133,10 +216,14 @@ export function changedFormatFiles(cwd, base, head, local = false) {
       "-z",
     ).split("\0"),
   );
+  // The validation index decides which paths are symlinks, not the comparison
+  // head: the checkout may be a merge commit that differs from `head`.
+  const symlinks = recordedSymlinks(cwd);
   return [...new Set(names)]
     .filter((name) => {
       if (!name || !extensions.has(extname(name)) || !present.has(name))
         return false;
+      if (symlinks.has(name)) return false;
       return isRegularFile(cwd, name, local);
     })
     .sort();
@@ -193,9 +280,7 @@ export async function runFormatter(cwd, paths, mode = Mode.Check) {
   if (!Object.values(Mode).includes(mode))
     throw new Error("Unknown formatting mode");
   if (!paths.length) return 0;
-  const manifestPath = require.resolve("rstack/package.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  const entry = resolve(dirname(manifestPath), manifest.bin.rs);
+  const entry = rstackEntry();
   let status = 0;
   // Bound argv size and prefix paths so leading dashes and negation characters
   // cannot become CLI flags or exclusion patterns. Rstack resolves files first.
