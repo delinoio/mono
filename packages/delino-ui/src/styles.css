@@ -311,13 +311,647 @@
     margin-top: 24px;
   }
 
+  /* Textarea. The field, label, description and error share the text field
+     rules. */
+  .dui-textarea {
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 88px;
+    max-height: 320px;
+    padding: 10px 14px;
+    border: 1px solid var(--dui-color-border);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+    color: var(--dui-color-text);
+    font: inherit;
+    font-size: 15px;
+    line-height: 1.5;
+    resize: vertical;
+  }
+
+  .dui-textarea:focus-visible {
+    border-color: var(--dui-color-focus-ring);
+    outline: 1px solid var(--dui-color-focus-ring);
+  }
+
+  .dui-textarea[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-text-field[data-invalid] .dui-textarea {
+    border-color: var(--dui-color-danger-text);
+  }
+
+  /* Checkbox */
+  .dui-checkbox-field {
+    display: grid;
+    gap: 2px;
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-checkbox-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    cursor: pointer;
+  }
+
+  .dui-checkbox-label {
+    color: var(--dui-color-text);
+    font-size: 15px;
+    line-height: 22px;
+  }
+
+  /* Indent by the checkbox width and gap, so it lines up with the label. */
+  .dui-checkbox-description {
+    margin: 0;
+    padding-inline-start: 30px;
+    color: var(--dui-color-text-muted);
+    font-size: 13px;
+  }
+
+  .dui-checkbox {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: 20px;
+    height: 20px;
+    margin-top: 1px;
+    padding: 0;
+    border: 2px solid var(--dui-color-border);
+    border-radius: 6px;
+    background: var(--dui-color-surface);
+    color: var(--dui-color-on-accent);
+    cursor: pointer;
+    transition:
+      background-color 0.15s,
+      border-color 0.15s;
+  }
+
+  .dui-checkbox:is([data-checked], [data-indeterminate]) {
+    border-color: var(--dui-color-accent);
+    background: var(--dui-color-accent);
+  }
+
+  .dui-checkbox:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .dui-checkbox[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-checkbox-indicator {
+    display: flex;
+  }
+
+  .dui-checkbox-indicator svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  .dui-checkbox-group {
+    display: grid;
+    gap: 12px;
+  }
+
+  /* Radio group */
+  .dui-radio-field {
+    display: grid;
+    gap: 8px;
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-radio-field-label {
+    color: var(--dui-color-text-muted);
+    font-size: 13px;
+    font-weight: 500;
+  }
+
+  .dui-radio-field-description {
+    margin: 0;
+    color: var(--dui-color-text-muted);
+    font-size: 13px;
+  }
+
+  .dui-radio-field-error {
+    color: var(--dui-color-danger-text);
+    font-size: 13px;
+  }
+
+  .dui-radio-group {
+    display: grid;
+    gap: 12px;
+  }
+
+  .dui-radio-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--dui-color-text);
+    font-size: 15px;
+    cursor: pointer;
+  }
+
+  .dui-radio {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    border: 2px solid var(--dui-color-border);
+    border-radius: 50%;
+    background: var(--dui-color-surface);
+    cursor: pointer;
+    transition: border-color 0.15s;
+  }
+
+  .dui-radio[data-checked] {
+    border-color: var(--dui-color-accent);
+  }
+
+  .dui-radio-field[data-invalid] .dui-radio {
+    border-color: var(--dui-color-danger-text);
+  }
+
+  .dui-radio:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .dui-radio[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-radio-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--dui-color-accent);
+  }
+
+  /* Select. The field, label, description and error share the text field
+     rules. */
+  .dui-select {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 44px;
+    padding: 0 12px 0 14px;
+    border: 1px solid var(--dui-color-border);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+    color: var(--dui-color-text);
+    font: inherit;
+    font-size: 15px;
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .dui-select:focus-visible {
+    border-color: var(--dui-color-focus-ring);
+    outline: 1px solid var(--dui-color-focus-ring);
+  }
+
+  .dui-select[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-text-field[data-invalid] .dui-select {
+    border-color: var(--dui-color-danger-text);
+  }
+
+  .dui-select-value[data-placeholder] {
+    color: var(--dui-color-text-muted);
+  }
+
+  .dui-select-icon {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    color: var(--dui-color-text-muted);
+  }
+
+  .dui-select-content {
+    box-sizing: border-box;
+    min-width: var(--anchor-width);
+    max-height: min(320px, var(--available-height));
+    overflow-y: auto;
+    margin: 0;
+    padding: 6px;
+    border: 1px solid var(--dui-color-neutral-hover);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+    color: var(--dui-color-text);
+    font-family: var(--dui-font-family);
+    transform-origin: var(--transform-origin);
+    transition:
+      opacity 0.15s,
+      scale 0.15s;
+  }
+
+  .dui-select-content:is([data-starting-style], [data-ending-style]) {
+    opacity: 0;
+    scale: 0.98;
+  }
+
+  .dui-select-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-height: 40px;
+    padding: 0 10px;
+    border-radius: 8px;
+    font-size: 15px;
+    cursor: pointer;
+  }
+
+  .dui-select-option[data-highlighted] {
+    background: var(--dui-color-neutral);
+  }
+
+  .dui-select-option[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-select-option-indicator {
+    display: flex;
+    color: var(--dui-color-accent);
+  }
+
+  .dui-select-option-indicator svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  /* Tabs */
+  .dui-tabs {
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-tabs-list {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--dui-color-neutral-hover);
+  }
+
+  .dui-tabs-tab {
+    min-height: 44px;
+    margin-bottom: -1px;
+    padding: 0 12px;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    background: none;
+    color: var(--dui-color-text-muted);
+    font: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+      color 0.15s,
+      border-color 0.15s;
+  }
+
+  .dui-tabs-tab:hover {
+    color: var(--dui-color-text);
+  }
+
+  .dui-tabs-tab[data-selected] {
+    border-bottom-color: var(--dui-color-text);
+    color: var(--dui-color-text);
+  }
+
+  .dui-tabs-tab:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: -2px;
+    border-radius: 8px 8px 0 0;
+  }
+
+  .dui-tabs-tab[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-tabs-panel {
+    padding-top: 16px;
+    color: var(--dui-color-text);
+  }
+
+  .dui-tabs-panel:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  /* Tooltip */
+  .dui-tooltip {
+    box-sizing: border-box;
+    max-width: 280px;
+    margin: 0;
+    padding: 6px 10px;
+    border: 0;
+    border-radius: 8px;
+    background: var(--dui-color-text);
+    color: var(--dui-color-surface);
+    font-family: var(--dui-font-family);
+    font-size: 13px;
+    line-height: 1.4;
+    transform-origin: var(--transform-origin);
+    transition:
+      opacity 0.15s,
+      scale 0.15s;
+  }
+
+  .dui-tooltip:is([data-starting-style], [data-ending-style]) {
+    opacity: 0;
+    scale: 0.96;
+  }
+
+  /* Toast. Stacking follows the UI SDK toast styling guide: toasts sit
+     absolutely in the region, the newest in front. */
+  /* The region can render as a top-layer popover, whose browser styles set
+     `inset: 0` and `margin: auto`. Reset them so only one edge applies. */
+  .dui-toast-region {
+    position: fixed;
+    inset: auto;
+    bottom: calc(16px + var(--keyboard-inset, 0px));
+    left: 50%;
+    overflow: visible;
+    z-index: 2147483647;
+    box-sizing: border-box;
+    width: min(400px, calc(100vw - 32px));
+    height: var(--toast-front-height);
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    translate: -50% 0;
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-toast-region[data-side="top"] {
+    top: 16px;
+    bottom: auto;
+  }
+
+  .dui-toast-region[data-align="start"] {
+    left: 16px;
+    translate: none;
+  }
+
+  .dui-toast-region[data-align="end"] {
+    right: 16px;
+    left: auto;
+    translate: none;
+  }
+
+  .dui-toast-region[data-expanded] {
+    height: calc(var(--toast-stack-height) + (var(--toast-count) - 1) * 8px);
+  }
+
+  .dui-toast-region [data-slot="toast-list"] {
+    position: relative;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .dui-toast {
+    --dui-toast-y: calc(var(--toast-index) * -8px);
+    position: absolute;
+    inset-inline: 0;
+    bottom: 0;
+    z-index: calc(100 - var(--toast-index));
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    box-sizing: border-box;
+    height: var(--toast-height);
+    overflow: hidden;
+    padding: 14px 16px;
+    border-radius: 16px;
+    background: var(--dui-color-text);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 20%);
+    color: var(--dui-color-surface);
+    translate: var(--toast-swipe-x, 0px)
+      calc(var(--dui-toast-y) + var(--toast-swipe-y, 0px));
+    scale: calc(1 - var(--toast-index) * 0.05);
+    transition-property: translate, scale, opacity, height;
+    transition-duration: 0.3s;
+    user-select: none;
+  }
+
+  .dui-toast-region[data-side="top"] .dui-toast {
+    --dui-toast-y: calc(var(--toast-index) * 8px);
+    top: 0;
+    bottom: auto;
+  }
+
+  .dui-toast:not([data-front], [data-expanded]) {
+    height: var(--toast-front-height);
+  }
+
+  .dui-toast[data-expanded] {
+    --dui-toast-y: calc(-1 * (var(--toast-offset) + var(--toast-index) * 8px));
+    scale: 1;
+  }
+
+  .dui-toast-region[data-side="top"] .dui-toast[data-expanded] {
+    --dui-toast-y: calc(var(--toast-offset) + var(--toast-index) * 8px);
+  }
+
+  .dui-toast[data-starting-style] {
+    transition: none;
+  }
+
+  .dui-toast[data-starting-style][data-front] {
+    --dui-toast-y: 100%;
+  }
+
+  .dui-toast-region[data-side="top"]
+    .dui-toast[data-starting-style][data-front] {
+    --dui-toast-y: -100%;
+  }
+
+  .dui-toast:is([data-starting-style]:not([data-front]), [data-ending-style]) {
+    opacity: 0;
+  }
+
+  .dui-toast[data-swiping] {
+    transition: none;
+  }
+
+  .dui-toast-text {
+    display: grid;
+    flex: 1;
+    gap: 2px;
+    min-width: 0;
+  }
+
+  .dui-toast-title {
+    font-size: 15px;
+    font-weight: 600;
+  }
+
+  .dui-toast-description {
+    opacity: 0.8;
+    font-size: 13px;
+  }
+
+  .dui-toast-button {
+    flex: none;
+  }
+
+  /* Avatar */
+  .dui-avatar {
+    position: relative;
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+    border-radius: 50%;
+    background: var(--dui-color-neutral);
+    color: var(--dui-color-text-muted);
+    font-family: var(--dui-font-family);
+    font-weight: 600;
+    vertical-align: middle;
+    user-select: none;
+  }
+
+  .dui-avatar[data-size="small"] {
+    width: 24px;
+    height: 24px;
+    font-size: 10px;
+  }
+
+  .dui-avatar[data-size="medium"] {
+    width: 40px;
+    height: 40px;
+    font-size: 15px;
+  }
+
+  .dui-avatar[data-size="large"] {
+    width: 64px;
+    height: 64px;
+    font-size: 22px;
+  }
+
+  .dui-avatar-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+  }
+
+  /* Progress */
+  .dui-progress {
+    display: grid;
+    gap: 8px;
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-progress-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .dui-progress-label {
+    color: var(--dui-color-text);
+    font-weight: 500;
+  }
+
+  .dui-progress-value {
+    color: var(--dui-color-text-muted);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .dui-progress-track {
+    position: relative;
+    height: 8px;
+    overflow: hidden;
+    border-radius: 4px;
+    background: var(--dui-color-neutral-hover);
+  }
+
+  .dui-progress-indicator {
+    height: 100%;
+    border-radius: inherit;
+    background: var(--dui-color-accent);
+    transition: width 0.3s;
+  }
+
+  .dui-progress-indicator[data-indeterminate] {
+    width: 40%;
+    animation: dui-progress-indeterminate 1.2s ease-in-out infinite;
+  }
+
+  @keyframes dui-progress-indeterminate {
+    from {
+      translate: -100% 0;
+    }
+
+    to {
+      translate: 250% 0;
+    }
+  }
+
+  /* Separator */
+  .dui-separator {
+    flex: none;
+    margin: 0;
+    border: 0;
+    background: var(--dui-color-neutral-hover);
+  }
+
+  .dui-separator[data-orientation="horizontal"] {
+    width: 100%;
+    height: 1px;
+  }
+
+  .dui-separator[data-orientation="vertical"] {
+    align-self: stretch;
+    width: 1px;
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .dui-button,
     .dui-switch,
     .dui-switch-thumb,
     .dui-dialog-backdrop,
-    .dui-dialog-content {
+    .dui-dialog-content,
+    .dui-checkbox,
+    .dui-radio,
+    .dui-select-content,
+    .dui-tabs-tab,
+    .dui-tooltip,
+    .dui-progress-indicator {
       transition: none;
+    }
+
+    .dui-toast {
+      transition-property: opacity;
+    }
+
+    .dui-progress-indicator[data-indeterminate] {
+      animation-duration: 3s;
     }
   }
 }
