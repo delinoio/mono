@@ -15,8 +15,9 @@ export type TextFieldProps = React.ComponentProps<typeof Input> & {
   /** Help text shown below the input. */
   description?: React.ReactNode;
   /**
-   * An error message to show. Setting it marks the field as invalid. Without
-   * it, the field shows the browser's message after a failed submit.
+   * An error message to show. A non-empty message marks the field as
+   * invalid. Without one (`undefined`, `null`, `false` or `""`), the field
+   * shows the browser's message after a failed submit.
    */
   error?: React.ReactNode;
 };
@@ -36,7 +37,8 @@ export function TextField({
   disabled,
   ...props
 }: TextFieldProps) {
-  const hasError = error !== undefined && error !== null && error !== false;
+  const hasError =
+    error !== undefined && error !== null && error !== false && error !== "";
 
   return (
     <Field

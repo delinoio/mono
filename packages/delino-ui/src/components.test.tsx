@@ -109,6 +109,16 @@ describe("TextField", () => {
     expect(screen.getByText("Enter a valid email.")).toBeTruthy();
   });
 
+  test("treats an empty error message as no error", () => {
+    render(<TextField label="Email" error="" />);
+
+    const input = screen.getByRole("textbox", { name: "Email" });
+    expect(input.getAttribute("aria-invalid")).toBeNull();
+    expect(
+      input.closest("[data-slot='field']")?.hasAttribute("data-invalid"),
+    ).toBe(false);
+  });
+
   test("reports typed values", () => {
     const values: string[] = [];
     render(
