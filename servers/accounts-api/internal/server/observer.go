@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net"
 	"net/http"
@@ -71,6 +72,23 @@ const (
 // head, an invalid chunked body, a full queue) the observer stops parsing and
 // the connection continues unobserved: it may then miss the record of a later
 // rejected request, but it never logs a request that was not rejected.
+//
+// Other rejections happen before net/http has a request at all, so they have no
+// method and path and are logged as http_request_rejected records instead:
+//
+//   - net/http answers a malformed request (400), a head over the limit (431),
+//     an unsupported Transfer-Encoding (501) and an unsupported protocol
+//     version (505) with one write of a fixed response shape on the raw
+//     connection (see parseDirectErrorResponse). The observer recognizes that
+//     write while no handler is running and logs it once, before the write.
+//   - When ReadHeaderTimeout expires, net/http closes the connection without
+//     any response. The observer sees the timed-out read of the connection and
+//     logs it when the read was waiting for a request head. A timeout of the
+//     keep-alive wait between requests (IdleTimeout), of a request body
+//     (ReadTimeout) and the read interruptions that net/http causes itself are
+//     not logged; see claimReadTimeout.
+//   - A connection that a handler hijacked is no longer net/http's, so the
+//     observer never logs for it (see ConnState).
 
 // observerPhase is the position of the incremental parser in the byte stream.
 type observerPhase int
@@ -127,17 +145,42 @@ type connObserver struct {
 	pending  []observedRequest
 	inFlight int
 	lastDone time.Time
+	// rejected is set once the connection logged a rejection, so every
+	// connection logs at most one, as net/http closes it after each rejection.
 	rejected bool
+	// hijacked is set when a handler took the connection over.
+	hijacked bool
+
+	// acceptedAt is when the connection was accepted.
+	acceptedAt time.Time
+	// requestStart is when the first byte arrived that no handler has finished
+	// since; it is zero until the next byte arrives. It is the start of the
+	// request that a rejection record measures.
+	requestStart time.Time
+	// parsedHeads counts the request heads that parsed. A read timeout on a
+	// connection whose parser is waiting for the first byte of a head is the
+	// header read timeout only while this is zero; later it is the idle wait.
+	parsedHeads int
+
+	// readDeadline is the last read deadline net/http set, and deadlineSetAt is
+	// when it set it; see deadlineExpired.
+	readDeadline  time.Time
+	deadlineSetAt time.Time
 }
 
 func newConnObserver(logger *slog.Logger) *connObserver {
-	return &connObserver{logger: logger, now: time.Now}
+	o := &connObserver{logger: logger, now: time.Now}
+	o.acceptedAt = o.now()
+	return o
 }
 
 // feed consumes inbound bytes in stream order.
 func (o *connObserver) feed(p []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
+	if len(p) > 0 && o.requestStart.IsZero() {
+		o.requestStart = o.now()
+	}
 	for len(p) > 0 && o.phase != phaseStopped {
 		switch o.phase {
 		case phaseHead:
@@ -216,6 +259,7 @@ func (o *connObserver) finishHead() {
 		o.stop()
 		return
 	}
+	o.parsedHeads++
 	observed := observedRequest{
 		method:       req.Method,
 		path:         req.URL.Path,
@@ -416,6 +460,9 @@ func (o *connObserver) handlerFinished() {
 	defer o.mu.Unlock()
 	o.inFlight--
 	o.lastDone = o.now()
+	// The next request starts with the next byte (or counts from lastDone when
+	// its bytes already arrived).
+	o.requestStart = time.Time{}
 }
 
 // expectationFailedStatus is the status line of every 417 response of net/http
@@ -448,7 +495,7 @@ func isExpectationFailedResponse(p []byte) bool {
 func (o *connObserver) claimRejection(p []byte) (observedRequest, time.Time, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.rejected || o.inFlight > 0 || len(o.pending) == 0 || !o.pending[0].expectFailed || !isExpectationFailedResponse(p) {
+	if o.rejected || o.hijacked || o.inFlight > 0 || len(o.pending) == 0 || !o.pending[0].expectFailed || !isExpectationFailedResponse(p) {
 		return observedRequest{}, time.Time{}, false
 	}
 	o.rejected = true
@@ -469,6 +516,201 @@ func (o *connObserver) logRejection(request observedRequest, start time.Time) {
 	logRequest(context.Background(), o.logger, request.method, request.path, http.StatusExpectationFailed, o.now().Sub(start), 0)
 }
 
+// RejectionReason identifies why net/http rejected a request before the
+// handler ran. The values are the stable `reason` field of the
+// http_request_rejected record.
+type RejectionReason string
+
+const (
+	// RejectionMalformedRequest is a request net/http cannot parse or accept:
+	// a malformed request line or header (400).
+	RejectionMalformedRequest RejectionReason = "malformed_request"
+	// RejectionHeaderTooLarge is a request head over MaxHeaderBytes (431).
+	RejectionHeaderTooLarge RejectionReason = "request_header_too_large"
+	// RejectionUnsupportedTransferEncoding is a Transfer-Encoding other than
+	// chunked (501).
+	RejectionUnsupportedTransferEncoding RejectionReason = "unsupported_transfer_encoding"
+	// RejectionUnsupportedProtocolVersion is a request of an HTTP version that
+	// net/http does not serve (505).
+	RejectionUnsupportedProtocolVersion RejectionReason = "unsupported_protocol_version"
+	// RejectionHeaderReadTimeout is a client that did not send a complete
+	// request head within ReadHeaderTimeout. net/http sends no response.
+	RejectionHeaderReadTimeout RejectionReason = "header_read_timeout"
+	// RejectionOther is any other status that net/http answers directly.
+	RejectionOther RejectionReason = "rejected"
+)
+
+// directErrorHeaders are the headers of every response that net/http's
+// connection loop writes itself for a request it rejects, in this order and
+// with nothing else. net/http writes the status line, these headers and the
+// body in one write to the raw connection and never adds Date or
+// Content-Length. A response of a handler, or of a request that reached the
+// handler, always carries Date, so it never has this shape.
+const directErrorHeaders = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+
+// parseDirectErrorResponse recognizes the response that net/http's connection
+// loop writes when it rejects a request before it exists as a request, and
+// returns its status. The status line is "HTTP/1.1 <code> <status text>",
+// optionally followed by ": <detail>" (net/http adds the detail for a missing
+// Host header and the like), and always says HTTP/1.1 whatever the client
+// sent.
+func parseDirectErrorResponse(p []byte) (int, bool) {
+	const prefix = "HTTP/1.1 "
+	if !bytes.HasPrefix(p, []byte(prefix)) || len(p) < len(prefix)+3 {
+		return 0, false
+	}
+	code, err := strconv.Atoi(string(p[len(prefix) : len(prefix)+3]))
+	if err != nil || code < 400 || code > 599 {
+		return 0, false
+	}
+	text := http.StatusText(code)
+	if text == "" {
+		return 0, false
+	}
+	rest := p[len(prefix)+3:]
+	if !bytes.HasPrefix(rest, []byte(" "+text)) {
+		return 0, false
+	}
+	rest = rest[1+len(text):]
+	if bytes.HasPrefix(rest, []byte(": ")) {
+		end := bytes.Index(rest, []byte("\r\n"))
+		if end < 0 {
+			return 0, false
+		}
+		rest = rest[end:]
+	}
+	if !bytes.HasPrefix(rest, []byte(directErrorHeaders)) {
+		return 0, false
+	}
+	return code, true
+}
+
+// rejectionReasonFor maps the status of a direct net/http error response to its
+// reason.
+func rejectionReasonFor(status int) RejectionReason {
+	switch status {
+	case http.StatusBadRequest:
+		return RejectionMalformedRequest
+	case http.StatusRequestHeaderFieldsTooLarge:
+		return RejectionHeaderTooLarge
+	case http.StatusNotImplemented:
+		return RejectionUnsupportedTransferEncoding
+	case http.StatusHTTPVersionNotSupported:
+		return RejectionUnsupportedProtocolVersion
+	default:
+		return RejectionOther
+	}
+}
+
+// rejectionStart returns when the request that is being rejected started: with
+// its first byte, or with the end of the last handler call when its bytes
+// arrived while that handler was still running, or with the accepted
+// connection. The caller holds o.mu.
+func (o *connObserver) rejectionStart() time.Time {
+	start := o.acceptedAt
+	if !o.requestStart.IsZero() {
+		start = o.requestStart
+	}
+	if o.lastDone.After(start) {
+		start = o.lastDone
+	}
+	return start
+}
+
+// claimDirectRejection reports whether this outbound write is a response that
+// net/http wrote for a request it rejected before the handler, and claims it so
+// it is logged exactly once.
+//
+// A response is only claimed while no handler runs, so it cannot be a response
+// of a handler, and never on a hijacked connection. The shape check does not
+// depend on the parser, so it also works after the parser stopped on the
+// malformed or oversized head that caused the response.
+func (o *connObserver) claimDirectRejection(p []byte) (RejectionReason, int, time.Time, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.rejected || o.hijacked || o.inFlight > 0 {
+		return "", 0, time.Time{}, false
+	}
+	status, ok := parseDirectErrorResponse(p)
+	if !ok {
+		return "", 0, time.Time{}, false
+	}
+	o.rejected = true
+	return rejectionReasonFor(status), status, o.rejectionStart(), true
+}
+
+// setReadDeadline records the read deadline that net/http sets on the
+// connection. net/http also sets a deadline that already passed to interrupt a
+// pending background read; such an interruption is told apart from a timer
+// expiry by deadlineExpired.
+func (o *connObserver) setReadDeadline(t time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.readDeadline = t
+	o.deadlineSetAt = o.now()
+}
+
+// deadlineExpired reports whether a read deadline timer expired, as opposed to
+// net/http interrupting a read with a deadline in the past (it does so to stop
+// the background read of a finished request, and a handler may do the same).
+// A deadline that was already in the past when it was set cannot have
+// expired. The caller holds o.mu.
+func (o *connObserver) deadlineExpired() bool {
+	return !o.readDeadline.IsZero() && o.readDeadline.After(o.deadlineSetAt)
+}
+
+// claimReadTimeout reports whether a read of the connection that failed with a
+// timeout was waiting for a request head that did not arrive in time, and
+// claims it so it is logged exactly once. net/http closes the connection
+// without a response in that case.
+//
+// Only a deadline timer that expired while the parser waited for (more of) a
+// request head counts, with no handler running:
+//
+//   - A head that is partly received counts, whatever deadline expired.
+//   - An empty head counts only while no request head ever parsed on the
+//     connection. A connection that connects and stalls is logged, because
+//     the contract covers every header read timeout, and so is one that sends
+//     nothing for ReadHeaderTimeout. After a request, net/http waits for the
+//     next one under IdleTimeout, which is a normal keep-alive close and is
+//     not logged.
+//   - A timeout while the parser skips a body (ReadTimeout), or after it
+//     stopped, is not a header timeout.
+func (o *connObserver) claimReadTimeout() (time.Time, bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if o.rejected || o.hijacked || o.inFlight > 0 || o.phase != phaseHead || !o.deadlineExpired() {
+		return time.Time{}, false
+	}
+	if len(o.head) == 0 && o.parsedHeads > 0 {
+		return time.Time{}, false
+	}
+	o.rejected = true
+	return o.rejectionStart(), true
+}
+
+// markHijacked records that a handler took the connection over. net/http no
+// longer reads or writes it, so nothing on it is a rejection.
+func (o *connObserver) markHijacked() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.hijacked = true
+	o.stop()
+}
+
+// logRejected writes the http_request_rejected record of a request that net/http
+// rejected before it had a request to hand to the handler. The record has no
+// method, path or byte count because none of them is reliable at that point.
+// status is the status net/http sent to the client, or 0 when it sent no
+// response (the header read timeout).
+func (o *connObserver) logRejected(reason RejectionReason, status int, start time.Time) {
+	o.logger.Info("http_request_rejected",
+		slog.String("reason", string(reason)),
+		slog.Int("status", status),
+		slog.Int64("duration_ms", o.now().Sub(start).Milliseconds()),
+	)
+}
+
 // observedConn tees a connection into its connObserver. It keeps the
 // net.Conn behavior net/http relies on, including CloseWrite.
 type observedConn struct {
@@ -481,6 +723,13 @@ func (c *observedConn) Read(p []byte) (int, error) {
 	if n > 0 {
 		c.obs.feed(p[:n])
 	}
+	var netErr net.Error
+	if err != nil && errors.As(err, &netErr) && netErr.Timeout() {
+		// net/http closes the connection without a response after this error.
+		if start, ok := c.obs.claimReadTimeout(); ok {
+			c.obs.logRejected(RejectionHeaderReadTimeout, 0, start)
+		}
+	}
 	return n, err
 }
 
@@ -489,8 +738,20 @@ func (c *observedConn) Write(p []byte) (int, error) {
 	// before net/http flushes the response.
 	if request, start, ok := c.obs.claimRejection(p); ok {
 		c.obs.logRejection(request, start)
+	} else if reason, status, start, ok := c.obs.claimDirectRejection(p); ok {
+		c.obs.logRejected(reason, status, start)
 	}
 	return c.Conn.Write(p)
+}
+
+func (c *observedConn) SetReadDeadline(t time.Time) error {
+	c.obs.setReadDeadline(t)
+	return c.Conn.SetReadDeadline(t)
+}
+
+func (c *observedConn) SetDeadline(t time.Time) error {
+	c.obs.setReadDeadline(t)
+	return c.Conn.SetDeadline(t)
 }
 
 // CloseWrite is used by net/http to half-close a connection before it closes
@@ -507,10 +768,14 @@ type observedListener struct {
 	logger *slog.Logger
 }
 
-// ObserveListener wraps listener so that requests that net/http rejects with
-// 417 before the handler runs are logged as http_request records. The server
-// that serves the listener must set ConnContext to this package's ConnContext
-// and MaxHeaderBytes to MaxHeaderBytes. It does not change any response.
+// ObserveListener wraps listener so that requests that net/http rejects before
+// the handler runs are logged: a 417 for an unsupported Expect header as an
+// http_request record, and a malformed request (400), an oversized head (431),
+// an unsupported Transfer-Encoding (501) or protocol version (505) and a
+// header read timeout as http_request_rejected records. The server that serves
+// the listener must set ConnContext to this package's ConnContext, ConnState to
+// this package's ConnState and MaxHeaderBytes to MaxHeaderBytes. It does not
+// change any response.
 func ObserveListener(listener net.Listener, logger *slog.Logger) net.Listener {
 	return observedListener{Listener: listener, logger: logger}
 }
@@ -533,6 +798,19 @@ func ConnContext(ctx context.Context, conn net.Conn) context.Context {
 		return context.WithValue(ctx, observerKey{}, observed.obs)
 	}
 	return ctx
+}
+
+// ConnState is the http.Server.ConnState hook that tells the connection's
+// observer when a handler hijacks the connection, so that the observer does not
+// treat the owner's own reads and writes as net/http's. Connections that
+// ObserveListener did not wrap are left alone.
+func ConnState(conn net.Conn, state http.ConnState) {
+	if state != http.StateHijacked {
+		return
+	}
+	if observed, ok := conn.(*observedConn); ok {
+		observed.obs.markHijacked()
+	}
 }
 
 func observerFrom(ctx context.Context) *connObserver {
