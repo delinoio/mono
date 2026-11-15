@@ -35,7 +35,11 @@ export function Checkbox({
   ...props
 }: CheckboxProps) {
   const descriptionId = React.useId();
-  const hasDescription = description !== undefined;
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
 
   return (
     <div className="dui-checkbox-field">

@@ -41,6 +41,11 @@ export function RadioGroup({
 }: RadioGroupProps) {
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
 
   return (
     <Field
@@ -49,7 +54,7 @@ export function RadioGroup({
       invalid={hasError ? true : undefined}
     >
       <FieldLabel className="dui-radio-field-label">{label}</FieldLabel>
-      {description === undefined ? null : (
+      {!hasDescription ? null : (
         <FieldDescription className="dui-radio-field-description">
           {description}
         </FieldDescription>

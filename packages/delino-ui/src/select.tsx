@@ -106,7 +106,10 @@ export function Select({
         </SelectTrigger>
         <SelectContent className="dui-select-content">{children}</SelectContent>
       </SelectRoot>
-      {description === undefined ? null : (
+      {description === undefined ||
+      description === null ||
+      description === false ||
+      description === "" ? null : (
         <FieldDescription className="dui-text-field-description">
           {description}
         </FieldDescription>

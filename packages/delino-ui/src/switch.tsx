@@ -24,11 +24,17 @@ export function Switch({
   className,
   ...props
 }: SwitchProps) {
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
+
   return (
     <Field className="dui-switch-field">
       <div className="dui-switch-text">
         <FieldLabel className="dui-switch-label">{label}</FieldLabel>
-        {description === undefined ? null : (
+        {!hasDescription ? null : (
           <FieldDescription className="dui-switch-description">
             {description}
           </FieldDescription>
