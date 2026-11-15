@@ -7,7 +7,7 @@ This contract owns the `delino-accounts-web` component of [`delino-accounts`](pr
 - `apps/delino-accounts/rsbuild.config.ts`: build and development server configuration.
 - `apps/delino-accounts/index.html`: HTML document template that sets `<html lang="en">`.
 - `apps/delino-accounts/src/`: application source, entry point and unit tests.
-- `apps/delino-accounts/public/`: static files copied to the build root, including Cloudflare Pages `_headers` and `_redirects`.
+- `apps/delino-accounts/public/`: static files copied to the build root, including the Cloudflare Pages `_headers` file. The directory must not contain a top-level `404.html` or a `_redirects` file with a rule that rewrites to `/index.html`; `src/static-hosting.test.ts` enforces this.
 - `apps/delino-accounts/turbo.json`: package-local Turbo task configuration.
 - `apps/delino-accounts/e2e.config.ts` and `apps/delino-accounts/e2e/`: end-to-end test config and tests, according to the [e2e contract](repository-e2e-contract.md).
 
@@ -36,7 +36,7 @@ This contract owns the `delino-accounts-web` component of [`delino-accounts`](pr
 | `account` | `/account` | planned   | Profile and preferences attached to the Logto user.                |
 | `billing` | `/billing` | planned   | Payment methods, billing contacts, balances, credits and invoices. |
 
-- `public/_redirects` rewrites every unknown path to `/index.html` with status `200`, so client-side routes load on direct navigation.
+- Client-side routes load on direct navigation through the Cloudflare Pages single-page-application fallback: when a project has no top-level `404.html`, Pages assumes a single-page application and serves the root (`/`, the `index.html` document) for any path that does not correspond to a static asset. The fallback applies only while the build output has no top-level `404.html`, so the app must not emit a `404.html`. The app must not add a `_redirects` rule that rewrites to `/index.html` (for example `/* /index.html 200`): Cloudflare rejects it as an infinite loop and ignores it, so it provides no routing. Unknown paths return status `200`, so the app renders its own not-found view once routes exist.
 - `public/_headers` sets Cloudflare Pages response headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and `X-Frame-Options: DENY`.
 - API origin: `src/config.ts` resolves the API server origin from the build-time variable `PUBLIC_API_ORIGIN`. An unset or empty value selects `https://accounts.api.delino.io`. The value must be an `http` or `https` origin with no credentials (user name or password), path, query or fragment, including an empty `?` or `#`; the build fails for other values. Error messages never echo the raw value because it may carry a credential. `readAccountsApiOrigin` is the only reader of the variable: `rsbuild.config.ts` calls it with `process.env` to fail the build and the dev server early, and `src/api-origin.ts` calls it with `import.meta.env` to export the validated `ACCOUNTS_API_ORIGIN` constant, which Rsbuild inlines into the client bundle. `src/index.tsx` sets the `data-api-origin` attribute of `<html>` to that constant so the build-time value is observable in the running app; it adds no visible markup, request or route.
 - API calls (`planned`): Connect RPC through `@connectrpc/connect-query` and React Query. The app must not call the API through Tauri-specific or ad-hoc bindings.

@@ -69,7 +69,13 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
 
 test("documentation changes select formatting without fixtures", (t) => {
   const f = fixture(t);
-  f.write("docs/space name\n한국어.md");
+  // Windows rejects control characters such as a line feed in filenames, so it
+  // keeps the space and Unicode coverage; other platforms also cover a newline.
+  f.write(
+    process.platform === "win32"
+      ? "docs/space name 한국어.md"
+      : "docs/space name\n한국어.md",
+  );
   assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
     quality: true,
     format: true,
@@ -77,6 +83,29 @@ test("documentation changes select formatting without fixtures", (t) => {
     go: false,
     e2e: false,
   });
+});
+
+test("documentation and source paths select formatting in any extension case", (t) => {
+  for (const path of [
+    "notes.MD",
+    "Component.TSX",
+    "data.JSON",
+    "docs/Guide.Md",
+  ]) {
+    const f = fixture(t);
+    f.write(path);
+    assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
+      quality: true,
+      format: true,
+      fixtures: false,
+      go: false,
+      e2e: false,
+    });
+  }
+  // An unsupported extension stays unformatted whatever its case.
+  const f = fixture(t);
+  f.write("NOTES.TXT");
+  assert.equal(plan(f.cwd, f.base, f.commit()).format, false);
 });
 
 test("every shared fixture input selects tests", async (t) => {

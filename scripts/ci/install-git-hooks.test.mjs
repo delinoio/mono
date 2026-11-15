@@ -26,6 +26,21 @@ const require = createRequire(import.meta.url);
 const lefthook = require("lefthook/get-exe.js").getExePath();
 const skipMessage = /skipping Lefthook installation/;
 
+// Shells that can start the installer. bash ignores "set -e" inside a command
+// substitution used as an "if" condition, so the installer must behave the same
+// there as under dash. A shell that is not installed is skipped.
+const shells = [
+  { name: "sh", command: ["sh"] },
+  { name: "dash", command: ["dash"] },
+  { name: "bash", command: ["bash"] },
+  { name: "bash --posix", command: ["bash", "--posix"] },
+];
+
+function shellAvailable([shell]) {
+  const probe = spawnSync(shell, ["-c", "exit 0"], { stdio: "ignore" });
+  return probe.error === undefined && probe.status === 0;
+}
+
 function environment() {
   const env = { ...process.env };
   // A developer's global core.hooksPath or an enclosing Git hook invocation must
@@ -63,8 +78,11 @@ function fixture(t) {
       join(path, "scripts/install-git-hooks.sh"),
     );
   };
-  const install = (cwd, script = "scripts/install-git-hooks.sh") =>
-    spawnSync("sh", [script], { cwd, env, encoding: "utf8" });
+  const install = (
+    cwd,
+    script = "scripts/install-git-hooks.sh",
+    [shell, ...shellArgs] = ["sh"],
+  ) => spawnSync(shell, [...shellArgs, script], { cwd, env, encoding: "utf8" });
   const installedHooks = (hooksDirectory) =>
     existsSync(hooksDirectory)
       ? readdirSync(hooksDirectory).filter((name) => !name.endsWith(".sample"))
@@ -161,6 +179,74 @@ test("keeps Lefthook's protection for an unrelated custom hooks path", (t) => {
   assert.notEqual(result.status, 0);
   assert.equal(existsSync(join(customHooks, "pre-commit")), false);
 });
+
+for (const { name, command } of shells) {
+  const options = {
+    skip: !shellAvailable(command) && `${name} is not installed`,
+  };
+
+  test(
+    `keeps Lefthook's protection for a missing custom hooks path under ${name}`,
+    options,
+    (t) => {
+      const { base, git, initRepository, copyProject, install } = fixture(t);
+      const clone = join(base, "clone");
+      initRepository(clone);
+      copyProject(clone);
+      // Both the configured path and the shared hooks directory must be absent so
+      // that a helper that wrongly succeeds canonicalizes them to the same value.
+      rmSync(join(clone, ".git/hooks"), { recursive: true, force: true });
+      git(clone, "config", "core.hooksPath", ".husky");
+
+      const result = install(clone, undefined, command);
+
+      assert.notEqual(result.status, 0, result.stdout);
+      assert.match(
+        result.stdout + result.stderr,
+        /Custom hooks paths are not supported/,
+      );
+      assert.equal(existsSync(join(clone, ".husky")), false);
+      assert.equal(existsSync(join(clone, ".git/hooks/pre-commit")), false);
+    },
+  );
+
+  test(
+    `forces installation into the shared hooks directory under ${name}`,
+    options,
+    (t) => {
+      const {
+        base,
+        git,
+        initRepository,
+        copyProject,
+        install,
+        installedHooks,
+      } = fixture(t);
+      const clone = join(base, "clone");
+      initRepository(clone);
+      copyProject(clone);
+      const sharedHooks = join(clone, ".git/hooks");
+      git(clone, "config", "core.hooksPath", sharedHooks);
+
+      const result = install(clone, undefined, command);
+
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(installedHooks(sharedHooks), ["pre-commit"]);
+    },
+  );
+
+  test(`installs hooks without core.hooksPath under ${name}`, options, (t) => {
+    const { base, initRepository, copyProject, install } = fixture(t);
+    const clone = join(base, "clone");
+    initRepository(clone);
+    copyProject(clone);
+
+    const result = install(clone, undefined, command);
+
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(existsSync(join(clone, ".git/hooks/pre-commit")));
+  });
+}
 
 test("skips an archive extracted inside another repository", (t) => {
   const { base, initRepository, copyProject, install, installedHooks } =

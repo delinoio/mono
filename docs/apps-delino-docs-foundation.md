@@ -34,7 +34,7 @@ This contract owns the `delino-docs` documentation site at `apps/delino-docs/`:
 
 Sidebar order for `/guide/` is owned by `docs/guide/_meta.json`. The navbar entries (`Guide` and `delino.io`) are owned by `docs/_nav.json`. `rspress.config.ts` must not set `themeConfig.nav` or `themeConfig.sidebar`, because either one disables the automatic navbar and sidebar generation from `_nav.json` and `_meta.json`. Use a directory-level `_meta.json` for any future section that needs an explicit sidebar.
 
-- Build artifacts: `index.html` per route, `404.html`, `sitemap.xml` with absolute `https://docs.delino.io` URLs, `llms.txt` and `llms-full.txt`.
+- Build artifacts, relative to `apps/delino-docs/dist/`: one HTML file per route (`/` as `index.html`, `/guide/introduction` as `guide/introduction.html` and `/guide/getting-started` as `guide/getting-started.html`; the build does not emit `<route>/index.html` for the guide routes), `404.html`, `sitemap.xml` with absolute `https://docs.delino.io` URLs, `llms.txt` and `llms-full.txt`.
 - `docs/public/_headers` sets Cloudflare Pages response headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and `X-Frame-Options: DENY`.
 - Rspress built-in full-text search is enabled. The index is generated at build time and is served as static assets; no AI search backend is used yet. If AI search is added, it must default to Cloudflare AI Search per repository defaults.
 
