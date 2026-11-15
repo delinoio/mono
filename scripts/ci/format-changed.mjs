@@ -45,9 +45,12 @@ const git = (cwd, ...args) =>
 // repository-root-relative paths while `git ls-files` prints paths relative to
 // (and limited to) its working directory, so every selector, the Rstack probe
 // and the formatter run from this one root. The invoking directory then never
-// changes which files are selected or how a selected path resolves.
+// changes which files are selected or how a selected path resolves. Only the
+// single newline that terminates Git's output is removed: the path itself may
+// legitimately end in whitespace (a checkout directory named `checkout `), and
+// trimming it would point every selector at a directory that does not exist.
 function repositoryRoot(start) {
-  return git(start, "rev-parse", "--show-toplevel").trim();
+  return git(start, "rev-parse", "--show-toplevel").replace(/\n$/u, "");
 }
 
 function revision(cwd, value) {

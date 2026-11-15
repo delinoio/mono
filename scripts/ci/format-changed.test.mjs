@@ -49,9 +49,20 @@ function isolateGitEnvironment(env) {
 // inherit this process's environment; isolate it before any test runs.
 isolateGitEnvironment(process.env);
 
-function fixture(t, initialCommit = true, parentEnv = process.env) {
-  const cwd = mkdtempSync(join(tmpdir(), "rstack-format-"));
+function fixture(
+  t,
+  initialCommit = true,
+  parentEnv = process.env,
+  directoryName = null,
+) {
+  let cwd = mkdtempSync(join(tmpdir(), "rstack-format-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  if (directoryName !== null) {
+    // Place the repository in a child directory with a chosen name; removing
+    // the unique parent cleans it up.
+    cwd = join(cwd, directoryName);
+    mkdirSync(cwd);
+  }
   const env = isolateGitEnvironment({ ...parentEnv, LEFTHOOK_BIN: lefthook });
   delete env.CI;
   delete env.TURBO_SCM_BASE;
@@ -1888,4 +1899,80 @@ test("pre-commit hook formats staged files when the commit runs in a subdirector
   assert.equal(f.git("show", "HEAD:apps/web/page.ts"), "const page = 1;");
   assert.equal(f.git("show", "HEAD:docs/guide.md"), "# Guide\n\n- item");
   assert.equal(f.git("show", "HEAD:scripts/tool.ts"), "const tool = 1;");
+});
+
+// `git rev-parse --show-toplevel` ends its output with one newline that is not
+// part of the path. A checkout directory whose own name ends in whitespace must
+// survive that newline removal; trimming all whitespace pointed every selector
+// at a nonexistent directory (`spawnSync git ENOENT`).
+const trailingSpaceDirectory = "checkout ";
+
+function trailingSpaceFixture(t) {
+  let f;
+  try {
+    f = fixture(t, true, process.env, trailingSpaceDirectory);
+  } catch (error) {
+    // Windows rejects or silently strips a trailing space in a directory name.
+    if (process.platform === "win32") return null;
+    throw error;
+  }
+  if (!f.cwd.endsWith(trailingSpaceDirectory)) return null;
+  if (!readdirSync(dirname(f.cwd)).includes(trailingSpaceDirectory))
+    return null;
+  for (const [name, text] of Object.entries(subdirectoryFiles)) {
+    f.write(name, text);
+  }
+  return f;
+}
+
+test("selectors work in a repository directory whose name ends in whitespace", (t) => {
+  const f = trailingSpaceFixture(t);
+  if (f === null)
+    return t.skip("trailing-space directory names are unsupported");
+  const names = Object.keys(subdirectoryFiles).sort();
+  f.git("add", "--", ...names);
+  const base = f.base;
+  for (const dir of [f.cwd, join(f.cwd, "scripts")]) {
+    assert.deepEqual(stagedFormatFiles(dir), names, `--staged from ${dir}`);
+  }
+  const head = f.commit();
+  for (const dir of [f.cwd, join(f.cwd, "scripts"), join(f.cwd, "apps/web")]) {
+    assert.deepEqual(
+      changedFormatFiles(dir, base, head),
+      names,
+      `explicit comparison from ${dir}`,
+    );
+    assert.deepEqual(changedFormatFiles(dir, head, head, true), []);
+    assert.ok(
+      allFormatFiles(dir).includes("apps/web/page.ts"),
+      `--all from ${dir}`,
+    );
+  }
+});
+
+test("CLI runs from the root and a subdirectory of a whitespace-terminated repository path", (t) => {
+  const f = trailingSpaceFixture(t);
+  if (f === null)
+    return t.skip("trailing-space directory names are unsupported");
+  const names = Object.keys(subdirectoryFiles).sort();
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (cwd, args) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  f.git("add", "--", ...names);
+  for (const args of [["--staged"], ["--all"]]) {
+    for (const dir of [f.cwd, join(f.cwd, "scripts")]) {
+      const result = run(dir, args);
+      const detail = `${args.join(" ")} from ${dir}\n${result.stdout}${result.stderr}`;
+      assert.doesNotMatch(result.stderr, /ENOENT/u, detail);
+      assert.match(result.stdout, /"ci_format"/u, detail);
+      // The unformatted fixture files fail the check; an unusable root would
+      // have thrown before any candidate was selected.
+      assert.equal(result.status, 1, detail);
+      assert.match(result.stdout, /"candidates":[1-9]/u, detail);
+    }
+  }
 });
