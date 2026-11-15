@@ -100,11 +100,20 @@ type statusRecorder struct {
 	hijacked    bool
 }
 
+// maxCommitStatus is the highest status code net/http accepts in WriteHeader
+// (see checkWriteHeaderCode in net/http/server.go).
+const maxCommitStatus = 999
+
 func (r *statusRecorder) WriteHeader(status int) {
 	// net/http sends informational 1xx headers (except 101 Switching Protocols)
 	// without committing the final status, so they must not be recorded. After
 	// a hijack net/http ignores the call, so nothing is committed either.
-	if !r.hijacked && !r.wroteHeader && (status < http.StatusContinue || status >= http.StatusOK || status == http.StatusSwitchingProtocols) {
+	// net/http commits only codes from 100 to 999 and panics on any other code
+	// before it writes a response, so such a code is never committed: leaving
+	// it unrecorded lets the panic fallback in logRequests report 500.
+	if !r.hijacked && !r.wroteHeader &&
+		status >= http.StatusContinue && status <= maxCommitStatus &&
+		(status >= http.StatusOK || status == http.StatusSwitchingProtocols) {
 		r.status = status
 		r.wroteHeader = true
 	}
