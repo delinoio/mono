@@ -29,7 +29,12 @@ export type DialogProps = Omit<
  * Escape or a press outside, and returns focus to its trigger.
  */
 export function Dialog(props: DialogProps) {
-  return <DialogRoot {...props} />;
+  // The type already omits `dismissible`, but types do not stop JS callers or
+  // untyped spread objects. Drop the key at runtime so Escape always closes.
+  const { dismissible: _dismissible, ...rest } = props as DialogProps & {
+    dismissible?: unknown;
+  };
+  return <DialogRoot {...rest} />;
 }
 
 type ButtonStyleProps = {

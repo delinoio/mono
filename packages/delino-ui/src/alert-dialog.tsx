@@ -34,7 +34,12 @@ export type AlertDialogProps = Omit<
  * outside does not.
  */
 export function AlertDialog(props: AlertDialogProps) {
-  return <AlertDialogRoot {...props} />;
+  // The type already omits `dismissible`, but types do not stop JS callers or
+  // untyped spread objects. Drop the key at runtime so Escape always closes.
+  const { dismissible: _dismissible, ...rest } = props as AlertDialogProps & {
+    dismissible?: unknown;
+  };
+  return <AlertDialogRoot {...rest} />;
 }
 
 type ButtonStyleProps = {

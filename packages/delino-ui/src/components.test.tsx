@@ -211,6 +211,30 @@ describe("Dialog", () => {
     expect(dialog.hasAttribute("data-closed")).toBe(true);
   });
 
+  test("closes with the Escape key even when dismissible is spread in", async () => {
+    // `dismissible` is omitted from the types; a JS caller or an untyped spread
+    // must still not be able to disable Escape at runtime.
+    const untyped = { dismissible: false } as object;
+    render(
+      <Dialog {...untyped}>
+        <DialogTrigger>Delete account</DialogTrigger>
+        <DialogContent>
+          <DialogTitle>Delete your account?</DialogTitle>
+          <DialogClose>Cancel</DialogClose>
+        </DialogContent>
+      </Dialog>,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete account" }));
+    });
+    const dialog = screen.getByRole("dialog");
+
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    expect(dialog.hasAttribute("data-closed")).toBe(true);
+  });
+
   test("closes from a close button", async () => {
     render(<Example />);
     await act(async () => {
@@ -473,6 +497,31 @@ describe("AlertDialog", () => {
 
   test("closes with the Escape key", async () => {
     render(<Example onAnswer={() => {}} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+    });
+    const dialog = screen.getByRole("alertdialog");
+
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    expect(dialog.hasAttribute("data-closed")).toBe(true);
+  });
+
+  test("closes with the Escape key even when dismissible is spread in", async () => {
+    // See the Dialog test: the runtime must ignore `dismissible`.
+    const untyped = { dismissible: false } as object;
+    render(
+      <AlertDialog {...untyped}>
+        <AlertDialogTrigger>Delete project</AlertDialogTrigger>
+        <AlertDialogContent>
+          <AlertDialogTitle>Delete this project?</AlertDialogTitle>
+          <AlertDialogActions>
+            <AlertDialogClose>Cancel</AlertDialogClose>
+          </AlertDialogActions>
+        </AlertDialogContent>
+      </AlertDialog>,
+    );
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
     });
