@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: Apache-2.0
+import { Field, FieldDescription, FieldLabel } from "@ui-sdk/react/field";
+import {
+  Slider as SliderRoot,
+  SliderControl,
+  SliderIndicator,
+  SliderThumb,
+  SliderTrack,
+  SliderValue,
+} from "@ui-sdk/react/slider";
+import type * as React from "react";
+import { mergeClassName } from "./class-name.ts";
+
+export type SliderProps = Omit<
+  React.ComponentProps<typeof SliderRoot>,
+  "children"
+> & {
+  /** The visible name of the slider. */
+  label: React.ReactNode;
+  /** Help text shown below the slider. */
+  description?: React.ReactNode;
+  /** Shows the formatted value, such as "40" or "20–80", next to the label. */
+  showValue?: boolean;
+  /**
+   * The accessible names of the thumbs of a range, such as
+   * `["Minimum price", "Maximum price"]`. A single thumb is named by `label`.
+   */
+  thumbLabels?: readonly string[];
+};
+
+/**
+ * A labeled slider built from UI SDK `Field` and `Slider`. Pass a number as
+ * `value` or `defaultValue` for one thumb, or an array for a range with one
+ * thumb per value. Arrow keys move the focused thumb.
+ */
+export function Slider({
+  label,
+  description,
+  showValue = false,
+  thumbLabels,
+  className,
+  disabled,
+  ...props
+}: SliderProps) {
+  const initial = props.value ?? props.defaultValue;
+  const thumbCount = Array.isArray(initial) ? initial.length : 1;
+  const isRange = Array.isArray(initial);
+
+  return (
+    <Field className="dui-text-field" disabled={disabled}>
+      <SliderRoot
+        className={mergeClassName("dui-slider", className)}
+        disabled={disabled}
+        {...props}
+      >
+        <div className="dui-slider-header">
+          <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
+          {showValue ? <SliderValue className="dui-slider-value" /> : null}
+        </div>
+        <SliderControl className="dui-slider-control">
+          <SliderTrack className="dui-slider-track">
+            <SliderIndicator className="dui-slider-indicator" />
+            {Array.from({ length: thumbCount }, (_, index) => (
+              <SliderThumb
+                // Thumbs are positional and never reorder, so the index is a
+                // stable key.
+                key={index}
+                index={index}
+                className="dui-slider-thumb"
+                aria-label={isRange ? thumbLabels?.[index] : undefined}
+              />
+            ))}
+          </SliderTrack>
+        </SliderControl>
+      </SliderRoot>
+      {description === undefined ? null : (
+        <FieldDescription className="dui-text-field-description">
+          {description}
+        </FieldDescription>
+      )}
+    </Field>
+  );
+}

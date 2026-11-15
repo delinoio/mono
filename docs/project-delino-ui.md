@@ -22,29 +22,44 @@ The project is a library, not a deployable. It has no `apps`, `cmds`, `servers`,
 
 - Component IDs, which are also the package subpath exports:
 
-| Component ID   | Export                   | UI SDK parts used                                                                                |
-| -------------- | ------------------------ | ------------------------------------------------------------------------------------------------ |
-| `alert-dialog` | `delino-ui/alert-dialog` | `AlertDialog` and its trigger, backdrop, content, title, description and close parts             |
-| `avatar`       | `delino-ui/avatar`       | `Avatar`, `AvatarImage`, `AvatarFallback`                                                        |
-| `button`       | `delino-ui/button`       | `Button`                                                                                         |
-| `checkbox`     | `delino-ui/checkbox`     | `Checkbox`, `CheckboxIndicator`, `CheckboxGroup`                                                 |
-| `dialog`       | `delino-ui/dialog`       | `Dialog` and its trigger, backdrop, content, title, description and close parts                  |
-| `progress`     | `delino-ui/progress`     | `Progress`, `ProgressLabel`, `ProgressValue`, `ProgressTrack`, `ProgressIndicator`               |
-| `radio-group`  | `delino-ui/radio-group`  | `Field`, `FieldLabel`, `FieldDescription`, `FieldError`, `RadioGroup`, `Radio`, `RadioIndicator` |
-| `select`       | `delino-ui/select`       | `Field` parts, `Select` and its trigger, value, content, item, item text and indicator           |
-| `separator`    | `delino-ui/separator`    | `Separator`                                                                                      |
-| `switch`       | `delino-ui/switch`       | `Field`, `FieldLabel`, `FieldDescription`, `Switch`, `SwitchThumb`                               |
-| `tabs`         | `delino-ui/tabs`         | `Tabs`, `TabsList`, `TabsTab`, `TabsPanel`                                                       |
-| `text-field`   | `delino-ui/text-field`   | `Field`, `FieldLabel`, `FieldDescription`, `FieldError`, `Input`                                 |
-| `textarea`     | `delino-ui/textarea`     | `Field`, `FieldLabel`, `FieldDescription`, `FieldError`, `Textarea`                              |
-| `toast`        | `delino-ui/toast`        | `ToastRegion`, `Toast`, `ToastTitle`, `ToastDescription`, `ToastAction`, `ToastClose`            |
-| `tooltip`      | `delino-ui/tooltip`      | `Tooltip`, `TooltipTrigger`, `TooltipContent`                                                    |
-| `styles`       | `delino-ui/styles.css`   | None. Design tokens and component styles.                                                        |
+| Component ID        | Export                        | UI SDK parts used                                                                                                                    |
+| ------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `accordion`         | `delino-ui/accordion`         | `Accordion`, `AccordionItem`, `AccordionHeader`, `AccordionTrigger`, `AccordionPanel`                                                |
+| `alert-dialog`      | `delino-ui/alert-dialog`      | `AlertDialog` and its trigger, backdrop, content, title, description and close parts                                                 |
+| `avatar`            | `delino-ui/avatar`            | `Avatar`, `AvatarImage`, `AvatarFallback`                                                                                            |
+| `badge`             | `delino-ui/badge`             | None. Static text with no behavior.                                                                                                  |
+| `button`            | `delino-ui/button`            | `Button`                                                                                                                             |
+| `card`              | `delino-ui/card`              | None. Static container with no behavior.                                                                                             |
+| `checkbox`          | `delino-ui/checkbox`          | `Checkbox`, `CheckboxIndicator`, `CheckboxGroup`                                                                                     |
+| `collapsible`       | `delino-ui/collapsible`       | `Collapsible`, `CollapsibleTrigger`, `CollapsiblePanel`                                                                              |
+| `dialog`            | `delino-ui/dialog`            | `Dialog` and its trigger, backdrop, content, title, description and close parts                                                      |
+| `drawer`            | `delino-ui/drawer`            | `Drawer` and its trigger, backdrop, content, title, description and close parts                                                      |
+| `menu`              | `delino-ui/menu`              | `Menu`, `MenuTrigger`, `MenuContent`, `MenuItem`, `MenuGroup`, `MenuGroupLabel`, `MenuSeparator`                                     |
+| `meter`             | `delino-ui/meter`             | `Meter`, `MeterLabel`, `MeterValue`, `MeterTrack`, `MeterIndicator`                                                                  |
+| `number-input`      | `delino-ui/number-input`      | `Field` parts, `NumberInput`, `NumberInputGroup`, `NumberInputControl`, `NumberInputDecrement`, `NumberInputIncrement`               |
+| `pagination`        | `delino-ui/pagination`        | `Pagination`, `PaginationList`, `PaginationItem`, `PaginationLink`, `PaginationPrevious`, `PaginationNext`, `PaginationEllipsis`     |
+| `password-input`    | `delino-ui/password-input`    | `Field` parts, `PasswordInput`, `PasswordInputControl`, `PasswordInputToggle`                                                        |
+| `popover`           | `delino-ui/popover`           | `Popover` and its trigger, content, title, description and close parts                                                               |
+| `progress`          | `delino-ui/progress`          | `Progress`, `ProgressLabel`, `ProgressValue`, `ProgressTrack`, `ProgressIndicator`                                                   |
+| `radio-group`       | `delino-ui/radio-group`       | `Field`, `FieldLabel`, `FieldDescription`, `FieldError`, `RadioGroup`, `Radio`, `RadioIndicator`                                     |
+| `segmented-control` | `delino-ui/segmented-control` | `SegmentedControl`, `SegmentedControlIndicator`, `SegmentedControlItem`                                                              |
+| `select`            | `delino-ui/select`            | `Field` parts, `Select` and its trigger, value, content, item, item text and indicator                                               |
+| `separator`         | `delino-ui/separator`         | `Separator`                                                                                                                          |
+| `skeleton`          | `delino-ui/skeleton`          | None. Static placeholder with no behavior.                                                                                           |
+| `slider`            | `delino-ui/slider`            | `Field`, `FieldLabel`, `FieldDescription`, `Slider`, `SliderValue`, `SliderControl`, `SliderTrack`, `SliderIndicator`, `SliderThumb` |
+| `switch`            | `delino-ui/switch`            | `Field`, `FieldLabel`, `FieldDescription`, `Switch`, `SwitchThumb`                                                                   |
+| `tabs`              | `delino-ui/tabs`              | `Tabs`, `TabsList`, `TabsTab`, `TabsPanel`                                                                                           |
+| `text-field`        | `delino-ui/text-field`        | `Field`, `FieldLabel`, `FieldDescription`, `FieldError`, `Input`                                                                     |
+| `textarea`          | `delino-ui/textarea`          | `Field`, `FieldLabel`, `FieldDescription`, `FieldError`, `Textarea`                                                                  |
+| `toast`             | `delino-ui/toast`             | `ToastRegion`, `Toast`, `ToastTitle`, `ToastDescription`, `ToastAction`, `ToastClose`                                                |
+| `toggle`            | `delino-ui/toggle`            | `Toggle`, `ToggleGroup`                                                                                                              |
+| `tooltip`           | `delino-ui/tooltip`           | `Tooltip`, `TooltipTrigger`, `TooltipContent`                                                                                        |
+| `styles`            | `delino-ui/styles.css`        | None. Design tokens and component styles.                                                                                            |
 
 - Consumers import components only from the exports above. They must not import files under `packages/delino-ui/src/` by path.
 - Apps that use the components must import `delino-ui/styles.css` before their own stylesheet.
-- Behavior, focus handling and ARIA come from UI SDK. This package must not reimplement them; it only composes UI SDK parts and styles them.
-- The package follows the [frontend design rules](../AGENTS.md#frontend-design-rules): dialogs and alert dialogs always close with the Escape key, and the single critical input of a form receives focus when the form is shown.
+- Behavior, focus handling and ARIA come from UI SDK. This package must not reimplement them; it only composes UI SDK parts and styles them. Components without behavior (`badge`, `card` and `skeleton`) render plain elements.
+- The package follows the [frontend design rules](../AGENTS.md#frontend-design-rules): dialogs, alert dialogs, drawers and popovers always close with the Escape key, and the single critical input of a form receives focus when the form is shown.
 - The package ships TypeScript source and has no build step, so it never writes a `dist` directory. Consumers compile the source with their own Rsbuild or Rspress build.
 - Deviation from repository defaults: the primary language is TypeScript, not Go, because the consumers are React web apps.
 
