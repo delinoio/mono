@@ -566,3 +566,48 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
     /\.go\.result == "skipped" and \$go_planned == "false"/,
   );
 });
+
+test("planner fails accurately for a non-UTF-8 path and skips unsupported ones", (t) => {
+  // Linux file systems hold any byte; APFS and Windows reject or normalize it.
+  const latin1 = (suffix) =>
+    Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9]), Buffer.from(suffix)]);
+  const f = fixture(t);
+  try {
+    writeFileSync(
+      Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".txt")]),
+      "x\n",
+    );
+    writeFileSync(
+      Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]),
+      "x\n",
+    );
+  } catch {
+    return t.skip("file system cannot hold a non-UTF-8 name");
+  }
+  const listing = execFileSync("git", ["ls-files", "--others", "-z"], {
+    cwd: f.cwd,
+    encoding: "buffer",
+  });
+  if (!listing.includes(latin1(".ts")) || !listing.includes(latin1(".txt")))
+    return t.skip("file system cannot hold a non-UTF-8 name");
+  // The unsupported extension alone selects nothing.
+  rmSync(Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]));
+  const unsupported = plan(f.cwd, f.base, f.commit());
+  assert.equal(unsupported.format, false);
+  // A formattable name makes the comparison fail with the accurate error
+  // instead of a raw ENOENT.
+  writeFileSync(
+    Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]),
+    "x\n",
+  );
+  const head = f.commit();
+  assert.throws(
+    () => plan(f.cwd, f.base, head),
+    (error) => {
+      assert.match(error.message, /caf\\xe9\.ts/u);
+      assert.match(error.message, /not valid UTF-8/u);
+      assert.doesNotMatch(error.message, /ENOENT/u);
+      return true;
+    },
+  );
+});
