@@ -49,9 +49,20 @@ function isolateGitEnvironment(env) {
 // inherit this process's environment; isolate it before any test runs.
 isolateGitEnvironment(process.env);
 
-function fixture(t, initialCommit = true, parentEnv = process.env) {
-  const cwd = mkdtempSync(join(tmpdir(), "rstack-format-"));
+function fixture(
+  t,
+  initialCommit = true,
+  parentEnv = process.env,
+  directoryName = null,
+) {
+  let cwd = mkdtempSync(join(tmpdir(), "rstack-format-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  if (directoryName !== null) {
+    // Place the repository in a child directory with a chosen name; removing
+    // the unique parent cleans it up.
+    cwd = join(cwd, directoryName);
+    mkdirSync(cwd);
+  }
   const env = isolateGitEnvironment({ ...parentEnv, LEFTHOOK_BIN: lefthook });
   delete env.CI;
   delete env.TURBO_SCM_BASE;
@@ -1680,3 +1691,288 @@ for (const status of [0, 1, 2]) {
     assert.match(result.stdout, new RegExp(`"status":${status}`));
   });
 }
+
+// Selection must depend on the repository, never on the directory the script
+// is started from. `git diff` prints repository-root-relative paths while
+// `git ls-files` prints paths relative to, and limited to, its working
+// directory; a selector that mixed the two returned an empty or partial list
+// from a subdirectory.
+const subdirectoryFiles = {
+  "apps/web/page.ts": "const   page = 1;\n",
+  "docs/guide.md": "# Guide\n\n*  item\n",
+  "scripts/tool.ts": "const   tool = 1;\n",
+  "packages/ui/data.JSON": '{"a":1}\n',
+};
+const subdirectories = ["scripts", "apps/web", "docs"];
+
+function subdirectoryFixture(t) {
+  const f = fixture(t);
+  for (const [name, text] of Object.entries(subdirectoryFiles)) {
+    f.write(name, text);
+  }
+  return f;
+}
+
+test("every selector returns the same repository-wide files from a subdirectory", (t) => {
+  const f = subdirectoryFixture(t);
+  const names = Object.keys(subdirectoryFiles).sort();
+  f.git("add", "--", ...names);
+  const staged = stagedFormatFiles(f.cwd);
+  assert.deepEqual(staged, names);
+  const base = f.base;
+  const head = f.commit();
+  f.write("docs/guide.md", "# Guide\n\n*  changed\n");
+  f.write("untracked/new.ts", "const   fresh = 1;\n");
+  const all = allFormatFiles(f.cwd);
+  assert.ok(all.includes("apps/web/page.ts"), all.join(","));
+  const explicit = changedFormatFiles(f.cwd, base, head);
+  assert.deepEqual(explicit, names);
+  const local = changedFormatFiles(f.cwd, head, head, true);
+  assert.deepEqual(local, ["docs/guide.md", "untracked/new.ts"]);
+  for (const sub of subdirectories) {
+    const dir = join(f.cwd, sub);
+    assert.deepEqual(allFormatFiles(dir), all, `--all from ${sub}`);
+    assert.deepEqual(
+      changedFormatFiles(dir, base, head),
+      explicit,
+      `explicit comparison from ${sub}`,
+    );
+    assert.deepEqual(
+      changedFormatFiles(dir, head, head, true),
+      local,
+      `local selection from ${sub}`,
+    );
+  }
+});
+
+test("staged selection from a subdirectory matches the root, including the missing-path failure", (t) => {
+  const f = subdirectoryFixture(t);
+  const names = Object.keys(subdirectoryFiles).sort();
+  f.git("add", "--", ...names);
+  for (const sub of subdirectories) {
+    assert.deepEqual(stagedFormatFiles(join(f.cwd, sub)), names, sub);
+  }
+  // The missing-path check resolves against the root, so a path that is really
+  // absent still fails and a path that exists no longer fails from a subdirectory.
+  rmSync(join(f.cwd, "docs/guide.md"));
+  for (const dir of [f.cwd, join(f.cwd, "scripts")]) {
+    assert.throws(
+      () => stagedFormatFiles(dir),
+      /missing from the working tree.*docs\/guide\.md/u,
+    );
+  }
+});
+
+test("symlink and exclusion handling is unchanged when run from a subdirectory", (t) => {
+  const f = fixture(t);
+  f.write("scripts/regular.ts", "const regular = 1;\n");
+  f.write("vendor/code.ts", "const   vendored = 1;\n");
+  recordSymlink(f, "apps/linked.ts");
+  recordSymlink(f, "scripts/linked.md", "../README.md");
+  const head = f.commit();
+  const dir = join(f.cwd, "scripts");
+  assert.ok(!allFormatFiles(dir).some((name) => /linked/u.test(name)));
+  assert.deepEqual(
+    changedFormatFiles(dir, f.base, head),
+    changedFormatFiles(f.cwd, f.base, head),
+  );
+  assert.ok(
+    !changedFormatFiles(dir, f.base, head).some((n) => /linked/u.test(n)),
+  );
+  // A staged excluded path missing from the worktree is skipped by the
+  // exclusion probe, which must also run at the repository root.
+  f.write("vendor/code.ts", "const   vendored = 2;\n");
+  f.git("add", "--", "vendor/code.ts");
+  rmSync(join(f.cwd, "vendor/code.ts"));
+  assert.deepEqual(stagedFormatFiles(dir), []);
+  assert.deepEqual(stagedFormatFiles(f.cwd), []);
+});
+
+test("runFormatter started in a subdirectory formats repository-root-relative paths", async (t) => {
+  const f = subdirectoryFixture(t);
+  const dir = join(f.cwd, "scripts");
+  const paths = ["apps/web/page.ts", "docs/guide.md"];
+  assert.equal(await runFormatter(dir, paths), 1);
+  assert.equal(await runFormatter(dir, paths, "write"), 0);
+  assert.equal(
+    readFileSync(join(f.cwd, "apps/web/page.ts"), "utf8"),
+    "const page = 1;\n",
+  );
+  assert.equal(
+    readFileSync(join(f.cwd, "docs/guide.md"), "utf8"),
+    "# Guide\n\n- item\n",
+  );
+  assert.equal(await runFormatter(dir, paths), 0);
+});
+
+test("CLI selects the same files and exit status from a subdirectory as from the root", (t) => {
+  const f = subdirectoryFixture(t);
+  const names = Object.keys(subdirectoryFiles).sort();
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (cwd, args) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  // Reduces a run to what must not depend on the invoking directory.
+  const outcome = (result) => {
+    const record = JSON.parse(
+      result.stdout.split("\n").find((line) => line.includes('"ci_format"')),
+    );
+    return {
+      status: result.status,
+      candidates: record.candidates,
+      base: record.base,
+      head: record.head,
+      staged: record.staged,
+      local: record.local,
+    };
+  };
+  const base = f.base;
+  f.git("add", "--", ...names);
+  const modes = [["--staged"]];
+  const head = f.commit();
+  modes.push(["--base", base, "--head", head], ["--all"], []);
+  f.write("untracked/new.ts", "const   fresh = 1;\n");
+  for (const args of modes) {
+    // The default local run needs origin/main; point it at the base commit.
+    if (args.length === 0)
+      f.git("update-ref", "refs/remotes/origin/main", base);
+    if (args[0] === "--staged") {
+      f.write("staged/one.ts", "const   one = 1;\n");
+      f.git("add", "--", "staged/one.ts");
+    }
+    const expected = outcome(run(f.cwd, args));
+    assert.ok(expected.candidates > 0, JSON.stringify([args, expected]));
+    assert.equal(expected.status, 1, JSON.stringify([args, expected]));
+    for (const sub of subdirectories) {
+      const result = run(join(f.cwd, sub), args);
+      assert.deepEqual(
+        outcome(result),
+        expected,
+        `${args.join(" ")} from ${sub}\n${result.stdout}${result.stderr}`,
+      );
+    }
+    if (args[0] === "--staged")
+      f.git("reset", "--quiet", "--", "staged/one.ts");
+  }
+});
+
+test("CLI --write from a subdirectory formats files outside that subdirectory", (t) => {
+  const f = subdirectoryFixture(t);
+  const base = f.base;
+  const head = f.commit();
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      base,
+      "--head",
+      head,
+      "--write",
+    ],
+    { cwd: join(f.cwd, "scripts"), env: f.env, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /"candidates":4,/u, result.stdout);
+  assert.equal(
+    readFileSync(join(f.cwd, "apps/web/page.ts"), "utf8"),
+    "const page = 1;\n",
+  );
+  assert.equal(
+    readFileSync(join(f.cwd, "docs/guide.md"), "utf8"),
+    "# Guide\n\n- item\n",
+  );
+});
+
+test("pre-commit hook formats staged files when the commit runs in a subdirectory", (t) => {
+  const f = subdirectoryFixture(t);
+  f.installHook();
+  f.git("add", "--", "apps/web/page.ts", "docs/guide.md", "scripts/tool.ts");
+  execFileSync("git", ["commit", "--quiet", "-m", "from subdirectory"], {
+    cwd: join(f.cwd, "scripts"),
+    env: f.env,
+    encoding: "utf8",
+  });
+  assert.equal(f.git("show", "HEAD:apps/web/page.ts"), "const page = 1;");
+  assert.equal(f.git("show", "HEAD:docs/guide.md"), "# Guide\n\n- item");
+  assert.equal(f.git("show", "HEAD:scripts/tool.ts"), "const tool = 1;");
+});
+
+// `git rev-parse --show-toplevel` ends its output with one newline that is not
+// part of the path. A checkout directory whose own name ends in whitespace must
+// survive that newline removal; trimming all whitespace pointed every selector
+// at a nonexistent directory (`spawnSync git ENOENT`).
+const trailingSpaceDirectory = "checkout ";
+
+function trailingSpaceFixture(t) {
+  let f;
+  try {
+    f = fixture(t, true, process.env, trailingSpaceDirectory);
+  } catch (error) {
+    // Windows rejects or silently strips a trailing space in a directory name.
+    if (process.platform === "win32") return null;
+    throw error;
+  }
+  if (!f.cwd.endsWith(trailingSpaceDirectory)) return null;
+  if (!readdirSync(dirname(f.cwd)).includes(trailingSpaceDirectory))
+    return null;
+  for (const [name, text] of Object.entries(subdirectoryFiles)) {
+    f.write(name, text);
+  }
+  return f;
+}
+
+test("selectors work in a repository directory whose name ends in whitespace", (t) => {
+  const f = trailingSpaceFixture(t);
+  if (f === null)
+    return t.skip("trailing-space directory names are unsupported");
+  const names = Object.keys(subdirectoryFiles).sort();
+  f.git("add", "--", ...names);
+  const base = f.base;
+  for (const dir of [f.cwd, join(f.cwd, "scripts")]) {
+    assert.deepEqual(stagedFormatFiles(dir), names, `--staged from ${dir}`);
+  }
+  const head = f.commit();
+  for (const dir of [f.cwd, join(f.cwd, "scripts"), join(f.cwd, "apps/web")]) {
+    assert.deepEqual(
+      changedFormatFiles(dir, base, head),
+      names,
+      `explicit comparison from ${dir}`,
+    );
+    assert.deepEqual(changedFormatFiles(dir, head, head, true), []);
+    assert.ok(
+      allFormatFiles(dir).includes("apps/web/page.ts"),
+      `--all from ${dir}`,
+    );
+  }
+});
+
+test("CLI runs from the root and a subdirectory of a whitespace-terminated repository path", (t) => {
+  const f = trailingSpaceFixture(t);
+  if (f === null)
+    return t.skip("trailing-space directory names are unsupported");
+  const names = Object.keys(subdirectoryFiles).sort();
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (cwd, args) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  f.git("add", "--", ...names);
+  for (const args of [["--staged"], ["--all"]]) {
+    for (const dir of [f.cwd, join(f.cwd, "scripts")]) {
+      const result = run(dir, args);
+      const detail = `${args.join(" ")} from ${dir}\n${result.stdout}${result.stderr}`;
+      assert.doesNotMatch(result.stderr, /ENOENT/u, detail);
+      assert.match(result.stdout, /"ci_format"/u, detail);
+      // The unformatted fixture files fail the check; an unusable root would
+      // have thrown before any candidate was selected.
+      assert.equal(result.status, 1, detail);
+      assert.match(result.stdout, /"candidates":[1-9]/u, detail);
+    }
+  }
+});

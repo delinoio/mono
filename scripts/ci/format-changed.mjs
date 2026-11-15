@@ -41,6 +41,18 @@ const git = (cwd, ...args) =>
     maxBuffer: 32 * 1024 * 1024,
   });
 
+// Top level of the working tree that contains `start`. `git diff` prints
+// repository-root-relative paths while `git ls-files` prints paths relative to
+// (and limited to) its working directory, so every selector, the Rstack probe
+// and the formatter run from this one root. The invoking directory then never
+// changes which files are selected or how a selected path resolves. Only the
+// single newline that terminates Git's output is removed: the path itself may
+// legitimately end in whitespace (a checkout directory named `checkout `), and
+// trimming it would point every selector at a directory that does not exist.
+function repositoryRoot(start) {
+  return git(start, "rev-parse", "--show-toplevel").replace(/\n$/u, "");
+}
+
 function revision(cwd, value) {
   if (!/^[0-9a-f]{40}$/u.test(value ?? "") || /^0+$/u.test(value)) {
     throw new Error(
@@ -94,7 +106,8 @@ function recordedSymlinks(cwd) {
   return symlinks;
 }
 
-export function allFormatFiles(cwd) {
+export function allFormatFiles(start) {
+  const cwd = repositoryRoot(start);
   const symlinks = recordedSymlinks(cwd);
   const names = git(cwd, "ls-files", "-z")
     .split("\0")
@@ -162,7 +175,8 @@ function stagedRegularFile(cwd, name) {
   }
 }
 
-export function stagedFormatFiles(cwd) {
+export function stagedFormatFiles(start) {
+  const cwd = repositoryRoot(start);
   const symlinks = recordedSymlinks(cwd);
   return git(
     cwd,
@@ -186,7 +200,8 @@ export function stagedFormatFiles(cwd) {
     .sort();
 }
 
-export function changedFormatFiles(cwd, base, head, local = false) {
+export function changedFormatFiles(start, base, head, local = false) {
+  const cwd = repositoryRoot(start);
   revision(cwd, base);
   revision(cwd, head);
   const names = git(
@@ -288,10 +303,12 @@ function runBatch(cwd, args) {
   });
 }
 
-export async function runFormatter(cwd, paths, mode = Mode.Check) {
+export async function runFormatter(start, paths, mode = Mode.Check) {
   if (!Object.values(Mode).includes(mode))
     throw new Error("Unknown formatting mode");
   if (!paths.length) return 0;
+  // Selected paths are repository-root-relative, so Rstack must run there too.
+  const cwd = repositoryRoot(start);
   const entry = rstackEntry();
   let status = 0;
   // Bound argv size and prefix paths so leading dashes and negation characters
@@ -331,7 +348,7 @@ export async function main(env = process.env) {
       head: { type: "string" },
     },
   });
-  const cwd = process.cwd();
+  const cwd = repositoryRoot(process.cwd());
   const ci = ciEnabled(env);
   const explicit =
     values.base !== undefined ||
