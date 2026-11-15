@@ -8,10 +8,21 @@
     "*.css"
   ],
   "exports": {
+    "./alert-dialog": "./src/alert-dialog.tsx",
+    "./avatar": "./src/avatar.tsx",
     "./button": "./src/button.tsx",
+    "./checkbox": "./src/checkbox.tsx",
     "./dialog": "./src/dialog.tsx",
+    "./progress": "./src/progress.tsx",
+    "./radio-group": "./src/radio-group.tsx",
+    "./select": "./src/select.tsx",
+    "./separator": "./src/separator.tsx",
     "./switch": "./src/switch.tsx",
+    "./tabs": "./src/tabs.tsx",
     "./text-field": "./src/text-field.tsx",
+    "./textarea": "./src/textarea.tsx",
+    "./toast": "./src/toast.tsx",
+    "./tooltip": "./src/tooltip.tsx",
     "./styles.css": "./src/styles.css"
   },
   "scripts": {

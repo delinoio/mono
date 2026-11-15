@@ -44,6 +44,38 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `DialogContent`: the dialog panel. It also renders the backdrop.
   - `DialogTitle` (level 2 heading, names the dialog), `DialogDescription` and `DialogActions` (button row).
   - `createDialogController` and the `DialogController` type are re-exported from UI SDK for dialogs that open from outside a trigger.
+- `delino-ui/textarea`
+  - `Textarea`: a labeled multi-line text input. Props: `label` (required), `description`, `error`, and all UI SDK `Textarea` props such as `value`, `defaultValue`, `onValueChange`, `name`, `rows`, `autoResize` and `autoFocus`. It follows the same error and focus rules as `TextField`.
+- `delino-ui/checkbox`
+  - `Checkbox`: a labeled checkbox. Props: `label` (required), `description`, and all UI SDK `Checkbox` props such as `checked`, `defaultChecked`, `onCheckedChange`, `name`, `value` and `disabled`. Pressing the label toggles it. It shows a check while checked and a dash while indeterminate. It wraps the checkbox in a native `label` instead of a UI SDK `Field`, so that it also works inside `CheckboxGroup`, which assigns each checkbox its own id.
+  - `CheckboxGroup`: a styled UI SDK `CheckboxGroup` that keeps one list of checked `Checkbox` values. Consumers name it with `aria-label` or `aria-labelledby`.
+  - The `CheckedState` type is re-exported from UI SDK.
+- `delino-ui/radio-group`
+  - `RadioGroup`: a labeled group with one checked value. Props: `label` (required, names the group), `description`, `error`, and all UI SDK `RadioGroup` props such as `value`, `defaultValue`, `onValueChange`, `name`, `required` and `disabled`. It follows the same error rules as `TextField`. Arrow keys move between options.
+  - `RadioGroupItem`: one option. Props: `value`, `children` (the visible option name) and the other UI SDK `Radio` props.
+- `delino-ui/select`
+  - `Select`: a labeled single-value picker. Props: `label` (required), `description`, `error`, `placeholder`, `value`, `defaultValue`, `onValueChange`, `name`, `required`, `disabled` and the other UI SDK `Select` options except `multiple`. `className` applies to the trigger. It follows the same error rules as `TextField`. The value type is `string`.
+  - `SelectOption`: one option. Props: `value`, `children` (the visible option name), `disabled` and the other UI SDK `SelectItem` props. A check marks the selected option.
+- `delino-ui/tabs`
+  - `Tabs`, `TabsList`, `TabsTab` and `TabsPanel`: styled UI SDK tabs parts with all their props. Each tab and its panel use the same `value`. Consumers name `TabsList` with `aria-label`.
+- `delino-ui/tooltip`
+  - `Tooltip`, `TooltipTrigger` and `TooltipContent`: styled UI SDK tooltip parts with all their props. `TooltipContent` defaults `sideOffset` to 8 pixels. Tooltips hold plain text only, because they cannot receive focus; interactive content goes in a dialog.
+- `delino-ui/toast`
+  - `ToastRegion`: shows the toast queue at the bottom center of the viewport by default (`side`, `align`). Each toast shows its title, description, action button (`Primary`) and cancel button (`Secondary`). It accepts the UI SDK `ToastRegion` props except `children`. Apps render it once near the root.
+  - `toast` and `createToaster` are re-exported from UI SDK. `toast()` adds a toast from anywhere; `createToaster()` creates a separate queue for a region's `toaster` prop.
+  - The `ToastData`, `Toaster` and `ToastType` types are re-exported from UI SDK.
+- `delino-ui/alert-dialog`
+  - `AlertDialog`: the alert dialog root. It accepts the UI SDK `AlertDialog` props except `dismissible`, which is removed so that every alert dialog closes with the Escape key. A press outside never closes it.
+  - `AlertDialogTrigger` and `AlertDialogClose`: buttons styled like `Button`, with `variant` and `size`. The trigger defaults to `Primary`, the close button to `Secondary`. `AlertDialogClose` reports its `value` as the `returnValue` of `onOpenChange`; `value="confirm"` is the agreeing answer. Opening focuses the first close button, so consumers put the least destructive answer first.
+  - `AlertDialogContent` (renders the backdrop), `AlertDialogTitle` (level 2 heading, names the dialog), `AlertDialogDescription` and `AlertDialogActions` share the `Dialog` styles.
+  - `createAlertDialogController`, `createConfirm` and the `AlertDialogController` type are re-exported from UI SDK.
+- `delino-ui/avatar`
+  - `Avatar`: a round picture. Props: `alt` (required), `fallback` (required, usually initials), `src`, `size` and the other UI SDK `Avatar` props. The fallback shows until the image loads and stays when it fails; it has role `img` and the `alt` text as its name.
+  - `AvatarSize`: `Small` (`small`, 24px), `Medium` (`medium`, 40px), `Large` (`large`, 64px). The default is `Medium`.
+- `delino-ui/progress`
+  - `Progress`: a named progress bar. Props: `label` (required), `showValue` (shows the formatted value, such as `40%`), and all UI SDK `Progress` props such as `value`, `min`, `max` and `format`. A `null` value shows an indeterminate bar.
+- `delino-ui/separator`
+  - `Separator`: a styled UI SDK `Separator` with all its props, such as `orientation`.
 - `delino-ui/styles.css`
   - Declares the cascade layer order `ui-sdk, delino-ui`. UI SDK rules are in `ui-sdk`; package rules are in `delino-ui`. Unlayered app styles override both.
   - Includes the UI SDK rule that hides closed parts with `hidden`, because statically rendered pages do not get it from UI SDK before hydration.
@@ -69,7 +101,7 @@ Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
 - `pnpm exec turbo run typecheck --filter=delino-ui`: TypeScript type check.
-- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, keyboard and dismissal behavior.
+- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior.
 
 Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI does not run its unit tests yet; add them to the workflow and its planner when package checks enter CI.
 

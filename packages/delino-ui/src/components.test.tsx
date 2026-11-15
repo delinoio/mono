@@ -7,7 +7,18 @@ import {
   render,
   screen,
 } from "@testing-library/react";
+import {
+  AlertDialog,
+  AlertDialogActions,
+  AlertDialogClose,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "./alert-dialog.tsx";
+import { Avatar, AvatarSize } from "./avatar.tsx";
 import { Button, ButtonSize, ButtonVariant } from "./button.tsx";
+import { Checkbox, CheckboxGroup } from "./checkbox.tsx";
 import {
   Dialog,
   DialogActions,
@@ -17,8 +28,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./dialog.tsx";
+import { Progress } from "./progress.tsx";
+import { RadioGroup, RadioGroupItem } from "./radio-group.tsx";
+import { Select, SelectOption } from "./select.tsx";
+import { Separator } from "./separator.tsx";
 import { Switch } from "./switch.tsx";
+import { Tabs, TabsList, TabsPanel, TabsTab } from "./tabs.tsx";
 import { TextField } from "./text-field.tsx";
+import { Textarea } from "./textarea.tsx";
+import { createToaster, ToastRegion } from "./toast.tsx";
+import { Tooltip, TooltipContent, TooltipTrigger } from "./tooltip.tsx";
 
 afterEach(() => {
   cleanup();
@@ -203,5 +222,305 @@ describe("Dialog", () => {
       fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     });
     expect(dialog.hasAttribute("data-closed")).toBe(true);
+  });
+});
+
+describe("Textarea", () => {
+  test("connects the label and shows the error message", () => {
+    render(<Textarea label="Message" error="Enter a message." />);
+
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    expect(textarea.tagName).toBe("TEXTAREA");
+    expect(textarea.className).toBe("dui-textarea");
+    expect(textarea.getAttribute("aria-invalid")).toBe("true");
+    expect(screen.getByText("Enter a message.")).toBeTruthy();
+  });
+});
+
+describe("Checkbox", () => {
+  test("toggles when its label is pressed", () => {
+    const changes: unknown[] = [];
+    render(
+      <Checkbox
+        label="Accept the terms"
+        description="Read them first."
+        onCheckedChange={(checked) => changes.push(checked)}
+      />,
+    );
+
+    const control = screen.getByRole("checkbox", { name: "Accept the terms" });
+    expect(control.getAttribute("aria-checked")).toBe("false");
+
+    fireEvent.click(screen.getByText("Accept the terms"));
+    expect(control.getAttribute("aria-checked")).toBe("true");
+    expect(changes).toEqual([true]);
+  });
+
+  test("reports the checked values of a group", () => {
+    const values: string[][] = [];
+    render(
+      <CheckboxGroup
+        aria-label="Toppings"
+        defaultValue={["cheese"]}
+        onValueChange={(value) => values.push(value)}
+      >
+        <Checkbox label="Cheese" value="cheese" />
+        <Checkbox label="Olives" value="olives" />
+      </CheckboxGroup>,
+    );
+
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Cheese" })
+        .getAttribute("aria-checked"),
+    ).toBe("true");
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Olives" }));
+    expect(values.at(-1)).toEqual(["cheese", "olives"]);
+  });
+});
+
+describe("RadioGroup", () => {
+  test("is named by its label and checks one option", () => {
+    const values: (string | null)[] = [];
+    render(
+      <RadioGroup
+        label="Plan"
+        defaultValue="monthly"
+        onValueChange={(value) => values.push(value)}
+      >
+        <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
+        <RadioGroupItem value="yearly">Yearly</RadioGroupItem>
+      </RadioGroup>,
+    );
+
+    expect(screen.getByRole("radiogroup", { name: "Plan" })).toBeTruthy();
+    const monthly = screen.getByRole("radio", { name: "Monthly" });
+    const yearly = screen.getByRole("radio", { name: "Yearly" });
+    expect(monthly.getAttribute("aria-checked")).toBe("true");
+
+    fireEvent.click(yearly);
+    expect(yearly.getAttribute("aria-checked")).toBe("true");
+    expect(monthly.getAttribute("aria-checked")).toBe("false");
+    expect(values).toEqual(["yearly"]);
+  });
+});
+
+describe("Select", () => {
+  test("shows the placeholder and opens a list of options", async () => {
+    render(
+      <Select label="Role" placeholder="Choose a role">
+        <SelectOption value="viewer">Viewer</SelectOption>
+        <SelectOption value="editor">Editor</SelectOption>
+      </Select>,
+    );
+
+    const trigger = screen.getByRole("combobox", { name: "Role" });
+    expect(trigger.className).toBe("dui-select");
+    expect(trigger.textContent).toContain("Choose a role");
+
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+    expect(screen.getByRole("option", { name: "Editor" })).toBeTruthy();
+  });
+
+  test("reports the chosen option", async () => {
+    const values: (string | null)[] = [];
+    render(
+      <Select label="Role" onValueChange={(value) => values.push(value)}>
+        <SelectOption value="viewer">Viewer</SelectOption>
+        <SelectOption value="editor">Editor</SelectOption>
+      </Select>,
+    );
+
+    const trigger = screen.getByRole("combobox", { name: "Role" });
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("option", { name: "Editor" }));
+    });
+    expect(values).toEqual(["editor"]);
+    expect(trigger.textContent).toContain("Editor");
+  });
+
+  test("shows the selected option in the trigger", () => {
+    render(
+      <Select label="Role" defaultValue="editor">
+        <SelectOption value="viewer">Viewer</SelectOption>
+        <SelectOption value="editor">Editor</SelectOption>
+      </Select>,
+    );
+
+    const trigger = screen.getByRole("combobox", { name: "Role" });
+    expect(trigger.textContent).toContain("Editor");
+  });
+});
+
+describe("Tabs", () => {
+  test("shows the panel of the selected tab", async () => {
+    render(
+      <Tabs defaultValue="account">
+        <TabsList aria-label="Settings">
+          <TabsTab value="account">Account</TabsTab>
+          <TabsTab value="password">Password</TabsTab>
+        </TabsList>
+        <TabsPanel value="account">Manage your profile.</TabsPanel>
+        <TabsPanel value="password">Choose a new password.</TabsPanel>
+      </Tabs>,
+    );
+
+    const account = screen.getByRole("tab", { name: "Account" });
+    expect(account.getAttribute("aria-selected")).toBe("true");
+    expect(screen.getByRole("tabpanel").textContent).toBe(
+      "Manage your profile.",
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("tab", { name: "Password" }));
+    });
+    expect(
+      screen
+        .getByRole("tab", { name: "Password" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(screen.getByRole("tabpanel").textContent).toBe(
+      "Choose a new password.",
+    );
+  });
+});
+
+describe("Tooltip", () => {
+  test("describes its trigger with hidden content", () => {
+    render(
+      <Tooltip>
+        <TooltipTrigger>Share</TooltipTrigger>
+        <TooltipContent>Anyone with the link can view</TooltipContent>
+      </Tooltip>,
+    );
+
+    const trigger = screen.getByRole("button", { name: "Share" });
+    const content = document.getElementById(
+      trigger.getAttribute("aria-describedby") ?? "",
+    );
+    expect(content?.getAttribute("role")).toBe("tooltip");
+    expect(content?.className).toBe("dui-tooltip");
+    expect(content?.textContent).toBe("Anyone with the link can view");
+    expect(content?.hasAttribute("hidden")).toBe(true);
+  });
+});
+
+describe("ToastRegion", () => {
+  test("shows a toast with its title, description and action", async () => {
+    const toaster = createToaster();
+    render(<ToastRegion toaster={toaster} aria-label="Notifications" />);
+
+    await act(async () => {
+      toaster("Event created", {
+        description: "Friday at 10:00 AM",
+        action: { label: "Undo" },
+      });
+    });
+
+    expect(screen.getByText("Event created").className).toBe("dui-toast-title");
+    expect(screen.getByText("Friday at 10:00 AM")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
+  });
+});
+
+describe("AlertDialog", () => {
+  function Example({ onAnswer }: { onAnswer: (value: unknown) => void }) {
+    return (
+      <AlertDialog
+        onOpenChange={(open, details) => {
+          if (!open) onAnswer(details.returnValue);
+        }}
+      >
+        <AlertDialogTrigger variant={ButtonVariant.Danger}>
+          Delete project
+        </AlertDialogTrigger>
+        <AlertDialogContent>
+          <AlertDialogTitle>Delete this project?</AlertDialogTitle>
+          <AlertDialogDescription>It cannot be undone.</AlertDialogDescription>
+          <AlertDialogActions>
+            <AlertDialogClose>Cancel</AlertDialogClose>
+            <AlertDialogClose value="confirm" variant={ButtonVariant.Danger}>
+              Delete
+            </AlertDialogClose>
+          </AlertDialogActions>
+        </AlertDialogContent>
+      </AlertDialog>
+    );
+  }
+
+  test("opens as a named alert dialog and reports the answer", async () => {
+    const answers: unknown[] = [];
+    render(<Example onAnswer={(value) => answers.push(value)} />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+    });
+    expect(
+      screen.getByRole("alertdialog", { name: "Delete this project?" }),
+    ).toBeTruthy();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete" }));
+    });
+    expect(answers).toEqual(["confirm"]);
+  });
+
+  test("closes with the Escape key", async () => {
+    render(<Example onAnswer={() => {}} />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+    });
+    const dialog = screen.getByRole("alertdialog");
+
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    expect(dialog.hasAttribute("data-closed")).toBe(true);
+  });
+});
+
+describe("Avatar", () => {
+  test("shows a named fallback without an image", () => {
+    render(<Avatar alt="Ada Lovelace" fallback="AL" size={AvatarSize.Large} />);
+
+    const fallback = screen.getByRole("img", { name: "Ada Lovelace" });
+    expect(fallback.textContent).toBe("AL");
+    expect(
+      fallback.closest("[data-slot='avatar']")?.getAttribute("data-size"),
+    ).toBe("large");
+  });
+});
+
+describe("Progress", () => {
+  test("is a named progress bar with its value", () => {
+    render(<Progress label="Uploading" value={40} showValue />);
+
+    const bar = screen.getByRole("progressbar", { name: "Uploading" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("40");
+    expect(screen.getByText("40%")).toBeTruthy();
+  });
+
+  test("is indeterminate without a value", () => {
+    render(<Progress label="Loading" value={null} />);
+
+    const bar = screen.getByRole("progressbar", { name: "Loading" });
+    expect(bar.hasAttribute("aria-valuenow")).toBe(false);
+    expect(bar.hasAttribute("data-indeterminate")).toBe(true);
+  });
+});
+
+describe("Separator", () => {
+  test("renders a separator with its orientation", () => {
+    render(<Separator orientation="vertical" />);
+
+    const separator = screen.getByRole("separator");
+    expect(separator.className).toBe("dui-separator");
+    expect(separator.getAttribute("data-orientation")).toBe("vertical");
   });
 });
