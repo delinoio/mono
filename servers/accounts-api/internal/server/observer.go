@@ -405,11 +405,18 @@ func (o *connObserver) feedTrailer(p []byte) []byte {
 	return nil
 }
 
-// parseChunkSize parses a chunk-size line the way net/http does: trailing
-// whitespace and a chunk extension are dropped and the rest must be a hex
-// number of at most 16 digits.
+// parseChunkSize parses a chunk-size line the way net/http does. The line,
+// which includes its final LF, must end in exactly one CRLF with no other CR.
+// Trailing spaces and tabs and a chunk extension are dropped and the rest must
+// be a hex number of at most 16 digits.
 func parseChunkSize(line []byte) (uint64, bool) {
-	line = bytes.TrimRight(line, " \t\r\n")
+	// net/http's readChunkLine rejects a bare LF and any CR before the line
+	// end, so check this before trimming anything.
+	if i := bytes.IndexByte(line, '\r'); i < 0 || i != len(line)-2 {
+		return 0, false
+	}
+	// After it removes the CRLF, net/http trims only spaces and tabs.
+	line = bytes.TrimRight(line[:len(line)-2], " \t")
 	if i := bytes.IndexByte(line, ';'); i >= 0 {
 		line = line[:i]
 	}

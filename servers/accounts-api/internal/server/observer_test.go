@@ -128,6 +128,36 @@ func TestObserverParsesRequestSequences(t *testing.T) {
 			[]pendingSummary{{"POST", "/a", false}},
 		},
 		{
+			"bare LF chunk size stops parsing",
+			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\nabc\r\n0\r\n\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}},
+		},
+		{
+			"CR before the chunk-size terminator stops parsing",
+			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\r\nabc\r\n0\r\n\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}},
+		},
+		{
+			"bare LF last-chunk size stops parsing",
+			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\n\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}},
+		},
+		{
+			"CR inside a chunk size line stops parsing",
+			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3\r;x\r\nabc\r\n0\r\n\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}},
+		},
+		{
+			"chunk size with trailing space and tab is skipped",
+			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3 \r\nabc\r\n3\t\r\nabc\r\n0 \t\r\n\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
+		},
+		{
+			"chunk size with extension and trailing whitespace is skipped",
+			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n3;e=1 \r\nabc\r\n0;e=2\r\n\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
+		},
+		{
 			"missing CRLF after chunk data stops parsing",
 			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nzXX0\r\n\r\n" + get("/b"),
 			[]pendingSummary{{"POST", "/a", false}},
