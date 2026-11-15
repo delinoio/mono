@@ -4,10 +4,13 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -113,7 +116,50 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return n, err
 }
 
-// Unwrap lets http.ResponseController reach the underlying writer.
+// commitStatus records status as the committed status unless a status is
+// already committed, which keeps the first-committed-status rule.
+func (r *statusRecorder) commitStatus(status int) {
+	if !r.wroteHeader {
+		r.status = status
+		r.wroteHeader = true
+	}
+}
+
+// FlushError sends buffered data to the client. net/http commits the response
+// header on the first flush, with 200 when no status was written, so the
+// recorder must observe it: http.ResponseController would otherwise reach the
+// underlying writer through Unwrap and the log of a later handler panic would
+// substitute 500 for a status the client already received. It delegates through
+// a ResponseController so a wrapped inner writer still works, and records the
+// status only when the inner writer supports flushing.
+func (r *statusRecorder) FlushError() error {
+	err := http.NewResponseController(r.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
+		r.commitStatus(http.StatusOK)
+	}
+	return err
+}
+
+// Flush implements http.Flusher for handlers that assert that interface
+// instead of using http.ResponseController. It ignores the error, as
+// http.Flusher has no way to return it.
+func (r *statusRecorder) Flush() {
+	_ = r.FlushError()
+}
+
+// Hijack takes over the connection. The client observes the switch of the
+// protocol, so a successful hijack records 101 when no status is committed. A
+// failed hijack (an unsupported writer or HTTP/2) leaves the state unchanged.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(r.ResponseWriter).Hijack()
+	if err == nil {
+		r.commitStatus(http.StatusSwitchingProtocols)
+	}
+	return conn, rw, err
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer for the
+// operations that statusRecorder does not implement itself.
 func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }

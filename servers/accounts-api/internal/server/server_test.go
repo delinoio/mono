@@ -239,6 +239,168 @@ func TestRequestLogOnPanic(t *testing.T) {
 	}
 }
 
+// serveCommittedRequest is like serveRequest, but it also reads the response
+// body, so a handler that commits a response and then panics is observed as the
+// client sees it: a response with a status followed by a body read error.
+func serveCommittedRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clientStatus int, bodyErr error, records []map[string]any) {
+	t.Helper()
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewJSONHandler(&logs, nil))
+	ts := httptest.NewUnstartedServer(logRequests(logger, handler))
+	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
+	ts.Start()
+	defer ts.Close()
+
+	resp, err := http.Get(ts.URL + "/probe")
+	if err == nil {
+		clientStatus = resp.StatusCode
+		_, bodyErr = io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+	// Close waits for in-flight handlers, so every log record is complete.
+	ts.Close()
+	return err, clientStatus, bodyErr, decodeRecords(t, &logs)
+}
+
+// TestRequestLogRecordsFlushedAndHijackedStatus checks that a response
+// committed through http.ResponseController is logged with the status the
+// client received, also when the handler then panics.
+func TestRequestLogRecordsFlushedAndHijackedStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		handler    http.HandlerFunc
+		panics     bool
+		wantStatus int
+	}{
+		{"flush then panic", func(w http.ResponseWriter, _ *http.Request) {
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				panic(err)
+			}
+			panic("boom")
+		}, true, http.StatusOK},
+		{"flush then return", func(w http.ResponseWriter, _ *http.Request) {
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				panic(err)
+			}
+		}, false, http.StatusOK},
+		{"explicit status, flush, then panic", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusNoContent)
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				panic(err)
+			}
+			panic("boom")
+		}, true, http.StatusNoContent},
+		{"informational, flush, final status, then panic", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusEarlyHints)
+			if err := http.NewResponseController(w).Flush(); err != nil {
+				panic(err)
+			}
+			w.WriteHeader(http.StatusOK)
+			panic("boom")
+		}, true, http.StatusOK},
+		{"flusher assertion then panic", func(w http.ResponseWriter, _ *http.Request) {
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				panic("the response writer is not an http.Flusher")
+			}
+			flusher.Flush()
+			panic("boom")
+		}, true, http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientErr, clientStatus, bodyErr, records := serveCommittedRequest(t, tc.handler)
+			if clientErr != nil {
+				t.Fatalf("client error = %v, want a response", clientErr)
+			}
+			if clientStatus != tc.wantStatus {
+				t.Errorf("client status = %d, want %d", clientStatus, tc.wantStatus)
+			}
+			// net/http aborts the connection after a panic. The client already
+			// has the header, so the failure shows up as a body read error.
+			if tc.panics && bodyErr == nil && tc.wantStatus != http.StatusNoContent {
+				t.Errorf("body read error = nil, want an error from the aborted connection")
+			}
+			if len(records) != 1 {
+				t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
+			}
+			if records[0]["status"] != float64(tc.wantStatus) {
+				t.Errorf("logged status = %v, want %d (client received %d)", records[0]["status"], tc.wantStatus, clientStatus)
+			}
+		})
+	}
+
+	t.Run("hijack then panic", func(t *testing.T) {
+		clientErr, clientStatus, records := serveRequest(t, func(w http.ResponseWriter, _ *http.Request) {
+			conn, _, err := http.NewResponseController(w).Hijack()
+			if err != nil {
+				panic(err)
+			}
+			// Close without writing a response, so the client sees a transport
+			// error and the log must not claim the 500 that net/http never sent.
+			_ = conn.Close()
+			panic("boom")
+		})
+		if clientErr == nil {
+			t.Errorf("client status = %d, want a transport error from the closed connection", clientStatus)
+		}
+		if len(records) != 1 {
+			t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
+		}
+		if records[0]["status"] != float64(http.StatusSwitchingProtocols) {
+			t.Errorf("logged status = %v, want %d", records[0]["status"], http.StatusSwitchingProtocols)
+		}
+	})
+}
+
+// plainWriter implements only http.ResponseWriter, so neither flushing nor
+// hijacking is supported through it.
+type plainWriter struct{ header http.Header }
+
+func (w plainWriter) Header() http.Header          { return w.header }
+func (plainWriter) Write(body []byte) (int, error) { return len(body), nil }
+func (plainWriter) WriteHeader(int)                {}
+
+func TestStatusRecorderFlushAndHijackState(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		inner      http.ResponseWriter
+		do         func(*statusRecorder) error
+		wantErr    bool
+		wantStatus int
+		wantWrote  bool
+	}{
+		{"flush", httptest.NewRecorder(), func(r *statusRecorder) error { return r.FlushError() }, false, http.StatusOK, true},
+		{"flush after explicit status", httptest.NewRecorder(), func(r *statusRecorder) error {
+			r.WriteHeader(http.StatusNoContent)
+			return r.FlushError()
+		}, false, http.StatusNoContent, true},
+		{"flush after informational", httptest.NewRecorder(), func(r *statusRecorder) error {
+			r.WriteHeader(http.StatusEarlyHints)
+			return r.FlushError()
+		}, false, http.StatusOK, true},
+		{"legacy flush", httptest.NewRecorder(), func(r *statusRecorder) error { r.Flush(); return nil }, false, http.StatusOK, true},
+		{"flush on a writer that cannot flush", plainWriter{header: http.Header{}}, func(r *statusRecorder) error { return r.FlushError() }, true, http.StatusOK, false},
+		{"hijack on a writer that cannot hijack", httptest.NewRecorder(), func(r *statusRecorder) error {
+			_, _, err := r.Hijack()
+			return err
+		}, true, http.StatusOK, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &statusRecorder{ResponseWriter: tc.inner, status: http.StatusOK}
+			err := tc.do(r)
+			if tc.wantErr != (err != nil) {
+				t.Errorf("error = %v, want error %v", err, tc.wantErr)
+			}
+			if tc.wantErr && !errors.Is(err, http.ErrNotSupported) {
+				t.Errorf("error = %v, want http.ErrNotSupported", err)
+			}
+			if r.status != tc.wantStatus || r.wroteHeader != tc.wantWrote {
+				t.Errorf("status = %d, wroteHeader = %v, want %d, %v", r.status, r.wroteHeader, tc.wantStatus, tc.wantWrote)
+			}
+		})
+	}
+}
+
 func TestRequestLogRepanicsSamePanicValue(t *testing.T) {
 	sentinel := errors.New("sentinel")
 	for _, value := range []any{sentinel, http.ErrAbortHandler} {
