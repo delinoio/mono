@@ -1418,6 +1418,65 @@ test("CLI rejects staged selection with other selection modes", (t) => {
   assert.equal(result.status, 2);
 });
 
+test("CLI rejects local --all combined with an explicit comparison", (t) => {
+  const f = fixture(t);
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const unformatted = "const value={answer:42}\n";
+  f.write("unrelated.ts", unformatted);
+  const head = f.commit();
+  const run = (args, env) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env,
+      encoding: "utf8",
+    });
+  const conflict =
+    /All-file formatting requires local execution without a comparison/;
+  const rejected = (result, label) => {
+    assert.equal(
+      result.status,
+      2,
+      `${label}: ${result.stdout}${result.stderr}`,
+    );
+    assert.match(result.stderr, /ci_format_error/, label);
+    assert.match(result.stderr, conflict, label);
+    assert.doesNotMatch(result.stdout, /"event":"ci_format"/, label);
+  };
+  for (const env of [f.env, { ...f.env, CI: "false" }]) {
+    for (const args of [
+      ["--all", "--base", f.base, "--head", head],
+      ["--all", "--base", f.base],
+      ["--all", "--head", f.base],
+      ["--all", "--write", "--base", f.base, "--head", head],
+    ])
+      rejected(run(args, env), args.join(" "));
+  }
+  for (const [name, comparison] of [
+    ["both", { TURBO_SCM_BASE: f.base, TURBO_SCM_HEAD: head }],
+    ["base", { TURBO_SCM_BASE: f.base }],
+    ["head", { TURBO_SCM_HEAD: head }],
+  ])
+    for (const args of [["--all"], ["--all", "--write"]])
+      rejected(
+        run(args, { ...f.env, ...comparison }),
+        `${args.join(" ")} with TURBO_SCM_BASE/HEAD ${name}`,
+      );
+  assert.equal(
+    readFileSync(join(f.cwd, "unrelated.ts"), "utf8"),
+    unformatted,
+    "a rejected --all --write run must not rewrite files",
+  );
+  // `--all` alone keeps the repository-wide selection.
+  const all = run(["--all"], f.env);
+  assert.equal(all.status, 1, `${all.stdout}${all.stderr}`);
+  assert.match(all.stdout, /"base":null,"head":null/);
+  assert.match(all.stdout, /"local":true/);
+  assert.match(
+    all.stdout,
+    new RegExp(`"candidates":${allFormatFiles(f.cwd).length}[,}]`),
+  );
+});
+
 test("CI is enabled unless unset, empty or an explicit false", () => {
   for (const value of [
     undefined,
