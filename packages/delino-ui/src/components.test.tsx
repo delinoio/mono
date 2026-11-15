@@ -30,6 +30,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "./dialog.tsx";
+import { NumberInput } from "./number-input.tsx";
+import { PasswordInput } from "./password-input.tsx";
 import { Progress } from "./progress.tsx";
 import { RadioGroup, RadioGroupItem } from "./radio-group.tsx";
 import { Select, SelectOption } from "./select.tsx";
@@ -316,6 +318,33 @@ describe("autoFocus inside Dialog", () => {
     expect(document.activeElement).toBe(textarea);
   });
 
+  test("focuses a NumberInput with autoFocus even after the close button", async () => {
+    render(
+      <DialogWith>
+        <NumberInput label="Amount" autoFocus />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    const input = screen.getByRole("textbox", { name: "Amount" });
+    expect(input.getAttribute("data-autofocus")).not.toBeNull();
+    expect(document.activeElement).toBe(input);
+  });
+
+  test("focuses a PasswordInput with autoFocus even after the close button", async () => {
+    render(
+      <DialogWith>
+        <PasswordInput label="Password" autoFocus />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    // A password input has no `textbox` role, so find it by its label.
+    const input = screen.getByLabelText("Password");
+    expect(input.getAttribute("data-autofocus")).not.toBeNull();
+    expect(document.activeElement).toBe(input);
+  });
+
   test("focuses the first tabbable element without an autoFocus input", async () => {
     render(
       <DialogWith>
@@ -340,6 +369,28 @@ describe("autoFocus inside Dialog", () => {
     );
   });
 
+  test("renders no data-autofocus on NumberInput and PasswordInput without autoFocus", async () => {
+    render(
+      <DialogWith>
+        <NumberInput label="Amount" />
+        <PasswordInput label="Password" />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    expect(
+      screen
+        .getByRole("textbox", { name: "Amount" })
+        .hasAttribute("data-autofocus"),
+    ).toBe(false);
+    expect(
+      screen.getByLabelText("Password").hasAttribute("data-autofocus"),
+    ).toBe(false);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close" }),
+    );
+  });
+
   test("focuses a TextField with autoFocus on mount outside a dialog", () => {
     render(<TextField label="Name" autoFocus />);
 
@@ -354,6 +405,20 @@ describe("autoFocus inside Dialog", () => {
     expect(document.activeElement).toBe(
       screen.getByRole("textbox", { name: "Message" }),
     );
+  });
+
+  test("focuses a NumberInput with autoFocus on mount outside a dialog", () => {
+    render(<NumberInput label="Amount" autoFocus />);
+
+    expect(document.activeElement).toBe(
+      screen.getByRole("textbox", { name: "Amount" }),
+    );
+  });
+
+  test("focuses a PasswordInput with autoFocus on mount outside a dialog", () => {
+    render(<PasswordInput label="Password" autoFocus />);
+
+    expect(document.activeElement).toBe(screen.getByLabelText("Password"));
   });
 });
 
