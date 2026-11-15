@@ -1040,6 +1040,102 @@ function conflictedMerge(f) {
   );
 }
 
+// Uppercase and mixed-case spellings of supported extensions, next to the
+// lowercase spelling of the same stem, to prove the spellings behave alike.
+const caseVariants = [
+  "notes.MD",
+  "Component.TSX",
+  "data.JSON",
+  "mixed.Yml",
+  "Lower.MD",
+  "lower.md",
+];
+
+test("every selector selects supported extensions in any letter case", (t) => {
+  const f = fixture(t);
+  const head = f.base;
+  for (const name of caseVariants) f.write(name, "# Case\n");
+  f.write("UPPER.TXT", "still unsupported\n");
+  f.git("add", "--", ...caseVariants, "UPPER.TXT");
+  assert.deepEqual(stagedFormatFiles(f.cwd), [...caseVariants].sort());
+  assert.deepEqual(
+    changedFormatFiles(f.cwd, head, head, true),
+    [...caseVariants].sort(),
+  );
+  const committed = f.commit();
+  assert.deepEqual(
+    changedFormatFiles(f.cwd, head, committed),
+    [...caseVariants].sort(),
+  );
+  assert.deepEqual(
+    changedFormatFiles(f.cwd, head, committed, true),
+    [...caseVariants].sort(),
+  );
+  assert.deepEqual(
+    allFormatFiles(f.cwd),
+    [...caseVariants, "package.json", "rstack.config.ts"].sort(),
+  );
+});
+
+test("case-insensitive selection still skips deleted paths and unsupported names", (t) => {
+  const f = fixture(t);
+  f.write("gone.MD", "# Gone\n");
+  const base = f.commit();
+  f.git("rm", "--quiet", "gone.MD");
+  f.write("kept.MD", "# Kept\n");
+  f.write("UPPER.TXT", "unsupported\n");
+  f.git("add", "--", "kept.MD", "UPPER.TXT");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.MD"]);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, base, true), ["kept.MD"]);
+});
+
+test("CLI selectors format an uppercase-extension file and leave excluded paths alone", async (t) => {
+  const f = fixture(t);
+  f.write("Notes.MD", "# Title\n\n*  item\n");
+  f.write("vendor/Ignored.TS", "deliberately invalid {{{\n");
+  const base = f.base;
+  const head = f.commit();
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const run = (args) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env: f.env,
+      encoding: "utf8",
+    });
+  const explicit = run(["--base", base, "--head", head]);
+  assert.equal(explicit.status, 1, explicit.stdout + explicit.stderr);
+  assert.match(explicit.stdout, /"candidates":2,/u, explicit.stdout);
+  assert.match(explicit.stderr + explicit.stdout, /Notes\.MD/u);
+  const all = run(["--all"]);
+  assert.equal(all.status, 1, all.stdout + all.stderr);
+  assert.match(all.stderr + all.stdout, /Notes\.MD/u);
+  const written = run(["--base", base, "--head", head, "--write"]);
+  assert.equal(written.status, 0, written.stdout + written.stderr);
+  assert.equal(
+    readFileSync(join(f.cwd, "Notes.MD"), "utf8"),
+    "# Title\n\n- item\n",
+  );
+  assert.equal(
+    readFileSync(join(f.cwd, "vendor/Ignored.TS"), "utf8"),
+    "deliberately invalid {{{\n",
+  );
+});
+
+test("pre-commit hook formats and stages a staged uppercase-extension file", (t) => {
+  const f = fixture(t);
+  f.installHook();
+  f.write("Notes.MD", "# Title\n\n*  item\n");
+  f.write("Component.TSX", "const   value={answer:42}\n");
+  f.git("add", "--", "Notes.MD", "Component.TSX");
+  f.git("commit", "--quiet", "-m", "uppercase extensions");
+  assert.equal(f.git("show", "HEAD:Notes.MD"), "# Title\n\n- item");
+  assert.equal(
+    f.git("show", "HEAD:Component.TSX"),
+    "const value = { answer: 42 };",
+  );
+  assert.equal(f.git("diff", "--name-only"), "");
+});
+
 test("all-file selection returns an unmerged path once, in sorted order", (t) => {
   const f = fixture(t);
   f.write("zeta.ts", "const zeta = 1;\n");
