@@ -8,7 +8,7 @@
     "build": "rspress build",
     "dev": "rspress dev",
     "preview": "rspress preview",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "mdx-tsc --noEmit",
     "test:e2e": "e2e run"
   },
   "dependencies": {
@@ -23,6 +23,7 @@
     "@types/react-dom": "19.3.0",
     "ai": "7.0.173",
     "e2e": "0.23.1",
+    "mdx-tsc": "0.3.0",
     "typescript": "6.0.3"
   }
 }

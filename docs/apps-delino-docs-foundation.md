@@ -59,7 +59,7 @@ Run from the repository root:
 - `pnpm install --frozen-lockfile`
 - `pnpm --filter delino-docs dev`: local development server.
 - `pnpm exec turbo run build --filter=delino-docs`: production build into `apps/delino-docs/dist/`.
-- `pnpm exec turbo run typecheck --filter=delino-docs`: TypeScript type check, including the e2e config and tests.
+- `pnpm exec turbo run typecheck --filter=delino-docs`: runs `mdx-tsc --noEmit`, which type-checks TypeScript (theme, Rspress config, e2e config and tests) and `.mdx` pages under `docs/` in one pass with the app `tsconfig.json`. `.md` pages are not type-checked, so use the `.mdx` extension for a page that imports components or passes props. The task passes when the TypeScript is valid and no `.mdx` page exists.
 - `pnpm exec turbo run test:e2e --filter=delino-docs`: browser end-to-end tests against the development server on a free loopback port. See the [e2e contract](repository-e2e-contract.md).
 - `pnpm --filter delino-docs preview`: serve the production build locally.
 
@@ -69,6 +69,7 @@ Remove `apps/delino-docs/dist/` after validation. CI runs the e2e suite in the `
 
 - `@rspress/core`, `react` and `react-dom`, pinned in `apps/delino-docs/package.json`.
 - `e2e`, `@e2e-dev/web` and `ai` for end-to-end tests, pinned in `apps/delino-docs/package.json`.
+- `mdx-tsc` (MIT license) for the `typecheck` task, pinned in `apps/delino-docs/package.json`. It is a community package with one maintainer; audit it under the [dependency security contract](repository-dependency-security-contract.md) when you change its version.
 - Cloudflare Pages: static hosting for `docs.delino.io`. Configure the Pages project with build command `pnpm exec turbo run build --filter=delino-docs` and output directory `apps/delino-docs/dist`.
 - [`delino-site`](project-delino-site.md): linked by absolute URL `https://delino.io`.
 
