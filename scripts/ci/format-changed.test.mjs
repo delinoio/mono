@@ -4,6 +4,7 @@ import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -43,12 +44,15 @@ function fixture(
   parentEnv = process.env,
   directoryName = null,
 ) {
-  let cwd = mkdtempSync(join(tmpdir(), "rstack-format-"));
-  t.after(() => rmSync(cwd, { recursive: true, force: true }));
+  const parent = mkdtempSync(join(tmpdir(), "rstack-format-"));
+  // Clean up the unique parent, not `cwd`: `cwd` is rebound to the child
+  // directory below, and removing only the child would leak the parent.
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  let cwd = parent;
   if (directoryName !== null) {
     // Place the repository in a child directory with a chosen name; removing
     // the unique parent cleans it up.
-    cwd = join(cwd, directoryName);
+    cwd = join(parent, directoryName);
     mkdirSync(cwd);
   }
   const env = isolateGitEnvironment({ ...parentEnv, LEFTHOOK_BIN: lefthook });
@@ -94,6 +98,7 @@ function fixture(
   };
   return {
     cwd,
+    parent,
     write,
     git,
     commit,
@@ -2301,6 +2306,28 @@ test("CLI runs from the root and a subdirectory of a whitespace-terminated repos
       assert.match(result.stdout, /"candidates":[1-9]/u, detail);
     }
   }
+});
+
+test("fixture removes the unique parent of a named child directory", (t) => {
+  const f = fixture(t, true, process.env, "named-child");
+  assert.equal(dirname(f.cwd), f.parent, "the repository is the named child");
+  assert.ok(existsSync(f.cwd), "the child directory exists during the test");
+  // Registered after the fixture's own cleanup hook, so it runs after it.
+  t.after(() => {
+    assert.equal(existsSync(f.parent), false, "unique parent must be removed");
+  });
+});
+
+test("fixture without a directory name removes its unique directory", (t) => {
+  const f = fixture(t);
+  assert.equal(f.cwd, f.parent, "the repository is the unique directory");
+  t.after(() => {
+    assert.equal(
+      existsSync(f.parent),
+      false,
+      "unique directory must be removed",
+    );
+  });
 });
 
 // A path name that is not valid UTF-8 (the Latin-1 name `caf\xe9.ts`). Linux
