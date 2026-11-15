@@ -27,6 +27,12 @@ This list is the work list of the batch. Fix every issue in the list. Do not fix
 
 Use the issue identifiers in this list for the `Closes DELI-<number>` and `Refs DELI-<number>` lines of each PR. Follow [the issue tracker contract](../../../docs/repository-issue-tracker-contract.md).
 
+## Dependency Constraints
+
+- Do not add new dependencies in the batch work. This includes packages, crates, Go modules and GitHub Actions.
+- Use only the dependencies that the repository already has.
+- If an issue cannot be fixed without a new dependency, do not fix it as part of the batch. Report the issue and the reason.
+
 ## CI Constraints
 
 - Do not start manual CI or trigger `workflow_dispatch`.
