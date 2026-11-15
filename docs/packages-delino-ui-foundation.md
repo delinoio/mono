@@ -61,7 +61,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
 - `delino-ui/tooltip`
   - `Tooltip`, `TooltipTrigger` and `TooltipContent`: styled UI SDK tooltip parts with all their props. `TooltipContent` defaults `sideOffset` to 8 pixels. Tooltips hold plain text only, because they cannot receive focus; interactive content goes in a dialog.
 - `delino-ui/toast`
-  - `ToastRegion`: shows the toast queue at the bottom center of the viewport by default (`side`, `align`). Each toast shows its title, description, action button (`Primary`) and cancel button (`Secondary`). It accepts the UI SDK `ToastRegion` props except `children`. Apps render it once near the root.
+  - `ToastRegion`: shows the toast queue at the bottom center of the viewport by default (`side`, `align`). Each toast shows its title, description, action button (`Primary`) and cancel button (`Secondary`). The region keeps a 16px offset from each viewport edge plus the device safe area (`env(safe-area-inset-*)`, which applies when the page sets `viewport-fit=cover`), and `align="start"` and `align="end"` follow the writing direction (logical `inset-inline-*` edges). It accepts the UI SDK `ToastRegion` props except `children`. Apps render it once near the root.
   - `toast` and `createToaster` are re-exported from UI SDK. `toast()` adds a toast from anywhere; `createToaster()` creates a separate queue for a region's `toaster` prop.
   - The `ToastData`, `Toaster` and `ToastType` types are re-exported from UI SDK.
 - `delino-ui/alert-dialog`
