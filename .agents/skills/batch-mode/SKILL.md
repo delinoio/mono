@@ -31,7 +31,7 @@ Use the issue identifiers in this list for the `Closes DELI-<number>` and `Refs 
 
 - Do not add new dependencies in the batch work. This includes packages, crates, Go modules and GitHub Actions.
 - Use only the dependencies that the repository already has.
-- If an issue cannot be fixed without a new dependency, do not fix it as part of the batch. Report the issue and the reason.
+- If an issue cannot be fixed without a new dependency, do not fix it as part of the batch. Handle it as described in [Unprocessable Issues](#unprocessable-issues).
 
 ## CI Constraints
 
@@ -39,5 +39,19 @@ Use the issue identifiers in this list for the `Closes DELI-<number>` and `Refs 
 - Use the existing PR's automatic CI.
 - Retrying a failed CI run is allowed.
 - Never modify `.github/workflows/CI.yml`.
+- If an issue cannot be fixed without a manual CI run or a change to `.github/workflows/CI.yml`, do not fix it as part of the batch. Handle it as described in [Unprocessable Issues](#unprocessable-issues).
+
+## Unprocessable Issues
+
+An issue is unprocessable when the rules of this skill do not permit the batch to fix it. Examples are an issue that needs a new dependency, a manual CI run or a change to `.github/workflows/CI.yml`.
+
+For each unprocessable issue in the batch work list:
+
+1. Do not implement a fix and do not create a PR for the issue.
+2. Move the issue to the `Backlog` status with `save_issue` (Linear MCP server). If the `Backlog` status cannot be resolved, run `list_issue_statuses` for the `DELI` team and use the status named `Backlog`. Do not substitute another status.
+3. Add a comment to the issue with `save_comment`. State which rule prevents the fix and what the issue needs before it can be fixed.
+4. In the batch report, list the issue with its identifier, its title, its URL and the reason.
+
+Move an issue to `Backlog` only when a rule of this skill prevents the fix. Do not move an issue because it is difficult, large or slow to fix.
 
 This skill gives the batch issue list and adds instructions only. It does not fix issues or create PRs by itself; the batch work does that for each issue in the list.

@@ -20,6 +20,7 @@ import { createRequire } from "node:module";
 import { delimiter, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
@@ -42,16 +43,9 @@ function shellAvailable([shell]) {
 }
 
 function environment() {
-  const env = { ...process.env };
   // A developer's global core.hooksPath or an enclosing Git hook invocation must
   // not change which branch of the installer runs.
-  for (const name of Object.keys(env)) {
-    if (name.startsWith("GIT_") || name === "LEFTHOOK_CONFIG") {
-      delete env[name];
-    }
-  }
-  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-  env.GIT_CONFIG_NOSYSTEM = "1";
+  const env = isolateGitEnvironment({ ...process.env });
   env.PATH = [dirname(lefthook), env.PATH].join(delimiter);
   return env;
 }

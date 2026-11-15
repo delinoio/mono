@@ -114,6 +114,91 @@ function fakeGo(t, script) {
   return dir;
 }
 
+// A fake `go` whose "build" writes a signal-counting program to the -o path.
+// The program mirrors the server's signal contract: the first SIGINT starts a
+// drain that ends after DrainMs with server_shutdown_completed; a second SIGINT
+// ends it at once without that event. Every SIGINT prints a child_sigint event.
+const DrainMs = 1500;
+const countingServer = `#!${process.execPath}
+let sigints = 0;
+process.on("SIGINT", () => {
+  sigints += 1;
+  console.log(JSON.stringify({ event: "child_sigint", n: sigints }));
+  if (sigints > 1) process.exit(2);
+  setTimeout(() => {
+    console.log(JSON.stringify({ event: "server_shutdown_completed" }));
+    process.exit(0);
+  }, ${DrainMs});
+});
+console.log(JSON.stringify({ event: "server_started" }));
+setInterval(() => {}, 1000);
+`;
+
+function fakeGoBuildingCountingServer(t) {
+  return fakeGo(
+    t,
+    [
+      'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
+      `cat > "$out" <<'PROGRAM'\n${countingServer}PROGRAM`,
+      'chmod 755 "$out"',
+    ].join("\n"),
+  );
+}
+
+const countEvents = (output, event) =>
+  output.split("\n").filter((line) => line.includes(`"${event}"`)).length;
+
+test(
+  "a process-group SIGINT reaches the server once and the drain completes",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const run = startLauncher(t, {
+      port: await freePort(),
+      pathPrefix: fakeGoBuildingCountingServer(t),
+    });
+    await waitReady(run);
+
+    // A terminal Ctrl-C signals every process of the foreground group. The
+    // server must not be in that group, or the launcher's forward would be a
+    // second delivery that ends the drain early.
+    process.kill(-run.child.pid, "SIGINT");
+    const { code } = await run.exited;
+
+    assert.equal(code, StatusSigint, run.stderr);
+    assert.equal(countEvents(run.stdout, "child_sigint"), 1, run.stdout);
+    assert.match(run.stdout, /"server_shutdown_completed"/);
+    assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
+    assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
+  },
+);
+
+test(
+  "a second process-group SIGINT during the drain still ends the server",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const run = startLauncher(t, {
+      port: await freePort(),
+      pathPrefix: fakeGoBuildingCountingServer(t),
+    });
+    await waitReady(run);
+
+    const started = Date.now();
+    process.kill(-run.child.pid, "SIGINT");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    process.kill(-run.child.pid, "SIGINT");
+    const { code } = await run.exited;
+
+    assert.equal(code, StatusSigint, run.stderr);
+    assert.equal(countEvents(run.stdout, "child_sigint"), 2, run.stdout);
+    assert.doesNotMatch(run.stdout, /"server_shutdown_completed"/);
+    assert.ok(
+      Date.now() - started < DrainMs,
+      "the second SIGINT did not end the drain early",
+    );
+    assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
+  },
+);
+
 test(
   "SIGTERM to the launcher shuts the server down gracefully",
   { skip, timeout: Timeout * 2 },
