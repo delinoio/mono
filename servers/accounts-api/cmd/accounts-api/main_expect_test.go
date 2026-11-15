@@ -355,7 +355,7 @@ func TestNewServerDoesNotLogRequestsThatNetHTTPNeverReaches(t *testing.T) {
 	})
 }
 
-func TestNewServerOversizedHeadIsRejectedWithoutARecord(t *testing.T) {
+func TestNewServerOversizedHeadIsRejectedWithoutAnHTTPRequestRecord(t *testing.T) {
 	addr, logs := startRequestLogServer(t)
 	head := "GET /healthz HTTP/1.1\r\nHost: test\r\nExpect: a-pony\r\nX-Fill: " + strings.Repeat("a", server.MaxHeaderBytes+8192) + "\r\n\r\n"
 	conn := dialRaw(t, addr)
@@ -366,7 +366,7 @@ func TestNewServerOversizedHeadIsRejectedWithoutARecord(t *testing.T) {
 		t.Fatalf("response = %.80q, want the net/http 431", response)
 	}
 	if records := requestRecords(t, logs); len(records) != 0 {
-		t.Errorf("records = %v, want none for an oversized head", records)
+		t.Errorf("records = %v, want no http_request record for an oversized head", records)
 	}
 }
 

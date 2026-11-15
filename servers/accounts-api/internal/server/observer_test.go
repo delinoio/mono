@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -11,7 +12,9 @@ import (
 	"net/http"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -228,7 +231,7 @@ func TestClaimRejection(t *testing.T) {
 		{"417 answering an HTTP/1.0 request", func(*connObserver) {}, strings.Replace(expectationFailedResponse, "HTTP/1.1", "HTTP/1.0", 1), true},
 		{"417 of another protocol version", func(*connObserver) {}, strings.Replace(expectationFailedResponse, "HTTP/1.1", "HTTP/2.0", 1), false},
 		{"short write", func(*connObserver) {}, "HTTP/1.", false},
-		{"handler still running", func(o *connObserver) { o.inFlight = 1 }, expectationFailedResponse, false},
+		{"handler still running", func(o *connObserver) { o.responding = true }, expectationFailedResponse, false},
 		{"other status", func(*connObserver) {}, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", false},
 		{"body continuation", func(*connObserver) {}, "xxHTTP/1.1 417 Expectation Failed\r\nConnection: close\r\n\r\n", false},
 		{"417 without Connection close", func(*connObserver) {}, "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n", false},
@@ -246,6 +249,23 @@ func TestClaimRejection(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("response of a handler still being written", func(t *testing.T) {
+		// net/http flushes the buffered end of a handler's response after the
+		// handler returned. A handler controls those bytes, so they are not a
+		// response of net/http even when they look like one.
+		o, _ := newTestObserver()
+		o.feed([]byte("GET /a HTTP/1.1\r\nHost: t\r\n\r\n" + badRequest))
+		o.handlerStarted()
+		o.handlerFinished()
+		if _, _, ok := o.claimRejection([]byte(expectationFailedResponse)); ok {
+			t.Fatal("claimed bytes of the handler's response written after the handler returned")
+		}
+		o.responseFinished()
+		if _, _, ok := o.claimRejection([]byte(expectationFailedResponse)); !ok {
+			t.Error("did not claim the 417 that net/http writes once the handler's response is complete")
+		}
+	})
 
 	t.Run("a request without a rejectable Expect is never claimed", func(t *testing.T) {
 		o, _ := newTestObserver()
@@ -384,4 +404,386 @@ func TestConnContextPairsOnlyObservedConnections(t *testing.T) {
 	if obs := observerFrom(ConnContext(t.Context(), observed)); obs != observed.obs {
 		t.Error("an observed connection was not paired with its observer")
 	}
+}
+
+func TestParseDirectErrorResponse(t *testing.T) {
+	const headers = "\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n"
+	for _, tc := range []struct {
+		name       string
+		write      string
+		wantStatus int
+		wantOK     bool
+	}{
+		{"400", "HTTP/1.1 400 Bad Request" + headers + "400 Bad Request", 400, true},
+		{"400 with a detail", "HTTP/1.1 400 Bad Request: missing required Host header" + headers + "400 Bad Request: missing required Host header", 400, true},
+		{"431", "HTTP/1.1 431 Request Header Fields Too Large" + headers + "431 Request Header Fields Too Large", 431, true},
+		{"501", "HTTP/1.1 501 Not Implemented" + headers + "Unsupported transfer encoding", 501, true},
+		{"505 with a detail", "HTTP/1.1 505 HTTP Version Not Supported: unsupported protocol version" + headers, 505, true},
+		{"status line only without the headers yet", "HTTP/1.1 400 Bad Request\r\n", 0, false},
+		{"a handler response carries Date", "HTTP/1.1 400 Bad Request\r\nDate: Thu, 05 Nov 2026 00:00:00 GMT\r\nContent-Length: 4\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nnope", 0, false},
+		{"handler response with the same headers and Date", "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\nDate: Thu, 05 Nov 2026 00:00:00 GMT\r\n\r\n", 0, false},
+		{"handler response with Content-Length", "HTTP/1.1 400 Bad Request\r\nContent-Length: 4\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n", 0, false},
+		{"other protocol version", "HTTP/1.0 400 Bad Request" + headers, 0, false},
+		{"success status", "HTTP/1.1 200 OK" + headers, 0, false},
+		{"status text of another code", "HTTP/1.1 400 Not Implemented" + headers, 0, false},
+		{"unknown status", "HTTP/1.1 499 " + headers, 0, false},
+		{"unterminated detail", "HTTP/1.1 400 Bad Request: detail", 0, false},
+		{"body continuation", "xxHTTP/1.1 400 Bad Request" + headers, 0, false},
+		{"short write", "HTTP/1.1 4", 0, false},
+		{"not a number", "HTTP/1.1 4x0 Bad Request" + headers, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			status, ok := parseDirectErrorResponse([]byte(tc.write))
+			if ok != tc.wantOK || status != tc.wantStatus {
+				t.Errorf("parseDirectErrorResponse = %d, %v; want %d, %v", status, ok, tc.wantStatus, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestRejectionReasonFor(t *testing.T) {
+	for status, want := range map[int]RejectionReason{
+		400: RejectionMalformedRequest,
+		431: RejectionHeaderTooLarge,
+		501: RejectionUnsupportedTransferEncoding,
+		505: RejectionUnsupportedProtocolVersion,
+		414: RejectionOther,
+		503: RejectionOther,
+	} {
+		if got := rejectionReasonFor(status); got != want {
+			t.Errorf("rejectionReasonFor(%d) = %q, want %q", status, got, want)
+		}
+	}
+}
+
+const directBadRequest = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+
+func TestClaimDirectRejection(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		setup  func(o *connObserver)
+		write  string
+		wantOK bool
+	}{
+		{"no pending request needed", func(*connObserver) {}, directBadRequest, true},
+		{"handler running", func(o *connObserver) { o.responding = true }, directBadRequest, false},
+		{"hijacked", func(o *connObserver) { o.markHijacked() }, directBadRequest, false},
+		{"already claimed", func(o *connObserver) { o.rejected = true }, directBadRequest, false},
+		{"parser gave up on the head", func(o *connObserver) { o.stop() }, directBadRequest, true},
+		{"not a direct error response", func(*connObserver) {}, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, _ := newTestObserver()
+			tc.setup(o)
+			_, _, _, ok := o.claimDirectRejection([]byte(tc.write))
+			if ok != tc.wantOK {
+				t.Errorf("claimDirectRejection = %v, want %v", ok, tc.wantOK)
+			}
+		})
+	}
+
+	t.Run("response of a handler still being written", func(t *testing.T) {
+		// The buffered end of a handler's response body is written after the
+		// handler returned; it must not be taken for a response of net/http.
+		o, _ := newTestObserver()
+		o.handlerStarted()
+		o.handlerFinished()
+		if _, _, _, ok := o.claimDirectRejection([]byte(directBadRequest)); ok {
+			t.Fatal("claimed bytes of the handler's response written after the handler returned")
+		}
+		o.responseFinished()
+		if _, _, _, ok := o.claimDirectRejection([]byte(directBadRequest)); !ok {
+			t.Error("did not claim the response that net/http writes once the handler's response is complete")
+		}
+	})
+
+	t.Run("claimed once", func(t *testing.T) {
+		o, _ := newTestObserver()
+		reason, status, _, ok := o.claimDirectRejection([]byte(directBadRequest))
+		if !ok || reason != RejectionMalformedRequest || status != 400 {
+			t.Fatalf("first claim = %q, %d, %v", reason, status, ok)
+		}
+		if _, _, _, ok := o.claimDirectRejection([]byte(directBadRequest)); ok {
+			t.Error("second claim succeeded, want exactly one record per connection")
+		}
+	})
+}
+
+func TestClaimReadTimeout(t *testing.T) {
+	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		setup func(o *connObserver)
+		// deadline is relative to the moment it is set.
+		deadline time.Duration
+		wantOK   bool
+	}{
+		{"connection that sent nothing", func(*connObserver) {}, time.Second, true},
+		{"partial head", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHo")) }, time.Second, true},
+		{"idle wait after a request", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\n")) }, time.Second, false},
+		{"partial head after a request", func(o *connObserver) {
+			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHo"))
+		}, time.Second, true},
+		{"read interrupted by a deadline in the past", func(*connObserver) {}, -time.Second, false},
+		{"no deadline set", func(*connObserver) {}, 0, false},
+		{"request body", func(o *connObserver) { o.feed([]byte("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\n\r\nab")) }, time.Second, false},
+		{"handler running", func(o *connObserver) { o.responding = true }, time.Second, false},
+		{"hijacked", func(o *connObserver) { o.markHijacked() }, time.Second, false},
+		{"already claimed", func(o *connObserver) { o.rejected = true }, time.Second, false},
+		{"parser stopped", func(o *connObserver) { o.feed([]byte("GARBAGE\r\n\r\n")) }, time.Second, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, _ := newTestObserver()
+			o.now = func() time.Time { return now }
+			tc.setup(o)
+			if tc.deadline != 0 {
+				o.setReadDeadline(now.Add(tc.deadline))
+			}
+			if _, ok := o.claimReadTimeout(); ok != tc.wantOK {
+				t.Errorf("claimReadTimeout = %v, want %v", ok, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestRejectionStart(t *testing.T) {
+	clock := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	o, _ := newTestObserver()
+	o.now = func() time.Time { return clock }
+	o.acceptedAt = clock
+	// Nothing arrived yet: the connection start counts.
+	clock = clock.Add(2 * time.Second)
+	if _, _, start, ok := o.claimDirectRejection([]byte(directBadRequest)); !ok || !start.Equal(o.acceptedAt) {
+		t.Errorf("start = %v, %v; want the accept time %v", start, ok, o.acceptedAt)
+	}
+
+	o, _ = newTestObserver()
+	o.now = func() time.Time { return clock }
+	o.acceptedAt = clock.Add(-time.Hour)
+	o.feed([]byte("GET / HTTP/1.1\r\n"))
+	first := clock
+	clock = clock.Add(time.Second)
+	if _, ok := o.claimReadTimeout(); ok {
+		t.Fatal("claimed a timeout without a deadline")
+	}
+	o.setReadDeadline(clock.Add(time.Second))
+	if start, ok := o.claimReadTimeout(); !ok || !start.Equal(first) {
+		t.Errorf("start = %v, %v; want the first byte %v", start, ok, first)
+	}
+}
+
+// TestRejectionStartOfAnAlreadyBufferedPartialRequest checks that the start of
+// a request whose first bytes arrived together with the previous request is not
+// moved by a later byte of the same request.
+func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
+	const get = "GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		// arrival is what the first read holds; more arrives nine seconds later.
+		arrival string
+		// handlers is the number of handler calls that finish before that.
+		handlers  int
+		wantStart time.Duration
+	}{
+		{"partial head after a complete request", get + "GET / HTTP/1.1\r\nHo", 1, time.Millisecond},
+		{"partial head after two pipelined requests", get + get + "GET / HTTP/1.1\r\nHo", 2, 2 * time.Millisecond},
+		// Nothing of the next request arrived before the handler finished, so
+		// its first byte starts it.
+		{"nothing buffered when the handler finishes", get, 1, 9 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := origin
+			o, _ := newTestObserver()
+			o.now = func() time.Time { return clock }
+			o.acceptedAt = origin.Add(-time.Hour)
+			o.feed([]byte(tc.arrival))
+			for range tc.handlers {
+				clock = clock.Add(time.Millisecond)
+				o.handlerStarted()
+				o.handlerFinished()
+			}
+			o.responseFinished()
+			clock = origin.Add(9 * time.Second)
+			o.feed([]byte("s"))
+			o.setReadDeadline(clock.Add(time.Second))
+			clock = clock.Add(time.Second)
+			start, ok := o.claimReadTimeout()
+			if !ok || !start.Equal(origin.Add(tc.wantStart)) {
+				t.Errorf("start = %v, %v; want %v after the first byte", start, ok, tc.wantStart)
+			}
+		})
+	}
+}
+
+func TestLogRejectedRecordShape(t *testing.T) {
+	o, logs := newTestObserver()
+	clock := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	o.now = func() time.Time { return clock.Add(1500 * time.Millisecond) }
+	o.logRejected(RejectionHeaderReadTimeout, 0, clock)
+	var record map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+		t.Fatalf("log is not JSON: %v: %s", err, logs.String())
+	}
+	want := map[string]any{"level": "INFO", "msg": "http_request_rejected", "reason": "header_read_timeout", "status": float64(0), "duration_ms": float64(1500)}
+	for key, value := range want {
+		if record[key] != value {
+			t.Errorf("%s = %v, want %v", key, record[key], value)
+		}
+	}
+	for _, key := range []string{"path", "method", "bytes"} {
+		if _, ok := record[key]; ok {
+			t.Errorf("record has %q, want none", key)
+		}
+	}
+}
+
+func TestConnStateEndsTheResponseOnIdle(t *testing.T) {
+	client, serverSide := net.Pipe()
+	defer client.Close()
+	defer serverSide.Close()
+	observed := &observedConn{Conn: serverSide, obs: newConnObserver(slog.New(slog.NewJSONHandler(io.Discard, nil)))}
+	observed.obs.handlerStarted()
+	observed.obs.handlerFinished()
+	ConnState(observed, http.StateActive)
+	if !observed.obs.responding {
+		t.Fatal("the response ended before net/http reported the connection idle")
+	}
+	ConnState(observed, http.StateIdle)
+	if observed.obs.responding {
+		t.Error("the response did not end when net/http reported the connection idle")
+	}
+	// A connection that ObserveListener did not wrap is left alone.
+	ConnState(serverSide, http.StateIdle)
+}
+
+// lockedBuffer is a log destination that the server goroutines and the test
+// read and write concurrently.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// serveObserved serves handler behind the request logger on a real net/http
+// server whose listener is observed, configured like newServer in
+// cmd/accounts-api, and returns its address and logs.
+func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffer) {
+	t.Helper()
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, nil))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{
+		Handler:        logRequests(logger, handler),
+		ConnContext:    ConnContext,
+		ConnState:      ConnState,
+		MaxHeaderBytes: MaxHeaderBytes,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ObserveListener(listener, logger))
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	return listener.Addr().String(), logs
+}
+
+func countRecords(logs *lockedBuffer, msg string) int {
+	return strings.Count(logs.String(), `"msg":"`+msg+`"`)
+}
+
+// TestHandlerResponseBytesAreNeverARejection writes, as the body of a handler's
+// own response, the bytes that net/http writes for a rejection. net/http
+// flushes the buffered end of that body after the handler returned, with the
+// connection already past the handler call, so it must not be logged as a
+// rejection next to the request's own http_request record.
+func TestHandlerResponseBytesAreNeverARejection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		// request is sent after the first one in the same write when non-empty.
+		pipelined string
+	}{
+		{"mimics a 400", directBadRequest, ""},
+		{"mimics a 417 for a pipelined request", expectationFailedResponse, "GET /bad HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/probe" {
+					return
+				}
+				w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)))
+				w.WriteHeader(http.StatusOK)
+				// Send the headers on their own, so that the body is the first
+				// bytes of the final write that net/http makes after the handler.
+				if err := http.NewResponseController(w).Flush(); err != nil {
+					t.Errorf("flush: %v", err)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			})
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			request := "GET /probe HTTP/1.1\r\nHost: t\r\n"
+			if tc.pipelined == "" {
+				request += "Connection: close\r\n"
+			}
+			if _, err := io.WriteString(conn, request+"\r\n"+tc.pipelined); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			response, _ := io.ReadAll(conn)
+			if !bytes.Contains(response, []byte(tc.body)) {
+				t.Fatalf("response = %q, want the handler's body", response)
+			}
+			if tc.pipelined != "" {
+				// The pipelined request is the 417 that net/http answers itself, and
+				// it is logged once, by the observer, after the handler's response.
+				if got := countRecords(logs, "http_request"); got != 2 {
+					t.Errorf("http_request records = %d, want 2: %s", got, logs.String())
+				}
+			} else if got := countRecords(logs, "http_request"); got != 1 {
+				t.Errorf("http_request records = %d, want 1: %s", got, logs.String())
+			}
+			if got := countRecords(logs, "http_request_rejected"); got != 0 {
+				t.Errorf("http_request_rejected records = %d, want none: %s", got, logs.String())
+			}
+		})
+	}
+}
+
+func TestConnStateMarksOnlyObservedHijackedConnections(t *testing.T) {
+	client, serverSide := net.Pipe()
+	defer client.Close()
+	defer serverSide.Close()
+	observed := &observedConn{Conn: serverSide, obs: newConnObserver(slog.New(slog.NewJSONHandler(io.Discard, nil)))}
+	ConnState(observed, http.StateActive)
+	if observed.obs.hijacked {
+		t.Fatal("an active connection was marked hijacked")
+	}
+	ConnState(observed, http.StateHijacked)
+	if !observed.obs.hijacked {
+		t.Error("a hijacked connection was not marked")
+	}
+	// A connection that ObserveListener did not wrap is left alone.
+	ConnState(serverSide, http.StateHijacked)
 }
