@@ -38,6 +38,19 @@ Sidebar order for `/guide/` is owned by `docs/guide/_meta.json`. The navbar entr
 - `docs/public/_headers` sets Cloudflare Pages response headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and `X-Frame-Options: DENY`.
 - Rspress built-in full-text search is enabled. The index is generated at build time and is served as static assets; no AI search backend is used yet. If AI search is added, it must default to Cloudflare AI Search per repository defaults.
 
+### Brand colors
+
+The Rspress theme variables `--rp-c-brand`, `--rp-c-brand-dark`, `--rp-c-brand-darker`, `--rp-c-brand-light`, `--rp-c-brand-lighter` and `--rp-c-brand-tint` are set in `theme/index.css`. The site does not share tokens with `delino-ui`; both Rspress apps keep an identical `theme/index.css`.
+
+- Light mode (`:root`) is the source brand blue `#3b5bfd`. It reaches 5.12:1 on the `#ffffff` page background.
+- Dark mode (`html.rp-dark`) overrides `--rp-c-brand` to `#8aa0ff`, `--rp-c-brand-light` to `#a3b4ff`, `--rp-c-brand-lighter` to `#c0ccff` and `--rp-c-brand-tint` to `rgba(138, 160, 255, 0.12)`. `--rp-c-brand-dark` (`#2c47d8`) and `--rp-c-brand-darker` (`#2238b3`) stay unchanged in both modes, because the home hero button gradient is built from them and carries white text (7.00:1).
+- Rspress paints text directly with `--rp-c-brand` (navbar item, heading anchors, search panel, feature card hover, overview links) and with `--rp-c-brand-light` (links and the active sidebar item). Every such text color must reach 4.5:1 against its rendered background in both modes.
+- Rspress 2.1.3 paints the current search suggestion with `--rp-c-brand` as the background and hard-coded white text. The dark override keeps that background at `#3b5bfd` (white text 5.12:1), and the dark overview hover background mixes `--rp-c-brand-dark` instead of `--rp-c-brand-lighter` (brand text 4.72:1, against 2.65:1 with the brighter ramp). Remove both overrides when Rspress derives these colors from the brand variables.
+
+The dark-mode `--rp-c-brand`, `--rp-c-brand-light` and `--rp-c-brand-lighter` values must each reach 4.5:1 (WCAG 2.1 normal text) against every Rspress dark surface: `#121212`, `#292e37`, `#343a46` and `#000000`. The light-mode brand blue does not meet this on those surfaces, which is why the dark ramp exists.
+
+The e2e suite checks this minimum on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. It also checks that the light-mode brand and the hero gradient colors do not change.
+
 ## Storage
 
 The site has no persistent storage, user uploads or server-side cache. All content is committed source. Static assets of at least 512 KiB require Git LFS according to the repository workflow contract.

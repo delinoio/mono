@@ -8,3 +8,43 @@
   --rp-c-brand-lighter: #8197ff;
   --rp-c-brand-tint: rgba(59, 91, 253, 0.08);
 }
+
+/*
+ * Dark-mode brand ramp. Rspress paints text directly with --rp-c-brand (active
+ * navbar item, heading anchors, search panel, hovered feature cards), and the
+ * light-mode brand reaches only 2.23:1 to 4.10:1 on the dark surfaces
+ * (#121212, #292e37, #343a46, #000). These values keep brand text at 4.5:1 or
+ * more on all of them. --rp-c-brand-dark and --rp-c-brand-darker stay
+ * unchanged on purpose: the home hero button gradient is built from them and
+ * carries white text. The contrast requirement is recorded in the foundation
+ * contract.
+ */
+html.rp-dark {
+  --rp-c-brand: #8aa0ff;
+  --rp-c-brand-light: #a3b4ff;
+  --rp-c-brand-lighter: #c0ccff;
+  --rp-c-brand-tint: rgba(138, 160, 255, 0.12);
+
+  /*
+   * Rspress mixes --rp-c-brand-lighter into this hover background, and the
+   * hovered title text uses --rp-c-brand. The brighter dark ramp would leave
+   * about 2.65:1, so mix the unchanged --rp-c-brand-dark instead.
+   */
+  --rp-c-overview-group-bg-hover: color-mix(
+    in srgb,
+    var(--rp-c-brand-dark) 30%,
+    transparent
+  );
+}
+
+/*
+ * Workaround: Rspress 2.1.3 paints the current search suggestion with
+ * --rp-c-brand as background and hard-coded #fff text. The brighter dark brand
+ * would drop that white text to about 2.6:1, so keep the original brand blue
+ * (#3b5bfd, 5.12:1 with white) behind it. Scope: dark mode and this one
+ * selector. Remove it once Rspress derives the suggestion text color from the
+ * brand variable or exposes a variable for this background.
+ */
+html.rp-dark .rp-suggest-item--current .rp-suggest-item__link {
+  background-color: #3b5bfd;
+}
