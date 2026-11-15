@@ -54,7 +54,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `RadioGroup`: a labeled group with one checked value. Props: `label` (required, names the group), `description`, `error`, and all UI SDK `RadioGroup` props such as `value`, `defaultValue`, `onValueChange`, `name`, `required` and `disabled`. It follows the same error rules as `TextField`. Arrow keys move between options.
   - `RadioGroupItem`: one option. Props: `value`, `children` (the visible option name) and the other UI SDK `Radio` props.
 - `delino-ui/select`
-  - `Select`: a labeled single-value picker. Props: `label` (required), `description`, `error`, `placeholder`, `value`, `defaultValue`, `onValueChange`, `name`, `required`, `disabled` and the other UI SDK `Select` options except `multiple`. `className` applies to the trigger. It follows the same error rules as `TextField`. The value type is `string`.
+  - `Select`: a labeled single-value picker. Props: `label` (required), `description`, `error`, `placeholder`, `value`, `defaultValue`, `onValueChange`, `name`, `required`, `disabled` and the other UI SDK `Select` options except `multiple`. `className` applies to the trigger. It follows the same error rules as `TextField`. The value type is `string`. An untyped `multiple` value is ignored at runtime, so `Select` always stays single-value.
   - `SelectOption`: one option. Props: `value`, `children` (the visible option name), `disabled` and the other UI SDK `SelectItem` props. A check marks the selected option.
 - `delino-ui/tabs`
   - `Tabs`, `TabsList`, `TabsTab` and `TabsPanel`: styled UI SDK tabs parts with all their props. Each tab and its panel use the same `value`. Consumers name `TabsList` with `aria-label`.

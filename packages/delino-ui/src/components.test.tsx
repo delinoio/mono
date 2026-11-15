@@ -464,6 +464,43 @@ describe("Select", () => {
     expect(trigger.textContent).toContain("Editor");
   });
 
+  test.each([
+    { name: "without multiple", untyped: {} as object },
+    {
+      name: "even when multiple is spread in",
+      // `multiple` is omitted from the types; a JS caller or an untyped spread
+      // must still not turn the select into a multi-value listbox at runtime.
+      untyped: { multiple: true } as object,
+    },
+  ])("stays a single-value picker $name", async ({ untyped }) => {
+    const values: unknown[] = [];
+    render(
+      <Select
+        label="Role"
+        value="viewer"
+        onValueChange={(value) => values.push(value)}
+        {...untyped}
+      >
+        <SelectOption value="viewer">Viewer</SelectOption>
+        <SelectOption value="editor">Editor</SelectOption>
+      </Select>,
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("combobox", { name: "Role" }));
+    });
+    const listbox = screen.getByRole("listbox");
+    expect(listbox.getAttribute("aria-multiselectable")).toBeNull();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("option", { name: "Editor" }));
+    });
+    expect(values).toEqual(["editor"]);
+    expect(
+      screen.queryByRole("listbox")?.hasAttribute("data-closed") ?? true,
+    ).toBe(true);
+  });
+
   test("shows the selected option in the trigger", () => {
     render(
       <Select label="Role" defaultValue="editor">

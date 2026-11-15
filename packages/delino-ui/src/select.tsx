@@ -67,6 +67,13 @@ export function Select({
   children,
   ...props
 }: SelectProps) {
+  // The type already omits `multiple`, but types do not stop JS callers or
+  // untyped spread objects. Drop the key at runtime, silently, so `Select`
+  // always stays a single-value picker. Remove this only if the type stops
+  // omitting `multiple`.
+  const { multiple: _multiple, ...rootProps } = props as typeof props & {
+    multiple?: unknown;
+  };
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
 
@@ -77,7 +84,7 @@ export function Select({
       invalid={hasError ? true : undefined}
     >
       <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
-      <SelectRoot disabled={disabled} {...props}>
+      <SelectRoot disabled={disabled} {...rootProps}>
         <SelectTrigger
           className={className ? `dui-select ${className}` : "dui-select"}
         >
