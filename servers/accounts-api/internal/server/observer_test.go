@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -42,6 +43,9 @@ func summarize(o *connObserver) []pendingSummary {
 
 func TestObserverParsesRequestSequences(t *testing.T) {
 	get := func(path string) string { return "GET " + path + " HTTP/1.1\r\nHost: t\r\n\r\n" }
+	post := func(path string) string {
+		return "POST " + path + " HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+	}
 	for _, tc := range []struct {
 		name   string
 		stream string
@@ -83,6 +87,41 @@ func TestObserverParsesRequestSequences(t *testing.T) {
 		},
 		{"malformed request line stops parsing", get("/a") + "NOT A REQUEST\r\n\r\n" + get("/b"), []pendingSummary{{"GET", "/a", false}}},
 		{"leading empty line stops parsing", "\r\n" + get("/a"), nil},
+		{
+			"leading CRLF after a POST is skipped",
+			post("/a") + "\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
+		},
+		{
+			"four mixed CR and LF bytes after a POST are skipped",
+			post("/a") + "\r\n\r\n" + get("/b") + "\n\r\r\n" + get("/c"),
+			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
+		},
+		{
+			"each POST allows its own four leading bytes",
+			post("/a") + "\r\n\r\n" + post("/b") + "\n\n\n\n" + get("/c"),
+			[]pendingSummary{{"POST", "/a", false}, {"POST", "/b", false}, {"GET", "/c", false}},
+		},
+		{
+			"five leading CR and LF bytes after a POST stop parsing",
+			post("/a") + "\r\n\r\n\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}},
+		},
+		{
+			"leading CRLF after a POST with a body is skipped",
+			"POST /a HTTP/1.1\r\nHost: t\r\nContent-Length: 2\r\n\r\nhi\r\n" + get("/b"),
+			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", false}},
+		},
+		{
+			"leading CRLF after a GET stops parsing",
+			get("/a") + "\r\n" + get("/b"),
+			[]pendingSummary{{"GET", "/a", false}},
+		},
+		{
+			"leading CRLF after a POST then an unsupported expectation is queued",
+			post("/a") + "\r\n" + "GET /b HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n" + get("/c"),
+			[]pendingSummary{{"POST", "/a", false}, {"GET", "/b", true}},
+		},
 		{
 			"invalid chunk size stops parsing",
 			"POST /a HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n" + get("/b"),
@@ -510,6 +549,7 @@ func TestClaimDirectRejection(t *testing.T) {
 }
 
 func TestClaimReadTimeout(t *testing.T) {
+	const postRequest = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
 	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name  string
@@ -524,6 +564,19 @@ func TestClaimReadTimeout(t *testing.T) {
 		{"partial head after a request", func(o *connObserver) {
 			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHo"))
 		}, time.Second, true},
+		{"idle wait after a POST", func(o *connObserver) { o.feed([]byte(postRequest)) }, time.Second, false},
+		// The skipped bytes are part of the next head that net/http is reading, so
+		// they count as a partly received head although the head buffer is empty.
+		{"one skipped CR after a POST", func(o *connObserver) { o.feed([]byte(postRequest + "\r")) }, time.Second, true},
+		{"four skipped CR and LF bytes after a POST", func(o *connObserver) { o.feed([]byte(postRequest + "\r\n\r\n")) }, time.Second, true},
+		{"skipped bytes after a POST in separate reads", func(o *connObserver) {
+			o.feed([]byte(postRequest))
+			o.feed([]byte("\r"))
+			o.feed([]byte("\n"))
+		}, time.Second, true},
+		{"idle wait after a head that followed skipped bytes", func(o *connObserver) {
+			o.feed([]byte(postRequest + "\r\n" + "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+		}, time.Second, false},
 		{"read interrupted by a deadline in the past", func(*connObserver) {}, -time.Second, false},
 		{"no deadline set", func(*connObserver) {}, 0, false},
 		{"request body", func(o *connObserver) { o.feed([]byte("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\n\r\nab")) }, time.Second, false},
@@ -681,6 +734,13 @@ func (b *lockedBuffer) String() string {
 // cmd/accounts-api, and returns its address and logs.
 func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffer) {
 	t.Helper()
+	return serveObservedWith(t, handler, nil)
+}
+
+// serveObservedWith is serveObserved with a hook that adjusts the server, for
+// example to set the timeouts, before it starts serving.
+func serveObservedWith(t *testing.T, handler http.HandlerFunc, configure func(*http.Server)) (string, *lockedBuffer) {
+	t.Helper()
 	logs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -692,6 +752,9 @@ func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffe
 		ConnContext:    ConnContext,
 		ConnState:      ConnState,
 		MaxHeaderBytes: MaxHeaderBytes,
+	}
+	if configure != nil {
+		configure(srv)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -766,6 +829,195 @@ func TestHandlerResponseBytesAreNeverARejection(t *testing.T) {
 			}
 			if got := countRecords(logs, "http_request_rejected"); got != 0 {
 				t.Errorf("http_request_rejected records = %d, want none: %s", got, logs.String())
+			}
+		})
+	}
+}
+
+// TestLeadingCRLFAfterAPostKeepsTheConnectionObserved sends raw bytes to a real
+// net/http server. net/http discards up to four leading CR or LF bytes after a
+// POST, so it answers the request that follows (here a 417) and the observer
+// must still log that 417; with five bytes or after another method net/http
+// answers 400, which is an http_request_rejected record.
+func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
+	const (
+		post   = "POST /post HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+		get    = "GET /get HTTP/1.1\r\nHost: t\r\n\r\n"
+		expect = "GET /missing HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n"
+	)
+	for _, tc := range []struct {
+		name string
+		// writes are sent one by one over one connection.
+		writes []string
+		// statuses are the response statuses the client must read, in order.
+		statuses []string
+		// records are the substrings that the http_request records contain in
+		// order; rejected is the number of http_request_rejected records.
+		records  []string
+		rejected int
+	}{
+		{
+			name:     "POST, CRLF, unsupported expectation",
+			writes:   []string{post, "\r\n", expect},
+			statuses: []string{"200", "417"},
+			records:  []string{`"path":"/post","status":200`, `"path":"/missing","status":417`},
+		},
+		{
+			name:     "POST, CRLF, normal request",
+			writes:   []string{post, "\r\n", get, get},
+			statuses: []string{"200", "200", "200"},
+			records:  []string{`"path":"/post"`, `"path":"/get"`, `"path":"/get"`},
+		},
+		{
+			name:     "POST, four bytes, unsupported expectation",
+			writes:   []string{post, "\r\n\r\n", expect},
+			statuses: []string{"200", "417"},
+			records:  []string{`"path":"/post"`, `"path":"/missing","status":417`},
+		},
+		{
+			name:     "POST, five bytes",
+			writes:   []string{post, "\r\n\r\n\n", expect},
+			statuses: []string{"200", "400"},
+			records:  []string{`"path":"/post"`},
+			rejected: 1,
+		},
+		{
+			name:     "CRLF as the first bytes",
+			writes:   []string{"\r\n", expect},
+			statuses: []string{"400"},
+			rejected: 1,
+		},
+		{
+			name:     "GET, CRLF",
+			writes:   []string{get, "\r\n", expect},
+			statuses: []string{"200", "400"},
+			records:  []string{`"path":"/get"`},
+			rejected: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "ok")
+			})
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			for _, w := range tc.writes {
+				if _, err := io.WriteString(conn, w); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				// Separate reads, so the parsing cannot depend on the writes
+				// arriving together.
+				time.Sleep(30 * time.Millisecond)
+			}
+			// Every case ends with a response that closes the connection, except
+			// the keep-alive one, which the client ends itself.
+			if tc.name == "POST, CRLF, normal request" {
+				time.Sleep(100 * time.Millisecond)
+				_ = conn.(*net.TCPConn).CloseWrite()
+			}
+			response, _ := io.ReadAll(conn)
+			// A handler body has no line end, so find the status lines anywhere.
+			var got []string
+			for _, m := range regexp.MustCompile(`HTTP/1\.1 (\d{3}) `).FindAllStringSubmatch(string(response), -1) {
+				got = append(got, m[1])
+			}
+			if !reflect.DeepEqual(got, tc.statuses) {
+				t.Errorf("response statuses = %v, want %v: %q", got, tc.statuses, response)
+			}
+			// The records are written before the responses, but the logger of the
+			// last request may still be finishing when the client sees the close.
+			deadline := time.Now().Add(2 * time.Second)
+			for countRecords(logs, "http_request") < len(tc.records) && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			var lines []string
+			for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+				if strings.Contains(line, `"msg":"http_request"`) {
+					lines = append(lines, line)
+				}
+			}
+			if len(lines) != len(tc.records) {
+				t.Fatalf("http_request records = %d, want %d: %s", len(lines), len(tc.records), logs.String())
+			}
+			for i, want := range tc.records {
+				if !strings.Contains(lines[i], want) {
+					t.Errorf("record %d = %s, want it to contain %s", i, lines[i], want)
+				}
+			}
+			if got := countRecords(logs, "http_request_rejected"); got != tc.rejected {
+				t.Errorf("http_request_rejected records = %d, want %d: %s", got, tc.rejected, logs.String())
+			}
+		})
+	}
+}
+
+// TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout stalls a real net/http
+// server after a POST and four leading CR and LF bytes. net/http waits for four
+// bytes of the next request under IdleTimeout, discards them and then reads the
+// head under ReadHeaderTimeout, so the stall is a header read timeout although
+// the observer's head buffer is empty (the bytes were skipped). The same stall
+// without the extra bytes is the keep-alive wait and is not logged.
+func TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout(t *testing.T) {
+	const (
+		headerTimeout = 200 * time.Millisecond
+		post          = "POST /post HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+	)
+	for _, tc := range []struct {
+		name string
+		// idleTimeout is long enough that only ReadHeaderTimeout can expire in time
+		// when net/http reads a head, and short enough for the idle case to expire.
+		idleTimeout time.Duration
+		writes      []string
+		wantLogged  bool
+	}{
+		{"POST, four leading bytes, stall", time.Hour, []string{post, "\r\n\r\n"}, true},
+		{"POST, stall", 3 * headerTimeout, []string{post}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := serveObservedWith(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "ok")
+			}, func(srv *http.Server) {
+				srv.ReadHeaderTimeout = headerTimeout
+				srv.IdleTimeout = tc.idleTimeout
+			})
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			for _, w := range tc.writes {
+				if _, err := io.WriteString(conn, w); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				// Separate reads, so the parsing cannot depend on the writes
+				// arriving together.
+				time.Sleep(30 * time.Millisecond)
+			}
+			// net/http closes the connection without a response once the timeout
+			// expires, which the client sees as the end of the stream after the
+			// response to the POST.
+			response, _ := io.ReadAll(conn)
+			if got := strings.Count(string(response), "HTTP/1.1 "); got != 1 {
+				t.Fatalf("responses = %d, want only the one to the POST: %q", got, response)
+			}
+			// The timed-out read is logged before net/http closes the connection;
+			// allow the logger a moment.
+			deadline := time.Now().Add(2 * time.Second)
+			for countRecords(logs, "http_request_rejected") == 0 && time.Now().Before(deadline) && tc.wantLogged {
+				time.Sleep(10 * time.Millisecond)
+			}
+			got := countRecords(logs, "http_request_rejected")
+			if tc.wantLogged {
+				if got != 1 || !strings.Contains(logs.String(), `"reason":"header_read_timeout"`) {
+					t.Errorf("want one header_read_timeout record, got %d: %s", got, logs.String())
+				}
+			} else if got != 0 {
+				t.Errorf("http_request_rejected records = %d, want none for the keep-alive wait: %s", got, logs.String())
 			}
 		})
 	}

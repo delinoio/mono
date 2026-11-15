@@ -35,6 +35,10 @@ const (
 	// chunk-size line and to the trailer section.
 	maxChunkLineBytes = 4096
 	maxTrailerBytes   = 4096
+	// maxLeadingCRorLF is the number of leading CR or LF bytes that net/http
+	// discards before a request line after a POST (numLeadingCRorLF in its
+	// server). The observer skips the same number.
+	maxLeadingCRorLF = 4
 	// retainedHeadCap is the largest head buffer kept between requests, so an
 	// idle keep-alive connection does not hold a large buffer.
 	retainedHeadCap = 4096
@@ -73,6 +77,12 @@ const (
 // head, an invalid chunked body, a full queue) the observer stops parsing and
 // the connection continues unobserved: it may then miss the record of a later
 // rejected request, but it never logs a request that was not rejected.
+//
+// net/http discards up to four leading CR or LF bytes before a request line
+// when the previous request on the connection was a POST, so the parser skips
+// them in that case too and keeps observing the connection. After any other
+// method, and at the start of the connection, an empty first line is not a
+// request and stops the parsing, as does a fifth leading CR or LF byte.
 //
 // Other rejections happen before net/http has a request at all, so they have no
 // method and path and are logged as http_request_rejected records instead:
@@ -138,6 +148,13 @@ type connObserver struct {
 	head      []byte
 	lineStart int
 	lines     int
+	// lastMethod is the method of the last request head that parsed. net/http
+	// keeps the same value (conn.lastMethod) and skips leading CR and LF bytes
+	// of the next head only after a POST.
+	lastMethod string
+	// leadingSkipped counts the leading CR and LF bytes skipped before the
+	// current head; it is reset when the head parses.
+	leadingSkipped int
 
 	// remaining counts the body or chunk data bytes still to skip.
 	remaining uint64
@@ -228,6 +245,16 @@ func (o *connObserver) stop() {
 // the unconsumed rest.
 func (o *connObserver) feedHead(p []byte) []byte {
 	for i, b := range p {
+		// net/http discards up to maxLeadingCRorLF CR or LF bytes before a request
+		// line when the previous request on the connection was a POST (a tolerance
+		// for clients that send an extra CRLF after a body). Skip the same bytes,
+		// wherever the reads split them. Any other byte, and every further CR or
+		// LF byte, is parsed as part of the head, so a fifth one still ends the
+		// parsing as net/http answers it with 400.
+		if len(o.head) == 0 && (b == '\r' || b == '\n') && o.lastMethod == http.MethodPost && o.leadingSkipped < maxLeadingCRorLF {
+			o.leadingSkipped++
+			continue
+		}
 		o.head = append(o.head, b)
 		if len(o.head) > maxObservedHeadBytes {
 			o.stop()
@@ -257,6 +284,7 @@ func (o *connObserver) feedHead(p []byte) []byte {
 func (o *connObserver) finishHead() {
 	head := o.head
 	o.lineStart, o.lines = 0, 0
+	o.leadingSkipped = 0
 	req, ok := parseObservedHead(head)
 	if cap(o.head) > retainedHeadCap {
 		o.head = nil
@@ -268,6 +296,7 @@ func (o *connObserver) finishHead() {
 		return
 	}
 	o.parsedHeads++
+	o.lastMethod = req.Method
 	observed := observedRequest{
 		method:       req.Method,
 		path:         req.URL.Path,
@@ -695,7 +724,8 @@ func (o *connObserver) deadlineExpired() bool {
 // Only a deadline timer that expired while the parser waited for (more of) a
 // request head counts, with no handler call or response in progress:
 //
-//   - A head that is partly received counts, whatever deadline expired.
+//   - A head that is partly received counts, whatever deadline expired. Leading
+//     CR and LF bytes that the parser skipped after a POST are part of it.
 //   - An empty head counts only while no request head ever parsed on the
 //     connection. A connection that connects and stalls is logged, because
 //     the contract covers every header read timeout, and so is one that sends
@@ -710,7 +740,11 @@ func (o *connObserver) claimReadTimeout() (time.Time, bool) {
 	if o.rejected || o.hijacked || o.responding || o.phase != phaseHead || !o.deadlineExpired() {
 		return time.Time{}, false
 	}
-	if len(o.head) == 0 && o.parsedHeads > 0 {
+	// The leading CR and LF bytes skipped after a POST are bytes of the next
+	// request that net/http has received too (it reads that head under
+	// ReadHeaderTimeout once it has them), so they make the head partly received
+	// even though the head buffer is still empty.
+	if len(o.head) == 0 && o.leadingSkipped == 0 && o.parsedHeads > 0 {
 		return time.Time{}, false
 	}
 	o.rejected = true
