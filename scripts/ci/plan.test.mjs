@@ -85,6 +85,29 @@ test("documentation changes select formatting without fixtures", (t) => {
   });
 });
 
+test("documentation and source paths select formatting in any extension case", (t) => {
+  for (const path of [
+    "notes.MD",
+    "Component.TSX",
+    "data.JSON",
+    "docs/Guide.Md",
+  ]) {
+    const f = fixture(t);
+    f.write(path);
+    assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
+      quality: true,
+      format: true,
+      fixtures: false,
+      go: false,
+      e2e: false,
+    });
+  }
+  // An unsupported extension stays unformatted whatever its case.
+  const f = fixture(t);
+  f.write("NOTES.TXT");
+  assert.equal(plan(f.cwd, f.base, f.commit()).format, false);
+});
+
 test("every shared fixture input selects tests", async (t) => {
   for (const path of [
     ".github/workflows/CI.yml",

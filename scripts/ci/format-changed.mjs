@@ -25,6 +25,14 @@ const extensions = new Set([
   ".md",
   ".mdx",
 ]);
+
+// Supported extensions are matched case-insensitively so `notes.MD`,
+// `Component.TSX` and `data.JSON` are selected like their lowercase forms.
+// Every selector shares this predicate so they cannot disagree on case.
+function isFormattableExtension(name) {
+  return extensions.has(extname(name).toLowerCase());
+}
+
 const Mode = Object.freeze({ Check: "check", Write: "write" });
 const git = (cwd, ...args) =>
   execFileSync("git", args, {
@@ -91,7 +99,7 @@ export function allFormatFiles(cwd) {
   const names = git(cwd, "ls-files", "-z")
     .split("\0")
     .filter((name) => {
-      if (!extensions.has(extname(name)) || symlinks.has(name)) return false;
+      if (!isFormattableExtension(name) || symlinks.has(name)) return false;
       return isRegularFile(cwd, name);
     });
   // `git ls-files` prints an unmerged path once per index stage (up to three
@@ -172,7 +180,7 @@ export function stagedFormatFiles(cwd) {
       // can hit the missing-file failure: an unsupported extension, a path the
       // index records as a symlink, and, inside stagedRegularFile, a path
       // excluded by the shared Rstack configuration.
-      if (!extensions.has(extname(name)) || symlinks.has(name)) return false;
+      if (!isFormattableExtension(name) || symlinks.has(name)) return false;
       return stagedRegularFile(cwd, name);
     })
     .sort();
@@ -225,7 +233,7 @@ export function changedFormatFiles(cwd, base, head, local = false) {
   const symlinks = recordedSymlinks(cwd);
   return [...new Set(names)]
     .filter((name) => {
-      if (!name || !extensions.has(extname(name)) || !present.has(name))
+      if (!name || !isFormattableExtension(name) || !present.has(name))
         return false;
       if (symlinks.has(name)) return false;
       return isRegularFile(cwd, name, local);
