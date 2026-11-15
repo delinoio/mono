@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func newTestHandler(t *testing.T) (http.Handler, *bytes.Buffer) {
@@ -166,17 +167,50 @@ func TestStatusRecorderWroteHeader(t *testing.T) {
 	}
 }
 
+// startLoggedServer starts a real HTTP server that serves handler behind the
+// request logger and writes the logs to the returned buffer. The returned
+// channel is closed once the logger has finished its request, which is after
+// its deferred record is written even when the handler panics (the outer defer
+// runs after the logger's own, while the panic unwinds). net/http's own panic
+// trace is discarded to keep test output quiet.
+//
+// Tests must wait on the channel before they read the buffer. httptest.Server's
+// Close waits only for connections that are still tracked, and a hijacked
+// connection leaves that set at once, so Close does not order the deferred log
+// write before the read of the shared buffer for a hijacking handler.
+func startLoggedServer(handler http.HandlerFunc) (ts *httptest.Server, logs *bytes.Buffer, logged <-chan struct{}) {
+	logs = &bytes.Buffer{}
+	done := make(chan struct{})
+	logger := slog.New(slog.NewJSONHandler(logs, nil))
+	logging := logRequests(logger, handler)
+	ts = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer close(done)
+		logging.ServeHTTP(w, r)
+	}))
+	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
+	ts.Start()
+	return ts, logs, done
+}
+
+// waitLogged blocks until the request logger has written its record, then
+// closes the server, which waits for the remaining non-hijacked connections.
+func waitLogged(t *testing.T, ts *httptest.Server, logged <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-logged:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the request logger did not finish the request")
+	}
+	ts.Close()
+}
+
 // serveRequest sends one GET to handler behind the request logger on a real
 // HTTP server and returns the client error (nil when a response arrived), the
 // client-observed status (0 on error) and the decoded log records. net/http's
 // own panic trace is discarded to keep test output quiet.
 func serveRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clientStatus int, records []map[string]any) {
 	t.Helper()
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	ts := httptest.NewUnstartedServer(logRequests(logger, handler))
-	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
-	ts.Start()
+	ts, logs, logged := startLoggedServer(handler)
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/probe")
@@ -184,9 +218,8 @@ func serveRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clie
 		clientStatus = resp.StatusCode
 		resp.Body.Close()
 	}
-	// Close waits for in-flight handlers, so every log record is complete.
-	ts.Close()
-	return err, clientStatus, decodeRecords(t, &logs)
+	waitLogged(t, ts, logged)
+	return err, clientStatus, decodeRecords(t, logs)
 }
 
 func TestRequestLogOnPanic(t *testing.T) {
@@ -244,11 +277,7 @@ func TestRequestLogOnPanic(t *testing.T) {
 // client sees it: a response with a status followed by a body read error.
 func serveCommittedRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clientStatus int, bodyErr error, records []map[string]any) {
 	t.Helper()
-	var logs bytes.Buffer
-	logger := slog.New(slog.NewJSONHandler(&logs, nil))
-	ts := httptest.NewUnstartedServer(logRequests(logger, handler))
-	ts.Config.ErrorLog = log.New(io.Discard, "", 0)
-	ts.Start()
+	ts, logs, logged := startLoggedServer(handler)
 	defer ts.Close()
 
 	resp, err := http.Get(ts.URL + "/probe")
@@ -257,9 +286,8 @@ func serveCommittedRequest(t *testing.T, handler http.HandlerFunc) (clientErr er
 		_, bodyErr = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
-	// Close waits for in-flight handlers, so every log record is complete.
-	ts.Close()
-	return err, clientStatus, bodyErr, decodeRecords(t, &logs)
+	waitLogged(t, ts, logged)
+	return err, clientStatus, bodyErr, decodeRecords(t, logs)
 }
 
 // TestRequestLogRecordsFlushedAndHijackedStatus checks that a response
