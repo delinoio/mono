@@ -12,7 +12,9 @@ import (
 	"net/http"
 	"reflect"
 	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -229,7 +231,7 @@ func TestClaimRejection(t *testing.T) {
 		{"417 answering an HTTP/1.0 request", func(*connObserver) {}, strings.Replace(expectationFailedResponse, "HTTP/1.1", "HTTP/1.0", 1), true},
 		{"417 of another protocol version", func(*connObserver) {}, strings.Replace(expectationFailedResponse, "HTTP/1.1", "HTTP/2.0", 1), false},
 		{"short write", func(*connObserver) {}, "HTTP/1.", false},
-		{"handler still running", func(o *connObserver) { o.inFlight = 1 }, expectationFailedResponse, false},
+		{"handler still running", func(o *connObserver) { o.responding = true }, expectationFailedResponse, false},
 		{"other status", func(*connObserver) {}, "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n", false},
 		{"body continuation", func(*connObserver) {}, "xxHTTP/1.1 417 Expectation Failed\r\nConnection: close\r\n\r\n", false},
 		{"417 without Connection close", func(*connObserver) {}, "HTTP/1.1 417 Expectation Failed\r\nContent-Length: 0\r\n\r\n", false},
@@ -247,6 +249,23 @@ func TestClaimRejection(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("response of a handler still being written", func(t *testing.T) {
+		// net/http flushes the buffered end of a handler's response after the
+		// handler returned. A handler controls those bytes, so they are not a
+		// response of net/http even when they look like one.
+		o, _ := newTestObserver()
+		o.feed([]byte("GET /a HTTP/1.1\r\nHost: t\r\n\r\n" + badRequest))
+		o.handlerStarted()
+		o.handlerFinished()
+		if _, _, ok := o.claimRejection([]byte(expectationFailedResponse)); ok {
+			t.Fatal("claimed bytes of the handler's response written after the handler returned")
+		}
+		o.responseFinished()
+		if _, _, ok := o.claimRejection([]byte(expectationFailedResponse)); !ok {
+			t.Error("did not claim the 417 that net/http writes once the handler's response is complete")
+		}
+	})
 
 	t.Run("a request without a rejectable Expect is never claimed", func(t *testing.T) {
 		o, _ := newTestObserver()
@@ -447,7 +466,7 @@ func TestClaimDirectRejection(t *testing.T) {
 		wantOK bool
 	}{
 		{"no pending request needed", func(*connObserver) {}, directBadRequest, true},
-		{"handler running", func(o *connObserver) { o.inFlight = 1 }, directBadRequest, false},
+		{"handler running", func(o *connObserver) { o.responding = true }, directBadRequest, false},
 		{"hijacked", func(o *connObserver) { o.markHijacked() }, directBadRequest, false},
 		{"already claimed", func(o *connObserver) { o.rejected = true }, directBadRequest, false},
 		{"parser gave up on the head", func(o *connObserver) { o.stop() }, directBadRequest, true},
@@ -462,6 +481,21 @@ func TestClaimDirectRejection(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("response of a handler still being written", func(t *testing.T) {
+		// The buffered end of a handler's response body is written after the
+		// handler returned; it must not be taken for a response of net/http.
+		o, _ := newTestObserver()
+		o.handlerStarted()
+		o.handlerFinished()
+		if _, _, _, ok := o.claimDirectRejection([]byte(directBadRequest)); ok {
+			t.Fatal("claimed bytes of the handler's response written after the handler returned")
+		}
+		o.responseFinished()
+		if _, _, _, ok := o.claimDirectRejection([]byte(directBadRequest)); !ok {
+			t.Error("did not claim the response that net/http writes once the handler's response is complete")
+		}
+	})
 
 	t.Run("claimed once", func(t *testing.T) {
 		o, _ := newTestObserver()
@@ -493,7 +527,7 @@ func TestClaimReadTimeout(t *testing.T) {
 		{"read interrupted by a deadline in the past", func(*connObserver) {}, -time.Second, false},
 		{"no deadline set", func(*connObserver) {}, 0, false},
 		{"request body", func(o *connObserver) { o.feed([]byte("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\n\r\nab")) }, time.Second, false},
-		{"handler running", func(o *connObserver) { o.inFlight = 1 }, time.Second, false},
+		{"handler running", func(o *connObserver) { o.responding = true }, time.Second, false},
 		{"hijacked", func(o *connObserver) { o.markHijacked() }, time.Second, false},
 		{"already claimed", func(o *connObserver) { o.rejected = true }, time.Second, false},
 		{"parser stopped", func(o *connObserver) { o.feed([]byte("GARBAGE\r\n\r\n")) }, time.Second, false},
@@ -557,6 +591,139 @@ func TestLogRejectedRecordShape(t *testing.T) {
 		if _, ok := record[key]; ok {
 			t.Errorf("record has %q, want none", key)
 		}
+	}
+}
+
+func TestConnStateEndsTheResponseOnIdle(t *testing.T) {
+	client, serverSide := net.Pipe()
+	defer client.Close()
+	defer serverSide.Close()
+	observed := &observedConn{Conn: serverSide, obs: newConnObserver(slog.New(slog.NewJSONHandler(io.Discard, nil)))}
+	observed.obs.handlerStarted()
+	observed.obs.handlerFinished()
+	ConnState(observed, http.StateActive)
+	if !observed.obs.responding {
+		t.Fatal("the response ended before net/http reported the connection idle")
+	}
+	ConnState(observed, http.StateIdle)
+	if observed.obs.responding {
+		t.Error("the response did not end when net/http reported the connection idle")
+	}
+	// A connection that ObserveListener did not wrap is left alone.
+	ConnState(serverSide, http.StateIdle)
+}
+
+// lockedBuffer is a log destination that the server goroutines and the test
+// read and write concurrently.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// serveObserved serves handler behind the request logger on a real net/http
+// server whose listener is observed, configured like newServer in
+// cmd/accounts-api, and returns its address and logs.
+func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffer) {
+	t.Helper()
+	logs := &lockedBuffer{}
+	logger := slog.New(slog.NewJSONHandler(logs, nil))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &http.Server{
+		Handler:        logRequests(logger, handler),
+		ConnContext:    ConnContext,
+		ConnState:      ConnState,
+		MaxHeaderBytes: MaxHeaderBytes,
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = srv.Serve(ObserveListener(listener, logger))
+	}()
+	t.Cleanup(func() {
+		_ = srv.Close()
+		<-done
+	})
+	return listener.Addr().String(), logs
+}
+
+func countRecords(logs *lockedBuffer, msg string) int {
+	return strings.Count(logs.String(), `"msg":"`+msg+`"`)
+}
+
+// TestHandlerResponseBytesAreNeverARejection writes, as the body of a handler's
+// own response, the bytes that net/http writes for a rejection. net/http
+// flushes the buffered end of that body after the handler returned, with the
+// connection already past the handler call, so it must not be logged as a
+// rejection next to the request's own http_request record.
+func TestHandlerResponseBytesAreNeverARejection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		// request is sent after the first one in the same write when non-empty.
+		pipelined string
+	}{
+		{"mimics a 400", directBadRequest, ""},
+		{"mimics a 417 for a pipelined request", expectationFailedResponse, "GET /bad HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/probe" {
+					return
+				}
+				w.Header().Set("Content-Length", strconv.Itoa(len(tc.body)))
+				w.WriteHeader(http.StatusOK)
+				// Send the headers on their own, so that the body is the first
+				// bytes of the final write that net/http makes after the handler.
+				if err := http.NewResponseController(w).Flush(); err != nil {
+					t.Errorf("flush: %v", err)
+				}
+				_, _ = io.WriteString(w, tc.body)
+			})
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			request := "GET /probe HTTP/1.1\r\nHost: t\r\n"
+			if tc.pipelined == "" {
+				request += "Connection: close\r\n"
+			}
+			if _, err := io.WriteString(conn, request+"\r\n"+tc.pipelined); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			response, _ := io.ReadAll(conn)
+			if !bytes.Contains(response, []byte(tc.body)) {
+				t.Fatalf("response = %q, want the handler's body", response)
+			}
+			if tc.pipelined != "" {
+				// The pipelined request is the 417 that net/http answers itself, and
+				// it is logged once, by the observer, after the handler's response.
+				if got := countRecords(logs, "http_request"); got != 2 {
+					t.Errorf("http_request records = %d, want 2: %s", got, logs.String())
+				}
+			} else if got := countRecords(logs, "http_request"); got != 1 {
+				t.Errorf("http_request records = %d, want 1: %s", got, logs.String())
+			}
+			if got := countRecords(logs, "http_request_rejected"); got != 0 {
+				t.Errorf("http_request_rejected records = %d, want none: %s", got, logs.String())
+			}
+		})
 	}
 }
 

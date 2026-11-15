@@ -363,6 +363,6 @@ func TestNewServerHijackedConnectionIsNeverLogged(t *testing.T) {
 
 func TestNewServerSetsConnState(t *testing.T) {
 	if srv := newServer(http.NotFoundHandler(), newTestLogger()); srv.ConnState == nil {
-		t.Error("ConnState is nil; a hijacked connection would be reported as a header read timeout")
+		t.Error("ConnState is nil; a hijacked connection would be reported as a header read timeout and no rejection would be logged after a handler response")
 	}
 }

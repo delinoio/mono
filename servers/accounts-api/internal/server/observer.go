@@ -61,10 +61,11 @@ const (
 //     dequeues the oldest pending request. Every request that net/http does not
 //     answer itself reaches the handler, and a rejection closes the connection,
 //     so the oldest pending request is the one net/http handles next.
-//   - When net/http writes the 417 response while no handler is running and the
-//     oldest pending request has an unsupported Expect header, that request is
-//     the rejected one and the observer logs its http_request record exactly
-//     once, before the response is written, as the request logger does.
+//   - When net/http writes the 417 response while no handler call or response
+//     of a handler is in progress and the oldest pending request has an
+//     unsupported Expect header, that request is the rejected one and the
+//     observer logs its http_request record exactly once, before the response
+//     is written, as the request logger does.
 //
 // The observer never answers, delays or alters traffic and starts no goroutine,
 // so a connection that net/http closes releases everything with it. Whenever the
@@ -80,7 +81,9 @@ const (
 //     an unsupported Transfer-Encoding (501) and an unsupported protocol
 //     version (505) with one write of a fixed response shape on the raw
 //     connection (see parseDirectErrorResponse). The observer recognizes that
-//     write while no handler is running and logs it once, before the write.
+//     write once the response of the last handler call is complete (the
+//     ConnState hook reports the connection idle) and logs it once, before the
+//     write.
 //   - When ReadHeaderTimeout expires, net/http closes the connection without
 //     any response. The observer sees the timed-out read of the connection and
 //     logs it when the read was waiting for a request head. A timeout of the
@@ -142,9 +145,14 @@ type connObserver struct {
 	line         []byte
 	trailerBytes int
 
-	pending  []observedRequest
-	inFlight int
-	lastDone time.Time
+	pending []observedRequest
+	// responding is set when a handler call starts and cleared when net/http
+	// reports the connection idle (see responseFinished). It covers the handler
+	// and the rest of its response: net/http writes the buffered tail of the
+	// response, which a handler controls, after the handler returned, so the end
+	// of the handler call alone does not end the writes that belong to it.
+	responding bool
+	lastDone   time.Time
 	// rejected is set once the connection logged a rejection, so every
 	// connection logs at most one, as net/http closes it after each rejection.
 	rejected bool
@@ -443,7 +451,7 @@ func equalFoldASCII(a, b string) bool {
 func (o *connObserver) handlerStarted() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.inFlight++
+	o.responding = true
 	if len(o.pending) > 0 {
 		o.pending[0] = observedRequest{}
 		o.pending = o.pending[1:]
@@ -455,14 +463,26 @@ func (o *connObserver) handlerStarted() {
 
 // handlerFinished records that a handler call returned or panicked. The next
 // pending request cannot start before that, which bounds its logged duration.
+// It does not end the response: net/http still flushes the buffered rest of it
+// afterwards (see responseFinished).
 func (o *connObserver) handlerFinished() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.inFlight--
 	o.lastDone = o.now()
 	// The next request starts with the next byte (or counts from lastDone when
 	// its bytes already arrived).
 	o.requestStart = time.Time{}
+}
+
+// responseFinished records that net/http finished the response of the last
+// handler call and is waiting for, or reading, the next request. It runs from
+// the StateIdle hook, which net/http calls after it flushed the response and
+// before it reads the next request. Every outbound write until then belongs to
+// the response of a handler, whatever bytes it has.
+func (o *connObserver) responseFinished() {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.responding = false
 }
 
 // expectationFailedStatus is the status line of every 417 response of net/http
@@ -495,7 +515,7 @@ func isExpectationFailedResponse(p []byte) bool {
 func (o *connObserver) claimRejection(p []byte) (observedRequest, time.Time, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.rejected || o.hijacked || o.inFlight > 0 || len(o.pending) == 0 || !o.pending[0].expectFailed || !isExpectationFailedResponse(p) {
+	if o.rejected || o.hijacked || o.responding || len(o.pending) == 0 || !o.pending[0].expectFailed || !isExpectationFailedResponse(p) {
 		return observedRequest{}, time.Time{}, false
 	}
 	o.rejected = true
@@ -621,14 +641,15 @@ func (o *connObserver) rejectionStart() time.Time {
 // net/http wrote for a request it rejected before the handler, and claims it so
 // it is logged exactly once.
 //
-// A response is only claimed while no handler runs, so it cannot be a response
-// of a handler, and never on a hijacked connection. The shape check does not
-// depend on the parser, so it also works after the parser stopped on the
+// A response is only claimed once the response of the last handler call is
+// complete (net/http reports the connection idle), so it cannot be bytes of a
+// handler's response, and never on a hijacked connection. The shape check does
+// not depend on the parser, so it also works after the parser stopped on the
 // malformed or oversized head that caused the response.
 func (o *connObserver) claimDirectRejection(p []byte) (RejectionReason, int, time.Time, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.rejected || o.hijacked || o.inFlight > 0 {
+	if o.rejected || o.hijacked || o.responding {
 		return "", 0, time.Time{}, false
 	}
 	status, ok := parseDirectErrorResponse(p)
@@ -665,7 +686,7 @@ func (o *connObserver) deadlineExpired() bool {
 // without a response in that case.
 //
 // Only a deadline timer that expired while the parser waited for (more of) a
-// request head counts, with no handler running:
+// request head counts, with no handler call or response in progress:
 //
 //   - A head that is partly received counts, whatever deadline expired.
 //   - An empty head counts only while no request head ever parsed on the
@@ -679,7 +700,7 @@ func (o *connObserver) deadlineExpired() bool {
 func (o *connObserver) claimReadTimeout() (time.Time, bool) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if o.rejected || o.hijacked || o.inFlight > 0 || o.phase != phaseHead || !o.deadlineExpired() {
+	if o.rejected || o.hijacked || o.responding || o.phase != phaseHead || !o.deadlineExpired() {
 		return time.Time{}, false
 	}
 	if len(o.head) == 0 && o.parsedHeads > 0 {
@@ -802,14 +823,20 @@ func ConnContext(ctx context.Context, conn net.Conn) context.Context {
 
 // ConnState is the http.Server.ConnState hook that tells the connection's
 // observer when a handler hijacks the connection, so that the observer does not
-// treat the owner's own reads and writes as net/http's. Connections that
+// treat the owner's own reads and writes as net/http's, and when net/http
+// finished a response, so that the observer does not treat the buffered end of a
+// handler's response body as a response of net/http. Connections that
 // ObserveListener did not wrap are left alone.
 func ConnState(conn net.Conn, state http.ConnState) {
-	if state != http.StateHijacked {
+	observed, ok := conn.(*observedConn)
+	if !ok {
 		return
 	}
-	if observed, ok := conn.(*observedConn); ok {
+	switch state {
+	case http.StateHijacked:
 		observed.obs.markHijacked()
+	case http.StateIdle:
+		observed.obs.responseFinished()
 	}
 }
 

@@ -106,7 +106,8 @@ func shutdownContext() (context.Context, context.CancelFunc) {
 // Transfer-Encoding (501) or protocol version (505) and a ReadHeaderTimeout
 // expiry. serve wraps the listener with server.ObserveListener, which logs
 // these rejections, and ConnContext and ConnState here pair each connection
-// with its observer and tell it about hijacked connections. MaxHeaderBytes is
+// with its observer and tell it about hijacked connections and about finished
+// responses. MaxHeaderBytes is
 // set explicitly because the observer derives its own head limit from the same
 // constant.
 func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
