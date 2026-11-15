@@ -35,7 +35,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
 - `delino-ui/text-field`
   - `TextField`: a labeled text input. Props: `label` (required), `description`, `error`, and all UI SDK `Input` props such as `value`, `defaultValue`, `onValueChange`, `name`, `type`, `required` and `autoFocus`. The field connects the label, description and error to the input.
   - A non-empty `error` marks the field invalid and shows the message. Without `error`, the field shows the browser's validation message after a failed submit.
-  - When the input is the single critical input of a form, the consumer must pass `autoFocus`.
+  - When the input is the single critical input of a form, the consumer must pass `autoFocus`. `autoFocus` also makes the input the initial focus target inside `Dialog`, even when another tabbable element such as the close button comes first. `TextField` sets `data-autofocus` on the input for this, because the UI SDK `Dialog` selects its initial focus by DOM attribute and React renders no `autofocus` attribute. A `data-autofocus` passed by the caller takes precedence. Without an `autoFocus` input, the `Dialog` focuses its first tabbable element. The attribute can be removed when the UI SDK reads the React `autoFocus` prop itself.
 - `delino-ui/switch`
   - `Switch`: a labeled on/off setting. Props: `label` (required), `description`, and all UI SDK `Switch` props such as `checked`, `defaultChecked`, `onCheckedChange`, `name` and `disabled`. It renders with role `switch` and a hidden native input for forms.
 - `delino-ui/dialog`
@@ -45,7 +45,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `DialogTitle` (level 2 heading, names the dialog), `DialogDescription` and `DialogActions` (button row).
   - `createDialogController` and the `DialogController` type are re-exported from UI SDK for dialogs that open from outside a trigger.
 - `delino-ui/textarea`
-  - `Textarea`: a labeled multi-line text input. Props: `label` (required), `description`, `error`, and all UI SDK `Textarea` props such as `value`, `defaultValue`, `onValueChange`, `name`, `rows`, `autoResize` and `autoFocus`. It follows the same error and focus rules as `TextField`.
+  - `Textarea`: a labeled multi-line text input. Props: `label` (required), `description`, `error`, and all UI SDK `Textarea` props such as `value`, `defaultValue`, `onValueChange`, `name`, `rows`, `autoResize` and `autoFocus`. It follows the same error and focus rules as `TextField`, including `autoFocus` taking the initial focus inside `Dialog` through `data-autofocus`.
 - `delino-ui/checkbox`
   - `Checkbox`: a labeled checkbox. Props: `label` (required), `description`, and all UI SDK `Checkbox` props such as `checked`, `defaultChecked`, `onCheckedChange`, `name`, `value` and `disabled`. Pressing the label toggles it. It shows a check while checked and a dash while indeterminate. It wraps the checkbox in a native `label` instead of a UI SDK `Field`, so that it also works inside `CheckboxGroup`, which assigns each checkbox its own id.
   - `CheckboxGroup`: a styled UI SDK `CheckboxGroup` that keeps one list of checked `Checkbox` values. Consumers name it with `aria-label` or `aria-labelledby`.

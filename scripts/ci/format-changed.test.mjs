@@ -22,29 +22,16 @@ import {
   allFormatFiles,
   changedFormatFiles,
   ciEnabled,
+  NonUtf8PathError,
   isThrowawayIndex,
   runFormatter,
   stagedFormatFiles,
 } from "./format-changed.mjs";
+import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
 const lefthook = require("lefthook/get-exe.js").getExePath();
-
-// A developer's global or system Git configuration (core.hooksPath,
-// commit.gpgsign, ...) and the GIT_* variables of an enclosing Git hook
-// invocation (GIT_DIR, GIT_INDEX_FILE, ...) must not change how the fixture
-// repositories behave. Mutates and returns `env`.
-function isolateGitEnvironment(env) {
-  for (const name of Object.keys(env)) {
-    if (name.startsWith("GIT_") || name === "LEFTHOOK_CONFIG") {
-      delete env[name];
-    }
-  }
-  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-  env.GIT_CONFIG_NOSYSTEM = "1";
-  return env;
-}
 
 // The exported selectors run git without an explicit environment, so they
 // inherit this process's environment; isolate it before any test runs.
@@ -624,6 +611,144 @@ test("pre-commit rejects a staged skip-worktree file missing from the worktree a
   const accepted = commit();
   assert.equal(accepted.status, 0, accepted.stdout + accepted.stderr);
   assert.notEqual(f.git("rev-parse", "HEAD"), head);
+});
+
+// A staged path that exists as a directory (a file replaced by a directory
+// after `git add`) has a staged blob that `--write` would never format, so it
+// must fail like a missing path instead of yielding zero candidates.
+const runStagedCli = (f) =>
+  spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/format-changed.mjs"), "--staged", "--write"],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+
+test("staged selection fails for a staged file replaced by a directory", (t) => {
+  const f = fixture(t);
+  f.write("staged.ts", "const   value = 1;\n");
+  f.write("other.ts", "const value = 2;\n");
+  f.git("add", "staged.ts", "other.ts");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["other.ts", "staged.ts"]);
+  rmSync(join(f.cwd, "staged.ts"));
+  mkdirSync(join(f.cwd, "staged.ts"));
+  assert.throws(
+    () => stagedFormatFiles(f.cwd),
+    (error) => {
+      assert.match(error.message, /staged\.ts/u);
+      assert.match(error.message, /directory/u);
+      assert.match(error.message, /not a regular file/u);
+      assert.doesNotMatch(error.message, /missing from the working tree/u);
+      return true;
+    },
+  );
+  const result = runStagedCli(f);
+  const output = result.stdout + result.stderr;
+  assert.equal(result.status, 2, output);
+  assert.equal(output.match(/ci_format_error/gu)?.length, 1, output);
+  assert.match(output, /staged\.ts/u);
+  assert.doesNotMatch(output, /candidates":?\s*[1-9]/u);
+});
+
+test("staged selection keeps a regular file selected and skips an excluded path replaced by a directory", (t) => {
+  const f = fixture(t);
+  f.write("regular.ts", "const   value = 1;\n");
+  f.write("vendor/lib.ts", "const   value = 1;\n");
+  f.write("pnpm-lock.yaml", "lockfileVersion:   '9.0'\n");
+  f.git("add", ".");
+  rmSync(join(f.cwd, "vendor/lib.ts"));
+  mkdirSync(join(f.cwd, "vendor/lib.ts"));
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  mkdirSync(join(f.cwd, "pnpm-lock.yaml"));
+  // Paths that the shared exclusions skip stay exempt whatever their type.
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["regular.ts"]);
+  const result = runStagedCli(f);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  // `--write` formats the worktree file; Lefthook `stage_fixed` stages it.
+  assert.equal(
+    readFileSync(join(f.cwd, "regular.ts"), "utf8"),
+    "const value = 1;\n",
+  );
+});
+
+test("staged selection fails for a staged path replaced by a directory behind a case-variant extension", (t) => {
+  const f = fixture(t);
+  f.write("Notes.MD", "# Title\n");
+  f.git("add", "Notes.MD");
+  rmSync(join(f.cwd, "Notes.MD"));
+  mkdirSync(join(f.cwd, "Notes.MD"));
+  assert.throws(() => stagedFormatFiles(f.cwd), /directory.*Notes\.MD/u);
+});
+
+test(
+  "staged selection exempts an index-recorded symlink and a gitlink whose worktree entry is a directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("target.ts", "const value = 1;\n");
+    f.git("add", "target.ts");
+    // A symlink staged as a symlink, then replaced by a directory.
+    symlinkSync("target.ts", join(f.cwd, "linked.ts"));
+    f.git("add", "linked.ts");
+    rmSync(join(f.cwd, "linked.ts"));
+    mkdirSync(join(f.cwd, "linked.ts"));
+    // A gitlink (mode 160000) is a directory in the worktree and has no blob.
+    const commit = "1".repeat(40);
+    f.git("update-index", "--add", "--cacheinfo", `160000,${commit},sub.md`);
+    mkdirSync(join(f.cwd, "sub.md"));
+    assert.deepEqual(stagedFormatFiles(f.cwd), ["target.ts"]);
+    const result = runStagedCli(f);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // A regular file replaced by a directory is still reported beside them.
+    f.write("file.ts", "const value = 1;\n");
+    f.git("add", "file.ts");
+    rmSync(join(f.cwd, "file.ts"));
+    mkdirSync(join(f.cwd, "file.ts"));
+    assert.throws(() => stagedFormatFiles(f.cwd), /directory.*file\.ts/u);
+  },
+);
+
+test(
+  "staged selection reports a worktree symlink that replaces a staged regular file",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("target.ts", "const value = 1;\n");
+    f.write("swapped.ts", "const   value = 2;\n");
+    f.git("add", "target.ts", "swapped.ts");
+    rmSync(join(f.cwd, "swapped.ts"));
+    symlinkSync("target.ts", join(f.cwd, "swapped.ts"));
+    assert.throws(
+      () => stagedFormatFiles(f.cwd),
+      /symbolic link.*swapped\.ts/u,
+    );
+  },
+);
+
+// Lefthook hides unstaged changes by restoring the staged content before the
+// hook runs, so a plain directory swap is invisible to the hook. A
+// skip-worktree entry, as in a sparse checkout, keeps the directory visible.
+test("pre-commit refuses a staged skip-worktree file replaced by a directory", (t) => {
+  const f = fixture(t);
+  f.write("staged.ts", "const value = 1;\n");
+  const head = f.commit();
+  f.installHook();
+  f.write("staged.ts", "const   value = 2;\n");
+  f.git("add", "staged.ts");
+  f.git("update-index", "--skip-worktree", "staged.ts");
+  rmSync(join(f.cwd, "staged.ts"));
+  mkdirSync(join(f.cwd, "staged.ts"));
+  const rejected = spawnSync("git", ["commit", "--quiet", "-m", "x"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+  });
+  const output = rejected.stdout + rejected.stderr;
+  assert.notEqual(rejected.status, 0, output);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.match(output, /ci_format_error/u);
+  assert.match(output, /staged\.ts/u);
+  assert.match(output, /directory/u);
+  assert.equal(f.git("show", ":staged.ts"), "const   value = 2;");
 });
 
 test("pre-commit accepts a staged skip-worktree lockfile missing from the worktree", (t) => {
@@ -2176,4 +2301,377 @@ test("CLI runs from the root and a subdirectory of a whitespace-terminated repos
       assert.match(result.stdout, /"candidates":[1-9]/u, detail);
     }
   }
+});
+
+// A path name that is not valid UTF-8 (the Latin-1 name `caf\xe9.ts`). Linux
+// file systems store arbitrary bytes, but APFS and Windows reject or normalize
+// such a name, so every fixture below attempts the write and skips when the
+// file system cannot hold the exact bytes. `fixture().git()` accepts only
+// strings, so the files are written and staged through raw `Buffer` paths.
+const latin1Name = (suffix = ".ts") =>
+  Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9]), Buffer.from(suffix)]);
+const rawPath = (f, raw) =>
+  Buffer.concat([Buffer.from(`${f.cwd}/`), Buffer.from(raw)]);
+
+function writeRaw(f, raw, text = "const   value = 1;\n") {
+  const directory = raw.lastIndexOf(0x2f);
+  if (directory !== -1) {
+    mkdirSync(join(f.cwd, Buffer.from(raw.subarray(0, directory)).toString()), {
+      recursive: true,
+    });
+  }
+  writeFileSync(rawPath(f, raw), text);
+}
+
+// Whether `git ls-files -z` lists `raw` byte for byte.
+function listsRaw(f, raw) {
+  const listing = execFileSync("git", ["ls-files", "--others", "-z"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "buffer",
+  });
+  return listing
+    .toString("latin1")
+    .split("\0")
+    .includes(Buffer.from(raw).toString("latin1"));
+}
+
+function stageRaw(f, ...names) {
+  execFileSync(
+    "git",
+    ["add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+    {
+      cwd: f.cwd,
+      env: f.env,
+      input: Buffer.concat(
+        names.flatMap((raw) => [Buffer.from(raw), Buffer.alloc(1)]),
+      ),
+    },
+  );
+}
+
+// Creates the fixture and writes each raw-named file. Returns null when the
+// file system cannot hold the names.
+function rawNameFixture(t, files) {
+  const f = fixture(t);
+  try {
+    for (const [raw, text] of files) writeRaw(f, raw, text);
+  } catch {
+    return null;
+  }
+  if (!files.every(([raw]) => listsRaw(f, raw))) return null;
+  return f;
+}
+
+const unsupportedFileSystem = "file system cannot hold a non-UTF-8 name";
+
+test("staged selection fails accurately for a staged non-UTF-8 formattable path", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  assert.throws(
+    () => stagedFormatFiles(f.cwd),
+    (error) => {
+      assert.ok(error instanceof NonUtf8PathError, error.message);
+      assert.equal(error.path, "caf\\xe9.ts");
+      assert.match(error.message, /caf\\xe9\.ts/u);
+      assert.match(error.message, /not valid UTF-8/u);
+      assert.match(error.message, /Rename the file/u);
+      assert.doesNotMatch(error.message, /missing from the working tree/u);
+      assert.doesNotMatch(error.message, /ENOENT/u);
+      return true;
+    },
+  );
+  const result = runStagedCli(f);
+  const output = result.stdout + result.stderr;
+  assert.equal(result.status, 2, output);
+  const errors = result.stderr
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.equal(errors.length, 1, output);
+  assert.equal(errors[0].event, "ci_format_error");
+  assert.match(errors[0].message, /caf\\xe9\.ts/u);
+  assert.match(errors[0].message, /not valid UTF-8/u);
+  assert.doesNotMatch(errors[0].message, /missing from the working tree/u);
+  assert.doesNotMatch(
+    result.stdout,
+    /ci_format"/u,
+    "no candidate was selected",
+  );
+});
+
+test("non-UTF-8 display escapes only the bytes that are not valid UTF-8", (t) => {
+  // Valid multibyte text stays readable; an invalid lead and a stray
+  // continuation byte are each escaped.
+  const raw = Buffer.concat([
+    Buffer.from("한"),
+    Buffer.from([0xed, 0x95]),
+    Buffer.from(".ts"),
+  ]);
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  assert.throws(
+    () => stagedFormatFiles(f.cwd),
+    (error) => {
+      assert.ok(error instanceof NonUtf8PathError, error.message);
+      assert.equal(error.path, "한\\xed\\x95.ts");
+      return true;
+    },
+  );
+});
+
+test("staged selection keeps non-UTF-8 paths that the exemptions skip silent", (t) => {
+  const excluded = Buffer.concat([Buffer.from("vendor/"), latin1Name()]);
+  const unsupported = latin1Name(".txt");
+  const f = rawNameFixture(t, [[excluded], [unsupported]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, excluded, unsupported);
+  assert.deepEqual(stagedFormatFiles(f.cwd), []);
+  for (const args of [["--staged"], ["--staged", "--write"]]) {
+    const result = spawnSync(
+      process.execPath,
+      [join(root, "scripts/ci/format-changed.mjs"), ...args],
+      { cwd: f.cwd, env: f.env, encoding: "utf8" },
+    );
+    const output = `${args.join(" ")}: ${result.stdout}${result.stderr}`;
+    assert.equal(result.status, 0, output);
+    assert.match(result.stdout, /"candidates":0/u, output);
+    assert.doesNotMatch(result.stderr, /ci_format_error/u, output);
+  }
+});
+
+test("staged selection skips a non-UTF-8 path that the index records as a symlink", (t) => {
+  if (process.platform === "win32") return t.skip("symlinks need privileges");
+  const raw = latin1Name();
+  const f = fixture(t);
+  try {
+    symlinkSync("target", rawPath(f, raw));
+  } catch {
+    return t.skip(unsupportedFileSystem);
+  }
+  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  assert.deepEqual(stagedFormatFiles(f.cwd), []);
+});
+
+test("staged selection still reports a valid UTF-8 path as missing and formats non-ASCII names", (t) => {
+  const f = fixture(t);
+  f.write("한국어.md", "# Title\n");
+  f.write("also.ts", "const   value = 1;\n");
+  f.git("add", "한국어.md", "also.ts");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["also.ts", "한국어.md"]);
+  rmSync(join(f.cwd, "한국어.md"));
+  assert.throws(
+    () => stagedFormatFiles(f.cwd),
+    (error) => {
+      assert.ok(!(error instanceof NonUtf8PathError), error.message);
+      assert.match(error.message, /missing from the working tree/u);
+      assert.ok(error.message.includes("한국어.md"), error.message);
+      return true;
+    },
+  );
+});
+
+test("selectors keep a valid UTF-8 name that starts with a byte order mark", (t) => {
+  // A fatal TextDecoder strips a leading U+FEFF, which would rename a valid
+  // path to one that does not exist; the validity check must not.
+  const name = "﻿bom.ts";
+  const f = fixture(t);
+  try {
+    f.write(name, "const   value = 1;\n");
+  } catch {
+    return t.skip("file system rejects a name that starts with U+FEFF");
+  }
+  const base = f.base;
+  f.git("add", "--", name);
+  assert.deepEqual(stagedFormatFiles(f.cwd), [name]);
+  const head = f.commit();
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), [name]);
+  assert.ok(allFormatFiles(f.cwd).includes(name));
+});
+
+test("explicit comparison fails accurately for a non-UTF-8 path and local selection skips it", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  const base = f.base;
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add non-UTF-8 path");
+  const head = f.git("rev-parse", "HEAD");
+  assert.throws(
+    () => changedFormatFiles(f.cwd, base, head),
+    (error) => {
+      assert.ok(error instanceof NonUtf8PathError, error.message);
+      assert.match(error.message, /caf\\xe9\.ts/u);
+      assert.match(error.message, /not valid UTF-8/u);
+      assert.doesNotMatch(error.message, /ENOENT/u);
+      return true;
+    },
+  );
+  // Local selection and --all keep the silent skip (documented limitation).
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), []);
+  assert.deepEqual(allFormatFiles(f.cwd), ["package.json", "rstack.config.ts"]);
+  const cli = (args) =>
+    spawnSync(
+      process.execPath,
+      [join(root, "scripts/ci/format-changed.mjs"), ...args],
+      { cwd: f.cwd, env: f.env, encoding: "utf8" },
+    );
+  const comparison = cli(["--base", base, "--head", head]);
+  assert.equal(comparison.status, 2, comparison.stdout + comparison.stderr);
+  assert.match(comparison.stderr, /not valid UTF-8/u);
+  assert.doesNotMatch(comparison.stderr, /ENOENT/u);
+  const all = cli(["--all"]);
+  const allOutput = all.stdout + all.stderr;
+  // The fixture's own unformatted package.json makes the check exit 1; the
+  // skipped path adds no failure, no error record and no candidate.
+  assert.equal(all.status, 1, allOutput);
+  assert.match(all.stdout, /"candidates":2,/u, allOutput);
+  assert.doesNotMatch(allOutput, /ci_format_error|ENOENT|caf/u, allOutput);
+});
+
+test("explicit comparison keeps excluded, unsupported and deleted non-UTF-8 paths silent", (t) => {
+  const excluded = Buffer.concat([Buffer.from("vendor/"), latin1Name()]);
+  const unsupported = latin1Name(".txt");
+  const deleted = latin1Name(".md");
+  const f = rawNameFixture(t, [[excluded], [unsupported], [deleted]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, deleted);
+  f.git("commit", "--quiet", "-m", "add the path that is deleted later");
+  const base = f.git("rev-parse", "HEAD");
+  stageRaw(f, excluded, unsupported);
+  rmSync(rawPath(f, deleted));
+  f.git("add", "--all");
+  f.git("commit", "--quiet", "-m", "exempt and deleted paths");
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
+});
+
+test("pre-commit refuses a staged non-UTF-8 path with an accurate error and keeps HEAD", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  const head = f.base;
+  f.installHook();
+  stageRaw(f, raw);
+  const rejected = spawnSync("git", ["commit", "--quiet", "-m", "x"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+  });
+  const output = rejected.stdout + rejected.stderr;
+  assert.notEqual(rejected.status, 0, output);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.match(output, /ci_format_error/u);
+  assert.match(output, /caf\\\\xe9\.ts/u);
+  assert.match(output, /not valid UTF-8/u);
+  assert.doesNotMatch(output, /missing from the working tree/u);
+});
+
+// A name that is not valid UTF-8 decodes to the same text as a valid name that
+// contains U+FFFD if each invalid byte is replaced by U+FFFD. Paths must keep
+// their byte-level identity, so the raw `caf\xe9.ts` and the valid
+// `caf�.ts` stay two different paths in every selector.
+const replacementName = "caf�.ts";
+const replacementBytes = Buffer.from(replacementName);
+
+test("explicit comparison selects the valid replacement of a renamed non-UTF-8 path", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add the non-UTF-8 path");
+  const base = f.git("rev-parse", "HEAD");
+  // Rename the raw name to the valid UTF-8 name that is its lossy decoding.
+  rmSync(rawPath(f, raw));
+  writeRaw(f, replacementBytes);
+  f.git("add", "--all");
+  f.git("commit", "--quiet", "-m", "rename to the valid replacement name");
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), [replacementName]);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), [
+    replacementName,
+  ]);
+  const comparison = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      base,
+      "--head",
+      head,
+    ],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  const output = comparison.stdout + comparison.stderr;
+  // The unformatted replacement fails the check (status 1); it is selected
+  // and is never rejected as a non-UTF-8 name (status 2).
+  assert.equal(comparison.status, 1, output);
+  assert.match(comparison.stdout, /"candidates":1,/u, output);
+  assert.doesNotMatch(output, /ci_format_error|not valid UTF-8/u, output);
+});
+
+test("explicit comparison still rejects a non-UTF-8 path that is added beside its valid lookalike", (t) => {
+  const f = rawNameFixture(t, [[replacementBytes]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, replacementBytes);
+  f.git("commit", "--quiet", "-m", "add the valid name");
+  const base = f.git("rev-parse", "HEAD");
+  const raw = latin1Name();
+  writeRaw(f, raw);
+  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add the non-UTF-8 name");
+  const head = f.git("rev-parse", "HEAD");
+  assert.throws(
+    () => changedFormatFiles(f.cwd, base, head),
+    (error) => {
+      assert.ok(error instanceof NonUtf8PathError, error.message);
+      assert.equal(error.path, "caf\\xe9.ts");
+      return true;
+    },
+  );
+  // The unchanged valid name is not in the range and the raw name is skipped
+  // locally, so nothing is selected.
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), []);
+});
+
+test("staged selection keeps a valid name whose lossy form equals a recorded symlink or a staged rename", (t) => {
+  if (process.platform === "win32") return t.skip("symlinks need privileges");
+  const raw = latin1Name();
+  const f = fixture(t);
+  try {
+    symlinkSync("target", rawPath(f, raw));
+    writeRaw(f, replacementBytes);
+  } catch {
+    return t.skip(unsupportedFileSystem);
+  }
+  if (!listsRaw(f, raw) || !listsRaw(f, replacementBytes))
+    return t.skip(unsupportedFileSystem);
+  // The index records the raw name as a symlink, which is exempt. The valid
+  // name is a different path and must stay selected.
+  stageRaw(f, raw, replacementBytes);
+  assert.deepEqual(stagedFormatFiles(f.cwd), [replacementName]);
+  f.git("commit", "--quiet", "-m", "symlink and valid name");
+  // Rename the symlink away: the staged deletion of the raw name must not mark
+  // the staged valid replacement as invalid.
+  rmSync(rawPath(f, raw));
+  writeRaw(f, replacementBytes, "const   other = 2;\n");
+  f.git("add", "--all");
+  assert.deepEqual(stagedFormatFiles(f.cwd), [replacementName]);
+});
+
+test("--all selects the valid lookalike once and skips the non-UTF-8 path", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw], [replacementBytes]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw, replacementBytes);
+  assert.deepEqual(allFormatFiles(f.cwd), [
+    replacementName,
+    "package.json",
+    "rstack.config.ts",
+  ]);
 });

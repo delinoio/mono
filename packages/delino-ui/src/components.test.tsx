@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, describe, expect, test } from "@rstest/core";
+import type * as React from "react";
 import {
   act,
   cleanup,
@@ -258,6 +259,100 @@ describe("Textarea", () => {
     expect(textarea.className).toBe("dui-textarea");
     expect(textarea.getAttribute("aria-invalid")).toBe("true");
     expect(screen.getByText("Enter a message.")).toBeTruthy();
+  });
+});
+
+describe("autoFocus inside Dialog", () => {
+  // The UI SDK dialog picks its initial focus target with a `[autofocus],
+  // [data-autofocus]` query, but React does not render an `autofocus`
+  // attribute for the `autoFocus` prop. The wrappers add `data-autofocus`.
+  function DialogWith({ children }: { children?: React.ReactNode }) {
+    return (
+      <Dialog>
+        <DialogTrigger>Open</DialogTrigger>
+        <DialogContent>
+          <DialogClose>Close</DialogClose>
+          <DialogTitle>Rename</DialogTitle>
+          {children}
+        </DialogContent>
+      </Dialog>
+    );
+  }
+
+  async function openDialog() {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Open" }));
+    });
+    // Wait for the open effects that move focus into the dialog.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    });
+  }
+
+  test("focuses a TextField with autoFocus even after the close button", async () => {
+    render(
+      <DialogWith>
+        <TextField label="Name" autoFocus />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    const input = screen.getByRole("textbox", { name: "Name" });
+    expect(input.getAttribute("data-autofocus")).not.toBeNull();
+    expect(document.activeElement).toBe(input);
+  });
+
+  test("focuses a Textarea with autoFocus even after the close button", async () => {
+    render(
+      <DialogWith>
+        <Textarea label="Message" autoFocus />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    expect(textarea.getAttribute("data-autofocus")).not.toBeNull();
+    expect(document.activeElement).toBe(textarea);
+  });
+
+  test("focuses the first tabbable element without an autoFocus input", async () => {
+    render(
+      <DialogWith>
+        <TextField label="Name" />
+        <Textarea label="Message" />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    expect(
+      screen
+        .getByRole("textbox", { name: "Name" })
+        .hasAttribute("data-autofocus"),
+    ).toBe(false);
+    expect(
+      screen
+        .getByRole("textbox", { name: "Message" })
+        .hasAttribute("data-autofocus"),
+    ).toBe(false);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close" }),
+    );
+  });
+
+  test("focuses a TextField with autoFocus on mount outside a dialog", () => {
+    render(<TextField label="Name" autoFocus />);
+
+    expect(document.activeElement).toBe(
+      screen.getByRole("textbox", { name: "Name" }),
+    );
+  });
+
+  test("focuses a Textarea with autoFocus on mount outside a dialog", () => {
+    render(<Textarea label="Message" autoFocus />);
+
+    expect(document.activeElement).toBe(
+      screen.getByRole("textbox", { name: "Message" }),
+    );
   });
 });
 

@@ -9,7 +9,14 @@
 // without a graceful shutdown. This launcher builds the server into a
 // temporary directory, runs the binary as its direct child, forwards SIGINT
 // and SIGTERM to the active child, waits for it to exit and removes the build
-// output afterwards. SIGHUP is not handled.
+// output afterwards. The child runs in its own process group so that a
+// process-group signal (a terminal Ctrl-C) reaches it exactly once, through the
+// launcher's forward.
+//
+// SIGHUP is not handled. Because the child is no longer in the launcher's
+// process group, a SIGHUP to that group (closing the terminal) or a SIGKILL of
+// the launcher stops the launcher only and leaves the server running as an
+// orphan that keeps its listening port. Stop such a server by its pid.
 //
 // Child processes use explicit argument arrays and `shell: false` according to
 // the repository environment contract. Configuration (`ADDR`, `LOG_LEVEL`),
@@ -26,6 +33,18 @@ const ForwardedSignal = Object.freeze({
   Terminate: "SIGTERM",
 });
 const signalExitCode = (signal) => 128 + constants.signals[signal];
+
+// Children run in their own process group (and session) on POSIX. A terminal
+// Ctrl-C signals the whole foreground group; with the child in that group it
+// would receive SIGINT directly and then again from the launcher's forward. The
+// server releases its signal registration on the first signal (a second signal
+// terminates it immediately), so the duplicate would abort the graceful drain.
+// Detached, only the launcher receives the group signal and forwards it once.
+// Windows is excluded: there `detached` opens a separate console window for the
+// child instead of creating a process group, and the launcher's Windows
+// behavior is unchanged. Remove the platform condition only together with a
+// Windows-specific signal design.
+const ownProcessGroup = process.platform !== "win32";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const binaryName =
@@ -52,6 +71,7 @@ function run(command, args) {
       cwd: packageDir,
       stdio: "inherit",
       shell: false,
+      detached: ownProcessGroup,
     });
     activeChild = child;
     child.once("error", (error) => {

@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 import {
   GoReason,
   MAIN_PUSH_EVENT,
@@ -25,11 +26,41 @@ import {
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 
+// The exported planner functions and the fixture helpers run git in this
+// process, so they inherit its environment. A developer's global or system Git
+// configuration (commit.gpgsign, ...) and the GIT_* variables of an enclosing
+// Git hook invocation (GIT_DIR, GIT_INDEX_FILE, ...) must not reach them;
+// isolate it before any test runs.
+isolateGitEnvironment(process.env);
+
+// Environment for a spawned planner CLI: an isolated copy of the current
+// environment, taken at spawn time. Load-time isolation alone cannot cover a
+// GIT_* variable set after this module loads, and the production planner
+// intentionally honors GIT_DIR. Drops inherited GITHUB_* variables: a
+// push-to-main runner sets GITHUB_EVENT_NAME and GITHUB_REF, which would force
+// go=true.
+function plannerEnvironment(extra = {}) {
+  return {
+    ...isolateGitEnvironment(
+      Object.fromEntries(
+        Object.entries(process.env).filter(
+          ([key]) => !key.startsWith("GITHUB_"),
+        ),
+      ),
+    ),
+    ...extra,
+  };
+}
+
 function fixture(t) {
   const cwd = mkdtempSync(join(tmpdir(), "ci-plan-"));
   t.after(() => rmSync(cwd, { recursive: true, force: true }));
   const git = (...args) =>
-    execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+    execFileSync("git", args, {
+      cwd,
+      encoding: "utf8",
+      env: isolateGitEnvironment({ ...process.env }),
+    }).trim();
   git("init", "--quiet");
   git("config", "user.name", "CI fixture");
   git("config", "user.email", "fixture@example.invalid");
@@ -375,19 +406,12 @@ test("planner CLI runs through physical and symlinked script paths", (t) => {
     const result = spawnSync(process.execPath, [script], {
       cwd: f.cwd,
       encoding: "utf8",
-      // Drop inherited GITHUB_* variables: a push-to-main runner sets
-      // GITHUB_EVENT_NAME and GITHUB_REF, which would force go=true here.
-      env: {
-        ...Object.fromEntries(
-          Object.entries(process.env).filter(
-            ([key]) => !key.startsWith("GITHUB_"),
-          ),
-        ),
+      env: plannerEnvironment({
         CI_BASE: f.base,
         CI_HEAD: head,
         GITHUB_OUTPUT: output,
         GITHUB_STEP_SUMMARY: summary,
-      },
+      }),
     });
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /"event":"ci_plan"/, script);
@@ -515,9 +539,6 @@ test("planner CLI forces go for a main push and keeps pull request selection", (
   const f = fixture(t);
   f.write("docs/guide.md");
   const head = f.commit();
-  const scrubbed = Object.fromEntries(
-    Object.entries(process.env).filter(([key]) => !key.startsWith("GITHUB_")),
-  );
   for (const [event, ref, go] of [
     [MAIN_PUSH_EVENT, MAIN_REF, "true"],
     ["pull_request", "refs/pull/1/merge", "false"],
@@ -530,15 +551,14 @@ test("planner CLI forces go for a main push and keeps pull request selection", (
       {
         cwd: f.cwd,
         encoding: "utf8",
-        env: {
-          ...scrubbed,
+        env: plannerEnvironment({
           CI_BASE: f.base,
           CI_HEAD: head,
           GITHUB_OUTPUT: output,
           GITHUB_STEP_SUMMARY: join(f.cwd, "cli-summary"),
           GITHUB_EVENT_NAME: event,
           GITHUB_REF: ref,
-        },
+        }),
       },
     );
     assert.equal(result.status, 0, result.stderr);
@@ -548,6 +568,53 @@ test("planner CLI forces go for a main push and keeps pull request selection", (
       event,
     );
   }
+});
+
+test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
+  const f = fixture(t);
+  f.write("docs/guide.md");
+  const head = f.commit();
+  // Set after module load, so only the explicit environment copy handed to the
+  // spawned planner can keep it out of the child. The production planner
+  // honors GIT_DIR, so a leaked value would fail the comparison.
+  const hostile = {
+    GIT_DIR: join(f.cwd, "no-such-git-dir"),
+    GIT_INDEX_FILE: join(f.cwd, "no-such-index"),
+    GIT_CONFIG_GLOBAL: join(f.cwd, "no-such-config"),
+  };
+  const saved = Object.fromEntries(
+    Object.keys(hostile).map((key) => [key, process.env[key]]),
+  );
+  t.after(() => {
+    for (const [key, value] of Object.entries(saved)) {
+      if (value === undefined) {
+        delete process.env[key];
+      } else {
+        process.env[key] = value;
+      }
+    }
+  });
+  Object.assign(process.env, hostile);
+  const output = join(f.cwd, "cli-output");
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/plan.mjs")],
+    {
+      cwd: f.cwd,
+      encoding: "utf8",
+      env: plannerEnvironment({
+        CI_BASE: f.base,
+        CI_HEAD: head,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: join(f.cwd, "cli-summary"),
+      }),
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(
+    readFileSync(output, "utf8"),
+    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+  );
 });
 
 // Read-only text check: the single `go` planner output must keep driving both
@@ -564,5 +631,50 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
   assert.match(
     workflow,
     /\.go\.result == "skipped" and \$go_planned == "false"/,
+  );
+});
+
+test("planner fails accurately for a non-UTF-8 path and skips unsupported ones", (t) => {
+  // Linux file systems hold any byte; APFS and Windows reject or normalize it.
+  const latin1 = (suffix) =>
+    Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9]), Buffer.from(suffix)]);
+  const f = fixture(t);
+  try {
+    writeFileSync(
+      Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".txt")]),
+      "x\n",
+    );
+    writeFileSync(
+      Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]),
+      "x\n",
+    );
+  } catch {
+    return t.skip("file system cannot hold a non-UTF-8 name");
+  }
+  const listing = execFileSync("git", ["ls-files", "--others", "-z"], {
+    cwd: f.cwd,
+    encoding: "buffer",
+  });
+  if (!listing.includes(latin1(".ts")) || !listing.includes(latin1(".txt")))
+    return t.skip("file system cannot hold a non-UTF-8 name");
+  // The unsupported extension alone selects nothing.
+  rmSync(Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]));
+  const unsupported = plan(f.cwd, f.base, f.commit());
+  assert.equal(unsupported.format, false);
+  // A formattable name makes the comparison fail with the accurate error
+  // instead of a raw ENOENT.
+  writeFileSync(
+    Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]),
+    "x\n",
+  );
+  const head = f.commit();
+  assert.throws(
+    () => plan(f.cwd, f.base, head),
+    (error) => {
+      assert.match(error.message, /caf\\xe9\.ts/u);
+      assert.match(error.message, /not valid UTF-8/u);
+      assert.doesNotMatch(error.message, /ENOENT/u);
+      return true;
+    },
   );
 });
