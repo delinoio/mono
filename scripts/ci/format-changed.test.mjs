@@ -1021,6 +1021,82 @@ test("all-file selection skips unstaged deletions and retains existing files", a
   assert.ok(f.git("status", "--porcelain").includes("D deleted.ts"));
 });
 
+// Leaves `conflict.ts` unmerged (index stages 1, 2 and 3) by merging two
+// branches that change the same line. The merge exits non-zero by design.
+function conflictedMerge(f) {
+  f.write("conflict.ts", "const value = 0;\n");
+  f.commit();
+  const main = f.git("branch", "--show-current");
+  f.git("switch", "--quiet", "-c", "side");
+  f.write("conflict.ts", "const value = 1;\n");
+  f.git("commit", "--quiet", "-am", "side");
+  f.git("switch", "--quiet", main);
+  f.write("conflict.ts", "const value = 2;\n");
+  f.git("commit", "--quiet", "-am", "main");
+  assert.throws(() => f.git("merge", "--quiet", "side"));
+  assert.equal(
+    f.git("ls-files", "--unmerged", "--", "conflict.ts").split("\n").length,
+    3,
+  );
+}
+
+test("all-file selection returns an unmerged path once, in sorted order", (t) => {
+  const f = fixture(t);
+  f.write("zeta.ts", "const zeta = 1;\n");
+  f.write("alpha.ts", "const alpha = 1;\n");
+  f.write("notes.txt", "not formattable\n");
+  conflictedMerge(f);
+  const paths = allFormatFiles(f.cwd);
+  assert.deepEqual(paths, [
+    "alpha.ts",
+    "conflict.ts",
+    "package.json",
+    "rstack.config.ts",
+    "zeta.ts",
+  ]);
+  assert.deepEqual(paths, [...paths].sort());
+  assert.equal(new Set(paths).size, paths.length);
+});
+
+test("all-file selection of a conflict-free index is unique and sorted", (t) => {
+  const f = fixture(t);
+  f.write("zeta.ts", "const zeta = 1;\n");
+  f.write("alpha.ts", "const alpha = 1;\n");
+  f.write("notes.txt", "not formattable\n");
+  f.commit();
+  const paths = allFormatFiles(f.cwd);
+  assert.deepEqual(paths, [
+    "alpha.ts",
+    "package.json",
+    "rstack.config.ts",
+    "zeta.ts",
+  ]);
+});
+
+test("CLI --all reports one candidate per distinct path after a conflicted merge", (t) => {
+  const f = fixture(t);
+  f.write("zeta.ts", "const zeta = 1;\n");
+  conflictedMerge(f);
+  // `git ls-files` repeats the unmerged path once per stage; count it once.
+  const distinct = new Set(f.git("ls-files").split("\n").filter(Boolean)).size;
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/format-changed.mjs"), "--all"],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  const output = `${result.stdout}${result.stderr}`;
+  // `.gitignore` is tracked but not a supported extension, so subtract it.
+  const candidates = allFormatFiles(f.cwd).length;
+  assert.equal(candidates, distinct - 1, output);
+  assert.match(
+    result.stdout,
+    new RegExp(`"event":"ci_format".*"candidates":${candidates},`, "u"),
+    output,
+  );
+  // The conflict markers are a parse error, which the formatter reports.
+  assert.notEqual(result.status, 0, output);
+});
+
 test("Rstack owns exclusions and retains Markdown prose and embedded code", async (t) => {
   const f = fixture(t);
   const ignored = [

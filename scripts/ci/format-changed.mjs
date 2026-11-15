@@ -88,12 +88,16 @@ function recordedSymlinks(cwd) {
 
 export function allFormatFiles(cwd) {
   const symlinks = recordedSymlinks(cwd);
-  return git(cwd, "ls-files", "-z")
+  const names = git(cwd, "ls-files", "-z")
     .split("\0")
     .filter((name) => {
       if (!extensions.has(extname(name)) || symlinks.has(name)) return false;
       return isRegularFile(cwd, name);
     });
+  // `git ls-files` prints an unmerged path once per index stage (up to three
+  // times after a conflicted merge), so deduplicate to keep the candidate
+  // count and the formatter arguments to one entry per path.
+  return [...new Set(names)].sort();
 }
 
 function rstackEntry() {
