@@ -55,8 +55,77 @@ describe("resolveAccountsApiOrigin", () => {
     "https://accounts.api.delino.io/#",
     "https://accounts.api.delino.io?#",
     "https://accounts.api.delino.io/?#",
+    // Paths that the URL parser normalizes to the root.
+    "https://accounts.api.delino.io/..",
+    "https://accounts.api.delino.io/.",
+    "https://accounts.api.delino.io/./",
+    "https://accounts.api.delino.io/%2e",
+    "https://accounts.api.delino.io/%2E%2e",
+    "https://accounts.api.delino.io/a/..",
+    "https://accounts.api.delino.io\\..",
+    "https://accounts.api.delino.io\\",
+    "https://accounts.api.delino.io//",
+    "https://accounts.api.delino.io/\t..",
   ])("rejects %s", (value) => {
     expect(() => resolveAccountsApiOrigin(value)).toThrow("PUBLIC_API_ORIGIN");
+  });
+
+  test("keeps the path-without-root message for a path that normalizes to the root", () => {
+    expect(() =>
+      resolveAccountsApiOrigin("https://accounts.api.delino.io/.."),
+    ).toThrow("must be an origin without a path, query or fragment");
+  });
+
+  test.each([
+    ["https://accounts.api.delino.io/", "https://accounts.api.delino.io"],
+    ["http://127.0.0.1:8100/", "http://127.0.0.1:8100"],
+    [
+      "https://accounts.api.delino.io:8443",
+      "https://accounts.api.delino.io:8443",
+    ],
+    ["https://accounts.api.delino.io/\t", "https://accounts.api.delino.io"],
+    // Lenient forms that the URL parser accepts stay accepted.
+    ["https:accounts.api.delino.io", "https://accounts.api.delino.io"],
+    ["https:///accounts.api.delino.io", "https://accounts.api.delino.io"],
+  ])("accepts %s", (value, origin) => {
+    expect(resolveAccountsApiOrigin(value)).toBe(origin);
+  });
+
+  test("names the scheme of a real non-http scheme", () => {
+    expect(() =>
+      resolveAccountsApiOrigin("ftp://accounts.api.delino.io"),
+    ).toThrow("PUBLIC_API_ORIGIN must use http or https, got ftp:");
+  });
+
+  test.each([
+    "token123:secret@host",
+    "abc123:pass@host",
+    "TOKEN123:secret@host",
+    "accounts.api.delino.io:8100",
+  ])("does not echo the text before the first colon of %s", (value) => {
+    let message = "";
+    try {
+      resolveAccountsApiOrigin(value);
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("PUBLIC_API_ORIGIN must use http or https");
+    expect(message).not.toMatch(/token123|abc123|secret|pass|accounts|8100/i);
+    expect(message).not.toContain("got");
+  });
+
+  test("keeps the credential check before the path check", () => {
+    expect(() =>
+      resolveAccountsApiOrigin("https://user:pass@accounts.api.delino.io/.."),
+    ).toThrow("PUBLIC_API_ORIGIN must not contain credentials");
+  });
+
+  test("rejects a path that normalizes to the root through the build reader", () => {
+    expect(() =>
+      readAccountsApiOrigin({
+        PUBLIC_API_ORIGIN: "https://accounts.api.delino.io/..",
+      }),
+    ).toThrow("PUBLIC_API_ORIGIN must be an origin without a path");
   });
 
   test.each([
@@ -95,6 +164,7 @@ describe("resolveAccountsApiOrigin", () => {
     }
     expect(message).toContain("PUBLIC_API_ORIGIN");
     expect(message).not.toContain("pass");
+    expect(message).not.toContain("user");
     expect(message).not.toContain("secret-path");
   });
 });
