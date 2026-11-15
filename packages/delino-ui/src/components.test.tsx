@@ -47,6 +47,15 @@ afterEach(() => {
   cleanup();
 });
 
+// Values of the `description` prop that mean "no description", like the
+// values of the `error` prop that mean "no error".
+const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
+  ["undefined", undefined],
+  ["null", null],
+  ["false", false],
+  ["empty string", ""],
+];
+
 describe("Button", () => {
   test("renders a native button with the variant and size", () => {
     render(
@@ -124,6 +133,32 @@ describe("TextField", () => {
     expect(describedBy.split(" ")).toContain(description.id);
   });
 
+  for (const [name, empty] of EMPTY_DESCRIPTIONS) {
+    test(`renders no description node for a ${name} description`, async () => {
+      const { container } = render(
+        <TextField label="Email" description={empty} />,
+      );
+      await act(async () => {});
+
+      const input = screen.getByRole("textbox", { name: "Email" });
+      expect(container.querySelector(".dui-text-field-description")).toBeNull();
+      expect(input.hasAttribute("aria-describedby")).toBe(false);
+    });
+  }
+
+  test("renders and references a numeric zero description", async () => {
+    const { container } = render(<TextField label="Count" description={0} />);
+    await act(async () => {});
+
+    const input = screen.getByRole("textbox", { name: "Count" });
+    const nodes = container.querySelectorAll(".dui-text-field-description");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]?.textContent).toBe("0");
+    expect((input.getAttribute("aria-describedby") ?? "").split(" ")).toContain(
+      nodes[0]?.id,
+    );
+  });
+
   test("marks the field invalid and shows the error message", () => {
     render(<TextField label="Email" error="Enter a valid email." />);
 
@@ -171,6 +206,34 @@ describe("Switch", () => {
     fireEvent.click(control);
     expect(control.getAttribute("aria-checked")).toBe("true");
     expect(changes).toEqual([true]);
+  });
+
+  for (const [name, empty] of EMPTY_DESCRIPTIONS) {
+    test(`renders no description node for a ${name} description`, async () => {
+      const { container } = render(
+        <Switch label="Alerts" description={empty} />,
+      );
+      await act(async () => {});
+
+      const control = screen.getByRole("switch", { name: "Alerts" });
+      expect(container.querySelector(".dui-switch-description")).toBeNull();
+      expect(control.hasAttribute("aria-describedby")).toBe(false);
+    });
+  }
+
+  test("describes the switch with a present description", async () => {
+    const { container } = render(
+      <Switch label="Alerts" description="We never share it." />,
+    );
+    await act(async () => {});
+
+    const control = screen.getByRole("switch", { name: "Alerts" });
+    const nodes = container.querySelectorAll(".dui-switch-description");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]?.textContent).toBe("We never share it.");
+    expect(
+      (control.getAttribute("aria-describedby") ?? "").split(" "),
+    ).toContain(nodes[0]?.id);
   });
 });
 
@@ -262,6 +325,34 @@ describe("Textarea", () => {
     expect(textarea.className).toBe("dui-textarea");
     expect(textarea.getAttribute("aria-invalid")).toBe("true");
     expect(screen.getByText("Enter a message.")).toBeTruthy();
+  });
+
+  for (const [name, empty] of EMPTY_DESCRIPTIONS) {
+    test(`renders no description node for a ${name} description`, async () => {
+      const { container } = render(
+        <Textarea label="Message" description={empty} />,
+      );
+      await act(async () => {});
+
+      const textarea = screen.getByRole("textbox", { name: "Message" });
+      expect(container.querySelector(".dui-text-field-description")).toBeNull();
+      expect(textarea.hasAttribute("aria-describedby")).toBe(false);
+    });
+  }
+
+  test("describes the textarea with a present description", async () => {
+    const { container } = render(
+      <Textarea label="Message" description="Keep it short." />,
+    );
+    await act(async () => {});
+
+    const textarea = screen.getByRole("textbox", { name: "Message" });
+    const nodes = container.querySelectorAll(".dui-text-field-description");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]?.textContent).toBe("Keep it short.");
+    expect(
+      (textarea.getAttribute("aria-describedby") ?? "").split(" "),
+    ).toContain(nodes[0]?.id);
   });
 });
 
@@ -441,6 +532,36 @@ describe("Checkbox", () => {
     expect(changes).toEqual([true]);
   });
 
+  for (const [name, empty] of EMPTY_DESCRIPTIONS) {
+    test(`renders no description node for a ${name} description`, async () => {
+      const { container } = render(
+        <Checkbox label="Accept the terms" description={empty} />,
+      );
+      await act(async () => {});
+
+      const control = screen.getByRole("checkbox", {
+        name: "Accept the terms",
+      });
+      expect(container.querySelector(".dui-checkbox-description")).toBeNull();
+      expect(control.hasAttribute("aria-describedby")).toBe(false);
+    });
+  }
+
+  test("describes the checkbox with a present description", async () => {
+    const { container } = render(
+      <Checkbox label="Accept the terms" description="Read them first." />,
+    );
+    await act(async () => {});
+
+    const control = screen.getByRole("checkbox", { name: "Accept the terms" });
+    const nodes = container.querySelectorAll(".dui-checkbox-description");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]?.textContent).toBe("Read them first.");
+    expect(
+      (control.getAttribute("aria-describedby") ?? "").split(" "),
+    ).toContain(nodes[0]?.id);
+  });
+
   test("reports the checked values of a group", () => {
     const values: string[][] = [];
     render(
@@ -488,6 +609,40 @@ describe("RadioGroup", () => {
     expect(yearly.getAttribute("aria-checked")).toBe("true");
     expect(monthly.getAttribute("aria-checked")).toBe("false");
     expect(values).toEqual(["yearly"]);
+  });
+
+  for (const [name, empty] of EMPTY_DESCRIPTIONS) {
+    test(`renders no description node for a ${name} description`, async () => {
+      const { container } = render(
+        <RadioGroup label="Plan" description={empty}>
+          <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
+        </RadioGroup>,
+      );
+      await act(async () => {});
+
+      const group = screen.getByRole("radiogroup", { name: "Plan" });
+      expect(
+        container.querySelector(".dui-radio-field-description"),
+      ).toBeNull();
+      expect(group.hasAttribute("aria-describedby")).toBe(false);
+    });
+  }
+
+  test("describes the group with a present description", async () => {
+    const { container } = render(
+      <RadioGroup label="Plan" description="Billed every period.">
+        <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
+      </RadioGroup>,
+    );
+    await act(async () => {});
+
+    const group = screen.getByRole("radiogroup", { name: "Plan" });
+    const nodes = container.querySelectorAll(".dui-radio-field-description");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]?.textContent).toBe("Billed every period.");
+    expect((group.getAttribute("aria-describedby") ?? "").split(" ")).toContain(
+      nodes[0]?.id,
+    );
   });
 });
 
@@ -565,6 +720,38 @@ describe("Select", () => {
     expect(
       screen.queryByRole("listbox")?.hasAttribute("data-closed") ?? true,
     ).toBe(true);
+  });
+
+  for (const [name, empty] of EMPTY_DESCRIPTIONS) {
+    test(`renders no description node for a ${name} description`, async () => {
+      const { container } = render(
+        <Select label="Role" description={empty}>
+          <SelectOption value="viewer">Viewer</SelectOption>
+        </Select>,
+      );
+      await act(async () => {});
+
+      const trigger = screen.getByRole("combobox", { name: "Role" });
+      expect(container.querySelector(".dui-text-field-description")).toBeNull();
+      expect(trigger.hasAttribute("aria-describedby")).toBe(false);
+    });
+  }
+
+  test("describes the trigger with a present description", async () => {
+    const { container } = render(
+      <Select label="Role" description="Who can edit.">
+        <SelectOption value="viewer">Viewer</SelectOption>
+      </Select>,
+    );
+    await act(async () => {});
+
+    const trigger = screen.getByRole("combobox", { name: "Role" });
+    const nodes = container.querySelectorAll(".dui-text-field-description");
+    expect(nodes.length).toBe(1);
+    expect(nodes[0]?.textContent).toBe("Who can edit.");
+    expect(
+      (trigger.getAttribute("aria-describedby") ?? "").split(" "),
+    ).toContain(nodes[0]?.id);
   });
 
   test("shows the selected option in the trigger", () => {

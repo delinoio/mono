@@ -39,6 +39,11 @@ export function TextField({
 }: TextFieldProps) {
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
 
   return (
     <Field
@@ -63,7 +68,7 @@ export function TextField({
         data-autofocus={props.autoFocus ? "" : undefined}
         {...props}
       />
-      {description === undefined ? null : (
+      {!hasDescription ? null : (
         <FieldDescription className="dui-text-field-description">
           {description}
         </FieldDescription>
