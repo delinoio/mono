@@ -2584,3 +2584,108 @@ test("pre-commit refuses a staged non-UTF-8 path with an accurate error and keep
   assert.match(output, /not valid UTF-8/u);
   assert.doesNotMatch(output, /missing from the working tree/u);
 });
+
+// A name that is not valid UTF-8 decodes to the same text as a valid name that
+// contains U+FFFD if each invalid byte is replaced by U+FFFD. Paths must keep
+// their byte-level identity, so the raw `caf\xe9.ts` and the valid
+// `caf�.ts` stay two different paths in every selector.
+const replacementName = "caf�.ts";
+const replacementBytes = Buffer.from(replacementName);
+
+test("explicit comparison selects the valid replacement of a renamed non-UTF-8 path", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add the non-UTF-8 path");
+  const base = f.git("rev-parse", "HEAD");
+  // Rename the raw name to the valid UTF-8 name that is its lossy decoding.
+  rmSync(rawPath(f, raw));
+  writeRaw(f, replacementBytes);
+  f.git("add", "--all");
+  f.git("commit", "--quiet", "-m", "rename to the valid replacement name");
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), [replacementName]);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), [
+    replacementName,
+  ]);
+  const comparison = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      base,
+      "--head",
+      head,
+    ],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  const output = comparison.stdout + comparison.stderr;
+  // The unformatted replacement fails the check (status 1); it is selected
+  // and is never rejected as a non-UTF-8 name (status 2).
+  assert.equal(comparison.status, 1, output);
+  assert.match(comparison.stdout, /"candidates":1,/u, output);
+  assert.doesNotMatch(output, /ci_format_error|not valid UTF-8/u, output);
+});
+
+test("explicit comparison still rejects a non-UTF-8 path that is added beside its valid lookalike", (t) => {
+  const f = rawNameFixture(t, [[replacementBytes]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, replacementBytes);
+  f.git("commit", "--quiet", "-m", "add the valid name");
+  const base = f.git("rev-parse", "HEAD");
+  const raw = latin1Name();
+  writeRaw(f, raw);
+  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add the non-UTF-8 name");
+  const head = f.git("rev-parse", "HEAD");
+  assert.throws(
+    () => changedFormatFiles(f.cwd, base, head),
+    (error) => {
+      assert.ok(error instanceof NonUtf8PathError, error.message);
+      assert.equal(error.path, "caf\\xe9.ts");
+      return true;
+    },
+  );
+  // The unchanged valid name is not in the range and the raw name is skipped
+  // locally, so nothing is selected.
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), []);
+});
+
+test("staged selection keeps a valid name whose lossy form equals a recorded symlink or a staged rename", (t) => {
+  if (process.platform === "win32") return t.skip("symlinks need privileges");
+  const raw = latin1Name();
+  const f = fixture(t);
+  try {
+    symlinkSync("target", rawPath(f, raw));
+    writeRaw(f, replacementBytes);
+  } catch {
+    return t.skip(unsupportedFileSystem);
+  }
+  if (!listsRaw(f, raw) || !listsRaw(f, replacementBytes))
+    return t.skip(unsupportedFileSystem);
+  // The index records the raw name as a symlink, which is exempt. The valid
+  // name is a different path and must stay selected.
+  stageRaw(f, raw, replacementBytes);
+  assert.deepEqual(stagedFormatFiles(f.cwd), [replacementName]);
+  f.git("commit", "--quiet", "-m", "symlink and valid name");
+  // Rename the symlink away: the staged deletion of the raw name must not mark
+  // the staged valid replacement as invalid.
+  rmSync(rawPath(f, raw));
+  writeRaw(f, replacementBytes, "const   other = 2;\n");
+  f.git("add", "--all");
+  assert.deepEqual(stagedFormatFiles(f.cwd), [replacementName]);
+});
+
+test("--all selects the valid lookalike once and skips the non-UTF-8 path", (t) => {
+  const raw = latin1Name();
+  const f = rawNameFixture(t, [[raw], [replacementBytes]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw, replacementBytes);
+  assert.deepEqual(allFormatFiles(f.cwd), [
+    replacementName,
+    "package.json",
+    "rstack.config.ts",
+  ]);
+});

@@ -46,8 +46,8 @@ const git = (cwd, ...args) =>
 // A path whose name is not valid UTF-8 (for example the Latin-1 name
 // `caf\xe9.ts` created on Linux) cannot be addressed by the formatter: Node
 // passes arguments to Rstack as UTF-8 and Rstack decodes its own file lists
-// lossily. A UTF-8 decode of Git's `-z` output turns each invalid byte into
-// U+FFFD, a name that does not exist on disk, so such a path used to look
+// lossily. A plain UTF-8 decode of Git's `-z` output turns each invalid byte
+// into U+FFFD, a name that does not exist on disk, so such a path used to look
 // missing (ENOENT). `NonUtf8PathError` reports it accurately instead.
 export class NonUtf8PathError extends Error {
   constructor(displayPath) {
@@ -68,9 +68,25 @@ function utf8SequenceLength(lead) {
   return 1;
 }
 
-// Display form of a raw path: valid UTF-8 text as is and every byte that is
-// not part of a valid sequence as `\xNN`, so the offending byte is visible.
-function escapeInvalidUtf8(raw) {
+// Byte-level path identity. Every path is held as a string, so a name that is
+// not valid UTF-8 needs a lossless form. Decoding it with U+FFFD would make it
+// equal to the valid name that really contains U+FFFD, and a rename from the
+// raw `caf\xe9.ts` to the valid `caf\ufffd.ts` would mark the valid
+// replacement as invalid. Instead each byte that is not part of a valid UTF-8
+// sequence (always 0x80-0xFF) becomes the lone low surrogate U+DC00 + byte, as
+// Python's `surrogateescape` does. A decoded valid UTF-8 string never contains
+// a lone surrogate, so the mapping is injective: two names are equal exactly
+// when their bytes are equal, in every list that Git prints.
+const InvalidByteBase = 0xdc00;
+const invalidByteEscape = /[\udc80-\udcff]/gu;
+
+// Whether the decoded name holds a byte that is not valid UTF-8.
+const hasInvalidBytes = (name) => /[\udc80-\udcff]/u.test(name);
+
+// Decodes a raw path name. Valid UTF-8 decodes as text (Buffer decoding, unlike
+// TextDecoder, keeps a leading U+FEFF) and every other byte is escaped.
+function decodePath(raw) {
+  if (isUtf8(raw)) return raw.toString("utf8");
   let text = "";
   for (let index = 0; index < raw.length;) {
     const length = Math.min(utf8SequenceLength(raw[index]), raw.length - index);
@@ -79,23 +95,32 @@ function escapeInvalidUtf8(raw) {
       text += chunk.toString("utf8");
       index += length;
     } else {
-      text += `\\x${raw[index].toString(16).padStart(2, "0")}`;
+      text += String.fromCharCode(InvalidByteBase + raw[index]);
       index += 1;
     }
   }
   return text;
 }
 
+// Display form of a decoded name: valid text as is and every byte that is not
+// part of a valid sequence as `\xNN`, so the offending byte is visible.
+const displayPath = (name) =>
+  name.replace(
+    invalidByteEscape,
+    (escaped) =>
+      `\\x${(escaped.charCodeAt(0) - InvalidByteBase).toString(16).padStart(2, "0")}`,
+  );
+
+// The name as Node passes it to a child process or the file system: each
+// escaped byte becomes U+FFFD. It is only for the Rstack exclusion probe, which
+// matches on the valid directory prefixes and never needs the exact bytes.
+const lossyPath = (name) => name.replace(invalidByteEscape, "\ufffd");
+
 // Runs a Git command that prints a NUL-separated path list and returns the
-// entries as strings. Valid UTF-8 entries decode exactly as before (a leading
-// U+FEFF is kept: Buffer decoding, unlike TextDecoder, never strips a BOM).
-// An entry that is not valid UTF-8 keeps its lossy U+FFFD form, so it compares
-// equal across every list that Git prints for the same path, and its escaped
-// display form is recorded in `invalid` keyed by that lossy form. Two distinct
-// invalid names can share a lossy form; that is accepted because both stay on
-// the same representation on every side of a comparison. Empty entries (the
-// terminator after the last path) are dropped.
-function gitPaths(cwd, args, invalid = new Map()) {
+// entries as strings in the byte-level form of `decodePath`. Valid UTF-8
+// entries decode exactly as before. Empty entries (the terminator after the
+// last path) are dropped.
+function gitPaths(cwd, args) {
   const output = execFileSync("git", args, {
     cwd,
     encoding: "buffer",
@@ -108,9 +133,7 @@ function gitPaths(cwd, args, invalid = new Map()) {
     const raw = output.subarray(start, end);
     start = end + 1;
     if (raw.length === 0) continue;
-    const name = raw.toString("utf8");
-    if (!isUtf8(raw)) invalid.set(name, escapeInvalidUtf8(raw));
-    names.push(name);
+    names.push(decodePath(raw));
   }
   return names;
 }
@@ -188,10 +211,12 @@ const recordedSymlinks = (cwd) => recordedPaths(cwd, [SymlinkMode]);
 export function allFormatFiles(start) {
   const cwd = repositoryRoot(start);
   const symlinks = recordedSymlinks(cwd);
-  // A name that is not valid UTF-8 stays a silent skip here: its lossy form
-  // never exists on disk, so `isRegularFile` reports it as gone. Rstack cannot
-  // format such a name, so --all keeps skipping it (see the contract).
+  // A name that is not valid UTF-8 stays a silent skip here: Rstack cannot
+  // format such a name, so --all keeps skipping it (see the contract). It is
+  // skipped by its bytes, never by looking up its lossy form, which may be the
+  // name of a different, valid file.
   const names = gitPaths(cwd, ["ls-files", "-z"]).filter((name) => {
+    if (hasInvalidBytes(name)) return false;
     if (!isFormattableExtension(name) || symlinks.has(name)) return false;
     return isRegularFile(cwd, name);
   });
@@ -221,7 +246,7 @@ function excludedByRstack(cwd, name) {
   try {
     const output = execFileSync(
       process.execPath,
-      [rstackEntry(), "fmt", "--stdin-filepath", `./${name}`],
+      [rstackEntry(), "fmt", "--stdin-filepath", `./${lossyPath(name)}`],
       {
         cwd,
         input: ExclusionProbe,
@@ -256,14 +281,14 @@ function entryKind(stats) {
 // even when present, so its absence or type is irrelevant and, like the
 // unstaged selectors, it is skipped. Symlinks and gitlinks recorded in the
 // index are exempted by the caller before the worktree is consulted.
-// `invalidDisplay` is the escaped form of a name that is not valid UTF-8 (its
-// lossy `name` never exists on disk). After the exclusion probe, which still
-// matches because directory prefixes are valid UTF-8, such a path fails with
-// the accurate non-UTF-8 error instead of the false missing-path diagnosis.
-function stagedRegularFile(cwd, name, invalidDisplay) {
-  if (invalidDisplay !== undefined) {
+// A `name` that is not valid UTF-8 has no lossless worktree path. After the
+// exclusion probe, which still matches because directory prefixes are valid
+// UTF-8, such a path fails with the accurate non-UTF-8 error instead of the
+// false missing-path diagnosis.
+function stagedRegularFile(cwd, name) {
+  if (hasInvalidBytes(name)) {
     if (excludedByRstack(cwd, name)) return false;
-    throw new NonUtf8PathError(invalidDisplay);
+    throw new NonUtf8PathError(displayPath(name));
   }
   let stats;
   try {
@@ -286,20 +311,15 @@ function stagedRegularFile(cwd, name, invalidDisplay) {
 export function stagedFormatFiles(start) {
   const cwd = repositoryRoot(start);
   const exempt = recordedPaths(cwd, [SymlinkMode, GitlinkMode]);
-  const invalid = new Map();
-  return gitPaths(
-    cwd,
-    [
-      "diff",
-      "--cached",
-      "--name-only",
-      "--no-renames",
-      "--diff-filter=ACMRT",
-      "-z",
-      "--",
-    ],
-    invalid,
-  )
+  return gitPaths(cwd, [
+    "diff",
+    "--cached",
+    "--name-only",
+    "--no-renames",
+    "--diff-filter=ACMRT",
+    "-z",
+    "--",
+  ])
     .filter((name) => {
       // Every exemption runs before the worktree is consulted, so none of them
       // can hit the missing-file or non-regular-file failure: an unsupported
@@ -308,7 +328,7 @@ export function stagedFormatFiles(start) {
       // configuration. A name that is not valid UTF-8 reaches the same probe
       // before its own failure.
       if (!isFormattableExtension(name) || exempt.has(name)) return false;
-      return stagedRegularFile(cwd, name, invalid.get(name));
+      return stagedRegularFile(cwd, name);
     })
     .sort();
 }
@@ -317,13 +337,15 @@ export function changedFormatFiles(start, base, head, local = false) {
   const cwd = repositoryRoot(start);
   revision(cwd, base);
   revision(cwd, head);
-  // Escaped forms of names in the planner range that are not valid UTF-8.
-  const invalid = new Map();
-  const names = gitPaths(
-    cwd,
-    ["diff", "--name-only", "--no-renames", "-z", base, head, "--"],
-    invalid,
-  );
+  const names = gitPaths(cwd, [
+    "diff",
+    "--name-only",
+    "--no-renames",
+    "-z",
+    base,
+    head,
+    "--",
+  ]);
   if (local) {
     // `git diff <head>` compares the tree with the working tree, so a path whose
     // index differs from HEAD but whose working tree equals HEAD (for example
@@ -360,12 +382,12 @@ export function changedFormatFiles(start, base, head, local = false) {
       if (symlinks.has(name)) return false;
       // The explicit comparison decides what CI validates, so a present path
       // whose name is not valid UTF-8 fails accurately after the exclusion
-      // probe. Local selection keeps the silent skip: `isRegularFile` reports
-      // the lossy name as gone. A path deleted in the range is not in
-      // `present` and was skipped above.
-      if (!local && invalid.has(name)) {
-        if (excludedByRstack(cwd, name)) return false;
-        throw new NonUtf8PathError(invalid.get(name));
+      // probe. Local selection keeps the silent skip. Names compare by their
+      // bytes, so a path deleted in the range is not in `present` and was
+      // skipped above, even when a valid name with the same lossy form exists.
+      if (hasInvalidBytes(name)) {
+        if (local || excludedByRstack(cwd, name)) return false;
+        throw new NonUtf8PathError(displayPath(name));
       }
       return isRegularFile(cwd, name, local);
     })
