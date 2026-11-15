@@ -1,10 +1,15 @@
 #!/usr/bin/env sh
 set -eu
 
+# Print the physical path of an existing directory and fail otherwise.
+# Exit explicitly after a failed cd: "set -e" is ignored inside a command
+# substitution that is an "if" condition under bash, so without the explicit
+# exit the subshell would print the caller's directory with status 0 and two
+# different missing paths would compare equal.
 canonicalize_existing_directory() {
 	(
 		CDPATH=
-		cd "$1" 2>/dev/null
+		cd -- "$1" 2>/dev/null || exit 1
 		pwd -P
 	)
 }
