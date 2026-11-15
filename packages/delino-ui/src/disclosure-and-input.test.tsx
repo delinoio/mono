@@ -7,6 +7,7 @@ import {
   render,
   screen,
 } from "@testing-library/react";
+import { readFileSync } from "node:fs";
 import {
   Accordion,
   AccordionHeadingLevel,
@@ -448,6 +449,20 @@ describe("Toggle", () => {
       fireEvent.click(screen.getByRole("button", { name: "Center" }));
     });
     expect(values).toEqual([["left"], ["center"]]);
+  });
+
+  // happy-dom does not compute the cascade from the stylesheet, so this
+  // checks the selectors textually. The hover rule is guarded with `:not()`,
+  // which raises its specificity above the pressed rule unless it also
+  // excludes the pressed state.
+  test("keeps the pressed surface while hovered", () => {
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    const hoverRule = /\.dui-toggle:hover[^{]*\{/.exec(css)?.[0] ?? "";
+    expect(hoverRule).toContain(":not([data-disabled])");
+    expect(hoverRule).toContain(":not([data-pressed])");
+    expect(css).toMatch(
+      /\.dui-toggle\[data-pressed\]\s*\{[^}]*background: var\(--dui-color-neutral-hover\)/,
+    );
   });
 });
 
