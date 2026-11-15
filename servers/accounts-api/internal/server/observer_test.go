@@ -572,6 +572,50 @@ func TestRejectionStart(t *testing.T) {
 	}
 }
 
+// TestRejectionStartOfAnAlreadyBufferedPartialRequest checks that the start of
+// a request whose first bytes arrived together with the previous request is not
+// moved by a later byte of the same request.
+func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
+	const get = "GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		// arrival is what the first read holds; more arrives nine seconds later.
+		arrival string
+		// handlers is the number of handler calls that finish before that.
+		handlers  int
+		wantStart time.Duration
+	}{
+		{"partial head after a complete request", get + "GET / HTTP/1.1\r\nHo", 1, time.Millisecond},
+		{"partial head after two pipelined requests", get + get + "GET / HTTP/1.1\r\nHo", 2, 2 * time.Millisecond},
+		// Nothing of the next request arrived before the handler finished, so
+		// its first byte starts it.
+		{"nothing buffered when the handler finishes", get, 1, 9 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := origin
+			o, _ := newTestObserver()
+			o.now = func() time.Time { return clock }
+			o.acceptedAt = origin.Add(-time.Hour)
+			o.feed([]byte(tc.arrival))
+			for range tc.handlers {
+				clock = clock.Add(time.Millisecond)
+				o.handlerStarted()
+				o.handlerFinished()
+			}
+			o.responseFinished()
+			clock = origin.Add(9 * time.Second)
+			o.feed([]byte("s"))
+			o.setReadDeadline(clock.Add(time.Second))
+			clock = clock.Add(time.Second)
+			start, ok := o.claimReadTimeout()
+			if !ok || !start.Equal(origin.Add(tc.wantStart)) {
+				t.Errorf("start = %v, %v; want %v after the first byte", start, ok, tc.wantStart)
+			}
+		})
+	}
+}
+
 func TestLogRejectedRecordShape(t *testing.T) {
 	o, logs := newTestObserver()
 	clock := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)

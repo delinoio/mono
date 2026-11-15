@@ -222,6 +222,40 @@ func TestNewServerLogsPartialHeadTimeoutAfterKeepAliveRequest(t *testing.T) {
 	}
 }
 
+// TestNewServerPartialHeadBufferedWithAnAnsweredRequestKeepsItsStart sends a
+// complete request and the start of the next head in one write, then the rest
+// of its Host header line late in the header read timeout. The record measures the
+// time since net/http started to wait for the head (the end of the first
+// response), not since that late byte.
+func TestNewServerPartialHeadBufferedWithAnAnsweredRequestKeepsItsStart(t *testing.T) {
+	const headerTimeout = 1500 * time.Millisecond
+	addr, logs := startRejectLogServer(t, headerTimeout, time.Minute)
+	conn := dialRaw(t, addr)
+	reader := bufio.NewReader(conn)
+	if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\nGET /healthz HTTP/1.1\r\nHost: te"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if status, _ := readResponse(t, conn, reader); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	time.Sleep(headerTimeout * 2 / 3)
+	if _, err := io.WriteString(conn, "st\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if rest, err := io.ReadAll(reader); err != nil || len(rest) != 0 {
+		t.Fatalf("read = %q, %v; want a silent close", rest, err)
+	}
+	records := rejectedRecords(t, logs)
+	if len(records) != 1 {
+		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
+	}
+	assertRejectedRecord(t, records[0], server.RejectionHeaderReadTimeout, 0)
+	// The late bytes arrived about a third of the timeout before the close.
+	if duration := records[0]["duration_ms"].(float64); duration < float64(headerTimeout.Milliseconds())*0.9 {
+		t.Errorf("duration_ms = %v, want about the %v timeout", duration, headerTimeout)
+	}
+}
+
 func TestNewServerNormalRequestLogsNoRejection(t *testing.T) {
 	addr, logs := startRequestLogServer(t)
 	response := exchange(t, addr, "GET /healthz HTTP/1.1\r\nHost: test\r\nConnection: close\r\n\r\n")
