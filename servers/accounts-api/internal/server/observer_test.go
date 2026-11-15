@@ -549,6 +549,7 @@ func TestClaimDirectRejection(t *testing.T) {
 }
 
 func TestClaimReadTimeout(t *testing.T) {
+	const postRequest = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
 	now := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name  string
@@ -563,6 +564,19 @@ func TestClaimReadTimeout(t *testing.T) {
 		{"partial head after a request", func(o *connObserver) {
 			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHo"))
 		}, time.Second, true},
+		{"idle wait after a POST", func(o *connObserver) { o.feed([]byte(postRequest)) }, time.Second, false},
+		// The skipped bytes are part of the next head that net/http is reading, so
+		// they count as a partly received head although the head buffer is empty.
+		{"one skipped CR after a POST", func(o *connObserver) { o.feed([]byte(postRequest + "\r")) }, time.Second, true},
+		{"four skipped CR and LF bytes after a POST", func(o *connObserver) { o.feed([]byte(postRequest + "\r\n\r\n")) }, time.Second, true},
+		{"skipped bytes after a POST in separate reads", func(o *connObserver) {
+			o.feed([]byte(postRequest))
+			o.feed([]byte("\r"))
+			o.feed([]byte("\n"))
+		}, time.Second, true},
+		{"idle wait after a head that followed skipped bytes", func(o *connObserver) {
+			o.feed([]byte(postRequest + "\r\n" + "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+		}, time.Second, false},
 		{"read interrupted by a deadline in the past", func(*connObserver) {}, -time.Second, false},
 		{"no deadline set", func(*connObserver) {}, 0, false},
 		{"request body", func(o *connObserver) { o.feed([]byte("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 9\r\n\r\nab")) }, time.Second, false},
@@ -720,6 +734,13 @@ func (b *lockedBuffer) String() string {
 // cmd/accounts-api, and returns its address and logs.
 func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffer) {
 	t.Helper()
+	return serveObservedWith(t, handler, nil)
+}
+
+// serveObservedWith is serveObserved with a hook that adjusts the server, for
+// example to set the timeouts, before it starts serving.
+func serveObservedWith(t *testing.T, handler http.HandlerFunc, configure func(*http.Server)) (string, *lockedBuffer) {
+	t.Helper()
 	logs := &lockedBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -731,6 +752,9 @@ func serveObserved(t *testing.T, handler http.HandlerFunc) (string, *lockedBuffe
 		ConnContext:    ConnContext,
 		ConnState:      ConnState,
 		MaxHeaderBytes: MaxHeaderBytes,
+	}
+	if configure != nil {
+		configure(srv)
 	}
 	done := make(chan struct{})
 	go func() {
@@ -926,6 +950,74 @@ func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 			}
 			if got := countRecords(logs, "http_request_rejected"); got != tc.rejected {
 				t.Errorf("http_request_rejected records = %d, want %d: %s", got, tc.rejected, logs.String())
+			}
+		})
+	}
+}
+
+// TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout stalls a real net/http
+// server after a POST and four leading CR and LF bytes. net/http waits for four
+// bytes of the next request under IdleTimeout, discards them and then reads the
+// head under ReadHeaderTimeout, so the stall is a header read timeout although
+// the observer's head buffer is empty (the bytes were skipped). The same stall
+// without the extra bytes is the keep-alive wait and is not logged.
+func TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout(t *testing.T) {
+	const (
+		headerTimeout = 200 * time.Millisecond
+		post          = "POST /post HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+	)
+	for _, tc := range []struct {
+		name string
+		// idleTimeout is long enough that only ReadHeaderTimeout can expire in time
+		// when net/http reads a head, and short enough for the idle case to expire.
+		idleTimeout time.Duration
+		writes      []string
+		wantLogged  bool
+	}{
+		{"POST, four leading bytes, stall", time.Hour, []string{post, "\r\n\r\n"}, true},
+		{"POST, stall", 3 * headerTimeout, []string{post}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := serveObservedWith(t, func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "ok")
+			}, func(srv *http.Server) {
+				srv.ReadHeaderTimeout = headerTimeout
+				srv.IdleTimeout = tc.idleTimeout
+			})
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			for _, w := range tc.writes {
+				if _, err := io.WriteString(conn, w); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+				// Separate reads, so the parsing cannot depend on the writes
+				// arriving together.
+				time.Sleep(30 * time.Millisecond)
+			}
+			// net/http closes the connection without a response once the timeout
+			// expires, which the client sees as the end of the stream after the
+			// response to the POST.
+			response, _ := io.ReadAll(conn)
+			if got := strings.Count(string(response), "HTTP/1.1 "); got != 1 {
+				t.Fatalf("responses = %d, want only the one to the POST: %q", got, response)
+			}
+			// The timed-out read is logged before net/http closes the connection;
+			// allow the logger a moment.
+			deadline := time.Now().Add(2 * time.Second)
+			for countRecords(logs, "http_request_rejected") == 0 && time.Now().Before(deadline) && tc.wantLogged {
+				time.Sleep(10 * time.Millisecond)
+			}
+			got := countRecords(logs, "http_request_rejected")
+			if tc.wantLogged {
+				if got != 1 || !strings.Contains(logs.String(), `"reason":"header_read_timeout"`) {
+					t.Errorf("want one header_read_timeout record, got %d: %s", got, logs.String())
+				}
+			} else if got != 0 {
+				t.Errorf("http_request_rejected records = %d, want none for the keep-alive wait: %s", got, logs.String())
 			}
 		})
 	}

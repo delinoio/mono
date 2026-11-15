@@ -724,7 +724,8 @@ func (o *connObserver) deadlineExpired() bool {
 // Only a deadline timer that expired while the parser waited for (more of) a
 // request head counts, with no handler call or response in progress:
 //
-//   - A head that is partly received counts, whatever deadline expired.
+//   - A head that is partly received counts, whatever deadline expired. Leading
+//     CR and LF bytes that the parser skipped after a POST are part of it.
 //   - An empty head counts only while no request head ever parsed on the
 //     connection. A connection that connects and stalls is logged, because
 //     the contract covers every header read timeout, and so is one that sends
@@ -739,7 +740,11 @@ func (o *connObserver) claimReadTimeout() (time.Time, bool) {
 	if o.rejected || o.hijacked || o.responding || o.phase != phaseHead || !o.deadlineExpired() {
 		return time.Time{}, false
 	}
-	if len(o.head) == 0 && o.parsedHeads > 0 {
+	// The leading CR and LF bytes skipped after a POST are bytes of the next
+	// request that net/http has received too (it reads that head under
+	// ReadHeaderTimeout once it has them), so they make the head partly received
+	// even though the head buffer is still empty.
+	if len(o.head) == 0 && o.leadingSkipped == 0 && o.parsedHeads > 0 {
 		return time.Time{}, false
 	}
 	o.rejected = true
