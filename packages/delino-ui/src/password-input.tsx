@@ -73,10 +73,22 @@ export function PasswordInput({
         disabled={disabled}
         {...props}
       >
+        {/*
+          Workaround: the UI SDK Dialog chooses its initial focus target with a
+          `[autofocus], [data-autofocus]` DOM query, but React handles the
+          `autoFocus` prop by calling `focus()` and renders no `autofocus`
+          attribute. Without `data-autofocus` on the control `<input>`, a Dialog
+          focuses its first tabbable element (usually the close button) instead
+          of this input. The attribute must be on the control, not the root:
+          caller props are spread onto the root `<div>`, which is not tabbable.
+          Scope: only when `autoFocus` is true. Remove when the UI SDK reads the
+          React `autoFocus` prop itself.
+        */}
         <PasswordInputControl
           className="dui-password-input-control"
           placeholder={placeholder}
           autoFocus={autoFocus}
+          data-autofocus={autoFocus ? "" : undefined}
         />
         <PasswordInputToggle
           className="dui-password-input-toggle"
