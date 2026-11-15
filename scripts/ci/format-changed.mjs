@@ -528,6 +528,13 @@ export async function main(env = process.env) {
         ? (values.base ?? env.TURBO_SCM_BASE)
         : git(cwd, "merge-base", "origin/main", head).trim();
   if (values.all && ci) throw new Error("CI formatting must use changed files");
+  // `--all` selects every tracked file and never reads the comparison, so
+  // honoring it would silently drop the requested range and skip revision
+  // validation. Reject the contradiction like `--staged` does.
+  if (values.all && explicit)
+    throw new Error(
+      "All-file formatting requires local execution without a comparison",
+    );
   const paths = values.staged
     ? stagedFormatFiles(cwd)
     : values.all
