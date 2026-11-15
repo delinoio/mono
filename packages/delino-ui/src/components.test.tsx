@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "@rstest/core";
 import type * as React from "react";
 import {
@@ -545,6 +546,61 @@ describe("ToastRegion", () => {
     expect(screen.getByText("Event created").className).toBe("dui-toast-title");
     expect(screen.getByText("Friday at 10:00 AM")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
+  });
+
+  // happy-dom cannot evaluate `env()` or logical insets, so this checks the
+  // stylesheet source: the package rules sit in a higher cascade layer than the
+  // UI SDK defaults and must keep the safe-area terms and logical edges.
+  describe("region offsets", () => {
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+    const block = (selector: string): string => {
+      const escaped = selector.replace(/[.[\]="]/g, "\\$&");
+      const match = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+      expect(match).not.toBeNull();
+      // Collapse formatter line wraps so declarations compare as one line.
+      return (match?.[1] ?? "")
+        .replace(/\s+/g, " ")
+        .replace(/\( /g, "(")
+        .replace(/ \)/g, ")")
+        .trim();
+    };
+
+    test("keeps the bottom and top offsets clear of the safe area", () => {
+      expect(block(".dui-toast-region")).toContain(
+        "bottom: calc(16px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px))",
+      );
+      expect(block('.dui-toast-region[data-side="top"]')).toContain(
+        "top: calc(16px + env(safe-area-inset-top, 0px))",
+      );
+    });
+
+    test("follows the writing direction for start and end alignment", () => {
+      const start = block('.dui-toast-region[data-align="start"]');
+      const end = block('.dui-toast-region[data-align="end"]');
+      expect(start).toContain(
+        "inset-inline-start: calc(16px + env(safe-area-inset-left, 0px))",
+      );
+      expect(end).toContain(
+        "inset-inline-end: calc(16px + env(safe-area-inset-right, 0px))",
+      );
+      // The physical reset must come first so the logical edge wins in RTL.
+      expect(start.indexOf("left: auto")).toBeGreaterThanOrEqual(0);
+      expect(start.indexOf("left: auto")).toBeLessThan(
+        start.indexOf("inset-inline-start"),
+      );
+      expect(end.indexOf("left: auto")).toBeGreaterThanOrEqual(0);
+      expect(end.indexOf("left: auto")).toBeLessThan(
+        end.indexOf("inset-inline-end"),
+      );
+      expect(start).not.toMatch(/\bleft:\s*16px/);
+      expect(end).not.toMatch(/\bright:\s*16px/);
+    });
+
+    test("keeps the centered default", () => {
+      const base = block(".dui-toast-region");
+      expect(base).toContain("left: 50%");
+      expect(base).toContain("translate: -50% 0");
+    });
   });
 });
 

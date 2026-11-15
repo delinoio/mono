@@ -682,14 +682,18 @@
     scale: 0.96;
   }
 
-  /* Toast. Stacking follows the UI SDK toast styling guide: toasts sit
+  /* Toast. Offsets keep 16px from each viewport edge plus the device safe area
+     (the UI SDK defaults the package layer overrides) and use logical edges so
+     start and end follow the writing direction. Stacking follows the UI SDK toast styling guide: toasts sit
      absolutely in the region, the newest in front. */
   /* The region can render as a top-layer popover, whose browser styles set
      `inset: 0` and `margin: auto`. Reset them so only one edge applies. */
   .dui-toast-region {
     position: fixed;
     inset: auto;
-    bottom: calc(16px + var(--keyboard-inset, 0px));
+    bottom: calc(
+      16px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px)
+    );
     left: 50%;
     overflow: visible;
     z-index: 2147483647;
@@ -705,18 +709,22 @@
   }
 
   .dui-toast-region[data-side="top"] {
-    top: 16px;
+    top: calc(16px + env(safe-area-inset-top, 0px));
     bottom: auto;
   }
 
   .dui-toast-region[data-align="start"] {
-    left: 16px;
+    /* Reset the centered `left` first: the logical edge must be the later
+       declaration so it wins when it maps to `left` (LTR) and the other edge
+       stays `auto` in RTL. */
+    left: auto;
+    inset-inline-start: calc(16px + env(safe-area-inset-left, 0px));
     translate: none;
   }
 
   .dui-toast-region[data-align="end"] {
-    right: 16px;
     left: auto;
+    inset-inline-end: calc(16px + env(safe-area-inset-right, 0px));
     translate: none;
   }
 
