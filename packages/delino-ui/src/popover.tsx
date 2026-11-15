@@ -29,7 +29,12 @@ export type PopoverProps = Omit<
  * `Popover`. It closes with Escape, a press outside or focus leaving it.
  */
 export function Popover(props: PopoverProps) {
-  return <PopoverRoot {...props} />;
+  // The type already omits `dismissible`, but types do not stop JS callers or
+  // untyped spread objects. Drop the key at runtime so Escape always closes.
+  const { dismissible: _dismissible, ...rest } = props as PopoverProps & {
+    dismissible?: unknown;
+  };
+  return <PopoverRoot {...rest} />;
 }
 
 type ButtonStyleProps = {
