@@ -31,7 +31,7 @@ Each app that has e2e tests owns these paths:
 - The target URL is `http://127.0.0.1:0`. The runner selects a free loopback port and passes it as `{port}` to `--port`, with `--host 127.0.0.1`. This is a documented exception to the fixed development ports in the [environment contract](repository-environment-contract.md#process-boundaries), so a suite can run while `pnpm dev` holds the fixed ports.
 - The app command receives only `PATH`, `HOME` and temporary-directory variables from the host. Build-time variables such as `PUBLIC_API_ORIGIN` use their defaults unless the config passes them explicitly.
 - Server output goes to `.e2e/logs/app.log`.
-- The suites test the development server. They do not test the production build, Cloudflare Pages `_headers` or `_redirects`, or deployed origins.
+- The suites test the development server. They do not test the production build, Cloudflare Pages `_headers`, the Cloudflare Pages single-page-application fallback (served only when the output has no top-level `404.html`), or deployed origins.
 
 ## Tests
 
