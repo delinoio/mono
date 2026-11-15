@@ -69,7 +69,13 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
 
 test("documentation changes select formatting without fixtures", (t) => {
   const f = fixture(t);
-  f.write("docs/space name\n한국어.md");
+  // Windows rejects control characters such as a line feed in filenames, so it
+  // keeps the space and Unicode coverage; other platforms also cover a newline.
+  f.write(
+    process.platform === "win32"
+      ? "docs/space name 한국어.md"
+      : "docs/space name\n한국어.md",
+  );
   assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
     quality: true,
     format: true,
