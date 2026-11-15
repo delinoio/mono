@@ -338,6 +338,22 @@ export function ciEnabled(env = process.env) {
   return value !== undefined && value !== "" && value !== "false";
 }
 
+// Git runs the pre-commit hook of a pathspec commit (`git commit <path>`,
+// `--only`, `--amend <path>`) against a throwaway `next-index-<pid>.lock`
+// index. Staging a fix there does not reach the real index: Git writes the real
+// index from its own pre-hook snapshot, leaving HEAD formatted and the index
+// stale (`MM`). The real index stays locked while the hook runs, so the hook
+// cannot repair it. The other commit forms use `index` (plain commit, linked
+// worktree) or `index.lock` (`-a`, `-i`), which Git keeps.
+// Remove this guard only when Git applies hook changes of a pathspec commit to
+// the real index.
+export function isThrowawayIndex(env) {
+  const path = env.GIT_INDEX_FILE;
+  if (!path) return false;
+  const name = path.split(/[\\/]/u).pop();
+  return /^next-index-.+\.lock$/u.test(name);
+}
+
 export async function main(env = process.env) {
   const { values } = parseArgs({
     options: {
@@ -379,7 +395,8 @@ export async function main(env = process.env) {
     : values.all
       ? allFormatFiles(cwd)
       : changedFormatFiles(cwd, base, head, !explicit);
-  const mode = values.write ? Mode.Write : Mode.Check;
+  const pathspecCommit = Boolean(values.staged) && isThrowawayIndex(env);
+  const mode = values.write && !pathspecCommit ? Mode.Write : Mode.Check;
   console.log(
     JSON.stringify({
       event: "ci_format",
@@ -402,6 +419,14 @@ export async function main(env = process.env) {
       candidates: paths.length,
     }),
   );
+  if (pathspecCommit && status !== 0)
+    // Check mode exits 1 for both unformatted files and parser failures.
+    throw new Error(
+      "git commit <path> cannot be formatted through the pre-commit hook: " +
+        "formatting is required or a staged file cannot be parsed. " +
+        "Nothing was changed. Fix the reported files, run `git add` on them " +
+        "and run a plain `git commit` without a path.",
+    );
   return status;
 }
 

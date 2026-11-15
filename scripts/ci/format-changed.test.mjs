@@ -22,6 +22,7 @@ import {
   allFormatFiles,
   changedFormatFiles,
   ciEnabled,
+  isThrowawayIndex,
   runFormatter,
   stagedFormatFiles,
 } from "./format-changed.mjs";
@@ -1691,6 +1692,206 @@ for (const status of [0, 1, 2]) {
     assert.match(result.stdout, new RegExp(`"status":${status}`));
   });
 }
+
+// Pathspec commits run the hook against Git's throwaway `next-index-*.lock`
+// index, so the hook must refuse to format there instead of staging a fix that
+// Git then discards. These fixtures drive the real Lefthook hook.
+const Unformatted = "const a={x:2}\n";
+const Formatted = "const a = { x: 2 };";
+
+// A fixture whose hook files are committed, so status output only lists the
+// files a scenario creates.
+function hookedFixture(t) {
+  const f = fixture(t);
+  f.installHook();
+  f.git("add", ".");
+  f.git("commit", "--quiet", "-m", "hook files");
+  return f;
+}
+
+function runCommit(f, ...args) {
+  return spawnSync("git", ["commit", "--quiet", ...args], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+  });
+}
+
+function runCommitIn(cwd, env, ...args) {
+  return spawnSync("git", ["commit", "--quiet", ...args], {
+    cwd,
+    env,
+    encoding: "utf8",
+  });
+}
+
+function assertNoHookLeftovers(f) {
+  assert.equal(f.git("stash", "list"), "");
+  const info = join(f.cwd, f.git("rev-parse", "--git-path", "info"));
+  assert.deepEqual(
+    readdirSync(info).filter((name) => name.endsWith(".patch")),
+    [],
+  );
+}
+
+test("isThrowawayIndex matches only Git's pathspec-commit temporary index", () => {
+  for (const GIT_INDEX_FILE of [
+    undefined,
+    "",
+    ".git/index",
+    "/x/.git/index",
+    "/x/.git/index.lock",
+    ".git/index.lock",
+    "/x/.git/worktrees/w/index",
+    "/x/.git/worktrees/w/index.lock",
+    "C:\\x\\.git\\index",
+  ])
+    assert.equal(isThrowawayIndex({ GIT_INDEX_FILE }), false, GIT_INDEX_FILE);
+  for (const GIT_INDEX_FILE of [
+    "/x/.git/next-index-91305.lock",
+    ".git/next-index-1263.lock",
+    "/x/.git/worktrees/w/next-index-7.lock",
+    "C:\\x\\.git\\next-index-7.lock",
+  ])
+    assert.equal(isThrowawayIndex({ GIT_INDEX_FILE }), true, GIT_INDEX_FILE);
+});
+
+test("pre-commit refuses a pathspec commit that needs formatting and recovers through add plus commit", (t) => {
+  const f = hookedFixture(t);
+  f.write("a.ts", Unformatted);
+  f.write("b.ts", "const b={y:1}\n");
+  f.git("add", "a.ts", "b.ts");
+  const head = f.git("rev-parse", "HEAD");
+  const result = runCommit(f, "-m", "pathspec", "--", "a.ts");
+  const output = result.stdout + result.stderr;
+  assert.notEqual(result.status, 0, output);
+  assert.match(output, /ci_format_error/);
+  assert.match(output, /git commit <path> cannot be formatted/);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.equal(f.git("show", ":a.ts"), Unformatted.trim());
+  assert.equal(readFileSync(join(f.cwd, "a.ts"), "utf8"), Unformatted);
+  assert.equal(f.git("status", "--porcelain"), "A  a.ts\nA  b.ts");
+  assertNoHookLeftovers(f);
+  f.git("add", "--", "a.ts", "b.ts");
+  f.git("commit", "--quiet", "-m", "recovered");
+  assert.equal(f.git("show", "HEAD:a.ts"), Formatted);
+  assert.equal(f.git("show", "HEAD:b.ts"), "const b = { y: 1 };");
+  assert.equal(f.git("status", "--porcelain"), "");
+});
+
+test("pre-commit refuses a pathspec commit with a parser error", (t) => {
+  const f = hookedFixture(t);
+  f.write("broken.ts", "const broken = ;\n");
+  f.git("add", "broken.ts");
+  const head = f.git("rev-parse", "HEAD");
+  const result = runCommit(f, "-m", "pathspec", "--", "broken.ts");
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.equal(f.git("rev-parse", "--verify", "HEAD"), head);
+  assert.equal(f.git("status", "--porcelain"), "A  broken.ts");
+});
+
+test("pre-commit lets a pathspec commit of formatted content through", (t) => {
+  const f = hookedFixture(t);
+  f.write("c.ts", "const c = { x: 1 };\n");
+  f.git("add", "c.ts");
+  const result = runCommit(f, "-m", "pathspec formatted", "--", "c.ts");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(f.git("show", "HEAD:c.ts"), "const c = { x: 1 };");
+  assert.equal(f.git("status", "--porcelain"), "");
+});
+
+test("pre-commit still formats git commit -a and keeps the index clean", (t) => {
+  const f = hookedFixture(t);
+  f.write("a.ts", "const a = { x: 1 };\n");
+  f.git("add", "a.ts");
+  f.git("commit", "--quiet", "-m", "formatted base");
+  f.write("a.ts", Unformatted);
+  const result = runCommit(f, "-a", "-m", "all");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(f.git("show", "HEAD:a.ts"), Formatted);
+  assert.equal(f.git("show", ":a.ts"), Formatted);
+  assert.equal(f.git("status", "--porcelain"), "");
+});
+
+test("pre-commit still formats git commit -i and keeps the index clean", (t) => {
+  const f = hookedFixture(t);
+  f.write("a.ts", "const a = { x: 1 };\n");
+  f.git("add", "a.ts");
+  f.git("commit", "--quiet", "-m", "formatted base");
+  f.write("a.ts", Unformatted);
+  f.git("add", "a.ts");
+  const result = runCommit(f, "-i", "-m", "include", "--", "a.ts");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.equal(f.git("show", "HEAD:a.ts"), Formatted);
+  assert.equal(f.git("show", ":a.ts"), Formatted);
+  assert.equal(f.git("status", "--porcelain"), "");
+});
+
+test("pre-commit refuses git commit --only and leaves the staged state untouched", (t) => {
+  const f = hookedFixture(t);
+  f.write("a.ts", "const a = { x: 1 };\n");
+  f.git("add", "a.ts");
+  f.git("commit", "--quiet", "-m", "formatted base");
+  f.write("a.ts", Unformatted);
+  const head = f.git("rev-parse", "HEAD");
+  const result = runCommit(f, "--only", "-m", "only", "a.ts");
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /ci_format_error/);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.equal(readFileSync(join(f.cwd, "a.ts"), "utf8"), Unformatted);
+  assert.equal(f.git("status", "--porcelain"), "M a.ts");
+  assertNoHookLeftovers(f);
+});
+
+test("pre-commit refuses git commit --amend with a path and keeps the amended commit", (t) => {
+  const f = hookedFixture(t);
+  f.write("a.ts", "const a = { x: 1 };\n");
+  f.git("add", "a.ts");
+  f.git("commit", "--quiet", "-m", "formatted");
+  const head = f.git("rev-parse", "HEAD");
+  f.write("a.ts", Unformatted);
+  const result = runCommit(f, "--amend", "--no-edit", "--", "a.ts");
+  assert.notEqual(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout + result.stderr, /ci_format_error/);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.equal(f.git("show", "HEAD:a.ts"), "const a = { x: 1 };");
+  assert.equal(readFileSync(join(f.cwd, "a.ts"), "utf8"), Unformatted);
+  assert.equal(f.git("status", "--porcelain"), "M a.ts");
+  assertNoHookLeftovers(f);
+});
+
+test("pre-commit formats plain commits from a linked worktree", (t) => {
+  const f = hookedFixture(t);
+  const linked = join(f.cwd, "..", `${f.cwd.split(/[\\/]/u).pop()}-linked`);
+  t.after(() => rmSync(linked, { recursive: true, force: true }));
+  f.git("worktree", "add", "--quiet", "-b", "linked", linked);
+  symlinkSync(
+    join(root, "node_modules"),
+    join(linked, "node_modules"),
+    process.platform === "win32" ? "junction" : "dir",
+  );
+  writeFileSync(join(linked, "a.ts"), Unformatted);
+  const git = (...args) =>
+    execFileSync("git", args, {
+      cwd: linked,
+      env: f.env,
+      encoding: "utf8",
+    }).trim();
+  git("add", "a.ts");
+  const plain = runCommitIn(linked, f.env, "-m", "linked");
+  assert.equal(plain.status, 0, plain.stdout + plain.stderr);
+  assert.equal(git("show", "HEAD:a.ts"), Formatted);
+  assert.equal(git("show", ":a.ts"), Formatted);
+  assert.equal(git("status", "--porcelain"), "");
+  // A pathspec commit in the linked worktree is refused the same way.
+  writeFileSync(join(linked, "d.ts"), "const d={z:3}\n");
+  git("add", "d.ts");
+  const head = git("rev-parse", "HEAD");
+  const refused = runCommitIn(linked, f.env, "-m", "linked path", "--", "d.ts");
+  assert.notEqual(refused.status, 0, refused.stdout + refused.stderr);
+  assert.equal(git("rev-parse", "HEAD"), head);
+  assert.equal(git("status", "--porcelain"), "A  d.ts");
+});
 
 // Selection must depend on the repository, never on the directory the script
 // is started from. `git diff` prints repository-root-relative paths while
