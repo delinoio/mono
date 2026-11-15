@@ -47,16 +47,9 @@ The Rspress theme variables `--rp-c-brand`, `--rp-c-brand-dark`, `--rp-c-brand-d
 - Rspress paints text directly with `--rp-c-brand` (navbar item, heading anchors, search panel, feature card hover, overview links) and with `--rp-c-brand-light` (links and the active sidebar item). Every such text color must reach 4.5:1 against its rendered background in both modes.
 - Rspress 2.1.3 paints the current search suggestion with `--rp-c-brand` as the background and hard-coded white text. The dark override keeps that background at `#3b5bfd` (white text 5.12:1), and the dark overview hover background mixes `--rp-c-brand-dark` instead of `--rp-c-brand-lighter` (brand text 4.72:1, against 2.65:1 with the brighter ramp). Remove both overrides when Rspress derives these colors from the brand variables.
 
-Measured WCAG 2.1 contrast ratios of the dark-mode text colors on the Rspress dark surfaces:
+The dark-mode `--rp-c-brand`, `--rp-c-brand-light` and `--rp-c-brand-lighter` values must each reach 4.5:1 (WCAG 2.1 normal text) against every Rspress dark surface: `#121212`, `#292e37`, `#343a46` and `#000000`. The light-mode brand blue does not meet this on those surfaces, which is why the dark ramp exists.
 
-| Dark text color                  | `#121212` | `#292e37` | `#343a46` | `#000000` |
-| -------------------------------- | --------- | --------- | --------- | --------- |
-| Before: `#3b5bfd`                | 3.66      | 2.66      | 2.23      | 4.10      |
-| `--rp-c-brand` `#8aa0ff`         | 7.63      | 5.55      | 4.65      | 8.55      |
-| `--rp-c-brand-light` `#a3b4ff`   | 9.39      | 6.84      | 5.72      | 10.53     |
-| `--rp-c-brand-lighter` `#c0ccff` | 11.88     | 8.65      | 7.24      | 13.32     |
-
-The e2e suite checks these minimums on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. Rendered checks in Chromium measured 7.63:1 for the active navbar item, heading anchors and search match highlight on `#121212`, and 7.84:1 for the active sidebar item on its tinted background. The current search suggestion measured 5.12:1 (white on `#3b5bfd`).
+The e2e suite checks this minimum on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. It also checks that the light-mode brand and the hero gradient colors do not change.
 
 ## Storage
 

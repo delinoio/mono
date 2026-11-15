@@ -16,7 +16,8 @@
  * (#121212, #292e37, #343a46, #000). These values keep brand text at 4.5:1 or
  * more on all of them. --rp-c-brand-dark and --rp-c-brand-darker stay
  * unchanged on purpose: the home hero button gradient is built from them and
- * carries white text. Measured ratios are recorded in the foundation contract.
+ * carries white text. The contrast requirement is recorded in the foundation
+ * contract.
  */
 html.rp-dark {
   --rp-c-brand: #8aa0ff;

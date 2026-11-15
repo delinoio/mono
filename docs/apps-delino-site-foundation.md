@@ -43,16 +43,9 @@ The Rspress theme variables `--rp-c-brand`, `--rp-c-brand-dark`, `--rp-c-brand-d
 - Rspress paints text directly with `--rp-c-brand` (navbar item, feature card hover) and with `--rp-c-brand-light` (links). Every such text color must reach 4.5:1 against its rendered background in both modes.
 - The dark overrides for the current search suggestion and the overview hover background in `theme/index.css` exist only to keep the file identical to `delino-docs`; this site renders neither.
 
-Measured WCAG 2.1 contrast ratios of the dark-mode text colors on the Rspress dark surfaces:
+The dark-mode `--rp-c-brand`, `--rp-c-brand-light` and `--rp-c-brand-lighter` values must each reach 4.5:1 (WCAG 2.1 normal text) against every Rspress dark surface: `#121212`, `#292e37`, `#343a46` and `#000000`. The light-mode brand blue does not meet this on those surfaces, which is why the dark ramp exists.
 
-| Dark text color                  | `#121212` | `#292e37` | `#343a46` | `#000000` |
-| -------------------------------- | --------- | --------- | --------- | --------- |
-| Before: `#3b5bfd`                | 3.66      | 2.66      | 2.23      | 4.10      |
-| `--rp-c-brand` `#8aa0ff`         | 7.63      | 5.55      | 4.65      | 8.55      |
-| `--rp-c-brand-light` `#a3b4ff`   | 9.39      | 6.84      | 5.72      | 10.53     |
-| `--rp-c-brand-lighter` `#c0ccff` | 11.88     | 8.65      | 7.24      | 13.32     |
-
-The e2e suite checks these minimums on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. A rendered check in Chromium measured 7.63:1 (7.15:1 at the lightest end of the card gradient) for the hovered feature card title on the home page.
+The e2e suite checks this minimum on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. It also checks that the light-mode brand and the hero gradient colors do not change.
 
 ## Storage
 
