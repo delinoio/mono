@@ -26,25 +26,11 @@ import {
   runFormatter,
   stagedFormatFiles,
 } from "./format-changed.mjs";
+import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const require = createRequire(import.meta.url);
 const lefthook = require("lefthook/get-exe.js").getExePath();
-
-// A developer's global or system Git configuration (core.hooksPath,
-// commit.gpgsign, ...) and the GIT_* variables of an enclosing Git hook
-// invocation (GIT_DIR, GIT_INDEX_FILE, ...) must not change how the fixture
-// repositories behave. Mutates and returns `env`.
-function isolateGitEnvironment(env) {
-  for (const name of Object.keys(env)) {
-    if (name.startsWith("GIT_") || name === "LEFTHOOK_CONFIG") {
-      delete env[name];
-    }
-  }
-  env.GIT_CONFIG_GLOBAL = process.platform === "win32" ? "NUL" : "/dev/null";
-  env.GIT_CONFIG_NOSYSTEM = "1";
-  return env;
-}
 
 // The exported selectors run git without an explicit environment, so they
 // inherit this process's environment; isolate it before any test runs.
