@@ -3,12 +3,14 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -354,30 +356,113 @@ func TestRequestLogRecordsFlushedAndHijackedStatus(t *testing.T) {
 			if records[0]["status"] != float64(tc.wantStatus) {
 				t.Errorf("logged status = %v, want %d (client received %d)", records[0]["status"], tc.wantStatus, clientStatus)
 			}
+			if _, ok := records[0]["hijacked"]; ok {
+				t.Errorf("record has a hijacked field %v, want none for a request that did not hijack", records[0]["hijacked"])
+			}
 		})
 	}
 
-	t.Run("hijack then panic", func(t *testing.T) {
-		clientErr, clientStatus, records := serveRequest(t, func(w http.ResponseWriter, _ *http.Request) {
-			conn, _, err := http.NewResponseController(w).Hijack()
-			if err != nil {
-				panic(err)
+	// A hijack only transfers the connection. The handler decides what, if
+	// anything, the client receives, and the recorder cannot observe it, so the
+	// log marks the takeover with hijacked, commits no status of its own (in
+	// particular not 101) and never substitutes 500 for a later panic. The
+	// logged status is the recorder's default of 200 here, which is not a
+	// client-observed status for these connections.
+	const rawNotFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+	const rawOK = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+	for _, tc := range []struct {
+		name         string
+		response     string
+		panics       bool
+		wantClient   int // 0 means a transport error is expected
+		wantLogged   int
+		wantHijacked bool
+	}{
+		{"hijack, raw 200 response, then return", rawOK, false, http.StatusOK, http.StatusOK, true},
+		{"hijack, raw 404 response, then return", rawNotFound, false, http.StatusNotFound, http.StatusOK, true},
+		{"hijack, raw 404 response, then panic", rawNotFound, true, http.StatusNotFound, http.StatusOK, true},
+		{"hijack, no response, then panic", "", true, 0, http.StatusOK, true},
+		{"hijack, no response, then return", "", false, 0, http.StatusOK, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clientErr, clientStatus, records := serveRequest(t, func(w http.ResponseWriter, _ *http.Request) {
+				conn, _, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					panic(err)
+				}
+				if tc.response != "" {
+					if _, err := io.WriteString(conn, tc.response); err != nil {
+						panic(err)
+					}
+				}
+				_ = conn.Close()
+				if tc.panics {
+					panic("boom")
+				}
+			})
+			if tc.wantClient == 0 && clientErr == nil {
+				t.Errorf("client status = %d, want a transport error from the closed connection", clientStatus)
 			}
-			// Close without writing a response, so the client sees a transport
-			// error and the log must not claim the 500 that net/http never sent.
-			_ = conn.Close()
-			panic("boom")
+			if tc.wantClient != 0 && (clientErr != nil || clientStatus != tc.wantClient) {
+				t.Errorf("client status = %d, error = %v, want status %d", clientStatus, clientErr, tc.wantClient)
+			}
+			if len(records) != 1 {
+				t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
+			}
+			if records[0]["status"] != float64(tc.wantLogged) {
+				t.Errorf("logged status = %v, want %d", records[0]["status"], tc.wantLogged)
+			}
+			if got, _ := records[0]["hijacked"].(bool); got != tc.wantHijacked {
+				t.Errorf("logged hijacked = %v, want %v", records[0]["hijacked"], tc.wantHijacked)
+			}
 		})
-		if clientErr == nil {
-			t.Errorf("client status = %d, want a transport error from the closed connection", clientStatus)
-		}
-		if len(records) != 1 {
-			t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
-		}
-		if records[0]["status"] != float64(http.StatusSwitchingProtocols) {
-			t.Errorf("logged status = %v, want %d", records[0]["status"], http.StatusSwitchingProtocols)
-		}
-	})
+	}
+}
+
+// hijackWriter is a response writer whose Hijack succeeds without a real
+// connection, so the recorder state after a takeover can be checked directly.
+type hijackWriter struct{ http.ResponseWriter }
+
+func (hijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }
+
+func TestStatusRecorderHijackState(t *testing.T) {
+	noop := func(*statusRecorder) {}
+	for _, tc := range []struct {
+		name       string
+		before     func(*statusRecorder) // runs before the hijack
+		after      func(*statusRecorder) // runs after the hijack
+		wantStatus int
+		wantWrote  bool
+	}{
+		{"hijack commits no status", noop, noop, http.StatusOK, false},
+		{"status committed before the hijack is kept", func(r *statusRecorder) {
+			r.WriteHeader(http.StatusNoContent)
+		}, noop, http.StatusNoContent, true},
+		{"WriteHeader after the hijack is ignored", noop, func(r *statusRecorder) {
+			r.WriteHeader(http.StatusInternalServerError)
+		}, http.StatusOK, false},
+		{"Write after the hijack commits nothing", noop, func(r *statusRecorder) {
+			_, _ = r.Write([]byte("raw"))
+		}, http.StatusOK, false},
+		{"flush after the hijack commits nothing", noop, func(r *statusRecorder) {
+			_ = r.FlushError()
+		}, http.StatusOK, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &statusRecorder{ResponseWriter: hijackWriter{httptest.NewRecorder()}, status: http.StatusOK}
+			tc.before(r)
+			if _, _, err := r.Hijack(); err != nil {
+				t.Fatalf("Hijack error = %v", err)
+			}
+			if !r.hijacked {
+				t.Errorf("hijacked = false, want true")
+			}
+			tc.after(r)
+			if r.status != tc.wantStatus || r.wroteHeader != tc.wantWrote {
+				t.Errorf("status = %d, wroteHeader = %v, want %d, %v", r.status, r.wroteHeader, tc.wantStatus, tc.wantWrote)
+			}
+		})
+	}
 }
 
 // plainWriter implements only http.ResponseWriter, so neither flushing nor
