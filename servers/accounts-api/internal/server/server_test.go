@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -169,6 +170,48 @@ func TestStatusRecorderWroteHeader(t *testing.T) {
 	}
 }
 
+// invalidStatusHandler returns a handler that writes a status code that
+// net/http rejects. net/http commits only 100..999 and panics on any other
+// code before it writes a response, so the client never receives the code.
+func invalidStatusHandler(code int) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(code)
+	}
+}
+
+// TestStatusRecorderInvalidStatusCodes checks that a status code that net/http
+// rejects with a panic is never recorded as committed, while valid codes keep
+// their recorded status. The inner writer is plainWriter because
+// httptest.ResponseRecorder also panics on an invalid code, which would hide
+// the recorder state under test.
+func TestStatusRecorderInvalidStatusCodes(t *testing.T) {
+	for _, tc := range []struct {
+		code       int
+		wantWrote  bool
+		wantStatus int
+	}{
+		{0, false, http.StatusOK},
+		{99, false, http.StatusOK},
+		{-1, false, http.StatusOK},
+		{1000, false, http.StatusOK},
+		{99999, false, http.StatusOK},
+		{http.StatusContinue, false, http.StatusOK},
+		{199, false, http.StatusOK},
+		{http.StatusSwitchingProtocols, true, http.StatusSwitchingProtocols},
+		{http.StatusOK, true, http.StatusOK},
+		{600, true, 600},
+		{999, true, 999},
+	} {
+		t.Run(fmt.Sprint(tc.code), func(t *testing.T) {
+			r := &statusRecorder{ResponseWriter: plainWriter{header: http.Header{}}, status: http.StatusOK}
+			r.WriteHeader(tc.code)
+			if r.wroteHeader != tc.wantWrote || r.status != tc.wantStatus {
+				t.Errorf("status = %d, wroteHeader = %v, want %d, %v", r.status, r.wroteHeader, tc.wantStatus, tc.wantWrote)
+			}
+		})
+	}
+}
+
 // startLoggedServer starts a real HTTP server that serves handler behind the
 // request logger and writes the logs to the returned buffer. The returned
 // channel is closed once the logger has finished its request, which is after
@@ -242,6 +285,11 @@ func TestRequestLogOnPanic(t *testing.T) {
 			_, _ = w.Write([]byte("partial"))
 			panic("boom")
 		}, http.StatusOK, len("partial")},
+		{"invalid status 0", invalidStatusHandler(0), http.StatusInternalServerError, 0},
+		{"invalid status 99", invalidStatusHandler(99), http.StatusInternalServerError, 0},
+		{"invalid status -1", invalidStatusHandler(-1), http.StatusInternalServerError, 0},
+		{"invalid status 1000", invalidStatusHandler(1000), http.StatusInternalServerError, 0},
+		{"invalid status 99999", invalidStatusHandler(99999), http.StatusInternalServerError, 0},
 		{"abort handler", func(http.ResponseWriter, *http.Request) {
 			panic(http.ErrAbortHandler)
 		}, http.StatusInternalServerError, 0},
