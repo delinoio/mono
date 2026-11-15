@@ -317,6 +317,28 @@ func TestNewServerDoesNotLogRequestsThatNetHTTPNeverReaches(t *testing.T) {
 		assertRequestRecord(t, records[0], "GET", "/healthz", http.StatusOK, len(healthzBody))
 	})
 
+	// net/http rejects a chunk-size line that does not end in exactly one CRLF,
+	// answers and closes the connection, and never reads the pipelined request.
+	for _, tc := range []struct{ name, sizeLine string }{
+		{"bare LF chunk size", "3\n"},
+		{"CR before the chunk-size terminator", "3\r\r\n"},
+	} {
+		t.Run("after a request with a "+tc.name, func(t *testing.T) {
+			addr, logs := startRequestLogServer(t)
+			response := exchange(t, addr, "POST /a HTTP/1.1\r\nHost: test\r\nTransfer-Encoding: chunked\r\n\r\n"+tc.sizeLine+"abc\r\n0\r\n\r\n"+reject)
+			if strings.Contains(response, "417") {
+				t.Fatalf("response = %q, want no 417 after an invalid chunked body", response)
+			}
+			records := requestRecords(t, logs)
+			if len(records) != 1 {
+				t.Fatalf("got %d http_request records, want exactly 1: %s", len(records), logs.String())
+			}
+			if method, _ := records[0]["method"].(string); method != "POST" {
+				t.Errorf("record = %v, want the POST and no record for the pipelined request", records[0])
+			}
+		})
+	}
+
 	t.Run("after a malformed request", func(t *testing.T) {
 		addr, logs := startRequestLogServer(t)
 		response := exchange(t, addr, "NOT A REQUEST\r\n\r\n"+reject)
