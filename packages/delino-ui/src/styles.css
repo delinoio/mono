@@ -931,6 +931,788 @@
     width: 1px;
   }
 
+  /* Accordion */
+  .dui-accordion {
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-accordion-item {
+    border-bottom: 1px solid var(--dui-color-neutral-hover);
+  }
+
+  .dui-accordion-header {
+    margin: 0;
+  }
+
+  .dui-accordion-trigger {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 52px;
+    padding: 12px 4px;
+    border: 0;
+    background: none;
+    color: var(--dui-color-text);
+    font: inherit;
+    font-size: 15px;
+    font-weight: 600;
+    text-align: start;
+    cursor: pointer;
+  }
+
+  .dui-accordion-trigger:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: -2px;
+    border-radius: 8px;
+  }
+
+  .dui-accordion-trigger[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-accordion-icon {
+    flex: none;
+    width: 16px;
+    height: 16px;
+    color: var(--dui-color-text-muted);
+    transition: rotate 0.2s;
+  }
+
+  .dui-accordion-trigger[data-open] .dui-accordion-icon {
+    rotate: 180deg;
+  }
+
+  /* UI SDK writes the measured height to `--accordion-panel-height`. */
+  .dui-accordion-panel {
+    height: var(--accordion-panel-height);
+    overflow: hidden;
+    color: var(--dui-color-text-muted);
+    font-size: 15px;
+    line-height: 1.5;
+    transition: height 0.2s;
+  }
+
+  .dui-accordion-panel:is([data-starting-style], [data-ending-style]) {
+    height: 0;
+  }
+
+  .dui-accordion-panel-content {
+    padding: 0 4px 16px;
+  }
+
+  /* Collapsible. The trigger uses the button rules. */
+  .dui-collapsible {
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-collapsible-panel {
+    height: var(--collapsible-panel-height);
+    overflow: hidden;
+    color: var(--dui-color-text);
+    transition: height 0.2s;
+  }
+
+  .dui-collapsible-panel:is([data-starting-style], [data-ending-style]) {
+    height: 0;
+  }
+
+  /* Popover. Triggers and close buttons use the button rules. */
+  .dui-popover {
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(320px, calc(100vw - 32px));
+    margin: 0;
+    padding: 16px;
+    border: 1px solid var(--dui-color-neutral-hover);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+    color: var(--dui-color-text);
+    font-family: var(--dui-font-family);
+    transform-origin: var(--transform-origin);
+    transition:
+      opacity 0.15s,
+      scale 0.15s;
+  }
+
+  .dui-popover:is([data-starting-style], [data-ending-style]) {
+    opacity: 0;
+    scale: 0.96;
+  }
+
+  .dui-popover-title {
+    margin: 0 0 4px;
+    font-size: 15px;
+    font-weight: 700;
+  }
+
+  .dui-popover-description {
+    margin: 0 0 12px;
+    color: var(--dui-color-text-muted);
+    font-size: 13px;
+  }
+
+  /* Menu. The trigger uses the button rules; the panel matches the select
+     list. */
+  .dui-menu {
+    box-sizing: border-box;
+    min-width: max(180px, var(--anchor-width));
+    max-height: var(--available-height);
+    overflow-y: auto;
+    margin: 0;
+    padding: 6px;
+    border: 1px solid var(--dui-color-neutral-hover);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+    box-shadow: 0 8px 24px rgb(0 0 0 / 16%);
+    color: var(--dui-color-text);
+    font-family: var(--dui-font-family);
+    transform-origin: var(--transform-origin);
+    transition:
+      opacity 0.15s,
+      scale 0.15s;
+  }
+
+  .dui-menu:is([data-starting-style], [data-ending-style]) {
+    opacity: 0;
+    scale: 0.98;
+  }
+
+  .dui-menu-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 40px;
+    padding: 0 10px;
+    border-radius: 8px;
+    font-size: 15px;
+    cursor: pointer;
+  }
+
+  .dui-menu-item[data-highlighted] {
+    background: var(--dui-color-neutral);
+  }
+
+  .dui-menu-item[data-destructive] {
+    color: var(--dui-color-danger-text);
+  }
+
+  .dui-menu-item:is([data-disabled], [data-pending]) {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-menu-item[data-pending] {
+    cursor: progress;
+  }
+
+  .dui-menu-group-label {
+    padding: 8px 10px 4px;
+    color: var(--dui-color-text-muted);
+    font-size: 12px;
+    font-weight: 600;
+  }
+
+  .dui-menu-separator {
+    height: 1px;
+    margin: 6px 0;
+    background: var(--dui-color-neutral-hover);
+  }
+
+  /* Drawer. UI SDK positions the sheet in its own viewport and drives the
+     sheet's `translate` and the backdrop's opacity, so these rules set only
+     size, surface and color. */
+  .dui-drawer-backdrop {
+    position: fixed;
+    inset: 0;
+    background: var(--dui-color-backdrop);
+  }
+
+  .dui-drawer-content {
+    position: relative;
+    box-sizing: border-box;
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 24px;
+    border: 0;
+    background: var(--dui-color-surface);
+    color: var(--dui-color-text);
+    font-family: var(--dui-font-family);
+    outline: none;
+  }
+
+  .dui-drawer-content:is([data-side="bottom"], [data-side="top"]) {
+    width: 100%;
+    max-width: 640px;
+    margin-inline: auto;
+  }
+
+  .dui-drawer-content[data-side="bottom"] {
+    padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
+    border-radius: var(--dui-radius-panel) var(--dui-radius-panel) 0 0;
+  }
+
+  .dui-drawer-content[data-side="top"] {
+    border-radius: 0 0 var(--dui-radius-panel) var(--dui-radius-panel);
+  }
+
+  .dui-drawer-content:is([data-side="left"], [data-side="right"]) {
+    width: min(400px, calc(100vw - 48px));
+    height: 100%;
+    max-height: none;
+  }
+
+  /* Covers the gap that a drag past the edge would open. */
+  .dui-drawer-content::after {
+    position: absolute;
+    background: inherit;
+    content: "";
+  }
+
+  .dui-drawer-content[data-side="bottom"]::after {
+    top: 100%;
+    inset-inline: 0;
+    height: 96px;
+  }
+
+  .dui-drawer-content[data-side="top"]::after {
+    bottom: 100%;
+    inset-inline: 0;
+    height: 96px;
+  }
+
+  .dui-drawer-content[data-side="left"]::after {
+    right: 100%;
+    inset-block: 0;
+    width: 96px;
+  }
+
+  .dui-drawer-content[data-side="right"]::after {
+    left: 100%;
+    inset-block: 0;
+    width: 96px;
+  }
+
+  .dui-drawer-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 24px;
+  }
+
+  /* Slider. The field, label and description share the text field rules. */
+  .dui-slider {
+    display: grid;
+    gap: 6px;
+  }
+
+  .dui-slider-header {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .dui-slider-value {
+    color: var(--dui-color-text-muted);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .dui-slider-control {
+    display: flex;
+    align-items: center;
+    width: 100%;
+    height: 24px;
+    touch-action: none;
+  }
+
+  .dui-slider-control[data-orientation="vertical"] {
+    justify-content: center;
+    width: 24px;
+    height: 160px;
+  }
+
+  .dui-slider-track {
+    width: 100%;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--dui-color-neutral-hover);
+  }
+
+  .dui-slider-track[data-orientation="vertical"] {
+    width: 6px;
+    height: 100%;
+  }
+
+  .dui-slider-indicator {
+    border-radius: inherit;
+    background: var(--dui-color-accent);
+  }
+
+  .dui-slider-thumb {
+    box-sizing: border-box;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--dui-color-accent);
+    border-radius: 50%;
+    background: #ffffff;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 20%);
+    cursor: grab;
+  }
+
+  .dui-slider-thumb[data-dragging] {
+    cursor: grabbing;
+  }
+
+  .dui-slider-thumb:has(:focus-visible) {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .dui-slider-thumb[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Number input. The field, label, description and error share the text
+     field rules. */
+  .dui-number-input-group {
+    display: inline-flex;
+    align-items: stretch;
+    box-sizing: border-box;
+    min-height: 44px;
+    border: 1px solid var(--dui-color-border);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+  }
+
+  .dui-number-input-group:has(:focus-visible) {
+    border-color: var(--dui-color-focus-ring);
+    outline: 1px solid var(--dui-color-focus-ring);
+  }
+
+  .dui-text-field[data-invalid] .dui-number-input-group {
+    border-color: var(--dui-color-danger-text);
+  }
+
+  .dui-number-input-group[data-disabled] {
+    opacity: 0.5;
+  }
+
+  .dui-number-input-control {
+    box-sizing: border-box;
+    width: 80px;
+    min-width: 0;
+    padding: 0 4px;
+    border: 0;
+    background: transparent;
+    color: var(--dui-color-text);
+    font: inherit;
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    outline: none;
+  }
+
+  .dui-number-input-button {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 44px;
+    padding: 0;
+    border: 0;
+    border-radius: var(--dui-radius-control);
+    background: none;
+    color: var(--dui-color-text);
+    cursor: pointer;
+  }
+
+  .dui-number-input-button svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .dui-number-input-button:hover:not([data-disabled]) {
+    background: var(--dui-color-neutral);
+  }
+
+  .dui-number-input-button:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: -2px;
+  }
+
+  .dui-number-input-button[data-disabled] {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  /* Password input. The field, label, description and error share the text
+     field rules. */
+  .dui-password-input {
+    display: flex;
+    align-items: center;
+    box-sizing: border-box;
+    width: 100%;
+    min-height: 44px;
+    padding: 0 4px 0 14px;
+    border: 1px solid var(--dui-color-border);
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-surface);
+  }
+
+  .dui-password-input:has(.dui-password-input-control:focus-visible) {
+    border-color: var(--dui-color-focus-ring);
+    outline: 1px solid var(--dui-color-focus-ring);
+  }
+
+  .dui-text-field[data-invalid] .dui-password-input {
+    border-color: var(--dui-color-danger-text);
+  }
+
+  .dui-password-input[data-disabled] {
+    opacity: 0.5;
+  }
+
+  .dui-password-input-control {
+    flex: 1;
+    min-width: 0;
+    height: 42px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--dui-color-text);
+    font: inherit;
+    font-size: 15px;
+    outline: none;
+  }
+
+  .dui-password-input-toggle {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    padding: 0;
+    border: 0;
+    border-radius: 8px;
+    background: none;
+    color: var(--dui-color-text-muted);
+    cursor: pointer;
+  }
+
+  .dui-password-input-toggle svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  .dui-password-input-toggle:hover:not([data-disabled]) {
+    background: var(--dui-color-neutral);
+    color: var(--dui-color-text);
+  }
+
+  .dui-password-input-toggle:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 0;
+  }
+
+  .dui-password-input-toggle[data-disabled] {
+    cursor: not-allowed;
+  }
+
+  /* Segmented control. UI SDK measures the checked item into the indicator's
+     `--segmented-control-indicator-*` properties. Unchecked text contrast:
+     #4e5968 on #f2f4f6 6.45:1, dark #b0b8c1 on #2c2c35 6.90:1. */
+  .dui-segmented-control {
+    position: relative;
+    display: inline-flex;
+    isolation: isolate;
+    gap: 2px;
+    box-sizing: border-box;
+    padding: 3px;
+    border-radius: var(--dui-radius-control);
+    background: var(--dui-color-neutral);
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-segmented-control[data-orientation="vertical"] {
+    flex-direction: column;
+  }
+
+  .dui-segmented-control-indicator {
+    position: absolute;
+    z-index: -1;
+    top: var(--segmented-control-indicator-top);
+    left: var(--segmented-control-indicator-left);
+    width: var(--segmented-control-indicator-width);
+    height: var(--segmented-control-indicator-height);
+    border-radius: 9px;
+    background: var(--dui-color-surface);
+    box-shadow: 0 1px 3px rgb(0 0 0 / 12%);
+    transition-property: top, left, width, height;
+    transition-duration: 0.2s;
+  }
+
+  .dui-segmented-control-item {
+    min-height: 34px;
+    padding: 0 14px;
+    border: 0;
+    border-radius: 9px;
+    background: none;
+    color: var(--dui-color-text-muted);
+    font: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: color 0.15s;
+  }
+
+  .dui-segmented-control-item[data-checked] {
+    color: var(--dui-color-text);
+  }
+
+  .dui-segmented-control-item:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 0;
+  }
+
+  .dui-segmented-control-item[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  /* Toggle */
+  .dui-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    box-sizing: border-box;
+    border: 0;
+    border-radius: var(--dui-radius-control);
+    background: none;
+    color: var(--dui-color-text-muted);
+    font-family: var(--dui-font-family);
+    font-weight: 600;
+    cursor: pointer;
+    transition:
+      background-color 0.15s,
+      color 0.15s;
+  }
+
+  .dui-toggle[data-size="small"] {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0 8px;
+    font-size: 13px;
+  }
+
+  .dui-toggle[data-size="medium"] {
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0 12px;
+    font-size: 15px;
+  }
+
+  .dui-toggle[data-size="large"] {
+    min-width: 52px;
+    min-height: 52px;
+    padding: 0 16px;
+    font-size: 17px;
+  }
+
+  .dui-toggle:hover:not([data-disabled]) {
+    background: var(--dui-color-neutral);
+    color: var(--dui-color-text);
+  }
+
+  .dui-toggle[data-pressed] {
+    background: var(--dui-color-neutral-hover);
+    color: var(--dui-color-text);
+  }
+
+  .dui-toggle:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .dui-toggle[data-disabled] {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .dui-toggle-group {
+    display: inline-flex;
+    gap: 4px;
+  }
+
+  .dui-toggle-group[data-orientation="vertical"] {
+    flex-direction: column;
+  }
+
+  /* Pagination */
+  .dui-pagination {
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-pagination-list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .dui-pagination-link,
+  .dui-pagination-step {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    box-sizing: border-box;
+    min-width: 40px;
+    min-height: 40px;
+    padding: 0 8px;
+    border: 0;
+    border-radius: 10px;
+    background: none;
+    color: var(--dui-color-text);
+    font: inherit;
+    font-size: 15px;
+    font-variant-numeric: tabular-nums;
+    text-decoration: none;
+    cursor: pointer;
+  }
+
+  .dui-pagination-link:hover,
+  .dui-pagination-step:hover:not([data-disabled]) {
+    background: var(--dui-color-neutral);
+  }
+
+  .dui-pagination-link[data-current] {
+    background: var(--dui-color-text);
+    color: var(--dui-color-surface);
+    font-weight: 600;
+  }
+
+  .dui-pagination-link:focus-visible,
+  .dui-pagination-step:focus-visible {
+    outline: 2px solid var(--dui-color-focus-ring);
+    outline-offset: 2px;
+  }
+
+  .dui-pagination-step svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  .dui-pagination-step[data-disabled] {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
+
+  .dui-pagination-ellipsis {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 32px;
+    color: var(--dui-color-text-muted);
+  }
+
+  .dui-pagination-ellipsis:empty::before {
+    content: "…";
+  }
+
+  /* Badge. Neutral text contrast: #191f28 on #f2f4f6 15.02:1, dark #f9fafb
+     on #2c2c35 13.23:1. White on the accent and danger colors is measured
+     above. */
+  .dui-badge {
+    display: inline-flex;
+    align-items: center;
+    box-sizing: border-box;
+    min-height: 22px;
+    padding: 0 8px;
+    border-radius: 6px;
+    font-family: var(--dui-font-family);
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+
+  .dui-badge[data-variant="neutral"] {
+    background: var(--dui-color-neutral);
+    color: var(--dui-color-text);
+  }
+
+  .dui-badge[data-variant="accent"] {
+    background: var(--dui-color-accent);
+    color: var(--dui-color-on-accent);
+  }
+
+  .dui-badge[data-variant="danger"] {
+    background: var(--dui-color-danger);
+    color: var(--dui-color-on-accent);
+  }
+
+  /* Card */
+  .dui-card {
+    box-sizing: border-box;
+    padding: 20px;
+    border: 1px solid var(--dui-color-neutral-hover);
+    border-radius: var(--dui-radius-panel);
+    background: var(--dui-color-surface);
+    color: var(--dui-color-text);
+    font-family: var(--dui-font-family);
+  }
+
+  .dui-card-title {
+    margin: 0 0 4px;
+    font-size: 17px;
+    font-weight: 700;
+  }
+
+  .dui-card-description {
+    margin: 0;
+    color: var(--dui-color-text-muted);
+    font-size: 15px;
+  }
+
+  .dui-card-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 16px;
+  }
+
+  /* Skeleton */
+  .dui-skeleton {
+    display: block;
+    width: 100%;
+    height: 1em;
+    border-radius: 6px;
+    background: var(--dui-color-neutral-hover);
+    animation: dui-skeleton-pulse 1.5s ease-in-out infinite;
+  }
+
+  .dui-skeleton[data-circle] {
+    border-radius: 50%;
+  }
+
+  @keyframes dui-skeleton-pulse {
+    50% {
+      opacity: 0.5;
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     .dui-button,
     .dui-switch,
@@ -942,7 +1724,15 @@
     .dui-select-content,
     .dui-tabs-tab,
     .dui-tooltip,
-    .dui-progress-indicator {
+    .dui-progress-indicator,
+    .dui-accordion-icon,
+    .dui-accordion-panel,
+    .dui-collapsible-panel,
+    .dui-popover,
+    .dui-menu,
+    .dui-segmented-control-indicator,
+    .dui-segmented-control-item,
+    .dui-toggle {
       transition: none;
     }
 
@@ -952,6 +1742,10 @@
 
     .dui-progress-indicator[data-indeterminate] {
       animation-duration: 3s;
+    }
+
+    .dui-skeleton {
+      animation: none;
     }
   }
 }
