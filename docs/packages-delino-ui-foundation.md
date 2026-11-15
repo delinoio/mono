@@ -76,6 +76,52 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `Progress`: a named progress bar. Props: `label` (required), `showValue` (shows the formatted value, such as `40%`), and all UI SDK `Progress` props such as `value`, `min`, `max` and `format`. A `null` value shows an indeterminate bar.
 - `delino-ui/separator`
   - `Separator`: a styled UI SDK `Separator` with all its props, such as `orientation`.
+- `delino-ui/password-input`
+  - `PasswordInput`: a labeled password field with a show/hide button. Props: `label` (required), `description`, `error`, `toggleLabel` (the button's accessible name, default `Show password`), `placeholder`, `autoFocus`, and all UI SDK `PasswordInput` props such as `value`, `defaultValue`, `onValueChange`, `visible`, `autoComplete`, `name`, `required` and `disabled`. The button keeps the same name in both states and reports the state with `aria-pressed`. It follows the same error and focus rules as `TextField`.
+- `delino-ui/number-input`
+  - `NumberInput`: a labeled number field with minus and plus buttons. Props: `label` (required), `description`, `error`, `decrementLabel` and `incrementLabel` (button names, default `Decrease` and `Increase`), `placeholder`, `autoFocus`, and all UI SDK `NumberInput` props such as `value`, `defaultValue`, `onValueChange`, `onValueCommit`, `min`, `max`, `step`, `format`, `name` and `disabled`. An empty input has the value `null`. It follows the same error and focus rules as `TextField`.
+- `delino-ui/slider`
+  - `Slider`: a labeled slider. Props: `label` (required), `description`, `showValue` (shows the formatted value), `thumbLabels` (the accessible names of range thumbs), and all UI SDK `Slider` props such as `value`, `defaultValue`, `onValueChange`, `onValueCommit`, `min`, `max`, `step`, `format`, `name` and `disabled`. A number value renders one thumb named by `label`; an array value renders one thumb per value, named by `thumbLabels`.
+- `delino-ui/segmented-control`
+  - `SegmentedControl` and `SegmentedControlItem`: a row of mutually exclusive choices with a highlight that slides to the checked item. They accept all UI SDK `SegmentedControl` and `SegmentedControlItem` props. Consumers name the control with `aria-label` or a surrounding field label.
+- `delino-ui/toggle`
+  - `Toggle`: a styled UI SDK `Toggle` with all its props and `size` (`ButtonSize`, default `Medium`). It reports its state with `aria-pressed`.
+  - `ToggleGroup`: a styled UI SDK `ToggleGroup` with all its props. Each `Toggle` inside has a `value`; one is pressed at a time unless `multiple` is set. Consumers name it with `aria-label`.
+- `delino-ui/accordion`
+  - `Accordion`: a styled UI SDK `Accordion` with all its props. The value is an array of open item values; one item opens at a time unless `multiple` is set.
+  - `AccordionItem`: one section. Props: `title` (required, the heading text), `headingLevel` (`AccordionHeadingLevel`), `children` (the panel content) and the other UI SDK `AccordionItem` props such as `value` and `disabled`. It renders the heading, trigger button and panel; the panel height animates.
+  - `AccordionHeadingLevel`: `H2` (`h2`) to `H6` (`h6`). The default is `H3`.
+  - `createAccordionController` and the `AccordionController` type are re-exported from UI SDK.
+- `delino-ui/collapsible`
+  - `Collapsible`, `CollapsibleTrigger` and `CollapsiblePanel`: styled UI SDK collapsible parts with all their props. The trigger is styled like `Button`, with `variant` (default `Secondary`) and `size`. The panel height animates.
+  - `createCollapsibleController` and the `CollapsibleController` type are re-exported from UI SDK.
+- `delino-ui/popover`
+  - `Popover`: the popover root. It accepts the UI SDK `Popover` props except `dismissible`, which is removed because the content has the dialog role and must close with the Escape key.
+  - `PopoverTrigger` and `PopoverClose`: buttons styled like `Button`, with `variant` and `size`. Both default to `Secondary`; the close button defaults to `Small`.
+  - `PopoverContent` (defaults `sideOffset` to 8 pixels), `PopoverTitle` (level 2 heading, names the popover) and `PopoverDescription`.
+  - `createPopoverController` and the `PopoverController` type are re-exported from UI SDK.
+- `delino-ui/menu`
+  - `Menu`: a UI SDK `Menu` with all its props. Each `MenuItem` has a `value`, and `onAction` receives it. A Promise returned from `onAction` keeps the item pending and the menu open until it settles.
+  - `MenuTrigger`: a button styled like `Button`, with `variant` (default `Secondary`) and `size`.
+  - `MenuContent` (defaults `sideOffset` to 8 pixels), `MenuItem` (`destructive` shows the danger color), `MenuGroup`, `MenuGroupLabel` and `MenuSeparator`: styled UI SDK parts with all their props.
+  - `createMenuController` and the `MenuController` type are re-exported from UI SDK.
+- `delino-ui/drawer`
+  - `Drawer`: a sheet that slides in from an edge of the screen. It accepts the UI SDK `Drawer` props, such as `side`, `snapPoints` and `modal`, except `dismissible`, which is removed so that every drawer closes with the Escape key.
+  - `DrawerTrigger` and `DrawerClose`: buttons styled like `Button`, with `variant` and `size`. The trigger defaults to `Primary`, the close button to `Secondary`. A Promise returned from the `DrawerClose` `action` keeps the drawer open until it settles.
+  - `DrawerContent` (renders the backdrop), `DrawerTitle` (level 2 heading, names the drawer), `DrawerDescription` and `DrawerActions` (button row). UI SDK moves the sheet and fades the backdrop; the styles set only size, surface and color.
+  - `createDrawerController` and the `DrawerController` and `DrawerSide` types are re-exported from UI SDK.
+- `delino-ui/pagination`
+  - `Pagination`: a navigation landmark with previous and next steps, page links and ellipses for long ranges. Props: `aria-label` (required), `previousLabel` and `nextLabel` (step names, default `Previous page` and `Next page`), and all UI SDK `Pagination` props such as `page`, `defaultPage`, `onPageChange`, `pageCount`, `total`, `pageSize`, `siblings`, `boundaries` and `getHref`. With `getHref` the parts are links; without it they are buttons. The current page has `aria-current="page"`.
+  - `createPaginationController` and the `PaginationController` type are re-exported from UI SDK.
+- `delino-ui/meter`
+  - `Meter`: a named measurement bar within a known range, such as storage used. Props: `label` (required), `showValue`, and all UI SDK `Meter` props such as `value`, `min`, `max` and `format`. It shares the `Progress` styles. Use `Progress` for the progress of a task.
+- `delino-ui/badge`
+  - `Badge`: a short status or count label in a `span`, with all `span` props. It has no UI SDK part because it has no behavior. Its text must carry the meaning; color alone must not.
+  - `BadgeVariant`: `Neutral` (`neutral`), `Accent` (`accent`), `Danger` (`danger`). The default is `Neutral`.
+- `delino-ui/card`
+  - `Card` (a `section`), `CardTitle` (level 3 heading), `CardDescription` and `CardActions` (button row): a static surface that groups related content, with all props of their elements. Consumers name the card with `aria-labelledby` pointing to its title, or with `aria-label`.
+- `delino-ui/skeleton`
+  - `Skeleton`: a pulsing placeholder for loading content. Props: `width` and `height` (CSS lengths; defaults `100%` and `1em`), `circle`, and the other `span` props except `children`. It is hidden from screen readers; consumers mark the loading region with `aria-busy`. The pulse stops under `prefers-reduced-motion`.
 - `delino-ui/styles.css`
   - Declares the cascade layer order `ui-sdk, delino-ui`. UI SDK rules are in `ui-sdk`; package rules are in `delino-ui`. Unlayered app styles override both.
   - Includes the UI SDK rule that hides closed parts with `hidden`, because statically rendered pages do not get it from UI SDK before hydration.
@@ -101,7 +147,7 @@ Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
 - `pnpm exec turbo run typecheck --filter=delino-ui`: TypeScript type check.
-- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior.
+- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior. `src/components.test.tsx` and `src/disclosure-and-input.test.tsx` hold them.
 
 Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI does not run its unit tests yet; add them to the workflow and its planner when package checks enter CI.
 
