@@ -4,10 +4,13 @@
 package server
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -84,19 +87,24 @@ func handleHealthz(logger *slog.Logger) http.HandlerFunc {
 // the first WriteHeader call or by the first implicit Write. bytes counts the
 // response body bytes net/http transmits; noBody marks a response that has no
 // body on the wire (a HEAD response), so body bytes the handler writes are
-// discarded by net/http and must not be counted.
+// discarded by net/http and must not be counted. hijacked reports that the
+// handler took over the connection: net/http then sends nothing and tracks no
+// response, so the recorder cannot know what status, if any, the client
+// received, and it stops recording statuses.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int
 	bytes       int
 	wroteHeader bool
 	noBody      bool
+	hijacked    bool
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
 	// net/http sends informational 1xx headers (except 101 Switching Protocols)
-	// without committing the final status, so they must not be recorded.
-	if !r.wroteHeader && (status < http.StatusContinue || status >= http.StatusOK || status == http.StatusSwitchingProtocols) {
+	// without committing the final status, so they must not be recorded. After
+	// a hijack net/http ignores the call, so nothing is committed either.
+	if !r.hijacked && !r.wroteHeader && (status < http.StatusContinue || status >= http.StatusOK || status == http.StatusSwitchingProtocols) {
 		r.status = status
 		r.wroteHeader = true
 	}
@@ -104,8 +112,11 @@ func (r *statusRecorder) WriteHeader(status int) {
 }
 
 func (r *statusRecorder) Write(body []byte) (int, error) {
-	// An implicit WriteHeader(200) commits the default status.
-	r.wroteHeader = true
+	// An implicit WriteHeader(200) commits the default status, except after a
+	// hijack, when net/http rejects the write with http.ErrHijacked.
+	if !r.hijacked {
+		r.wroteHeader = true
+	}
 	n, err := r.ResponseWriter.Write(body)
 	if !r.noBody {
 		r.bytes += n
@@ -113,7 +124,53 @@ func (r *statusRecorder) Write(body []byte) (int, error) {
 	return n, err
 }
 
-// Unwrap lets http.ResponseController reach the underlying writer.
+// commitStatus records status as the committed status unless a status is
+// already committed, which keeps the first-committed-status rule.
+func (r *statusRecorder) commitStatus(status int) {
+	if !r.hijacked && !r.wroteHeader {
+		r.status = status
+		r.wroteHeader = true
+	}
+}
+
+// FlushError sends buffered data to the client. net/http commits the response
+// header on the first flush, with 200 when no status was written, so the
+// recorder must observe it: http.ResponseController would otherwise reach the
+// underlying writer through Unwrap and the log of a later handler panic would
+// substitute 500 for a status the client already received. It delegates through
+// a ResponseController so a wrapped inner writer still works, and records the
+// status only when the inner writer supports flushing.
+func (r *statusRecorder) FlushError() error {
+	err := http.NewResponseController(r.ResponseWriter).Flush()
+	if !errors.Is(err, http.ErrNotSupported) {
+		r.commitStatus(http.StatusOK)
+	}
+	return err
+}
+
+// Flush implements http.Flusher for handlers that assert that interface
+// instead of using http.ResponseController. It ignores the error, as
+// http.Flusher has no way to return it.
+func (r *statusRecorder) Flush() {
+	_ = r.FlushError()
+}
+
+// Hijack takes over the connection. A hijack only transfers the connection: the
+// handler may then send a 101 switch, a raw response with any other status, or
+// nothing, and the recorder cannot observe which. A successful hijack therefore
+// records the takeover separately from the committed status and commits no
+// status itself. A failed hijack (an unsupported writer or HTTP/2) leaves the
+// state unchanged.
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	conn, rw, err := http.NewResponseController(r.ResponseWriter).Hijack()
+	if err == nil {
+		r.hijacked = true
+	}
+	return conn, rw, err
+}
+
+// Unwrap lets http.ResponseController reach the underlying writer for the
+// operations that statusRecorder does not implement itself.
 func (r *statusRecorder) Unwrap() http.ResponseWriter {
 	return r.ResponseWriter
 }
@@ -141,12 +198,19 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 		returned := false
 		defer func() {
 			status := recorder.status
-			if !returned && !recorder.wroteHeader {
+			if !returned && !recorder.wroteHeader && !recorder.hijacked {
 				// The handler did not return and nothing was committed, so
 				// net/http will not send a response; record it as a failure.
+				// A hijacked connection is excluded: net/http sends no response
+				// for it, and the handler may have written its own, so a 500
+				// would be a status the recorder cannot know.
 				status = http.StatusInternalServerError
 			}
-			logRequest(r.Context(), logger, r.Method, r.URL.Path, status, time.Since(start), recorder.bytes)
+			var attrs []slog.Attr
+			if recorder.hijacked {
+				attrs = append(attrs, slog.Bool("hijacked", true))
+			}
+			logRequest(r.Context(), logger, r.Method, r.URL.Path, status, time.Since(start), recorder.bytes, attrs...)
 		}()
 		next.ServeHTTP(recorder, r)
 		returned = true
@@ -155,13 +219,16 @@ func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 
 // logRequest writes the http_request record. It is the only place that defines
 // the record shape, shared by the request logger and by the observer that logs
-// requests net/http rejects before the handler runs.
-func logRequest(ctx context.Context, logger *slog.Logger, method, path string, status int, duration time.Duration, bytes int) {
-	logger.InfoContext(ctx, "http_request",
+// requests net/http rejects before the handler runs. extra attributes follow
+// the fixed fields; the request logger uses them only for a hijacked
+// connection, so the record of every other request keeps its shape.
+func logRequest(ctx context.Context, logger *slog.Logger, method, path string, status int, duration time.Duration, bytes int, extra ...slog.Attr) {
+	attrs := []slog.Attr{
 		slog.String("method", method),
 		slog.String("path", path),
 		slog.Int("status", status),
 		slog.Int64("duration_ms", duration.Milliseconds()),
 		slog.Int("bytes", bytes),
-	)
+	}
+	logger.LogAttrs(ctx, slog.LevelInfo, "http_request", append(attrs, extra...)...)
 }
