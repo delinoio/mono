@@ -864,6 +864,121 @@ func TestHandlerResponseBytesAreNeverARejection(t *testing.T) {
 	}
 }
 
+// requestRecord is the part of an http_request record that the 417 tests
+// compare.
+type requestRecord struct {
+	Path   string `json:"path"`
+	Status int    `json:"status"`
+	Bytes  int64  `json:"bytes"`
+}
+
+// requestRecords returns the http_request records in logs, in log order.
+func requestRecords(t *testing.T, logs *lockedBuffer) []requestRecord {
+	t.Helper()
+	var records []requestRecord
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry struct {
+			Msg string `json:"msg"`
+			requestRecord
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		if entry.Msg == "http_request" {
+			records = append(records, entry.requestRecord)
+		}
+	}
+	return records
+}
+
+// TestHandlerExpectationFailedIsNotClaimedAsARejection pipelines a request with
+// an unsupported Expect header behind a request whose handler answers 417
+// itself. The Expect request is queued as the oldest pending request when the
+// handler's response is flushed, so a handler 417 that carries Connection: close
+// has the same bytes as the 417 that net/http writes for a rejection. The
+// observer must not claim those bytes: net/http never read or answered the
+// Expect request when the handler closes the connection.
+func TestHandlerExpectationFailedIsNotClaimedAsARejection(t *testing.T) {
+	const (
+		teapot  = "GET /teapot HTTP/1.1\r\nHost: t\r\n\r\n"
+		missing = "GET /missing HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n"
+	)
+	for _, tc := range []struct {
+		name string
+		// handlerClose makes the /teapot handler send Connection: close with its 417.
+		handlerClose bool
+		// request is written to the connection in one write.
+		request string
+		// statuses is the number of 417 status lines the client must read.
+		statuses int
+		records  []requestRecord
+	}{
+		{
+			name:         "handler 417 with Connection close logs only the handler's request",
+			handlerClose: true,
+			request:      teapot + missing,
+			statuses:     1,
+			records:      []requestRecord{{Path: "/teapot", Status: 417, Bytes: 0}},
+		},
+		{
+			name:         "handler 417 without Connection close still logs the request that net/http rejects",
+			handlerClose: false,
+			request:      teapot + missing,
+			statuses:     2,
+			records: []requestRecord{
+				{Path: "/teapot", Status: 417, Bytes: 0},
+				{Path: "/missing", Status: 417, Bytes: 0},
+			},
+		},
+		{
+			name:     "a lone Expect request is logged once",
+			request:  missing,
+			statuses: 1,
+			records:  []requestRecord{{Path: "/missing", Status: 417, Bytes: 0}},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/teapot" {
+					return
+				}
+				if tc.handlerClose {
+					w.Header().Set("Connection", "close")
+				}
+				w.WriteHeader(http.StatusExpectationFailed)
+			})
+			conn, err := net.Dial("tcp", addr)
+			if err != nil {
+				t.Fatalf("dial: %v", err)
+			}
+			defer conn.Close()
+			_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+			if _, err := io.WriteString(conn, tc.request); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			// net/http closes the connection after a 417 with Connection: close, and
+			// after its own 417, so the read ends at EOF.
+			response, _ := io.ReadAll(conn)
+			if got := bytes.Count(response, []byte("HTTP/1.1 417 Expectation Failed\r\n")); got != tc.statuses {
+				t.Errorf("417 status lines = %d, want %d: %q", got, tc.statuses, response)
+			}
+			// The observer logs a net/http rejection before it writes the response,
+			// and the request logger logs after the handler returns, which is before
+			// net/http flushes the handler's response. The client has read to EOF, so
+			// every record exists; the connection teardown is the only thing left.
+			if got := requestRecords(t, logs); !reflect.DeepEqual(got, tc.records) {
+				t.Errorf("http_request records = %+v, want %+v: %s", got, tc.records, logs.String())
+			}
+			if got := countRecords(logs, "http_request_rejected"); got != 0 {
+				t.Errorf("http_request_rejected records = %d, want none: %s", got, logs.String())
+			}
+		})
+	}
+}
+
 // TestLeadingCRLFAfterAPostKeepsTheConnectionObserved sends raw bytes to a real
 // net/http server. net/http discards up to four leading CR or LF bytes after a
 // POST, so it answers the request that follows (here a 417) and the observer
