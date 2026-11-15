@@ -82,29 +82,34 @@ function isRegularFile(cwd, name, skipGone = true) {
   }
 }
 
-// Git index mode of a tracked symbolic link.
+// Git index modes of entries whose worktree form is not a formattable blob: a
+// tracked symbolic link and a gitlink (submodule commit pointer).
 const SymlinkMode = "120000";
+const GitlinkMode = "160000";
 
-// Paths recorded as symbolic links in the current index. A checkout without
+// Paths recorded with one of `modes` in the current index. A checkout without
 // symlink support (Windows without privileges, `core.symlinks=false`) writes
-// such a path as a regular file holding the link target, so the worktree file
-// type alone cannot identify it; formatting would rewrite the placeholder and
-// change what Git records. `git ls-files --stage` reads the index that Git
+// a symlink path as a regular file holding the link target, so the worktree
+// file type alone cannot identify it; formatting would rewrite the placeholder
+// and change what Git records. A gitlink is a directory in the worktree and
+// has no blob to format. `git ls-files --stage` reads the index that Git
 // resolves from the environment (honoring GIT_INDEX_FILE inside hooks), so it
 // is the validation index, works before the first commit and never consults the
 // comparison head. Each entry is `<mode> <object> <stage>\t<path>`; the path
 // follows the first tab and may itself contain tabs or newlines.
-function recordedSymlinks(cwd) {
-  const symlinks = new Set();
+function recordedPaths(cwd, modes) {
+  const paths = new Set();
   for (const entry of git(cwd, "ls-files", "--stage", "-z").split("\0")) {
     const tab = entry.indexOf("\t");
     if (tab === -1) continue;
-    if (entry.slice(0, tab).split(" ")[0] === SymlinkMode) {
-      symlinks.add(entry.slice(tab + 1));
+    if (modes.includes(entry.slice(0, tab).split(" ")[0])) {
+      paths.add(entry.slice(tab + 1));
     }
   }
-  return symlinks;
+  return paths;
 }
+
+const recordedSymlinks = (cwd) => recordedPaths(cwd, [SymlinkMode]);
 
 export function allFormatFiles(start) {
   const cwd = repositoryRoot(start);
@@ -155,16 +160,31 @@ function excludedByRstack(cwd, name) {
   }
 }
 
+// Human-readable kind of a non-regular lstat result for diagnostics.
+function entryKind(stats) {
+  if (stats.isDirectory()) return "directory";
+  if (stats.isSymbolicLink()) return "symbolic link";
+  if (stats.isFIFO()) return "FIFO";
+  if (stats.isSocket()) return "socket";
+  if (stats.isBlockDevice()) return "block device";
+  if (stats.isCharacterDevice()) return "character device";
+  return "non-regular file";
+}
+
 // Staged deletions are excluded by --diff-filter, so every selected path is a
 // staged addition, modification, rename or type change. Such a path that is
 // missing from the working tree (removed after `git add`, or outside a sparse
-// checkout) has a staged blob that `--write` would never format. Fail naming the
-// path instead of silently skipping it, so the commit cannot bypass formatting.
-// A path that the shared exclusions skip is never formatted even when present,
-// so its absence is irrelevant and, like the unstaged selectors, it is skipped.
+// checkout) or that exists as a non-regular entry (for example a directory
+// that replaced the file) has a staged blob that `--write` would never format.
+// Fail naming the path instead of silently skipping it, so the commit cannot
+// bypass formatting. A path that the shared exclusions skip is never formatted
+// even when present, so its absence or type is irrelevant and, like the
+// unstaged selectors, it is skipped. Symlinks and gitlinks recorded in the
+// index are exempted by the caller before the worktree is consulted.
 function stagedRegularFile(cwd, name) {
+  let stats;
   try {
-    return isRegularFile(cwd, name, false);
+    stats = lstatSync(resolve(cwd, name));
   } catch (error) {
     if (!goneCodes.has(error.code)) throw error;
     if (excludedByRstack(cwd, name)) return false;
@@ -173,11 +193,16 @@ function stagedRegularFile(cwd, name) {
       { cause: error },
     );
   }
+  if (stats.isFile()) return true;
+  if (excludedByRstack(cwd, name)) return false;
+  throw new Error(
+    `Staged path exists in the working tree as a ${entryKind(stats)}, not a regular file, and cannot be formatted: ${name}. Restore the regular file, or unstage it with "git restore --staged -- <path>" (or "git rm --cached -- <path>" to commit its deletion), then commit again.`,
+  );
 }
 
 export function stagedFormatFiles(start) {
   const cwd = repositoryRoot(start);
-  const symlinks = recordedSymlinks(cwd);
+  const exempt = recordedPaths(cwd, [SymlinkMode, GitlinkMode]);
   return git(
     cwd,
     "diff",
@@ -191,10 +216,11 @@ export function stagedFormatFiles(start) {
     .split("\0")
     .filter((name) => {
       // Every exemption runs before the worktree is consulted, so none of them
-      // can hit the missing-file failure: an unsupported extension, a path the
-      // index records as a symlink, and, inside stagedRegularFile, a path
-      // excluded by the shared Rstack configuration.
-      if (!isFormattableExtension(name) || symlinks.has(name)) return false;
+      // can hit the missing-file or non-regular-file failure: an unsupported
+      // extension, a path the index records as a symlink or gitlink, and,
+      // inside stagedRegularFile, a path excluded by the shared Rstack
+      // configuration.
+      if (!isFormattableExtension(name) || exempt.has(name)) return false;
       return stagedRegularFile(cwd, name);
     })
     .sort();

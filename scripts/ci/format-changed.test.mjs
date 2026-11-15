@@ -626,6 +626,144 @@ test("pre-commit rejects a staged skip-worktree file missing from the worktree a
   assert.notEqual(f.git("rev-parse", "HEAD"), head);
 });
 
+// A staged path that exists as a directory (a file replaced by a directory
+// after `git add`) has a staged blob that `--write` would never format, so it
+// must fail like a missing path instead of yielding zero candidates.
+const runStagedCli = (f) =>
+  spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/format-changed.mjs"), "--staged", "--write"],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+
+test("staged selection fails for a staged file replaced by a directory", (t) => {
+  const f = fixture(t);
+  f.write("staged.ts", "const   value = 1;\n");
+  f.write("other.ts", "const value = 2;\n");
+  f.git("add", "staged.ts", "other.ts");
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["other.ts", "staged.ts"]);
+  rmSync(join(f.cwd, "staged.ts"));
+  mkdirSync(join(f.cwd, "staged.ts"));
+  assert.throws(
+    () => stagedFormatFiles(f.cwd),
+    (error) => {
+      assert.match(error.message, /staged\.ts/u);
+      assert.match(error.message, /directory/u);
+      assert.match(error.message, /not a regular file/u);
+      assert.doesNotMatch(error.message, /missing from the working tree/u);
+      return true;
+    },
+  );
+  const result = runStagedCli(f);
+  const output = result.stdout + result.stderr;
+  assert.equal(result.status, 2, output);
+  assert.equal(output.match(/ci_format_error/gu)?.length, 1, output);
+  assert.match(output, /staged\.ts/u);
+  assert.doesNotMatch(output, /candidates":?\s*[1-9]/u);
+});
+
+test("staged selection keeps a regular file selected and skips an excluded path replaced by a directory", (t) => {
+  const f = fixture(t);
+  f.write("regular.ts", "const   value = 1;\n");
+  f.write("vendor/lib.ts", "const   value = 1;\n");
+  f.write("pnpm-lock.yaml", "lockfileVersion:   '9.0'\n");
+  f.git("add", ".");
+  rmSync(join(f.cwd, "vendor/lib.ts"));
+  mkdirSync(join(f.cwd, "vendor/lib.ts"));
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  mkdirSync(join(f.cwd, "pnpm-lock.yaml"));
+  // Paths that the shared exclusions skip stay exempt whatever their type.
+  assert.deepEqual(stagedFormatFiles(f.cwd), ["regular.ts"]);
+  const result = runStagedCli(f);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  // `--write` formats the worktree file; Lefthook `stage_fixed` stages it.
+  assert.equal(
+    readFileSync(join(f.cwd, "regular.ts"), "utf8"),
+    "const value = 1;\n",
+  );
+});
+
+test("staged selection fails for a staged path replaced by a directory behind a case-variant extension", (t) => {
+  const f = fixture(t);
+  f.write("Notes.MD", "# Title\n");
+  f.git("add", "Notes.MD");
+  rmSync(join(f.cwd, "Notes.MD"));
+  mkdirSync(join(f.cwd, "Notes.MD"));
+  assert.throws(() => stagedFormatFiles(f.cwd), /directory.*Notes\.MD/u);
+});
+
+test(
+  "staged selection exempts an index-recorded symlink and a gitlink whose worktree entry is a directory",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("target.ts", "const value = 1;\n");
+    f.git("add", "target.ts");
+    // A symlink staged as a symlink, then replaced by a directory.
+    symlinkSync("target.ts", join(f.cwd, "linked.ts"));
+    f.git("add", "linked.ts");
+    rmSync(join(f.cwd, "linked.ts"));
+    mkdirSync(join(f.cwd, "linked.ts"));
+    // A gitlink (mode 160000) is a directory in the worktree and has no blob.
+    const commit = "1".repeat(40);
+    f.git("update-index", "--add", "--cacheinfo", `160000,${commit},sub.md`);
+    mkdirSync(join(f.cwd, "sub.md"));
+    assert.deepEqual(stagedFormatFiles(f.cwd), ["target.ts"]);
+    const result = runStagedCli(f);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // A regular file replaced by a directory is still reported beside them.
+    f.write("file.ts", "const value = 1;\n");
+    f.git("add", "file.ts");
+    rmSync(join(f.cwd, "file.ts"));
+    mkdirSync(join(f.cwd, "file.ts"));
+    assert.throws(() => stagedFormatFiles(f.cwd), /directory.*file\.ts/u);
+  },
+);
+
+test(
+  "staged selection reports a worktree symlink that replaces a staged regular file",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("target.ts", "const value = 1;\n");
+    f.write("swapped.ts", "const   value = 2;\n");
+    f.git("add", "target.ts", "swapped.ts");
+    rmSync(join(f.cwd, "swapped.ts"));
+    symlinkSync("target.ts", join(f.cwd, "swapped.ts"));
+    assert.throws(
+      () => stagedFormatFiles(f.cwd),
+      /symbolic link.*swapped\.ts/u,
+    );
+  },
+);
+
+// Lefthook hides unstaged changes by restoring the staged content before the
+// hook runs, so a plain directory swap is invisible to the hook. A
+// skip-worktree entry, as in a sparse checkout, keeps the directory visible.
+test("pre-commit refuses a staged skip-worktree file replaced by a directory", (t) => {
+  const f = fixture(t);
+  f.write("staged.ts", "const value = 1;\n");
+  const head = f.commit();
+  f.installHook();
+  f.write("staged.ts", "const   value = 2;\n");
+  f.git("add", "staged.ts");
+  f.git("update-index", "--skip-worktree", "staged.ts");
+  rmSync(join(f.cwd, "staged.ts"));
+  mkdirSync(join(f.cwd, "staged.ts"));
+  const rejected = spawnSync("git", ["commit", "--quiet", "-m", "x"], {
+    cwd: f.cwd,
+    env: f.env,
+    encoding: "utf8",
+  });
+  const output = rejected.stdout + rejected.stderr;
+  assert.notEqual(rejected.status, 0, output);
+  assert.equal(f.git("rev-parse", "HEAD"), head);
+  assert.match(output, /ci_format_error/u);
+  assert.match(output, /staged\.ts/u);
+  assert.match(output, /directory/u);
+  assert.equal(f.git("show", ":staged.ts"), "const   value = 2;");
+});
+
 test("pre-commit accepts a staged skip-worktree lockfile missing from the worktree", (t) => {
   const f = fixture(t);
   f.write("pnpm-lock.yaml", "lockfileVersion: '9.0'\n");
