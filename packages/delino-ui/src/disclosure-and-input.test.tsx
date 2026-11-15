@@ -165,6 +165,30 @@ describe("Popover", () => {
     });
     expect(popover.hasAttribute("data-closed")).toBe(true);
   });
+
+  test("closes with the Escape key even when dismissible is spread in", async () => {
+    // `dismissible` is omitted from the types; a JS caller or an untyped spread
+    // must still not be able to disable Escape at runtime.
+    const untyped = { dismissible: false } as object;
+    render(
+      <Popover {...untyped}>
+        <PopoverTrigger>Share</PopoverTrigger>
+        <PopoverContent>
+          <PopoverTitle>Share this page</PopoverTitle>
+          <PopoverClose>Done</PopoverClose>
+        </PopoverContent>
+      </Popover>,
+    );
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Share" }));
+    });
+    const popover = screen.getByRole("dialog");
+
+    await act(async () => {
+      fireEvent.keyDown(popover, { key: "Escape" });
+    });
+    expect(popover.hasAttribute("data-closed")).toBe(true);
+  });
 });
 
 describe("Menu", () => {
@@ -226,6 +250,32 @@ describe("Drawer", () => {
 
   test("closes with the Escape key", async () => {
     render(<Example />);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+    });
+    const drawer = screen.getByRole("dialog");
+
+    await act(async () => {
+      fireEvent.keyDown(drawer, { key: "Escape" });
+    });
+    expect(drawer.hasAttribute("data-closed")).toBe(true);
+  });
+
+  test("closes with the Escape key even when dismissible is spread in", async () => {
+    // `dismissible` is omitted from the types; a JS caller or an untyped spread
+    // must still not be able to disable Escape at runtime.
+    const untyped = { dismissible: false } as object;
+    render(
+      <Drawer {...untyped}>
+        <DrawerTrigger>Filters</DrawerTrigger>
+        <DrawerContent>
+          <DrawerTitle>Filter results</DrawerTitle>
+          <DrawerActions>
+            <DrawerClose>Cancel</DrawerClose>
+          </DrawerActions>
+        </DrawerContent>
+      </Drawer>,
+    );
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Filters" }));
     });

@@ -31,7 +31,12 @@ export type DrawerProps = Omit<
  * returns focus to its trigger.
  */
 export function Drawer(props: DrawerProps) {
-  return <DrawerRoot {...props} />;
+  // The type already omits `dismissible`, but types do not stop JS callers or
+  // untyped spread objects. Drop the key at runtime so Escape always closes.
+  const { dismissible: _dismissible, ...rest } = props as DrawerProps & {
+    dismissible?: unknown;
+  };
+  return <DrawerRoot {...rest} />;
 }
 
 type ButtonStyleProps = {
