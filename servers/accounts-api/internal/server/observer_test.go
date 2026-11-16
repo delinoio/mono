@@ -8,12 +8,14 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"maps"
 	"math/rand"
 	"net"
 	"net/http"
 	"reflect"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1046,10 +1048,8 @@ func TestLogRejectedRecordShape(t *testing.T) {
 			t.Errorf("%s = %v, want %v", key, record[key], value)
 		}
 	}
-	for _, key := range []string{"path", "method", "bytes"} {
-		if _, ok := record[key]; ok {
-			t.Errorf("record has %q, want none", key)
-		}
+	if got, want := slices.Sorted(maps.Keys(record)), []string{"duration_ms", "level", "msg", "reason", "status", "time"}; !slices.Equal(got, want) {
+		t.Errorf("record keys = %v, want %v: %v", got, want, record)
 	}
 }
 
