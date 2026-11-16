@@ -39,6 +39,11 @@ const (
 	// discards before a request line after a POST (numLeadingCRorLF in its
 	// server). The observer skips the same number.
 	maxLeadingCRorLF = 4
+	// peekedHeadBytes is the number of bytes of the next request that net/http
+	// waits for under IdleTimeout after a response (it calls Peek(4) on the
+	// connection reader). Only once it has them does it arm ReadHeaderTimeout, so
+	// fewer bytes than this after a request are still the keep-alive wait.
+	peekedHeadBytes = 4
 	// retainedHeadCap is the largest head buffer kept between requests, so an
 	// idle keep-alive connection does not hold a large buffer.
 	retainedHeadCap = 4096
@@ -101,10 +106,12 @@ const (
 //     last line break it logs a header_read_timeout record at once. With a
 //     partial line buffered it waits for what net/http does: the 400 is logged
 //     as the malformed request it is, and a close without a response is logged
-//     as header_read_timeout when the connection closes (see ConnState). A
-//     timeout of the keep-alive wait between requests (IdleTimeout), of a
-//     request body (ReadTimeout) and the read interruptions that net/http causes
-//     itself are not logged; see claimReadTimeout.
+//     as header_read_timeout when the connection closes (see ConnState). After
+//     an earlier request, net/http arms ReadHeaderTimeout only once four bytes of
+//     the next request arrived, so a stall with fewer bytes is the keep-alive
+//     wait. A timeout of the keep-alive wait between requests (IdleTimeout), of
+//     a request body (ReadTimeout) and the read interruptions that net/http
+//     causes itself are not logged; see claimReadTimeout.
 //   - A connection that a handler hijacked is no longer net/http's, so the
 //     observer never logs for it (see ConnState).
 
@@ -757,14 +764,17 @@ func (o *connObserver) deadlineExpired() bool {
 // Only a deadline timer that expired while the parser waited for (more of) a
 // request head counts, with no handler call or response in progress:
 //
-//   - A head that is partly received counts, whatever deadline expired. Leading
-//     CR and LF bytes that the parser skipped after a POST are part of it.
-//   - An empty head counts only while no request head ever parsed on the
-//     connection. A connection that connects and stalls is logged, because
-//     the contract covers every header read timeout, and so is one that sends
-//     nothing for ReadHeaderTimeout. After a request, net/http waits for the
-//     next one under IdleTimeout, which is a normal keep-alive close and is
-//     not logged.
+//   - While no request head ever parsed on the connection, any partly received
+//     head counts, and so does an empty one: a connection that connects and
+//     stalls is logged, because the contract covers every header read timeout,
+//     and so is one that sends nothing for ReadHeaderTimeout.
+//   - After a request, net/http waits for the first four bytes of the next one
+//     under IdleTimeout and arms ReadHeaderTimeout only once it has them (see
+//     peekedHeadBytes). A stall with fewer than four bytes of the next request is
+//     therefore the keep-alive wait, a normal close that is not logged. From four
+//     bytes on, the stall is a header read timeout, whatever deadline the
+//     observer sees. Leading CR and LF bytes that the parser skipped after a POST
+//     count as received bytes, because net/http has received them too.
 //   - A timeout while the parser skips a body (ReadTimeout), or after it
 //     stopped, is not a header timeout.
 //
@@ -783,11 +793,12 @@ func (o *connObserver) claimReadTimeout() (time.Time, bool) {
 	if o.rejected || o.hijacked || o.responding || o.phase != phaseHead || !o.deadlineExpired() {
 		return time.Time{}, false
 	}
-	// The leading CR and LF bytes skipped after a POST are bytes of the next
-	// request that net/http has received too (it reads that head under
-	// ReadHeaderTimeout once it has them), so they make the head partly received
-	// even though the head buffer is still empty.
-	if len(o.head) == 0 && o.leadingSkipped == 0 && o.parsedHeads > 0 {
+	// The observer cannot see which deadline net/http set, but it sees every byte
+	// first, so the bytes of the next request that it received (the head buffer
+	// plus the leading CR and LF bytes skipped after a POST, which net/http has
+	// received too) are a lower bound of what net/http has buffered. Below
+	// peekedHeadBytes net/http is still in the keep-alive wait under IdleTimeout.
+	if o.parsedHeads > 0 && len(o.head)+o.leadingSkipped < peekedHeadBytes {
 		return time.Time{}, false
 	}
 	if len(o.head) > o.lineStart {
