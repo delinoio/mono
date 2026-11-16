@@ -137,17 +137,17 @@ func (h *helperProcess) signal(sig syscall.Signal) {
 	}
 }
 
-// wait waits for the helper to exit within limit and returns its wait status
-// and how long the exit took.
-func (h *helperProcess) wait(limit time.Duration) (syscall.WaitStatus, time.Duration) {
+// wait waits for the helper to exit within limit and returns its wait status.
+// It fails the test immediately when the helper is still running after limit,
+// so a slow exit never reaches the caller; callers only see a real exit.
+func (h *helperProcess) wait(limit time.Duration) syscall.WaitStatus {
 	h.t.Helper()
-	start := time.Now()
 	select {
 	case <-h.exited:
 	case <-time.After(limit):
 		h.t.Fatalf("helper still running %v after the signal; output:\n%s", limit, h.out.String())
 	}
-	return h.cmd.ProcessState.Sys().(syscall.WaitStatus), time.Since(start)
+	return h.cmd.ProcessState.Sys().(syscall.WaitStatus)
 }
 
 // getAsync starts a GET and delivers the status code, or -1 on a client error.
@@ -178,12 +178,9 @@ func TestSecondTerminationSignalTerminatesProcessDuringDrain(t *testing.T) {
 			h.waitForLine("server_shutdown_started")
 			h.signal(sig)
 
-			status, elapsed := h.wait(5 * time.Second)
+			status := h.wait(5 * time.Second)
 			if !status.Signaled() || status.Signal() != sig {
 				t.Errorf("wait status = %v, want terminated by %v", status, sig)
-			}
-			if elapsed >= 5*time.Second {
-				t.Errorf("exit took %v after the second signal, want a prompt exit", elapsed)
 			}
 			if strings.Contains(h.out.String(), "server_shutdown_completed") {
 				t.Errorf("output reports a completed shutdown:\n%s", h.out.String())
@@ -203,7 +200,7 @@ func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) 
 	if got := <-status; got != http.StatusOK {
 		t.Errorf("in-flight request status = %d, want %d", got, http.StatusOK)
 	}
-	ws, _ := h.wait(5 * time.Second)
+	ws := h.wait(5 * time.Second)
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Errorf("wait status = %v, want exit status 0", ws)
 	}
@@ -224,7 +221,7 @@ func TestSingleTerminationSignalWithoutTrafficExitsZero(t *testing.T) {
 
 	h.signal(syscall.SIGTERM)
 	h.waitForLine("server_shutdown_completed")
-	ws, _ := h.wait(5 * time.Second)
+	ws := h.wait(5 * time.Second)
 	if !ws.Exited() || ws.ExitStatus() != 0 {
 		t.Errorf("wait status = %v, want exit status 0", ws)
 	}
