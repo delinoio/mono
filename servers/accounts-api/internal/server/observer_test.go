@@ -589,11 +589,17 @@ func TestClaimReadTimeout(t *testing.T) {
 		wantOK   bool
 	}{
 		{"connection that sent nothing", func(*connObserver) {}, time.Second, true},
-		{"partial head", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHo")) }, time.Second, true},
+		{"partial head at a line boundary", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n")) }, time.Second, true},
+		// A partial line is not claimed yet: net/http answers it with a 400 or
+		// closes without a response (see TestPartialLineHeaderTimeoutWaitsForNetHTTP).
+		{"partial head inside a line", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHo")) }, time.Second, false},
 		{"idle wait after a request", func(o *connObserver) { o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\n")) }, time.Second, false},
-		{"partial head after a request", func(o *connObserver) {
-			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHo"))
+		{"partial head after a request, at a line boundary", func(o *connObserver) {
+			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHost: t\r\n"))
 		}, time.Second, true},
+		{"partial head after a request, inside a line", func(o *connObserver) {
+			o.feed([]byte("GET / HTTP/1.1\r\nHost: t\r\n\r\nGET / HTTP/1.1\r\nHo"))
+		}, time.Second, false},
 		{"idle wait after a POST", func(o *connObserver) { o.feed([]byte(postRequest)) }, time.Second, false},
 		// The skipped bytes are part of the next head that net/http is reading, so
 		// they count as a partly received head although the head buffer is empty.
@@ -663,17 +669,19 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
 		name string
-		// arrival is what the first read holds; more arrives nine seconds later.
+		// arrival is what the first read holds; more arrives nine seconds later and
+		// ends at a line boundary, so that the stall is claimed at once.
 		arrival string
+		more    string
 		// handlers is the number of handler calls that finish before that.
 		handlers  int
 		wantStart time.Duration
 	}{
-		{"partial head after a complete request", get + "GET / HTTP/1.1\r\nHo", 1, time.Millisecond},
-		{"partial head after two pipelined requests", get + get + "GET / HTTP/1.1\r\nHo", 2, 2 * time.Millisecond},
+		{"partial head after a complete request", get + "GET / HTTP/1.1\r\nHo", "st: t\r\n", 1, time.Millisecond},
+		{"partial head after two pipelined requests", get + get + "GET / HTTP/1.1\r\nHo", "st: t\r\n", 2, 2 * time.Millisecond},
 		// Nothing of the next request arrived before the handler finished, so
 		// its first byte starts it.
-		{"nothing buffered when the handler finishes", get, 1, 9 * time.Second},
+		{"nothing buffered when the handler finishes", get, "GET / HTTP/1.1\r\n", 1, 9 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := origin
@@ -688,7 +696,7 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 			}
 			o.responseFinished()
 			clock = origin.Add(9 * time.Second)
-			o.feed([]byte("s"))
+			o.feed([]byte(tc.more))
 			o.setReadDeadline(clock.Add(time.Second))
 			clock = clock.Add(time.Second)
 			start, ok := o.claimReadTimeout()
@@ -697,6 +705,130 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPartialLineHeaderTimeoutWaitsForNetHTTP checks the header timeout inside
+// a partial line. net/http answers such a line with a 400 or closes the
+// connection without a response, and the observer learns which only from the
+// write or from the close, so the timeout is not claimed when the read fails.
+func TestPartialLineHeaderTimeoutWaitsForNetHTTP(t *testing.T) {
+	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	// pendingObserver returns an observer whose connection received a partial
+	// line at origin, with a read deadline that expired at origin+1s.
+	pendingObserver := func(t *testing.T) (*connObserver, *time.Time) {
+		t.Helper()
+		clock := origin
+		o, _ := newTestObserver()
+		o.now = func() time.Time { return clock }
+		o.acceptedAt = origin.Add(-time.Hour)
+		o.feed([]byte("GET /hea"))
+		o.setReadDeadline(origin.Add(time.Second))
+		clock = origin.Add(2 * time.Second)
+		if _, ok := o.claimReadTimeout(); ok {
+			t.Fatal("claimed a header timeout inside a partial line before net/http answered")
+		}
+		if !o.timeoutPending || !o.timeoutPendingStart.Equal(origin) {
+			t.Fatalf("timeoutPending = %v, start = %v; want a pending timeout started at the first byte", o.timeoutPending, o.timeoutPendingStart)
+		}
+		if o.rejected {
+			t.Fatal("marked the connection rejected while the timeout is pending")
+		}
+		return o, &clock
+	}
+
+	t.Run("net/http answers with a 400", func(t *testing.T) {
+		o, _ := pendingObserver(t)
+		reason, status, start, ok := o.claimDirectRejection([]byte(directBadRequest))
+		if !ok || reason != RejectionMalformedRequest || status != http.StatusBadRequest || !start.Equal(origin) {
+			t.Fatalf("claimDirectRejection = %q, %d, %v, %v; want a malformed_request 400 started at the first byte", reason, status, start, ok)
+		}
+		if o.timeoutPending {
+			t.Error("the timeout is still pending after the 400 claimed the rejection")
+		}
+		if _, ok := o.claimPendingTimeout(); ok {
+			t.Error("the close claimed a second record for the connection")
+		}
+	})
+
+	t.Run("net/http closes without a response", func(t *testing.T) {
+		o, _ := pendingObserver(t)
+		start, ok := o.claimPendingTimeout()
+		if !ok || !start.Equal(origin) {
+			t.Fatalf("claimPendingTimeout = %v, %v; want the first byte %v", start, ok, origin)
+		}
+		if _, ok := o.claimPendingTimeout(); ok {
+			t.Error("claimed the pending timeout twice")
+		}
+		if _, _, _, ok := o.claimDirectRejection([]byte(directBadRequest)); ok {
+			t.Error("claimed a rejection after the timeout record was written")
+		}
+	})
+
+	t.Run("a hijacked connection logs nothing", func(t *testing.T) {
+		o, _ := pendingObserver(t)
+		o.markHijacked()
+		if _, ok := o.claimPendingTimeout(); ok {
+			t.Error("claimed a pending timeout on a hijacked connection")
+		}
+	})
+
+	t.Run("a later empty read timeout keeps the first start", func(t *testing.T) {
+		o, clock := pendingObserver(t)
+		*clock = origin.Add(3 * time.Second)
+		if _, ok := o.claimReadTimeout(); ok {
+			t.Fatal("claimed a second timeout")
+		}
+		if start, ok := o.claimPendingTimeout(); !ok || !start.Equal(origin) {
+			t.Errorf("claimPendingTimeout = %v, %v; want %v", start, ok, origin)
+		}
+	})
+
+	t.Run("nothing pending", func(t *testing.T) {
+		o, _ := newTestObserver()
+		if _, ok := o.claimPendingTimeout(); ok {
+			t.Error("claimed a timeout that never happened")
+		}
+	})
+}
+
+// TestConnStateLogsAPendingHeaderTimeoutWhenTheConnectionCloses drives the
+// ConnState hook of a wrapped connection: the pending timeout is logged once,
+// with status 0 and the start of the request, when net/http reports the
+// connection closed without a 400.
+func TestConnStateLogsAPendingHeaderTimeoutWhenTheConnectionCloses(t *testing.T) {
+	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	clock := origin
+	client, serverSide := net.Pipe()
+	defer client.Close()
+	defer serverSide.Close()
+	var logs bytes.Buffer
+	observed := &observedConn{Conn: serverSide, obs: newConnObserver(slog.New(slog.NewJSONHandler(&logs, nil)))}
+	observed.obs.now = func() time.Time { return clock }
+	observed.obs.acceptedAt = origin.Add(-time.Hour)
+	observed.obs.feed([]byte("GET /hea"))
+	observed.obs.setReadDeadline(origin.Add(time.Second))
+	clock = origin.Add(2 * time.Second)
+	if _, ok := observed.obs.claimReadTimeout(); ok {
+		t.Fatal("claimed a header timeout inside a partial line")
+	}
+
+	ConnState(observed, http.StateClosed)
+	ConnState(observed, http.StateClosed)
+	var record map[string]any
+	if lines := strings.Split(strings.TrimSpace(logs.String()), "\n"); len(lines) != 1 {
+		t.Fatalf("got %d log lines, want exactly 1: %s", len(lines), logs.String())
+	} else if err := json.Unmarshal([]byte(lines[0]), &record); err != nil {
+		t.Fatalf("log is not JSON: %v: %s", err, logs.String())
+	}
+	want := map[string]any{"msg": "http_request_rejected", "reason": "header_read_timeout", "status": float64(0), "duration_ms": float64(2000)}
+	for key, value := range want {
+		if record[key] != value {
+			t.Errorf("%s = %v, want %v", key, record[key], value)
+		}
+	}
+
+	// A connection that ObserveListener did not wrap is left alone.
+	ConnState(serverSide, http.StateClosed)
 }
 
 // TestRejectionStartIgnoresDrainedBodyBytes checks that the body of a request
