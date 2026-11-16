@@ -1706,6 +1706,12 @@
     height: 16px;
   }
 
+  /* The chevron paths point left (Previous) and right (Next), and the flex
+     list reverses under right-to-left text, so the icons mirror with it. */
+  .dui-pagination-step:dir(rtl) svg {
+    scale: -1 1;
+  }
+
   .dui-pagination-step[data-disabled] {
     opacity: 0.4;
     cursor: not-allowed;

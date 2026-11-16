@@ -904,6 +904,14 @@ describe("Pagination", () => {
     });
     expect(pages).toEqual([2, 3]);
   });
+
+  test("mirrors the step icons in right-to-left text", () => {
+    // happy-dom cannot match :dir(), so the rule is checked as stylesheet text.
+    // The chevron paths are fixed (left for Previous, right for Next) while the
+    // flex list reverses under dir="rtl", so the icons must mirror with it.
+    expect(block(".dui-pagination-step svg")).not.toContain("scale");
+    expect(block(".dui-pagination-step:dir(rtl) svg")).toContain("scale: -1 1");
+  });
 });
 
 describe("Meter", () => {
