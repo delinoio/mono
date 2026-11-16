@@ -1039,6 +1039,42 @@ test("planner CLI reports an unset or malformed comparison as a ci_format_error 
   }
 });
 
+test("planner CLI fails with one ci_format_error and publishes nothing when a publication target is unusable", (t) => {
+  const f = fixture(t);
+  f.write("docs/guide.md");
+  const head = f.commit();
+  const comparison = { CI_BASE: f.base, CI_HEAD: head };
+  const directory = join(f.cwd, "a-directory");
+  mkdirSync(directory);
+  const cases = [
+    // `undefined` overrides the default and spawnSync leaves the variable out.
+    { env: { GITHUB_OUTPUT: undefined }, message: /GITHUB_OUTPUT/u },
+    {
+      env: { GITHUB_STEP_SUMMARY: undefined },
+      message: /GITHUB_STEP_SUMMARY/u,
+    },
+    { env: { GITHUB_OUTPUT: directory }, message: /EISDIR|directory/iu },
+  ];
+  for (const { env, message } of cases) {
+    const label = JSON.stringify(Object.keys(env));
+    const { result, output, summary } = runPlannerCli(f, {
+      ...comparison,
+      ...env,
+    });
+    assert.equal(result.status, 2, `${label}: ${result.stderr}`);
+    assert.equal(result.stdout, "", `${label}: no ci_plan record`);
+    const lines = result.stderr.split("\n").filter(Boolean);
+    assert.equal(lines.length, 1, `${label}: ${result.stderr}`);
+    const record = JSON.parse(lines[0]);
+    assert.equal(record.event, "ci_format_error", label);
+    assert.match(record.message, message, label);
+    if (!("GITHUB_OUTPUT" in env && env.GITHUB_OUTPUT !== undefined)) {
+      assert.equal(existsSync(output), false, `${label}: no outputs`);
+    }
+    assert.equal(existsSync(summary), false, `${label}: no summary`);
+  }
+});
+
 test("planner CLI still exits 0 with one ci_plan record and no error record on success", (t) => {
   const f = fixture(t);
   f.write("docs/guide.md");
