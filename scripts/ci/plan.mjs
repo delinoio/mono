@@ -29,17 +29,23 @@ export function isE2eInput(path) {
   return e2eInputs.has(path) || /^apps\/[^/]+\//.test(path);
 }
 
-// The root and every workspace `turbo.json` configure the tasks that the
-// Turbo fixtures inspect.
+// Workspace package roots, as directories that hold one level of packages.
+// Keep these roots in sync with `pnpm-workspace.yaml`; plan.test.mjs
+// cross-checks them.
+export const workspaceRoots = ["apps", "packages", "servers"];
+
+// Only the root `turbo.json` and the `turbo.json` placed directly inside a
+// workspace package configure the tasks that the Turbo fixtures inspect. Turbo
+// ignores a `turbo.json` at any other depth, so it does not select fixtures.
 export function isTurboConfigInput(path) {
-  return path === "turbo.json" || path.endsWith("/turbo.json");
+  return (
+    path === "turbo.json" ||
+    new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/turbo\\.json$`).test(path)
+  );
 }
 
 // A package manifest directly inside a workspace package selects the Turbo
-// fixtures, which resolve every workspace package. Keep these roots in sync
-// with `pnpm-workspace.yaml`; plan.test.mjs cross-checks them.
-export const workspaceRoots = ["apps", "packages", "servers"];
-
+// fixtures, which resolve every workspace package.
 export function isWorkspaceManifest(path) {
   return new RegExp(
     `^(${workspaceRoots.join("|")})/[^/]+/package\\.json$`,
