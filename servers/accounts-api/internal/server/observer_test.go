@@ -682,6 +682,10 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 		// Nothing of the next request arrived before the handler finished, so
 		// its first byte starts it.
 		{"nothing buffered when the handler finishes", get, "GET / HTTP/1.1\r\n", 1, 9 * time.Second},
+		// Leading CR and LF bytes after a POST are skipped, so they are in
+		// neither the head buffer nor the pending requests, but they are the first
+		// bytes of the next request.
+		{"leading bytes skipped before the handler finished", "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n\r\n", "GET / HTTP/1.1\r\n", 1, time.Millisecond},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			clock := origin
@@ -703,6 +707,70 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 			if !ok || !start.Equal(origin.Add(tc.wantStart)) {
 				t.Errorf("start = %v, %v; want %v after the first byte", start, ok, tc.wantStart)
 			}
+		})
+	}
+}
+
+// TestLeadingCRLFDuringTheHandlerKeepsTheRejectionStart checks the start of a
+// rejected request after leading CR and LF bytes that net/http skips after a
+// POST. The bytes belong to the next request, so when they arrive while the
+// handler still runs, the request starts when the handler ends, and a later
+// byte must not move it. Skipped bytes that arrive after the handler, or none,
+// leave the start unchanged.
+func TestLeadingCRLFDuringTheHandlerKeepsTheRejectionStart(t *testing.T) {
+	const post = "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		// skippedAt is when "\r\n" arrives; a negative value means it never does.
+		skippedAt time.Duration
+		// wantStart is relative to origin.
+		wantStart time.Duration
+	}{
+		{"skipped bytes during the handler", 5 * time.Millisecond, 10 * time.Millisecond},
+		{"skipped bytes after the handler", 200 * time.Millisecond, 200 * time.Millisecond},
+		{"no skipped bytes", -1, 500 * time.Millisecond},
+	} {
+		// run feeds the POST at origin, finishes its handler at origin+10ms, and
+		// sends the later bytes at origin+500ms, then claims with claim.
+		run := func(t *testing.T, claim func(o *connObserver, clock *time.Time) (time.Time, bool), later string) {
+			clock := origin
+			o, _ := newTestObserver()
+			o.now = func() time.Time { return clock }
+			o.acceptedAt = origin.Add(-time.Hour)
+			o.feed([]byte(post))
+			skipped := tc.skippedAt >= 0
+			if skipped && tc.skippedAt < 10*time.Millisecond {
+				clock = origin.Add(tc.skippedAt)
+				o.feed([]byte("\r\n"))
+			}
+			clock = origin.Add(10 * time.Millisecond)
+			o.handlerStarted()
+			o.handlerFinished()
+			o.responseFinished()
+			if skipped && tc.skippedAt >= 10*time.Millisecond {
+				clock = origin.Add(tc.skippedAt)
+				o.feed([]byte("\r\n"))
+			}
+			clock = origin.Add(500 * time.Millisecond)
+			o.feed([]byte(later))
+			start, ok := claim(o, &clock)
+			if !ok || !start.Equal(origin.Add(tc.wantStart)) {
+				t.Errorf("start = %v, %v; want %v after the origin", start, ok, tc.wantStart)
+			}
+		}
+		t.Run(tc.name+", rejected with a 400", func(t *testing.T) {
+			run(t, func(o *connObserver, _ *time.Time) (time.Time, bool) {
+				reason, status, start, ok := o.claimDirectRejection([]byte(directBadRequest))
+				return start, ok && reason == RejectionMalformedRequest && status == http.StatusBadRequest
+			}, "GARBAGE\r\n\r\n")
+		})
+		t.Run(tc.name+", header read timeout", func(t *testing.T) {
+			run(t, func(o *connObserver, clock *time.Time) (time.Time, bool) {
+				o.setReadDeadline(clock.Add(time.Second))
+				*clock = clock.Add(time.Second)
+				return o.claimReadTimeout()
+			}, "GET / HTTP/1.1\r\n")
 		})
 	}
 }
@@ -1385,6 +1453,84 @@ func TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout(t *testing.T) {
 				t.Errorf("http_request_rejected records = %d, want none for the keep-alive wait: %s", got, logs.String())
 			}
 		})
+	}
+}
+
+// TestLeadingCRLFDuringTheHandlerKeepsTheRejectedRequestStart sends raw bytes to
+// a real net/http server. A leading CR arrives while the POST handler still
+// runs, so net/http skips it as the start of the next request. The request that
+// follows 700 ms after the handler ended is rejected with a 400. Its logged
+// duration starts when the handler ended, not at the late bytes that net/http
+// does not skip.
+func TestLeadingCRLFDuringTheHandlerKeepsTheRejectedRequestStart(t *testing.T) {
+	const post = "POST /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
+	addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		_, _ = io.WriteString(w, "ok")
+	})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+	write := func(s string) {
+		t.Helper()
+		if _, err := io.WriteString(conn, s); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	write(post)
+	time.Sleep(50 * time.Millisecond)
+	// One byte per write: net/http reads a single byte in the background while
+	// the handler runs.
+	write("\r")
+	// Wait for the response, so the handler has ended when the next bytes go.
+	var response []byte
+	buf := make([]byte, 512)
+	for !strings.HasSuffix(string(response), "ok") {
+		n, err := conn.Read(buf)
+		response = append(response, buf[:n]...)
+		if err != nil {
+			t.Fatalf("read the first response: %v (%q)", err, response)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+	write("\n")
+	time.Sleep(400 * time.Millisecond)
+	write("GARBAGE\r\n\r\n")
+	rest, _ := io.ReadAll(conn)
+	response = append(response, rest...)
+	if !strings.Contains(string(response), "HTTP/1.1 200 ") || !strings.Contains(string(response), "HTTP/1.1 400 ") {
+		t.Fatalf("responses = %q, want a 200 and then a 400", response)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for countRecords(logs, "http_request_rejected") == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := countRecords(logs, "http_request_rejected"); got != 1 {
+		t.Fatalf("http_request_rejected records = %d, want 1: %s", got, logs.String())
+	}
+	var record struct {
+		Reason     string  `json:"reason"`
+		Status     int     `json:"status"`
+		DurationMS float64 `json:"duration_ms"`
+	}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.Contains(line, `"msg":"http_request_rejected"`) {
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatalf("decode %s: %v", line, err)
+			}
+		}
+	}
+	if record.Reason != string(RejectionMalformedRequest) || record.Status != http.StatusBadRequest {
+		t.Errorf("record = %+v, want a malformed_request 400", record)
+	}
+	// The handler ended about 300 ms after the POST and the rejection came about
+	// 700 ms after that. Without the fix the start is the "\n" byte that arrived
+	// 300 ms after the handler ended, so the logged duration is about 400 ms.
+	if record.DurationMS < 600 {
+		t.Errorf("duration_ms = %v, want at least 600 from the end of the handler: %s", record.DurationMS, logs.String())
 	}
 }
 

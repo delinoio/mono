@@ -524,9 +524,11 @@ func (o *connObserver) handlerFinished() {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	o.lastDone = o.now()
-	if len(o.head) > 0 || len(o.pending) > 0 {
+	if len(o.head) > 0 || len(o.pending) > 0 || o.leadingSkipped > 0 {
 		// Bytes of a later request already arrived, for example the start of the
 		// next head in the same read as the request that this handler answered.
+		// Skipped leading CR and LF bytes after a POST count too: they are in
+		// neither head nor pending, but they belong to the next request.
 		// Keep their arrival time: a later byte of that request must not restart
 		// the measured duration. rejectionStart bounds it by lastDone, because
 		// net/http reads the request only after the handler is done.
