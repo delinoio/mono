@@ -76,6 +76,20 @@ function describedByIds(container: HTMLElement) {
   );
 }
 
+/**
+ * Asserts that an empty description leaves one empty, hidden description
+ * element and no `aria-describedby` id without a matching element.
+ */
+function expectHiddenEmptyDescription(container: HTMLElement) {
+  const nodes = container.querySelectorAll(".dui-text-field-description");
+  expect(nodes.length).toBe(1);
+  expect(nodes[0]?.hasAttribute("hidden")).toBe(true);
+  expect(nodes[0]?.textContent).toBe("");
+  for (const id of describedByIds(container)) {
+    expect(container.querySelector(`[id="${id}"]`)).not.toBeNull();
+  }
+}
+
 describe("Accordion", () => {
   function Example() {
     return (
@@ -437,15 +451,14 @@ describe("Slider", () => {
   });
 
   test.each(EMPTY_DESCRIPTIONS)(
-    "renders no description element or reference for %s",
+    "renders a hidden empty description element for %s",
     async (_name, description) => {
       const { container } = render(
         <Slider label="Volume" defaultValue={40} description={description} />,
       );
       await act(async () => {});
 
-      expect(container.querySelector(".dui-text-field-description")).toBeNull();
-      expect(describedByIds(container)).toEqual([]);
+      expectHiddenEmptyDescription(container);
     },
   );
 
@@ -463,15 +476,12 @@ describe("Slider", () => {
     }
   });
 
-  test("references a range description from the group and omits empty ones", async () => {
+  test("references a range description from the group and hides empty ones", async () => {
     const empty = render(
       <Slider label="Price" defaultValue={[20, 80]} description="" />,
     );
     await act(async () => {});
-    expect(
-      empty.container.querySelector(".dui-text-field-description"),
-    ).toBeNull();
-    expect(describedByIds(empty.container)).toEqual([]);
+    expectHiddenEmptyDescription(empty.container);
     empty.unmount();
 
     const { container } = render(
@@ -520,15 +530,14 @@ describe("NumberInput", () => {
   });
 
   test.each(EMPTY_DESCRIPTIONS)(
-    "renders no description element or reference for %s",
+    "renders a hidden empty description element for %s",
     async (_name, description) => {
       const { container } = render(
         <NumberInput label="Tickets" description={description} />,
       );
       await act(async () => {});
 
-      expect(container.querySelector(".dui-text-field-description")).toBeNull();
-      expect(describedByIds(container)).toEqual([]);
+      expectHiddenEmptyDescription(container);
     },
   );
 
@@ -585,15 +594,14 @@ describe("PasswordInput", () => {
   });
 
   test.each(EMPTY_DESCRIPTIONS)(
-    "renders no description element or reference for %s",
+    "renders a hidden empty description element for %s",
     async (_name, description) => {
       const { container } = render(
         <PasswordInput label="Password" description={description} />,
       );
       await act(async () => {});
 
-      expect(container.querySelector(".dui-text-field-description")).toBeNull();
-      expect(describedByIds(container)).toEqual([]);
+      expectHiddenEmptyDescription(container);
     },
   );
 

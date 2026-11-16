@@ -56,6 +56,26 @@ const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
   ["empty string", ""],
 ];
 
+/**
+ * Asserts that an empty description leaves one empty, hidden description
+ * element and no `aria-describedby` id without a matching element.
+ */
+function expectHiddenEmptyDescription(
+  container: HTMLElement,
+  selector: string,
+) {
+  const nodes = container.querySelectorAll(selector);
+  expect(nodes.length).toBe(1);
+  expect(nodes[0]?.hasAttribute("hidden")).toBe(true);
+  expect(nodes[0]?.textContent).toBe("");
+  for (const element of container.querySelectorAll("[aria-describedby]")) {
+    for (const id of element.getAttribute("aria-describedby")?.split(" ") ??
+      []) {
+      expect(container.querySelector(`[id="${id}"]`)).not.toBeNull();
+    }
+  }
+}
+
 describe("Button", () => {
   test("renders a native button with the variant and size", () => {
     render(
@@ -155,15 +175,14 @@ describe("TextField", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders no description node for a ${name} description`, async () => {
+    test(`renders a hidden empty description node for a ${name} description`, async () => {
       const { container } = render(
         <TextField label="Email" description={empty} />,
       );
       await act(async () => {});
 
-      const input = screen.getByRole("textbox", { name: "Email" });
-      expect(container.querySelector(".dui-text-field-description")).toBeNull();
-      expect(input.hasAttribute("aria-describedby")).toBe(false);
+      expect(screen.getByRole("textbox", { name: "Email" })).toBeTruthy();
+      expectHiddenEmptyDescription(container, ".dui-text-field-description");
     });
   }
 
@@ -230,15 +249,14 @@ describe("Switch", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders no description node for a ${name} description`, async () => {
+    test(`renders a hidden empty description node for a ${name} description`, async () => {
       const { container } = render(
         <Switch label="Alerts" description={empty} />,
       );
       await act(async () => {});
 
-      const control = screen.getByRole("switch", { name: "Alerts" });
-      expect(container.querySelector(".dui-switch-description")).toBeNull();
-      expect(control.hasAttribute("aria-describedby")).toBe(false);
+      expect(screen.getByRole("switch", { name: "Alerts" })).toBeTruthy();
+      expectHiddenEmptyDescription(container, ".dui-switch-description");
     });
   }
 
@@ -360,15 +378,14 @@ describe("Textarea", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders no description node for a ${name} description`, async () => {
+    test(`renders a hidden empty description node for a ${name} description`, async () => {
       const { container } = render(
         <Textarea label="Message" description={empty} />,
       );
       await act(async () => {});
 
-      const textarea = screen.getByRole("textbox", { name: "Message" });
-      expect(container.querySelector(".dui-text-field-description")).toBeNull();
-      expect(textarea.hasAttribute("aria-describedby")).toBe(false);
+      expect(screen.getByRole("textbox", { name: "Message" })).toBeTruthy();
+      expectHiddenEmptyDescription(container, ".dui-text-field-description");
     });
   }
 
@@ -626,7 +643,7 @@ describe("Checkbox", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders no description node for a ${name} description`, async () => {
+    test(`renders a hidden empty description node for a ${name} description`, async () => {
       const { container } = render(
         <Checkbox label="Accept the terms" description={empty} />,
       );
@@ -783,7 +800,7 @@ describe("RadioGroup", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders no description node for a ${name} description`, async () => {
+    test(`renders a hidden empty description node for a ${name} description`, async () => {
       const { container } = render(
         <RadioGroup label="Plan" description={empty}>
           <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
@@ -791,11 +808,8 @@ describe("RadioGroup", () => {
       );
       await act(async () => {});
 
-      const group = screen.getByRole("radiogroup", { name: "Plan" });
-      expect(
-        container.querySelector(".dui-radio-field-description"),
-      ).toBeNull();
-      expect(group.hasAttribute("aria-describedby")).toBe(false);
+      expect(screen.getByRole("radiogroup", { name: "Plan" })).toBeTruthy();
+      expectHiddenEmptyDescription(container, ".dui-radio-field-description");
     });
   }
 
@@ -894,7 +908,7 @@ describe("Select", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders no description node for a ${name} description`, async () => {
+    test(`renders a hidden empty description node for a ${name} description`, async () => {
       const { container } = render(
         <Select label="Role" description={empty}>
           <SelectOption value="viewer">Viewer</SelectOption>
@@ -902,9 +916,8 @@ describe("Select", () => {
       );
       await act(async () => {});
 
-      const trigger = screen.getByRole("combobox", { name: "Role" });
-      expect(container.querySelector(".dui-text-field-description")).toBeNull();
-      expect(trigger.hasAttribute("aria-describedby")).toBe(false);
+      expect(screen.getByRole("combobox", { name: "Role" })).toBeTruthy();
+      expectHiddenEmptyDescription(container, ".dui-text-field-description");
     });
   }
 

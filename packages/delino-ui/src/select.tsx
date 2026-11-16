@@ -74,6 +74,11 @@ export function Select({
   const { multiple: _multiple, ...rootProps } = props as typeof props & {
     multiple?: unknown;
   };
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
 
@@ -106,14 +111,18 @@ export function Select({
         </SelectTrigger>
         <SelectContent className="dui-select-content">{children}</SelectContent>
       </SelectRoot>
-      {description === undefined ||
-      description === null ||
-      description === false ||
-      description === "" ? null : (
-        <FieldDescription className="dui-text-field-description">
-          {description}
-        </FieldDescription>
-      )}
+      {/* Workaround: the UI SDK Field predicts the description id in
+          aria-describedby before the field binds on the client, so static
+          markup would point at a missing element. Always render the
+          description and hide it when empty (display: none from the package
+          styles). Remove when the UI SDK stops predicting an id for an
+          unregistered description. */}
+      <FieldDescription
+        className="dui-text-field-description"
+        hidden={!hasDescription}
+      >
+        {hasDescription ? description : null}
+      </FieldDescription>
       {hasError ? (
         <FieldError className="dui-text-field-error">{error}</FieldError>
       ) : (
