@@ -8,6 +8,7 @@ import {
   screen,
 } from "@testing-library/react";
 import { readFileSync } from "node:fs";
+import type * as React from "react";
 import {
   Accordion,
   AccordionHeadingLevel,
@@ -60,6 +61,20 @@ import { Toggle, ToggleGroup } from "./toggle.tsx";
 afterEach(() => {
   cleanup();
 });
+
+const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
+  ["undefined", undefined],
+  ["null", null],
+  ["false", false],
+  ["an empty string", ""],
+];
+
+/** Every id that an `aria-describedby` attribute in the container references. */
+function describedByIds(container: HTMLElement) {
+  return Array.from(container.querySelectorAll("[aria-describedby]")).flatMap(
+    (element) => element.getAttribute("aria-describedby")?.split(" ") ?? [],
+  );
+}
 
 describe("Accordion", () => {
   function Example() {
@@ -339,6 +354,53 @@ describe("Slider", () => {
     });
     expect(values).toEqual([41]);
   });
+
+  test.each(EMPTY_DESCRIPTIONS)(
+    "renders no description element or reference for %s",
+    async (_name, description) => {
+      const { container } = render(
+        <Slider label="Volume" defaultValue={40} description={description} />,
+      );
+      await act(async () => {});
+
+      expect(container.querySelector(".dui-text-field-description")).toBeNull();
+      expect(describedByIds(container)).toEqual([]);
+    },
+  );
+
+  test("references a description that is the number 0 or non-empty", async () => {
+    for (const description of [0, "Help text"]) {
+      const { container, unmount } = render(
+        <Slider label="Volume" defaultValue={40} description={description} />,
+      );
+      await act(async () => {});
+
+      const element = container.querySelector(".dui-text-field-description");
+      expect(element?.textContent).toBe(String(description));
+      expect(describedByIds(container)).toContain(element?.id);
+      unmount();
+    }
+  });
+
+  test("references a range description from the group and omits empty ones", async () => {
+    const empty = render(
+      <Slider label="Price" defaultValue={[20, 80]} description="" />,
+    );
+    await act(async () => {});
+    expect(
+      empty.container.querySelector(".dui-text-field-description"),
+    ).toBeNull();
+    expect(describedByIds(empty.container)).toEqual([]);
+    empty.unmount();
+
+    const { container } = render(
+      <Slider label="Price" defaultValue={[20, 80]} description="Per night" />,
+    );
+    await act(async () => {});
+    const element = container.querySelector(".dui-text-field-description");
+    expect(element?.textContent).toBe("Per night");
+    expect(describedByIds(container)).toContain(element?.id);
+  });
 });
 
 describe("NumberInput", () => {
@@ -374,6 +436,33 @@ describe("NumberInput", () => {
         .getByRole("textbox", { name: "Tickets" })
         .getAttribute("aria-invalid"),
     ).toBe("true");
+  });
+
+  test.each(EMPTY_DESCRIPTIONS)(
+    "renders no description element or reference for %s",
+    async (_name, description) => {
+      const { container } = render(
+        <NumberInput label="Tickets" description={description} />,
+      );
+      await act(async () => {});
+
+      expect(container.querySelector(".dui-text-field-description")).toBeNull();
+      expect(describedByIds(container)).toEqual([]);
+    },
+  );
+
+  test("references a description that is the number 0 or non-empty", async () => {
+    for (const description of [0, "Help text"]) {
+      const { container, unmount } = render(
+        <NumberInput label="Tickets" description={description} />,
+      );
+      await act(async () => {});
+
+      const element = container.querySelector(".dui-text-field-description");
+      expect(element?.textContent).toBe(String(description));
+      expect(describedByIds(container)).toContain(element?.id);
+      unmount();
+    }
   });
 });
 
@@ -412,6 +501,33 @@ describe("PasswordInput", () => {
     expect(screen.getByLabelText("Password")).toBe(
       container.querySelector("input"),
     );
+  });
+
+  test.each(EMPTY_DESCRIPTIONS)(
+    "renders no description element or reference for %s",
+    async (_name, description) => {
+      const { container } = render(
+        <PasswordInput label="Password" description={description} />,
+      );
+      await act(async () => {});
+
+      expect(container.querySelector(".dui-text-field-description")).toBeNull();
+      expect(describedByIds(container)).toEqual([]);
+    },
+  );
+
+  test("references a description that is the number 0 or non-empty", async () => {
+    for (const description of [0, "Help text"]) {
+      const { container, unmount } = render(
+        <PasswordInput label="Password" description={description} />,
+      );
+      await act(async () => {});
+
+      const element = container.querySelector(".dui-text-field-description");
+      expect(element?.textContent).toBe(String(description));
+      expect(describedByIds(container)).toContain(element?.id);
+      unmount();
+    }
   });
 });
 
