@@ -2527,7 +2527,14 @@ test("CLI --write from a subdirectory formats files outside that subdirectory", 
   );
 });
 
-test("pre-commit hook formats staged files when the commit runs in a subdirectory", (t) => {
+// Lefthook runs `node scripts/ci/format-changed.mjs --staged --write` from the
+// repository root, so the script never starts in the directory where
+// `git commit` was invoked. This test therefore verifies hook routing for a
+// commit started in a subdirectory, not the script's own independence from its
+// invoking directory. That independence is covered by the subdirectory tests
+// above that call the selectors, runFormatter and the CLI directly from a
+// subdirectory.
+test("pre-commit hook formats staged files when git commit starts in a subdirectory", (t) => {
   const f = subdirectoryFixture(t);
   f.installHook();
   f.git("add", "--", "apps/web/page.ts", "docs/guide.md", "scripts/tool.ts");
