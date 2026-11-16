@@ -545,7 +545,8 @@ describe("Skeleton", () => {
     expect(skeleton.getAttribute("aria-hidden")).toBe("true");
     expect(skeleton.hasAttribute("data-circle")).toBe(true);
     expect(skeleton.style.width).toBe("120px");
-    expect(skeleton.style.height).toBe("120px");
+    expect(skeleton.style.height).toBe("auto");
+    expect(skeleton.style.aspectRatio).toBe("1 / 1");
   });
 
   test("draws a 1em circle when a circle has no dimension", () => {
@@ -554,25 +555,38 @@ describe("Skeleton", () => {
     const skeleton = container.firstElementChild as HTMLElement;
     expect(skeleton.style.width).toBe("1em");
     expect(skeleton.style.height).toBe("1em");
+    expect(skeleton.style.aspectRatio).toBe("");
   });
 
-  test("copies the given dimension of a circle to the other one", () => {
+  test("derives the other side of a circle from a square aspect ratio", () => {
     const { container } = render(
       <>
         <Skeleton circle height="32px" />
         <Skeleton circle width="48px" />
+        <Skeleton circle width="60%" />
       </>,
     );
 
-    const [byHeight, byWidth] = Array.from(container.children) as HTMLElement[];
+    const [byHeight, byWidth, byPercent] = Array.from(
+      container.children,
+    ) as HTMLElement[];
+    // A copied percentage would resolve against the container height, which is
+    // often `auto`, so the omitted side must not copy the given one.
     expect([byHeight.style.width, byHeight.style.height]).toEqual([
-      "32px",
+      "auto",
       "32px",
     ]);
     expect([byWidth.style.width, byWidth.style.height]).toEqual([
       "48px",
-      "48px",
+      "auto",
     ]);
+    expect([byPercent.style.width, byPercent.style.height]).toEqual([
+      "60%",
+      "auto",
+    ]);
+    for (const skeleton of [byHeight, byWidth, byPercent]) {
+      expect(skeleton.style.aspectRatio).toBe("1 / 1");
+    }
   });
 
   test("uses both dimensions of a circle as given", () => {
@@ -583,6 +597,7 @@ describe("Skeleton", () => {
     const skeleton = container.firstElementChild as HTMLElement;
     expect(skeleton.style.width).toBe("40px");
     expect(skeleton.style.height).toBe("24px");
+    expect(skeleton.style.aspectRatio).toBe("");
   });
 
   test("leaves a non-circle with one dimension to the stylesheet", () => {
