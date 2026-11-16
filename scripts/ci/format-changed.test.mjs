@@ -1211,9 +1211,13 @@ test("the case-sensitivity probe reports the filesystem behavior and cleans up",
   const sensitive = isCaseSensitiveDirectory(parent);
   assert.equal(typeof sensitive, "boolean");
   assert.deepEqual(readdirSync(parent), []);
-  // Linux CI runners use case-sensitive filesystems; elsewhere the answer
-  // depends on the volume, so assert the concrete value only on Linux.
-  if (process.platform === "linux") assert.equal(sensitive, true);
+  // Compare the probe with an independent observation of the same directory:
+  // create one file, then look it up by a differently cased name. Asserting a
+  // concrete value from the platform name would fail on a case-insensitive
+  // volume (for example a casefolded or mounted directory on Linux).
+  writeFileSync(join(parent, "observed.txt"), "lower\n");
+  const resolvesByOtherCase = existsSync(join(parent, "OBSERVED.TXT"));
+  assert.equal(sensitive, !resolvesByOtherCase);
 });
 
 test("every selector selects supported extensions in any letter case", (t) => {
