@@ -23,15 +23,16 @@ export type SliderProps = Omit<
   showValue?: boolean;
   /**
    * The accessible names of the thumbs of a range, such as
-   * `["Minimum price", "Maximum price"]`. A single thumb is named by `label`.
+   * `["Minimum price", "Maximum price"]`. A range has more than one value.
+   * A single thumb is named by `label`, including a one-value array.
    */
   thumbLabels?: readonly string[];
 };
 
 /**
  * A labeled slider built from UI SDK `Field` and `Slider`. Pass a number as
- * `value` or `defaultValue` for one thumb, or an array for a range with one
- * thumb per value. Arrow keys move the focused thumb.
+ * `value` or `defaultValue` for one thumb, or an array of more than one value for a
+ * range with one thumb per value. An array of one value is one thumb. Arrow keys move the focused thumb.
  */
 export function Slider({
   label,
@@ -44,7 +45,9 @@ export function Slider({
 }: SliderProps) {
   const initial = props.value ?? props.defaultValue;
   const thumbCount = Array.isArray(initial) ? initial.length : 1;
-  const isRange = Array.isArray(initial);
+  // The UI SDK treats only an array of more than one value as a range. A
+  // one-value array is a single thumb that the field label names.
+  const isRange = Array.isArray(initial) && initial.length > 1;
   const hasDescription =
     description !== undefined &&
     description !== null &&
