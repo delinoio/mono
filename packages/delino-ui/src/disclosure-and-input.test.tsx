@@ -378,6 +378,16 @@ describe("NumberInput", () => {
 });
 
 describe("PasswordInput", () => {
+  // happy-dom computes no layout, so this checks the stylesheet source. The row
+  // is a flex box that mirrors in right-to-left text, so its padding must be
+  // logical: 14px on the input side and 4px on the toggle side.
+  test("pads the row with logical properties", () => {
+    const rule = block(".dui-password-input");
+    expect(rule).toContain("padding-inline: 14px 4px");
+    expect(rule).toContain("padding-block: 0");
+    expect(rule).not.toMatch(/(^|[\s;])padding:/);
+  });
+
   test("shows and hides the password from its toggle", async () => {
     const { container } = render(
       <PasswordInput label="Password" autoComplete="current-password" />,
