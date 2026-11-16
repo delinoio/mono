@@ -1244,6 +1244,28 @@ describe("Avatar", () => {
       fallback.closest("[data-slot='avatar']")?.getAttribute("data-size"),
     ).toBe("large");
   });
+
+  test.each(["", "   "])("treats the blank src %j as no image", (src) => {
+    const { container } = render(
+      <Avatar alt="Ada Lovelace" fallback="AL" src={src} />,
+    );
+
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByRole("img", { name: "Ada Lovelace" }).textContent).toBe(
+      "AL",
+    );
+  });
+
+  test.each(["https://example.test/ada.png", " https://example.test/ada.png "])(
+    "passes the src %j to the image unchanged",
+    (src) => {
+      const { container } = render(
+        <Avatar alt="Ada Lovelace" fallback="AL" src={src} />,
+      );
+
+      expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
+    },
+  );
 });
 
 describe("Progress", () => {
