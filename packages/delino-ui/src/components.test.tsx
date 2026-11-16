@@ -1188,6 +1188,30 @@ describe("Progress", () => {
     expect(bar.hasAttribute("aria-valuenow")).toBe(false);
     expect(bar.hasAttribute("data-indeterminate")).toBe(true);
   });
+
+  test("draws state indicators with the accent graphic token", () => {
+    // Progress and Meter share the Progress classes. The dark value keeps the
+    // fill and the Select check at least 3:1 against their neutral surfaces,
+    // which the filled-control accent (#1b64da) does not.
+    for (const selector of [
+      ".dui-progress-indicator",
+      ".dui-slider-indicator",
+    ]) {
+      expect(block(selector)).toContain(
+        "background: var(--dui-color-accent-graphic)",
+      );
+    }
+    expect(block(".dui-select-option-indicator")).toContain(
+      "color: var(--dui-color-accent-graphic)",
+    );
+    expect(css).toMatch(/:root \{[^}]*--dui-color-accent-graphic: #1b64da;/);
+    expect(css).toMatch(
+      /prefers-color-scheme: dark\) \{\s*:root \{[^}]*--dui-color-accent-graphic: #4593fc;/,
+    );
+    // Filled controls keep the original accent with its on-accent text.
+    expect(css).toMatch(/--dui-color-accent: #1b64da;/);
+    expect(css).not.toMatch(/--dui-color-accent: #4593fc/);
+  });
 });
 
 describe("Separator", () => {

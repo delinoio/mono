@@ -17,9 +17,14 @@
 
 @layer delino-ui {
   /* Contrast targets (WCAG 2.1): text at least 4.5:1 (SC 1.4.3), control
-     borders and focus rings at least 3:1 (SC 1.4.11). Measured values:
-     #ffffff on #1b64da 5.41:1, #ffffff on #d22030 5.26:1, #d22030 on
-     #ffffff 5.26:1, #8b95a1 on #ffffff 3.04:1, #3182f6 on #ffffff 3.71:1. */
+     borders, focus rings and state indicators at least 3:1 (SC 1.4.11).
+     Measured values: #ffffff on #1b64da 5.41:1, #ffffff on #d22030 5.26:1,
+     #d22030 on #ffffff 5.26:1, #8b95a1 on #ffffff 3.04:1, #3182f6 on
+     #ffffff 3.71:1. State indicators (the Progress, Meter and Slider fill
+     and the Select option check) use --dui-color-accent-graphic instead of
+     --dui-color-accent, because #1b64da is only 2.01:1 against the dark
+     track (#3c3c47) and 2.56:1 against the dark highlighted option
+     (#2c2c35). */
   :root {
     --dui-color-text: #191f28;
     --dui-color-text-muted: #4e5968;
@@ -27,6 +32,7 @@
     --dui-color-border: #8b95a1;
     --dui-color-accent: #1b64da;
     --dui-color-accent-hover: #1957c2;
+    --dui-color-accent-graphic: #1b64da;
     --dui-color-on-accent: #ffffff;
     --dui-color-neutral: #f2f4f6;
     --dui-color-neutral-hover: #e5e8eb;
@@ -41,13 +47,17 @@
   }
 
   /* Dark surface #1e1e24: #6b7684 border 3.59:1, #ff6b78 danger text
-     6.02:1, #b0b8c1 muted text 8.27:1. */
+     6.02:1, #b0b8c1 muted text 8.27:1. The dark accent graphic #4593fc is
+     3.54:1 on the Progress and Slider track (#3c3c47) and 4.50:1 on the
+     highlighted Select option (#2c2c35). The accent for filled controls
+     with #ffffff text (Button, Badge, Switch, Checkbox) stays #1b64da. */
   @media (prefers-color-scheme: dark) {
     :root {
       --dui-color-text: #f9fafb;
       --dui-color-text-muted: #b0b8c1;
       --dui-color-surface: #1e1e24;
       --dui-color-border: #6b7684;
+      --dui-color-accent-graphic: #4593fc;
       --dui-color-neutral: #2c2c35;
       --dui-color-neutral-hover: #3c3c47;
       --dui-color-danger-text: #ff6b78;
@@ -606,7 +616,7 @@
 
   .dui-select-option-indicator {
     display: flex;
-    color: var(--dui-color-accent);
+    color: var(--dui-color-accent-graphic);
   }
 
   .dui-select-option-indicator svg {
@@ -966,7 +976,7 @@
   .dui-progress-indicator {
     height: 100%;
     border-radius: inherit;
-    background: var(--dui-color-accent);
+    background: var(--dui-color-accent-graphic);
     transition: width 0.3s;
   }
 
@@ -1309,7 +1319,7 @@
 
   .dui-slider-indicator {
     border-radius: inherit;
-    background: var(--dui-color-accent);
+    background: var(--dui-color-accent-graphic);
   }
 
   .dui-slider-thumb {
