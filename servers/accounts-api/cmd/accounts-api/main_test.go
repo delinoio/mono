@@ -108,9 +108,12 @@ func TestServeIgnoresErrServerClosed(t *testing.T) {
 func TestServeCleanShutdownReturnsNil(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// Create the listener on the test goroutine: newTestListener calls t.Fatalf,
+	// which must not run on any other goroutine.
+	listener := newTestListener(t)
 	done := make(chan error, 1)
 	go func() {
-		done <- serve(ctx, noStop, &http.Server{}, newTestListener(t), newTestLogger(), time.Second)
+		done <- serve(ctx, noStop, &http.Server{}, listener, newTestLogger(), time.Second)
 	}()
 
 	cancel()
