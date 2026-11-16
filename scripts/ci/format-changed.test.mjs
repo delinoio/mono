@@ -1215,38 +1215,69 @@ function conflictedMerge(f) {
 
 // Uppercase and mixed-case spellings of supported extensions, next to the
 // lowercase spelling of the same stem, to prove the spellings behave alike.
-const caseVariants = [
-  "notes.MD",
-  "Component.TSX",
-  "data.JSON",
-  "mixed.Yml",
-  "Lower.MD",
-  "lower.md",
-];
+const caseVariants = ["notes.MD", "Component.TSX", "data.JSON", "mixed.Yml"];
+
+// Two spellings of one stem. They are distinct files only on a case-sensitive
+// filesystem; on a case-insensitive one (default macOS/APFS and Windows/NTFS
+// volumes) they are the same file and cannot be staged as separate paths.
+const caseCollidingVariants = ["Lower.MD", "lower.md"];
+
+// Reports whether `directory` distinguishes names that differ only by letter
+// case. The probe writes two such files into a fresh child directory, so the
+// answer reflects the filesystem that holds `directory`, not the platform.
+function isCaseSensitiveDirectory(directory) {
+  const probe = mkdtempSync(join(directory, "case-probe-"));
+  try {
+    writeFileSync(join(probe, "probe.txt"), "lower\n");
+    writeFileSync(join(probe, "PROBE.TXT"), "upper\n");
+    return readdirSync(probe).length === 2;
+  } finally {
+    rmSync(probe, { recursive: true, force: true });
+  }
+}
+
+test("the case-sensitivity probe reports the filesystem behavior and cleans up", (t) => {
+  const parent = mkdtempSync(join(tmpdir(), "rstack-case-probe-"));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  const sensitive = isCaseSensitiveDirectory(parent);
+  assert.equal(typeof sensitive, "boolean");
+  assert.deepEqual(readdirSync(parent), []);
+  // Compare the probe with an independent observation of the same directory:
+  // create one file, then look it up by a differently cased name. Asserting a
+  // concrete value from the platform name would fail on a case-insensitive
+  // volume (for example a casefolded or mounted directory on Linux).
+  writeFileSync(join(parent, "observed.txt"), "lower\n");
+  const resolvesByOtherCase = existsSync(join(parent, "OBSERVED.TXT"));
+  assert.equal(sensitive, !resolvesByOtherCase);
+});
 
 test("every selector selects supported extensions in any letter case", (t) => {
   const f = fixture(t);
   const head = f.base;
-  for (const name of caseVariants) f.write(name, "# Case\n");
+  // Write the colliding pair only where both spellings are distinct files.
+  const names = isCaseSensitiveDirectory(f.parent)
+    ? [...caseVariants, ...caseCollidingVariants]
+    : [...caseVariants];
+  for (const name of names) f.write(name, "# Case\n");
   f.write("UPPER.TXT", "still unsupported\n");
-  f.git("add", "--", ...caseVariants, "UPPER.TXT");
-  assert.deepEqual(stagedFormatFiles(f.cwd), [...caseVariants].sort());
+  f.git("add", "--", ...names, "UPPER.TXT");
+  assert.deepEqual(stagedFormatFiles(f.cwd), [...names].sort());
   assert.deepEqual(
     changedFormatFiles(f.cwd, head, head, true),
-    [...caseVariants].sort(),
+    [...names].sort(),
   );
   const committed = f.commit();
   assert.deepEqual(
     changedFormatFiles(f.cwd, head, committed),
-    [...caseVariants].sort(),
+    [...names].sort(),
   );
   assert.deepEqual(
     changedFormatFiles(f.cwd, head, committed, true),
-    [...caseVariants].sort(),
+    [...names].sort(),
   );
   assert.deepEqual(
     allFormatFiles(f.cwd),
-    [...caseVariants, "package.json", "rstack.config.ts"].sort(),
+    [...names, "package.json", "rstack.config.ts"].sort(),
   );
 });
 
