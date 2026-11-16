@@ -2636,6 +2636,85 @@ test("explicit comparison keeps excluded, unsupported and deleted non-UTF-8 path
   assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
 });
 
+// Records `raw` in the index with a git mode (for example a gitlink) through
+// `git update-index --index-info`, which accepts the raw name bytes. The
+// worktree entry is the caller's to create.
+function recordRaw(f, mode, raw, object = "1".repeat(40)) {
+  execFileSync("git", ["update-index", "-z", "--add", "--index-info"], {
+    cwd: f.cwd,
+    env: f.env,
+    input: Buffer.concat([
+      Buffer.from(`${mode} ${object}\t`),
+      Buffer.from(raw),
+      Buffer.alloc(1),
+    ]),
+  });
+}
+
+const gitlinkMode = "160000";
+
+test("explicit comparison skips a non-UTF-8 gitlink and still rejects a non-UTF-8 regular file", (t) => {
+  const gitlink = latin1Name(".md");
+  const f = rawNameFixture(t, [[latin1Name(".ts")]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  const base = f.base;
+  // A gitlink is a directory in the worktree and has no blob to format.
+  recordRaw(f, gitlinkMode, gitlink);
+  mkdirSync(rawPath(f, gitlink));
+  if (!listsRaw(f, latin1Name(".ts"))) return t.skip(unsupportedFileSystem);
+  f.git("commit", "--quiet", "-m", "add a non-UTF-8 gitlink");
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), []);
+  assert.deepEqual(stagedFormatFiles(f.cwd), []);
+  const comparison = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      base,
+      "--head",
+      head,
+    ],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  const output = comparison.stdout + comparison.stderr;
+  assert.equal(comparison.status, 0, output);
+  assert.match(comparison.stdout, /"candidates":0/u, output);
+  assert.doesNotMatch(output, /ci_format_error/u, output);
+  // Positive control: a non-UTF-8 regular file in the next range still fails.
+  const regular = latin1Name(".ts");
+  stageRaw(f, regular);
+  f.git("commit", "--quiet", "-m", "add a non-UTF-8 regular file");
+  const next = f.git("rev-parse", "HEAD");
+  assert.throws(
+    () => changedFormatFiles(f.cwd, head, next),
+    (error) => {
+      assert.ok(error instanceof NonUtf8PathError, error.message);
+      assert.equal(error.path, "caf\\xe9.ts");
+      return true;
+    },
+  );
+});
+
+test("explicit comparison still skips a valid UTF-8 gitlink and a non-UTF-8 symlink", (t) => {
+  if (process.platform === "win32") return t.skip("symlinks need privileges");
+  const raw = latin1Name(".md");
+  const f = fixture(t);
+  try {
+    symlinkSync("target", rawPath(f, raw));
+  } catch {
+    return t.skip(unsupportedFileSystem);
+  }
+  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  recordRaw(f, gitlinkMode, Buffer.from("submod.md"));
+  mkdirSync(join(f.cwd, "submod.md"));
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add a symlink and a gitlink");
+  const head = f.git("rev-parse", "HEAD");
+  assert.deepEqual(changedFormatFiles(f.cwd, f.base, head), []);
+});
+
 test("pre-commit refuses a staged non-UTF-8 path with an accurate error and keeps HEAD", (t) => {
   const raw = latin1Name();
   const f = rawNameFixture(t, [[raw]]);
