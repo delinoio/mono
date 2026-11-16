@@ -333,7 +333,27 @@ export function stagedFormatFiles(start) {
     .sort();
 }
 
-export function changedFormatFiles(start, base, head, local = false) {
+// What an explicit comparison does with a present formattable path whose name
+// is not valid UTF-8 and that no exemption skipped. `Fail` is the formatter
+// behavior: after the shared-exclusion probe it throws `NonUtf8PathError`.
+// `Defer` selects the path without probing, for the CI planner: the planner
+// runs without installed dependencies, so it cannot evaluate the Rstack
+// exclusions, and the probe's "cannot run" fallback would wrongly reject an
+// excluded name. The planner only counts the selected names (it never passes
+// them on as path arguments); the `quality` job's formatter runs with Rstack
+// installed and gives the verdict.
+export const NonUtf8Policy = Object.freeze({
+  Fail: "fail",
+  Defer: "defer",
+});
+
+export function changedFormatFiles(
+  start,
+  base,
+  head,
+  local = false,
+  nonUtf8 = NonUtf8Policy.Fail,
+) {
   const cwd = repositoryRoot(start);
   revision(cwd, base);
   revision(cwd, head);
@@ -387,8 +407,12 @@ export function changedFormatFiles(start, base, head, local = false) {
       // probe. Local selection keeps the silent skip. Names compare by their
       // bytes, so a path deleted in the range is not in `present` and was
       // skipped above, even when a valid name with the same lossy form exists.
+      // The `Defer` policy selects the name before any probe (see
+      // `NonUtf8Policy`).
       if (hasInvalidBytes(name)) {
-        if (local || excludedByRstack(cwd, name)) return false;
+        if (local) return false;
+        if (nonUtf8 === NonUtf8Policy.Defer) return true;
+        if (excludedByRstack(cwd, name)) return false;
         throw new NonUtf8PathError(displayPath(name));
       }
       return isRegularFile(cwd, name, local);

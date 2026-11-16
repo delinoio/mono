@@ -24,6 +24,7 @@ import {
   changedFormatFiles,
   ciEnabled,
   NonUtf8PathError,
+  NonUtf8Policy,
   isThrowawayIndex,
   runFormatter,
   stagedFormatFiles,
@@ -2713,6 +2714,76 @@ test("explicit comparison still skips a valid UTF-8 gitlink and a non-UTF-8 syml
   f.git("commit", "--quiet", "-m", "add a symlink and a gitlink");
   const head = f.git("rev-parse", "HEAD");
   assert.deepEqual(changedFormatFiles(f.cwd, f.base, head), []);
+});
+
+test("explicit comparison with the Defer policy selects every present formattable non-UTF-8 name", (t) => {
+  const excluded = Buffer.concat([Buffer.from("vendor/"), latin1Name()]);
+  const plain = Buffer.concat([Buffer.from("src_"), latin1Name()]);
+  const unsupported = latin1Name(".txt");
+  const deleted = latin1Name(".md");
+  const f = rawNameFixture(t, [[excluded], [plain], [unsupported], [deleted]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, deleted);
+  f.git("commit", "--quiet", "-m", "add the path that is deleted later");
+  const base = f.git("rev-parse", "HEAD");
+  stageRaw(f, excluded, plain, unsupported);
+  rmSync(rawPath(f, deleted));
+  f.git("add", "--all");
+  f.git("commit", "--quiet", "-m", "add the non-UTF-8 paths");
+  const head = f.git("rev-parse", "HEAD");
+  // `Defer` returns one entry per present formattable name and none for the
+  // unsupported extension or the deleted path.
+  assert.deepEqual(
+    changedFormatFiles(f.cwd, base, head, false, NonUtf8Policy.Defer),
+    [`src_caf${"\udce9"}.ts`, `vendor/caf${"\udce9"}.ts`],
+  );
+  // The default policy keeps the formatter behavior: the non-excluded name
+  // fails and the excluded name alone is skipped.
+  assert.throws(
+    () => changedFormatFiles(f.cwd, base, head),
+    (error) =>
+      error instanceof NonUtf8PathError && error.path === "src_caf\\xe9.ts",
+  );
+  stageRaw(f, excluded);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), []);
+  // Local selection stays a silent skip under either policy.
+  assert.deepEqual(
+    changedFormatFiles(f.cwd, base, head, true, NonUtf8Policy.Defer),
+    [],
+  );
+});
+
+test("formatter CLI keeps skipping an excluded non-UTF-8 name and rejecting a non-excluded one", (t) => {
+  const excluded = Buffer.concat([Buffer.from("vendor/"), latin1Name()]);
+  const plain = Buffer.concat([Buffer.from("src_"), latin1Name()]);
+  const f = rawNameFixture(t, [[excluded], [plain]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  const base = f.base;
+  stageRaw(f, excluded);
+  f.git("commit", "--quiet", "-m", "add the excluded path");
+  const excludedHead = f.git("rev-parse", "HEAD");
+  stageRaw(f, plain);
+  f.git("commit", "--quiet", "-m", "add the non-excluded path");
+  const head = f.git("rev-parse", "HEAD");
+  const cli = (from, to) =>
+    spawnSync(
+      process.execPath,
+      [
+        join(root, "scripts/ci/format-changed.mjs"),
+        "--base",
+        from,
+        "--head",
+        to,
+      ],
+      { cwd: f.cwd, env: f.env, encoding: "utf8" },
+    );
+  const skipped = cli(base, excludedHead);
+  assert.equal(skipped.status, 0, skipped.stdout + skipped.stderr);
+  assert.match(skipped.stdout, /"candidates":0/u);
+  const rejected = cli(excludedHead, head);
+  assert.equal(rejected.status, 2, rejected.stdout + rejected.stderr);
+  assert.match(rejected.stderr, /ci_format_error/u);
+  assert.match(rejected.stderr, /src_caf\\\\xe9\.ts/u);
 });
 
 test("pre-commit refuses a staged non-UTF-8 path with an accurate error and keeps HEAD", (t) => {

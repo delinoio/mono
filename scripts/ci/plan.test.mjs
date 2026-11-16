@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
+  copyFileSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -683,47 +684,100 @@ test("planner skips a non-UTF-8 gitlink instead of failing", (t) => {
   assert.match(result.stdout, /"event":"ci_plan"/u);
 });
 
-test("planner fails accurately for a non-UTF-8 path and skips unsupported ones", (t) => {
-  // Linux file systems hold any byte; APFS and Windows reject or normalize it.
-  const latin1 = (suffix) =>
-    Buffer.concat([Buffer.from([0x63, 0x61, 0x66, 0xe9]), Buffer.from(suffix)]);
-  const f = fixture(t);
+// A path name that is not valid UTF-8 (the Latin-1 name `caf\xe9<suffix>`).
+// Linux file systems hold any byte; APFS and Windows reject or normalize it,
+// so the tests below attempt the write and skip when the exact bytes are not
+// listed back by Git.
+const latin1Name = (suffix, prefix = "") =>
+  Buffer.concat([
+    Buffer.from(prefix),
+    Buffer.from([0x63, 0x61, 0x66, 0xe9]),
+    Buffer.from(suffix),
+  ]);
+const unsupportedFileSystem = "file system cannot hold a non-UTF-8 name";
+
+// Writes each raw name (a Buffer, possibly under a valid directory prefix) in
+// the fixture. Returns false when the file system cannot hold them.
+function writeRawNames(f, ...names) {
   try {
-    writeFileSync(
-      Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".txt")]),
-      "x\n",
-    );
-    writeFileSync(
-      Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]),
-      "x\n",
-    );
+    for (const raw of names) {
+      const slash = raw.lastIndexOf(0x2f);
+      if (slash !== -1) {
+        mkdirSync(join(f.cwd, raw.subarray(0, slash).toString()), {
+          recursive: true,
+        });
+      }
+      writeFileSync(Buffer.concat([Buffer.from(`${f.cwd}/`), raw]), "x\n");
+    }
   } catch {
-    return t.skip("file system cannot hold a non-UTF-8 name");
+    return false;
   }
   const listing = execFileSync("git", ["ls-files", "--others", "-z"], {
     cwd: f.cwd,
     encoding: "buffer",
   });
-  if (!listing.includes(latin1(".ts")) || !listing.includes(latin1(".txt")))
-    return t.skip("file system cannot hold a non-UTF-8 name");
+  return names.every((raw) => listing.includes(raw));
+}
+
+test("planner defers the verdict for a non-UTF-8 path and skips unsupported ones", (t) => {
+  const f = fixture(t);
+  if (!writeRawNames(f, latin1Name(".txt"), latin1Name(".ts")))
+    return t.skip(unsupportedFileSystem);
   // The unsupported extension alone selects nothing.
-  rmSync(Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]));
+  rmSync(Buffer.concat([Buffer.from(`${f.cwd}/`), latin1Name(".ts")]));
   const unsupported = plan(f.cwd, f.base, f.commit());
   assert.equal(unsupported.format, false);
-  // A formattable name makes the comparison fail with the accurate error
-  // instead of a raw ENOENT.
-  writeFileSync(
-    Buffer.concat([Buffer.from(`${f.cwd}/`), latin1(".ts")]),
-    "x\n",
-  );
+  // A formattable name selects formatting: the planner cannot evaluate the
+  // shared exclusions without Rstack, so the `quality` job's formatter gives
+  // the verdict. It neither throws nor reports a missing path.
+  assert.ok(writeRawNames(f, latin1Name(".ts")));
   const head = f.commit();
-  assert.throws(
-    () => plan(f.cwd, f.base, head),
-    (error) => {
-      assert.match(error.message, /caf\\xe9\.ts/u);
-      assert.match(error.message, /not valid UTF-8/u);
-      assert.doesNotMatch(error.message, /ENOENT/u);
-      return true;
-    },
-  );
+  assert.equal(plan(f.cwd, f.base, head).format, true);
+});
+
+test("planner selects formatting for non-UTF-8 names whether or not Rstack excludes them", (t) => {
+  for (const raw of [latin1Name(".ts", "vendor/"), latin1Name(".ts", "src_")]) {
+    const f = fixture(t);
+    if (!writeRawNames(f, raw)) return t.skip(unsupportedFileSystem);
+    assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
+      quality: true,
+      format: true,
+      fixtures: false,
+      go: false,
+      e2e: false,
+    });
+  }
+});
+
+test("planner without installed dependencies publishes format=true for non-UTF-8 names", (t) => {
+  // Copy the planner next to no `node_modules` so Rstack cannot be resolved,
+  // as in the `changes` job, which installs nothing.
+  const bare = mkdtempSync(join(tmpdir(), "ci-plan-bare-"));
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+  for (const file of ["plan.mjs", "format-changed.mjs"]) {
+    copyFileSync(join(root, "scripts/ci", file), join(bare, file));
+  }
+  for (const raw of [latin1Name(".ts", "vendor/"), latin1Name(".ts", "src_")]) {
+    const f = fixture(t);
+    if (!writeRawNames(f, raw)) return t.skip(unsupportedFileSystem);
+    const head = f.commit();
+    const output = join(f.cwd, "cli-output");
+    const summary = join(f.cwd, "cli-summary");
+    const result = spawnSync(process.execPath, [join(bare, "plan.mjs")], {
+      cwd: f.cwd,
+      encoding: "utf8",
+      env: plannerEnvironment({
+        CI_BASE: f.base,
+        CI_HEAD: head,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: summary,
+      }),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const records = result.stdout.split("\n").filter(Boolean);
+    assert.equal(records.length, 1, result.stdout);
+    assert.equal(JSON.parse(records[0]).event, "ci_plan");
+    assert.match(readFileSync(output, "utf8"), /^format=true$/mu);
+    assert.match(readFileSync(summary, "utf8"), /^CI plan: /u);
+  }
 });
