@@ -425,14 +425,17 @@ export function changedFormatFiles(
   }
   // The checkout may be a PR merge commit. Select paths from the planner range,
   // then check the actual validation tree; never replace it with head contents.
+  // The index alone defines that tree in explicit mode: an untracked file is
+  // working-tree state, so one that shares its name with a path the range
+  // deleted (or never added to the index) must not make the path a candidate.
+  // Only the local selection reads untracked files.
   const present = new Set(
-    gitPaths(cwd, [
-      "ls-files",
-      "--cached",
-      "--others",
-      "--exclude-standard",
-      "-z",
-    ]),
+    gitPaths(
+      cwd,
+      local
+        ? ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+        : ["ls-files", "--cached", "-z"],
+    ),
   );
   // The validation index decides which paths are symlinks or gitlinks, not the
   // comparison head: the checkout may be a merge commit that differs from
@@ -447,8 +450,9 @@ export function changedFormatFiles(
       // The explicit comparison decides what CI validates, so a present path
       // whose name is not valid UTF-8 fails accurately after the exclusion
       // probe. Local selection keeps the silent skip. Names compare by their
-      // bytes, so a path deleted in the range is not in `present` and was
-      // skipped above, even when a valid name with the same lossy form exists.
+      // bytes, so a path deleted in the range is not in the explicit `present`
+      // and was skipped above, even when a valid name with the same lossy form
+      // exists.
       // The `Defer` policy selects the name before any probe (see
       // `NonUtf8Policy`).
       if (hasInvalidBytes(name)) {

@@ -928,6 +928,99 @@ test("explicit comparisons exclude paths that differ from HEAD only in the index
   }
 });
 
+// Untracked files are working-tree state. The explicit comparison validates the
+// index, so an untracked file whose name matches a path the range deleted must
+// not make that path a candidate; only the local selection reads untracked files.
+test("explicit comparison ignores an untracked file that re-creates a range-deleted path", (t) => {
+  const f = fixture(t);
+  f.write("deleted.ts", "const deleted = 1;\n");
+  const base = f.commit();
+  rmSync(join(f.cwd, "deleted.ts"));
+  const head = f.commit();
+  f.write("deleted.ts", "const   untracked = 2;\n");
+  assert.ok(f.git("status", "--porcelain").includes("?? deleted.ts"));
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, false), []);
+  // The local selection still reads the untracked file.
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), ["deleted.ts"]);
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      base,
+      "--head",
+      head,
+    ],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  const output = result.stdout + result.stderr;
+  assert.equal(result.status, 0, output);
+  assert.match(result.stdout, /"candidates":0/u, output);
+  assert.match(result.stdout, /"local":false/u, output);
+  // The untracked file is left as it was.
+  assert.equal(
+    readFileSync(join(f.cwd, "deleted.ts"), "utf8"),
+    "const   untracked = 2;\n",
+  );
+});
+
+test("explicit comparison selects a range-deleted path that the validation index still tracks", (t) => {
+  const f = fixture(t);
+  f.write("kept.ts", "const kept = 1;\n");
+  const base = f.commit();
+  rmSync(join(f.cwd, "kept.ts"));
+  const head = f.commit();
+  // A merge-commit checkout can differ from `head`: check out `base` so the
+  // index and working tree still hold the path the range deleted.
+  f.git("checkout", "--quiet", "--detach", base);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), ["kept.ts"]);
+});
+
+test("explicit comparison ignores an untracked file for a path the range added", (t) => {
+  const f = fixture(t);
+  const base = f.base;
+  f.write("added.ts", "const added = 1;\n");
+  const head = f.commit();
+  // The validation tree is `base`: the index does not track `added.ts`.
+  f.git("checkout", "--quiet", "--detach", base);
+  f.write("added.ts", "const   untracked = 2;\n");
+  assert.ok(f.git("status", "--porcelain").includes("?? added.ts"));
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), ["added.ts"]);
+});
+
+test("explicit comparison silently skips a range-deleted non-UTF-8 path re-created untracked", (t) => {
+  const raw = latin1Name(".ts");
+  const f = rawNameFixture(t, [[raw]]);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  stageRaw(f, raw);
+  f.git("commit", "--quiet", "-m", "add the path that is deleted later");
+  const base = f.git("rev-parse", "HEAD");
+  rmSync(rawPath(f, raw));
+  f.git("add", "--all");
+  f.git("commit", "--quiet", "-m", "delete the path");
+  const head = f.git("rev-parse", "HEAD");
+  writeRaw(f, raw);
+  if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      base,
+      "--head",
+      head,
+    ],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  const output = result.stdout + result.stderr;
+  assert.equal(result.status, 0, output);
+  assert.match(result.stdout, /"candidates":0/u, output);
+  assert.doesNotMatch(output, /ci_format_error|not valid UTF-8/u, output);
+});
+
 test("--staged selection keeps reporting an index-only path", (t) => {
   const f = fixture(t);
   f.write("f.ts", "const value = 1;\n");
