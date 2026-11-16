@@ -56,6 +56,23 @@ const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
   ["empty string", ""],
 ];
 
+// happy-dom computes no layout, so stylesheet-only behavior is checked against
+// the stylesheet source. `block` returns the declarations of the first rule
+// whose selector is exactly `selector`, so selectors with pseudo-classes such
+// as `:dir(rtl)` and `:hover:not([data-disabled])` match literally.
+const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+const block = (selector: string): string => {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const match = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+  expect(match).not.toBeNull();
+  // Collapse formatter line wraps so declarations compare as one line.
+  return (match?.[1] ?? "")
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/ \)/g, ")")
+    .trim();
+};
+
 describe("Button", () => {
   test("renders a native button with the variant and size", () => {
     render(
@@ -798,6 +815,67 @@ describe("Tabs", () => {
       "Choose a new password.",
     );
   });
+
+  // The vertical stylesheet rules select on the SDK `data-orientation`
+  // attribute, so lock the attributes they depend on.
+  test("marks every part of vertical tabs with the orientation", () => {
+    render(
+      <Tabs defaultValue="account" orientation="vertical">
+        <TabsList aria-label="Settings">
+          <TabsTab value="account">Account</TabsTab>
+          <TabsTab value="password">Password</TabsTab>
+        </TabsList>
+        <TabsPanel value="account">Manage your profile.</TabsPanel>
+        <TabsPanel value="password">Choose a new password.</TabsPanel>
+      </Tabs>,
+    );
+
+    const list = screen.getByRole("tablist", { name: "Settings" });
+    expect(list.getAttribute("aria-orientation")).toBe("vertical");
+    expect(list.getAttribute("data-orientation")).toBe("vertical");
+    expect(
+      screen
+        .getByRole("tab", { name: "Account" })
+        .getAttribute("data-orientation"),
+    ).toBe("vertical");
+    expect(screen.getByRole("tabpanel").getAttribute("data-orientation")).toBe(
+      "vertical",
+    );
+  });
+
+  test("lays vertical tabs out as a column beside the panel", () => {
+    expect(block('.dui-tabs[data-orientation="vertical"]')).toContain(
+      "display: flex",
+    );
+    const list = block('.dui-tabs-list[data-orientation="vertical"]');
+    expect(list).toContain("flex-direction: column");
+    expect(list).toContain(
+      "border-inline-end: 1px solid var(--dui-color-neutral-hover)",
+    );
+    expect(list).toContain("border-bottom: 0");
+
+    const tab = block('.dui-tabs-tab[data-orientation="vertical"]');
+    expect(tab).toContain("border-inline-end: 2px solid transparent");
+    expect(tab).toContain("margin-inline-end: -1px");
+    expect(tab).toContain("margin-bottom: 0");
+    expect(tab).toContain("border-bottom: 0");
+
+    expect(
+      block('.dui-tabs-tab[data-orientation="vertical"][data-selected]'),
+    ).toContain("border-inline-end-color: var(--dui-color-text)");
+    expect(block('.dui-tabs-panel[data-orientation="vertical"]')).toContain(
+      "padding-top: 0",
+    );
+  });
+
+  test("mirrors vertical tabs with logical properties only", () => {
+    const tabsRules = css.slice(
+      css.indexOf("/* Tabs */"),
+      css.indexOf("/* Tooltip */"),
+    );
+    expect(tabsRules).not.toMatch(/\[dir=/);
+    expect(tabsRules).not.toMatch(/:dir\(/);
+  });
 });
 
 describe("Tooltip", () => {
@@ -841,19 +919,6 @@ describe("ToastRegion", () => {
   // stylesheet source: the package rules sit in a higher cascade layer than the
   // UI SDK defaults and must keep the safe-area terms and logical edges.
   describe("region offsets", () => {
-    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
-    const block = (selector: string): string => {
-      const escaped = selector.replace(/[.[\]="]/g, "\\$&");
-      const match = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
-      expect(match).not.toBeNull();
-      // Collapse formatter line wraps so declarations compare as one line.
-      return (match?.[1] ?? "")
-        .replace(/\s+/g, " ")
-        .replace(/\( /g, "(")
-        .replace(/ \)/g, ")")
-        .trim();
-    };
-
     test("keeps the bottom and top offsets clear of the safe area", () => {
       expect(block(".dui-toast-region")).toContain(
         "bottom: calc(16px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px))",

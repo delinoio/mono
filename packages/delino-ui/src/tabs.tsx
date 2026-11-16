@@ -23,8 +23,8 @@ export function Tabs({ className, ...props }: TabsProps) {
 export type TabsListProps = React.ComponentProps<typeof TabsListPart>;
 
 /**
- * The row of tabs. Give it an accessible name with `aria-label`. Arrow keys
- * move between tabs.
+ * The list of tabs: a row, or a column when `orientation` is `vertical`. Give
+ * it an accessible name with `aria-label`. Arrow keys move between tabs.
  */
 export function TabsList({ className, ...props }: TabsListProps) {
   return (
