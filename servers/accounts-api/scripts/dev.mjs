@@ -91,6 +91,9 @@ const stoppedStatus = () => signalExitCode(received);
 async function main() {
   const buildDir = await mkdtemp(join(tmpdir(), "accounts-api-dev-"));
   try {
+    // A signal during the `mkdtemp` await above found no child to forward to
+    // and was only recorded; the build must not start after it.
+    if (received) return stoppedStatus();
     const binary = join(buildDir, binaryName);
     // -buildvcs=false matches the `build` script: in a linked Git worktree Go's
     // VCS discovery can fail with "error obtaining VCS status". Remove it
