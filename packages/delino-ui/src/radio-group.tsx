@@ -65,9 +65,7 @@ export function RadioGroup({
         {...props}
       />
       {hasError ? (
-        <FieldError className="dui-radio-field-error" match>
-          {error}
-        </FieldError>
+        <FieldError className="dui-radio-field-error">{error}</FieldError>
       ) : (
         <FieldError className="dui-radio-field-error" />
       )}
