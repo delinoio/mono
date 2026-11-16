@@ -1110,6 +1110,41 @@ test("every selector skips an index-recorded symlink checked out as a regular fi
   assert.ok(!allFormatFiles(f.cwd).includes("linked.ts"));
 });
 
+test("every selector skips an index-recorded gitlink, whatever its worktree entry is", (t) => {
+  for (const asDirectory of [false, true]) {
+    const f = fixture(t);
+    f.write("regular.ts", "const regular = 1;\n");
+    f.git("add", "regular.ts");
+    f.git("update-index", "--add", "--cacheinfo", `160000,${f.base},sub.ts`);
+    f.git("commit", "-m", "record gitlink");
+    const head = f.git("rev-parse", "HEAD");
+    assert.equal(indexMode(f, "sub.ts"), "160000");
+    // The worktree entry is a regular file (the defect case) or a directory.
+    if (asDirectory) {
+      f.write("sub.ts/inner.ts", "const inner = 1;\n");
+    } else {
+      f.write("sub.ts", "const broken = ;\n");
+    }
+    f.write("regular.ts", "const regular = 2;\n");
+    f.git("add", "regular.ts");
+    const label = asDirectory ? "directory" : "regular file";
+    const skipsGitlink = (names) =>
+      !names.some((name) => name === "sub.ts" || name.startsWith("sub.ts/"));
+    const all = allFormatFiles(f.cwd);
+    assert.ok(all.includes("regular.ts"), `${label}: ${all.join(",")}`);
+    assert.ok(skipsGitlink(all), `${label} --all: ${all.join(",")}`);
+    const staged = stagedFormatFiles(f.cwd);
+    assert.ok(skipsGitlink(staged), `${label} --staged: ${staged.join(",")}`);
+    const local = changedFormatFiles(f.cwd, f.base, head, true);
+    assert.ok(skipsGitlink(local), `${label} local: ${local.join(",")}`);
+    const explicit = changedFormatFiles(f.cwd, f.base, head);
+    assert.ok(
+      skipsGitlink(explicit),
+      `${label} explicit: ${explicit.join(",")}`,
+    );
+  }
+});
+
 test("--staged selection skips a recorded symlink, including before the first commit", (t) => {
   const f = fixture(t, false);
   f.write("regular.ts", "const   regular = 1;\n");
