@@ -141,6 +141,28 @@ describe("disabled field with an error", () => {
   });
 });
 
+describe.each([
+  ["number-input", NumberInput],
+  ["password-input", PasswordInput],
+] as const)("%s caller ARIA props in static markup", (slot, Component) => {
+  test("places them on the input and none on the root", () => {
+    const markup = renderToStaticMarkup(
+      <Component
+        label="Code"
+        description="Help text."
+        aria-describedby="a b"
+        aria-label="Pass code"
+      />,
+    );
+    const root = markup.match(new RegExp(`<div[^>]*data-slot="${slot}"[^>]*>`));
+    expect(root?.[0]).toBeTruthy();
+    expect(root?.[0]).not.toContain("aria-");
+    const input = markup.match(/<input[^>]*>/)?.[0] ?? "";
+    expect(input).toMatch(/aria-describedby="a b [^"]+"/);
+    expect(input).toContain('aria-label="Pass code"');
+  });
+});
+
 type DescriptionCase = {
   name: string;
   /** Renders the component with the given description. */
