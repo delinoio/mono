@@ -136,9 +136,7 @@ export function PasswordInput({
         </FieldDescription>
       ) : null}
       {hasError ? (
-        <FieldError className="dui-text-field-error" match>
-          {error}
-        </FieldError>
+        <FieldError className="dui-text-field-error">{error}</FieldError>
       ) : (
         <FieldError className="dui-text-field-error" />
       )}

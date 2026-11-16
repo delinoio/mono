@@ -74,9 +74,7 @@ export function Textarea({
         </FieldDescription>
       )}
       {hasError ? (
-        <FieldError className="dui-text-field-error" match>
-          {error}
-        </FieldError>
+        <FieldError className="dui-text-field-error">{error}</FieldError>
       ) : (
         <FieldError className="dui-text-field-error" />
       )}
