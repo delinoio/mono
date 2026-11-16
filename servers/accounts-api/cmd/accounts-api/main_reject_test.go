@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -64,6 +65,15 @@ func assertRejectedRecord(t *testing.T, record map[string]any, reason server.Rej
 // can observe both timeouts.
 func startRejectLogServer(t *testing.T, headerTimeout, idleTimeout time.Duration) (string, *syncBuffer) {
 	t.Helper()
+	addr, logs, _ := startRejectLogServerWithShutdown(t, headerTimeout, idleTimeout)
+	return addr, logs
+}
+
+// startRejectLogServerWithShutdown is startRejectLogServer that also returns a
+// function that starts the graceful shutdown and waits until serve returned. It
+// is safe to call more than once; the test cleanup calls it too.
+func startRejectLogServerWithShutdown(t *testing.T, headerTimeout, idleTimeout time.Duration) (string, *syncBuffer, func()) {
+	t.Helper()
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 	srv := newServer(server.NewHandler(logger), logger)
@@ -74,11 +84,15 @@ func startRejectLogServer(t *testing.T, headerTimeout, idleTimeout time.Duration
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() { done <- serve(ctx, noStop, srv, listener, logger, time.Second) }()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-	return listener.Addr().String(), logs
+	var once sync.Once
+	shutdown := func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
+	t.Cleanup(shutdown)
+	return listener.Addr().String(), logs, shutdown
 }
 
 func TestNewServerLogsRequestsRejectedBeforeTheHandler(t *testing.T) {
@@ -168,6 +182,154 @@ func TestNewServerLogsHeaderReadTimeout(t *testing.T) {
 			}
 		})
 	}
+}
+
+// netHTTPBadRequest is the whole response that net/http writes for a request
+// head it cannot parse.
+const netHTTPBadRequest = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n400 Bad Request"
+
+// TestNewServerLogsTheBadRequestAfterAHeaderTimeoutInAMalformedPartialLine
+// stalls a connection inside a partial line that net/http cannot accept as the
+// start of a line. net/http parses the line as if it were complete when the
+// header timeout expires, so it answers with a 400, and the log says the same
+// instead of a header read timeout without a response. Valid partial lines and
+// line boundaries still close without a response.
+func TestNewServerLogsTheBadRequestAfterAHeaderTimeoutInAMalformedPartialLine(t *testing.T) {
+	const headerTimeout = 200 * time.Millisecond
+	for _, tc := range []struct {
+		name string
+		// send is written before the connection stalls.
+		send string
+		// wantBadRequest reports that net/http answers with a 400; otherwise it
+		// closes the connection without a response.
+		wantBadRequest bool
+	}{
+		{"request line cut inside the target", "GET /hea", true},
+		{"request line cut inside the method", "GE", true},
+		{"request line cut inside the version", "GET / HTTP/1.", true},
+		{"request line with a lone CR", "GET / HTTP/1.1\r", true},
+		{"header name cut", "GET / HTTP/1.1\r\nHost: test\r\nUser-Ag", true},
+		{"header line with a lone CR", "GET / HTTP/1.1\r\nHost: test\r\nX: y\r", true},
+		{"colon without a name", "GET / HTTP/1.1\r\nHost: test\r\n:", true},
+		{"empty line with a lone CR", "GET / HTTP/1.1\r\nHost: test\r\n\r", true},
+		{"complete request line", "GET / HTTP/1.1", false},
+		{"line boundary after a header", "GET / HTTP/1.1\r\nHost: test\r\n", false},
+		{"valid header line without its end", "GET / HTTP/1.1\r\nHost: test\r\nX: y", false},
+		{"nothing sent", "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr, logs := startRejectLogServer(t, headerTimeout, time.Minute)
+			conn := dialRaw(t, addr)
+			if tc.send != "" {
+				if _, err := io.WriteString(conn, tc.send); err != nil {
+					t.Fatalf("write: %v", err)
+				}
+			}
+			_, response := expectClosedWithin(t, conn, 5*time.Second)
+			records := waitForRejectedRecords(t, logs, 1)
+			if len(records) != 1 {
+				t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
+			}
+			if tc.wantBadRequest {
+				if response != netHTTPBadRequest {
+					t.Errorf("response = %q, want the unchanged net/http 400", response)
+				}
+				assertRejectedRecord(t, records[0], server.RejectionMalformedRequest, http.StatusBadRequest)
+			} else {
+				if response != "" {
+					t.Errorf("response = %q, want none: net/http closes without a response", response)
+				}
+				assertRejectedRecord(t, records[0], server.RejectionHeaderReadTimeout, 0)
+			}
+			// The request starts with its first byte, or with the connection when
+			// nothing was sent, so the record measures about the timeout.
+			if duration := records[0]["duration_ms"].(float64); duration < float64(headerTimeout.Milliseconds())*0.5 {
+				t.Errorf("duration_ms = %v, want about the %v timeout", duration, headerTimeout)
+			}
+			if records := requestRecords(t, logs); len(records) != 0 {
+				t.Errorf("http_request records = %v, want none", records)
+			}
+		})
+	}
+}
+
+// TestNewServerLogsTheBadRequestAfterAHeaderTimeoutOnAKeepAliveConnection is the
+// same stall after an answered request on the same connection.
+func TestNewServerLogsTheBadRequestAfterAHeaderTimeoutOnAKeepAliveConnection(t *testing.T) {
+	const headerTimeout = 200 * time.Millisecond
+	addr, logs := startRejectLogServer(t, headerTimeout, time.Minute)
+	conn := dialRaw(t, addr)
+	reader := bufio.NewReader(conn)
+	if _, err := io.WriteString(conn, "GET /healthz HTTP/1.1\r\nHost: test\r\n\r\n"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if status, _ := readResponse(t, conn, reader); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if _, err := io.WriteString(conn, "GET /hea"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	rest, err := io.ReadAll(reader)
+	if err != nil || string(rest) != netHTTPBadRequest {
+		t.Fatalf("read = %q, %v; want the net/http 400", rest, err)
+	}
+	records := waitForRejectedRecords(t, logs, 1)
+	if len(records) != 1 {
+		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
+	}
+	assertRejectedRecord(t, records[0], server.RejectionMalformedRequest, http.StatusBadRequest)
+	if requests := requestRecords(t, logs); len(requests) != 1 {
+		t.Errorf("got %d http_request records, want exactly 1 for the answered request: %s", len(requests), logs.String())
+	}
+}
+
+// TestNewServerLogsOneHeaderTimeoutForAPartialLineDuringShutdown stalls a
+// connection inside a malformed partial line and starts the shutdown. net/http
+// sends no response during a shutdown, whatever the line is, so the log holds
+// one header read timeout without a response.
+func TestNewServerLogsOneHeaderTimeoutForAPartialLineDuringShutdown(t *testing.T) {
+	const headerTimeout = 300 * time.Millisecond
+	addr, logs, shutdown := startRejectLogServerWithShutdown(t, headerTimeout, time.Minute)
+	conn := dialRaw(t, addr)
+	if _, err := io.WriteString(conn, "GET /hea"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	// Let the server read the partial line before the shutdown starts.
+	time.Sleep(50 * time.Millisecond)
+	shutdownDone := make(chan struct{})
+	go func() {
+		defer close(shutdownDone)
+		shutdown()
+	}()
+	_, response := expectClosedWithin(t, conn, 5*time.Second)
+	if response != "" {
+		t.Errorf("response = %q, want none: net/http sends no response during a shutdown", response)
+	}
+	select {
+	case <-shutdownDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdown did not complete")
+	}
+	records := rejectedRecords(t, logs)
+	if len(records) != 1 {
+		t.Fatalf("got %d http_request_rejected records, want exactly 1: %s", len(records), logs.String())
+	}
+	assertRejectedRecord(t, records[0], server.RejectionHeaderReadTimeout, 0)
+}
+
+// waitForRejectedRecords returns the http_request_rejected records once at
+// least want of them are logged, or after a short wait. A header read timeout
+// inside a partial line is logged when the connection closes, which can be a
+// moment after the client saw it close.
+func waitForRejectedRecords(t *testing.T, logs *syncBuffer, want int) []map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(rejectedRecords(t, logs)) < want && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	// Give an unexpected second record the chance to appear.
+	time.Sleep(30 * time.Millisecond)
+	return rejectedRecords(t, logs)
 }
 
 func TestNewServerIdleKeepAliveTimeoutIsNotLogged(t *testing.T) {
