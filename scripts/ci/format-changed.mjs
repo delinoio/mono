@@ -509,10 +509,15 @@ function runBatch(cwd, args) {
   });
 }
 
-export async function runFormatter(start, paths, mode = Mode.Check) {
+// Runs every Rstack batch and returns `{ status, signal }`. `signal` is the
+// first forwarded signal (null when none); a stopped run reports the shell
+// convention `128 + signal` as `status` and starts no further batch. Callers
+// that must tell a stopped run from a failed check read `signal`, because a
+// signal exit code is indistinguishable from a check status by value alone.
+async function runFormatterBatches(start, paths, mode) {
   if (!Object.values(Mode).includes(mode))
     throw new Error("Unknown formatting mode");
-  if (!paths.length) return 0;
+  if (!paths.length) return { status: 0, signal: null };
   // Selected paths are repository-root-relative, so Rstack must run there too.
   const cwd = repositoryRoot(start);
   const entry = rstackEntry();
@@ -530,10 +535,14 @@ export async function runFormatter(start, paths, mode = Mode.Check) {
     ]);
     // A stopped run must not start another batch; report the shell convention
     // for the received signal instead of the child's own status.
-    if (signal) return signalExitCode(signal);
+    if (signal) return { status: signalExitCode(signal), signal };
     status = Math.max(status, batchStatus);
   }
-  return status;
+  return { status, signal: null };
+}
+
+export async function runFormatter(start, paths, mode = Mode.Check) {
+  return (await runFormatterBatches(start, paths, mode)).status;
 }
 
 // CI is enabled when the variable is set to anything except an empty value or
@@ -624,7 +633,7 @@ export async function main(env = process.env) {
       local: !explicit,
     }),
   );
-  const status = await runFormatter(cwd, paths, mode);
+  const { status, signal } = await runFormatterBatches(cwd, paths, mode);
   console.log(
     JSON.stringify({
       event: "ci_format_result",
@@ -632,7 +641,10 @@ export async function main(env = process.env) {
       candidates: paths.length,
     }),
   );
-  if (pathspecCommit && status !== 0)
+  // A run stopped by a signal exits 128+signal and was not a formatting verdict,
+  // so only a non-signal failure gets the pathspec-commit guidance. The signal
+  // is checked directly: `status > 128` would also match a child's own status.
+  if (pathspecCommit && !signal && status !== 0)
     // Check mode exits 1 for both unformatted files and parser failures.
     throw new Error(
       "git commit <path> cannot be formatted through the pre-commit hook: " +
