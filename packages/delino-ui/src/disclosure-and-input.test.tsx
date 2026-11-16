@@ -327,6 +327,35 @@ describe("Drawer", () => {
     expect(drawer.hasAttribute("data-closed")).toBe(true);
   });
 
+  test.each([
+    { modal: undefined, backdrop: true },
+    { modal: true, backdrop: true },
+    { modal: false, backdrop: false },
+    { modal: "trap-focus" as const, backdrop: false },
+  ])(
+    "renders the backdrop only for a modal drawer (modal=$modal)",
+    async ({ modal, backdrop }) => {
+      render(
+        <Drawer modal={modal}>
+          <DrawerTrigger>Filters</DrawerTrigger>
+          <DrawerContent>
+            <DrawerTitle>Filter results</DrawerTitle>
+          </DrawerContent>
+        </Drawer>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+      });
+      expect(
+        screen.getByRole("dialog", { name: "Filter results" }),
+      ).toBeTruthy();
+      // SDK popups can portal, so query the document.
+      expect(document.querySelector(".dui-drawer-backdrop") !== null).toBe(
+        backdrop,
+      );
+    },
+  );
+
   describe("gap cover", () => {
     // happy-dom computes neither layout nor the cascade, so the scrollable
     // overflow is checked on the stylesheet text. A real-browser measurement
