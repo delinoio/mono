@@ -1147,8 +1147,23 @@ describe("ToastRegion", () => {
 
     test("keeps the centered default", () => {
       const base = block(".dui-toast-region");
-      expect(base).toContain("left: 50%");
+      // The centered region sits in the middle of the safe area, not the
+      // viewport, so both its center and its width account for the insets.
+      expect(base).toContain(
+        "left: calc(50% + (env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) / 2)",
+      );
+      expect(base).toContain(
+        "width: min(400px, calc(100vw - 32px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)))",
+      );
       expect(base).toContain("translate: -50% 0");
+      // Start and end alignments inherit the narrower width and set only
+      // their own edge.
+      expect(block('.dui-toast-region[data-align="start"]')).not.toContain(
+        "width",
+      );
+      expect(block('.dui-toast-region[data-align="end"]')).not.toContain(
+        "width",
+      );
     });
   });
 });
