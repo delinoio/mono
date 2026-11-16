@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "@rstest/core";
 import type * as React from "react";
 import {
@@ -41,6 +40,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from "./tabs.tsx";
 import { TextField } from "./text-field.tsx";
 import { Textarea } from "./textarea.tsx";
 import { createToaster, ToastRegion } from "./toast.tsx";
+import { block, css } from "./stylesheet-source.ts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./tooltip.tsx";
 
 afterEach(() => {
@@ -55,24 +55,6 @@ const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
   ["false", false],
   ["empty string", ""],
 ];
-
-// happy-dom computes no layout, so stylesheet-only behavior is checked against
-// the stylesheet source. `block` returns the declarations of the first rule
-// whose selector is exactly `selector`, so selectors with pseudo-classes such
-// as `:dir(rtl)` and `:hover:not([data-disabled])` match literally.
-const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
-// Collapse formatter line wraps (including wrapped selectors and values) so
-// rules compare as single lines.
-const compactCss = css
-  .replace(/\s+/g, " ")
-  .replace(/\( /g, "(")
-  .replace(/ \)/g, ")");
-const block = (selector: string): string => {
-  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(`${escaped} \\{([^}]*)\\}`).exec(compactCss);
-  expect(match).not.toBeNull();
-  return (match?.[1] ?? "").trim();
-};
 
 describe("Button", () => {
   test("renders a native button with the variant and size", () => {

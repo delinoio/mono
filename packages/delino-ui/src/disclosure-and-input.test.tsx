@@ -54,6 +54,7 @@ import {
 } from "./segmented-control.tsx";
 import { Skeleton } from "./skeleton.tsx";
 import { Slider } from "./slider.tsx";
+import { block } from "./stylesheet-source.ts";
 import { Toggle, ToggleGroup } from "./toggle.tsx";
 
 afterEach(() => {
@@ -152,6 +153,15 @@ describe("Popover", () => {
     });
     const popover = screen.getByRole("dialog", { name: "Share this page" });
     expect(popover.className).toBe("dui-popover");
+  });
+
+  // happy-dom computes no layout, so this checks the stylesheet source: a popover
+  // taller than the space left in the viewport must stop at that height and
+  // scroll inside, as the menu and select popups do.
+  test("is bounded by the available height and scrolls inside", () => {
+    const rule = block(".dui-popover");
+    expect(rule).toContain("max-height: var(--available-height)");
+    expect(rule).toContain("overflow-y: auto");
   });
 
   test("closes with the Escape key", async () => {
