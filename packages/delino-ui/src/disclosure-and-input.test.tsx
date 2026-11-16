@@ -732,6 +732,15 @@ describe("Meter", () => {
     const meter = screen.getByRole("meter", { name: "Storage used" });
     expect(meter.getAttribute("aria-valuenow")).toBe("40");
     expect(meter.className).toBe("dui-progress");
+    expect(screen.getByText("40%")).toBeTruthy();
+  });
+
+  test("shows no value by default", () => {
+    render(<Meter label="Storage used" value={40} />);
+
+    const meter = screen.getByRole("meter", { name: "Storage used" });
+    expect(meter.getAttribute("aria-valuenow")).toBe("40");
+    expect(screen.queryByText("40%")).toBeNull();
   });
 });
 
