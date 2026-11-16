@@ -699,6 +699,94 @@ func TestRejectionStartOfAnAlreadyBufferedPartialRequest(t *testing.T) {
 	}
 }
 
+// TestRejectionStartIgnoresDrainedBodyBytes checks that the body of a request
+// whose handler returned without reading it does not start the next request.
+// net/http drains that body afterwards, and the drained bytes reach the
+// observer after the handler finished, so a start stamped from them would lie
+// between the end of the handler and the first byte of the rejected request.
+func TestRejectionStartIgnoresDrainedBodyBytes(t *testing.T) {
+	const head = "POST /a HTTP/1.1\r\nHost: t\r\n"
+	origin := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		// request is the head of the POST; body is what arrives 90 ms after the
+		// handler finished.
+		request string
+		body    string
+	}{
+		{"content length", head + "Content-Length: 5\r\n\r\n", "hello"},
+		{"chunked with a trailer", head + "Transfer-Encoding: chunked\r\n\r\n", "5\r\nhello\r\n0\r\nX-T: 1\r\n\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			clock := origin
+			o, _ := newTestObserver()
+			o.now = func() time.Time { return clock }
+			o.acceptedAt = origin.Add(-time.Hour)
+			o.feed([]byte(tc.request))
+			clock = origin.Add(10 * time.Millisecond)
+			o.handlerStarted()
+			o.handlerFinished()
+			o.responseFinished()
+			clock = origin.Add(100 * time.Millisecond)
+			o.feed([]byte(tc.body))
+			clock = origin.Add(500 * time.Millisecond)
+			o.feed([]byte("GARBAGE\r\n\r\n"))
+			clock = origin.Add(501 * time.Millisecond)
+			_, _, start, ok := o.claimDirectRejection([]byte(directBadRequest))
+			if !ok {
+				t.Fatal("did not claim the 400")
+			}
+			if want := origin.Add(500 * time.Millisecond); !start.Equal(want) {
+				t.Errorf("start = %v after the origin, want %v: the drained body must not move it", start.Sub(origin), want.Sub(origin))
+			}
+		})
+	}
+
+	t.Run("a stalled partial head after the drained body", func(t *testing.T) {
+		// The start of a partial head that arrives after the drained body is its
+		// own first byte, and the timeout is measured from there.
+		clock := origin
+		o, _ := newTestObserver()
+		o.now = func() time.Time { return clock }
+		o.acceptedAt = origin.Add(-time.Hour)
+		o.feed([]byte(head + "Content-Length: 5\r\n\r\n"))
+		clock = origin.Add(10 * time.Millisecond)
+		o.handlerStarted()
+		o.handlerFinished()
+		o.responseFinished()
+		clock = origin.Add(100 * time.Millisecond)
+		o.feed([]byte("hello"))
+		clock = origin.Add(500 * time.Millisecond)
+		o.feed([]byte("GET /next HTTP/1.1\r\nHost: t\r\n"))
+		o.setReadDeadline(origin.Add(time.Second))
+		clock = origin.Add(2 * time.Second)
+		start, ok := o.claimReadTimeout()
+		if !ok || !start.Equal(origin.Add(500*time.Millisecond)) {
+			t.Errorf("start = %v, %v; want the first byte of the partial head at 500ms", start.Sub(origin), ok)
+		}
+	})
+
+	t.Run("a body without a rejected request after it", func(t *testing.T) {
+		// With only the drained body after the handler, nothing started the next
+		// request, so the start falls back to the end of the last handler call.
+		clock := origin
+		o, _ := newTestObserver()
+		o.now = func() time.Time { return clock }
+		o.acceptedAt = origin.Add(-time.Hour)
+		o.feed([]byte(head + "Content-Length: 5\r\n\r\n"))
+		clock = origin.Add(10 * time.Millisecond)
+		o.handlerStarted()
+		o.handlerFinished()
+		o.responseFinished()
+		clock = origin.Add(100 * time.Millisecond)
+		o.feed([]byte("hello"))
+		_, _, start, ok := o.claimDirectRejection([]byte(directBadRequest))
+		if want := origin.Add(10 * time.Millisecond); !ok || !start.Equal(want) {
+			t.Errorf("start = %v, %v; want the end of the handler at %v", start.Sub(origin), ok, want.Sub(origin))
+		}
+	})
+}
+
 func TestLogRejectedRecordShape(t *testing.T) {
 	o, logs := newTestObserver()
 	clock := time.Date(2026, 11, 5, 0, 0, 0, 0, time.UTC)
@@ -1183,4 +1271,121 @@ func TestConnStateMarksOnlyObservedHijackedConnections(t *testing.T) {
 	}
 	// A connection that ObserveListener did not wrap is left alone.
 	ConnState(serverSide, http.StateHijacked)
+}
+
+// rejectedRecord is the part of an http_request_rejected record that the
+// duration tests compare.
+type rejectedRecord struct {
+	Reason     string `json:"reason"`
+	Status     int    `json:"status"`
+	DurationMS int64  `json:"duration_ms"`
+}
+
+// rejectedRecords returns the http_request_rejected records in logs, in log
+// order.
+func rejectedRecords(t *testing.T, logs *lockedBuffer) []rejectedRecord {
+	t.Helper()
+	var records []rejectedRecord
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry struct {
+			Msg string `json:"msg"`
+			rejectedRecord
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		if entry.Msg == "http_request_rejected" {
+			records = append(records, entry.rejectedRecord)
+		}
+	}
+	return records
+}
+
+// TestDrainedRequestBodyDoesNotMoveRejectionStart sends a request whose handler
+// never reads the body, so net/http drains the body when it arrives, and then
+// rejects the next request. The logged duration is the time since the first
+// byte of the rejected request, not since the drained body.
+func TestDrainedRequestBodyDoesNotMoveRejectionStart(t *testing.T) {
+	const (
+		gap           = 300 * time.Millisecond
+		headerTimeout = 400 * time.Millisecond
+		postHead      = "POST /post HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n\r\n"
+	)
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "0")
+	}
+	dial := func(t *testing.T, addr string) net.Conn {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		return conn
+	}
+	write := func(t *testing.T, conn net.Conn, s string) {
+		t.Helper()
+		if _, err := io.WriteString(conn, s); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+	waitForRejection := func(t *testing.T, logs *lockedBuffer) []rejectedRecord {
+		t.Helper()
+		deadline := time.Now().Add(3 * time.Second)
+		for countRecords(logs, "http_request_rejected") == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		return rejectedRecords(t, logs)
+	}
+
+	t.Run("malformed request", func(t *testing.T) {
+		addr, logs := serveObserved(t, handler)
+		conn := dial(t, addr)
+		write(t, conn, postHead)
+		time.Sleep(gap)
+		write(t, conn, "hello")
+		time.Sleep(gap)
+		write(t, conn, "GARBAGE\r\n\r\n")
+		_, _ = io.ReadAll(conn)
+		records := waitForRejection(t, logs)
+		if len(records) != 1 || records[0].Status != http.StatusBadRequest || records[0].Reason != string(RejectionMalformedRequest) {
+			t.Fatalf("rejected records = %+v, want one malformed_request 400: %s", records, logs.String())
+		}
+		if records[0].DurationMS > 50 {
+			t.Errorf("duration_ms = %d, want at most 50: the rejected request started when its own bytes arrived, not %v earlier with the drained body", records[0].DurationMS, gap)
+		}
+		// The answered POST is logged too, so the body was drained on a
+		// keep-alive connection.
+		if got := countRecords(logs, "http_request"); got != 1 {
+			t.Errorf("http_request records = %d, want 1: %s", got, logs.String())
+		}
+	})
+
+	t.Run("header read timeout", func(t *testing.T) {
+		addr, logs := serveObservedWith(t, handler, func(srv *http.Server) {
+			srv.ReadHeaderTimeout = headerTimeout
+		})
+		conn := dial(t, addr)
+		write(t, conn, postHead)
+		time.Sleep(gap)
+		write(t, conn, "hello")
+		time.Sleep(gap)
+		// The tail ends at a line boundary, so net/http closes the connection
+		// without a response when the header timeout expires.
+		write(t, conn, "GET /next HTTP/1.1\r\nHost: t\r\n")
+		_, _ = io.ReadAll(conn)
+		records := waitForRejection(t, logs)
+		if len(records) != 1 || records[0].Status != 0 || records[0].Reason != string(RejectionHeaderReadTimeout) {
+			t.Fatalf("rejected records = %+v, want one header_read_timeout: %s", records, logs.String())
+		}
+		// The timeout runs from the first byte of the partial head, and the
+		// drained body arrived gap before it.
+		if ms := records[0].DurationMS; ms < headerTimeout.Milliseconds()-50 || ms > (headerTimeout+gap/2).Milliseconds() {
+			t.Errorf("duration_ms = %d, want about %d: the drained body must not count", ms, headerTimeout.Milliseconds())
+		}
+	})
 }
