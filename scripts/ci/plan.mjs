@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import { changedFormatFiles, NonUtf8Policy } from "./format-changed.mjs";
+import {
+  changedFormatFiles,
+  MissingPathPolicy,
+  NonUtf8Policy,
+} from "./format-changed.mjs";
 
 const fixtureInputs = new Set([
   ".github/workflows/CI.yml",
@@ -60,10 +64,18 @@ export function isGoInput(path) {
 export function plan(cwd, base, head) {
   // Reuse the formatter's revision validation and literal-path selection. The
   // planner runs without installed dependencies and cannot evaluate the Rstack
-  // exclusions, so a non-UTF-8 formattable name is deferred: it selects
-  // formatting and the `quality` job's formatter gives the verdict.
+  // exclusions, so a non-UTF-8 formattable name and a formattable path missing
+  // from the working tree are deferred: they select formatting and the
+  // `quality` job's formatter gives the verdict.
   const format =
-    changedFormatFiles(cwd, base, head, false, NonUtf8Policy.Defer).length > 0;
+    changedFormatFiles(
+      cwd,
+      base,
+      head,
+      false,
+      NonUtf8Policy.Defer,
+      MissingPathPolicy.Defer,
+    ).length > 0;
   const paths = execFileSync(
     "git",
     ["diff", "--name-only", "--no-renames", "-z", base, head, "--"],

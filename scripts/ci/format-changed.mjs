@@ -392,12 +392,40 @@ export const NonUtf8Policy = Object.freeze({
   Defer: "defer",
 });
 
+// What an explicit comparison does with a formattable index path whose
+// working-tree entry is gone (see `GoneCode`). `Fail` is the formatter
+// behavior: a path that the shared Rstack exclusions skip is skipped, any other
+// path rethrows the original `lstat` error. `Defer` selects the path without
+// probing, for the CI planner, for the same reason as `NonUtf8Policy.Defer`:
+// the planner cannot evaluate the exclusions, and the probe's "cannot run"
+// fallback would wrongly fail an excluded path. The `quality` job's formatter
+// gives the verdict.
+export const MissingPathPolicy = Object.freeze({
+  Fail: "fail",
+  Defer: "defer",
+});
+
+// Explicit-comparison regular-file check. Unlike `stagedRegularFile` and the
+// local selector, which skip a gone path, the explicit comparison decides what
+// CI validates, so a gone path fails unless the shared exclusions skip it.
+function explicitRegularFile(cwd, name, missing) {
+  try {
+    return lstatSync(resolve(cwd, name)).isFile();
+  } catch (error) {
+    if (!goneCodes.has(error.code)) throw error;
+    if (missing === MissingPathPolicy.Defer) return true;
+    if (excludedByRstack(cwd, name)) return false;
+    throw error;
+  }
+}
+
 export function changedFormatFiles(
   start,
   base,
   head,
   local = false,
   nonUtf8 = NonUtf8Policy.Fail,
+  missing = MissingPathPolicy.Fail,
 ) {
   const cwd = repositoryRoot(start);
   revision(cwd, base);
@@ -464,7 +492,9 @@ export function changedFormatFiles(
         if (excludedByRstack(cwd, name)) return false;
         throw new NonUtf8PathError(displayPath(name));
       }
-      return isRegularFile(cwd, name, local);
+      return local
+        ? isRegularFile(cwd, name, true)
+        : explicitRegularFile(cwd, name, missing);
     })
     .sort();
 }
