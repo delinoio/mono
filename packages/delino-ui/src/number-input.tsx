@@ -59,6 +59,11 @@ export function NumberInput({
 }: NumberInputProps) {
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
 
   return (
     <Field
@@ -118,11 +123,11 @@ export function NumberInput({
           </NumberInputIncrement>
         </NumberInputGroup>
       </NumberInputRoot>
-      {description === undefined ? null : (
+      {hasDescription ? (
         <FieldDescription className="dui-text-field-description">
           {description}
         </FieldDescription>
-      )}
+      ) : null}
       {hasError ? (
         <FieldError className="dui-text-field-error" match>
           {error}

@@ -45,6 +45,11 @@ export function Slider({
   const initial = props.value ?? props.defaultValue;
   const thumbCount = Array.isArray(initial) ? initial.length : 1;
   const isRange = Array.isArray(initial);
+  const hasDescription =
+    description !== undefined &&
+    description !== null &&
+    description !== false &&
+    description !== "";
 
   return (
     <Field className="dui-text-field" disabled={disabled}>
@@ -73,11 +78,11 @@ export function Slider({
           </SliderTrack>
         </SliderControl>
       </SliderRoot>
-      {description === undefined ? null : (
+      {hasDescription ? (
         <FieldDescription className="dui-text-field-description">
           {description}
         </FieldDescription>
-      )}
+      ) : null}
     </Field>
   );
 }
