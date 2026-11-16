@@ -12,7 +12,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import test from "node:test";
 
 // These tests start the real launcher, which builds and runs the real server.
@@ -446,5 +446,64 @@ test(
 
     await waitGone(run, pids, "the orphaned server to be killed");
     await assertNoListener(port);
+  },
+);
+
+// The window between the launcher's module-level signal handlers and the start
+// of the build is a few hundred microseconds wide (one `mkdtemp`), so a test
+// cannot hit it by timing. This preload module widens it: it delays `mkdtemp`
+// and announces the delayed call on standard error, which proves the launcher
+// has installed its signal handlers (they are installed before `main` runs).
+const MkdtempDelayMs = 1500;
+const mkdtempDelayPreload = `
+import fs from "node:fs/promises";
+import { syncBuiltinESMExports } from "node:module";
+const mkdtemp = fs.mkdtemp;
+fs.mkdtemp = async (...args) => {
+  console.error(JSON.stringify({ event: "test_mkdtemp_delayed" }));
+  await new Promise((resolve) => setTimeout(resolve, ${MkdtempDelayMs}));
+  return mkdtemp(...args);
+};
+// Propagate the replacement to the named ESM imports of node:fs/promises.
+syncBuiltinESMExports();
+`;
+
+test(
+  "SIGTERM before the build starts never runs the build or the server",
+  { skip, timeout: Timeout * 2 },
+  async (t) => {
+    const port = await freePort();
+    const supportDir = mkdtempSync(join(tmpdir(), "accounts-api-preload-"));
+    t.after(() => rmSync(supportDir, { recursive: true, force: true }));
+    const preload = join(supportDir, "delay-mkdtemp.mjs");
+    writeFileSync(preload, mkdtempDelayPreload);
+    const marker = join(supportDir, "go-started");
+    // Any invocation of go leaves the marker. It exits non-zero at once so a
+    // launcher that wrongly starts the build does not hang the test.
+    const run = startLauncher(t, {
+      port,
+      env: {
+        MARKER: marker,
+        NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+      },
+      pathPrefix: fakeGo(t, ['touch "$MARKER"', "exit 1"].join("\n")),
+    });
+    await waitFor(
+      run,
+      () => countEvents(run.stderr, "test_mkdtemp_delayed") > 0,
+      "the delayed mkdtemp call",
+    );
+
+    // The launcher is waiting for mkdtemp, so there is no child to forward the
+    // signal to; the launcher has to act on it before it starts the build.
+    process.kill(run.child.pid, "SIGTERM");
+    const { code } = await run.exited;
+
+    assert.equal(code, StatusSigterm, run.stderr);
+    assert.equal(existsSync(marker), false, "go was started after the signal");
+    assert.doesNotMatch(run.stdout, /"server_started"/);
+    assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
+    await assertNoListener(port);
+    assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
   },
 );
