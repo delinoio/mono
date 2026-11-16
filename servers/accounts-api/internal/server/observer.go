@@ -178,9 +178,10 @@ type connObserver struct {
 
 	// acceptedAt is when the connection was accepted.
 	acceptedAt time.Time
-	// requestStart is when the first byte arrived that no handler has finished
-	// since; it is zero until the next byte arrives. It is the start of the
-	// request that a rejection record measures.
+	// requestStart is when the first request head byte arrived that no handler
+	// has finished since; it is zero until the next head byte arrives. Body bytes
+	// never set it (see feedHead). It is the start of the request that a
+	// rejection record measures.
 	requestStart time.Time
 	// parsedHeads counts the request heads that parsed. A read timeout on a
 	// connection whose parser is waiting for the first byte of a head is the
@@ -203,9 +204,6 @@ func newConnObserver(logger *slog.Logger) *connObserver {
 func (o *connObserver) feed(p []byte) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	if len(p) > 0 && o.requestStart.IsZero() {
-		o.requestStart = o.now()
-	}
 	for len(p) > 0 && o.phase != phaseStopped {
 		switch o.phase {
 		case phaseHead:
@@ -244,6 +242,14 @@ func (o *connObserver) stop() {
 // feedHead appends bytes to the current head until its empty line and returns
 // the unconsumed rest.
 func (o *connObserver) feedHead(p []byte) []byte {
+	// Only head bytes can start the request that a rejection record measures.
+	// Body bytes belong to a request that already started: net/http drains the
+	// unread body of a request after its handler returned, and those bytes must
+	// not become the start of the next request. A read that carries the end of a
+	// body and the start of the next head is stamped here, at that read's time.
+	if len(p) > 0 && o.requestStart.IsZero() {
+		o.requestStart = o.now()
+	}
 	for i, b := range p {
 		// net/http discards up to maxLeadingCRorLF CR or LF bytes before a request
 		// line when the previous request on the connection was a POST (a tolerance
