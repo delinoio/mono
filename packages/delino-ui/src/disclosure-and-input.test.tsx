@@ -831,6 +831,15 @@ describe("Skeleton", () => {
     expect(bare.getAttribute("style")).toBeNull();
   });
 
+  test("keeps a circle from being stretched by a flex container", () => {
+    // happy-dom computes no layout, so the stylesheet text is checked. Without
+    // `align-self`, the default `align-items: stretch` of a flex container
+    // replaces the size that `aspect-ratio` derives for the auto side.
+    expect(block(".dui-skeleton[data-circle]")).toContain(
+      "align-self: flex-start",
+    );
+  });
+
   test("lets the caller style win over the circle diameter", () => {
     const { container } = render(<Skeleton circle style={{ width: "24px" }} />);
 
