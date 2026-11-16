@@ -25,6 +25,7 @@ import {
   ciEnabled,
   NonUtf8PathError,
   NonUtf8Policy,
+  NonUtf8RootError,
   isThrowawayIndex,
   runFormatter,
   stagedFormatFiles,
@@ -2366,6 +2367,126 @@ test("CLI runs from the root and a subdirectory of a whitespace-terminated repos
       assert.match(result.stdout, /"candidates":[1-9]/u, detail);
     }
   }
+});
+
+// A checkout whose own path is not valid UTF-8 (`<parent>/caf\xe9`). The test
+// process cannot address it with a string, so the directory is renamed through
+// raw `Buffer` paths and the CLI is started by `/bin/sh`, which changes into it
+// with a glob (the parent holds nothing else). Returns null when the file
+// system cannot hold the name or Git does not report the raw root.
+function nonUtf8CheckoutFixture(t) {
+  if (process.platform === "win32") return null;
+  const f = fixture(t, true, process.env, "checkout");
+  // An unformatted staged file: a formatter run in write mode would change it.
+  f.write("staged.ts", "const   value = 1;\n");
+  f.git("add", "--", "staged.ts");
+  const renamed = Buffer.concat([Buffer.from(`${f.parent}/`), latin1Name("")]);
+  try {
+    renameSync(f.cwd, renamed);
+  } catch {
+    return null;
+  }
+  const inCheckout = (command, args, extraEnv = {}) =>
+    spawnSync(
+      "/bin/sh",
+      ["-c", 'cd -- caf* && exec "$@"', "sh", command, ...args],
+      { cwd: f.parent, env: { ...f.env, ...extraEnv }, encoding: "utf8" },
+    );
+  const toplevel = inCheckout("git", ["rev-parse", "--show-toplevel"]);
+  const reported = spawnSync(
+    "/bin/sh",
+    ["-c", "cd -- caf* && exec git rev-parse --show-toplevel"],
+    { cwd: f.parent, env: f.env, encoding: "buffer" },
+  );
+  if (toplevel.status !== 0 || !reported.stdout.includes(0xe9)) return null;
+  return { ...f, inCheckout };
+}
+
+test("every CLI mode reports a non-UTF-8 checkout path accurately", (t) => {
+  const f = nonUtf8CheckoutFixture(t);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  const before = f.inCheckout("git", ["status", "--porcelain"]).stdout;
+  assert.match(before, /^A  staged\.ts$/mu);
+  for (const args of [
+    ["--all"],
+    ["--staged"],
+    ["--staged", "--write"],
+    ["--base", f.base, "--head", f.base],
+  ]) {
+    const result = f.inCheckout(process.execPath, [script, ...args]);
+    const label = `${args.join(" ")}\n${result.stdout}${result.stderr}`;
+    assert.equal(result.status, 2, label);
+    assert.doesNotMatch(result.stdout, /"ci_format"/u, label);
+    const lines = result.stderr.split("\n").filter(Boolean);
+    assert.equal(lines.length, 1, label);
+    const record = JSON.parse(lines[0]);
+    assert.equal(record.event, "ci_format_error", label);
+    assert.match(record.message, /checkout path is not valid UTF-8/u, label);
+    assert.match(record.message, /caf\\xe9/u, label);
+    assert.match(record.message, /Move or rename the checkout/u, label);
+    assert.doesNotMatch(result.stderr, /ENOENT/u, label);
+  }
+  assert.equal(
+    f.inCheckout("git", ["status", "--porcelain"]).stdout,
+    before,
+    "no file was changed",
+  );
+});
+
+test("a non-UTF-8 checkout path raises NonUtf8RootError from the selectors", (t) => {
+  const f = nonUtf8CheckoutFixture(t);
+  if (f === null) return t.skip(unsupportedFileSystem);
+  // The selector module runs in the checkout so its `process.cwd()` is the
+  // lossy form of the raw path, as it is for the CLI.
+  const probe = `
+    import { allFormatFiles } from ${JSON.stringify(
+      new URL("./format-changed.mjs", import.meta.url).href,
+    )};
+    try { allFormatFiles(process.cwd()); } catch (error) {
+      console.log(JSON.stringify({ name: error.name, path: error.path }));
+    }
+  `;
+  const result = f.inCheckout(process.execPath, [
+    "--input-type=module",
+    "--eval",
+    probe,
+  ]);
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const { name, path } = JSON.parse(result.stdout);
+  assert.equal(name, NonUtf8RootError.name);
+  assert.match(path, /caf\\xe9$/u);
+});
+
+test("a checkout path with a valid replacement character still works", (t) => {
+  const f = fixture(t, true, process.env, "caf\ufffd");
+  const result = spawnSync(
+    process.execPath,
+    [
+      join(root, "scripts/ci/format-changed.mjs"),
+      "--base",
+      f.base,
+      "--head",
+      f.base,
+    ],
+    { cwd: f.cwd, env: f.env, encoding: "utf8" },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /"candidates":0/u);
+  assert.match(result.stdout, /ci_format_result/u);
+  assert.equal(result.stderr, "");
+});
+
+test("a missing Git executable keeps its own message", (t) => {
+  const f = fixture(t);
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/format-changed.mjs"), "--all"],
+    { cwd: f.cwd, env: { ...f.env, PATH: "/nonexistent" }, encoding: "utf8" },
+  );
+  assert.equal(result.status, 2, result.stdout + result.stderr);
+  assert.match(result.stderr, /spawnSync git ENOENT/u);
+  assert.doesNotMatch(result.stderr, /not valid UTF-8/u);
 });
 
 test("fixture removes the unique parent of a named child directory", (t) => {

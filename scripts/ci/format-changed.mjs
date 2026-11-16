@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isUtf8 } from "node:buffer";
 import { execFileSync, spawn } from "node:child_process";
-import { lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { constants } from "node:os";
 import { dirname, extname, resolve } from "node:path";
@@ -55,6 +55,20 @@ export class NonUtf8PathError extends Error {
       `Path name is not valid UTF-8 and cannot be formatted: ${displayPath}. The formatter cannot address a file name that is not valid UTF-8. Rename the file to a valid UTF-8 name ("git mv" for a tracked path) and commit the rename.`,
     );
     this.name = "NonUtf8PathError";
+    this.path = displayPath;
+  }
+}
+
+// The checkout path itself is not valid UTF-8. Node decodes `process.cwd()` and
+// Git's output as UTF-8, so the path it holds has U+FFFD in place of each
+// invalid byte and names a directory that does not exist; passing it as a child
+// process `cwd` fails with the same `ENOENT` as a missing Git executable.
+export class NonUtf8RootError extends Error {
+  constructor(displayPath) {
+    super(
+      `The checkout path is not valid UTF-8 and cannot be used as a repository root: ${displayPath}. The formatter resolves every selector, the shared-exclusion probe and the Rstack run against this path, and a directory whose name is not valid UTF-8 cannot be addressed. Move or rename the checkout to a path that is valid UTF-8 and run the command again.`,
+    );
+    this.name = "NonUtf8RootError";
     this.path = displayPath;
   }
 }
@@ -147,7 +161,35 @@ function gitPaths(cwd, args) {
 // legitimately end in whitespace (a checkout directory named `checkout `), and
 // trimming it would point every selector at a directory that does not exist.
 function repositoryRoot(start) {
-  return git(start, "rev-parse", "--show-toplevel").replace(/\n$/u, "");
+  try {
+    return git(start, "rev-parse", "--show-toplevel").replace(/\n$/u, "");
+  } catch (error) {
+    throw nonUtf8RootDiagnosis(start, error) ?? error;
+  }
+}
+
+// Workaround for a checkout whose own path is not valid UTF-8. Why: Node cannot
+// represent such a path, so `start` (usually `process.cwd()`) holds U+FFFD for
+// each invalid byte, `execFileSync` fails with `ENOENT` for the missing `cwd`,
+// and the error is indistinguishable from a missing Git executable. Scope: it
+// only diagnoses the checkout that contains the current directory, found by
+// asking Git without a `cwd`; a library caller that passes the lossy path of
+// another checkout keeps the original error, as does a missing Git. Removal:
+// when the formatter can run from such a root (that needs every child process
+// to avoid absolute paths) and this diagnosis is no longer needed.
+function nonUtf8RootDiagnosis(start, error) {
+  if (error?.code !== "ENOENT" || existsSync(start)) return null;
+  let raw;
+  try {
+    raw = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+      encoding: "buffer",
+      maxBuffer: GitMaxBuffer,
+    });
+  } catch {
+    return null;
+  }
+  const root = decodePath(raw).replace(/\n$/u, "");
+  return hasInvalidBytes(root) ? new NonUtf8RootError(displayPath(root)) : null;
 }
 
 function revision(cwd, value) {
