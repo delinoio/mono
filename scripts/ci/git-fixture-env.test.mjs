@@ -34,14 +34,18 @@ function repository(t, ambient) {
   return { cwd, git };
 }
 
-test("isolation returns the documented environment and drops ambient variables", () => {
+test("isolation returns the documented environment and drops ambient GIT_* and LEFTHOOK* variables", () => {
   const env = isolateGitEnvironment({
     PATH: "/bin",
     GIT_DIR: "/somewhere",
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "core.excludesFile",
     GIT_CONFIG_VALUE_0: "/somewhere/ignore",
+    LEFTHOOK: "0",
+    LEFTHOOK_BIN: "/somewhere/lefthook",
     LEFTHOOK_CONFIG: "/somewhere/lefthook.yml",
+    LEFTHOOK_EXCLUDE: "rstack-fmt",
+    LEFTHOOK_OUTPUT: "summary",
     UNRELATED: "kept",
   });
   assert.deepEqual(env, {

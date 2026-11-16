@@ -57,7 +57,10 @@ function fixture(
     cwd = join(parent, directoryName);
     mkdirSync(cwd);
   }
-  const env = isolateGitEnvironment({ ...parentEnv, LEFTHOOK_BIN: lefthook });
+  // Set LEFTHOOK_BIN after isolation: the helper removes every LEFTHOOK*
+  // variable from the inherited environment, including a caller-provided one.
+  const env = isolateGitEnvironment({ ...parentEnv });
+  env.LEFTHOOK_BIN = lefthook;
   delete env.CI;
   delete env.TURBO_SCM_BASE;
   delete env.TURBO_SCM_HEAD;
@@ -135,6 +138,32 @@ test("fixture ignores hostile global Git configuration and GIT_* variables", (t)
   f.git("commit", "--quiet", "-m", "hostile environment");
   assert.equal(
     f.git("show", "HEAD:hostile.ts"),
+    "const value = { answer: 42 };",
+  );
+});
+
+test("fixture ignores hostile LEFTHOOK* variables", (t) => {
+  const f = fixture(t, true, {
+    ...process.env,
+    LEFTHOOK: "0",
+    LEFTHOOK_EXCLUDE: "rstack-fmt",
+    LEFTHOOK_OUTPUT: "summary",
+    LEFTHOOK_QUIET: "meta,success,summary",
+    LEFTHOOK_VERBOSE: "1",
+  });
+  assert.equal(f.env.LEFTHOOK_BIN, lefthook);
+  assert.deepEqual(
+    Object.keys(f.env)
+      .filter((name) => name.startsWith("LEFTHOOK"))
+      .sort(),
+    ["LEFTHOOK_BIN"],
+  );
+  f.installHook();
+  f.write("lefthook-env.ts", "const value={answer:42}\n");
+  f.git("add", "lefthook-env.ts");
+  f.git("commit", "--quiet", "-m", "hostile lefthook environment");
+  assert.equal(
+    f.git("show", "HEAD:lefthook-env.ts"),
     "const value = { answer: 42 };",
   );
 });
