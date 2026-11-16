@@ -1160,13 +1160,20 @@
     margin-inline: auto;
   }
 
+  /* Each side paints a surface-colored `box-shadow` offset 96px toward its
+     edge. It covers the gap that a drag past the edge would open. Unlike an
+     absolutely positioned pseudo-element, a shadow is painted outside the
+     box, is not clipped by the sheet's own `overflow-y: auto`, and adds no
+     scrollable overflow to the scrolling sheet. */
   .dui-drawer-content[data-side="bottom"] {
     padding-bottom: calc(24px + env(safe-area-inset-bottom, 0px));
     border-radius: var(--dui-radius-panel) var(--dui-radius-panel) 0 0;
+    box-shadow: 0 96px 0 0 var(--dui-color-surface);
   }
 
   .dui-drawer-content[data-side="top"] {
     border-radius: 0 0 var(--dui-radius-panel) var(--dui-radius-panel);
+    box-shadow: 0 -96px 0 0 var(--dui-color-surface);
   }
 
   .dui-drawer-content:is([data-side="left"], [data-side="right"]) {
@@ -1175,35 +1182,12 @@
     max-height: none;
   }
 
-  /* Covers the gap that a drag past the edge would open. */
-  .dui-drawer-content::after {
-    position: absolute;
-    background: inherit;
-    content: "";
+  .dui-drawer-content[data-side="left"] {
+    box-shadow: -96px 0 0 0 var(--dui-color-surface);
   }
 
-  .dui-drawer-content[data-side="bottom"]::after {
-    top: 100%;
-    inset-inline: 0;
-    height: 96px;
-  }
-
-  .dui-drawer-content[data-side="top"]::after {
-    bottom: 100%;
-    inset-inline: 0;
-    height: 96px;
-  }
-
-  .dui-drawer-content[data-side="left"]::after {
-    right: 100%;
-    inset-block: 0;
-    width: 96px;
-  }
-
-  .dui-drawer-content[data-side="right"]::after {
-    left: 100%;
-    inset-block: 0;
-    width: 96px;
+  .dui-drawer-content[data-side="right"] {
+    box-shadow: 96px 0 0 0 var(--dui-color-surface);
   }
 
   .dui-drawer-actions {

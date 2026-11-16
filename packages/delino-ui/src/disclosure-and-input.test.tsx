@@ -287,6 +287,29 @@ describe("Drawer", () => {
     });
     expect(drawer.hasAttribute("data-closed")).toBe(true);
   });
+
+  describe("gap cover", () => {
+    // happy-dom computes neither layout nor the cascade, so the scrollable
+    // overflow is checked on the stylesheet text. A real-browser measurement
+    // belongs to the pull request validation record.
+    const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+
+    test("has no pseudo-element that adds scrollable overflow", () => {
+      expect(css).not.toMatch(/\.dui-drawer-content[^{]*::(?:after|before)/);
+    });
+
+    test.each([
+      ["bottom", "0 96px 0 0"],
+      ["top", "0 -96px 0 0"],
+      ["left", "-96px 0 0 0"],
+      ["right", "96px 0 0 0"],
+    ])("paints the %s gap with a surface-colored shadow", (side, offset) => {
+      const rule = new RegExp(
+        `\\.dui-drawer-content\\[data-side="${side}"\\]\\s*\\{[^}]*box-shadow:\\s*${offset.replace(/-/g, "\\-")} var\\(--dui-color-surface\\);`,
+      );
+      expect(css).toMatch(rule);
+    });
+  });
 });
 
 describe("Slider", () => {
