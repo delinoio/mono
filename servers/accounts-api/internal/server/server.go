@@ -85,12 +85,16 @@ func handleHealthz(logger *slog.Logger) http.HandlerFunc {
 // status is the first committed status, matching what net/http sends to the
 // client; wroteHeader reports whether a header has been committed, either by
 // the first WriteHeader call or by the first implicit Write. bytes counts the
-// response body bytes net/http transmits; noBody marks a response that has no
-// body on the wire (a HEAD response), so body bytes the handler writes are
-// discarded by net/http and must not be counted. hijacked reports that the
-// handler took over the connection: net/http then sends nothing and tracks no
-// response, so the recorder cannot know what status, if any, the client
-// received, and it stops recording statuses.
+// response body bytes that net/http accepted from the handler. It equals what
+// the client receives for a response that completes. net/http buffers the
+// response and discards the buffered part when the handler panics or the
+// client disconnects, so the count can exceed what the client received.
+// noBody marks a response that has no body on the wire (a HEAD response), so
+// body bytes the handler writes are discarded by net/http and must not be
+// counted. hijacked reports that the handler took over the connection:
+// net/http then sends nothing and tracks no response, so the recorder cannot
+// know what status, if any, the client received, and it stops recording
+// statuses.
 type statusRecorder struct {
 	http.ResponseWriter
 	status      int

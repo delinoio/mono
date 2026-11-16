@@ -267,40 +267,72 @@ func serveRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clie
 	return err, clientStatus, decodeRecords(t, logs)
 }
 
+// TestRequestLogOnPanic checks the status and bytes of the record of a handler
+// that panics, together with what the client received. bytes counts the body
+// bytes net/http accepted from the handler, not what reached the client:
+// net/http buffers the response (a 2048-byte buffer in front of the chunked
+// writer) and discards the buffered part when the handler panics, so the
+// logged count exceeds wantClientBody for bytes that were still buffered. The
+// client body is read with serveCommittedRequest, so a flushed part that
+// reached the client before the abort is counted.
 func TestRequestLogOnPanic(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		handler    http.HandlerFunc
-		wantStatus int
-		wantBytes  int
+		name           string
+		handler        http.HandlerFunc
+		wantStatus     int
+		wantBytes      int
+		wantClientBody int
 	}{
 		{"before any write", func(http.ResponseWriter, *http.Request) {
 			panic("boom")
-		}, http.StatusInternalServerError, 0},
+		}, http.StatusInternalServerError, 0, 0},
 		{"after committed status", func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusAccepted)
 			panic("boom")
-		}, http.StatusAccepted, 0},
+		}, http.StatusAccepted, 0, 0},
 		{"after body write", func(w http.ResponseWriter, _ *http.Request) {
 			_, _ = w.Write([]byte("partial"))
 			panic("boom")
-		}, http.StatusOK, len("partial")},
-		{"invalid status 0", invalidStatusHandler(0), http.StatusInternalServerError, 0},
-		{"invalid status 99", invalidStatusHandler(99), http.StatusInternalServerError, 0},
-		{"invalid status -1", invalidStatusHandler(-1), http.StatusInternalServerError, 0},
-		{"invalid status 1000", invalidStatusHandler(1000), http.StatusInternalServerError, 0},
-		{"invalid status 99999", invalidStatusHandler(99999), http.StatusInternalServerError, 0},
+		}, http.StatusOK, len("partial"), 0},
+		{"after body write and flush", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("partial"))
+			flushOrPanic(w)
+			panic("boom")
+		}, http.StatusOK, len("partial"), len("partial")},
+		{"flush then more body", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte("partial"))
+			flushOrPanic(w)
+			_, _ = w.Write([]byte("abc"))
+			panic("boom")
+		}, http.StatusOK, len("partial") + len("abc"), len("partial")},
+		{"full buffer plus one byte", func(w http.ResponseWriter, _ *http.Request) {
+			// The first write fills the 2048-byte net/http buffer exactly. The
+			// second write forces net/http to send that buffer and keep the one
+			// new byte buffered, which the panic then discards.
+			_, _ = w.Write(bytes.Repeat([]byte("x"), 2048))
+			_, _ = w.Write([]byte("y"))
+			panic("boom")
+		}, http.StatusOK, 2049, 2048},
+		{"invalid status 0", invalidStatusHandler(0), http.StatusInternalServerError, 0, 0},
+		{"invalid status 99", invalidStatusHandler(99), http.StatusInternalServerError, 0, 0},
+		{"invalid status -1", invalidStatusHandler(-1), http.StatusInternalServerError, 0, 0},
+		{"invalid status 1000", invalidStatusHandler(1000), http.StatusInternalServerError, 0, 0},
+		{"invalid status 99999", invalidStatusHandler(99999), http.StatusInternalServerError, 0, 0},
 		{"abort handler", func(http.ResponseWriter, *http.Request) {
 			panic(http.ErrAbortHandler)
-		}, http.StatusInternalServerError, 0},
+		}, http.StatusInternalServerError, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			clientErr, clientStatus, records := serveRequest(t, tc.handler)
-			// net/http recovers the re-raised panic by closing the connection
-			// without sending a response, so the client sees an error rather
-			// than a 500 status.
-			if clientErr == nil {
-				t.Errorf("client status = %d, want a transport error from the aborted connection", clientStatus)
+			clientErr, clientStatus, bodyErr, clientBody, records := serveCommittedRequest(t, tc.handler)
+			// net/http recovers the re-raised panic by closing the connection.
+			// Without a flushed header the client sees a transport error rather
+			// than a 500 status; with one it sees the status followed by a body
+			// read error.
+			if clientErr == nil && bodyErr == nil {
+				t.Errorf("client status = %d with a complete body, want an error from the aborted connection", clientStatus)
+			}
+			if clientBody != int64(tc.wantClientBody) {
+				t.Errorf("client received %d body bytes, want %d", clientBody, tc.wantClientBody)
 			}
 			if len(records) != 1 {
 				t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
@@ -313,7 +345,7 @@ func TestRequestLogOnPanic(t *testing.T) {
 				t.Errorf("logged status = %v, want %d", record["status"], tc.wantStatus)
 			}
 			if record["bytes"] != float64(tc.wantBytes) {
-				t.Errorf("logged bytes = %v, want %d", record["bytes"], tc.wantBytes)
+				t.Errorf("logged bytes = %v, want %d (client received %d)", record["bytes"], tc.wantBytes, clientBody)
 			}
 			if duration, ok := record["duration_ms"].(float64); !ok || duration < 0 {
 				t.Errorf("duration_ms = %v, want a non-negative number", record["duration_ms"])
@@ -322,10 +354,19 @@ func TestRequestLogOnPanic(t *testing.T) {
 	}
 }
 
+// flushOrPanic flushes the response and panics when the flush fails, so a
+// handler that cannot flush fails the test instead of passing silently.
+func flushOrPanic(w http.ResponseWriter) {
+	if err := http.NewResponseController(w).Flush(); err != nil {
+		panic(err)
+	}
+}
+
 // serveCommittedRequest is like serveRequest, but it also reads the response
 // body, so a handler that commits a response and then panics is observed as the
 // client sees it: a response with a status followed by a body read error.
-func serveCommittedRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clientStatus int, bodyErr error, records []map[string]any) {
+// clientBody is the number of body bytes the client read before the read ended.
+func serveCommittedRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clientStatus int, bodyErr error, clientBody int64, records []map[string]any) {
 	t.Helper()
 	ts, logs, logged := startLoggedServer(handler)
 	defer ts.Close()
@@ -333,11 +374,11 @@ func serveCommittedRequest(t *testing.T, handler http.HandlerFunc) (clientErr er
 	resp, err := http.Get(ts.URL + "/probe")
 	if err == nil {
 		clientStatus = resp.StatusCode
-		_, bodyErr = io.Copy(io.Discard, resp.Body)
+		clientBody, bodyErr = io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
 	}
 	waitLogged(t, ts, logged)
-	return err, clientStatus, bodyErr, decodeRecords(t, logs)
+	return err, clientStatus, bodyErr, clientBody, decodeRecords(t, logs)
 }
 
 // TestRequestLogRecordsFlushedAndHijackedStatus checks that a response
@@ -386,7 +427,7 @@ func TestRequestLogRecordsFlushedAndHijackedStatus(t *testing.T) {
 		}, true, http.StatusOK},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			clientErr, clientStatus, bodyErr, records := serveCommittedRequest(t, tc.handler)
+			clientErr, clientStatus, bodyErr, _, records := serveCommittedRequest(t, tc.handler)
 			if clientErr != nil {
 				t.Fatalf("client error = %v, want a response", clientErr)
 			}
