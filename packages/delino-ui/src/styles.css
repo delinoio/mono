@@ -658,6 +658,43 @@
     outline-offset: 2px;
   }
 
+  /* Vertical tabs: the list becomes a column beside the panel, and the
+     selected marker moves to the inline-end edge. */
+  .dui-tabs[data-orientation="vertical"] {
+    display: flex;
+    align-items: flex-start;
+    gap: 24px;
+  }
+
+  .dui-tabs-list[data-orientation="vertical"] {
+    flex: none;
+    flex-direction: column;
+    border-bottom: 0;
+    border-inline-end: 1px solid var(--dui-color-neutral-hover);
+  }
+
+  .dui-tabs-tab[data-orientation="vertical"] {
+    margin-bottom: 0;
+    margin-inline-end: -1px;
+    border-bottom: 0;
+    border-inline-end: 2px solid transparent;
+    text-align: start;
+  }
+
+  .dui-tabs-tab[data-orientation="vertical"][data-selected] {
+    border-inline-end-color: var(--dui-color-text);
+  }
+
+  .dui-tabs-tab[data-orientation="vertical"]:focus-visible {
+    border-radius: 8px;
+  }
+
+  .dui-tabs-panel[data-orientation="vertical"] {
+    flex: 1;
+    min-width: 0;
+    padding-top: 0;
+  }
+
   /* Tooltip */
   .dui-tooltip {
     box-sizing: border-box;
