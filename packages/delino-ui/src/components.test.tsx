@@ -61,16 +61,17 @@ const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
 // whose selector is exactly `selector`, so selectors with pseudo-classes such
 // as `:dir(rtl)` and `:hover:not([data-disabled])` match literally.
 const css = readFileSync(new URL("./styles.css", import.meta.url), "utf8");
+// Collapse formatter line wraps (including wrapped selectors and values) so
+// rules compare as single lines.
+const compactCss = css
+  .replace(/\s+/g, " ")
+  .replace(/\( /g, "(")
+  .replace(/ \)/g, ")");
 const block = (selector: string): string => {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const match = new RegExp(`${escaped}\\s*\\{([^}]*)\\}`).exec(css);
+  const match = new RegExp(`${escaped} \\{([^}]*)\\}`).exec(compactCss);
   expect(match).not.toBeNull();
-  // Collapse formatter line wraps so declarations compare as one line.
-  return (match?.[1] ?? "")
-    .replace(/\s+/g, " ")
-    .replace(/\( /g, "(")
-    .replace(/ \)/g, ")")
-    .trim();
+  return (match?.[1] ?? "").trim();
 };
 
 describe("Button", () => {
@@ -137,6 +138,27 @@ describe("Button", () => {
       finish();
     });
     expect(button.hasAttribute("data-pending")).toBe(false);
+  });
+
+  // The check is textual because happy-dom does not compute the cascade or
+  // apply `:hover`.
+  test("skips the hover background while disabled or pending", () => {
+    const hoverBackgrounds = {
+      primary: "--dui-color-accent-hover",
+      secondary: "--dui-color-neutral-hover",
+      danger: "--dui-color-danger-hover",
+    };
+    for (const [variant, token] of Object.entries(hoverBackgrounds)) {
+      expect(
+        block(
+          `.dui-button[data-variant="${variant}"]:hover:not([data-disabled]):not([data-pending])`,
+        ),
+      ).toBe(`background: var(${token});`);
+    }
+    // The dimmed look of disabled and pending buttons is untouched.
+    expect(block(".dui-button:is([data-disabled], [data-pending])")).toContain(
+      "opacity: 0.5",
+    );
   });
 });
 
@@ -840,6 +862,18 @@ describe("Tabs", () => {
     ).toBe("vertical");
     expect(screen.getByRole("tabpanel").getAttribute("data-orientation")).toBe(
       "vertical",
+    );
+  });
+
+  // The check is textual because happy-dom does not compute the cascade or
+  // apply `:hover`.
+  test("skips the hover color on disabled tabs", () => {
+    expect(block(".dui-tabs-tab:hover:not([data-disabled])")).toBe(
+      "color: var(--dui-color-text);",
+    );
+    expect(block(".dui-tabs-tab[data-disabled]")).toContain("opacity: 0.5");
+    expect(block(".dui-tabs-tab[data-selected]")).toContain(
+      "color: var(--dui-color-text)",
     );
   });
 
