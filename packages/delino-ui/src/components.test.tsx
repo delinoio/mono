@@ -594,6 +594,84 @@ describe("Checkbox", () => {
     ).toContain(nodes[0]?.id);
   });
 
+  test("keeps the description id after a caller aria-describedby", async () => {
+    render(
+      <>
+        <p id="extra-help">Ask an adult first.</p>
+        <Checkbox
+          label="Accept the terms"
+          description="Read them first."
+          aria-describedby="extra-help"
+        />
+      </>,
+    );
+    await act(async () => {});
+
+    const control = screen.getByRole("checkbox", { name: "Accept the terms" });
+    const description = screen.getByText("Read them first.");
+    const ids = (control.getAttribute("aria-describedby") ?? "").split(" ");
+    expect(ids).toEqual(["extra-help", description.id]);
+    for (const id of ids) {
+      expect(document.getElementById(id)).not.toBeNull();
+    }
+  });
+
+  test("keeps a multi-id caller aria-describedby as written", async () => {
+    render(
+      <Checkbox
+        label="Accept the terms"
+        description="Read them first."
+        aria-describedby="a b"
+      />,
+    );
+    await act(async () => {});
+
+    const control = screen.getByRole("checkbox", { name: "Accept the terms" });
+    const description = screen.getByText("Read them first.");
+    expect(control.getAttribute("aria-describedby")).toBe(
+      `a b ${description.id}`,
+    );
+  });
+
+  test("uses only the caller aria-describedby without a description", async () => {
+    render(<Checkbox label="Accept the terms" aria-describedby="extra-help" />);
+    await act(async () => {});
+
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Accept the terms" })
+        .getAttribute("aria-describedby"),
+    ).toBe("extra-help");
+  });
+
+  test("adds no empty token for an empty caller aria-describedby", async () => {
+    render(
+      <Checkbox
+        label="Accept the terms"
+        description="Read them first."
+        aria-describedby=""
+      />,
+    );
+    await act(async () => {});
+
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Accept the terms" })
+        .getAttribute("aria-describedby"),
+    ).toBe(screen.getByText("Read them first.").id);
+  });
+
+  test("renders no aria-describedby with neither a description nor a caller value", async () => {
+    render(<Checkbox label="Accept the terms" aria-describedby="" />);
+    await act(async () => {});
+
+    expect(
+      screen
+        .getByRole("checkbox", { name: "Accept the terms" })
+        .hasAttribute("aria-describedby"),
+    ).toBe(false);
+  });
+
   test("reports the checked values of a group", () => {
     const values: string[][] = [];
     render(
