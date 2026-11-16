@@ -256,6 +256,17 @@ describe("Switch", () => {
       (control.getAttribute("aria-describedby") ?? "").split(" "),
     ).toContain(nodes[0]?.id);
   });
+
+  // happy-dom can neither lay out nor match `:dir()`, so this checks the
+  // stylesheet source: the checked thumb travels to the inline-end edge.
+  test("reverses the checked thumb travel in right-to-left text", () => {
+    expect(block(".dui-switch-thumb[data-checked]")).toContain(
+      "translate: 18px 0",
+    );
+    expect(block(".dui-switch-thumb[data-checked]:dir(rtl)")).toContain(
+      "translate: -18px 0",
+    );
+  });
 });
 
 describe("Dialog", () => {

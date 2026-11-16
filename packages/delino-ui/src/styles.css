@@ -261,6 +261,14 @@
     translate: 18px 0;
   }
 
+  /* The thumb travel is a physical `translate`, so it must reverse in a
+     right-to-left document: the track starts at the right edge there. `:dir()`
+     follows the nearest `dir` attribute, so a nested `dir="ltr"` region inside
+     a right-to-left page keeps the left-to-right travel. */
+  .dui-switch-thumb[data-checked]:dir(rtl) {
+    translate: -18px 0;
+  }
+
   /* Dialog */
   .dui-dialog-backdrop {
     position: fixed;
