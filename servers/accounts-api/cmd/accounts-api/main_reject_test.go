@@ -9,8 +9,10 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -43,8 +45,10 @@ func rejectedRecords(t *testing.T, logs *syncBuffer) []map[string]any {
 	return records
 }
 
-// assertRejectedRecord checks the shape of a http_request_rejected record: no
-// path, method or bytes, and a non-negative duration.
+// assertRejectedRecord checks the shape of a http_request_rejected record: exactly
+// the keys the contract lists plus the standard time, level and msg (so no
+// request data such as a path, method, header or request line), and a
+// non-negative duration.
 func assertRejectedRecord(t *testing.T, record map[string]any, reason server.RejectionReason, status int) {
 	t.Helper()
 	if record["level"] != "INFO" || record["reason"] != string(reason) || record["status"] != float64(status) {
@@ -53,10 +57,8 @@ func assertRejectedRecord(t *testing.T, record map[string]any, reason server.Rej
 	if duration, ok := record["duration_ms"].(float64); !ok || duration < 0 {
 		t.Errorf("duration_ms = %v, want a non-negative number", record["duration_ms"])
 	}
-	for _, field := range []string{"path", "method", "bytes"} {
-		if _, ok := record[field]; ok {
-			t.Errorf("record = %v, want no %q field: it is not known before the request parses", record, field)
-		}
+	if got, want := slices.Sorted(maps.Keys(record)), []string{"duration_ms", "level", "msg", "reason", "status", "time"}; !slices.Equal(got, want) {
+		t.Errorf("record keys = %v, want %v: %v", got, want, record)
 	}
 }
 
