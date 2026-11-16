@@ -545,5 +545,65 @@ describe("Skeleton", () => {
     expect(skeleton.getAttribute("aria-hidden")).toBe("true");
     expect(skeleton.hasAttribute("data-circle")).toBe(true);
     expect(skeleton.style.width).toBe("120px");
+    expect(skeleton.style.height).toBe("120px");
+  });
+
+  test("draws a 1em circle when a circle has no dimension", () => {
+    const { container } = render(<Skeleton circle />);
+
+    const skeleton = container.firstElementChild as HTMLElement;
+    expect(skeleton.style.width).toBe("1em");
+    expect(skeleton.style.height).toBe("1em");
+  });
+
+  test("copies the given dimension of a circle to the other one", () => {
+    const { container } = render(
+      <>
+        <Skeleton circle height="32px" />
+        <Skeleton circle width="48px" />
+      </>,
+    );
+
+    const [byHeight, byWidth] = Array.from(container.children) as HTMLElement[];
+    expect([byHeight.style.width, byHeight.style.height]).toEqual([
+      "32px",
+      "32px",
+    ]);
+    expect([byWidth.style.width, byWidth.style.height]).toEqual([
+      "48px",
+      "48px",
+    ]);
+  });
+
+  test("uses both dimensions of a circle as given", () => {
+    const { container } = render(
+      <Skeleton circle width="40px" height="24px" />,
+    );
+
+    const skeleton = container.firstElementChild as HTMLElement;
+    expect(skeleton.style.width).toBe("40px");
+    expect(skeleton.style.height).toBe("24px");
+  });
+
+  test("leaves a non-circle with one dimension to the stylesheet", () => {
+    const { container } = render(
+      <>
+        <Skeleton width="120px" />
+        <Skeleton />
+      </>,
+    );
+
+    const [widthOnly, bare] = Array.from(container.children) as HTMLElement[];
+    expect(widthOnly.style.width).toBe("120px");
+    expect(widthOnly.style.height).toBe("");
+    expect(bare.getAttribute("style")).toBeNull();
+  });
+
+  test("lets the caller style win over the circle diameter", () => {
+    const { container } = render(<Skeleton circle style={{ width: "24px" }} />);
+
+    const skeleton = container.firstElementChild as HTMLElement;
+    expect(skeleton.style.width).toBe("24px");
+    expect(skeleton.style.height).toBe("1em");
   });
 });
