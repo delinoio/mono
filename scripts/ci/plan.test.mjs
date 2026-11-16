@@ -634,6 +634,55 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
   );
 });
 
+test("planner skips a non-UTF-8 gitlink instead of failing", (t) => {
+  const raw = Buffer.concat([
+    Buffer.from([0x63, 0x61, 0x66, 0xe9]),
+    Buffer.from(".md"),
+  ]);
+  const f = fixture(t);
+  try {
+    // A gitlink is a directory in the worktree and has no blob to format.
+    mkdirSync(Buffer.concat([Buffer.from(`${f.cwd}/`), raw]));
+  } catch {
+    return t.skip("file system cannot hold a non-UTF-8 name");
+  }
+  execFileSync("git", ["update-index", "-z", "--add", "--index-info"], {
+    cwd: f.cwd,
+    env: isolateGitEnvironment({ ...process.env }),
+    input: Buffer.concat([
+      Buffer.from(`160000 ${"1".repeat(40)}\t`),
+      raw,
+      Buffer.alloc(1),
+    ]),
+  });
+  const listing = execFileSync("git", ["ls-files", "-z"], {
+    cwd: f.cwd,
+    encoding: "buffer",
+  });
+  if (!listing.includes(raw))
+    return t.skip("file system cannot hold a non-UTF-8 name");
+  f.git("commit", "--quiet", "-m", "add a non-UTF-8 gitlink");
+  const head = f.git("rev-parse", "HEAD");
+  assert.equal(plan(f.cwd, f.base, head).format, false);
+  const output = join(f.cwd, "cli-output");
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/plan.mjs")],
+    {
+      cwd: f.cwd,
+      encoding: "utf8",
+      env: plannerEnvironment({
+        CI_BASE: f.base,
+        CI_HEAD: head,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: join(f.cwd, "cli-summary"),
+      }),
+    },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /"event":"ci_plan"/u);
+});
+
 test("planner fails accurately for a non-UTF-8 path and skips unsupported ones", (t) => {
   // Linux file systems hold any byte; APFS and Windows reject or normalize it.
   const latin1 = (suffix) =>

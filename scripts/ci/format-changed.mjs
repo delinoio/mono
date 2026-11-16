@@ -372,14 +372,16 @@ export function changedFormatFiles(start, base, head, local = false) {
       "-z",
     ]),
   );
-  // The validation index decides which paths are symlinks, not the comparison
-  // head: the checkout may be a merge commit that differs from `head`.
-  const symlinks = recordedSymlinks(cwd);
+  // The validation index decides which paths are symlinks or gitlinks, not the
+  // comparison head: the checkout may be a merge commit that differs from
+  // `head`. Both have no blob to format, so they are exempted before the
+  // non-UTF-8 check below, as `stagedFormatFiles` does.
+  const exempt = recordedPaths(cwd, [SymlinkMode, GitlinkMode]);
   return [...new Set(names)]
     .filter((name) => {
       if (!name || !isFormattableExtension(name) || !present.has(name))
         return false;
-      if (symlinks.has(name)) return false;
+      if (exempt.has(name)) return false;
       // The explicit comparison decides what CI validates, so a present path
       // whose name is not valid UTF-8 fails accurately after the exclusion
       // probe. Local selection keeps the silent skip. Names compare by their
