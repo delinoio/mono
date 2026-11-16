@@ -755,11 +755,23 @@
     bottom: calc(
       16px + var(--keyboard-inset, 0px) + env(safe-area-inset-bottom, 0px)
     );
-    left: 50%;
+    /* Center in the safe area, not the viewport: the width subtracts both
+       horizontal insets and the center shifts by half their difference, so the
+       edges are 16px + inset-left and 16px + inset-right from the viewport. */
+    left: calc(
+      50% + (env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) /
+        2
+    );
     overflow: visible;
     z-index: 2147483647;
     box-sizing: border-box;
-    width: min(400px, calc(100vw - 32px));
+    width: min(
+      400px,
+      calc(
+        100vw - 32px - env(safe-area-inset-left, 0px) -
+          env(safe-area-inset-right, 0px)
+      )
+    );
     height: var(--toast-front-height);
     margin: 0;
     padding: 0;
