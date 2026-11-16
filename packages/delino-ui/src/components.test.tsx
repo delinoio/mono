@@ -76,6 +76,23 @@ function expectHiddenEmptyDescription(
   }
 }
 
+/**
+ * Asserts that `control` is described by `description`. Unlike comparing
+ * `aria-describedby` with `description.id` directly, this fails when the
+ * description is missing, has an empty id, or the control has no
+ * `aria-describedby` (where both sides would otherwise normalise to "").
+ */
+function expectDescribedBy(
+  control: Element,
+  description: Element | null | undefined,
+) {
+  expect(description).toBeTruthy();
+  expect(description?.id).not.toBe("");
+  expect(control.getAttribute("aria-describedby")?.split(" ")).toContain(
+    description?.id,
+  );
+}
+
 describe("Button", () => {
   test("renders a native button with the variant and size", () => {
     render(
@@ -169,9 +186,7 @@ describe("TextField", () => {
     render(<TextField label="Email" description="We never share it." />);
 
     const input = screen.getByRole("textbox", { name: "Email" });
-    const describedBy = input.getAttribute("aria-describedby") ?? "";
-    const description = screen.getByText("We never share it.");
-    expect(describedBy.split(" ")).toContain(description.id);
+    expectDescribedBy(input, screen.getByText("We never share it."));
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
@@ -194,9 +209,7 @@ describe("TextField", () => {
     const nodes = container.querySelectorAll(".dui-text-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("0");
-    expect((input.getAttribute("aria-describedby") ?? "").split(" ")).toContain(
-      nodes[0]?.id,
-    );
+    expectDescribedBy(input, nodes[0]);
   });
 
   test("marks the field invalid and shows the error message", () => {
@@ -270,9 +283,7 @@ describe("Switch", () => {
     const nodes = container.querySelectorAll(".dui-switch-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("We never share it.");
-    expect(
-      (control.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(control, nodes[0]);
   });
 
   // happy-dom can neither lay out nor match `:dir()`, so this checks the
@@ -399,9 +410,7 @@ describe("Textarea", () => {
     const nodes = container.querySelectorAll(".dui-text-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Keep it short.");
-    expect(
-      (textarea.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(textarea, nodes[0]);
   });
 });
 
@@ -667,9 +676,7 @@ describe("Checkbox", () => {
     const nodes = container.querySelectorAll(".dui-checkbox-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Read them first.");
-    expect(
-      (control.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(control, nodes[0]);
   });
 
   test("keeps the description id after a caller aria-describedby", async () => {
@@ -825,9 +832,7 @@ describe("RadioGroup", () => {
     const nodes = container.querySelectorAll(".dui-radio-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Billed every period.");
-    expect((group.getAttribute("aria-describedby") ?? "").split(" ")).toContain(
-      nodes[0]?.id,
-    );
+    expectDescribedBy(group, nodes[0]);
   });
 });
 
@@ -933,9 +938,7 @@ describe("Select", () => {
     const nodes = container.querySelectorAll(".dui-text-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Who can edit.");
-    expect(
-      (trigger.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(trigger, nodes[0]);
   });
 
   test("shows the selected option in the trigger", () => {
