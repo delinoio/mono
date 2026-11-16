@@ -529,6 +529,82 @@ describe("NumberInput", () => {
     ).toBe("true");
   });
 
+  test.each(["help", "a b"])(
+    "puts a caller aria-describedby %j before the description id on the input",
+    async (callerIds) => {
+      const { container } = render(
+        <NumberInput
+          label="Tickets"
+          description="Help text"
+          aria-describedby={callerIds}
+        />,
+      );
+      await act(async () => {});
+
+      const description = container.querySelector(
+        ".dui-text-field-description",
+      );
+      expect(description?.id).toBeTruthy();
+      expect(
+        container.querySelector("input")?.getAttribute("aria-describedby"),
+      ).toBe(`${callerIds} ${description?.id}`);
+      expect(
+        container
+          .querySelector("[data-slot=number-input]")
+          ?.hasAttribute("aria-describedby"),
+      ).toBe(false);
+    },
+  );
+
+  test("keeps a caller aria-describedby first when there is no description", async () => {
+    const { container } = render(
+      <NumberInput label="Tickets" aria-describedby="help" />,
+    );
+    await act(async () => {});
+
+    // An empty hidden description element is always rendered and registered.
+    const hidden = container.querySelector(".dui-text-field-description");
+    expect(hidden?.id).toBeTruthy();
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(`help ${hidden?.id}`);
+  });
+
+  test("adds no empty token for an empty caller aria-describedby", async () => {
+    const { container } = render(
+      <NumberInput
+        label="Tickets"
+        description="Help text"
+        aria-describedby=""
+      />,
+    );
+    await act(async () => {});
+
+    const description = container.querySelector(".dui-text-field-description");
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(description?.id);
+  });
+
+  test("puts a caller aria-label and aria-labelledby on the input, not the root", async () => {
+    const { container } = render(
+      <NumberInput
+        label="Tickets"
+        aria-label="Pass code"
+        aria-labelledby="x"
+      />,
+    );
+    await act(async () => {});
+
+    const input = container.querySelector("input");
+    expect(input?.getAttribute("aria-label")).toBe("Pass code");
+    expect(input?.getAttribute("aria-labelledby")).toContain("x");
+    const root = container.querySelector("[data-slot=number-input]");
+    expect(root?.hasAttribute("aria-label")).toBe(false);
+    expect(root?.hasAttribute("aria-labelledby")).toBe(false);
+    expect(root?.hasAttribute("aria-describedby")).toBe(false);
+  });
+
   test.each(EMPTY_DESCRIPTIONS)(
     "renders a hidden empty description element for %s",
     async (_name, description) => {
@@ -565,6 +641,82 @@ describe("PasswordInput", () => {
     expect(rule).toContain("padding-inline: 14px 4px");
     expect(rule).toContain("padding-block: 0");
     expect(rule).not.toMatch(/(^|[\s;])padding:/);
+  });
+
+  test.each(["help", "a b"])(
+    "puts a caller aria-describedby %j before the description id on the input",
+    async (callerIds) => {
+      const { container } = render(
+        <PasswordInput
+          label="Password"
+          description="Help text"
+          aria-describedby={callerIds}
+        />,
+      );
+      await act(async () => {});
+
+      const description = container.querySelector(
+        ".dui-text-field-description",
+      );
+      expect(description?.id).toBeTruthy();
+      expect(
+        container.querySelector("input")?.getAttribute("aria-describedby"),
+      ).toBe(`${callerIds} ${description?.id}`);
+      expect(
+        container
+          .querySelector("[data-slot=password-input]")
+          ?.hasAttribute("aria-describedby"),
+      ).toBe(false);
+    },
+  );
+
+  test("keeps a caller aria-describedby first when there is no description", async () => {
+    const { container } = render(
+      <PasswordInput label="Password" aria-describedby="help" />,
+    );
+    await act(async () => {});
+
+    // An empty hidden description element is always rendered and registered.
+    const hidden = container.querySelector(".dui-text-field-description");
+    expect(hidden?.id).toBeTruthy();
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(`help ${hidden?.id}`);
+  });
+
+  test("adds no empty token for an empty caller aria-describedby", async () => {
+    const { container } = render(
+      <PasswordInput
+        label="Password"
+        description="Help text"
+        aria-describedby=""
+      />,
+    );
+    await act(async () => {});
+
+    const description = container.querySelector(".dui-text-field-description");
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(description?.id);
+  });
+
+  test("puts a caller aria-label and aria-labelledby on the input, not the root", async () => {
+    const { container } = render(
+      <PasswordInput
+        label="Password"
+        aria-label="Pass code"
+        aria-labelledby="x"
+      />,
+    );
+    await act(async () => {});
+
+    const input = container.querySelector("input");
+    expect(input?.getAttribute("aria-label")).toBe("Pass code");
+    expect(input?.getAttribute("aria-labelledby")).toContain("x");
+    const root = container.querySelector("[data-slot=password-input]");
+    expect(root?.hasAttribute("aria-label")).toBe(false);
+    expect(root?.hasAttribute("aria-labelledby")).toBe(false);
+    expect(root?.hasAttribute("aria-describedby")).toBe(false);
   });
 
   test("shows and hides the password from its toggle", async () => {
