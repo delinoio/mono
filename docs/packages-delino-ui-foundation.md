@@ -40,7 +40,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
 - `delino-ui/switch`
   - `Switch`: a labeled on/off setting. Props: `label` (required), `description`, and all UI SDK `Switch` props such as `checked`, `defaultChecked`, `onCheckedChange`, `name` and `disabled`. It renders with role `switch` and a hidden native input for forms. The thumb travels to the inline-end edge, so it mirrors under `dir="rtl"`.
 - `delino-ui/dialog`
-  - `Dialog`: the modal dialog root. It accepts the UI SDK `Dialog` props except `dismissible`, which is removed so that every dialog closes with the Escape key.
+  - `Dialog`: the modal dialog root. It accepts the UI SDK `Dialog` props except `dismissible`, `modal` and `presentation`, which are removed so that every dialog is modal with a backdrop, closes with the Escape key and is centered. Use `Drawer` for a sheet.
   - `DialogTrigger` and `DialogClose`: buttons styled like `Button`, with `variant` and `size`. The trigger defaults to `Primary`, the close button to `Secondary`. A Promise returned from the `DialogClose` `action` keeps the dialog open until it settles.
   - `DialogContent`: the dialog panel. It also renders the backdrop.
   - `DialogTitle` (level 2 heading, names the dialog), `DialogDescription` and `DialogActions` (button row).

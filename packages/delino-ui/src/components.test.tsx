@@ -363,6 +363,52 @@ describe("Dialog", () => {
     expect(dialog.hasAttribute("data-closed")).toBe(true);
   });
 
+  test.each([
+    { modal: false },
+    { modal: "trap-focus" },
+    { presentation: "sheet" },
+  ])(
+    "stays a centered modal dialog when %o is spread in",
+    async (untypedProps) => {
+      // `modal` and `presentation` are omitted from the types; an untyped
+      // spread must still get the modal dialog with its backdrop.
+      const untyped = untypedProps as object;
+      render(
+        <Dialog {...untyped}>
+          <DialogTrigger>Delete account</DialogTrigger>
+          <DialogContent>
+            <DialogTitle>Delete your account?</DialogTitle>
+            <DialogClose>Cancel</DialogClose>
+          </DialogContent>
+        </Dialog>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Delete account" }));
+      });
+      const dialog = screen.getByRole("dialog");
+
+      expect(dialog.getAttribute("aria-modal")).toBe("true");
+      expect(dialog.getAttribute("data-presentation")).not.toBe("sheet");
+      expect(document.querySelector(".dui-dialog-backdrop")).not.toBeNull();
+    },
+  );
+
+  test("does not type-check modal or presentation props", () => {
+    // Enforced by `tsc` (typecheck), not at runtime: the function is never
+    // called, and each directive fails the build if the prop becomes valid.
+    function NeverRendered() {
+      return (
+        <>
+          {/* @ts-expect-error modal is omitted from DialogProps */}
+          <Dialog modal={false} />
+          {/* @ts-expect-error presentation is omitted from DialogProps */}
+          <Dialog presentation="sheet" />
+        </>
+      );
+    }
+    expect(typeof NeverRendered).toBe("function");
+  });
+
   test("closes from a close button", async () => {
     render(<Example />);
     await act(async () => {

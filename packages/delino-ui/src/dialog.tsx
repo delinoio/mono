@@ -17,22 +17,33 @@ export type { DialogController } from "@ui-sdk/react/dialog";
 
 /**
  * The props of `Dialog`. `dismissible` is left out because every dialog in
- * Delino apps must close with the Escape key.
+ * Delino apps must close with the Escape key. `modal` and `presentation` are
+ * left out because every dialog is a centered modal with a backdrop; use
+ * `Drawer` for an edge sheet.
  */
 export type DialogProps = Omit<
   React.ComponentProps<typeof DialogRoot>,
-  "dismissible"
+  "dismissible" | "modal" | "presentation"
 >;
 
 /**
- * A modal dialog built from UI SDK `Dialog`. It traps focus, closes with
- * Escape or a press outside, and returns focus to its trigger.
+ * A modal dialog built from UI SDK `Dialog`. It is always centered and modal:
+ * it traps focus, closes with Escape or a press outside, and returns focus to
+ * its trigger. Use `Drawer` for an edge sheet.
  */
 export function Dialog(props: DialogProps) {
-  // The type already omits `dismissible`, but types do not stop JS callers or
-  // untyped spread objects. Drop the key at runtime so Escape always closes.
-  const { dismissible: _dismissible, ...rest } = props as DialogProps & {
+  // The type already omits these props, but types do not stop JS callers or
+  // untyped spread objects. Drop the keys at runtime so Escape always closes
+  // and the dialog stays modal and centered.
+  const {
+    dismissible: _dismissible,
+    modal: _modal,
+    presentation: _presentation,
+    ...rest
+  } = props as DialogProps & {
     dismissible?: unknown;
+    modal?: unknown;
+    presentation?: unknown;
   };
   return <DialogRoot {...rest} />;
 }
