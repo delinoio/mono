@@ -127,6 +127,19 @@ export function main(env = process.env, cwd = process.cwd()) {
 }
 
 // import.meta.main needs Node 24.2+; it also holds for symlinked script paths.
+// A selection failure (a comparison revision that does not exist, an unset or
+// malformed comparison, an unreadable checkout) must reach the log as one
+// parseable record, like the formatter's, not as a stack trace. Exit code 2 is
+// the formatter's handled-failure code and tells it apart from a crash (1).
+// `main()` writes the outputs and the summary only after `plan()` succeeds, so
+// a failure still publishes nothing and the `changes` job still fails closed.
 if (import.meta.main) {
-  main();
+  try {
+    main();
+  } catch (error) {
+    console.error(
+      JSON.stringify({ event: "ci_format_error", message: error.message }),
+    );
+    process.exitCode = 2;
+  }
 }

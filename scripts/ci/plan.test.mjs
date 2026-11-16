@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
   copyFileSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -780,4 +781,91 @@ test("planner without installed dependencies publishes format=true for non-UTF-8
     assert.match(readFileSync(output, "utf8"), /^format=true$/mu);
     assert.match(readFileSync(summary, "utf8"), /^CI plan: /u);
   }
+});
+
+// Runs the planner CLI with `extra` as its comparison and output variables.
+function runPlannerCli(f, extra) {
+  const output = join(f.cwd, "cli-output");
+  const summary = join(f.cwd, "cli-summary");
+  const result = spawnSync(
+    process.execPath,
+    [join(root, "scripts/ci/plan.mjs")],
+    {
+      cwd: f.cwd,
+      encoding: "utf8",
+      env: plannerEnvironment({
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: summary,
+        ...extra,
+      }),
+    },
+  );
+  return { result, output, summary };
+}
+
+// Git's own `fatal:` line can precede the record, as it does for the
+// formatter, so parse the last stderr line.
+function lastStderrRecord(result) {
+  const lines = result.stderr.split("\n").filter(Boolean);
+  return JSON.parse(lines.at(-1));
+}
+
+test("planner CLI reports a missing comparison revision as a ci_format_error record", (t) => {
+  const f = fixture(t);
+  f.write("docs/guide.md");
+  const head = f.commit();
+  // Well-formed 40-hex SHA that names no object: `git cat-file -e` fails.
+  const { result, output, summary } = runPlannerCli(f, {
+    CI_BASE: "de".repeat(20),
+    CI_HEAD: head,
+  });
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(result.stdout, "", "no ci_plan record on failure");
+  const record = lastStderrRecord(result);
+  assert.equal(record.event, "ci_format_error");
+  assert.equal(typeof record.message, "string");
+  assert.doesNotMatch(result.stderr, /\n\s+at /u, "no stack trace");
+  assert.equal(existsSync(output), false, "no outputs on failure");
+  assert.equal(existsSync(summary), false, "no summary on failure");
+});
+
+test("planner CLI reports an unset or malformed comparison as a ci_format_error record", (t) => {
+  const f = fixture(t);
+  f.write("docs/guide.md");
+  const head = f.commit();
+  for (const comparison of [
+    { CI_HEAD: head },
+    { CI_BASE: "not-a-sha", CI_HEAD: head },
+    { CI_BASE: "0".repeat(40), CI_HEAD: head },
+  ]) {
+    const { result, output, summary } = runPlannerCli(f, comparison);
+    const label = JSON.stringify(comparison);
+    assert.equal(result.status, 2, `${label}: ${result.stderr}`);
+    assert.equal(result.stdout, "", label);
+    const lines = result.stderr.split("\n").filter(Boolean);
+    assert.equal(lines.length, 1, `${label}: ${result.stderr}`);
+    const record = JSON.parse(lines[0]);
+    assert.equal(record.event, "ci_format_error", label);
+    assert.match(record.message, /nonzero 40-character comparison SHA/u, label);
+    assert.equal(existsSync(output), false, label);
+    assert.equal(existsSync(summary), false, label);
+  }
+});
+
+test("planner CLI still exits 0 with one ci_plan record and no error record on success", (t) => {
+  const f = fixture(t);
+  f.write("docs/guide.md");
+  const head = f.commit();
+  const { result, output } = runPlannerCli(f, {
+    CI_BASE: f.base,
+    CI_HEAD: head,
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, "");
+  assert.equal(result.stdout.split("\n").filter(Boolean).length, 1);
+  assert.match(result.stdout, /"event":"ci_plan"/u);
+  assert.equal(
+    readFileSync(output, "utf8"),
+    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+  );
 });
