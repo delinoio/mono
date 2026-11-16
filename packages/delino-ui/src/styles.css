@@ -1076,6 +1076,8 @@
     box-sizing: border-box;
     width: max-content;
     max-width: min(320px, calc(100vw - 32px));
+    max-height: var(--available-height);
+    overflow-y: auto;
     margin: 0;
     padding: 16px;
     border: 1px solid var(--dui-color-neutral-hover);
