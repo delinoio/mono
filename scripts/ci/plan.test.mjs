@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -868,4 +869,52 @@ test("planner CLI still exits 0 with one ci_plan record and no error record on s
     readFileSync(output, "utf8"),
     "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
   );
+});
+
+test("planner CLI reports a non-UTF-8 checkout path accurately", (t) => {
+  if (process.platform === "win32") return t.skip(unsupportedFileSystem);
+  const f = fixture(t);
+  f.write("docs/guide.md");
+  const head = f.commit();
+  // Move the checkout to `<parent>/caf\xe9`; the test process cannot address
+  // it with a string, so the planner is started through `/bin/sh` with a glob.
+  const parent = mkdtempSync(join(tmpdir(), "ci-plan-root-"));
+  t.after(() => rmSync(parent, { recursive: true, force: true }));
+  try {
+    renameSync(
+      f.cwd,
+      Buffer.concat([Buffer.from(`${parent}/`), latin1Name("")]),
+    );
+  } catch {
+    return t.skip(unsupportedFileSystem);
+  }
+  const env = plannerEnvironment({
+    CI_BASE: f.base,
+    CI_HEAD: head,
+    GITHUB_OUTPUT: join(parent, "output"),
+    GITHUB_STEP_SUMMARY: join(parent, "summary"),
+  });
+  const result = spawnSync(
+    "/bin/sh",
+    [
+      "-c",
+      'cd -- caf* && exec "$@"',
+      "sh",
+      process.execPath,
+      join(root, "scripts/ci/plan.mjs"),
+    ],
+    { cwd: parent, env, encoding: "utf8" },
+  );
+  assert.equal(result.status, 2, result.stderr);
+  assert.equal(result.stdout, "");
+  const lines = result.stderr.split("\n").filter(Boolean);
+  assert.equal(lines.length, 1, result.stderr);
+  const record = JSON.parse(lines[0]);
+  assert.equal(record.event, "ci_format_error");
+  assert.match(record.message, /checkout path is not valid UTF-8/u);
+  assert.match(record.message, /caf\\xe9/u);
+  assert.match(record.message, /Move or rename the checkout/u);
+  assert.doesNotMatch(record.message, /ENOENT/u);
+  assert.equal(existsSync(join(parent, "output")), false);
+  assert.equal(existsSync(join(parent, "summary")), false);
 });
