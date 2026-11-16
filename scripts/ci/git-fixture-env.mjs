@@ -3,7 +3,11 @@
 // A developer's global or system Git configuration (core.hooksPath,
 // commit.gpgsign, ...), their global ignore and attributes files, and the GIT_*
 // variables of an enclosing Git hook invocation (GIT_DIR, GIT_INDEX_FILE, ...)
-// must not change how fixture repositories behave. Shared by the scripts/ci
+// must not change how fixture repositories behave. The same holds for every
+// LEFTHOOK* variable (LEFTHOOK=0, LEFTHOOK_EXCLUDE, LEFTHOOK_OUTPUT,
+// LEFTHOOK_CONFIG, ...), which would disable, skip or reconfigure the
+// generated hooks. Callers that need a Lefthook variable, such as
+// LEFTHOOK_BIN, set it on the returned environment. Shared by the scripts/ci
 // test suites; this module is not a test file, so
 // `node --test scripts/ci/*.test.mjs` does not collect it.
 // Mutates and returns `env`.
@@ -11,7 +15,7 @@ const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
 
 export function isolateGitEnvironment(env) {
   for (const name of Object.keys(env)) {
-    if (name.startsWith("GIT_") || name === "LEFTHOOK_CONFIG") {
+    if (name.startsWith("GIT_") || name.startsWith("LEFTHOOK")) {
       delete env[name];
     }
   }
