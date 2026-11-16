@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // A developer's global or system Git configuration (core.hooksPath,
-// commit.gpgsign, ...), their global ignore and attributes files, and the GIT_*
+// commit.gpgsign, ...), their global ignore and attributes files, the system
+// attributes file, and the GIT_*
 // variables of an enclosing Git hook invocation (GIT_DIR, GIT_INDEX_FILE, ...)
 // must not change how fixture repositories behave. The same holds for every
 // LEFTHOOK* variable (LEFTHOOK=0, LEFTHOOK_EXCLUDE, LEFTHOOK_OUTPUT,
@@ -31,6 +32,17 @@ export function isolateGitEnvironment(env) {
   // fixture environment built here. Requires Git 2.31 or newer for
   // GIT_CONFIG_COUNT. Remove once Git offers a single switch that disables
   // the XDG default ignore and attributes files.
+  //
+  // Workaround: the system attributes file ($(prefix)/etc/gitattributes) is a
+  // separate attributes frame that neither GIT_CONFIG_NOSYSTEM nor
+  // core.attributesFile covers, so a host-level rule could still change fixture
+  // file bytes. GIT_ATTR_NOSYSTEM=1 is the only switch for it. The variable is
+  // undocumented but stable since Git 1.7.4, so the Git 2.31 minimum for
+  // GIT_CONFIG_COUNT stays the binding minimum. Scope: every fixture
+  // environment built here; callers cannot override it because the loop above
+  // removes it. Remove once Git offers a single switch that disables every
+  // default ignore and attributes file.
+  env.GIT_ATTR_NOSYSTEM = "1";
   env.GIT_CONFIG_COUNT = "2";
   env.GIT_CONFIG_KEY_0 = "core.excludesFile";
   env.GIT_CONFIG_VALUE_0 = nullDevice;
