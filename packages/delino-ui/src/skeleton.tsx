@@ -17,7 +17,9 @@ export type SkeletonProps = Omit<React.ComponentProps<"span">, "children"> & {
    * Draws a circle, for avatar placeholders. The circle is a square with a
    * round border, so an omitted `width` or `height` follows the other side
    * through a square `aspect-ratio`, and both default to `1em` when both are
-   * omitted. Give both only when you want an ellipse.
+   * omitted. Give both only when you want an ellipse. A circle keeps its size
+   * and is not stretched by a flex container; the stylesheet sets
+   * `align-self: flex-start` on it.
    */
   circle?: boolean;
 };

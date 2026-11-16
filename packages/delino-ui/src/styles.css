@@ -1774,6 +1774,12 @@
 
   .dui-skeleton[data-circle] {
     border-radius: 50%;
+    /* A circle with one given side takes the other from a square
+       aspect-ratio, which only applies to an auto axis. The default
+       align-items: stretch of a flex container would make the cross axis
+       definite and replace the ratio-derived size, so the circle opts out and
+       keeps its size. */
+    align-self: flex-start;
   }
 
   @keyframes dui-skeleton-pulse {
