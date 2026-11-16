@@ -1731,6 +1731,14 @@ test("CLI keeps CI restrictions for non-false CI values", (t) => {
 test("explicit false CI behaves exactly like unset CI for non-staged runs", (t) => {
   const f = fixture(t);
   const script = join(root, "scripts/ci/format-changed.mjs");
+  // The default local run computes its base as the merge base of origin/main
+  // and HEAD. Without an origin/main ref it fails identically with and without
+  // CI=false, which makes the equality assertions vacuous. Commit a formatted
+  // change ahead of the base and point origin/main at the base so the default
+  // run reaches the real local selection.
+  f.write("changed.ts", "const value = 1;\n");
+  f.commit();
+  f.git("update-ref", "refs/remotes/origin/main", f.base);
   for (const args of [["--all"], ["--base", f.base, "--head", f.base], []]) {
     const run = (env) =>
       spawnSync(process.execPath, [script, ...args], {
@@ -1751,6 +1759,17 @@ test("explicit false CI behaves exactly like unset CI for non-staged runs", (t) 
     );
     assert.equal(disabled.stderr, unset.stderr, args.join(" "));
     assert.doesNotMatch(disabled.stderr, /CI formatting/);
+    if (args.length === 0) {
+      // The default local run must succeed on the formatted file and select the
+      // one file changed since the merge base, not fail on a missing base. The
+      // reported base is the merge base, so it proves the base was computed.
+      assert.equal(unset.status, 0, unset.stderr);
+      const selection = JSON.parse(unset.stdout.split("\n")[0]);
+      assert.equal(selection.event, "ci_format");
+      assert.equal(selection.base, f.base);
+      assert.equal(selection.local, true);
+      assert.equal(selection.candidates, 1);
+    }
   }
   const comparison = spawnSync(
     process.execPath,
