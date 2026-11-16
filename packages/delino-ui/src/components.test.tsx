@@ -514,6 +514,67 @@ describe("autoFocus inside Dialog", () => {
     );
   });
 
+  // A caller `data-autofocus` is spread onto the non-tabbable root element. The
+  // UI SDK dialog takes the first `[data-autofocus]` match in document order and
+  // does not try later matches, so a root match must never exist.
+  test("keeps the NumberInput control as the only data-autofocus target with autoFocus and a caller data-autofocus", async () => {
+    render(
+      <DialogWith>
+        <NumberInput label="Amount" autoFocus data-autofocus="" />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    const input = screen.getByRole("textbox", { name: "Amount" });
+    const targets = document.querySelectorAll("[data-autofocus]");
+    expect(targets.length).toBe(1);
+    expect(targets[0]).toBe(input);
+    expect(document.activeElement).toBe(input);
+  });
+
+  test("keeps the PasswordInput control as the only data-autofocus target with autoFocus and a caller data-autofocus", async () => {
+    render(
+      <DialogWith>
+        <PasswordInput label="Password" autoFocus data-autofocus="" />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    const input = screen.getByLabelText("Password");
+    const targets = document.querySelectorAll("[data-autofocus]");
+    expect(targets.length).toBe(1);
+    expect(targets[0]).toBe(input);
+    expect(document.activeElement).toBe(input);
+  });
+
+  test("ignores a caller data-autofocus on NumberInput without autoFocus", async () => {
+    render(
+      <DialogWith>
+        <NumberInput label="Amount" data-autofocus="" />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    expect(document.querySelectorAll("[data-autofocus]").length).toBe(0);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close" }),
+    );
+  });
+
+  test("ignores a caller data-autofocus on PasswordInput without autoFocus", async () => {
+    render(
+      <DialogWith>
+        <PasswordInput label="Password" data-autofocus="" />
+      </DialogWith>,
+    );
+    await openDialog();
+
+    expect(document.querySelectorAll("[data-autofocus]").length).toBe(0);
+    expect(document.activeElement).toBe(
+      screen.getByRole("button", { name: "Close" }),
+    );
+  });
+
   test("focuses a TextField with autoFocus on mount outside a dialog", () => {
     render(<TextField label="Name" autoFocus />);
 
