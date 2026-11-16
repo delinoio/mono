@@ -1926,6 +1926,82 @@ for (const { signal, exitCode } of signalCases) {
   );
 }
 
+// A pathspec commit (throwaway `next-index-*.lock` index) turns a failed check
+// into the `ci_format_error` guidance and exit 2. A signal stop is no check
+// verdict, so it must keep the 128+signal exit code and report no such error.
+for (const { signal, exitCode } of signalCases) {
+  test(
+    `${signal} during a pathspec-commit staged run exits ${exitCode} without ci_format_error`,
+    { skip: process.platform === "win32" },
+    async (t) => {
+      const { f, state, lines } = standInFixture(t, 120);
+      // Stage a change for every file so the staged selection spans batches.
+      for (let index = 0; index < 120; index += 1)
+        f.write(`files/f${index}.ts`, `export const value${index} = 2;\n`);
+      f.git("add", ".");
+      const gitDir = join(f.cwd, f.git("rev-parse", "--git-dir"));
+      const throwaway = join(gitDir, "next-index-1.lock");
+      copyFileSync(join(gitDir, "index"), throwaway);
+      const parent = spawn(
+        process.execPath,
+        [join(f.cwd, "scripts/ci/format-changed.mjs"), "--staged", "--write"],
+        {
+          cwd: f.cwd,
+          env: { ...f.env, GIT_INDEX_FILE: throwaway, STANDIN_DIR: state },
+          stdio: ["ignore", "pipe", "pipe"],
+        },
+      );
+      t.after(() => parent.kill("SIGKILL"));
+      let stderr = "";
+      parent.stderr.on("data", (chunk) => (stderr += chunk));
+      const closed = new Promise((done) =>
+        parent.once("close", (code, closeSignal) =>
+          done({ code, closeSignal }),
+        ),
+      );
+      await waitFor(() => lines("batches.log").length > 0, "the first batch");
+      parent.kill(signal);
+      const { code, closeSignal } = await closed;
+      assert.equal(closeSignal, null, "the parent must exit by itself");
+      assert.equal(code, exitCode, stderr);
+      assert.equal(lines("batches.log").length, 1, "no further batch starts");
+      assert.match(
+        stderr,
+        new RegExp(`"event":"ci_format_signal","signal":"${signal}"`),
+      );
+      assert.doesNotMatch(stderr, /ci_format_error/u);
+    },
+  );
+}
+
+test("a pathspec-commit staged run still exits 2 with guidance when a check fails", async (t) => {
+  const { f, state } = standInFixture(t, 3);
+  for (let index = 0; index < 3; index += 1)
+    f.write(`files/f${index}.ts`, `export const value${index} = 2;\n`);
+  f.git("add", ".");
+  const gitDir = join(f.cwd, f.git("rev-parse", "--git-dir"));
+  const throwaway = join(gitDir, "next-index-1.lock");
+  copyFileSync(join(gitDir, "index"), throwaway);
+  const result = spawnSync(
+    process.execPath,
+    [join(f.cwd, "scripts/ci/format-changed.mjs"), "--staged", "--write"],
+    {
+      cwd: f.cwd,
+      env: {
+        ...f.env,
+        GIT_INDEX_FILE: throwaway,
+        STANDIN_DIR: state,
+        STANDIN_EXIT: "1",
+      },
+      encoding: "utf8",
+    },
+  );
+  assert.equal(result.status, 2, result.stderr);
+  assert.match(result.stderr, /"event":"ci_format_error"/u);
+  assert.match(result.stderr, /git commit <path> cannot be formatted/u);
+  assert.doesNotMatch(result.stderr, /ci_format_signal/u);
+});
+
 for (const status of [0, 1, 2]) {
   test(`formatter exits ${status} when every Rstack batch exits ${status}`, async (t) => {
     const { f, state, lines } = standInFixture(t, 60);
