@@ -122,7 +122,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
 - `delino-ui/card`
   - `Card` (a `section`), `CardTitle` (level 3 heading), `CardDescription` and `CardActions` (button row): a static surface that groups related content, with all props of their elements. Consumers name the card with `aria-labelledby` pointing to its title, or with `aria-label`.
 - `delino-ui/skeleton`
-  - `Skeleton`: a pulsing placeholder for loading content. Props: `width` and `height` (CSS lengths; defaults `100%` and `1em`), `circle`, and the other `span` props except `children`. It is hidden from screen readers; consumers mark the loading region with `aria-busy`. The pulse stops under `prefers-reduced-motion`.
+  - `Skeleton`: a pulsing placeholder for loading content. Props: `width` and `height` (CSS lengths; defaults `100%` and `1em`), `circle` (draws a circle; an omitted `width` or `height` follows the given side through a square `aspect-ratio`, so the placeholder stays round also for a percentage size, and both default to `1em` when both are omitted; give both to draw an ellipse), and the other `span` props except `children`. It is hidden from screen readers; consumers mark the loading region with `aria-busy`. The pulse stops under `prefers-reduced-motion`.
 - `delino-ui/styles.css`
   - Declares the cascade layer order `ui-sdk, delino-ui`. UI SDK rules are in `ui-sdk`; package rules are in `delino-ui`. Unlayered app styles override both.
   - Includes the UI SDK rule that hides closed parts with `hidden`, because statically rendered pages do not get it from UI SDK before hydration.

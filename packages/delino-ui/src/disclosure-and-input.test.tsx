@@ -762,5 +762,80 @@ describe("Skeleton", () => {
     expect(skeleton.getAttribute("aria-hidden")).toBe("true");
     expect(skeleton.hasAttribute("data-circle")).toBe(true);
     expect(skeleton.style.width).toBe("120px");
+    expect(skeleton.style.height).toBe("auto");
+    expect(skeleton.style.aspectRatio).toBe("1 / 1");
+  });
+
+  test("draws a 1em circle when a circle has no dimension", () => {
+    const { container } = render(<Skeleton circle />);
+
+    const skeleton = container.firstElementChild as HTMLElement;
+    expect(skeleton.style.width).toBe("1em");
+    expect(skeleton.style.height).toBe("1em");
+    expect(skeleton.style.aspectRatio).toBe("");
+  });
+
+  test("derives the other side of a circle from a square aspect ratio", () => {
+    const { container } = render(
+      <>
+        <Skeleton circle height="32px" />
+        <Skeleton circle width="48px" />
+        <Skeleton circle width="60%" />
+      </>,
+    );
+
+    const [byHeight, byWidth, byPercent] = Array.from(
+      container.children,
+    ) as HTMLElement[];
+    // A copied percentage would resolve against the container height, which is
+    // often `auto`, so the omitted side must not copy the given one.
+    expect([byHeight.style.width, byHeight.style.height]).toEqual([
+      "auto",
+      "32px",
+    ]);
+    expect([byWidth.style.width, byWidth.style.height]).toEqual([
+      "48px",
+      "auto",
+    ]);
+    expect([byPercent.style.width, byPercent.style.height]).toEqual([
+      "60%",
+      "auto",
+    ]);
+    for (const skeleton of [byHeight, byWidth, byPercent]) {
+      expect(skeleton.style.aspectRatio).toBe("1 / 1");
+    }
+  });
+
+  test("uses both dimensions of a circle as given", () => {
+    const { container } = render(
+      <Skeleton circle width="40px" height="24px" />,
+    );
+
+    const skeleton = container.firstElementChild as HTMLElement;
+    expect(skeleton.style.width).toBe("40px");
+    expect(skeleton.style.height).toBe("24px");
+    expect(skeleton.style.aspectRatio).toBe("");
+  });
+
+  test("leaves a non-circle with one dimension to the stylesheet", () => {
+    const { container } = render(
+      <>
+        <Skeleton width="120px" />
+        <Skeleton />
+      </>,
+    );
+
+    const [widthOnly, bare] = Array.from(container.children) as HTMLElement[];
+    expect(widthOnly.style.width).toBe("120px");
+    expect(widthOnly.style.height).toBe("");
+    expect(bare.getAttribute("style")).toBeNull();
+  });
+
+  test("lets the caller style win over the circle diameter", () => {
+    const { container } = render(<Skeleton circle style={{ width: "24px" }} />);
+
+    const skeleton = container.firstElementChild as HTMLElement;
+    expect(skeleton.style.width).toBe("24px");
+    expect(skeleton.style.height).toBe("1em");
   });
 });
