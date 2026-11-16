@@ -281,12 +281,144 @@ test("only direct workspace package manifests select fixtures", (t) => {
   assert.equal(result.fixtures, false);
 });
 
+const WORKSPACE_MANIFEST_NAME = "pnpm-workspace.yaml";
+const WORKSPACE_PACKAGES_KEY = "packages:";
+// A planner-supported workspace glob is exactly "<root>/*": one plain
+// directory name followed by a single-level wildcard. Anything else (negation,
+// "**", nested roots, relative prefixes, bare directories) is not understood by
+// the planner's workspace manifest selector.
+const WORKSPACE_GLOB_PATTERN = /^([^*/\s!]+)\/\*$/;
+
+// Returns the workspace roots listed in the `packages:` block of a
+// pnpm-workspace.yaml text. Accepts the valid YAML spellings of a list entry
+// (single or double quotes, trailing comments). Fails closed: an entry that is
+// not a "<root>/*" glob throws instead of being skipped, so the cross-check
+// below cannot pass while the manifest and `workspaceRoots` differ.
+function workspaceGlobRoots(manifest) {
+  const lines = manifest.split("\n");
+  const start = lines.findIndex(
+    (line) => line.trimEnd() === WORKSPACE_PACKAGES_KEY,
+  );
+  assert.notEqual(
+    start,
+    -1,
+    `${WORKSPACE_MANIFEST_NAME} has no packages block`,
+  );
+  const roots = [];
+  for (const line of lines.slice(start + 1)) {
+    // Blank and comment-only lines, at any indentation, do not end the block.
+    if (/^\s*(#.*)?$/.test(line)) {
+      continue;
+    }
+    if (/^\S/.test(line)) {
+      break;
+    }
+    const entryMatch = line.match(/^\s*-\s+(.+)$/);
+    if (!entryMatch) {
+      continue;
+    }
+    let entry = entryMatch[1].replace(/\s+#.*$/, "").trim();
+    const quoted = entry.match(/^(['"])(.*)\1$/);
+    if (quoted) {
+      entry = quoted[2];
+    }
+    const globMatch = entry.match(WORKSPACE_GLOB_PATTERN);
+    if (!globMatch) {
+      throw new Error(
+        `unsupported ${WORKSPACE_MANIFEST_NAME} workspace entry: ${entry}`,
+      );
+    }
+    roots.push(globMatch[1]);
+  }
+  if (roots.length === 0) {
+    throw new Error(`${WORKSPACE_MANIFEST_NAME} packages block has no entries`);
+  }
+  return roots;
+}
+
+function sortedWorkspaceRootsMatch(manifest) {
+  assert.deepEqual(
+    [...workspaceRoots].sort(),
+    workspaceGlobRoots(manifest).sort(),
+  );
+}
+
 test("workspace manifest roots match pnpm-workspace.yaml", () => {
-  const globs = readFileSync(join(root, "pnpm-workspace.yaml"), "utf8")
-    .split("\n")
-    .map((line) => line.match(/^\s+-\s+(\S+?)\/\*\s*$/)?.[1])
-    .filter(Boolean);
-  assert.deepEqual([...workspaceRoots].sort(), globs.sort());
+  sortedWorkspaceRootsMatch(
+    readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8"),
+  );
+});
+
+test("workspace glob parser accepts quotes and trailing comments", () => {
+  assert.deepEqual(
+    workspaceGlobRoots(
+      "packages:\n  - apps/*\n  - 'crates/*'\n  - \"tools/*\"\n  - libs/*  # note\n",
+    ),
+    ["apps", "crates", "tools", "libs"],
+  );
+});
+
+test("workspace glob parser fails closed on unsupported entries", async (t) => {
+  for (const entry of ["packages/**", "'!excluded/*'", "apps/a", "./apps/*"]) {
+    await t.test(entry, () => {
+      assert.throws(
+        () => workspaceGlobRoots(`packages:\n  - apps/*\n  - ${entry}\n`),
+        (error) =>
+          error.message.includes(entry.replaceAll("'", "")) &&
+          error.message.includes(WORKSPACE_MANIFEST_NAME),
+      );
+    });
+  }
+});
+
+test("workspace glob parser reads only the packages block", () => {
+  assert.deepEqual(
+    workspaceGlobRoots(
+      "packages:\n  - apps/*\nonlyBuiltDependencies:\n  - esbuild\n",
+    ),
+    ["apps"],
+  );
+});
+
+test("workspace glob parser skips comment and blank lines inside the packages block", () => {
+  assert.deepEqual(
+    workspaceGlobRoots(
+      "packages:\n  - apps/*\n# column-zero comment\n\n    # indented comment\n  - crates/*\nonlyBuiltDependencies:\n# trailing comment\n  - esbuild\n",
+    ),
+    ["apps", "crates"],
+  );
+});
+
+test("workspace roots cross-check detects a root after a column-zero comment", () => {
+  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  assert.throws(
+    () =>
+      sortedWorkspaceRootsMatch(
+        `${current.trimEnd()}\n# additional workspace roots\n  - crates/*\n`,
+      ),
+    assert.AssertionError,
+  );
+});
+
+test("workspace glob parser rejects an empty packages block", () => {
+  assert.throws(() => workspaceGlobRoots("packages:\n"));
+});
+
+test("workspace roots cross-check detects extra roots in any spelling", async (t) => {
+  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  for (const entry of [
+    "crates/*",
+    "'crates/*'",
+    '"crates/*"',
+    "crates/*  # note",
+  ]) {
+    await t.test(entry, () => {
+      assert.throws(
+        () => sortedWorkspaceRootsMatch(`${current.trimEnd()}\n  - ${entry}\n`),
+        assert.AssertionError,
+      );
+    });
+  }
 });
 
 test("Go sources and module files select Go checks", async (t) => {
