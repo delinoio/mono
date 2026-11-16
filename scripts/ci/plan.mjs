@@ -82,8 +82,8 @@ export function plan(cwd, base, head) {
   return { quality: format || fixtures, format, fixtures, go, e2e };
 }
 
-// Why the `go` output has its value. Logged in the ci_plan record only.
-export const GoReason = Object.freeze({
+// Why a forced output has its value. Logged in the ci_plan record only.
+export const OutputReason = Object.freeze({
   Diff: "diff",
   MainPush: "main-push",
 });
@@ -100,14 +100,26 @@ export function isMainPush(env) {
 
 export function main(env = process.env, cwd = process.cwd()) {
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
-  // Branch-wide cancellation can cancel a main-push run before its Go job
-  // finishes, and the next push then compares only against its own parent.
-  // Every main push therefore runs the Go checks against its own head so a
-  // later documentation-only push cannot hide a cancelled predecessor's Go
-  // range. Pull request and manual comparisons keep affected selection.
+  // Branch-wide cancellation can cancel a main-push run before its Go,
+  // fixtures or e2e jobs finish, and the next push then compares only against
+  // its own parent. Every main push therefore runs the Go checks, the fixtures
+  // and the e2e suites against its own head so a later documentation-only push
+  // cannot hide a cancelled predecessor's range. The fixtures step lives in
+  // the `quality` job, so forcing fixtures forces quality too. `format` stays
+  // diff-derived: the formatter compares the same range and a forced run
+  // would not widen it. Pull request and manual comparisons keep affected
+  // selection.
   const mainPush = isMainPush(env);
-  const result = { ...diffPlan, go: diffPlan.go || mainPush };
-  const goReason = mainPush && !diffPlan.go ? GoReason.MainPush : GoReason.Diff;
+  const fixtures = diffPlan.fixtures || mainPush;
+  const result = {
+    ...diffPlan,
+    fixtures,
+    quality: diffPlan.quality || fixtures,
+    go: diffPlan.go || mainPush,
+    e2e: diffPlan.e2e || mainPush,
+  };
+  const reasonOf = (selectedByDiff) =>
+    mainPush && !selectedByDiff ? OutputReason.MainPush : OutputReason.Diff;
   const record = {
     event: "ci_plan",
     validationRevision: execFileSync("git", ["rev-parse", "HEAD"], {
@@ -117,7 +129,9 @@ export function main(env = process.env, cwd = process.cwd()) {
     base: env.CI_BASE,
     head: env.CI_HEAD,
     ...result,
-    goReason,
+    goReason: reasonOf(diffPlan.go),
+    fixturesReason: reasonOf(diffPlan.fixtures),
+    e2eReason: reasonOf(diffPlan.e2e),
   };
   console.log(JSON.stringify(record));
   appendFileSync(
