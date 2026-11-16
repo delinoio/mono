@@ -249,6 +249,10 @@ function workspaceGlobRoots(manifest) {
   );
   const roots = [];
   for (const line of lines.slice(start + 1)) {
+    // Blank and comment-only lines, at any indentation, do not end the block.
+    if (/^\s*(#.*)?$/.test(line)) {
+      continue;
+    }
     if (/^\S/.test(line)) {
       break;
     }
@@ -316,6 +320,26 @@ test("workspace glob parser reads only the packages block", () => {
       "packages:\n  - apps/*\nonlyBuiltDependencies:\n  - esbuild\n",
     ),
     ["apps"],
+  );
+});
+
+test("workspace glob parser skips comment and blank lines inside the packages block", () => {
+  assert.deepEqual(
+    workspaceGlobRoots(
+      "packages:\n  - apps/*\n# column-zero comment\n\n    # indented comment\n  - crates/*\nonlyBuiltDependencies:\n# trailing comment\n  - esbuild\n",
+    ),
+    ["apps", "crates"],
+  );
+});
+
+test("workspace roots cross-check detects a root after a column-zero comment", () => {
+  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  assert.throws(
+    () =>
+      sortedWorkspaceRootsMatch(
+        `${current.trimEnd()}\n# additional workspace roots\n  - crates/*\n`,
+      ),
+    assert.AssertionError,
   );
 });
 
