@@ -157,6 +157,7 @@ test("every shared fixture input selects tests", async (t) => {
     "turbo.json",
     "apps/delino-accounts/turbo.json",
     "servers/accounts-api/turbo.json",
+    "packages/delino-ui/turbo.json",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -173,8 +174,61 @@ test("only turbo.json files select Turbo configuration fixtures", (t) => {
   f.write("apps/example/not-turbo.json");
   f.write("apps/example/turbo.json.example");
   f.write("apps/example/turbo.json/readme.txt");
+  f.write("turbo.json/readme.txt");
   const result = plan(f.cwd, f.base, f.commit());
   assert.equal(result.fixtures, false);
+});
+
+test("only root and direct workspace package turbo.json select fixtures", async (t) => {
+  // Turbo reads a package configuration only directly inside a workspace
+  // package, so a `turbo.json` at any other depth is not a fixture input.
+  for (const path of [
+    "docs/turbo.json",
+    "apps/foo/bar/turbo.json",
+    "packages/x/src/turbo.json",
+    "apps/turbo.json",
+    "cmds/example/turbo.json",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      const result = plan(f.cwd, f.base, f.commit());
+      assert.equal(result.fixtures, false);
+    });
+  }
+  // Only app packages select e2e suites, so a stray turbo.json elsewhere does
+  // not.
+  const f = fixture(t);
+  f.write("docs/turbo.json");
+  assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
+});
+
+test("deleted and renamed turbo.json files select fixtures", (t) => {
+  const f = fixture(t);
+  f.write("packages/old-lib/turbo.json");
+  f.write("apps/old-app/turbo.json");
+  f.write("servers/old-server/turbo.json");
+  const base = f.commit();
+  f.git("rm", "--quiet", "packages/old-lib/turbo.json");
+  // --no-renames reports a moved file as a deletion plus an addition.
+  f.git("mv", "apps/old-app/turbo.json", "docs-only.txt");
+  const result = plan(f.cwd, base, f.commit());
+  assert.equal(result.quality, true);
+  assert.equal(result.fixtures, true);
+
+  const g = fixture(t);
+  g.write("servers/old-server/turbo.json");
+  const renameBase = g.commit();
+  g.write("servers/new-server/readme.txt", "kept\n");
+  g.git("mv", "servers/old-server/turbo.json", "servers/new-server/turbo.json");
+  assert.equal(plan(g.cwd, renameBase, g.commit()).fixtures, true);
+
+  // A deleted turbo.json at an unsupported depth stays unselected.
+  const h = fixture(t);
+  h.write("packages/x/src/turbo.json");
+  const deleteBase = h.commit();
+  h.git("rm", "--quiet", "packages/x/src/turbo.json");
+  assert.equal(plan(h.cwd, deleteBase, h.commit()).fixtures, false);
 });
 
 test("workspace package manifests select fixtures", async (t) => {
