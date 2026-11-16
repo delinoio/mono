@@ -469,7 +469,9 @@ func TestRequestLogRecordsFlushedAndHijackedStatus(t *testing.T) {
 
 // hijackWriter is a response writer whose Hijack succeeds without a real
 // connection, so the recorder state after a takeover can be checked directly.
-type hijackWriter struct{ http.ResponseWriter }
+// The embedded recorder keeps Flush available so a flush after the hijack
+// reaches the commitStatus guard instead of failing with http.ErrNotSupported.
+type hijackWriter struct{ *httptest.ResponseRecorder }
 
 func (hijackWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) { return nil, nil, nil }
 
