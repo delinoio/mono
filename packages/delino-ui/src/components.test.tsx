@@ -1097,6 +1097,114 @@ describe("ToastRegion", () => {
     expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
   });
 
+  // happy-dom computes no cascade, so the focus ring contrast is checked from
+  // the authored hex tokens. Dark mode inverts the toast (its surface is the
+  // `text` token), so the ring that reaches the toast buttons must be measured
+  // against that surface and not against the normal dark surface.
+  describe("focus ring contrast", () => {
+    const compact = css
+      .replace(/\s+/g, " ")
+      .replace(/\( /g, "(")
+      .replace(/ \)/g, ")");
+
+    // Bodies of every `@media (prefers-color-scheme: dark)` block, by brace
+    // matching. `block()` returns only the first match of a selector.
+    function darkMediaBodies(): string[] {
+      const opener = "@media (prefers-color-scheme: dark) {";
+      const bodies: string[] = [];
+      let from = compact.indexOf(opener);
+      while (from !== -1) {
+        const start = from + opener.length;
+        let depth = 1;
+        let end = start;
+        while (depth > 0 && end < compact.length) {
+          const char = compact[end];
+          if (char === "{") depth += 1;
+          if (char === "}") depth -= 1;
+          end += 1;
+        }
+        bodies.push(compact.slice(start, end - 1));
+        from = compact.indexOf(opener, end);
+      }
+      return bodies;
+    }
+
+    function darkRule(selector: string): string[] {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(`(?:^|[ }])${escaped} \\{([^}]*)\\}`, "g");
+      return darkMediaBodies().flatMap((body) =>
+        [...body.matchAll(pattern)].map((match) => match[1] ?? ""),
+      );
+    }
+
+    function property(
+      declarations: string[],
+      name: string,
+    ): string | undefined {
+      const pattern = new RegExp(`(?:^|[ ;])${name}: (#[0-9a-fA-F]{6})`);
+      for (const text of [...declarations].reverse()) {
+        const value = pattern.exec(text)?.[1];
+        if (value) return value;
+      }
+      return undefined;
+    }
+
+    function luminance(hex: string): number {
+      const channels = [1, 3, 5].map((index) => {
+        const value = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+        return value <= 0.03928
+          ? value / 12.92
+          : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return (
+        0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!
+      );
+    }
+
+    function contrast(first: string, second: string): number {
+      const [high, low] = [luminance(first), luminance(second)].sort(
+        (a, b) => b - a,
+      );
+      return (high! + 0.05) / (low! + 0.05);
+    }
+
+    test("keeps the toast surface and the button ring wired to the tokens", () => {
+      expect(block(".dui-toast")).toContain(
+        "background: var(--dui-color-text)",
+      );
+      expect(block(".dui-button:focus-visible")).toContain(
+        "outline: 2px solid var(--dui-color-focus-ring)",
+      );
+    });
+
+    test("keeps the light ring at 3:1 on the toast surface", () => {
+      const light = [block(":root")];
+      const ring = property(light, "--dui-color-focus-ring");
+      const surface = property(light, "--dui-color-text");
+      expect(ring).toBeDefined();
+      expect(surface).toBeDefined();
+      expect(contrast(ring!, surface!)).toBeGreaterThanOrEqual(3);
+    });
+
+    test("gives the dark toast buttons a ring at 3:1 on the toast surface", () => {
+      const darkRoot = darkRule(":root");
+      const surface = property(darkRoot, "--dui-color-text");
+      // A `.dui-toast` override wins over the dark `:root` ring for the buttons.
+      const ring =
+        property(darkRule(".dui-toast"), "--dui-color-focus-ring") ??
+        property(darkRoot, "--dui-color-focus-ring");
+      expect(surface).toBeDefined();
+      expect(ring).toBeDefined();
+      expect(contrast(ring!, surface!)).toBeGreaterThanOrEqual(3);
+    });
+
+    test("keeps the dark ring token outside the toast", () => {
+      expect(property(darkRule(":root"), "--dui-color-focus-ring")).toBe(
+        "#4593fc",
+      );
+    });
+  });
+
   // happy-dom cannot evaluate `env()` or logical insets, so this checks the
   // stylesheet source: the package rules sit in a higher cascade layer than the
   // UI SDK defaults and must keep the safe-area terms and logical edges.

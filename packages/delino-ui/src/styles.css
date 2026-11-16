@@ -20,11 +20,13 @@
      borders, focus rings and state indicators at least 3:1 (SC 1.4.11).
      Measured values: #ffffff on #1b64da 5.41:1, #ffffff on #d22030 5.26:1,
      #d22030 on #ffffff 5.26:1, #8b95a1 on #ffffff 3.04:1, #3182f6 on
-     #ffffff 3.71:1. State indicators (the Progress, Meter and Slider fill
+     #ffffff 3.71:1, #3182f6 on #f9fafb 3.55:1 (the dark toast surface).
+     State indicators (the Progress, Meter and Slider fill
      and the Select option check) use --dui-color-accent-graphic instead of
      --dui-color-accent, because #1b64da is only 2.01:1 against the dark
      track (#3c3c47) and 2.56:1 against the dark highlighted option
-     (#2c2c35). */
+     (#2c2c35). The dark focus ring #4593fc is only 2.94:1 on the inverted
+     dark toast surface #f9fafb, so .dui-toast overrides it. */
   :root {
     --dui-color-text: #191f28;
     --dui-color-text-muted: #4e5968;
@@ -910,6 +912,16 @@
 
   .dui-toast-button {
     flex: none;
+  }
+
+  /* Dark mode inverts the toast: its surface is the near-white text token
+     (#f9fafb). The dark focus ring #4593fc was measured against the normal
+     dark surface and is only 2.94:1 there, so the toast buttons, which
+     inherit the token, use the light-theme ring (#3182f6, 3.55:1). */
+  @media (prefers-color-scheme: dark) {
+    .dui-toast {
+      --dui-color-focus-ring: #3182f6;
+    }
   }
 
   /* Avatar */
