@@ -18,9 +18,9 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 import {
-  GoReason,
   MAIN_PUSH_EVENT,
   MAIN_REF,
+  OutputReason,
   isMainPush,
   main,
   plan,
@@ -41,7 +41,7 @@ isolateGitEnvironment(process.env);
 // GIT_* variable set after this module loads, and the production planner
 // intentionally honors GIT_DIR. Drops inherited GITHUB_* variables: a
 // push-to-main runner sets GITHUB_EVENT_NAME and GITHUB_REF, which would force
-// go=true.
+// go, fixtures and e2e.
 function plannerEnvironment(extra = {}) {
   return {
     ...isolateGitEnvironment(
@@ -639,7 +639,7 @@ test("main-push event constants and detection are exact", () => {
 });
 
 for (const row of eventMatrix) {
-  test(`planner go output for ${row.name} with a documentation-only range`, (t) => {
+  test(`planner outputs for ${row.name} with a documentation-only range`, (t) => {
     const f = fixture(t);
     f.write("docs/guide.md");
     const head = f.commit();
@@ -658,22 +658,72 @@ for (const row of eventMatrix) {
       },
       f.cwd,
     );
-    // Only the go selection depends on the event; every other output still
-    // follows the comparison.
+    // Only a push to main forces fixtures, go and e2e (and so quality); format
+    // still follows the comparison for every event.
+    const mainPush = row.main === true;
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=false\ngo=${row.main === true}\ne2e=false\n`,
+      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\ne2e=${mainPush}\n`,
     );
     const record = JSON.parse(logged.join(""));
-    assert.equal(record.go, row.main === true);
-    assert.equal(record.goReason, row.main ? GoReason.MainPush : GoReason.Diff);
-    assert.equal(
-      JSON.parse(readFileSync(summary, "utf8").slice("CI plan: ".length))
-        .goReason,
-      record.goReason,
+    assert.equal(record.go, mainPush);
+    assert.equal(record.fixtures, mainPush);
+    assert.equal(record.e2e, mainPush);
+    const reason = mainPush ? OutputReason.MainPush : OutputReason.Diff;
+    assert.equal(record.goReason, reason);
+    assert.equal(record.fixturesReason, reason);
+    assert.equal(record.e2eReason, reason);
+    assert.deepEqual(
+      JSON.parse(readFileSync(summary, "utf8").slice("CI plan: ".length)),
+      record,
     );
   });
 }
+
+test("a later documentation-only main push still selects the fixtures and e2e of a cancelled predecessor", (t) => {
+  const f = fixture(t);
+  // Push A selects fixtures (package.json) and e2e (an app path).
+  f.write("package.json", "{}\n");
+  f.write("apps/example/src/index.ts");
+  const first = f.commit();
+  // Push B, which cancelled A's run, only changes documentation and compares
+  // from A's head only.
+  f.write("docs/example.md");
+  const second = f.commit();
+  assert.deepEqual(plan(f.cwd, first, second), {
+    quality: true,
+    format: true,
+    fixtures: false,
+    go: false,
+    e2e: false,
+  });
+  const run = (event, ref) => {
+    const output = join(f.cwd, `output-${event}`.replaceAll("/", "_"));
+    rmSync(output, { force: true });
+    t.mock.method(console, "log", () => {});
+    main(
+      {
+        CI_BASE: first,
+        CI_HEAD: second,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+        GITHUB_EVENT_NAME: event,
+        GITHUB_REF: ref,
+      },
+      f.cwd,
+    );
+    t.mock.restoreAll();
+    return readFileSync(output, "utf8");
+  };
+  assert.equal(
+    run(MAIN_PUSH_EVENT, MAIN_REF),
+    "quality=true\nformat=true\nfixtures=true\ngo=true\ne2e=true\n",
+  );
+  assert.equal(
+    run("pull_request", "refs/pull/1/merge"),
+    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+  );
+});
 
 test("Go changes select go for every event and keep the diff reason", (t) => {
   const f = fixture(t);
@@ -698,12 +748,50 @@ test("Go changes select go for every event and keep the diff reason", (t) => {
       f.cwd,
     );
     assert.match(readFileSync(output, "utf8"), /\ngo=true\n/, row.name);
-    assert.equal(JSON.parse(logged.at(-1)).goReason, GoReason.Diff, row.name);
+    const record = JSON.parse(logged.at(-1));
+    assert.equal(record.goReason, OutputReason.Diff, row.name);
+    // A Go-only range does not select fixtures or e2e, so only a main push
+    // forces them.
+    assert.equal(
+      record.fixturesReason,
+      row.main ? OutputReason.MainPush : OutputReason.Diff,
+      row.name,
+    );
+    assert.equal(
+      record.e2eReason,
+      row.main ? OutputReason.MainPush : OutputReason.Diff,
+      row.name,
+    );
     t.mock.restoreAll();
   }
 });
 
-test("main push keeps an empty comparison selecting only Go", (t) => {
+test("fixture and e2e changes keep the diff reason on a main push", (t) => {
+  const f = fixture(t);
+  f.write("package.json", "{}\n");
+  f.write("apps/example/src/index.ts");
+  const head = f.commit();
+  const logged = [];
+  t.mock.method(console, "log", (line) => logged.push(line));
+  main(
+    {
+      CI_BASE: f.base,
+      CI_HEAD: head,
+      GITHUB_OUTPUT: join(f.cwd, "output"),
+      GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+      GITHUB_EVENT_NAME: MAIN_PUSH_EVENT,
+      GITHUB_REF: MAIN_REF,
+    },
+    f.cwd,
+  );
+  const record = JSON.parse(logged.at(-1));
+  // The diff selects fixtures and e2e on its own; only go is forced.
+  assert.equal(record.fixturesReason, OutputReason.Diff);
+  assert.equal(record.e2eReason, OutputReason.Diff);
+  assert.equal(record.goReason, OutputReason.MainPush);
+});
+
+test("main push selects every whole-suite check for an empty comparison", (t) => {
   const f = fixture(t);
   const output = join(f.cwd, "output");
   t.mock.method(console, "log", () => {});
@@ -720,15 +808,15 @@ test("main push keeps an empty comparison selecting only Go", (t) => {
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=false\nformat=false\nfixtures=false\ngo=true\ne2e=false\n",
+    "quality=true\nformat=false\nfixtures=true\ngo=true\ne2e=true\n",
   );
 });
 
-test("planner CLI forces go for a main push and keeps pull request selection", (t) => {
+test("planner CLI forces whole-suite checks for a main push and keeps pull request selection", (t) => {
   const f = fixture(t);
   f.write("docs/guide.md");
   const head = f.commit();
-  for (const [event, ref, go] of [
+  for (const [event, ref, forced] of [
     [MAIN_PUSH_EVENT, MAIN_REF, "true"],
     ["pull_request", "refs/pull/1/merge", "false"],
     ["workflow_dispatch", MAIN_REF, "false"],
@@ -753,7 +841,7 @@ test("planner CLI forces go for a main push and keeps pull request selection", (
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=false\ngo=${go}\ne2e=false\n`,
+      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\ne2e=${forced}\n`,
       event,
     );
   }
@@ -820,6 +908,48 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
   assert.match(
     workflow,
     /\.go\.result == "skipped" and \$go_planned == "false"/,
+  );
+});
+
+// Read-only text check: the `quality`, `fixtures` and `e2e` planner outputs
+// must keep driving their jobs and the aggregate, so the planner's main-push
+// selection is enforced by ci-result without a workflow edit.
+test("CI workflow reads the planner quality, fixtures and e2e outputs for their jobs and the aggregate", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+  for (const output of ["quality", "fixtures", "e2e"]) {
+    assert.match(
+      workflow,
+      new RegExp(
+        `^\\s+${output}: \\$\\{\\{ steps\\.plan\\.outputs\\.${output} \\}\\}$`,
+        "m",
+      ),
+      output,
+    );
+  }
+  assert.match(
+    workflow,
+    /^\s+if: needs\.changes\.outputs\.quality == 'true'$/m,
+  );
+  assert.match(
+    workflow,
+    /^\s+if: needs\.changes\.outputs\.fixtures == 'true'$/m,
+  );
+  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.e2e == 'true'$/m);
+  assert.match(
+    workflow,
+    /^\s+QUALITY_PLANNED: \$\{\{ needs\.changes\.outputs\.quality \}\}$/m,
+  );
+  assert.match(
+    workflow,
+    /^\s+E2E_PLANNED: \$\{\{ needs\.changes\.outputs\.e2e \}\}$/m,
+  );
+  assert.match(
+    workflow,
+    /\.quality\.result == "skipped" and \$planned == "false"/,
+  );
+  assert.match(
+    workflow,
+    /\.e2e\.result == "skipped" and \$e2e_planned == "false"/,
   );
 });
 
