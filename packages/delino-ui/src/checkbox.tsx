@@ -32,6 +32,7 @@ export function Checkbox({
   label,
   description,
   className,
+  "aria-describedby": ariaDescribedBy,
   ...props
 }: CheckboxProps) {
   const descriptionId = React.useId();
@@ -40,13 +41,21 @@ export function Checkbox({
     description !== null &&
     description !== false &&
     description !== "";
+  // Keep the caller's ids first and add the description id after them, the
+  // same order the UI SDK field uses. An empty caller value adds no token.
+  const describedBy = [
+    ariaDescribedBy,
+    hasDescription ? descriptionId : undefined,
+  ]
+    .filter(Boolean)
+    .join(" ");
 
   return (
     <div className="dui-checkbox-field">
       <label className="dui-checkbox-item">
         <CheckboxPart
           className={mergeClassName("dui-checkbox", className)}
-          aria-describedby={hasDescription ? descriptionId : undefined}
+          aria-describedby={describedBy || undefined}
           {...props}
         >
           <CheckboxIndicator className="dui-checkbox-indicator">
