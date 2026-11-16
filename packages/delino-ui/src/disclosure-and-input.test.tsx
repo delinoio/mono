@@ -345,6 +345,64 @@ describe("Slider", () => {
     expect(values).toEqual([41]);
   });
 
+  test("names a one-value array thumb with the label, not thumbLabels", () => {
+    const { rerender } = render(
+      <Slider label="Price" defaultValue={[20]} thumbLabels={["Min"]} />,
+    );
+
+    const thumb = screen.getByRole("slider", { name: "Price" });
+    expect((thumb as HTMLInputElement).value).toBe("20");
+    expect(thumb.hasAttribute("aria-label")).toBe(false);
+    expect(screen.queryByRole("slider", { name: "Min" })).toBeNull();
+    expect(screen.getAllByRole("slider").length).toBe(1);
+
+    rerender(
+      <Slider
+        label="Price"
+        value={[30]}
+        onValueChange={() => {}}
+        thumbLabels={["Min"]}
+      />,
+    );
+    const controlled = screen.getByRole("slider", { name: "Price" });
+    expect((controlled as HTMLInputElement).value).toBe("30");
+    expect(controlled.hasAttribute("aria-label")).toBe(false);
+    expect(screen.queryByRole("slider", { name: "Min" })).toBeNull();
+  });
+
+  test("moves a one-value array thumb and reports an array", async () => {
+    const values: (number | number[])[] = [];
+    render(
+      <Slider
+        label="Price"
+        defaultValue={[20]}
+        onValueChange={(value) => values.push(value)}
+      />,
+    );
+
+    await act(async () => {
+      fireEvent.keyDown(screen.getByRole("slider", { name: "Price" }), {
+        key: "ArrowRight",
+      });
+    });
+    expect(values).toEqual([[21]]);
+  });
+
+  test("keeps naming each thumb of a range by thumbLabels", () => {
+    render(
+      <Slider
+        label="Price"
+        value={[20, 80]}
+        onValueChange={() => {}}
+        thumbLabels={["Minimum price", "Maximum price"]}
+      />,
+    );
+
+    expect(screen.getAllByRole("slider").length).toBe(2);
+    expect(screen.getByRole("slider", { name: "Minimum price" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Maximum price" })).toBeTruthy();
+  });
+
   test.each(EMPTY_DESCRIPTIONS)(
     "renders no description element or reference for %s",
     async (_name, description) => {
