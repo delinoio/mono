@@ -7,6 +7,8 @@ import { NumberInput } from "./number-input.tsx";
 import { PasswordInput } from "./password-input.tsx";
 import { RadioGroup, RadioGroupItem } from "./radio-group.tsx";
 import { Select, SelectOption } from "./select.tsx";
+import { Slider } from "./slider.tsx";
+import { Switch } from "./switch.tsx";
 import { Textarea } from "./textarea.tsx";
 import { TextField } from "./text-field.tsx";
 
@@ -138,3 +140,106 @@ describe("disabled field with an error", () => {
     expect(danglingDescribedByIds(markup)).toEqual([]);
   });
 });
+
+type DescriptionCase = {
+  name: string;
+  /** Renders the component with the given description. */
+  field: (description: React.ReactNode) => React.ReactElement;
+};
+
+const DESCRIPTION_CASES: DescriptionCase[] = [
+  {
+    name: "TextField",
+    field: (description) => (
+      <TextField label="Name" description={description} />
+    ),
+  },
+  {
+    name: "Textarea",
+    field: (description) => <Textarea label="Bio" description={description} />,
+  },
+  {
+    name: "PasswordInput",
+    field: (description) => (
+      <PasswordInput label="Password" description={description} />
+    ),
+  },
+  {
+    name: "NumberInput",
+    field: (description) => (
+      <NumberInput label="Tickets" description={description} />
+    ),
+  },
+  {
+    name: "Select",
+    field: (description) => (
+      <Select label="Role" description={description}>
+        <SelectOption value="admin">Admin</SelectOption>
+      </Select>
+    ),
+  },
+  {
+    name: "RadioGroup",
+    field: (description) => (
+      <RadioGroup label="Plan" description={description}>
+        <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
+      </RadioGroup>
+    ),
+  },
+  {
+    name: "Slider",
+    field: (description) => (
+      <Slider label="Volume" defaultValue={40} description={description} />
+    ),
+  },
+  {
+    name: "Switch",
+    field: (description) => <Switch label="Alerts" description={description} />,
+  },
+];
+
+const EMPTY_DESCRIPTIONS: [string, React.ReactNode][] = [
+  ["undefined", undefined],
+  ["null", null],
+  ["false", false],
+  ["an empty string", ""],
+];
+
+describe.each(DESCRIPTION_CASES)(
+  "$name description in static markup",
+  (descriptionCase) => {
+    test.each(EMPTY_DESCRIPTIONS)(
+      "has no unresolved aria-describedby id for %s",
+      (_name, description) => {
+        const markup = renderToStaticMarkup(descriptionCase.field(description));
+        expect(danglingDescribedByIds(markup)).toEqual([]);
+      },
+    );
+
+    test.each(EMPTY_DESCRIPTIONS)(
+      "renders only an empty hidden description element for %s",
+      (_name, description) => {
+        const markup = renderToStaticMarkup(descriptionCase.field(description));
+        const elements = Array.from(
+          markup.matchAll(
+            /<[^>]*data-slot="field-description"[^>]*>(.*?)<\/p>/g,
+          ),
+        );
+        expect(elements.length).toBe(1);
+        expect(elements[0]?.[0]).toMatch(/\shidden=""/);
+        expect(elements[0]?.[1]).toBe("");
+      },
+    );
+
+    test("renders and references a present description", () => {
+      const markup = renderToStaticMarkup(descriptionCase.field("Help text."));
+      expect(markup).toContain("Help text.");
+      const element = markup.match(
+        /<[^>]*data-slot="field-description"[^>]*>/,
+      )?.[0];
+      expect(element).toBeDefined();
+      expect(element).not.toContain("hidden");
+      expect(danglingDescribedByIds(markup)).toEqual([]);
+    });
+  },
+);

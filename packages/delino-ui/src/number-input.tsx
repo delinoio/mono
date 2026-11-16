@@ -136,11 +136,18 @@ export function NumberInput({
           </NumberInputIncrement>
         </NumberInputGroup>
       </NumberInputRoot>
-      {hasDescription ? (
-        <FieldDescription className="dui-text-field-description">
-          {description}
-        </FieldDescription>
-      ) : null}
+      {/* Workaround: the UI SDK Field predicts the description id in
+          aria-describedby before the field binds on the client, so static
+          markup would point at a missing element. Always render the
+          description and hide it when empty (display: none from the package
+          styles). Remove when the UI SDK stops predicting an id for an
+          unregistered description. */}
+      <FieldDescription
+        className="dui-text-field-description"
+        hidden={!hasDescription}
+      >
+        {hasDescription ? description : null}
+      </FieldDescription>
       {hasError ? (
         <FieldError className="dui-text-field-error">{error}</FieldError>
       ) : (

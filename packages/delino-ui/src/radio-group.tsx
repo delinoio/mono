@@ -54,11 +54,18 @@ export function RadioGroup({
       invalid={hasError ? true : undefined}
     >
       <FieldLabel className="dui-radio-field-label">{label}</FieldLabel>
-      {!hasDescription ? null : (
-        <FieldDescription className="dui-radio-field-description">
-          {description}
-        </FieldDescription>
-      )}
+      {/* Workaround: the UI SDK Field predicts the description id in
+          aria-describedby before the field binds on the client, so static
+          markup would point at a missing element. Always render the
+          description and hide it when empty (display: none from the package
+          styles). Remove when the UI SDK stops predicting an id for an
+          unregistered description. */}
+      <FieldDescription
+        className="dui-radio-field-description"
+        hidden={!hasDescription}
+      >
+        {hasDescription ? description : null}
+      </FieldDescription>
       <RadioGroupPart
         className={mergeClassName("dui-radio-group", className)}
         disabled={disabled}
