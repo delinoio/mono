@@ -338,7 +338,11 @@ test(
     assert.equal(result.status, 1, result.stdout);
     assert.ok(result.stderr.includes(hook), result.stderr);
     assert.ok(result.stderr.includes(backup), result.stderr);
-    assert.doesNotMatch(result.stdout, /overwriting/);
+    assert.equal(
+      result.stdout,
+      "",
+      "the installer must refuse before it starts Lefthook",
+    );
     assert.deepEqual(snapshot(hook), before.hook);
     assert.deepEqual(snapshot(backup), before.backup);
   },
