@@ -57,6 +57,18 @@ export function NumberInput({
   disabled,
   ...props
 }: NumberInputProps) {
+  // A caller `data-autofocus` would be spread onto the non-tabbable root
+  // `<div>`. The UI SDK Dialog takes the first `[data-autofocus]` match in
+  // document order and does not try later matches, so a root match comes
+  // before the control and makes the Dialog fall back to its first tabbable
+  // element. Drop the attribute so only the control, which sets it from
+  // `autoFocus`, can be the initial focus target. The prop types do not
+  // declare it, so the cast reaches the key. Remove this when the UI SDK
+  // Dialog skips non-tabbable `[data-autofocus]` matches.
+  const { "data-autofocus": _dataAutofocus, ...rootProps } =
+    props as typeof props & {
+      "data-autofocus"?: unknown;
+    };
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -75,7 +87,7 @@ export function NumberInput({
       <NumberInputRoot
         className={mergeClassName("dui-number-input", className)}
         disabled={disabled}
-        {...props}
+        {...rootProps}
       >
         <NumberInputGroup className="dui-number-input-group">
           <NumberInputDecrement
@@ -98,7 +110,8 @@ export function NumberInput({
             attribute. Without `data-autofocus` on the control `<input>`, a Dialog
             focuses its first tabbable element (usually the close button) instead
             of this input. The attribute must be on the control, not the root:
-            caller props are spread onto the root `<div>`, which is not tabbable.
+            the root `<div>` is not tabbable, so a caller `data-autofocus` is dropped
+            from the root props above.
             Scope: only when `autoFocus` is true. Remove when the UI SDK reads the
             React `autoFocus` prop itself.
           */}
