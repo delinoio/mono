@@ -23,6 +23,12 @@ const launcher = fileURLToPath(new URL("./dev.mjs", import.meta.url));
 const StatusSigint = 130;
 const StatusSigterm = 143;
 const Timeout = 60_000;
+// The deadline of waitFor. It must stay below the smallest per-test timeout
+// (Timeout) minus the setup time that runs before the first wait (port
+// reservation and launcher start). The node:test timer starts with the test, so
+// an equal deadline lets the runner fail the test first with a bare "test timed
+// out" and the stdout/stderr diagnostic of waitFor is never printed.
+const WaitTimeout = 45_000;
 
 // Reserves a free loopback port number. The port is released before returning,
 // so a launcher started right after can bind it.
@@ -141,7 +147,7 @@ function startLauncher(t, { port, env = {}, pathPrefix } = {}) {
 }
 
 async function waitFor(run, predicate, what) {
-  const deadline = Date.now() + Timeout;
+  const deadline = Date.now() + WaitTimeout;
   while (Date.now() < deadline) {
     if (predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 50));
