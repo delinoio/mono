@@ -230,8 +230,9 @@ const GitlinkMode = "160000";
 // symlink support (Windows without privileges, `core.symlinks=false`) writes
 // a symlink path as a regular file holding the link target, so the worktree
 // file type alone cannot identify it; formatting would rewrite the placeholder
-// and change what Git records. A gitlink is a directory in the worktree and
-// has no blob to format. `git ls-files --stage` reads the index that Git
+// and change what Git records. A gitlink is a commit pointer, not a blob: it
+// is normally a directory in the worktree, but the exemption follows the
+// index mode even when the worktree entry is a regular file. `git ls-files --stage` reads the index that Git
 // resolves from the environment (honoring GIT_INDEX_FILE inside hooks), so it
 // is the validation index, works before the first commit and never consults the
 // comparison head. Each entry is `<mode> <object> <stage>\t<path>`; the path
@@ -248,18 +249,20 @@ function recordedPaths(cwd, modes) {
   return paths;
 }
 
-const recordedSymlinks = (cwd) => recordedPaths(cwd, [SymlinkMode]);
+// Every selector uses this one helper so their exemptions cannot diverge.
+const recordedNonFormattablePaths = (cwd) =>
+  recordedPaths(cwd, [SymlinkMode, GitlinkMode]);
 
 export function allFormatFiles(start) {
   const cwd = repositoryRoot(start);
-  const symlinks = recordedSymlinks(cwd);
+  const exempt = recordedNonFormattablePaths(cwd);
   // A name that is not valid UTF-8 stays a silent skip here: Rstack cannot
   // format such a name, so --all keeps skipping it (see the contract). It is
   // skipped by its bytes, never by looking up its lossy form, which may be the
   // name of a different, valid file.
   const names = gitPaths(cwd, ["ls-files", "-z"]).filter((name) => {
     if (hasInvalidBytes(name)) return false;
-    if (!isFormattableExtension(name) || symlinks.has(name)) return false;
+    if (!isFormattableExtension(name) || exempt.has(name)) return false;
     return isRegularFile(cwd, name);
   });
   // `git ls-files` prints an unmerged path once per index stage (up to three
@@ -352,7 +355,7 @@ function stagedRegularFile(cwd, name) {
 
 export function stagedFormatFiles(start) {
   const cwd = repositoryRoot(start);
-  const exempt = recordedPaths(cwd, [SymlinkMode, GitlinkMode]);
+  const exempt = recordedNonFormattablePaths(cwd);
   return gitPaths(cwd, [
     "diff",
     "--cached",
@@ -469,7 +472,7 @@ export function changedFormatFiles(
   // comparison head: the checkout may be a merge commit that differs from
   // `head`. Both have no blob to format, so they are exempted before the
   // non-UTF-8 check below, as `stagedFormatFiles` does.
-  const exempt = recordedPaths(cwd, [SymlinkMode, GitlinkMode]);
+  const exempt = recordedNonFormattablePaths(cwd);
   return [...new Set(names)]
     .filter((name) => {
       if (!name || !isFormattableExtension(name) || !present.has(name))

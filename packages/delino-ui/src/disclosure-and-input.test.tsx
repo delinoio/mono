@@ -327,6 +327,35 @@ describe("Drawer", () => {
     expect(drawer.hasAttribute("data-closed")).toBe(true);
   });
 
+  test.each([
+    { modal: undefined, backdrop: true },
+    { modal: true, backdrop: true },
+    { modal: false, backdrop: false },
+    { modal: "trap-focus" as const, backdrop: false },
+  ])(
+    "renders the backdrop only for a modal drawer (modal=$modal)",
+    async ({ modal, backdrop }) => {
+      render(
+        <Drawer modal={modal}>
+          <DrawerTrigger>Filters</DrawerTrigger>
+          <DrawerContent>
+            <DrawerTitle>Filter results</DrawerTitle>
+          </DrawerContent>
+        </Drawer>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Filters" }));
+      });
+      expect(
+        screen.getByRole("dialog", { name: "Filter results" }),
+      ).toBeTruthy();
+      // SDK popups can portal, so query the document.
+      expect(document.querySelector(".dui-drawer-backdrop") !== null).toBe(
+        backdrop,
+      );
+    },
+  );
+
   describe("gap cover", () => {
     // happy-dom computes neither layout nor the cascade, so the scrollable
     // overflow is checked on the stylesheet text. A real-browser measurement
@@ -529,6 +558,82 @@ describe("NumberInput", () => {
     ).toBe("true");
   });
 
+  test.each(["help", "a b"])(
+    "puts a caller aria-describedby %j before the description id on the input",
+    async (callerIds) => {
+      const { container } = render(
+        <NumberInput
+          label="Tickets"
+          description="Help text"
+          aria-describedby={callerIds}
+        />,
+      );
+      await act(async () => {});
+
+      const description = container.querySelector(
+        ".dui-text-field-description",
+      );
+      expect(description?.id).toBeTruthy();
+      expect(
+        container.querySelector("input")?.getAttribute("aria-describedby"),
+      ).toBe(`${callerIds} ${description?.id}`);
+      expect(
+        container
+          .querySelector("[data-slot=number-input]")
+          ?.hasAttribute("aria-describedby"),
+      ).toBe(false);
+    },
+  );
+
+  test("keeps a caller aria-describedby first when there is no description", async () => {
+    const { container } = render(
+      <NumberInput label="Tickets" aria-describedby="help" />,
+    );
+    await act(async () => {});
+
+    // An empty hidden description element is always rendered and registered.
+    const hidden = container.querySelector(".dui-text-field-description");
+    expect(hidden?.id).toBeTruthy();
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(`help ${hidden?.id}`);
+  });
+
+  test("adds no empty token for an empty caller aria-describedby", async () => {
+    const { container } = render(
+      <NumberInput
+        label="Tickets"
+        description="Help text"
+        aria-describedby=""
+      />,
+    );
+    await act(async () => {});
+
+    const description = container.querySelector(".dui-text-field-description");
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(description?.id);
+  });
+
+  test("puts a caller aria-label and aria-labelledby on the input, not the root", async () => {
+    const { container } = render(
+      <NumberInput
+        label="Tickets"
+        aria-label="Pass code"
+        aria-labelledby="x"
+      />,
+    );
+    await act(async () => {});
+
+    const input = container.querySelector("input");
+    expect(input?.getAttribute("aria-label")).toBe("Pass code");
+    expect(input?.getAttribute("aria-labelledby")).toContain("x");
+    const root = container.querySelector("[data-slot=number-input]");
+    expect(root?.hasAttribute("aria-label")).toBe(false);
+    expect(root?.hasAttribute("aria-labelledby")).toBe(false);
+    expect(root?.hasAttribute("aria-describedby")).toBe(false);
+  });
+
   test.each(EMPTY_DESCRIPTIONS)(
     "renders a hidden empty description element for %s",
     async (_name, description) => {
@@ -565,6 +670,82 @@ describe("PasswordInput", () => {
     expect(rule).toContain("padding-inline: 14px 4px");
     expect(rule).toContain("padding-block: 0");
     expect(rule).not.toMatch(/(^|[\s;])padding:/);
+  });
+
+  test.each(["help", "a b"])(
+    "puts a caller aria-describedby %j before the description id on the input",
+    async (callerIds) => {
+      const { container } = render(
+        <PasswordInput
+          label="Password"
+          description="Help text"
+          aria-describedby={callerIds}
+        />,
+      );
+      await act(async () => {});
+
+      const description = container.querySelector(
+        ".dui-text-field-description",
+      );
+      expect(description?.id).toBeTruthy();
+      expect(
+        container.querySelector("input")?.getAttribute("aria-describedby"),
+      ).toBe(`${callerIds} ${description?.id}`);
+      expect(
+        container
+          .querySelector("[data-slot=password-input]")
+          ?.hasAttribute("aria-describedby"),
+      ).toBe(false);
+    },
+  );
+
+  test("keeps a caller aria-describedby first when there is no description", async () => {
+    const { container } = render(
+      <PasswordInput label="Password" aria-describedby="help" />,
+    );
+    await act(async () => {});
+
+    // An empty hidden description element is always rendered and registered.
+    const hidden = container.querySelector(".dui-text-field-description");
+    expect(hidden?.id).toBeTruthy();
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(`help ${hidden?.id}`);
+  });
+
+  test("adds no empty token for an empty caller aria-describedby", async () => {
+    const { container } = render(
+      <PasswordInput
+        label="Password"
+        description="Help text"
+        aria-describedby=""
+      />,
+    );
+    await act(async () => {});
+
+    const description = container.querySelector(".dui-text-field-description");
+    expect(
+      container.querySelector("input")?.getAttribute("aria-describedby"),
+    ).toBe(description?.id);
+  });
+
+  test("puts a caller aria-label and aria-labelledby on the input, not the root", async () => {
+    const { container } = render(
+      <PasswordInput
+        label="Password"
+        aria-label="Pass code"
+        aria-labelledby="x"
+      />,
+    );
+    await act(async () => {});
+
+    const input = container.querySelector("input");
+    expect(input?.getAttribute("aria-label")).toBe("Pass code");
+    expect(input?.getAttribute("aria-labelledby")).toContain("x");
+    const root = container.querySelector("[data-slot=password-input]");
+    expect(root?.hasAttribute("aria-label")).toBe(false);
+    expect(root?.hasAttribute("aria-labelledby")).toBe(false);
+    expect(root?.hasAttribute("aria-describedby")).toBe(false);
   });
 
   test("shows and hides the password from its toggle", async () => {
@@ -723,6 +904,14 @@ describe("Pagination", () => {
     });
     expect(pages).toEqual([2, 3]);
   });
+
+  test("mirrors the step icons in right-to-left text", () => {
+    // happy-dom cannot match :dir(), so the rule is checked as stylesheet text.
+    // The chevron paths are fixed (left for Previous, right for Next) while the
+    // flex list reverses under dir="rtl", so the icons must mirror with it.
+    expect(block(".dui-pagination-step svg")).not.toContain("scale");
+    expect(block(".dui-pagination-step:dir(rtl) svg")).toContain("scale: -1 1");
+  });
 });
 
 describe("Meter", () => {
@@ -732,6 +921,15 @@ describe("Meter", () => {
     const meter = screen.getByRole("meter", { name: "Storage used" });
     expect(meter.getAttribute("aria-valuenow")).toBe("40");
     expect(meter.className).toBe("dui-progress");
+    expect(screen.getByText("40%")).toBeTruthy();
+  });
+
+  test("shows no value by default", () => {
+    render(<Meter label="Storage used" value={40} />);
+
+    const meter = screen.getByRole("meter", { name: "Storage used" });
+    expect(meter.getAttribute("aria-valuenow")).toBe("40");
+    expect(screen.queryByText("40%")).toBeNull();
   });
 });
 

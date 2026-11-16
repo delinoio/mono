@@ -94,8 +94,8 @@ export function plan(cwd, base, head) {
   return { quality: format || fixtures, format, fixtures, go, e2e };
 }
 
-// Why the `go` output has its value. Logged in the ci_plan record only.
-export const GoReason = Object.freeze({
+// Why a forced output has its value. Logged in the ci_plan record only.
+export const OutputReason = Object.freeze({
   Diff: "diff",
   MainPush: "main-push",
 });
@@ -110,16 +110,43 @@ export function isMainPush(env) {
   );
 }
 
+// The planner publishes its selections through these runner-provided files.
+const PUBLICATION_VARIABLES = Object.freeze([
+  "GITHUB_OUTPUT",
+  "GITHUB_STEP_SUMMARY",
+]);
+
 export function main(env = process.env, cwd = process.cwd()) {
+  // Check the publication targets before any selection or logging so a missing
+  // variable fails closed with nothing printed or written.
+  for (const name of PUBLICATION_VARIABLES) {
+    if (typeof env[name] !== "string" || env[name] === "") {
+      throw new Error(
+        `${name} is not set; the planner publishes its selections through it`,
+      );
+    }
+  }
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
-  // Branch-wide cancellation can cancel a main-push run before its Go job
-  // finishes, and the next push then compares only against its own parent.
-  // Every main push therefore runs the Go checks against its own head so a
-  // later documentation-only push cannot hide a cancelled predecessor's Go
-  // range. Pull request and manual comparisons keep affected selection.
+  // Branch-wide cancellation can cancel a main-push run before its Go,
+  // fixtures or e2e jobs finish, and the next push then compares only against
+  // its own parent. Every main push therefore runs the Go checks, the fixtures
+  // and the e2e suites against its own head so a later documentation-only push
+  // cannot hide a cancelled predecessor's range. The fixtures step lives in
+  // the `quality` job, so forcing fixtures forces quality too. `format` stays
+  // diff-derived: the formatter compares the same range and a forced run
+  // would not widen it. Pull request and manual comparisons keep affected
+  // selection.
   const mainPush = isMainPush(env);
-  const result = { ...diffPlan, go: diffPlan.go || mainPush };
-  const goReason = mainPush && !diffPlan.go ? GoReason.MainPush : GoReason.Diff;
+  const fixtures = diffPlan.fixtures || mainPush;
+  const result = {
+    ...diffPlan,
+    fixtures,
+    quality: diffPlan.quality || fixtures,
+    go: diffPlan.go || mainPush,
+    e2e: diffPlan.e2e || mainPush,
+  };
+  const reasonOf = (selectedByDiff) =>
+    mainPush && !selectedByDiff ? OutputReason.MainPush : OutputReason.Diff;
   const record = {
     event: "ci_plan",
     validationRevision: execFileSync("git", ["rev-parse", "HEAD"], {
@@ -129,9 +156,10 @@ export function main(env = process.env, cwd = process.cwd()) {
     base: env.CI_BASE,
     head: env.CI_HEAD,
     ...result,
-    goReason,
+    goReason: reasonOf(diffPlan.go),
+    fixturesReason: reasonOf(diffPlan.fixtures),
+    e2eReason: reasonOf(diffPlan.e2e),
   };
-  console.log(JSON.stringify(record));
   appendFileSync(
     env.GITHUB_OUTPUT,
     Object.entries(result)
@@ -142,6 +170,8 @@ export function main(env = process.env, cwd = process.cwd()) {
     env.GITHUB_STEP_SUMMARY,
     `CI plan: ${JSON.stringify(record)}\n`,
   );
+  // Logged last so a failed publication never leaves a success record behind.
+  console.log(JSON.stringify(record));
 }
 
 // import.meta.main needs Node 24.2+; it also holds for symlinked script paths.
@@ -149,8 +179,12 @@ export function main(env = process.env, cwd = process.cwd()) {
 // malformed comparison, an unreadable checkout) must reach the log as one
 // parseable record, like the formatter's, not as a stack trace. Exit code 2 is
 // the formatter's handled-failure code and tells it apart from a crash (1).
-// `main()` writes the outputs and the summary only after `plan()` succeeds, so
-// a failure still publishes nothing and the `changes` job still fails closed.
+// `main()` checks both publication variables first, then writes the outputs and
+// the summary only after `plan()` succeeds, and logs the ci_plan record last, so
+// a selection or configuration failure publishes and prints nothing and the
+// `changes` job still fails closed. Residual limit: a real I/O failure on the
+// second write (the summary) can still leave the outputs file written; atomic
+// publishing is out of scope.
 if (import.meta.main) {
   try {
     main();

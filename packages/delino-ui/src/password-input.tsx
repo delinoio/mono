@@ -66,10 +66,21 @@ export function PasswordInput({
   // `autoFocus`, can be the initial focus target. The prop types do not
   // declare it, so the cast reaches the key. Remove this when the UI SDK
   // Dialog skips non-tabbable `[data-autofocus]` matches.
-  const { "data-autofocus": _dataAutofocus, ...rootProps } =
-    props as typeof props & {
-      "data-autofocus"?: unknown;
-    };
+  //
+  // Caller `aria-describedby`, `aria-label` and `aria-labelledby` go to the
+  // control too: the root `<div>` has no role, so they would name or describe
+  // nothing there. The UI SDK merges the caller `aria-describedby` ahead of
+  // the description and error ids on the control. All other caller props stay
+  // on the root.
+  const {
+    "data-autofocus": _dataAutofocus,
+    "aria-describedby": ariaDescribedBy,
+    "aria-label": ariaLabel,
+    "aria-labelledby": ariaLabelledBy,
+    ...rootProps
+  } = props as typeof props & {
+    "data-autofocus"?: unknown;
+  };
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -99,6 +110,8 @@ export function PasswordInput({
           of this input. The attribute must be on the control, not the root:
           the root `<div>` is not tabbable, so a caller `data-autofocus` is dropped
           from the root props above.
+          Exception: the caller ARIA props are not dropped but routed to the
+          control (see above), because the root has no role.
           Scope: only when `autoFocus` is true. Remove when the UI SDK reads the
           React `autoFocus` prop itself.
         */}
@@ -106,6 +119,9 @@ export function PasswordInput({
           className="dui-password-input-control"
           placeholder={placeholder}
           autoFocus={autoFocus}
+          aria-describedby={ariaDescribedBy}
+          aria-label={ariaLabel}
+          aria-labelledby={ariaLabelledBy}
           data-autofocus={autoFocus ? "" : undefined}
         />
         <PasswordInputToggle

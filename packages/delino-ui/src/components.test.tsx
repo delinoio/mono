@@ -76,6 +76,23 @@ function expectHiddenEmptyDescription(
   }
 }
 
+/**
+ * Asserts that `control` is described by `description`. Unlike comparing
+ * `aria-describedby` with `description.id` directly, this fails when the
+ * description is missing, has an empty id, or the control has no
+ * `aria-describedby` (where both sides would otherwise normalise to "").
+ */
+function expectDescribedBy(
+  control: Element,
+  description: Element | null | undefined,
+) {
+  expect(description).toBeTruthy();
+  expect(description?.id).not.toBe("");
+  expect(control.getAttribute("aria-describedby")?.split(" ")).toContain(
+    description?.id,
+  );
+}
+
 describe("Button", () => {
   test("renders a native button with the variant and size", () => {
     render(
@@ -169,9 +186,7 @@ describe("TextField", () => {
     render(<TextField label="Email" description="We never share it." />);
 
     const input = screen.getByRole("textbox", { name: "Email" });
-    const describedBy = input.getAttribute("aria-describedby") ?? "";
-    const description = screen.getByText("We never share it.");
-    expect(describedBy.split(" ")).toContain(description.id);
+    expectDescribedBy(input, screen.getByText("We never share it."));
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
@@ -194,9 +209,7 @@ describe("TextField", () => {
     const nodes = container.querySelectorAll(".dui-text-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("0");
-    expect((input.getAttribute("aria-describedby") ?? "").split(" ")).toContain(
-      nodes[0]?.id,
-    );
+    expectDescribedBy(input, nodes[0]);
   });
 
   test("marks the field invalid and shows the error message", () => {
@@ -270,9 +283,7 @@ describe("Switch", () => {
     const nodes = container.querySelectorAll(".dui-switch-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("We never share it.");
-    expect(
-      (control.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(control, nodes[0]);
   });
 
   // happy-dom can neither lay out nor match `:dir()`, so this checks the
@@ -352,6 +363,52 @@ describe("Dialog", () => {
     expect(dialog.hasAttribute("data-closed")).toBe(true);
   });
 
+  test.each([
+    { modal: false },
+    { modal: "trap-focus" },
+    { presentation: "sheet" },
+  ])(
+    "stays a centered modal dialog when %o is spread in",
+    async (untypedProps) => {
+      // `modal` and `presentation` are omitted from the types; an untyped
+      // spread must still get the modal dialog with its backdrop.
+      const untyped = untypedProps as object;
+      render(
+        <Dialog {...untyped}>
+          <DialogTrigger>Delete account</DialogTrigger>
+          <DialogContent>
+            <DialogTitle>Delete your account?</DialogTitle>
+            <DialogClose>Cancel</DialogClose>
+          </DialogContent>
+        </Dialog>,
+      );
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "Delete account" }));
+      });
+      const dialog = screen.getByRole("dialog");
+
+      expect(dialog.getAttribute("aria-modal")).toBe("true");
+      expect(dialog.getAttribute("data-presentation")).not.toBe("sheet");
+      expect(document.querySelector(".dui-dialog-backdrop")).not.toBeNull();
+    },
+  );
+
+  test("does not type-check modal or presentation props", () => {
+    // Enforced by `tsc` (typecheck), not at runtime: the function is never
+    // called, and each directive fails the build if the prop becomes valid.
+    function NeverRendered() {
+      return (
+        <>
+          {/* @ts-expect-error modal is omitted from DialogProps */}
+          <Dialog modal={false} />
+          {/* @ts-expect-error presentation is omitted from DialogProps */}
+          <Dialog presentation="sheet" />
+        </>
+      );
+    }
+    expect(typeof NeverRendered).toBe("function");
+  });
+
   test("closes from a close button", async () => {
     render(<Example />);
     await act(async () => {
@@ -399,9 +456,7 @@ describe("Textarea", () => {
     const nodes = container.querySelectorAll(".dui-text-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Keep it short.");
-    expect(
-      (textarea.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(textarea, nodes[0]);
   });
 });
 
@@ -667,9 +722,7 @@ describe("Checkbox", () => {
     const nodes = container.querySelectorAll(".dui-checkbox-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Read them first.");
-    expect(
-      (control.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(control, nodes[0]);
   });
 
   test("keeps the description id after a caller aria-describedby", async () => {
@@ -825,9 +878,7 @@ describe("RadioGroup", () => {
     const nodes = container.querySelectorAll(".dui-radio-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Billed every period.");
-    expect((group.getAttribute("aria-describedby") ?? "").split(" ")).toContain(
-      nodes[0]?.id,
-    );
+    expectDescribedBy(group, nodes[0]);
   });
 });
 
@@ -933,9 +984,7 @@ describe("Select", () => {
     const nodes = container.querySelectorAll(".dui-text-field-description");
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Who can edit.");
-    expect(
-      (trigger.getAttribute("aria-describedby") ?? "").split(" "),
-    ).toContain(nodes[0]?.id);
+    expectDescribedBy(trigger, nodes[0]);
   });
 
   test("shows the selected option in the trigger", () => {
@@ -1094,6 +1143,114 @@ describe("ToastRegion", () => {
     expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
   });
 
+  // happy-dom computes no cascade, so the focus ring contrast is checked from
+  // the authored hex tokens. Dark mode inverts the toast (its surface is the
+  // `text` token), so the ring that reaches the toast buttons must be measured
+  // against that surface and not against the normal dark surface.
+  describe("focus ring contrast", () => {
+    const compact = css
+      .replace(/\s+/g, " ")
+      .replace(/\( /g, "(")
+      .replace(/ \)/g, ")");
+
+    // Bodies of every `@media (prefers-color-scheme: dark)` block, by brace
+    // matching. `block()` returns only the first match of a selector.
+    function darkMediaBodies(): string[] {
+      const opener = "@media (prefers-color-scheme: dark) {";
+      const bodies: string[] = [];
+      let from = compact.indexOf(opener);
+      while (from !== -1) {
+        const start = from + opener.length;
+        let depth = 1;
+        let end = start;
+        while (depth > 0 && end < compact.length) {
+          const char = compact[end];
+          if (char === "{") depth += 1;
+          if (char === "}") depth -= 1;
+          end += 1;
+        }
+        bodies.push(compact.slice(start, end - 1));
+        from = compact.indexOf(opener, end);
+      }
+      return bodies;
+    }
+
+    function darkRule(selector: string): string[] {
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const pattern = new RegExp(`(?:^|[ }])${escaped} \\{([^}]*)\\}`, "g");
+      return darkMediaBodies().flatMap((body) =>
+        [...body.matchAll(pattern)].map((match) => match[1] ?? ""),
+      );
+    }
+
+    function property(
+      declarations: string[],
+      name: string,
+    ): string | undefined {
+      const pattern = new RegExp(`(?:^|[ ;])${name}: (#[0-9a-fA-F]{6})`);
+      for (const text of [...declarations].reverse()) {
+        const value = pattern.exec(text)?.[1];
+        if (value) return value;
+      }
+      return undefined;
+    }
+
+    function luminance(hex: string): number {
+      const channels = [1, 3, 5].map((index) => {
+        const value = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+        return value <= 0.03928
+          ? value / 12.92
+          : ((value + 0.055) / 1.055) ** 2.4;
+      });
+      return (
+        0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!
+      );
+    }
+
+    function contrast(first: string, second: string): number {
+      const [high, low] = [luminance(first), luminance(second)].sort(
+        (a, b) => b - a,
+      );
+      return (high! + 0.05) / (low! + 0.05);
+    }
+
+    test("keeps the toast surface and the button ring wired to the tokens", () => {
+      expect(block(".dui-toast")).toContain(
+        "background: var(--dui-color-text)",
+      );
+      expect(block(".dui-button:focus-visible")).toContain(
+        "outline: 2px solid var(--dui-color-focus-ring)",
+      );
+    });
+
+    test("keeps the light ring at 3:1 on the toast surface", () => {
+      const light = [block(":root")];
+      const ring = property(light, "--dui-color-focus-ring");
+      const surface = property(light, "--dui-color-text");
+      expect(ring).toBeDefined();
+      expect(surface).toBeDefined();
+      expect(contrast(ring!, surface!)).toBeGreaterThanOrEqual(3);
+    });
+
+    test("gives the dark toast buttons a ring at 3:1 on the toast surface", () => {
+      const darkRoot = darkRule(":root");
+      const surface = property(darkRoot, "--dui-color-text");
+      // A `.dui-toast` override wins over the dark `:root` ring for the buttons.
+      const ring =
+        property(darkRule(".dui-toast"), "--dui-color-focus-ring") ??
+        property(darkRoot, "--dui-color-focus-ring");
+      expect(surface).toBeDefined();
+      expect(ring).toBeDefined();
+      expect(contrast(ring!, surface!)).toBeGreaterThanOrEqual(3);
+    });
+
+    test("keeps the dark ring token outside the toast", () => {
+      expect(property(darkRule(":root"), "--dui-color-focus-ring")).toBe(
+        "#4593fc",
+      );
+    });
+  });
+
   // happy-dom cannot evaluate `env()` or logical insets, so this checks the
   // stylesheet source: the package rules sit in a higher cascade layer than the
   // UI SDK defaults and must keep the safe-area terms and logical edges.
@@ -1147,8 +1304,23 @@ describe("ToastRegion", () => {
 
     test("keeps the centered default", () => {
       const base = block(".dui-toast-region");
-      expect(base).toContain("left: 50%");
+      // The centered region sits in the middle of the safe area, not the
+      // viewport, so both its center and its width account for the insets.
+      expect(base).toContain(
+        "left: calc(50% + (env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)) / 2)",
+      );
+      expect(base).toContain(
+        "width: min(400px, calc(100vw - 32px - env(safe-area-inset-left, 0px) - env(safe-area-inset-right, 0px)))",
+      );
       expect(base).toContain("translate: -50% 0");
+      // Start and end alignments inherit the narrower width and set only
+      // their own edge.
+      expect(block('.dui-toast-region[data-align="start"]')).not.toContain(
+        "width",
+      );
+      expect(block('.dui-toast-region[data-align="end"]')).not.toContain(
+        "width",
+      );
     });
   });
 });
@@ -1244,6 +1416,28 @@ describe("Avatar", () => {
       fallback.closest("[data-slot='avatar']")?.getAttribute("data-size"),
     ).toBe("large");
   });
+
+  test.each(["", "   "])("treats the blank src %j as no image", (src) => {
+    const { container } = render(
+      <Avatar alt="Ada Lovelace" fallback="AL" src={src} />,
+    );
+
+    expect(container.querySelector("img")).toBeNull();
+    expect(screen.getByRole("img", { name: "Ada Lovelace" }).textContent).toBe(
+      "AL",
+    );
+  });
+
+  test.each(["https://example.test/ada.png", " https://example.test/ada.png "])(
+    "passes the src %j to the image unchanged",
+    (src) => {
+      const { container } = render(
+        <Avatar alt="Ada Lovelace" fallback="AL" src={src} />,
+      );
+
+      expect(container.querySelector("img")?.getAttribute("src")).toBe(src);
+    },
+  );
 });
 
 describe("Progress", () => {

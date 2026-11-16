@@ -21,7 +21,7 @@ export type AvatarProps = Omit<
   React.ComponentProps<typeof AvatarRoot>,
   "children"
 > & {
-  /** The image URL. Without one, or when it fails to load, the fallback shows. */
+  /** The image URL. Without one, with a blank one, or when it fails to load, the fallback shows. */
   src?: string;
   /** The image's text alternative, usually the person's name. */
   alt: string;
@@ -48,7 +48,8 @@ export function Avatar({
       className={mergeClassName("dui-avatar", className)}
       {...props}
     >
-      {src === undefined ? null : (
+      {/* The original value is passed through untrimmed; only the check ignores blanks. */}
+      {src === undefined || src.trim() === "" ? null : (
         <AvatarImage className="dui-avatar-image" src={src} alt={alt} />
       )}
       {/* The fallback stands in for the image, so it carries the same name. */}

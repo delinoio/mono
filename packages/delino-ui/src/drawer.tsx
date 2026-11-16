@@ -8,7 +8,7 @@ import {
   DrawerTitle as DrawerTitlePart,
   DrawerTrigger as DrawerTriggerPart,
 } from "@ui-sdk/react/drawer";
-import type * as React from "react";
+import * as React from "react";
 import { ButtonSize, ButtonVariant } from "./button.tsx";
 import { mergeClassName } from "./class-name.ts";
 
@@ -24,6 +24,12 @@ export type DrawerProps = Omit<
   "dismissible"
 >;
 
+// The UI SDK gives the backdrop part no signal for the root `modal` value, so
+// the wrapper carries it to `DrawerContent` itself. Only the `modal` prop is
+// read: a modality set solely through a `controller` is not seen. Remove this
+// context when the UI SDK exposes `modal` to the backdrop part.
+const DrawerModalContext = React.createContext<DrawerProps["modal"]>(undefined);
+
 /**
  * A sheet that slides in from an edge of the screen, built from UI SDK
  * `Drawer`. It opens from the bottom by default (`side`). It traps focus,
@@ -36,7 +42,11 @@ export function Drawer(props: DrawerProps) {
   const { dismissible: _dismissible, ...rest } = props as DrawerProps & {
     dismissible?: unknown;
   };
-  return <DrawerRoot {...rest} />;
+  return (
+    <DrawerModalContext value={rest.modal}>
+      <DrawerRoot {...rest} />
+    </DrawerModalContext>
+  );
 }
 
 type ButtonStyleProps = {
@@ -69,14 +79,19 @@ export function DrawerTrigger({
 export type DrawerContentProps = React.ComponentProps<typeof DrawerContentPart>;
 
 /**
- * The sheet. It also renders the backdrop. The drawer moves the sheet and
+ * The sheet. It also renders the backdrop, but only for a modal drawer
+ * (`modal` unset or `true`); `modal={false}` and `"trap-focus"` leave the
+ * page usable and undimmed. The drawer moves the sheet and
  * fades the backdrop itself, so do not style their `translate` or
  * `opacity`.
  */
 export function DrawerContent({ className, ...props }: DrawerContentProps) {
+  const modal = React.useContext(DrawerModalContext);
   return (
     <>
-      <DrawerBackdrop className="dui-drawer-backdrop" />
+      {modal === undefined || modal === true ? (
+        <DrawerBackdrop className="dui-drawer-backdrop" />
+      ) : null}
       <DrawerContentPart
         className={mergeClassName("dui-drawer-content", className)}
         {...props}

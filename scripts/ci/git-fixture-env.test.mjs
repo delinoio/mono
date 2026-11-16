@@ -38,6 +38,7 @@ test("isolation returns the documented environment and drops ambient GIT_* and L
   const env = isolateGitEnvironment({
     PATH: "/bin",
     GIT_DIR: "/somewhere",
+    GIT_ATTR_NOSYSTEM: "0",
     GIT_CONFIG_COUNT: "1",
     GIT_CONFIG_KEY_0: "core.excludesFile",
     GIT_CONFIG_VALUE_0: "/somewhere/ignore",
@@ -53,6 +54,7 @@ test("isolation returns the documented environment and drops ambient GIT_* and L
     UNRELATED: "kept",
     GIT_CONFIG_GLOBAL: nullDevice,
     GIT_CONFIG_NOSYSTEM: "1",
+    GIT_ATTR_NOSYSTEM: "1",
     GIT_CONFIG_COUNT: "2",
     GIT_CONFIG_KEY_0: "core.excludesFile",
     GIT_CONFIG_VALUE_0: nullDevice,
