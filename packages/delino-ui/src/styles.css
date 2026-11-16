@@ -101,7 +101,9 @@
     color: var(--dui-color-on-accent);
   }
 
-  .dui-button[data-variant="primary"]:hover {
+  .dui-button[data-variant="primary"]:hover:not([data-disabled]):not(
+      [data-pending]
+    ) {
     background: var(--dui-color-accent-hover);
   }
 
@@ -110,7 +112,9 @@
     color: var(--dui-color-text);
   }
 
-  .dui-button[data-variant="secondary"]:hover {
+  .dui-button[data-variant="secondary"]:hover:not([data-disabled]):not(
+      [data-pending]
+    ) {
     background: var(--dui-color-neutral-hover);
   }
 
@@ -119,7 +123,9 @@
     color: var(--dui-color-on-accent);
   }
 
-  .dui-button[data-variant="danger"]:hover {
+  .dui-button[data-variant="danger"]:hover:not([data-disabled]):not(
+      [data-pending]
+    ) {
     background: var(--dui-color-danger-hover);
   }
 
@@ -628,7 +634,7 @@
       border-color 0.15s;
   }
 
-  .dui-tabs-tab:hover {
+  .dui-tabs-tab:hover:not([data-disabled]) {
     color: var(--dui-color-text);
   }
 
