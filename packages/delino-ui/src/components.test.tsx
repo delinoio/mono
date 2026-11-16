@@ -966,6 +966,22 @@ describe("ToastRegion", () => {
       expect(end).not.toMatch(/\bright:\s*16px/);
     });
 
+    test("clears the safe-area inset of the anchored edge in right-to-left text", () => {
+      expect(block('.dui-toast-region[data-align="start"]:dir(rtl)')).toContain(
+        "inset-inline-start: calc(16px + env(safe-area-inset-right, 0px))",
+      );
+      expect(block('.dui-toast-region[data-align="end"]:dir(rtl)')).toContain(
+        "inset-inline-end: calc(16px + env(safe-area-inset-left, 0px))",
+      );
+      // The left-to-right rules keep their own-side insets.
+      expect(block('.dui-toast-region[data-align="start"]')).toContain(
+        "env(safe-area-inset-left, 0px)",
+      );
+      expect(block('.dui-toast-region[data-align="end"]')).toContain(
+        "env(safe-area-inset-right, 0px)",
+      );
+    });
+
     test("keeps the centered default", () => {
       const base = block(".dui-toast-region");
       expect(base).toContain("left: 50%");

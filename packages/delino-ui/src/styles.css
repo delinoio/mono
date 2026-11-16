@@ -771,6 +771,19 @@
     translate: none;
   }
 
+  /* The safe-area insets are physical, but the logical edges mirror in
+     right-to-left text: the start edge is then the right edge and the end edge
+     is the left edge. Swap the insets so each edge clears the inset on its own
+     side. `:dir()` follows the computed direction, the one `inset-inline-*`
+     uses, including a direction inherited from an ancestor. */
+  .dui-toast-region[data-align="start"]:dir(rtl) {
+    inset-inline-start: calc(16px + env(safe-area-inset-right, 0px));
+  }
+
+  .dui-toast-region[data-align="end"]:dir(rtl) {
+    inset-inline-end: calc(16px + env(safe-area-inset-left, 0px));
+  }
+
   .dui-toast-region[data-expanded] {
     height: calc(var(--toast-stack-height) + (var(--toast-count) - 1) * 8px);
   }

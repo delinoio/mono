@@ -14,7 +14,7 @@ This contract owns the [`delino-ui`](project-delino-ui.md) package at `packages/
 - Language: TypeScript with React 19 (`"jsx": "react-jsx"`).
 - Component foundation: UI SDK, `@ui-sdk/core` and `@ui-sdk/react`, pinned to an exact version. UI SDK is headless: it renders unstyled parts with `data-slot` and state attributes such as `data-open`, `data-checked` and `data-pending`.
 - Test runner: Rstest `@rstest/core` with the `happy-dom` environment and Testing Library.
-- Runtime: the browser of the consuming app. Node.js from root `.nvmrc` runs the type check and tests.
+- Runtime: the browser of the consuming app. Node.js from root `.nvmrc` runs the type check and tests. Rules that correct right-to-left layout use the `:dir()` pseudo-class (Chrome 120, Safari 16.4, Firefox 49 and newer). A consuming app whose build targets older browsers must keep `:dir()`: a build that lowers it to `:lang()` applies those rules only to pages whose `lang` is a right-to-left language.
 - Distribution: TypeScript source through `package.json` `exports`. The package has no build script and writes no `dist` directory. Consumers compile it with Rsbuild or Rspress, which transpile workspace sources outside `node_modules`.
 - Deviation from repository defaults: TypeScript instead of Go, because the package is consumed by React web apps.
 
