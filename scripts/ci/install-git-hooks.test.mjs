@@ -76,7 +76,15 @@ function fixture(t) {
     cwd,
     script = "scripts/install-git-hooks.sh",
     [shell, ...shellArgs] = ["sh"],
-  ) => spawnSync(shell, [...shellArgs, script], { cwd, env, encoding: "utf8" });
+  ) =>
+    // A shell that is started with a mismatched PWD ignores it and reports the
+    // physical directory, which hides symlink handling in the installer. Give
+    // the shell the logical path a user's "cd" would have left in PWD.
+    spawnSync(shell, [...shellArgs, script], {
+      cwd,
+      env: { ...env, PWD: cwd },
+      encoding: "utf8",
+    });
   const installedHooks = (hooksDirectory) =>
     existsSync(hooksDirectory)
       ? readdirSync(hooksDirectory).filter((name) => !name.endsWith(".sample"))
@@ -338,7 +346,11 @@ test(
     assert.equal(result.status, 1, result.stdout);
     assert.ok(result.stderr.includes(hook), result.stderr);
     assert.ok(result.stderr.includes(backup), result.stderr);
-    assert.doesNotMatch(result.stdout, /overwriting/);
+    assert.equal(
+      result.stdout,
+      "",
+      "the installer must refuse before it starts Lefthook",
+    );
     assert.deepEqual(snapshot(hook), before.hook);
     assert.deepEqual(snapshot(backup), before.backup);
   },
