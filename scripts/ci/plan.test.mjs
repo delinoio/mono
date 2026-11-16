@@ -937,6 +937,42 @@ test("planner selects formatting for non-UTF-8 names whether or not Rstack exclu
   }
 });
 
+test("planner without installed dependencies publishes format=true for a path missing from the working tree", (t) => {
+  // The planner cannot evaluate the shared exclusions, so it defers a missing
+  // formattable path, excluded or not, to the `quality` job's formatter.
+  const bare = mkdtempSync(join(tmpdir(), "ci-plan-bare-"));
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+  for (const file of ["plan.mjs", "format-changed.mjs"]) {
+    copyFileSync(join(root, "scripts/ci", file), join(bare, file));
+  }
+  for (const missing of ["vendor/lib.ts", "src/lib.ts"]) {
+    const f = fixture(t);
+    f.write(missing, "const value = 1;\n");
+    const base = f.commit();
+    f.write(missing, "const value = 2;\n");
+    const head = f.commit();
+    f.git("update-index", "--skip-worktree", missing);
+    rmSync(join(f.cwd, dirname(missing)), { recursive: true });
+    const output = join(f.cwd, "cli-output");
+    const summary = join(f.cwd, "cli-summary");
+    const result = spawnSync(process.execPath, [join(bare, "plan.mjs")], {
+      cwd: f.cwd,
+      encoding: "utf8",
+      env: plannerEnvironment({
+        CI_BASE: base,
+        CI_HEAD: head,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: summary,
+      }),
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const records = result.stdout.split("\n").filter(Boolean);
+    assert.equal(records.length, 1, result.stdout);
+    assert.equal(JSON.parse(records[0]).event, "ci_plan");
+    assert.match(readFileSync(output, "utf8"), /^format=true$/mu);
+  }
+});
+
 test("planner without installed dependencies publishes format=true for non-UTF-8 names", (t) => {
   // Copy the planner next to no `node_modules` so Rstack cannot be resolved,
   // as in the `changes` job, which installs nothing.

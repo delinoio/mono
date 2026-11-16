@@ -27,6 +27,7 @@ import {
   NonUtf8Policy,
   NonUtf8RootError,
   isThrowawayIndex,
+  MissingPathPolicy,
   runFormatter,
   stagedFormatFiles,
 } from "./format-changed.mjs";
@@ -962,6 +963,139 @@ test("explicit comparison ignores an untracked file that re-creates a range-dele
   assert.equal(
     readFileSync(join(f.cwd, "deleted.ts"), "utf8"),
     "const   untracked = 2;\n",
+  );
+});
+
+// A path that the shared Rstack exclusions skip never reaches the formatter, so
+// its absence from the working tree (skip-worktree or sparse checkout) must not
+// fail an explicit comparison. A formattable path that is not excluded still
+// fails, because CI validates the full checkout.
+function missingRangeFixture(t) {
+  const f = fixture(t);
+  const names = ["pnpm-lock.yaml", "vendor/lib.ts", "kept.ts", "c.ts"];
+  const text = (name, version) =>
+    name.endsWith(".yaml")
+      ? `lockfileVersion: ${version}\n`
+      : `const value = ${version};\n`;
+  for (const name of names) f.write(name, text(name, 1));
+  const base = f.commit();
+  for (const name of names) f.write(name, text(name, 2));
+  const head = f.commit();
+  return { f, base, head };
+}
+
+const runExplicitCli = (f, base, head) => {
+  const script = join(root, "scripts/ci/format-changed.mjs");
+  return [
+    [["--base", base, "--head", head], f.env],
+    [[], { ...f.env, CI: "true", TURBO_SCM_BASE: base, TURBO_SCM_HEAD: head }],
+  ].map(([args, env]) =>
+    spawnSync(process.execPath, [script, ...args], {
+      cwd: f.cwd,
+      env,
+      encoding: "utf8",
+    }),
+  );
+};
+
+test("explicit comparison skips an excluded path that is missing from the working tree", (t) => {
+  const { f, base, head } = missingRangeFixture(t);
+  f.git("update-index", "--skip-worktree", "pnpm-lock.yaml", "vendor/lib.ts");
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  rmSync(join(f.cwd, "vendor"), { recursive: true });
+  const expected = ["c.ts", "kept.ts"];
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), expected);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head, false), expected);
+  // The local selection keeps its silent skip.
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), []);
+  for (const result of runExplicitCli(f, base, head)) {
+    const output = result.stdout + result.stderr;
+    assert.equal(result.status, 0, output);
+    assert.match(result.stdout, /"candidates":2/u, output);
+    assert.doesNotMatch(output, /ENOENT|ci_format_error/u);
+  }
+});
+
+test("explicit comparison still fails for a non-excluded path that is missing from the working tree", (t) => {
+  const { f, base, head } = missingRangeFixture(t);
+  f.git("update-index", "--skip-worktree", "pnpm-lock.yaml", "vendor/lib.ts");
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  rmSync(join(f.cwd, "vendor"), { recursive: true });
+  rmSync(join(f.cwd, "c.ts"));
+  assert.throws(() => changedFormatFiles(f.cwd, base, head), /ENOENT.*c\.ts/u);
+  for (const result of runExplicitCli(f, base, head)) {
+    const output = result.stdout + result.stderr;
+    assert.equal(result.status, 2, output);
+    assert.match(result.stderr, /"event":"ci_format_error"/u, output);
+    assert.match(result.stderr, /c\.ts/u, output);
+  }
+});
+
+for (const { name, skip, breakParent } of [
+  {
+    name: "ENOTDIR",
+    skip: false,
+    breakParent: (f) => {
+      rmSync(join(f.cwd, "vendor"), { recursive: true });
+      f.write("vendor", "not a directory\n");
+    },
+  },
+  {
+    name: "ELOOP",
+    skip: process.platform === "win32",
+    breakParent: (f) => {
+      rmSync(join(f.cwd, "vendor"), { recursive: true });
+      symlinkSync("vendor", join(f.cwd, "vendor"));
+    },
+  },
+]) {
+  test(
+    `explicit comparison skips an excluded path whose parent raises ${name}`,
+    { skip },
+    (t) => {
+      const { f, base, head } = missingRangeFixture(t);
+      breakParent(f);
+      assert.deepEqual(changedFormatFiles(f.cwd, base, head), [
+        "c.ts",
+        "kept.ts",
+        "pnpm-lock.yaml",
+      ]);
+    },
+  );
+}
+
+test("explicit comparison keeps a range-deleted path skipped beside a missing excluded path", (t) => {
+  const { f, base } = missingRangeFixture(t);
+  f.write("old.ts", "const old = 1;\n");
+  const middle = f.commit();
+  rmSync(join(f.cwd, "old.ts"));
+  const head = f.commit();
+  f.git("update-index", "--skip-worktree", "vendor/lib.ts");
+  rmSync(join(f.cwd, "vendor"), { recursive: true });
+  assert.deepEqual(changedFormatFiles(f.cwd, middle, head), []);
+  assert.deepEqual(changedFormatFiles(f.cwd, base, head), [
+    "c.ts",
+    "kept.ts",
+    "pnpm-lock.yaml",
+  ]);
+});
+
+test("explicit comparison with the Defer missing-path policy selects a missing path without probing", (t) => {
+  const { f, base, head } = missingRangeFixture(t);
+  f.git("update-index", "--skip-worktree", "pnpm-lock.yaml", "vendor/lib.ts");
+  rmSync(join(f.cwd, "pnpm-lock.yaml"));
+  rmSync(join(f.cwd, "vendor"), { recursive: true });
+  rmSync(join(f.cwd, "c.ts"));
+  assert.deepEqual(
+    changedFormatFiles(
+      f.cwd,
+      base,
+      head,
+      false,
+      NonUtf8Policy.Fail,
+      MissingPathPolicy.Defer,
+    ),
+    ["c.ts", "kept.ts", "pnpm-lock.yaml", "vendor/lib.ts"],
   );
 });
 
