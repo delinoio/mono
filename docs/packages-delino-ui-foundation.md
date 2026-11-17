@@ -148,7 +148,7 @@ Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
 - `pnpm exec turbo run typecheck --filter=delino-ui`: TypeScript type check.
-- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior. `src/components.test.tsx` and `src/disclosure-and-input.test.tsx` hold them.
+- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior, and for static (server-rendered) markup: description and error id references, empty descriptions, disabled-field errors and caller ARIA routing. `src/components.test.tsx`, `src/disclosure-and-input.test.tsx` and `src/ssr-field-error.test.tsx` hold them.
 
 Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI does not run its unit tests yet; add them to the workflow and its planner when package checks enter CI.
 
