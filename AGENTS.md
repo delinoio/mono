@@ -34,6 +34,7 @@
 - Run `git commit` only after `git add`; once files are staged, commit without unnecessary delay so staged changes are preserved in history.
 - Committing may require workspace binaries (for example, git hooks). If required binaries are missing, run `pnpm install` at the repository root and retry the commit.
 - CI changes must preserve affected manual validation and exclude macOS runners from PRs, main pushes and affected manual runs. Follow `docs/repository-workflow-contract.md`.
+- Add a changeset with `pnpm changeset` to every pull request whose change must be deployed or released. `.github/workflows/deploy.yml` deploys only packages released by pending changesets. Follow `docs/repository-workflow-contract.md#deployment-workflow`.
 - Keep `.infisical.json`, `.dev-environment/`, real `.env` files, user credentials, and production/release/signing credentials uncommitted. Service-local `.env.example` files contain names, validation guidance, placeholders, and safe loopback defaults only; do not add a root environment example or expose internal secret paths in public product docs.
 - After addressing pull request review comments and pushing updates, mark the corresponding review threads as resolved.
 - When no explicit scope is specified and you are currently working within a pull request scope, interpret instructions within the current pull request scope.
@@ -85,6 +86,7 @@
 - When a new project does not specify its primary language, default to Golang.
 - Prefer Rspack-family build tools when possible, including Rsbuild and Rspress for app and documentation surfaces.
 - Static sites under `apps/` should use Rsbuild/Rspress-style toolchains and deploy to Cloudflare Pages by default. Existing documented exceptions remain valid until their project contract changes.
+- Backend services under `servers/` should deploy to Railway, and persistent relational databases should use PlanetScale Postgres, unless a project contract documents an exception.
 - File handling should default to Cloudflare R2 object storage plus signed URLs for upload and download access unless a project contract documents another storage or access pattern.
 
 ## Documentation-First Policy

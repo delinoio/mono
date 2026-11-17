@@ -8,7 +8,8 @@ This contract owns the `accounts-api` component of [`delino-accounts`](project-d
 - `servers/accounts-api/internal/config/`: environment configuration loading and validation.
 - `servers/accounts-api/internal/server/`: HTTP handler, routes, middleware and the connection observer that logs requests rejected before the handler runs.
 - `servers/accounts-api/.env.example`: configuration names and safe loopback defaults.
-- `servers/accounts-api/package.json` and `turbo.json`: workspace task wiring.
+- `servers/accounts-api/package.json` and `turbo.json`: workspace task wiring and the `deploy` field.
+- `servers/accounts-api/Dockerfile` and `railway.json`: Railway runtime image and service configuration.
 - `servers/accounts-api/scripts/`: development launcher (`dev.mjs`) and its process-level tests.
 
 The API server is the system of record for account and billing information. It is licensed under `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md).
@@ -24,7 +25,9 @@ The API server is the system of record for account and billing information. It i
   - `WriteTimeout` is 30 seconds for writing a response.
   - `IdleTimeout` is 120 seconds: a keep-alive connection that is waiting for the next request is closed after this time.
   - `WriteTimeout` limits the lifetime of every response, so a long-lived streaming RPC must lift or extend it for that handler (`http.ResponseController.SetWriteDeadline`) in the change that adds the stream.
-- Deployment target: not selected. Record the target, its configuration source and its TLS termination in this contract before the first deployment.
+- Deployment target: the Railway service `accounts-api`, deployed by the [deployment workflow](repository-workflow-contract.md#deployment-workflow). The workflow builds a static `linux/amd64` binary with `CGO_ENABLED=0`; `servers/accounts-api/turbo.json` passes `CGO_ENABLED`, `GOOS` and `GOARCH` through to the uncached `build` task. The `Dockerfile` copies `dist/accounts-api` into the digest-pinned `gcr.io/distroless/static-debian12:nonroot` image and runs it as the `nonroot` user. `railway.json` selects the Dockerfile builder, checks `GET /healthz` before Railway switches traffic and restarts the process on failure up to 10 times.
+- Configuration source: Railway service variables of the production environment. Set `ADDR` to `:<port>` and set the target port of the public domain to the same port. Secrets are also Railway service variables; they never enter the repository or the GitHub environment.
+- TLS termination: the Railway edge terminates TLS for `accounts.api.delino.io` and forwards plain HTTP to the process.
 
 ## Users and Operators
 
@@ -68,7 +71,7 @@ The API server is the system of record for account and billing information. It i
 
 ## Storage
 
-The scaffold has no persistent storage. The database is not selected. Before the first persisted entity, record the database, the migration tool and the backup policy in this contract. File uploads, such as invoice documents, use Cloudflare R2 with signed URLs according to the repository defaults unless this contract documents another choice.
+The scaffold has no persistent storage. The database is PlanetScale Postgres, according to the repository defaults. Before the first persisted entity, record the migration tool and the backup policy in this contract, and add the database stage that runs before the servers to the [deployment workflow](repository-workflow-contract.md#deployment-workflow). File uploads, such as invoice documents, use Cloudflare R2 with signed URLs according to the repository defaults unless this contract documents another choice.
 
 ## Security
 
@@ -151,7 +154,7 @@ CI runs the repository Go checks in the root Go module when Go sources or Go mod
 
 ## Dependencies and Integrations
 
-- Upstream: Logto shared tenant (`planned`), payment provider (not selected), database (not selected).
+- Upstream: Logto shared tenant (`planned`), payment provider (not selected), PlanetScale Postgres (`planned`).
 - Downstream: [`delino-accounts-web`](apps-delino-accounts-foundation.md).
 - Protocol schemas: `protos/delino/accounts/` (`planned`).
 

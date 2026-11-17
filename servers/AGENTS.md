@@ -16,6 +16,7 @@
 - Follow root `AGENTS.md` and the owning project/domain contracts.
 
 - Write Go code and comments in English; use `log/slog` structured logging and never log secrets or sensitive payloads.
+- Each deployed server declares a `deploy` field in its `package.json` and keeps a `Dockerfile` and `railway.json` in its package root. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow).
 - Server Go code uses the root Go module `github.com/delinoio/mono`; do not add a `go.mod` under `servers/`. Each server has a workspace `package.json` whose scripts wrap the Go toolchain. Run `gofmt`, `go vet ./...` and `go test ./...` from the repository root before finishing.
 
 ## Owning contracts

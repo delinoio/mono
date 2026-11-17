@@ -55,7 +55,7 @@ The site has no persistent storage, user uploads or server-side cache. All conte
 
 - The site is public. Content must not include secrets, internal hostnames, repository-internal paths or operational internals.
 - The build requires no secrets or environment variables.
-- Cloudflare Pages deployment credentials are not stored in the repository.
+- Cloudflare Pages deployment credentials are secrets of the `static-sites` GitHub environment. They are not stored in the repository.
 
 ## Logging
 
@@ -72,13 +72,13 @@ Run from the repository root:
 - `pnpm exec turbo run test:e2e --filter=delino-site`: browser end-to-end tests against the development server on a free loopback port. See the [e2e contract](repository-e2e-contract.md).
 - `pnpm --filter delino-site preview`: serve the production build locally.
 
-Remove `apps/delino-site/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI does not build or deploy this site yet; add the build check to the workflow and its planner when the site enters CI.
+Remove `apps/delino-site/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI does not build this site. The [deployment workflow](repository-workflow-contract.md#deployment-workflow) builds and deploys it when a pending changeset releases it.
 
 ## Dependencies and Integrations
 
 - `@rspress/core`, `react` and `react-dom`, pinned in `apps/delino-site/package.json`.
 - `e2e`, `@e2e-dev/web` and `ai` for end-to-end tests, pinned in `apps/delino-site/package.json`.
-- Cloudflare Pages: static hosting for `delino.io`. Configure the Pages project with build command `pnpm exec turbo run build --filter=delino-site` and output directory `apps/delino-site/dist`.
+- Cloudflare Pages: static hosting for `delino.io`. The `deploy` field of `apps/delino-site/package.json` names the Direct Upload Pages project `delino-site`. The deployment workflow builds with `pnpm exec turbo run build --filter=delino-site` and uploads `apps/delino-site/dist`.
 - [`delino-docs`](project-delino-docs.md): linked by absolute URL `https://docs.delino.io`.
 
 ## Change Triggers
