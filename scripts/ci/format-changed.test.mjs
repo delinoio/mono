@@ -114,6 +114,16 @@ function fixture(
   };
 }
 
+// An unformatted file in a fresh directory outside the repository, the target
+// of a replaced parent. Rstack would rewrite it if a selector handed it over.
+const outsideSource = "const   outside = 3;\n";
+function outsideDirectory(t) {
+  const outside = mkdtempSync(join(tmpdir(), "rstack-format-outside-"));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  writeFileSync(join(outside, "b.ts"), outsideSource);
+  return outside;
+}
+
 test("fixture ignores hostile global Git configuration and GIT_* variables", (t) => {
   const hostile = mkdtempSync(join(tmpdir(), "rstack-hostile-"));
   t.after(() => rmSync(hostile, { recursive: true, force: true }));
@@ -496,6 +506,12 @@ test("staged selection skips paths excluded by the shared configuration when the
   rmSync(join(f.cwd, "vendor"), { recursive: true, force: true });
   f.write("vendor", "not a directory\n");
   assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
+  // ... and behind a parent replaced by a symlink to an outside directory.
+  if (process.platform !== "win32") {
+    rmSync(join(f.cwd, "vendor"));
+    symlinkSync(outsideDirectory(t), join(f.cwd, "vendor"));
+    assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
+  }
 });
 
 test("the exclusion probe covers every supported extension", (t) => {
@@ -1041,6 +1057,15 @@ for (const { name, skip, breakParent } of [
     },
   },
   {
+    name: "SYMLINK",
+    skip: process.platform === "win32",
+    breakParent: (f, t) => {
+      const outside = outsideDirectory(t);
+      rmSync(join(f.cwd, "vendor"), { recursive: true });
+      symlinkSync(outside, join(f.cwd, "vendor"));
+    },
+  },
+  {
     name: "ELOOP",
     skip: process.platform === "win32",
     breakParent: (f) => {
@@ -1054,7 +1079,7 @@ for (const { name, skip, breakParent } of [
     { skip },
     (t) => {
       const { f, base, head } = missingRangeFixture(t);
-      breakParent(f);
+      breakParent(f, t);
       assert.deepEqual(changedFormatFiles(f.cwd, base, head), [
         "c.ts",
         "kept.ts",
@@ -1949,11 +1974,14 @@ test("explicit false CI behaves exactly like unset CI for non-staged runs", (t) 
 });
 
 // Parent-path breakage: a tracked `a/b.ts` whose parent `a` became a regular
-// file (ENOTDIR) or a self-referencing symlink (ELOOP). Git accepts both.
+// file (ENOTDIR), a self-referencing symlink (ELOOP) or a symlink to a
+// directory outside the repository (SYMLINK). Git accepts all of them.
 const brokenParents = [
   {
     name: "ENOTDIR",
     skip: false,
+    stagedPattern: /ENOTDIR.*a\/b\.ts/u,
+    explicitPattern: /ENOTDIR/u,
     breakParent: (f) => {
       rmSync(join(f.cwd, "a"), { recursive: true });
       f.write("a", "not a directory\n");
@@ -1962,21 +1990,43 @@ const brokenParents = [
   {
     name: "ELOOP",
     skip: process.platform === "win32",
+    stagedPattern: /ELOOP.*a\/b\.ts/u,
+    explicitPattern: /ELOOP/u,
     breakParent: (f) => {
       rmSync(join(f.cwd, "a"), { recursive: true });
       symlinkSync("a", join(f.cwd, "a"));
     },
   },
+  {
+    name: "SYMLINK",
+    skip: process.platform === "win32",
+    stagedPattern:
+      /a\/b\.ts.*parent directory resolves outside the repository through a symbolic link/u,
+    explicitPattern:
+      /parent directory of a\/b\.ts resolves outside the repository through a symbolic link/u,
+    breakParent: (f, t) => {
+      const outside = outsideDirectory(t);
+      rmSync(join(f.cwd, "a"), { recursive: true });
+      symlinkSync(outside, join(f.cwd, "a"));
+      f.outsideFile = join(outside, "b.ts");
+    },
+  },
 ];
 
-for (const { name, skip, breakParent } of brokenParents) {
+for (const {
+  name,
+  skip,
+  stagedPattern,
+  explicitPattern,
+  breakParent,
+} of brokenParents) {
   const setup = (t) => {
     const f = fixture(t);
     f.write("a/b.ts", "const value = 1;\n");
     const head = f.commit();
     f.write("a/b.ts", "const value = 2;\n");
     f.git("add", "a/b.ts");
-    breakParent(f);
+    breakParent(f, t);
     return { f, head };
   };
 
@@ -1988,10 +2038,7 @@ for (const { name, skip, breakParent } of brokenParents) {
       assert.doesNotMatch(allFormatFiles(f.cwd).join("\n"), /^a\/b\.ts$/mu);
       assert.deepEqual(changedFormatFiles(f.cwd, f.base, head, true), []);
       // A staged blob that cannot be formatted must block the commit.
-      assert.throws(
-        () => stagedFormatFiles(f.cwd),
-        new RegExp(`${name}.*a/b\\.ts`, "u"),
-      );
+      assert.throws(() => stagedFormatFiles(f.cwd), stagedPattern);
     },
   );
 
@@ -2002,7 +2049,7 @@ for (const { name, skip, breakParent } of brokenParents) {
       const { f, head } = setup(t);
       assert.throws(
         () => changedFormatFiles(f.cwd, f.base, head),
-        new RegExp(name),
+        explicitPattern,
       );
     },
   );
@@ -2029,9 +2076,44 @@ for (const { name, skip, breakParent } of brokenParents) {
       assert.equal(staged.status, 2, stagedOutput);
       assert.match(staged.stderr, /ci_format_error/u, stagedOutput);
       assert.match(staged.stderr, /a\/b\.ts/u, stagedOutput);
+      assert.equal(
+        staged.stderr.match(/"event":"ci_format_error"/gu).length,
+        1,
+        stagedOutput,
+      );
+      assert.match(staged.stderr, stagedPattern, stagedOutput);
+      // A path behind a symlinked parent must never reach Rstack: the outside
+      // file keeps its bytes through both the --all and the --staged runs.
+      if (f.outsideFile) {
+        assert.equal(readFileSync(f.outsideFile, "utf8"), outsideSource);
+      }
     },
   );
 }
+
+// A repository reached through a symlinked ancestor is not a symlinked parent:
+// the resolved path of a tracked file equals its name below the resolved root.
+test(
+  "selectors keep a normal nested file when the repository is reached through a symlinked path",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("src/c.ts", "const value = 1;\n");
+    const head = f.commit();
+    f.write("src/c.ts", "const value = 2;\n");
+    f.git("add", "src/c.ts");
+    const links = mkdtempSync(join(tmpdir(), "rstack-format-rootlink-"));
+    t.after(() => rmSync(links, { recursive: true, force: true }));
+    const rootlink = join(links, "rootlink");
+    symlinkSync(f.cwd, rootlink);
+    assert.ok(allFormatFiles(rootlink).includes("src/c.ts"));
+    assert.deepEqual(changedFormatFiles(rootlink, f.base, head), ["src/c.ts"]);
+    assert.deepEqual(changedFormatFiles(rootlink, head, head, true), [
+      "src/c.ts",
+    ]);
+    assert.deepEqual(stagedFormatFiles(rootlink), ["src/c.ts"]);
+  },
+);
 
 test(
   "selectors keep unrelated lstat errors fatal",

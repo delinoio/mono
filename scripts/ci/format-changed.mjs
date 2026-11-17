@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isUtf8 } from "node:buffer";
 import { execFileSync, spawn } from "node:child_process";
-import { existsSync, lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { createRequire } from "node:module";
 import { constants } from "node:os";
-import { dirname, extname, resolve } from "node:path";
+import { dirname, extname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 
 const require = createRequire(import.meta.url);
@@ -202,19 +202,49 @@ function revision(cwd, value) {
   return value;
 }
 
-// A tracked path is gone when it is missing or when a parent component was
-// replaced by a file (ENOTDIR) or a symlink loop (ELOOP); Git still accepts
-// such working trees. Every other lstat error stays fatal.
+// A tracked path is gone when it is missing, when a parent component was
+// replaced by a file (ENOTDIR) or a symlink loop (ELOOP), or when a parent
+// component was replaced by a symlink to a directory that resolves outside the
+// repository (OutsideRepository, a synthetic code raised by
+// `assertInsideRepository`); Git still accepts such working trees. Every other
+// lstat error stays fatal.
 const GoneCode = Object.freeze({
   Missing: "ENOENT",
   NotDirectory: "ENOTDIR",
   SymlinkLoop: "ELOOP",
+  OutsideRepository: "EOUTSIDEREPO",
 });
 const goneCodes = new Set(Object.values(GoneCode));
 
+// `lstat` follows every parent component, so a tracked directory replaced by a
+// symlink to a directory elsewhere reports the outside file as a regular file
+// and Rstack would then rewrite it. Git cannot track a path below a symlink, so
+// the fully resolved path of a present regular file must equal its name below
+// the resolved repository root (which itself may be reached through a symlinked
+// ancestor). One `realpath` call covers every parent component.
+function assertInsideRepository(cwd, name) {
+  if (realpathSync(resolve(cwd, name)) === join(realpathSync(cwd), name)) {
+    return;
+  }
+  throw Object.assign(
+    new Error(
+      `A parent directory of ${name} resolves outside the repository through a symbolic link, so the path is treated as missing from the working tree`,
+    ),
+    { code: GoneCode.OutsideRepository },
+  );
+}
+
+// Regular file whose resolved location is inside the repository. Gone-path
+// errors, including the symlinked-parent one, propagate to the callers.
+function regularFileInside(cwd, name) {
+  if (!lstatSync(resolve(cwd, name)).isFile()) return false;
+  assertInsideRepository(cwd, name);
+  return true;
+}
+
 function isRegularFile(cwd, name, skipGone = true) {
   try {
-    return lstatSync(resolve(cwd, name)).isFile();
+    return regularFileInside(cwd, name);
   } catch (error) {
     if (skipGone && goneCodes.has(error.code)) return false;
     throw error;
@@ -338,9 +368,16 @@ function stagedRegularFile(cwd, name) {
   let stats;
   try {
     stats = lstatSync(resolve(cwd, name));
+    if (stats.isFile()) assertInsideRepository(cwd, name);
   } catch (error) {
     if (!goneCodes.has(error.code)) throw error;
     if (excludedByRstack(cwd, name)) return false;
+    if (error.code === GoneCode.OutsideRepository) {
+      throw new Error(
+        `Staged path ${name} cannot be formatted because a parent directory resolves outside the repository through a symbolic link. Restore the parent directory, or unstage the path with "git restore --staged -- <path>" (or "git rm --cached -- <path>" to commit its deletion), then commit again.`,
+        { cause: error },
+      );
+    }
     throw new Error(
       `Staged path is missing from the working tree (${error.code}) and cannot be formatted: ${name}. Restore the file, or unstage it with "git restore --staged -- <path>" (or "git rm --cached -- <path>" to commit its deletion), then commit again.`,
       { cause: error },
@@ -410,7 +447,7 @@ export const MissingPathPolicy = Object.freeze({
 // CI validates, so a gone path fails unless the shared exclusions skip it.
 function explicitRegularFile(cwd, name, missing) {
   try {
-    return lstatSync(resolve(cwd, name)).isFile();
+    return regularFileInside(cwd, name);
   } catch (error) {
     if (!goneCodes.has(error.code)) throw error;
     if (missing === MissingPathPolicy.Defer) return true;
