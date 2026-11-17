@@ -698,7 +698,7 @@ describe("Checkbox", () => {
   });
 
   for (const [name, empty] of EMPTY_DESCRIPTIONS) {
-    test(`renders a hidden empty description node for a ${name} description`, async () => {
+    test(`renders no description node for a ${name} description`, async () => {
       const { container } = render(
         <Checkbox label="Accept the terms" description={empty} />,
       );
