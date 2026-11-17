@@ -998,6 +998,13 @@ describe("Select", () => {
     const trigger = screen.getByRole("combobox", { name: "Role" });
     expect(trigger.textContent).toContain("Editor");
   });
+
+  test("insets the trigger with logical padding so right-to-left keeps 14px on the value side", () => {
+    const rule = block(".dui-select");
+    expect(rule).toContain("padding-inline: 14px 12px");
+    expect(rule).toContain("padding-block: 0");
+    expect(rule).not.toMatch(/(^|[\s;])padding:/);
+  });
 });
 
 describe("Tabs", () => {

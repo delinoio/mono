@@ -535,7 +535,8 @@
     box-sizing: border-box;
     width: 100%;
     min-height: 44px;
-    padding: 0 12px 0 14px;
+    padding-block: 0;
+    padding-inline: 14px 12px;
     border: 1px solid var(--dui-color-border);
     border-radius: var(--dui-radius-control);
     background: var(--dui-color-surface);
