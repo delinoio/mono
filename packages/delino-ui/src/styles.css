@@ -917,8 +917,18 @@
     font-size: 13px;
   }
 
+  /* The UI SDK treats `toast-close` as an icon-only button: it fixes a 28px
+     width and height and draws a close icon in `::before`. The package renders
+     a text label in that slot, so the size follows the label (the small button
+     `min-height` still applies) and the SDK icon is hidden. */
   .dui-toast-button {
     flex: none;
+    width: auto;
+    height: auto;
+  }
+
+  .dui-toast-button::before {
+    display: none;
   }
 
   /* Dark mode inverts the toast: its surface is the near-white text token

@@ -1163,6 +1163,14 @@ describe("ToastRegion", () => {
     expect(screen.getByRole("button", { name: "Undo" })).toBeTruthy();
   });
 
+  // happy-dom computes no cascade, so this checks the stylesheet source: the
+  // SDK sizes `toast-close` as a 28px icon button with a `::before` icon, and
+  // the package must reset both for the text cancel label.
+  test("sizes the cancel button to its label and hides the SDK icon", () => {
+    expect(block(".dui-toast-button")).toContain("width: auto");
+    expect(block(".dui-toast-button::before")).toContain("display: none");
+  });
+
   // happy-dom computes no cascade, so the focus ring contrast is checked from
   // the authored hex tokens. Dark mode inverts the toast (its surface is the
   // `text` token), so the ring that reaches the toast buttons must be measured
