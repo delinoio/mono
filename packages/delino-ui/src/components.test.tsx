@@ -421,6 +421,19 @@ describe("Dialog", () => {
     });
     expect(dialog.hasAttribute("data-closed")).toBe(true);
   });
+
+  test("centers the panel by resetting the popover inset and margin", () => {
+    // The content renders as a top-layer popover whose browser and UI SDK
+    // styles leave `right: 0`, `bottom: 0` and `margin: auto`; without the
+    // reset the panel is displaced from the viewport center.
+    const panel = block(".dui-dialog-content");
+    expect(panel).toContain("right: auto");
+    expect(panel).toContain("bottom: auto");
+    expect(panel).toContain("margin: 0");
+    expect(panel).toContain("top: 50%");
+    expect(panel).toContain("left: 50%");
+    expect(panel).toContain("translate: -50% -50%");
+  });
 });
 
 describe("Textarea", () => {
