@@ -3,6 +3,10 @@
   "version": "0.0.0",
   "private": true,
   "license": "FSL-1.1-ALv2",
+  "deploy": {
+    "target": "railway",
+    "service": "accounts-api"
+  },
   "scripts": {
     "build": "go build -buildvcs=false -o dist/accounts-api ./cmd/accounts-api",
     "dev": "node scripts/dev.mjs",
