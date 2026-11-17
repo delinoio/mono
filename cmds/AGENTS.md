@@ -26,7 +26,7 @@
 
 - Avoid undocumented cross-domain coupling.
 
-- Run relevant Go tests (`go test`) when code in this domain changes.
+- When Go code in this domain changes, run `gofmt`, `go vet ./...` and `go test ./...` from the repository root before finishing.
 
 ## Owning contracts
 
