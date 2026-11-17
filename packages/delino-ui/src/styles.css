@@ -293,10 +293,16 @@
     opacity: 0;
   }
 
+  /* The content renders as a top-layer popover, whose browser and UI SDK
+     styles set `inset: 0` and `margin: auto`. Reset them so only the
+     centering offsets apply. */
   .dui-dialog-content {
     position: fixed;
     top: 50%;
+    right: auto;
+    bottom: auto;
     left: 50%;
+    margin: 0;
     box-sizing: border-box;
     width: min(400px, calc(100vw - 32px));
     max-height: calc(100vh - 32px);
