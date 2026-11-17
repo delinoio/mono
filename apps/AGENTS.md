@@ -24,4 +24,5 @@
 - `apps/delino-site/`: [project index](../docs/project-delino-site.md) and [foundation contract](../docs/apps-delino-site-foundation.md)
 - `apps/delino-docs/`: [project index](../docs/project-delino-docs.md) and [foundation contract](../docs/apps-delino-docs-foundation.md)
 - `apps/delino-accounts/`: [project index](../docs/project-delino-accounts.md) and [web app foundation contract](../docs/apps-delino-accounts-foundation.md)
+- `apps/delidev/`: [project index](../docs/project-delidev.md) and [foundation contract](../docs/apps-delidev-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

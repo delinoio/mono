@@ -27,6 +27,7 @@ const shellEnv = {
   ADDR: "127.0.0.1:9123",
   LOG_LEVEL: "debug",
   PUBLIC_API_ORIGIN: "ftp://bad",
+  TAURI_DEV_HOST: "192.0.2.10",
 };
 
 // Expected `passThroughEnv` of each workspace `dev` task. `null` means that the
@@ -34,6 +35,7 @@ const shellEnv = {
 const expectedPassThroughEnv = {
   "accounts-api#dev": ["ADDR", "LOG_LEVEL"],
   "delino-accounts#dev": ["PUBLIC_API_ORIGIN"],
+  "delidev#dev": ["TAURI_DEV_HOST"],
   "delino-docs#dev": null,
   "delino-site#dev": null,
 };

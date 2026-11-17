@@ -42,6 +42,11 @@
 - [Project index](project-delino-ui.md)
 - [Shared UI component package foundation](packages-delino-ui-foundation.md)
 
+### delidev
+
+- [Project index](project-delidev.md)
+- [Desktop and mobile app foundation](apps-delidev-foundation.md)
+
 Before implementing a new project, add `project-<id>.md`, at least one `<domain>-<project-or-component>-<contract>.md`, and their links here. Use lowercase kebab-case IDs and domain prefixes `apps`, `cmds`, `servers`, `crates`, `protos`, or `packages`.
 
 ## Instruction update policy

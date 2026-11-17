@@ -89,6 +89,7 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
     format: false,
     fixtures: false,
     go: false,
+    rust: false,
     e2e: false,
   });
   f.write("assets/image.svg");
@@ -97,6 +98,7 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
     format: false,
     fixtures: false,
     go: false,
+    rust: false,
     e2e: false,
   });
 });
@@ -115,6 +117,7 @@ test("documentation changes select formatting without fixtures", (t) => {
     format: true,
     fixtures: false,
     go: false,
+    rust: false,
     e2e: false,
   });
 });
@@ -133,6 +136,7 @@ test("documentation and source paths select formatting in any extension case", (
       format: true,
       fixtures: false,
       go: false,
+      rust: false,
       e2e: false,
     });
   }
@@ -440,6 +444,42 @@ test("Go sources and module files select Go checks", async (t) => {
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
+test("Rust sources, Cargo files, toolchain files and Tauri crates select Rust checks", async (t) => {
+  for (const path of [
+    "apps/example/src-tauri/src/lib.rs",
+    "apps/example/src-tauri/tauri.conf.json",
+    "apps/example/src-tauri/capabilities/default.json",
+    "apps/example/src-tauri/Cargo.toml",
+    "crates/example/src/lib.rs",
+    "crates/example/build.rs",
+    "Cargo.toml",
+    "Cargo.lock",
+    "rust-toolchain",
+    ".rustfmt.toml",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.equal(plan(f.cwd, f.base, f.commit()).rust, true);
+    });
+  }
+  const f = fixture(t);
+  f.write("apps/example/src/App.tsx");
+  f.write("apps/example/src-tauri.md");
+  f.write("crates/example/README.md");
+  f.write("docs/Cargo.toml.example");
+  f.write("crates/rust-toolchain.md");
+  assert.equal(plan(f.cwd, f.base, f.commit()).rust, false);
+});
+
+test("deleted Rust files still select Rust checks", (t) => {
+  const f = fixture(t);
+  f.write("crates/example/src/old.rs");
+  const base = f.commit();
+  f.git("rm", "--quiet", "crates/example/src/old.rs");
+  assert.equal(plan(f.cwd, base, f.commit()).rust, true);
+});
+
 test("app paths and shared workspace inputs select e2e suites", async (t) => {
   for (const path of [
     "apps/delino-accounts/src/App.tsx",
@@ -485,6 +525,7 @@ test("deleted inputs and renamed paths still select affected fixtures", (t) => {
     format: true,
     fixtures: true,
     go: false,
+    rust: false,
     e2e: false,
   });
 });
@@ -499,6 +540,7 @@ test("deleted documentation has no remaining formatting input", (t) => {
     format: false,
     fixtures: false,
     go: false,
+    rust: false,
     e2e: false,
   });
 });
@@ -527,7 +569,7 @@ test("planner publishes booleans and records exact comparison and checkout", (t)
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
   );
   const record = JSON.parse(
     readFileSync(summary, "utf8").slice("CI plan: ".length),
@@ -570,6 +612,7 @@ test("planner accepts more than 1 MiB of changed paths", (t) => {
     format: false,
     fixtures: false,
     go: false,
+    rust: false,
     e2e: false,
   });
 });
@@ -606,7 +649,7 @@ test("planner CLI runs through physical and symlinked script paths", (t) => {
     assert.match(result.stdout, /"event":"ci_plan"/, script);
     assert.equal(
       readFileSync(output, "utf8"),
-      "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
       script,
     );
   }
@@ -663,14 +706,16 @@ for (const row of eventMatrix) {
     const mainPush = row.main === true;
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\ne2e=${mainPush}\n`,
+      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\n`,
     );
     const record = JSON.parse(logged.join(""));
     assert.equal(record.go, mainPush);
+    assert.equal(record.rust, mainPush);
     assert.equal(record.fixtures, mainPush);
     assert.equal(record.e2e, mainPush);
     const reason = mainPush ? OutputReason.MainPush : OutputReason.Diff;
     assert.equal(record.goReason, reason);
+    assert.equal(record.rustReason, reason);
     assert.equal(record.fixturesReason, reason);
     assert.equal(record.e2eReason, reason);
     assert.deepEqual(
@@ -695,6 +740,7 @@ test("a later documentation-only main push still selects the fixtures and e2e of
     format: true,
     fixtures: false,
     go: false,
+    rust: false,
     e2e: false,
   });
   const run = (event, ref) => {
@@ -717,11 +763,11 @@ test("a later documentation-only main push still selects the fixtures and e2e of
   };
   assert.equal(
     run(MAIN_PUSH_EVENT, MAIN_REF),
-    "quality=true\nformat=true\nfixtures=true\ngo=true\ne2e=true\n",
+    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\n",
   );
   assert.equal(
     run("pull_request", "refs/pull/1/merge"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
   );
 });
 
@@ -785,10 +831,11 @@ test("fixture and e2e changes keep the diff reason on a main push", (t) => {
     f.cwd,
   );
   const record = JSON.parse(logged.at(-1));
-  // The diff selects fixtures and e2e on its own; only go is forced.
+  // The diff selects fixtures and e2e on its own; only go and rust are forced.
   assert.equal(record.fixturesReason, OutputReason.Diff);
   assert.equal(record.e2eReason, OutputReason.Diff);
   assert.equal(record.goReason, OutputReason.MainPush);
+  assert.equal(record.rustReason, OutputReason.MainPush);
 });
 
 test("main push selects every whole-suite check for an empty comparison", (t) => {
@@ -808,7 +855,7 @@ test("main push selects every whole-suite check for an empty comparison", (t) =>
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=false\nfixtures=true\ngo=true\ne2e=true\n",
+    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\n",
   );
 });
 
@@ -841,7 +888,7 @@ test("planner CLI forces whole-suite checks for a main push and keeps pull reque
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\ne2e=${forced}\n`,
+      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\n`,
       event,
     );
   }
@@ -890,7 +937,7 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
   );
 });
 
@@ -908,6 +955,58 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
   assert.match(
     workflow,
     /\.go\.result == "skipped" and \$go_planned == "false"/,
+  );
+});
+
+test("Rust changes select rust for every event and keep the diff reason", (t) => {
+  const f = fixture(t);
+  f.write("apps/example/src-tauri/src/lib.rs");
+  const head = f.commit();
+  for (const row of eventMatrix) {
+    const output = join(
+      f.cwd,
+      `output-${row.event}-${row.ref}`.replaceAll("/", "_"),
+    );
+    const logged = [];
+    t.mock.method(console, "log", (line) => logged.push(line));
+    main(
+      {
+        CI_BASE: f.base,
+        CI_HEAD: head,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+        GITHUB_EVENT_NAME: row.event,
+        GITHUB_REF: row.ref,
+      },
+      f.cwd,
+    );
+    assert.match(readFileSync(output, "utf8"), /\nrust=true\n/, row.name);
+    const record = JSON.parse(logged.at(-1));
+    assert.equal(record.rustReason, OutputReason.Diff, row.name);
+    // A Rust-only range does not select Go, so only a main push forces it.
+    assert.equal(
+      record.goReason,
+      row.main ? OutputReason.MainPush : OutputReason.Diff,
+      row.name,
+    );
+    t.mock.restoreAll();
+  }
+});
+
+// Read-only text check: the single `rust` planner output must keep driving
+// both the Rust job and the aggregate, so the planner's main-push selection is
+// enforced by ci-result without a workflow edit.
+test("CI workflow reads the planner rust output for the Rust job and the aggregate", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+  assert.match(workflow, /^\s+rust: \$\{\{ steps\.plan\.outputs\.rust \}\}$/m);
+  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.rust == 'true'$/m);
+  assert.match(
+    workflow,
+    /^\s+RUST_PLANNED: \$\{\{ needs\.changes\.outputs\.rust \}\}$/m,
+  );
+  assert.match(
+    workflow,
+    /\.rust\.result == "skipped" and \$rust_planned == "false"/,
   );
 });
 
@@ -1062,6 +1161,7 @@ test("planner selects formatting for non-UTF-8 names whether or not Rstack exclu
       format: true,
       fixtures: false,
       go: false,
+      rust: false,
       e2e: false,
     });
   }
@@ -1255,7 +1355,7 @@ test("planner CLI still exits 0 with one ci_plan record and no error record on s
   assert.match(result.stdout, /"event":"ci_plan"/u);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
   );
 });
 
