@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawnSync } from "node:child_process";
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { isolateGitEnvironment } from "./git-fixture-env.mjs";
+import { isolateGitEnvironment, parseGitVersion } from "./git-fixture-env.mjs";
 
 const nullDevice = process.platform === "win32" ? "NUL" : "/dev/null";
 
@@ -105,4 +111,97 @@ test("isolation lets a path under a globally ignored directory be added", (t) =>
   writeFileSync(join(cwd, "vendor", "ignored.ts"), "export {};\n");
   git("add", "--", "vendor/ignored.ts");
   assert.equal(git("ls-files"), "vendor/ignored.ts");
+});
+
+test("parseGitVersion reads stock, vendor-suffixed and unparseable output", () => {
+  assert.deepEqual(parseGitVersion("git version 2.43.0"), {
+    major: 2,
+    minor: 43,
+  });
+  assert.deepEqual(parseGitVersion("git version 2.31.1"), {
+    major: 2,
+    minor: 31,
+  });
+  assert.deepEqual(parseGitVersion("git version 2.43.0.windows.1"), {
+    major: 2,
+    minor: 43,
+  });
+  assert.deepEqual(parseGitVersion("git version 2.43.0.vfs.0.1"), {
+    major: 2,
+    minor: 43,
+  });
+  assert.deepEqual(parseGitVersion("git version 2.39.5 (Apple Git-154)"), {
+    major: 2,
+    minor: 39,
+  });
+  assert.equal(parseGitVersion("not git"), null);
+});
+
+// Runs the helper in a child node process (fresh version cache) with a fake
+// `git` that prints `versionLine` first on PATH.
+function gateWithFakeGit(t, versionLine) {
+  const bin = mkdtempSync(join(tmpdir(), "git-fixture-env-fakegit-"));
+  t.after(() => rmSync(bin, { recursive: true, force: true }));
+  writeFileSync(join(bin, "git"), `#!/bin/sh\necho '${versionLine}'\n`);
+  chmodSync(join(bin, "git"), 0o755);
+  const helper = new URL("./git-fixture-env.mjs", import.meta.url).href;
+  const script = `import(${JSON.stringify(helper)}).then((m) => { console.log(JSON.stringify(m.isolateGitEnvironment({}))); });`;
+  return spawnSync(process.execPath, ["-e", script], {
+    encoding: "utf8",
+    env: { ...process.env, PATH: `${bin}:${process.env.PATH}` },
+  });
+}
+
+test(
+  "version gate rejects Git 2.31 and names the minimum and GIT_CONFIG_GLOBAL",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const result = gateWithFakeGit(t, "git version 2.31.1");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /2\.31/);
+    assert.match(result.stderr, /Git 2\.32/);
+    assert.match(result.stderr, /GIT_CONFIG_GLOBAL/);
+  },
+);
+
+test(
+  "version gate accepts Git 2.32.0",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const result = gateWithFakeGit(t, "git version 2.32.0");
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(JSON.parse(result.stdout).GIT_CONFIG_GLOBAL, nullDevice);
+  },
+);
+
+test(
+  "version gate rejects unparseable output and quotes it",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const result = gateWithFakeGit(t, "hello");
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /hello/);
+    assert.match(result.stderr, /GIT_CONFIG_GLOBAL/);
+  },
+);
+
+test("isolation ignores a hostile global gitconfig under HOME", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "git-fixture-env-home-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  writeFileSync(
+    join(home, ".gitconfig"),
+    "[commit]\n\tgpgsign = true\n[gpg]\n\tprogram = /bin/false\n",
+  );
+  const { git } = repository(t, { HOME: home });
+  git(
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@example.com",
+    "commit",
+    "--allow-empty",
+    "-m",
+    "x",
+  );
+  assert.equal(git("rev-list", "--count", "HEAD"), "1");
 });
