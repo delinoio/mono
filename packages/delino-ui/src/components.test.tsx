@@ -286,9 +286,15 @@ describe("Switch", () => {
     expectDescribedBy(control, nodes[0]);
   });
 
-  // happy-dom can neither lay out nor match `:dir()`, so this checks the
-  // stylesheet source: the checked thumb travels to the inline-end edge.
-  test("reverses the checked thumb travel in right-to-left text", () => {
+  // happy-dom can neither lay out nor match `:dir()` or the UI SDK cascade
+  // layer, so this only checks the stylesheet source text. It proves that the
+  // checked-thumb rules declare the `translate` travel and reset the SDK's
+  // `margin-inline-start: auto`. It does not prove the rendered thumb
+  // position; that needs a real-browser layout check.
+  test("moves the checked thumb once, and reverses it in right-to-left text", () => {
+    expect(block(".dui-switch-thumb[data-checked]")).toContain(
+      "margin-inline-start: 0",
+    );
     expect(block(".dui-switch-thumb[data-checked]")).toContain(
       "translate: 18px 0",
     );
