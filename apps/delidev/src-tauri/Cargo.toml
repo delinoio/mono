@@ -1,0 +1,37 @@
+[package]
+name = "delidev"
+version = "0.0.0"
+description = "DeliDev desktop and mobile app"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[lib]
+# `staticlib` and `cdylib` are the iOS and Android library outputs; `rlib`
+# links the desktop binary in `src/main.rs`.
+name = "delidev_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "=3.0.0-alpha.4", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "=3.0.0-alpha.6", features = [] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Desktop targets run on the Chromium Embedded Framework. Depending on this
+# crate is also how `tauri-build` and the Tauri CLI detect a CEF app, so they
+# ship the CEF distribution, sign it and run `tauri dev` from an `.app` bundle
+# on macOS. CEF has no Android or iOS port, so the mobile targets below keep
+# the system webview through `tauri-runtime-wry`.
+[target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
+tauri-runtime-cef = { version = "=3.0.0-alpha.7", features = ["devtools"] }
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+tauri-runtime-wry = { version = "=3.0.0-alpha.6" }
+
+[dev-dependencies]
+serde_json = "1"

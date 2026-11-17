@@ -61,6 +61,21 @@ export function isGoInput(path) {
   return path.endsWith(".go") || /(^|\/)go\.(mod|sum)$/.test(path);
 }
 
+// Root Rust toolchain and formatter configuration.
+const rustInputs = new Set(["rust-toolchain", ".rustfmt.toml"]);
+
+// Rust sources, Cargo manifests and lockfiles, the root toolchain files and
+// every path of a Tauri app crate select the Rust checks. A Tauri crate also
+// compiles its `tauri.conf.json`, capabilities and icons into the binary.
+export function isRustInput(path) {
+  return (
+    rustInputs.has(path) ||
+    path.endsWith(".rs") ||
+    /(^|\/)Cargo\.(toml|lock)$/.test(path) ||
+    /(^|\/)src-tauri\//.test(path)
+  );
+}
+
 export function plan(cwd, base, head) {
   // Reuse the formatter's revision validation and literal-path selection. The
   // planner runs without installed dependencies and cannot evaluate the Rstack
@@ -90,8 +105,9 @@ export function plan(cwd, base, head) {
       isWorkspaceManifest(path),
   );
   const go = paths.some(isGoInput);
+  const rust = paths.some(isRustInput);
   const e2e = paths.some(isE2eInput);
-  return { quality: format || fixtures, format, fixtures, go, e2e };
+  return { quality: format || fixtures, format, fixtures, go, rust, e2e };
 }
 
 // Why a forced output has its value. Logged in the ci_plan record only.
@@ -127,10 +143,10 @@ export function main(env = process.env, cwd = process.cwd()) {
     }
   }
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
-  // Branch-wide cancellation can cancel a main-push run before its Go,
+  // Branch-wide cancellation can cancel a main-push run before its Go, Rust,
   // fixtures or e2e jobs finish, and the next push then compares only against
-  // its own parent. Every main push therefore runs the Go checks, the fixtures
-  // and the e2e suites against its own head so a later documentation-only push
+  // its own parent. Every main push therefore runs the Go checks, the Rust
+  // checks, the fixtures and the e2e suites against its own head so a later documentation-only push
   // cannot hide a cancelled predecessor's range. The fixtures step lives in
   // the `quality` job, so forcing fixtures forces quality too. `format` stays
   // diff-derived: the formatter compares the same range and a forced run
@@ -143,6 +159,7 @@ export function main(env = process.env, cwd = process.cwd()) {
     fixtures,
     quality: diffPlan.quality || fixtures,
     go: diffPlan.go || mainPush,
+    rust: diffPlan.rust || mainPush,
     e2e: diffPlan.e2e || mainPush,
   };
   const reasonOf = (selectedByDiff) =>
@@ -157,6 +174,7 @@ export function main(env = process.env, cwd = process.cwd()) {
     head: env.CI_HEAD,
     ...result,
     goReason: reasonOf(diffPlan.go),
+    rustReason: reasonOf(diffPlan.rust),
     fixturesReason: reasonOf(diffPlan.fixtures),
     e2eReason: reasonOf(diffPlan.e2e),
   };
