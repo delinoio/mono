@@ -269,7 +269,13 @@
     transition: translate 0.15s;
   }
 
+  /* UI SDK sets `margin-inline-start: auto` on the checked thumb, which already
+     pushes it to the inline-end edge of the flex track. The package moves the
+     thumb with `translate` only (so the transition animates), so reset the
+     margin; otherwise the thumb travels twice. The margin is logical, so this
+     one reset covers the `:dir(rtl)` rule below too. */
   .dui-switch-thumb[data-checked] {
+    margin-inline-start: 0;
     translate: 18px 0;
   }
 
