@@ -37,12 +37,17 @@ const bashVersion = spawnSync(
   .stdout?.trim()
   .split(" ")
   .map(Number) ?? [0, 0];
-const skip =
-  process.platform === "win32"
-    ? "the deploy scripts run on Linux"
-    : bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)
-      ? `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`
-      : false;
+// The scripts and the stubs call jq, which the Ubuntu runners provide.
+const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
+function skipReason() {
+  if (process.platform === "win32") return "the deploy scripts run on Linux";
+  if (!hasJq) return "jq is not installed";
+  if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
+    return `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
+  }
+  return false;
+}
+const skip = skipReason();
 
 function scratch(t) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-scripts-"));

@@ -21,6 +21,13 @@
 #                         (default 5).
 set -euo pipefail
 
+# `;;&` in the command dispatch needs Bash 4; the other deploy scripts need
+# 4.4, so keep one minimum.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "::error::$0 needs Bash 4.4 or newer, not $BASH_VERSION." >&2
+  exit 2
+fi
+
 interval="${DEPLOY_POLL_INTERVAL:-10}"
 # GNU coreutils `timeout` (`gtimeout` when Homebrew installs it with a prefix).
 timeout_command=""
@@ -143,8 +150,10 @@ case "$command" in
   wait-railway)
     service="$2" id="$3"
     if ! poll "Railway deployment $id of $service" "${DEPLOY_POLL_TIMEOUT:-1800}" read-railway railway_classify "$service" "$id"; then
-      railway logs "$id" --service "$service" --build --lines 200 < /dev/null || true
-      railway logs "$id" --service "$service" --deployment --lines 200 < /dev/null || true
+      # Best-effort diagnostics with a short limit, so an unresponsive API
+      # cannot hold the deployment queue after the verdict.
+      "$timeout_command" 30 railway logs "$id" --service "$service" --build --lines 200 < /dev/null || true
+      "$timeout_command" 30 railway logs "$id" --service "$service" --deployment --lines 200 < /dev/null || true
       exit 1
     fi
     ;;
