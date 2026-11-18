@@ -440,6 +440,33 @@ test("guard looks up a planned file beyond a full listing", { skip }, (t) => {
   }
 });
 
+test(
+  "guard counts subdirectories when it detects a full listing",
+  { skip },
+  (t) => {
+    const entries = [
+      { name: "nested", type: "dir", sha: blobNew },
+      ...Array.from({ length: 999 }, (_, i) => ({
+        name: `other-${i}.md`,
+        type: "file",
+        sha: blobNew,
+      })),
+    ];
+    const result = runGuard(
+      t,
+      {
+        ...runs([7, "in_progress"]),
+        "repos/owner/repo/contents/.changeset/zzz.md": [
+          { body: { sha: blobA } },
+        ],
+        "repos/owner/repo/contents/.changeset": [{ body: entries }],
+      },
+      { zzz: blobA },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+  },
+);
+
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(
     t,

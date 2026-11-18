@@ -165,7 +165,7 @@ esac
 # file locally: one request per check, whatever the number of changesets.
 status=0
 api "repos/$REPOSITORY/contents/.changeset?ref=main&per_page=1000" \
-  --jq '[.[] | select(.type == "file") | {key: .name, value: .sha}] | from_entries' || status=$?
+  --jq '[.[] | {key: .name, value: .sha}] | from_entries' || status=$?
 case "$status" in
   0) current="$api_output" ;;
   4) current='{}' ;;
@@ -174,8 +174,9 @@ case "$status" in
     exit 1
     ;;
 esac
-# The contents API lists at most 1,000 entries; a planned file that is
-# missing from a full listing may only be beyond the limit.
+# The contents API lists at most 1,000 entries of any type (the map keeps
+# subdirectories too, so its size is the listing size); a planned file that
+# is missing from a full listing may only be beyond the limit.
 listing_full=false
 if (( $(jq 'length' <<< "$current") >= 1000 )); then
   listing_full=true
