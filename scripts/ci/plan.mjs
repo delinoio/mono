@@ -105,6 +105,9 @@ export function plan(cwd, base, head) {
     (path) =>
       fixtureInputs.has(path) ||
       path.startsWith("scripts/ci/") ||
+      // A pending changeset is validated in the quality job, so that an
+      // invalid one cannot reach main and stop every deployment.
+      path.startsWith(".changeset/") ||
       isTurboConfigInput(path) ||
       isWorkspaceManifest(path),
   );
