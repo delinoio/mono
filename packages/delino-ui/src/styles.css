@@ -546,6 +546,7 @@
     gap: 8px;
     box-sizing: border-box;
     width: 100%;
+    min-width: 0;
     min-height: 44px;
     padding-block: 0;
     padding-inline: 14px 12px;
@@ -571,6 +572,16 @@
 
   .dui-text-field[data-invalid] .dui-select {
     border-color: var(--dui-color-danger-text);
+  }
+
+  /* A long value stays on one line and is cut with an ellipsis instead of
+     widening the trigger. min-width: 0 lets this flex item shrink below its
+     text width. */
+  .dui-select-value {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .dui-select-value[data-placeholder] {

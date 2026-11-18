@@ -1024,6 +1024,33 @@ describe("Select", () => {
     expect(rule).toContain("padding-block: 0");
     expect(rule).not.toMatch(/(^|[\s;])padding:/);
   });
+
+  test("keeps a long value on one line and truncates it with an ellipsis", () => {
+    const trigger = block(".dui-select");
+    expect(trigger).toContain("min-width: 0");
+
+    const value = block(".dui-select-value");
+    expect(value).toContain("min-width: 0");
+    expect(value).toContain("overflow: hidden");
+    expect(value).toContain("text-overflow: ellipsis");
+    expect(value).toContain("white-space: nowrap");
+  });
+
+  test("renders a long value as the first child of the trigger with its full text", () => {
+    const longValue = "first.last+notifications@example.com";
+    render(
+      <Select label="Email" defaultValue={longValue}>
+        <SelectOption value={longValue}>{longValue}</SelectOption>
+        <SelectOption value="short">Short</SelectOption>
+      </Select>,
+    );
+
+    const trigger = screen.getByRole("combobox", { name: "Email" });
+    const value = trigger.firstElementChild;
+    expect(value?.tagName).toBe("SPAN");
+    expect(value?.classList.contains("dui-select-value")).toBe(true);
+    expect(value?.textContent).toBe(longValue);
+  });
 });
 
 describe("Tabs", () => {
