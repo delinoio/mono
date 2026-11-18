@@ -3484,7 +3484,11 @@ test("explicit comparison still rejects a non-UTF-8 path that is added beside it
   f.git("commit", "--quiet", "-m", "add the valid name");
   const base = f.git("rev-parse", "HEAD");
   const raw = latin1Name();
-  writeRaw(f, raw);
+  try {
+    writeRaw(f, raw);
+  } catch {
+    return t.skip(unsupportedFileSystem);
+  }
   if (!listsRaw(f, raw)) return t.skip(unsupportedFileSystem);
   stageRaw(f, raw);
   f.git("commit", "--quiet", "-m", "add the non-UTF-8 name");
