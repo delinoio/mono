@@ -150,7 +150,7 @@ Run from the repository root:
 - `pnpm exec turbo run typecheck --filter=delino-ui`: TypeScript type check.
 - `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior, and for static (server-rendered) markup: description and error id references, empty descriptions, disabled-field errors and caller ARIA routing. `src/components.test.tsx`, `src/disclosure-and-input.test.tsx` and `src/ssr-field-error.test.tsx` hold them.
 
-Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI does not run its unit tests yet; add them to the workflow and its planner when package checks enter CI.
+Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI runs its unit tests through root `pnpm test` in the `quality` job when the planner selects fixtures, as the [workflow contract](repository-workflow-contract.md) describes. The planner always selects fixtures for a push to `main`, but not for a pull request that changes only package source, so run `pnpm test` locally for such a change.
 
 ## Dependencies and Integrations
 
