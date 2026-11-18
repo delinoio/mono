@@ -8,6 +8,10 @@ import {
 } from "./format-changed.mjs";
 
 const fixtureInputs = new Set([
+  // The deploy fixtures read the repository Changesets config, and the
+  // deploy workflow calls the scripts that they cover.
+  ".changeset/config.json",
+  ".github/workflows/deploy.yml",
   ".github/workflows/CI.yml",
   ".nvmrc",
   "package.json",
@@ -101,6 +105,9 @@ export function plan(cwd, base, head) {
     (path) =>
       fixtureInputs.has(path) ||
       path.startsWith("scripts/ci/") ||
+      // A pending changeset is validated in the quality job, so that an
+      // invalid one cannot reach main and stop every deployment.
+      path.startsWith(".changeset/") ||
       isTurboConfigInput(path) ||
       isWorkspaceManifest(path),
   );

@@ -4,6 +4,10 @@
   "private": true,
   "license": "Apache-2.0",
   "type": "module",
+  "deploy": {
+    "target": "cloudflare-pages",
+    "project": "delino-docs"
+  },
   "scripts": {
     "build": "rspress build",
     "dev": "rspress dev",

@@ -59,7 +59,7 @@ The site has no persistent storage, user uploads or server-side cache. All conte
 
 - The site is public. Content must not include secrets, internal hostnames, repository-internal paths or operational internals.
 - The build requires no secrets or environment variables.
-- Cloudflare Pages deployment credentials are not stored in the repository.
+- Cloudflare Pages deployment credentials are secrets of the `static-sites` GitHub environment. They are not stored in the repository.
 
 ## Logging
 
@@ -76,13 +76,13 @@ Run from the repository root:
 - `pnpm exec turbo run test:e2e --filter=delino-docs`: browser end-to-end tests against the development server on a free loopback port. See the [e2e contract](repository-e2e-contract.md).
 - `pnpm --filter delino-docs preview`: serve the production build locally.
 
-Remove `apps/delino-docs/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI does not build or deploy this site yet; add the build check to the workflow and its planner when the site enters CI.
+Remove `apps/delino-docs/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI does not build this site. The [deployment workflow](repository-workflow-contract.md#deployment-workflow) builds and deploys it when a pending changeset releases it.
 
 ## Dependencies and Integrations
 
 - `@rspress/core`, `react` and `react-dom`, pinned in `apps/delino-docs/package.json`.
 - `e2e`, `@e2e-dev/web` and `ai` for end-to-end tests, pinned in `apps/delino-docs/package.json`.
-- Cloudflare Pages: static hosting for `docs.delino.io`. Configure the Pages project with build command `pnpm exec turbo run build --filter=delino-docs` and output directory `apps/delino-docs/dist`.
+- Cloudflare Pages: static hosting for `docs.delino.io`. The `deploy` field of `apps/delino-docs/package.json` names the Direct Upload Pages project `delino-docs`. The deployment workflow builds with `pnpm exec turbo run build --filter=delino-docs` and uploads `apps/delino-docs/dist`.
 - [`delino-site`](project-delino-site.md): linked by absolute URL `https://delino.io`.
 
 ## Change Triggers

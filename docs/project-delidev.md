@@ -42,6 +42,7 @@ The Chromium Embedded Framework (CEF) has no Android or iOS port, so mobile targ
 - Business flows with Delino services use Connect RPC, not Tauri-specific bindings. Tauri commands are limited to native capabilities of the device and the app shell.
 - Authentication and account management follow the [authentication contract](repository-auth-contract.md). Billing follows the [billing contract](repository-billing-contract.md). The scaffold has no sign-in or billing flow yet.
 - Deviation from repository defaults: the frontend uses Rsbuild instead of Rspress because it is an application. It is not a static site and does not deploy to Cloudflare Pages; it ships inside the native bundles.
+- Changesets ignores `delidev` until `changeset version` can update the Cargo and Tauri versions together with the npm manifest; see the [deployment workflow](repository-workflow-contract.md#release-selection-with-changesets).
 - Open decisions: release signing, notarization, store distribution, auto-update, the Android and iOS native project generation (`gen/android`, `gen/apple`) and the content security policy. Record each decision in the foundation contract before the implementation that depends on it.
 
 ## Change Policy

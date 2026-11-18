@@ -15,6 +15,8 @@ Repository-owned source, package metadata and future release artifacts use Apach
 - When a new project does not specify its primary language, default to Golang.
 - Build tooling should prefer the Rspack family when it fits the runtime and deployment target, including Rsbuild and Rspress for app and documentation surfaces.
 - Static sites under `apps/` should use Rsbuild/Rspress-style toolchains and deploy to Cloudflare Pages by default. Any exception must be documented in its project contract.
+- Backend services under `servers/` should deploy to Railway by default. Any exception must be documented in its project contract.
+- Persistent relational databases should use PlanetScale Postgres by default. Any exception must be documented in its project contract.
 - File handling should use Cloudflare R2 for object storage plus signed URLs for upload and download access by default. Use another storage or access pattern only when the project contract documents the reason, trust boundary, and migration considerations.
 
 ## Repository-Wide Rules
@@ -39,7 +41,7 @@ Instruction-file updates in this requirement apply only to changes in developmen
 - Pull request title scopes should use stable lowercase project, component, domain, or tooling identifiers from repository contracts when one applies.
 - Pull request titles must not omit the scope and must not use bracket-style project prefixes.
 - Root `pnpm install` must support linked worktrees when the effective Git hooks path resolves to the repository's shared common-directory hooks directory, without overriding an unrelated custom hooks path. Source archives and other workspaces without Git metadata skip hook installation without running project preparation.
-- The registered projects are the static sites `delino-site` and `delino-docs`, the account and billing project `delino-accounts`, the shared React UI component package `delino-ui` and the desktop and mobile app `delidev`. The public documentation application is `delino-docs`. The repository has no release workflows yet. New projects must define their own development, validation and publication contracts before implementation.
+- The registered projects are the static sites `delino-site` and `delino-docs`, the account and billing project `delino-accounts`, the shared React UI component package `delino-ui` and the desktop and mobile app `delidev`. The public documentation application is `delino-docs`. `.github/workflows/deploy.yml` deploys the servers and static sites selected by pending changesets; see `docs/repository-workflow-contract.md`. New projects must define their own development, validation and publication contracts before implementation.
 
 ## References
 

@@ -6,7 +6,8 @@
       "passThroughEnv": ["ADDR", "LOG_LEVEL"]
     },
     "build": {
-      "cache": false
+      "cache": false,
+      "passThroughEnv": ["CGO_ENABLED", "GOOS", "GOARCH"]
     },
     "lint": {
       "cache": false

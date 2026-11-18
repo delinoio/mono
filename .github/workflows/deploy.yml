@@ -1,0 +1,388 @@
+name: Deploy
+# Deploys the packages selected by the pending changesets on `main`, in
+# dependency order: servers (Railway) first, then static sites (Cloudflare
+# Pages). The PlanetScale Postgres database has no migration job yet; see
+# docs/repository-workflow-contract.md#deployment-workflow.
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+  # The stale-plan check lists the runs of this workflow.
+  actions: read
+concurrency:
+  # One production deployment at a time. A dispatch from another ref fails
+  # in `plan`; give it its own group so that it cannot replace a pending
+  # `main` deployment in the queue.
+  group: ${{ github.ref == 'refs/heads/main' && 'deploy' || format('deploy-rejected-{0}', github.run_id) }}
+  cancel-in-progress: false
+jobs:
+  plan:
+    name: Plan deployment
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.revision.outputs.sha }}
+      releases: ${{ steps.plan.outputs.releases }}
+      servers: ${{ steps.plan.outputs.servers }}
+      static_sites: ${{ steps.plan.outputs.static_sites }}
+      changeset_blobs: ${{ steps.blobs.outputs.changeset_blobs }}
+      has_changesets: ${{ steps.plan.outputs.has_changesets }}
+      has_servers: ${{ steps.plan.outputs.has_servers }}
+      has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
+    steps:
+      - name: Require the main branch
+        if: github.ref != 'refs/heads/main'
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          echo "::error::Deploy runs only on refs/heads/main, not $REF."
+          exit 1
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Read the current `main`, not the dispatch SHA. A run that waited in
+          # the `deploy` concurrency queue must not see changesets that the
+          # previous run already consumed. Later jobs use the recorded SHA.
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Require the deploy workflow of the dispatch revision
+        # This job reads the current `main`, but GitHub runs the workflow
+        # file of the dispatch revision. A run that waited in the queue while
+        # the deploy workflow or its scripts changed would pair old YAML with
+        # new scripts; dispatch again instead.
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          if ! git diff --quiet "$DISPATCH_SHA" HEAD -- .github/workflows/deploy.yml scripts/ci/; then
+            echo "::error::The deploy workflow or its scripts changed on main after this run was dispatched at $DISPATCH_SHA. Start a new deployment."
+            exit 1
+          fi
+      - name: Record the deployed revision
+        id: revision
+        run: |
+          sha="$(git rev-parse HEAD)"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "Deployed revision: $sha" >> "$GITHUB_STEP_SUMMARY"
+      - name: Read pending changesets
+        run: pnpm exec changeset status --output "$RUNNER_TEMP/changeset-status.json"
+      - name: Select and order deployables
+        id: plan
+        run: node scripts/ci/deploy-plan.mjs "$RUNNER_TEMP/changeset-status.json"
+      - name: Record the planned changeset files
+        id: blobs
+        env:
+          CHANGESETS: ${{ steps.plan.outputs.changesets }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          blobs='{}'
+          while read -r id; do
+            blob="$(git rev-parse "HEAD:.changeset/$id.md")"
+            blobs="$(jq -c --arg id "$id" --arg blob "$blob" '. + {($id): $blob}' <<< "$blobs")"
+          done < <(jq -r '.[]' <<< "$CHANGESETS")
+          echo "changeset_blobs=$blobs" >> "$GITHUB_OUTPUT"
+
+  build-servers:
+    name: Build ${{ matrix.server.name }}
+    needs: plan
+    if: needs.plan.outputs.has_servers == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      # Every server builds in parallel. One failed build stops the run before
+      # any server is deployed.
+      fail-fast: true
+      matrix:
+        server: ${{ fromJSON(needs.plan.outputs.servers) }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          # Production artifacts must contain Git LFS objects, not pointers.
+          lfs: true
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build
+        env:
+          NAME: ${{ matrix.server.name }}
+          # Railway runs linux/amd64 containers on a distroless static base.
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: amd64
+        run: pnpm exec turbo run build --filter="$NAME"
+      - name: Assemble the Railway build context
+        env:
+          DIR: ${{ matrix.server.dir }}
+          NAME: ${{ matrix.server.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in Dockerfile railway.json; do
+            if [[ ! -f "$DIR/$file" ]]; then
+              echo "::error::$NAME has no $DIR/$file."
+              exit 1
+            fi
+          done
+          context="$RUNNER_TEMP/context"
+          mkdir -p "$context"
+          cp "$DIR/Dockerfile" "$DIR/railway.json" "$context/"
+          # The runtime image must carry the FSL-1.1-ALv2 terms and notice
+          # (docs/repository-license-contract.md).
+          cp servers/LICENSE "$context/LICENSE"
+          # The binary statically links the Go standard library and runtime
+          # (BSD-3-Clause), whose notice must ship with it.
+          cp "$(go env GOROOT)/LICENSE" "$context/GO-LICENSE"
+          cp -R "$DIR/dist" "$context/dist"
+          # A tar archive keeps the executable mode, which artifacts drop.
+          tar -czf "$RUNNER_TEMP/$NAME.tar.gz" -C "$context" .
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: server-${{ matrix.server.name }}
+          path: ${{ runner.temp }}/${{ matrix.server.name }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy-servers:
+    name: Deploy servers
+    # Every build, the static sites included, finishes before the first
+    # upload, so a broken site cannot leave new servers without a release.
+    # `!failure()` keeps the job when no site (or no server build) ran.
+    needs: [plan, build-servers, build-static-sites]
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_servers == 'true' }}
+    runs-on: ubuntu-latest
+    environment: servers
+    env:
+      # Railway CLI release asset, verified against the SHA-256 that GitHub
+      # publishes for it. Update both values together.
+      RAILWAY_CLI_VERSION: 5.69.0
+      RAILWAY_CLI_SHA256: 1bd0612e743adf69b13bee7a6e49dd9bf2f0efb5f97b90f90d1b15b122a840e5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/check-pending-changesets.sh
+            scripts/ci/deploy-provider.sh
+            scripts/ci/deploy-targets.sh
+          sparse-checkout-cone-mode: false
+      - name: Check that the plan is still current
+        env:
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: server-*
+          path: ${{ runner.temp }}/servers
+          merge-multiple: true
+      - name: Install the Railway CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="railway-v${RAILWAY_CLI_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/railwayapp/cli/releases/download/v${RAILWAY_CLI_VERSION}/$asset"
+          echo "$RAILWAY_CLI_SHA256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/bin" railway
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/railway" --version
+      - name: Deploy in dependency order
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+          SERVERS: ${{ needs.plan.outputs.servers }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          # The stale-plan check runs again right before each upload.
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${RAILWAY_TOKEN:-}" ]]; then
+            echo "::error::The servers environment has no RAILWAY_TOKEN secret."
+            exit 1
+          fi
+          scripts/ci/deploy-targets.sh servers
+
+  build-static-sites:
+    name: Build static sites
+    needs: plan
+    if: needs.plan.outputs.has_static_sites == 'true'
+    runs-on: ubuntu-latest
+    # No deployment environment and no secrets: the build runs third-party
+    # build plugins, so it runs on its own runner. The deploy job receives
+    # only the built output, never this workspace.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          # Production artifacts must contain Git LFS objects, not pointers.
+          lfs: true
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build in dependency order
+        env:
+          SITES: ${{ needs.plan.outputs.static_sites }}
+        run: scripts/ci/deploy-targets.sh build-static-sites
+      - name: Pack the build output
+        env:
+          SITES: ${{ needs.plan.outputs.static_sites }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < <(jq -r '.[].output' <<< "$SITES")
+          tar -czf "$RUNNER_TEMP/static-sites.tar.gz" -- "${outputs[@]}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: static-sites
+          path: ${{ runner.temp }}/static-sites.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  deploy-static-sites:
+    name: Deploy static sites
+    needs: [plan, deploy-servers, build-static-sites]
+    # Run after the servers, also when no server was selected.
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_static_sites == 'true' }}
+    runs-on: ubuntu-latest
+    environment: static-sites
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - name: Check that the plan is still current
+        env:
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      # Wrangler is a root devDependency, so the lockfile pins it. No build
+      # runs in this job, and `--ignore-scripts` runs no install scripts.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: static-sites
+          path: ${{ runner.temp }}/static-sites
+      - name: Unpack the build output
+        # Unpack outside the checkout, and only the planned output
+        # directories, so that the artifact of the build job cannot replace a
+        # script that the next step runs with the deploy secrets.
+        env:
+          SITES: ${{ needs.plan.outputs.static_sites }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < <(jq -r '.[].output' <<< "$SITES")
+          mkdir -p "$RUNNER_TEMP/site-output"
+          tar -xzf "$RUNNER_TEMP/static-sites/static-sites.tar.gz" \
+            -C "$RUNNER_TEMP/site-output" --no-same-owner --no-same-permissions -- "${outputs[@]}"
+          # Accept only regular files and directories: Wrangler follows
+          # symlinks, so a link could publish files from outside the build
+          # output, and special files have no place in a site.
+          unexpected="$(find "$RUNNER_TEMP/site-output" ! -type f ! -type d -print)"
+          if [[ -n "$unexpected" ]]; then
+            echo "::error::The build output contains entries that are not regular files or directories: ${unexpected//$'\n'/, }"
+            exit 1
+          fi
+      - name: Deploy in dependency order
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          SITES: ${{ needs.plan.outputs.static_sites }}
+          SITES_ROOT: ${{ runner.temp }}/site-output
+          SHA: ${{ needs.plan.outputs.sha }}
+          # The stale-plan check runs again right before each upload.
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for secret in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID; do
+            if [[ -z "${!secret:-}" ]]; then
+              echo "::error::The static-sites environment has no $secret secret."
+              exit 1
+            fi
+          done
+          scripts/ci/deploy-targets.sh static-sites
+
+  release:
+    name: Version and tag
+    needs:
+      [
+        plan,
+        build-servers,
+        deploy-servers,
+        build-static-sites,
+        deploy-static-sites,
+      ]
+    # Run only after every selected deployment succeeded. Skipped deployments
+    # (no server or no static site selected) do not block the release.
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_changesets == 'true' }}
+    runs-on: ubuntu-latest
+    # Job permissions replace the workflow permissions, so repeat
+    # `actions: read` for the stale-plan check.
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 0
+      - name: Check that the plan is still current
+        env:
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Commit versions, tag and push
+        env:
+          RELEASES: ${{ needs.plan.outputs.releases }}
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          scripts/ci/deploy-release.sh

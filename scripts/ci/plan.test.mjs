@@ -148,7 +148,10 @@ test("documentation and source paths select formatting in any extension case", (
 
 test("every shared fixture input selects tests", async (t) => {
   for (const path of [
+    ".changeset/config.json",
+    ".changeset/brave-cats-run.md",
     ".github/workflows/CI.yml",
+    ".github/workflows/deploy.yml",
     ".nvmrc",
     "package.json",
     "pnpm-lock.yaml",
