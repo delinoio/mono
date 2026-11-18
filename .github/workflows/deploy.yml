@@ -7,6 +7,8 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+  # The stale-plan check lists the runs of this workflow.
+  actions: read
 concurrency:
   group: deploy
   cancel-in-progress: false
@@ -19,7 +21,7 @@ jobs:
       releases: ${{ steps.plan.outputs.releases }}
       servers: ${{ steps.plan.outputs.servers }}
       static_sites: ${{ steps.plan.outputs.static_sites }}
-      changesets: ${{ steps.plan.outputs.changesets }}
+      changeset_blobs: ${{ steps.blobs.outputs.changeset_blobs }}
       has_changesets: ${{ steps.plan.outputs.has_changesets }}
       has_servers: ${{ steps.plan.outputs.has_servers }}
       has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
@@ -56,6 +58,19 @@ jobs:
       - name: Select and order deployables
         id: plan
         run: node scripts/ci/deploy-plan.mjs "$RUNNER_TEMP/changeset-status.json"
+      - name: Record the planned changeset files
+        id: blobs
+        env:
+          CHANGESETS: ${{ steps.plan.outputs.changesets }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          blobs='{}'
+          while read -r id; do
+            blob="$(git rev-parse "HEAD:.changeset/$id.md")"
+            blobs="$(jq -c --arg id "$id" --arg blob "$blob" '. + {($id): $blob}' <<< "$blobs")"
+          done < <(jq -r '.[]' <<< "$CHANGESETS")
+          echo "changeset_blobs=$blobs" >> "$GITHUB_OUTPUT"
 
   build-servers:
     name: Build ${{ matrix.server.name }}
@@ -107,6 +122,9 @@ jobs:
           context="$RUNNER_TEMP/context"
           mkdir -p "$context"
           cp "$DIR/Dockerfile" "$DIR/railway.json" "$context/"
+          # The runtime image must carry the FSL-1.1-ALv2 terms and notice
+          # (docs/repository-license-contract.md).
+          cp servers/LICENSE "$context/LICENSE"
           cp -R "$DIR/dist" "$context/dist"
           # A tar archive keeps the executable mode, which artifacts drop.
           tar -czf "$RUNNER_TEMP/$NAME.tar.gz" -C "$context" .
@@ -137,8 +155,9 @@ jobs:
           sparse-checkout-cone-mode: false
       - name: Check that the plan is still current
         env:
-          CHANGESETS: ${{ needs.plan.outputs.changesets }}
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
           REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/check-pending-changesets.sh
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -175,10 +194,21 @@ jobs:
           # code of `railway up` alone is not a verdict: the CLI exits 0 when
           # its status stream closes before the deployment finishes.
           wait_for_deployment() {
-            local service="$1" id="$2" status="" deadline=$((SECONDS + 1800))
+            local service="$1" id="$2" status="" errors=0 deadline=$((SECONDS + 1800))
             while (( SECONDS < deadline )); do
-              status="$(railway deployment list --service "$service" --limit 20 --json < /dev/null \
-                | jq -r --arg id "$id" '.[] | select(.id == $id) | .status')"
+              # Tolerate a few consecutive failed polls (network or API
+              # errors); the deployment itself may still succeed.
+              if ! status="$(railway deployment list --service "$service" --limit 20 --json < /dev/null \
+                | jq -r --arg id "$id" '.[] | select(.id == $id) | .status')"; then
+                if (( ++errors >= 5 )); then
+                  echo "::error::Could not read the status of deployment $id of $service 5 times in a row."
+                  return 1
+                fi
+                echo "::warning::Could not read the status of deployment $id of $service (failure $errors of 5)."
+                sleep 10
+                continue
+              fi
+              errors=0
               case "$status" in
                 SUCCESS) echo "Deployment $id of $service: $status"; return 0 ;;
                 FAILED | CRASHED | REMOVED | REMOVING | SKIPPED)
@@ -227,8 +257,9 @@ jobs:
           persist-credentials: false
       - name: Check that the plan is still current
         env:
-          CHANGESETS: ${{ needs.plan.outputs.changesets }}
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
           REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/check-pending-changesets.sh
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
@@ -258,12 +289,23 @@ jobs:
           # Wrangler exits 0 when it cannot determine the final status, so
           # its exit code alone is not a verdict.
           wait_for_deployment() {
-            local project="$1" id="$2" stage="" deadline=$((SECONDS + 600))
+            local project="$1" id="$2" stage="" errors=0 deadline=$((SECONDS + 600))
             while (( SECONDS < deadline )); do
-              stage="$(curl -fsS --retry 3 \
+              # Tolerate a few consecutive failed polls (network or API
+              # errors); the deployment itself may still succeed.
+              if ! stage="$(curl -fsS --retry 3 \
                 -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
                 "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$project/deployments/$id" \
-                | jq -r '.result.latest_stage | "\(.name) \(.status)"')"
+                | jq -r '.result.latest_stage | "\(.name) \(.status)"')"; then
+                if (( ++errors >= 5 )); then
+                  echo "::error::Could not read the status of deployment $id of $project 5 times in a row."
+                  return 1
+                fi
+                echo "::warning::Could not read the status of deployment $id of $project (failure $errors of 5)."
+                sleep 5
+                continue
+              fi
+              errors=0
               case "$stage" in
                 "deploy success") echo "Deployment $id of $project: $stage"; return 0 ;;
                 *" failure" | *" canceled")
@@ -312,8 +354,9 @@ jobs:
           fetch-depth: 0
       - name: Check that the plan is still current
         env:
-          CHANGESETS: ${{ needs.plan.outputs.changesets }}
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
           REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/check-pending-changesets.sh
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
@@ -326,74 +369,7 @@ jobs:
         env:
           RELEASES: ${{ needs.plan.outputs.releases }}
           SHA: ${{ needs.plan.outputs.sha }}
-        shell: bash
         run: |
-          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          mapfile -t tags < <(jq -r '.[] | "\(.name)@\(.version)"' <<< "$RELEASES")
-
-          # Consume exactly the changesets that this run deployed. A version
-          # bump can change a `workspace:<version>` range, so refresh the
-          # lockfile in the same commit to keep frozen installs working.
-          pnpm exec changeset version
-          pnpm install --lockfile-only --no-frozen-lockfile --ignore-scripts
-          git add -A
-          {
-            printf 'chore(release): version deployed packages\n\n'
-            printf 'Deployed revision: %s\n' "$SHA"
-            if (( ${#tags[@]} > 0 )); then
-              printf '\n'
-              printf -- '- %s\n' "${tags[@]}"
-            fi
-          } > "$RUNNER_TEMP/commit-message"
-          git commit --quiet --file="$RUNNER_TEMP/commit-message"
-
-          # Tag the version commit, whose parent is the deployed revision, so
-          # each tag holds exactly the deployed tree plus the version files.
-          # The tags stay on this commit even when `main` gets a cherry-picked
-          # copy of it below.
-          version_commit="$(git rev-parse HEAD)"
-          for tag in "${tags[@]}"; do
-            if git rev-parse --quiet --verify "refs/tags/$tag" > /dev/null; then
-              echo "::error::Tag $tag already exists. Check the version in the pending changesets."
-              exit 1
-            fi
-            git tag --annotate "$tag" --message "$tag deployed from $SHA" "$version_commit"
-          done
-          tag_refspecs=()
-          for tag in "${tags[@]}"; do tag_refspecs+=("refs/tags/$tag"); done
-
-          # Push `main` and every tag atomically, so a rejected push leaves
-          # neither on the remote. Only a moved `main` is retried: the version
-          # commit is cherry-picked onto the new `main` (changesets merged
-          # later stay pending). Any other rejection, such as a ruleset denial
-          # or an existing tag, fails at once.
-          max_attempts=3
-          for (( attempt = 1; ; attempt++ )); do
-            if git push --atomic origin HEAD:refs/heads/main "${tag_refspecs[@]}"; then
-              {
-                echo "## Release"
-                echo "Version commit on main: $(git rev-parse HEAD)"
-                echo "Tagged version commit: $version_commit"
-                if (( ${#tags[@]} > 0 )); then
-                  printf -- '- `%s`\n' "${tags[@]}"
-                else
-                  echo "No tags: every release kept its version."
-                fi
-              } >> "$GITHUB_STEP_SUMMARY"
-              exit 0
-            fi
-            git fetch --quiet origin main
-            if git merge-base --is-ancestor origin/main HEAD; then
-              echo "::error::The push was rejected although main did not move. Check the main ruleset and existing tags."
-              exit 1
-            fi
-            if (( attempt >= max_attempts )); then
-              echo "::error::main kept moving; the version commit and tags were not pushed after $max_attempts attempts."
-              exit 1
-            fi
-            echo "::warning::main moved during the deployment; replaying the version commit (attempt $attempt of $max_attempts)."
-            git reset --quiet --hard origin/main
-            git cherry-pick "$version_commit"
-          done
+          scripts/ci/deploy-release.sh
