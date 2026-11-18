@@ -73,12 +73,16 @@ for tag in "${tags[@]}"; do
 done
 
 # Push `main` and every tag atomically, so a rejected push leaves neither on
-# the remote. Only a moved `main` is retried: the version commit is
-# cherry-picked onto the new `main` (changesets merged later stay pending).
-# Any other rejection, such as a ruleset denial or an existing remote tag,
-# fails at once.
+# the remote. The lease pins the expected `main` tip, so a `main` that was
+# rewound or rewritten is never fast-forwarded back over the deployed
+# revision. Only a `main` that moved forward from the deployed revision is
+# retried: the version commit is cherry-picked onto the new `main`
+# (changesets merged later stay pending). Any other rejection, such as a
+# ruleset denial or an existing remote tag, fails at once.
+expected_tip="$SHA"
 for (( attempt = 1; ; attempt++ )); do
-  if git push --atomic origin HEAD:refs/heads/main "${tag_refspecs[@]}"; then
+  if git push --atomic --force-with-lease="refs/heads/main:$expected_tip" \
+    origin HEAD:refs/heads/main "${tag_refspecs[@]}"; then
     {
       echo "## Release"
       echo "Version commit on main: $(git rev-parse HEAD)"
@@ -92,8 +96,13 @@ for (( attempt = 1; ; attempt++ )); do
     exit 0
   fi
   git fetch --quiet origin main
-  if git merge-base --is-ancestor origin/main HEAD; then
+  tip="$(git rev-parse origin/main)"
+  if [[ "$tip" == "$expected_tip" ]]; then
     echo "::error::The push was rejected although main did not move. Check the main ruleset and existing tags."
+    exit 1
+  fi
+  if ! git merge-base --is-ancestor "$SHA" "$tip"; then
+    echo "::error::main no longer contains the deployed revision $SHA (it was rewound or rewritten); the version commit and tags were not pushed."
     exit 1
   fi
   if (( attempt >= max_attempts )); then
@@ -105,12 +114,21 @@ for (( attempt = 1; ; attempt++ )); do
   # fetched `main` first.
   while IFS=$'\t' read -r id blob; do
     [[ -n "$id" ]] || continue
-    if [[ "$(git rev-parse --quiet --verify "origin/main:.changeset/$id.md" || true)" != "$blob" ]]; then
+    if [[ "$(git rev-parse --quiet --verify "$tip:.changeset/$id.md" || true)" != "$blob" ]]; then
       echo "::error::.changeset/$id.md changed or was removed on main during the deployment; the version commit and tags were not pushed."
       exit 1
     fi
   done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$CHANGESET_BLOBS")
+  # `changeset version` saw only the manifests of the deployed revision. A
+  # manifest or lockfile change on `main` (for example a new exact workspace
+  # dependency on a released package) needs a fresh plan.
+  changed_manifests="$(git diff --name-only "$SHA" "$tip" -- package.json '*/package.json' pnpm-lock.yaml pnpm-workspace.yaml .changeset/config.json)"
+  if [[ -n "$changed_manifests" ]]; then
+    echo "::error::main changed package manifests during the deployment (${changed_manifests//$'\n'/, }); start a new deployment. The version commit and tags were not pushed."
+    exit 1
+  fi
   echo "::warning::main moved during the deployment; replaying the version commit (attempt $attempt of $max_attempts)."
-  git reset --quiet --hard origin/main
+  git reset --quiet --hard "$tip"
   git cherry-pick "$version_commit"
+  expected_tip="$tip"
 done
