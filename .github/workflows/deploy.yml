@@ -157,8 +157,11 @@ jobs:
 
   deploy-servers:
     name: Deploy servers
-    needs: [plan, build-servers]
-    if: needs.plan.outputs.has_servers == 'true'
+    # Every build, the static sites included, finishes before the first
+    # upload, so a broken site cannot leave new servers without a release.
+    # `!failure()` keeps the job when no site (or no server build) ran.
+    needs: [plan, build-servers, build-static-sites]
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_servers == 'true' }}
     runs-on: ubuntu-latest
     environment: servers
     env:
