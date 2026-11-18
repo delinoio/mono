@@ -26,7 +26,7 @@
 
 - Avoid undocumented cross-domain coupling.
 
-- When Go code in this domain changes, run `gofmt`, `go vet ./...` and `go test ./...` from the repository root before finishing.
+- When Go code in this domain changes, run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` from the repository root and confirm that it prints no path, then run `go vet ./...` and `go test ./...` from the repository root before finishing.
 
 ## Owning contracts
 
