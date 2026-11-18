@@ -293,12 +293,24 @@ jobs:
           name: static-sites
           path: ${{ runner.temp }}/static-sites
       - name: Unpack the build output
-        run: tar -xzf "$RUNNER_TEMP/static-sites/static-sites.tar.gz"
+        # Unpack outside the checkout, and only the planned output
+        # directories, so that the artifact of the build job cannot replace a
+        # script that the next step runs with the deploy secrets.
+        env:
+          SITES: ${{ needs.plan.outputs.static_sites }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t outputs < <(jq -r '.[].output' <<< "$SITES")
+          mkdir -p "$RUNNER_TEMP/site-output"
+          tar -xzf "$RUNNER_TEMP/static-sites/static-sites.tar.gz" \
+            -C "$RUNNER_TEMP/site-output" --no-same-owner --no-same-permissions -- "${outputs[@]}"
       - name: Deploy in dependency order
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           SITES: ${{ needs.plan.outputs.static_sites }}
+          SITES_ROOT: ${{ runner.temp }}/site-output
           SHA: ${{ needs.plan.outputs.sha }}
           # The stale-plan check runs again right before each upload.
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}

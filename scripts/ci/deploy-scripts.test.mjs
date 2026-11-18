@@ -1349,6 +1349,23 @@ test("targets check the plan before each site upload", { skip }, (t) => {
   ]);
 });
 
+test("targets deploy site outputs from SITES_ROOT", { skip }, (t) => {
+  const root = scratch(t);
+  for (const site of ["docs", "site"]) {
+    mkdirSync(join(root, "apps", site, "dist"), { recursive: true });
+  }
+  const result = runTargets(t, "static-sites", { env: { SITES_ROOT: root } });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const uploads = result.calls.filter((call) =>
+    call.startsWith("pnpm exec wrangler"),
+  );
+  assert.equal(uploads.length, 2);
+  assert.ok(
+    uploads[0].includes(`pages deploy ${root}/apps/docs/dist `),
+    uploads[0],
+  );
+});
+
 test("targets build sites without uploading them", { skip }, (t) => {
   const result = runTargets(t, "build-static-sites");
   assert.equal(result.status, 0, result.stdout + result.stderr);

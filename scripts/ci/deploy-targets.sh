@@ -19,6 +19,10 @@
 #   DEPLOY_GUARD         stale-plan check command
 #                        (default scripts/ci/check-pending-changesets.sh).
 #   DEPLOY_PROVIDER      provider helper (default scripts/ci/deploy-provider.sh).
+#   SITES_ROOT           directory that holds the site outputs for
+#                        `static-sites` (default: the working directory). The
+#                        workflow unpacks the build artifact outside the
+#                        checkout and points this at it.
 #   Plus the environment of the stale-plan check and the provider helper.
 set -euo pipefail
 
@@ -88,8 +92,10 @@ deploy_static_sites() {
   require_targets SITES "${SITES:-}" name version project output
   echo "## Static sites" >> "$summary"
   local name version project output result id
+  local sites_root="${SITES_ROOT:-.}"
   while IFS=$'\t' read -r -u 3 name version project output; do
     echo "::group::Deploy $name@$version to Cloudflare Pages project $project"
+    output="$sites_root/$output"
     if [[ ! -d "$output" ]]; then
       echo "::error::$output of $name was not built; run build-static-sites first."
       exit 1
