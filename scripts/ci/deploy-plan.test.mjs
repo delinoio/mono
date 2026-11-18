@@ -272,6 +272,25 @@ test("ties break alphabetically within a stage after an earlier stage", () => {
   );
 });
 
+test("workspace aliases order the aliased package first", () => {
+  const servers = [
+    pkg("servers/a", {
+      name: "a",
+      dependencies: { provider: "workspace:z@*" },
+      deploy: { target: DeployTarget.Railway, service: "a" },
+    }),
+    pkg("servers/z", {
+      name: "z",
+      deploy: { target: DeployTarget.Railway, service: "z" },
+    }),
+  ];
+  const result = plan(status(["a", "1.0.0"], ["z", "1.0.0"]), servers);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["z", "a"],
+  );
+});
+
 test("dependencies through unselected packages keep their order", () => {
   const sites = [
     pkg("apps/a", {

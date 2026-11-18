@@ -121,6 +121,17 @@ function deployable(pkg) {
   return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
 }
 
+// Returns the workspace package that a dependency entry links. A pnpm alias
+// such as `"provider": "workspace:z@*"` links package `z` under the key
+// `provider`, so the spec, not the key, names the package.
+function workspaceTarget(key, spec, packagesByName) {
+  if (typeof spec === "string" && spec.startsWith("workspace:")) {
+    const alias = /^(@?[^@]+)@/.exec(spec.slice("workspace:".length));
+    if (alias && packagesByName.has(alias[1])) return alias[1];
+  }
+  return key;
+}
+
 // Orders the selected names so that every workspace dependency, direct or
 // through unselected packages, comes before its dependents. Among the
 // packages whose dependencies are already ordered, the alphabetically first
@@ -139,7 +150,11 @@ function topologicalOrder(selected, packagesByName) {
     state.set(name, "visiting");
     const manifest = packagesByName.get(name).manifest;
     const deps = new Set(
-      dependencyFields.flatMap((field) => Object.keys(manifest[field] ?? {})),
+      dependencyFields.flatMap((field) =>
+        Object.entries(manifest[field] ?? {}).map(([key, spec]) =>
+          workspaceTarget(key, spec, packagesByName),
+        ),
+      ),
     );
     const reached = new Set();
     for (const dep of [...deps].sort()) {
