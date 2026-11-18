@@ -6,7 +6,7 @@ import {
   MeterTrack,
   MeterValue,
 } from "@ui-sdk/react/meter";
-import type * as React from "react";
+import * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 
 export type MeterProps = Omit<
@@ -28,12 +28,25 @@ export function Meter({
   label,
   showValue = false,
   className,
+  "aria-labelledby": ariaLabelledBy,
   ...props
 }: MeterProps) {
+  // Workaround: the UI SDK registers the gauge label only after mount, so
+  // static (server-rendered) markup has a label id that nothing references and
+  // the bar has no accessible name. This id gives the root a reference in the
+  // first render. Scope: `Meter` only. Remove it when the UI SDK registers the
+  // gauge label before it renders the root.
+  const labelId = React.useId();
   return (
-    <MeterRoot className={mergeClassName("dui-progress", className)} {...props}>
+    <MeterRoot
+      className={mergeClassName("dui-progress", className)}
+      aria-labelledby={ariaLabelledBy || labelId}
+      {...props}
+    >
       <div className="dui-progress-header">
-        <MeterLabel className="dui-progress-label">{label}</MeterLabel>
+        <MeterLabel id={labelId} className="dui-progress-label">
+          {label}
+        </MeterLabel>
         {showValue ? <MeterValue className="dui-progress-value" /> : null}
       </div>
       <MeterTrack className="dui-progress-track">

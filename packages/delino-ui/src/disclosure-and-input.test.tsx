@@ -924,6 +924,17 @@ describe("Meter", () => {
     expect(screen.getByText("40%")).toBeTruthy();
   });
 
+  test("references its label element for its name", () => {
+    const { container } = render(<Meter label="Storage used" value={40} />);
+
+    const meter = screen.getByRole("meter", { name: "Storage used" });
+    const labelId = meter.getAttribute("aria-labelledby");
+    expect(labelId).toBeTruthy();
+    expect(container.querySelector(`[id="${labelId}"]`)?.textContent).toBe(
+      "Storage used",
+    );
+  });
+
   test("shows no value by default", () => {
     render(<Meter label="Storage used" value={40} />);
 

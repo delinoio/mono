@@ -74,7 +74,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `Avatar`: a round picture. Props: `alt` (required), `fallback` (required, usually initials), `src`, `size` and the other UI SDK `Avatar` props. An empty or whitespace-only `src` counts as no URL: no image renders and the fallback shows, and so does an untyped `null` or other non-string `src`, without throwing. The fallback shows until the image loads and stays when it fails; it has role `img` and the `alt` text as its name.
   - `AvatarSize`: `Small` (`small`, 24px), `Medium` (`medium`, 40px), `Large` (`large`, 64px). The default is `Medium`.
 - `delino-ui/progress`
-  - `Progress`: a named progress bar. Props: `label` (required), `showValue` (shows the formatted value, such as `40%`), and all UI SDK `Progress` props such as `value`, `min`, `max` and `format`. A `null` value shows an indeterminate bar, and its sweep mirrors under right-to-left text.
+  - `Progress`: a named progress bar. Props: `label` (required), `showValue` (shows the formatted value, such as `40%`), and all UI SDK `Progress` props such as `value`, `min`, `max` and `format`. The bar is named in statically rendered markup, before any client code runs: the root references the label through a stable label id, and a caller `aria-labelledby` replaces that reference. A `null` value shows an indeterminate bar, and its sweep mirrors under right-to-left text.
 - `delino-ui/separator`
   - `Separator`: a styled UI SDK `Separator` with all its props, such as `orientation`.
 - `delino-ui/password-input`
@@ -115,7 +115,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `Pagination`: a navigation landmark with previous and next steps, page links and ellipses for long ranges. Props: `aria-label` (required), `previousLabel` and `nextLabel` (step names, default `Previous page` and `Next page`), and all UI SDK `Pagination` props such as `page`, `defaultPage`, `onPageChange`, `pageCount`, `total`, `pageSize`, `siblings`, `boundaries` and `getHref`. With `getHref` the parts are links; without it they are buttons. The current page has `aria-current="page"`. The previous and next icons mirror under `dir="rtl"`.
   - `createPaginationController` and the `PaginationController` type are re-exported from UI SDK.
 - `delino-ui/meter`
-  - `Meter`: a named measurement bar within a known range, such as storage used. Props: `label` (required), `showValue`, and all UI SDK `Meter` props such as `value`, `min`, `max` and `format`. It shares the `Progress` styles. Use `Progress` for the progress of a task.
+  - `Meter`: a named measurement bar within a known range, such as storage used. Props: `label` (required), `showValue`, and all UI SDK `Meter` props such as `value`, `min`, `max` and `format`. The bar is named in statically rendered markup, before any client code runs: the root references the label through a stable label id, and a caller `aria-labelledby` replaces that reference. It shares the `Progress` styles. Use `Progress` for the progress of a task.
 - `delino-ui/badge`
   - `Badge`: a short status or count label in a `span`, with all `span` props. It has no UI SDK part because it has no behavior. Its text must carry the meaning; color alone must not.
   - `BadgeVariant`: `Neutral` (`neutral`), `Accent` (`accent`), `Danger` (`danger`). The default is `Neutral`.
@@ -148,7 +148,7 @@ Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
 - `pnpm exec turbo run typecheck --filter=delino-ui`: TypeScript type check.
-- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior, and for static (server-rendered) markup: description and error id references, empty descriptions, disabled-field errors and caller ARIA routing. `src/components.test.tsx`, `src/disclosure-and-input.test.tsx` and `src/ssr-field-error.test.tsx` hold them.
+- `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior, and for static (server-rendered) markup: description and error id references, empty descriptions, disabled-field errors, caller ARIA routing and gauge names. `src/components.test.tsx`, `src/disclosure-and-input.test.tsx`, `src/ssr-field-error.test.tsx` and `src/ssr-gauge-name.test.tsx` hold them.
 
 Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI runs its unit tests through root `pnpm test` in the `quality` job when the planner selects fixtures, as the [workflow contract](repository-workflow-contract.md) describes. The planner always selects fixtures for a push to `main`, but not for a pull request that changes only package source, so run `pnpm test` locally for such a change.
 

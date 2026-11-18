@@ -1536,6 +1536,17 @@ describe("Progress", () => {
     expect(screen.getByText("40%")).toBeTruthy();
   });
 
+  test("references its label element for its name", () => {
+    const { container } = render(<Progress label="Uploading" value={40} />);
+
+    const bar = screen.getByRole("progressbar", { name: "Uploading" });
+    const labelId = bar.getAttribute("aria-labelledby");
+    expect(labelId).toBeTruthy();
+    expect(container.querySelector(`[id="${labelId}"]`)?.textContent).toBe(
+      "Uploading",
+    );
+  });
+
   test("is indeterminate without a value", () => {
     render(<Progress label="Loading" value={null} />);
 
