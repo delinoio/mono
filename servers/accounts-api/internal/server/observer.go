@@ -79,7 +79,11 @@ const (
 //     state that ConnContext stores in the request context. A handler call
 //     dequeues the oldest pending request. Every request that net/http does not
 //     answer itself reaches the handler, and a rejection closes the connection,
-//     so the oldest pending request is the one net/http handles next.
+//     so the oldest pending request is the one net/http handles next. This
+//     holds only when http.Server.DisableGeneralOptionsHandler is true:
+//     otherwise net/http answers a server-wide "OPTIONS *" request with its
+//     built-in handler, the entry of that request stays queued at the front
+//     and the pairing is offset for the rest of the connection.
 //   - When net/http writes the 417 response while no handler call or response
 //     of a handler is in progress and the oldest pending request has an
 //     unsupported Expect header, that request is the rejected one and the
@@ -928,8 +932,12 @@ type observedListener struct {
 // an unsupported Transfer-Encoding (501) or protocol version (505) and a
 // header read timeout as http_request_rejected records. The server that serves
 // the listener must set ConnContext to this package's ConnContext, ConnState to
-// this package's ConnState and MaxHeaderBytes to MaxHeaderBytes. It does not
-// change any response.
+// this package's ConnState, MaxHeaderBytes to MaxHeaderBytes and
+// DisableGeneralOptionsHandler to true, and must serve NewHandler so that
+// net/http does not answer a server-wide "OPTIONS *" request itself. Otherwise
+// that request is not logged, a later 417 on the same connection is not logged,
+// and the duration_ms of later http_request_rejected records on that connection
+// is measured from the "OPTIONS *" request. It does not change any response.
 func ObserveListener(listener net.Listener, logger *slog.Logger) net.Listener {
 	return observedListener{Listener: listener, logger: logger}
 }
