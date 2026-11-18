@@ -1243,7 +1243,11 @@ test("every selector skips an index-recorded symlink checked out as a regular fi
   f.write("regular.ts", "const regular = 1;\n");
   recordSymlink(f, "linked.ts");
   recordSymlink(f, "dir/linked.md", "../README.md");
-  recordSymlink(f, "tab\tname.json", "../x.json");
+  // Windows rejects control characters such as a tab in file names, so the
+  // tab-named placeholder cannot be written there; other platforms keep it.
+  if (process.platform !== "win32") {
+    recordSymlink(f, "tab\tname.json", "../x.json");
+  }
   const head = f.commit();
   assert.equal(indexMode(f, "linked.ts"), "120000");
   assert.equal(indexMode(f, "regular.ts"), "100644");
