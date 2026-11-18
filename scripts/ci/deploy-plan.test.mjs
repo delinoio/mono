@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -10,6 +16,7 @@ import {
   DeployPlanError,
   DeployTarget,
   ReleaseType,
+  check,
   main,
   plan,
   readWorkspacePackages,
@@ -489,6 +496,21 @@ test("main writes GitHub outputs and a summary", () => {
     ]);
     assert.equal(JSON.parse(outputs.servers)[0].service, "accounts-api");
     assert.match(readFileSync(summaryPath, "utf8"), /accounts-api@0\.1\.0/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("check accepts the repository and rejects bad changeset file names", () => {
+  assert.doesNotThrow(() => check(root));
+  const dir = mkdtempSync(join(tmpdir(), "deploy-plan-check-"));
+  try {
+    mkdirSync(join(dir, ".changeset"));
+    writeFileSync(join(dir, ".changeset", "README.md"), "# x\n");
+    writeFileSync(join(dir, ".changeset", "brave-cats.md"), "---\n---\n");
+    assert.deepEqual(check(dir), ["brave-cats"]);
+    writeFileSync(join(dir, ".changeset", "release notes.md"), "---\n---\n");
+    assert.throws(() => check(dir), /"release notes" is not a plain file name/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

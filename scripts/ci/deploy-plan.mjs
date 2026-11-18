@@ -207,6 +207,32 @@ function topologicalOrder(selected, packagesByName) {
   return ordered;
 }
 
+// The deploy jobs use changeset ids in API paths and output maps.
+function checkChangesetId(id) {
+  if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+    throw new DeployPlanError(
+      `changeset id ${JSON.stringify(id)} is not a plain file name`,
+    );
+  }
+  return id;
+}
+
+// Applies the plan rules that do not depend on a release to the repository:
+// every pending changeset file name and every deployable manifest. CI runs
+// this, so a change that would stop every deployment fails in its own pull
+// request.
+export function check(repoRoot) {
+  const changesetDir = join(repoRoot, ".changeset");
+  const ids = existsSync(changesetDir)
+    ? readdirSync(changesetDir)
+        .filter((file) => file.endsWith(".md") && file !== "README.md")
+        .map((file) => file.slice(0, -".md".length))
+    : [];
+  for (const id of ids) checkChangesetId(id);
+  plan({ changesets: [], releases: [] }, readWorkspacePackages(repoRoot));
+  return ids;
+}
+
 // Two deployables that name the same Railway service or Pages project would
 // overwrite each other, while both get a release tag. Checks every
 // deployable of the workspace, selected or not.
@@ -265,14 +291,7 @@ export function plan(status, packages) {
     // The deploy jobs check that these changeset files are still pending on
     // `main` before they upload, so a rerun of an old run cannot deploy a
     // superseded revision.
-    changesets: (status.changesets ?? []).map(({ id }) => {
-      if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
-        throw new DeployPlanError(
-          `changeset id ${JSON.stringify(id)} is not a plain file name`,
-        );
-      }
-      return id;
-    }),
+    changesets: (status.changesets ?? []).map(({ id }) => checkChangesetId(id)),
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
     servers: deployables.filter((d) => d.kind === DeployKind.Server),
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
@@ -285,8 +304,17 @@ export function main({
   repoRoot = fileURLToPath(new URL("../..", import.meta.url)),
 } = {}) {
   const [statusPath] = argv;
+  if (statusPath === "--check") {
+    const ids = check(argv[1] ?? repoRoot);
+    console.log(
+      JSON.stringify({ event: "deploy_plan_check", changesets: ids }),
+    );
+    return undefined;
+  }
   if (!statusPath) {
-    throw new DeployPlanError("usage: deploy-plan.mjs <changeset-status.json>");
+    throw new DeployPlanError(
+      "usage: deploy-plan.mjs <changeset-status.json> | --check [repo-root]",
+    );
   }
   const status = JSON.parse(readFileSync(statusPath, "utf8"));
   const result = plan(status, readWorkspacePackages(repoRoot));

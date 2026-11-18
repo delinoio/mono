@@ -56,6 +56,20 @@ test("passes without running changeset when none is pending", { skip }, (t) => {
   assert.equal(result.calls, "");
 });
 
+test(
+  "rejects a changeset file name that the deploy planner rejects",
+  { skip },
+  (t) => {
+    const result = run(t, {
+      ...base,
+      "release notes.md": '---\n"a": patch\n---\n\nx\n',
+    });
+    assert.equal(result.status, 2, result.stdout + result.stderr);
+    assert.match(result.stderr, /release notes\\?" is not a plain file name/);
+    assert.equal(result.calls, "");
+  },
+);
+
 test("runs changeset version for a pending changeset", { skip }, (t) => {
   const ok = run(t, { ...base, "brave.md": '---\n"a": patch\n---\n\nx\n' });
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
