@@ -123,10 +123,14 @@ function deployable(pkg) {
   return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
 }
 
-// Returns the workspace package that a dependency entry links. A pnpm alias
-// links another package under the key: `"provider": "workspace:z@*"` names
-// package `z`, and `"client": "workspace:../z"` names the package in that
-// directory, relative to the declaring package.
+// Returns the workspace package that a dependency entry links, or undefined
+// when it links none. pnpm links a workspace package only through the
+// `workspace:` protocol (`linkWorkspacePackages` is off), so a plain range or
+// a registry alias such as `npm:lodash@4` never links one, even when its key
+// names a workspace package. A pnpm alias links another package under the
+// key: `"provider": "workspace:z@*"` names package `z`, and
+// `"client": "workspace:../z"` names the package in that directory, relative
+// to the declaring package.
 function workspaceTarget(
   key,
   spec,
@@ -134,17 +138,17 @@ function workspaceTarget(
   packagesByName,
   packagesByDir,
 ) {
-  if (typeof spec === "string" && spec.startsWith("workspace:")) {
-    const target = spec.slice("workspace:".length);
-    if (target.startsWith("./") || target.startsWith("../")) {
-      const pkg = packagesByDir.get(
-        posix.normalize(posix.join(declaringDir, target)).replace(/\/+$/, ""),
-      );
-      if (pkg) return pkg.manifest.name;
-    }
-    const alias = /^(@?[^@]+)@/.exec(target);
-    if (alias && packagesByName.has(alias[1])) return alias[1];
+  if (typeof spec !== "string" || !spec.startsWith("workspace:"))
+    return undefined;
+  const target = spec.slice("workspace:".length);
+  if (target.startsWith("./") || target.startsWith("../")) {
+    const pkg = packagesByDir.get(
+      posix.normalize(posix.join(declaringDir, target)).replace(/\/+$/, ""),
+    );
+    return pkg?.manifest.name;
   }
+  const alias = /^(@?[^@]+)@/.exec(target);
+  if (alias && packagesByName.has(alias[1])) return alias[1];
   return key;
 }
 

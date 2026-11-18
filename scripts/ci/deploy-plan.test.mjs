@@ -310,6 +310,36 @@ test("relative workspace aliases order the linked package first", () => {
   );
 });
 
+test("only workspace: specs link workspace packages", () => {
+  const servers = [
+    pkg("servers/a", {
+      name: "a",
+      // A registry alias and a plain range under a workspace package name do
+      // not link the workspace package (linkWorkspacePackages is off).
+      dependencies: { b: "npm:lodash@4.17.21", c: "^1.0.0" },
+      deploy: { target: DeployTarget.Railway, service: "a" },
+    }),
+    pkg("servers/b", {
+      name: "b",
+      dependencies: { a: "workspace:*" },
+      deploy: { target: DeployTarget.Railway, service: "b" },
+    }),
+    pkg("servers/c", {
+      name: "c",
+      dependencies: { a: "workspace:^" },
+      deploy: { target: DeployTarget.Railway, service: "c" },
+    }),
+  ];
+  const result = plan(
+    status(["a", "1.0.0"], ["b", "1.0.0"], ["c", "1.0.0"]),
+    servers,
+  );
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["a", "b", "c"],
+  );
+});
+
 test("dependencies through unselected packages keep their order", () => {
   const sites = [
     pkg("apps/a", {
