@@ -188,14 +188,23 @@ export function plan(status, packages) {
     .filter((r) => r.type !== ReleaseType.None)
     .map(({ name, version }) => ({ name, version }));
   const versions = new Map(allReleases.map((r) => [r.name, r.version]));
-  const ordered = topologicalOrder(new Set(versions.keys()), packagesByName);
-  const deployables = ordered
-    .map((name) => deployable(packagesByName.get(name)))
-    .filter(Boolean)
-    .map((d) => ({ ...d, version: versions.get(d.name) }));
-  deployables.sort(
-    (a, b) => kindOrder.indexOf(a.kind) - kindOrder.indexOf(b.kind),
+  const byName = new Map(
+    [...versions.keys()]
+      .map((name) => deployable(packagesByName.get(name)))
+      .filter(Boolean)
+      .map((d) => [d.name, { ...d, version: versions.get(d.name) }]),
   );
+  // Order each deployment stage on its own: dependencies in an earlier stage
+  // are already deployed, so the alphabetical tie-break applies within the
+  // stage.
+  const deployables = kindOrder.flatMap((kind) => {
+    const names = [...byName.values()]
+      .filter((d) => d.kind === kind)
+      .map((d) => d.name);
+    return topologicalOrder(new Set(names), packagesByName).map((name) =>
+      byName.get(name),
+    );
+  });
   return {
     // The deploy jobs check that these changeset files are still pending on
     // `main` before they upload, so a rerun of an old run cannot deploy a

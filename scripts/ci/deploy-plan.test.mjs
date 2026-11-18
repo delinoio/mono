@@ -242,6 +242,36 @@ test("ties break alphabetically among packages that are ready", () => {
   );
 });
 
+test("ties break alphabetically within a stage after an earlier stage", () => {
+  const mixed = [
+    pkg("servers/z-api", {
+      name: "z-api",
+      deploy: { target: DeployTarget.Railway, service: "z-api" },
+    }),
+    pkg("apps/a-site", {
+      name: "a-site",
+      dependencies: { "z-api": "workspace:*" },
+      deploy: { target: DeployTarget.CloudflarePages, project: "a-site" },
+    }),
+    pkg("apps/b-site", {
+      name: "b-site",
+      deploy: { target: DeployTarget.CloudflarePages, project: "b-site" },
+    }),
+  ];
+  const result = plan(
+    status(["a-site", "1.0.0"], ["b-site", "1.0.0"], ["z-api", "1.0.0"]),
+    mixed,
+  );
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["z-api"],
+  );
+  assert.deepEqual(
+    result.staticSites.map((d) => d.name),
+    ["a-site", "b-site"],
+  );
+});
+
 test("dependencies through unselected packages keep their order", () => {
   const sites = [
     pkg("apps/a", {
