@@ -35,6 +35,14 @@ Backend services must validate every Logto access token before they trust it. Fo
 - For organization-level API resources, check that the `organization_id` claim matches the organization in the request.
 - Do not accept ID tokens as API credentials.
 
+## Documented exceptions
+
+A project may accept a credential other than a Logto access token only when its project index records the exception, its scope and its controls, and this section lists it. An exception never adds an identity provider, a password store or a sign-in flow for people.
+
+| Project                         | Credential                                                                 | Scope                                                                                                                                                                  | Owning contract                                               |
+| ------------------------------- | -------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------- |
+| [`ownsand`](project-ownsand.md) | Organization API keys for programs, and device key pairs for device agents | API keys have the `member` permissions of one organization; device credentials reach only their own device's agent channel. The server stores only hashes of API keys. | [Identity and access](project-ownsand.md#identity-and-access) |
+
 ## Configuration and secrets
 
 - The Logto tenant endpoint, application IDs and API resource indicators are configuration. Application secrets and Management API credentials are secrets and follow the [environment contract](repository-environment-contract.md).

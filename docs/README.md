@@ -47,6 +47,16 @@
 - [Project index](project-delidev.md)
 - [Desktop and mobile app foundation](apps-delidev-foundation.md)
 
+### ownsand
+
+- [Project index](project-ownsand.md)
+- [Control plane foundation](servers-ownsand-api-foundation.md)
+- [Device agent and guest helper foundation](cmds-ownsand-agent-foundation.md)
+- [Command-line interface foundation](cmds-ownsand-cli-foundation.md)
+- [Web console foundation](apps-ownsand-console-foundation.md)
+- [Connect RPC API contract](protos-ownsand-api-contract.md)
+- [TypeScript and Go SDK foundation](packages-ownsand-sdk-foundation.md)
+
 Before implementing a new project, add `project-<id>.md`, at least one `<domain>-<project-or-component>-<contract>.md`, and their links here. Use lowercase kebab-case IDs and domain prefixes `apps`, `cmds`, `servers`, `crates`, `protos`, or `packages`.
 
 ## Instruction update policy
