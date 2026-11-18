@@ -207,6 +207,23 @@ function topologicalOrder(selected, packagesByName) {
   return ordered;
 }
 
+// Two deployables that name the same Railway service or Pages project would
+// overwrite each other, while both get a release tag. Checks every
+// deployable of the workspace, selected or not.
+function rejectSharedDestinations(packages) {
+  const owners = new Map();
+  for (const pkg of packages) {
+    const d = deployable(pkg);
+    if (!d) continue;
+    const key = `${d.target}:${d.service ?? d.project}`;
+    const owner = owners.get(key);
+    if (owner) {
+      throw new DeployPlanError(`${owner} and ${d.name} both deploy to ${key}`);
+    }
+    owners.set(key, d.name);
+  }
+}
+
 // Builds the deployment plan from the `changeset status` JSON and the
 // workspace packages.
 export function plan(status, packages) {
@@ -226,6 +243,7 @@ export function plan(status, packages) {
     .filter((r) => r.type !== ReleaseType.None)
     .map(({ name, version }) => ({ name, version }));
   const versions = new Map(allReleases.map((r) => [r.name, r.version]));
+  rejectSharedDestinations(packages);
   const byName = new Map(
     [...versions.keys()]
       .map((name) => deployable(packagesByName.get(name)))

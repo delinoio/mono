@@ -161,6 +161,29 @@ test("a changeset id that is not a plain file name fails", () => {
   }
 });
 
+test("two deployables with the same destination fail", () => {
+  for (const [target, field] of [
+    [DeployTarget.CloudflarePages, "project"],
+    [DeployTarget.Railway, "service"],
+  ]) {
+    const root = target === DeployTarget.Railway ? "servers" : "apps";
+    const shared = [
+      pkg(`${root}/one`, {
+        name: "one",
+        deploy: { target, [field]: "shared" },
+      }),
+      pkg(`${root}/two`, {
+        name: "two",
+        deploy: { target, [field]: "shared" },
+      }),
+    ];
+    assert.throws(
+      () => plan(status(["one", "1.0.0"]), shared),
+      /one and two both deploy to .*:shared/,
+    );
+  }
+});
+
 test("an unknown release fails", () => {
   assert.throws(
     () => plan(status(["missing", "1.0.0"]), workspace),
