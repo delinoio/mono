@@ -19,7 +19,7 @@ jobs:
       releases: ${{ steps.plan.outputs.releases }}
       servers: ${{ steps.plan.outputs.servers }}
       static_sites: ${{ steps.plan.outputs.static_sites }}
-      has_releases: ${{ steps.plan.outputs.has_releases }}
+      has_changesets: ${{ steps.plan.outputs.has_changesets }}
       has_servers: ${{ steps.plan.outputs.has_servers }}
       has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
     steps:
@@ -32,6 +32,10 @@ jobs:
           exit 1
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          # Read the current `main`, not the dispatch SHA. A run that waited in
+          # the `deploy` concurrency queue must not see changesets that the
+          # previous run already consumed. Later jobs use the recorded SHA.
+          ref: main
           fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
@@ -213,7 +217,7 @@ jobs:
     needs: [plan, build-servers, deploy-servers, deploy-static-sites]
     # Run only after every selected deployment succeeded. Skipped deployments
     # (no server or no static site selected) do not block the release.
-    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_releases == 'true' }}
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_changesets == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -239,44 +243,63 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           mapfile -t tags < <(jq -r '.[] | "\(.name)@\(.version)"' <<< "$RELEASES")
 
-          # Consume exactly the changesets that this run deployed.
+          # Consume exactly the changesets that this run deployed. A version
+          # bump can change a `workspace:<version>` range, so refresh the
+          # lockfile in the same commit to keep frozen installs working.
           pnpm exec changeset version
+          pnpm install --lockfile-only --no-frozen-lockfile --ignore-scripts
           git add -A
           {
             printf 'chore(release): version deployed packages\n\n'
-            printf 'Deployed revision: %s\n\n' "$SHA"
-            printf -- '- %s\n' "${tags[@]}"
+            printf 'Deployed revision: %s\n' "$SHA"
+            if (( ${#tags[@]} > 0 )); then
+              printf '\n'
+              printf -- '- %s\n' "${tags[@]}"
+            fi
           } > "$RUNNER_TEMP/commit-message"
           git commit --quiet --file="$RUNNER_TEMP/commit-message"
 
           tag_head() {
+            local tag
             for tag in "${tags[@]}"; do
               git tag --force --annotate "$tag" --message "$tag deployed from $SHA"
             done
           }
 
           # Push the version commit and every tag atomically, so a rejected
-          # push leaves neither on the remote. When `main` moved during the
-          # deployment, cherry-pick the same version commit onto the new
-          # `main` (changesets merged later stay pending) and retry.
+          # push leaves neither on the remote. Only a moved `main` is retried:
+          # the same version commit is cherry-picked onto the new `main`
+          # (changesets merged later stay pending). Any other rejection, such
+          # as a ruleset denial or an existing tag, fails at once.
           tag_head
-          for attempt in 1 2 3; do
+          max_attempts=3
+          for (( attempt = 1; ; attempt++ )); do
             refspecs=(HEAD:refs/heads/main)
             for tag in "${tags[@]}"; do refspecs+=("refs/tags/$tag"); done
             if git push --atomic origin "${refspecs[@]}"; then
               {
                 echo "## Release"
                 echo "Version commit: $(git rev-parse HEAD)"
-                printf -- '- `%s`\n' "${tags[@]}"
+                if (( ${#tags[@]} > 0 )); then
+                  printf -- '- `%s`\n' "${tags[@]}"
+                else
+                  echo "No tags: every release kept its version."
+                fi
               } >> "$GITHUB_STEP_SUMMARY"
               exit 0
             fi
-            echo "::warning::Push attempt $attempt was rejected; replaying the version commit on the current main."
-            version_commit="$(git rev-parse HEAD)"
             git fetch --quiet origin main
+            if git merge-base --is-ancestor origin/main HEAD; then
+              echo "::error::The push was rejected although main did not move. Check the main ruleset and existing tags."
+              exit 1
+            fi
+            if (( attempt >= max_attempts )); then
+              echo "::error::main kept moving; the version commit and tags were not pushed after $max_attempts attempts."
+              exit 1
+            fi
+            echo "::warning::main moved during the deployment; replaying the version commit (attempt $attempt of $max_attempts)."
+            version_commit="$(git rev-parse HEAD)"
             git reset --quiet --hard origin/main
             git cherry-pick "$version_commit"
             tag_head
           done
-          echo "::error::Could not push the version commit and tags."
-          exit 1
