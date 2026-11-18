@@ -1534,6 +1534,23 @@ describe("Progress", () => {
     expect(bar.hasAttribute("data-indeterminate")).toBe(true);
   });
 
+  // happy-dom computes no animation, so this checks the stylesheet source. It
+  // does not prove the rendered sweep; that needs a real-browser check.
+  test("mirrors the indeterminate sweep in right-to-left text", () => {
+    expect(block(".dui-progress-indicator[data-indeterminate]")).toContain(
+      "animation: dui-progress-indeterminate 1.2s",
+    );
+    expect(
+      block(".dui-progress-indicator[data-indeterminate]:dir(rtl)"),
+    ).toContain("animation-name: dui-progress-indeterminate-rtl");
+    // block() matches only plain rules, so read the keyframes from the
+    // whitespace-collapsed stylesheet.
+    const compact = css.replace(/\s+/g, " ");
+    expect(compact).toMatch(
+      /@keyframes dui-progress-indeterminate-rtl \{ from \{ translate: 100% 0; \} to \{ translate: -250% 0; \} \}/,
+    );
+  });
+
   test("draws state indicators with the accent graphic token", () => {
     // Progress and Meter share the Progress classes. The dark value keeps the
     // fill and the Select check at least 3:1 against their neutral surfaces,
