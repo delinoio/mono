@@ -305,6 +305,13 @@ jobs:
           mkdir -p "$RUNNER_TEMP/site-output"
           tar -xzf "$RUNNER_TEMP/static-sites/static-sites.tar.gz" \
             -C "$RUNNER_TEMP/site-output" --no-same-owner --no-same-permissions -- "${outputs[@]}"
+          # Wrangler follows symlinks, so a link could publish files from
+          # outside the build output.
+          links="$(find "$RUNNER_TEMP/site-output" -type l -print)"
+          if [[ -n "$links" ]]; then
+            echo "::error::The build output contains symlinks: ${links//$'\n'/, }"
+            exit 1
+          fi
       - name: Deploy in dependency order
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
