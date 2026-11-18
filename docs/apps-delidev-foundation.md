@@ -63,7 +63,7 @@ The scaffold stores no app data. CEF keeps its Chromium profile (cookies, cache 
 ## Logging
 
 - `src/logging.rs` installs a `tracing` subscriber that writes structured events to stderr.
-- `DELIDEV_LOG` holds `tracing` filter directives. The default is `info`, which is also used when the value is not valid.
+- `DELIDEV_LOG` holds `tracing` filter directives. The default is `info`, which is also used when the value is empty or not valid.
 - ANSI color is on by default. A non-empty `NO_COLOR` turns it off.
 - `run()` logs one `starting delidev` event with the version, runtime, platform and operating system.
 - Android and iOS do not show the process stderr. A platform log sink for mobile is not part of the scaffold.
