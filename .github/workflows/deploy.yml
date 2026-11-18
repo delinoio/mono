@@ -345,8 +345,11 @@ jobs:
     # (no server or no static site selected) do not block the release.
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_changesets == 'true' }}
     runs-on: ubuntu-latest
+    # Job permissions replace the workflow permissions, so repeat
+    # `actions: read` for the stale-plan check.
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:

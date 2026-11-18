@@ -38,6 +38,9 @@ function scratch(t) {
 function stubGh(dir, responses) {
   const bin = join(dir, "bin");
   mkdirSync(bin);
+  // The stub uses require(); keep it CommonJS even when the scratch directory
+  // sits inside a package with "type": "module".
+  writeFileSync(join(bin, "package.json"), '{"type":"commonjs"}\n');
   writeFileSync(join(dir, "responses.json"), JSON.stringify(responses));
   writeFileSync(join(dir, "calls.json"), "{}");
   const stub = join(bin, "gh");
@@ -91,12 +94,21 @@ const runs = (...entries) => ({
   "repos/owner/repo/actions/workflows/deploy.yml/runs": [
     {
       body: {
-        workflow_runs: entries.map(([run_number, status]) => ({
-          run_number,
-          status,
-        })),
+        workflow_runs: entries.map(
+          ([run_number, status, conclusion = null]) => ({
+            id: 1000 + run_number,
+            run_number,
+            status,
+            conclusion,
+          }),
+        ),
       },
     },
+  ],
+});
+const jobs = (runNumber, ...startedAt) => ({
+  [`repos/owner/repo/actions/runs/${1000 + runNumber}/jobs`]: [
+    { body: { jobs: startedAt.map((started_at) => ({ started_at })) } },
   ],
 });
 const changeset = (id, ...list) => ({
@@ -143,6 +155,45 @@ test("guard stops a rerun after a newer run started", { skip }, (t) => {
     /plan is stale: run #9 .* started after this run #7/,
   );
 });
+
+test("guard ignores a newer run cancelled in the queue", { skip }, (t) => {
+  const result = runGuard(
+    t,
+    {
+      ...runs(
+        [9, "pending"],
+        [8, "completed", "cancelled"],
+        [7, "in_progress"],
+      ),
+      ...jobs(8),
+      ...changeset("a", { body: { sha: "blob-a" } }),
+    },
+    { a: "blob-a" },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /Ignoring run #8/);
+});
+
+test(
+  "guard stops a rerun after a newer run was cancelled mid-deploy",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runs([8, "completed", "cancelled"], [7, "completed", "failure"]),
+        ...jobs(8, "2026-11-18T00:00:00Z", null),
+        ...changeset("a", { body: { sha: "blob-a" } }),
+      },
+      { a: "blob-a" },
+    );
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stdout,
+      /plan is stale: run #8 .* started after this run #7/,
+    );
+  },
+);
 
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(

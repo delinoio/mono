@@ -7,8 +7,10 @@
 # changesets that changed after planning. The plan is stale when:
 #
 # - a newer run of the deploy workflow started, even one that failed or was
-#   cancelled, because it may already have deployed a newer revision (a newer
-#   run that still waits in the concurrency queue does not count);
+#   cancelled, because it may already have deployed a newer revision. A newer
+#   run that still waits in the concurrency queue does not count, and neither
+#   does one that GitHub cancelled in the queue (a later dispatch replaces the
+#   pending run of the group) before any of its jobs started;
 # - a planned changeset is no longer on `main` (another run released it); or
 # - a planned changeset changed on `main` after planning (different blob).
 #
@@ -59,15 +61,30 @@ if [[ ! "$GITHUB_RUN_NUMBER" =~ ^[0-9]+$ ]]; then
 fi
 status=0
 api "repos/$REPOSITORY/actions/workflows/$WORKFLOW/runs?per_page=50" \
-  --jq "[.workflow_runs[] | select(.run_number > $GITHUB_RUN_NUMBER and (.status == \"in_progress\" or .status == \"completed\")) | .run_number] | max // 0" \
+  --jq ".workflow_runs[] | select(.run_number > $GITHUB_RUN_NUMBER and (.status == \"in_progress\" or .status == \"completed\")) | [.id, .run_number, .conclusion // \"\"] | @tsv" \
   || status=$?
 if (( status != 0 )); then
   echo "::error::Could not list the runs of $WORKFLOW: $api_output"
   exit 1
 fi
-if (( api_output > 0 )); then
-  stale "run #$api_output of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."
-fi
+newer_runs="$api_output"
+while IFS=$'\t' read -r run_id run_number conclusion; do
+  [[ -n "$run_id" ]] || continue
+  if [[ "$conclusion" == "cancelled" ]]; then
+    status=0
+    api "repos/$REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+      --jq '[.jobs[] | select(.started_at != null)] | length' || status=$?
+    if (( status != 0 )); then
+      echo "::error::Could not list the jobs of run #$run_number: $api_output"
+      exit 1
+    fi
+    if (( api_output == 0 )); then
+      echo "Ignoring run #$run_number: it was cancelled before any job started."
+      continue
+    fi
+  fi
+  stale "run #$run_number of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."
+done <<< "$newer_runs"
 
 mapfile -t ids < <(jq -r 'keys[]' <<< "$CHANGESET_BLOBS")
 for id in "${ids[@]}"; do
