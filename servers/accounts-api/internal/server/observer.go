@@ -16,9 +16,11 @@ import (
 )
 
 // MaxHeaderBytes is the request header limit of the production http.Server.
-// The request head observer derives its own limit from it, so the observer
-// never accepts a head that net/http would reject and never gives up on a head
-// that net/http accepts.
+// The request head observer derives its own limit from it. For the first head
+// of a connection the observer never accepts a head that net/http would
+// reject. For a later head it may accept up to 4096 bytes that net/http
+// rejects (see maxObservedFollowUpHeadBytes). In both cases it never gives up
+// on a head that net/http accepts.
 const MaxHeaderBytes = http.DefaultMaxHeaderBytes
 
 const (
