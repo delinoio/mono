@@ -37,7 +37,14 @@ export function readAccountsApiOrigin(env: AccountsBuildEnv): string {
  * credential, including inside an otherwise malformed value.
  */
 export function resolveAccountsApiOrigin(value: string | undefined): string {
-  const raw = value?.trim() || DEFAULT_ACCOUNTS_API_ORIGIN;
+  // Do not use trim(): it also removes Unicode spaces (for example U+00A0,
+  // U+FEFF and U+3000) that the URL parser keeps and rejects. Only a value
+  // made of tab, line feed, vertical tab, form feed, carriage return and space
+  // counts as empty. The original value goes to the parser unchanged.
+  const raw =
+    value === undefined || /^[\t-\r ]*$/.test(value)
+      ? DEFAULT_ACCOUNTS_API_ORIGIN
+      : value;
   let url: URL;
   try {
     url = new URL(raw);

@@ -34,6 +34,58 @@ describe("resolveAccountsApiOrigin", () => {
     expect(resolveAccountsApiOrigin("  ")).toBe(DEFAULT_ACCOUNTS_API_ORIGIN);
   });
 
+  test.each([
+    ["two spaces", "  "],
+    ["a tab", "\t"],
+    ["CR LF", "\r\n"],
+    ["a vertical tab", "\u000b"],
+    ["a form feed", "\u000c"],
+    ["mixed ASCII white space", " \t\u000b\u000c "],
+  ])("uses the production origin for %s", (_name, input) => {
+    expect(resolveAccountsApiOrigin(input)).toBe(DEFAULT_ACCOUNTS_API_ORIGIN);
+  });
+
+  test("uses the production origin for an empty string", () => {
+    expect(resolveAccountsApiOrigin("")).toBe(DEFAULT_ACCOUNTS_API_ORIGIN);
+  });
+
+  test.each([
+    ["U+00A0 before", " https://accounts.api.delino.io"],
+    ["U+00A0 after", "https://accounts.api.delino.io "],
+    ["U+FEFF before", "﻿https://accounts.api.delino.io"],
+    ["U+3000 before", "　https://accounts.api.delino.io"],
+    ["U+2028 before", " https://accounts.api.delino.io"],
+    ["U+2029 before", " https://accounts.api.delino.io"],
+    ["U+1680 before", " https://accounts.api.delino.io"],
+    ["U+202F before", " https://accounts.api.delino.io"],
+    ["U+205F before", " https://accounts.api.delino.io"],
+    ["U+2000 and U+200A before", "  https://accounts.api.delino.io"],
+    ["U+00A0 alone", " "],
+    ["U+FEFF alone", "﻿"],
+    ["U+3000 alone", "　"],
+    ["U+00A0 before a path", " https://accounts.api.delino.io/v1"],
+    ["U+00A0 before credentials", " https://user:pw@host"],
+  ])("rejects Unicode white space: %s", (_name, input) => {
+    expect(() => resolveAccountsApiOrigin(input)).toThrow(
+      "PUBLIC_API_ORIGIN is not a valid URL",
+    );
+  });
+
+  test("still accepts ASCII edge characters that the parser ignores", () => {
+    expect(resolveAccountsApiOrigin(" https://accounts.api.delino.io ")).toBe(
+      DEFAULT_ACCOUNTS_API_ORIGIN,
+    );
+    expect(
+      resolveAccountsApiOrigin("\u0001https://accounts.api.delino.io"),
+    ).toBe(DEFAULT_ACCOUNTS_API_ORIGIN);
+    expect(
+      resolveAccountsApiOrigin("https://accounts.api.delino.io\u0000"),
+    ).toBe(DEFAULT_ACCOUNTS_API_ORIGIN);
+    expect(resolveAccountsApiOrigin("https://accounts.api.delino.io/\t")).toBe(
+      DEFAULT_ACCOUNTS_API_ORIGIN,
+    );
+  });
+
   test("normalizes an explicit origin", () => {
     expect(resolveAccountsApiOrigin("http://127.0.0.1:8100/")).toBe(
       "http://127.0.0.1:8100",
