@@ -174,10 +174,28 @@ case "$status" in
     exit 1
     ;;
 esac
+# The contents API lists at most 1,000 entries; a planned file that is
+# missing from a full listing may only be beyond the limit.
+listing_full=false
+if (( $(jq 'length' <<< "$current") >= 1000 )); then
+  listing_full=true
+fi
 mapfile -t ids < <(jq -r 'keys[]' <<< "$CHANGESET_BLOBS")
 for id in "${ids[@]}"; do
   expected="$(jq -r --arg id "$id" '.[$id]' <<< "$CHANGESET_BLOBS")"
   actual="$(jq -r --arg file "$id.md" '.[$file] // ""' <<< "$current")"
+  if [[ -z "$actual" && "$listing_full" == true ]]; then
+    status=0
+    api "repos/$REPOSITORY/contents/.changeset/$id.md?ref=main" --jq '.sha' || status=$?
+    case "$status" in
+      0) actual="$api_output" ;;
+      4) ;;
+      *)
+        echo "::error::Could not read .changeset/$id.md on main: $api_output"
+        exit 1
+        ;;
+    esac
+  fi
   if [[ -z "$actual" ]]; then
     stale ".changeset/$id.md is no longer on main; another run already released it."
   fi

@@ -415,6 +415,31 @@ test(
   },
 );
 
+test("guard looks up a planned file beyond a full listing", { skip }, (t) => {
+  const others = Array.from({ length: 1000 }, (_, i) => ({
+    name: `other-${i}.md`,
+    type: "file",
+    sha: blobNew,
+  }));
+  for (const [file, expected] of [
+    [{ body: { sha: blobA } }, 0],
+    [{ error: "gh: Not Found (HTTP 404)" }, 1],
+  ]) {
+    const result = runGuard(
+      t,
+      {
+        ...runs([7, "in_progress"]),
+        // The specific file comes first: the stub matches by prefix.
+        "repos/owner/repo/contents/.changeset/a.md": [file],
+        "repos/owner/repo/contents/.changeset": [{ body: others }],
+      },
+      { a: blobA },
+    );
+    assert.equal(result.status, expected, result.stdout + result.stderr);
+    assert.equal(result.calls["repos/owner/repo/contents/.changeset/a.md"], 1);
+  }
+});
+
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(
     t,
