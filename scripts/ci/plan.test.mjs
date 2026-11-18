@@ -148,6 +148,7 @@ test("documentation and source paths select formatting in any extension case", (
 
 test("every shared fixture input selects tests", async (t) => {
   for (const path of [
+    ".changeset/config.json",
     ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
