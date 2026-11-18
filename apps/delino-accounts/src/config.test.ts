@@ -114,6 +114,46 @@ describe("resolveAccountsApiOrigin", () => {
     expect(message).not.toContain("got");
   });
 
+  // The URL parser removes leading and trailing C0 control characters and
+  // spaces before parsing, so the raw-path check must ignore them as well.
+  test.each([
+    "\u0001https://accounts.api.delino.io",
+    "\u0000https://accounts.api.delino.io/",
+    " \u0001 https://accounts.api.delino.io",
+    "https://accounts.api.delino.io/\u0000",
+    "https://accounts.api.delino.io/\u0001\u0002",
+    "https://accounts.api.delino.io\u0000",
+    "https://accounts.api.delino.io\u001f",
+    "https://accounts.api.delino.io \u0000 ",
+  ])("accepts the origin surrounded by control characters in %j", (value) => {
+    expect(resolveAccountsApiOrigin(value)).toBe(DEFAULT_ACCOUNTS_API_ORIGIN);
+  });
+
+  test.each([
+    "https://accounts.api.delino.io/path\u0000",
+    "https://accounts.api.delino.io/\u0000x",
+    "https://accounts.api.delino.io?\u0000",
+    "https://accounts.api.delino.io#\u0000",
+    "\u0000https://accounts.api.delino.io/path",
+    "\u0000https://accounts.api.delino.io/..",
+    "https://accounts.api.delino.io/..\u0000",
+    "https://accounts.api.delino.io/path/dir\u0001",
+  ])("still rejects a path, query or fragment in %j", (value) => {
+    expect(() => resolveAccountsApiOrigin(value)).toThrow(
+      "PUBLIC_API_ORIGIN must be an origin without a path, query or fragment",
+    );
+  });
+
+  test.each([
+    "\u0001",
+    "\u0000\u0000",
+    "https://accounts.api.delino.io\u0000/path",
+  ])("rejects %j as an invalid URL", (value) => {
+    expect(() => resolveAccountsApiOrigin(value)).toThrow(
+      "PUBLIC_API_ORIGIN is not a valid URL",
+    );
+  });
+
   test("keeps the credential check before the path check", () => {
     expect(() =>
       resolveAccountsApiOrigin("https://user:pass@accounts.api.delino.io/.."),

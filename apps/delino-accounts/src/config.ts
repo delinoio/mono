@@ -3,6 +3,15 @@
 /** Production origin of accounts-api. */
 export const DEFAULT_ACCOUNTS_API_ORIGIN = "https://accounts.api.delino.io";
 
+/**
+ * Matches the leading and trailing run of C0 control characters (U+0000 to
+ * U+001F) and spaces that the URL parser removes before it parses a value.
+ */
+const PARSER_EDGE_STRIP = new RegExp(
+  "^[\\u0000-\\u0020]+|[\\u0000-\\u0020]+$",
+  "g",
+);
+
 /** Build-time environment that carries `PUBLIC_API_ORIGIN`. */
 export interface AccountsBuildEnv {
   readonly PUBLIC_API_ORIGIN?: string;
@@ -58,10 +67,15 @@ export function resolveAccountsApiOrigin(value: string | undefined): string {
   //
   // `url.pathname` is normalized, so `/..`, `/.`, `/%2e` and `/a/..` collapse to
   // `/` and a backslash acts as a slash. The raw text after the authority is
-  // therefore checked too. The URL parser drops tab, CR and LF; the scheme is
-  // followed by any run of `/` or `\` (`https:host` and `https:///host` are
-  // accepted by the parser), which is stripped together with the authority.
+  // therefore checked too. The URL parser removes leading and trailing C0
+  // control characters and spaces, and drops tab, CR and LF anywhere; the
+  // scheme is followed by any run of `/` or `\` (`https:host` and
+  // `https:///host` are accepted by the parser), which is stripped together
+  // with the authority. The control characters are matched by code point range
+  // through `RegExp` so the pattern mirrors the parser without a control
+  // character in a regular expression literal.
   const rawPath = raw
+    .replace(PARSER_EDGE_STRIP, "")
     .replace(/[\t\n\r]/g, "")
     .replace(/^[A-Za-z][A-Za-z0-9+.-]*:[/\\]*/, "")
     .replace(/^[^/\\?#]*/, "");
