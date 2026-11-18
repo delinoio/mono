@@ -124,14 +124,17 @@ pages_status() {
   curl -fsS --retry 3 \
     -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
     "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$project/deployments/$id" \
-    | jq -r '.result.latest_stage | "\(.name) \(.status)"'
+    | jq -r '.result | "\(.environment) \(.latest_stage.name) \(.latest_stage.status)"'
 }
 
+# A preview deployment never updates production, for example when the
+# project's production branch is not `main`; treat it as a failure.
 pages_classify() {
   case "$1" in
-    "deploy success") echo success ;;
-    *" failure" | *" canceled") echo failure ;;
-    *) echo pending ;;
+    "production deploy success") echo success ;;
+    production" "*" failure" | production" "*" canceled") echo failure ;;
+    production" "*) echo pending ;;
+    *) echo failure ;;
   esac
 }
 
