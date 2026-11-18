@@ -478,6 +478,15 @@ test(
       ],
       [[{ filename: "pnpm-lock.yaml" }], /\(pnpm-lock\.yaml\)/],
       [
+        [
+          {
+            filename: "apps/web/package.disabled",
+            previous_filename: "apps/web/package.json",
+          },
+        ],
+        /\(apps\/web\/package\.json\)/,
+      ],
+      [
         Array.from({ length: 300 }, (_, i) => ({ filename: `src/${i}.ts` })),
         /too many files since the plan/,
       ],
@@ -915,6 +924,27 @@ test(
     }
     assert.equal(remoteGit(remote, "rev-parse", "main"), sha);
     assert.equal(git(work, "status", "--porcelain"), "");
+  },
+);
+
+test(
+  "release stops when main renamed a package manifest away",
+  { skip },
+  (t) => {
+    const { dir, remote, work } = releaseFixture(t);
+    const sha = addChangeset(work, "one", { a: "patch" });
+    const other = join(dir, "rename");
+    git(dir, "clone", "--quiet", "--branch", "main", remote, other);
+    git(other, "mv", "pkgs/b/package.json", "pkgs/b/package.disabled");
+    commitAll(other, "rename manifest");
+    git(other, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+    const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }]);
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stdout,
+      /main changed package manifests .*pkgs\/b\/package\.json/,
+    );
+    assert.equal(remoteGit(remote, "tag"), "");
   },
 );
 

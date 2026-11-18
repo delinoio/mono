@@ -134,7 +134,9 @@ for (( attempt = 1; ; attempt++ )); do
   # `changeset version` saw only the manifests of the deployed revision. A
   # manifest or lockfile change on `main` (for example a new exact workspace
   # dependency on a released package) needs a fresh plan.
-  changed_manifests="$(git diff --name-only "$SHA" "$tip" -- package.json '*/package.json' pnpm-lock.yaml pnpm-workspace.yaml .changeset/config.json)"
+  # `--no-renames` lists both paths of a rename, so a manifest renamed away
+  # also counts.
+  changed_manifests="$(git diff --no-renames --name-only "$SHA" "$tip" -- package.json '*/package.json' pnpm-lock.yaml pnpm-workspace.yaml .changeset/config.json)"
   if [[ -n "$changed_manifests" ]]; then
     echo "::error::main changed package manifests during the deployment (${changed_manifests//$'\n'/, }); start a new deployment. The version commit and tags were not pushed."
     exit 1

@@ -146,12 +146,13 @@ done <<< "$newer_runs"
 # The planned revision must still be on `main`. A `main` that was rewound or
 # rewritten after planning can keep a changeset with the same blob, but the
 # code to deploy is no longer on `main`.
-# The same comparison lists the files that changed on `main` since the plan.
+# The same comparison lists the files that changed on `main` since the plan,
+# with both paths of a rename (a manifest renamed away also counts).
 # A changed package manifest, lockfile, workspace file or Changesets config
 # makes the release job refuse to version and tag, so stop before uploading.
 status=0
 api "repos/$REPOSITORY/compare/$SHA...main?per_page=100" \
-  --jq '{status, total: ((.files // []) | length), manifests: [(.files // [])[].filename | select(test("(^|/)package\\.json$") or . == "pnpm-lock.yaml" or . == "pnpm-workspace.yaml" or . == ".changeset/config.json")]}' \
+  --jq '{status, total: ((.files // []) | length), manifests: [(.files // [])[] | .filename, (.previous_filename // empty) | select(test("(^|/)package\\.json$") or . == "pnpm-lock.yaml" or . == "pnpm-workspace.yaml" or . == ".changeset/config.json")]}' \
   || status=$?
 case "$status" in
   0) ;;
