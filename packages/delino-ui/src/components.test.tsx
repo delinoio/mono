@@ -1462,6 +1462,22 @@ describe("Avatar", () => {
     );
   });
 
+  test.each([{ src: null }, { src: 42 }])(
+    "renders no image and does not throw for the untyped src %j",
+    (untyped) => {
+      // The type allows only a string, but untyped spread objects can carry
+      // anything.
+      const { container } = render(
+        <Avatar alt="Ada Lovelace" fallback="AL" {...(untyped as object)} />,
+      );
+
+      expect(container.querySelector("img")).toBeNull();
+      expect(
+        screen.getByRole("img", { name: "Ada Lovelace" }).textContent,
+      ).toBe("AL");
+    },
+  );
+
   test.each(["https://example.test/ada.png", " https://example.test/ada.png "])(
     "passes the src %j to the image unchanged",
     (src) => {

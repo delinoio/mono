@@ -48,10 +48,13 @@ export function Avatar({
       className={mergeClassName("dui-avatar", className)}
       {...props}
     >
-      {/* The original value is passed through untrimmed; only the check ignores blanks. */}
-      {src === undefined || src.trim() === "" ? null : (
+      {/* The type allows only a string, but untyped callers can pass null or
+          another value; treat anything that is not a string as no URL. The
+          original value is passed through untrimmed; only the check ignores
+          blanks. */}
+      {typeof src === "string" && src.trim() !== "" ? (
         <AvatarImage className="dui-avatar-image" src={src} alt={alt} />
-      )}
+      ) : null}
       {/* The fallback stands in for the image, so it carries the same name. */}
       <AvatarFallback
         className="dui-avatar-fallback"

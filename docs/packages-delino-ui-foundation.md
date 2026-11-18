@@ -71,7 +71,7 @@ Each export is a stable interface. Exported enums are the stable identifiers for
   - `AlertDialogContent` (renders the backdrop), `AlertDialogTitle` (level 2 heading, names the dialog), `AlertDialogDescription` and `AlertDialogActions` share the `Dialog` styles.
   - `createAlertDialogController`, `createConfirm` and the `AlertDialogController` type are re-exported from UI SDK.
 - `delino-ui/avatar`
-  - `Avatar`: a round picture. Props: `alt` (required), `fallback` (required, usually initials), `src`, `size` and the other UI SDK `Avatar` props. An empty or whitespace-only `src` counts as no URL: no image renders and the fallback shows. The fallback shows until the image loads and stays when it fails; it has role `img` and the `alt` text as its name.
+  - `Avatar`: a round picture. Props: `alt` (required), `fallback` (required, usually initials), `src`, `size` and the other UI SDK `Avatar` props. An empty or whitespace-only `src` counts as no URL: no image renders and the fallback shows, and so does an untyped `null` or other non-string `src`, without throwing. The fallback shows until the image loads and stays when it fails; it has role `img` and the `alt` text as its name.
   - `AvatarSize`: `Small` (`small`, 24px), `Medium` (`medium`, 40px), `Large` (`large`, 64px). The default is `Medium`.
 - `delino-ui/progress`
   - `Progress`: a named progress bar. Props: `label` (required), `showValue` (shows the formatted value, such as `40%`), and all UI SDK `Progress` props such as `value`, `min`, `max` and `format`. A `null` value shows an indeterminate bar.
