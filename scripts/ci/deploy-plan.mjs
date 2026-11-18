@@ -26,8 +26,9 @@ export const DeployKind = Object.freeze({
   StaticSite: "static-site",
 });
 
-// Kind order of a deployment: the database is migrated outside this workflow,
-// servers come next and static sites, which call the servers, come last.
+// Kind order of a deployment: the database stage (not implemented yet; see
+// the deployment workflow contract) comes first, then servers, then static
+// sites, which call the servers.
 const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 
 const targetRules = {

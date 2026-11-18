@@ -18,4 +18,4 @@ Imported agent skills retain their upstream licenses, attribution and notices. A
 
 ## Distribution
 
-Future distributions must include the complete applicable license terms and notices. A server image that the deployment workflow builds is a distribution and carries `servers/LICENSE`. Hosting a static site (for example on Cloudflare Pages) is not a distribution: the uploaded site does not need the root `LICENSE` and `NOTICE`. Validate package contents in the owning project's distribution checks. This repository publishes no runtime packages or release artifacts yet.
+Future distributions must include the complete applicable license terms and notices. A server image that the deployment workflow builds is a distribution and carries `servers/LICENSE`. Hosting a static site (for example on Cloudflare Pages) is not a distribution: the uploaded site does not need the root `LICENSE` and `NOTICE`. Validate package contents in the owning project's distribution checks. Apart from the server images that the deployment workflow deploys, this repository publishes no runtime packages or release artifacts yet.
