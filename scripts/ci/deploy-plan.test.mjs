@@ -216,6 +216,72 @@ test("missing service or project names fail", () => {
   assert.throws(() => plan(status(["web", "1.0.0"]), site), /deploy.project/);
 });
 
+test("ties break alphabetically among packages that are ready", () => {
+  const sites = [
+    pkg("apps/a", {
+      name: "a",
+      dependencies: { z: "workspace:*" },
+      deploy: { target: DeployTarget.CloudflarePages, project: "a" },
+    }),
+    pkg("apps/b", {
+      name: "b",
+      deploy: { target: DeployTarget.CloudflarePages, project: "b" },
+    }),
+    pkg("apps/z", {
+      name: "z",
+      deploy: { target: DeployTarget.CloudflarePages, project: "z" },
+    }),
+  ];
+  const result = plan(
+    status(["a", "1.0.0"], ["b", "1.0.0"], ["z", "1.0.0"]),
+    sites,
+  );
+  assert.deepEqual(
+    result.staticSites.map((d) => d.name),
+    ["b", "z", "a"],
+  );
+});
+
+test("dependencies through unselected packages keep their order", () => {
+  const sites = [
+    pkg("apps/a", {
+      name: "a",
+      dependencies: { mid: "workspace:*" },
+      deploy: { target: DeployTarget.CloudflarePages, project: "a" },
+    }),
+    pkg("packages/mid", { name: "mid", dependencies: { z: "workspace:*" } }),
+    pkg("apps/z", {
+      name: "z",
+      deploy: { target: DeployTarget.CloudflarePages, project: "z" },
+    }),
+  ];
+  const result = plan(status(["a", "1.0.0"], ["z", "1.0.0"]), sites);
+  assert.deepEqual(
+    result.staticSites.map((d) => d.name),
+    ["z", "a"],
+  );
+});
+
+test("a static site output must be a directory inside the package", () => {
+  const site = (output) => [
+    pkg("apps/web", {
+      name: "web",
+      deploy: { target: DeployTarget.CloudflarePages, project: "web", output },
+    }),
+  ];
+  for (const output of ["", ".", "./", "/abs", "..", "../x", "dist/../.."]) {
+    assert.throws(
+      () => plan(status(["web", "1.0.0"]), site(output)),
+      /deploy.output/,
+      JSON.stringify(output),
+    );
+  }
+  assert.equal(
+    plan(status(["web", "1.0.0"]), site("./build/")).staticSites[0].output,
+    "apps/web/build",
+  );
+});
+
 test("a static site output outside the package fails", () => {
   const site = [
     pkg("apps/web", {

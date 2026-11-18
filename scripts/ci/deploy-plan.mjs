@@ -9,7 +9,7 @@
 // dependent through `devDependencies`, or an explicit `none` changeset) is
 // deployed when it is deployable, but keeps its version and gets no tag.
 import { appendFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
 import { workspaceRoots } from "./plan.mjs";
 
@@ -101,26 +101,35 @@ function deployable(pkg) {
   if (typeof deploy.project !== "string" || deploy.project === "") {
     throw new DeployPlanError(`${name}: deploy.project is required`);
   }
-  const output = deploy.output ?? "dist";
+  const raw = deploy.output ?? "dist";
+  // The output must be a directory inside the package, never the package
+  // root itself (`""` or `"."`) or a path outside it.
+  const output =
+    typeof raw === "string" ? posix.normalize(raw).replace(/\/+$/, "") : "";
   if (
-    typeof output !== "string" ||
+    output === "" ||
+    output === "." ||
     output.startsWith("/") ||
-    output.split("/").includes("..")
+    output === ".." ||
+    output.startsWith("../")
   ) {
     throw new DeployPlanError(
-      `${name}: deploy.output must be a package-relative path`,
+      `${name}: deploy.output must be a directory inside the package`,
     );
   }
   return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
 }
 
-// Orders the selected names so that every workspace dependency comes before
-// its dependents. Ties keep alphabetical order, so the result is stable.
+// Orders the selected names so that every workspace dependency, direct or
+// through unselected packages, comes before its dependents. Among the
+// packages whose dependencies are already ordered, the alphabetically first
+// one comes next, so the result is stable.
 function topologicalOrder(selected, packagesByName) {
-  const ordered = [];
+  // Selected packages that each package depends on, transitively.
+  const reach = new Map();
   const state = new Map();
   const visit = (name, path) => {
-    if (state.get(name) === "done") return;
+    if (state.get(name) === "done") return reach.get(name);
     if (state.get(name) === "visiting") {
       throw new DeployPlanError(
         `workspace dependency cycle: ${[...path, name].join(" -> ")}`,
@@ -131,13 +140,31 @@ function topologicalOrder(selected, packagesByName) {
     const deps = new Set(
       dependencyFields.flatMap((field) => Object.keys(manifest[field] ?? {})),
     );
+    const reached = new Set();
     for (const dep of [...deps].sort()) {
-      if (packagesByName.has(dep)) visit(dep, [...path, name]);
+      if (!packagesByName.has(dep)) continue;
+      if (selected.has(dep)) reached.add(dep);
+      for (const transitive of visit(dep, [...path, name])) {
+        reached.add(transitive);
+      }
     }
     state.set(name, "done");
-    if (selected.has(name)) ordered.push(name);
+    reach.set(name, reached);
+    return reached;
   };
   for (const name of [...selected].sort()) visit(name, []);
+
+  const ordered = [];
+  const remaining = new Set(selected);
+  while (remaining.size > 0) {
+    const next = [...remaining]
+      .filter((name) =>
+        [...reach.get(name)].every((dep) => !remaining.has(dep)),
+      )
+      .sort()[0];
+    ordered.push(next);
+    remaining.delete(next);
+  }
   return ordered;
 }
 
