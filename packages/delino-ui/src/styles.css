@@ -877,6 +877,16 @@
     user-select: none;
   }
 
+  /* UI SDK draws a 1px border on every toast. The package surface is a
+     borderless inverted surface, like the tooltip, dialog and drawer, so the
+     border is reset for every type except `error`. The error toast keeps the
+     SDK's tinted border as its only error cue; the package has no error color
+     of its own. The border sits outside the explicit `height` (border-box),
+     so the toast box size does not change. */
+  .dui-toast:not([data-type="error"]) {
+    border: 0;
+  }
+
   .dui-toast-region[data-side="top"] .dui-toast {
     --dui-toast-y: calc(var(--toast-index) * 8px);
     top: 0;

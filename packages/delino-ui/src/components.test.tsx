@@ -1204,6 +1204,16 @@ describe("ToastRegion", () => {
     expect(block(".dui-toast-button::before")).toContain("display: none");
   });
 
+  // happy-dom computes no cascade, so this checks the stylesheet source: the
+  // SDK draws a 1px border on every toast and tints it for `error` only. The
+  // package resets it for every other type and must leave the error border to
+  // the SDK, so no rule here may target the error type.
+  test("resets the SDK border on every toast type except error", () => {
+    expect(block('.dui-toast:not([data-type="error"])')).toContain("border: 0");
+    expect(block(".dui-toast")).not.toMatch(/(^|[\s;])border(-width)?:/);
+    expect(css).not.toMatch(/\.dui-toast\[data-type=["']?error["']?\]/);
+  });
+
   // happy-dom computes no cascade, so the focus ring contrast is checked from
   // the authored hex tokens. Dark mode inverts the toast (its surface is the
   // `text` token), so the ring that reaches the toast buttons must be measured
