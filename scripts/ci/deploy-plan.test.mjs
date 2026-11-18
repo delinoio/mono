@@ -511,6 +511,11 @@ test("check accepts the repository and rejects bad changeset file names", () => 
     assert.deepEqual(check(dir), ["brave-cats"]);
     writeFileSync(join(dir, ".changeset", "release notes.md"), "---\n---\n");
     assert.throws(() => check(dir), /"release notes" is not a plain file name/);
+    rmSync(join(dir, ".changeset", "release notes.md"));
+    // The Changesets reader also reads `.changeset/pre/*.md` as `pre/<id>`.
+    mkdirSync(join(dir, ".changeset", "pre"));
+    writeFileSync(join(dir, ".changeset", "pre", "fix-api.md"), "---\n---\n");
+    assert.throws(() => check(dir), /"pre\/fix-api" is not a plain file name/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

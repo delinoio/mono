@@ -217,7 +217,8 @@ function checkChangesetId(id) {
   return id;
 }
 
-// Matches the files that @changesets/read (3.0.3) reads as changesets.
+// Matches the files that @changesets/read (1.0.1, used by @changesets/cli
+// 3.0.3) reads as changesets, by base name.
 function isChangesetFile(file) {
   return (
     !file.startsWith(".") &&
@@ -232,12 +233,18 @@ function isChangesetFile(file) {
 // this, so a change that would stop every deployment fails in its own pull
 // request.
 export function check(repoRoot) {
+  // The reader also reads `.changeset/pre/*.md`, with the id `pre/<name>`.
+  const list = (dir, prefix) =>
+    existsSync(dir)
+      ? readdirSync(dir)
+          .filter(isChangesetFile)
+          .map((file) => prefix + file.slice(0, -".md".length))
+      : [];
   const changesetDir = join(repoRoot, ".changeset");
-  const ids = existsSync(changesetDir)
-    ? readdirSync(changesetDir)
-        .filter(isChangesetFile)
-        .map((file) => file.slice(0, -".md".length))
-    : [];
+  const ids = [
+    ...list(changesetDir, ""),
+    ...list(join(changesetDir, "pre"), "pre/"),
+  ];
   for (const id of ids) checkChangesetId(id);
   plan({ changesets: [], releases: [] }, readWorkspacePackages(repoRoot));
   return ids;

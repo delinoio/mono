@@ -27,7 +27,7 @@ node "$here/deploy-plan.mjs" --check "$root"
 # (The glob skips hidden files.)
 shopt -s nullglob
 pending=()
-for file in .changeset/*.md; do
+for file in .changeset/*.md .changeset/pre/*.md; do
   name="$(basename "$file")"
   if [[ "$(tr '[:upper:]' '[:lower:]' <<< "$name")" == readme.md || "$name" == AGENTS.md || "$name" == CLAUDE.md || "$name" == GEMINI.md ]]; then
     continue
