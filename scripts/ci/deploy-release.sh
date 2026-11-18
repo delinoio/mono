@@ -26,6 +26,18 @@ fi
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 max_attempts="${DEPLOY_RELEASE_MAX_ATTEMPTS:-3}"
 
+# A missing or malformed list would consume the changesets without tags.
+# `[]` is valid: every release kept its version.
+if ! jq -e 'type == "array" and all(.[]; type == "object" and (.name | type == "string" and length > 0) and (.version | type == "string" and length > 0))' \
+  <<< "${RELEASES:-}" > /dev/null 2>&1; then
+  echo "::error::RELEASES is not a JSON list of releases: ${RELEASES:-<empty>}"
+  exit 1
+fi
+if ! jq -e 'type == "object" and all(.[]; type == "string" and test("^[0-9a-f]{40}$"))' \
+  <<< "${CHANGESET_BLOBS:-}" > /dev/null 2>&1; then
+  echo "::error::CHANGESET_BLOBS is not a map of changeset blob SHAs: ${CHANGESET_BLOBS:-<empty>}"
+  exit 1
+fi
 if [[ "$(git rev-parse HEAD)" != "$SHA" ]]; then
   echo "::error::HEAD is not the deployed revision $SHA."
   exit 1

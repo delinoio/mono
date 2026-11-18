@@ -95,6 +95,8 @@ process.stdout.write(execFileSync("jq", ["-r", jq], { input: JSON.stringify(resp
 }
 
 const plannedSha = "c".repeat(40);
+const blobA = "a".repeat(40);
+const blobNew = "b".repeat(40);
 
 function runGuard(t, responses, blobs, runNumber = "7") {
   const dir = scratch(t);
@@ -167,9 +169,9 @@ test("guard passes a current plan", { skip }, (t) => {
     t,
     {
       ...runs([7, "in_progress"], [6, "completed"]),
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /The plan is current/);
@@ -180,9 +182,9 @@ test("guard ignores a newer run that waits in the queue", { skip }, (t) => {
     t,
     {
       ...runs([8, "pending"], [7, "in_progress"]),
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
 });
@@ -192,9 +194,9 @@ test("guard stops a rerun after a newer run started", { skip }, (t) => {
     t,
     {
       ...runs([9, "completed"], [8, "pending"], [7, "completed"]),
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 1);
   assert.match(
@@ -213,9 +215,9 @@ test("guard ignores a newer run cancelled in the queue", { skip }, (t) => {
         [7, "in_progress"],
       ),
       ...jobs(8),
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.stdout, /Ignoring run #8/);
@@ -230,9 +232,9 @@ test(
       {
         ...runs([8, "completed", "cancelled"], [7, "completed", "failure"]),
         ...jobs(8, "2026-11-18T00:00:00Z", null),
-        ...changeset("a", { body: { sha: "blob-a" } }),
+        ...changeset("a", { body: { sha: blobA } }),
       },
-      { a: "blob-a" },
+      { a: blobA },
     );
     assert.equal(result.status, 1);
     assert.match(
@@ -259,9 +261,9 @@ test("guard reads further pages until it reaches this run", { skip }, (t) => {
         [7, "in_progress"],
       ]),
       ...jobsOfCancelled,
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 1, result.stdout + result.stderr);
   assert.match(
@@ -275,9 +277,9 @@ test("guard lists only runs on main", { skip }, (t) => {
     t,
     {
       ...runs([7, "in_progress"]),
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.args, /runs\?branch=main&/);
@@ -292,9 +294,9 @@ test(
       {
         ...runs([8, "queued", null, 2], [7, "in_progress"]),
         ...jobs(8, "2026-11-18T00:00:00Z"),
-        ...changeset("a", { body: { sha: "blob-a" } }),
+        ...changeset("a", { body: { sha: blobA } }),
       },
-      { a: "blob-a" },
+      { a: blobA },
     );
     assert.equal(result.status, 1, result.stdout + result.stderr);
     assert.match(
@@ -313,9 +315,9 @@ test(
       {
         ...runs([8, "pending", null, 2], [7, "in_progress"]),
         ...jobs(8),
-        ...changeset("a", { body: { sha: "blob-a" } }),
+        ...changeset("a", { body: { sha: blobA } }),
       },
-      { a: "blob-a" },
+      { a: blobA },
     );
     assert.equal(result.status, 0, result.stdout + result.stderr);
     assert.match(result.stdout, /Ignoring run #8/);
@@ -331,9 +333,9 @@ test("guard reports a rewound main as stale", { skip }, (t) => {
           { body: { status: compare } },
         ],
         ...runs([7, "in_progress"]),
-        ...changeset("a", { body: { sha: "blob-a" } }),
+        ...changeset("a", { body: { sha: blobA } }),
       },
-      { a: "blob-a" },
+      { a: blobA },
     );
     assert.equal(result.status, 1, compare);
     assert.match(result.stdout, /main no longer contains the planned revision/);
@@ -346,12 +348,38 @@ test("guard reads every jobs page of a cancelled newer run", { skip }, (t) => {
     {
       ...runs([8, "completed", "cancelled"], [7, "in_progress"]),
       ...jobPages(8, Array(100).fill(null), ["2026-11-18T00:00:00Z"]),
-      ...changeset("a", { body: { sha: "blob-a" } }),
+      ...changeset("a", { body: { sha: blobA } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 1, result.stdout + result.stderr);
   assert.match(result.stdout, /plan is stale: run #8/);
+});
+
+test("guard rejects a missing or malformed changeset map", { skip }, (t) => {
+  for (const blobs of ["", "null", "{}", '{"a":"short"}']) {
+    const dir = scratch(t);
+    const bin = stubGh(dir, {
+      ...runs([7, "in_progress"]),
+      ...changeset("a", { error: "gh: Not Found (HTTP 404)" }),
+    });
+    const result = spawnSync("bash", [guard], {
+      encoding: "utf8",
+      env: {
+        ...baseEnv,
+        PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+        CHANGESET_BLOBS: blobs,
+        REPOSITORY: "owner/repo",
+        WORKFLOW: "deploy.yml",
+        GITHUB_RUN_NUMBER: "7",
+        SHA: plannedSha,
+        GH_TOKEN: "token",
+        CHECK_RETRY_DELAY: "0",
+      },
+    });
+    assert.equal(result.status, 1, JSON.stringify(blobs));
+    assert.match(result.stdout, /CHANGESET_BLOBS is not a nonempty map/);
+  }
 });
 
 test("guard reports a released changeset as stale", { skip }, (t) => {
@@ -361,7 +389,7 @@ test("guard reports a released changeset as stale", { skip }, (t) => {
       ...runs([7, "in_progress"]),
       ...changeset("a", { error: "gh: Not Found (HTTP 404)" }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 1);
   assert.match(
@@ -376,9 +404,9 @@ test("guard reports an edited changeset as stale", { skip }, (t) => {
     t,
     {
       ...runs([7, "in_progress"]),
-      ...changeset("a", { body: { sha: "blob-new" } }),
+      ...changeset("a", { body: { sha: blobNew } }),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 1);
   assert.match(
@@ -397,7 +425,7 @@ test(
         ...runs([7, "in_progress"]),
         ...changeset("a", { error: "gh: Bad credentials (HTTP 401)" }),
       },
-      { a: "blob-a" },
+      { a: blobA },
     );
     assert.equal(result.status, 1);
     assert.doesNotMatch(result.stdout, /plan is stale/);
@@ -417,10 +445,10 @@ test("guard retries a transient API error", { skip }, (t) => {
       ...changeset(
         "a",
         { error: "gh: Server Error (HTTP 502)" },
-        { body: { sha: "blob-a" } },
+        { body: { sha: blobA } },
       ),
     },
-    { a: "blob-a" },
+    { a: blobA },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.equal(result.calls["repos/owner/repo/contents/.changeset/a.md"], 2);
@@ -732,6 +760,31 @@ test("release stops when main changed package manifests", { skip }, (t) => {
   );
   assert.equal(remoteGit(remote, "tag"), "");
 });
+
+test(
+  "release rejects a missing release list before changing anything",
+  { skip },
+  (t) => {
+    const { remote, work } = releaseFixture(t);
+    const sha = addChangeset(work, "one", { a: "patch" });
+    for (const releases of ["", "null", "{}"]) {
+      const result = spawnSync("bash", [release], {
+        cwd: work,
+        encoding: "utf8",
+        env: {
+          ...baseEnv,
+          RELEASES: releases,
+          CHANGESET_BLOBS: JSON.stringify(changesetBlobs(work, sha)),
+          SHA: sha,
+        },
+      });
+      assert.equal(result.status, 1, JSON.stringify(releases));
+      assert.match(result.stdout, /RELEASES is not a JSON list/);
+    }
+    assert.equal(remoteGit(remote, "rev-parse", "main"), sha);
+    assert.equal(git(work, "status", "--porcelain"), "");
+  },
+);
 
 test("release stops when main keeps moving", { skip }, (t) => {
   const { dir, remote, work } = releaseFixture(t);

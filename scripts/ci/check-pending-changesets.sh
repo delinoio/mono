@@ -64,6 +64,12 @@ stale() {
   exit 1
 }
 
+# A missing or malformed map would skip every changeset check below.
+if ! jq -e 'type == "object" and length > 0 and all(.[]; type == "string" and test("^[0-9a-f]{40}$"))' \
+  <<< "${CHANGESET_BLOBS:-}" > /dev/null 2>&1; then
+  echo "::error::CHANGESET_BLOBS is not a nonempty map of changeset blob SHAs: ${CHANGESET_BLOBS:-<empty>}"
+  exit 1
+fi
 if [[ ! "${SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "::error::SHA is not a full commit SHA: ${SHA:-}"
   exit 1
