@@ -146,8 +146,13 @@ done <<< "$newer_runs"
 # The planned revision must still be on `main`. A `main` that was rewound or
 # rewritten after planning can keep a changeset with the same blob, but the
 # code to deploy is no longer on `main`.
+# The same comparison lists the files that changed on `main` since the plan.
+# A changed package manifest, lockfile, workspace file or Changesets config
+# makes the release job refuse to version and tag, so stop before uploading.
 status=0
-api "repos/$REPOSITORY/compare/$SHA...main" --jq '.status' || status=$?
+api "repos/$REPOSITORY/compare/$SHA...main?per_page=100" \
+  --jq '{status, total: ((.files // []) | length), manifests: [(.files // [])[].filename | select(test("(^|/)package\\.json$") or . == "pnpm-lock.yaml" or . == "pnpm-workspace.yaml" or . == ".changeset/config.json")]}' \
+  || status=$?
 case "$status" in
   0) ;;
   4) stale "the planned revision $SHA is not in the repository any more." ;;
@@ -156,10 +161,21 @@ case "$status" in
     exit 1
     ;;
 esac
-case "$api_output" in
+compare="$api_output"
+compare_status="$(jq -r '.status' <<< "$compare")"
+case "$compare_status" in
   identical | ahead) ;;
-  *) stale "main no longer contains the planned revision $SHA (compare status: $api_output)." ;;
+  *) stale "main no longer contains the planned revision $SHA (compare status: $compare_status)." ;;
 esac
+manifests="$(jq -r '.manifests | join(", ")' <<< "$compare")"
+if [[ -n "$manifests" ]]; then
+  stale "main changed package manifests since the plan ($manifests); the release would not version or tag this deployment."
+fi
+# The compare API lists at most 300 changed files; a list that may be
+# truncated cannot prove that no manifest changed.
+if (( $(jq '.total' <<< "$compare") >= 300 )); then
+  stale "main changed too many files since the plan to check its package manifests."
+fi
 
 # Read the `.changeset` directory of `main` once and compare every planned
 # file locally: one request per check, whatever the number of changesets.

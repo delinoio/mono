@@ -467,6 +467,53 @@ test(
   },
 );
 
+test(
+  "guard stops an upload after main changed package manifests",
+  { skip },
+  (t) => {
+    for (const [files, message] of [
+      [
+        [{ filename: "src/a.ts" }, { filename: "apps/web/package.json" }],
+        /main changed package manifests since the plan \(apps\/web\/package\.json\)/,
+      ],
+      [[{ filename: "pnpm-lock.yaml" }], /\(pnpm-lock\.yaml\)/],
+      [
+        Array.from({ length: 300 }, (_, i) => ({ filename: `src/${i}.ts` })),
+        /too many files since the plan/,
+      ],
+    ]) {
+      const result = runGuard(
+        t,
+        {
+          [`repos/owner/repo/compare/${plannedSha}...main`]: [
+            { body: { status: "ahead", files } },
+          ],
+          ...runs([7, "in_progress"]),
+          ...changeset("a", { body: { sha: blobA } }),
+        },
+        { a: blobA },
+      );
+      assert.equal(result.status, 1, result.stdout + result.stderr);
+      assert.match(result.stdout, message);
+    }
+  },
+);
+
+test("guard allows unrelated changes on main", { skip }, (t) => {
+  const result = runGuard(
+    t,
+    {
+      [`repos/owner/repo/compare/${plannedSha}...main`]: [
+        { body: { status: "ahead", files: [{ filename: "docs/x.md" }] } },
+      ],
+      ...runs([7, "in_progress"]),
+      ...changeset("a", { body: { sha: blobA } }),
+    },
+    { a: blobA },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(
     t,
