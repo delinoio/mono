@@ -160,7 +160,17 @@ export function plan(status, packages) {
     (a, b) => kindOrder.indexOf(a.kind) - kindOrder.indexOf(b.kind),
   );
   return {
-    changesets: (status.changesets ?? []).length,
+    // The deploy jobs check that these changeset files are still pending on
+    // `main` before they upload, so a rerun of an old run cannot deploy a
+    // superseded revision.
+    changesets: (status.changesets ?? []).map(({ id }) => {
+      if (typeof id !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(id)) {
+        throw new DeployPlanError(
+          `changeset id ${JSON.stringify(id)} is not a plain file name`,
+        );
+      }
+      return id;
+    }),
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
     servers: deployables.filter((d) => d.kind === DeployKind.Server),
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
@@ -196,7 +206,8 @@ export function main({
         `static_sites=${JSON.stringify(result.staticSites)}`,
         // Any pending changeset, including one with only `none` releases,
         // needs the release job to consume it.
-        `has_changesets=${result.changesets > 0}`,
+        `changesets=${JSON.stringify(result.changesets)}`,
+        `has_changesets=${result.changesets.length > 0}`,
         `has_servers=${result.servers.length > 0}`,
         `has_static_sites=${result.staticSites.length > 0}`,
         "",
@@ -205,7 +216,7 @@ export function main({
   }
   if (env.GITHUB_STEP_SUMMARY) {
     const lines = ["## Deployment plan", ""];
-    if (result.changesets === 0) {
+    if (result.changesets.length === 0) {
       lines.push("No pending changesets. Nothing to deploy.");
     } else {
       lines.push("| Order | Package | Version | Kind | Target |");

@@ -19,6 +19,7 @@ jobs:
       releases: ${{ steps.plan.outputs.releases }}
       servers: ${{ steps.plan.outputs.servers }}
       static_sites: ${{ steps.plan.outputs.static_sites }}
+      changesets: ${{ steps.plan.outputs.changesets }}
       has_changesets: ${{ steps.plan.outputs.has_changesets }}
       has_servers: ${{ steps.plan.outputs.has_servers }}
       has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
@@ -122,24 +123,41 @@ jobs:
     if: needs.plan.outputs.has_servers == 'true'
     runs-on: ubuntu-latest
     environment: servers
+    env:
+      # Railway CLI release asset, verified against the SHA-256 that GitHub
+      # publishes for it. Update both values together.
+      RAILWAY_CLI_VERSION: 5.69.0
+      RAILWAY_CLI_SHA256: 1bd0612e743adf69b13bee7a6e49dd9bf2f0efb5f97b90f90d1b15b122a840e5
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
-          sparse-checkout: .nvmrc
+          sparse-checkout: scripts/ci/check-pending-changesets.sh
           sparse-checkout-cone-mode: false
+      - name: Check that the plan is still current
+        env:
+          CHANGESETS: ${{ needs.plan.outputs.changesets }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: server-*
           path: ${{ runner.temp }}/servers
           merge-multiple: true
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
-        with:
-          node-version-file: .nvmrc
-          package-manager-cache: false
       - name: Install the Railway CLI
-        run: npm install --global @railway/cli@5.69.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset="railway-v${RAILWAY_CLI_VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" \
+            "https://github.com/railwayapp/cli/releases/download/v${RAILWAY_CLI_VERSION}/$asset"
+          echo "$RAILWAY_CLI_SHA256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/bin" railway
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/bin/railway" --version
       - name: Deploy in dependency order
         env:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
@@ -152,19 +170,48 @@ jobs:
             echo "::error::The servers environment has no RAILWAY_TOKEN secret."
             exit 1
           fi
+
+          # Wait for an explicit terminal status of one deployment. The exit
+          # code of `railway up` alone is not a verdict: the CLI exits 0 when
+          # its status stream closes before the deployment finishes.
+          wait_for_deployment() {
+            local service="$1" id="$2" status="" deadline=$((SECONDS + 1800))
+            while (( SECONDS < deadline )); do
+              status="$(railway deployment list --service "$service" --limit 20 --json < /dev/null \
+                | jq -r --arg id "$id" '.[] | select(.id == $id) | .status')"
+              case "$status" in
+                SUCCESS) echo "Deployment $id of $service: $status"; return 0 ;;
+                FAILED | CRASHED | REMOVED | REMOVING | SKIPPED)
+                  echo "::error::Deployment $id of $service ended with status $status."
+                  railway logs "$id" --service "$service" --build --lines 200 < /dev/null || true
+                  railway logs "$id" --service "$service" --deployment --lines 200 < /dev/null || true
+                  return 1
+                  ;;
+              esac
+              echo "Deployment $id of $service: ${status:-not listed yet}"
+              sleep 10
+            done
+            echo "::error::Deployment $id of $service did not finish within 30 minutes (last status: ${status:-unknown})."
+            return 1
+          }
+
           echo "## Servers" >> "$GITHUB_STEP_SUMMARY"
-          while IFS=$'\t' read -r name version service; do
+          while IFS=$'\t' read -r -u 3 name version service; do
             context="$RUNNER_TEMP/context-$name"
             mkdir -p "$context"
             tar -xzf "$RUNNER_TEMP/servers/$name.tar.gz" -C "$context"
             echo "::group::Deploy $name@$version to Railway service $service"
-            # --ci waits for the deployment result and exits non-zero when the
-            # build or the deployment fails.
-            railway up "$context" --path-as-root --no-gitignore --ci \
-              --service "$service" --message "$name@$version ($SHA)"
+            id="$(railway up "$context" --path-as-root --no-gitignore --detach --json \
+              --service "$service" --message "$name@$version ($SHA)" < /dev/null \
+              | jq -R -r 'fromjson? | objects | select(.deploymentId != null) | .deploymentId' | tail -n 1)"
+            if [[ -z "$id" ]]; then
+              echo "::error::railway up returned no deployment id for $name."
+              exit 1
+            fi
+            wait_for_deployment "$service" "$id"
             echo "::endgroup::"
-            echo "- $name@$version: Railway service \`$service\`" >> "$GITHUB_STEP_SUMMARY"
-          done < <(jq -r '.[] | [.name, .version, .service] | @tsv' <<< "$SERVERS")
+            echo "- $name@$version: Railway service \`$service\`, deployment \`$id\`" >> "$GITHUB_STEP_SUMMARY"
+          done 3< <(jq -r '.[] | [.name, .version, .service] | @tsv' <<< "$SERVERS")
 
   deploy-static-sites:
     name: Deploy static sites
@@ -178,14 +225,19 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
+      - name: Check that the plan is still current
+        env:
+          CHANGESETS: ${{ needs.plan.outputs.changesets }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
+      # Wrangler is a root devDependency, so the lockfile pins it.
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Install Wrangler
-        run: npm install --global wrangler@4.154.0
       - name: Build and deploy in dependency order
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -201,16 +253,48 @@ jobs:
               exit 1
             fi
           done
+
+          # Wait until the deploy stage of one Pages deployment succeeds.
+          # Wrangler exits 0 when it cannot determine the final status, so
+          # its exit code alone is not a verdict.
+          wait_for_deployment() {
+            local project="$1" id="$2" stage="" deadline=$((SECONDS + 600))
+            while (( SECONDS < deadline )); do
+              stage="$(curl -fsS --retry 3 \
+                -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+                "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/$project/deployments/$id" \
+                | jq -r '.result.latest_stage | "\(.name) \(.status)"')"
+              case "$stage" in
+                "deploy success") echo "Deployment $id of $project: $stage"; return 0 ;;
+                *" failure" | *" canceled")
+                  echo "::error::Deployment $id of $project ended with stage $stage."
+                  return 1
+                  ;;
+              esac
+              echo "Deployment $id of $project: $stage"
+              sleep 5
+            done
+            echo "::error::Deployment $id of $project did not finish within 10 minutes (last stage: ${stage:-unknown})."
+            return 1
+          }
+
           echo "## Static sites" >> "$GITHUB_STEP_SUMMARY"
-          while IFS=$'\t' read -r name version project output; do
+          while IFS=$'\t' read -r -u 3 name version project output; do
             echo "::group::Build and deploy $name@$version to Cloudflare Pages project $project"
-            pnpm exec turbo run build --filter="$name"
-            wrangler pages deploy "$output" --project-name "$project" \
-              --branch main --commit-hash "$SHA" \
-              --commit-message "$name@$version"
+            pnpm exec turbo run build --filter="$name" < /dev/null
+            result="$RUNNER_TEMP/wrangler-$name.ndjson"
+            WRANGLER_OUTPUT_FILE_PATH="$result" pnpm exec wrangler pages deploy "$output" \
+              --project-name "$project" --branch main --commit-hash "$SHA" \
+              --commit-message "$name@$version" < /dev/null
+            id="$(jq -r 'select(.type == "pages-deploy") | .deployment_id' "$result" | tail -n 1)"
+            if [[ -z "$id" ]]; then
+              echo "::error::wrangler pages deploy returned no deployment id for $name."
+              exit 1
+            fi
+            wait_for_deployment "$project" "$id"
             echo "::endgroup::"
-            echo "- $name@$version: Cloudflare Pages project \`$project\`" >> "$GITHUB_STEP_SUMMARY"
-          done < <(jq -r '.[] | [.name, .version, .project, .output] | @tsv' <<< "$SITES")
+            echo "- $name@$version: Cloudflare Pages project \`$project\`, deployment \`$id\`" >> "$GITHUB_STEP_SUMMARY"
+          done 3< <(jq -r '.[] | [.name, .version, .project, .output] | @tsv' <<< "$SITES")
 
   release:
     name: Version and tag
@@ -226,6 +310,12 @@ jobs:
         with:
           ref: ${{ needs.plan.outputs.sha }}
           fetch-depth: 0
+      - name: Check that the plan is still current
+        env:
+          CHANGESETS: ${{ needs.plan.outputs.changesets }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -259,27 +349,33 @@ jobs:
           } > "$RUNNER_TEMP/commit-message"
           git commit --quiet --file="$RUNNER_TEMP/commit-message"
 
-          tag_head() {
-            local tag
-            for tag in "${tags[@]}"; do
-              git tag --force --annotate "$tag" --message "$tag deployed from $SHA"
-            done
-          }
+          # Tag the version commit, whose parent is the deployed revision, so
+          # each tag holds exactly the deployed tree plus the version files.
+          # The tags stay on this commit even when `main` gets a cherry-picked
+          # copy of it below.
+          version_commit="$(git rev-parse HEAD)"
+          for tag in "${tags[@]}"; do
+            if git rev-parse --quiet --verify "refs/tags/$tag" > /dev/null; then
+              echo "::error::Tag $tag already exists. Check the version in the pending changesets."
+              exit 1
+            fi
+            git tag --annotate "$tag" --message "$tag deployed from $SHA" "$version_commit"
+          done
+          tag_refspecs=()
+          for tag in "${tags[@]}"; do tag_refspecs+=("refs/tags/$tag"); done
 
-          # Push the version commit and every tag atomically, so a rejected
-          # push leaves neither on the remote. Only a moved `main` is retried:
-          # the same version commit is cherry-picked onto the new `main`
-          # (changesets merged later stay pending). Any other rejection, such
-          # as a ruleset denial or an existing tag, fails at once.
-          tag_head
+          # Push `main` and every tag atomically, so a rejected push leaves
+          # neither on the remote. Only a moved `main` is retried: the version
+          # commit is cherry-picked onto the new `main` (changesets merged
+          # later stay pending). Any other rejection, such as a ruleset denial
+          # or an existing tag, fails at once.
           max_attempts=3
           for (( attempt = 1; ; attempt++ )); do
-            refspecs=(HEAD:refs/heads/main)
-            for tag in "${tags[@]}"; do refspecs+=("refs/tags/$tag"); done
-            if git push --atomic origin "${refspecs[@]}"; then
+            if git push --atomic origin HEAD:refs/heads/main "${tag_refspecs[@]}"; then
               {
                 echo "## Release"
-                echo "Version commit: $(git rev-parse HEAD)"
+                echo "Version commit on main: $(git rev-parse HEAD)"
+                echo "Tagged version commit: $version_commit"
                 if (( ${#tags[@]} > 0 )); then
                   printf -- '- `%s`\n' "${tags[@]}"
                 else
@@ -298,8 +394,6 @@ jobs:
               exit 1
             fi
             echo "::warning::main moved during the deployment; replaying the version commit (attempt $attempt of $max_attempts)."
-            version_commit="$(git rev-parse HEAD)"
             git reset --quiet --hard origin/main
             git cherry-pick "$version_commit"
-            tag_head
           done

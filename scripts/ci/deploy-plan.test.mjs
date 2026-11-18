@@ -57,7 +57,7 @@ const status = (...releases) => ({
 
 test("no pending changesets select nothing", () => {
   assert.deepEqual(plan({ changesets: [], releases: [] }, workspace), {
-    changesets: 0,
+    changesets: [],
     releases: [],
     servers: [],
     staticSites: [],
@@ -98,7 +98,7 @@ const devDependencyStatus = {
 
 test("none releases are deployed but not tagged", () => {
   const result = plan(devDependencyStatus, workspace);
-  assert.equal(result.changesets, 1);
+  assert.deepEqual(result.changesets, ["fix"]);
   assert.deepEqual(result.releases, [{ name: "ui", version: "0.0.1" }]);
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.version]),
@@ -108,7 +108,7 @@ test("none releases are deployed but not tagged", () => {
 
 test("changesets with only none releases still need the release job", () => {
   const result = plan(status(["api", "0.1.0", ReleaseType.None]), workspace);
-  assert.equal(result.changesets, 1);
+  assert.deepEqual(result.changesets, ["change"]);
   assert.deepEqual(result.releases, []);
   assert.deepEqual(
     result.servers.map((d) => d.name),
@@ -150,6 +150,15 @@ test("deployables follow workspace dependency order within each kind", () => {
     result.releases.map((r) => r.name),
     ["a-site", "api", "billing", "ui", "web"],
   );
+});
+
+test("a changeset id that is not a plain file name fails", () => {
+  for (const id of ["../x", "a/b", "", ".hidden"]) {
+    assert.throws(
+      () => plan({ changesets: [{ id }], releases: [] }, workspace),
+      /not a plain file name/,
+    );
+  }
 });
 
 test("an unknown release fails", () => {
@@ -272,6 +281,7 @@ test("main writes GitHub outputs and a summary", () => {
         ]),
     );
     assert.equal(outputs.has_changesets, "true");
+    assert.deepEqual(JSON.parse(outputs.changesets), ["change"]);
     assert.equal(outputs.has_servers, "true");
     assert.equal(outputs.has_static_sites, "false");
     assert.deepEqual(JSON.parse(outputs.releases), [
