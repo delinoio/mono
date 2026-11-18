@@ -150,6 +150,7 @@ test("every shared fixture input selects tests", async (t) => {
   for (const path of [
     ".changeset/config.json",
     ".github/workflows/CI.yml",
+    ".github/workflows/deploy.yml",
     ".nvmrc",
     "package.json",
     "pnpm-lock.yaml",

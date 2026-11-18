@@ -8,8 +8,10 @@ import {
 } from "./format-changed.mjs";
 
 const fixtureInputs = new Set([
-  // The deploy release fixtures read the repository Changesets config.
+  // The deploy fixtures read the repository Changesets config, and the
+  // deploy workflow calls the scripts that they cover.
   ".changeset/config.json",
+  ".github/workflows/deploy.yml",
   ".github/workflows/CI.yml",
   ".nvmrc",
   "package.json",
