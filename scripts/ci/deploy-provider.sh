@@ -22,6 +22,14 @@
 set -euo pipefail
 
 interval="${DEPLOY_POLL_INTERVAL:-10}"
+# GNU coreutils `timeout` (`gtimeout` when Homebrew installs it with a prefix).
+timeout_command=""
+for candidate in timeout gtimeout; do
+  if command -v "$candidate" > /dev/null; then
+    timeout_command="$candidate"
+    break
+  fi
+done
 max_errors="${DEPLOY_POLL_ERRORS:-5}"
 
 # Prints the last `deploymentId` of the `railway up --detach --json` output on
@@ -59,7 +67,7 @@ poll() {
   local label="$1" timeout="$2" read_command="$3" classify="$4" name="$5" id="$6"
   local value="" errors=0 deadline=$((SECONDS + timeout)) verdict remaining
   while (( (remaining = deadline - SECONDS) > 0 )); do
-    if ! value="$(timeout "$remaining" bash "$0" "$read_command" "$name" "$id")" || (( SECONDS >= deadline )); then
+    if ! value="$("$timeout_command" "$remaining" bash "$0" "$read_command" "$name" "$id")" || (( SECONDS >= deadline )); then
       (( SECONDS < deadline )) || break
       if (( ++errors >= max_errors )); then
         echo "::error::Could not read the status of $label $max_errors times in a row."
@@ -126,6 +134,12 @@ case "$command" in
   pages-id) pages_id "$2" ;;
   read-railway) railway_status "$2" "$3" ;;
   read-pages) pages_status "$2" "$3" ;;
+  wait-railway | wait-pages)
+    if [[ -z "$timeout_command" ]]; then
+      echo "::error::$0 $command needs GNU coreutils timeout (or gtimeout)." >&2
+      exit 2
+    fi
+    ;;&
   wait-railway)
     service="$2" id="$3"
     if ! poll "Railway deployment $id of $service" "${DEPLOY_POLL_TIMEOUT:-1800}" read-railway railway_classify "$service" "$id"; then

@@ -712,6 +712,13 @@ process.stdout.write(
   return bin;
 }
 
+// The wait commands need GNU coreutils `timeout` (or `gtimeout`).
+const hasTimeout = ["timeout", "gtimeout"].some(
+  (command) => spawnSync("sh", ["-c", `command -v ${command}`]).status === 0,
+);
+const skipWait =
+  skip || (!hasTimeout && "GNU coreutils timeout is not installed");
+
 function runProvider(t, args, { responses = {}, input, env = {} } = {}) {
   const dir = scratch(t);
   const bin = stubProvider(dir, responses);
@@ -771,7 +778,7 @@ test(
   },
 );
 
-test("provider waits for Railway SUCCESS", { skip }, (t) => {
+test("provider waits for Railway SUCCESS", { skip: skipWait }, (t) => {
   const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
     responses: {
       "deployment list": [
@@ -792,7 +799,7 @@ test("provider waits for Railway SUCCESS", { skip }, (t) => {
 
 test(
   "provider fails on a failed Railway deployment and prints its logs",
-  { skip },
+  { skip: skipWait },
   (t) => {
     for (const status of [
       "FAILED",
@@ -818,28 +825,32 @@ test(
   },
 );
 
-test("provider tolerates a few failed Railway status reads", { skip }, (t) => {
-  const ok = runProvider(t, ["wait-railway", "api", "dep-1"], {
-    responses: {
-      "deployment list": [
-        { exit: 1 },
-        { exit: 1 },
-        railwayList("dep-1", "SUCCESS"),
-      ],
-    },
-  });
-  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
-  assert.match(ok.stdout, /failure 2 of 5/);
-  const failed = runProvider(t, ["wait-railway", "api", "dep-1"], {
-    responses: { "deployment list": [{ exit: 1 }] },
-  });
-  assert.equal(failed.status, 1);
-  assert.match(failed.stdout, /5 times in a row/);
-});
+test(
+  "provider tolerates a few failed Railway status reads",
+  { skip: skipWait },
+  (t) => {
+    const ok = runProvider(t, ["wait-railway", "api", "dep-1"], {
+      responses: {
+        "deployment list": [
+          { exit: 1 },
+          { exit: 1 },
+          railwayList("dep-1", "SUCCESS"),
+        ],
+      },
+    });
+    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+    assert.match(ok.stdout, /failure 2 of 5/);
+    const failed = runProvider(t, ["wait-railway", "api", "dep-1"], {
+      responses: { "deployment list": [{ exit: 1 }] },
+    });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stdout, /5 times in a row/);
+  },
+);
 
 test(
   "provider gives up on a Railway deployment after the timeout",
-  { skip },
+  { skip: skipWait },
   (t) => {
     const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
       responses: { "deployment list": [railwayList("dep-1", "BUILDING")] },
@@ -850,7 +861,7 @@ test(
   },
 );
 
-test("provider waits for the Pages deploy stage", { skip }, (t) => {
+test("provider waits for the Pages deploy stage", { skip: skipWait }, (t) => {
   const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
     responses: {
       curl: [
@@ -869,7 +880,7 @@ test("provider waits for the Pages deploy stage", { skip }, (t) => {
 
 test(
   "provider fails on a failed or canceled Pages deployment",
-  { skip },
+  { skip: skipWait },
   (t) => {
     for (const [name, status] of [
       ["build", "failure"],
@@ -901,7 +912,7 @@ test(
 
 test(
   "provider does not wait for a status read past the deadline",
-  { skip },
+  { skip: skipWait },
   (t) => {
     const started = Date.now();
     const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
