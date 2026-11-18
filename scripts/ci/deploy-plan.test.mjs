@@ -291,6 +291,25 @@ test("workspace aliases order the aliased package first", () => {
   );
 });
 
+test("relative workspace aliases order the linked package first", () => {
+  const sites = [
+    pkg("apps/accounts", {
+      name: "accounts",
+      dependencies: { "docs-client": "workspace:../docs" },
+      deploy: { target: DeployTarget.CloudflarePages, project: "accounts" },
+    }),
+    pkg("apps/docs", {
+      name: "docs",
+      deploy: { target: DeployTarget.CloudflarePages, project: "docs" },
+    }),
+  ];
+  const result = plan(status(["accounts", "1.0.0"], ["docs", "1.0.0"]), sites);
+  assert.deepEqual(
+    result.staticSites.map((d) => d.name),
+    ["docs", "accounts"],
+  );
+});
+
 test("dependencies through unselected packages keep their order", () => {
   const sites = [
     pkg("apps/a", {

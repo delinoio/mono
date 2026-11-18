@@ -2,8 +2,10 @@
 //
 // Selects the deployables of one `deploy.yml` run from the pending changesets
 // and orders them by dependency. Input is the JSON file written by
-// `changeset status --output <file>`; the release list in it already includes
-// the dependents of each released package. Only workspace packages with a
+// `changeset status --output <file>`. Changesets adds some dependents of a
+// released package to that list, but not all (see the deployment workflow
+// contract), so maintainers select dependents explicitly. Only workspace
+// packages with a
 // `deploy` manifest field are deployed. Every release whose version advances
 // is tagged after the deployment, deployable or not. A `none` release (a
 // dependent through `devDependencies`, or an explicit `none` changeset) is
@@ -122,11 +124,25 @@ function deployable(pkg) {
 }
 
 // Returns the workspace package that a dependency entry links. A pnpm alias
-// such as `"provider": "workspace:z@*"` links package `z` under the key
-// `provider`, so the spec, not the key, names the package.
-function workspaceTarget(key, spec, packagesByName) {
+// links another package under the key: `"provider": "workspace:z@*"` names
+// package `z`, and `"client": "workspace:../z"` names the package in that
+// directory, relative to the declaring package.
+function workspaceTarget(
+  key,
+  spec,
+  declaringDir,
+  packagesByName,
+  packagesByDir,
+) {
   if (typeof spec === "string" && spec.startsWith("workspace:")) {
-    const alias = /^(@?[^@]+)@/.exec(spec.slice("workspace:".length));
+    const target = spec.slice("workspace:".length);
+    if (target.startsWith("./") || target.startsWith("../")) {
+      const pkg = packagesByDir.get(
+        posix.normalize(posix.join(declaringDir, target)).replace(/\/+$/, ""),
+      );
+      if (pkg) return pkg.manifest.name;
+    }
+    const alias = /^(@?[^@]+)@/.exec(target);
     if (alias && packagesByName.has(alias[1])) return alias[1];
   }
   return key;
@@ -137,6 +153,9 @@ function workspaceTarget(key, spec, packagesByName) {
 // packages whose dependencies are already ordered, the alphabetically first
 // one comes next, so the result is stable.
 function topologicalOrder(selected, packagesByName) {
+  const packagesByDir = new Map(
+    [...packagesByName.values()].map((pkg) => [pkg.dir, pkg]),
+  );
   // Selected packages that each package depends on, transitively.
   const reach = new Map();
   const state = new Map();
@@ -148,11 +167,11 @@ function topologicalOrder(selected, packagesByName) {
       );
     }
     state.set(name, "visiting");
-    const manifest = packagesByName.get(name).manifest;
+    const { manifest, dir } = packagesByName.get(name);
     const deps = new Set(
       dependencyFields.flatMap((field) =>
         Object.entries(manifest[field] ?? {}).map(([key, spec]) =>
-          workspaceTarget(key, spec, packagesByName),
+          workspaceTarget(key, spec, dir, packagesByName, packagesByDir),
         ),
       ),
     );
