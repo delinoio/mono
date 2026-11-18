@@ -116,12 +116,15 @@ function runGuard(t, responses, blobs, runNumber = "7") {
 
 const runPage = (entries) => ({
   body: {
-    workflow_runs: entries.map(([run_number, status, conclusion = null]) => ({
-      id: 1000 + run_number,
-      run_number,
-      status,
-      conclusion,
-    })),
+    workflow_runs: entries.map(
+      ([run_number, status, conclusion = null, run_attempt = 1]) => ({
+        id: 1000 + run_number,
+        run_number,
+        status,
+        conclusion,
+        run_attempt,
+      }),
+    ),
   },
 });
 // Each argument is one page of runs, newest first. An empty page follows.
@@ -261,6 +264,45 @@ test("guard lists only runs on main", { skip }, (t) => {
   assert.equal(result.status, 0, result.stdout + result.stderr);
   assert.match(result.args, /runs\?branch=main&/);
 });
+
+test(
+  "guard stops a rerun while a newer deployed run waits to rerun",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runs([8, "queued", null, 2], [7, "in_progress"]),
+        ...jobs(8, "2026-11-18T00:00:00Z"),
+        ...changeset("a", { body: { sha: "blob-a" } }),
+      },
+      { a: "blob-a" },
+    );
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stdout,
+      /plan is stale: run #8 .* started after this run #7/,
+    );
+  },
+);
+
+test(
+  "guard ignores a queued rerun in which no job ever started",
+  { skip },
+  (t) => {
+    const result = runGuard(
+      t,
+      {
+        ...runs([8, "pending", null, 2], [7, "in_progress"]),
+        ...jobs(8),
+        ...changeset("a", { body: { sha: "blob-a" } }),
+      },
+      { a: "blob-a" },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /Ignoring run #8/);
+  },
+);
 
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(

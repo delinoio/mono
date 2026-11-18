@@ -8,9 +8,10 @@
 #
 # - a newer run of the deploy workflow on `main` started, even one that failed or was
 #   cancelled, because it may already have deployed a newer revision. A newer
-#   run that still waits in the concurrency queue does not count, and neither
-#   does one that GitHub cancelled in the queue (a later dispatch replaces the
-#   pending run of the group) before any of its jobs started;
+#   run whose first attempt still waits in the concurrency queue does not
+#   count, and neither does a cancelled or queued run in which no job of any
+#   attempt started (a later dispatch replaces the pending run of the group).
+#   A queued rerun counts when an earlier attempt started a job;
 # - a planned changeset is no longer on `main` (another run released it); or
 # - a planned changeset changed on `main` after planning (different blob).
 #
@@ -69,10 +70,19 @@ fi
 # lists runs newest first, so read pages until a page reaches this run or
 # runs out; a page of queue-cancelled runs must not hide a newer started run.
 newer_runs=""
+# Each newer run gets a kind (no empty TSV fields, because a tab is an IFS
+# whitespace character and empty fields would collapse):
+# - started: in progress, or completed without being cancelled;
+# - probe: cancelled, or a rerun (attempt > 1) that waits in the queue; an
+#   earlier attempt may have deployed, so its jobs decide;
+# - queued: a first attempt that waits in the queue; ignored.
+kind_filter='if .status == "in_progress" or (.status == "completed" and .conclusion != "cancelled") then "started"
+  elif .status == "completed" or (.run_attempt // 1) > 1 then "probe"
+  else "queued" end'
 for (( page = 1; ; page++ )); do
   status=0
   api "repos/$REPOSITORY/actions/workflows/$WORKFLOW/runs?branch=main&per_page=100&page=$page" \
-    --jq '.workflow_runs[] | [.id, .run_number, .status, .conclusion // ""] | @tsv' \
+    --jq ".workflow_runs[] | [.id, .run_number, ($kind_filter)] | @tsv" \
     || status=$?
   if (( status != 0 )); then
     echo "::error::Could not list the runs of $WORKFLOW: $api_output"
@@ -80,23 +90,24 @@ for (( page = 1; ; page++ )); do
   fi
   [[ -n "$api_output" ]] || break
   reached=false
-  while IFS=$'\t' read -r run_id run_number run_status conclusion; do
+  while IFS=$'\t' read -r run_id run_number kind; do
     if (( run_number <= GITHUB_RUN_NUMBER )); then
       reached=true
-    elif [[ "$run_status" == "in_progress" || "$run_status" == "completed" ]]; then
-      newer_runs+="$run_id"$'\t'"$run_number"$'\t'"$conclusion"$'\n'
+    elif [[ "$kind" != "queued" ]]; then
+      newer_runs+="$run_id"$'\t'"$run_number"$'\t'"$kind"$'\n'
     fi
   done <<< "$api_output"
   if [[ "$reached" == true ]]; then
     break
   fi
 done
-while IFS=$'\t' read -r run_id run_number conclusion; do
+while IFS=$'\t' read -r run_id run_number kind; do
   [[ -n "$run_id" ]] || continue
-  if [[ "$conclusion" == "cancelled" ]]; then
+  if [[ "$kind" == "probe" ]]; then
     status=0
     # `filter=all` covers every attempt: an earlier attempt of a rerun may
-    # have deployed even when the latest attempt was cancelled in the queue.
+    # have deployed even when the latest attempt was cancelled or still
+    # waits in the queue.
     api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100" \
       --jq '[.jobs[] | select(.started_at != null)] | length' || status=$?
     if (( status != 0 )); then
@@ -104,7 +115,7 @@ while IFS=$'\t' read -r run_id run_number conclusion; do
       exit 1
     fi
     if (( api_output == 0 )); then
-      echo "Ignoring run #$run_number: it was cancelled before any job of any attempt started."
+      echo "Ignoring run #$run_number: no job of any attempt started."
       continue
     fi
   fi
