@@ -249,7 +249,12 @@ jobs:
           package-manager-cache: false
       # Wrangler is a root devDependency, so the lockfile pins it.
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Build and deploy in dependency order
+      - name: Build in dependency order
+        # No deploy secrets here: the build runs third-party build plugins.
+        env:
+          SITES: ${{ needs.plan.outputs.static_sites }}
+        run: scripts/ci/deploy-targets.sh build-static-sites
+      - name: Deploy in dependency order
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

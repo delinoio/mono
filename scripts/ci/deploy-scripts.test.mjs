@@ -1170,6 +1170,10 @@ function runTargets(
     'case "$1" in railway-id) cat > /dev/null; echo dep ;; pages-id) echo pages ;; esac',
   );
   mkdirSync(join(dir, "servers"));
+  // Site outputs, relative to the working directory, as after a build.
+  for (const site of ["docs", "site"]) {
+    mkdirSync(join(dir, "apps", site, "dist"), { recursive: true });
+  }
   for (const name of ["api", "worker"]) {
     const context = join(dir, `ctx-${name}`);
     mkdirSync(context);
@@ -1183,6 +1187,7 @@ function runTargets(
     ]);
   }
   const result = spawnSync("bash", [targets, command], {
+    cwd: dir,
     encoding: "utf8",
     env: {
       ...baseEnv,
@@ -1222,41 +1227,74 @@ function runTargets(
 test("targets check the plan before each site upload", { skip }, (t) => {
   const result = runTargets(t, "static-sites");
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  // Command, subcommand and, for builds, uploads and waits, the target.
+  // Command, subcommand and, for uploads and waits, the target.
   const order = result.calls.map((call) => {
     const words = call.split(" ").filter(Boolean);
     const keep = words[0] === "pnpm" || words[1] === "wait-pages" ? 3 : 2;
     return words.slice(0, keep).join(" ");
   });
-  assert.deepEqual(
-    order,
-    [
-      "pnpm exec turbo",
-      "guard ",
-      "pnpm exec wrangler",
-      "provider pages-id ",
-      "provider wait-pages docs",
-      "pnpm exec turbo",
-      "guard ",
-      "pnpm exec wrangler",
-      "provider pages-id ",
-      "provider wait-pages site",
-    ].map((call) => call.trim()),
-  );
+  assert.deepEqual(order, [
+    "guard",
+    "pnpm exec wrangler",
+    "provider pages-id",
+    "provider wait-pages docs",
+    "guard",
+    "pnpm exec wrangler",
+    "provider pages-id",
+    "provider wait-pages site",
+  ]);
+});
+
+test("targets build sites without uploading them", { skip }, (t) => {
+  const result = runTargets(t, "build-static-sites");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.calls, [
+    "pnpm exec turbo run build --filter=docs",
+    "pnpm exec turbo run build --filter=site",
+  ]);
 });
 
 test(
-  "targets stop a site upload when its changeset is withdrawn during the build",
+  "targets fail when a site build or its output is missing",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    // `static-sites` without a prior build: the outputs do not exist.
+    const result = spawnSync("bash", [targets, "static-sites"], {
+      cwd: dir,
+      encoding: "utf8",
+      env: {
+        ...baseEnv,
+        SITES: JSON.stringify([
+          {
+            name: "docs",
+            version: "1.0.0",
+            project: "docs",
+            output: "apps/docs/dist",
+          },
+        ]),
+        DEPLOY_GUARD: "/bin/false",
+      },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /was not built; run build-static-sites first/);
+  },
+);
+
+test(
+  "targets stop the next site upload when the plan goes stale",
   { skip },
   (t) => {
     const result = runTargets(t, "static-sites", {
-      pnpmBody: '[[ "$2" != turbo ]] || touch "$STUB_DIR/withdrawn"',
+      pnpmBody: '[[ "$2" != wrangler ]] || touch "$STUB_DIR/withdrawn"',
     });
     assert.equal(result.status, 1);
     assert.match(result.stdout, /The plan is stale/);
-    assert.ok(
-      !result.calls.some((call) => call.startsWith("pnpm exec wrangler")),
+    const uploads = result.calls.filter((call) =>
+      call.startsWith("pnpm exec wrangler"),
     );
+    assert.equal(uploads.length, 1);
+    assert.match(uploads[0], /--project-name docs/);
   },
 );
 

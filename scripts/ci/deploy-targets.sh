@@ -8,6 +8,7 @@
 #
 # Usage:
 #   deploy-targets.sh servers        # SERVERS: plan servers JSON
+#   deploy-targets.sh build-static-sites  # SITES; run without deploy secrets
 #   deploy-targets.sh static-sites   # SITES: plan static sites JSON
 #
 # Environment:
@@ -67,13 +68,32 @@ deploy_servers() {
   done 3< <(jq -r '.[] | [.name, .version, .service] | @tsv' <<< "$SERVERS")
 }
 
+# Builds every site in plan order. The workflow runs this in a step without
+# deploy secrets, because the build runs third-party plugins.
+build_static_sites() {
+  require_targets SITES "${SITES:-}" name version project output
+  local name version project output
+  while IFS=$'\t' read -r -u 3 name version project output; do
+    echo "::group::Build $name@$version"
+    pnpm exec turbo run build --filter="$name" < /dev/null
+    if [[ ! -d "$output" ]]; then
+      echo "::error::The build of $name produced no $output directory."
+      exit 1
+    fi
+    echo "::endgroup::"
+  done 3< <(jq -r '.[] | [.name, .version, .project, .output] | @tsv' <<< "$SITES")
+}
+
 deploy_static_sites() {
   require_targets SITES "${SITES:-}" name version project output
   echo "## Static sites" >> "$summary"
   local name version project output result id
   while IFS=$'\t' read -r -u 3 name version project output; do
-    echo "::group::Build and deploy $name@$version to Cloudflare Pages project $project"
-    pnpm exec turbo run build --filter="$name" < /dev/null
+    echo "::group::Deploy $name@$version to Cloudflare Pages project $project"
+    if [[ ! -d "$output" ]]; then
+      echo "::error::$output of $name was not built; run build-static-sites first."
+      exit 1
+    fi
     check_plan
     result="$RUNNER_TEMP/wrangler-$name.ndjson"
     WRANGLER_OUTPUT_FILE_PATH="$result" pnpm exec wrangler pages deploy "$output" \
@@ -90,9 +110,10 @@ deploy_static_sites() {
 
 case "${1:-}" in
   servers) deploy_servers ;;
+  build-static-sites) build_static_sites ;;
   static-sites) deploy_static_sites ;;
   *)
-    echo "usage: $0 servers | static-sites" >&2
+    echo "usage: $0 servers | build-static-sites | static-sites" >&2
     exit 2
     ;;
 esac
