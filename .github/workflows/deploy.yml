@@ -302,6 +302,7 @@ jobs:
       - name: Commit versions, tag and push
         env:
           RELEASES: ${{ needs.plan.outputs.releases }}
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
           SHA: ${{ needs.plan.outputs.sha }}
         run: |
           git config user.name "github-actions[bot]"

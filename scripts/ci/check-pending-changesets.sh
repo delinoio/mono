@@ -95,14 +95,16 @@ while IFS=$'\t' read -r run_id run_number conclusion; do
   [[ -n "$run_id" ]] || continue
   if [[ "$conclusion" == "cancelled" ]]; then
     status=0
-    api "repos/$REPOSITORY/actions/runs/$run_id/jobs?per_page=100" \
+    # `filter=all` covers every attempt: an earlier attempt of a rerun may
+    # have deployed even when the latest attempt was cancelled in the queue.
+    api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100" \
       --jq '[.jobs[] | select(.started_at != null)] | length' || status=$?
     if (( status != 0 )); then
       echo "::error::Could not list the jobs of run #$run_number: $api_output"
       exit 1
     fi
     if (( api_output == 0 )); then
-      echo "Ignoring run #$run_number: it was cancelled before any job started."
+      echo "Ignoring run #$run_number: it was cancelled before any job of any attempt started."
       continue
     fi
   fi

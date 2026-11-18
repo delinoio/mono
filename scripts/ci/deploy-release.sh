@@ -10,6 +10,9 @@
 #   RELEASES             JSON array of {name, version} to tag (releases whose
 #                        version advances).
 #   SHA                  deployed revision; HEAD must be this commit.
+#   CHANGESET_BLOBS      JSON object that maps each planned changeset id to
+#                        its Git blob SHA at the plan. A retry after `main`
+#                        moved stops when one of them changed or is gone.
 #   GITHUB_STEP_SUMMARY  optional summary file.
 #   DEPLOY_RELEASE_MAX_ATTEMPTS  optional push attempts (default 3).
 set -euo pipefail
@@ -97,6 +100,16 @@ for (( attempt = 1; ; attempt++ )); do
     echo "::error::main kept moving; the version commit and tags were not pushed after $max_attempts attempts."
     exit 1
   fi
+  # The cherry-pick would also succeed when `main` deleted a planned
+  # changeset (both sides delete it), so check the planned changesets on the
+  # fetched `main` first.
+  while IFS=$'\t' read -r id blob; do
+    [[ -n "$id" ]] || continue
+    if [[ "$(git rev-parse --quiet --verify "origin/main:.changeset/$id.md" || true)" != "$blob" ]]; then
+      echo "::error::.changeset/$id.md changed or was removed on main during the deployment; the version commit and tags were not pushed."
+      exit 1
+    fi
+  done < <(jq -r 'to_entries[] | [.key, .value] | @tsv' <<< "$CHANGESET_BLOBS")
   echo "::warning::main moved during the deployment; replaying the version commit (attempt $attempt of $max_attempts)."
   git reset --quiet --hard origin/main
   git cherry-pick "$version_commit"

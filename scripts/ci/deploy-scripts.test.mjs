@@ -218,6 +218,8 @@ test(
       result.stdout,
       /plan is stale: run #8 .* started after this run #7/,
     );
+    // The jobs of every attempt count, not only the latest attempt.
+    assert.match(result.args, /actions\/runs\/1008\/jobs\?filter=all&/);
   },
 );
 
@@ -427,9 +429,23 @@ function moveMain(dir, remote, file, content) {
   git(other, "push", "--quiet", "origin", "HEAD:refs/heads/main");
 }
 
+// Blob SHAs of the changesets at `sha`, as the plan job records them.
+function changesetBlobs(work, sha) {
+  const blobs = {};
+  for (const line of git(work, "ls-tree", sha, ".changeset/").split("\n")) {
+    const match = /^\S+ blob (\S+)\t\.changeset\/(.+)\.md$/.exec(line);
+    if (match && match[2] !== "README") blobs[match[2]] = match[1];
+  }
+  return blobs;
+}
+
 function runRelease(work, sha, releases, extraEnv = {}) {
   const summary = join(work, "..", "summary.md");
   writeFileSync(summary, "");
+  const blobs =
+    /^[0-9a-f]{40}$/.test(sha) && sha !== "0".repeat(40)
+      ? changesetBlobs(work, sha)
+      : {};
   const result = spawnSync("bash", [release], {
     cwd: work,
     encoding: "utf8",
@@ -440,6 +456,7 @@ function runRelease(work, sha, releases, extraEnv = {}) {
       GIT_COMMITTER_NAME: "t",
       GIT_COMMITTER_EMAIL: "t@example.invalid",
       RELEASES: JSON.stringify(releases),
+      CHANGESET_BLOBS: JSON.stringify(blobs),
       SHA: sha,
       GITHUB_STEP_SUMMARY: summary,
       ...extraEnv,
@@ -564,6 +581,26 @@ test("release fails at once when a tag already exists", { skip }, (t) => {
   assert.equal(remoteGit(remote, "rev-parse", "main"), sha);
 });
 
+test("release stops when main withdrew a planned changeset", { skip }, (t) => {
+  const { dir, remote, work } = releaseFixture(t);
+  const sha = addChangeset(work, "one", { a: "patch" });
+  // Another clone deletes the planned changeset while the run deploys.
+  const other = join(dir, "withdraw");
+  git(dir, "clone", "--quiet", "--branch", "main", remote, other);
+  git(other, "rm", "--quiet", ".changeset/one.md");
+  commitAll(other, "withdraw changeset");
+  git(other, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+  const withdrawn = remoteGit(remote, "rev-parse", "main");
+  const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }]);
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stdout,
+    /\.changeset\/one\.md changed or was removed on main/,
+  );
+  assert.equal(remoteGit(remote, "rev-parse", "main"), withdrawn);
+  assert.equal(remoteGit(remote, "tag"), "");
+});
+
 test("release stops when main keeps moving", { skip }, (t) => {
   const { dir, remote, work } = releaseFixture(t);
   const sha = addChangeset(work, "one", { a: "patch" });
@@ -616,6 +653,9 @@ const count = fs.existsSync(state) ? Number(fs.readFileSync(state, "utf8")) : 0;
 fs.writeFileSync(state, String(count + 1));
 const list = responses[key] ?? [{ stdout: "" }];
 const response = list[Math.min(count, list.length - 1)];
+if (response.sleep) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, response.sleep * 1000);
+}
 if (response.exit) {
   process.stderr.write("stub failure\\n");
   process.exit(response.exit);
@@ -800,5 +840,34 @@ test(
       assert.equal(result.status, 1, `${name} ${status}`);
       assert.match(result.stdout, new RegExp(`ended with ${name} ${status}`));
     }
+  },
+);
+
+test(
+  "provider rejects a Pages record without a deployment id",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    const file = join(dir, "wrangler.ndjson");
+    writeFileSync(file, '{"type":"pages-deploy","version":1}\n');
+    const result = runProvider(t, ["pages-id", file]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /returned no deployment id/);
+  },
+);
+
+test(
+  "provider does not wait for a status read past the deadline",
+  { skip },
+  (t) => {
+    const started = Date.now();
+    const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
+      responses: { curl: [{ sleep: 5, ...pagesStage("deploy", "success") }] },
+      env: { DEPLOY_POLL_TIMEOUT: "1" },
+    });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(result.stdout, /did not finish within 1 seconds/);
+    assert.ok(Date.now() - started < 4000, "the slow read was not cut off");
   },
 );
