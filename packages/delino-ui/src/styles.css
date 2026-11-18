@@ -1042,6 +1042,27 @@
     }
   }
 
+  /* The sweep is a physical `translate`, but the bar starts at the inline-start
+     edge of the track, which is the right edge in a right-to-left document.
+     Reusing the left-to-right keyframes there would start the bar inside the
+     track and leave it outside for the last part of every loop, so mirror the
+     travel: from fully outside on the right to fully outside on the left.
+     `:dir()` follows the nearest `dir` attribute, so a nested `dir="ltr"`
+     region inside a right-to-left page keeps the left-to-right sweep. */
+  .dui-progress-indicator[data-indeterminate]:dir(rtl) {
+    animation-name: dui-progress-indeterminate-rtl;
+  }
+
+  @keyframes dui-progress-indeterminate-rtl {
+    from {
+      translate: 100% 0;
+    }
+
+    to {
+      translate: -250% 0;
+    }
+  }
+
   /* Separator */
   .dui-separator {
     flex: none;
