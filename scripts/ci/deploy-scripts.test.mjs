@@ -648,6 +648,46 @@ test("release stops when main withdrew a planned changeset", { skip }, (t) => {
   assert.equal(remoteGit(remote, "tag"), "");
 });
 
+test("release does not restore a rewound main", { skip }, (t) => {
+  const { dir, remote, work } = releaseFixture(t);
+  const before = git(work, "rev-parse", "HEAD");
+  const sha = addChangeset(work, "one", { a: "patch" });
+  // A maintainer rewinds main to the commit before the deployed revision.
+  const other = join(dir, "rewind");
+  git(dir, "clone", "--quiet", "--branch", "main", remote, other);
+  git(
+    other,
+    "push",
+    "--quiet",
+    "--force",
+    "origin",
+    `${before}:refs/heads/main`,
+  );
+  const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }]);
+  assert.equal(result.status, 1);
+  assert.match(result.stdout, /no longer contains the deployed revision/);
+  assert.equal(remoteGit(remote, "rev-parse", "main"), before);
+  assert.equal(remoteGit(remote, "tag"), "");
+});
+
+test("release stops when main changed package manifests", { skip }, (t) => {
+  const { dir, remote, work } = releaseFixture(t);
+  const sha = addChangeset(work, "one", { a: "patch" });
+  moveMain(
+    dir,
+    remote,
+    "pkgs/b/package.json",
+    `${JSON.stringify({ name: "b", version: "0.0.0", private: true, dependencies: { a: "workspace:0.0.0" } }, null, 2)}\n`,
+  );
+  const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }]);
+  assert.equal(result.status, 1);
+  assert.match(
+    result.stdout,
+    /main changed package manifests .*pkgs\/b\/package\.json/,
+  );
+  assert.equal(remoteGit(remote, "tag"), "");
+});
+
 test("release stops when main keeps moving", { skip }, (t) => {
   const { dir, remote, work } = releaseFixture(t);
   const sha = addChangeset(work, "one", { a: "patch" });
@@ -927,5 +967,153 @@ test(
     assert.equal(result.status, 1, result.stdout + result.stderr);
     assert.match(result.stdout, /did not finish within 1 seconds/);
     assert.ok(Date.now() - started < 4000, "the slow read was not cut off");
+  },
+);
+
+// --- deploy-targets.sh -----------------------------------------------------
+
+const targets = join(root, "scripts/ci/deploy-targets.sh");
+
+// Writes an executable shell stub that appends its name and arguments to
+// `calls.log` and then runs `body`.
+function shellStub(bin, name, body = "") {
+  const file = join(bin, name);
+  writeFileSync(
+    file,
+    `#!/usr/bin/env bash\necho "${name} $*" >> "$STUB_DIR/calls.log"\n${body}\n`,
+  );
+  chmodSync(file, 0o755);
+  return file;
+}
+
+// Runs deploy-targets.sh with stubbed `pnpm`, `railway`, guard and provider.
+// The guard fails once `withdrawn` exists, as when a changeset is withdrawn
+// on main.
+function runTargets(
+  t,
+  command,
+  { env = {}, pnpmBody = "", railwayBody = "" } = {},
+) {
+  const dir = scratch(t);
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(dir, "calls.log"), "");
+  shellStub(bin, "pnpm", pnpmBody);
+  shellStub(bin, "railway", railwayBody || 'echo \'{"deploymentId":"dep"}\'');
+  const guardStub = shellStub(
+    bin,
+    "guard",
+    '[[ ! -e "$STUB_DIR/withdrawn" ]] || { echo "::error::The plan is stale"; exit 1; }',
+  );
+  const providerStub = shellStub(
+    bin,
+    "provider",
+    'case "$1" in railway-id) cat > /dev/null; echo dep ;; pages-id) echo pages ;; esac',
+  );
+  mkdirSync(join(dir, "servers"));
+  for (const name of ["api", "worker"]) {
+    const context = join(dir, `ctx-${name}`);
+    mkdirSync(context);
+    writeFileSync(join(context, "Dockerfile"), "FROM scratch\n");
+    execFileSync("tar", [
+      "-czf",
+      join(dir, "servers", `${name}.tar.gz`),
+      "-C",
+      context,
+      ".",
+    ]);
+  }
+  const result = spawnSync("bash", [targets, command], {
+    encoding: "utf8",
+    env: {
+      ...baseEnv,
+      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      STUB_DIR: dir,
+      RUNNER_TEMP: dir,
+      SHA: "a".repeat(40),
+      DEPLOY_GUARD: guardStub,
+      DEPLOY_PROVIDER: providerStub,
+      SERVERS: JSON.stringify([
+        { name: "api", version: "1.0.0", service: "api" },
+        { name: "worker", version: "1.0.0", service: "worker" },
+      ]),
+      SITES: JSON.stringify([
+        {
+          name: "docs",
+          version: "1.0.0",
+          project: "docs",
+          output: "apps/docs/dist",
+        },
+        {
+          name: "site",
+          version: "1.0.0",
+          project: "site",
+          output: "apps/site/dist",
+        },
+      ]),
+      ...env,
+    },
+  });
+  return {
+    ...result,
+    calls: readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n"),
+  };
+}
+
+test("targets check the plan before each site upload", { skip }, (t) => {
+  const result = runTargets(t, "static-sites");
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  // Command, subcommand and, for builds, uploads and waits, the target.
+  const order = result.calls.map((call) => {
+    const words = call.split(" ").filter(Boolean);
+    const keep = words[0] === "pnpm" || words[1] === "wait-pages" ? 3 : 2;
+    return words.slice(0, keep).join(" ");
+  });
+  assert.deepEqual(
+    order,
+    [
+      "pnpm exec turbo",
+      "guard ",
+      "pnpm exec wrangler",
+      "provider pages-id ",
+      "provider wait-pages docs",
+      "pnpm exec turbo",
+      "guard ",
+      "pnpm exec wrangler",
+      "provider pages-id ",
+      "provider wait-pages site",
+    ].map((call) => call.trim()),
+  );
+});
+
+test(
+  "targets stop a site upload when its changeset is withdrawn during the build",
+  { skip },
+  (t) => {
+    const result = runTargets(t, "static-sites", {
+      pnpmBody: '[[ "$2" != turbo ]] || touch "$STUB_DIR/withdrawn"',
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /The plan is stale/);
+    assert.ok(
+      !result.calls.some((call) => call.startsWith("pnpm exec wrangler")),
+    );
+  },
+);
+
+test(
+  "targets stop the next server upload when the plan goes stale",
+  { skip },
+  (t) => {
+    const result = runTargets(t, "servers", {
+      railwayBody:
+        'touch "$STUB_DIR/withdrawn"; echo \'{"deploymentId":"dep"}\'',
+    });
+    assert.equal(result.status, 1);
+    const uploads = result.calls.filter((call) =>
+      call.startsWith("railway up"),
+    );
+    assert.equal(uploads.length, 1);
+    assert.match(uploads[0], /--service api/);
   },
 );

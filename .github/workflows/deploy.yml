@@ -160,6 +160,7 @@ jobs:
           sparse-checkout: |
             scripts/ci/check-pending-changesets.sh
             scripts/ci/deploy-provider.sh
+            scripts/ci/deploy-targets.sh
           sparse-checkout-cone-mode: false
       - name: Check that the plan is still current
         env:
@@ -190,6 +191,11 @@ jobs:
           RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           SERVERS: ${{ needs.plan.outputs.servers }}
           SHA: ${{ needs.plan.outputs.sha }}
+          # The stale-plan check runs again right before each upload.
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -197,22 +203,7 @@ jobs:
             echo "::error::The servers environment has no RAILWAY_TOKEN secret."
             exit 1
           fi
-
-          echo "## Servers" >> "$GITHUB_STEP_SUMMARY"
-          while IFS=$'\t' read -r -u 3 name version service; do
-            context="$RUNNER_TEMP/context-$name"
-            mkdir -p "$context"
-            tar -xzf "$RUNNER_TEMP/servers/$name.tar.gz" -C "$context"
-            echo "::group::Deploy $name@$version to Railway service $service"
-            # The exit code of `railway up` is not a verdict; wait for an
-            # explicit terminal status of the deployment.
-            id="$(railway up "$context" --path-as-root --no-gitignore --detach --json \
-              --service "$service" --message "$name@$version ($SHA)" < /dev/null \
-              | scripts/ci/deploy-provider.sh railway-id)"
-            scripts/ci/deploy-provider.sh wait-railway "$service" "$id"
-            echo "::endgroup::"
-            echo "- $name@$version: Railway service \`$service\`, deployment \`$id\`" >> "$GITHUB_STEP_SUMMARY"
-          done 3< <(jq -r '.[] | [.name, .version, .service] | @tsv' <<< "$SERVERS")
+          scripts/ci/deploy-targets.sh servers
 
   deploy-static-sites:
     name: Deploy static sites
@@ -246,6 +237,11 @@ jobs:
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           SITES: ${{ needs.plan.outputs.static_sites }}
           SHA: ${{ needs.plan.outputs.sha }}
+          # The stale-plan check runs again right before each upload.
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -255,22 +251,7 @@ jobs:
               exit 1
             fi
           done
-
-          echo "## Static sites" >> "$GITHUB_STEP_SUMMARY"
-          while IFS=$'\t' read -r -u 3 name version project output; do
-            echo "::group::Build and deploy $name@$version to Cloudflare Pages project $project"
-            pnpm exec turbo run build --filter="$name" < /dev/null
-            result="$RUNNER_TEMP/wrangler-$name.ndjson"
-            WRANGLER_OUTPUT_FILE_PATH="$result" pnpm exec wrangler pages deploy "$output" \
-              --project-name "$project" --branch main --commit-hash "$SHA" \
-              --commit-message "$name@$version" < /dev/null
-            # Wrangler exits 0 also when it cannot determine the final
-            # status; wait until the deploy stage of the deployment succeeds.
-            id="$(scripts/ci/deploy-provider.sh pages-id "$result")"
-            DEPLOY_POLL_INTERVAL=5 scripts/ci/deploy-provider.sh wait-pages "$project" "$id"
-            echo "::endgroup::"
-            echo "- $name@$version: Cloudflare Pages project \`$project\`, deployment \`$id\`" >> "$GITHUB_STEP_SUMMARY"
-          done 3< <(jq -r '.[] | [.name, .version, .project, .output] | @tsv' <<< "$SITES")
+          scripts/ci/deploy-targets.sh static-sites
 
   release:
     name: Version and tag
