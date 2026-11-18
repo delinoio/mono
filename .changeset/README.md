@@ -8,6 +8,6 @@ Add a changeset to each pull request whose change must be deployed or released:
 pnpm changeset
 ```
 
-Select every changed package and its bump type, and write a short summary. Select a dependent site or server explicitly when it must be rebuilt and deployed; Changesets does not always add dependents. The deployment workflow consumes the changesets after a successful deployment, commits the new versions and changelogs to `main` and pushes a `<package>@<version>` tag for each package whose version advances.
+Select every changed package and its bump type, and write a short summary. Do not select `delidev`: Changesets ignores it until its native versions can be updated together. Select a dependent site or server explicitly when it must be rebuilt and deployed; Changesets does not always add dependents. The deployment workflow consumes the changesets after a successful deployment, commits the new versions and changelogs to `main` and pushes a `<package>@<version>` tag for each package whose version advances.
 
 See the [deployment workflow contract](../docs/repository-workflow-contract.md#deployment-workflow).
