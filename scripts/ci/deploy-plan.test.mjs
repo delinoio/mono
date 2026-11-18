@@ -9,6 +9,7 @@ import {
   DeployKind,
   DeployPlanError,
   DeployTarget,
+  ReleaseType,
   main,
   plan,
   readWorkspacePackages,
@@ -46,11 +47,17 @@ const workspace = [
 ];
 
 const status = (...releases) => ({
-  releases: releases.map(([name, newVersion]) => ({ name, newVersion })),
+  changesets: [{ id: "change", releases: [], summary: "Change." }],
+  releases: releases.map(([name, newVersion, type = "patch"]) => ({
+    name,
+    type,
+    newVersion,
+  })),
 });
 
 test("no pending changesets select nothing", () => {
   assert.deepEqual(plan({ changesets: [], releases: [] }, workspace), {
+    changesets: 0,
     releases: [],
     servers: [],
     staticSites: [],
@@ -62,6 +69,51 @@ test("releases without a deploy field are versioned but not deployed", () => {
   assert.deepEqual(result.releases, [{ name: "ui", version: "0.0.1" }]);
   assert.deepEqual(result.servers, []);
   assert.deepEqual(result.staticSites, []);
+});
+
+// Shape of `changeset status --output` for a `ui: patch` changeset when `web`
+// depends on `ui` only through `devDependencies` (checked with
+// @changesets/cli 3.0.3).
+const devDependencyStatus = {
+  changesets: [
+    { releases: [{ name: "ui", type: "patch" }], summary: "Fix.", id: "fix" },
+  ],
+  releases: [
+    {
+      name: "ui",
+      type: "patch",
+      oldVersion: "0.0.0",
+      changesets: ["fix"],
+      newVersion: "0.0.1",
+    },
+    {
+      name: "web",
+      type: ReleaseType.None,
+      oldVersion: "0.1.0",
+      changesets: [],
+      newVersion: "0.1.0",
+    },
+  ],
+};
+
+test("none releases are deployed but not tagged", () => {
+  const result = plan(devDependencyStatus, workspace);
+  assert.equal(result.changesets, 1);
+  assert.deepEqual(result.releases, [{ name: "ui", version: "0.0.1" }]);
+  assert.deepEqual(
+    result.staticSites.map((d) => [d.name, d.version]),
+    [["web", "0.1.0"]],
+  );
+});
+
+test("changesets with only none releases still need the release job", () => {
+  const result = plan(status(["api", "0.1.0", ReleaseType.None]), workspace);
+  assert.equal(result.changesets, 1);
+  assert.deepEqual(result.releases, []);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["api"],
+  );
 });
 
 test("deployables follow workspace dependency order within each kind", () => {
@@ -219,7 +271,7 @@ test("main writes GitHub outputs and a summary", () => {
           line.slice(line.indexOf("=") + 1),
         ]),
     );
-    assert.equal(outputs.has_releases, "true");
+    assert.equal(outputs.has_changesets, "true");
     assert.equal(outputs.has_servers, "true");
     assert.equal(outputs.has_static_sites, "false");
     assert.deepEqual(JSON.parse(outputs.releases), [

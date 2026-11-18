@@ -3,9 +3,11 @@
 // Selects the deployables of one `deploy.yml` run from the pending changesets
 // and orders them by dependency. Input is the JSON file written by
 // `changeset status --output <file>`; the release list in it already includes
-// the dependents that Changesets bumps. Only workspace packages with a
-// `deploy` manifest field are deployed. Every release is versioned and tagged
-// after the deployment, deployable or not.
+// the dependents of each released package. Only workspace packages with a
+// `deploy` manifest field are deployed. Every release whose version advances
+// is tagged after the deployment, deployable or not. A `none` release (a
+// dependent through `devDependencies`, or an explicit `none` changeset) is
+// deployed when it is deployable, but keeps its version and gets no tag.
 import { appendFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,6 +41,11 @@ const dependencyFields = [
   "peerDependencies",
   "optionalDependencies",
 ];
+
+// Changesets release types that the planner treats differently.
+export const ReleaseType = Object.freeze({
+  None: "none",
+});
 
 export class DeployPlanError extends Error {}
 
@@ -131,13 +138,19 @@ export function plan(status, packages) {
   const packagesByName = new Map(
     packages.map((pkg) => [pkg.manifest.name, pkg]),
   );
-  const releases = (status.releases ?? []).map(({ name, newVersion }) => {
-    if (!packagesByName.has(name)) {
-      throw new DeployPlanError(`release ${name} is not a workspace package`);
-    }
-    return { name, version: newVersion };
-  });
-  const versions = new Map(releases.map((r) => [r.name, r.version]));
+  const allReleases = (status.releases ?? []).map(
+    ({ name, type, newVersion }) => {
+      if (!packagesByName.has(name)) {
+        throw new DeployPlanError(`release ${name} is not a workspace package`);
+      }
+      return { name, type, version: newVersion };
+    },
+  );
+  // A `none` release keeps its current version, whose tag may already exist.
+  const releases = allReleases
+    .filter((r) => r.type !== ReleaseType.None)
+    .map(({ name, version }) => ({ name, version }));
+  const versions = new Map(allReleases.map((r) => [r.name, r.version]));
   const ordered = topologicalOrder(new Set(versions.keys()), packagesByName);
   const deployables = ordered
     .map((name) => deployable(packagesByName.get(name)))
@@ -147,6 +160,7 @@ export function plan(status, packages) {
     (a, b) => kindOrder.indexOf(a.kind) - kindOrder.indexOf(b.kind),
   );
   return {
+    changesets: (status.changesets ?? []).length,
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
     servers: deployables.filter((d) => d.kind === DeployKind.Server),
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
@@ -167,6 +181,7 @@ export function main({
   console.log(
     JSON.stringify({
       event: "deploy_plan",
+      changesets: result.changesets,
       releases: result.releases,
       servers: result.servers.map((d) => d.name),
       staticSites: result.staticSites.map((d) => d.name),
@@ -179,7 +194,9 @@ export function main({
         `releases=${JSON.stringify(result.releases)}`,
         `servers=${JSON.stringify(result.servers)}`,
         `static_sites=${JSON.stringify(result.staticSites)}`,
-        `has_releases=${result.releases.length > 0}`,
+        // Any pending changeset, including one with only `none` releases,
+        // needs the release job to consume it.
+        `has_changesets=${result.changesets > 0}`,
         `has_servers=${result.servers.length > 0}`,
         `has_static_sites=${result.staticSites.length > 0}`,
         "",
@@ -188,7 +205,7 @@ export function main({
   }
   if (env.GITHUB_STEP_SUMMARY) {
     const lines = ["## Deployment plan", ""];
-    if (result.releases.length === 0) {
+    if (result.changesets === 0) {
       lines.push("No pending changesets. Nothing to deploy.");
     } else {
       lines.push("| Order | Package | Version | Kind | Target |");
@@ -200,7 +217,7 @@ export function main({
       });
       lines.push("");
       lines.push(
-        `Versioned and tagged: ${result.releases.map((r) => `${r.name}@${r.version}`).join(", ")}`,
+        `Versioned and tagged: ${result.releases.map((r) => `${r.name}@${r.version}`).join(", ") || "none"}`,
       );
     }
     appendFileSync(env.GITHUB_STEP_SUMMARY, `${lines.join("\n")}\n`);
