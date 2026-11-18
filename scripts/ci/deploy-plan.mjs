@@ -217,6 +217,16 @@ function checkChangesetId(id) {
   return id;
 }
 
+// Matches the files that @changesets/read (3.0.3) reads as changesets.
+function isChangesetFile(file) {
+  return (
+    !file.startsWith(".") &&
+    file.endsWith(".md") &&
+    !/^README\.md$/i.test(file) &&
+    !["AGENTS.md", "CLAUDE.md", "GEMINI.md"].includes(file)
+  );
+}
+
 // Applies the plan rules that do not depend on a release to the repository:
 // every pending changeset file name and every deployable manifest. CI runs
 // this, so a change that would stop every deployment fails in its own pull
@@ -225,7 +235,7 @@ export function check(repoRoot) {
   const changesetDir = join(repoRoot, ".changeset");
   const ids = existsSync(changesetDir)
     ? readdirSync(changesetDir)
-        .filter((file) => file.endsWith(".md") && file !== "README.md")
+        .filter(isChangesetFile)
         .map((file) => file.slice(0, -".md".length))
     : [];
   for (const id of ids) checkChangesetId(id);

@@ -21,10 +21,18 @@ cd "$root"
 
 node "$here/deploy-plan.mjs" --check "$root"
 
+# The same files that @changesets/read treats as changesets: Markdown files
+# that are not hidden, not README.md (any case) and not an agent guidance
+# file (AGENTS.md, CLAUDE.md, GEMINI.md).
+# (The glob skips hidden files.)
 shopt -s nullglob
 pending=()
 for file in .changeset/*.md; do
-  [[ "$(basename "$file")" == README.md ]] || pending+=("$file")
+  name="$(basename "$file")"
+  if [[ "$(tr '[:upper:]' '[:lower:]' <<< "$name")" == readme.md || "$name" == AGENTS.md || "$name" == CLAUDE.md || "$name" == GEMINI.md ]]; then
+    continue
+  fi
+  pending+=("$file")
 done
 
 if (( ${#pending[@]} == 0 )); then

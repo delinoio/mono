@@ -70,6 +70,24 @@ test(
   },
 );
 
+test("ignores the files that Changesets ignores", { skip }, (t) => {
+  const result = run(
+    t,
+    {
+      ...base,
+      "AGENTS.md": "# Agents\n",
+      "CLAUDE.md": "# Claude\n",
+      "GEMINI.md": "# Gemini\n",
+      "readme.md": "# lower\n",
+      ".draft.md": "x\n",
+    },
+    1,
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /No pending changesets/);
+  assert.equal(result.calls, "");
+});
+
 test("runs changeset version for a pending changeset", { skip }, (t) => {
   const ok = run(t, { ...base, "brave.md": '---\n"a": patch\n---\n\nx\n' });
   assert.equal(ok.status, 0, ok.stdout + ok.stderr);
