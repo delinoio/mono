@@ -24,7 +24,25 @@ const root = fileURLToPath(new URL("../..", import.meta.url));
 const guard = join(root, "scripts/ci/check-pending-changesets.sh");
 const release = join(root, "scripts/ci/deploy-release.sh");
 const baseEnv = isolateGitEnvironment({ ...process.env });
-const skip = process.platform === "win32" && "the deploy scripts run on Linux";
+const provider = join(root, "scripts/ci/deploy-provider.sh");
+// The scripts need Bash 4.4 or newer (`mapfile`, empty arrays under `set -u`);
+// macOS ships Bash 3.2.
+const bashVersion = spawnSync(
+  "bash",
+  ["-c", 'echo "${BASH_VERSINFO[0]} ${BASH_VERSINFO[1]}"'],
+  {
+    encoding: "utf8",
+  },
+)
+  .stdout?.trim()
+  .split(" ")
+  .map(Number) ?? [0, 0];
+const skip =
+  process.platform === "win32"
+    ? "the deploy scripts run on Linux"
+    : bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)
+      ? `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`
+      : false;
 
 function scratch(t) {
   const dir = mkdtempSync(join(tmpdir(), "deploy-scripts-"));
@@ -52,6 +70,7 @@ const { execFileSync } = require("node:child_process");
 const dir = ${JSON.stringify(dir)};
 const args = process.argv.slice(2);
 const path = args[1];
+if (process.env.GH_STUB_ARGS_LOG) fs.appendFileSync(process.env.GH_STUB_ARGS_LOG, path + "\\n");
 const jq = args.includes("--jq") ? args[args.indexOf("--jq") + 1] : ".";
 const responses = JSON.parse(fs.readFileSync(dir + "/responses.json", "utf8"));
 const calls = JSON.parse(fs.readFileSync(dir + "/calls.json", "utf8"));
@@ -84,28 +103,35 @@ function runGuard(t, responses, blobs, runNumber = "7") {
       GITHUB_RUN_NUMBER: runNumber,
       GH_TOKEN: "token",
       CHECK_RETRY_DELAY: "0",
+      GH_STUB_ARGS_LOG: join(dir, "args.log"),
     },
   });
   const calls = JSON.parse(readFileSync(join(dir, "calls.json"), "utf8"));
-  return { ...result, calls };
+  const args = readFileSync(join(dir, "args.log"), {
+    encoding: "utf8",
+    flag: "a+",
+  });
+  return { ...result, calls, args };
 }
 
-const runs = (...entries) => ({
+const runPage = (entries) => ({
+  body: {
+    workflow_runs: entries.map(([run_number, status, conclusion = null]) => ({
+      id: 1000 + run_number,
+      run_number,
+      status,
+      conclusion,
+    })),
+  },
+});
+// Each argument is one page of runs, newest first. An empty page follows.
+const runPages = (...pages) => ({
   "repos/owner/repo/actions/workflows/deploy.yml/runs": [
-    {
-      body: {
-        workflow_runs: entries.map(
-          ([run_number, status, conclusion = null]) => ({
-            id: 1000 + run_number,
-            run_number,
-            status,
-            conclusion,
-          }),
-        ),
-      },
-    },
+    ...pages.map(runPage),
+    runPage([]),
   ],
 });
+const runs = (...entries) => runPages(entries);
 const jobs = (runNumber, ...startedAt) => ({
   [`repos/owner/repo/actions/runs/${1000 + runNumber}/jobs`]: [
     { body: { jobs: startedAt.map((started_at) => ({ started_at })) } },
@@ -194,6 +220,45 @@ test(
     );
   },
 );
+
+test("guard reads further pages until it reaches this run", { skip }, (t) => {
+  const cancelled = Array.from({ length: 100 }, (_, i) => [
+    110 - i,
+    "completed",
+    "cancelled",
+  ]);
+  const jobsOfCancelled = Object.assign({}, ...cancelled.map(([n]) => jobs(n)));
+  const result = runGuard(
+    t,
+    {
+      ...runPages(cancelled, [
+        [8, "completed", "failure"],
+        [7, "in_progress"],
+      ]),
+      ...jobsOfCancelled,
+      ...changeset("a", { body: { sha: "blob-a" } }),
+    },
+    { a: "blob-a" },
+  );
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(
+    result.stdout,
+    /plan is stale: run #8 .* started after this run #7/,
+  );
+});
+
+test("guard lists only runs on main", { skip }, (t) => {
+  const result = runGuard(
+    t,
+    {
+      ...runs([7, "in_progress"]),
+      ...changeset("a", { body: { sha: "blob-a" } }),
+    },
+    { a: "blob-a" },
+  );
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.args, /runs\?branch=main&/);
+});
 
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(
@@ -520,5 +585,220 @@ test(
     const result = runRelease(work, "0".repeat(40), []);
     assert.equal(result.status, 1);
     assert.match(result.stdout, /HEAD is not the deployed revision/);
+  },
+);
+
+// --- deploy-provider.sh ----------------------------------------------------
+
+// Stubs `railway` and `curl`. Responses are keyed by the first two `railway`
+// arguments (`deployment list`, `logs <id>`) or by `curl`. Each response is
+// used once and the last one repeats; {exit} makes the call fail.
+function stubProvider(dir, responses) {
+  const bin = join(dir, "bin");
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, "package.json"), '{"type":"commonjs"}\n');
+  writeFileSync(join(dir, "responses.json"), JSON.stringify(responses));
+  writeFileSync(join(dir, "calls.log"), "");
+  for (const command of ["railway", "curl"]) {
+    const file = join(bin, command);
+    writeFileSync(
+      file,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const dir = ${JSON.stringify(dir)};
+const command = ${JSON.stringify(command)};
+const args = process.argv.slice(2);
+const key = command === "curl" ? "curl" : args.slice(0, 2).join(" ");
+fs.appendFileSync(dir + "/calls.log", command + " " + args.join(" ") + "\\n");
+const responses = JSON.parse(fs.readFileSync(dir + "/responses.json", "utf8"));
+const state = dir + "/count-" + key.replace(/\\W/g, "_");
+const count = fs.existsSync(state) ? Number(fs.readFileSync(state, "utf8")) : 0;
+fs.writeFileSync(state, String(count + 1));
+const list = responses[key] ?? [{ stdout: "" }];
+const response = list[Math.min(count, list.length - 1)];
+if (response.exit) {
+  process.stderr.write("stub failure\\n");
+  process.exit(response.exit);
+}
+process.stdout.write(
+  typeof response.stdout === "string" ? response.stdout : JSON.stringify(response.stdout),
+);
+`,
+    );
+    chmodSync(file, 0o755);
+  }
+  return bin;
+}
+
+function runProvider(t, args, { responses = {}, input, env = {} } = {}) {
+  const dir = scratch(t);
+  const bin = stubProvider(dir, responses);
+  const result = spawnSync("bash", [provider, ...args], {
+    encoding: "utf8",
+    input,
+    env: {
+      ...baseEnv,
+      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      CLOUDFLARE_API_TOKEN: "token",
+      CLOUDFLARE_ACCOUNT_ID: "account",
+      DEPLOY_POLL_INTERVAL: "0",
+      ...env,
+    },
+  });
+  return { ...result, calls: readFileSync(join(dir, "calls.log"), "utf8") };
+}
+
+const railwayList = (id, status) => ({
+  stdout: [{ id, status, createdAt: "2026-11-18T00:00:00Z" }],
+});
+const pagesStage = (name, status) => ({
+  stdout: { result: { latest_stage: { name, status } } },
+});
+
+test(
+  "provider reads the Railway deployment id from JSON output",
+  { skip },
+  (t) => {
+    const result = runProvider(t, ["railway-id"], {
+      input: 'Indexing...\n{"deploymentId":"dep-1","logsUrl":"https://x"}\n',
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "dep-1");
+    assert.equal(
+      runProvider(t, ["railway-id"], { input: "no json\n" }).status,
+      1,
+    );
+  },
+);
+
+test(
+  "provider reads the Pages deployment id from Wrangler output",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    const file = join(dir, "wrangler.ndjson");
+    writeFileSync(
+      file,
+      '{"type":"wrangler-session","version":1}\n{"type":"pages-deploy","version":1,"deployment_id":"pages-1"}\n',
+    );
+    const result = runProvider(t, ["pages-id", file]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "pages-1");
+    writeFileSync(file, '{"type":"wrangler-session","version":1}\n');
+    assert.equal(runProvider(t, ["pages-id", file]).status, 1);
+  },
+);
+
+test("provider waits for Railway SUCCESS", { skip }, (t) => {
+  const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
+    responses: {
+      "deployment list": [
+        { stdout: [] },
+        railwayList("dep-1", "BUILDING"),
+        railwayList("dep-1", "DEPLOYING"),
+        railwayList("dep-1", "SUCCESS"),
+      ],
+    },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(result.stdout, /SUCCESS/);
+  assert.match(
+    result.calls,
+    /railway deployment list --service api --limit 20 --json/,
+  );
+});
+
+test(
+  "provider fails on a failed Railway deployment and prints its logs",
+  { skip },
+  (t) => {
+    for (const status of [
+      "FAILED",
+      "CRASHED",
+      "REMOVED",
+      "REMOVING",
+      "SKIPPED",
+    ]) {
+      const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
+        responses: { "deployment list": [railwayList("dep-1", status)] },
+      });
+      assert.equal(result.status, 1, status);
+      assert.match(result.stdout, new RegExp(`ended with ${status}`));
+      assert.match(
+        result.calls,
+        /railway logs dep-1 --service api --build --lines 200/,
+      );
+      assert.match(
+        result.calls,
+        /railway logs dep-1 --service api --deployment --lines 200/,
+      );
+    }
+  },
+);
+
+test("provider tolerates a few failed Railway status reads", { skip }, (t) => {
+  const ok = runProvider(t, ["wait-railway", "api", "dep-1"], {
+    responses: {
+      "deployment list": [
+        { exit: 1 },
+        { exit: 1 },
+        railwayList("dep-1", "SUCCESS"),
+      ],
+    },
+  });
+  assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+  assert.match(ok.stdout, /failure 2 of 5/);
+  const failed = runProvider(t, ["wait-railway", "api", "dep-1"], {
+    responses: { "deployment list": [{ exit: 1 }] },
+  });
+  assert.equal(failed.status, 1);
+  assert.match(failed.stdout, /5 times in a row/);
+});
+
+test(
+  "provider gives up on a Railway deployment after the timeout",
+  { skip },
+  (t) => {
+    const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
+      responses: { "deployment list": [railwayList("dep-1", "BUILDING")] },
+      env: { DEPLOY_POLL_TIMEOUT: "0" },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /did not finish within 0 seconds/);
+  },
+);
+
+test("provider waits for the Pages deploy stage", { skip }, (t) => {
+  const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
+    responses: {
+      curl: [
+        pagesStage("build", "active"),
+        pagesStage("deploy", "active"),
+        pagesStage("deploy", "success"),
+      ],
+    },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.match(
+    result.calls,
+    /curl .*accounts\/account\/pages\/projects\/site\/deployments\/pages-1/,
+  );
+});
+
+test(
+  "provider fails on a failed or canceled Pages deployment",
+  { skip },
+  (t) => {
+    for (const [name, status] of [
+      ["build", "failure"],
+      ["deploy", "failure"],
+      ["deploy", "canceled"],
+    ]) {
+      const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
+        responses: { curl: [pagesStage(name, status)] },
+      });
+      assert.equal(result.status, 1, `${name} ${status}`);
+      assert.match(result.stdout, new RegExp(`ended with ${name} ${status}`));
+    }
   },
 );

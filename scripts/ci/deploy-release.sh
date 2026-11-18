@@ -14,6 +14,12 @@
 #   DEPLOY_RELEASE_MAX_ATTEMPTS  optional push attempts (default 3).
 set -euo pipefail
 
+# Empty arrays under `set -u` and `mapfile` need Bash 4.4 or newer.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "::error::$0 needs Bash 4.4 or newer, not $BASH_VERSION."
+  exit 2
+fi
+
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 max_attempts="${DEPLOY_RELEASE_MAX_ATTEMPTS:-3}"
 

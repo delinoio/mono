@@ -6,7 +6,7 @@
 # check an old run could overwrite the deployment of a newer run or release
 # changesets that changed after planning. The plan is stale when:
 #
-# - a newer run of the deploy workflow started, even one that failed or was
+# - a newer run of the deploy workflow on `main` started, even one that failed or was
 #   cancelled, because it may already have deployed a newer revision. A newer
 #   run that still waits in the concurrency queue does not count, and neither
 #   does one that GitHub cancelled in the queue (a later dispatch replaces the
@@ -26,6 +26,12 @@
 #   GH_TOKEN            token with contents: read and actions: read.
 #   CHECK_RETRY_DELAY   optional seconds between retries (default 5).
 set -euo pipefail
+
+# Empty arrays under `set -u` and `mapfile` need Bash 4.4 or newer.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+  echo "::error::$0 needs Bash 4.4 or newer, not $BASH_VERSION."
+  exit 2
+fi
 
 retry_delay="${CHECK_RETRY_DELAY:-5}"
 api_output=""
@@ -59,15 +65,32 @@ if [[ ! "$GITHUB_RUN_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "::error::GITHUB_RUN_NUMBER is not a number: $GITHUB_RUN_NUMBER"
   exit 1
 fi
-status=0
-api "repos/$REPOSITORY/actions/workflows/$WORKFLOW/runs?per_page=50" \
-  --jq ".workflow_runs[] | select(.run_number > $GITHUB_RUN_NUMBER and (.status == \"in_progress\" or .status == \"completed\")) | [.id, .run_number, .conclusion // \"\"] | @tsv" \
-  || status=$?
-if (( status != 0 )); then
-  echo "::error::Could not list the runs of $WORKFLOW: $api_output"
-  exit 1
-fi
-newer_runs="$api_output"
+# Collect the started runs on `main` that are newer than this run. The API
+# lists runs newest first, so read pages until a page reaches this run or
+# runs out; a page of queue-cancelled runs must not hide a newer started run.
+newer_runs=""
+for (( page = 1; ; page++ )); do
+  status=0
+  api "repos/$REPOSITORY/actions/workflows/$WORKFLOW/runs?branch=main&per_page=100&page=$page" \
+    --jq '.workflow_runs[] | [.id, .run_number, .status, .conclusion // ""] | @tsv' \
+    || status=$?
+  if (( status != 0 )); then
+    echo "::error::Could not list the runs of $WORKFLOW: $api_output"
+    exit 1
+  fi
+  [[ -n "$api_output" ]] || break
+  reached=false
+  while IFS=$'\t' read -r run_id run_number run_status conclusion; do
+    if (( run_number <= GITHUB_RUN_NUMBER )); then
+      reached=true
+    elif [[ "$run_status" == "in_progress" || "$run_status" == "completed" ]]; then
+      newer_runs+="$run_id"$'\t'"$run_number"$'\t'"$conclusion"$'\n'
+    fi
+  done <<< "$api_output"
+  if [[ "$reached" == true ]]; then
+    break
+  fi
+done
 while IFS=$'\t' read -r run_id run_number conclusion; do
   [[ -n "$run_id" ]] || continue
   if [[ "$conclusion" == "cancelled" ]]; then
