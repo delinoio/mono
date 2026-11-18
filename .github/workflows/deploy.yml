@@ -128,6 +128,9 @@ jobs:
           # The runtime image must carry the FSL-1.1-ALv2 terms and notice
           # (docs/repository-license-contract.md).
           cp servers/LICENSE "$context/LICENSE"
+          # The binary statically links the Go standard library and runtime
+          # (BSD-3-Clause), whose notice must ship with it.
+          cp "$(go env GOROOT)/LICENSE" "$context/GO-LICENSE"
           cp -R "$DIR/dist" "$context/dist"
           # A tar archive keeps the executable mode, which artifacts drop.
           tar -czf "$RUNNER_TEMP/$NAME.tar.gz" -C "$context" .
