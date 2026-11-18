@@ -101,11 +101,10 @@ jobs:
         if: needs.changes.outputs.fixtures == 'true'
         run: pnpm test
       - name: Validate pending changesets
-        # `changeset version` rejects a changeset for an unknown package or
-        # one that mixes the ignored `delidev` with other packages. It only
-        # rewrites files of this throwaway checkout and runs last.
+        # Runs `changeset version` when a changeset is pending; it rewrites
+        # files of this throwaway checkout, so it runs last.
         if: needs.changes.outputs.fixtures == 'true'
-        run: pnpm exec changeset version
+        run: scripts/ci/validate-changesets.sh
       - name: Record validation result
         if: always()
         env:
@@ -117,7 +116,7 @@ jobs:
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
           echo "Planned: format=$FORMAT_PLANNED; fixtures=$FIXTURES_PLANNED" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test; pnpm exec changeset version (pending changeset validation)' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test; scripts/ci/validate-changesets.sh (pending changeset validation)' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Runtime, account, native platform and release acceptance: not performed; CI does not build or deploy app projects yet.' >> "$GITHUB_STEP_SUMMARY"
   go:
