@@ -220,9 +220,12 @@ const goneCodes = new Set(Object.values(GoneCode));
 // symlink to a directory elsewhere reports the outside file as a regular file
 // and Rstack would then rewrite it. Git cannot track a path below a symlink, so
 // the fully resolved path of a present regular file must equal its name below
-// the resolved repository root (which itself may be reached through a symlinked
-// ancestor). One `realpath` call covers every parent component.
-function assertInsideRepository(cwd, name) {
+// the resolved repository root. The selectors always pass the resolved root
+// that `git rev-parse --show-toplevel` prints, so they never give this check a
+// root that contains a symlink; the check itself also accepts such a root
+// because it compares against `realpathSync(cwd)`, and a direct test pins that.
+// One `realpath` call covers every parent component.
+export function assertInsideRepository(cwd, name) {
   if (realpathSync(resolve(cwd, name)) === join(realpathSync(cwd), name)) {
     return;
   }

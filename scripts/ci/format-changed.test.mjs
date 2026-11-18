@@ -21,6 +21,7 @@ import { fileURLToPath } from "node:url";
 import test from "node:test";
 import {
   allFormatFiles,
+  assertInsideRepository,
   changedFormatFiles,
   ciEnabled,
   NonUtf8PathError,
@@ -2095,8 +2096,10 @@ for (const {
   );
 }
 
-// A repository reached through a symlinked ancestor is not a symlinked parent:
-// the resolved path of a tracked file equals its name below the resolved root.
+// A symlinked `start` argument is accepted because `git rev-parse
+// --show-toplevel` returns the resolved root, so the selectors never hand the
+// check a root with a symlink. The ancestor tolerance of the check itself is
+// pinned by the two direct tests after this one.
 test(
   "selectors keep a normal nested file when the repository is reached through a symlinked path",
   { skip: process.platform === "win32" },
@@ -2116,6 +2119,40 @@ test(
       "src/c.ts",
     ]);
     assert.deepEqual(stagedFormatFiles(rootlink), ["src/c.ts"]);
+  },
+);
+
+test(
+  "assertInsideRepository accepts a normal file when the root is a symlink",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("src/c.ts", "const value = 1;\n");
+    f.commit();
+    const links = mkdtempSync(join(tmpdir(), "rstack-format-rootlink-"));
+    t.after(() => rmSync(links, { recursive: true, force: true }));
+    const rootlink = join(links, "rootlink");
+    symlinkSync(f.cwd, rootlink);
+    assert.doesNotThrow(() => assertInsideRepository(rootlink, "src/c.ts"));
+  },
+);
+
+test(
+  "assertInsideRepository rejects a symlinked parent when the root is a symlink",
+  { skip: process.platform === "win32" },
+  (t) => {
+    const f = fixture(t);
+    f.write("src/c.ts", "const value = 1;\n");
+    f.commit();
+    const outside = outsideDirectory(t);
+    symlinkSync(outside, join(f.cwd, "a"));
+    const links = mkdtempSync(join(tmpdir(), "rstack-format-rootlink-"));
+    t.after(() => rmSync(links, { recursive: true, force: true }));
+    const rootlink = join(links, "rootlink");
+    symlinkSync(f.cwd, rootlink);
+    assert.throws(() => assertInsideRepository(rootlink, "a/b.ts"), {
+      code: "EOUTSIDEREPO",
+    });
   },
 );
 
