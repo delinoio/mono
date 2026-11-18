@@ -117,10 +117,10 @@ function fixture(
 // An unformatted file in a fresh directory outside the repository, the target
 // of a replaced parent. Rstack would rewrite it if a selector handed it over.
 const outsideSource = "const   outside = 3;\n";
-function outsideDirectory(t) {
+function outsideDirectory(t, fileName = "b.ts") {
   const outside = mkdtempSync(join(tmpdir(), "rstack-format-outside-"));
   t.after(() => rmSync(outside, { recursive: true, force: true }));
-  writeFileSync(join(outside, "b.ts"), outsideSource);
+  writeFileSync(join(outside, fileName), outsideSource);
   return outside;
 }
 
@@ -509,7 +509,7 @@ test("staged selection skips paths excluded by the shared configuration when the
   // ... and behind a parent replaced by a symlink to an outside directory.
   if (process.platform !== "win32") {
     rmSync(join(f.cwd, "vendor"));
-    symlinkSync(outsideDirectory(t), join(f.cwd, "vendor"));
+    symlinkSync(outsideDirectory(t, "lib.ts"), join(f.cwd, "vendor"));
     assert.deepEqual(stagedFormatFiles(f.cwd), ["kept.ts"]);
   }
 });
@@ -1060,7 +1060,7 @@ for (const { name, skip, breakParent } of [
     name: "SYMLINK",
     skip: process.platform === "win32",
     breakParent: (f, t) => {
-      const outside = outsideDirectory(t);
+      const outside = outsideDirectory(t, "lib.ts");
       rmSync(join(f.cwd, "vendor"), { recursive: true });
       symlinkSync(outside, join(f.cwd, "vendor"));
     },
