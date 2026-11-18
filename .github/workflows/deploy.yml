@@ -165,6 +165,7 @@ jobs:
       - name: Check that the plan is still current
         env:
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}
@@ -220,6 +221,7 @@ jobs:
       - name: Check that the plan is still current
         env:
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}
@@ -273,6 +275,7 @@ jobs:
       - name: Check that the plan is still current
         env:
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
           REPOSITORY: ${{ github.repository }}
           WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}

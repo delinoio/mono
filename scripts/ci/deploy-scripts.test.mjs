@@ -94,9 +94,16 @@ process.stdout.write(execFileSync("jq", ["-r", jq], { input: JSON.stringify(resp
   return bin;
 }
 
+const plannedSha = "c".repeat(40);
+
 function runGuard(t, responses, blobs, runNumber = "7") {
   const dir = scratch(t);
-  const bin = stubGh(dir, responses);
+  const bin = stubGh(dir, {
+    [`repos/owner/repo/compare/${plannedSha}...main`]: [
+      { body: { status: "ahead" } },
+    ],
+    ...responses,
+  });
   const result = spawnSync("bash", [guard], {
     encoding: "utf8",
     env: {
@@ -106,6 +113,7 @@ function runGuard(t, responses, blobs, runNumber = "7") {
       REPOSITORY: "owner/repo",
       WORKFLOW: "deploy.yml",
       GITHUB_RUN_NUMBER: runNumber,
+      SHA: plannedSha,
       GH_TOKEN: "token",
       CHECK_RETRY_DELAY: "0",
       GH_STUB_ARGS_LOG: join(dir, "args.log"),
@@ -140,11 +148,16 @@ const runPages = (...pages) => ({
   ],
 });
 const runs = (...entries) => runPages(entries);
-const jobs = (runNumber, ...startedAt) => ({
+// One page of jobs, then an empty page. More pages: pass arrays.
+const jobPages = (runNumber, ...pages) => ({
   [`repos/owner/repo/actions/runs/${1000 + runNumber}/jobs`]: [
-    { body: { jobs: startedAt.map((started_at) => ({ started_at })) } },
+    ...pages.map((startedAt) => ({
+      body: { jobs: startedAt.map((started_at) => ({ started_at })) },
+    })),
+    { body: { jobs: [] } },
   ],
 });
+const jobs = (runNumber, ...startedAt) => jobPages(runNumber, startedAt);
 const changeset = (id, ...list) => ({
   [`repos/owner/repo/contents/.changeset/${id}.md`]: list,
 });
@@ -308,6 +321,38 @@ test(
     assert.match(result.stdout, /Ignoring run #8/);
   },
 );
+
+test("guard reports a rewound main as stale", { skip }, (t) => {
+  for (const compare of ["behind", "diverged"]) {
+    const result = runGuard(
+      t,
+      {
+        [`repos/owner/repo/compare/${plannedSha}...main`]: [
+          { body: { status: compare } },
+        ],
+        ...runs([7, "in_progress"]),
+        ...changeset("a", { body: { sha: "blob-a" } }),
+      },
+      { a: "blob-a" },
+    );
+    assert.equal(result.status, 1, compare);
+    assert.match(result.stdout, /main no longer contains the planned revision/);
+  }
+});
+
+test("guard reads every jobs page of a cancelled newer run", { skip }, (t) => {
+  const result = runGuard(
+    t,
+    {
+      ...runs([8, "completed", "cancelled"], [7, "in_progress"]),
+      ...jobPages(8, Array(100).fill(null), ["2026-11-18T00:00:00Z"]),
+      ...changeset("a", { body: { sha: "blob-a" } }),
+    },
+    { a: "blob-a" },
+  );
+  assert.equal(result.status, 1, result.stdout + result.stderr);
+  assert.match(result.stdout, /plan is stale: run #8/);
+});
 
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(
@@ -785,8 +830,8 @@ function runProvider(t, args, { responses = {}, input, env = {} } = {}) {
 const railwayList = (id, status) => ({
   stdout: [{ id, status, createdAt: "2026-11-18T00:00:00Z" }],
 });
-const pagesStage = (name, status) => ({
-  stdout: { result: { latest_stage: { name, status } } },
+const pagesStage = (name, status, environment = "production") => ({
+  stdout: { result: { environment, latest_stage: { name, status } } },
 });
 
 test(
@@ -936,7 +981,10 @@ test(
         responses: { curl: [pagesStage(name, status)] },
       });
       assert.equal(result.status, 1, `${name} ${status}`);
-      assert.match(result.stdout, new RegExp(`ended with ${name} ${status}`));
+      assert.match(
+        result.stdout,
+        new RegExp(`ended with production ${name} ${status}`),
+      );
     }
   },
 );
@@ -1117,3 +1165,29 @@ test(
     assert.match(uploads[0], /--service api/);
   },
 );
+
+test(
+  "provider fails on a Pages preview deployment",
+  { skip: skipWait },
+  (t) => {
+    const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
+      responses: { curl: [pagesStage("deploy", "success", "preview")] },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /ended with preview deploy success/);
+  },
+);
+
+test("targets reject an empty or malformed target list", { skip }, (t) => {
+  for (const [command, env] of [
+    ["static-sites", { SITES: "" }],
+    ["static-sites", { SITES: "[]" }],
+    ["servers", { SERVERS: "not json" }],
+    ["servers", { SERVERS: '[{"name":"api"}]' }],
+  ]) {
+    const result = runTargets(t, command, { env });
+    assert.equal(result.status, 1, `${command} ${JSON.stringify(env)}`);
+    assert.match(result.stderr, /is not a nonempty list of deployables/);
+    assert.deepEqual(result.calls, [""]);
+  }
+});

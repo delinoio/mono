@@ -31,11 +31,23 @@ guard="${DEPLOY_GUARD:-$here/check-pending-changesets.sh}"
 provider="${DEPLOY_PROVIDER:-$here/deploy-provider.sh}"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
+# Requires a nonempty JSON array of objects that have every given field, so
+# a missing or malformed plan output cannot pass as "nothing to deploy".
+require_targets() {
+  local label="$1" json="$2"
+  shift 2
+  if ! jq -e --args 'type == "array" and length > 0 and all(.[]; type == "object" and (. as $o | $ARGS.positional | all(. as $k | $o[$k] | type == "string" and length > 0)))' "$@" <<< "$json" > /dev/null 2>&1; then
+    echo "::error::$label is not a nonempty list of deployables: ${json:-<empty>}" >&2
+    exit 1
+  fi
+}
+
 check_plan() {
   "$guard" < /dev/null
 }
 
 deploy_servers() {
+  require_targets SERVERS "${SERVERS:-}" name version service
   echo "## Servers" >> "$summary"
   local name version service context id
   while IFS=$'\t' read -r -u 3 name version service; do
@@ -56,6 +68,7 @@ deploy_servers() {
 }
 
 deploy_static_sites() {
+  require_targets SITES "${SITES:-}" name version project output
   echo "## Static sites" >> "$summary"
   local name version project output result id
   while IFS=$'\t' read -r -u 3 name version project output; do

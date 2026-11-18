@@ -12,6 +12,7 @@
 #   count, and neither does a cancelled or queued run in which no job of any
 #   attempt started (a later dispatch replaces the pending run of the group).
 #   A queued rerun counts when an earlier attempt started a job;
+# - `main` no longer contains the planned revision (rewound or rewritten);
 # - a planned changeset is no longer on `main` (another run released it); or
 # - a planned changeset changed on `main` after planning (different blob).
 #
@@ -24,6 +25,7 @@
 #   REPOSITORY          owner/name of the GitHub repository.
 #   WORKFLOW            file name of the deploy workflow, e.g. deploy.yml.
 #   GITHUB_RUN_NUMBER   run number of this run (kept by reruns).
+#   SHA                 planned revision; `main` must still contain it.
 #   GH_TOKEN            token with contents: read and actions: read.
 #   CHECK_RETRY_DELAY   optional seconds between retries (default 5).
 set -euo pipefail
@@ -62,6 +64,10 @@ stale() {
   exit 1
 }
 
+if [[ ! "${SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "::error::SHA is not a full commit SHA: ${SHA:-}"
+  exit 1
+fi
 if [[ ! "$GITHUB_RUN_NUMBER" =~ ^[0-9]+$ ]]; then
   echo "::error::GITHUB_RUN_NUMBER is not a number: $GITHUB_RUN_NUMBER"
   exit 1
@@ -104,23 +110,50 @@ done
 while IFS=$'\t' read -r run_id run_number kind; do
   [[ -n "$run_id" ]] || continue
   if [[ "$kind" == "probe" ]]; then
-    status=0
     # `filter=all` covers every attempt: an earlier attempt of a rerun may
     # have deployed even when the latest attempt was cancelled or still
-    # waits in the queue.
-    api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100" \
-      --jq '[.jobs[] | select(.started_at != null)] | length' || status=$?
-    if (( status != 0 )); then
-      echo "::error::Could not list the jobs of run #$run_number: $api_output"
-      exit 1
-    fi
-    if (( api_output == 0 )); then
+    # waits in the queue. Read every page until a started job appears.
+    started=0
+    for (( job_page = 1; ; job_page++ )); do
+      status=0
+      api "repos/$REPOSITORY/actions/runs/$run_id/jobs?filter=all&per_page=100&page=$job_page" \
+        --jq '"\([.jobs[] | select(.started_at != null)] | length) \(.jobs | length)"' || status=$?
+      if (( status != 0 )); then
+        echo "::error::Could not list the jobs of run #$run_number: $api_output"
+        exit 1
+      fi
+      read -r page_started page_jobs <<< "$api_output"
+      if (( page_started > 0 )); then
+        started=1
+        break
+      fi
+      (( page_jobs > 0 )) || break
+    done
+    if (( started == 0 )); then
       echo "Ignoring run #$run_number: no job of any attempt started."
       continue
     fi
   fi
   stale "run #$run_number of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."
 done <<< "$newer_runs"
+
+# The planned revision must still be on `main`. A `main` that was rewound or
+# rewritten after planning can keep a changeset with the same blob, but the
+# code to deploy is no longer on `main`.
+status=0
+api "repos/$REPOSITORY/compare/$SHA...main" --jq '.status' || status=$?
+case "$status" in
+  0) ;;
+  4) stale "the planned revision $SHA is not in the repository any more." ;;
+  *)
+    echo "::error::Could not compare the planned revision with main: $api_output"
+    exit 1
+    ;;
+esac
+case "$api_output" in
+  identical | ahead) ;;
+  *) stale "main no longer contains the planned revision $SHA (compare status: $api_output)." ;;
+esac
 
 mapfile -t ids < <(jq -r 'keys[]' <<< "$CHANGESET_BLOBS")
 for id in "${ids[@]}"; do
