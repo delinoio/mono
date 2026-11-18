@@ -50,6 +50,18 @@ jobs:
           node-version-file: .nvmrc
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Require the deploy workflow of the dispatch revision
+        # This job reads the current `main`, but GitHub runs the workflow
+        # file of the dispatch revision. A run that waited in the queue while
+        # the deploy workflow or its scripts changed would pair old YAML with
+        # new scripts; dispatch again instead.
+        env:
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          if ! git diff --quiet "$DISPATCH_SHA" HEAD -- .github/workflows/deploy.yml scripts/ci/; then
+            echo "::error::The deploy workflow or its scripts changed on main after this run was dispatched at $DISPATCH_SHA. Start a new deployment."
+            exit 1
+          fi
       - name: Record the deployed revision
         id: revision
         run: |
@@ -90,6 +102,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
+          # Production artifacts must contain Git LFS objects, not pointers.
+          lfs: true
           persist-credentials: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -217,6 +231,8 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
+          # Production artifacts must contain Git LFS objects, not pointers.
+          lfs: true
           persist-credentials: false
       - name: Check that the plan is still current
         env:
