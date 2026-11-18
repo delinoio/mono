@@ -161,7 +161,13 @@ const jobPages = (runNumber, ...pages) => ({
 });
 const jobs = (runNumber, ...startedAt) => jobPages(runNumber, startedAt);
 const changeset = (id, ...list) => ({
-  [`repos/owner/repo/contents/.changeset/${id}.md`]: list,
+  // The guard lists the `.changeset` directory once; a {body: {sha}}
+  // response becomes a listing that contains `<id>.md` with that blob.
+  "repos/owner/repo/contents/.changeset": list.map((response) =>
+    response.body
+      ? { body: [{ name: `${id}.md`, type: "file", sha: response.body.sha }] }
+      : response,
+  ),
 });
 
 test("guard passes a current plan", { skip }, (t) => {
@@ -382,6 +388,33 @@ test("guard rejects a missing or malformed changeset map", { skip }, (t) => {
   }
 });
 
+test(
+  "guard lists .changeset once for many planned changesets",
+  { skip },
+  (t) => {
+    const ids = Array.from({ length: 150 }, (_, i) => `c${i}`);
+    const blobs = Object.fromEntries(ids.map((id) => [id, blobA]));
+    const result = runGuard(
+      t,
+      {
+        ...runs([7, "in_progress"]),
+        "repos/owner/repo/contents/.changeset": [
+          {
+            body: ids.map((id) => ({
+              name: `${id}.md`,
+              type: "file",
+              sha: blobA,
+            })),
+          },
+        ],
+      },
+      blobs,
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.equal(result.calls["repos/owner/repo/contents/.changeset"], 1);
+  },
+);
+
 test("guard reports a released changeset as stale", { skip }, (t) => {
   const result = runGuard(
     t,
@@ -396,7 +429,7 @@ test("guard reports a released changeset as stale", { skip }, (t) => {
     result.stdout,
     /plan is stale: .changeset\/a.md is no longer on main/,
   );
-  assert.equal(result.calls["repos/owner/repo/contents/.changeset/a.md"], 1);
+  assert.equal(result.calls["repos/owner/repo/contents/.changeset"], 1);
 });
 
 test("guard reports an edited changeset as stale", { skip }, (t) => {
@@ -431,9 +464,9 @@ test(
     assert.doesNotMatch(result.stdout, /plan is stale/);
     assert.match(
       result.stdout,
-      /Could not read .changeset\/a.md on main: gh: Bad credentials \(HTTP 401\)/,
+      /Could not list .changeset on main: gh: Bad credentials \(HTTP 401\)/,
     );
-    assert.equal(result.calls["repos/owner/repo/contents/.changeset/a.md"], 3);
+    assert.equal(result.calls["repos/owner/repo/contents/.changeset"], 3);
   },
 );
 
@@ -451,7 +484,7 @@ test("guard retries a transient API error", { skip }, (t) => {
     { a: blobA },
   );
   assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.equal(result.calls["repos/owner/repo/contents/.changeset/a.md"], 2);
+  assert.equal(result.calls["repos/owner/repo/contents/.changeset"], 2);
 });
 
 // --- deploy-release.sh -----------------------------------------------------

@@ -65,7 +65,7 @@ stale() {
 }
 
 # A missing or malformed map would skip every changeset check below.
-if ! jq -e 'type == "object" and length > 0 and all(.[]; type == "string" and test("^[0-9a-f]{40}$"))' \
+if ! jq -es 'length == 1 and (.[0] | type == "object" and length > 0 and all(.[]; type == "string" and test("^[0-9a-f]{40}$")))' \
   <<< "${CHANGESET_BLOBS:-}" > /dev/null 2>&1; then
   echo "::error::CHANGESET_BLOBS is not a nonempty map of changeset blob SHAs: ${CHANGESET_BLOBS:-<empty>}"
   exit 1
@@ -161,20 +161,27 @@ case "$api_output" in
   *) stale "main no longer contains the planned revision $SHA (compare status: $api_output)." ;;
 esac
 
+# Read the `.changeset` directory of `main` once and compare every planned
+# file locally: one request per check, whatever the number of changesets.
+status=0
+api "repos/$REPOSITORY/contents/.changeset?ref=main&per_page=1000" \
+  --jq '[.[] | select(.type == "file") | {key: .name, value: .sha}] | from_entries' || status=$?
+case "$status" in
+  0) current="$api_output" ;;
+  4) current='{}' ;;
+  *)
+    echo "::error::Could not list .changeset on main: $api_output"
+    exit 1
+    ;;
+esac
 mapfile -t ids < <(jq -r 'keys[]' <<< "$CHANGESET_BLOBS")
 for id in "${ids[@]}"; do
   expected="$(jq -r --arg id "$id" '.[$id]' <<< "$CHANGESET_BLOBS")"
-  status=0
-  api "repos/$REPOSITORY/contents/.changeset/$id.md?ref=main" --jq '.sha' || status=$?
-  case "$status" in
-    0) ;;
-    4) stale ".changeset/$id.md is no longer on main; another run already released it." ;;
-    *)
-      echo "::error::Could not read .changeset/$id.md on main: $api_output"
-      exit 1
-      ;;
-  esac
-  if [[ "$api_output" != "$expected" ]]; then
+  actual="$(jq -r --arg file "$id.md" '.[$file] // ""' <<< "$current")"
+  if [[ -z "$actual" ]]; then
+    stale ".changeset/$id.md is no longer on main; another run already released it."
+  fi
+  if [[ "$actual" != "$expected" ]]; then
     stale ".changeset/$id.md changed on main after planning."
   fi
 done
