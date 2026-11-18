@@ -3245,10 +3245,17 @@ test("explicit comparison fails accurately for a non-UTF-8 path and local select
   const all = cli(["--all"]);
   const allOutput = all.stdout + all.stderr;
   // The fixture's own unformatted package.json makes the check exit 1; the
-  // skipped path adds no failure, no error record and no candidate.
+  // skipped path adds no failure, no error record and no candidate. Match the
+  // escaped display form of the path name (one backslash in plain text, two
+  // in JSON): the output also carries the validationRevision, a lowercase hex
+  // SHA that can contain the bare text "caf".
   assert.equal(all.status, 1, allOutput);
   assert.match(all.stdout, /"candidates":2,/u, allOutput);
-  assert.doesNotMatch(allOutput, /ci_format_error|ENOENT|caf/u, allOutput);
+  assert.doesNotMatch(
+    allOutput,
+    /ci_format_error|ENOENT|caf\\{1,2}xe9/u,
+    allOutput,
+  );
 });
 
 test("explicit comparison keeps excluded, unsupported and deleted non-UTF-8 paths silent", (t) => {
