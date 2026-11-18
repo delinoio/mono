@@ -22,9 +22,19 @@ import (
 const MaxHeaderBytes = http.DefaultMaxHeaderBytes
 
 const (
-	// maxObservedHeadBytes matches the limit net/http applies to one request
-	// head: MaxHeaderBytes plus 4096 bytes for the request line and slack.
+	// maxObservedHeadBytes matches the limit net/http applies to the first
+	// request head of a connection: MaxHeaderBytes plus 4096 bytes for the
+	// request line and slack.
 	maxObservedHeadBytes = MaxHeaderBytes + 4096
+	// maxObservedFollowUpHeadBytes is the limit for a head that follows an
+	// earlier head on the same connection. net/http does not charge to a
+	// keep-alive request the bytes that its Peek(4) wait after the previous
+	// response already buffered, which can be up to the 4096 bytes of its
+	// connection buffer, so it accepts a head that large beyond
+	// maxObservedHeadBytes. The observer cannot see how many bytes were
+	// buffered, so it allows the upper bound. It assumes the 4096-byte
+	// connection buffer of net/http: review this value when that size changes.
+	maxObservedFollowUpHeadBytes = maxObservedHeadBytes + 4096
 	// maxPendingRequests bounds the parsed requests that net/http has read from
 	// the connection but not yet dispatched to the handler. net/http reads
 	// through a 4 KiB buffer, so a connection cannot lead the handler by more
@@ -270,6 +280,10 @@ func (o *connObserver) feedHead(p []byte) []byte {
 	if len(p) > 0 && o.requestStart.IsZero() {
 		o.requestStart = o.now()
 	}
+	headLimit := maxObservedHeadBytes
+	if o.parsedHeads > 0 {
+		headLimit = maxObservedFollowUpHeadBytes
+	}
 	for i, b := range p {
 		// net/http discards up to maxLeadingCRorLF CR or LF bytes before a request
 		// line when the previous request on the connection was a POST (a tolerance
@@ -282,7 +296,7 @@ func (o *connObserver) feedHead(p []byte) []byte {
 			continue
 		}
 		o.head = append(o.head, b)
-		if len(o.head) > maxObservedHeadBytes {
+		if len(o.head) > headLimit {
 			o.stop()
 			return nil
 		}

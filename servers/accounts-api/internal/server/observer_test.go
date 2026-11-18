@@ -237,6 +237,49 @@ func TestObserverAcceptsHeadAtTheNetHTTPLimit(t *testing.T) {
 	}
 }
 
+// headOfSize returns a request head of exactly size bytes: one long X-Fill
+// header, the shape that net/http accounts for byte by byte.
+func headOfSize(path string, size int, extra string) string {
+	prefix := "GET " + path + " HTTP/1.1\r\nHost: t\r\n" + extra + "X-Fill: "
+	suffix := "\r\n\r\n"
+	return prefix + strings.Repeat("a", size-len(prefix)-len(suffix)) + suffix
+}
+
+func TestObserverBoundsFollowUpHeadSize(t *testing.T) {
+	const (
+		first     = "GET /first HTTP/1.1\r\nHost: t\r\n\r\n"
+		followUp  = "/follow"
+		wantLimit = maxObservedFollowUpHeadBytes
+	)
+	t.Run("a follow-up head of exactly the limit is observed", func(t *testing.T) {
+		o, _ := newTestObserver()
+		o.feed([]byte(first))
+		o.feed([]byte(headOfSize(followUp, wantLimit, "")))
+		if got := summarize(o); len(got) != 2 || got[1].path != followUp {
+			t.Errorf("pending = %v, want the follow-up head of exactly the limit to be observed after the first request", got)
+		}
+	})
+	t.Run("one byte more stops the observer", func(t *testing.T) {
+		o, _ := newTestObserver()
+		o.feed([]byte(first))
+		o.feed([]byte(headOfSize(followUp, wantLimit+1, "")))
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if o.phase != phaseStopped || len(o.pending) != 1 {
+			t.Errorf("phase = %v, pending = %d, want a stopped observer with only the first request queued", o.phase, len(o.pending))
+		}
+	})
+	t.Run("the first head keeps the lower limit", func(t *testing.T) {
+		o, _ := newTestObserver()
+		o.feed([]byte(headOfSize("/big", maxObservedHeadBytes+1, "")))
+		o.mu.Lock()
+		defer o.mu.Unlock()
+		if o.phase != phaseStopped {
+			t.Errorf("phase = %v, want the first head of one byte over maxObservedHeadBytes to stop the observer", o.phase)
+		}
+	})
+}
+
 func TestObserverBoundsPendingRequests(t *testing.T) {
 	o, _ := newTestObserver()
 	request := []byte("GET / HTTP/1.1\r\nHost: t\r\n\r\n")
@@ -1814,6 +1857,162 @@ func TestDrainedRequestBodyDoesNotMoveRejectionStart(t *testing.T) {
 		// drained body arrived gap before it.
 		if ms := records[0].DurationMS; ms < headerTimeout.Milliseconds()-50 || ms > (headerTimeout+gap/2).Milliseconds() {
 			t.Errorf("duration_ms = %d, want about %d: the drained body must not count", ms, headerTimeout.Milliseconds())
+		}
+	})
+}
+
+// TestKeepAliveHeadBeyondTheFirstHeadLimit sends, on a kept-alive connection to
+// a real net/http server, a head that is up to 4096 bytes larger than the
+// limit for the first head of a connection. net/http does not charge the bytes
+// that its keep-alive wait already buffered to that head, so it serves the
+// request, and the observer must keep parsing the connection: the request that
+// follows is logged, and so is a stall after it.
+func TestKeepAliveHeadBeyondTheFirstHeadLimit(t *testing.T) {
+	const headerTimeout = 300 * time.Millisecond
+	handler := func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "0")
+	}
+	dial := func(t *testing.T, addr string) (net.Conn, *bufio.Reader) {
+		t.Helper()
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+		return conn, bufio.NewReader(conn)
+	}
+	// roundTrip writes one request in a single write and reads its response.
+	roundTrip := func(t *testing.T, conn net.Conn, reader *bufio.Reader, request string) int {
+		t.Helper()
+		if _, err := io.WriteString(conn, request); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		resp, err := http.ReadResponse(reader, nil)
+		if err != nil {
+			t.Fatalf("read response: %v", err)
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode
+	}
+	waitFor := func(logs *lockedBuffer, msg string, want int) {
+		deadline := time.Now().Add(3 * time.Second)
+		for countRecords(logs, msg) < want && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	const (
+		first = "GET /first HTTP/1.1\r\nHost: t\r\n\r\n"
+		pony  = "GET /missing HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n"
+	)
+
+	for _, over := range []int{1, 904, 4096} {
+		size := maxObservedHeadBytes + over
+		t.Run("later 417 is logged, head "+strconv.Itoa(over)+" bytes over the first head limit", func(t *testing.T) {
+			addr, logs := serveObserved(t, handler)
+			conn, reader := dial(t, addr)
+			if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
+				t.Fatalf("first status = %d, want 200", got)
+			}
+			if got := roundTrip(t, conn, reader, headOfSize("/big", size, "")); got != http.StatusOK {
+				t.Fatalf("big status = %d, want 200 (net/http serves a head of %d bytes here)", got, size)
+			}
+			if got := roundTrip(t, conn, reader, pony); got != http.StatusExpectationFailed {
+				t.Fatalf("pony status = %d, want 417", got)
+			}
+			waitFor(logs, "http_request", 3)
+			if got := strings.Count(logs.String(), `"path":"/missing"`); got != 1 || !strings.Contains(logs.String(), `"status":417`) {
+				t.Errorf("want exactly one /missing record with status 417, got %d: %s", got, logs.String())
+			}
+			if got := countRecords(logs, "http_request"); got != 3 {
+				t.Errorf("http_request records = %d, want 3: %s", got, logs.String())
+			}
+			if got := countRecords(logs, "http_request_rejected"); got != 0 {
+				t.Errorf("http_request_rejected records = %d, want none: %s", got, logs.String())
+			}
+		})
+	}
+
+	t.Run("later header read timeout is logged", func(t *testing.T) {
+		addr, logs := serveObservedWith(t, handler, func(srv *http.Server) {
+			srv.ReadHeaderTimeout = headerTimeout
+		})
+		conn, reader := dial(t, addr)
+		if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
+			t.Fatalf("first status = %d, want 200", got)
+		}
+		if got := roundTrip(t, conn, reader, headOfSize("/big", maxObservedHeadBytes+5000-4096, "")); got != http.StatusOK {
+			t.Fatalf("big status = %d, want 200", got)
+		}
+		if _, err := io.WriteString(conn, "GET /stall HTTP/1.1\r\nHost: t\r\n"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, _ = io.ReadAll(reader)
+		waitFor(logs, "http_request_rejected", 1)
+		records := rejectedRecords(t, logs)
+		if len(records) != 1 || records[0].Reason != string(RejectionHeaderReadTimeout) || records[0].Status != 0 {
+			t.Fatalf("rejected records = %+v, want one header_read_timeout with status 0: %s", records, logs.String())
+		}
+	})
+
+	t.Run("a head past the follow-up limit is a 431", func(t *testing.T) {
+		addr, logs := serveObserved(t, handler)
+		conn, reader := dial(t, addr)
+		if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
+			t.Fatalf("first status = %d, want 200", got)
+		}
+		// The 431 closes the connection, so the request after the head never
+		// reaches net/http and must not be logged as a 417.
+		request := headOfSize("/huge", maxObservedFollowUpHeadBytes+1, "") + pony
+		if got := roundTrip(t, conn, reader, request); got != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("status = %d, want 431", got)
+		}
+		waitFor(logs, "http_request_rejected", 1)
+		records := rejectedRecords(t, logs)
+		if len(records) != 1 || records[0].Reason != string(RejectionHeaderTooLarge) || records[0].Status != http.StatusRequestHeaderFieldsTooLarge {
+			t.Fatalf("rejected records = %+v, want one request_header_too_large 431: %s", records, logs.String())
+		}
+		if strings.Contains(logs.String(), `"path":"/missing"`) {
+			t.Errorf("a /missing record was written for a request behind a rejected head: %s", logs.String())
+		}
+	})
+
+	t.Run("a fresh connection keeps the first head limit", func(t *testing.T) {
+		for _, tc := range []struct {
+			size int
+			want int
+		}{
+			{maxObservedHeadBytes, http.StatusOK},
+			{maxObservedHeadBytes + 1, http.StatusRequestHeaderFieldsTooLarge},
+		} {
+			addr, logs := serveObserved(t, handler)
+			conn, reader := dial(t, addr)
+			if got := roundTrip(t, conn, reader, headOfSize("/big", tc.size, "")); got != tc.want {
+				t.Errorf("size %d: status = %d, want %d: %s", tc.size, got, tc.want, logs.String())
+			}
+		}
+	})
+
+	t.Run("a stall in the middle of a line after a large head is a malformed request", func(t *testing.T) {
+		addr, logs := serveObservedWith(t, handler, func(srv *http.Server) {
+			srv.ReadHeaderTimeout = headerTimeout
+		})
+		conn, reader := dial(t, addr)
+		if got := roundTrip(t, conn, reader, first); got != http.StatusOK {
+			t.Fatalf("first status = %d, want 200", got)
+		}
+		if got := roundTrip(t, conn, reader, headOfSize("/big", maxObservedHeadBytes+904, "")); got != http.StatusOK {
+			t.Fatalf("big status = %d, want 200", got)
+		}
+		if _, err := io.WriteString(conn, "GET /stall HTTP/1.1\r\nHos"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		_, _ = io.ReadAll(reader)
+		waitFor(logs, "http_request_rejected", 1)
+		records := rejectedRecords(t, logs)
+		if len(records) != 1 || records[0].Reason != string(RejectionMalformedRequest) || records[0].Status != http.StatusBadRequest {
+			t.Fatalf("rejected records = %+v, want one malformed_request 400: %s", records, logs.String())
 		}
 	})
 }
