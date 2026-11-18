@@ -36,7 +36,7 @@ summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 require_targets() {
   local label="$1" json="$2"
   shift 2
-  if ! jq -e --args 'type == "array" and length > 0 and all(.[]; type == "object" and (. as $o | $ARGS.positional | all(. as $k | $o[$k] | type == "string" and length > 0)))' "$@" <<< "$json" > /dev/null 2>&1; then
+  if ! jq -es --args 'length == 1 and (.[0] | type == "array" and length > 0 and all(.[]; type == "object" and (. as $o | $ARGS.positional | all(. as $k | $o[$k] | type == "string" and length > 0))))' "$@" <<< "$json" > /dev/null 2>&1; then
     echo "::error::$label is not a nonempty list of deployables: ${json:-<empty>}" >&2
     exit 1
   fi
