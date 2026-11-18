@@ -1,6 +1,6 @@
 # Delino
 
-Monorepo for Delino services. It currently contains the `delino-site`, `delino-docs` and `delino-accounts` web apps, the `accounts-api` Go server, the shared React UI component package `delino-ui` in `packages/`, and shared instructions, skills, documentation and formatting tooling. The `crates/`, `cmds/` and `protos/` directories are reserved: they hold only scoped `AGENTS.md` instructions today, and no Rust workspace, Go command tools or protocol schemas exist yet.
+Monorepo for Delino services. It currently contains the `delino-site`, `delino-docs` and `delino-accounts` web apps, the `delidev` desktop and mobile app, the `accounts-api` Go server, the shared React UI component package `delino-ui` in `packages/`, and shared instructions, skills, documentation and formatting tooling. The root Cargo workspace has one member, `apps/delidev/src-tauri`. The `crates/`, `cmds/` and `protos/` directories are reserved: they hold only scoped `AGENTS.md` instructions today, and no Go command tools or protocol schemas exist yet.
 
 ## License
 
