@@ -1157,6 +1157,9 @@ func serveObservedWith(t *testing.T, handler http.HandlerFunc, configure func(*h
 		ConnContext:    ConnContext,
 		ConnState:      ConnState,
 		MaxHeaderBytes: MaxHeaderBytes,
+		// Mirrors newServer: without it net/http answers "OPTIONS *" itself,
+		// which the observer cannot pair with a handler call.
+		DisableGeneralOptionsHandler: true,
 	}
 	if configure != nil {
 		configure(srv)
@@ -1267,6 +1270,70 @@ func requestRecords(t *testing.T, logs *lockedBuffer) []requestRecord {
 		}
 	}
 	return records
+}
+
+// TestObservedOptionsStarRequestThenUnsupportedExpect sends a server-wide
+// "OPTIONS *" request and then a request with an unsupported Expect header on
+// one connection. The observed server sets DisableGeneralOptionsHandler, as
+// newServer does, so the handler sees "OPTIONS *" and the observer pairs the
+// later 417 with its own request. With the field left false, net/http answers
+// "OPTIONS *" itself, the observer keeps its entry queued and the 417 is lost.
+func TestObservedOptionsStarRequestThenUnsupportedExpect(t *testing.T) {
+	addr, logs := serveObserved(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+	const request = "OPTIONS * HTTP/1.1\r\nHost: t\r\n\r\n" +
+		"GET /b HTTP/1.1\r\nHost: t\r\nExpect: a-pony\r\n\r\n"
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	response, _ := io.ReadAll(conn)
+	text := string(response)
+	i200 := strings.Index(text, "HTTP/1.1 200 ")
+	i417 := strings.Index(text, "HTTP/1.1 417 ")
+	if i200 < 0 || i417 < i200 || !strings.Contains(text[i417:], "Connection: close") {
+		t.Fatalf("response = %q, want 200 and then 417 with Connection: close", text)
+	}
+
+	var records []struct {
+		Msg    string `json:"msg"`
+		Method string `json:"method"`
+		Path   string `json:"path"`
+		Status int    `json:"status"`
+	}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry struct {
+			Msg    string `json:"msg"`
+			Method string `json:"method"`
+			Path   string `json:"path"`
+			Status int    `json:"status"`
+		}
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", line, err)
+		}
+		records = append(records, entry)
+	}
+	if len(records) != 2 {
+		t.Fatalf("records = %+v, want exactly two http_request records: %s", records, logs.String())
+	}
+	for i, want := range []struct {
+		method, path string
+		status       int
+	}{{"OPTIONS", "*", 200}, {"GET", "/b", 417}} {
+		got := records[i]
+		if got.Msg != "http_request" || got.Method != want.method || got.Path != want.path || got.Status != want.status {
+			t.Errorf("record %d = %+v, want http_request %s %s %d", i, got, want.method, want.path, want.status)
+		}
+	}
 }
 
 // TestHandlerExpectationFailedIsNotClaimedAsARejection pipelines a request with

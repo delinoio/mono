@@ -25,7 +25,10 @@ const maxOptionsBodyBytes = 4 << 10
 // request logger. net/http answers that request before it consults the
 // configured Handler unless http.Server.DisableGeneralOptionsHandler is set, so
 // the production server must set it (see newServer in cmd/accounts-api);
-// otherwise the request is neither routed here nor logged.
+// otherwise the request is neither routed here nor logged, a later 417 on the
+// same connection is not logged by the request head observer, and the
+// duration_ms of later http_request_rejected records on that connection is
+// measured from the "OPTIONS *" request.
 func NewHandler(logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz(logger))
