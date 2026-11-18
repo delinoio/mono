@@ -181,6 +181,19 @@ test("a deploy target outside its workspace root fails", () => {
   );
 });
 
+test("a scoped deployable package name fails", () => {
+  const scoped = [
+    pkg("servers/api", {
+      name: "@delino/api",
+      deploy: { target: DeployTarget.Railway, service: "api" },
+    }),
+  ];
+  assert.throws(
+    () => plan(status(["@delino/api", "1.0.0"]), scoped),
+    /deployable package name/,
+  );
+});
+
 test("an unknown deploy target fails", () => {
   const bad = [pkg("servers/api", { name: "api", deploy: { target: "fly" } })];
   assert.throws(() => plan(status(["api", "1.0.0"]), bad), /deploy.target/);

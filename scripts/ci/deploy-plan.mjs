@@ -47,6 +47,8 @@ export const ReleaseType = Object.freeze({
   None: "none",
 });
 
+const deployableName = /^[a-z0-9][a-z0-9._-]*$/;
+
 export class DeployPlanError extends Error {}
 
 // Reads every workspace package directly inside a workspace root.
@@ -75,6 +77,13 @@ function deployable(pkg) {
   if (!rule) {
     throw new DeployPlanError(
       `${name}: deploy.target must be one of ${Object.values(DeployTarget).join(", ")}`,
+    );
+  }
+  // The workflow uses the package name in file paths, artifact names and
+  // tags, so a deployable name must not contain a scope or a slash.
+  if (!deployableName.test(name)) {
+    throw new DeployPlanError(
+      `${name}: a deployable package name must match ${deployableName}`,
     );
   }
   if (!pkg.dir.startsWith(`${rule.root}/`)) {
