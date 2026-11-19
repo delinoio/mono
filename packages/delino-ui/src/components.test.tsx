@@ -1650,6 +1650,15 @@ describe("Progress", () => {
     expect(bar.hasAttribute("data-indeterminate")).toBe(true);
   });
 
+  // happy-dom computes no layout, so this checks the stylesheet source. It does
+  // not prove the rendered widths; that needs a real-browser check.
+  test("keeps the root to one grid track so the header spans the track", () => {
+    expect(block(".dui-progress")).toContain(
+      "grid-template-columns: minmax(0, 1fr)",
+    );
+    expect(block(".dui-progress")).toContain("gap: 8px");
+  });
+
   // happy-dom computes no animation, so this checks the stylesheet source. It
   // does not prove the rendered sweep; that needs a real-browser check.
   test("mirrors the indeterminate sweep in right-to-left text", () => {
