@@ -44,7 +44,7 @@ The SDKs expose the public services of the [protos contract](protos-ownsand-api-
 
 ### Data path
 
-- For exec and file operations, an SDK that supports peer-to-peer calls `OpenSession` once per sandbox handle and tries a WebRTC data channel to the agent. A relay-only SDK, and a client with the transport forced to `RELAY`, does not call `OpenSession`; it calls the relay RPCs directly.
+- For exec and file operations, an SDK that supports peer-to-peer calls `GetIceServers` and then `OpenSession` once per sandbox handle and tries a WebRTC data channel to the agent. A relay-only SDK, and a client with the transport forced to `RELAY`, does not call `OpenSession`; it calls the relay RPCs directly.
 - When the data channel does not open within 10 seconds, or fails during a session, the SDK uses the relay RPCs for that sandbox handle. The SDK never runs an exec again, because the command may have run. The SDK generates the `exec_id` before it sends an exec, so it can continue an exec that was in progress with `AttachExec` on the relay, also when the stream ended before the `started` event. It generates a `read_id` for each file read and continues the read from the next offset with the same `read_id`. When `AttachExec` fails with `not_found`, the exec fails with a data path error and its outcome is unknown.
 - A relay stream can end before the operation ends because of the Railway edge limits. The SDK continues it with `AttachExec` or `ReadFile` from the next offset without a visible error. A `ReadFile` that fails with `not_found` because its `read_id` expired is a visible error.
 - After any session end (15 minutes idle, the 1-hour absolute expiry, a revocation or the agent losing its channel), the SDK calls `GetIceServers` and `OpenSession` again before the next operation and tries peer-to-peer again. Only an ICE failure, or a new session that cannot open, moves the handle to the relay. The SDK recognizes a session end by the session-end frame that the agent sends before it closes the data channel; a data channel that closes without that frame is a failure. A revoked credential then fails with `unauthenticated` or `permission_denied`.
@@ -58,7 +58,7 @@ The SDKs persist nothing. They keep sessions and credentials in memory only.
 ## Security
 
 - Credentials stay in memory. The SDKs never write them to disk or logs.
-- The SDKs connect only to the configured API origin, the STUN service in the session offer and the agent's ICE candidates.
+- The SDKs connect only to the configured API origin, the STUN servers that `GetIceServers` returns and the agent's ICE candidates.
 - The data channel accepts only the DTLS fingerprint in the agent's answer that `OpenSession` returned over the authenticated control plane connection.
 
 ## Logging
