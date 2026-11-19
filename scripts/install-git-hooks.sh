@@ -14,6 +14,26 @@ canonicalize_existing_directory() {
 	)
 }
 
+# Print a path that two spellings of the same hooks directory share, even when
+# that directory does not exist yet. An existing directory resolves physically.
+# A missing directory resolves through its parent, so "<git dir>/hooks/",
+# "<git dir>/./hooks" and "<git dir>//hooks" all become "<physical git dir>/hooks".
+# Fail when the parent is missing too; the caller then keeps the raw spelling, so
+# an unrelated missing custom path still reaches Lefthook's own protection.
+# The argument must be absolute, because dirname and basename of a relative
+# path would resolve against the current directory.
+comparable_hooks_path() {
+	if resolved_hooks_path="$(canonicalize_existing_directory "$1")"; then
+		printf '%s\n' "$resolved_hooks_path"
+		return 0
+	fi
+	if resolved_hooks_parent="$(canonicalize_existing_directory "$(dirname -- "$1")")"; then
+		printf '%s\n' "$resolved_hooks_parent/$(basename -- "$1")"
+		return 0
+	fi
+	return 1
+}
+
 # Exit before Lefthook can overwrite "<hook>.old" with a non-Lefthook hook.
 refuse_backup_overwrite() {
 	hook_file="$canonical_hooks_path/$1"
@@ -58,12 +78,12 @@ case "$configured_hooks_path" in
 esac
 
 canonical_hooks_path="$absolute_hooks_path"
-if normalized_hooks_path="$(canonicalize_existing_directory "$absolute_hooks_path")"; then
+if normalized_hooks_path="$(comparable_hooks_path "$absolute_hooks_path")"; then
 	canonical_hooks_path="$normalized_hooks_path"
 fi
 
 canonical_shared_hooks_path="$shared_hooks_path"
-if normalized_shared_hooks_path="$(canonicalize_existing_directory "$shared_hooks_path")"; then
+if normalized_shared_hooks_path="$(comparable_hooks_path "$shared_hooks_path")"; then
 	canonical_shared_hooks_path="$normalized_shared_hooks_path"
 fi
 
