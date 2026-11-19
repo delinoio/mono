@@ -86,8 +86,8 @@ func shutdownContext() (context.Context, context.CancelFunc) {
 // newServer is the single production construction point of the http.Server.
 //
 // net/http reports its own internal errors (a recovered handler panic with its
-// stack trace, a superfluous WriteHeader call, TLS handshake and malformed
-// request errors) through Server.ErrorLog. When ErrorLog is nil it falls back
+// stack trace, a superfluous WriteHeader call and TLS handshake errors)
+// through Server.ErrorLog. When ErrorLog is nil it falls back
 // to the standard library's default logger. After slog.SetDefault that logger
 // forwards to the slog default handler at INFO level, so these failures would
 // be recorded as INFO and dropped when LOG_LEVEL is warn or error; without
