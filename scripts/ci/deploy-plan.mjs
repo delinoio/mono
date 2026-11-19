@@ -33,10 +33,13 @@ export const DeployKind = Object.freeze({
 // sites, which call the servers.
 const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 
-const targetRules = {
-  [DeployTarget.Railway]: { kind: DeployKind.Server, root: "servers" },
-  [DeployTarget.CloudflarePages]: { kind: DeployKind.StaticSite, root: "apps" },
-};
+// A Map, not a plain object: `Map.get` matches by SameValueZero, so inherited
+// `Object.prototype` members (`constructor`, `__proto__`, ...) and arrays that
+// coerce to a valid key (`["railway"]`) never resolve to a rule.
+const targetRules = new Map([
+  [DeployTarget.Railway, { kind: DeployKind.Server, root: "servers" }],
+  [DeployTarget.CloudflarePages, { kind: DeployKind.StaticSite, root: "apps" }],
+]);
 
 const dependencyFields = [
   "dependencies",
@@ -76,7 +79,7 @@ export function readWorkspacePackages(repoRoot) {
 function deployable(pkg) {
   const { name, deploy } = pkg.manifest;
   if (deploy === undefined) return undefined;
-  const rule = targetRules[deploy?.target];
+  const rule = targetRules.get(deploy?.target);
   if (!rule) {
     throw new DeployPlanError(
       `${name}: deploy.target must be one of ${Object.values(DeployTarget).join(", ")}`,

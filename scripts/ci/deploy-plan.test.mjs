@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import {
   mkdirSync,
   mkdtempSync,
@@ -224,9 +225,93 @@ test("a scoped deployable package name fails", () => {
   );
 });
 
+const invalidTargetMessage =
+  /^(web|api): deploy\.target must be one of railway, cloudflare-pages$/;
+
 test("an unknown deploy target fails", () => {
   const bad = [pkg("servers/api", { name: "api", deploy: { target: "fly" } })];
-  assert.throws(() => plan(status(["api", "1.0.0"]), bad), /deploy.target/);
+  assert.throws(
+    () => plan(status(["api", "1.0.0"]), bad),
+    (error) => {
+      assert.ok(error instanceof DeployPlanError);
+      assert.match(error.message, invalidTargetMessage);
+      return true;
+    },
+  );
+});
+
+// Every value that is not an own, valid target string must fail with the
+// invalid-target diagnostic, whatever other deploy fields the manifest has.
+// The values include `Object.prototype` member names, which a plain-object
+// lookup would resolve to inherited members, and arrays, which a plain-object
+// lookup would coerce to a valid target key.
+const invalidTargets = [
+  "constructor",
+  "toString",
+  "valueOf",
+  "hasOwnProperty",
+  "__proto__",
+  ["railway"],
+  ["cloudflare-pages"],
+  "",
+  null,
+  7,
+  { toString: () => "railway" },
+];
+
+test("a non-target deploy.target value fails with the invalid-target diagnostic", () => {
+  for (const target of invalidTargets) {
+    // `target` is a computed value, so `__proto__` stays an own data value.
+    const label = JSON.stringify(target) ?? String(target);
+    const deployFields = [
+      { target },
+      { target, project: "web" },
+      { target, service: "svc" },
+      { target, service: "svc", project: "web" },
+    ];
+    for (const deploy of deployFields) {
+      for (const dir of ["apps/web", "servers/api"]) {
+        const name = dir === "apps/web" ? "web" : "api";
+        const bad = [pkg(dir, { name, deploy })];
+        assert.throws(
+          () => plan(status([name, "1.0.0"]), bad),
+          (error) => {
+            assert.ok(error instanceof DeployPlanError, label);
+            assert.match(error.message, invalidTargetMessage, label);
+            assert.doesNotMatch(
+              error.message,
+              /undefined\/|is required/,
+              label,
+            );
+            return true;
+          },
+          label,
+        );
+      }
+    }
+  }
+});
+
+test("valid targets still plan and keep the root restriction", () => {
+  const result = plan(status(["api", "1.0.0"], ["web", "1.0.0"]), workspace);
+  assert.deepEqual(
+    result.servers.map((d) => [d.name, d.target]),
+    [["api", DeployTarget.Railway]],
+  );
+  assert.deepEqual(
+    result.staticSites.map((d) => [d.name, d.target]),
+    [["web", DeployTarget.CloudflarePages]],
+  );
+  const wrongRoot = [
+    pkg("apps/web", {
+      name: "web",
+      deploy: { target: DeployTarget.Railway, service: "web" },
+    }),
+  ];
+  assert.throws(
+    () => plan(status(["web", "1.0.0"]), wrongRoot),
+    /web: deploy\.target railway is allowed only under servers\//,
+  );
 });
 
 test("missing service or project names fail", () => {
@@ -498,6 +583,47 @@ test("main writes GitHub outputs and a summary", () => {
     assert.match(readFileSync(summaryPath, "utf8"), /accounts-api@0\.1\.0/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("check and the --check CLI reject non-target deploy.target values", () => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  const cases = [
+    ["servers/api", "api", { target: ["railway"], project: "p" }],
+    ["servers/api", "api", { target: "__proto__", service: "s" }],
+    ["apps/web", "web", { target: "constructor", project: "web" }],
+    ["apps/web", "web", { target: ["cloudflare-pages"], project: "web" }],
+  ];
+  for (const [dir, name, deploy] of cases) {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-target-"));
+    try {
+      mkdirSync(join(workDir, ".changeset"));
+      writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+      mkdirSync(join(workDir, dir), { recursive: true });
+      writeFileSync(
+        join(workDir, dir, "package.json"),
+        JSON.stringify({ name, deploy }),
+      );
+      const label = JSON.stringify(deploy);
+      assert.throws(
+        () => check(workDir),
+        (error) => {
+          assert.ok(error instanceof DeployPlanError, label);
+          assert.match(error.message, invalidTargetMessage, label);
+          return true;
+        },
+        label,
+      );
+      const run = spawnSync(process.execPath, [cli, "--check", workDir], {
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 2, label);
+      const event = JSON.parse(run.stderr.trim());
+      assert.equal(event.event, "deploy_plan_error", label);
+      assert.match(event.message, invalidTargetMessage, label);
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
   }
 });
 
