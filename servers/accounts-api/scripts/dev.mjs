@@ -7,11 +7,12 @@
 // own, so a SIGTERM sent to the launcher process (`kill`, `timeout`, a
 // supervisor, pnpm or Turbo) ended `go run` and left the server listening
 // without a graceful shutdown. This launcher builds the server into a
-// temporary directory, runs the binary as its direct child, forwards SIGINT
-// and SIGTERM to the active child, waits for it to exit and removes the build
-// output afterwards. The child runs in its own process group so that a
-// process-group signal (a terminal Ctrl-C) reaches it exactly once, through the
-// launcher's forward.
+// temporary directory, runs the binary as its direct child, forwards SIGINT,
+// SIGTERM and SIGQUIT to the active child, waits for it to exit and removes the
+// build output afterwards. The child runs in its own process group so that a
+// process-group signal (a terminal Ctrl-C or Ctrl-\) reaches it exactly once,
+// through the launcher's forward. SIGQUIT makes the Go server print its
+// goroutine dump and exit; the launcher then exits with status 131.
 //
 // SIGHUP is not handled. Because the child is no longer in the launcher's
 // process group, a SIGHUP to that group (closing the terminal) or a SIGKILL of
@@ -31,6 +32,9 @@ import { fileURLToPath } from "node:url";
 const ForwardedSignal = Object.freeze({
   Interrupt: "SIGINT",
   Terminate: "SIGTERM",
+  // Without a handler, Node ends the launcher on SIGQUIT and leaves the server
+  // running as an orphan (the server is in its own process group).
+  Quit: "SIGQUIT",
 });
 const signalExitCode = (signal) => 128 + constants.signals[signal];
 

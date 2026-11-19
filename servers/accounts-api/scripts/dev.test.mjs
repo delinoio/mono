@@ -22,6 +22,7 @@ const skip = process.platform === "win32";
 const launcher = fileURLToPath(new URL("./dev.mjs", import.meta.url));
 const StatusSigint = 130;
 const StatusSigterm = 143;
+const StatusSigquit = 131;
 const Timeout = 60_000;
 // The deadline of waitFor. It must stay below the smallest per-test timeout
 // (Timeout) minus the setup time that runs before the first wait (port
@@ -310,6 +311,39 @@ test(
 );
 
 test(
+  "a process-group SIGQUIT reaches the server once and leaves no orphan",
+  { skip, timeout: Timeout * 2 },
+  async (t) => {
+    const port = await freePort();
+    const run = startLauncher(t, { port });
+    await waitReady(run);
+    const pids = [...run.childPids];
+    assert.ok(pids.length > 0, "the server pid was not recorded");
+
+    // A terminal Ctrl-\ signals every process of the foreground group. Only the
+    // launcher is in that group; it must forward the signal to the server
+    // instead of dying and orphaning the server.
+    process.kill(-run.child.pid, "SIGQUIT");
+    const { code } = await run.exited;
+
+    assert.equal(code, StatusSigquit, run.stderr);
+    assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
+    assert.match(run.stderr, /"signal":"SIGQUIT"/);
+    // The Go runtime prints one goroutine dump for the one SIGQUIT it receives.
+    assert.equal(
+      (`${run.stdout}\n${run.stderr}`.match(/SIGQUIT: quit/g) ?? []).length,
+      1,
+      `stdout: ${run.stdout}\nstderr: ${run.stderr}`,
+    );
+    // The Go runtime exits at once, so no graceful shutdown completes.
+    assert.doesNotMatch(run.stdout, /"server_shutdown_completed"/);
+    await waitGone(run, pids, "the server to exit");
+    await assertNoListener(port);
+    assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
+  },
+);
+
+test(
   "an occupied port fails without a server",
   { skip, timeout: Timeout * 2 },
   async (t) => {
@@ -395,6 +429,48 @@ test(
     const { code } = await run.exited;
 
     assert.equal(code, StatusSigterm, run.stderr);
+    assert.doesNotMatch(run.stdout, /"server_started"/);
+    await assertNoListener(port);
+    assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
+  },
+);
+
+test(
+  "a process-group SIGQUIT during the build never starts the server",
+  { skip, timeout: Timeout * 2 },
+  async (t) => {
+    const port = await freePort();
+    const markerDir = mkdtempSync(join(tmpdir(), "accounts-api-marker-"));
+    t.after(() => rmSync(markerDir, { recursive: true, force: true }));
+    const marker = join(markerDir, "go-started");
+    // The fake go waits, then on SIGQUIT completes a real build and exits 0.
+    // A launcher that ignored the signal would start the server next.
+    const realGo = join(
+      execFileSync("go", ["env", "GOROOT"], { encoding: "utf8" }).trim(),
+      "bin",
+      "go",
+    );
+    const run = startLauncher(t, {
+      port,
+      env: { REAL_GO: realGo, MARKER: marker },
+      pathPrefix: fakeGo(
+        t,
+        [
+          'touch "$MARKER"',
+          "sleep 60 &",
+          "pid=$!",
+          'trap \'kill $pid; exec "$REAL_GO" "$@"\' QUIT',
+          "wait $pid",
+        ].join("\n"),
+      ),
+    });
+    await waitFor(run, () => existsSync(marker), "the build to start");
+
+    process.kill(-run.child.pid, "SIGQUIT");
+    const { code } = await run.exited;
+
+    assert.equal(code, StatusSigquit, run.stderr);
+    assert.equal(countEvents(run.stderr, "accounts_api_dev_signal"), 1);
     assert.doesNotMatch(run.stdout, /"server_started"/);
     await assertNoListener(port);
     assert.deepEqual(readdirSync(run.tmp), [], "build output was not removed");
