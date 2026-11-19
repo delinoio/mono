@@ -69,7 +69,7 @@ The project has one hosted deployable (the control plane), one static site (the 
 
 ### Identifiers and states
 
-- New persisted entities use UUID v7 identifiers: organizations, memberships, invitations, devices, enrollment tokens, API keys, sandboxes, snapshots, templates, exec sessions and audit events.
+- New persisted entities use UUID v7 identifiers: organizations, memberships, invitations, devices, enrollment tokens, API keys, sandboxes, snapshots, templates and audit events. Callers generate the `exec_id`, `read_id` and `write_id` values as UUID v7; the control plane does not persist them and does not trust them as server identifiers.
 - Sandbox, device, snapshot and agent-version-policy states use the enums in the [protos contract](protos-ownsand-api-contract.md#enums). Components must not compare free-form state strings.
 - A sandbox stays on the device that created it for its whole life. OwnSand never moves a sandbox to another device. When a device goes offline, its sandboxes change to `unreachable`. When the agent reconnects, the agent reports the actual state and the control plane replaces the stored state with it.
 

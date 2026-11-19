@@ -28,6 +28,7 @@ Both SDKs give programs and the [CLI](cmds-ownsand-cli-foundation.md) one client
 
 - The client takes the API origin (default `https://ownsand.api.delino.io`) and one credential: an API key or a function that returns a current Logto access token.
 - Without an explicit credential, both SDKs read the `OWNSAND_API_KEY` environment variable. They read no other environment variables for credentials.
+- The client takes an optional organization ID and uses it for every RPC that needs one; without it, the SDKs read `OWNSAND_ORG`. A call can override it. An RPC that needs an organization fails before it is sent when neither is set.
 - The client never logs or includes the credential in errors.
 
 ### Operations
@@ -46,7 +47,7 @@ The SDKs expose the public services of the [protos contract](protos-ownsand-api-
 - For exec and file operations, an SDK that supports peer-to-peer calls `OpenSession` once per sandbox handle and tries a WebRTC data channel to the agent. A relay-only SDK, and a client with the transport forced to `RELAY`, does not call `OpenSession`; it calls the relay RPCs directly.
 - When the data channel does not open within 10 seconds, or fails during a session, the SDK uses the relay RPCs for that sandbox handle. The SDK never runs an exec again, because the command may have run. The SDK generates the `exec_id` before it sends an exec, so it can continue an exec that was in progress with `AttachExec` on the relay, also when the stream ended before the `started` event. It generates a `read_id` for each file read and continues the read from the next offset with the same `read_id`. When `AttachExec` fails with `not_found`, the exec fails with a data path error and its outcome is unknown.
 - A relay stream can end before the operation ends because of the Railway edge limits. The SDK continues it with `AttachExec` or `ReadFile` from the next offset without a visible error. A `ReadFile` that fails with `not_found` because its `read_id` expired is a visible error.
-- After any session end (15 minutes idle, the 1-hour absolute expiry, a revocation or the agent losing its channel), the SDK calls `GetIceServers` and `OpenSession` again before the next operation and tries peer-to-peer again. Only an ICE failure, or a new session that cannot open, moves the handle to the relay. A revoked credential then fails with `unauthenticated` or `permission_denied`.
+- After any session end (15 minutes idle, the 1-hour absolute expiry, a revocation or the agent losing its channel), the SDK calls `GetIceServers` and `OpenSession` again before the next operation and tries peer-to-peer again. Only an ICE failure, or a new session that cannot open, moves the handle to the relay. The SDK recognizes a session end by the session-end frame that the agent sends before it closes the data channel; a data channel that closes without that frame is a failure. A revoked credential then fails with `unauthenticated` or `permission_denied`.
 - The caller can force a transport (`PEER_TO_PEER` or `RELAY`) for tests. The SDK reports the transport in use.
 - Both transports carry the same `DataFrame` messages and give the same results.
 
