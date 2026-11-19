@@ -1023,6 +1023,13 @@
   /* Progress */
   .dui-progress {
     display: grid;
+    /* Workaround: the SDK stylesheet gives progress and meter roots two grid
+       columns (1fr auto) for direct label and value children. This package
+       wraps both in one header, so the 8px gap would act as a column gap and
+       leave the header narrower than the track. One track keeps the header
+       and the track the same width. Scope: Progress and Meter. Remove when
+       the SDK stops declaring columns on these roots. */
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px;
     font-family: var(--dui-font-family);
   }
