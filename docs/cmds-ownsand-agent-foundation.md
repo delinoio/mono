@@ -54,7 +54,7 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 
 - The guest architecture is the host architecture.
 - Linux: the microVM implementation is an open decision (Firecracker class). Record the selected implementation, its version pin and how the agent runs it (for example, a jailer with one unprivileged user per sandbox) before the Linux runtime implementation.
-- macOS: a Virtualization.framework VM runs in the process that created it. Restarting the agent stops every running and paused VM on macOS. This is one reason for the update rule in [Agent updates](#agent-updates).
+- macOS: a Virtualization.framework VM runs in the process that created it. Restarting the agent stops every running and paused VM on every host OS, because every VM is bound to the agent process (see [TTL](#ttl)); on macOS the VMs also run inside the agent process. This is one reason for the update rule in [Agent updates](#agent-updates).
 - Each sandbox gets the vCPU count, memory and disk of its create request. The agent rejects a create command that exceeds the device limits that the control plane sent, or that would start a third macOS guest, as a second check after the scheduler.
 
 ### Guest helper
@@ -77,7 +77,7 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 
 ### TTL
 
-The agent stores the idle and maximum deadlines of each sandbox in its state directory and enforces them as the [control plane contract](servers-ownsand-api-foundation.md#ttl) defines, also while it is disconnected. Every VM is bound to the agent process, so that `max_ttl` holds even when the agent stops: when the agent process ends, its VMs stop (on Linux through the cgroup and a parent-death signal of each VM process, on Windows through the Host Compute Service setting `ShouldTerminateOnLastHandleClosed` on each compute system, with the agent holding the only handle, so that HCS ends the VM when the agent process ends, and on macOS because the VMs run inside the agent process). After a restart, it enforces deadlines that passed while it was stopped at once, also for a VM that survived because this binding failed. When a deadline passed and the VM is also gone (for example, on macOS after an agent restart), the TTL end reason wins over `LOST_ON_DEVICE`.
+The agent stores the idle and maximum deadlines of each sandbox in its state directory and enforces them as the [control plane contract](servers-ownsand-api-foundation.md#ttl) defines, also while it is disconnected. Every VM is bound to the agent process, so that `max_ttl` holds even when the agent stops: when the agent process ends, its VMs stop (on Linux through the cgroup and a parent-death signal of each VM process, on Windows through the Host Compute Service setting `ShouldTerminateOnLastHandleClosed` on each compute system, with the agent holding the only handle, so that HCS ends the VM when the agent process ends, and on macOS because the VMs run inside the agent process). After a restart, it enforces deadlines that passed while it was stopped at once, also for a VM that survived because this binding failed. When a deadline passed and the VM is also gone (for example, after an agent restart), the TTL end reason wins over `LOST_ON_DEVICE`.
 
 ### Images
 
@@ -89,7 +89,7 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 
 ### Pause, resume and snapshots
 
-- Pause stops the VM's vCPUs and keeps its memory. Resume continues it. On macOS, paused VMs end when the agent process ends.
+- Pause stops the VM's vCPUs and keeps its memory. Resume continues it. Paused VMs also end when the agent process ends, on every host OS.
 - A snapshot captures the guest disk. Where the hypervisor supports it, the snapshot also captures the memory state; record per hypervisor which content a snapshot holds before its implementation. A sandbox created from a snapshot is a new sandbox with a new ID.
 - Snapshots stay in the agent state directory by default.
 - A macOS snapshot also holds the VM's auxiliary storage, its hardware model and its machine identifier, which Virtualization.framework needs to boot the disk. A macOS snapshot can restore only on a Mac that reports support for its hardware model. The agent reports its supported macOS hardware models as a capability and checks support again before an import. The agent never runs two VMs with the same macOS machine identifier at the same time. Whether a restored macOS disk boots with a new machine identifier must be verified in the change that implements the macOS runtime. Until that is verified, the scheduler reserves machine identifiers according to the [control plane scheduler](servers-ownsand-api-foundation.md#scheduler), and the agent rejects a create that would reuse a running identifier.
