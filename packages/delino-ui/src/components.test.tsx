@@ -286,6 +286,14 @@ describe("Switch", () => {
     expectDescribedBy(control, nodes[0]);
   });
 
+  // happy-dom cannot lay out, so this only checks the stylesheet source text.
+  // It proves that the field rule declares the row direction that overrides the
+  // column direction of the UI SDK stylesheet. It does not prove the rendered
+  // layout; that needs a real-browser layout check.
+  test("lays out the label block and the switch on one row", () => {
+    expect(block(".dui-switch-field")).toContain("flex-direction: row");
+  });
+
   // happy-dom can neither lay out nor match `:dir()` or the UI SDK cascade
   // layer, so this only checks the stylesheet source text. It proves that the
   // checked-thumb rules declare the `translate` travel and reset the SDK's

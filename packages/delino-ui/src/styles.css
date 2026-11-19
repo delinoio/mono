@@ -207,8 +207,13 @@
   }
 
   /* Switch */
+  /* The UI SDK stylesheet lays out a Field as a column. Declare the row so the
+     label block sits at the inline start and the switch at the inline end,
+     mirrored in right-to-left text. Remove when the UI SDK stops setting the
+     Field direction. */
   .dui-switch-field {
     display: flex;
+    flex-direction: row;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
