@@ -388,6 +388,35 @@ test("guard rejects a missing or malformed changeset map", { skip }, (t) => {
   }
 });
 
+test("guard annotates an unset or malformed run number", { skip }, (t) => {
+  for (const runNumber of [undefined, "", "abc"]) {
+    const dir = scratch(t);
+    const bin = stubGh(dir, {});
+    const env = {
+      ...baseEnv,
+      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      CHANGESET_BLOBS: JSON.stringify({ a: "a".repeat(40) }),
+      REPOSITORY: "owner/repo",
+      WORKFLOW: "deploy.yml",
+      SHA: plannedSha,
+      GH_TOKEN: "token",
+      CHECK_RETRY_DELAY: "0",
+    };
+    // baseEnv spreads process.env, so remove an inherited run number.
+    delete env.GITHUB_RUN_NUMBER;
+    if (runNumber !== undefined) env.GITHUB_RUN_NUMBER = runNumber;
+    const result = spawnSync("bash", [guard], { encoding: "utf8", env });
+    const label = `run number ${JSON.stringify(runNumber) ?? "unset"}`;
+    assert.equal(result.status, 1, label);
+    assert.equal(
+      result.stdout,
+      `::error::GITHUB_RUN_NUMBER is not a number: ${runNumber ?? ""}\n`,
+      label,
+    );
+    assert.doesNotMatch(result.stderr, /unbound variable/, label);
+  }
+});
+
 test(
   "guard lists .changeset once for many planned changesets",
   { skip },
