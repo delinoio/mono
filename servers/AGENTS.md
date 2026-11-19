@@ -16,7 +16,7 @@
 - Follow root `AGENTS.md` and the owning project/domain contracts.
 
 - Write Go code and comments in English; use `log/slog` structured logging and never log secrets or sensitive payloads.
-- Each deployed server declares a `deploy` field in its `package.json` and keeps a `Dockerfile` and `railway.json` in its package root. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow).
+- Each server deployed to Railway declares a `deploy` field in its `package.json` and keeps a `Dockerfile` and `railway.json` in its package root. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow). A server that its project contract deploys to another host has no `railway.json` and declares no `deploy` field until the deployment workflow supports its target.
 - Server Go code uses the root Go module `github.com/delinoio/mono`; do not add a `go.mod` under `servers/`. Each server has a workspace `package.json` whose scripts wrap the Go toolchain. Run `gofmt`, `go vet ./...` and `go test ./...` from the repository root before finishing.
 
 ## Owning contracts
@@ -28,4 +28,5 @@
 - [Repository licensing](../docs/repository-license-contract.md)
 - `servers/accounts-api/`: [project index](../docs/project-delino-accounts.md) and [API server foundation contract](../docs/servers-accounts-api-foundation.md)
 - `servers/ownsand-api/` (`planned`): [project index](../docs/project-ownsand.md) and [control plane foundation contract](../docs/servers-ownsand-api-foundation.md)
+- `servers/ownsand-relay/` (`planned`): [project index](../docs/project-ownsand.md) and [relay server foundation contract](../docs/servers-ownsand-relay-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

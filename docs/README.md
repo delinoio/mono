@@ -51,6 +51,7 @@
 
 - [Project index](project-ownsand.md)
 - [Control plane foundation](servers-ownsand-api-foundation.md)
+- [Relay server foundation](servers-ownsand-relay-foundation.md)
 - [Device agent and guest helper foundation](cmds-ownsand-agent-foundation.md)
 - [Command-line interface foundation](cmds-ownsand-cli-foundation.md)
 - [Web console foundation](apps-ownsand-console-foundation.md)
