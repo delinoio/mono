@@ -214,6 +214,11 @@
   /* Switch */
   .dui-switch-field {
     display: flex;
+    /* Workaround: the optional UI SDK stylesheet sets `flex-direction: column`
+       on every Field. Without this reset the label block and the switch stack
+       instead of sharing one row. Scope: this field only. Remove when the UI
+       SDK stops setting a direction on Field. */
+    flex-direction: row;
     align-items: center;
     justify-content: space-between;
     gap: 16px;
