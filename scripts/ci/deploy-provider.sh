@@ -53,10 +53,16 @@ railway_id() {
 }
 
 # Prints the last `pages-deploy` deployment ID of a Wrangler output file
-# (`WRANGLER_OUTPUT_FILE_PATH`, newline-delimited JSON).
+# (`WRANGLER_OUTPUT_FILE_PATH`, newline-delimited JSON). Lines that are not
+# valid JSON are skipped, and a missing, unreadable or non-file path reports
+# the same "no deployment id" error instead of a raw jq failure.
 pages_id() {
-  local id
-  id="$(jq -r 'select(.type == "pages-deploy") | .deployment_id | select(type == "string" and length > 0)' "$1" | tail -n 1)"
+  local id=""
+  if [[ -f "$1" && -r "$1" ]]; then
+    # `|| true` keeps errexit/pipefail from ending the script before the
+    # error branch below when jq still fails on the file.
+    id="$(jq -R -r 'fromjson? | objects | select(.type == "pages-deploy") | .deployment_id | select(type == "string" and length > 0)' "$1" 2>/dev/null | tail -n 1)" || true
+  fi
   if [[ -z "$id" ]]; then
     echo "::error::wrangler pages deploy returned no deployment id." >&2
     return 1
