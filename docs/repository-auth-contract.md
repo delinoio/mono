@@ -2,7 +2,7 @@
 
 ## Scope
 
-This contract defines user authentication and identity for every project and domain in the repository. Project and domain contracts may add authorization rules, but they must not introduce a separate identity system.
+This contract defines user authentication and identity for every project and domain in the repository. Project and domain contracts may add authorization rules, but they must not introduce a separate identity system. The credentials listed under [Documented exceptions](#documented-exceptions) are not an identity system for people.
 
 ## Identity provider
 
@@ -34,6 +34,14 @@ Backend services must validate every Logto access token before they trust it. Fo
 - Split the space-separated `scope` claim and check the scopes the operation requires.
 - For organization-level API resources, check that the `organization_id` claim matches the organization in the request.
 - Do not accept ID tokens as API credentials.
+
+## Documented exceptions
+
+A project may accept a credential other than a Logto access token only when its project index records the exception, its scope and its controls, and this section lists it. An exception never adds an identity provider, a password store or a sign-in flow for people.
+
+| Project                         | Credential                                                                                            | Scope                                                                                                                                                                                                                                                                                                                                | Owning contract                                               |
+| ------------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------- |
+| [`ownsand`](project-ownsand.md) | Organization API keys for programs, one-time enrollment tokens and device key pairs for device agents | API keys have a subset of the `member` permissions of one organization; an enrollment token expires within 24 hours and creates exactly one device in one organization; device credentials reach only their own device's agent channel. The server stores only hashes of API keys, enrollment tokens and device session credentials. | [Identity and access](project-ownsand.md#identity-and-access) |
 
 ## Configuration and secrets
 

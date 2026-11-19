@@ -14,4 +14,5 @@
 
 - [Repository defaults](../docs/repository-defaults.md)
 - [Repository workflow](../docs/repository-workflow-contract.md)
+- `protos/delino/ownsand/` (`planned`): [project index](../docs/project-ownsand.md) and [API contract](../docs/protos-ownsand-api-contract.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

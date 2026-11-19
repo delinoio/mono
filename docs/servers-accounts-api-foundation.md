@@ -33,6 +33,7 @@ The API server is the system of record for account and billing information. It i
 
 - The [`delino-accounts-web`](apps-delino-accounts-foundation.md) app, which calls the API on behalf of signed-in users.
 - Other Delino services. The repository rules require every service to use this API for shared account data and for billing, including billable usage or charge reports (`planned`). Record each consuming service and the RPCs that it uses here before it calls the API.
+- [`ownsand-api`](servers-ownsand-api-foundation.md) (`planned`): reads the display profile (display name) of OwnSand organization members by Logto user ID, server-to-server with its own Logto machine-to-machine credential. `ownsand-api` checks the membership before it asks; this API trusts the machine credential and its scope, not the end user. This needs an `AccountService` RPC that returns the display profiles of a list of users, and a scope for it. Record the RPC and the scope here in the change that adds them. No browser origin is needed.
 - Operators who deploy and monitor the server.
 
 ## Interfaces and Contracts
