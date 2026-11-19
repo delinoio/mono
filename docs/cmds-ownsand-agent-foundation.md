@@ -77,7 +77,7 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 
 ### TTL
 
-The agent stores the idle and maximum deadlines of each sandbox in its state directory and enforces them as the [control plane contract](servers-ownsand-api-foundation.md#ttl) defines, also while it is disconnected. After a restart, it enforces deadlines that passed while it was stopped at once.
+The agent stores the idle and maximum deadlines of each sandbox in its state directory and enforces them as the [control plane contract](servers-ownsand-api-foundation.md#ttl) defines, also while it is disconnected. After a restart, it enforces deadlines that passed while it was stopped at once. When a deadline passed and the VM is also gone (for example, on macOS after an agent restart), the TTL end reason wins over `LOST_ON_DEVICE`.
 
 ### Images
 
