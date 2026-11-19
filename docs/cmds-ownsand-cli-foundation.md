@@ -42,7 +42,7 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 
 - The organization comes from `--org` or the `OWNSAND_ORG` environment variable. `ownsand org` commands that need no organization and `ownsand member accept`, which takes the organization from the invitation, ignore them.
 - `sandbox create` requires `--idle-ttl` and `--max-ttl`, `--vcpu`, `--memory` and `--disk`. It has no default TTL.
-- `sandbox exec` streams stdout and stderr to the CLI's own standard streams and exits with the command's exit code. When the data path fails, it exits with status `255` and a data path error on standard error.
+- `sandbox exec` streams stdout and stderr to the CLI's own standard streams and exits with the command's exit code when it is between 0 and 255. A nonzero code outside that range exits with status `255`, and a command that a signal ended exits with `128` plus the signal number (or `255` when that is above 255), so a failed command never exits with `0`. `--format json` keeps the exact value. When the data path fails, it exits with status `255` and a data path error on standard error.
 - `member accept` reads the invitation secret from standard input or from the file named by `--secret-file`. It never accepts the secret as a command-line argument, because other local users can read process arguments.
 - When an exec loses output (`output_truncated`), `sandbox exec` writes a warning with the missing offsets to standard error and exits with status `255` after the command ends.
 - Exit status `255` means a data path failure or lost output, but a guest command can also exit with `255`. A script that must tell them apart uses `--format json`.
