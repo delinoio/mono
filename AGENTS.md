@@ -53,7 +53,7 @@
 - `docs/`: Source of truth for project contracts and repository documentation.
 - `apps/`: User-facing apps and documentation web surfaces.
 - `crates/`: Rust crates and Rust-based tooling.
-- `cmds/`: Go command tools for workflow orchestration.
+- `cmds/`: Go command-line tools and device-side programs.
 - `servers/`: Backend services, licensed under FSL-1.1-ALv2.
 - `protos/`: Versioned protocol schemas and committed Go bindings.
 - `packages/`: Shared generated and runtime packages.
