@@ -85,9 +85,18 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	return cfg, nil
 }
 
+// asciiWhiteSpace is the set of ASCII white space characters that are removed
+// from the edges of a configuration value: space, tab, LF, VT, FF and CR.
+const asciiWhiteSpace = "\t\n\v\f\r "
+
+// lookupNonEmpty returns the value of name without leading and trailing ASCII
+// white space. It deliberately does not use strings.TrimSpace, which also
+// removes Unicode white space such as U+00A0 and U+3000: such a value would
+// count as unset, or be validated after its padding was removed, instead of
+// being rejected as not valid.
 func lookupNonEmpty(lookup func(string) (string, bool), name string) string {
 	value, _ := lookup(name)
-	return strings.TrimSpace(value)
+	return strings.Trim(value, asciiWhiteSpace)
 }
 
 func validateAddr(value string) error {

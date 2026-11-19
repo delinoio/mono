@@ -142,3 +142,105 @@ func TestSlogLevel(t *testing.T) {
 		}
 	}
 }
+
+// unicodeWhiteSpace lists Unicode white space characters that
+// strings.TrimSpace removes but that are not ASCII white space.
+var unicodeWhiteSpace = map[string]string{
+	"U+00A0": " ",
+	"U+0085": "\u0085",
+	"U+1680": " ",
+	"U+2000": " ",
+	"U+200A": " ",
+	"U+2028": " ",
+	"U+2029": " ",
+	"U+202F": " ",
+	"U+205F": " ",
+	"U+3000": "　",
+}
+
+func TestLoadRejectsUnicodeWhiteSpaceAddr(t *testing.T) {
+	values := map[string]string{
+		"U+3000 before address":    "　127.0.0.1:9000",
+		"U+00A0 after address":     "127.0.0.1:9000 ",
+		"ASCII space then U+00A0":  "  ",
+		"U+00A0 before port":       " :8100",
+		"U+00A0 around ASCII pads": "  127.0.0.1:9000  ",
+	}
+	for name, value := range unicodeWhiteSpace {
+		values[name+" only"] = value
+	}
+	for name, addr := range values {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(lookupFrom(map[string]string{EnvAddr: addr}))
+			if err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+			if !strings.Contains(err.Error(), EnvAddr) {
+				t.Errorf("error = %q, want it to name %s", err, EnvAddr)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsUnicodeWhiteSpaceLogLevel(t *testing.T) {
+	values := map[string]string{
+		"U+00A0 only":            " ",
+		"U+3000 only":            "　",
+		"U+00A0 before level":    " debug",
+		"U+00A0 after level":     "debug ",
+		"U+2028 before level":    " info",
+		"ASCII and U+00A0 mixed": "   ",
+	}
+	for name, level := range values {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(lookupFrom(map[string]string{EnvLogLevel: level}))
+			if err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+			if !strings.Contains(err.Error(), EnvLogLevel) {
+				t.Errorf("error = %q, want it to name %s", err, EnvLogLevel)
+			}
+		})
+	}
+}
+
+func TestLoadDefaultsForEveryASCIIWhiteSpace(t *testing.T) {
+	for name, value := range map[string]string{
+		"space":           " ",
+		"tab":             "\t",
+		"carriage return": "\r",
+		"line feed":       "\n",
+		"vertical tab":    "\v",
+		"form feed":       "\f",
+		"all six":         " \t\r\n\v\f",
+	} {
+		t.Run(name, func(t *testing.T) {
+			cfg, err := Load(lookupFrom(map[string]string{EnvAddr: value, EnvLogLevel: value}))
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Addr != DefaultAddr {
+				t.Errorf("Addr = %q, want %q", cfg.Addr, DefaultAddr)
+			}
+			if cfg.LogLevel != LogLevelInfo {
+				t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, LogLevelInfo)
+			}
+		})
+	}
+}
+
+func TestLoadTrimsASCIIPadding(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvAddr:     " \t127.0.0.1:9000\r\n\v\f ",
+		EnvLogLevel: " debug ",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Addr != "127.0.0.1:9000" {
+		t.Errorf("Addr = %q, want %q", cfg.Addr, "127.0.0.1:9000")
+	}
+	if cfg.LogLevel != LogLevelDebug {
+		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, LogLevelDebug)
+	}
+}
