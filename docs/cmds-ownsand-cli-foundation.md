@@ -63,7 +63,7 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 ## Security
 
 - The CLI never prints stored tokens or API keys, except a new secret once at issue time.
-- The CLI never sends credentials to any origin except the configured API origin and the Logto tenant.
+- The CLI never sends credentials to any origin except the configured API origin and the Logto tenant. It sends a relay ticket only to the relay origin that `AuthorizeRelay` returned with it.
 
 ## Logging
 
@@ -76,7 +76,7 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 
 ## Dependencies and Integrations
 
-- Upstream: the [Go SDK](packages-ownsand-sdk-foundation.md), the [control plane](servers-ownsand-api-foundation.md) and the Logto shared tenant.
+- Upstream: the [Go SDK](packages-ownsand-sdk-foundation.md), the [control plane](servers-ownsand-api-foundation.md), the [relay server](servers-ownsand-relay-foundation.md) and the Logto shared tenant.
 
 ## Change Triggers
 

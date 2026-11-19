@@ -1,0 +1,129 @@
+# servers-ownsand-relay foundation contract
+
+## Scope
+
+This contract owns the `ownsand-relay` data plane server of [`ownsand`](project-ownsand.md) at `servers/ownsand-relay/` (`planned`). The relay server carries the traffic that would cost the most on Railway: the relay fallback of the data path (exec output and file contents) and the STUN service. It runs on a DigitalOcean Droplet, not on Railway. The [project index](project-ownsand.md#deviations-from-repository-defaults) records this deviation from the Railway default.
+
+The relay server holds no database connection, no organization data and no sandbox content at rest. It verifies relay tickets that the [control plane](servers-ownsand-api-foundation.md) signs, forwards `DataFrame` messages between callers and device agents in memory, and answers STUN binding requests. It is licensed under `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md).
+
+Planned layout, following the `accounts-api` server conventions:
+
+- `servers/ownsand-relay/cmd/ownsand-relay/`: process entry point.
+- `servers/ownsand-relay/internal/`: configuration, TLS, Connect handlers, ticket verification, the agent connection registry, frame forwarding and the STUN listener.
+- `servers/ownsand-relay/package.json`, `turbo.json`, `.env.example` and `Dockerfile`: workspace wiring and the container image. The relay has no `railway.json`.
+
+## Runtime and Language
+
+- Language: Go in the root module `github.com/delinoio/mono`. Import path: `github.com/delinoio/mono/servers/ownsand-relay/...`. Logging: `log/slog`.
+- Runtime: one long-running process that serves HTTPS on TCP port 443 and STUN on UDP port 3478.
+- Deployment target: one DigitalOcean Droplet that runs the relay container. Production origin: `https://ownsand-relay.api.delino.io`. STUN URL: `stun:ownsand-relay.api.delino.io:3478`.
+- Reason for the deviation: Railway bills network egress at $0.05 per GB, and its public networking exposes no UDP ports. DigitalOcean bills Droplet outbound transfer beyond the pooled account allowance at $0.01 per GiB, does not bill inbound transfer, and its Cloud Firewalls accept UDP rules. Relay traffic leaves the server twice (to the caller and to the agent), so it is the largest egress cost of the project. Sources: [Railway pricing plans](https://docs.railway.com/pricing/plans), [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/) and [DigitalOcean firewall rules](https://docs.digitalocean.com/products/networking/firewalls/how-to/configure-rules/).
+- TLS: the process terminates TLS itself and serves HTTP/2 and HTTP/1.1. The DNS record of `ownsand-relay.api.delino.io` points directly at the Droplet and must not go through an HTTP proxy (for example, a proxied Cloudflare record), because the STUN service needs the Droplet address and the agent connection needs HTTP/2 from end to end. Record the certificate source and its renewal with the implementation.
+- Railway edge limits do not apply to the relay server. The relay server sets its own limits in [Interfaces and Contracts](#interfaces-and-contracts).
+- Instances: the first version runs exactly one relay server. Each relay ticket names the relay origin, so a later change can add relay servers (for example, per region) without a protocol change. Record the selection rule in this contract and in the [control plane contract](servers-ownsand-api-foundation.md#data-path-signaling-and-relay) before a second relay server runs.
+- Firewall: a DigitalOcean Cloud Firewall allows inbound TCP 443, UDP 3478 and the port that the certificate source needs, and allows SSH only from operator addresses. Record the rules with the deployment.
+- Development port (`planned`): `127.0.0.1:8301` for HTTPS and `127.0.0.1:3478` for STUN. Add them to the [environment contract](repository-environment-contract.md) in the change that adds the development launcher.
+
+## Users and Operators
+
+- Callers (the [SDKs](packages-ownsand-sdk-foundation.md) and the [CLI](cmds-ownsand-cli-foundation.md)) that hold a caller relay ticket from `DataPathService.AuthorizeRelay`.
+- [Device agents](cmds-ownsand-agent-foundation.md) that hold an agent relay ticket from a relay grant.
+- Callers and device agents that send STUN binding requests.
+- Operators who deploy and monitor the Droplet.
+
+## Interfaces and Contracts
+
+- Business APIs: `RelayService` and `RelayAgentService` of the [protos contract](protos-ownsand-api-contract.md#relay-services).
+- Operational endpoint: `GET /healthz` without authentication returns `200` with `{"status":"ok"}` while the process can serve HTTP requests.
+- Browser access: none in this version. The relay server sends no CORS headers.
+
+### Relay tickets
+
+- The control plane signs every relay ticket with an Ed25519 key. The relay server holds only the public keys, so it cannot issue a ticket. The ticket format and fields are owned by the [protos contract](protos-ownsand-api-contract.md#relay-tickets).
+- The relay server accepts a ticket only when its signature verifies with a configured public key that matches its key ID, its `relay_origin` equals the relay server's own origin, its expiry has not passed (with at most 30 seconds of clock skew) and its kind matches the RPC: `CALLER` tickets on `RelayService`, `AGENT` tickets on `RelayAgentService`. It rejects any other ticket with `unauthenticated` and the same message. It never sends a ticket to the control plane.
+- Key rotation: the relay server accepts every configured public key. To rotate, an operator adds the new public key to the relay server first, then switches the control plane to the new private key, and removes the old public key after every ticket that it signed has expired.
+- A caller ticket authorizes `RelayService` calls only for its `sandbox_id`, on its `device_id`, until its expiry. The relay server checks the request's `organization_id` and `sandbox_id` against the ticket and rejects a mismatch with `permission_denied`. An RPC must start before the ticket expires. A stream that started before the expiry continues until it ends according to [Relay streams](#relay-streams).
+- The relay server does not check revocation itself. The device agent is the enforcement point: it serves a relay frame only for a ticket ID of a live relay grant that the control plane sent on the agent channel, and it ends the streams of a grant when the control plane revokes it or when that agent channel closes, according to the [agent contract](cmds-ownsand-agent-foundation.md#data-path). A compromised relay server therefore cannot reach a sandbox without a live grant.
+
+### Agent connections
+
+- A device agent opens `RelayAgentService.Connect`, a bidirectional stream over HTTP/2, with the `AGENT` ticket of a relay grant in the `Authorization: Bearer` header. The relay server registers the connection for the ticket's `device_id`. When a second connection for the same device opens, the relay server ends the RPCs on the older connection with `unavailable` and closes it.
+- Each side sends a keepalive frame at least every 30 seconds while the connection has no other traffic. The relay server closes a connection that receives nothing for 90 seconds.
+- When an agent connection closes, the relay server ends every RPC routed on it with `unavailable`.
+
+### Relay streams
+
+- For each `RelayService` call, the relay server allocates a `stream_id` that is unique among the open RPCs on that agent connection, sends a stream-open frame with the ticket ID and the `sandbox_id`, translates the request into `DataFrame` messages and translates the agent's frames back into responses. The [protos contract](protos-ownsand-api-contract.md#data-path-framing) owns the frames.
+- When no agent connection for the ticket's device exists, the relay server waits up to 10 seconds for one, and then fails the RPC with `unavailable`.
+- When the agent ends the streams of a ticket with a session-end frame, the relay server ends each affected RPC with `unavailable` and the `SessionEndReason` in the error detail. The caller then calls `AuthorizeRelay` again, which returns the authorization error when the ticket was revoked.
+- A server stream sends a `keepalive` event at least every 60 seconds while it has nothing else to send, so that caller-side proxies and NAT devices keep the connection. The relay server ends each stream before it has run for 14 minutes, so that every long operation is authorized again within a bounded time; the caller continues with the resume rules of the [protos contract](protos-ownsand-api-contract.md#exec).
+- A `WriteFile` request body must finish uploading within 5 minutes, and the relay server fails a slower request with `deadline_exceeded`. The SDKs retry the chunk with the same `write_id`.
+- Forwarding uses bounded in-memory buffers with back-pressure in both directions. The relay server never writes frames to disk, to logs or to object storage. Record the per-connection buffer limit and the concurrency limits per agent connection and per ticket here before the relay implementation.
+- A relay server restart or deployment ends every open RPC and agent connection. Callers continue with the resume rules, and agents reconnect while they hold a live grant.
+
+### STUN
+
+- The relay server answers STUN binding requests ([RFC 8489](https://www.rfc-editor.org/rfc/rfc8489.html)) on UDP port 3478 without authentication. It does not offer TURN and does not relay media or data over UDP.
+- The control plane returns the STUN URL from `DataPathService.GetIceServers` and in the agent configuration message. The URL is control plane configuration, so a change of the STUN address needs no client release.
+- Rate-limit STUN responses per source address, so that the service cannot amplify traffic toward a spoofed address. Record the limit with the implementation.
+- The STUN server implementation (for example, the pion STUN package or a STUN-only coturn process in the same container) is a new dependency. Record it here with its dependency approval.
+
+## Storage
+
+The relay server stores nothing persistently. It keeps agent connections, open RPCs and frame buffers in process memory only.
+
+## Security
+
+- Accept only the relay tickets in [Relay tickets](#relay-tickets). Never accept Logto access tokens, API keys or device session credentials; callers never send them to the relay origin.
+- The relay server is content-blind for storage: it forwards sandbox content in memory only.
+- Configuration (the relay origin, the relay ticket public keys with their key IDs, the TLS configuration and the STUN rate limit) comes from the Droplet's environment according to the [environment contract](repository-environment-contract.md). The relay server needs no secret except its TLS private key. `.env.example` lists the names with placeholders only.
+- Rate-limit ticket verification failures per client address. The relay server terminates TCP itself, so the client address is the connection's peer address.
+- The Droplet runs only the relay container and the components that the deployment needs. Record the operating system update policy with the deployment.
+
+## Logging
+
+- Structured JSON logs on standard output with `log/slog`. Record where the Droplet sends them with the deployment.
+- One record per RPC with the procedure, ticket ID, organization ID, sandbox ID, device ID, Connect code, frame counts, byte counts and duration.
+- Agent connection events: device ID, connect, disconnect, replacement and the number of RPCs that each disconnect ended.
+- STUN: aggregate request and rate-limit counts, not one record per request.
+- Never log tickets, signed ticket bodies, TLS keys, exec commands, environment values, exec output or file contents.
+
+## Build and Test
+
+Record the package scripts with the implementation, following `accounts-api`:
+
+- `pnpm exec turbo run build --filter=ownsand-relay`, `lint` (`go vet ./...`) and `test` (`go test ./...`).
+- From the repository root: `gofmt` check, `go vet ./...` and `go test ./...`, according to `servers/AGENTS.md`.
+- Required tests: ticket verification (bad signature, unknown key ID, expired ticket, wrong relay origin, wrong kind, mismatched organization or sandbox), agent connection replacement, the 10-second wait for an agent connection, stream keepalive and the 14-minute stream end, `WriteFile` upload deadline, forwarding without persistence, back-pressure, session-end frames, STUN binding responses and rate limiting, and log redaction.
+
+## Deployment
+
+- The [deployment workflow](repository-workflow-contract.md#deployment-workflow) deploys only Railway servers and Cloudflare Pages sites today. Record the Droplet provisioning, the deployment job, its credentials and its rollback procedure in the workflow contract before the first deployment of the relay server. Until then, the relay server is not deployed.
+- The deployment updates the relay server before the control plane when a change needs both, so that the relay server accepts a new public key or frame kind before the control plane uses it.
+
+## Dependencies and Integrations
+
+- Upstream: the [control plane](servers-ownsand-api-foundation.md), which signs relay tickets and sends relay grants to agents. The relay server makes no request to the control plane.
+- Peers: [SDKs](packages-ownsand-sdk-foundation.md), the [CLI](cmds-ownsand-cli-foundation.md) and [device agents](cmds-ownsand-agent-foundation.md).
+- Protocol schemas: [protos contract](protos-ownsand-api-contract.md).
+- Platform: DigitalOcean Droplets and Cloud Firewalls.
+
+## Change Triggers
+
+- Update [project-ownsand.md](project-ownsand.md) when the origin, the STUN URL, the deployment target or the number of relay servers changes.
+- Update the [protos contract](protos-ownsand-api-contract.md) with every `RelayService`, `RelayAgentService`, ticket or `DataFrame` change.
+- Update the [control plane contract](servers-ownsand-api-foundation.md) and the [agent contract](cmds-ownsand-agent-foundation.md) when ticket, grant or revocation rules change.
+- Update [repository-workflow-contract.md](repository-workflow-contract.md) when the relay server joins the deployment workflow.
+- Update `servers/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
+
+## References
+
+- [project-ownsand.md](project-ownsand.md)
+- [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md)
+- [servers-accounts-api-foundation.md](servers-accounts-api-foundation.md)
+- [repository-defaults.md](repository-defaults.md)
+- [repository-environment-contract.md](repository-environment-contract.md)
+- [repository-license-contract.md](repository-license-contract.md)
+- [repository-workflow-contract.md](repository-workflow-contract.md)
+- [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/)
+- [Railway pricing plans](https://docs.railway.com/pricing/plans)

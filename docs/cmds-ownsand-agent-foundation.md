@@ -98,10 +98,12 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 ### Data path
 
 - The agent accepts a WebRTC data channel only for an `OpenSession` offer that it received from the control plane on the agent channel, and only from the DTLS fingerprint in that offer.
-- The agent answers with its ICE candidates, including STUN-derived server-reflexive candidates. When ICE fails, the caller uses the relay, and the agent serves the same `DataFrame` requests from the agent channel.
-- The agent enforces the session end rules of the [control plane contract](servers-ownsand-api-foundation.md#data-path-signaling-and-relay) on its data channels: idle time, absolute expiry, revocation messages and loss of the agent channel.
+- The agent answers with its ICE candidates, including STUN-derived server-reflexive candidates. When ICE fails, the caller uses the [relay server](servers-ownsand-relay-foundation.md), and the agent serves the same `DataFrame` requests from its relay connection.
+- Relay grants: the agent accepts a relay grant only on the agent channel, acknowledges it and binds it to that channel. While it holds at least one unexpired grant or one open relay stream for a relay origin, it keeps one `RelayAgentService.Connect` connection to that origin, opened with the `AGENT` ticket of its newest grant. It reconnects with back-off after a connection loss while such a grant or stream exists, and closes the connection 60 seconds after the last grant expired and the last relay stream ended. The relay connection is an outbound HTTPS connection; it opens no listening port.
+- The agent serves a relay stream only for a relay stream open frame whose ticket ID names a live, unrevoked grant for the frame's `sandbox_id`, according to the [protos contract](protos-ownsand-api-contract.md#data-path-framing). A grant that expires stops new relay streams but does not end open ones.
+- The agent enforces the session end rules of the [control plane contract](servers-ownsand-api-foundation.md#data-path-signaling-and-relay) on its data channels and on the relay streams of each grant: idle time and absolute expiry for sessions, and revocation messages and loss of the agent channel for both. It sends a session-end frame on each affected relay stream before it ends it.
 - The agent runs each exec independently of the data path that started it, and keeps its recent output and exit result for `AttachExec` according to the [protos contract](protos-ownsand-api-contract.md#exec).
-- The agent never sends sandbox content anywhere except to the data channel of the session or to the relay.
+- The agent never sends sandbox content anywhere except to the data channel of the session or to its relay connection, for a stream of a live grant.
 
 ### Device removal
 
@@ -123,31 +125,31 @@ When `Authenticate` reports that the device is unknown and the agent has no reco
 
 - State directory, readable only by the agent's service account: `/var/lib/ownsand-agent` on Linux, `/Library/Application Support/ownsand-agent` on macOS and `%ProgramData%\ownsand-agent` on Windows.
 - Contents: an identity file with the device ID and the Ed25519 private key, kept apart from the other records so that the loss of sandbox records does not lose the identity; the control plane origin, the sandbox and snapshot records with their TTL deadlines, VM disks, memory state, snapshots, base images and the pending update.
-- The agent never writes enrollment tokens, session credentials, signed URLs, exec content or file content to its logs.
+- The agent never writes enrollment tokens, session credentials, relay tickets, signed URLs, exec content or file content to its logs.
 
 ## Security
 
 - The device private key never leaves the device. Removal and `reset` delete it.
-- Sandbox content stays in the VM, the state directory, the data channel, the relay stream or an explicit R2 export.
+- Sandbox content stays in the VM, the state directory, the data channel, the relay connection or an explicit R2 export.
 - The agent validates every guest path request inside the guest helper, so a guest path never touches the host file system.
-- The agent's own connections go only to the control plane origin, the STUN service, R2 signed URLs, release downloads and, during `ownsand-agent image build` without an operator-supplied IPSW, Apple's restore image lookup and download. Guest traffic that the [network policy](#network-policy) allows and the agent's DNS forwarding for guests are guest traffic, not agent connections; on macOS the agent's userspace network stack opens them for the guest. The agent has one more exception: for a session that `OpenSession` authorized, its ICE agent binds ephemeral UDP sockets, sends connectivity checks to the caller's candidates and accepts the caller's checks and traffic. These sockets exist only for the session and accept only the DTLS fingerprint of the offer. The agent opens no other listening port on the host network.
+- The agent's own connections go only to the control plane origin, the relay origin of a live grant, the STUN service, R2 signed URLs, release downloads and, during `ownsand-agent image build` without an operator-supplied IPSW, Apple's restore image lookup and download. Guest traffic that the [network policy](#network-policy) allows and the agent's DNS forwarding for guests are guest traffic, not agent connections; on macOS the agent's userspace network stack opens them for the guest. The agent has one more exception: for a session that `OpenSession` authorized, its ICE agent binds ephemeral UDP sockets, sends connectivity checks to the caller's candidates and accepts the caller's checks and traffic. These sockets exist only for the session and accept only the DTLS fingerprint of the offer. The agent opens no other listening port on the host network.
 
 ## Logging
 
 - Structured JSON logs with `log/slog` to the platform service log (journald, the unified log or the Windows event log, or a log file in the state directory; record the choice with the implementation).
 - Events: enrollment result, authentication result, channel connect and disconnect, capability report, command ID and result, sandbox state change, TTL expiry, network setup result, snapshot export and import progress, data path transport selection, and update verification and installation.
-- Never log enrollment tokens, session credentials, private keys, signed URLs, SDP bodies, exec commands, environment values, exec output or file contents.
+- Never log enrollment tokens, session credentials, relay tickets, private keys, signed URLs, SDP bodies, exec commands, environment values, exec output or file contents.
 
 ## Build and Test
 
 - From the repository root: `gofmt` check, `go vet ./...` and `go test ./...`, according to `cmds/AGENTS.md`.
 - CI runs on Linux only and excludes macOS runners from pull requests and main pushes, according to the [workflow contract](repository-workflow-contract.md). Cross-compile the macOS and Windows code paths with `GOOS` on Linux so that CI checks that they build; behavior on macOS and Windows needs device acceptance.
-- Unit tests: TTL clocks, update verification (bad signature, hash mismatch, revoked version, update while sandboxes run, pinned version), state report reconciliation (including `LOST_ON_DEVICE`), network policy rule generation (including on-link prefix changes), session end rules, exec output retention and token handling.
+- Unit tests: TTL clocks, update verification (bad signature, hash mismatch, revoked version, update while sandboxes run, pinned version), state report reconciliation (including `LOST_ON_DEVICE`), network policy rule generation (including on-link prefix changes), session end rules, relay grant binding, expiry and revocation, relay connection lifetime, exec output retention and token handling.
 - Device acceptance on real Linux, macOS and Windows hosts: the full lifecycle, the network policy tests, the relay fallback, disconnect and reconnect, snapshot export and restore on a second device, removal clean-up and signed updates. Record the results in pull requests and Linear issues, separate from CI.
 
 ## Dependencies and Integrations
 
-- Upstream: the [control plane](servers-ownsand-api-foundation.md), the STUN service, Cloudflare R2 signed URLs, the release manifest host.
+- Upstream: the [control plane](servers-ownsand-api-foundation.md), the [relay server](servers-ownsand-relay-foundation.md) (relay connections and STUN), Cloudflare R2 signed URLs, the release manifest host.
 - Platform: KVM and the microVM runtime, Virtualization.framework, Hyper-V Host Compute Service.
 - Protocol schemas: [protos contract](protos-ownsand-api-contract.md).
 

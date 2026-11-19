@@ -2,7 +2,7 @@
 
 ## Goal
 
-OwnSand turns devices that a team already owns into a private sandbox cloud. A team registers its Linux, macOS and Windows devices in an OwnSand organization. Members and programs then create, use and delete isolated sandboxes on those devices through one Connect RPC API. They do not need a third-party sandbox provider, and sandbox disks and snapshots stay on the team's own hardware by default. Exec output and file contents reach callers in two ways: directly from the device over the peer-to-peer data channel, or in transit through the control plane relay, which stores nothing. Sandbox disks leave the devices only in snapshots that a caller exports to R2 on purpose.
+OwnSand turns devices that a team already owns into a private sandbox cloud. A team registers its Linux, macOS and Windows devices in an OwnSand organization. Members and programs then create, use and delete isolated sandboxes on those devices through one Connect RPC API. They do not need a third-party sandbox provider, and sandbox disks and snapshots stay on the team's own hardware by default. Exec output and file contents reach callers in two ways: directly from the device over the peer-to-peer data channel, or in transit through the relay server, which stores nothing. Sandbox disks leave the devices only in snapshots that a caller exports to R2 on purpose.
 
 Success criterion: on one Linux, one macOS and one Windows device, an organization member runs the full sandbox lifecycle through the SDK. The lifecycle is create, exec, file read and write, pause, resume, snapshot and delete.
 
@@ -15,6 +15,7 @@ Success criterion: on one Linux, one macOS and one Windows device, an organizati
 All paths are `planned`. This project is in the documentation-only phase. Create each path, its workspace membership and its validation scripts in the change that starts its runtime implementation.
 
 - `servers/ownsand-api/` (`planned`): Go control plane served at `https://ownsand.api.delino.io`.
+- `servers/ownsand-relay/` (`planned`): Go relay server on a DigitalOcean Droplet, served at `https://ownsand-relay.api.delino.io` with STUN on UDP port 3478.
 - `cmds/ownsand-agent/` (`planned`): Go device agent that runs on each enrolled host.
 - `cmds/ownsand-guest/` (`planned`): Go helper that runs inside each sandbox guest and serves exec and file requests from the device agent.
 - `cmds/ownsand/` (`planned`): Go command-line interface for people and programs.
@@ -23,11 +24,12 @@ All paths are `planned`. This project is in the documentation-only phase. Create
 - `packages/ownsand-sdk/` (`planned`): TypeScript SDK.
 - `packages/ownsand-sdk-go/` (`planned`): Go SDK.
 
-The project has one hosted deployable (the control plane), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.
+The project has two hosted deployables (the control plane on Railway and the relay server on DigitalOcean), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.
 
 ## Domain Contract Documents
 
 - [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md): control plane.
+- [servers-ownsand-relay-foundation.md](servers-ownsand-relay-foundation.md): relay server and STUN.
 - [cmds-ownsand-agent-foundation.md](cmds-ownsand-agent-foundation.md): device agent, guest helper, isolation, networking and agent updates.
 - [cmds-ownsand-cli-foundation.md](cmds-ownsand-cli-foundation.md): command-line interface.
 - [apps-ownsand-console-foundation.md](apps-ownsand-console-foundation.md): web console.
@@ -41,6 +43,7 @@ The project has one hosted deployable (the control plane), one static site (the 
 | Component ID      | Path                        | Kind                  | Production origin or distribution    |
 | ----------------- | --------------------------- | --------------------- | ------------------------------------ |
 | `ownsand-api`     | `servers/ownsand-api/`      | Railway server        | `https://ownsand.api.delino.io`      |
+| `ownsand-relay`   | `servers/ownsand-relay/`    | DigitalOcean Droplet  | `https://ownsand-relay.api.delino.io` |
 | `ownsand-console` | `apps/ownsand/`             | Cloudflare Pages site | `https://ownsand.delino.io`          |
 | `ownsand-agent`   | `cmds/ownsand-agent/`       | Host service binary   | Signed release, self-updating        |
 | `ownsand-guest`   | `cmds/ownsand-guest/`       | Guest helper binary   | Installed into each guest image      |
@@ -53,9 +56,11 @@ The project has one hosted deployable (the control plane), one static site (the 
 
 - The public API is OwnSand's own Connect RPC API in the protobuf package `delino.ownsand.v1`. It is not compatible with the E2B API. The [protos contract](protos-ownsand-api-contract.md) owns every service, message and enum.
 - Every business flow between components uses Connect RPC or the protobuf framing that the protos contract defines. Plain HTTP endpoints are limited to operational endpoints such as health checks.
-- Railway platform facts: Railway's published limits state the 5-minute and 15-minute request limits and the WebSocket exemption. They do not state the HTTP version between the edge and the container or the absence of public UDP. Railway community reports and templates say that the edge forwards HTTP/1.1 to the container and that public networking exposes no UDP ports. The contracts treat both as constraints; verify them with Railway in the change that records the agent channel transport and the STUN deployment. Sources: [specs and limits](https://docs.railway.com/networking/public-networking/specs-and-limits), [HTTP/2 edge feedback](https://station.railway.com/feedback/http-2-support-on-edge-proxy-50adedfe) and [a WebRTC template that uses TCP because of the missing UDP](https://railway.com/deploy/livekit-voice-agent-self-hosted-webrtc-ai-on-railway--livekit-voice-agent).
-- The Railway public edge forwards HTTP/1.1 to the container (see the platform facts above). Public RPCs that callers reach through `https://ownsand.api.delino.io` must therefore be unary or server-streaming. Bidirectional RPCs need HTTP/2 from end to end and must not be used on that route. Client-streaming RPCs are not used either, because browser clients cannot send them. The edge also closes a request that transfers no data for 5 minutes or that runs for more than 15 minutes, so long-lived relay streams send keepalive events and callers resume them, according to the [protos contract](protos-ownsand-api-contract.md#exec). The [control plane contract](servers-ownsand-api-foundation.md#interfaces-and-contracts) records the transport of the long-lived agent channel.
-- Exec streams and file transfers use a peer-to-peer WebRTC data channel between the caller (SDK or CLI) and the device agent when ICE succeeds. The control plane does the signaling. When the peer-to-peer connection fails, the caller uses the relay RPCs of the control plane, which forward the same frames to the agent. The relay does not store payloads.
+- Railway platform facts: Railway's published limits state the 5-minute and 15-minute request limits and the WebSocket exemption. They do not state the HTTP version between the edge and the container or the absence of public UDP. Railway community reports and templates say that the edge forwards HTTP/1.1 to the container and that public networking exposes no UDP ports. The contracts treat both as constraints; verify them with Railway in the change that records the agent channel transport. STUN runs on the relay server on DigitalOcean, so it does not depend on Railway UDP support. Sources: [specs and limits](https://docs.railway.com/networking/public-networking/specs-and-limits), [HTTP/2 edge feedback](https://station.railway.com/feedback/http-2-support-on-edge-proxy-50adedfe) and [a WebRTC template that uses TCP because of the missing UDP](https://railway.com/deploy/livekit-voice-agent-self-hosted-webrtc-ai-on-railway--livekit-voice-agent).
+- The Railway public edge forwards HTTP/1.1 to the container (see the platform facts above). Public RPCs that callers reach through `https://ownsand.api.delino.io` must therefore be unary or server-streaming. Bidirectional RPCs need HTTP/2 from end to end and must not be used on that route. Client-streaming RPCs are not used either, because browser clients cannot send them. The edge also closes a request that transfers no data for 5 minutes or that runs for more than 15 minutes. The relay streams run on the relay server, not behind this edge; they still send keepalive events and end before 14 minutes, and callers resume them according to the [protos contract](protos-ownsand-api-contract.md#exec). The [control plane contract](servers-ownsand-api-foundation.md#interfaces-and-contracts) records the transport of the long-lived agent channel.
+- Exec streams and file transfers use a peer-to-peer WebRTC data channel between the caller (SDK or CLI) and the device agent when ICE succeeds. The control plane does the signaling. When the peer-to-peer connection fails, the caller gets a relay ticket from the control plane and uses the relay RPCs of the relay server, which forward the same frames to the agent. The relay server does not store payloads.
+- Traffic placement: traffic whose volume grows with sandbox content (relay exec output and file contents) and STUN run on the relay server on DigitalOcean, not on Railway. Railway bills network egress at $0.05 per GB; DigitalOcean bills Droplet outbound transfer beyond the pooled account allowance at $0.01 per GiB and does not bill inbound transfer ([Railway pricing](https://docs.railway.com/pricing/plans), [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/)). The control plane on Railway carries only the API, signaling, relay authorization and agent channel traffic. A new data flow whose volume grows with sandbox content must use the peer-to-peer path, the relay server or R2 signed URLs, never the control plane or the agent channel.
+- The relay server holds no database connection. The control plane authorizes each relay use with signed relay tickets and sends a matching relay grant to the agent on the agent channel; the agent serves relay frames only for live grants, so revocation does not depend on the relay server. The [relay server contract](servers-ownsand-relay-foundation.md#relay-tickets) owns ticket verification.
 
 ### Identity and access
 
@@ -75,8 +80,8 @@ The project has one hosted deployable (the control plane), one static site (the 
 
 ### Licensing and code sharing
 
-- `servers/ownsand-api/` uses `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). Every other OwnSand path uses Apache-2.0.
-- The agent, the guest helper, the CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/ownsand/v1/` or `packages/ownsand-sdk-go/`.
+- `servers/ownsand-api/` and `servers/ownsand-relay/` use `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). Every other OwnSand path uses Apache-2.0.
+- The agent, the guest helper, the CLI and the SDKs must not import code from `servers/`. The control plane and the relay server do not import each other's `internal` packages; they share only the protos. Code that the control plane shares with them lives in `protos/delino/ownsand/v1/` or `packages/ownsand-sdk-go/`.
 
 ### Repository rules that apply without change
 
@@ -88,7 +93,7 @@ The project has one hosted deployable (the control plane), one static site (the 
 
 - Program authentication with organization API keys, as described above.
 - Sandbox disks, memory state, local snapshots and the locally built macOS and Windows base images stay on the device file system, not in Cloudflare R2. They are sandbox content that belongs to the device owner. Only an explicit snapshot export goes to R2, with signed URLs, according to the default.
-- STUN needs public UDP. Railway public networking does not expose UDP ports (see the [platform facts](#protocol-and-api)), so the STUN service cannot run on Railway. Its deployment target is an open decision and becomes a documented deviation from the Railway default when it is selected.
+- The relay server (`ownsand-relay`) runs on a DigitalOcean Droplet, not on Railway, for two reasons. Relay traffic is the largest egress of the project, and DigitalOcean outbound transfer costs less than Railway egress (see [traffic placement](#protocol-and-api)). STUN needs public UDP, and Railway public networking does not expose UDP ports (see the [platform facts](#protocol-and-api)). The [relay server contract](servers-ownsand-relay-foundation.md#runtime-and-language) owns the Droplet, its firewall and its TLS termination, and the [workflow contract](repository-workflow-contract.md#deployment-workflow) must record its deployment before the first relay deployment.
 
 ### Platform and license constraints
 
@@ -103,12 +108,12 @@ Record each decision in the owning domain contract before the implementation tha
 
 - The release signing tool and the key custody process ([agent contract](cmds-ownsand-agent-foundation.md#agent-updates)).
 - The microVM implementation for Linux hosts (Firecracker class) ([agent contract](cmds-ownsand-agent-foundation.md#isolation)).
-- The STUN deployment and the relay deployment ([control plane contract](servers-ownsand-api-foundation.md#data-path-signaling-and-relay)).
+- The relay server deployment job, its TLS certificate source and its buffer and concurrency limits ([relay server contract](servers-ownsand-relay-foundation.md#deployment)).
 - The transport of the long-lived agent channel through the Railway edge ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
 - The database migration tool and the backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)).
 - The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
-- The protobuf code generation tool and every new third-party dependency. The root Go module has no third-party dependencies today. OwnSand needs at least Connect, protobuf, a Postgres driver, a WebRTC library (pion), and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
+- The protobuf code generation tool and every new third-party dependency. The root Go module has no third-party dependencies today. OwnSand needs at least Connect, protobuf, a Postgres driver, a WebRTC library (pion), a STUN server library, and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
 
 ## Change Policy
 
@@ -117,6 +122,7 @@ Record each decision in the owning domain contract before the implementation tha
 - Update the [protos contract](protos-ownsand-api-contract.md) before or with every RPC, message or enum change. Update the SDK, CLI and console contracts when a change affects their surface.
 - Update [repository-auth-contract.md](repository-auth-contract.md) when the API key exception changes.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
+- Update the [relay server contract](servers-ownsand-relay-foundation.md) and this index together when the traffic placement or the relay server deployment target changes.
 - Update `apps/AGENTS.md`, `cmds/AGENTS.md`, `servers/AGENTS.md`, `packages/AGENTS.md` and `protos/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts. Distinguish fixture, build and packaging checks from acceptance on real Linux, macOS and Windows devices.
 
