@@ -21,7 +21,7 @@ Organization owners, admins and members who sign in with Logto. API keys do not 
 - The console calls the control plane only through its absolute origin. It reads the origin from `PUBLIC_API_ORIGIN` and uses `https://ownsand.api.delino.io` when the value is not set. It must not import source from `servers/`.
 - Authentication: the console is a Logto single-page application that requests access tokens for the API resource `https://ownsand.api.delino.io`. Record the application registration and scopes with the implementation.
 - Account settings: the console links to `https://accounts.delino.io`. It has no profile or account pages.
-- Member display names: the console reads the shared profile of each member from the `delino-accounts` API at `https://accounts.api.delino.io`, according to the [API server contract](servers-accounts-api-foundation.md#users-and-operators). It shows the Logto user ID when a profile cannot be read. It does not store profiles.
+- Member display names: `ListMembers` returns the display name of each member, which the control plane reads from the `delino-accounts` API. The console does not call the `delino-accounts` API and needs no token for it. It shows the Logto user ID when a member has no display name. It does not store profiles.
 
 | Route ID            | Path                                      | Content                                                                                 | Minimum role                                                               |
 | ------------------- | ----------------------------------------- | --------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
