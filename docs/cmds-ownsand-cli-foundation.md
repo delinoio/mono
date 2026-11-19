@@ -44,7 +44,7 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 - `sandbox create` requires `--idle-ttl` and `--max-ttl`, `--vcpu`, `--memory` and `--disk`. It has no default TTL.
 - `sandbox exec` streams stdout and stderr to the CLI's own standard streams and exits with the command's exit code. When the data path fails, it exits with status `255` and a data path error on standard error.
 - `file read` writes the raw file contents to standard output or to the path in `--to`. `file write` reads from standard input or from the path in `--from`. `--format` does not apply to these raw contents.
-- Commands that create a secret (`member invite`, `enrollment-token create`, `api-key create`) print the secret once on standard output and the other fields on standard error, so that a script can capture only the secret.
+- Commands that create a secret (`member invite`, `enrollment-token create`, `api-key create`) print the secret once on standard output and the other fields on standard error, so that a script can capture only the secret. With `--format json`, they print one JSON object with the secret and the other fields on standard output.
 - `--format json` prints machine-readable JSON for every command that prints data, except the raw file contents of `file read`. The default is `--format text`.
 - Output uses ANSI color by default. `--no-color` and `NO_COLOR` turn it off.
 
