@@ -74,8 +74,8 @@ if [[ ! "${SHA:-}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "::error::SHA is not a full commit SHA: ${SHA:-}"
   exit 1
 fi
-if [[ ! "$GITHUB_RUN_NUMBER" =~ ^[0-9]+$ ]]; then
-  echo "::error::GITHUB_RUN_NUMBER is not a number: $GITHUB_RUN_NUMBER"
+if [[ ! "${GITHUB_RUN_NUMBER:-}" =~ ^[0-9]+$ ]]; then
+  echo "::error::GITHUB_RUN_NUMBER is not a number: ${GITHUB_RUN_NUMBER:-}"
   exit 1
 fi
 # Collect the started runs on `main` that are newer than this run. The API
