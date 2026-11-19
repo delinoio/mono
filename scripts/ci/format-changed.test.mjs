@@ -1283,6 +1283,15 @@ test("every selector skips an index-recorded gitlink, whatever its worktree entr
     f.git("commit", "-m", "record gitlink");
     const head = f.git("rev-parse", "HEAD");
     assert.equal(indexMode(f, "sub.ts"), "160000");
+    // Restage the gitlink with an object different from the one HEAD records
+    // (HEAD holds f.base) so `git diff --cached` lists it and the staged
+    // selector's gitlink exemption is exercised, not bypassed by an index that
+    // equals HEAD.
+    f.git("update-index", "--cacheinfo", `160000,${head},sub.ts`);
+    assert.match(
+      f.git("diff", "--cached", "--name-only", "--diff-filter=ACMRT"),
+      /^sub\.ts$/mu,
+    );
     // The worktree entry is a regular file (the defect case) or a directory.
     if (asDirectory) {
       f.write("sub.ts/inner.ts", "const inner = 1;\n");
