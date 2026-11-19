@@ -76,6 +76,7 @@ The SDKs log nothing by default. An optional logger receives RPC names, sandbox 
 - Upstream: the [control plane](servers-ownsand-api-foundation.md) and the [protos contract](protos-ownsand-api-contract.md).
 - Peers: the [device agent](cmds-ownsand-agent-foundation.md#data-path).
 - Downstream: the [CLI](cmds-ownsand-cli-foundation.md) uses the Go SDK.
+- Publication: the npm package name and publication workflow of the TypeScript SDK are an [open decision](project-ownsand.md#open-decisions); the repository publishes no packages to a registry today. The Go SDK needs no publication, because it is part of the root Go module.
 - New dependencies: Connect and protobuf runtimes for both languages, pion for Go and a WebRTC library for Node.js. Each needs owner approval.
 
 ## Change Triggers

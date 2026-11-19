@@ -2,7 +2,7 @@
 
 ## Goal
 
-OwnSand turns devices that a team already owns into a private sandbox cloud. A team registers its Linux, macOS and Windows devices in an OwnSand organization. Members and programs then create, use and delete isolated sandboxes on those devices through one Connect RPC API. They do not need a third-party sandbox provider, and sandbox disks and snapshots stay on the team's own hardware by default. Sandbox content leaves the devices only in transit through the control plane relay, which stores nothing, and in snapshots that a caller exports to R2 on purpose.
+OwnSand turns devices that a team already owns into a private sandbox cloud. A team registers its Linux, macOS and Windows devices in an OwnSand organization. Members and programs then create, use and delete isolated sandboxes on those devices through one Connect RPC API. They do not need a third-party sandbox provider, and sandbox disks and snapshots stay on the team's own hardware by default. Exec output and file contents reach callers in two ways: directly from the device over the peer-to-peer data channel, or in transit through the control plane relay, which stores nothing. Sandbox disks leave the devices only in snapshots that a caller exports to R2 on purpose.
 
 Success criterion: on one Linux, one macOS and one Windows device, an organization member runs the full sandbox lifecycle through the SDK. The lifecycle is create, exec, file read and write, pause, resume, snapshot and delete.
 
@@ -107,6 +107,7 @@ Record each decision in the owning domain contract before the implementation tha
 - The transport of the long-lived agent channel through the Railway edge ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
 - The database migration tool and the backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)).
+- The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
 - The protobuf code generation tool and every new third-party dependency. The root Go module has no third-party dependencies today. OwnSand needs at least Connect, protobuf, a Postgres driver, a WebRTC library (pion), and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
 
 ## Change Policy
