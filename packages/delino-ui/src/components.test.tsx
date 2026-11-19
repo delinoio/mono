@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { readdirSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, test } from "@rstest/core";
 import type * as React from "react";
 import {
@@ -1180,6 +1181,71 @@ describe("Tooltip", () => {
 });
 
 describe("ToastRegion", () => {
+  // Helpers that read the authored hex tokens from the stylesheet source. The
+  // focus ring and error border contrast tests below share them.
+  const compact = css
+    .replace(/\s+/g, " ")
+    .replace(/\( /g, "(")
+    .replace(/ \)/g, ")");
+
+  // Bodies of every `@media (prefers-color-scheme: dark)` block, by brace
+  // matching. `block()` returns only the first match of a selector.
+  function darkMediaBodies(): string[] {
+    const opener = "@media (prefers-color-scheme: dark) {";
+    const bodies: string[] = [];
+    let from = compact.indexOf(opener);
+    while (from !== -1) {
+      const start = from + opener.length;
+      let depth = 1;
+      let end = start;
+      while (depth > 0 && end < compact.length) {
+        const char = compact[end];
+        if (char === "{") depth += 1;
+        if (char === "}") depth -= 1;
+        end += 1;
+      }
+      bodies.push(compact.slice(start, end - 1));
+      from = compact.indexOf(opener, end);
+    }
+    return bodies;
+  }
+
+  function darkRule(selector: string): string[] {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const pattern = new RegExp(`(?:^|[ }])${escaped} \\{([^}]*)\\}`, "g");
+    return darkMediaBodies().flatMap((body) =>
+      [...body.matchAll(pattern)].map((match) => match[1] ?? ""),
+    );
+  }
+
+  function property(declarations: string[], name: string): string | undefined {
+    const pattern = new RegExp(`(?:^|[ ;])${name}: (#[0-9a-fA-F]{6})`);
+    for (const text of [...declarations].reverse()) {
+      const value = pattern.exec(text)?.[1];
+      if (value) return value;
+    }
+    return undefined;
+  }
+
+  function luminance(hex: string): number {
+    const channels = [1, 3, 5].map((index) => {
+      const value = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+      return value <= 0.03928
+        ? value / 12.92
+        : ((value + 0.055) / 1.055) ** 2.4;
+    });
+    return (
+      0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!
+    );
+  }
+
+  function contrast(first: string, second: string): number {
+    const [high, low] = [luminance(first), luminance(second)].sort(
+      (a, b) => b - a,
+    );
+    return (high! + 0.05) / (low! + 0.05);
+  }
+
   test("shows a toast with its title, description and action", async () => {
     const toaster = createToaster();
     render(<ToastRegion toaster={toaster} aria-label="Notifications" />);
@@ -1204,14 +1270,61 @@ describe("ToastRegion", () => {
     expect(block(".dui-toast-button::before")).toContain("display: none");
   });
 
-  // happy-dom computes no cascade, so this checks the stylesheet source: the
-  // SDK draws a 1px border on every toast and tints it for `error` only. The
-  // package resets it for every other type and must leave the error border to
-  // the SDK, so no rule here may target the error type.
-  test("resets the SDK border on every toast type except error", () => {
-    expect(block('.dui-toast:not([data-type="error"])')).toContain("border: 0");
-    expect(block(".dui-toast")).not.toMatch(/(^|[\s;])border(-width)?:/);
-    expect(css).not.toMatch(/\.dui-toast\[data-type=["']?error["']?\]/);
+  // happy-dom computes no cascade, so this checks the stylesheet source. The
+  // UI SDK draws its toast border only in its optional stylesheet, which no
+  // app loads, so the package resets the border for every type except `error`
+  // and draws the error border itself.
+  describe("error border", () => {
+    test("draws a 1px package-owned border on the error toast", () => {
+      expect(block('.dui-toast[data-type="error"]')).toContain(
+        "border: 1px solid var(--dui-color-danger-inverse)",
+      );
+    });
+
+    test("resets the border on every other toast type", () => {
+      expect(block('.dui-toast:not([data-type="error"])')).toContain(
+        "border: 0",
+      );
+      expect(block(".dui-toast")).not.toMatch(/(^|[\s;])border(-width)?:/);
+    });
+
+    test("keeps the error border at 3:1 on the toast surface in both schemes", () => {
+      // The toast surface is the `text` token, so it inverts in dark mode and
+      // the border token uses the opposite pair to the danger text token.
+      const light = [block(":root")];
+      const dark = darkRule(":root");
+      expect(property(light, "--dui-color-danger-inverse")).toBe("#ff6b78");
+      expect(property(dark, "--dui-color-danger-inverse")).toBe("#d22030");
+      expect(property(light, "--dui-color-text")).toBe("#191f28");
+      expect(property(dark, "--dui-color-text")).toBe("#f9fafb");
+      for (const scheme of [light, dark]) {
+        const border = property(scheme, "--dui-color-danger-inverse");
+        const surface = property(scheme, "--dui-color-text");
+        expect(contrast(border!, surface!)).toBeGreaterThanOrEqual(3);
+      }
+    });
+
+    test("does not import or re-export the UI SDK stylesheet", () => {
+      const packageRoot = new URL("../", import.meta.url);
+      const manifest = readFileSync(
+        new URL("package.json", packageRoot),
+        "utf8",
+      );
+      const exportsField = JSON.stringify(
+        (JSON.parse(manifest) as { exports?: unknown }).exports ?? {},
+      );
+      expect(exportsField).not.toContain("@ui-sdk");
+      expect(css).not.toMatch(/@import[^;]*ui-sdk/);
+      const sourceFiles = readdirSync(new URL("./", import.meta.url)).filter(
+        (name) => /\.(css|ts|tsx)$/.test(name) && !name.endsWith(".test.tsx"),
+      );
+      for (const name of sourceFiles) {
+        const text = readFileSync(new URL(name, import.meta.url), "utf8");
+        expect(text, name).not.toMatch(
+          /(?:@import|import|export)[^;\n]*@ui-sdk\/[^"';\n]*\.css/,
+        );
+      }
+    });
   });
 
   // happy-dom computes no cascade, so the focus ring contrast is checked from
@@ -1219,72 +1332,6 @@ describe("ToastRegion", () => {
   // `text` token), so the ring that reaches the toast buttons must be measured
   // against that surface and not against the normal dark surface.
   describe("focus ring contrast", () => {
-    const compact = css
-      .replace(/\s+/g, " ")
-      .replace(/\( /g, "(")
-      .replace(/ \)/g, ")");
-
-    // Bodies of every `@media (prefers-color-scheme: dark)` block, by brace
-    // matching. `block()` returns only the first match of a selector.
-    function darkMediaBodies(): string[] {
-      const opener = "@media (prefers-color-scheme: dark) {";
-      const bodies: string[] = [];
-      let from = compact.indexOf(opener);
-      while (from !== -1) {
-        const start = from + opener.length;
-        let depth = 1;
-        let end = start;
-        while (depth > 0 && end < compact.length) {
-          const char = compact[end];
-          if (char === "{") depth += 1;
-          if (char === "}") depth -= 1;
-          end += 1;
-        }
-        bodies.push(compact.slice(start, end - 1));
-        from = compact.indexOf(opener, end);
-      }
-      return bodies;
-    }
-
-    function darkRule(selector: string): string[] {
-      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const pattern = new RegExp(`(?:^|[ }])${escaped} \\{([^}]*)\\}`, "g");
-      return darkMediaBodies().flatMap((body) =>
-        [...body.matchAll(pattern)].map((match) => match[1] ?? ""),
-      );
-    }
-
-    function property(
-      declarations: string[],
-      name: string,
-    ): string | undefined {
-      const pattern = new RegExp(`(?:^|[ ;])${name}: (#[0-9a-fA-F]{6})`);
-      for (const text of [...declarations].reverse()) {
-        const value = pattern.exec(text)?.[1];
-        if (value) return value;
-      }
-      return undefined;
-    }
-
-    function luminance(hex: string): number {
-      const channels = [1, 3, 5].map((index) => {
-        const value = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
-        return value <= 0.03928
-          ? value / 12.92
-          : ((value + 0.055) / 1.055) ** 2.4;
-      });
-      return (
-        0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!
-      );
-    }
-
-    function contrast(first: string, second: string): number {
-      const [high, low] = [luminance(first), luminance(second)].sort(
-        (a, b) => b - a,
-      );
-      return (high! + 0.05) / (low! + 0.05);
-    }
-
     test("keeps the toast surface and the button ring wired to the tokens", () => {
       expect(block(".dui-toast")).toContain(
         "background: var(--dui-color-text)",

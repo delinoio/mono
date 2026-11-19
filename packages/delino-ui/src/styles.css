@@ -26,7 +26,10 @@
      --dui-color-accent, because #1b64da is only 2.01:1 against the dark
      track (#3c3c47) and 2.56:1 against the dark highlighted option
      (#2c2c35). The dark focus ring #4593fc is only 2.94:1 on the inverted
-     dark toast surface #f9fafb, so .dui-toast overrides it. */
+     dark toast surface #f9fafb, so .dui-toast overrides it. The error toast
+     border uses --dui-color-danger-inverse, the opposite pair to the danger
+     text: #ff6b78 on the light toast surface #191f28 6.01:1 and #d22030 on
+     the dark toast surface #f9fafb 5.04:1. */
   :root {
     --dui-color-text: #191f28;
     --dui-color-text-muted: #4e5968;
@@ -41,6 +44,7 @@
     --dui-color-danger: #d22030;
     --dui-color-danger-hover: #b81c2b;
     --dui-color-danger-text: #d22030;
+    --dui-color-danger-inverse: #ff6b78;
     --dui-color-backdrop: rgb(0 0 0 / 40%);
     --dui-color-focus-ring: #3182f6;
     --dui-radius-control: 12px;
@@ -63,6 +67,7 @@
       --dui-color-neutral: #2c2c35;
       --dui-color-neutral-hover: #3c3c47;
       --dui-color-danger-text: #ff6b78;
+      --dui-color-danger-inverse: #d22030;
       --dui-color-backdrop: rgb(0 0 0 / 60%);
       --dui-color-focus-ring: #4593fc;
     }
@@ -877,14 +882,20 @@
     user-select: none;
   }
 
-  /* UI SDK draws a 1px border on every toast. The package surface is a
-     borderless inverted surface, like the tooltip, dialog and drawer, so the
-     border is reset for every type except `error`. The error toast keeps the
-     SDK's tinted border as its only error cue; the package has no error color
-     of its own. The border sits outside the explicit `height` (border-box),
-     so the toast box size does not change. */
+  /* The UI SDK draws a 1px border on every toast, and tints it for `error`,
+     only in its optional stylesheet, which apps do not load, so the package
+     cannot rely on it. The package surface is a borderless inverted surface,
+     like the tooltip, dialog and drawer, so the border is reset for every type
+     except `error`. The package draws the error border itself with its own
+     danger token for the inverted toast surface (the package already has
+     danger tokens for fields and buttons). The border sits inside the
+     explicit `height` (border-box), so the toast box size does not change. */
   .dui-toast:not([data-type="error"]) {
     border: 0;
+  }
+
+  .dui-toast[data-type="error"] {
+    border: 1px solid var(--dui-color-danger-inverse);
   }
 
   .dui-toast-region[data-side="top"] .dui-toast {
