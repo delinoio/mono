@@ -40,7 +40,7 @@ Both components use Apache-2.0 and must not import code from `servers/`.
 
 ### Capabilities
 
-The agent reports its capabilities after each authentication: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), the supported macOS hardware models, and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
+The agent reports its capabilities after each authentication, again when its built images or hypervisor checks change, and its free disk at least every 60 seconds and whenever it changes by more than 1 GiB: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), the supported macOS hardware models, and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
 
 ### Isolation
 
@@ -105,9 +105,9 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 
 ### Device removal
 
-When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image. It records in its state directory that it received an authenticated removal notice and finished the clean-up. Then it calls `ConfirmRemoval` with a nonce from `CreateChallenge` signed by its device key, retrying with back-off until the call succeeds, or until `CreateChallenge` or `ConfirmRemoval` reports the device as unknown: in this recorded state, an unknown device means that an earlier confirmation succeeded and its response was lost. Only then does it delete the device key and exit enrolled state. The control plane deletes the removal tombstone when `ConfirmRemoval` succeeds. `ownsand-agent reset` does the same without the control plane.
+When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image. It records in its state directory that it received an authenticated removal notice and finished the clean-up. Then it calls `ConfirmRemoval` with a nonce from `CreateChallenge` signed by its device key, retrying with back-off until the call succeeds, or until `ConfirmRemoval` reports the device as unknown: in this recorded state, an unknown device means that an earlier confirmation succeeded and its response was lost. Only then does it delete the device key and exit enrolled state. The control plane deletes the removal tombstone when `ConfirmRemoval` succeeds. `ownsand-agent reset` does the same without the control plane.
 
-When `CreateChallenge` or `Authenticate` reports that the device is unknown and the agent has no record of a removal notice, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device for up to 1 year. An operator runs `ownsand-agent reset` to delete the data.
+When `Authenticate` reports that the device is unknown and the agent has no record of a removal notice, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device for up to 1 year. An operator runs `ownsand-agent reset` to delete the data.
 
 ### Agent updates
 
@@ -122,7 +122,7 @@ When `CreateChallenge` or `Authenticate` reports that the device is unknown and 
 ## Storage
 
 - State directory, readable only by the agent's service account: `/var/lib/ownsand-agent` on Linux, `/Library/Application Support/ownsand-agent` on macOS and `%ProgramData%\ownsand-agent` on Windows.
-- Contents: the device ID, the Ed25519 private key, the control plane origin, the sandbox and snapshot records with their TTL deadlines, VM disks, memory state, snapshots, base images and the pending update.
+- Contents: an identity file with the device ID and the Ed25519 private key, kept apart from the other records so that the loss of sandbox records does not lose the identity; the control plane origin, the sandbox and snapshot records with their TTL deadlines, VM disks, memory state, snapshots, base images and the pending update.
 - The agent never writes enrollment tokens, session credentials, signed URLs, exec content or file content to its logs.
 
 ## Security
