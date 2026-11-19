@@ -28,12 +28,12 @@ Organization owners, admins and members who sign in with Logto. API keys do not 
 | `invitation`        | `/invitations/accept`                     | Accept an invitation secret as the signed-in user.                      | signed in                                    |
 | `sandboxes`         | `/orgs/:organizationId/sandboxes`         | Sandbox list with state, device, resources, TTL deadlines and labels.   | `member`                                     |
 | `devices`           | `/orgs/:organizationId/devices`           | Devices with state, capabilities, limits, allocation and agent version. | `member`                                     |
-| `members`           | `/orgs/:organizationId/members`           | Members, roles and invitations.                                         | `member` (changes need `admin`)              |
+| `members`           | `/orgs/:organizationId/members`           | Members and roles; invitations for `admin` and above.                   | `member` (changes need `admin`)              |
 | `enrollment-tokens` | `/orgs/:organizationId/enrollment-tokens` | Create, list and revoke enrollment tokens.                              | `admin`                                      |
 | `api-keys`          | `/orgs/:organizationId/api-keys`          | Create, list and revoke API keys.                                       | `admin`                                      |
 | `settings`          | `/orgs/:organizationId/settings`          | Agent version policy, ownership transfer and organization deletion.     | `admin` (transfer and deletion need `owner`) |
 
-- The invitation secret arrives in the URL fragment of the invitation link, so it does not reach Cloudflare Pages logs. The console removes it from the address bar after it reads it.
+- The invitation secret arrives in the URL fragment of the invitation link, so it does not reach Cloudflare Pages logs. The console removes it from the address bar after it reads it. When the user is not signed in, the console keeps the secret in `sessionStorage` only for the Logto sign-in redirect, because the fragment does not survive the redirect. It deletes the secret from `sessionStorage` when `AcceptInvitation` returns, also when the call fails, and when the user leaves the invitation page.
 - New secrets (invitation links, enrollment tokens, API keys) appear once in a dialog with a copy action and a statement that they will not appear again.
 - The per-device admin settings UI (device limits and removal) is an open decision. Record its route and layout here before the implementation.
 - The console hides actions that the user's role does not allow, and the control plane still enforces every permission.
@@ -41,7 +41,7 @@ Organization owners, admins and members who sign in with Logto. API keys do not 
 
 ## Storage
 
-The console stores nothing except the Logto SDK session state in the browser. It never stores API keys, enrollment tokens or invitation secrets in browser storage.
+The console stores nothing except the Logto SDK session state in the browser. It never stores API keys or enrollment tokens in browser storage. The only exception for invitation secrets is the short `sessionStorage` use during the sign-in redirect described above.
 
 ## Security
 
