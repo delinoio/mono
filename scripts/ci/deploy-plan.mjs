@@ -79,6 +79,15 @@ export function readWorkspacePackages(repoRoot) {
 function deployable(pkg) {
   const { name, deploy } = pkg.manifest;
   if (deploy === undefined) return undefined;
+  // A manifest can omit the name or give a non-string one. Report the package
+  // directory, because there is no usable name to report.
+  if (typeof name !== "string") {
+    throw new DeployPlanError(
+      `${pkg.dir}: a deployable package name must be a string, got ${
+        JSON.stringify(name) ?? "no name"
+      }`,
+    );
+  }
   const rule = targetRules.get(deploy?.target);
   if (!rule) {
     throw new DeployPlanError(
