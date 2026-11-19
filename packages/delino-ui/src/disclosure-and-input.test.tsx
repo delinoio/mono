@@ -524,6 +524,15 @@ describe("Slider", () => {
 });
 
 describe("NumberInput", () => {
+  test("sizes the control and buttons from the group, not the SDK", () => {
+    // The SDK stylesheet fixes these parts at 32px; they must follow the
+    // 44px group instead.
+    const control = block(".dui-number-input-control");
+    expect(control).toMatch(/height: auto;/);
+    expect(control).toContain("margin-inline: 0;");
+    expect(block(".dui-number-input-button")).toMatch(/height: auto;/);
+  });
+
   test("steps the value with its buttons", async () => {
     const values: (number | null)[] = [];
     render(

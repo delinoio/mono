@@ -1472,9 +1472,16 @@
     opacity: 0.5;
   }
 
+  /* The SDK stylesheet fixes the control and the step buttons at 8 spacing
+     units and gives the control a -1px inline margin. Both would leave empty
+     space inside the 44px group. Let the parts follow the group through
+     align-items: stretch. Remove the height and margin resets when the SDK
+     stops sizing these parts. */
   .dui-number-input-control {
     box-sizing: border-box;
     width: 80px;
+    height: auto;
+    margin-inline: 0;
     min-width: 0;
     padding: 0 4px;
     border: 0;
@@ -1493,6 +1500,7 @@
     align-items: center;
     justify-content: center;
     width: 44px;
+    height: auto;
     padding: 0;
     border: 0;
     border-radius: var(--dui-radius-control);
