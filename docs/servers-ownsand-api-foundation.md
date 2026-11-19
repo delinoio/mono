@@ -102,6 +102,8 @@ Three public RPCs take no `organization_id`. They accept only a Logto access tok
 - With an explicit `device_id`, the scheduler checks the same conditions and does not select another device. It fails with the code that the error-code rule in this section gives for that device.
 - A sandbox from a snapshot or template runs on the device that holds the snapshot locally, or on any eligible device with the same OS and architecture when the snapshot is exported. Memory state restores only on the device that took the snapshot, and only when the request's `vcpu_count`, `memory_mib` and network mode equal the snapshot's values, because the saved state includes the virtual devices. These conditions only allow an attempt: when the hypervisor reports that it cannot read the saved state (for example, after a save format change), the agent boots the snapshot disk cold, and the sandbox reports which restore path it used. In every other case the sandbox restores the disk and boots cold, until a runtime contract defines a compatibility check for memory state on other devices (for example, the CPU model for Firecracker-class snapshots). The scheduler prefers the snapshot device when memory state can restore there.
 - The scheduler reserves the resources in the same transaction that creates the sandbox record, so two concurrent requests cannot both use the last free capacity of a device.
+- A create first looks up its `idempotency_key`, right after authorization and before placement or the live-channel check: a known key with the same parameters returns the original sandbox even when its device is offline now.
+- When the agent rejects a create command before it makes a VM (for example, with `resource_exhausted` after its free disk check), the server sets the sandbox to `failed` with `CREATE_FAILED` and releases its reservation. A lost command result is not a rejection: the sandbox stays `creating` until the agent reports it, because the VM may exist.
 
 ### TTL
 
@@ -157,7 +159,7 @@ The server writes one audit event in the same transaction as each successful act
 | `SANDBOX_CREATED`              | `CreateSandbox`                                                                                                                                                                                                                                                                                                                                                                        |
 | `SANDBOX_DELETED`              | The sandbox reaches `DELETED` or `FAILED` for any reason, including a delete request, a TTL end, a device removal, an organization deletion, `CREATE_FAILED` and `LOST_ON_DEVICE` (with the `SYSTEM` actor when no caller asked for it); written once, with the end reason and the actor of the delete request when there is one. A delete of an already ended sandbox writes nothing. |
 
-- Fields: `audit_event_id`, `organization_id`, `action`, actor kind (`PrincipalKind`) and actor ID, target kind (`AuditTargetKind`) and target ID, request ID and time.
+- Fields: `audit_event_id`, `organization_id`, `action`, actor kind (`PrincipalKind`) and actor ID, end reason (`SandboxEndReason`, only for `SANDBOX_DELETED`), target kind (`AuditTargetKind`) and target ID, request ID and time.
 - Retention: 90 days. A daily job deletes older events. Organization deletion does not delete audit events early.
 - The first version defines no audit read RPC. Adding one is a change to this contract and the protos contract.
 

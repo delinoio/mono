@@ -2,7 +2,7 @@
 
 ## Scope
 
-This contract defines user authentication and identity for every project and domain in the repository. Project and domain contracts may add authorization rules, but they must not introduce a separate identity system.
+This contract defines user authentication and identity for every project and domain in the repository. Project and domain contracts may add authorization rules, but they must not introduce a separate identity system. The credentials listed under [Documented exceptions](#documented-exceptions) are not an identity system for people.
 
 ## Identity provider
 
