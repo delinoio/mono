@@ -57,7 +57,7 @@ The console sends no logs to a service in this version. Browser console messages
 ## Build and Test
 
 - Package scripts `dev`, `build`, `lint`, `typecheck` and `test` run through root Turborepo tasks. Record them with the implementation.
-- Add an end-to-end suite according to the [e2e contract](repository-e2e-contract.md) when the console has its first route.
+- When the console has its first route, extend the scope of the [e2e contract](repository-e2e-contract.md) to `ownsand-console` and add an end-to-end suite according to it.
 
 ## Dependencies and Integrations
 
