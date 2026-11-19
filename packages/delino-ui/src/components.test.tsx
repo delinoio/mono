@@ -845,6 +845,29 @@ describe("Checkbox", () => {
     fireEvent.click(screen.getByRole("checkbox", { name: "Olives" }));
     expect(values.at(-1)).toEqual(["cheese", "olives"]);
   });
+
+  // happy-dom computes no cascade, so the cursor is checked on the stylesheet
+  // source. The row is a native label, so its rule keys on the disabled state
+  // of the control inside it, which the DOM checks below pin.
+  test("shows a not-allowed cursor on a disabled row only", () => {
+    expect(block(".dui-checkbox-item")).toContain("cursor: pointer;");
+    expect(
+      block(".dui-checkbox-item:has(.dui-checkbox[data-disabled])"),
+    ).toContain("cursor: not-allowed;");
+  });
+
+  test("marks the control inside the row disabled for the row cursor rule", () => {
+    const { container } = render(
+      <CheckboxGroup aria-label="Toppings" disabled>
+        <Checkbox value="cheese" label="Cheese" />
+      </CheckboxGroup>,
+    );
+    expect(
+      container.querySelector(
+        ".dui-checkbox-item .dui-checkbox[data-disabled]",
+      ),
+    ).not.toBeNull();
+  });
 });
 
 describe("RadioGroup", () => {
@@ -899,6 +922,25 @@ describe("RadioGroup", () => {
     expect(nodes.length).toBe(1);
     expect(nodes[0]?.textContent).toBe("Billed every period.");
     expectDescribedBy(group, nodes[0]);
+  });
+
+  // See the Checkbox row cursor tests: the row is a native label.
+  test("shows a not-allowed cursor on a disabled row only", () => {
+    expect(block(".dui-radio-item")).toContain("cursor: pointer;");
+    expect(block(".dui-radio-item:has(.dui-radio[data-disabled])")).toContain(
+      "cursor: not-allowed;",
+    );
+  });
+
+  test("marks the control inside the row disabled for the row cursor rule", () => {
+    const { container } = render(
+      <RadioGroup label="Plan" disabled>
+        <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
+      </RadioGroup>,
+    );
+    expect(
+      container.querySelector(".dui-radio-item .dui-radio[data-disabled]"),
+    ).not.toBeNull();
   });
 });
 
