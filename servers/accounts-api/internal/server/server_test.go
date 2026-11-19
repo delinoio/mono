@@ -693,3 +693,45 @@ func TestRequestLogBytesForHead(t *testing.T) {
 		})
 	}
 }
+
+// TestRequestLogBytesCountsAcceptedBytes checks that the logged bytes are the
+// bytes net/http accepted from the handler, not the bytes the handler offered.
+// With a declared Content-Length of 1, net/http rejects a 3-byte write whole
+// with http.ErrContentLength and transmits none of it, so the record must log 0.
+func TestRequestLogBytesCountsAcceptedBytes(t *testing.T) {
+	var (
+		writtenN   int
+		writtenErr error
+	)
+	clientErr, clientStatus, _, clientBody, records := serveCommittedRequest(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "1")
+		writtenN, writtenErr = w.Write([]byte("abc"))
+	})
+
+	// serveCommittedRequest returns after the request was logged, which happens
+	// after the handler returned, so the handler's results are safe to read.
+	if writtenN != 0 {
+		t.Errorf("handler write n = %d, want 0", writtenN)
+	}
+	if !errors.Is(writtenErr, http.ErrContentLength) {
+		t.Errorf("handler write error = %v, want %v", writtenErr, http.ErrContentLength)
+	}
+	if clientErr != nil {
+		t.Fatalf("client error = %v, want a response", clientErr)
+	}
+	if clientStatus != http.StatusOK {
+		t.Errorf("client status = %d, want 200", clientStatus)
+	}
+	if clientBody != 0 {
+		t.Errorf("client read %d body bytes, want 0", clientBody)
+	}
+	if len(records) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
+	}
+	if records[0]["msg"] != "http_request" {
+		t.Errorf("record msg = %v, want http_request", records[0]["msg"])
+	}
+	if records[0]["bytes"] != float64(0) {
+		t.Errorf("logged bytes = %v, want 0", records[0]["bytes"])
+	}
+}
