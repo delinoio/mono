@@ -23,7 +23,7 @@ Repository-owned source, package metadata and future release artifacts use Apach
 
 These rules are not defaults; project and domain contracts must not deviate from them.
 
-- Authentication uses one shared Logto tenant for all services. See `docs/repository-auth-contract.md`.
+- Authentication uses one shared Logto tenant for all services. A project may accept another credential for programs or devices only when the documented exceptions in `docs/repository-auth-contract.md` list it. See `docs/repository-auth-contract.md`.
 - User charges use USD with 0.000001 USD precision. See `docs/repository-billing-contract.md`.
 - Account management and billing for every service use `delino-accounts`. See `docs/repository-auth-contract.md`, `docs/repository-billing-contract.md` and `docs/project-delino-accounts.md`.
 

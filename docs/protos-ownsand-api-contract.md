@@ -86,6 +86,18 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 |                       | `ReadFile`                 | server-streaming | Relay: stream the contents of a guest file from an offset.                                   |
 |                       | `WriteFile`                | unary            | Relay: write one chunk of a guest file at an offset. See [file transfer](#file-transfer).    |
 
+### Sandbox state rules
+
+| RPC                                                          | Required sandbox state                                                 | Otherwise                                                                    |
+| ------------------------------------------------------------ | ---------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
+| `Exec`, `AttachExec`, `ReadFile`, `WriteFile`, `OpenSession` | `RUNNING`                                                              | `unavailable` for `UNREACHABLE`; `failed_precondition` for every other state |
+| `PauseSandbox`                                               | `RUNNING` (`PAUSED` succeeds without change)                           | as above                                                                     |
+| `ResumeSandbox`                                              | `PAUSED` (`RUNNING` succeeds without change)                           | as above                                                                     |
+| `CreateSnapshot`                                             | `RUNNING` or `PAUSED`                                                  | as above                                                                     |
+| `DeleteSandbox`                                              | any state except `DELETED` and `FAILED` (those succeed without change) | —                                                                            |
+
+`CreateSandbox` returns the sandbox in `CREATING` without waiting for the agent; the caller watches `GetSandbox` until `RUNNING` or `FAILED`. `CreateSnapshot` and `ExportSnapshot` also return at once with a snapshot in `CREATING` or `EXPORTING`. `PauseSandbox`, `ResumeSandbox` and `DeleteSandbox` wait up to 60 seconds for the agent result and then return the current state, which the caller can watch with `GetSandbox`.
+
 ### Create request
 
 `CreateSandboxRequest` fields:
@@ -94,7 +106,7 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 - `source`: exactly one of `base_image` (a `BaseImage` enum value), `snapshot_id` or `template_id`.
 - `resources`: `vcpu_count`, `memory_mib` and `disk_gib`. All three are required and must be greater than zero. For a snapshot or template source, `disk_gib` must be at least the snapshot's disk size, and the server rejects a smaller disk with `invalid_argument`. Memory state restores only when `vcpu_count` and `memory_mib` equal the snapshot's values; other values are valid and boot the disk cold, according to the [control plane scheduler](servers-ownsand-api-foundation.md#scheduler).
 - `idle_ttl` and `max_ttl`: required. Both must be greater than zero, `idle_ttl` must not be greater than `max_ttl`, and `max_ttl` must not be greater than 7 days. The server rejects a request that breaks any of these rules, including a missing TTL, with `invalid_argument`. Exactly 7 days is valid. There is no default TTL.
-- `placement`: optional `device_id`, or optional `host_os` and `arch` filters. `guest_os` is derived from the source. With `device_id`, the scheduler does not select another device: the request fails with `unavailable` when the device is not reachable and with `failed_precondition` when it cannot run the sandbox, according to the [control plane scheduler](servers-ownsand-api-foundation.md#scheduler).
+- `placement`: optional `device_id`, or optional `host_os` and `arch` filters. `guest_os` is derived from the source. With `device_id`, the scheduler does not select another device: the request fails with `unavailable` or `failed_precondition` according to the error-code rule of the [control plane scheduler](servers-ownsand-api-foundation.md#scheduler), according to the [control plane scheduler](servers-ownsand-api-foundation.md#scheduler).
 - `network`: `NETWORK_MODE_OUTBOUND` (the default when the field is absent) or `NETWORK_MODE_NONE`. A present `network` message with an unspecified mode fails with `invalid_argument`. The field is a message so that later policies can extend it without a new RPC.
 - `labels`: optional string map (at most 32 entries; keys at most 63 bytes, values at most 255 bytes). Labels must not contain secrets; they appear in logs and in the console.
 

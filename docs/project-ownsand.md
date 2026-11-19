@@ -99,7 +99,7 @@ The project has one hosted deployable (the control plane), one static site (the 
 
 ### Open decisions
 
-Record each decision in the owning domain contract before the implementation that depends on it:
+Record each decision in the owning domain contract before the implementation that depends on it. The domain contracts also own narrower open decisions (for example, the macOS userspace network stack, the Windows network enforcement, the Linux base image, the snapshot content per hypervisor, the CLI keychain storage and the rate-limit client address header); each is recorded where it applies. The cross-domain ones are:
 
 - The release signing tool and the key custody process ([agent contract](cmds-ownsand-agent-foundation.md#agent-updates)).
 - The microVM implementation for Linux hosts (Firecracker class) ([agent contract](cmds-ownsand-agent-foundation.md#isolation)).
