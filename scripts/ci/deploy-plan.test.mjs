@@ -225,6 +225,107 @@ test("a scoped deployable package name fails", () => {
   );
 });
 
+test("a non-string deployable package name fails with the package directory", () => {
+  const targets = [
+    ["servers/api", { target: DeployTarget.Railway, service: "api" }],
+    ["apps/web", { target: DeployTarget.CloudflarePages, project: "web" }],
+  ];
+  const names = [undefined, null, 123, true, ["api"]];
+  for (const [dir, deploy] of targets) {
+    for (const name of names) {
+      const manifest = name === undefined ? { deploy } : { name, deploy };
+      const label = `${dir} ${JSON.stringify(name)}`;
+      assert.throws(
+        () => plan(status(), [pkg(dir, manifest)]),
+        (error) => {
+          assert.ok(error instanceof DeployPlanError, label);
+          assert.match(
+            error.message,
+            /a deployable package name must be a string/,
+            label,
+          );
+          assert.ok(error.message.startsWith(`${dir}: `), label);
+          assert.ok(!error.message.includes("undefined: "), label);
+          return true;
+        },
+        label,
+      );
+    }
+  }
+});
+
+test("string deployable names that fail the pattern still fail", () => {
+  for (const name of ["", "@delino/api", "UPPER"]) {
+    assert.throws(
+      () =>
+        plan(status(), [
+          pkg("servers/api", {
+            name,
+            deploy: { target: DeployTarget.Railway, service: "api" },
+          }),
+        ]),
+      /a deployable package name must match/,
+      JSON.stringify(name),
+    );
+  }
+});
+
+test("check and the --check CLI reject a nameless deployable", () => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  const cases = [
+    ["servers/api", { deploy: { target: "railway", service: "api" } }],
+    [
+      "servers/api",
+      { name: null, deploy: { target: "railway", service: "api" } },
+    ],
+    [
+      "apps/web",
+      { name: 123, deploy: { target: "cloudflare-pages", project: "web" } },
+    ],
+    [
+      "apps/web",
+      { name: true, deploy: { target: "cloudflare-pages", project: "web" } },
+    ],
+    [
+      "servers/api",
+      { name: ["api"], deploy: { target: "railway", service: "api" } },
+    ],
+  ];
+  const message =
+    /^(servers\/api|apps\/web): a deployable package name must be a string/;
+  for (const [dir, manifest] of cases) {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-name-"));
+    const label = JSON.stringify(manifest);
+    try {
+      mkdirSync(join(workDir, ".changeset"));
+      writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+      mkdirSync(join(workDir, dir), { recursive: true });
+      writeFileSync(
+        join(workDir, dir, "package.json"),
+        JSON.stringify(manifest),
+      );
+      assert.throws(
+        () => check(workDir),
+        (error) => {
+          assert.ok(error instanceof DeployPlanError, label);
+          assert.match(error.message, message, label);
+          return true;
+        },
+        label,
+      );
+      const run = spawnSync(process.execPath, [cli, "--check", workDir], {
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 2, label);
+      const event = JSON.parse(run.stderr.trim());
+      assert.equal(event.event, "deploy_plan_error", label);
+      assert.match(event.message, message, label);
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+});
+
 const invalidTargetMessage =
   /^(web|api): deploy\.target must be one of railway, cloudflare-pages$/;
 
