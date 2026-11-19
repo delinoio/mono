@@ -40,7 +40,7 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 | `ownsand snapshot`         | `create`, `get`, `list`, `delete`, `export`                                          |
 | `ownsand template`         | `create`, `list`, `delete`                                                           |
 
-- The organization comes from `--org` or the `OWNSAND_ORG` environment variable. `ownsand org` commands that need no organization ignore them.
+- The organization comes from `--org` or the `OWNSAND_ORG` environment variable. `ownsand org` commands that need no organization and `ownsand member accept`, which takes the organization from the invitation, ignore them.
 - `sandbox create` requires `--idle-ttl` and `--max-ttl`, `--vcpu`, `--memory` and `--disk`. It has no default TTL.
 - `sandbox exec` streams stdout and stderr to the CLI's own standard streams and exits with the command's exit code. When the data path fails, it exits with status `255` and a data path error on standard error.
 - `member accept` reads the invitation secret from standard input or from the file named by `--secret-file`. It never accepts the secret as a command-line argument, because other local users can read process arguments.
