@@ -244,3 +244,47 @@ func TestLoadTrimsASCIIPadding(t *testing.T) {
 		t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, LogLevelDebug)
 	}
 }
+
+func TestLoadRejectsNonASCIILogLevelThatFoldsToLevelName(t *testing.T) {
+	for name, tc := range map[string]struct {
+		value string
+		want  string
+	}{
+		"U+0130 then NFO":             {value: "İNFO", want: "İNFO"},
+		"U+0130 then nfo":             {value: "İnfo", want: "İnfo"},
+		"U+0130 with ASCII padding":   {value: " İNFO ", want: "İNFO"},
+		"U+212A (Kelvin sign) in nfo": {value: "KNFO", want: "KNFO"},
+		"U+0131 (dotless i) nfo":      {value: "ınfo", want: "ınfo"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(lookupFrom(map[string]string{EnvLogLevel: tc.value}))
+			if err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+			want := fmt.Sprintf("LOG_LEVEL must be one of debug, info, warn, error; got %q", tc.want)
+			if err.Error() != want {
+				t.Errorf("error = %q, want %q", err, want)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsASCIILogLevelInAnyCase(t *testing.T) {
+	for value, want := range map[string]LogLevel{
+		"DEBUG": LogLevelDebug,
+		"WARN":  LogLevelWarn,
+		"Error": LogLevelError,
+		"INFO":  LogLevelInfo,
+		"iNfO":  LogLevelInfo,
+	} {
+		t.Run(value, func(t *testing.T) {
+			cfg, err := Load(lookupFrom(map[string]string{EnvLogLevel: value}))
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.LogLevel != want {
+				t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, want)
+			}
+		})
+	}
+}

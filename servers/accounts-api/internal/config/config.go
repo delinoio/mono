@@ -47,8 +47,26 @@ func (l LogLevel) SlogLevel() slog.Level {
 	}
 }
 
+// asciiLower returns value with only the ASCII letters A-Z converted to lower
+// case. It deliberately does not use strings.ToLower, which applies Unicode
+// case mapping: U+0130 (capital I with dot above) followed by "NFO" would
+// lower-case to "info" and pass validation, although the value is not one of
+// the documented level names.
+func asciiLower(value string) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 func parseLogLevel(value string) (LogLevel, error) {
-	switch level := LogLevel(strings.ToLower(value)); level {
+	switch level := LogLevel(asciiLower(value)); level {
 	case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
 		return level, nil
 	default:
