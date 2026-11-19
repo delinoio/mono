@@ -99,7 +99,8 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 
 ### Exec
 
-- `ExecRequest`: `organization_id`, `sandbox_id`, `command` (argument array, the first element is the program), `env` (string map), `working_directory` and optional `timeout`. A shell runs only when the caller passes one, for example `["/bin/sh", "-c", "..."]`.
+- `ExecRequest`: `organization_id`, `sandbox_id`, `exec_id`, `command` (argument array, the first element is the program), `env` (string map), `working_directory` and optional `timeout`. A shell runs only when the caller passes one, for example `["/bin/sh", "-c", "..."]`.
+- The caller generates the `exec_id` (a UUID v7) before it sends the request, so it can resume the exec even when the stream ends before the `started` event. The agent runs each `exec_id` at most once: a second `ExecRequest` with a known `exec_id` attaches to the existing exec from offset 0 and does not run the command again.
 - The response stream carries `ExecEvent` messages in order: one `started` event with the `exec_id`, then `stdout` and `stderr` chunks (at most 64 KiB each), then exactly one `exited` event with the exit code, or a `failed` event when the command could not start. Each output chunk carries its byte offset in its stream (stdout or stderr).
 - The command runs on the agent independently of the stream. A stream may end before the command ends: the relay ends a stream itself before the Railway edge limit and sends a `keepalive` event at least every 60 seconds while the command produces no output. A stream that ends without `exited` or `failed` does not stop the command.
 - `AttachExec` takes the `exec_id` and the next stdout and stderr offsets, and continues the same event sequence. The agent keeps the last 8 MiB of each output stream and the exit result for 10 minutes after the command ends. When the requested offset is older than the kept output, the first event is `output_truncated` with the first available offsets. When the exec is unknown, or its result is no longer kept, `AttachExec` fails with `not_found`; the outcome of the command is then unknown.
@@ -108,17 +109,17 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 
 ### File transfer
 
-- `ReadFile` takes an optional start `offset` and streams `FileChunk` messages of at most 1 MiB with the `offset` of each chunk and a final message with the file `size_bytes`. After an interrupted stream, the caller calls `ReadFile` again from the next offset.
-- `WriteFile` is unary. Connect can carry client streams over HTTP/1.1, but browser clients cannot send them, and unary chunks let a caller retry or resume one chunk after an interrupted upload. Each call writes one chunk of at most 1 MiB at an `offset` to a `write_id` that the first call opens. The last call sets `finish` with the total `size_bytes` and the file `mode`. The agent writes to a temporary file and renames it into place only after `finish`, so a failed upload never leaves a partial file at the target path.
+- `ReadFile` takes an optional start `offset` and an optional `file_version`, and streams `FileChunk` messages of at most 1 MiB with the `offset` of each chunk and a final message with the file `size_bytes`. The first message carries the `file_version` that the guest helper computes from the file identity, size and modification time. After an interrupted stream, the caller calls `ReadFile` again from the next offset with that `file_version`. When the file changed, the call fails with `failed_precondition`, so a resumed read never combines two versions of a file.
+- `WriteFile` is unary. Connect can carry client streams over HTTP/1.1, but browser clients cannot send them, and unary chunks let a caller retry or resume one chunk after an interrupted upload. Each call writes one chunk of at most 1 MiB at an `offset` to a `write_id` that the first call opens. The last call sets `finish` with the total `size_bytes` and the file `mode`. The agent writes to a temporary file and renames it into place only after `finish`, so a failed upload never leaves a partial file at the target path. The guest helper deletes the temporary file of a `write_id` that receives no chunk for 15 minutes; a later call with that `write_id` fails with `not_found`.
 - Paths are absolute guest paths. The guest helper resolves them inside the guest; the device agent never resolves a guest path on the host file system.
 
 ### Data path framing
 
 The peer-to-peer data channel and the relay carry the same `DataFrame` messages, so the agent and the guest helper handle both transports with one implementation.
 
-- `DataFrame` has a `request_id`, a `kind` (`DataFrameKind`) and one payload: an exec request, an exec event, a file read request, a file chunk, a file write chunk, a file write result or an error.
+- `DataFrame` has a `request_id`, a `kind` (`DataFrameKind`) and one payload: an exec request, an exec attach request (with the `exec_id` and the next stdout and stderr offsets), an exec event, a file read request, a file chunk, a file write chunk, a file write result or an error.
 - On the WebRTC data channel, the frames form one byte stream: each frame is encoded as a varint length followed by the encoded `DataFrame`. The sender splits this byte stream into data channel messages of at most 16 KiB, which is below the 64 KiB default receive limit of [RFC 8841](https://www.rfc-editor.org/rfc/rfc8841.html#section-6.1). The receiver reassembles frames from the length prefixes. The data channel is ordered and reliable. One data channel serves one `OpenSession` session and may carry several concurrent requests, distinguished by `request_id`.
-- The relay RPCs (`Exec`, `ReadFile`, `WriteFile`) translate their requests into `DataFrame` messages for the agent and translate the agent's frames back into responses.
+- The relay RPCs (`Exec`, `AttachExec`, `ReadFile`, `WriteFile`) translate their requests into `DataFrame` messages for the agent and translate the agent's frames back into responses.
 
 ### Agent channel
 
@@ -129,6 +130,7 @@ The peer-to-peer data channel and the relay carry the same `DataFrame` messages,
 | `Enroll`          | unary      | Exchange an enrollment token and the device public key for a `device_id`.                                                                            |
 | `CreateChallenge` | unary      | Return a one-time nonce for the device.                                                                                                              |
 | `Authenticate`    | unary      | Exchange a signed nonce for a short-lived `osd_` device session credential, or return the removal notice.                                            |
+| `ConfirmRemoval`  | unary      | Confirm the local clean-up of a removed device with a signed nonce. Accepted only for removed devices; idempotent.                                   |
 | `Channel`         | long-lived | Carry `AgentEnvelope` messages in both directions. The [control plane contract](servers-ownsand-api-foundation.md#agent-channel) owns the transport. |
 
 `AgentEnvelope` carries one of: heartbeat, capability report, state report (all sandboxes, snapshots and images on the device), command (create, delete, pause, resume, snapshot, export, import, clean up, update), command result, signaling message (SDP offer with the session ID, principal and absolute expiry; SDP answer; ICE candidate), session revocation and relay `DataFrame`. Each sandbox entry in a state report has its state and, for an ended sandbox, its `SandboxEndReason`.

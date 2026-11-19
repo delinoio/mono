@@ -40,7 +40,7 @@ Both components use Apache-2.0 and must not import code from `servers/`.
 
 ### Capabilities
 
-The agent reports its capabilities after each authentication: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
+The agent reports its capabilities after each authentication: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), the supported macOS hardware models, and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
 
 ### Isolation
 
@@ -66,7 +66,7 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 ### Network policy
 
 - The default mode `OUTBOUND` gives the guest outbound internet access through NAT on the host.
-- In `OUTBOUND` mode, the agent drops every guest packet to these destinations: the host's own addresses on all interfaces; `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `224.0.0.0/4` and `240.0.0.0/4`; `::1/128`, `fc00::/7`, `fe80::/10` and `ff00::/8`; `64:ff9b:1::/48`; the IPv4-mapped IPv6 forms of the IPv4 ranges; and every on-link prefix of every host interface, from the host routing table, for IPv4 and IPv6. The on-link prefixes cover LANs that use globally routed addresses, such as most IPv6 LANs. The agent updates the rules when interfaces, addresses or routes change. Inbound connections to the guest are not allowed.
+- In `OUTBOUND` mode, the agent drops every guest packet to these destinations: the host's own addresses on all interfaces; `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `224.0.0.0/4` and `240.0.0.0/4`; `::1/128`, `fc00::/7`, `fe80::/10` and `ff00::/8`; `64:ff9b:1::/48`; the IPv4-mapped (`::ffff:0:0/96`) and NAT64 well-known prefix (`64:ff9b::/96`) forms of the IPv4 ranges; and every on-link prefix of every host interface, from the host routing table, for IPv4 and IPv6. The on-link prefixes cover LANs that use globally routed addresses, such as most IPv6 LANs. The agent updates the rules when interfaces, addresses or routes change. Inbound connections to the guest are not allowed.
 - DNS: the agent serves DNS to the guest at the guest gateway address and resolves the queries through the host resolver. The gateway accepts only DNS (UDP and TCP port 53) from the guest; this is the only exception to the host-address rule. A name that resolves to a blocked address stays unreachable, because the packet filter applies after resolution.
 - `NONE` mode attaches no network device to the guest. The guest helper still works through the hypervisor socket.
 - Enforcement per host:
@@ -92,6 +92,7 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 - Pause stops the VM's vCPUs and keeps its memory. Resume continues it. On macOS, paused VMs end when the agent process ends.
 - A snapshot captures the guest disk. Where the hypervisor supports it, the snapshot also captures the memory state; record per hypervisor which content a snapshot holds before its implementation. A sandbox created from a snapshot is a new sandbox with a new ID.
 - Snapshots stay in the agent state directory by default.
+- A macOS snapshot also holds the VM's auxiliary storage, its hardware model and its machine identifier, which Virtualization.framework needs to boot the disk. A macOS snapshot can restore only on a Mac that reports support for its hardware model. The agent reports its supported macOS hardware models as a capability and checks support again before an import.
 - Export: the agent uploads the snapshot to R2 with the signed URLs that the control plane issues, in parts, and reports the SHA-256 of each part. Import: the agent downloads with signed URLs, checks the hashes and only then marks the snapshot ready. An exported snapshot can run only on a device with the same host OS and architecture.
 
 ### Data path
@@ -104,9 +105,9 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 
 ### Device removal
 
-When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image, deletes the device key, reports the result when it is still connected, and exits enrolled state. The control plane deletes the removal tombstone after it receives the result. `ownsand-agent reset` does the same without the control plane.
+When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image. Then it calls `ConfirmRemoval` with a nonce from `CreateChallenge` signed by its device key, retrying with back-off until the call succeeds. Only then does it delete the device key and exit enrolled state. The control plane deletes the removal tombstone when `ConfirmRemoval` succeeds. `ownsand-agent reset` does the same without the control plane.
 
-When `CreateChallenge` or `Authenticate` reports that the device is unknown, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device. An operator runs `ownsand-agent reset` to delete the data.
+When `CreateChallenge` or `Authenticate` reports that the device is unknown, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device for up to 1 year. An operator runs `ownsand-agent reset` to delete the data.
 
 ### Agent updates
 
@@ -114,6 +115,7 @@ When `CreateChallenge` or `Authenticate` reports that the device is unknown, the
 - The agent downloads a signed release manifest and the release artifact for its platform. The manifest names the version, the platform, the SHA-256 of the artifact and the versions that are revoked. The agent verifies the manifest signature with a public key that is built into the agent, and verifies the artifact hash, before it installs anything. It rejects a release with a bad signature, a hash mismatch or a revoked version, and reports `FAILED`.
 - The agent keeps a list of built-in public keys so that a release signed with the current key can introduce the next key.
 - The agent installs an update only when no sandbox is `creating`, `running` or `paused` and no snapshot export or import runs. Until then, it reports `PENDING_IDLE` and keeps serving its sandboxes. It never stops a sandbox to install an update.
+- When the signed manifest revokes the running version, the agent rejects new create commands and reports its version as revoked, so the scheduler stops placing sandboxes on it. Running sandboxes end at their `max_ttl` at the latest, which every sandbox must have, and the agent then installs the update.
 - A version lower than the running version is installed only when the organization policy pins it.
 - The release signing tool and the key custody process are open decisions. Record them here before the first release.
 
