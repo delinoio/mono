@@ -1884,8 +1884,12 @@
        aspect-ratio, which only applies to an auto axis. The default
        align-items: stretch of a flex container would make the cross axis
        definite and replace the ratio-derived size, so the circle opts out and
-       keeps its size. */
+       keeps its size. A grid container with justify-items: stretch or
+       place-items: stretch does the same on the inline axis, so the circle
+       opts out of that axis with justify-self. The block axis is covered by
+       align-self, which applies to grid items too. */
     align-self: flex-start;
+    justify-self: flex-start;
   }
 
   @keyframes dui-skeleton-pulse {
