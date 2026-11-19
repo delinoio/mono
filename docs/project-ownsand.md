@@ -40,17 +40,17 @@ The project has two hosted deployables (the control plane on Railway and the rel
 
 ### Components
 
-| Component ID      | Path                        | Kind                  | Production origin or distribution    |
-| ----------------- | --------------------------- | --------------------- | ------------------------------------ |
-| `ownsand-api`     | `servers/ownsand-api/`      | Railway server        | `https://ownsand.api.delino.io`      |
+| Component ID      | Path                        | Kind                  | Production origin or distribution     |
+| ----------------- | --------------------------- | --------------------- | ------------------------------------- |
+| `ownsand-api`     | `servers/ownsand-api/`      | Railway server        | `https://ownsand.api.delino.io`       |
 | `ownsand-relay`   | `servers/ownsand-relay/`    | DigitalOcean Droplet  | `https://ownsand-relay.api.delino.io` |
-| `ownsand-console` | `apps/ownsand/`             | Cloudflare Pages site | `https://ownsand.delino.io`          |
-| `ownsand-agent`   | `cmds/ownsand-agent/`       | Host service binary   | Signed release, self-updating        |
-| `ownsand-guest`   | `cmds/ownsand-guest/`       | Guest helper binary   | Installed into each guest image      |
-| `ownsand-cli`     | `cmds/ownsand/`             | CLI binary            | Release artifact                     |
-| `ownsand-sdk-ts`  | `packages/ownsand-sdk/`     | TypeScript package    | npm package                          |
-| `ownsand-sdk-go`  | `packages/ownsand-sdk-go/`  | Go package            | Root Go module import path           |
-| `ownsand-protos`  | `protos/delino/ownsand/v1/` | Schemas and bindings  | Root Go module and generated TS code |
+| `ownsand-console` | `apps/ownsand/`             | Cloudflare Pages site | `https://ownsand.delino.io`           |
+| `ownsand-agent`   | `cmds/ownsand-agent/`       | Host service binary   | Signed release, self-updating         |
+| `ownsand-guest`   | `cmds/ownsand-guest/`       | Guest helper binary   | Installed into each guest image       |
+| `ownsand-cli`     | `cmds/ownsand/`             | CLI binary            | Release artifact                      |
+| `ownsand-sdk-ts`  | `packages/ownsand-sdk/`     | TypeScript package    | npm package                           |
+| `ownsand-sdk-go`  | `packages/ownsand-sdk-go/`  | Go package            | Root Go module import path            |
+| `ownsand-protos`  | `protos/delino/ownsand/v1/` | Schemas and bindings  | Root Go module and generated TS code  |
 
 ### Protocol and API
 
