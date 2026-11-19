@@ -722,7 +722,9 @@ export async function main(env = process.env) {
   // so only a non-signal failure gets the pathspec-commit guidance. The signal
   // is checked directly: `status > 128` would also match a child's own status.
   if (pathspecCommit && !signal && status !== 0)
-    // Check mode exits 1 for both unformatted files and parser failures.
+    // Check mode exits 1 when a file needs formatting and 2 when a file cannot
+    // be parsed; the highest batch status wins. Both fail the commit with the
+    // same guidance because the hook cannot fix either in a pathspec commit.
     throw new Error(
       "git commit <path> cannot be formatted through the pre-commit hook: " +
         "formatting is required or a staged file cannot be parsed. " +
