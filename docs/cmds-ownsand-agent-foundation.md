@@ -92,7 +92,7 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 - Pause stops the VM's vCPUs and keeps its memory. Resume continues it. On macOS, paused VMs end when the agent process ends.
 - A snapshot captures the guest disk. Where the hypervisor supports it, the snapshot also captures the memory state; record per hypervisor which content a snapshot holds before its implementation. A sandbox created from a snapshot is a new sandbox with a new ID.
 - Snapshots stay in the agent state directory by default.
-- A macOS snapshot also holds the VM's auxiliary storage, its hardware model and its machine identifier, which Virtualization.framework needs to boot the disk. A macOS snapshot can restore only on a Mac that reports support for its hardware model. The agent reports its supported macOS hardware models as a capability and checks support again before an import.
+- A macOS snapshot also holds the VM's auxiliary storage, its hardware model and its machine identifier, which Virtualization.framework needs to boot the disk. A macOS snapshot can restore only on a Mac that reports support for its hardware model. The agent reports its supported macOS hardware models as a capability and checks support again before an import. The agent never runs two VMs with the same macOS machine identifier at the same time. Whether a restored macOS disk boots with a new machine identifier must be verified in the change that implements the macOS runtime. Until that is verified, a macOS snapshot or template backs at most one running sandbox at a time, and the scheduler treats a second request as not eligible.
 - Export: the agent uploads the snapshot to R2 with the signed URLs that the control plane issues, in parts, and reports the SHA-256 of each part. Import: the agent downloads with signed URLs, checks the hashes and only then marks the snapshot ready. An exported snapshot can run only on a device with the same host OS and architecture.
 
 ### Data path
@@ -105,9 +105,9 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 
 ### Device removal
 
-When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image. Then it calls `ConfirmRemoval` with a nonce from `CreateChallenge` signed by its device key, retrying with back-off until the call succeeds. Only then does it delete the device key and exit enrolled state. The control plane deletes the removal tombstone when `ConfirmRemoval` succeeds. `ownsand-agent reset` does the same without the control plane.
+When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image. It records in its state directory that it received an authenticated removal notice and finished the clean-up. Then it calls `ConfirmRemoval` with a nonce from `CreateChallenge` signed by its device key, retrying with back-off until the call succeeds, or until `CreateChallenge` or `ConfirmRemoval` reports the device as unknown: in this recorded state, an unknown device means that an earlier confirmation succeeded and its response was lost. Only then does it delete the device key and exit enrolled state. The control plane deletes the removal tombstone when `ConfirmRemoval` succeeds. `ownsand-agent reset` does the same without the control plane.
 
-When `CreateChallenge` or `Authenticate` reports that the device is unknown, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device for up to 1 year. An operator runs `ownsand-agent reset` to delete the data.
+When `CreateChallenge` or `Authenticate` reports that the device is unknown and the agent has no record of a removal notice, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device for up to 1 year. An operator runs `ownsand-agent reset` to delete the data.
 
 ### Agent updates
 
@@ -115,7 +115,7 @@ When `CreateChallenge` or `Authenticate` reports that the device is unknown, the
 - The agent downloads a signed release manifest and the release artifact for its platform. The manifest names the version, the platform, the SHA-256 of the artifact and the versions that are revoked. The agent verifies the manifest signature with a public key that is built into the agent, and verifies the artifact hash, before it installs anything. It rejects a release with a bad signature, a hash mismatch or a revoked version, and reports `FAILED`.
 - The agent keeps a list of built-in public keys so that a release signed with the current key can introduce the next key.
 - The agent installs an update only when no sandbox is `creating`, `running` or `paused` and no snapshot export or import runs. Until then, it reports `PENDING_IDLE` and keeps serving its sandboxes. It never stops a sandbox to install an update.
-- When the signed manifest revokes the running version, the agent rejects new create commands and reports its version as revoked, so the scheduler stops placing sandboxes on it. Running sandboxes end at their `max_ttl` at the latest, which every sandbox must have, and the agent then installs the update.
+- When the signed manifest revokes the running version, the agent rejects new create commands and reports its version as revoked, so the scheduler stops placing sandboxes on it. Running sandboxes end at their `max_ttl` at the latest, which every sandbox must have, and the agent then installs the update. Revocation overrides the organization's `HOLD` or `PIN` policy: the control plane then sends the default target version, according to the [control plane contract](servers-ownsand-api-foundation.md#agent-version-policy).
 - A version lower than the running version is installed only when the organization policy pins it.
 - The release signing tool and the key custody process are open decisions. Record them here before the first release.
 
@@ -130,7 +130,7 @@ When `CreateChallenge` or `Authenticate` reports that the device is unknown, the
 - The device private key never leaves the device. Removal and `reset` delete it.
 - Sandbox content stays in the VM, the state directory, the data channel, the relay stream or an explicit R2 export.
 - The agent validates every guest path request inside the guest helper, so a guest path never touches the host file system.
-- The agent opens connections only to the control plane origin, the STUN service, R2 signed URLs and release downloads, with one exception: for a session that `OpenSession` authorized, its ICE agent binds ephemeral UDP sockets, sends connectivity checks to the caller's candidates and accepts the caller's checks and traffic. These sockets exist only for the session and accept only the DTLS fingerprint of the offer. The agent opens no other listening port on the host network.
+- The agent's own connections go only to the control plane origin, the STUN service, R2 signed URLs and release downloads. Guest traffic that the [network policy](#network-policy) allows and the agent's DNS forwarding for guests are guest traffic, not agent connections; on macOS the agent's userspace network stack opens them for the guest. The agent has one more exception: for a session that `OpenSession` authorized, its ICE agent binds ephemeral UDP sockets, sends connectivity checks to the caller's candidates and accepts the caller's checks and traffic. These sockets exist only for the session and accept only the DTLS fingerprint of the offer. The agent opens no other listening port on the host network.
 
 ## Logging
 
