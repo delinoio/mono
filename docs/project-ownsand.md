@@ -129,6 +129,10 @@ Record each decision in the owning domain contract before the implementation tha
 
 ## References
 
+- [servers-ownsand-relay-foundation.md](servers-ownsand-relay-foundation.md)
+- [Railway pricing plans](https://docs.railway.com/pricing/plans)
+- [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/)
+- [DigitalOcean firewall rules](https://docs.digitalocean.com/products/networking/firewalls/how-to/configure-rules/)
 - [repository-defaults.md](repository-defaults.md)
 - [repository-auth-contract.md](repository-auth-contract.md)
 - [repository-billing-contract.md](repository-billing-contract.md)
