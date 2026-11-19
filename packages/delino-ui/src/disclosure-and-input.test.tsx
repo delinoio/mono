@@ -1057,13 +1057,15 @@ describe("Skeleton", () => {
     expect(bare.getAttribute("style")).toBeNull();
   });
 
-  test("keeps a circle from being stretched by a flex container", () => {
+  test("keeps a circle from being stretched by a flex or grid container", () => {
     // happy-dom computes no layout, so the stylesheet text is checked. Without
     // `align-self`, the default `align-items: stretch` of a flex container
-    // replaces the size that `aspect-ratio` derives for the auto side.
-    expect(block(".dui-skeleton[data-circle]")).toContain(
-      "align-self: flex-start",
-    );
+    // replaces the size that `aspect-ratio` derives for the auto side. Without
+    // `justify-self`, `justify-items: stretch` or `place-items: stretch` on a
+    // grid container does the same on the inline axis.
+    const circle = block(".dui-skeleton[data-circle]");
+    expect(circle).toContain("align-self: flex-start");
+    expect(circle).toContain("justify-self: flex-start");
   });
 
   test("lets the caller style win over the circle diameter", () => {
