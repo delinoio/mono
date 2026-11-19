@@ -1461,10 +1461,17 @@
     opacity: 0.5;
   }
 
+  /* The UI SDK stylesheet fixes the control and step buttons at a smaller
+     height and collapses its own borders with a negative inline margin on the
+     control. Here the row is the 44px group, so the parts follow it through
+     align-items: stretch. Remove these overrides when the UI SDK stylesheet
+     stops sizing the parts. */
   .dui-number-input-control {
     box-sizing: border-box;
     width: 80px;
+    height: auto;
     min-width: 0;
+    margin-inline: 0;
     padding: 0 4px;
     border: 0;
     background: transparent;
@@ -1482,6 +1489,7 @@
     align-items: center;
     justify-content: center;
     width: 44px;
+    height: auto;
     padding: 0;
     border: 0;
     border-radius: var(--dui-radius-control);

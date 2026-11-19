@@ -547,6 +547,15 @@ describe("NumberInput", () => {
     expect(values).toEqual([2]);
   });
 
+  test("lets the control and step buttons follow the group height", () => {
+    // The UI SDK stylesheet fixes both parts at a smaller height, so the
+    // package must reset it for the 44px group to fill them.
+    const control = block(".dui-number-input-control");
+    expect(control).toMatch(/height: (auto|42px)/);
+    expect(control).toContain("margin-inline: 0");
+    expect(block(".dui-number-input-button")).toMatch(/height: (auto|42px)/);
+  });
+
   test("marks the field invalid and shows the error message", () => {
     render(<NumberInput label="Tickets" error="Choose at least one." />);
 
