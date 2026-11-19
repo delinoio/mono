@@ -400,6 +400,13 @@
     cursor: pointer;
   }
 
+  /* The row is a native label, so the disabled state of the control inside it
+     is matched with :has(). Keeps the cursor on the label text in step with
+     the control. */
+  .dui-checkbox-item:has(.dui-checkbox[data-disabled]) {
+    cursor: not-allowed;
+  }
+
   .dui-checkbox-label {
     color: var(--dui-color-text);
     font-size: 15px;
@@ -499,6 +506,11 @@
     color: var(--dui-color-text);
     font-size: 15px;
     cursor: pointer;
+  }
+
+  /* Same as the checkbox row: match the disabled control inside the label. */
+  .dui-radio-item:has(.dui-radio[data-disabled]) {
+    cursor: not-allowed;
   }
 
   .dui-radio {
