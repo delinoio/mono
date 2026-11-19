@@ -1219,6 +1219,52 @@ test(
 );
 
 test(
+  "provider reports a missing or directory Wrangler output path without a jq error",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    for (const path of [join(dir, "missing.ndjson"), dir]) {
+      const result = runProvider(t, ["pages-id", path]);
+      assert.equal(result.status, 1);
+      assert.equal(result.stdout, "");
+      assert.match(result.stderr, /returned no deployment id/);
+      assert.doesNotMatch(result.stderr, /jq:/);
+    }
+  },
+);
+
+test(
+  "provider reports a Wrangler output file with only non-JSON lines",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    const file = join(dir, "wrangler.ndjson");
+    writeFileSync(file, "junk\n");
+    const result = runProvider(t, ["pages-id", file]);
+    assert.equal(result.status, 1);
+    assert.equal(result.stdout, "");
+    assert.match(result.stderr, /returned no deployment id/);
+    assert.doesNotMatch(result.stderr, /jq:/);
+  },
+);
+
+test(
+  "provider skips non-JSON lines around a Pages deploy record",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    const file = join(dir, "wrangler.ndjson");
+    writeFileSync(
+      file,
+      'junk\n{"type":"pages-deploy","version":1,"deployment_id":"pages-1"}\n',
+    );
+    const result = runProvider(t, ["pages-id", file]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.stdout.trim(), "pages-1");
+  },
+);
+
+test(
   "provider does not wait for a status read past the deadline",
   { skip: skipWait },
   (t) => {
