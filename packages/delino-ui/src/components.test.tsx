@@ -292,6 +292,12 @@ describe("Switch", () => {
   // checked-thumb rules declare the `translate` travel and reset the SDK's
   // `margin-inline-start: auto`. It does not prove the rendered thumb
   // position; that needs a real-browser layout check.
+  // The UI SDK stylesheet makes every Field a column. happy-dom computes no
+  // cascade, so this checks that the package rule resets the direction to row.
+  test("keeps the label block and switch on one row", () => {
+    expect(block(".dui-switch-field")).toContain("flex-direction: row");
+  });
+
   test("moves the checked thumb once, and reverses it in right-to-left text", () => {
     expect(block(".dui-switch-thumb[data-checked]")).toContain(
       "margin-inline-start: 0",
