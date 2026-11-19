@@ -107,7 +107,7 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 - The agent never sends sandbox content anywhere except to the data channel of the session or to its relay connection, for a stream that it admitted under a live grant and that has not ended, been revoked or reached its stream deadline.
 - The agent records the request digest of each exec, read and write when it first accepts the operation on either transport, checks continuations against it, and releases a grant on the agent channel when the grant has no open stream and its operation finished, according to the [protos contract](protos-ownsand-api-contract.md#relay-tickets) and the [control plane contract](servers-ownsand-api-foundation.md#data-path-signaling-and-relay).
 - When the agent accepts a server-streaming relay request (`Exec`, `AttachExec` or `ReadFile`), it sends a keepalive event for that stream at once, so the caller sees that the request was accepted before any output arrives. `WriteFile` is unary and has no acceptance event.
-- The agent acknowledges each relay grant with a result: accepted, or rejected because of its per-device grant limit. It grants credit windows for request payload frames on each relay stream and buffers at most that window.
+- The agent acknowledges each relay grant with a result: accepted, or rejected because of its per-device grant limit. It grants credit windows for request payload frames on each relay stream, sending the first window when it accepts the stream open frame, and buffers at most that window. It releases a grant also when the grant's last stream ended with an error that leaves no operation to continue.
 
 ### Device removal
 
