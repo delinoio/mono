@@ -95,7 +95,11 @@ Record the package scripts with the implementation, following `accounts-api`:
 
 - `pnpm exec turbo run build --filter=ownsand-relay`, `lint` (`go vet ./...`) and `test` (`go test ./...`).
 - From the repository root: `gofmt` check, `go vet ./...` and `go test ./...`, according to `servers/AGENTS.md`.
-- Required tests: ticket verification (bad signature, unknown key ID, expired ticket, wrong relay origin, wrong kind, mismatched organization or sandbox), agent connection replacement, the 10-second wait for an agent connection, stream keepalive and the 14-minute stream end, relay stream close frames and `stream_id` non-reuse, operation ID checks against the ticket, the agent's 90-second idle reconnect, the 5-minute `WriteFile` call deadline including the agent's result, acceptance of every configured public key during key rotation, the 30-second clock skew on `expires_at`, the 90-second agent connection idle close, closing an agent connection that sends beyond its credit window, `GET /healthz`, per-stream credit windows with one slow and one fast caller on the same device, an `AGENT` connection that outlives its ticket, stream rotation with an OK status, `WriteFile` upload deadline, forwarding without persistence, back-pressure, session-end frames, STUN binding responses and rate limiting, and log redaction.
+- Required tests:
+  - Tickets: bad signature, unknown key ID, acceptance of every configured public key during key rotation, expired ticket and the 30-second clock skew on `expires_at`, wrong relay origin, wrong kind, mismatched organization, sandbox or operation ID.
+  - Agent connections: replacement, the 10-second wait for an agent connection, the 90-second idle close on the relay server and the agent's 90-second idle reconnect, an `AGENT` connection that outlives its ticket, and closing an agent connection that sends beyond its credit window.
+  - Streams and flow control: stream keepalive, stream rotation with an OK status before 14 minutes, relay stream close frames and `stream_id` non-reuse, per-stream credit windows with one slow and one fast caller on the same device, the 5-minute `WriteFile` call deadline including the agent's result, session-end frames, and forwarding without persistence.
+  - STUN binding responses and rate limiting, `GET /healthz`, and log redaction.
 
 ## Deployment
 
