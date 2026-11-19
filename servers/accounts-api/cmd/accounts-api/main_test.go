@@ -127,16 +127,18 @@ func TestServeCleanShutdownReturnsNil(t *testing.T) {
 	}
 }
 
-// startServe runs serve on a real listener and returns the listener address and
-// a channel that receives serve's result.
-func startServe(ctx context.Context, t *testing.T, handler http.Handler, timeout time.Duration) (string, <-chan error) {
+// startServe runs serve on a real listener and returns the server, the listener
+// address and a channel that receives serve's result. The caller may read
+// srv.BaseContext only after serve has returned, because serve sets it.
+func startServe(ctx context.Context, t *testing.T, handler http.Handler, timeout time.Duration) (*http.Server, string, <-chan error) {
 	t.Helper()
 	listener := newTestListener(t)
+	srv := &http.Server{Handler: handler}
 	done := make(chan error, 1)
 	go func() {
-		done <- serve(ctx, noStop, &http.Server{Handler: handler}, listener, newTestLogger(), timeout)
+		done <- serve(ctx, noStop, srv, listener, newTestLogger(), timeout)
 	}()
-	return listener.Addr().String(), done
+	return srv, listener.Addr().String(), done
 }
 
 func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
@@ -145,10 +147,8 @@ func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
 
 	started := make(chan struct{})
 	release := make(chan struct{})
-	handlerCtx := make(chan context.Context, 1)
 	handlerCtxErr := make(chan error, 1)
-	addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		handlerCtx <- r.Context()
+	srv, addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-release
 		handlerCtxErr <- r.Context().Err()
@@ -198,9 +198,12 @@ func TestServeDrainsInFlightRequestWithoutCancellingItsContext(t *testing.T) {
 		t.Fatal("serve did not return after the request completed")
 	}
 
-	// The server-lifetime context ends with the drain.
-	if err := (<-handlerCtx).Err(); err == nil {
-		t.Fatal("request context was not cancelled after serve returned")
+	// The server-lifetime context ends with the drain. Read it through
+	// srv.BaseContext: a request context is released once its handler returns, so
+	// it would report cancellation even without the server-lifetime cancel.
+	// Receiving from done orders this read after serve set BaseContext.
+	if err := srv.BaseContext(nil).Err(); err == nil {
+		t.Fatal("server-lifetime context was not cancelled after a successful drain")
 	}
 }
 
@@ -211,7 +214,7 @@ func TestServeCancelsRequestContextOnlyAfterShutdownDeadline(t *testing.T) {
 
 	started := make(chan struct{})
 	cancelledAt := make(chan time.Time, 1)
-	addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	_, addr, done := startServe(ctx, t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(started)
 		<-r.Context().Done()
 		cancelledAt <- time.Now()
