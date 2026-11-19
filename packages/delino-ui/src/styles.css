@@ -1012,6 +1012,12 @@
   /* Progress */
   .dui-progress {
     display: grid;
+    /* The UI SDK stylesheet makes the root a two-column grid for a label and a
+       value that are direct children. The package wraps both in one header, so
+       it declares one column; otherwise the column gap narrows the header
+       against the track. Remove this when the UI SDK stylesheet stops setting
+       a column template on the root. */
+    grid-template-columns: minmax(0, 1fr);
     gap: 8px;
     font-family: var(--dui-font-family);
   }

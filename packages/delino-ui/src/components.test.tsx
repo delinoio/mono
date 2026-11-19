@@ -1536,6 +1536,12 @@ describe("Progress", () => {
     expect(screen.getByText("40%")).toBeTruthy();
   });
 
+  test("declares one grid column so the header spans the track", () => {
+    expect(block(".dui-progress")).toContain(
+      "grid-template-columns: minmax(0, 1fr)",
+    );
+  });
+
   test("references its label element for its name", () => {
     const { container } = render(<Progress label="Uploading" value={40} />);
 
