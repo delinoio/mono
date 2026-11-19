@@ -46,7 +46,7 @@ The console stores nothing except the Logto SDK session state in the browser. It
 
 ## Security
 
-- Secrets appear once and are never stored by the console.
+- Secrets appear once and are never stored by the console, except the short `sessionStorage` use of an invitation secret during the sign-in redirect described in [Interfaces and Contracts](#interfaces-and-contracts).
 - Destructive actions (device removal, API key revocation, organization deletion, ownership transfer) need an explicit confirmation step.
 - The console shows no exec output or file contents; it has no exec or file features in this version.
 
