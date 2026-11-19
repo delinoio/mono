@@ -146,6 +146,7 @@
 - Logto is the only identity provider. All services share one Logto tenant per deployment environment; do not add service-local password storage, sign-up flows or another identity provider.
 - Use the Logto user ID (`sub`) as the canonical user identifier across services.
 - Backend services must validate Logto access tokens (signature, issuer, expiration, audience and required scopes) and must not accept ID tokens as API credentials.
+- A project may accept a credential other than a Logto access token for programs or devices only when the "Documented exceptions" section of `docs/repository-auth-contract.md` lists it.
 - Use `delino-accounts` for account management in every service. Link users to `https://accounts.delino.io` for profile and account settings, and read shared account data from `https://accounts.api.delino.io`. Do not build service-local account management pages or duplicate the shared account profile.
 - Follow `docs/repository-auth-contract.md` and `docs/project-delino-accounts.md`.
 

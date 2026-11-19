@@ -43,8 +43,10 @@ The SDKs expose the public services of the [protos contract](protos-ownsand-api-
 
 ### Data path
 
-- For exec and file operations, the SDK calls `OpenSession` once per sandbox handle and tries a peer-to-peer WebRTC data channel to the agent.
-- When the data channel does not open within 10 seconds, or fails during a session, the SDK uses the relay RPCs for that sandbox handle. A request that was in progress on the failed channel fails with a data path error; the SDK does not retry an exec automatically, because the command may have run.
+- For exec and file operations, an SDK that supports peer-to-peer calls `OpenSession` once per sandbox handle and tries a WebRTC data channel to the agent. A relay-only SDK, and a client with the transport forced to `RELAY`, does not call `OpenSession`; it calls the relay RPCs directly.
+- When the data channel does not open within 10 seconds, or fails during a session, the SDK uses the relay RPCs for that sandbox handle. The SDK never runs an exec again, because the command may have run. It continues an exec that was in progress with `AttachExec` on the relay, and continues a file read from the next offset. When `AttachExec` fails with `not_found`, the exec fails with a data path error and its outcome is unknown.
+- A relay stream can end before the operation ends because of the Railway edge limits. The SDK continues it with `AttachExec` or `ReadFile` from the next offset without a visible error.
+- After the 1-hour absolute expiry of a session, or a revocation, the SDK calls `OpenSession` again before the next operation. A revoked credential then fails with `unauthenticated` or `permission_denied`.
 - The caller can force a transport (`PEER_TO_PEER` or `RELAY`) for tests. The SDK reports the transport in use.
 - Both transports carry the same `DataFrame` messages and give the same results.
 
@@ -66,7 +68,7 @@ The SDKs log nothing by default. An optional logger receives RPC names, sandbox 
 
 - TypeScript SDK: package scripts `build`, `lint`, `typecheck` and `test`, run through root Turborepo tasks. Record them with the implementation.
 - Go SDK: `gofmt` check, `go vet ./...` and `go test ./...` from the repository root.
-- Required tests: TTL validation before the request, transport fallback from peer-to-peer to relay, a failed exec stream that is not retried, chunked file writes, and credential redaction in errors.
+- Required tests: TTL validation before the request, transport fallback from peer-to-peer to relay, relay-only operation without `OpenSession`, exec continuation with `AttachExec` (also for a command that produces no output for more than 5 minutes), an exec that is never run again, chunked file writes, and credential redaction in errors.
 
 ## Dependencies and Integrations
 

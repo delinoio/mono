@@ -40,7 +40,7 @@ Both components use Apache-2.0 and must not import code from `servers/`.
 
 ### Capabilities
 
-The agent reports its capabilities after each authentication: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
+The agent reports its capabilities after each authentication: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
 
 ### Isolation
 
@@ -55,7 +55,7 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 - The guest architecture is the host architecture.
 - Linux: the microVM implementation is an open decision (Firecracker class). Record the selected implementation, its version pin and how the agent runs it (for example, a jailer with one unprivileged user per sandbox) before the Linux runtime implementation.
 - macOS: a Virtualization.framework VM runs in the process that created it. Restarting the agent stops every running and paused VM on macOS. This is one reason for the update rule in [Agent updates](#agent-updates).
-- Each sandbox gets the vCPU count, memory and disk of its create request. The agent rejects a create command that exceeds the device limits that the control plane sent, as a second check after the scheduler.
+- Each sandbox gets the vCPU count, memory and disk of its create request. The agent rejects a create command that exceeds the device limits that the control plane sent, or that would start a third macOS guest, as a second check after the scheduler.
 
 ### Guest helper
 
@@ -66,14 +66,14 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 ### Network policy
 
 - The default mode `OUTBOUND` gives the guest outbound internet access through NAT on the host.
-- In `OUTBOUND` mode, the agent drops every guest packet to these destinations: the host's own addresses on all interfaces; `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `224.0.0.0/4` and `240.0.0.0/4`; `::1/128`, `fc00::/7`, `fe80::/10` and `ff00::/8`; and the IPv4-mapped IPv6 forms of the IPv4 ranges. Inbound connections to the guest are not allowed.
-- DNS: the agent serves DNS to the guest at the guest gateway address and resolves the queries through the host resolver. The gateway accepts only DNS from the guest. A name that resolves to a blocked address stays unreachable, because the packet filter applies after resolution.
+- In `OUTBOUND` mode, the agent drops every guest packet to these destinations: the host's own addresses on all interfaces; `0.0.0.0/8`, `10.0.0.0/8`, `100.64.0.0/10`, `127.0.0.0/8`, `169.254.0.0/16`, `172.16.0.0/12`, `192.168.0.0/16`, `224.0.0.0/4` and `240.0.0.0/4`; `::1/128`, `fc00::/7`, `fe80::/10` and `ff00::/8`; `64:ff9b:1::/48`; the IPv4-mapped IPv6 forms of the IPv4 ranges; and every on-link prefix of every host interface, from the host routing table, for IPv4 and IPv6. The on-link prefixes cover LANs that use globally routed addresses, such as most IPv6 LANs. The agent updates the rules when interfaces, addresses or routes change. Inbound connections to the guest are not allowed.
+- DNS: the agent serves DNS to the guest at the guest gateway address and resolves the queries through the host resolver. The gateway accepts only DNS (UDP and TCP port 53) from the guest; this is the only exception to the host-address rule. A name that resolves to a blocked address stays unreachable, because the packet filter applies after resolution.
 - `NONE` mode attaches no network device to the guest. The guest helper still works through the hypervisor socket.
 - Enforcement per host:
   - Linux: a tap device per sandbox with nftables rules in a table that the agent owns. The agent needs `CAP_NET_ADMIN`.
   - macOS: the built-in Virtualization.framework NAT attachment cannot filter LAN destinations. The agent attaches the guest network through a file-handle attachment to a userspace network stack in the agent that applies the policy. The network stack library is an open decision and a new dependency.
   - Windows: open decision between Host Networking Service ACL policies on the sandbox endpoint and a Windows Filtering Platform filter. Record the mechanism before the Windows runtime implementation.
-- Network policy tests must show, on each host OS, that the guest reaches the internet in `OUTBOUND` mode and cannot reach the host, the LAN or the link-local range, and that a `NONE` guest has no network.
+- Network policy tests must show, on each host OS, that the guest reaches the internet in `OUTBOUND` mode and cannot reach the host, the LAN or the link-local range, also on a LAN with global IPv6 addresses, and that a `NONE` guest has no network.
 
 ### TTL
 
@@ -98,11 +98,15 @@ The agent stores the idle and maximum deadlines of each sandbox in its state dir
 
 - The agent accepts a WebRTC data channel only for an `OpenSession` offer that it received from the control plane on the agent channel, and only from the DTLS fingerprint in that offer.
 - The agent answers with its ICE candidates, including STUN-derived server-reflexive candidates. When ICE fails, the caller uses the relay, and the agent serves the same `DataFrame` requests from the agent channel.
+- The agent enforces the session end rules of the [control plane contract](servers-ownsand-api-foundation.md#data-path-signaling-and-relay) on its data channels: idle time, absolute expiry, revocation messages and loss of the agent channel.
+- The agent runs each exec independently of the data path that started it, and keeps its recent output and exit result for `AttachExec` according to the [protos contract](protos-ownsand-api-contract.md#exec).
 - The agent never sends sandbox content anywhere except to the data channel of the session or to the relay.
 
 ### Device removal
 
-When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image, deletes the device key, reports the result when it is still connected, and exits enrolled state. `ownsand-agent reset` does the same without the control plane.
+When the agent receives a clean-up command or a removal notice from `Authenticate`, it stops and deletes every local sandbox, snapshot and locally built image, deletes the device key, reports the result when it is still connected, and exits enrolled state. The control plane deletes the removal tombstone after it receives the result. `ownsand-agent reset` does the same without the control plane.
+
+When `CreateChallenge` or `Authenticate` reports that the device is unknown, the agent keeps its local data, logs the error and retries with back-off, because the control plane keeps a tombstone for every removed device. An operator runs `ownsand-agent reset` to delete the data.
 
 ### Agent updates
 
@@ -124,7 +128,7 @@ When the agent receives a clean-up command or a removal notice from `Authenticat
 - The device private key never leaves the device. Removal and `reset` delete it.
 - Sandbox content stays in the VM, the state directory, the data channel, the relay stream or an explicit R2 export.
 - The agent validates every guest path request inside the guest helper, so a guest path never touches the host file system.
-- The agent connects only outbound, to the control plane origin, the STUN service, R2 signed URLs and release downloads. It opens no inbound listening port on the host network.
+- The agent opens connections only to the control plane origin, the STUN service, R2 signed URLs and release downloads, with one exception: for a session that `OpenSession` authorized, its ICE agent binds ephemeral UDP sockets, sends connectivity checks to the caller's candidates and accepts the caller's checks and traffic. These sockets exist only for the session and accept only the DTLS fingerprint of the offer. The agent opens no other listening port on the host network.
 
 ## Logging
 
@@ -136,7 +140,7 @@ When the agent receives a clean-up command or a removal notice from `Authenticat
 
 - From the repository root: `gofmt` check, `go vet ./...` and `go test ./...`, according to `cmds/AGENTS.md`.
 - CI runs on Linux only and excludes macOS runners from pull requests and main pushes, according to the [workflow contract](repository-workflow-contract.md). Cross-compile the macOS and Windows code paths with `GOOS` on Linux so that CI checks that they build; behavior on macOS and Windows needs device acceptance.
-- Unit tests: TTL clocks, update verification (bad signature, hash mismatch, revoked version, update while sandboxes run, pinned version), state report reconciliation, network policy rule generation and token handling.
+- Unit tests: TTL clocks, update verification (bad signature, hash mismatch, revoked version, update while sandboxes run, pinned version), state report reconciliation (including `LOST_ON_DEVICE`), network policy rule generation (including on-link prefix changes), session end rules, exec output retention and token handling.
 - Device acceptance on real Linux, macOS and Windows hosts: the full lifecycle, the network policy tests, the relay fallback, disconnect and reconnect, snapshot export and restore on a second device, removal clean-up and signed updates. Record the results in pull requests and Linear issues, separate from CI.
 
 ## Dependencies and Integrations

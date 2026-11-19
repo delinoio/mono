@@ -29,7 +29,7 @@ The schemas are the single source of truth for the public API, the agent channel
 - Package: `delino.ownsand.v1`. A breaking change needs a new package version (`v2`). Within `v1`, do not reuse or renumber fields, do not change field types, and reserve the numbers and names of removed fields.
 - Identifiers are UUID v7 values in canonical text form in `string` fields named `<entity>_id`.
 - Times use `google.protobuf.Timestamp`. Durations use `google.protobuf.Duration`.
-- Every enum has a zero value `<ENUM>_UNSPECIFIED`. The server rejects `UNSPECIFIED` in a request with `invalid_argument`.
+- Every enum has a zero value `<ENUM>_UNSPECIFIED`. The server rejects `UNSPECIFIED` in a required enum field with `invalid_argument`. Optional enum fields, such as list filters and placement filters, use proto3 `optional`; an absent optional field means no filter.
 - Sizes use `int64` fields with a unit suffix: `memory_mib`, `disk_gib`, `size_bytes`.
 - List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`.
 - Errors use Connect error codes. Detail messages never contain secrets or sandbox content.
@@ -52,7 +52,7 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 |                       | `AcceptInvitation`         | unary            | Join the organization with an invitation secret, as the signed-in user.                      |
 |                       | `ListMembers`              | unary            | List members and roles.                                                                      |
 |                       | `UpdateMemberRole`         | unary            | Change a member role between `admin` and `member`.                                           |
-|                       | `RemoveMember`             | unary            | Remove a member. A member may also remove itself, except the `owner`.                        |
+|                       | `RemoveMember`             | unary            | Remove a member. An `admin` or `member` may also remove itself; the `owner` cannot.          |
 | `DeviceService`       | `CreateEnrollmentToken`    | unary            | Create a one-time enrollment token with an expiry. Returns the secret once.                  |
 |                       | `ListEnrollmentTokens`     | unary            | List enrollment tokens without secrets.                                                      |
 |                       | `RevokeEnrollmentToken`    | unary            | Revoke an unused enrollment token.                                                           |
@@ -81,7 +81,8 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 |                       | `DeleteTemplate`           | unary            | Delete a template. The source snapshot stays.                                                |
 | `DataPathService`     | `OpenSession`              | unary            | Signal a peer-to-peer data channel: send the caller's SDP offer, return the agent's answer.  |
 |                       | `Exec`                     | server-streaming | Relay: run a command and stream stdout, stderr and the exit code.                            |
-|                       | `ReadFile`                 | server-streaming | Relay: stream the contents of a guest file.                                                  |
+|                       | `AttachExec`               | server-streaming | Relay: continue the event stream of a running or finished exec from given output offsets.    |
+|                       | `ReadFile`                 | server-streaming | Relay: stream the contents of a guest file from an offset.                                   |
 |                       | `WriteFile`                | unary            | Relay: write one chunk of a guest file at an offset. See [file transfer](#file-transfer).    |
 
 ### Create request
@@ -92,20 +93,23 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 - `source`: exactly one of `base_image` (a `BaseImage` enum value), `snapshot_id` or `template_id`.
 - `resources`: `vcpu_count`, `memory_mib` and `disk_gib`. All three are required and must be greater than zero.
 - `idle_ttl` and `max_ttl`: required. Both must be greater than zero, and `idle_ttl` must not be greater than `max_ttl`. The server rejects a request without them with `invalid_argument`. There is no default TTL.
-- `placement`: optional `device_id`, or optional `host_os` and `arch` filters. With `device_id`, the scheduler does not select another device when that device cannot run the sandbox; the request fails with `failed_precondition`.
+- `placement`: optional `device_id`, or optional `host_os` and `arch` filters. `guest_os` is derived from the source. With `device_id`, the scheduler does not select another device when that device cannot run the sandbox; the request fails with `failed_precondition`.
 - `network`: `NETWORK_MODE_OUTBOUND` (the default when the field is absent) or `NETWORK_MODE_NONE`. The field is a message so that later policies can extend it without a new RPC.
 - `labels`: optional string map (at most 32 entries; keys at most 63 bytes, values at most 255 bytes). Labels must not contain secrets; they appear in logs and in the console.
 
 ### Exec
 
 - `ExecRequest`: `organization_id`, `sandbox_id`, `command` (argument array, the first element is the program), `env` (string map), `working_directory` and optional `timeout`. A shell runs only when the caller passes one, for example `["/bin/sh", "-c", "..."]`.
-- The response stream carries `ExecEvent` messages in order: one `started` event with the `exec_id`, then `stdout` and `stderr` chunks (at most 64 KiB each), then exactly one `exited` event with the exit code, or a `failed` event when the command could not start. A stream that ends without `exited` or `failed` means that the data path failed; the outcome of the command is unknown.
+- The response stream carries `ExecEvent` messages in order: one `started` event with the `exec_id`, then `stdout` and `stderr` chunks (at most 64 KiB each), then exactly one `exited` event with the exit code, or a `failed` event when the command could not start. Each output chunk carries its byte offset in its stream (stdout or stderr).
+- The command runs on the agent independently of the stream. A stream may end before the command ends: the relay ends a stream itself before the Railway edge limit and sends a `keepalive` event at least every 60 seconds while the command produces no output. A stream that ends without `exited` or `failed` does not stop the command.
+- `AttachExec` takes the `exec_id` and the next stdout and stderr offsets, and continues the same event sequence. The agent keeps the last 8 MiB of each output stream and the exit result for 10 minutes after the command ends. When the requested offset is older than the kept output, the first event is `output_truncated` with the first available offsets. When the exec is unknown, or its result is no longer kept, `AttachExec` fails with `not_found`; the outcome of the command is then unknown.
+- On the peer-to-peer data channel, the same exec continues after a channel failure with an `AttachExec` request frame on a new session or on the relay.
 - Stdin is not part of `v1`.
 
 ### File transfer
 
-- `ReadFile` streams `FileChunk` messages of at most 1 MiB with the `offset` of each chunk and a final message with the file `size_bytes`.
-- `WriteFile` is unary because the Railway edge does not carry client streams. Each call writes one chunk of at most 1 MiB at an `offset` to a `write_id` that the first call opens. The last call sets `finish` with the total `size_bytes` and the file `mode`. The agent writes to a temporary file and renames it into place only after `finish`, so a failed upload never leaves a partial file at the target path.
+- `ReadFile` takes an optional start `offset` and streams `FileChunk` messages of at most 1 MiB with the `offset` of each chunk and a final message with the file `size_bytes`. After an interrupted stream, the caller calls `ReadFile` again from the next offset.
+- `WriteFile` is unary. Connect can carry client streams over HTTP/1.1, but browser clients cannot send them, and unary chunks let a caller retry or resume one chunk after an interrupted upload. Each call writes one chunk of at most 1 MiB at an `offset` to a `write_id` that the first call opens. The last call sets `finish` with the total `size_bytes` and the file `mode`. The agent writes to a temporary file and renames it into place only after `finish`, so a failed upload never leaves a partial file at the target path.
 - Paths are absolute guest paths. The guest helper resolves them inside the guest; the device agent never resolves a guest path on the host file system.
 
 ### Data path framing
@@ -113,7 +117,7 @@ Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationS
 The peer-to-peer data channel and the relay carry the same `DataFrame` messages, so the agent and the guest helper handle both transports with one implementation.
 
 - `DataFrame` has a `request_id`, a `kind` (`DataFrameKind`) and one payload: an exec request, an exec event, a file read request, a file chunk, a file write chunk, a file write result or an error.
-- On the WebRTC data channel, each frame is a length-delimited binary message. One data channel serves one `OpenSession` session and may carry several concurrent requests, distinguished by `request_id`.
+- On the WebRTC data channel, the frames form one byte stream: each frame is encoded as a varint length followed by the encoded `DataFrame`. The sender splits this byte stream into data channel messages of at most 16 KiB, which is below the 64 KiB default receive limit of [RFC 8841](https://www.rfc-editor.org/rfc/rfc8841.html#section-6.1). The receiver reassembles frames from the length prefixes. The data channel is ordered and reliable. One data channel serves one `OpenSession` session and may carry several concurrent requests, distinguished by `request_id`.
 - The relay RPCs (`Exec`, `ReadFile`, `WriteFile`) translate their requests into `DataFrame` messages for the agent and translate the agent's frames back into responses.
 
 ### Agent channel
@@ -124,10 +128,10 @@ The peer-to-peer data channel and the relay carry the same `DataFrame` messages,
 | ----------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Enroll`          | unary      | Exchange an enrollment token and the device public key for a `device_id`.                                                                            |
 | `CreateChallenge` | unary      | Return a one-time nonce for the device.                                                                                                              |
-| `Authenticate`    | unary      | Exchange a signed nonce for a short-lived device session credential, or return the removal notice.                                                   |
+| `Authenticate`    | unary      | Exchange a signed nonce for a short-lived `osd_` device session credential, or return the removal notice.                                            |
 | `Channel`         | long-lived | Carry `AgentEnvelope` messages in both directions. The [control plane contract](servers-ownsand-api-foundation.md#agent-channel) owns the transport. |
 
-`AgentEnvelope` carries one of: heartbeat, capability report, state report (all sandboxes, snapshots and images on the device), command (create, delete, pause, resume, snapshot, export, import, clean up, update), command result, signaling message (SDP offer, SDP answer, ICE candidate) and relay `DataFrame`.
+`AgentEnvelope` carries one of: heartbeat, capability report, state report (all sandboxes, snapshots and images on the device), command (create, delete, pause, resume, snapshot, export, import, clean up, update), command result, signaling message (SDP offer with the session ID, principal and absolute expiry; SDP answer; ICE candidate), session revocation and relay `DataFrame`. Each sandbox entry in a state report has its state and, for an ended sandbox, its `SandboxEndReason`.
 
 ### Guest channel
 
@@ -135,26 +139,28 @@ The peer-to-peer data channel and the relay carry the same `DataFrame` messages,
 
 ### Enums
 
-| Enum                     | Values (without the enum prefix)                                                                                      |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------- |
-| `Role`                   | `OWNER`, `ADMIN`, `MEMBER`                                                                                            |
-| `HostOs`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                           |
-| `Arch`                   | `AMD64`, `ARM64`                                                                                                      |
-| `GuestOs`                | `LINUX`, `MACOS`, `WINDOWS`                                                                                           |
-| `BaseImage`              | `LINUX`, `MACOS`, `WINDOWS`                                                                                           |
-| `DeviceState`            | `ONLINE`, `OFFLINE`, `REMOVED`                                                                                        |
-| `SandboxState`           | `CREATING`, `RUNNING`, `PAUSED`, `DELETING`, `DELETED`, `FAILED`, `UNREACHABLE`                                       |
-| `SandboxEndReason`       | `DELETED_BY_CALLER`, `IDLE_TTL_EXPIRED`, `MAX_TTL_EXPIRED`, `DEVICE_REMOVED`, `ORGANIZATION_DELETED`, `CREATE_FAILED` |
-| `SnapshotState`          | `CREATING`, `READY`, `FAILED`, `DELETING`                                                                             |
-| `SnapshotExportState`    | `NOT_EXPORTED`, `EXPORTING`, `EXPORTED`, `EXPORT_FAILED`                                                              |
-| `NetworkMode`            | `OUTBOUND`, `NONE`                                                                                                    |
-| `AgentVersionPolicyMode` | `FOLLOW_DEFAULT`, `PIN`, `HOLD`                                                                                       |
-| `AgentUpdateState`       | `UP_TO_DATE`, `PENDING_IDLE`, `DOWNLOADING`, `INSTALLING`, `FAILED`                                                   |
-| `DataPathTransport`      | `PEER_TO_PEER`, `RELAY`                                                                                               |
-| `DataFrameKind`          | One value per payload in [data path framing](#data-path-framing)                                                      |
-| `AuditAction`            | The values in the [control plane audit table](servers-ownsand-api-foundation.md#audit-events)                         |
+| Enum                     | Values (without the enum prefix)                                                                                                        |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `Role`                   | `OWNER`, `ADMIN`, `MEMBER`                                                                                                              |
+| `HostOs`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `Arch`                   | `AMD64`, `ARM64`                                                                                                                        |
+| `GuestOs`                | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `BaseImage`              | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `DeviceState`            | `ONLINE`, `OFFLINE`, `REMOVED`                                                                                                          |
+| `SandboxState`           | `CREATING`, `RUNNING`, `PAUSED`, `DELETING`, `DELETED`, `FAILED`, `UNREACHABLE`                                                         |
+| `SandboxEndReason`       | `DELETED_BY_CALLER`, `IDLE_TTL_EXPIRED`, `MAX_TTL_EXPIRED`, `DEVICE_REMOVED`, `ORGANIZATION_DELETED`, `CREATE_FAILED`, `LOST_ON_DEVICE` |
+| `SnapshotState`          | `CREATING`, `READY`, `FAILED`, `DELETING`                                                                                               |
+| `SnapshotExportState`    | `NOT_EXPORTED`, `EXPORTING`, `EXPORTED`, `EXPORT_FAILED`                                                                                |
+| `NetworkMode`            | `OUTBOUND`, `NONE`                                                                                                                      |
+| `AgentVersionPolicyMode` | `FOLLOW_DEFAULT`, `PIN`, `HOLD`                                                                                                         |
+| `AgentUpdateState`       | `UP_TO_DATE`, `PENDING_IDLE`, `DOWNLOADING`, `INSTALLING`, `FAILED`                                                                     |
+| `DataPathTransport`      | `PEER_TO_PEER`, `RELAY`                                                                                                                 |
+| `DataFrameKind`          | One value per payload in [data path framing](#data-path-framing)                                                                        |
+| `AuditAction`            | The values in the [control plane audit table](servers-ownsand-api-foundation.md#audit-events)                                           |
 
-A sandbox that is `UNREACHABLE` also reports its last known state in `last_known_state`. `DELETED` and `FAILED` sandboxes report a `SandboxEndReason`.
+A sandbox that is `UNREACHABLE` also reports its last known state in `last_known_state`. `DELETED` and `FAILED` sandboxes report a `SandboxEndReason`. `LOST_ON_DEVICE` means that the sandbox's VM or its record no longer exists on the device, for example after a host reboot.
+
+A deleted snapshot has no terminal state: its record is removed. A snapshot whose local copy was removed with its device keeps its record only when it is exported; its location then names no device.
 
 ## Storage
 
