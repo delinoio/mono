@@ -257,6 +257,7 @@ message AgentCommand {
     ImportSnapshotCommand import_snapshot = 8;
     CleanUpCommand clean_up = 9;
     UpdateAgentCommand update_agent = 10;
+    DeleteSnapshotCommand delete_snapshot = 11;
   }
 }
 
@@ -320,6 +321,16 @@ message ImportSnapshotCommand {
   // The hashes that the control plane stored at export. The agent never
   // trusts hashes stored in R2.
   repeated SnapshotPart parts = 2;
+}
+
+// Delete the local copy of a snapshot whose record the control plane
+// deleted. The agent succeeds also when it holds no copy. It fails with
+// FAILED_PRECONDITION while a create or an export uses the copy; the
+// control plane sends the command again for each snapshot that a later
+// state report lists and that it does not know. An agent that does not
+// know this command answers UNIMPLEMENTED and keeps the copy.
+message DeleteSnapshotCommand {
+  string snapshot_id = 1;
 }
 
 // The device was removed: delete every local sandbox, snapshot and locally
