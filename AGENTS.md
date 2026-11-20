@@ -29,7 +29,7 @@
 - When introducing a workaround, leave sufficient comments that explain why it exists, its scope, and the conditions for removing it.
 - Prefer enum types over strings whenever possible.
 - If you modified Rust code, run `cargo test` from the root directory before finishing your task. The root `Cargo.toml` defines the Rust workspace; add every new crate as an explicit member in the same change, as described in `crates/AGENTS.md`.
-- If you modified frontend code, run `pnpm test` from the root directory before finishing your task; only `apps/delino-accounts` and `packages/delino-ui` define frontend tests today, so `apps/delino-docs`, `apps/delino-site` and `apps/delidev` are covered by their `typecheck` and `build` scripts instead.
+- If you modified frontend code, run `pnpm test` from the root directory before finishing your task; only `apps/delino-accounts`, `packages/delino-ui` and `packages/ownsand-sdk` define TypeScript tests today, so `apps/delino-docs`, `apps/delino-site` and `apps/delidev` are covered by their `typecheck` and `build` scripts instead.
 - Commit your work as frequent as possible using git. Do NOT use `--no-verify` flag.
 - Run `git commit` only after `git add`; once files are staged, commit without unnecessary delay so staged changes are preserved in history.
 - Committing may require workspace binaries (for example, git hooks). If required binaries are missing, run `pnpm install` at the repository root and retry the commit.
