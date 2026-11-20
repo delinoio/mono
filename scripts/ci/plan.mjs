@@ -5,6 +5,7 @@ import {
   changedFormatFiles,
   MissingPathPolicy,
   NonUtf8Policy,
+  repositoryRoot,
 } from "./format-changed.mjs";
 
 const fixtureInputs = new Set([
@@ -98,8 +99,17 @@ export function plan(cwd, base, head) {
   const paths = execFileSync(
     "git",
     ["diff", "--name-only", "--no-renames", "-z", base, head, "--"],
-    // Match the formatter's limit so large comparisons do not hit ENOBUFS.
-    { cwd, encoding: "utf8", maxBuffer: 32 * 1024 * 1024 },
+    // Run from the repository root, like the formatter selectors: with
+    // `diff.relative=true`, `git diff --name-only` prints paths relative to
+    // (and limited to) its working directory, so a run from a subdirectory
+    // would otherwise drop every change outside it and strip the prefix that
+    // the selectors below match. Match the formatter's buffer limit so large
+    // comparisons do not hit ENOBUFS.
+    {
+      cwd: repositoryRoot(cwd),
+      encoding: "utf8",
+      maxBuffer: 32 * 1024 * 1024,
+    },
   ).split("\0");
   const fixtures = paths.some(
     (path) =>
