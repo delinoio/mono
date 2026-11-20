@@ -15,7 +15,7 @@ Repository-owned source, package metadata and future release artifacts use Apach
 - When a new project does not specify its primary language, default to Golang.
 - Build tooling should prefer the Rspack family when it fits the runtime and deployment target, including Rsbuild and Rspress for app and documentation surfaces.
 - Static sites under `apps/` should use Rsbuild/Rspress-style toolchains and deploy to Cloudflare Pages by default. Any exception must be documented in its project contract.
-- Backend services under `servers/` should deploy to Railway by default. Any exception must be documented in its project contract.
+- Backend services under `servers/` should deploy to the shared DigitalOcean Droplet by default, as containers behind its Caddy reverse proxy. Any exception must be documented in its project contract.
 - Persistent relational databases should use PlanetScale Postgres by default. Any exception must be documented in its project contract.
 - File handling should use Cloudflare R2 for object storage plus signed URLs for upload and download access by default. Use another storage or access pattern only when the project contract documents the reason, trust boundary, and migration considerations.
 

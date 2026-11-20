@@ -9,7 +9,7 @@ This contract owns the `accounts-api` component of [`delino-accounts`](project-d
 - `servers/accounts-api/internal/server/`: HTTP handler, routes, middleware and the connection observer that logs requests rejected before the handler runs.
 - `servers/accounts-api/.env.example`: configuration names and safe loopback defaults.
 - `servers/accounts-api/package.json` and `turbo.json`: workspace task wiring and the `deploy` field.
-- `servers/accounts-api/Dockerfile` and `railway.json`: Railway runtime image and service configuration.
+- `servers/accounts-api/Dockerfile`: runtime image of the Droplet deployment.
 - `servers/accounts-api/scripts/`: development launcher (`dev.mjs`) and its process-level tests.
 
 The API server is the system of record for account and billing information. It is licensed under `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md).
@@ -25,9 +25,9 @@ The API server is the system of record for account and billing information. It i
   - `WriteTimeout` is 30 seconds for writing a response.
   - `IdleTimeout` is 120 seconds: a keep-alive connection that is waiting for the next request is closed after this time.
   - `WriteTimeout` limits the lifetime of every response, so a long-lived streaming RPC must lift or extend it for that handler (`http.ResponseController.SetWriteDeadline`) in the change that adds the stream.
-- Deployment target: the Railway service `accounts-api`, deployed by the [deployment workflow](repository-workflow-contract.md#deployment-workflow). The workflow builds a static `linux/amd64` binary with `CGO_ENABLED=0`; `servers/accounts-api/turbo.json` passes `CGO_ENABLED`, `GOOS` and `GOARCH` through to the uncached `build` task. The `Dockerfile` copies `dist/accounts-api`, the FSL-1.1-ALv2 `LICENSE` (`/usr/share/licenses/accounts-api/LICENSE`) and the Go toolchain BSD-3-Clause notice (`/usr/share/licenses/accounts-api/GO-LICENSE`) into the digest-pinned `gcr.io/distroless/static-debian12:nonroot` image and runs it as the `nonroot` user. `railway.json` selects the Dockerfile builder, checks `GET /healthz` before Railway switches traffic and restarts the process on failure up to 10 times.
-- Configuration source: Railway service variables of the production environment. Set `ADDR` to `:<port>` and `PORT` to the same port, and set the target port of the public domain to that port. The server reads only `ADDR`, but the Railway health check of `/healthz` uses `PORT`. Secrets are also Railway service variables; they never enter the repository or the GitHub environment.
-- TLS termination: the Railway edge terminates TLS for `accounts.api.delino.io` and forwards plain HTTP to the process.
+- Deployment target: the Droplet service `accounts-api` on the shared DigitalOcean Droplet, deployed by the [deployment workflow](repository-workflow-contract.md#deployment-workflow). The `deploy` field sets the host name `accounts.api.delino.io` and the container port `8080`. The workflow builds a static `linux/amd64` binary with `CGO_ENABLED=0`; `servers/accounts-api/turbo.json` passes `CGO_ENABLED`, `GOOS` and `GOARCH` through to the uncached `build` task. The `Dockerfile` copies `dist/accounts-api`, the FSL-1.1-ALv2 `LICENSE` (`/usr/share/licenses/accounts-api/LICENSE`) and the Go toolchain BSD-3-Clause notice (`/usr/share/licenses/accounts-api/GO-LICENSE`) into the digest-pinned `gcr.io/distroless/static-debian12:nonroot` image and runs it as the `nonroot` user. The deployment checks `GET /healthz` before the reverse proxy sends traffic to the new container, and Docker restarts the container when the process exits (restart policy `unless-stopped`).
+- Configuration source: the env file `/srv/delino/env/accounts-api.env` on the Droplet, which maintainers keep. The deployment sets `ADDR` to `:8080` from the `deploy` field, so the env file must not set `ADDR`. Secrets are also in the env file; they never enter the repository or the GitHub environment.
+- TLS termination: the Caddy reverse proxy on the Droplet terminates TLS for `accounts.api.delino.io` and forwards plain HTTP/1.1 to the container.
 
 ## Users and Operators
 

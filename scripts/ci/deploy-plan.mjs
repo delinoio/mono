@@ -17,7 +17,7 @@ import { workspaceRoots } from "./plan.mjs";
 
 // Stable deployment target identifiers of the `deploy.target` manifest field.
 export const DeployTarget = Object.freeze({
-  Railway: "railway",
+  Droplet: "droplet",
   CloudflarePages: "cloudflare-pages",
 });
 
@@ -35,9 +35,9 @@ const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 
 // A Map, not a plain object: `Map.get` matches by SameValueZero, so inherited
 // `Object.prototype` members (`constructor`, `__proto__`, ...) and arrays that
-// coerce to a valid key (`["railway"]`) never resolve to a rule.
+// coerce to a valid key (`["droplet"]`) never resolve to a rule.
 const targetRules = new Map([
-  [DeployTarget.Railway, { kind: DeployKind.Server, root: "servers" }],
+  [DeployTarget.Droplet, { kind: DeployKind.Server, root: "servers" }],
   [DeployTarget.CloudflarePages, { kind: DeployKind.StaticSite, root: "apps" }],
 ]);
 
@@ -54,6 +54,21 @@ export const ReleaseType = Object.freeze({
 });
 
 const deployableName = /^[a-z0-9][a-z0-9._-]*$/;
+
+// A Droplet service name is a container name, a Docker network alias that
+// the reverse proxy resolves, and a file name on the Droplet, so it allows no
+// dots and no other characters that a shell, DNS or a path would interpret.
+const dropletServiceName = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
+// A fully qualified host name of lowercase DNS labels. The reverse proxy
+// requests a certificate for it, so it must have at least two labels.
+const dropletHostname =
+  /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+// The container listens on this port inside its own network namespace. Ports
+// below 1024 need privileges that the non-root server images do not have.
+const minimumDropletPort = 1024;
+const maximumDropletPort = 65535;
 
 export class DeployPlanError extends Error {}
 
@@ -107,11 +122,39 @@ function deployable(pkg) {
     );
   }
   const base = { name, dir: pkg.dir, kind: rule.kind, target: deploy.target };
-  if (deploy.target === DeployTarget.Railway) {
+  if (deploy.target === DeployTarget.Droplet) {
     if (typeof deploy.service !== "string" || deploy.service === "") {
       throw new DeployPlanError(`${name}: deploy.service is required`);
     }
-    return { ...base, service: deploy.service };
+    if (!dropletServiceName.test(deploy.service)) {
+      throw new DeployPlanError(
+        `${name}: deploy.service must match ${dropletServiceName}`,
+      );
+    }
+    if (typeof deploy.hostname !== "string" || deploy.hostname === "") {
+      throw new DeployPlanError(`${name}: deploy.hostname is required`);
+    }
+    if (!dropletHostname.test(deploy.hostname)) {
+      throw new DeployPlanError(
+        `${name}: deploy.hostname must be a lowercase fully qualified host name`,
+      );
+    }
+    if (
+      !Number.isInteger(deploy.port) ||
+      deploy.port < minimumDropletPort ||
+      deploy.port > maximumDropletPort
+    ) {
+      throw new DeployPlanError(
+        `${name}: deploy.port must be an integer from ${minimumDropletPort} to ${maximumDropletPort}`,
+      );
+    }
+    return {
+      ...base,
+      service: deploy.service,
+      hostname: deploy.hostname,
+      // A string, so that the deploy loop can require nonempty string fields.
+      port: String(deploy.port),
+    };
   }
   if (typeof deploy.project !== "string" || deploy.project === "") {
     throw new DeployPlanError(`${name}: deploy.project is required`);
@@ -262,20 +305,27 @@ export function check(repoRoot) {
   return ids;
 }
 
-// Two deployables that name the same Railway service or Pages project would
-// overwrite each other, while both get a release tag. Checks every
-// deployable of the workspace, selected or not.
+// Two deployables that name the same Droplet service or Pages project would
+// overwrite each other, while both get a release tag. Two Droplet services
+// with the same host name would replace each other's reverse proxy route.
+// Checks every deployable of the workspace, selected or not.
 function rejectSharedDestinations(packages) {
   const owners = new Map();
   for (const pkg of packages) {
     const d = deployable(pkg);
     if (!d) continue;
-    const key = `${d.target}:${d.service ?? d.project}`;
-    const owner = owners.get(key);
-    if (owner) {
-      throw new DeployPlanError(`${owner} and ${d.name} both deploy to ${key}`);
+    const keys = [`${d.target}:${d.service ?? d.project}`];
+    if (d.hostname !== undefined)
+      keys.push(`${d.target}-hostname:${d.hostname}`);
+    for (const key of keys) {
+      const owner = owners.get(key);
+      if (owner) {
+        throw new DeployPlanError(
+          `${owner} and ${d.name} both deploy to ${key}`,
+        );
+      }
+      owners.set(key, d.name);
     }
-    owners.set(key, d.name);
   }
 }
 

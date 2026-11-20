@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Fixtures for the shell steps of `.github/workflows/deploy.yml`:
-// `check-pending-changesets.sh` (against a stubbed `gh`) and
+// `check-pending-changesets.sh` (against a stubbed `gh`),
+// `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
+// `droplet-deploy.sh` (against stubbed `docker` and `curl`) and
 // `deploy-release.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -1003,16 +1005,15 @@ test(
 
 // --- deploy-provider.sh ----------------------------------------------------
 
-// Stubs `railway` and `curl`. Responses are keyed by the first two `railway`
-// arguments (`deployment list`, `logs <id>`) or by `curl`. Each response is
-// used once and the last one repeats; {exit} makes the call fail.
+// Stubs `curl`. Responses are keyed by `curl`. Each response is used once and
+// the last one repeats; {exit} makes the call fail.
 function stubProvider(dir, responses) {
   const bin = join(dir, "bin");
   mkdirSync(bin, { recursive: true });
   writeFileSync(join(bin, "package.json"), '{"type":"commonjs"}\n');
   writeFileSync(join(dir, "responses.json"), JSON.stringify(responses));
   writeFileSync(join(dir, "calls.log"), "");
-  for (const command of ["railway", "curl"]) {
+  for (const command of ["curl"]) {
     const file = join(bin, command);
     writeFileSync(
       file,
@@ -1071,28 +1072,9 @@ function runProvider(t, args, { responses = {}, input, env = {} } = {}) {
   return { ...result, calls: readFileSync(join(dir, "calls.log"), "utf8") };
 }
 
-const railwayList = (id, status) => ({
-  stdout: [{ id, status, createdAt: "2026-11-18T00:00:00Z" }],
-});
 const pagesStage = (name, status, environment = "production") => ({
   stdout: { result: { environment, latest_stage: { name, status } } },
 });
-
-test(
-  "provider reads the Railway deployment id from JSON output",
-  { skip },
-  (t) => {
-    const result = runProvider(t, ["railway-id"], {
-      input: 'Indexing...\n{"deploymentId":"dep-1","logsUrl":"https://x"}\n',
-    });
-    assert.equal(result.status, 0, result.stderr);
-    assert.equal(result.stdout.trim(), "dep-1");
-    assert.equal(
-      runProvider(t, ["railway-id"], { input: "no json\n" }).status,
-      1,
-    );
-  },
-);
 
 test(
   "provider reads the Pages deployment id from Wrangler output",
@@ -1112,17 +1094,12 @@ test(
   },
 );
 
-const providerUsage =
-  /usage: .*railway-id \| pages-id <file> \| wait-railway <service> <id> \| wait-pages <project> <id>/;
+const providerUsage = /usage: .*pages-id <file> \| wait-pages <project> <id>/;
 
 for (const args of [
   ["pages-id"],
-  ["read-railway"],
-  ["read-railway", "svc"],
   ["read-pages"],
   ["read-pages", "proj"],
-  ["wait-railway"],
-  ["wait-railway", "svc"],
   ["wait-pages"],
   ["wait-pages", "proj"],
 ]) {
@@ -1159,7 +1136,13 @@ test(
 );
 
 test("provider keeps its other bad-usage and error exits", { skip }, (t) => {
-  for (const args of [[], ["bogus"]]) {
+  // The Railway commands no longer exist.
+  for (const args of [
+    [],
+    ["bogus"],
+    ["railway-id"],
+    ["wait-railway", "a", "b"],
+  ]) {
     const result = runProvider(t, args);
     assert.equal(result.status, 2, result.stderr);
     assert.match(result.stderr, providerUsage);
@@ -1171,96 +1154,7 @@ test("provider keeps its other bad-usage and error exits", { skip }, (t) => {
     emptyFile.stderr,
     /::error::wrangler pages deploy returned no deployment id\./,
   );
-  const emptyInput = runProvider(t, ["railway-id"], { input: "" });
-  assert.equal(emptyInput.status, 1);
-  assert.match(
-    emptyInput.stderr,
-    /::error::railway up returned no deployment id\./,
-  );
 });
-
-test("provider waits for Railway SUCCESS", { skip: skipWait }, (t) => {
-  const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
-    responses: {
-      "deployment list": [
-        { stdout: [] },
-        railwayList("dep-1", "BUILDING"),
-        railwayList("dep-1", "DEPLOYING"),
-        railwayList("dep-1", "SUCCESS"),
-      ],
-    },
-  });
-  assert.equal(result.status, 0, result.stdout + result.stderr);
-  assert.match(result.stdout, /SUCCESS/);
-  assert.match(
-    result.calls,
-    /railway deployment list --service api --limit 20 --json/,
-  );
-});
-
-test(
-  "provider fails on a failed Railway deployment and prints its logs",
-  { skip: skipWait },
-  (t) => {
-    for (const status of [
-      "FAILED",
-      "CRASHED",
-      "REMOVED",
-      "REMOVING",
-      "SKIPPED",
-    ]) {
-      const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
-        responses: { "deployment list": [railwayList("dep-1", status)] },
-      });
-      assert.equal(result.status, 1, status);
-      assert.match(result.stdout, new RegExp(`ended with ${status}`));
-      assert.match(
-        result.calls,
-        /railway logs dep-1 --service api --build --lines 200/,
-      );
-      assert.match(
-        result.calls,
-        /railway logs dep-1 --service api --deployment --lines 200/,
-      );
-    }
-  },
-);
-
-test(
-  "provider tolerates a few failed Railway status reads",
-  { skip: skipWait },
-  (t) => {
-    const ok = runProvider(t, ["wait-railway", "api", "dep-1"], {
-      responses: {
-        "deployment list": [
-          { exit: 1 },
-          { exit: 1 },
-          railwayList("dep-1", "SUCCESS"),
-        ],
-      },
-    });
-    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
-    assert.match(ok.stdout, /failure 2 of 5/);
-    const failed = runProvider(t, ["wait-railway", "api", "dep-1"], {
-      responses: { "deployment list": [{ exit: 1 }] },
-    });
-    assert.equal(failed.status, 1);
-    assert.match(failed.stdout, /5 times in a row/);
-  },
-);
-
-test(
-  "provider gives up on a Railway deployment after the timeout",
-  { skip: skipWait },
-  (t) => {
-    const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
-      responses: { "deployment list": [railwayList("dep-1", "BUILDING")] },
-      env: { DEPLOY_POLL_TIMEOUT: "0" },
-    });
-    assert.equal(result.status, 1);
-    assert.match(result.stdout, /did not finish within 0 seconds/);
-  },
-);
 
 test("provider waits for the Pages deploy stage", { skip: skipWait }, (t) => {
   const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
@@ -1361,6 +1255,38 @@ test(
 );
 
 test(
+  "provider tolerates a few failed Pages status reads",
+  { skip: skipWait },
+  (t) => {
+    const ok = runProvider(t, ["wait-pages", "site", "pages-1"], {
+      responses: {
+        curl: [{ exit: 22 }, { exit: 22 }, pagesStage("deploy", "success")],
+      },
+    });
+    assert.equal(ok.status, 0, ok.stdout + ok.stderr);
+    assert.match(ok.stdout, /failure 2 of 5/);
+    const failed = runProvider(t, ["wait-pages", "site", "pages-1"], {
+      responses: { curl: [{ exit: 22 }] },
+    });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stdout, /5 times in a row/);
+  },
+);
+
+test(
+  "provider gives up on a Pages deployment after the timeout",
+  { skip: skipWait },
+  (t) => {
+    const result = runProvider(t, ["wait-pages", "site", "pages-1"], {
+      responses: { curl: [pagesStage("deploy", "active")] },
+      env: { DEPLOY_POLL_TIMEOUT: "0" },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stdout, /did not finish within 0 seconds/);
+  },
+);
+
+test(
   "provider does not wait for a status read past the deadline",
   { skip: skipWait },
   (t) => {
@@ -1391,20 +1317,34 @@ function shellStub(bin, name, body = "") {
   return file;
 }
 
-// Runs deploy-targets.sh with stubbed `pnpm`, `railway`, guard and provider.
-// The guard fails once `withdrawn` exists, as when a changeset is withdrawn
-// on main.
+const digest = `sha256:${"d".repeat(64)}`;
+
+// Runs deploy-targets.sh with stubbed `pnpm`, `docker`, `ssh`, guard and
+// provider. The guard fails once `withdrawn` exists, as when a changeset is
+// withdrawn on main. The `ssh` stub saves the remote script from standard
+// input to `remote-<n>.sh`.
 function runTargets(
   t,
   command,
-  { env = {}, pnpmBody = "", railwayBody = "" } = {},
+  { env = {}, pnpmBody = "", dockerBody = "", sshBody = "" } = {},
 ) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
   mkdirSync(bin);
   writeFileSync(join(dir, "calls.log"), "");
   shellStub(bin, "pnpm", pnpmBody);
-  shellStub(bin, "railway", railwayBody || 'echo \'{"deploymentId":"dep"}\'');
+  shellStub(
+    bin,
+    "docker",
+    dockerBody ||
+      `[[ "$1 $2" != "buildx imagetools" ]] || echo '{"digest":"${digest}"}'`,
+  );
+  shellStub(
+    bin,
+    "ssh",
+    `n=$(ls "$STUB_DIR" | grep -c '^remote-' || true); cat > "$STUB_DIR/remote-$n.sh"\n${sshBody}`,
+  );
+  writeFileSync(join(dir, "ssh_config"), "Host droplet\n");
   const guardStub = shellStub(
     bin,
     "guard",
@@ -1413,7 +1353,7 @@ function runTargets(
   const providerStub = shellStub(
     bin,
     "provider",
-    'case "$1" in railway-id) cat > /dev/null; echo dep ;; pages-id) echo pages ;; esac',
+    'case "$1" in pages-id) echo pages ;; esac',
   );
   mkdirSync(join(dir, "servers"));
   // Site outputs, relative to the working directory, as after a build.
@@ -1443,9 +1383,23 @@ function runTargets(
       SHA: "a".repeat(40),
       DEPLOY_GUARD: guardStub,
       DEPLOY_PROVIDER: providerStub,
+      DROPLET_REGISTRY: "registry.digitalocean.com/delino",
+      DROPLET_SSH_CONFIG: join(dir, "ssh_config"),
       SERVERS: JSON.stringify([
-        { name: "api", version: "1.0.0", service: "api" },
-        { name: "worker", version: "1.0.0", service: "worker" },
+        {
+          name: "api",
+          version: "1.0.0",
+          service: "api",
+          hostname: "api.example.com",
+          port: "8080",
+        },
+        {
+          name: "worker",
+          version: "1.0.0",
+          service: "worker-svc",
+          hostname: "worker.example.com",
+          port: "9000",
+        },
       ]),
       SITES: JSON.stringify([
         {
@@ -1466,6 +1420,7 @@ function runTargets(
   });
   return {
     ...result,
+    dir,
     calls: readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n"),
   };
 }
@@ -1566,15 +1521,84 @@ test(
   { skip },
   (t) => {
     const result = runTargets(t, "servers", {
-      railwayBody:
-        'touch "$STUB_DIR/withdrawn"; echo \'{"deploymentId":"dep"}\'',
+      sshBody: 'touch "$STUB_DIR/withdrawn"',
     });
     assert.equal(result.status, 1);
-    const uploads = result.calls.filter((call) =>
-      call.startsWith("railway up"),
+    assert.match(result.stdout, /The plan is stale/);
+    const deploys = result.calls.filter((call) => call.startsWith("ssh "));
+    assert.equal(deploys.length, 1);
+    assert.match(deploys[0], / api registry/);
+  },
+);
+
+test(
+  "targets push each server image and deploy it by digest over SSH",
+  { skip },
+  (t) => {
+    const result = runTargets(t, "servers");
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const sha = "a".repeat(40);
+    const registry = "registry.digitalocean.com/delino";
+    assert.deepEqual(result.calls, [
+      `docker load --quiet --input ${result.dir}/servers/api.tar.gz`,
+      `docker tag api:${sha} ${registry}/api:${sha}`,
+      `docker push --quiet ${registry}/api:${sha}`,
+      `docker buildx imagetools inspect ${registry}/api:${sha} --format {{json .Manifest}}`,
+      "guard ",
+      `ssh -F ${result.dir}/ssh_config droplet bash -s -- api ${registry}/api@${digest} 8080 api.example.com`,
+      `docker load --quiet --input ${result.dir}/servers/worker.tar.gz`,
+      `docker tag worker:${sha} ${registry}/worker-svc:${sha}`,
+      `docker push --quiet ${registry}/worker-svc:${sha}`,
+      `docker buildx imagetools inspect ${registry}/worker-svc:${sha} --format {{json .Manifest}}`,
+      "guard ",
+      `ssh -F ${result.dir}/ssh_config droplet bash -s -- worker-svc ${registry}/worker-svc@${digest} 9000 worker.example.com`,
+    ]);
+    // The remote side receives the deploy script on standard input.
+    assert.equal(
+      readFileSync(join(result.dir, "remote-0.sh"), "utf8"),
+      readFileSync(join(root, "scripts/ci/droplet-deploy.sh"), "utf8"),
     );
-    assert.equal(uploads.length, 1);
-    assert.match(uploads[0], /--service api/);
+  },
+);
+
+test(
+  "targets stop when the registry returns no digest or the remote deploy fails",
+  { skip },
+  (t) => {
+    const noDigest = runTargets(t, "servers", {
+      dockerBody: '[[ "$1 $2" != "buildx imagetools" ]] || echo "{}"',
+    });
+    assert.equal(noDigest.status, 1);
+    assert.match(noDigest.stderr, /returned no digest/);
+    assert.ok(!noDigest.calls.some((call) => call.startsWith("ssh ")));
+    const failed = runTargets(t, "servers", { sshBody: "exit 1" });
+    assert.equal(failed.status, 1);
+    assert.equal(
+      failed.calls.filter((call) => call.startsWith("ssh ")).length,
+      1,
+    );
+  },
+);
+
+test(
+  "targets require the registry and the SSH configuration for servers",
+  { skip },
+  (t) => {
+    for (const [env, message] of [
+      [{ DROPLET_REGISTRY: "" }, /DROPLET_REGISTRY is not/],
+      [
+        { DROPLET_REGISTRY: "registry.digitalocean.com" },
+        /DROPLET_REGISTRY is not/,
+      ],
+      [{ DROPLET_REGISTRY: "Registry/x y" }, /DROPLET_REGISTRY is not/],
+      [{ DROPLET_SSH_CONFIG: "" }, /DROPLET_SSH_CONFIG is not/],
+      [{ DROPLET_SSH_CONFIG: "/nonexistent" }, /DROPLET_SSH_CONFIG is not/],
+    ]) {
+      const result = runTargets(t, "servers", { env });
+      assert.equal(result.status, 1, JSON.stringify(env));
+      assert.match(result.stderr, message);
+      assert.deepEqual(result.calls, [""]);
+    }
   },
 );
 
@@ -1596,6 +1620,13 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
     ["static-sites", { SITES: "[]" }],
     ["servers", { SERVERS: "not json" }],
     ["servers", { SERVERS: '[{"name":"api"}]' }],
+    [
+      "servers",
+      {
+        SERVERS:
+          '[{"name":"api","version":"1.0.0","service":"api","hostname":"a.example.com"}]',
+      },
+    ],
   ]) {
     const result = runTargets(t, command, { env });
     assert.equal(result.status, 1, `${command} ${JSON.stringify(env)}`);
@@ -1603,3 +1634,247 @@ test("targets reject an empty or malformed target list", { skip }, (t) => {
     assert.deepEqual(result.calls, [""]);
   }
 });
+
+// --- droplet-deploy.sh -----------------------------------------------------
+
+const dropletDeploy = join(root, "scripts/ci/droplet-deploy.sh");
+const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(64)}`;
+
+// Runs droplet-deploy.sh the way deploy-targets.sh does (`bash -s` with the
+// script on standard input) against stubbed `docker` and `curl`. `old` lists
+// the IDs of running containers of the service. Stub behavior:
+//   STUB_STATUS   `docker inspect` container status (default running).
+//   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
+//   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
+function runDroplet(
+  t,
+  args = ["api", dropletImage, "8080", "api.example.com"],
+  { env = {}, old = [], envFile = "LOG_LEVEL=info\n", route, state } = {},
+) {
+  const dir = scratch(t);
+  const bin = join(dir, "bin");
+  const deployRoot = join(dir, "srv");
+  mkdirSync(bin);
+  mkdirSync(join(deployRoot, "env"), { recursive: true });
+  mkdirSync(join(deployRoot, "caddy", "sites"), { recursive: true });
+  writeFileSync(join(dir, "calls.log"), "");
+  // `null` leaves the env file out.
+  if (envFile !== null) {
+    writeFileSync(join(deployRoot, "env", "api.env"), envFile);
+  }
+  if (state !== undefined) {
+    mkdirSync(join(deployRoot, "state"));
+    writeFileSync(join(deployRoot, "state", "api.current"), state);
+  }
+  if (route !== undefined) {
+    writeFileSync(join(deployRoot, "caddy", "sites", "api.caddy"), route);
+  }
+  shellStub(
+    bin,
+    "docker",
+    `case "$1" in
+  ps) printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
+  inspect)
+    case "$3" in
+      *State.Status*) echo "\${STUB_STATUS:-running}" ;;
+      *) echo 172.18.0.5 ;;
+    esac ;;
+  exec) exit "\${STUB_RELOAD:-0}" ;;
+  logs) echo "server log line" ;;
+esac`,
+  );
+  shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
+  const result = spawnSync("bash", ["-s", "--", ...args], {
+    encoding: "utf8",
+    input: readFileSync(dropletDeploy, "utf8"),
+    env: {
+      ...baseEnv,
+      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      STUB_DIR: dir,
+      DROPLET_ROOT: deployRoot,
+      DROPLET_HEALTH_TIMEOUT: "3",
+      ...env,
+    },
+  });
+  const read = (path) => {
+    try {
+      return readFileSync(join(deployRoot, path), "utf8");
+    } catch {
+      return undefined;
+    }
+  };
+  return {
+    ...result,
+    read,
+    calls: readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n"),
+  };
+}
+
+const commands = (calls) =>
+  calls.map((call) => call.split(" ").slice(0, 2).join(" "));
+
+test(
+  "droplet deploy starts, checks, routes and then stops the old container",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, { old: ["old1"] });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(commands(result.calls), [
+      "docker pull",
+      "docker ps",
+      "docker run",
+      "docker inspect",
+      "docker inspect",
+      "curl --fail",
+      "docker exec",
+      "docker stop",
+      "docker rm",
+      "docker image",
+    ]);
+    const run = result.calls.find((call) => call.startsWith("docker run"));
+    for (const part of [
+      "--network delino --network-alias api",
+      "--label io.delino.service=api",
+      "--restart unless-stopped",
+      "/srv/env/api.env",
+      "--env ADDR=:8080",
+      dropletImage,
+    ]) {
+      assert.ok(run.includes(part), `${part} in ${run}`);
+    }
+    assert.match(
+      result.calls.find((call) => call.startsWith("curl")),
+      /http:\/\/172\.18\.0\.5:8080\/healthz/,
+    );
+    assert.match(
+      result.calls.find((call) => call.startsWith("docker exec")),
+      /^docker exec caddy caddy reload --config \/etc\/caddy\/Caddyfile --adapter caddyfile$/,
+    );
+    assert.match(
+      result.calls.find((call) => call.startsWith("docker stop")),
+      / old1$/,
+    );
+    const route = result.read("caddy/sites/api.caddy");
+    assert.match(route, /^api\.example\.com \{$/m);
+    assert.match(route, /reverse_proxy api:8080 \{/);
+    assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+  },
+);
+
+test("droplet deploy does not reload an unchanged route", { skip }, (t) => {
+  const first = runDroplet(t);
+  assert.equal(first.status, 0, first.stderr);
+  const route = first.read("caddy/sites/api.caddy");
+  const next = `registry.digitalocean.com/delino/api@sha256:${"f".repeat(64)}`;
+  // A second run in a fresh root with the state of the first run.
+  const second = runDroplet(t, ["api", next, "8080", "api.example.com"], {
+    old: ["old1"],
+    route,
+  });
+  assert.equal(second.status, 0, second.stderr);
+  // The route did not change, so the proxy is not reloaded.
+  assert.ok(!second.calls.some((call) => call.startsWith("docker exec")));
+  assert.equal(second.read("state/api.current"), `${next}\n`);
+});
+
+test(
+  "droplet deploy keeps the previous image for a rollback",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      state: `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(
+      result.read("state/api.previous"),
+      `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`,
+    );
+  },
+);
+
+test(
+  "droplet deploy removes an unhealthy container and keeps the old one",
+  { skip },
+  (t) => {
+    for (const env of [{ STUB_HEALTHY: "0" }, { STUB_STATUS: "exited" }]) {
+      const result = runDroplet(t, undefined, { old: ["old1"], env });
+      const label = JSON.stringify(env);
+      assert.equal(result.status, 1, label);
+      assert.match(result.stderr, /did not pass the health check/, label);
+      assert.match(result.stdout, /server log line/, label);
+      assert.ok(
+        result.calls.some((call) => call.startsWith("docker rm --force api-")),
+        label,
+      );
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker stop")),
+        label,
+      );
+      assert.equal(result.read("caddy/sites/api.caddy"), undefined, label);
+      assert.equal(result.read("state/api.current"), undefined, label);
+    }
+  },
+);
+
+test(
+  "droplet deploy restores the route when the proxy rejects it",
+  { skip },
+  (t) => {
+    const previous = "# old route\nold.example.com {\n}\n";
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      route: previous,
+      env: { STUB_RELOAD: "1" },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /did not accept the route/);
+    assert.equal(result.read("caddy/sites/api.caddy"), previous);
+    assert.ok(
+      result.calls.some((call) => call.startsWith("docker rm --force api-")),
+    );
+    assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+    // Without a previous route, the new route file is removed.
+    const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
+    assert.equal(first.status, 1);
+    assert.equal(first.read("caddy/sites/api.caddy"), undefined);
+  },
+);
+
+test(
+  "droplet deploy rejects bad arguments and configuration before any change",
+  { skip },
+  (t) => {
+    const image = dropletImage;
+    for (const [args, options, message] of [
+      [["api", image, "8080"], {}, /usage: droplet-deploy\.sh/],
+      [["API", image, "8080", "api.example.com"], {}, /service name/],
+      [["api;x", image, "8080", "api.example.com"], {}, /service name/],
+      [
+        ["api", "registry/api:latest", "8080", "api.example.com"],
+        {},
+        /pinned by digest/,
+      ],
+      [["api", image, "80", "api.example.com"], {}, /port/],
+      [["api", image, "70000", "api.example.com"], {}, /port/],
+      [["api", image, "8080", "localhost"], {}, /host name/],
+      [["api", image, "8080", "a.example.com;x"], {}, /host name/],
+      [
+        ["api", image, "8080", "api.example.com"],
+        { envFile: null },
+        /api\.env does not exist/,
+      ],
+      [
+        ["api", image, "8080", "api.example.com"],
+        { envFile: "ADDR=:1\n" },
+        /sets ADDR/,
+      ],
+    ]) {
+      const result = runDroplet(t, args, options);
+      const label = JSON.stringify([args, options]);
+      assert.notEqual(result.status, 0, label);
+      assert.match(result.stderr, message, label);
+      assert.deepEqual(result.calls, [""], label);
+    }
+  },
+);

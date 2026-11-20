@@ -4,8 +4,10 @@
   "private": true,
   "license": "FSL-1.1-ALv2",
   "deploy": {
-    "target": "railway",
-    "service": "accounts-api"
+    "target": "droplet",
+    "service": "accounts-api",
+    "hostname": "accounts.api.delino.io",
+    "port": 8080
   },
   "scripts": {
     "build": "go build -buildvcs=false -o dist/accounts-api ./cmd/accounts-api",
