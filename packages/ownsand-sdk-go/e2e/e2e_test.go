@@ -214,6 +214,40 @@ func TestOwnSandEndToEnd(t *testing.T) {
 		})
 	}
 
+	if os.Getenv(envOutbound) == "1" {
+		res.step("OUTBOUND: the guest reaches the internet and DNS but not its gateway", func() error {
+			o := createOpts(10*time.Minute, time.Hour, "")
+			o.Network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
+			sb, err := user.CreateSandbox(ctx, o)
+			if err != nil {
+				return err
+			}
+			defer func() {
+				_, _ = sb.Delete(ctx)
+				sb.Close()
+			}()
+			wctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+			defer cancel()
+			if info, err := sb.Wait(wctx, 500*time.Millisecond); err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+				return fmt.Errorf("sandbox %v (%v): %v", info.GetState(), info.GetEndReason(), err)
+			}
+			// The kernel ip= argument records the gateway, which is also the
+			// DNS server, in /proc/net/pnp.
+			script := `bb=/bin/busybox; gw=$($bb awk '/nameserver/{print $2; exit}' /proc/net/pnp)
+$bb ping -c 1 -W 5 ` + outboundTarget + ` >/dev/null 2>&1 && echo internet=ok || echo internet=fail
+$bb nslookup example.com $gw >/dev/null 2>&1 && echo dns=ok || echo dns=fail
+$bb ping -c 1 -W 2 $gw >/dev/null 2>&1 && echo gateway=reachable || echo gateway=blocked`
+			out, err := runExec(ctx, sb, "/bin/sh", "-c", script)
+			if err != nil {
+				return err
+			}
+			if got := out.stdout.String(); got != "internet=ok\ndns=ok\ngateway=blocked\n" {
+				return fmt.Errorf("network checks: %q", got)
+			}
+			return nil
+		})
+	}
+
 	res.step("TTL: an idle sandbox ends with IDLE_TTL_EXPIRED", func() error {
 		sb, err := createRunning(ctx, user, 20*time.Second, time.Hour, "")
 		if err != nil {

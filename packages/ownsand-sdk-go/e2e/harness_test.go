@@ -42,9 +42,16 @@ const (
 	// envLong adds the steps that take longer than 15 minutes (the relay
 	// stream rotation).
 	envLong = "OWNSAND_E2E_LONG"
+	// envOutbound adds an OUTBOUND sandbox step. The agent then needs
+	// CAP_NET_ADMIN, nft and ip, so run the test as root in its own network
+	// namespace (for example, a privileged container).
+	envOutbound = "OWNSAND_E2E_OUTBOUND"
 	// envKeepLogs keeps the process logs in this directory after the run.
 	envKeepLogs = "OWNSAND_E2E_LOG_DIR"
 )
+
+// outboundTarget is the internet address that an OUTBOUND guest pings.
+const outboundTarget = "1.1.1.1"
 
 // apiResource is the audience of minted user tokens. It is the control
 // plane default, so the test does not need to set OWNSAND_API_RESOURCE.
