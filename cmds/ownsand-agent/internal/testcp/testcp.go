@@ -322,6 +322,16 @@ func (s *Server) Send(env *ownsandv1.AgentEnvelope) bool {
 	}
 }
 
+// IssueCredential creates a device session credential without the
+// challenge flow, for tests of components that only need a credential.
+func (s *Server) IssueCredential(deviceID string) string {
+	cred := randomToken("osd_")
+	s.mu.Lock()
+	s.sessions[cred] = deviceID
+	s.mu.Unlock()
+	return cred
+}
+
 // Current returns the current channel.
 func (s *Server) Current() *Channel {
 	s.mu.Lock()

@@ -173,6 +173,28 @@ func (a *Agent) Key() *identity.Key { return a.key }
 // Control returns the control plane client.
 func (a *Agent) Control() *cpclient.Client { return a.cp }
 
+// NewDeviceSession gets a new device session credential with
+// CreateChallenge and Authenticate, for one relay connection. Secret: the
+// caller must not log it.
+func (a *Agent) NewDeviceSession(ctx context.Context) (string, error) {
+	st, err := a.st.LoadAgent()
+	if err != nil {
+		return "", err
+	}
+	res, err := a.cp.Authenticate(ctx, a.DeviceID(), a.key, st.StateEpoch)
+	if err != nil {
+		return "", err
+	}
+	if res.Removal != nil {
+		select {
+		case a.removal <- struct{}{}:
+		default:
+		}
+		return "", errors.New("agent: the device was removed")
+	}
+	return res.Session.Credential, nil
+}
+
 // Logger returns the agent logger.
 func (a *Agent) Logger() *slog.Logger { return a.logger }
 
