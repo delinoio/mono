@@ -11,7 +11,7 @@ Both SDKs give programs and the [CLI](cmds-ownsand-cli-foundation.md) one client
 
 ## Runtime and Language
 
-- TypeScript SDK: ES modules for Node.js 24 (the `.nvmrc` baseline). It uses Connect for ECMAScript with the TypeScript bindings generated from the schemas. Record where the generated TypeScript code lives with the first schema. Browser support is not part of this version; the web console uses the generated bindings with `@connectrpc/connect-query` directly.
+- TypeScript SDK: ES modules for Node.js 24 (the `.nvmrc` baseline). It uses Connect for ECMAScript with the TypeScript bindings generated from the schemas. The generated TypeScript code lives in `packages/ownsand-sdk/src/gen/` (`planned`), which the shared formatter already excludes; the change that creates the TypeScript SDK adds its generation step (buf with the protobuf-es plugin, pinned) to `protos/buf.gen.yaml` or to a package-local template and extends the drift check of the [protos contract](protos-ownsand-api-contract.md#build-and-test) to it. Browser support is not part of this version; the web console uses the generated bindings with `@connectrpc/connect-query` directly.
 - Go SDK: Go in the root module. It uses the committed Go bindings in `protos/delino/ownsand/v1/` and does not generate code.
 - Node.js has no built-in WebRTC implementation, so the TypeScript SDK's peer-to-peer data path needs a WebRTC library. The library is an open decision and a new dependency. Until it is approved, the TypeScript SDK uses the relay only.
 - The Go SDK uses pion for the peer-to-peer data path. pion is a new dependency that needs owner approval.

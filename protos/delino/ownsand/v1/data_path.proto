@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// DataPathService signals peer-to-peer data channels and authorizes relay
+// use.
+service DataPathService {
+  // Return the STUN server URLs that a caller uses to gather candidates
+  // before OpenSession.
+  rpc GetIceServers(GetIceServersRequest) returns (GetIceServersResponse);
+  // Send the caller's SDP offer and return the agent's answer. Signaling is
+  // non-trickle: the offer and the answer carry all candidates.
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  // Grant relay access to one operation on a sandbox.
+  rpc AuthorizeRelay(AuthorizeRelayRequest) returns (AuthorizeRelayResponse);
+}
+
+message IceServer {
+  // For example `stun:ownsand.api.delino.io:3478`.
+  repeated string urls = 1;
+}
+
+message GetIceServersRequest {
+  string organization_id = 1;
+}
+
+message GetIceServersResponse {
+  repeated IceServer ice_servers = 1;
+}
+
+message OpenSessionRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  // SDP offer with all ICE candidates. Never log.
+  string sdp_offer = 3;
+}
+
+message OpenSessionResponse {
+  string session_id = 1;
+  // SDP answer of the agent with all ICE candidates. Never log.
+  string sdp_answer = 2;
+  // Absolute expiry, 1 hour after OpenSession.
+  google.protobuf.Timestamp expire_time = 3;
+  // Remaining lifetime when the control plane sent the response.
+  google.protobuf.Duration expires_in = 4;
+}
+
+message AuthorizeRelayRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  RelayOperationKind operation_kind = 3;
+  // exec_id, read_id or write_id.
+  string operation_id = 4;
+  // SHA-256 of the RelayRequestBinding (32 bytes). Absent for ATTACH_EXEC.
+  bytes request_digest = 5;
+  // UUID v7 that the caller generates for each logical request and reuses
+  // for every retry of it.
+  string authorization_id = 6;
+  // Grant that this request replaces, for a renewal.
+  optional string replaces_grant_id = 7;
+}
+
+message AuthorizeRelayResponse {
+  // UUID v7. Not a credential. Sent in the Ownsand-Relay-Grant-Id header of
+  // each RelayService request.
+  string grant_id = 1;
+  google.protobuf.Timestamp expire_time = 2;
+  // Remaining lifetime when the control plane sent the response. The SDK
+  // measures it on its monotonic clock.
+  google.protobuf.Duration expires_in = 3;
+}

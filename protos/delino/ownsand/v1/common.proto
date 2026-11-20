@@ -1,0 +1,296 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "google/protobuf/duration.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// Common enums and messages of the OwnSand API. The owning contract is
+// docs/protos-ownsand-api-contract.md.
+
+// Role of a member in an organization.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_OWNER = 1;
+  ROLE_ADMIN = 2;
+  ROLE_MEMBER = 3;
+}
+
+// Operating system of a device host.
+enum HostOs {
+  HOST_OS_UNSPECIFIED = 0;
+  HOST_OS_LINUX = 1;
+  HOST_OS_MACOS = 2;
+  HOST_OS_WINDOWS = 3;
+}
+
+// CPU architecture of a device. A sandbox always uses its device architecture.
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_AMD64 = 1;
+  ARCH_ARM64 = 2;
+}
+
+// Operating system of a sandbox guest.
+enum GuestOs {
+  GUEST_OS_UNSPECIFIED = 0;
+  GUEST_OS_LINUX = 1;
+  GUEST_OS_MACOS = 2;
+  GUEST_OS_WINDOWS = 3;
+}
+
+// Base image of a new sandbox.
+enum BaseImage {
+  BASE_IMAGE_UNSPECIFIED = 0;
+  BASE_IMAGE_LINUX = 1;
+  BASE_IMAGE_MACOS = 2;
+  BASE_IMAGE_WINDOWS = 3;
+}
+
+// Connection state of a device.
+enum DeviceState {
+  DEVICE_STATE_UNSPECIFIED = 0;
+  DEVICE_STATE_ONLINE = 1;
+  DEVICE_STATE_OFFLINE = 2;
+  DEVICE_STATE_REMOVED = 3;
+}
+
+// State of a sandbox. DELETED and FAILED are terminal.
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_CREATING = 1;
+  SANDBOX_STATE_RUNNING = 2;
+  SANDBOX_STATE_PAUSED = 3;
+  SANDBOX_STATE_DELETING = 4;
+  SANDBOX_STATE_DELETED = 5;
+  SANDBOX_STATE_FAILED = 6;
+  // The device of a non-terminal sandbox is offline. The sandbox reports its
+  // last known state in `last_known_state`.
+  SANDBOX_STATE_UNREACHABLE = 7;
+}
+
+// Why a sandbox ended.
+enum SandboxEndReason {
+  SANDBOX_END_REASON_UNSPECIFIED = 0;
+  SANDBOX_END_REASON_DELETED_BY_CALLER = 1;
+  SANDBOX_END_REASON_IDLE_TTL_EXPIRED = 2;
+  SANDBOX_END_REASON_MAX_TTL_EXPIRED = 3;
+  SANDBOX_END_REASON_DEVICE_REMOVED = 4;
+  SANDBOX_END_REASON_ORGANIZATION_DELETED = 5;
+  SANDBOX_END_REASON_CREATE_FAILED = 6;
+  // The VM or its record no longer exists on the device, for example after a
+  // host reboot.
+  SANDBOX_END_REASON_LOST_ON_DEVICE = 7;
+}
+
+// How a sandbox started.
+enum SandboxRestorePath {
+  SANDBOX_RESTORE_PATH_UNSPECIFIED = 0;
+  // The sandbox booted a base image.
+  SANDBOX_RESTORE_PATH_BASE_IMAGE = 1;
+  // The sandbox restored a snapshot disk and booted cold.
+  SANDBOX_RESTORE_PATH_DISK_COLD_BOOT = 2;
+  // The sandbox restored the memory state of a snapshot.
+  SANDBOX_RESTORE_PATH_MEMORY_STATE = 3;
+}
+
+// State of a snapshot. A deleted snapshot has no state: its record is removed.
+enum SnapshotState {
+  SNAPSHOT_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_STATE_CREATING = 1;
+  SNAPSHOT_STATE_READY = 2;
+  SNAPSHOT_STATE_FAILED = 3;
+  SNAPSHOT_STATE_DELETING = 4;
+}
+
+// Export state of a snapshot.
+enum SnapshotExportState {
+  SNAPSHOT_EXPORT_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_EXPORT_STATE_NOT_EXPORTED = 1;
+  SNAPSHOT_EXPORT_STATE_EXPORTING = 2;
+  SNAPSHOT_EXPORT_STATE_EXPORTED = 3;
+  SNAPSHOT_EXPORT_STATE_EXPORT_FAILED = 4;
+}
+
+// Network mode of a sandbox.
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  // Outbound internet access through NAT, without the host, the LAN and
+  // internal networks.
+  NETWORK_MODE_OUTBOUND = 1;
+  // No network device.
+  NETWORK_MODE_NONE = 2;
+}
+
+// Agent version policy of an organization.
+enum AgentVersionPolicyMode {
+  AGENT_VERSION_POLICY_MODE_UNSPECIFIED = 0;
+  AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT = 1;
+  AGENT_VERSION_POLICY_MODE_PIN = 2;
+  AGENT_VERSION_POLICY_MODE_HOLD = 3;
+}
+
+// Kind of an authenticated principal.
+enum PrincipalKind {
+  PRINCIPAL_KIND_UNSPECIFIED = 0;
+  PRINCIPAL_KIND_USER = 1;
+  PRINCIPAL_KIND_API_KEY = 2;
+  PRINCIPAL_KIND_DEVICE = 3;
+  PRINCIPAL_KIND_SYSTEM = 4;
+}
+
+// State of an enrollment token.
+enum EnrollmentTokenState {
+  ENROLLMENT_TOKEN_STATE_UNSPECIFIED = 0;
+  ENROLLMENT_TOKEN_STATE_PENDING = 1;
+  ENROLLMENT_TOKEN_STATE_USED = 2;
+  ENROLLMENT_TOKEN_STATE_REVOKED = 3;
+  ENROLLMENT_TOKEN_STATE_EXPIRED = 4;
+}
+
+// State of an invitation.
+enum InvitationState {
+  INVITATION_STATE_UNSPECIFIED = 0;
+  INVITATION_STATE_PENDING = 1;
+  INVITATION_STATE_ACCEPTED = 2;
+  INVITATION_STATE_REVOKED = 3;
+  INVITATION_STATE_EXPIRED = 4;
+}
+
+// State of an API key.
+enum ApiKeyState {
+  API_KEY_STATE_UNSPECIFIED = 0;
+  API_KEY_STATE_ACTIVE = 1;
+  API_KEY_STATE_REVOKED = 2;
+}
+
+// Update state of a device agent.
+enum AgentUpdateState {
+  AGENT_UPDATE_STATE_UNSPECIFIED = 0;
+  AGENT_UPDATE_STATE_UP_TO_DATE = 1;
+  AGENT_UPDATE_STATE_PENDING_IDLE = 2;
+  AGENT_UPDATE_STATE_DOWNLOADING = 3;
+  AGENT_UPDATE_STATE_INSTALLING = 4;
+  AGENT_UPDATE_STATE_FAILED = 5;
+  AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE = 6;
+}
+
+// Why a data path session or a relay stream ended.
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED = 0;
+  SESSION_END_REASON_IDLE = 1;
+  SESSION_END_REASON_EXPIRED = 2;
+  SESSION_END_REASON_REVOKED = 3;
+  SESSION_END_REASON_AGENT_CHANNEL_LOST = 4;
+  // Relay only: the relay stream open named no live grant.
+  SESSION_END_REASON_GRANT_INVALID = 5;
+  // Relay only: a replacement grant ended the streams of its predecessor.
+  SESSION_END_REASON_GRANT_REPLACED = 6;
+}
+
+// Transport of the data path.
+enum DataPathTransport {
+  DATA_PATH_TRANSPORT_UNSPECIFIED = 0;
+  DATA_PATH_TRANSPORT_PEER_TO_PEER = 1;
+  DATA_PATH_TRANSPORT_RELAY = 2;
+}
+
+// Operation that a relay grant covers.
+enum RelayOperationKind {
+  RELAY_OPERATION_KIND_UNSPECIFIED = 0;
+  // `Exec` and `AttachExec` of one `exec_id`, with a request digest.
+  RELAY_OPERATION_KIND_EXEC = 1;
+  // `AttachExec` only, without a request digest.
+  RELAY_OPERATION_KIND_ATTACH_EXEC = 2;
+  RELAY_OPERATION_KIND_READ_FILE = 3;
+  RELAY_OPERATION_KIND_WRITE_FILE = 4;
+}
+
+// Result of a relay grant on the agent.
+enum RelayGrantResult {
+  RELAY_GRANT_RESULT_UNSPECIFIED = 0;
+  RELAY_GRANT_RESULT_ACCEPTED = 1;
+  RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT = 2;
+}
+
+// Error code carried inside frames and agent channel results. The numeric
+// values equal the Connect error codes, so that a component can turn an
+// ErrorCode into a Connect error without a lookup table.
+enum ErrorCode {
+  ERROR_CODE_UNSPECIFIED = 0;
+  ERROR_CODE_CANCELED = 1;
+  ERROR_CODE_UNKNOWN = 2;
+  ERROR_CODE_INVALID_ARGUMENT = 3;
+  ERROR_CODE_DEADLINE_EXCEEDED = 4;
+  ERROR_CODE_NOT_FOUND = 5;
+  ERROR_CODE_ALREADY_EXISTS = 6;
+  ERROR_CODE_PERMISSION_DENIED = 7;
+  ERROR_CODE_RESOURCE_EXHAUSTED = 8;
+  ERROR_CODE_FAILED_PRECONDITION = 9;
+  ERROR_CODE_ABORTED = 10;
+  ERROR_CODE_OUT_OF_RANGE = 11;
+  ERROR_CODE_UNIMPLEMENTED = 12;
+  ERROR_CODE_INTERNAL = 13;
+  ERROR_CODE_UNAVAILABLE = 14;
+  ERROR_CODE_DATA_LOSS = 15;
+  ERROR_CODE_UNAUTHENTICATED = 16;
+}
+
+// An authenticated principal.
+message Principal {
+  PrincipalKind kind = 1;
+  // Logto `sub` for USER, the API key ID for API_KEY, the device ID for
+  // DEVICE and empty for SYSTEM.
+  string id = 2;
+}
+
+// Resources of a sandbox. All values are greater than zero.
+message Resources {
+  int32 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+}
+
+// Device limits. See the device limits section of the protos contract.
+message DeviceLimits {
+  // Upper limit of vCPUs of all sandboxes on the device, before overcommit.
+  // One sandbox never gets more vCPUs than this value.
+  int32 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+  // 100 to 400 in steps of 25. A new device starts at 100.
+  int32 vcpu_overcommit_percent = 4;
+}
+
+// Error detail of a frame or an agent channel result. The message never
+// contains secrets or sandbox content.
+message ErrorDetail {
+  ErrorCode code = 1;
+  string message = 2;
+  // Retry delay for RESOURCE_EXHAUSTED results, when the sender knows one.
+  google.protobuf.Duration retry_after = 3;
+  // Set when a session-end reason caused the error, for example
+  // GRANT_INVALID on a relay RPC that ends with UNAVAILABLE.
+  SessionEndReason session_end_reason = 4;
+}
+
+// Sent when the agent accepted an Exec, AttachExec or ReadFile request. It
+// carries no payload.
+message RequestAccepted {}
+
+// A keepalive inside an exec event or a file read stream. It carries no
+// payload and does not move an offset.
+message Keepalive {}
+
+// Revision of a sandbox on its device. A revision from a newer epoch is newer
+// than every revision from an older epoch; within one epoch, a higher counter
+// is newer.
+message SandboxRevision {
+  // UUID v7 that the agent creates when it starts with a lost or reset state
+  // directory.
+  string epoch = 1;
+  uint64 counter = 2;
+}

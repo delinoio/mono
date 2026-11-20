@@ -1,0 +1,464 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "delino/ownsand/v1/device.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// AgentService is the device-facing API. It is not part of the SDKs. Only
+// Channel carries a bearer credential (the `osd_` device session
+// credential); Enroll authenticates with the enrollment token, and
+// Authenticate and ConfirmRemoval with a nonce that the device key signed.
+service AgentService {
+  // Exchange an enrollment token and the device public key for a device_id.
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  // Return a one-time nonce for the device. Stateless on the server.
+  rpc CreateChallenge(CreateChallengeRequest) returns (CreateChallengeResponse);
+  // Exchange a signed nonce for a device session credential, or return the
+  // removal notice. An unknown device fails with not_found.
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  // Confirm the local clean-up of a removed device. Accepted only for
+  // removed devices; an unknown device fails with not_found.
+  rpc ConfirmRemoval(ConfirmRemovalRequest) returns (ConfirmRemovalResponse);
+  // Carry AgentEnvelope messages in both directions. The control plane
+  // contract owns the transport decision.
+  rpc Channel(stream ChannelRequest) returns (stream ChannelResponse);
+}
+
+// Operation of a signed URL.
+enum SignedUrlOperation {
+  SIGNED_URL_OPERATION_UNSPECIFIED = 0;
+  // Upload a snapshot part (export).
+  SIGNED_URL_OPERATION_UPLOAD = 1;
+  // Download a snapshot part (import).
+  SIGNED_URL_OPERATION_DOWNLOAD = 2;
+}
+
+message EnrollRequest {
+  // `ose_` followed by 32 random bytes in unpadded base64url.
+  // Secret: never log.
+  string enrollment_token = 1;
+  // Ed25519 public key of the device (32 bytes).
+  bytes public_key = 2;
+  // Host name of the device, shown as the device name.
+  string name = 3;
+  HostOs host_os = 4;
+  Arch arch = 5;
+  string agent_version = 6;
+}
+
+message EnrollResponse {
+  string device_id = 1;
+  string organization_id = 2;
+}
+
+message CreateChallengeRequest {
+  string device_id = 1;
+}
+
+message CreateChallengeResponse {
+  // Opaque single-use nonce. It expires after 60 seconds.
+  bytes nonce = 1;
+  google.protobuf.Timestamp expire_time = 2;
+}
+
+message AuthenticateRequest {
+  string device_id = 1;
+  bytes nonce = 2;
+  // Ed25519 signature of the bytes `ownsand-authenticate` followed by the
+  // nonce.
+  bytes signature = 3;
+  // State epoch of the agent (a UUID v7). A new epoch means that the agent
+  // started with a lost or reset state directory.
+  string state_epoch = 4;
+}
+
+message DeviceSession {
+  // `osd_` followed by 32 random bytes in unpadded base64url. It expires 15
+  // minutes after issue and opens one agent channel or relay connection.
+  // Secret: never log.
+  string device_session_credential = 1;
+  google.protobuf.Timestamp expire_time = 2;
+  google.protobuf.Duration expires_in = 3;
+  string organization_id = 4;
+}
+
+// The device was removed. The agent cleans up and calls ConfirmRemoval.
+message RemovalNotice {
+  google.protobuf.Timestamp remove_time = 1;
+}
+
+message AuthenticateResponse {
+  oneof result {
+    DeviceSession session = 1;
+    RemovalNotice removal_notice = 2;
+  }
+}
+
+message ConfirmRemovalRequest {
+  string device_id = 1;
+  bytes nonce = 2;
+  // Ed25519 signature of the bytes `ownsand-confirm-removal` followed by the
+  // nonce.
+  bytes signature = 3;
+}
+
+message ConfirmRemovalResponse {}
+
+// Agent to control plane: one envelope.
+message ChannelRequest {
+  AgentEnvelope envelope = 1;
+}
+
+// Control plane to agent: one envelope.
+message ChannelResponse {
+  AgentEnvelope envelope = 1;
+}
+
+// One message of the agent channel. The agent channel carries no DataFrame.
+message AgentEnvelope {
+  oneof message {
+    // Agent to control plane.
+    Heartbeat heartbeat = 1;
+    // Control plane to agent.
+    HeartbeatAck heartbeat_ack = 2;
+    // Agent to control plane.
+    CapabilityReport capability_report = 3;
+    // Agent to control plane.
+    StateReport state_report = 4;
+    // Agent to control plane.
+    SandboxUpdate sandbox_update = 5;
+    // Control plane to agent.
+    StateAck state_ack = 6;
+    // Control plane to agent.
+    AgentCommand command = 7;
+    // Agent to control plane.
+    AgentCommandResult command_result = 8;
+    // Control plane to agent.
+    AgentConfiguration configuration = 9;
+    // Both directions: offer to the agent, answer to the control plane.
+    SignalingMessage signaling = 10;
+    // Control plane to agent.
+    SessionRevocation session_revocation = 11;
+    // Agent to control plane.
+    RevocationAck revocation_ack = 12;
+    // Agent to control plane.
+    SignedUrlRequest signed_url_request = 13;
+    // Control plane to agent.
+    SignedUrlGrant signed_url_grant = 14;
+    // Control plane to agent.
+    RelayGrant relay_grant = 15;
+    // Agent to control plane.
+    RelayGrantAck relay_grant_ack = 16;
+    // Agent to control plane.
+    RelayGrantRelease relay_grant_release = 17;
+  }
+}
+
+// Sent every 15 seconds.
+message Heartbeat {
+  uint64 sequence = 1;
+  AgentUpdateState update_state = 2;
+  // Version that the agent downloads or installs, when it has one.
+  string update_target_version = 3;
+}
+
+// Answers the heartbeat with the same sequence on the same channel.
+message HeartbeatAck {
+  uint64 sequence = 1;
+}
+
+// Sent after each authentication, when built images or hypervisor checks
+// change, and with the free disk at least every 60 seconds.
+message CapabilityReport {
+  HostOs host_os = 1;
+  Arch arch = 2;
+  string agent_version = 3;
+  DeviceCapabilities capabilities = 4;
+}
+
+// State of one sandbox on the device.
+message SandboxStateEntry {
+  string sandbox_id = 1;
+  SandboxState state = 2;
+  // Set for DELETED and FAILED.
+  SandboxEndReason end_reason = 3;
+  google.protobuf.Timestamp idle_deadline = 4;
+  SandboxRevision revision = 5;
+  SandboxRestorePath restore_path = 6;
+}
+
+// A snapshot that the device holds locally.
+message SnapshotStateEntry {
+  string snapshot_id = 1;
+  string source_sandbox_id = 2;
+  SnapshotState state = 3;
+  GuestOs guest_os = 4;
+  Resources resources = 5;
+  NetworkMode network_mode = 6;
+  bool has_memory_state = 7;
+  int64 size_bytes = 8;
+  bytes macos_hardware_model = 9;
+}
+
+// Full state of the device. Sent after Authenticate on each new channel.
+message StateReport {
+  // Increases with each report of one agent process; the acknowledgement
+  // names it.
+  uint64 report_sequence = 1;
+  string state_epoch = 2;
+  repeated SandboxStateEntry sandboxes = 3;
+  repeated SnapshotStateEntry snapshots = 4;
+  repeated BaseImage built_base_images = 5;
+}
+
+// One local change of a sandbox, including a moved idle deadline (at most
+// once per minute for each sandbox).
+message SandboxUpdate {
+  SandboxStateEntry sandbox = 1;
+}
+
+message StateReportAck {
+  uint64 report_sequence = 1;
+  // The revisions that the control plane applied or confirmed.
+  repeated SandboxUpdateAck sandboxes = 2;
+}
+
+message SandboxUpdateAck {
+  string sandbox_id = 1;
+  SandboxRevision revision = 2;
+}
+
+// Acknowledgement of a state report or a sandbox update.
+message StateAck {
+  oneof ack {
+    StateReportAck state_report = 1;
+    SandboxUpdateAck sandbox_update = 2;
+  }
+}
+
+// A command for the agent. The agent reports the result with the same
+// command_id.
+message AgentCommand {
+  string command_id = 1;
+  oneof command {
+    CreateSandboxCommand create_sandbox = 2;
+    DeleteSandboxCommand delete_sandbox = 3;
+    PauseSandboxCommand pause_sandbox = 4;
+    ResumeSandboxCommand resume_sandbox = 5;
+    CreateSnapshotCommand create_snapshot = 6;
+    ExportSnapshotCommand export_snapshot = 7;
+    ImportSnapshotCommand import_snapshot = 8;
+    CleanUpCommand clean_up = 9;
+    UpdateAgentCommand update_agent = 10;
+  }
+}
+
+message CreateSandboxCommand {
+  string sandbox_id = 1;
+  // A template source is resolved to its snapshot.
+  oneof source {
+    BaseImage base_image = 2;
+    string snapshot_id = 3;
+  }
+  Resources resources = 4;
+  NetworkMode network_mode = 5;
+  GuestOs guest_os = 6;
+  google.protobuf.Duration idle_ttl = 7;
+  google.protobuf.Duration max_ttl = 8;
+  google.protobuf.Timestamp create_time = 9;
+  // create_time plus max_ttl.
+  google.protobuf.Timestamp max_deadline = 10;
+  // The device limits that the scheduler used. The agent checks the create
+  // against the stricter of these and its last configuration.
+  DeviceLimits limits = 11;
+  // True when the scheduler allows a memory-state restore attempt.
+  bool memory_restore_allowed = 12;
+}
+
+message DeleteSandboxCommand {
+  string sandbox_id = 1;
+  SandboxEndReason end_reason = 2;
+}
+
+message PauseSandboxCommand {
+  string sandbox_id = 1;
+}
+
+message ResumeSandboxCommand {
+  string sandbox_id = 1;
+}
+
+message CreateSnapshotCommand {
+  string snapshot_id = 1;
+  string sandbox_id = 2;
+}
+
+// One part of an exported snapshot.
+message SnapshotPart {
+  // Starts at 1.
+  int32 part_number = 1;
+  int64 size_bytes = 2;
+  // SHA-256 of the part (32 bytes).
+  bytes sha256 = 3;
+}
+
+message ExportSnapshotCommand {
+  string snapshot_id = 1;
+  // Size of every part except the last one.
+  int64 part_size_bytes = 2;
+}
+
+message ImportSnapshotCommand {
+  SnapshotStateEntry snapshot = 1;
+  // The hashes that the control plane stored at export. The agent never
+  // trusts hashes stored in R2.
+  repeated SnapshotPart parts = 2;
+}
+
+// The device was removed: delete every local sandbox, snapshot and locally
+// built image, then call ConfirmRemoval.
+message CleanUpCommand {}
+
+message UpdateAgentCommand {
+  string target_version = 1;
+  // Install also when the target is lower than the running version.
+  bool revocation_recovery = 2;
+}
+
+message CreateSandboxResult {
+  SandboxStateEntry sandbox = 1;
+}
+
+message SandboxCommandResult {
+  SandboxStateEntry sandbox = 1;
+}
+
+message CreateSnapshotResult {
+  SnapshotStateEntry snapshot = 1;
+}
+
+message ExportSnapshotResult {
+  repeated SnapshotPart parts = 1;
+  int64 size_bytes = 2;
+}
+
+message ImportSnapshotResult {
+  SnapshotStateEntry snapshot = 1;
+}
+
+message AgentCommandResult {
+  string command_id = 1;
+  // Absent on success.
+  ErrorDetail error = 2;
+  oneof result {
+    CreateSandboxResult create_sandbox = 3;
+    // Result of delete, pause and resume.
+    SandboxCommandResult sandbox = 4;
+    CreateSnapshotResult create_snapshot = 5;
+    ExportSnapshotResult export_snapshot = 6;
+    ImportSnapshotResult import_snapshot = 7;
+  }
+}
+
+// Sent when the channel opens and after each change.
+message AgentConfiguration {
+  // For example `stun:ownsand.api.delino.io:3478`.
+  repeated string stun_urls = 1;
+  DeviceLimits limits = 2;
+}
+
+message SignalingOffer {
+  string session_id = 1;
+  string sandbox_id = 2;
+  Principal principal = 3;
+  // Absolute expiry of the session, 1 hour after OpenSession.
+  google.protobuf.Timestamp expire_time = 4;
+  google.protobuf.Duration expires_in = 5;
+  // SDP offer with all candidates. Never log.
+  string sdp = 6;
+}
+
+message SignalingAnswer {
+  string session_id = 1;
+  // SDP answer with all candidates. Never log. Empty when error is set.
+  string sdp = 2;
+  ErrorDetail error = 3;
+}
+
+message SignalingMessage {
+  oneof message {
+    SignalingOffer offer = 1;
+    SignalingAnswer answer = 2;
+  }
+}
+
+message SessionRevocation {
+  string revocation_id = 1;
+  oneof target {
+    string session_id = 2;
+    string relay_grant_id = 3;
+  }
+}
+
+message RevocationAck {
+  string revocation_id = 1;
+}
+
+message SignedUrlRequest {
+  string request_id = 1;
+  string snapshot_id = 2;
+  SignedUrlOperation operation = 3;
+  repeated int32 part_numbers = 4;
+}
+
+message SignedPartUrl {
+  int32 part_number = 1;
+  // Signed URL. Never log.
+  string url = 2;
+  google.protobuf.Timestamp expire_time = 3;
+}
+
+message SignedUrlGrant {
+  string request_id = 1;
+  string snapshot_id = 2;
+  SignedUrlOperation operation = 3;
+  repeated SignedPartUrl part_urls = 4;
+  // Set when the control plane issues no URLs, for example after the
+  // snapshot was deleted.
+  ErrorDetail error = 5;
+}
+
+message RelayGrant {
+  string grant_id = 1;
+  optional string replaces_grant_id = 2;
+  string sandbox_id = 3;
+  RelayOperationKind operation_kind = 4;
+  string operation_id = 5;
+  // Absent for ATTACH_EXEC.
+  bytes request_digest = 6;
+  Principal principal = 7;
+  google.protobuf.Timestamp expire_time = 8;
+  google.protobuf.Timestamp stream_deadline = 9;
+  // Remaining durations when the control plane sent the grant. The agent
+  // measures them on its monotonic clock.
+  google.protobuf.Duration expires_in = 10;
+  google.protobuf.Duration stream_deadline_in = 11;
+}
+
+message RelayGrantAck {
+  string grant_id = 1;
+  RelayGrantResult result = 2;
+  // The grant that the agent actually replaced, if any.
+  string replaced_grant_id = 3;
+}
+
+message RelayGrantRelease {
+  string grant_id = 1;
+}

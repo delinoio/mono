@@ -1,0 +1,62 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// Audit actions of the control plane audit table. v1 has no audit read RPC;
+// the control plane uses these values for its stored audit events.
+enum AuditAction {
+  AUDIT_ACTION_UNSPECIFIED = 0;
+  AUDIT_ACTION_ORGANIZATION_CREATED = 1;
+  AUDIT_ACTION_ORGANIZATION_DELETED = 2;
+  AUDIT_ACTION_OWNERSHIP_TRANSFERRED = 3;
+  AUDIT_ACTION_INVITATION_CREATED = 4;
+  AUDIT_ACTION_INVITATION_REVOKED = 5;
+  AUDIT_ACTION_MEMBER_JOINED = 6;
+  AUDIT_ACTION_MEMBER_ROLE_CHANGED = 7;
+  AUDIT_ACTION_MEMBER_REMOVED = 8;
+  AUDIT_ACTION_ENROLLMENT_TOKEN_CREATED = 9;
+  AUDIT_ACTION_ENROLLMENT_TOKEN_REVOKED = 10;
+  AUDIT_ACTION_DEVICE_ENROLLED = 11;
+  AUDIT_ACTION_DEVICE_LIMITS_CHANGED = 12;
+  AUDIT_ACTION_DEVICE_REMOVED = 13;
+  AUDIT_ACTION_AGENT_VERSION_POLICY_CHANGED = 14;
+  AUDIT_ACTION_API_KEY_CREATED = 15;
+  AUDIT_ACTION_API_KEY_REVOKED = 16;
+  AUDIT_ACTION_SANDBOX_CREATED = 17;
+  AUDIT_ACTION_SANDBOX_DELETED = 18;
+}
+
+// Kind of the target of an audit event.
+enum AuditTargetKind {
+  AUDIT_TARGET_KIND_UNSPECIFIED = 0;
+  AUDIT_TARGET_KIND_ORGANIZATION = 1;
+  AUDIT_TARGET_KIND_MEMBERSHIP = 2;
+  AUDIT_TARGET_KIND_INVITATION = 3;
+  AUDIT_TARGET_KIND_DEVICE = 4;
+  AUDIT_TARGET_KIND_ENROLLMENT_TOKEN = 5;
+  AUDIT_TARGET_KIND_API_KEY = 6;
+  AUDIT_TARGET_KIND_SANDBOX = 7;
+  AUDIT_TARGET_KIND_AGENT_VERSION_POLICY = 8;
+}
+
+// One audit event. It never records exec commands, exec output, file
+// contents, secrets or labels.
+message AuditEvent {
+  string audit_event_id = 1;
+  string organization_id = 2;
+  AuditAction action = 3;
+  Principal actor = 4;
+  // Only for SANDBOX_DELETED.
+  SandboxEndReason end_reason = 5;
+  AuditTargetKind target_kind = 6;
+  string target_id = 7;
+  string request_id = 8;
+  google.protobuf.Timestamp create_time = 9;
+}

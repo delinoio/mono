@@ -1,0 +1,75 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// OrganizationService manages organizations. CreateOrganization and
+// ListOrganizations take no organization_id and accept only Logto access
+// tokens.
+service OrganizationService {
+  // Create an organization. The caller becomes its owner.
+  rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
+  // Read one organization.
+  rpc GetOrganization(GetOrganizationRequest) returns (GetOrganizationResponse);
+  // List the organizations of the signed-in user.
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+  // Delete the organization and start its clean-up.
+  rpc DeleteOrganization(DeleteOrganizationRequest) returns (DeleteOrganizationResponse);
+  // Make another member the owner. The previous owner becomes admin.
+  rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+}
+
+message Organization {
+  string organization_id = 1;
+  string name = 2;
+  google.protobuf.Timestamp create_time = 3;
+  // Role of the calling user in the organization.
+  Role caller_role = 4;
+}
+
+message CreateOrganizationRequest {
+  string name = 1;
+}
+
+message CreateOrganizationResponse {
+  Organization organization = 1;
+}
+
+message GetOrganizationRequest {
+  string organization_id = 1;
+}
+
+message GetOrganizationResponse {
+  Organization organization = 1;
+}
+
+message ListOrganizationsRequest {
+  // Default 50, maximum 200.
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListOrganizationsResponse {
+  repeated Organization organizations = 1;
+  string next_page_token = 2;
+}
+
+message DeleteOrganizationRequest {
+  string organization_id = 1;
+}
+
+message DeleteOrganizationResponse {}
+
+message TransferOwnershipRequest {
+  string organization_id = 1;
+  // Logto `sub` of an existing member that becomes the owner.
+  string user_id = 2;
+}
+
+message TransferOwnershipResponse {}

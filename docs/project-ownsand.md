@@ -12,14 +12,14 @@ Success criterion: on one Linux, one macOS and one Windows device, an organizati
 
 ## Domain Ownership Map
 
-All paths are `planned`. This project is in the documentation-only phase. Create each path, its workspace membership and its validation scripts in the change that starts its runtime implementation.
+Paths marked `planned` do not exist yet. Create each path, its workspace membership and its validation scripts in the change that starts its runtime implementation.
 
 - `servers/ownsand-api/` (`planned`): Go control plane on the shared DigitalOcean Droplet, served at `https://ownsand.api.delino.io`. It also serves the relay fallback of the data path and STUN on UDP port 3478.
 - `cmds/ownsand-agent/` (`planned`): Go device agent that runs on each enrolled host.
 - `cmds/ownsand-guest/` (`planned`): Go helper that runs inside each sandbox guest and serves exec and file requests from the device agent.
 - `cmds/ownsand/` (`planned`): Go command-line interface for people and programs.
 - `apps/ownsand/` (`planned`): Rsbuild React web console served at `https://ownsand.delino.io`.
-- `protos/delino/ownsand/v1/` (`planned`): Connect RPC schemas and the committed Go bindings.
+- `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
 - `packages/ownsand-sdk/` (`planned`): TypeScript SDK.
 - `packages/ownsand-sdk-go/` (`planned`): Go SDK.
 
@@ -110,7 +110,7 @@ Record each decision in the owning domain contract before the implementation tha
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
 - The database migration tool and the backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)).
 - The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
-- The protobuf code generation tool and every new third-party dependency. The root Go module has no third-party dependencies today. OwnSand needs at least Connect, protobuf, a Postgres driver, a WebRTC library (pion), a STUN server library, and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
+- Every new third-party dependency. The protobuf code generation tool (buf with the Go and Connect plugins) and the Go protobuf and Connect runtimes are recorded in the [protos contract](protos-ownsand-api-contract.md#runtime-and-language). OwnSand also needs a Postgres driver, a WebRTC library (pion), a STUN server library, and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
 
 ## Change Policy
 

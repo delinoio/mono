@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Go code generation for the repository protobuf schemas. The plugins run
+# through `go run` with exact versions, so generation needs no installed
+# plugin binaries. Keep protoc-gen-go equal to the google.golang.org/protobuf
+# version and protoc-gen-connect-go equal to the connectrpc.com/connect
+# version in the root go.mod.
+version: v2
+clean: false
+plugins:
+  - local:
+      - go
+      - run
+      - google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.12
+    out: .
+    opt:
+      - paths=source_relative
+  - local:
+      - go
+      - run
+      - connectrpc.com/connect/cmd/protoc-gen-connect-go@v1.21.1
+    out: .
+    opt:
+      - paths=source_relative
