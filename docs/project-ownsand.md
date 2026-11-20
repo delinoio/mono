@@ -21,7 +21,7 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `apps/ownsand/` (`planned`): Rsbuild React web console served at `https://ownsand.delino.io`.
 - `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
 - `packages/ownsand-sdk/` (`planned`): TypeScript SDK.
-- `packages/ownsand-sdk-go/`: Go SDK. The shared data path packages exist; the SDK client is `planned`.
+- `packages/ownsand-sdk-go/`: Go SDK: the client in the package root and the shared data path packages in its subpackages.
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.
 
@@ -110,7 +110,7 @@ Record each decision in the owning domain contract before the implementation tha
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
 - The database backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)). The migration tool is recorded there (an embedded forward-only runner).
 - The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
-- Every new third-party dependency. The protobuf code generation tool (buf with the Go and Connect plugins) and the Go protobuf and Connect runtimes are recorded in the [protos contract](protos-ownsand-api-contract.md#runtime-and-language). The control plane records its Postgres driver (`github.com/jackc/pgx/v5`), JWT library (`github.com/go-jose/go-jose/v4`) and STUN library (`github.com/pion/stun/v3`) in its [contract](servers-ownsand-api-foundation.md#dependencies-and-integrations). The device agent records `golang.org/x/sys`, its WebRTC library (`github.com/pion/webrtc/v4`) and Firecracker in the [agent contract](cmds-ownsand-agent-foundation.md#dependencies-and-integrations) and its data path section. OwnSand also needs hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
+- Every new third-party dependency. The protobuf code generation tool (buf with the Go and Connect plugins) and the Go protobuf and Connect runtimes are recorded in the [protos contract](protos-ownsand-api-contract.md#runtime-and-language). The control plane records its Postgres driver (`github.com/jackc/pgx/v5`), JWT library (`github.com/go-jose/go-jose/v4`) and STUN library (`github.com/pion/stun/v3`) in its [contract](servers-ownsand-api-foundation.md#dependencies-and-integrations). The device agent records `golang.org/x/sys`, its WebRTC library (`github.com/pion/webrtc/v4`) and Firecracker in the [agent contract](cmds-ownsand-agent-foundation.md#dependencies-and-integrations) and its data path section, and the Go SDK records the same WebRTC library in its [contract](packages-ownsand-sdk-foundation.md#dependencies-and-integrations). OwnSand also needs hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
 
 ## Change Policy
 
