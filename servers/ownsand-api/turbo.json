@@ -13,10 +13,12 @@
         "OWNSAND_NONCE_KEY",
         "OWNSAND_NONCE_KEY_PREVIOUS",
         "OWNSAND_RELEASE_MANIFEST_URL",
+        "OWNSAND_STUN_URLS",
         "R2_ACCESS_KEY_ID",
         "R2_BUCKET",
         "R2_ENDPOINT",
-        "R2_SECRET_ACCESS_KEY"
+        "R2_SECRET_ACCESS_KEY",
+        "STUN_ADDR"
       ]
     },
     "build": {

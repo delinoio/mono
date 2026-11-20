@@ -138,6 +138,8 @@ function startLauncher(t, { port, env = {}, pathPrefix } = {}) {
     // An unreachable placeholder keeps the configuration valid in tests that
     // never start a server.
     DATABASE_URL: databaseURL || "postgres://ownsand@127.0.0.1:1/none",
+    // A free UDP port, so that the test never needs the default STUN port.
+    STUN_ADDR: "127.0.0.1:0",
   };
   delete childEnv.LOG_LEVEL;
   Object.assign(childEnv, env);

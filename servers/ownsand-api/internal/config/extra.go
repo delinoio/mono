@@ -17,6 +17,14 @@ const (
 	EnvR2AccessKeyID      = "R2_ACCESS_KEY_ID"
 	EnvR2SecretAccessKey  = "R2_SECRET_ACCESS_KEY"
 	EnvReleaseManifestURL = "OWNSAND_RELEASE_MANIFEST_URL"
+	EnvSTUNAddr           = "STUN_ADDR"
+	EnvSTUNURLs           = "OWNSAND_STUN_URLS"
+)
+
+// STUN defaults: loopback for local runs; the public URL for clients.
+const (
+	DefaultSTUNAddr = "127.0.0.1:3478"
+	DefaultSTUNURLs = "stun:ownsand.api.delino.io:3478"
 )
 
 // MinNonceKeyBytes is the shortest accepted nonce key.
@@ -42,6 +50,10 @@ type Extra struct {
 	R2               R2
 	// Release manifest location sent to agents.
 	ReleaseManifestURL string
+	// UDP listen address of the STUN server.
+	STUNAddr string
+	// STUN server URLs that callers and agents get.
+	STUNURLs []string
 }
 
 func decodeKey(name, v string) ([]byte, error) {
@@ -95,6 +107,27 @@ func loadExtra(lookup Lookup) (Extra, error) {
 			return e, err
 		}
 		e.ReleaseManifestURL = v
+	}
+	e.STUNAddr = DefaultSTUNAddr
+	if v := get(lookup, EnvSTUNAddr); v != "" {
+		if err := validateAddr(EnvSTUNAddr, v); err != nil {
+			return e, err
+		}
+		e.STUNAddr = v
+	}
+	urls := get(lookup, EnvSTUNURLs)
+	if urls == "" {
+		urls = DefaultSTUNURLs
+	}
+	for _, u := range strings.Split(urls, ",") {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if !strings.HasPrefix(u, "stun:") {
+			return e, fmt.Errorf("%s entries must be stun: URLs; got %q", EnvSTUNURLs, u)
+		}
+		e.STUNURLs = append(e.STUNURLs, u)
 	}
 	return e, nil
 }

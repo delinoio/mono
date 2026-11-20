@@ -21,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/server"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/store"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/stunserver"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -67,10 +68,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	udp, err := net.ListenPacket("udp", cfg.Extra.STUNAddr)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	go func() {
+		if err := stunserver.New(udp, logger).Serve(bgCtx); err != nil {
+			logger.Error("stun_server_failed", slog.Any("error", err))
+		}
+	}()
 	srv := server.New(a.Handler, logger)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(listener) }()
-	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)))
+	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)))
 
 	select {
 	case err := <-serveErr:
