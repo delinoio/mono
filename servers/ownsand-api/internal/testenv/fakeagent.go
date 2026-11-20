@@ -31,6 +31,11 @@ type FakeAgent struct {
 	// OnCommand, when set, answers a command instead of the default
 	// behavior; returning nil sends no result.
 	OnCommand func(a *FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult
+	// OnGrant answers a relay grant; nil accepts it. Returning nil sends no
+	// acknowledgement.
+	OnGrant func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck
+	// OnOffer answers a signaling offer; nil answers with a fixed SDP.
+	OnOffer func(o *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -154,6 +159,64 @@ func (a *FakeAgent) read() {
 		if cmd := env.GetCommand(); cmd != nil {
 			go a.answer(cmd)
 		}
+		if g := env.GetRelayGrant(); g != nil {
+			go a.ackGrant(g)
+		}
+		if o := env.GetSignaling().GetOffer(); o != nil {
+			go a.answerOffer(o)
+		}
+		if r := env.GetSessionRevocation(); r != nil {
+			go a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RevocationAck{RevocationAck: &ownsandv1.RevocationAck{RevocationId: r.GetRevocationId()}}})
+		}
+	}
+}
+
+// SetOnGrant replaces the relay grant hook while the agent runs.
+func (a *FakeAgent) SetOnGrant(fn func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck) {
+	a.mu.Lock()
+	a.OnGrant = fn
+	a.mu.Unlock()
+}
+
+// SetOnOffer replaces the signaling hook while the agent runs.
+func (a *FakeAgent) SetOnOffer(fn func(o *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer) {
+	a.mu.Lock()
+	a.OnOffer = fn
+	a.mu.Unlock()
+}
+
+// SetOnCommand replaces the command hook while the agent runs.
+func (a *FakeAgent) SetOnCommand(fn func(a *FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult) {
+	a.mu.Lock()
+	a.OnCommand = fn
+	a.mu.Unlock()
+}
+
+func (a *FakeAgent) ackGrant(g *ownsandv1.RelayGrant) {
+	ack := &ownsandv1.RelayGrantAck{GrantId: g.GetGrantId(), Result: ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED, ReplacedGrantId: g.GetReplacesGrantId()}
+	a.mu.Lock()
+	hook := a.OnGrant
+	a.mu.Unlock()
+	if hook != nil {
+		ack = hook(g)
+	}
+	if ack != nil {
+		a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrantAck{RelayGrantAck: ack}})
+	}
+}
+
+func (a *FakeAgent) answerOffer(o *ownsandv1.SignalingOffer) {
+	ans := &ownsandv1.SignalingAnswer{SessionId: o.GetSessionId(), Sdp: "v=0 answer"}
+	a.mu.Lock()
+	hook := a.OnOffer
+	a.mu.Unlock()
+	if hook != nil {
+		ans = hook(o)
+	}
+	if ans != nil {
+		a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Signaling{Signaling: &ownsandv1.SignalingMessage{
+			Message: &ownsandv1.SignalingMessage_Answer{Answer: ans},
+		}}})
 	}
 }
 
@@ -196,8 +259,11 @@ func (a *FakeAgent) SendUpdate(e *ownsandv1.SandboxStateEntry) {
 
 func (a *FakeAgent) answer(cmd *ownsandv1.AgentCommand) {
 	var res *ownsandv1.AgentCommandResult
-	if a.OnCommand != nil {
-		res = a.OnCommand(a, cmd)
+	a.mu.Lock()
+	hook := a.OnCommand
+	a.mu.Unlock()
+	if hook != nil {
+		res = hook(a, cmd)
 	} else {
 		res = a.DefaultAnswer(cmd)
 	}

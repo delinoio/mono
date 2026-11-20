@@ -135,6 +135,8 @@ func New(t testing.TB, opts ...Option) *Env {
 		Timing:   &timing,
 		Objects:  objects,
 		STUNURLs: []string{"stun:127.0.0.1:3478"},
+		RelayTiming: &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
+			RequestDeadline: 2 * time.Second, GrantAck: time.Second, Signaling: 2 * time.Second},
 	}
 	for _, opt := range opts {
 		opt(&o)

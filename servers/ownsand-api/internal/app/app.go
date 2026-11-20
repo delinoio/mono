@@ -24,6 +24,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/janitor"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/server"
 )
 
@@ -60,6 +61,11 @@ type Options struct {
 	// InstanceID names this instance in the lease; empty selects a new
 	// UUID v7.
 	InstanceID string
+
+	// RelayLimits and RelayTiming override the relay limits and durations
+	// (tests).
+	RelayLimits *relay.Limits
+	RelayTiming *api.RelayTiming
 }
 
 // App is a wired control plane.
@@ -68,6 +74,7 @@ type App struct {
 	Service *api.Service
 	Lease   *lease.Lease
 	Control *api.Control
+	Plane   *api.DataPlane
 	handler http.Handler
 }
 
@@ -122,6 +129,15 @@ func New(opts Options) (*App, error) {
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
 		OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
 	svc.Lease = l
+	relayLimits := relay.DefaultLimits()
+	if opts.RelayLimits != nil {
+		relayLimits = *opts.RelayLimits
+	}
+	relayTiming := api.DefaultRelayTiming()
+	if opts.RelayTiming != nil {
+		relayTiming = *opts.RelayTiming
+	}
+	plane := api.NewDataPlane(svc, relayLimits, relayTiming)
 	authn := &api.Authenticator{Service: svc, Logto: opts.Logto}
 	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.TrustProxyClientAddress)...)}
 
@@ -134,12 +150,16 @@ func New(opts Options) (*App, error) {
 	add(ownsandv1connect.NewAgentServiceHandler(api.AgentHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...))
+	add(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...))
+	add(ownsandv1connect.NewRelayServiceHandler(api.RelayHandler{DataPlane: plane}, handlerOpts...))
+	add(ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane}, handlerOpts...))
 
 	return &App{
 		opts:    opts,
 		Service: svc,
 		Lease:   l,
 		Control: control,
+		Plane:   plane,
 		handler: server.NewHandler(server.Options{Logger: opts.Logger, CORSOrigins: opts.CORSOrigins, Mounts: mounts}),
 	}, nil
 }

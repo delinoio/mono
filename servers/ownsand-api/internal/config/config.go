@@ -35,6 +35,9 @@ const (
 	EnvR2AccessKeyID           = "OWNSAND_R2_ACCESS_KEY_ID"
 	EnvR2SecretAccessKey       = "OWNSAND_R2_SECRET_ACCESS_KEY"
 	EnvSnapshotPartSizeBytes   = "OWNSAND_SNAPSHOT_PART_SIZE_BYTES"
+	EnvSTUNAddr                = "OWNSAND_STUN_ADDR"
+	EnvSTUNRateBytesPerSecond  = "OWNSAND_STUN_RATE_LIMIT_BYTES_PER_SECOND"
+	EnvSTUNRateBurstBytes      = "OWNSAND_STUN_RATE_LIMIT_BURST_BYTES"
 )
 
 // Defaults.
@@ -47,6 +50,13 @@ const (
 	DefaultCORSOrigin = "https://ownsand.delino.io"
 	// DefaultSTUNURL is the production STUN URL that callers and agents get.
 	DefaultSTUNURL = "stun:ownsand.api.delino.io:3478"
+	// DefaultSTUNAddr is the UDP listen address of the STUN service.
+	DefaultSTUNAddr = "127.0.0.1:3478"
+	// DefaultSTUNRateBytesPerSecond and DefaultSTUNRateBurstBytes are the
+	// response byte budget per source address: about 25 binding responses
+	// per second sustained with a burst of about 100.
+	DefaultSTUNRateBytesPerSecond = 1024
+	DefaultSTUNRateBurstBytes     = 4096
 	// DefaultSnapshotPartSizeBytes is the snapshot export part size (64 MiB).
 	DefaultSnapshotPartSizeBytes = 64 << 20
 	// minNonceKeySize is the smallest accepted nonce key.
@@ -118,6 +128,12 @@ type Config struct {
 
 	R2                    R2
 	SnapshotPartSizeBytes int64
+
+	// STUNAddr is the UDP listen address of STUN; STUNRateBytesPerSecond
+	// and STUNRateBurstBytes budget response bytes per source address.
+	STUNAddr               string
+	STUNRateBytesPerSecond int
+	STUNRateBurstBytes     int
 }
 
 // Load reads the configuration through lookup, which has the signature of
@@ -246,7 +262,32 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.SnapshotPartSizeBytes = n
 	}
+	cfg.STUNAddr = DefaultSTUNAddr
+	if v := get(EnvSTUNAddr); v != "" {
+		if err := validateAddr(EnvSTUNAddr, v); err != nil {
+			return Config{}, err
+		}
+		cfg.STUNAddr = v
+	}
+	var err2 error
+	if cfg.STUNRateBytesPerSecond, err2 = positiveInt(EnvSTUNRateBytesPerSecond, get(EnvSTUNRateBytesPerSecond), DefaultSTUNRateBytesPerSecond); err2 != nil {
+		return Config{}, err2
+	}
+	if cfg.STUNRateBurstBytes, err2 = positiveInt(EnvSTUNRateBurstBytes, get(EnvSTUNRateBurstBytes), DefaultSTUNRateBurstBytes); err2 != nil {
+		return Config{}, err2
+	}
 	return cfg, nil
+}
+
+func positiveInt(name, value string, def int) (int, error) {
+	if value == "" {
+		return def, nil
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n <= 0 {
+		return 0, fmt.Errorf("%s must be a positive integer", name)
+	}
+	return n, nil
 }
 
 func splitList(v string) []string {
