@@ -136,6 +136,10 @@ func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID str
 type reconcileResult struct {
 	deletes []pendingDelete
 	changed []string
+	// snapshotDeletes are listed snapshots without a record: their record
+	// was deleted while the device was offline or before it learned the
+	// delete-snapshot command.
+	snapshotDeletes []string
 }
 
 // reconcileStateReport applies a full state report of the device: each
@@ -196,6 +200,11 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 		if err := s.reconcileSnapshotsTx(ctx, tx, deviceID, report.GetSnapshots()); err != nil {
 			return err
 		}
+		unknown, err := unknownSnapshotsTx(ctx, tx, report.GetSnapshots())
+		if err != nil {
+			return err
+		}
+		out.snapshotDeletes = unknown
 		if err := s.mergeBuiltImagesTx(ctx, tx, deviceID, report.GetBuiltBaseImages()); err != nil {
 			return err
 		}
@@ -290,6 +299,36 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 		}
 	}
 	return nil
+}
+
+// unknownSnapshotsTx returns the listed snapshot IDs that have no record.
+// The control plane creates the record of every snapshot before it sends
+// the create or import command, so a listed snapshot without a record was
+// deleted and its local copy is stale.
+func unknownSnapshotsTx(ctx context.Context, tx pgx.Tx, entries []*ownsandv1.SnapshotStateEntry) ([]string, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
+	var ids []string
+	for _, e := range entries {
+		if validateID("snapshot_id", e.GetSnapshotId()) == nil {
+			ids = append(ids, e.GetSnapshotId())
+		}
+	}
+	rows, err := tx.Query(ctx, "SELECT id FROM unnest($1::uuid[]) AS listed(id) WHERE NOT EXISTS (SELECT 1 FROM snapshots WHERE snapshot_id = listed.id)", ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var unknown []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		unknown = append(unknown, id)
+	}
+	return unknown, rows.Err()
 }
 
 // applySnapshotEntryTx stores the agent's report of a snapshot.

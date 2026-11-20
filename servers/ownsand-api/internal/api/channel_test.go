@@ -459,6 +459,54 @@ func TestDeviceRemovalOverTheChannel(t *testing.T) {
 	}
 }
 
+// TestDeleteSnapshotDeletesLocalCopy checks that DeleteSnapshot sends the
+// delete-snapshot command to the device, and that a state report that
+// lists a snapshot without a record gets the command too.
+func TestDeleteSnapshotDeletesLocalCopy(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	dev, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, _ := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	snap, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapID := snap.Msg.GetSnapshot().GetSnapshotId()
+	agent.Eventually("snapshot on the device", func() bool { return agent.HasSnapshot(snapID) })
+	testenv.Eventually(t, "snapshot ready", func() bool {
+		s, err := c.Snapshot.GetSnapshot(ctx, connect.NewRequest(&ownsandv1.GetSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
+		return err == nil && s.Msg.GetSnapshot().GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY
+	})
+	if _, err := c.Snapshot.DeleteSnapshot(ctx, connect.NewRequest(&ownsandv1.DeleteSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID})); err != nil {
+		t.Fatal(err)
+	}
+	agent.WaitFor("delete snapshot command", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetDeleteSnapshot().GetSnapshotId() == snapID
+	})
+	agent.Eventually("local copy deleted", func() bool { return !agent.HasSnapshot(snapID) })
+
+	// A copy that the device kept while it missed the command (offline, or
+	// an older agent) is deleted after its next state report.
+	agent.Close()
+	stale, _ := uuidv7.NewString()
+	agent2 := env.NewFakeAgent(dev)
+	agent2.OnCommand = func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		return fa.DefaultAnswer(cmd)
+	}
+	agent2.SetSandbox(sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, 0)
+	agent2.AddSnapshot(&ownsandv1.SnapshotStateEntry{SnapshotId: stale, State: ownsandv1.SnapshotState_SNAPSHOT_STATE_READY, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX})
+	agent2.Connect()
+	agent2.WaitFor("delete stale snapshot command", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetDeleteSnapshot().GetSnapshotId() == stale
+	})
+	agent2.Eventually("stale copy deleted", func() bool { return !agent2.HasSnapshot(stale) })
+}
+
 func TestSnapshotsTemplatesAndExport(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()

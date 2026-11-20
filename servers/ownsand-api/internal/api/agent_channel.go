@@ -30,11 +30,12 @@ const (
 	cmdImportSnapshot
 	cmdCleanUp
 	cmdUpdateAgent
+	cmdDeleteSnapshot
 )
 
 func (k commandKind) String() string {
 	return [...]string{"", "create_sandbox", "delete_sandbox", "pause_sandbox", "resume_sandbox", "create_snapshot",
-		"export_snapshot", "import_snapshot", "clean_up", "update_agent"}[k]
+		"export_snapshot", "import_snapshot", "clean_up", "update_agent", "delete_snapshot"}[k]
 }
 
 // commandInfo is what the server remembers about a sent command, so that it
@@ -75,6 +76,19 @@ func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandI
 func (s *Service) sendDelete(ctx context.Context, conn *hub.Conn, orgID string, d pendingDelete) {
 	_, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdDeleteSandbox, orgID: orgID, sandboxID: d.sandboxID},
 		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: d.sandboxID, EndReason: d.reason}}})
+	if err != nil {
+		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
+	}
+}
+
+// sendDeleteSnapshot tells a connected agent to delete its local copy of a
+// snapshot whose record was deleted. The agent answers success also when
+// it holds no copy; a failure (the copy is in use, or an older agent) is
+// only logged, and a later state report that lists the copy triggers the
+// command again.
+func (s *Service) sendDeleteSnapshot(ctx context.Context, conn *hub.Conn, orgID, snapshotID string) {
+	_, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdDeleteSnapshot, orgID: orgID, snapshotID: snapshotID},
+		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapshotID}}})
 	if err != nil {
 		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
 	}
@@ -292,6 +306,9 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	}
 	for _, d := range res.deletes {
 		s.sendDelete(ctx, conn, conn.OrganizationID, d)
+	}
+	for _, id := range res.snapshotDeletes {
+		s.sendDeleteSnapshot(ctx, conn, conn.OrganizationID, id)
 	}
 	return s.evaluateUpdate(ctx, conn)
 }
