@@ -12,6 +12,8 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/agent"
@@ -23,6 +25,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/nonce"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/r2"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/rpc"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/server"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/store"
@@ -49,6 +52,7 @@ type App struct {
 	Lease   *lease.Manager
 	Agents  *agent.Hub
 	R2      *r2.Client
+	Relay   *relay.Manager
 }
 
 // leaseRef lets the hub ask the lease manager that main connects later.
@@ -62,6 +66,8 @@ type Options struct {
 	DisplayNames accounts.DisplayNameSource
 	// R2HTTP replaces the R2 HTTP client in tests.
 	R2HTTP *http.Client
+	// RelayLimits replaces the data path limits in tests.
+	RelayLimits *relay.Limits
 }
 
 // New assembles the app.
@@ -109,11 +115,20 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger, opts Options) 
 	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxService{Server: a.API, Agents: a.Agents}, opt))
 	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotService{Server: a.API, Agents: a.Agents, ExportConfigured: a.R2 != nil}, opt))
 	add(ownsandv1connect.NewAgentServiceHandler(agentService, opt))
-	// Services of later layers answer unimplemented until they are added.
-	add(ownsandv1connect.NewDataPathServiceHandler(ownsandv1connect.UnimplementedDataPathServiceHandler{}, opt))
-	add(ownsandv1connect.NewRelayServiceHandler(ownsandv1connect.UnimplementedRelayServiceHandler{}, opt))
-	add(ownsandv1connect.NewRelayAgentServiceHandler(ownsandv1connect.UnimplementedRelayAgentServiceHandler{}, opt))
-	a.Handler = server.NewHandler(routes, cfg.CORSAllowedOrigins)
+	limits := relay.Defaults()
+	if opts.RelayLimits != nil {
+		limits = *opts.RelayLimits
+	}
+	ice := []*ownsandv1.IceServer{{Urls: cfg.Extra.STUNURLs}}
+	if len(cfg.Extra.STUNURLs) == 0 {
+		ice = nil
+	}
+	a.Agents.IceServers = func() []*ownsandv1.IceServer { return ice }
+	a.Relay = relay.NewManager(a.Agents, st, a.API, logger, limits, ice)
+	add(ownsandv1connect.NewDataPathServiceHandler(relay.DataPathService{M: a.Relay}, opt))
+	add(ownsandv1connect.NewRelayServiceHandler(relay.RelayService{M: a.Relay}, opt))
+	add(ownsandv1connect.NewRelayAgentServiceHandler(relay.AgentRelayService{M: a.Relay}, opt, connect.WithReadMaxBytes(int(datapath.MaxFrameSize)+1024)))
+	a.Handler = a.Relay.Middleware(server.NewHandler(routes, cfg.CORSAllowedOrigins))
 	return a
 }
 
@@ -141,6 +156,7 @@ func (a *App) ObjectStore() jobs.ObjectStore {
 // Start runs the background components until ctx ends.
 func (a *App) Start(ctx context.Context) {
 	go a.Agents.RunLeaseWork(ctx)
+	go a.Relay.Run(ctx)
 }
 
 // Drain runs when the server starts to shut down: it closes every agent

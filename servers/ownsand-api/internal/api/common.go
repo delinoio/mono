@@ -140,3 +140,10 @@ func tsPtr(t *time.Time) *timestamppb.Timestamp {
 func principalProto(a store.Actor) *ownsandv1.Principal {
 	return &ownsandv1.Principal{Kind: a.Kind, Id: a.ID}
 }
+
+// Authorize applies the authorization matrix for the caller in ctx. Other
+// packages (the data path and the relay) use it.
+func (s *Server) Authorize(ctx context.Context, organizationID string, action authz.Action) (auth.Principal, error) {
+	p, _, err := s.authorize(ctx, organizationID, action)
+	return p, err
+}

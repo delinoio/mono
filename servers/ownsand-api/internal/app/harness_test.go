@@ -85,6 +85,7 @@ func newHarness(t *testing.T, hopts ...harnessOptions) *harness {
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cfg := config.Config{Addr: "127.0.0.1:0", APIResource: config.DefaultAPIResource, CORSAllowedOrigins: []string{"http://127.0.0.1:3300"}}
 	cfg.Extra.NonceKey = []byte("test-nonce-key-0123456789abcdef!")
+	cfg.Extra.STUNURLs = []string{config.DefaultSTUNURLs}
 	opts := Options{Tokens: fakeTokens{}}
 	for _, o := range hopts {
 		if o.cfg != nil {

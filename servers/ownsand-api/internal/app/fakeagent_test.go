@@ -139,7 +139,11 @@ func (a *fakeAgent) open(cred string) (*connect.BidiStreamForClient[ownsandv1.Ag
 			if err != nil {
 				return
 			}
-			in <- env
+			select {
+			case in <- env:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}()
 	a.t.Cleanup(cancel)
@@ -188,12 +192,19 @@ func (a *fakeAgent) waitClosed(d time.Duration) bool {
 	}
 }
 
+// disconnect ends the agent channel like an agent that shuts down: it closes
+// its side of the stream (the server sees the end at once) and cancels it.
 func (a *fakeAgent) disconnect() {
 	a.mu.Lock()
-	cancel, closed := a.cancel, a.closed
+	stream, cancel, closed := a.stream, a.cancel, a.closed
 	a.mu.Unlock()
+	_ = stream.CloseRequest()
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		a.t.Fatal("the server did not end the agent channel")
+	}
 	cancel()
-	<-closed
 }
 
 // command waits for the next command.
