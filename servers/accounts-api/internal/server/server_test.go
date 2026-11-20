@@ -726,3 +726,44 @@ func TestRequestLogBytesForHead(t *testing.T) {
 		})
 	}
 }
+
+// TestRequestLogBytesCountsAcceptedBytes pins that bytes adds the count n that
+// net/http returns from Write, not the length of the slice the handler passed.
+// A handler that declares Content-Length: 1 and writes 3 bytes is rejected by
+// net/http with http.ErrContentLength and n == 0, so the record logs 0 bytes
+// although len(body) is 3. A recorder that added len(body) would log 3.
+func TestRequestLogBytesCountsAcceptedBytes(t *testing.T) {
+	var (
+		wroteN   int
+		writeErr error
+	)
+	handler := func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "1")
+		wroteN, writeErr = w.Write([]byte("abc"))
+	}
+
+	_, clientStatus, _, clientBody, records := serveCommittedRequest(t, handler)
+
+	// serveCommittedRequest returns after the log record is complete, so the
+	// handler results above are safe to read. The short body ends the client
+	// read with an error that this test does not assert on.
+	if wroteN != 0 || !errors.Is(writeErr, http.ErrContentLength) {
+		t.Errorf("Write returned (%d, %v), want (0, an error wrapping http.ErrContentLength)", wroteN, writeErr)
+	}
+	if clientStatus != http.StatusOK {
+		t.Errorf("client status = %d, want %d", clientStatus, http.StatusOK)
+	}
+	if clientBody != 0 {
+		t.Errorf("client received %d body bytes, want 0", clientBody)
+	}
+	if len(records) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
+	}
+	record := records[0]
+	if record["msg"] != "http_request" || record["status"] != float64(http.StatusOK) {
+		t.Errorf("unexpected request log: %v", record)
+	}
+	if record["bytes"] != float64(0) {
+		t.Errorf("logged bytes = %v, want 0 (net/http accepted none of the 3 bytes)", record["bytes"])
+	}
+}
