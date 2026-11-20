@@ -1635,7 +1635,9 @@
 
   /* Segmented control. UI SDK measures the checked item into the indicator's
      `--segmented-control-indicator-*` properties. Unchecked text contrast:
-     #4e5968 on #f2f4f6 6.45:1, dark #b0b8c1 on #2c2c35 6.90:1. */
+     #4e5968 on #f2f4f6 6.45:1, dark #b0b8c1 on #2c2c35 6.90:1. The optional UI
+     SDK stylesheet draws a 1px border on the track and on the indicator; the
+     track and the pill here are borderless, so both reset it. */
   .dui-segmented-control {
     position: relative;
     display: inline-flex;
@@ -1643,6 +1645,7 @@
     gap: 2px;
     box-sizing: border-box;
     padding: 3px;
+    border: 0;
     border-radius: var(--dui-radius-control);
     background: var(--dui-color-neutral);
     font-family: var(--dui-font-family);
@@ -1659,6 +1662,7 @@
     left: var(--segmented-control-indicator-left);
     width: var(--segmented-control-indicator-width);
     height: var(--segmented-control-indicator-height);
+    border: 0;
     border-radius: 9px;
     background: var(--dui-color-surface);
     box-shadow: 0 1px 3px rgb(0 0 0 / 12%);
