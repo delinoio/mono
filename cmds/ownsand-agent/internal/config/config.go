@@ -1,0 +1,171 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Package config holds the agent configuration. Every setting comes from a
+// command-line flag or an OWNSAND_AGENT_* environment variable; the
+// control plane origin is also recorded in the state directory at
+// enrollment.
+package config
+
+import (
+	"crypto/ed25519"
+	"encoding/base64"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
+)
+
+// Environment variables of the agent.
+const (
+	EnvStateDir           = "OWNSAND_AGENT_STATE_DIR"
+	EnvAPIURL             = "OWNSAND_AGENT_API_URL"
+	EnvRuntime            = "OWNSAND_AGENT_RUNTIME"
+	EnvGuestBinary        = "OWNSAND_AGENT_GUEST_BINARY"
+	EnvReleaseManifestURL = "OWNSAND_AGENT_RELEASE_MANIFEST_URL"
+	EnvReleasePublicKeys  = "OWNSAND_AGENT_RELEASE_PUBLIC_KEYS"
+	EnvLogLevel           = "OWNSAND_AGENT_LOG_LEVEL"
+)
+
+// DefaultAPIURL is the production control plane origin.
+const DefaultAPIURL = "https://ownsand.api.delino.io"
+
+// RuntimeKind selects the sandbox runtime backend.
+type RuntimeKind int
+
+const (
+	RuntimeKindUnspecified RuntimeKind = iota
+	// RuntimeKindFirecracker runs each sandbox in a Firecracker microVM
+	// (Linux hosts).
+	RuntimeKindFirecracker
+	// RuntimeKindProcess runs the real guest helper as a host process for
+	// each sandbox. It is a test runtime: it gives no isolation and must
+	// never serve real workloads. End-to-end tests use it where no
+	// hypervisor is available.
+	RuntimeKindProcess
+)
+
+func (k RuntimeKind) String() string {
+	switch k {
+	case RuntimeKindFirecracker:
+		return "firecracker"
+	case RuntimeKindProcess:
+		return "process"
+	}
+	return "unspecified"
+}
+
+// ParseRuntimeKind parses a runtime name.
+func ParseRuntimeKind(s string) (RuntimeKind, error) {
+	switch s {
+	case "firecracker":
+		return RuntimeKindFirecracker, nil
+	case "process":
+		return RuntimeKindProcess, nil
+	}
+	return RuntimeKindUnspecified, fmt.Errorf("config: unknown runtime %q (want firecracker or process)", s)
+}
+
+// DefaultRuntime returns the production runtime of the host OS, or
+// unspecified when this agent version has none.
+func DefaultRuntime() RuntimeKind {
+	if runtime.GOOS == "linux" {
+		return RuntimeKindFirecracker
+	}
+	return RuntimeKindUnspecified
+}
+
+// Config is the agent configuration.
+type Config struct {
+	StateDir string
+	// APIURLOverride replaces the control plane origin recorded at
+	// enrollment, when set.
+	APIURLOverride string
+	Runtime        RuntimeKind
+	// GuestBinary is the guest helper binary of the process runtime.
+	GuestBinary        string
+	ReleaseManifestURL string
+	// ReleasePublicKeys are added to the built-in release keys.
+	ReleasePublicKeys []ed25519.PublicKey
+	LogLevel          slog.Level
+}
+
+// DefaultStateDir returns the state directory of the host OS.
+func DefaultStateDir() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "/Library/Application Support/ownsand-agent"
+	case "windows":
+		base := os.Getenv("ProgramData")
+		if base == "" {
+			base = `C:\ProgramData`
+		}
+		return filepath.Join(base, "ownsand-agent")
+	}
+	return "/var/lib/ownsand-agent"
+}
+
+// Lookup reads an environment variable.
+type Lookup func(string) (string, bool)
+
+// FromEnv builds the configuration from environment variables and
+// defaults.
+func FromEnv(lookup Lookup) (Config, error) {
+	get := func(name string) string {
+		v, _ := lookup(name)
+		return strings.TrimSpace(v)
+	}
+	cfg := Config{
+		StateDir:           get(EnvStateDir),
+		APIURLOverride:     get(EnvAPIURL),
+		GuestBinary:        get(EnvGuestBinary),
+		ReleaseManifestURL: get(EnvReleaseManifestURL),
+		Runtime:            DefaultRuntime(),
+	}
+	if cfg.StateDir == "" {
+		cfg.StateDir = DefaultStateDir()
+	}
+	if v := get(EnvRuntime); v != "" {
+		kind, err := ParseRuntimeKind(v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.Runtime = kind
+	}
+	if v := get(EnvLogLevel); v != "" {
+		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
+			return Config{}, fmt.Errorf("config: invalid %s %q", EnvLogLevel, v)
+		}
+	}
+	keys, err := ParsePublicKeys(get(EnvReleasePublicKeys))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ReleasePublicKeys = keys
+	return cfg, nil
+}
+
+// ParsePublicKeys parses a comma-separated list of base64 (standard or URL
+// alphabet, padded or not) Ed25519 public keys.
+func ParsePublicKeys(s string) ([]ed25519.PublicKey, error) {
+	var keys []ed25519.PublicKey
+	for _, part := range strings.Split(s, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		var raw []byte
+		var err error
+		for _, enc := range []*base64.Encoding{base64.StdEncoding, base64.RawStdEncoding, base64.URLEncoding, base64.RawURLEncoding} {
+			if raw, err = enc.DecodeString(part); err == nil {
+				break
+			}
+		}
+		if err != nil || len(raw) != ed25519.PublicKeySize {
+			return nil, fmt.Errorf("config: %s holds a value that is not a base64 Ed25519 public key", EnvReleasePublicKeys)
+		}
+		keys = append(keys, ed25519.PublicKey(raw))
+	}
+	return keys, nil
+}
