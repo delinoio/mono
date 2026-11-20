@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Requires Git 2.32 or newer: GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM, which
-// disable the per-user configuration, are ignored by older Git, and
-// GIT_CONFIG_COUNT needs 2.31. `isolateGitEnvironment` therefore fails loudly
-// on older Git instead of silently reading the developer's ~/.gitconfig.
+// Requires Git 2.32 or newer: GIT_CONFIG_GLOBAL, which disables the per-user
+// configuration, is ignored by older Git, and GIT_CONFIG_COUNT needs 2.31.
+// GIT_CONFIG_NOSYSTEM, which disables the system configuration, is also set.
+// `isolateGitEnvironment` therefore fails loudly on older Git instead of
+// silently reading the developer's ~/.gitconfig.
 //
 // A developer's global or system Git configuration (core.hooksPath,
 // commit.gpgsign, ...), their global ignore and attributes files, the system
@@ -80,9 +81,9 @@ export function isolateGitEnvironment(env) {
   // their text conversion. Pointing both settings at the null device through
   // command-scoped configuration replaces those defaults. Scope: every
   // fixture environment built here. Requires Git 2.32 or newer overall
-  // (GIT_CONFIG_GLOBAL and GIT_CONFIG_SYSTEM need 2.32; GIT_CONFIG_COUNT
-  // needs 2.31). Remove once Git offers a single switch that disables
-  // the XDG default ignore and attributes files.
+  // (GIT_CONFIG_GLOBAL needs 2.32; GIT_CONFIG_COUNT needs 2.31). Remove once
+  // Git offers a single switch that disables the XDG default ignore and
+  // attributes files.
   //
   // Workaround: the system attributes file ($(prefix)/etc/gitattributes) is a
   // separate attributes frame that neither GIT_CONFIG_NOSYSTEM nor
