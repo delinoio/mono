@@ -280,12 +280,12 @@ func TestCreateRejectedByAgent(t *testing.T) {
 	ctx := context.Background()
 	org := env.NewOrg("alice")
 	_, agent := setupAgent(t, env, org, nil)
-	agent.OnCommand = func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+	agent.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
 		if cmd.GetCreateSandbox() != nil {
 			return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "no disk"}}
 		}
 		return fa.DefaultAnswer(cmd)
-	}
+	})
 	c := org.OwnerClient
 	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
 	if err != nil {

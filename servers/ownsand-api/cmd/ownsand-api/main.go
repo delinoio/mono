@@ -20,6 +20,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/stun"
 )
 
 // shutdownTimeout bounds the drain after a termination signal. Long-lived
@@ -97,14 +98,26 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	udp, err := net.ListenPacket("udp", cfg.STUNAddr)
+	if err != nil {
+		_ = listener.Close()
+		return err
+	}
+	stunServer := stun.New(logger, cfg.STUNRateBytesPerSecond, cfg.STUNRateBurstBytes)
 	srv := newServer(a.Handler(), logger)
 
 	workersCtx, stopWorkers := context.WithCancel(context.Background())
 	var workers sync.WaitGroup
-	workers.Add(1)
+	workers.Add(2)
 	go func() {
 		defer workers.Done()
 		a.Run(workersCtx)
+	}()
+	go func() {
+		defer workers.Done()
+		if err := stunServer.Serve(workersCtx, udp); err != nil {
+			logger.Error("stun_server_failed", slog.Any("error", err))
+		}
 	}()
 	// stopAndWait releases the lease (which closes the agent channels) and
 	// stops the workers; it runs before the HTTP drain and again on return.
@@ -114,7 +127,7 @@ func run() error {
 	}
 	defer stopAndWait()
 
-	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)))
+	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)))
 	return serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
 }
 

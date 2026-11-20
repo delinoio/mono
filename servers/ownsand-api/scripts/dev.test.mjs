@@ -55,6 +55,7 @@ test(
       ADDR: `127.0.0.1:${port}`,
       OWNSAND_DATABASE_URL: databaseURL,
       OWNSAND_LOGTO_ISSUER: "http://127.0.0.1:9/oidc",
+      OWNSAND_STUN_ADDR: "127.0.0.1:0",
     });
     const deadline = Date.now() + 90_000;
     let healthy = false;
