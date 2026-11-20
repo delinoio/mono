@@ -55,7 +55,7 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 - The guest architecture is the host architecture.
 - Linux: the microVM implementation is an open decision (Firecracker class). Record the selected implementation, its version pin and how the agent runs it (for example, a jailer with one unprivileged user per sandbox) before the Linux runtime implementation.
 - macOS: a Virtualization.framework VM runs in the process that created it. Restarting the agent stops every running and paused VM on every host OS, because every VM is bound to the agent process (see [TTL](#ttl)); on macOS the VMs also run inside the agent process. This is one reason for the update rule in [Agent updates](#agent-updates).
-- Each sandbox gets the vCPU count, memory and disk of its create request. The agent rejects a create command that exceeds the device limits that the control plane sent, or that would start a third macOS guest, as a second check after the scheduler.
+- Each sandbox gets the vCPU count, memory and disk of its create request. The agent rejects a create command that exceeds the device limits that the control plane sent (for vCPU, the effective vCPU limit of the [control plane vCPU overcommit rule](servers-ownsand-api-foundation.md#vcpu-overcommit), and never more vCPUs for one sandbox than the vCPU limit itself), or that would start a third macOS guest, as a second check after the scheduler.
 
 ### Guest helper
 

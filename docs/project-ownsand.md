@@ -116,7 +116,7 @@ Record each decision in the owning domain contract before the implementation tha
 
 - Update this index and every affected domain contract together when component IDs, origins, ownership paths, the authentication exception, the data path or the licensing boundary change.
 - Change a `planned` path to an actual path in the same change that creates it. That change also adds the workspace membership, the package scripts and the validation commands that the owning domain contract defines.
-- Update the [protos contract](protos-ownsand-api-contract.md) before or with every RPC, message or enum change. Update the SDK, CLI and console contracts when a change affects their surface.
+- Update the [protos contract](protos-ownsand-api-contract.md) before or with every RPC, message or enum change. Check the [tide project](project-tide.md), which consumes the public API, when a public RPC changes. Update the SDK, CLI and console contracts when a change affects their surface.
 - Update [repository-auth-contract.md](repository-auth-contract.md) when the API key, enrollment token or device credential exception changes.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
 - Update the [control plane contract](servers-ownsand-api-foundation.md) and this index together when the traffic placement or the deployment target changes.
@@ -126,6 +126,7 @@ Record each decision in the owning domain contract before the implementation tha
 ## References
 
 - [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md)
+- [project-tide.md](project-tide.md): a consumer of the public API that runs GitHub Actions jobs and coding-agent sessions on OwnSand devices.
 - [DigitalOcean bandwidth billing](https://docs.digitalocean.com/platform/billing/bandwidth/)
 - [repository-defaults.md](repository-defaults.md)
 - [repository-auth-contract.md](repository-auth-contract.md)

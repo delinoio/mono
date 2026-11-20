@@ -57,6 +57,15 @@
 - [Connect RPC API contract](protos-ownsand-api-contract.md)
 - [TypeScript and Go SDK foundation](packages-ownsand-sdk-foundation.md)
 
+### tide
+
+- [Project index](project-tide.md)
+- [Control plane foundation](servers-tide-api-foundation.md)
+- [Connect RPC API contract](protos-tide-api-contract.md)
+- [Web console foundation](apps-tide-console-foundation.md)
+- [Command-line interface foundation](cmds-tide-cli-foundation.md)
+- [TypeScript and Go SDK foundation](packages-tide-sdk-foundation.md)
+
 Before implementing a new project, add `project-<id>.md`, at least one `<domain>-<project-or-component>-<contract>.md`, and their links here. Use lowercase kebab-case IDs and domain prefixes `apps`, `cmds`, `servers`, `crates`, `protos`, or `packages`.
 
 ## Instruction update policy
