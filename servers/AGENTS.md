@@ -28,5 +28,4 @@
 - [Repository licensing](../docs/repository-license-contract.md)
 - `servers/accounts-api/`: [project index](../docs/project-delino-accounts.md) and [API server foundation contract](../docs/servers-accounts-api-foundation.md)
 - `servers/ownsand-api/` (`planned`): [project index](../docs/project-ownsand.md) and [control plane foundation contract](../docs/servers-ownsand-api-foundation.md)
-- `servers/ownsand-relay/` (`planned`): [project index](../docs/project-ownsand.md) and [relay server foundation contract](../docs/servers-ownsand-relay-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.
