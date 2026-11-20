@@ -1112,6 +1112,73 @@ test(
   },
 );
 
+const providerUsage =
+  /usage: .*railway-id \| pages-id <file> \| wait-railway <service> <id> \| wait-pages <project> <id>/;
+
+for (const args of [
+  ["pages-id"],
+  ["read-railway"],
+  ["read-railway", "svc"],
+  ["read-pages"],
+  ["read-pages", "proj"],
+  ["wait-railway"],
+  ["wait-railway", "svc"],
+  ["wait-pages"],
+  ["wait-pages", "proj"],
+]) {
+  test(
+    `provider prints the usage line for \`${args.join(" ")}\``,
+    { skip },
+    (t) => {
+      const result = runProvider(t, args);
+      assert.equal(result.status, 2, result.stderr);
+      assert.match(result.stderr, providerUsage);
+      assert.doesNotMatch(result.stderr, /unbound variable/);
+      // The usage check stops the script before any provider CLI call.
+      assert.equal(result.calls, "");
+    },
+  );
+}
+
+test(
+  "provider reports a missing argument before a missing timeout command",
+  { skip },
+  (t) => {
+    // A PATH that holds only `bash` hides both `timeout` and `gtimeout`.
+    const bin = join(scratch(t), "bash-only");
+    mkdirSync(bin);
+    const bash = spawnSync("sh", ["-c", "command -v bash"], {
+      encoding: "utf8",
+    }).stdout.trim();
+    symlinkSync(bash, join(bin, "bash"));
+    const result = runProvider(t, ["wait-pages"], { env: { PATH: bin } });
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, providerUsage);
+    assert.doesNotMatch(result.stderr, /timeout/);
+  },
+);
+
+test("provider keeps its other bad-usage and error exits", { skip }, (t) => {
+  for (const args of [[], ["bogus"]]) {
+    const result = runProvider(t, args);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, providerUsage);
+  }
+  // An empty value is an argument, not a missing one.
+  const emptyFile = runProvider(t, ["pages-id", ""]);
+  assert.equal(emptyFile.status, 1);
+  assert.match(
+    emptyFile.stderr,
+    /::error::wrangler pages deploy returned no deployment id\./,
+  );
+  const emptyInput = runProvider(t, ["railway-id"], { input: "" });
+  assert.equal(emptyInput.status, 1);
+  assert.match(
+    emptyInput.stderr,
+    /::error::railway up returned no deployment id\./,
+  );
+});
+
 test("provider waits for Railway SUCCESS", { skip: skipWait }, (t) => {
   const result = runProvider(t, ["wait-railway", "api", "dep-1"], {
     responses: {

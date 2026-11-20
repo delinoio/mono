@@ -144,7 +144,27 @@ pages_classify() {
   esac
 }
 
+# Prints the usage line and exits with status 2. The `*)` branch of the command
+# dispatch and the argument-count check below share it.
+usage() {
+  echo "usage: $0 railway-id | pages-id <file> | wait-railway <service> <id> | wait-pages <project> <id>" >&2
+  exit 2
+}
+
 command="${1:-}"
+# `set -u` would stop a missing positional argument with a Bash diagnostic and
+# exit status 1, so count the arguments of each subcommand before dispatch.
+# `read-railway` and `read-pages` are the internal status reads of `poll` and
+# stay out of the usage line.
+case "$command" in
+  pages-id) required_arguments=1 ;;
+  read-railway | read-pages | wait-railway | wait-pages) required_arguments=2 ;;
+  *) required_arguments=0 ;;
+esac
+if (( $# <= required_arguments )); then
+  usage
+fi
+
 case "$command" in
   railway-id) railway_id ;;
   pages-id) pages_id "$2" ;;
@@ -170,8 +190,5 @@ case "$command" in
     project="$2" id="$3"
     poll "Pages deployment $id of $project" "${DEPLOY_POLL_TIMEOUT:-600}" read-pages pages_classify "$project" "$id"
     ;;
-  *)
-    echo "usage: $0 railway-id | pages-id <file> | wait-railway <service> <id> | wait-pages <project> <id>" >&2
-    exit 2
-    ;;
+  *) usage ;;
 esac
