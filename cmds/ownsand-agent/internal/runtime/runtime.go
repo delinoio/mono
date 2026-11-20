@@ -1,5 +1,5 @@
-// Package runtime defines the hypervisor runtime interface of the agent and
-// selects the implementation of the host OS. Every sandbox is a VM: no
+// Package runtime defines the hypervisor runtime interface of the agent. The
+// platform package selects the implementation of the host OS. Every sandbox is a VM: no
 // implementation runs sandbox code in a host process or container.
 package runtime
 
@@ -104,4 +104,10 @@ type Runtime interface {
 type Config struct {
 	StateDir string
 	Logger   *slog.Logger
+	// Passive opens the runtime without host side effects (no network
+	// setup), for commands such as enroll and reset that do not run VMs.
+	Passive bool
+	// AllowUnsignedImage accepts an unsigned Linux base image. Development
+	// and acceptance only.
+	AllowUnsignedImage bool
 }

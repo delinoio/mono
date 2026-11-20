@@ -17,6 +17,12 @@ type unsupportedRuntime struct {
 	checks map[string]string
 }
 
+// NewUnsupported returns a runtime that supports no guest and reports the
+// given hypervisor checks.
+func NewUnsupported(name string, checks map[string]string) Runtime {
+	return &unsupportedRuntime{name: name, checks: checks}
+}
+
 func (u *unsupportedRuntime) Name() string { return u.name }
 
 func (u *unsupportedRuntime) Capabilities(context.Context) Capabilities {

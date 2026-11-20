@@ -25,6 +25,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/controlplane"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/hostinfo"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/platform"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/runtime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/state"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -38,7 +39,7 @@ type Env struct {
 	Stderr  io.Writer
 	Getenv  func(string) string
 	Version string
-	// NewRuntime overrides runtime.New (tests).
+	// NewRuntime overrides platform.New (tests).
 	NewRuntime func(runtime.Config) (runtime.Runtime, error)
 	// IsTerminal reports whether stdin is a terminal.
 	IsTerminal func() bool
@@ -50,7 +51,7 @@ type Env struct {
 // Main runs a command and returns the exit code.
 func Main(env Env) int {
 	if env.NewRuntime == nil {
-		env.NewRuntime = runtime.New
+		env.NewRuntime = platform.New
 	}
 	global := flag.NewFlagSet("ownsand-agent", flag.ContinueOnError)
 	global.SetOutput(env.Stderr)
@@ -192,7 +193,7 @@ func enroll(env Env, p *Printer, dirPath string, args []string) error {
 			return fmt.Errorf("save the device key: %w", err)
 		}
 	}
-	rt, err := env.NewRuntime(runtime.Config{StateDir: dirPath, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	rt, err := env.NewRuntime(runtime.Config{StateDir: dirPath, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Passive: true})
 	if err != nil {
 		return err
 	}
@@ -279,7 +280,10 @@ func run(env Env, dirPath string, args []string) error {
 	if err != nil || !id.Enrolled() {
 		return errors.New("the device is not enrolled; run `ownsand-agent enroll` first")
 	}
-	rt, err := env.NewRuntime(runtime.Config{StateDir: dirPath, Logger: log})
+	// Development and acceptance only: accept an unsigned Linux base image
+	// while no release signing key exists. The runtime logs a warning.
+	allowUnsigned := env.Getenv("OWNSAND_AGENT_ALLOW_UNSIGNED_IMAGE") == "1"
+	rt, err := env.NewRuntime(runtime.Config{StateDir: dirPath, Logger: log, AllowUnsignedImage: allowUnsigned})
 	if err != nil {
 		return fmt.Errorf("start runtime: %w", err)
 	}
@@ -421,7 +425,7 @@ func reset(env Env, p *Printer, dirPath string, args []string) error {
 	if err != nil {
 		return err
 	}
-	rt, err := env.NewRuntime(runtime.Config{StateDir: dirPath, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	rt, err := env.NewRuntime(runtime.Config{StateDir: dirPath, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), Passive: true})
 	if err != nil {
 		return err
 	}

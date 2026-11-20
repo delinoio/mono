@@ -3,7 +3,7 @@
 // net.Pipe, so tests exercise the guest protocol without a VM.
 //
 // Only _test.go files import this package. The agent's production runtime
-// selection (runtime.New) cannot return it, so it is not selectable from
+// selection (platform.New) cannot return it, so it is not selectable from
 // production configuration.
 package runtimetest
 
