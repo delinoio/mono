@@ -1,0 +1,165 @@
+# Project: tide
+
+## Goal
+
+tide runs GitHub Actions jobs and coding-agent sessions on one shared pool of devices that a team already owns. The devices are the devices of an [OwnSand](project-ownsand.md) organization. tide gives every job and every session a fresh OwnSand sandbox, and deletes the sandbox when the work ends.
+
+Problem: a small team has only a few devices. Existing products run either CI jobs or agent sessions on the team's machines, never both. When a team splits its few devices into "CI devices" and "agent devices", one group often waits while the other group is idle. On a Mac this is worse, because one Mac runs at most two macOS guests at the same time. tide keeps one queue for both kinds of work, so every request can use every free device.
+
+tide is a separate service on top of OwnSand. OwnSand stays a general sandbox platform and knows nothing about GitHub or agent vendors. tide holds the GitHub and vendor integrations, the queue and the priority rules.
+
+Success criterion: a tide organization is linked to an OwnSand organization that has one Linux device, one macOS device and one Windows device. On this device pool:
+
+- GitHub Actions jobs with Linux, macOS and Windows guests run in tide runners.
+- Sessions of Claude Code, Cursor, OpenAI Codex and Devin run in tide runners on guest OSes that each vendor supports.
+- When the free capacity is not sufficient, requests wait in the tide queue and start in priority order when capacity becomes free.
+
+## Project ID
+
+`tide`
+
+## Domain Ownership Map
+
+All paths are `planned`. This project is in the documentation-only phase. Create each path, its workspace membership and its validation scripts in the change that starts its runtime implementation.
+
+- `servers/tide-api/` (`planned`): Go control plane on the shared DigitalOcean Droplet, served at `https://tide.api.delino.io`. It owns the queue, the dispatcher, the GitHub App integration, the agent vendor adapters and the Claude Code orchestrator processes.
+- `apps/tide/` (`planned`): Rsbuild React web console served at `https://tide.delino.io`.
+- `cmds/tide/` (`planned`): Go command-line interface.
+- `protos/delino/tide/v1/` (`planned`): Connect RPC schemas and the committed Go bindings.
+- `packages/tide-sdk/` (`planned`): TypeScript SDK.
+- `packages/tide-sdk-go/` (`planned`): Go SDK.
+
+The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and one distributed program (the CLI). tide distributes no device program: OwnSand owns every program that runs on a device. The project has no `crates` paths.
+
+## Domain Contract Documents
+
+- [servers-tide-api-foundation.md](servers-tide-api-foundation.md): control plane, queue, dispatcher, GitHub App integration and agent vendor adapters.
+- [protos-tide-api-contract.md](protos-tide-api-contract.md): Connect RPC services, messages and enums.
+- [apps-tide-console-foundation.md](apps-tide-console-foundation.md): web console.
+- [cmds-tide-cli-foundation.md](cmds-tide-cli-foundation.md): command-line interface.
+- [packages-tide-sdk-foundation.md](packages-tide-sdk-foundation.md): TypeScript and Go SDKs.
+
+## Cross-Domain Invariants
+
+### Components
+
+| Component ID   | Path                     | Kind                  | Production origin or distribution    |
+| -------------- | ------------------------ | --------------------- | ------------------------------------ |
+| `tide-api`     | `servers/tide-api/`      | Droplet server        | `https://tide.api.delino.io`         |
+| `tide-console` | `apps/tide/`             | Cloudflare Pages site | `https://tide.delino.io`             |
+| `tide-cli`     | `cmds/tide/`             | CLI binary            | Release artifact                     |
+| `tide-sdk-ts`  | `packages/tide-sdk/`     | TypeScript package    | npm package                          |
+| `tide-sdk-go`  | `packages/tide-sdk-go/`  | Go package            | Root Go module import path           |
+| `tide-protos`  | `protos/delino/tide/v1/` | Schemas and bindings  | Root Go module and generated TS code |
+
+### Layering on OwnSand
+
+- tide uses OwnSand only through the public Connect RPC API of `ownsand-api`, with the [OwnSand Go SDK](packages-ownsand-sdk-foundation.md) and one OwnSand organization API key per tide organization. tide never connects to a device agent and never imports code from `servers/ownsand-api/`.
+- OwnSand has no tide-specific behavior. The only OwnSand change that tide needs is the general [vCPU overcommit rule](servers-ownsand-api-foundation.md#vcpu-overcommit). A later tide feature that needs another OwnSand capability must add it to the OwnSand contracts as a general sandbox capability.
+- One tide organization links to exactly one OwnSand organization, and one OwnSand organization links to at most one tide organization. Two tide organizations on the same devices would split the queue again, which is the problem that tide solves.
+- OwnSand stays the owner of devices, device limits and sandbox placement. tide decides only which request asks OwnSand for a sandbox next. The OwnSand scheduler selects the device.
+- Other callers of the same OwnSand organization (people, the OwnSand CLI or other programs) can still create sandboxes. tide counts their resources as used capacity and never deletes their sandboxes.
+
+### Workloads
+
+- Workload kinds use the enum `WorkloadKind`: `GITHUB_JOB` and `AGENT_SESSION`.
+- Agent vendors use the enum `AgentVendor`: `CLAUDE_CODE`, `CURSOR`, `OPENAI_CODEX` and `DEVIN`.
+- A **runner profile** is an admin-defined description of one kind of runner: its name, workload kind, agent vendor (for `AGENT_SESSION`), guest OS, OwnSand source (base image or template), resources, network mode, TTLs, priority, maximum queue wait and warm count. The [control plane contract](servers-tide-api-foundation.md#runner-profiles) owns the fields and their validation.
+- A **request** is one unit of demand: one queued GitHub Actions job, or one agent session that a vendor asks to run.
+- A **runner** is one OwnSand sandbox that tide created for a runner profile. A runner serves at most one request and is never reused. tide deletes the sandbox when the work ends.
+- A **warm runner** is a running sandbox of a runner profile that waits for a request without a request assigned. Each runner profile has a warm count, which is `0` by default.
+
+### Scheduling
+
+- tide keeps one queue per tide organization for both workload kinds.
+- Priorities use the enum `Priority`: `HIGH`, `NORMAL` and `LOW`. A new `GITHUB_JOB` runner profile has `HIGH` and a new `AGENT_SESSION` runner profile has `NORMAL`. An admin can change the priority of each runner profile.
+- tide does not preempt work in this version. It never stops, pauses or deletes a runner that serves a request in order to free capacity. tide frees capacity only by deleting warm runners.
+- tide uses the vCPU overcommit of OwnSand devices and does not overcommit on its own.
+- Each runner profile has a maximum queue wait. A request that waits longer ends with `EXPIRED`. External limits can end a request earlier: GitHub cancels a queued job after 24 hours, and OpenAI waits at most 5 minutes for an executor.
+
+### Protocol and API
+
+- The public API is tide's own Connect RPC API in the protobuf package `delino.tide.v1`. The [protos contract](protos-tide-api-contract.md) owns every service, message and enum.
+- Public RPCs are unary or server-streaming, like the [OwnSand transport rule](project-ownsand.md#protocol-and-api), so that browser clients can call them.
+- Inbound webhooks from GitHub and from OpenAI are plain HTTP `POST` endpoints, because those third parties do not call Connect RPC. They are the only plain HTTP endpoints besides operational endpoints. Each webhook endpoint verifies the sender's signature before it reads the payload. The [control plane contract](servers-tide-api-foundation.md#webhooks) owns them.
+
+### Identity and access
+
+- People authenticate with Logto access tokens according to the [authentication contract](repository-auth-contract.md). The Logto user ID (`sub`) is the user ID in every tide table.
+- tide stores its own organizations, memberships and invitations, with the same roles and rules as OwnSand: `owner`, `admin` and `member`. tide memberships are separate from OwnSand memberships. The [control plane contract](servers-tide-api-foundation.md#authorization) owns the authorization matrix.
+- tide has no program API keys in this version. The CLI and the SDKs use Logto access tokens.
+- **Authentication contract exception.** `tide-api` accepts GitHub webhook deliveries signed with the webhook secret of the tide GitHub App, and OpenAI webhook deliveries signed with the webhook secret of an OpenAI Codex integration. A webhook signature authenticates only the delivery of an event from that sender. It gives no access to any RPC. The [authentication contract](repository-auth-contract.md#documented-exceptions) lists this exception.
+- tide holds credentials that it uses toward other services: one OwnSand API key per tide organization, the GitHub App private key and the agent vendor credentials of each agent integration. tide encrypts organization credentials at rest and never returns them through the API. The [control plane contract](servers-tide-api-foundation.md#secrets) owns their handling.
+- Code in a runner can read every credential that tide gives to that runner. tide gives a runner only the credential that its runner process needs, and never the OwnSand API key or the GitHub App private key.
+
+### Identifiers and states
+
+- New persisted entities use UUID v7 identifiers: organizations, memberships, invitations, OwnSand links, GitHub installations, agent integrations, runner profiles, requests, runners and audit events.
+- Request and runner states use the enums of the [protos contract](protos-tide-api-contract.md#enums). Components must not compare free-form state strings.
+
+### Licensing and code sharing
+
+- `servers/tide-api/` uses `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). Every other tide path uses Apache-2.0.
+- The CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/tide/v1/` or `packages/tide-sdk-go/`.
+
+### Repository rules that apply without change
+
+- Account management links to `https://accounts.delino.io`. tide builds no profile or account settings pages.
+- tide does not charge users in this version. Billing and usage reporting to `delino-accounts` are out of scope. A later change that adds charges must use `delino-accounts` according to the [billing contract](repository-billing-contract.md).
+- Logs use `log/slog` in Go. No log record or audit event contains secrets, tokens, credentials, JIT runner configurations, vendor work orders, commands that carry them, or runner output.
+- tide needs no feature flag in this version. It is a new project without existing users or behavior to protect, and the OwnSand vCPU overcommit starts at `100` (no overcommit) on every device.
+
+### Deviations from repository defaults
+
+- Inbound webhooks from GitHub and OpenAI use plain HTTP endpoints, as described in [Protocol and API](#protocol-and-api).
+- The webhook signature exception, as described in [Identity and access](#identity-and-access).
+
+### Platform and vendor constraints
+
+- GitHub: only github.com and GitHub Enterprise Cloud organizations. tide registers organization-level runners only, so repositories of personal accounts and GitHub Enterprise Server are out of scope.
+- Claude Code self-hosted runners run on Linux and macOS, not on Windows. Self-hosted environments are a beta feature of the Claude Team and Enterprise plans.
+- Cursor Self-Hosted Pools need a Cursor Enterprise plan and a service account API key.
+- Devin Outposts need a Devin plan that includes Outposts.
+- OpenAI Codex self-hosted sandboxes need an OpenAI environment key and an OpenAI webhook for the project.
+- macOS guests need an Apple silicon device, and one Mac runs at most two macOS guests at the same time. The OwnSand scheduler enforces this limit for tide too.
+- Delino distributes no macOS or Windows image. Runner profiles use OwnSand base images or OwnSand templates that the organization builds.
+
+### Open decisions
+
+Record each decision in the owning domain contract before the implementation that depends on it. The cross-domain ones are:
+
+- The collection, retention and alerting of the Prometheus metrics. The repository has no metrics collection infrastructure today ([control plane contract](servers-tide-api-foundation.md#metrics)).
+- The pinned versions and the update policy of the GitHub Actions runner and of each vendor runner program that tide installs ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
+- The retention period of ended requests, ended runners and audit events ([control plane contract](servers-tide-api-foundation.md#storage)).
+- The npm package name and publication workflow of the TypeScript SDK, together with the same open decision of OwnSand.
+- Every new third-party dependency. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
+
+## Change Policy
+
+- Update this index and every affected domain contract together when component IDs, origins, ownership paths, the authentication exception, the layering on OwnSand or the licensing boundary change.
+- Change a `planned` path to an actual path in the same change that creates it. That change also adds the workspace membership, the package scripts and the validation commands that the owning domain contract defines.
+- Update the [protos contract](protos-tide-api-contract.md) before or with every RPC, message or enum change. Update the SDK, CLI and console contracts when a change affects their surface.
+- Update the OwnSand contracts first when tide needs a new OwnSand capability, and keep that capability general.
+- Update [repository-auth-contract.md](repository-auth-contract.md) when the webhook signature exception changes.
+- Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
+- Update `apps/AGENTS.md`, `cmds/AGENTS.md`, `servers/AGENTS.md`, `packages/AGENTS.md` and `protos/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts. Distinguish fixture, build and packaging checks from acceptance with real GitHub organizations, real vendor accounts and real Linux, macOS and Windows devices.
+
+## References
+
+- [project-ownsand.md](project-ownsand.md)
+- [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md)
+- [repository-defaults.md](repository-defaults.md)
+- [repository-auth-contract.md](repository-auth-contract.md)
+- [repository-billing-contract.md](repository-billing-contract.md)
+- [repository-dependency-security-contract.md](repository-dependency-security-contract.md)
+- [repository-environment-contract.md](repository-environment-contract.md)
+- [repository-license-contract.md](repository-license-contract.md)
+- [repository-workflow-contract.md](repository-workflow-contract.md)
+- [project-template.md](project-template.md)
+- [GitHub REST API: self-hosted runners](https://docs.github.com/en/rest/actions/self-hosted-runners)
+- [GitHub webhook events: `workflow_job`](https://docs.github.com/en/webhooks/webhook-events-and-payloads#workflow_job)
+- [Claude Code self-hosted environments](https://code.claude.com/docs/en/self-hosted-environments)
+- [Cursor self-hosted machines](https://cursor.com/docs/cloud-agent/self-hosted)
+- [OpenAI self-hosted sandboxes](https://developers.openai.com/api/docs/guides/agents-api/environments/self-hosted)
+- [Devin Outposts](https://docs.devin.ai/cloud/outposts/overview)

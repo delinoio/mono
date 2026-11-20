@@ -28,4 +28,5 @@
 - `apps/delino-accounts/`: [project index](../docs/project-delino-accounts.md) and [web app foundation contract](../docs/apps-delino-accounts-foundation.md)
 - `apps/delidev/`: [project index](../docs/project-delidev.md) and [foundation contract](../docs/apps-delidev-foundation.md)
 - `apps/ownsand/` (`planned`): [project index](../docs/project-ownsand.md) and [web console foundation contract](../docs/apps-ownsand-console-foundation.md)
+- `apps/tide/` (`planned`): [project index](../docs/project-tide.md) and [web console foundation contract](../docs/apps-tide-console-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.
