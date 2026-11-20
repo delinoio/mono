@@ -110,6 +110,29 @@ Record each decision in the owning domain contract before the implementation tha
 - The registry name and publication workflow of the TypeScript SDK (the workspace package `@delino/ownsand-sdk` is private). The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
 - Every new third-party dependency. The [protos contract](protos-ownsand-api-contract.md#runtime-and-language) records the code generation tool and the approved Connect and protobuf runtimes. The owner also approved a Postgres driver (pgx), pion (WebRTC and STUN) and the TypeScript Connect and protobuf runtimes; each is recorded in the change that adds it, with a [dependency security](repository-dependency-security-contract.md) review. Hypervisor bindings for Virtualization.framework and Hyper-V still need owner approval.
 
+## End-to-end acceptance
+
+The opt-in Go test `packages/ownsand-sdk-go/e2e/` runs the components together on one Linux host. It builds `ownsand-api`, `ownsand-agent` and the `ownsand` CLI, starts the control plane against a new Postgres database and a local JWKS issuer that stands in for Logto, enrolls and runs a real agent with Firecracker microVMs, and drives the Go SDK and the CLI. It imports only public packages; the control plane is used only as a built binary. Without `OWNSAND_E2E=1` it skips, so CI stays green.
+
+Steps, each forced once onto the relay and once onto the peer-to-peer data channel (loopback host candidates and the control plane STUN server): create an organization, create an enrollment token, enroll and connect the agent, set the device limits, and then through the Go SDK create a sandbox, exec (stdout, stderr and the exit code), write a multi-chunk file and an empty file, read them, pause, resume, snapshot, create a sandbox from the snapshot and read its disk, and delete. The SDK steps also cover a command that cannot start, an exec timeout, `AttachExec` of an ended exec, the `not_found` and `failed_precondition` error frames, and an API key revocation during an exec. The CLI runs the same lifecycle with an API key. Then an idle TTL expiry (`IDLE_TTL_EXPIRED`), an agent killed and restarted (`FAILED` with `LOST_ON_DEVICE`) and device removal (`DEVICE_REMOVED`, the agent confirms the removal, deletes its identity and exits).
+
+Requirements: Linux with read and write access to `/dev/kvm`, Go, `mkfs.ext4` (e2fsprogs, used without root through `mkfs.ext4 -d`) and a Postgres server where the test may create and drop a database. Sandboxes use `NETWORK_MODE_NONE`, so the agent needs no `CAP_NET_ADMIN`; its network policy errors in the log are expected. The artifact directory holds:
+
+- `firecracker`: `firecracker-v1.17.0-<arch>` from the official release, checked against its `.sha256.txt`, according to the [agent contract](cmds-ownsand-agent-foundation.md#isolation).
+- `vmlinux`: an uncompressed guest kernel with virtio-mmio block, virtio vsock and kernel IP autoconfiguration, according to the [agent contract](cmds-ownsand-agent-foundation.md#images).
+- `busybox`: a static busybox binary. The test builds `rootfs.ext4` from it, a minimal init and a static `ownsand-guest` built from the same revision, so the guest helper always matches the agent under test.
+
+Command (from the repository root; `OWNSAND_TEST_DATABASE_URL` also works for the database):
+
+```sh
+OWNSAND_E2E=1 \
+OWNSAND_E2E_DATABASE_URL='postgres://<user>:<password>@127.0.0.1:5432/postgres?sslmode=disable' \
+OWNSAND_E2E_FC_DIR=<artifact directory> \
+go test -count=1 -v -timeout 30m ./packages/ownsand-sdk-go/e2e/
+```
+
+`OWNSAND_E2E_LOG_DIR=<dir>` keeps the control plane, agent and enrollment logs; the test prints their tails when it fails. `OWNSAND_E2E_LONG=1` adds a silent 15-minute relay exec that must survive the control plane's 14-minute stream rotation (raise `-timeout` to 45m). The test does not cover `OUTBOUND` networking, snapshot export, macOS and Windows hosts, NAT traversal across networks or the Logto tenant itself; those remain device acceptance items. Record the results in pull requests and Linear issues according to the change policy below.
+
 ## Change Policy
 
 - Update this index and every affected domain contract together when component IDs, origins, ownership paths, the authentication exception, the data path or the licensing boundary change.
