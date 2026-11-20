@@ -143,6 +143,9 @@ jobs:
           fi
           go vet ./...
           go test ./...
+      - name: Check protobuf bindings
+        shell: bash
+        run: scripts/protos/generate.sh --check
       - name: Record validation result
         if: always()
         env:
@@ -151,7 +154,7 @@ jobs:
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...; scripts/protos/generate.sh --check (buf lint and the generated-binding drift check)' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Runtime, deployment and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
   rust:

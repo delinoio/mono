@@ -428,12 +428,15 @@ test("workspace roots cross-check detects extra roots in any spelling", async (t
   }
 });
 
-test("Go sources and module files select Go checks", async (t) => {
+test("Go sources, module files and protobuf schemas select Go checks", async (t) => {
   for (const path of [
     "servers/example/main.go",
     "servers/example/go.mod",
     "cmds/example/go.sum",
     "go.mod",
+    "protos/delino/example/v1/example.proto",
+    "protos/buf.yaml",
+    "protos/buf.gen.yaml",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -444,6 +447,8 @@ test("Go sources and module files select Go checks", async (t) => {
   const f = fixture(t);
   f.write("servers/example/README.md");
   f.write("servers/example/go.mod.example");
+  f.write("protos/AGENTS.md");
+  f.write("docs/example.proto.md");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
