@@ -1,0 +1,28 @@
+# systemd unit of the OwnSand device agent.
+#
+# KillMode=control-group makes systemd kill every process in the service
+# cgroup, including the Firecracker processes of all sandboxes, when the agent
+# stops or exits, so no VM outlives the agent and max_ttl holds. Each VM
+# process also has a parent-death signal from the agent's launcher thread.
+# Restart=always starts the new binary after an agent update exits.
+[Unit]
+Description=OwnSand device agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ownsand-agent run
+Restart=always
+RestartSec=5
+KillMode=control-group
+# The agent needs /dev/kvm, CAP_NET_ADMIN for its tap devices and nftables
+# table, and write access to /proc/sys/net/ipv4/ip_forward.
+User=root
+StateDirectory=ownsand-agent
+StateDirectoryMode=0700
+UMask=0077
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

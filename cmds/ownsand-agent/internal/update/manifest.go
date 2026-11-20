@@ -74,8 +74,9 @@ type Artifact struct {
 // built-in key.
 var ErrBadSignature = errors.New("release manifest signature is not valid for any built-in key")
 
-// VerifyManifest checks the signatures and decodes the manifest.
-func VerifyManifest(data []byte, keys []ReleaseKey) (*Manifest, error) {
+// VerifyPayload checks the signatures of a signed envelope and returns the
+// signed payload bytes. The Linux base image manifest uses the same envelope.
+func VerifyPayload(data []byte, keys []ReleaseKey) ([]byte, error) {
 	var sm SignedManifest
 	if err := json.Unmarshal(data, &sm); err != nil {
 		return nil, fmt.Errorf("decode signed manifest: %w", err)
@@ -85,7 +86,6 @@ func VerifyManifest(data []byte, keys []ReleaseKey) (*Manifest, error) {
 		return nil, fmt.Errorf("decode manifest payload: %w", err)
 	}
 	msg := append([]byte(ManifestSignatureContext), payload...)
-	verified := false
 	for _, s := range sm.Signatures {
 		sig, err := base64.StdEncoding.DecodeString(s.Signature)
 		if err != nil {
@@ -93,12 +93,18 @@ func VerifyManifest(data []byte, keys []ReleaseKey) (*Manifest, error) {
 		}
 		for _, k := range keys {
 			if k.ID == s.KeyID && len(k.PublicKey) == ed25519.PublicKeySize && ed25519.Verify(k.PublicKey, msg, sig) {
-				verified = true
+				return payload, nil
 			}
 		}
 	}
-	if !verified {
-		return nil, ErrBadSignature
+	return nil, ErrBadSignature
+}
+
+// VerifyManifest checks the signatures and decodes the manifest.
+func VerifyManifest(data []byte, keys []ReleaseKey) (*Manifest, error) {
+	payload, err := VerifyPayload(data, keys)
+	if err != nil {
+		return nil, err
 	}
 	var m Manifest
 	if err := json.Unmarshal(payload, &m); err != nil {
@@ -107,17 +113,22 @@ func VerifyManifest(data []byte, keys []ReleaseKey) (*Manifest, error) {
 	return &m, nil
 }
 
+// SignPayload signs arbitrary payload bytes in the signed envelope.
+func SignPayload(payload []byte, keyID string, key ed25519.PrivateKey) ([]byte, error) {
+	sig := ed25519.Sign(key, append([]byte(ManifestSignatureContext), payload...))
+	return json.Marshal(SignedManifest{
+		Payload:    base64.StdEncoding.EncodeToString(payload),
+		Signatures: []Signature{{KeyID: keyID, Signature: base64.StdEncoding.EncodeToString(sig)}},
+	})
+}
+
 // SignManifest signs a manifest. Tests and the future release tool use it.
 func SignManifest(m *Manifest, keyID string, key ed25519.PrivateKey) ([]byte, error) {
 	payload, err := json.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
-	sig := ed25519.Sign(key, append([]byte(ManifestSignatureContext), payload...))
-	return json.Marshal(SignedManifest{
-		Payload:    base64.StdEncoding.EncodeToString(payload),
-		Signatures: []Signature{{KeyID: keyID, Signature: base64.StdEncoding.EncodeToString(sig)}},
-	})
+	return SignPayload(payload, keyID, key)
 }
 
 // IsRevoked reports whether version is revoked.

@@ -2,12 +2,17 @@
 
 package platform
 
-import "github.com/delinoio/mono/cmds/ownsand-agent/internal/runtime"
+import (
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/runtime"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/runtime/firecracker"
+)
 
-// New returns the Linux runtime. The Firecracker runtime is not wired yet,
-// so every guest is reported as unsupported.
-func New(runtime.Config) (runtime.Runtime, error) {
-	return runtime.NewUnsupported("firecracker", map[string]string{
-		"firecracker": "not implemented in this agent version",
-	}), nil
+// New returns the Firecracker runtime.
+func New(cfg runtime.Config) (runtime.Runtime, error) {
+	return firecracker.New(firecracker.Config{
+		StateDir:           cfg.StateDir,
+		Logger:             cfg.Logger,
+		AllowUnsignedImage: cfg.AllowUnsignedImage,
+		SkipNetwork:        cfg.Passive,
+	})
 }
