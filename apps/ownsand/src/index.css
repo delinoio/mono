@@ -1,0 +1,329 @@
+/* Layout of the OwnSand console. Colors and controls come from the delino-ui
+   tokens (`--dui-*`), which also switch for the dark color scheme. */
+:root {
+  color-scheme: light dark;
+  font-family: var(--dui-font-family, system-ui, sans-serif);
+  color: var(--dui-color-text);
+  background: var(--dui-color-neutral);
+}
+
+body {
+  margin: 0;
+}
+
+.app {
+  min-height: 100vh;
+}
+
+.app-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 12px 20px;
+  background: var(--dui-color-surface);
+  border-bottom: 1px solid var(--dui-color-border);
+}
+
+.brand {
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--dui-color-text);
+  text-decoration: none;
+}
+
+.account-nav {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+}
+
+.organization-bar {
+  padding: 12px 20px 0;
+  background: var(--dui-color-surface);
+  border-bottom: 1px solid var(--dui-color-border);
+}
+
+.organization-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  max-width: 1080px;
+  margin: 0 auto;
+}
+
+.organization-name {
+  font-weight: 700;
+}
+
+.role-chip,
+.label-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--dui-color-border);
+  font-size: 13px;
+  color: var(--dui-color-text-muted);
+}
+
+/* WebKit drops list semantics from a list with `list-style: none`; the nav
+   landmark names this list, so the missing list role is acceptable here. */
+.tabs {
+  display: flex;
+  gap: 4px;
+  max-width: 1080px;
+  margin: 8px auto 0;
+  padding: 0;
+  list-style: none;
+  overflow-x: auto;
+}
+
+.tab {
+  display: block;
+  padding: 10px 12px;
+  color: var(--dui-color-text-muted);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+  white-space: nowrap;
+}
+
+.tab[aria-current="page"] {
+  color: var(--dui-color-text);
+  font-weight: 600;
+  border-bottom-color: var(--dui-color-accent);
+}
+
+.page {
+  box-sizing: border-box;
+  max-width: 1080px;
+  margin: 0 auto;
+  padding: 32px 20px 64px;
+  display: grid;
+  gap: 20px;
+  align-content: start;
+}
+
+.page.narrow {
+  max-width: 560px;
+}
+
+.page-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.page-header h1 {
+  margin: 0 0 6px;
+  font-size: 24px;
+}
+
+.page-header p {
+  margin: 0;
+}
+
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+h2 {
+  margin: 8px 0 12px;
+  font-size: 18px;
+}
+
+section {
+  display: grid;
+  gap: 12px;
+}
+
+.muted {
+  color: var(--dui-color-text-muted);
+}
+
+.empty {
+  margin: 0;
+  padding: 24px;
+  border: 1px dashed var(--dui-color-border);
+  border-radius: var(--dui-radius-panel);
+  color: var(--dui-color-text-muted);
+  text-align: center;
+}
+
+.form-error {
+  margin: 0;
+  color: var(--dui-color-danger-text);
+}
+
+.text-link {
+  color: var(--dui-color-accent);
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+}
+
+.card-list {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.card-link {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 16px 20px;
+  border-radius: var(--dui-radius-panel);
+  background: var(--dui-color-surface);
+  border: 1px solid var(--dui-color-border);
+  color: var(--dui-color-text);
+  text-decoration: none;
+}
+
+.card-link:hover {
+  border-color: var(--dui-color-accent);
+}
+
+.card-link-title {
+  font-weight: 600;
+}
+
+.inline-form,
+.limits-form,
+.policy-form {
+  display: grid;
+  gap: 12px;
+}
+
+.table-scroll {
+  overflow-x: auto;
+  background: var(--dui-color-surface);
+  border: 1px solid var(--dui-color-border);
+  border-radius: var(--dui-radius-panel);
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 14px;
+}
+
+th,
+td {
+  padding: 10px 12px;
+  text-align: start;
+  vertical-align: top;
+  border-bottom: 1px solid var(--dui-color-border);
+}
+
+th {
+  color: var(--dui-color-text-muted);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.row-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.labels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.load-more {
+  display: flex;
+  justify-content: center;
+}
+
+.details {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  background: var(--dui-color-surface);
+  border: 1px solid var(--dui-color-border);
+  border-radius: var(--dui-radius-panel);
+}
+
+.details-row {
+  display: grid;
+  grid-template-columns: minmax(120px, 200px) 1fr;
+  gap: 12px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--dui-color-border);
+}
+
+.details-row:last-child {
+  border-bottom: none;
+}
+
+.details dt {
+  color: var(--dui-color-text-muted);
+}
+
+.details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.danger-zone {
+  border-color: var(--dui-color-danger);
+}
+
+.secret-warning {
+  margin: 0 0 12px;
+  font-weight: 600;
+}
+
+.secret-label {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 14px;
+  color: var(--dui-color-text-muted);
+}
+
+.secret-value {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  border: 1px solid var(--dui-color-border);
+  border-radius: var(--dui-radius-control);
+  background: var(--dui-color-neutral);
+  color: var(--dui-color-text);
+  resize: none;
+  overflow-wrap: anywhere;
+}
+
+.secret-status {
+  min-height: 1.4em;
+  margin: 8px 0 0;
+  color: var(--dui-color-text-muted);
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}

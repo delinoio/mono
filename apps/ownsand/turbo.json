@@ -1,0 +1,22 @@
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "dev": {
+      "passThroughEnv": [
+        "PUBLIC_API_ORIGIN",
+        "PUBLIC_LOGTO_ENDPOINT",
+        "PUBLIC_LOGTO_APP_ID"
+      ]
+    },
+    "build": {
+      "env": [
+        "PUBLIC_API_ORIGIN",
+        "PUBLIC_LOGTO_ENDPOINT",
+        "PUBLIC_LOGTO_APP_ID",
+        "PUBLIC_OWNSAND_E2E_FAKE_AUTH"
+      ],
+      "inputs": ["$TURBO_DEFAULT$", ".env", ".env.*"]
+    }
+  }
+}
