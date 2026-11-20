@@ -1,0 +1,338 @@
+// SPDX-License-Identifier: Apache-2.0
+import { create } from "@bufbuild/protobuf";
+import {
+  type Client,
+  ConnectError,
+  createClient,
+  type Transport,
+} from "@connectrpc/connect";
+import { type Clock, systemClock } from "./clock.ts";
+import {
+  ActivityRegistry,
+  createApiTransport,
+  type Credential,
+  type Env,
+  EnvVar,
+  processEnv,
+  resolveApiOrigin,
+  resolveCredential,
+} from "./connection.ts";
+import {
+  classifyFailure,
+  FailureClass,
+  OwnSandConfigError,
+  OwnSandError,
+} from "./errors.ts";
+import { ApiKeyService } from "./gen/delino/ownsand/v1/api_key_pb.ts";
+import type {
+  Arch,
+  BaseImage,
+  DataPathTransport,
+  HostOs,
+  NetworkMode,
+} from "./gen/delino/ownsand/v1/common_pb.ts";
+import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
+import { DeviceService } from "./gen/delino/ownsand/v1/device_pb.ts";
+import { MemberService } from "./gen/delino/ownsand/v1/member_pb.ts";
+import { OrganizationService } from "./gen/delino/ownsand/v1/organization_pb.ts";
+import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
+import {
+  CreateSandboxRequestSchema,
+  SandboxService,
+} from "./gen/delino/ownsand/v1/sandbox_pb.ts";
+import {
+  type Snapshot,
+  SnapshotService,
+  type Template,
+} from "./gen/delino/ownsand/v1/snapshot_pb.ts";
+import type { Logger } from "./logger.ts";
+import {
+  type PeerConnectionConstructor,
+  runtimePeerConnection,
+} from "./p2p/webrtc.ts";
+import { type OperationContext } from "./relay/context.ts";
+import { backoffMs } from "./relay/recovery.ts";
+import { Sandbox } from "./sandbox.ts";
+import { UuidV7Generator } from "./uuidv7.ts";
+import {
+  durationFromMs,
+  validateLabels,
+  validateResources,
+  validateTtl,
+} from "./validate.ts";
+
+export interface OwnSandClientOptions {
+  /** API origin. Default: https://ownsand.api.delino.io. */
+  origin?: string;
+  /** An organization API key. */
+  apiKey?: string;
+  /** A function that returns a current Logto access token. */
+  accessToken?: () => string | Promise<string>;
+  /** Default organization; `OWNSAND_ORG` when absent. */
+  organizationId?: string;
+  /** Forces a data path transport, for example for tests. */
+  transport?: DataPathTransport;
+  /**
+   * WebRTC implementation for the peer-to-peer data path. Default: the
+   * runtime's `RTCPeerConnection`, if any. `false` disables peer-to-peer.
+   */
+  webrtc?: { RTCPeerConnection: PeerConnectionConstructor } | false;
+  /** Optional logger. The SDK logs nothing without one. */
+  logger?: Logger;
+  /** Fetch implementation. Default: the global fetch. */
+  fetch?: typeof globalThis.fetch;
+  /** Time source. Default: the system clock. */
+  clock?: Clock;
+  /** Environment. Default: the process environment. */
+  env?: Env;
+}
+
+/** Exactly one sandbox source. */
+export type SandboxSourceInput =
+  { baseImage: BaseImage } | { snapshotId: string } | { templateId: string };
+
+export interface CreateSandboxInput {
+  source: SandboxSourceInput;
+  resources: { vcpuCount: number; memoryMib: number; diskGib: number };
+  /** Idle TTL in milliseconds. Required; there is no default. */
+  idleTtl: number;
+  /** Maximum TTL in milliseconds, at most 7 days. Required. */
+  maxTtl: number;
+  placement?: { deviceId?: string; hostOs?: HostOs; arch?: Arch };
+  network?: NetworkMode;
+  labels?: Record<string, string>;
+  organizationId?: string;
+  signal?: AbortSignal;
+}
+
+/** Retries of one logical create after a lost response. */
+const CREATE_ATTEMPTS = 4;
+
+/**
+ * The OwnSand client: the public services with idiomatic names and sandbox
+ * handles with the data path.
+ */
+export class OwnSandClient {
+  readonly origin: string;
+  readonly organizationId: string | undefined;
+  readonly organizations: Client<typeof OrganizationService>;
+  readonly members: Client<typeof MemberService>;
+  readonly devices: Client<typeof DeviceService>;
+  readonly apiKeys: Client<typeof ApiKeyService>;
+  readonly sandboxes: Client<typeof SandboxService>;
+  readonly snapshots: Client<typeof SnapshotService>;
+  readonly dataPath: Client<typeof DataPathService>;
+  readonly relay: Client<typeof RelayService>;
+  readonly #clock: Clock;
+  readonly #ids: UuidV7Generator;
+  readonly #activity = new ActivityRegistry();
+  readonly #logger: Logger | undefined;
+  readonly #Peer: PeerConnectionConstructor | undefined;
+  readonly #forced: DataPathTransport | undefined;
+
+  constructor(options: OwnSandClientOptions = {}) {
+    const env = options.env ?? processEnv();
+    if (options.apiKey !== undefined && options.accessToken !== undefined) {
+      throw new OwnSandConfigError("pass either apiKey or accessToken");
+    }
+    const explicit: Credential | undefined =
+      options.apiKey !== undefined
+        ? { apiKey: options.apiKey }
+        : options.accessToken !== undefined
+          ? { accessToken: options.accessToken }
+          : undefined;
+    const credential = resolveCredential(explicit, env);
+    this.origin = resolveApiOrigin(options.origin);
+    const org = options.organizationId ?? env[EnvVar.Organization];
+    this.organizationId = org === "" ? undefined : org;
+    this.#clock = options.clock ?? systemClock;
+    this.#ids = new UuidV7Generator(() => this.#clock.wallNow());
+    this.#logger = options.logger;
+    this.#forced = options.transport;
+    this.#Peer =
+      options.webrtc === false
+        ? undefined
+        : (options.webrtc?.RTCPeerConnection ?? runtimePeerConnection());
+    const transport: Transport = createApiTransport({
+      origin: this.origin,
+      credential,
+      organizationId: this.organizationId,
+      fetch: options.fetch ?? globalThis.fetch.bind(globalThis),
+      logger: options.logger,
+      activity: this.#activity,
+      now: () => this.#clock.now(),
+    });
+    this.organizations = createClient(OrganizationService, transport);
+    this.members = createClient(MemberService, transport);
+    this.devices = createClient(DeviceService, transport);
+    this.apiKeys = createClient(ApiKeyService, transport);
+    this.sandboxes = createClient(SandboxService, transport);
+    this.snapshots = createClient(SnapshotService, transport);
+    this.dataPath = createClient(DataPathService, transport);
+    this.relay = createClient(RelayService, transport);
+  }
+
+  #org(override: string | undefined): string {
+    const org = override ?? this.organizationId;
+    if (org === undefined || org === "") {
+      throw new OwnSandConfigError(
+        `no organization: set organizationId or ${EnvVar.Organization}`,
+      );
+    }
+    return org;
+  }
+
+  /** Returns a handle of an existing sandbox. */
+  sandbox(
+    sandboxId: string,
+    options: { organizationId?: string } = {},
+  ): Sandbox {
+    return this.#handle(
+      sandboxId,
+      this.#org(options.organizationId),
+      undefined,
+    );
+  }
+
+  #handle(
+    sandboxId: string,
+    organizationId: string,
+    info: Sandbox["info"],
+  ): Sandbox {
+    const ctx: OperationContext = {
+      clock: this.#clock,
+      ids: this.#ids,
+      dataPath: this.dataPath,
+      relay: this.relay,
+      sandboxes: this.sandboxes,
+      activity: this.#activity,
+      logger: this.#logger,
+      organizationId,
+      sandboxId,
+    };
+    return new Sandbox(ctx, this.snapshots, this.#Peer, this.#forced, info);
+  }
+
+  /**
+   * Creates a sandbox. It validates the TTLs and resources before the
+   * request, generates one idempotency key for this create and reuses it for
+   * every retry after a lost response. The sandbox starts in `CREATING`;
+   * use `waitUntilStable` on the handle.
+   */
+  async createSandbox(input: CreateSandboxInput): Promise<Sandbox> {
+    validateTtl(input.idleTtl, input.maxTtl);
+    validateResources(input.resources);
+    validateLabels(input.labels);
+    const organizationId = this.#org(input.organizationId);
+    const source = input.source;
+    const request = create(CreateSandboxRequestSchema, {
+      organizationId,
+      idempotencyKey: this.#ids.next(),
+      source: {
+        source:
+          "baseImage" in source
+            ? { case: "baseImage", value: source.baseImage }
+            : "snapshotId" in source
+              ? { case: "snapshotId", value: source.snapshotId }
+              : { case: "templateId", value: source.templateId },
+      },
+      resources: {
+        vcpuCount: input.resources.vcpuCount,
+        memoryMib: BigInt(input.resources.memoryMib),
+        diskGib: BigInt(input.resources.diskGib),
+      },
+      idleTtl: durationFromMs(input.idleTtl),
+      maxTtl: durationFromMs(input.maxTtl),
+      placement: input.placement,
+      network:
+        input.network === undefined ? undefined : { mode: input.network },
+      labels: { ...input.labels },
+    });
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await this.sandboxes.createSandbox(request, {
+          signal: input.signal,
+        });
+        if (res.sandbox === undefined) {
+          throw new OwnSandError("CreateSandbox returned no sandbox");
+        }
+        return this.#handle(res.sandbox.sandboxId, organizationId, res.sandbox);
+      } catch (error) {
+        if (
+          input.signal?.aborted ||
+          attempt + 1 >= CREATE_ATTEMPTS ||
+          !(
+            error instanceof ConnectError || !(error instanceof OwnSandError)
+          ) ||
+          classifyFailure(error) === FailureClass.Terminal
+        ) {
+          throw error;
+        }
+        await this.#clock.sleep(backoffMs(attempt), input.signal);
+      }
+    }
+  }
+
+  async getSnapshot(
+    snapshotId: string,
+    organizationId?: string,
+  ): Promise<Snapshot> {
+    const res = await this.snapshots.getSnapshot({
+      organizationId: this.#org(organizationId),
+      snapshotId,
+    });
+    return required(res.snapshot, "snapshot");
+  }
+
+  async deleteSnapshot(
+    snapshotId: string,
+    organizationId?: string,
+  ): Promise<void> {
+    await this.snapshots.deleteSnapshot({
+      organizationId: this.#org(organizationId),
+      snapshotId,
+    });
+  }
+
+  /** Starts an export to R2. It returns at once with `EXPORTING`. */
+  async exportSnapshot(
+    snapshotId: string,
+    organizationId?: string,
+  ): Promise<Snapshot> {
+    const res = await this.snapshots.exportSnapshot({
+      organizationId: this.#org(organizationId),
+      snapshotId,
+    });
+    return required(res.snapshot, "snapshot");
+  }
+
+  async createTemplate(
+    snapshotId: string,
+    name: string,
+    organizationId?: string,
+  ): Promise<Template> {
+    const res = await this.snapshots.createTemplate({
+      organizationId: this.#org(organizationId),
+      snapshotId,
+      name,
+    });
+    return required(res.template, "template");
+  }
+
+  async deleteTemplate(
+    templateId: string,
+    organizationId?: string,
+  ): Promise<void> {
+    await this.snapshots.deleteTemplate({
+      organizationId: this.#org(organizationId),
+      templateId,
+    });
+  }
+}
+
+function required<T>(value: T | undefined, name: string): T {
+  if (value === undefined) {
+    throw new OwnSandError(`the response carried no ${name}`);
+  }
+  return value;
+}
