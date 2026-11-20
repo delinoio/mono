@@ -1,0 +1,639 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package api
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
+
+	"github.com/delinoio/mono/packages/ownsand-sdk-go/validate"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/scheduler"
+)
+
+// SandboxHandler serves SandboxService.
+type SandboxHandler struct{ *Service }
+
+var _ ownsandv1connect.SandboxServiceHandler = SandboxHandler{}
+
+// idempotencyLifetime is how long a create idempotency key is kept.
+const idempotencyLifetime = 24 * time.Hour
+
+// guestOfBaseImage maps a base image to its guest OS.
+func guestOfBaseImage(b ownsandv1.BaseImage) ownsandv1.GuestOs {
+	switch b {
+	case ownsandv1.BaseImage_BASE_IMAGE_LINUX:
+		return ownsandv1.GuestOs_GUEST_OS_LINUX
+	case ownsandv1.BaseImage_BASE_IMAGE_MACOS:
+		return ownsandv1.GuestOs_GUEST_OS_MACOS
+	case ownsandv1.BaseImage_BASE_IMAGE_WINDOWS:
+		return ownsandv1.GuestOs_GUEST_OS_WINDOWS
+	}
+	return ownsandv1.GuestOs_GUEST_OS_UNSPECIFIED
+}
+
+// requestHash is the SHA-256 of the deterministic encoding of a create
+// request, which the idempotency key binds.
+func requestHash(req *ownsandv1.CreateSandboxRequest) ([]byte, error) {
+	b, err := proto.MarshalOptions{Deterministic: true}.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(b)
+	return sum[:], nil
+}
+
+// lookupIdempotent returns the sandbox of a known idempotency key, or nil.
+// A known key with other parameters fails with already_exists.
+func (s *Service) lookupIdempotent(ctx context.Context, q db.Querier, orgID, key string, hash []byte) (*sandboxRow, error) {
+	var stored []byte
+	var sandboxID string
+	err := q.QueryRow(ctx, "SELECT request_sha256, sandbox_id::text FROM sandbox_create_keys WHERE organization_id = $1 AND idempotency_key = $2 AND expire_time > $3",
+		orgID, key, s.now()).Scan(&stored, &sandboxID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !auth.HashEqual(stored, hash) {
+		return nil, errAlreadyExists("the idempotency_key was used with other parameters")
+	}
+	return loadSandbox(ctx, q, orgID, sandboxID, false)
+}
+
+// placementDevices loads every non-removed device of the organization for
+// the scheduler. The caller holds row locks on them.
+func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string, lineage string) ([]scheduler.Device, error) {
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM devices WHERE organization_id = $1 AND state <> $2 FOR UPDATE",
+		orgID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED)); err != nil {
+		return nil, err
+	}
+	reserved := false
+	if lineage != "" {
+		// The identifier is reserved while any sandbox that uses it may still
+		// run: a sandbox in an active stored state, or one that ended because
+		// its device was removed while the removal is unconfirmed, until its
+		// max_ttl deadline.
+		err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM sandboxes s WHERE s.machine_lineage = $1 AND s.max_deadline > $2 AND (
+			s.agent_state IN (1, 2, 3, 4)
+			OR (s.end_reason IN (4, 5) AND EXISTS (SELECT 1 FROM devices d WHERE d.device_id = s.device_id AND d.state = 3))))`,
+			lineage, s.now()).Scan(&reserved)
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT d.device_id::text, d.state, d.host_os, d.arch, d.capabilities, d.limit_vcpu_count, d.limit_memory_mib, d.limit_disk_gib,
+		d.vcpu_overcommit_percent, d.update_state, d.pending_idle_since, `+versionRevokedQuery()+`,
+		COALESCE(a.vcpu, 0), COALESCE(a.memory, 0), COALESCE(a.disk, 0), COALESCE(a.macos, 0), COALESCE(a.unreported, 0)
+		FROM devices d LEFT JOIN LATERAL (
+			SELECT sum(s.vcpu_count)::int AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
+				count(*) FILTER (WHERE s.guest_os = 2)::int AS macos,
+				COALESCE(sum(s.disk_gib) FILTER (WHERE s.agent_state = 1 AND s.revision_epoch = ''), 0)::bigint AS unreported
+			FROM sandboxes s WHERE s.device_id = d.device_id AND s.agent_state IN (1, 2, 3, 4)
+		) a ON true
+		WHERE d.organization_id = $1 AND d.state <> $2 ORDER BY d.device_id`, orgID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []scheduler.Device
+	for rows.Next() {
+		var d scheduler.Device
+		var state, host, arch, update int16
+		var caps []byte
+		limits := &ownsandv1.DeviceLimits{}
+		alloc := &ownsandv1.DeviceAllocation{}
+		if err := rows.Scan(&d.ID, &state, &host, &arch, &caps, &limits.VcpuCount, &limits.MemoryMib, &limits.DiskGib, &limits.VcpuOvercommitPercent,
+			&update, &d.PendingIdleSince, &d.VersionRevoked, &alloc.VcpuCount, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount, &d.UnreportedCreatingDiskGiB); err != nil {
+			return nil, err
+		}
+		d.Online = ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_ONLINE
+		d.LiveChannel = s.Hub != nil && s.Hub.Live(d.ID) != nil
+		d.HostOS, d.Arch = ownsandv1.HostOs(host), ownsandv1.Arch(arch)
+		if len(caps) > 0 {
+			d.Capabilities = &ownsandv1.DeviceCapabilities{}
+			if err := proto.Unmarshal(caps, d.Capabilities); err != nil {
+				return nil, err
+			}
+		}
+		d.Limits, d.Allocation = limits, alloc
+		d.UpdateState = ownsandv1.AgentUpdateState(update)
+		d.MachineIdentifierReserved = reserved
+		out = append(out, d)
+	}
+	return out, rows.Err()
+}
+
+// resolvedSource is the snapshot behind a snapshot or template source.
+type resolvedSource struct {
+	snapshot   *snapshotRow
+	templateID string
+	copies     []string
+	parts      []*ownsandv1.SnapshotPart
+}
+
+func (s *Service) resolveSource(ctx context.Context, q db.Querier, orgID string, src *ownsandv1.SandboxSource) (*resolvedSource, error) {
+	var res resolvedSource
+	snapshotID := src.GetSnapshotId()
+	if src.GetTemplateId() != "" {
+		res.templateID = src.GetTemplateId()
+		err := q.QueryRow(ctx, "SELECT snapshot_id::text FROM templates WHERE organization_id = $1 AND template_id = $2", orgID, res.templateID).Scan(&snapshotID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, errNotFound("template")
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if snapshotID == "" {
+		return nil, nil
+	}
+	sn, err := loadSnapshot(ctx, q, orgID, snapshotID, false)
+	if err != nil {
+		return nil, err
+	}
+	if sn.pb.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		return nil, errPrecondition("the snapshot is not ready")
+	}
+	res.snapshot = sn
+	rows, err := q.Query(ctx, "SELECT device_id::text FROM snapshot_copies WHERE snapshot_id = $1", snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		res.copies = append(res.copies, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	partRows, err := q.Query(ctx, "SELECT part_number, size_bytes, sha256 FROM snapshot_parts WHERE snapshot_id = $1 ORDER BY part_number", snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	defer partRows.Close()
+	for partRows.Next() {
+		var p ownsandv1.SnapshotPart
+		if err := partRows.Scan(&p.PartNumber, &p.SizeBytes, &p.Sha256); err != nil {
+			return nil, err
+		}
+		res.parts = append(res.parts, &p)
+	}
+	return &res, partRows.Err()
+}
+
+func schedulerCode(err error) error {
+	var se *scheduler.Error
+	if !errors.As(err, &se) {
+		return err
+	}
+	return connect.NewError(connect.Code(se.Code), errors.New(se.Reason))
+}
+
+func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+	m := req.Msg
+	orgID := m.GetOrganizationId()
+	p, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes)
+	if err != nil {
+		return nil, err
+	}
+	if err := validate.CreateSandboxRequest(m); err != nil {
+		return nil, errInvalid(err)
+	}
+	network, _ := validate.NetworkMode(m.GetNetwork())
+	hash, err := requestHash(m)
+	if err != nil {
+		return nil, h.internal(ctx, "hash create request", err)
+	}
+	// The idempotency key is checked right after authorization and before
+	// placement or the live-channel check.
+	if existing, err := h.lookupIdempotent(ctx, h.DB.Pool, orgID, m.GetIdempotencyKey(), hash); err != nil || existing != nil {
+		if err != nil {
+			return nil, h.internal(ctx, "create sandbox", err)
+		}
+		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: existing.proto()}), nil
+	}
+	src, err := h.resolveSource(ctx, h.DB.Pool, orgID, m.GetSource())
+	if err != nil {
+		return nil, h.internal(ctx, "create sandbox", err)
+	}
+	sreq := scheduler.Request{
+		VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
+		NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
+		DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
+	}
+	lineage := ""
+	if src != nil {
+		sn := src.snapshot.pb
+		if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
+			return nil, errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
+		}
+		sreq.GuestOS = sn.GetGuestOs()
+		sreq.Snapshot = &scheduler.Snapshot{
+			ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
+			Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
+			HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
+			MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
+			MacOSHardwareModel: sn.GetMacosHardwareModel(),
+		}
+		if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
+			lineage = src.snapshot.lineage
+		}
+	} else {
+		sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
+	}
+
+	sandboxID := newID()
+	now := h.now()
+	var created *sandboxRow
+	var decision scheduler.Decision
+	var limits *ownsandv1.DeviceLimits
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		devices, err := h.placementDevices(ctx, tx, orgID, lineage)
+		if err != nil {
+			return err
+		}
+		decision, err = scheduler.Place(sreq, devices, now)
+		if err != nil {
+			return schedulerCode(err)
+		}
+		var hostOS ownsandv1.HostOs
+		var arch ownsandv1.Arch
+		for _, d := range devices {
+			if d.ID == decision.DeviceID {
+				limits, hostOS, arch = d.Limits, d.HostOS, d.Arch
+			}
+		}
+		labels, err := json.Marshal(nonNil(m.GetLabels()))
+		if err != nil {
+			return err
+		}
+		var base, srcSnapshot, srcTemplate, resolved, machine any
+		if src == nil {
+			base = int16(sreq.BaseImage)
+			if sreq.GuestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
+				machine = sandboxID
+			}
+		} else {
+			resolved = src.snapshot.pb.GetSnapshotId()
+			if src.templateID != "" {
+				srcTemplate = src.templateID
+			} else {
+				srcSnapshot = src.snapshot.pb.GetSnapshotId()
+			}
+			if lineage != "" {
+				machine = lineage
+			}
+		}
+		idle, maxTTL := m.GetIdleTtl().AsDuration(), m.GetMaxTtl().AsDuration()
+		if _, err := tx.Exec(ctx, `INSERT INTO sandboxes (sandbox_id, organization_id, device_id, agent_state, source_base_image, source_snapshot_id,
+			source_template_id, resolved_snapshot_id, vcpu_count, memory_mib, disk_gib, guest_os, host_os, arch, network_mode, labels,
+			idle_ttl_ms, max_ttl_ms, idle_deadline, max_deadline, machine_lineage, created_by_kind, created_by_id, create_time)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
+			sandboxID, orgID, decision.DeviceID, int16(ownsandv1.SandboxState_SANDBOX_STATE_CREATING), base, srcSnapshot, srcTemplate, resolved,
+			sreq.VCPUCount, sreq.MemoryMiB, sreq.DiskGiB, int16(sreq.GuestOS), int16(hostOS), int16(arch), int16(network), labels,
+			idle.Milliseconds(), maxTTL.Milliseconds(), now.Add(idle), now.Add(maxTTL), machine, int16(p.Kind), p.ID, now); err != nil {
+			return err
+		}
+		tag, err := tx.Exec(ctx, `INSERT INTO sandbox_create_keys (organization_id, idempotency_key, request_sha256, sandbox_id, expire_time)
+			VALUES ($1, $2, $3, $4, $5) ON CONFLICT (organization_id, idempotency_key) DO UPDATE
+			SET request_sha256 = EXCLUDED.request_sha256, sandbox_id = EXCLUDED.sandbox_id, expire_time = EXCLUDED.expire_time
+			WHERE sandbox_create_keys.expire_time <= $6`,
+			orgID, m.GetIdempotencyKey(), hash, sandboxID, now.Add(idempotencyLifetime), now)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return errIdempotencyRace
+		}
+		if err := h.writeAudit(ctx, tx, auditEvent{
+			OrganizationID: orgID, Action: ownsandv1.AuditAction_AUDIT_ACTION_SANDBOX_CREATED, Actor: p,
+			TargetKind: ownsandv1.AuditTargetKind_AUDIT_TARGET_KIND_SANDBOX, TargetID: sandboxID,
+		}); err != nil {
+			return err
+		}
+		created, err = loadSandbox(ctx, tx, orgID, sandboxID, false)
+		return err
+	})
+	if errors.Is(err, errIdempotencyRace) {
+		// A concurrent request with the same key committed first.
+		existing, lerr := h.lookupIdempotent(ctx, h.DB.Pool, orgID, m.GetIdempotencyKey(), hash)
+		if lerr != nil || existing == nil {
+			return nil, h.internal(ctx, "create sandbox", errors.Join(err, lerr))
+		}
+		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: existing.proto()}), nil
+	}
+	if err != nil {
+		return nil, h.internal(ctx, "create sandbox", err)
+	}
+	h.Logger.InfoContext(ctx, "sandbox_created", slog.String("sandbox_id", sandboxID), slog.String("device_id", decision.DeviceID),
+		slog.Bool("memory_restore", decision.MemoryRestore), slog.Bool("import", decision.NeedsImport))
+
+	cmd := &ownsandv1.CreateSandboxCommand{
+		SandboxId:            sandboxID,
+		Resources:            &ownsandv1.Resources{VcpuCount: sreq.VCPUCount, MemoryMib: sreq.MemoryMiB, DiskGib: sreq.DiskGiB},
+		NetworkMode:          network,
+		GuestOs:              sreq.GuestOS,
+		IdleTtl:              m.GetIdleTtl(),
+		MaxTtl:               m.GetMaxTtl(),
+		CreateTime:           ts(now),
+		MaxDeadline:          ts(now.Add(m.GetMaxTtl().AsDuration())),
+		Limits:               limits,
+		MemoryRestoreAllowed: decision.MemoryRestore,
+	}
+	if src == nil {
+		cmd.Source = &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: sreq.BaseImage}
+	} else {
+		cmd.Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: src.snapshot.pb.GetSnapshotId()}
+	}
+	conn := h.Hub.Live(decision.DeviceID)
+	if conn == nil {
+		// The channel closed after placement. The sandbox stays CREATING
+		// until the device's next state report, which reports it as lost.
+		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: created.proto()}), nil
+	}
+	info := commandInfo{kind: cmdCreateSandbox, orgID: orgID, sandboxID: sandboxID}
+	if decision.NeedsImport {
+		go h.importThenCreate(conn, info, src, cmd)
+	} else if _, err := h.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
+		h.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", sandboxID), slog.Any("error", err))
+	}
+	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: created.proto()}), nil
+}
+
+var errIdempotencyRace = errors.New("idempotency key race")
+
+func nonNil(m map[string]string) map[string]string {
+	if m == nil {
+		return map[string]string{}
+	}
+	return m
+}
+
+// importThenCreate imports an exported snapshot on the selected device and
+// then sends the create command. A failed import fails the create.
+func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolvedSource, cmd *ownsandv1.CreateSandboxCommand) {
+	ctx, cancel := context.WithTimeout(conn.Context(), s.Timing.ImportWait)
+	defer cancel()
+	sn := src.snapshot.pb
+	importCmd := &ownsandv1.AgentCommand{CommandId: newID(), Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{
+		Snapshot: &ownsandv1.SnapshotStateEntry{
+			SnapshotId: sn.GetSnapshotId(), SourceSandboxId: sn.GetSourceSandboxId(), State: sn.GetState(), GuestOs: sn.GetGuestOs(),
+			Resources: sn.GetResources(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
+			SizeBytes: sn.GetSizeBytes(), MacosHardwareModel: sn.GetMacosHardwareModel(),
+		},
+		Parts: src.parts,
+	}}}
+	wait := s.Hub.Commands.Register(importCmd.CommandId)
+	defer s.Hub.Commands.Cancel(importCmd.CommandId)
+	if _, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdImportSnapshot, orgID: info.orgID, snapshotID: sn.GetSnapshotId()}, importCmd); err != nil {
+		return
+	}
+	select {
+	case res := <-wait:
+		if res.GetError() != nil {
+			_ = s.failCreateRejected(context.WithoutCancel(ctx), info.sandboxID)
+			s.watch.fire(info.sandboxID)
+			return
+		}
+	case <-ctx.Done():
+		return
+	}
+	if _, err := s.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
+		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", info.sandboxID), slog.Any("error", err))
+	}
+}
+
+func (h SandboxHandler) GetSandbox(ctx context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+		return nil, err
+	}
+	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, req.Msg.GetSandboxId(), false)
+	if err != nil {
+		return nil, h.internal(ctx, "get sandbox", err)
+	}
+	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: sb.proto()}), nil
+}
+
+// shownStateSQL computes the shown state of a sandbox row in SQL, like
+// sandboxRow.shownState.
+const shownStateSQL = `(CASE WHEN s.agent_state IN (5, 6) THEN s.agent_state WHEN COALESCE(d.state, 3) <> 1 THEN 7
+	WHEN s.delete_pending THEN 4 ELSE s.agent_state END)`
+
+func (h SandboxHandler) ListSandboxes(ctx context.Context, req *connect.Request[ownsandv1.ListSandboxesRequest]) (*connect.Response[ownsandv1.ListSandboxesResponse], error) {
+	m := req.Msg
+	orgID := m.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	limit, after, err := pageArgs(m.GetPageSize(), m.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
+	where := []string{"s.organization_id = $1", "s.sandbox_id > $2"}
+	args := []any{orgID, afterKey(after)}
+	if m.DeviceId != nil {
+		if err := validateID("device_id", m.GetDeviceId()); err != nil {
+			return nil, err
+		}
+		args = append(args, m.GetDeviceId())
+		where = append(where, fmt.Sprintf("s.device_id = $%d", len(args)))
+	}
+	if m.State != nil {
+		if _, ok := ownsandv1.SandboxState_name[int32(m.GetState())]; !ok || m.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED {
+			return nil, errInvalidf("invalid state: must be a sandbox state")
+		}
+		args = append(args, int16(m.GetState()))
+		where = append(where, fmt.Sprintf("%s = $%d", shownStateSQL, len(args)))
+	} else if !m.GetIncludeEnded() {
+		where = append(where, "s.agent_state NOT IN (5, 6)")
+	}
+	args = append(args, limit)
+	rows, err := h.DB.Pool.Query(ctx, sandboxSelect+" WHERE "+strings.Join(where, " AND ")+fmt.Sprintf(" ORDER BY s.sandbox_id LIMIT $%d", len(args)), args...)
+	if err != nil {
+		return nil, h.internal(ctx, "list sandboxes", err)
+	}
+	defer rows.Close()
+	resp := &ownsandv1.ListSandboxesResponse{}
+	for rows.Next() {
+		sb, err := scanSandbox(rows)
+		if err != nil {
+			return nil, h.internal(ctx, "list sandboxes", err)
+		}
+		resp.Sandboxes = append(resp.Sandboxes, sb.proto())
+	}
+	if err := rows.Err(); err != nil {
+		return nil, h.internal(ctx, "list sandboxes", err)
+	}
+	last := ""
+	if n := len(resp.Sandboxes); n > 0 {
+		last = resp.Sandboxes[n-1].GetSandboxId()
+	}
+	resp.NextPageToken = nextPageToken(len(resp.Sandboxes), limit, last)
+	return connect.NewResponse(resp), nil
+}
+
+// waitSandbox waits up to the command wait for done to report true on the
+// sandbox, and returns the current sandbox either way.
+func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool) (*sandboxRow, error) {
+	deadline := time.NewTimer(s.Timing.CommandWait)
+	defer deadline.Stop()
+	// Other instances change sandboxes too, so poll as a fallback to the
+	// in-process notification.
+	poll := time.NewTicker(time.Second)
+	defer poll.Stop()
+	for {
+		changed := s.watch.watch(sandboxID)
+		sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+		if err != nil || done(sb) {
+			return sb, err
+		}
+		select {
+		case <-changed:
+		case <-poll.C:
+		case <-deadline.C:
+			return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[ownsandv1.DeleteSandboxRequest]) (*connect.Response[ownsandv1.DeleteSandboxResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	sandboxID := req.Msg.GetSandboxId()
+	var sb *sandboxRow
+	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
+		if err != nil {
+			return err
+		}
+		if err := validateID("sandbox_id", sandboxID); err != nil {
+			return err
+		}
+		sb, err = loadSandbox(ctx, tx, orgID, sandboxID, true)
+		if err != nil || isTerminal(sb.AgentState) || sb.DeletePending {
+			return err
+		}
+		// Any instance records the pending delete; the lease holder sends the
+		// delete command, at once or when the device reconnects.
+		if _, err := tx.Exec(ctx, `UPDATE sandboxes SET delete_pending = true, delete_end_reason = $2, delete_actor_kind = $3, delete_actor_id = $4
+			WHERE sandbox_id = $1`, sandboxID, int16(ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER), int16(p.Kind), p.ID); err != nil {
+			return err
+		}
+		return events.Write(ctx, tx, events.Event{Kind: events.KindSandboxDeleteRequested, OrganizationID: orgID, SandboxID: sandboxID, DeviceID: sb.DeviceID})
+	})
+	if err != nil {
+		return nil, h.internal(ctx, "delete sandbox", err)
+	}
+	if isTerminal(sb.AgentState) {
+		return connect.NewResponse(&ownsandv1.DeleteSandboxResponse{Sandbox: sb.proto()}), nil
+	}
+	h.notify()
+	sb, err = h.waitSandbox(ctx, orgID, sandboxID, func(r *sandboxRow) bool { return isTerminal(r.AgentState) })
+	if err != nil {
+		return nil, h.internal(ctx, "delete sandbox", err)
+	}
+	return connect.NewResponse(&ownsandv1.DeleteSandboxResponse{Sandbox: sb.proto()}), nil
+}
+
+// pauseOrResume runs PauseSandbox (pause true) or ResumeSandbox.
+func (h SandboxHandler) pauseOrResume(ctx context.Context, orgID, sandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	if err := validateID("sandbox_id", sandboxID); err != nil {
+		return nil, err
+	}
+	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)
+	if err != nil {
+		return nil, h.internal(ctx, "load sandbox", err)
+	}
+	from, to, rpc := ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, "PauseSandbox"
+	info := commandInfo{kind: cmdPauseSandbox, orgID: orgID, sandboxID: sandboxID}
+	cmd := &ownsandv1.AgentCommand{CommandId: newID(), Command: &ownsandv1.AgentCommand_PauseSandbox{PauseSandbox: &ownsandv1.PauseSandboxCommand{SandboxId: sandboxID}}}
+	if !pause {
+		from, to, rpc = to, from, "ResumeSandbox"
+		info.kind = cmdResumeSandbox
+		cmd.Command = &ownsandv1.AgentCommand_ResumeSandbox{ResumeSandbox: &ownsandv1.ResumeSandboxCommand{SandboxId: sandboxID}}
+	}
+	state, _ := sb.shownState()
+	if state == to {
+		return sb.proto(), nil
+	}
+	if state != from {
+		return nil, stateErr(state, rpc)
+	}
+	conn := h.Hub.Live(sb.DeviceID)
+	if conn == nil {
+		return nil, errUnavailable("the sandbox's device has no live agent channel")
+	}
+	wait := h.Hub.Commands.Register(cmd.CommandId)
+	defer h.Hub.Commands.Cancel(cmd.CommandId)
+	if _, err := h.sendCommand(ctx, conn, info, cmd); err != nil {
+		return nil, errUnavailable("the agent channel closed")
+	}
+	timer := time.NewTimer(h.Timing.CommandWait)
+	defer timer.Stop()
+	select {
+	case res := <-wait:
+		if e := res.GetError(); e != nil {
+			code := connect.Code(e.GetCode())
+			if code < connect.CodeCanceled || code > connect.CodeUnauthenticated {
+				code = connect.CodeInternal
+			}
+			return nil, connect.NewError(code, fmt.Errorf("the agent rejected %s: %s", rpc, e.GetMessage()))
+		}
+	case <-timer.C:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-conn.Done():
+	}
+	sb, err = loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)
+	if err != nil {
+		return nil, h.internal(ctx, "load sandbox", err)
+	}
+	return sb.proto(), nil
+}
+
+func (h SandboxHandler) PauseSandbox(ctx context.Context, req *connect.Request[ownsandv1.PauseSandboxRequest]) (*connect.Response[ownsandv1.PauseSandboxResponse], error) {
+	sb, err := h.pauseOrResume(ctx, req.Msg.GetOrganizationId(), req.Msg.GetSandboxId(), true)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&ownsandv1.PauseSandboxResponse{Sandbox: sb}), nil
+}
+
+func (h SandboxHandler) ResumeSandbox(ctx context.Context, req *connect.Request[ownsandv1.ResumeSandboxRequest]) (*connect.Response[ownsandv1.ResumeSandboxResponse], error) {
+	sb, err := h.pauseOrResume(ctx, req.Msg.GetOrganizationId(), req.Msg.GetSandboxId(), false)
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&ownsandv1.ResumeSandboxResponse{Sandbox: sb}), nil
+}

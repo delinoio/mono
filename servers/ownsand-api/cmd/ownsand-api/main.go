@@ -19,6 +19,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 )
 
 // shutdownTimeout bounds the drain after a termination signal. Long-lived
@@ -66,6 +67,10 @@ func run() error {
 		}
 	}
 
+	var objects objectstore.Store
+	if cfg.R2.Enabled {
+		objects = &objectstore.R2{Endpoint: cfg.R2.Endpoint, Bucket: cfg.R2.Bucket, AccessKeyID: cfg.R2.AccessKeyID, SecretAccessKey: cfg.R2.SecretAccessKey}
+	}
 	a, err := app.New(app.Options{
 		DB:     database,
 		Logger: logger,
@@ -80,6 +85,9 @@ func run() error {
 		NonceKeyPrevious:        cfg.NonceKeyPrevious,
 		CORSOrigins:             cfg.CORSOrigins,
 		TrustProxyClientAddress: cfg.TrustProxyClientAddress,
+		STUNURLs:                cfg.STUNURLs,
+		Objects:                 objects,
+		SnapshotPartSizeBytes:   cfg.SnapshotPartSizeBytes,
 	})
 	if err != nil {
 		return err
@@ -98,13 +106,16 @@ func run() error {
 		defer workers.Done()
 		a.Run(workersCtx)
 	}()
-	defer func() {
+	// stopAndWait releases the lease (which closes the agent channels) and
+	// stops the workers; it runs before the HTTP drain and again on return.
+	stopAndWait := func() {
 		stopWorkers()
 		workers.Wait()
-	}()
+	}
+	defer stopAndWait()
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)))
-	return serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopWorkers)
+	return serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
 }
 
 // newServer returns the HTTP server. It serves HTTP/1.1 and HTTP/2 without

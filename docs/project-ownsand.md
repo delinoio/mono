@@ -106,7 +106,7 @@ Record each decision in the owning domain contract before the implementation tha
 - The release signing tool and the key custody process ([agent contract](cmds-ownsand-agent-foundation.md#agent-updates)).
 - The microVM implementation for Linux hosts (Firecracker class) ([agent contract](cmds-ownsand-agent-foundation.md#isolation)).
 - The public UDP port for STUN in the [deployment workflow](repository-workflow-contract.md#deployment-workflow), and the verification of the h2c and long-lived stream behavior of the Caddy route of `ownsand-api` ([control plane contract](servers-ownsand-api-foundation.md#runtime-and-language)).
-- The transport of the long-lived agent channel: a Connect bidirectional stream through the Caddy h2c route or a WebSocket upgrade on the same origin ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
+- The WebSocket fallback of the agent channel and the relay connection for devices behind HTTP/1.1-only proxies. The primary transport is recorded: a Connect bidirectional stream over HTTP/2 ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
 - The database backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)). The migration tool is recorded there (an embedded forward-only runner).
 - The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.

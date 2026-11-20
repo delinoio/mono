@@ -71,3 +71,31 @@ func TestLoadRejects(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadR2AndSTUN(t *testing.T) {
+	v := minimal()
+	v[EnvSTUNURLs] = "stun:a:3478, stun:b:3478"
+	v[EnvR2Endpoint] = "https://acct.r2.cloudflarestorage.com"
+	v[EnvR2Bucket] = "b"
+	v[EnvR2AccessKeyID] = "k"
+	v[EnvR2SecretAccessKey] = "s"
+	v[EnvSnapshotPartSizeBytes] = "10485760"
+	cfg, err := Load(env(v))
+	if err != nil || len(cfg.STUNURLs) != 2 || !cfg.R2.Enabled || cfg.SnapshotPartSizeBytes != 10<<20 {
+		t.Fatalf("cfg = %+v, %v", cfg, err)
+	}
+	for name, mutate := range map[string]func(map[string]string){
+		"partial r2":     func(v map[string]string) { delete(v, EnvR2Bucket) },
+		"bad stun":       func(v map[string]string) { v[EnvSTUNURLs] = "turn:x" },
+		"tiny part size": func(v map[string]string) { v[EnvSnapshotPartSizeBytes] = "1024" },
+	} {
+		w := map[string]string{}
+		for k, val := range v {
+			w[k] = val
+		}
+		mutate(w)
+		if _, err := Load(env(w)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
