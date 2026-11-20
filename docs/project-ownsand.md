@@ -21,7 +21,7 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `apps/ownsand/` (`planned`): Rsbuild React web console served at `https://ownsand.delino.io`.
 - `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
 - `packages/ownsand-sdk/` (`planned`): TypeScript SDK.
-- `packages/ownsand-sdk-go/` (`planned`): Go SDK.
+- `packages/ownsand-sdk-go/`: Go SDK. The shared data path packages exist; the SDK client is `planned`.
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.
 
