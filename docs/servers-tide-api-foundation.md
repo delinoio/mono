@@ -128,7 +128,8 @@ An agent integration holds the vendor credentials and settings of one vendor acc
 #### Claude Code
 
 - For each `CLAUDE_CODE` integration, the lease holder runs `claude self-hosted-runner orchestrator` as a child process with a hooks directory that contains the tide `spawn-runner` hook. The orchestrator uses the environment key; the key never enters a runner.
-- The hook is the `tide-api` binary in hook mode. It sends the session ID, the spawn reason and the work order to the parent process over a Unix domain socket in the container, which is not reachable from the network. It exits with `0` when tide stored the request, and with `1` (retry) when tide could not store it.
+- The hook is the `tide-api` binary in hook mode. It sends the session ID, the spawn reason and the work order to the parent process over a Unix domain socket in the container, which is not reachable from the network. It exits with `0` only after tide stored the request together with its work order, and with `1` (retry) when tide could not store both.
+- The work order is a secret, and the request needs it after a restart or a lease handover. tide stores it encrypted with the [secrets](#secrets) rules, in the same transaction as the request. tide deletes the stored work order when the runner of the request becomes `BUSY` or when the request ends. A runner start that fails before `BUSY` returns the request to the queue, and the next runner uses the stored work order again. A new lease holder reads the stored work order, so a deployment does not make a queued Claude Code request undispatchable.
 - A runner gets the work order of its session and starts `claude self-hosted-runner` with it as the Claude Code reference documents. The runner serves that session and exits.
 - The parent process restarts a crashed orchestrator with exponential backoff (1 second to 1 minute) and logs each restart.
 - When tide ends a request without a runner (for example, at the maximum queue wait), the Claude Code orchestrator rules decide whether Anthropic sends a new spawn request for the session.
@@ -217,7 +218,7 @@ An agent integration holds the vendor credentials and settings of one vendor acc
 
 ### Secrets
 
-- Organization credentials are the OwnSand API key and the credentials of each agent integration. The server encrypts each one with AES-256-GCM before it stores it. The encryption key comes from the service secret `TIDE_SECRET_KEYS`, which holds one or more keys with IDs. Each stored value records the ID of its key, so that the operator can add a new key and re-encrypt stored values.
+- Organization credentials are the OwnSand API key and the credentials of each agent integration. Claude Code work orders of queued requests use the same encryption. The server encrypts each one with AES-256-GCM before it stores it. The encryption key comes from the service secret `TIDE_SECRET_KEYS`, which holds one or more keys with IDs. Each stored value records the ID of its key, so that the operator can add a new key and re-encrypt stored values.
 - The API accepts credentials only in set operations and never returns them. Read operations return only whether a credential is set and when it was set.
 - The GitHub App ID, private key, client ID, client secret and webhook secret are service secrets of the deployment, according to the [environment contract](repository-environment-contract.md).
 - The server decrypts a credential only for the call that uses it, and passes a runner credential only to the runner that needs it, as the [agent integrations table](#agent-integrations) shows. The OwnSand API key, the GitHub App private key, the Claude Code environment key, the Devin API token and the OpenAI webhook secret never enter a runner.
@@ -259,7 +260,7 @@ The server records audit events for: organization creation and deletion, ownersh
 - Requests store the vendor or GitHub key (GitHub job ID, Claude Code session ID, Cursor or Devin request ID, OpenAI session and environment ID) with a unique constraint per organization and source, so that a repeated event or claim cannot create a second request.
 - Webhook delivery IDs are kept for 7 days.
 - Open decision: the retention period of ended requests, ended runners and audit events, the database migration tool and the backup policy. Record them here before the storage implementation.
-- tide stores no runner output, no JIT configuration and no vendor work order.
+- tide stores no runner output and no JIT configuration. It stores a Claude Code work order only encrypted and only until the runner of the request is `BUSY` or the request ends; see [Claude Code](#claude-code).
 
 ## Security
 
