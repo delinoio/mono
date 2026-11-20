@@ -24,6 +24,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/controlplane"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/datapath"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/hostinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/platform"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/runtime"
@@ -291,6 +292,14 @@ func run(env Env, dirPath string, args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	cfg := agent.Config{Dir: dir, Identity: id, Version: env.Version, Runtime: rt, Logger: log}
+	cfg.NewDataPath = func(a *agent.Agent) (agent.DataPath, error) {
+		return datapath.New(datapath.Config{
+			Sandboxes:    a.Mgr,
+			Logger:       log,
+			Origin:       id.Origin,
+			Authenticate: a.RelayCredential,
+		})
+	}
 	if env.Configure != nil {
 		env.Configure(&cfg)
 	}

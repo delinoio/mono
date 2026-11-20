@@ -63,7 +63,7 @@ type Config struct {
 	ReleaseKeys []update.ReleaseKey
 	// NewDataPath builds the data path. Default: a data path that rejects
 	// sessions and grants.
-	NewDataPath func(a *Agent) DataPath
+	NewDataPath func(a *Agent) (DataPath, error)
 	// Install overrides update.InstallBinary (tests).
 	Install func(path string) error
 	// ChannelTiming overrides the channel timing (tests).
@@ -155,7 +155,11 @@ func New(ctx context.Context, cfg Config) (*Agent, error) {
 	}
 	a.Mgr = mgr
 	if cfg.NewDataPath != nil {
-		a.dp = cfg.NewDataPath(a)
+		dp, err := cfg.NewDataPath(a)
+		if err != nil {
+			return nil, fmt.Errorf("start the data path: %w", err)
+		}
+		a.dp = dp
 	} else {
 		a.dp = rejectingDataPath{a}
 	}
@@ -170,6 +174,20 @@ func (a *Agent) Identity() *state.Identity { return a.cfg.Identity }
 
 // Client returns the control plane client.
 func (a *Agent) Client() *controlplane.Client { return a.cp }
+
+// RelayCredential returns a new device session credential for a relay
+// connection: each relay connection uses its own credential.
+func (a *Agent) RelayCredential(ctx context.Context) (string, error) {
+	id := a.cfg.Identity
+	res, sess, err := a.cp.Authenticate(ctx, id.DeviceID, id.PrivateKey, a.Mgr.Epoch())
+	if err != nil {
+		return "", err
+	}
+	if res != controlplane.AuthCredential {
+		return "", errors.New("the control plane did not issue a device session credential")
+	}
+	return sess.Credential, nil
+}
 
 // Updater returns the update state machine.
 func (a *Agent) Updater() *update.Updater { return a.upd }
