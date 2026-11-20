@@ -1,0 +1,260 @@
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// Role of a member in an organization.
+enum Role {
+  ROLE_UNSPECIFIED = 0;
+  ROLE_OWNER = 1;
+  ROLE_ADMIN = 2;
+  ROLE_MEMBER = 3;
+}
+
+// Operating system of a device host.
+enum HostOs {
+  HOST_OS_UNSPECIFIED = 0;
+  HOST_OS_LINUX = 1;
+  HOST_OS_MACOS = 2;
+  HOST_OS_WINDOWS = 3;
+}
+
+// CPU architecture of a device and of its guests.
+enum Arch {
+  ARCH_UNSPECIFIED = 0;
+  ARCH_AMD64 = 1;
+  ARCH_ARM64 = 2;
+}
+
+// Operating system of a sandbox guest.
+enum GuestOs {
+  GUEST_OS_UNSPECIFIED = 0;
+  GUEST_OS_LINUX = 1;
+  GUEST_OS_MACOS = 2;
+  GUEST_OS_WINDOWS = 3;
+}
+
+// Base image that a sandbox boots from.
+enum BaseImage {
+  BASE_IMAGE_UNSPECIFIED = 0;
+  BASE_IMAGE_LINUX = 1;
+  BASE_IMAGE_MACOS = 2;
+  BASE_IMAGE_WINDOWS = 3;
+}
+
+enum DeviceState {
+  DEVICE_STATE_UNSPECIFIED = 0;
+  DEVICE_STATE_ONLINE = 1;
+  DEVICE_STATE_OFFLINE = 2;
+  DEVICE_STATE_REMOVED = 3;
+}
+
+enum SandboxState {
+  SANDBOX_STATE_UNSPECIFIED = 0;
+  SANDBOX_STATE_CREATING = 1;
+  SANDBOX_STATE_RUNNING = 2;
+  SANDBOX_STATE_PAUSED = 3;
+  SANDBOX_STATE_DELETING = 4;
+  SANDBOX_STATE_DELETED = 5;
+  SANDBOX_STATE_FAILED = 6;
+  SANDBOX_STATE_UNREACHABLE = 7;
+}
+
+enum SandboxEndReason {
+  SANDBOX_END_REASON_UNSPECIFIED = 0;
+  SANDBOX_END_REASON_DELETED_BY_CALLER = 1;
+  SANDBOX_END_REASON_IDLE_TTL_EXPIRED = 2;
+  SANDBOX_END_REASON_MAX_TTL_EXPIRED = 3;
+  SANDBOX_END_REASON_DEVICE_REMOVED = 4;
+  SANDBOX_END_REASON_ORGANIZATION_DELETED = 5;
+  SANDBOX_END_REASON_CREATE_FAILED = 6;
+  SANDBOX_END_REASON_LOST_ON_DEVICE = 7;
+}
+
+enum SnapshotState {
+  SNAPSHOT_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_STATE_CREATING = 1;
+  SNAPSHOT_STATE_READY = 2;
+  SNAPSHOT_STATE_FAILED = 3;
+  SNAPSHOT_STATE_DELETING = 4;
+}
+
+enum SnapshotExportState {
+  SNAPSHOT_EXPORT_STATE_UNSPECIFIED = 0;
+  SNAPSHOT_EXPORT_STATE_NOT_EXPORTED = 1;
+  SNAPSHOT_EXPORT_STATE_EXPORTING = 2;
+  SNAPSHOT_EXPORT_STATE_EXPORTED = 3;
+  SNAPSHOT_EXPORT_STATE_EXPORT_FAILED = 4;
+}
+
+enum NetworkMode {
+  NETWORK_MODE_UNSPECIFIED = 0;
+  NETWORK_MODE_OUTBOUND = 1;
+  NETWORK_MODE_NONE = 2;
+}
+
+enum AgentVersionPolicyMode {
+  AGENT_VERSION_POLICY_MODE_UNSPECIFIED = 0;
+  AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT = 1;
+  AGENT_VERSION_POLICY_MODE_PIN = 2;
+  AGENT_VERSION_POLICY_MODE_HOLD = 3;
+}
+
+enum PrincipalKind {
+  PRINCIPAL_KIND_UNSPECIFIED = 0;
+  PRINCIPAL_KIND_USER = 1;
+  PRINCIPAL_KIND_API_KEY = 2;
+  PRINCIPAL_KIND_DEVICE = 3;
+  PRINCIPAL_KIND_SYSTEM = 4;
+}
+
+enum AuditTargetKind {
+  AUDIT_TARGET_KIND_UNSPECIFIED = 0;
+  AUDIT_TARGET_KIND_ORGANIZATION = 1;
+  AUDIT_TARGET_KIND_MEMBERSHIP = 2;
+  AUDIT_TARGET_KIND_INVITATION = 3;
+  AUDIT_TARGET_KIND_DEVICE = 4;
+  AUDIT_TARGET_KIND_ENROLLMENT_TOKEN = 5;
+  AUDIT_TARGET_KIND_API_KEY = 6;
+  AUDIT_TARGET_KIND_SANDBOX = 7;
+  AUDIT_TARGET_KIND_AGENT_VERSION_POLICY = 8;
+}
+
+enum AuditAction {
+  AUDIT_ACTION_UNSPECIFIED = 0;
+  AUDIT_ACTION_ORGANIZATION_CREATED = 1;
+  AUDIT_ACTION_ORGANIZATION_DELETED = 2;
+  AUDIT_ACTION_OWNERSHIP_TRANSFERRED = 3;
+  AUDIT_ACTION_INVITATION_CREATED = 4;
+  AUDIT_ACTION_INVITATION_REVOKED = 5;
+  AUDIT_ACTION_MEMBER_JOINED = 6;
+  AUDIT_ACTION_MEMBER_ROLE_CHANGED = 7;
+  AUDIT_ACTION_MEMBER_REMOVED = 8;
+  AUDIT_ACTION_ENROLLMENT_TOKEN_CREATED = 9;
+  AUDIT_ACTION_ENROLLMENT_TOKEN_REVOKED = 10;
+  AUDIT_ACTION_DEVICE_ENROLLED = 11;
+  AUDIT_ACTION_DEVICE_LIMITS_CHANGED = 12;
+  AUDIT_ACTION_DEVICE_REMOVED = 13;
+  AUDIT_ACTION_AGENT_VERSION_POLICY_CHANGED = 14;
+  AUDIT_ACTION_API_KEY_CREATED = 15;
+  AUDIT_ACTION_API_KEY_REVOKED = 16;
+  AUDIT_ACTION_SANDBOX_CREATED = 17;
+  AUDIT_ACTION_SANDBOX_DELETED = 18;
+}
+
+enum EnrollmentTokenState {
+  ENROLLMENT_TOKEN_STATE_UNSPECIFIED = 0;
+  ENROLLMENT_TOKEN_STATE_PENDING = 1;
+  ENROLLMENT_TOKEN_STATE_USED = 2;
+  ENROLLMENT_TOKEN_STATE_REVOKED = 3;
+  ENROLLMENT_TOKEN_STATE_EXPIRED = 4;
+}
+
+enum InvitationState {
+  INVITATION_STATE_UNSPECIFIED = 0;
+  INVITATION_STATE_PENDING = 1;
+  INVITATION_STATE_ACCEPTED = 2;
+  INVITATION_STATE_REVOKED = 3;
+  INVITATION_STATE_EXPIRED = 4;
+}
+
+enum ApiKeyState {
+  API_KEY_STATE_UNSPECIFIED = 0;
+  API_KEY_STATE_ACTIVE = 1;
+  API_KEY_STATE_REVOKED = 2;
+}
+
+enum AgentUpdateState {
+  AGENT_UPDATE_STATE_UNSPECIFIED = 0;
+  AGENT_UPDATE_STATE_UP_TO_DATE = 1;
+  AGENT_UPDATE_STATE_PENDING_IDLE = 2;
+  AGENT_UPDATE_STATE_DOWNLOADING = 3;
+  AGENT_UPDATE_STATE_INSTALLING = 4;
+  AGENT_UPDATE_STATE_FAILED = 5;
+  AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE = 6;
+}
+
+enum SessionEndReason {
+  SESSION_END_REASON_UNSPECIFIED = 0;
+  SESSION_END_REASON_IDLE = 1;
+  SESSION_END_REASON_EXPIRED = 2;
+  SESSION_END_REASON_REVOKED = 3;
+  SESSION_END_REASON_AGENT_CHANNEL_LOST = 4;
+  // Relay only.
+  SESSION_END_REASON_GRANT_INVALID = 5;
+  // Relay only.
+  SESSION_END_REASON_GRANT_REPLACED = 6;
+}
+
+enum DataPathTransport {
+  DATA_PATH_TRANSPORT_UNSPECIFIED = 0;
+  DATA_PATH_TRANSPORT_PEER_TO_PEER = 1;
+  DATA_PATH_TRANSPORT_RELAY = 2;
+}
+
+enum RelayOperationKind {
+  RELAY_OPERATION_KIND_UNSPECIFIED = 0;
+  // Exec and AttachExec of one exec_id, bound to the request digest.
+  RELAY_OPERATION_KIND_EXEC = 1;
+  // AttachExec only, without a request digest.
+  RELAY_OPERATION_KIND_ATTACH_EXEC = 2;
+  RELAY_OPERATION_KIND_READ_FILE = 3;
+  RELAY_OPERATION_KIND_WRITE_FILE = 4;
+}
+
+enum RelayGrantResult {
+  RELAY_GRANT_RESULT_UNSPECIFIED = 0;
+  RELAY_GRANT_RESULT_ACCEPTED = 1;
+  RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT = 2;
+}
+
+// The principal that performed or holds something.
+message Principal {
+  PrincipalKind kind = 1;
+  // Logto sub for USER, API key ID for API_KEY, device ID for DEVICE, empty for SYSTEM.
+  string id = 2;
+}
+
+// Resources of one sandbox.
+message Resources {
+  int64 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+}
+
+// Placement filters of a create request.
+message Placement {
+  optional string device_id = 1;
+  optional HostOs host_os = 2;
+  optional Arch arch = 3;
+}
+
+// Network policy of a sandbox. A message so that later policies can extend it.
+message NetworkPolicy {
+  NetworkMode mode = 1;
+}
+
+// Detail attached to an `unavailable` error that a session end or an invalid relay grant caused.
+message SessionEndDetail {
+  SessionEndReason reason = 1;
+}
+
+// Detail attached to a `resource_exhausted` error.
+message RetryDetail {
+  google.protobuf.Duration retry_delay = 1;
+}
+
+// Common paging fields are repeated on each list request: page_size (default 50, maximum 200) and page_token.
+message PageInfo {
+  string next_page_token = 1;
+}
+
+// A timestamp pair for TTL deadlines.
+message TtlDeadlines {
+  google.protobuf.Timestamp idle_deadline = 1;
+  google.protobuf.Timestamp max_deadline = 2;
+}

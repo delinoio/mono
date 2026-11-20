@@ -1,0 +1,377 @@
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+message Organization {
+  string organization_id = 1;
+  string name = 2;
+  google.protobuf.Timestamp create_time = 3;
+  // Role of the calling user. Unspecified for API key callers.
+  Role caller_role = 4;
+}
+
+message CreateOrganizationRequest {
+  string name = 1;
+}
+
+message CreateOrganizationResponse {
+  Organization organization = 1;
+}
+
+message GetOrganizationRequest {
+  string organization_id = 1;
+}
+
+message GetOrganizationResponse {
+  Organization organization = 1;
+}
+
+message ListOrganizationsRequest {
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListOrganizationsResponse {
+  repeated Organization organizations = 1;
+  string next_page_token = 2;
+}
+
+message DeleteOrganizationRequest {
+  string organization_id = 1;
+}
+
+message DeleteOrganizationResponse {}
+
+message TransferOwnershipRequest {
+  string organization_id = 1;
+  // Logto sub of the existing member that becomes the owner.
+  string new_owner_user_id = 2;
+}
+
+message TransferOwnershipResponse {}
+
+service OrganizationService {
+  // Create an organization. The caller becomes its owner.
+  rpc CreateOrganization(CreateOrganizationRequest) returns (CreateOrganizationResponse);
+  rpc GetOrganization(GetOrganizationRequest) returns (GetOrganizationResponse);
+  // List the organizations of the signed-in user.
+  rpc ListOrganizations(ListOrganizationsRequest) returns (ListOrganizationsResponse);
+  // Delete the organization and start its clean-up.
+  rpc DeleteOrganization(DeleteOrganizationRequest) returns (DeleteOrganizationResponse);
+  // Make another member the owner. The previous owner becomes admin.
+  rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+}
+
+message Member {
+  string organization_id = 1;
+  string membership_id = 2;
+  // Logto sub, opaque.
+  string user_id = 3;
+  Role role = 4;
+  // Empty when the display name is unavailable.
+  string display_name = 5;
+  google.protobuf.Timestamp join_time = 6;
+}
+
+message Invitation {
+  string organization_id = 1;
+  string invitation_id = 2;
+  Role role = 3;
+  InvitationState state = 4;
+  google.protobuf.Timestamp create_time = 5;
+  google.protobuf.Timestamp expire_time = 6;
+  Principal created_by = 7;
+  // Non-secret display prefix of the invitation secret.
+  string secret_prefix = 8;
+}
+
+message CreateInvitationRequest {
+  string organization_id = 1;
+  // ROLE_ADMIN or ROLE_MEMBER.
+  Role role = 2;
+}
+
+message CreateInvitationResponse {
+  Invitation invitation = 1;
+  // Secret: never log.
+  string invitation_secret = 2;
+}
+
+message ListInvitationsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListInvitationsResponse {
+  repeated Invitation invitations = 1;
+  string next_page_token = 2;
+}
+
+message RevokeInvitationRequest {
+  string organization_id = 1;
+  string invitation_id = 2;
+}
+
+message RevokeInvitationResponse {}
+
+message AcceptInvitationRequest {
+  // Secret: never log.
+  string invitation_secret = 1;
+}
+
+message AcceptInvitationResponse {
+  Organization organization = 1;
+  Member member = 2;
+}
+
+message ListMembersRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListMembersResponse {
+  repeated Member members = 1;
+  string next_page_token = 2;
+}
+
+message UpdateMemberRoleRequest {
+  string organization_id = 1;
+  string user_id = 2;
+  // ROLE_ADMIN or ROLE_MEMBER.
+  Role role = 3;
+}
+
+message UpdateMemberRoleResponse {
+  Member member = 1;
+}
+
+message RemoveMemberRequest {
+  string organization_id = 1;
+  string user_id = 2;
+}
+
+message RemoveMemberResponse {}
+
+service MemberService {
+  rpc CreateInvitation(CreateInvitationRequest) returns (CreateInvitationResponse);
+  rpc ListInvitations(ListInvitationsRequest) returns (ListInvitationsResponse);
+  rpc RevokeInvitation(RevokeInvitationRequest) returns (RevokeInvitationResponse);
+  rpc AcceptInvitation(AcceptInvitationRequest) returns (AcceptInvitationResponse);
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+  rpc UpdateMemberRole(UpdateMemberRoleRequest) returns (UpdateMemberRoleResponse);
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+}
+
+message ApiKey {
+  string organization_id = 1;
+  string api_key_id = 2;
+  string name = 3;
+  ApiKeyState state = 4;
+  // Non-secret display prefix.
+  string secret_prefix = 5;
+  google.protobuf.Timestamp create_time = 6;
+  Principal created_by = 7;
+  google.protobuf.Timestamp revoke_time = 8;
+}
+
+message CreateApiKeyRequest {
+  string organization_id = 1;
+  string name = 2;
+}
+
+message CreateApiKeyResponse {
+  ApiKey api_key = 1;
+  // Secret: never log.
+  string api_key_secret = 2;
+}
+
+message ListApiKeysRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListApiKeysResponse {
+  repeated ApiKey api_keys = 1;
+  string next_page_token = 2;
+}
+
+message RevokeApiKeyRequest {
+  string organization_id = 1;
+  string api_key_id = 2;
+}
+
+message RevokeApiKeyResponse {}
+
+service ApiKeyService {
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+  rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+}
+
+message DeviceCapabilities {
+  HostOs host_os = 1;
+  Arch arch = 2;
+  string agent_version = 3;
+  int64 logical_cpu_count = 4;
+  int64 memory_mib = 5;
+  int64 free_disk_bytes = 6;
+  repeated GuestOs guest_oses = 7;
+  repeated BaseImage built_base_images = 8;
+  bool macos_guests_supported = 9;
+  // Opaque identifiers of the supported macOS hardware models.
+  repeated string macos_hardware_models = 10;
+  // Hypervisor checks by name, for example "kvm" -> "ok".
+  map<string, string> hypervisor_checks = 11;
+}
+
+message DeviceLimits {
+  int64 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+}
+
+message Device {
+  string organization_id = 1;
+  string device_id = 2;
+  string name = 3;
+  DeviceState state = 4;
+  DeviceCapabilities capabilities = 5;
+  DeviceLimits limits = 6;
+  // Resources that creating, running, paused and deleting sandboxes hold.
+  Resources allocated = 7;
+  string agent_version = 8;
+  AgentUpdateState update_state = 9;
+  google.protobuf.Timestamp enroll_time = 10;
+  google.protobuf.Timestamp last_seen_time = 11;
+}
+
+message EnrollmentToken {
+  string organization_id = 1;
+  string enrollment_token_id = 2;
+  EnrollmentTokenState state = 3;
+  string secret_prefix = 4;
+  google.protobuf.Timestamp create_time = 5;
+  google.protobuf.Timestamp expire_time = 6;
+  Principal created_by = 7;
+  // Set when the token was used.
+  string device_id = 8;
+}
+
+message CreateEnrollmentTokenRequest {
+  string organization_id = 1;
+  // At most 24 hours. Defaults to 24 hours when absent.
+  google.protobuf.Duration expires_in = 2;
+  // Name of the device that enrolls with the token.
+  string device_name = 3;
+}
+
+message CreateEnrollmentTokenResponse {
+  EnrollmentToken enrollment_token = 1;
+  // Secret: never log.
+  string enrollment_token_secret = 2;
+}
+
+message ListEnrollmentTokensRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListEnrollmentTokensResponse {
+  repeated EnrollmentToken enrollment_tokens = 1;
+  string next_page_token = 2;
+}
+
+message RevokeEnrollmentTokenRequest {
+  string organization_id = 1;
+  string enrollment_token_id = 2;
+}
+
+message RevokeEnrollmentTokenResponse {}
+
+message ListDevicesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  // Removed devices are listed only on request.
+  bool include_removed = 4;
+}
+
+message ListDevicesResponse {
+  repeated Device devices = 1;
+  string next_page_token = 2;
+}
+
+message GetDeviceRequest {
+  string organization_id = 1;
+  string device_id = 2;
+}
+
+message GetDeviceResponse {
+  Device device = 1;
+}
+
+message UpdateDeviceLimitsRequest {
+  string organization_id = 1;
+  string device_id = 2;
+  DeviceLimits limits = 3;
+}
+
+message UpdateDeviceLimitsResponse {
+  Device device = 1;
+}
+
+message RemoveDeviceRequest {
+  string organization_id = 1;
+  string device_id = 2;
+}
+
+message RemoveDeviceResponse {}
+
+message AgentVersionPolicy {
+  string organization_id = 1;
+  AgentVersionPolicyMode mode = 2;
+  // Set for PIN.
+  string pinned_version = 3;
+  // Default target version per platform key "<host_os>/<arch>" in lowercase, for example "linux/amd64".
+  map<string, string> default_versions = 4;
+}
+
+message GetAgentVersionPolicyRequest {
+  string organization_id = 1;
+}
+
+message GetAgentVersionPolicyResponse {
+  AgentVersionPolicy policy = 1;
+}
+
+message UpdateAgentVersionPolicyRequest {
+  string organization_id = 1;
+  AgentVersionPolicyMode mode = 2;
+  string pinned_version = 3;
+}
+
+message UpdateAgentVersionPolicyResponse {
+  AgentVersionPolicy policy = 1;
+}
+
+service DeviceService {
+  rpc CreateEnrollmentToken(CreateEnrollmentTokenRequest) returns (CreateEnrollmentTokenResponse);
+  rpc ListEnrollmentTokens(ListEnrollmentTokensRequest) returns (ListEnrollmentTokensResponse);
+  rpc RevokeEnrollmentToken(RevokeEnrollmentTokenRequest) returns (RevokeEnrollmentTokenResponse);
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
+  rpc UpdateDeviceLimits(UpdateDeviceLimitsRequest) returns (UpdateDeviceLimitsResponse);
+  rpc RemoveDevice(RemoveDeviceRequest) returns (RemoveDeviceResponse);
+  rpc GetAgentVersionPolicy(GetAgentVersionPolicyRequest) returns (GetAgentVersionPolicyResponse);
+  rpc UpdateAgentVersionPolicy(UpdateAgentVersionPolicyRequest) returns (UpdateAgentVersionPolicyResponse);
+}

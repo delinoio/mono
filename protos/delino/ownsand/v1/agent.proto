@@ -1,0 +1,371 @@
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "delino/ownsand/v1/datapath.proto";
+import "delino/ownsand/v1/organization.proto";
+import "delino/ownsand/v1/sandbox.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// ---------------------------------------------------------------------------
+// Device-facing AgentService. Not part of the SDKs.
+// ---------------------------------------------------------------------------
+
+message EnrollRequest {
+  // Secret: never log.
+  string enrollment_token = 1;
+  // Raw 32-byte Ed25519 public key.
+  bytes public_key = 2;
+  DeviceCapabilities capabilities = 3;
+}
+
+message EnrollResponse {
+  string device_id = 1;
+  string organization_id = 2;
+}
+
+message CreateChallengeRequest {
+  string device_id = 1;
+}
+
+message CreateChallengeResponse {
+  bytes nonce = 1;
+  google.protobuf.Timestamp expire_time = 2;
+}
+
+// Revision of a sandbox: a newer epoch always wins.
+message SandboxRevision {
+  string epoch = 1;
+  uint64 counter = 2;
+}
+
+message AuthenticateRequest {
+  string device_id = 1;
+  bytes nonce = 2;
+  // Ed25519 signature over "ownsand-authenticate" || nonce.
+  bytes signature = 3;
+  // The agent's state epoch.
+  string state_epoch = 4;
+}
+
+message AuthenticateResponse {
+  oneof result {
+    // Secret: never log.
+    string device_session_credential = 1;
+    // The device was removed; clean up and call ConfirmRemoval.
+    RemovalNotice removal_notice = 2;
+  }
+  google.protobuf.Timestamp expire_time = 3;
+}
+
+message RemovalNotice {}
+
+message ConfirmRemovalRequest {
+  string device_id = 1;
+  bytes nonce = 2;
+  // Ed25519 signature over "ownsand-confirm-removal" || nonce.
+  bytes signature = 3;
+}
+
+message ConfirmRemovalResponse {}
+
+// Agent channel envelope. Never carries a DataFrame.
+message AgentEnvelope {
+  oneof message {
+    Heartbeat heartbeat = 1;
+    DeviceCapabilities capability_report = 2;
+    StateReport state_report = 3;
+    AgentCommand command = 4;
+    AgentCommandResult command_result = 5;
+    AgentConfiguration configuration = 6;
+    SandboxUpdate sandbox_update = 7;
+    HeartbeatAck heartbeat_ack = 8;
+    StateAck state_ack = 9;
+    SignalingOffer signaling_offer = 10;
+    SignalingAnswer signaling_answer = 11;
+    SessionRevocation session_revocation = 12;
+    RevocationAck revocation_ack = 13;
+    SignedUrlRequest signed_url_request = 14;
+    SignedUrlGrant signed_url_grant = 15;
+    RelayGrant relay_grant = 16;
+    RelayGrantAck relay_grant_ack = 17;
+    RelayGrantRelease relay_grant_release = 18;
+    SnapshotUpdate snapshot_update = 19;
+    UpdateStatus update_status = 20;
+  }
+}
+
+message Heartbeat {
+  uint64 sequence = 1;
+}
+
+message HeartbeatAck {
+  uint64 sequence = 1;
+}
+
+message SandboxReport {
+  string sandbox_id = 1;
+  SandboxState state = 2;
+  SandboxEndReason end_reason = 3;
+  google.protobuf.Timestamp idle_deadline = 4;
+  SandboxRevision revision = 5;
+  RestorePath restore_path = 6;
+}
+
+message SnapshotReport {
+  string snapshot_id = 1;
+  SnapshotState state = 2;
+  int64 size_bytes = 3;
+  bool has_memory_state = 4;
+  string macos_hardware_model = 5;
+}
+
+message StateReport {
+  uint64 report_id = 1;
+  repeated SandboxReport sandboxes = 2;
+  repeated SnapshotReport snapshots = 3;
+  repeated BaseImage built_base_images = 4;
+  string agent_version = 5;
+  AgentUpdateState update_state = 6;
+}
+
+message SandboxUpdate {
+  SandboxReport sandbox = 1;
+}
+
+message SnapshotUpdate {
+  SnapshotReport snapshot = 1;
+  SnapshotExportState export_state = 2;
+  // SHA-256 of each exported part, in part order.
+  repeated bytes part_sha256 = 3;
+}
+
+message StateAck {
+  oneof target {
+    uint64 report_id = 1;
+    SandboxAck sandbox = 2;
+  }
+}
+
+message SandboxAck {
+  string sandbox_id = 1;
+  SandboxRevision revision = 2;
+}
+
+message UpdateStatus {
+  string agent_version = 1;
+  AgentUpdateState update_state = 2;
+  string target_version = 3;
+  string message = 4;
+}
+
+message AgentConfiguration {
+  repeated IceServer ice_servers = 1;
+  DeviceLimits limits = 2;
+  // Target agent version and whether it is a revocation recovery.
+  string target_version = 3;
+  bool revocation_recovery = 4;
+  string release_manifest_url = 5;
+}
+
+message CreateSandboxCommand {
+  string sandbox_id = 1;
+  SandboxSource source = 2;
+  Resources resources = 3;
+  NetworkMode network_mode = 4;
+  google.protobuf.Timestamp idle_deadline = 5;
+  google.protobuf.Timestamp max_deadline = 6;
+  google.protobuf.Duration idle_ttl = 7;
+  // Limits that the scheduler used.
+  DeviceLimits limits = 8;
+  // Set when the source snapshot must be imported from R2 first.
+  ImportSnapshotCommand import = 9;
+  // macOS machine identifier to use, opaque.
+  bytes macos_machine_identifier = 10;
+  bool try_memory_restore = 11;
+}
+
+message DeleteSandboxCommand {
+  string sandbox_id = 1;
+  SandboxEndReason reason = 2;
+}
+
+message PauseSandboxCommand {
+  string sandbox_id = 1;
+}
+
+message ResumeSandboxCommand {
+  string sandbox_id = 1;
+}
+
+message CreateSnapshotCommand {
+  string sandbox_id = 1;
+  string snapshot_id = 2;
+}
+
+message DeleteSnapshotCommand {
+  string snapshot_id = 1;
+}
+
+message ExportSnapshotCommand {
+  string snapshot_id = 1;
+}
+
+message ImportSnapshotCommand {
+  string snapshot_id = 1;
+  repeated bytes part_sha256 = 2;
+  int64 size_bytes = 3;
+  GuestOs guest_os = 4;
+  string macos_hardware_model = 5;
+}
+
+message CleanUpCommand {}
+
+message UpdateCommand {
+  string target_version = 1;
+  bool revocation_recovery = 2;
+}
+
+message AgentCommand {
+  string command_id = 1;
+  oneof command {
+    CreateSandboxCommand create_sandbox = 2;
+    DeleteSandboxCommand delete_sandbox = 3;
+    PauseSandboxCommand pause_sandbox = 4;
+    ResumeSandboxCommand resume_sandbox = 5;
+    CreateSnapshotCommand create_snapshot = 6;
+    ExportSnapshotCommand export_snapshot = 7;
+    ImportSnapshotCommand import_snapshot = 8;
+    CleanUpCommand clean_up = 9;
+    UpdateCommand update = 10;
+    DeleteSnapshotCommand delete_snapshot = 11;
+  }
+}
+
+message AgentCommandResult {
+  string command_id = 1;
+  // Connect error code name; empty on success.
+  string error_code = 2;
+  string error_message = 3;
+  oneof result {
+    SandboxReport sandbox = 4;
+    SnapshotReport snapshot = 5;
+  }
+}
+
+message SignalingOffer {
+  string session_id = 1;
+  string sandbox_id = 2;
+  Principal principal = 3;
+  google.protobuf.Timestamp expire_time = 4;
+  // Never logged.
+  string sdp_offer = 5;
+}
+
+message SignalingAnswer {
+  string session_id = 1;
+  // Never logged. Empty with error_code on failure.
+  string sdp_answer = 2;
+  string error_code = 3;
+  string error_message = 4;
+}
+
+message SessionRevocation {
+  string revocation_id = 1;
+  oneof target {
+    string session_id = 2;
+    string grant_id = 3;
+  }
+}
+
+message RevocationAck {
+  string revocation_id = 1;
+}
+
+message SignedUrlRequest {
+  string request_id = 1;
+  string snapshot_id = 2;
+  // 1-based part numbers.
+  repeated int32 part_numbers = 3;
+  bool upload = 4;
+}
+
+message SignedUrlGrant {
+  string request_id = 1;
+  string snapshot_id = 2;
+  // Part number to signed URL. Never logged.
+  map<int32, string> urls = 3;
+  google.protobuf.Timestamp expire_time = 4;
+  string error_code = 5;
+}
+
+message RelayGrant {
+  string grant_id = 1;
+  optional string replaces_grant_id = 2;
+  string sandbox_id = 3;
+  RelayOperationKind operation_kind = 4;
+  string operation_id = 5;
+  bytes request_digest = 6;
+  Principal principal = 7;
+  google.protobuf.Timestamp expires_at = 8;
+  google.protobuf.Timestamp stream_deadline = 9;
+  google.protobuf.Duration expires_in = 10;
+  google.protobuf.Duration stream_deadline_in = 11;
+}
+
+message RelayGrantAck {
+  string grant_id = 1;
+  RelayGrantResult result = 2;
+  optional string replaced_grant_id = 3;
+}
+
+message RelayGrantRelease {
+  string grant_id = 1;
+}
+
+service AgentService {
+  rpc Enroll(EnrollRequest) returns (EnrollResponse);
+  rpc CreateChallenge(CreateChallengeRequest) returns (CreateChallengeResponse);
+  rpc Authenticate(AuthenticateRequest) returns (AuthenticateResponse);
+  rpc ConfirmRemoval(ConfirmRemovalRequest) returns (ConfirmRemovalResponse);
+  // Long-lived agent channel over HTTP/2 (h2c behind Caddy). Authenticated with the osd_ credential.
+  rpc Channel(stream AgentEnvelope) returns (stream AgentEnvelope);
+}
+
+// ---------------------------------------------------------------------------
+// Guest channel inside each sandbox over the hypervisor socket.
+// ---------------------------------------------------------------------------
+
+message SetClockRequest {
+  google.protobuf.Timestamp now = 1;
+}
+
+message GuestReadyRequest {}
+
+message GuestReadyResponse {
+  string guest_version = 1;
+  GuestOs guest_os = 2;
+}
+
+// Control messages on the guest channel. Data uses DataFrame on the same
+// connection, length-prefixed like the data channel.
+message GuestControl {
+  oneof message {
+    GuestReadyRequest ready_request = 1;
+    GuestReadyResponse ready_response = 2;
+    SetClockRequest set_clock = 3;
+  }
+}
+
+// One message on the guest channel: control messages or data path frames.
+// Each GuestFrame is encoded as a varint length followed by the message.
+message GuestFrame {
+  oneof frame {
+    GuestControl control = 1;
+    DataFrame data = 2;
+  }
+}

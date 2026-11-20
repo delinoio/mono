@@ -1,0 +1,249 @@
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// How a sandbox from a snapshot or template was started.
+enum RestorePath {
+  RESTORE_PATH_UNSPECIFIED = 0;
+  // Booted from a base image.
+  RESTORE_PATH_BASE_IMAGE = 1;
+  // Restored the snapshot disk and booted cold.
+  RESTORE_PATH_COLD_BOOT = 2;
+  // Restored the snapshot memory state.
+  RESTORE_PATH_MEMORY_STATE = 3;
+}
+
+message SandboxSource {
+  oneof source {
+    BaseImage base_image = 1;
+    string snapshot_id = 2;
+    string template_id = 3;
+  }
+}
+
+message Sandbox {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  string device_id = 3;
+  SandboxState state = 4;
+  // Set while the state is UNREACHABLE.
+  SandboxState last_known_state = 5;
+  // Set for DELETED and FAILED.
+  SandboxEndReason end_reason = 6;
+  SandboxSource source = 7;
+  GuestOs guest_os = 8;
+  Arch arch = 9;
+  Resources resources = 10;
+  NetworkPolicy network = 11;
+  google.protobuf.Duration idle_ttl = 12;
+  google.protobuf.Duration max_ttl = 13;
+  google.protobuf.Timestamp idle_deadline = 14;
+  google.protobuf.Timestamp max_deadline = 15;
+  map<string, string> labels = 16;
+  Principal created_by = 17;
+  google.protobuf.Timestamp create_time = 18;
+  google.protobuf.Timestamp end_time = 19;
+  RestorePath restore_path = 20;
+}
+
+message CreateSandboxRequest {
+  string organization_id = 1;
+  // UUID v7 that the caller generates for each logical create.
+  string idempotency_key = 2;
+  SandboxSource source = 3;
+  Resources resources = 4;
+  google.protobuf.Duration idle_ttl = 5;
+  google.protobuf.Duration max_ttl = 6;
+  Placement placement = 7;
+  // Absent means NETWORK_MODE_OUTBOUND.
+  NetworkPolicy network = 8;
+  // At most 32 entries; keys at most 63 bytes, values at most 255 bytes. Never secrets.
+  map<string, string> labels = 9;
+}
+
+message CreateSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message GetSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message GetSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message ListSandboxesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  optional string device_id = 4;
+  // Asking for DELETED or FAILED includes ended sandboxes.
+  repeated SandboxState states = 5;
+}
+
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message DeleteSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message PauseSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message PauseSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message ResumeSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message ResumeSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+service SandboxService {
+  // Create a sandbox. Returns the sandbox in CREATING without waiting for the agent.
+  rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+  rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+}
+
+message Snapshot {
+  string organization_id = 1;
+  string snapshot_id = 2;
+  // Source sandbox. May name a sandbox that no longer exists.
+  string sandbox_id = 3;
+  // Device that holds the local copy. Empty when no local copy exists.
+  string device_id = 4;
+  SnapshotState state = 5;
+  SnapshotExportState export_state = 6;
+  GuestOs guest_os = 7;
+  Arch arch = 8;
+  HostOs host_os = 9;
+  Resources resources = 10;
+  NetworkMode network_mode = 11;
+  bool has_memory_state = 12;
+  int64 size_bytes = 13;
+  // Opaque macOS hardware model; empty for other guests.
+  string macos_hardware_model = 14;
+  Principal created_by = 15;
+  google.protobuf.Timestamp create_time = 16;
+}
+
+message CreateSnapshotRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message GetSnapshotRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+}
+
+message GetSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message ListSnapshotsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  optional string device_id = 4;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSnapshotRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+}
+
+message DeleteSnapshotResponse {}
+
+message ExportSnapshotRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+}
+
+message ExportSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message Template {
+  string organization_id = 1;
+  string template_id = 2;
+  string name = 3;
+  string snapshot_id = 4;
+  Principal created_by = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message CreateTemplateRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+  string name = 3;
+}
+
+message CreateTemplateResponse {
+  Template template = 1;
+}
+
+message ListTemplatesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListTemplatesResponse {
+  repeated Template templates = 1;
+  string next_page_token = 2;
+}
+
+message DeleteTemplateRequest {
+  string organization_id = 1;
+  string template_id = 2;
+}
+
+message DeleteTemplateResponse {}
+
+service SnapshotService {
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  // Fails with failed_precondition while a template references the snapshot.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (ExportSnapshotResponse);
+  rpc CreateTemplate(CreateTemplateRequest) returns (CreateTemplateResponse);
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
+}

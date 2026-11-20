@@ -4,8 +4,9 @@
 
 This contract owns the Connect RPC schemas of [`ownsand`](project-ownsand.md):
 
-- `protos/delino/ownsand/v1/` (`planned`): `.proto` files of the protobuf package `delino.ownsand.v1`.
-- The generated Go bindings, committed next to the schemas (`planned`): message code in the Go package `github.com/delinoio/mono/protos/delino/ownsand/v1` (package name `ownsandv1`) and Connect handlers and clients in its `ownsandv1connect` subpackage.
+- `protos/delino/ownsand/v1/`: `.proto` files of the protobuf package `delino.ownsand.v1`. The files are `common.proto` (shared enums and messages), `organization.proto` (`OrganizationService`, `MemberService`, `ApiKeyService` and `DeviceService`), `sandbox.proto` (`SandboxService` and `SnapshotService`), `datapath.proto` (exec and file messages, `DataFrame`, `DataPathService`, `RelayService` and `RelayAgentService`) and `agent.proto` (`AgentService`, `AgentEnvelope` and the guest channel frames).
+- `protos/buf.yaml` and `protos/buf.gen.yaml`: the buf module, lint and code generation configuration.
+- The generated Go bindings, committed next to the schemas: message code in the Go package `github.com/delinoio/mono/protos/delino/ownsand/v1` (package name `ownsandv1`) and Connect handlers and clients in its `ownsandv1connect` subpackage.
 
 The schemas are the single source of truth for the public API, the agent channel and the data path framing. The control plane, the device agent, the guest helper, the CLI, the web console and both SDKs consume them. The schemas and the generated code use Apache-2.0.
 
@@ -14,7 +15,8 @@ The schemas are the single source of truth for the public API, the agent channel
 - Language: Protocol Buffers (proto3), compiled for Connect RPC.
 - Go bindings: committed to the repository in the root Go module `github.com/delinoio/mono`. Go consumers import them directly and do not run code generation.
 - TypeScript bindings: generated for the [TypeScript SDK](packages-ownsand-sdk-foundation.md) and the [web console](apps-ownsand-console-foundation.md). The SDK contract owns where the generated TypeScript code lives.
-- Code generation tool: open decision. Record the tool, its pinned version, the generation command and the CI drift check in this contract in the change that adds the first schema. The tool and the protobuf and Connect runtime libraries are new dependencies and need owner approval.
+- Code generation tool: [buf](https://buf.build/docs/) `v1.74.0` with the local plugins `protoc-gen-go` (`google.golang.org/protobuf` `v1.36.12`) and `protoc-gen-connect-go` (`connectrpc.com/connect` `v1.21.1`). Every tool runs through `go run <module>@<version>`, so the tools use the Go module cache and are not requirements of the root `go.mod`. The owner approved buf, the Go plugins and the Go runtime libraries `google.golang.org/protobuf` and `connectrpc.com/connect`.
+- Generation command: `scripts/protos/generate.sh` from any directory of the repository. It runs `buf lint` and `buf generate` in `protos/`. `scripts/protos/generate.sh --check` also fails when the committed bindings differ from the generated output or when generated files are not committed.
 
 ## Users and Operators
 
@@ -26,6 +28,7 @@ The schemas are the single source of truth for the public API, the agent channel
 
 ### General rules
 
+- Field-level details that the tables below do not name (for example, the display names of organizations, devices and API keys, and the list filter fields) are defined by the schema files and their comments.
 - Package: `delino.ownsand.v1`. A breaking change needs a new package version (`v2`). Within `v1`, do not reuse or renumber fields, do not change field types, and reserve the numbers and names of removed fields.
 - Identifiers that OwnSand or its callers generate are UUID v7 values in canonical text form in `string` fields named `<entity>_id`. User ID fields (`user_id`) hold the Logto `sub` unchanged as an opaque string and are not validated as UUIDs.
 - Times use `google.protobuf.Timestamp`. Durations use `google.protobuf.Duration`.
@@ -231,13 +234,14 @@ The schemas define no logging. Components log RPC names, identifiers, enum value
 
 ## Build and Test
 
-- Before the first schema, record the generation command and the lint and breaking-change checks in this section.
-- CI must fail when the committed Go bindings differ from the generated output.
+- Generation and lint: `scripts/protos/generate.sh` (see [Runtime and Language](#runtime-and-language)). Lint uses the buf `STANDARD` rules except the per-RPC unique request and response rules, because the relay RPCs and `DataFrame` share the operation messages (for example, `ExecRequest`).
+- CI: the `go` job runs `scripts/protos/generate.sh --check`, so CI fails when the committed Go bindings differ from the generated output. The CI planner selects the `go` job for every `.proto` file and buf configuration file under `protos/`.
+- Breaking-change check: `buf breaking` with the `FILE` rules is configured in `protos/buf.yaml`. CI does not run it until a released `v1` baseline exists; record the baseline revision and add the CI step before the first external release of the SDKs.
 - Go consumers run `gofmt`, `go vet ./...` and `go test ./...` from the repository root according to `cmds/AGENTS.md` and `servers/AGENTS.md`.
 
 ## Dependencies and Integrations
 
-- Upstream: the protobuf compiler and the Connect code generators (open decision, needs owner approval).
+- Upstream: buf and the Go code generators listed in [Runtime and Language](#runtime-and-language).
 - Downstream: [control plane](servers-ownsand-api-foundation.md), [device agent and guest helper](cmds-ownsand-agent-foundation.md), [CLI](cmds-ownsand-cli-foundation.md), [web console](apps-ownsand-console-foundation.md) and [SDKs](packages-ownsand-sdk-foundation.md).
 
 ## Change Triggers
