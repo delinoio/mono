@@ -1472,8 +1472,14 @@
   }
 
   /* Number input. The field, label, description and error share the text
-     field rules. */
+     field rules. The SDK stylesheet makes the number input root a column
+     flex container, which would stretch the group across the whole field and
+     leave empty space after the plus button. align-self keeps the group as wide
+     as its control and step buttons. It has no effect when the root is not a
+     flex container. Remove it when the SDK stops making the root a flex
+     container. */
   .dui-number-input-group {
+    align-self: flex-start;
     display: inline-flex;
     align-items: stretch;
     box-sizing: border-box;
