@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
+	"github.com/pion/webrtc/v4"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -72,6 +75,55 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	if res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("create result %v\n%s", res, logs.String())
 	}
+	// The data path is wired: an offer gets an SDP answer, and a relay
+	// grant is acknowledged and opens a relay connection.
+	relayOpened := make(chan string, 4)
+	cp.SetRelayHandler(func(ctx context.Context, deviceID string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		req, err := stream.Receive()
+		if err == nil && req.GetFrame().GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE {
+			relayOpened <- deviceID
+		}
+		<-ctx.Done()
+		return nil
+	})
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	if _, err := pc.CreateDataChannel("ownsand-data", nil); err != nil {
+		t.Fatal(err)
+	}
+	offer, _ := pc.CreateOffer(nil)
+	gathered := webrtc.GatheringCompletePromise(pc)
+	pc.SetLocalDescription(offer)
+	<-gathered
+	sessionID, _ := uuidv7.NewString()
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Signaling{Signaling: &ownsandv1.SignalingMessage{Message: &ownsandv1.SignalingMessage_Offer{Offer: &ownsandv1.SignalingOffer{
+		SessionId: sessionID, SandboxId: id, ExpiresIn: durationpb.New(time.Hour), Sdp: pc.LocalDescription().SDP,
+	}}}}})
+	answer, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetSignaling().GetAnswer().GetSessionId() == sessionID
+	})
+	if answer.GetSignaling().GetAnswer().GetSdp() == "" {
+		t.Fatalf("signaling answer %v\n%s", answer, logs.String())
+	}
+	grantID, _ := uuidv7.NewString()
+	execID, _ := uuidv7.NewString()
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrant{RelayGrant: &ownsandv1.RelayGrant{
+		GrantId: grantID, SandboxId: id, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, OperationId: execID,
+		ExpiresIn: durationpb.New(15 * time.Minute), StreamDeadlineIn: durationpb.New(30 * time.Minute),
+	}}})
+	ack, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool { return e.GetRelayGrantAck().GetGrantId() == grantID })
+	if ack.GetRelayGrantAck().GetResult() != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
+		t.Fatalf("relay grant ack %v", ack)
+	}
+	select {
+	case <-relayOpened:
+	case <-time.After(20 * time.Second):
+		t.Fatalf("no relay connection\n%s", logs.String())
+	}
+
 	run.Process.Signal(syscall.SIGTERM)
 	done := make(chan error, 1)
 	go func() { done <- run.Wait() }()
