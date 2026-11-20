@@ -14,7 +14,7 @@ Success criterion: on one Linux, one macOS and one Windows device, an organizati
 
 Paths marked `planned` do not exist yet. Create each path, its workspace membership and its validation scripts in the change that starts its runtime implementation.
 
-- `servers/ownsand-api/` (`planned`): Go control plane on the shared DigitalOcean Droplet, served at `https://ownsand.api.delino.io`. It also serves the relay fallback of the data path and STUN on UDP port 3478.
+- `servers/ownsand-api/`: Go control plane on the shared DigitalOcean Droplet, served at `https://ownsand.api.delino.io`. It also serves the relay fallback of the data path and STUN on UDP port 3478.
 - `cmds/ownsand-agent/` (`planned`): Go device agent that runs on each enrolled host.
 - `cmds/ownsand-guest/` (`planned`): Go helper that runs inside each sandbox guest and serves exec and file requests from the device agent.
 - `cmds/ownsand/` (`planned`): Go command-line interface for people and programs.
@@ -108,9 +108,9 @@ Record each decision in the owning domain contract before the implementation tha
 - The public UDP port for STUN in the [deployment workflow](repository-workflow-contract.md#deployment-workflow), and the verification of the h2c and long-lived stream behavior of the Caddy route of `ownsand-api` ([control plane contract](servers-ownsand-api-foundation.md#runtime-and-language)).
 - The transport of the long-lived agent channel: a Connect bidirectional stream through the Caddy h2c route or a WebSocket upgrade on the same origin ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
-- The database migration tool and the backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)).
+- The database backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)). The migration tool is recorded there (an embedded forward-only runner).
 - The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
-- Every new third-party dependency. The protobuf code generation tool (buf with the Go and Connect plugins) and the Go protobuf and Connect runtimes are recorded in the [protos contract](protos-ownsand-api-contract.md#runtime-and-language). OwnSand also needs a Postgres driver, a WebRTC library (pion), a STUN server library, and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
+- Every new third-party dependency. The protobuf code generation tool (buf with the Go and Connect plugins) and the Go protobuf and Connect runtimes are recorded in the [protos contract](protos-ownsand-api-contract.md#runtime-and-language). The control plane records its Postgres driver (`github.com/jackc/pgx/v5`) and JWT library (`github.com/go-jose/go-jose/v4`) in its [contract](servers-ownsand-api-foundation.md#dependencies-and-integrations). OwnSand also needs a WebRTC library (pion), a STUN server library, and hypervisor bindings for Virtualization.framework and Hyper-V. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it.
 
 ## Change Policy
 

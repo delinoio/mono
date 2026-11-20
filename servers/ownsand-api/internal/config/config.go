@@ -1,0 +1,231 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+// Package config loads and validates the ownsand-api configuration from
+// environment variables. The owning contract is
+// docs/servers-ownsand-api-foundation.md (Configuration).
+package config
+
+import (
+	"encoding/base64"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/url"
+	"strconv"
+	"strings"
+)
+
+// Environment variable names read by the server.
+const (
+	EnvAddr                    = "ADDR"
+	EnvLogLevel                = "LOG_LEVEL"
+	EnvDatabaseURL             = "OWNSAND_DATABASE_URL"
+	EnvLogtoIssuer             = "OWNSAND_LOGTO_ISSUER"
+	EnvLogtoJWKSURL            = "OWNSAND_LOGTO_JWKS_URL"
+	EnvLogtoJWKSFile           = "OWNSAND_LOGTO_JWKS_FILE"
+	EnvLogtoAudience           = "OWNSAND_LOGTO_AUDIENCE"
+	EnvNonceKey                = "OWNSAND_NONCE_KEY"
+	EnvNonceKeyPrevious        = "OWNSAND_NONCE_KEY_PREVIOUS"
+	EnvCORSOrigins             = "OWNSAND_CORS_ORIGINS"
+	EnvTrustProxyClientAddress = "OWNSAND_TRUST_PROXY_CLIENT_ADDRESS"
+	EnvRunMigrations           = "OWNSAND_RUN_MIGRATIONS"
+)
+
+// Defaults.
+const (
+	// DefaultAddr is the development port of the control plane (h2c).
+	DefaultAddr = "127.0.0.1:8300"
+	// DefaultAudience is the Logto API resource indicator of OwnSand.
+	DefaultAudience = "https://ownsand.api.delino.io"
+	// DefaultCORSOrigin is the production console origin.
+	DefaultCORSOrigin = "https://ownsand.delino.io"
+	// minNonceKeySize is the smallest accepted nonce key.
+	minNonceKeySize = 32
+)
+
+// LogLevel is the accepted set of log level values.
+type LogLevel string
+
+const (
+	LogLevelDebug LogLevel = "debug"
+	LogLevelInfo  LogLevel = "info"
+	LogLevelWarn  LogLevel = "warn"
+	LogLevelError LogLevel = "error"
+)
+
+// SlogLevel converts the configured level to a slog level.
+func (l LogLevel) SlogLevel() slog.Level {
+	switch l {
+	case LogLevelDebug:
+		return slog.LevelDebug
+	case LogLevelWarn:
+		return slog.LevelWarn
+	case LogLevelError:
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
+}
+
+// Config is the validated server configuration. It holds secrets; never log
+// it as a whole.
+type Config struct {
+	Addr        string
+	LogLevel    LogLevel
+	DatabaseURL string
+	// RunMigrations applies the embedded migrations at startup.
+	RunMigrations bool
+
+	LogtoIssuer   string
+	LogtoJWKSURL  string
+	LogtoJWKSFile string
+	LogtoAudience string
+
+	// NonceKey is nil when unset: the server then uses a random key per
+	// process, which is valid only for a single instance.
+	NonceKey         []byte
+	NonceKeyPrevious []byte
+
+	CORSOrigins []string
+	// TrustProxyClientAddress uses the last X-Forwarded-For entry (the one
+	// that the Caddy reverse proxy appends) as the client address for rate
+	// limits.
+	TrustProxyClientAddress bool
+}
+
+// Load reads the configuration through lookup, which has the signature of
+// os.LookupEnv.
+func Load(lookup func(string) (string, bool)) (Config, error) {
+	cfg := Config{
+		Addr:          DefaultAddr,
+		LogLevel:      LogLevelInfo,
+		RunMigrations: true,
+		LogtoAudience: DefaultAudience,
+		CORSOrigins:   []string{DefaultCORSOrigin},
+	}
+	get := func(name string) string {
+		value, _ := lookup(name)
+		return strings.Trim(value, "\t\n\v\f\r ")
+	}
+
+	if v := get(EnvAddr); v != "" {
+		if err := validateAddr(EnvAddr, v); err != nil {
+			return Config{}, err
+		}
+		cfg.Addr = v
+	}
+	if v := get(EnvLogLevel); v != "" {
+		switch level := LogLevel(strings.ToLower(v)); level {
+		case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
+			cfg.LogLevel = level
+		default:
+			return Config{}, fmt.Errorf("%s must be one of debug, info, warn, error", EnvLogLevel)
+		}
+	}
+	cfg.DatabaseURL = get(EnvDatabaseURL)
+	if cfg.DatabaseURL == "" {
+		return Config{}, fmt.Errorf("%s is required", EnvDatabaseURL)
+	}
+	if v := get(EnvRunMigrations); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvRunMigrations)
+		}
+		cfg.RunMigrations = b
+	}
+
+	cfg.LogtoIssuer = get(EnvLogtoIssuer)
+	if cfg.LogtoIssuer == "" {
+		return Config{}, fmt.Errorf("%s is required", EnvLogtoIssuer)
+	}
+	if err := validateURL(EnvLogtoIssuer, cfg.LogtoIssuer); err != nil {
+		return Config{}, err
+	}
+	cfg.LogtoJWKSFile = get(EnvLogtoJWKSFile)
+	cfg.LogtoJWKSURL = get(EnvLogtoJWKSURL)
+	if cfg.LogtoJWKSURL == "" && cfg.LogtoJWKSFile == "" {
+		cfg.LogtoJWKSURL = strings.TrimSuffix(cfg.LogtoIssuer, "/") + "/jwks"
+	}
+	if cfg.LogtoJWKSURL != "" {
+		if err := validateURL(EnvLogtoJWKSURL, cfg.LogtoJWKSURL); err != nil {
+			return Config{}, err
+		}
+	}
+	if v := get(EnvLogtoAudience); v != "" {
+		cfg.LogtoAudience = v
+	}
+
+	var err error
+	if cfg.NonceKey, err = parseKey(EnvNonceKey, get(EnvNonceKey)); err != nil {
+		return Config{}, err
+	}
+	if cfg.NonceKeyPrevious, err = parseKey(EnvNonceKeyPrevious, get(EnvNonceKeyPrevious)); err != nil {
+		return Config{}, err
+	}
+	if cfg.NonceKeyPrevious != nil && cfg.NonceKey == nil {
+		return Config{}, fmt.Errorf("%s needs %s", EnvNonceKeyPrevious, EnvNonceKey)
+	}
+
+	if v := get(EnvCORSOrigins); v != "" {
+		cfg.CORSOrigins = nil
+		for _, origin := range splitList(v) {
+			u, err := url.Parse(origin)
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
+				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
+			}
+			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)
+		}
+	}
+	if v := get(EnvTrustProxyClientAddress); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvTrustProxyClientAddress)
+		}
+		cfg.TrustProxyClientAddress = b
+	}
+
+	return cfg, nil
+}
+
+func splitList(v string) []string {
+	var out []string
+	for _, item := range strings.Split(v, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			out = append(out, item)
+		}
+	}
+	return out
+}
+
+func parseKey(name, value string) ([]byte, error) {
+	if value == "" {
+		return nil, nil
+	}
+	key, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(value, "="))
+	if err != nil {
+		key, err = base64.StdEncoding.DecodeString(value)
+	}
+	if err != nil || len(key) < minNonceKeySize {
+		return nil, fmt.Errorf("%s must be at least %d bytes in base64", name, minNonceKeySize)
+	}
+	return key, nil
+}
+
+func validateURL(name, value string) error {
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		return fmt.Errorf("%s must be an http or https URL", name)
+	}
+	return nil
+}
+
+func validateAddr(name, value string) error {
+	_, port, err := net.SplitHostPort(value)
+	if err != nil {
+		return fmt.Errorf("%s must be a host:port address: %w", name, err)
+	}
+	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
+		return fmt.Errorf("%s port must be a number from 0 to 65535", name)
+	}
+	return nil
+}
