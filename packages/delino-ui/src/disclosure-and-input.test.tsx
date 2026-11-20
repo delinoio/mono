@@ -533,6 +533,14 @@ describe("NumberInput", () => {
     expect(block(".dui-number-input-button")).toMatch(/height: auto;/);
   });
 
+  test("keeps the group as wide as its parts inside a flex root", () => {
+    // The SDK stylesheet makes the root a column flex container, which
+    // stretches a group without align-self across the whole field.
+    expect(block(".dui-number-input-group")).toContain(
+      "align-self: flex-start;",
+    );
+  });
+
   test("steps the value with its buttons", async () => {
     const values: (number | null)[] = [];
     render(
