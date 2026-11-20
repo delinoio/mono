@@ -15,11 +15,15 @@ import (
 
 	"connectrpc.com/connect"
 
+	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/janitor"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/server"
 )
 
@@ -45,12 +49,25 @@ type Options struct {
 	// JanitorInterval is the retention job interval; zero selects the
 	// default.
 	JanitorInterval time.Duration
+
+	// STUNURLs are sent to agents and callers.
+	STUNURLs []string
+	// Objects signs snapshot part URLs; nil disables exports.
+	Objects               objectstore.Store
+	SnapshotPartSizeBytes int64
+	// Timing overrides the contract durations (tests).
+	Timing *api.Timing
+	// InstanceID names this instance in the lease; empty selects a new
+	// UUID v7.
+	InstanceID string
 }
 
 // App is a wired control plane.
 type App struct {
 	opts    Options
 	Service *api.Service
+	Lease   *lease.Lease
+	Control *api.Control
 	handler http.Handler
 }
 
@@ -74,14 +91,37 @@ func New(opts Options) (*App, error) {
 	if opts.Limits != nil {
 		limits = *opts.Limits
 	}
-	svc := &api.Service{
-		DB:           opts.DB,
-		Logger:       opts.Logger,
-		Now:          opts.Now,
-		Nonces:       auth.NewNonceIssuer(key, opts.NonceKeyPrevious, opts.Now),
-		Limits:       limits,
-		DisplayNames: opts.DisplayNames,
+	timing := api.DefaultTiming()
+	if opts.Timing != nil {
+		timing = *opts.Timing
 	}
+	if opts.InstanceID == "" {
+		id, err := uuidv7.NewString()
+		if err != nil {
+			return nil, err
+		}
+		opts.InstanceID = id
+	}
+	if opts.SnapshotPartSizeBytes == 0 {
+		opts.SnapshotPartSizeBytes = 64 << 20
+	}
+	svc := &api.Service{
+		DB:                    opts.DB,
+		Logger:                opts.Logger,
+		Now:                   opts.Now,
+		Nonces:                auth.NewNonceIssuer(key, opts.NonceKeyPrevious, opts.Now),
+		Limits:                limits,
+		DisplayNames:          opts.DisplayNames,
+		Hub:                   hub.New(),
+		Objects:               opts.Objects,
+		STUNURLs:              opts.STUNURLs,
+		SnapshotPartSizeBytes: opts.SnapshotPartSizeBytes,
+		Timing:                timing,
+	}
+	control := api.NewControl(svc)
+	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
+		OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
+	svc.Lease = l
 	authn := &api.Authenticator{Service: svc, Logto: opts.Logto}
 	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.TrustProxyClientAddress)...)}
 
@@ -92,10 +132,14 @@ func New(opts Options) (*App, error) {
 	add(ownsandv1connect.NewApiKeyServiceHandler(api.APIKeyHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewDeviceServiceHandler(api.DeviceHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewAgentServiceHandler(api.AgentHandler{Service: svc}, handlerOpts...))
+	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...))
+	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...))
 
 	return &App{
 		opts:    opts,
 		Service: svc,
+		Lease:   l,
+		Control: control,
 		handler: server.NewHandler(server.Options{Logger: opts.Logger, CORSOrigins: opts.CORSOrigins, Mounts: mounts}),
 	}, nil
 }
@@ -106,10 +150,20 @@ func (a *App) Handler() http.Handler { return a.handler }
 // Run runs the background workers until ctx ends and waits for them.
 func (a *App) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(1)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		janitor.Run(ctx, a.opts.DB, a.opts.Logger, a.opts.Now, a.opts.JanitorInterval)
+	}()
+	go func() {
+		defer wg.Done()
+		// Run releases the lease when ctx ends, which closes every agent
+		// channel before the HTTP server drains.
+		a.Lease.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		a.Control.Run(ctx)
 	}()
 	wg.Wait()
 }

@@ -1,0 +1,492 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package api
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
+
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+)
+
+// SnapshotHandler serves SnapshotService.
+type SnapshotHandler struct{ *Service }
+
+var _ ownsandv1connect.SnapshotServiceHandler = SnapshotHandler{}
+
+// maxSnapshotParts bounds the part numbers of one export.
+const maxSnapshotParts = 10000
+
+const snapshotColumns = `snapshot_id::text, organization_id::text, source_sandbox_id::text, COALESCE(device_id::text, ''), state, export_state,
+	guest_os, host_os, arch, vcpu_count, memory_mib, disk_gib, network_mode, has_memory_state, size_bytes, COALESCE(macos_hardware_model, ''::bytea),
+	COALESCE(machine_lineage::text, ''), created_by_kind, created_by_id, create_time`
+
+type snapshotRow struct {
+	pb      *ownsandv1.Snapshot
+	lineage string
+}
+
+func scanSnapshot(row pgx.Row) (*snapshotRow, error) {
+	var sn ownsandv1.Snapshot
+	var state, export, guest, host, arch, network, kind int16
+	var createdBy, lineage string
+	var created time.Time
+	var res ownsandv1.Resources
+	if err := row.Scan(&sn.SnapshotId, &sn.OrganizationId, &sn.SourceSandboxId, &sn.DeviceId, &state, &export, &guest, &host, &arch,
+		&res.VcpuCount, &res.MemoryMib, &res.DiskGib, &network, &sn.HasMemoryState, &sn.SizeBytes, &sn.MacosHardwareModel, &lineage,
+		&kind, &createdBy, &created); err != nil {
+		return nil, err
+	}
+	sn.State = ownsandv1.SnapshotState(state)
+	sn.ExportState = ownsandv1.SnapshotExportState(export)
+	sn.GuestOs = ownsandv1.GuestOs(guest)
+	sn.HostOs = ownsandv1.HostOs(host)
+	sn.Arch = ownsandv1.Arch(arch)
+	sn.Resources = &res
+	sn.NetworkMode = ownsandv1.NetworkMode(network)
+	sn.CreatedBy = principalProto(kind, createdBy)
+	sn.CreateTime = ts(created)
+	if len(sn.MacosHardwareModel) == 0 {
+		sn.MacosHardwareModel = nil
+	}
+	return &snapshotRow{pb: &sn, lineage: lineage}, nil
+}
+
+func loadSnapshot(ctx context.Context, q db.Querier, orgID, snapshotID string, lock bool) (*snapshotRow, error) {
+	sql := "SELECT " + snapshotColumns + " FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2"
+	if lock {
+		sql += " FOR UPDATE"
+	}
+	sn, err := scanSnapshot(q.QueryRow(ctx, sql, orgID, snapshotID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errNotFound("snapshot")
+	}
+	return sn, err
+}
+
+// stateErr applies the sandbox state rule of a table row: unavailable for
+// UNREACHABLE and failed_precondition for the other states.
+func stateErr(state ownsandv1.SandboxState, rpc string) error {
+	if state == ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE {
+		return errUnavailable("the sandbox's device is offline")
+	}
+	return errPrecondition(fmt.Sprintf("%s is not allowed in state %s", rpc, state))
+}
+
+func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Request[ownsandv1.CreateSnapshotRequest]) (*connect.Response[ownsandv1.CreateSnapshotResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	p, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+		return nil, err
+	}
+	var snap *snapshotRow
+	var conn *hub.Conn
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		sb, err := loadSandbox(ctx, tx, orgID, req.Msg.GetSandboxId(), true)
+		if err != nil {
+			return err
+		}
+		state, _ := sb.shownState()
+		if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+			return stateErr(state, "CreateSnapshot")
+		}
+		conn = h.Hub.Live(sb.DeviceID)
+		if conn == nil {
+			return errUnavailable("the sandbox's device has no live agent channel")
+		}
+		id := newID()
+		lineage := any(nil)
+		if sb.GuestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
+			lineage = sb.ID
+			if sb.MachineLineage != "" {
+				lineage = sb.MachineLineage
+			}
+		}
+		snap, err = scanSnapshot(tx.QueryRow(ctx, `INSERT INTO snapshots (snapshot_id, organization_id, source_sandbox_id, device_id, state, export_state,
+			guest_os, host_os, arch, vcpu_count, memory_mib, disk_gib, network_mode, machine_lineage, created_by_kind, created_by_id, create_time)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17) RETURNING `+snapshotColumns,
+			id, orgID, sb.ID, sb.DeviceID, int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_NOT_EXPORTED),
+			int16(sb.GuestOS), int16(sb.HostOS), int16(sb.Arch), sb.VCPUCount, sb.MemoryMiB, sb.DiskGiB, int16(sb.NetworkMode), lineage, int16(p.Kind), p.ID, h.now()))
+		return err
+	})
+	if err != nil {
+		return nil, h.internal(ctx, "create snapshot", err)
+	}
+	if _, err := h.sendCommand(ctx, conn, commandInfo{kind: cmdCreateSnapshot, orgID: orgID, sandboxID: snap.pb.GetSourceSandboxId(), snapshotID: snap.pb.GetSnapshotId()},
+		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{
+			SnapshotId: snap.pb.GetSnapshotId(), SandboxId: snap.pb.GetSourceSandboxId(),
+		}}}); err != nil {
+		_, _ = h.DB.Pool.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1", snap.pb.GetSnapshotId(), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED))
+		return nil, errUnavailable("the agent channel closed")
+	}
+	return connect.NewResponse(&ownsandv1.CreateSnapshotResponse{Snapshot: snap.pb}), nil
+}
+
+func (s *Service) applySnapshotResult(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+	if res.GetError() != nil || res.GetCreateSnapshot().GetSnapshot() == nil {
+		_, err := s.DB.Pool.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", info.snapshotID,
+			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
+		return err
+	}
+	return s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		return applySnapshotEntryTx(ctx, tx, info.snapshotID, res.GetCreateSnapshot().GetSnapshot())
+	})
+}
+
+func (s *Service) applyExportResult(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+	return s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		var export int16
+		err := tx.QueryRow(ctx, "SELECT export_state FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", info.snapshotID).Scan(&export)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil // deleted meanwhile; its clean-up job removes the parts
+		}
+		if err != nil || ownsandv1.SnapshotExportState(export) != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING {
+			return err
+		}
+		result := res.GetExportSnapshot()
+		if res.GetError() != nil || result == nil || len(result.GetParts()) == 0 {
+			_, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED))
+			return err
+		}
+		if _, err := tx.Exec(ctx, "DELETE FROM snapshot_parts WHERE snapshot_id = $1", info.snapshotID); err != nil {
+			return err
+		}
+		for _, part := range result.GetParts() {
+			if part.GetPartNumber() < 1 || part.GetPartNumber() > maxSnapshotParts || len(part.GetSha256()) != 32 || part.GetSizeBytes() < 0 {
+				_, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED))
+				return err
+			}
+			if _, err := tx.Exec(ctx, "INSERT INTO snapshot_parts (snapshot_id, part_number, size_bytes, sha256) VALUES ($1, $2, $3, $4)",
+				info.snapshotID, part.GetPartNumber(), part.GetSizeBytes(), part.GetSha256()); err != nil {
+				return err
+			}
+		}
+		_, err = tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED))
+		return err
+	})
+}
+
+// partKey is the R2 object key of one exported part.
+func partKey(orgID, snapshotID string, part int32) string {
+	return fmt.Sprintf("%sparts/%d", snapshotPrefix(orgID, snapshotID), part)
+}
+
+// handleSignedURLRequest issues fresh part URLs to the agent that runs an
+// export (UPLOAD, the device that holds the snapshot while it is EXPORTING)
+// or an import (DOWNLOAD, a device of the organization with the same OS and
+// architecture while the snapshot is EXPORTED). URLs expire after 15
+// minutes and are never logged.
+func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r *ownsandv1.SignedUrlRequest) error {
+	grant := &ownsandv1.SignedUrlGrant{RequestId: r.GetRequestId(), SnapshotId: r.GetSnapshotId(), Operation: r.GetOperation()}
+	deny := func(code ownsandv1.ErrorCode, msg string) error {
+		grant.Error = &ownsandv1.ErrorDetail{Code: code, Message: msg}
+		grant.PartUrls = nil
+		return conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SignedUrlGrant{SignedUrlGrant: grant}})
+	}
+	if s.Objects == nil {
+		return deny(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot export storage is not configured")
+	}
+	if !validID(r.GetSnapshotId()) || len(r.GetPartNumbers()) == 0 || len(r.GetPartNumbers()) > maxSnapshotParts {
+		return deny(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid signed URL request")
+	}
+	sn, err := loadSnapshot(ctx, s.DB.Pool, conn.OrganizationID, r.GetSnapshotId(), false)
+	if err != nil {
+		return deny(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "snapshot not found")
+	}
+	var host, arch int16
+	if err := s.DB.Pool.QueryRow(ctx, "SELECT host_os, arch FROM devices WHERE device_id = $1", conn.DeviceID).Scan(&host, &arch); err != nil {
+		return err
+	}
+	var presign func(string, time.Duration) (string, time.Time, error)
+	switch r.GetOperation() {
+	case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_UPLOAD:
+		if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || sn.pb.GetDeviceId() != conn.DeviceID {
+			return deny(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not being exported by this device")
+		}
+		presign = s.Objects.PresignPut
+	case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD:
+		if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED ||
+			ownsandv1.HostOs(host) != sn.pb.GetHostOs() || ownsandv1.Arch(arch) != sn.pb.GetArch() {
+			return deny(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not exported for this device")
+		}
+		presign = s.Objects.PresignGet
+	default:
+		return deny(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid operation")
+	}
+	for _, n := range r.GetPartNumbers() {
+		if n < 1 || n > maxSnapshotParts {
+			return deny(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid part number")
+		}
+		u, exp, err := presign(partKey(conn.OrganizationID, sn.pb.GetSnapshotId(), n), signedURLLifetime)
+		if err != nil {
+			return deny(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "signing failed")
+		}
+		grant.PartUrls = append(grant.PartUrls, &ownsandv1.SignedPartUrl{PartNumber: n, Url: u, ExpireTime: ts(exp)})
+	}
+	s.Logger.InfoContext(ctx, "signed_urls_issued", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", sn.pb.GetSnapshotId()),
+		slog.String("operation", r.GetOperation().String()), slog.Int("parts", len(grant.PartUrls)))
+	return conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SignedUrlGrant{SignedUrlGrant: grant}})
+}
+
+func validID(id string) bool { return validateID("id", id) == nil }
+
+func (h SnapshotHandler) GetSnapshot(ctx context.Context, req *connect.Request[ownsandv1.GetSnapshotRequest]) (*connect.Response[ownsandv1.GetSnapshotResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+		return nil, err
+	}
+	sn, err := loadSnapshot(ctx, h.DB.Pool, orgID, req.Msg.GetSnapshotId(), false)
+	if err != nil {
+		return nil, h.internal(ctx, "get snapshot", err)
+	}
+	return connect.NewResponse(&ownsandv1.GetSnapshotResponse{Snapshot: sn.pb}), nil
+}
+
+func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request[ownsandv1.ListSnapshotsRequest]) (*connect.Response[ownsandv1.ListSnapshotsResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	limit, after, err := pageArgs(req.Msg.GetPageSize(), req.Msg.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
+	where := []string{"organization_id = $1", "snapshot_id > $2"}
+	args := []any{orgID, afterKey(after)}
+	if req.Msg.SandboxId != nil {
+		if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+			return nil, err
+		}
+		args = append(args, req.Msg.GetSandboxId())
+		where = append(where, fmt.Sprintf("source_sandbox_id = $%d", len(args)))
+	}
+	if req.Msg.DeviceId != nil {
+		if err := validateID("device_id", req.Msg.GetDeviceId()); err != nil {
+			return nil, err
+		}
+		args = append(args, req.Msg.GetDeviceId())
+		where = append(where, fmt.Sprintf("device_id = $%d", len(args)))
+	}
+	args = append(args, limit)
+	rows, err := h.DB.Pool.Query(ctx, "SELECT "+snapshotColumns+" FROM snapshots WHERE "+strings.Join(where, " AND ")+fmt.Sprintf(" ORDER BY snapshot_id LIMIT $%d", len(args)), args...)
+	if err != nil {
+		return nil, h.internal(ctx, "list snapshots", err)
+	}
+	defer rows.Close()
+	resp := &ownsandv1.ListSnapshotsResponse{}
+	for rows.Next() {
+		sn, err := scanSnapshot(rows)
+		if err != nil {
+			return nil, h.internal(ctx, "list snapshots", err)
+		}
+		resp.Snapshots = append(resp.Snapshots, sn.pb)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, h.internal(ctx, "list snapshots", err)
+	}
+	last := ""
+	if n := len(resp.Snapshots); n > 0 {
+		last = resp.Snapshots[n-1].GetSnapshotId()
+	}
+	resp.NextPageToken = nextPageToken(len(resp.Snapshots), limit, last)
+	return connect.NewResponse(resp), nil
+}
+
+func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Request[ownsandv1.DeleteSnapshotRequest]) (*connect.Response[ownsandv1.DeleteSnapshotResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if _, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes); err != nil {
+			return err
+		}
+		if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+			return err
+		}
+		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		if err != nil {
+			return err
+		}
+		var templates bool
+		if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM templates WHERE snapshot_id = $1)", sn.pb.GetSnapshotId()).Scan(&templates); err != nil {
+			return err
+		}
+		if templates {
+			return errPrecondition("a template references the snapshot")
+		}
+		return h.deleteSnapshotRecordTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.pb.GetExportState())
+	})
+	if err != nil {
+		return nil, h.internal(ctx, "delete snapshot", err)
+	}
+	return connect.NewResponse(&ownsandv1.DeleteSnapshotResponse{}), nil
+}
+
+func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Request[ownsandv1.ExportSnapshotRequest]) (*connect.Response[ownsandv1.ExportSnapshotResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+		return nil, err
+	}
+	if h.Objects == nil {
+		return nil, errPrecondition("snapshot export storage is not configured")
+	}
+	var sn *snapshotRow
+	var conn *hub.Conn
+	start := false
+	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		sn, err = loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		if err != nil {
+			return err
+		}
+		switch sn.pb.GetExportState() {
+		case ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED:
+			return nil
+		}
+		if sn.pb.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+			return errPrecondition("only a ready snapshot can be exported")
+		}
+		if sn.pb.GetDeviceId() == "" {
+			return errPrecondition("no device holds the snapshot")
+		}
+		conn = h.Hub.Live(sn.pb.GetDeviceId())
+		if conn == nil {
+			return errUnavailable("the snapshot's device has no live agent channel")
+		}
+		sn, err = scanSnapshot(tx.QueryRow(ctx, "UPDATE snapshots SET export_state = $2, export_part_size_bytes = $3 WHERE snapshot_id = $1 RETURNING "+snapshotColumns,
+			sn.pb.GetSnapshotId(), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING), h.SnapshotPartSizeBytes))
+		start = err == nil
+		return err
+	})
+	if err != nil {
+		return nil, h.internal(ctx, "export snapshot", err)
+	}
+	if start {
+		if _, err := h.sendCommand(ctx, conn, commandInfo{kind: cmdExportSnapshot, orgID: orgID, snapshotID: sn.pb.GetSnapshotId()},
+			&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{
+				SnapshotId: sn.pb.GetSnapshotId(), PartSizeBytes: h.SnapshotPartSizeBytes,
+			}}}); err != nil {
+			_, _ = h.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", sn.pb.GetSnapshotId(), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED))
+			return nil, errUnavailable("the agent channel closed")
+		}
+	}
+	return connect.NewResponse(&ownsandv1.ExportSnapshotResponse{Snapshot: sn.pb}), nil
+}
+
+const templateColumns = `template_id::text, organization_id::text, name, snapshot_id::text, created_by_kind, created_by_id, create_time`
+
+func scanTemplate(row pgx.Row) (*ownsandv1.Template, error) {
+	var t ownsandv1.Template
+	var kind int16
+	var createdBy string
+	var created time.Time
+	if err := row.Scan(&t.TemplateId, &t.OrganizationId, &t.Name, &t.SnapshotId, &kind, &createdBy, &created); err != nil {
+		return nil, err
+	}
+	t.CreatedBy = principalProto(kind, createdBy)
+	t.CreateTime = ts(created)
+	return &t, nil
+}
+
+func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Request[ownsandv1.CreateTemplateRequest]) (*connect.Response[ownsandv1.CreateTemplateResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	var t *ownsandv1.Template
+	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
+		if err != nil {
+			return err
+		}
+		if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+			return err
+		}
+		if err := validateName("name", req.Msg.GetName()); err != nil {
+			return err
+		}
+		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		if err != nil {
+			return err
+		}
+		if sn.pb.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+			return errPrecondition("only a ready snapshot can back a template")
+		}
+		t, err = scanTemplate(tx.QueryRow(ctx, `INSERT INTO templates (template_id, organization_id, name, snapshot_id, created_by_kind, created_by_id, create_time)
+			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING `+templateColumns, newID(), orgID, req.Msg.GetName(), sn.pb.GetSnapshotId(), int16(p.Kind), p.ID, h.now()))
+		if db.IsUniqueViolation(err) {
+			return errAlreadyExists("a template with this name exists")
+		}
+		return err
+	})
+	if err != nil {
+		return nil, h.internal(ctx, "create template", err)
+	}
+	return connect.NewResponse(&ownsandv1.CreateTemplateResponse{Template: t}), nil
+}
+
+func (h SnapshotHandler) ListTemplates(ctx context.Context, req *connect.Request[ownsandv1.ListTemplatesRequest]) (*connect.Response[ownsandv1.ListTemplatesResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	limit, after, err := pageArgs(req.Msg.GetPageSize(), req.Msg.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
+	rows, err := h.DB.Pool.Query(ctx, "SELECT "+templateColumns+" FROM templates WHERE organization_id = $1 AND template_id > $2 ORDER BY template_id LIMIT $3", orgID, afterKey(after), limit)
+	if err != nil {
+		return nil, h.internal(ctx, "list templates", err)
+	}
+	defer rows.Close()
+	resp := &ownsandv1.ListTemplatesResponse{}
+	for rows.Next() {
+		t, err := scanTemplate(rows)
+		if err != nil {
+			return nil, h.internal(ctx, "list templates", err)
+		}
+		resp.Templates = append(resp.Templates, t)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, h.internal(ctx, "list templates", err)
+	}
+	last := ""
+	if n := len(resp.Templates); n > 0 {
+		last = resp.Templates[n-1].GetTemplateId()
+	}
+	resp.NextPageToken = nextPageToken(len(resp.Templates), limit, last)
+	return connect.NewResponse(resp), nil
+}
+
+func (h SnapshotHandler) DeleteTemplate(ctx context.Context, req *connect.Request[ownsandv1.DeleteTemplateRequest]) (*connect.Response[ownsandv1.DeleteTemplateResponse], error) {
+	orgID := req.Msg.GetOrganizationId()
+	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+		return nil, err
+	}
+	if err := validateID("template_id", req.Msg.GetTemplateId()); err != nil {
+		return nil, err
+	}
+	tag, err := h.DB.Pool.Exec(ctx, "DELETE FROM templates WHERE organization_id = $1 AND template_id = $2", orgID, req.Msg.GetTemplateId())
+	if err != nil {
+		return nil, h.internal(ctx, "delete template", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, errNotFound("template")
+	}
+	return connect.NewResponse(&ownsandv1.DeleteTemplateResponse{}), nil
+}

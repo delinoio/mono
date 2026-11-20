@@ -31,6 +31,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 )
 
@@ -95,6 +96,8 @@ type Env struct {
 	Clock  *Clock
 	Logs   *SafeBuffer
 	Logger *slog.Logger
+	// Objects is the in-memory object store of snapshot exports.
+	Objects *objectstore.Memory
 }
 
 // Option changes the app options before New wires the app.
@@ -114,12 +117,24 @@ func New(t testing.TB, opts ...Option) *Env {
 		PerPrefix: ratelimit.New(1000, 1000, clock.Now),
 		PerClient: ratelimit.New(1000, 1000, clock.Now),
 	}
+	timing := api.Timing{
+		HeartbeatTimeout: 45 * time.Second,
+		CommandWait:      5 * time.Second,
+		EventPoll:        50 * time.Millisecond,
+		OfflineSweep:     100 * time.Millisecond,
+		CleanupPoll:      time.Hour,
+		ImportWait:       10 * time.Second,
+	}
+	objects := objectstore.NewMemory(clock.Now)
 	o := app.Options{
-		DB:     database,
-		Logger: logger,
-		Now:    clock.Now,
-		Logto:  fakeLogto{},
-		Limits: &limits,
+		DB:       database,
+		Logger:   logger,
+		Now:      clock.Now,
+		Logto:    fakeLogto{},
+		Limits:   &limits,
+		Timing:   &timing,
+		Objects:  objects,
+		STUNURLs: []string{"stun:127.0.0.1:3478"},
 	}
 	for _, opt := range opts {
 		opt(&o)
@@ -142,7 +157,7 @@ func New(t testing.TB, opts ...Option) *Env {
 		cancel()
 		<-done
 	})
-	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, Logger: logger}
+	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, Logger: logger, Objects: objects}
 }
 
 // UserToken returns a fake Logto access token for userID.

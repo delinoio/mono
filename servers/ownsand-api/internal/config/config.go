@@ -29,6 +29,12 @@ const (
 	EnvCORSOrigins             = "OWNSAND_CORS_ORIGINS"
 	EnvTrustProxyClientAddress = "OWNSAND_TRUST_PROXY_CLIENT_ADDRESS"
 	EnvRunMigrations           = "OWNSAND_RUN_MIGRATIONS"
+	EnvSTUNURLs                = "OWNSAND_STUN_URLS"
+	EnvR2Endpoint              = "OWNSAND_R2_ENDPOINT"
+	EnvR2Bucket                = "OWNSAND_R2_BUCKET"
+	EnvR2AccessKeyID           = "OWNSAND_R2_ACCESS_KEY_ID"
+	EnvR2SecretAccessKey       = "OWNSAND_R2_SECRET_ACCESS_KEY"
+	EnvSnapshotPartSizeBytes   = "OWNSAND_SNAPSHOT_PART_SIZE_BYTES"
 )
 
 // Defaults.
@@ -39,6 +45,10 @@ const (
 	DefaultAudience = "https://ownsand.api.delino.io"
 	// DefaultCORSOrigin is the production console origin.
 	DefaultCORSOrigin = "https://ownsand.delino.io"
+	// DefaultSTUNURL is the production STUN URL that callers and agents get.
+	DefaultSTUNURL = "stun:ownsand.api.delino.io:3478"
+	// DefaultSnapshotPartSizeBytes is the snapshot export part size (64 MiB).
+	DefaultSnapshotPartSizeBytes = 64 << 20
 	// minNonceKeySize is the smallest accepted nonce key.
 	minNonceKeySize = 32
 )
@@ -67,6 +77,17 @@ func (l LogLevel) SlogLevel() slog.Level {
 	}
 }
 
+// R2 is the object storage configuration of snapshot exports. Enabled is
+// false when no bucket is configured; exports then fail with
+// failed_precondition.
+type R2 struct {
+	Enabled         bool
+	Endpoint        string
+	Bucket          string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
 // Config is the validated server configuration. It holds secrets; never log
 // it as a whole.
 type Config struct {
@@ -91,17 +112,25 @@ type Config struct {
 	// that the Caddy reverse proxy appends) as the client address for rate
 	// limits.
 	TrustProxyClientAddress bool
+
+	// STUNURLs are the STUN server URLs for callers and agents.
+	STUNURLs []string
+
+	R2                    R2
+	SnapshotPartSizeBytes int64
 }
 
 // Load reads the configuration through lookup, which has the signature of
 // os.LookupEnv.
 func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg := Config{
-		Addr:          DefaultAddr,
-		LogLevel:      LogLevelInfo,
-		RunMigrations: true,
-		LogtoAudience: DefaultAudience,
-		CORSOrigins:   []string{DefaultCORSOrigin},
+		Addr:                  DefaultAddr,
+		LogLevel:              LogLevelInfo,
+		RunMigrations:         true,
+		LogtoAudience:         DefaultAudience,
+		CORSOrigins:           []string{DefaultCORSOrigin},
+		STUNURLs:              []string{DefaultSTUNURL},
+		SnapshotPartSizeBytes: DefaultSnapshotPartSizeBytes,
 	}
 	get := func(name string) string {
 		value, _ := lookup(name)
@@ -184,6 +213,39 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.TrustProxyClientAddress = b
 	}
 
+	if v := get(EnvSTUNURLs); v != "" {
+		cfg.STUNURLs = nil
+		for _, u := range splitList(v) {
+			if !strings.HasPrefix(u, "stun:") {
+				return Config{}, fmt.Errorf("%s must list stun: URLs", EnvSTUNURLs)
+			}
+			cfg.STUNURLs = append(cfg.STUNURLs, u)
+		}
+	}
+	cfg.R2 = R2{
+		Endpoint:        get(EnvR2Endpoint),
+		Bucket:          get(EnvR2Bucket),
+		AccessKeyID:     get(EnvR2AccessKeyID),
+		SecretAccessKey: get(EnvR2SecretAccessKey),
+	}
+	if cfg.R2.Bucket != "" || cfg.R2.Endpoint != "" || cfg.R2.AccessKeyID != "" || cfg.R2.SecretAccessKey != "" {
+		if cfg.R2.Bucket == "" || cfg.R2.Endpoint == "" || cfg.R2.AccessKeyID == "" || cfg.R2.SecretAccessKey == "" {
+			return Config{}, fmt.Errorf("%s, %s, %s and %s must be set together", EnvR2Endpoint, EnvR2Bucket, EnvR2AccessKeyID, EnvR2SecretAccessKey)
+		}
+		if err := validateURL(EnvR2Endpoint, cfg.R2.Endpoint); err != nil {
+			return Config{}, err
+		}
+		cfg.R2.Enabled = true
+	}
+	if v := get(EnvSnapshotPartSizeBytes); v != "" {
+		n, err := strconv.ParseInt(v, 10, 64)
+		// Each part is one R2 object; 5 MiB to 5 GiB keeps the part count
+		// below 10,000 for disks up to 50 TiB and inside the object size limit.
+		if err != nil || n < 5<<20 || n > 5<<30 {
+			return Config{}, fmt.Errorf("%s must be 5 MiB to 5 GiB", EnvSnapshotPartSizeBytes)
+		}
+		cfg.SnapshotPartSizeBytes = n
+	}
 	return cfg, nil
 }
 

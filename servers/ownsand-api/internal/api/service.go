@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -24,6 +25,9 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 )
 
@@ -81,6 +85,72 @@ type Service struct {
 	// transaction wrote control events, so it does not wait for its next
 	// poll.
 	Notify func()
+
+	// Agent channel dependencies.
+	Hub   *hub.Hub
+	Lease LeaseHolder
+	// Objects signs snapshot part URLs and deletes R2 prefixes; nil when R2
+	// is not configured.
+	Objects objectstore.Store
+	// STUNURLs are sent to agents in the configuration message and to
+	// callers by GetIceServers.
+	STUNURLs []string
+	// SnapshotPartSizeBytes is the export part size.
+	SnapshotPartSizeBytes int64
+	// Timing of the contract; tests shorten them.
+	Timing Timing
+
+	// DataPath handles the data path envelopes of the agent channel
+	// (signaling answers, revocation and relay grant acknowledgements and
+	// releases) and the revocation events. Nil until the data path exists.
+	DataPath DataPathHooks
+
+	watch    sandboxWatch
+	commands sync.Map // command ID -> commandInfo
+}
+
+// LeaseHolder reports whether this instance holds the instance lease.
+type LeaseHolder interface {
+	Held() bool
+}
+
+// DataPathHooks receives the data path parts of the agent channel.
+type DataPathHooks interface {
+	// HandleEnvelope handles a data path envelope from the agent and reports
+	// whether it was one.
+	HandleEnvelope(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) bool
+	// HandleEvent applies a revocation event.
+	HandleEvent(ctx context.Context, e events.Event)
+}
+
+// Timing holds the durations of the agent channel rules.
+type Timing struct {
+	// HeartbeatTimeout closes a channel without a heartbeat (45 seconds).
+	HeartbeatTimeout time.Duration
+	// CommandWait bounds the wait of PauseSandbox, ResumeSandbox and
+	// DeleteSandbox for the agent result (60 seconds).
+	CommandWait time.Duration
+	// EventPoll is the poll interval of the control event processor.
+	EventPoll time.Duration
+	// OfflineSweep is the interval of the check that marks devices offline
+	// that are online without a channel on the lease holder.
+	OfflineSweep time.Duration
+	// CleanupPoll is the interval of the R2 clean-up worker.
+	CleanupPoll time.Duration
+	// ImportWait bounds a snapshot import before the create.
+	ImportWait time.Duration
+}
+
+// DefaultTiming returns the contract values.
+func DefaultTiming() Timing {
+	return Timing{
+		HeartbeatTimeout: 45 * time.Second,
+		CommandWait:      60 * time.Second,
+		EventPoll:        time.Second,
+		OfflineSweep:     5 * time.Second,
+		CleanupPoll:      30 * time.Second,
+		ImportWait:       2 * time.Hour,
+	}
 }
 
 func (s *Service) notify() {
