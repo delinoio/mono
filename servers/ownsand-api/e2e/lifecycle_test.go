@@ -137,105 +137,109 @@ func (s *stack) waitLocalSnapshotGone(t *testing.T, a agentProc, snapshotID stri
 func TestLifecycleSDK(t *testing.T) {
 	s := newStack(t)
 	for _, tr := range transports {
-		t.Run(tr.String(), func(t *testing.T) {
-			ctx := s.ctx(5 * time.Minute)
-			c := s.apiKeyClient(tr)
-			sb, err := c.CreateSandbox(ctx, createParams())
-			if err != nil {
-				t.Fatalf("CreateSandbox: %v", err)
-			}
-			defer sb.Close()
-			info, err := sb.WaitStable(ctx)
-			if err != nil {
-				t.Fatalf("WaitStable: %v", err)
-			}
-			if info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-				t.Fatalf("sandbox state %v, want RUNNING", info.GetState())
-			}
+		t.Run(tr.String(), func(t *testing.T) { sdkLifecycle(t, s, tr) })
+	}
+}
 
-			stdout, stderr, res := execCollect(ctx, t, sb, "/bin/sh", "-c", "echo out; echo err >&2; exit 7")
-			if stdout != "out\n" || stderr != "err\n" || exitCode(res) != 7 {
-				t.Fatalf("exec = (%q, %q, %+v), want (out, err, 7)", stdout, stderr, res)
-			}
-			if res.Transport != wantTransport(tr) {
-				t.Errorf("exec transport %v, want %v", res.Transport, wantTransport(tr))
-			}
+// sdkLifecycle drives the full sandbox lifecycle through the Go SDK on one
+// forced transport.
+func sdkLifecycle(t *testing.T, s *stack, tr ownsand.Transport) {
+	ctx := s.ctx(5 * time.Minute)
+	c := s.apiKeyClient(tr)
+	sb, err := c.CreateSandbox(ctx, createParams())
+	if err != nil {
+		t.Fatalf("CreateSandbox: %v", err)
+	}
+	defer sb.Close()
+	info, err := sb.WaitStable(ctx)
+	if err != nil {
+		t.Fatalf("WaitStable: %v", err)
+	}
+	if info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("sandbox state %v, want RUNNING", info.GetState())
+	}
 
-			// Multi-chunk file write and read (the SDK chunks at 1 MiB).
-			root := workDir(ctx, t, sb)
-			data := randomBytes(t, 3<<20+12345)
-			n, err := sb.WriteFile(ctx, root+"/e2e.bin", bytes.NewReader(data), ownsand.WriteOptions{})
-			if err != nil || n != int64(len(data)) {
-				t.Fatalf("WriteFile = (%d, %v)", n, err)
-			}
-			got, err := sb.ReadFileBytes(ctx, root+"/e2e.bin")
-			if err != nil {
-				t.Fatalf("ReadFile: %v", err)
-			}
-			if !bytes.Equal(got, data) {
-				t.Fatalf("ReadFile returned %d bytes (sha %x), want %d bytes (sha %x)", len(got), sha256.Sum256(got), len(data), sha256.Sum256(data))
-			}
-			out, _, res := execCollect(ctx, t, sb, "/bin/sh", "-c", "wc -c < e2e.bin")
-			if strings.TrimSpace(out) != strconv.Itoa(len(data)) || exitCode(res) != 0 {
-				t.Fatalf("guest size %q (%+v)", out, res)
-			}
+	stdout, stderr, res := execCollect(ctx, t, sb, "/bin/sh", "-c", "echo out; echo err >&2; exit 7")
+	if stdout != "out\n" || stderr != "err\n" || exitCode(res) != 7 {
+		t.Fatalf("exec = (%q, %q, %+v), want (out, err, 7)", stdout, stderr, res)
+	}
+	if res.Transport != wantTransport(tr) {
+		t.Errorf("exec transport %v, want %v", res.Transport, wantTransport(tr))
+	}
 
-			testAttachExec(ctx, t, sb)
+	// Multi-chunk file write and read (the SDK chunks at 1 MiB).
+	root := workDir(ctx, t, sb)
+	data := randomBytes(t, 3<<20+12345)
+	n, err := sb.WriteFile(ctx, root+"/e2e.bin", bytes.NewReader(data), ownsand.WriteOptions{})
+	if err != nil || n != int64(len(data)) {
+		t.Fatalf("WriteFile = (%d, %v)", n, err)
+	}
+	got, err := sb.ReadFileBytes(ctx, root+"/e2e.bin")
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("ReadFile returned %d bytes (sha %x), want %d bytes (sha %x)", len(got), sha256.Sum256(got), len(data), sha256.Sum256(data))
+	}
+	out, _, res := execCollect(ctx, t, sb, "/bin/sh", "-c", "wc -c < e2e.bin")
+	if strings.TrimSpace(out) != strconv.Itoa(len(data)) || exitCode(res) != 0 {
+		t.Fatalf("guest size %q (%+v)", out, res)
+	}
 
-			if p, err := sb.Pause(ctx); err != nil || p.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
-				t.Fatalf("Pause = (%v, %v)", p.GetState(), err)
-			}
-			if r, err := sb.Resume(ctx); err != nil || r.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-				t.Fatalf("Resume = (%v, %v)", r.GetState(), err)
-			}
-			if out, _, res := execCollect(ctx, t, sb, "/bin/echo", "resumed"); out != "resumed\n" || exitCode(res) != 0 {
-				t.Fatalf("exec after resume = (%q, %+v)", out, res)
-			}
+	testAttachExec(ctx, t, sb)
 
-			snap, err := sb.Snapshot(ctx)
-			if err != nil {
-				t.Fatalf("Snapshot: %v", err)
-			}
-			waitSnapshotReady(ctx, t, c, snap.GetSnapshotId())
+	if p, err := sb.Pause(ctx); err != nil || p.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("Pause = (%v, %v)", p.GetState(), err)
+	}
+	if r, err := sb.Resume(ctx); err != nil || r.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("Resume = (%v, %v)", r.GetState(), err)
+	}
+	if out, _, res := execCollect(ctx, t, sb, "/bin/echo", "resumed"); out != "resumed\n" || exitCode(res) != 0 {
+		t.Fatalf("exec after resume = (%q, %+v)", out, res)
+	}
 
-			// A sandbox from the snapshot holds the written file.
-			p := createParams()
-			p.BaseImage = ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED
-			p.SnapshotID = snap.GetSnapshotId()
-			restored, err := c.CreateSandbox(ctx, p)
-			if err != nil {
-				t.Fatalf("CreateSandbox from snapshot: %v", err)
-			}
-			defer restored.Close()
-			if info, err := restored.WaitStable(ctx); err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-				t.Fatalf("restored WaitStable = (%v, %v)", info.GetState(), err)
-			}
-			// The restored sandbox has its own root; the file came with the
-			// snapshot.
-			got, err = restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+"/e2e.bin")
-			if err != nil || !bytes.Equal(got, data) {
-				t.Fatalf("restored ReadFile = (%d bytes, %v)", len(got), err)
-			}
-			if _, err := restored.Delete(ctx); err != nil {
-				t.Fatalf("delete restored: %v", err)
-			}
+	snap, err := sb.Snapshot(ctx)
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	waitSnapshotReady(ctx, t, c, snap.GetSnapshotId())
 
-			if _, err := c.Snapshots().Delete(ctx, &ownsandv1.DeleteSnapshotRequest{SnapshotId: snap.GetSnapshotId()}); err != nil {
-				t.Fatalf("DeleteSnapshot: %v", err)
-			}
-			s.waitLocalSnapshotGone(t, s.agents[0], snap.GetSnapshotId())
-			if _, err := sb.Delete(ctx); err != nil {
-				t.Fatalf("Delete: %v", err)
-			}
-			final, err := sb.WaitStable(ctx)
-			var ended *ownsand.ErrSandboxEnded
-			if err != nil && !errors.As(err, &ended) {
-				t.Fatalf("WaitStable after delete: %v", err)
-			}
-			if err == nil && final.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
-				t.Fatalf("state after delete %v", final.GetState())
-			}
-		})
+	// A sandbox from the snapshot holds the written file.
+	p := createParams()
+	p.BaseImage = ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED
+	p.SnapshotID = snap.GetSnapshotId()
+	restored, err := c.CreateSandbox(ctx, p)
+	if err != nil {
+		t.Fatalf("CreateSandbox from snapshot: %v", err)
+	}
+	defer restored.Close()
+	if info, err := restored.WaitStable(ctx); err != nil || info.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("restored WaitStable = (%v, %v)", info.GetState(), err)
+	}
+	// The restored sandbox has its own root; the file came with the
+	// snapshot.
+	got, err = restored.ReadFileBytes(ctx, workDir(ctx, t, restored)+"/e2e.bin")
+	if err != nil || !bytes.Equal(got, data) {
+		t.Fatalf("restored ReadFile = (%d bytes, %v)", len(got), err)
+	}
+	if _, err := restored.Delete(ctx); err != nil {
+		t.Fatalf("delete restored: %v", err)
+	}
+
+	if _, err := c.Snapshots().Delete(ctx, &ownsandv1.DeleteSnapshotRequest{SnapshotId: snap.GetSnapshotId()}); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	s.waitLocalSnapshotGone(t, s.agents[0], snap.GetSnapshotId())
+	if _, err := sb.Delete(ctx); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	final, err := sb.WaitStable(ctx)
+	var ended *ownsand.ErrSandboxEnded
+	if err != nil && !errors.As(err, &ended) {
+		t.Fatalf("WaitStable after delete: %v", err)
+	}
+	if err == nil && final.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("state after delete %v", final.GetState())
 	}
 }
 

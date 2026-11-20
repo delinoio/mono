@@ -203,6 +203,8 @@ type stackOptions struct {
 	agents int
 	// objects runs the fake S3 store and configures snapshot export.
 	objects bool
+	// agentEnv selects the agent runtime; nil means the process runtime.
+	agentEnv []string
 }
 
 // agentProc is one enrolled agent process.
@@ -279,8 +281,12 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	s.orgID = org.GetOrganization().GetOrganizationId()
 	user = s.userClient(ownsand.TransportAuto)
 
+	runtimeEnv := o.agentEnv
+	if runtimeEnv == nil {
+		runtimeEnv = []string{"OWNSAND_AGENT_RUNTIME=process", "OWNSAND_AGENT_GUEST_BINARY=" + filepath.Join(bins, "ownsand-guest")}
+	}
 	for i := range o.agents {
-		s.agents = append(s.agents, s.startAgent(ctx, user, work, i))
+		s.agents = append(s.agents, s.startAgent(ctx, user, work, i, runtimeEnv))
 	}
 	s.deviceID = s.agents[0].deviceID
 	k, err := user.APIKeys().Create(ctx, &ownsandv1.CreateApiKeyRequest{OrganizationId: s.orgID, Name: "e2e"})
@@ -293,7 +299,7 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 
 // startAgent enrolls agent i with a new enrollment token, runs it, waits
 // until its device is online and sets its limits.
-func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work string, i int) agentProc {
+func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work string, i int, runtimeEnv []string) agentProc {
 	t := s.t
 	t.Helper()
 	tok, err := user.Devices().CreateEnrollmentToken(ctx, &ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: s.orgID, Ttl: durationpb.New(time.Hour)})
@@ -301,13 +307,11 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 		t.Fatalf("CreateEnrollmentToken: %v", err)
 	}
 	stateDir := filepath.Join(work, fmt.Sprintf("agent-%d", i))
-	agentEnv := []string{
+	agentEnv := append([]string{
 		"OWNSAND_AGENT_STATE_DIR=" + stateDir,
-		"OWNSAND_AGENT_RUNTIME=process",
-		"OWNSAND_AGENT_GUEST_BINARY=" + filepath.Join(s.bins, "ownsand-guest"),
 		"OWNSAND_AGENT_LOG_LEVEL=debug",
 		"NO_COLOR=1",
-	}
+	}, runtimeEnv...)
 	enroll := exec.CommandContext(ctx, filepath.Join(s.bins, "ownsand-agent"), "enroll", "--api-url", s.apiURL, "--name", fmt.Sprintf("e2e-device-%d", i))
 	enroll.Env = append(os.Environ(), agentEnv...)
 	enroll.Stdin = strings.NewReader(tok.GetEnrollmentToken() + "\n")
