@@ -32,6 +32,6 @@
 
 - [Repository defaults](../docs/repository-defaults.md)
 - [Repository workflow](../docs/repository-workflow-contract.md)
-- `cmds/ownsand-agent/` and `cmds/ownsand-guest/` (`planned`): [project index](../docs/project-ownsand.md) and [device agent foundation contract](../docs/cmds-ownsand-agent-foundation.md)
+- `cmds/ownsand-agent/` and `cmds/ownsand-guest/`: [project index](../docs/project-ownsand.md) and [device agent foundation contract](../docs/cmds-ownsand-agent-foundation.md)
 - `cmds/ownsand/`: [project index](../docs/project-ownsand.md) and [CLI foundation contract](../docs/cmds-ownsand-cli-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.
