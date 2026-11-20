@@ -38,6 +38,9 @@ func envOr(name, fallback string) string {
 }
 
 func main() {
+	if isInit() {
+		os.Exit(runInit(os.Args[1:]))
+	}
 	os.Exit(run(os.Args[1:]))
 }
 
