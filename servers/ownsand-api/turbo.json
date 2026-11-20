@@ -9,7 +9,14 @@
         "DATABASE_URL",
         "LOGTO_ENDPOINT",
         "LOG_LEVEL",
-        "OWNSAND_API_RESOURCE"
+        "OWNSAND_API_RESOURCE",
+        "OWNSAND_NONCE_KEY",
+        "OWNSAND_NONCE_KEY_PREVIOUS",
+        "OWNSAND_RELEASE_MANIFEST_URL",
+        "R2_ACCESS_KEY_ID",
+        "R2_BUCKET",
+        "R2_ENDPOINT",
+        "R2_SECRET_ACCESS_KEY"
       ]
     },
     "build": {

@@ -21,6 +21,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/pgtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/secret"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/server"
@@ -67,19 +68,54 @@ type harness struct {
 	logs   *syncBuffer
 }
 
+// harnessOptions adjust the app in a test.
+type harnessOptions struct {
+	cfg  func(*config.Config)
+	opts func(*Options)
+	app  func(*App)
+}
+
 // newHarness starts the app on an h2c httptest server backed by a fresh
-// Postgres database.
-func newHarness(t *testing.T) *harness {
+// Postgres database. The app holds the single-instance lease and runs its
+// background loops until the test ends.
+func newHarness(t *testing.T, hopts ...harnessOptions) *harness {
 	t.Helper()
 	st := pgtest.New(t)
 	logs := &syncBuffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	cfg := config.Config{Addr: "127.0.0.1:0", APIResource: config.DefaultAPIResource, CORSAllowedOrigins: []string{"http://127.0.0.1:3300"}}
-	a := New(cfg, st, logger, Options{Tokens: fakeTokens{}})
+	cfg.Extra.NonceKey = []byte("test-nonce-key-0123456789abcdef!")
+	opts := Options{Tokens: fakeTokens{}}
+	for _, o := range hopts {
+		if o.cfg != nil {
+			o.cfg(&cfg)
+		}
+		if o.opts != nil {
+			o.opts(&opts)
+		}
+	}
+	a := New(cfg, st, logger, opts)
+	for _, o := range hopts {
+		if o.app != nil {
+			o.app(a)
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m := &lease.Manager{Backend: st, Holder: store.NewID(), Logger: logger, Interval: time.Second}
+	a.UseLease(m)
+	go m.Run(ctx)
+	a.Start(ctx)
 	srv := httptest.NewUnstartedServer(a.Handler)
 	srv.Config = server.New(a.Handler, logger)
 	srv.Start()
-	t.Cleanup(srv.Close)
+	t.Cleanup(func() {
+		a.Drain(context.Background())
+		cancel()
+		srv.Close()
+	})
+	for i := 0; i < 300 && !a.Agents.Ready(); i++ {
+		time.Sleep(10 * time.Millisecond)
+	}
 	return &harness{t: t, app: a, store: st, url: srv.URL, client: h2cClient(), logs: logs}
 }
 
