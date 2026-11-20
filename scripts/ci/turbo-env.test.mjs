@@ -37,6 +37,21 @@ const expectedPassThroughEnv = {
   "delino-accounts#dev": ["PUBLIC_API_ORIGIN"],
   "delidev#dev": ["TAURI_DEV_HOST"],
   "delino-docs#dev": null,
+  // Turbo reports the pass-through list sorted.
+  "ownsand-api#dev": [
+    "ADDR",
+    "LOG_LEVEL",
+    "OWNSAND_CORS_ORIGINS",
+    "OWNSAND_DATABASE_URL",
+    "OWNSAND_LOGTO_AUDIENCE",
+    "OWNSAND_LOGTO_ISSUER",
+    "OWNSAND_LOGTO_JWKS_FILE",
+    "OWNSAND_LOGTO_JWKS_URL",
+    "OWNSAND_NONCE_KEY",
+    "OWNSAND_NONCE_KEY_PREVIOUS",
+    "OWNSAND_RUN_MIGRATIONS",
+    "OWNSAND_TRUST_PROXY_CLIENT_ADDRESS",
+  ],
   "delino-site#dev": null,
 };
 
