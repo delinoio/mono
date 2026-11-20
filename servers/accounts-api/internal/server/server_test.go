@@ -267,6 +267,39 @@ func serveRequest(t *testing.T, handler http.HandlerFunc) (clientErr error, clie
 	return err, clientStatus, decodeRecords(t, logs)
 }
 
+// TestRequestLogDurationIsMeasured checks that duration_ms of the http_request
+// record measures the request. Test requests normally finish in well under one
+// millisecond, which logs as 0, so a handler that sleeps gives the field a
+// value that a constant or a negated duration cannot match. The lower bound
+// cannot fail under load: time.Since never reports less than the sleep. The
+// upper bound only catches a unit error.
+func TestRequestLogDurationIsMeasured(t *testing.T) {
+	const (
+		handlerDelay        = 20 * time.Millisecond
+		maxPlausibleSeconds = 5
+	)
+	_, _, records := serveRequest(t, func(http.ResponseWriter, *http.Request) {
+		time.Sleep(handlerDelay)
+	})
+	if len(records) != 1 {
+		t.Fatalf("got %d log records, want exactly 1: %v", len(records), records)
+	}
+	record := records[0]
+	if record["msg"] != "http_request" {
+		t.Fatalf("unexpected request log: %v", record)
+	}
+	duration, ok := record["duration_ms"].(float64)
+	if !ok {
+		t.Fatalf("duration_ms = %v, want a number", record["duration_ms"])
+	}
+	if want := float64(handlerDelay.Milliseconds()); duration < want {
+		t.Errorf("duration_ms = %v, want at least %v", duration, want)
+	}
+	if want := float64(maxPlausibleSeconds * time.Second.Milliseconds()); duration > want {
+		t.Errorf("duration_ms = %v, want at most %v", duration, want)
+	}
+}
+
 // TestRequestLogOnPanic checks the status and bytes of the record of a handler
 // that panics, together with what the client received. bytes counts the body
 // bytes net/http accepted from the handler, not what reached the client:
