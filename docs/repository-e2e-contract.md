@@ -2,13 +2,13 @@
 
 ## Scope
 
-This contract owns browser end-to-end (e2e) tests for web apps under `apps/`. It applies to `delino-accounts`, `delino-site` and `delino-docs`. Unit tests, API server tests and native platform tests are out of scope.
+This contract owns browser end-to-end (e2e) tests for web apps under `apps/`. It applies to `delino-accounts`, `delino-site`, `delino-docs` and `ownsand-console`. Unit tests, API server tests and native platform tests are out of scope.
 
 ## Framework
 
 - Use the [`e2e`](https://www.npmjs.com/package/e2e) npm package (SDK, runner and CLI) with the `@e2e-dev/web` engine. The engine drives Chromium through a pinned `playwright-core`; do not add `playwright` or `@playwright/test`.
 - Use the `ai` package (Vercel AI SDK) for the model behind `agent.*` steps.
-- Pin `e2e`, `@e2e-dev/web` and `ai` to exact versions in each app's `devDependencies`. Keep the three apps on the same versions. `e2e` is pre-1.0, so review its changelog for config and API changes before an upgrade.
+- Pin `e2e`, `@e2e-dev/web` and `ai` to exact versions in each app's `devDependencies`. Keep every app on the same versions. `e2e` is pre-1.0, so review its changelog for config and API changes before an upgrade.
 - The runtime is Node.js from root `.nvmrc`. `e2e` requires Node.js 24.8 or newer.
 
 ## Layout
@@ -30,6 +30,7 @@ Each app that has e2e tests owns these paths:
 - The runner starts the app development server through `app.command` and stops it when the run ends. Name the server binary (`rsbuild` or `rspress`) as the executable, not a wrapper script.
 - The target URL is `http://127.0.0.1:0`. The runner selects a free loopback port and passes it as `{port}` to `--port`, with `--host 127.0.0.1`. This is a documented exception to the fixed development ports in the [environment contract](repository-environment-contract.md#process-boundaries), so a suite can run while `pnpm dev` holds the fixed ports.
 - The app command receives only `PATH`, `HOME` and temporary-directory variables from the host. Build-time variables such as `PUBLIC_API_ORIGIN` use their defaults unless the config passes them explicitly.
+- An app whose pages need a signed-in user and an API server may run its suite against an in-browser fake API that its own contract defines, selected by a build-time variable that the config passes and that production builds reject. `ownsand-console` passes `PUBLIC_OWNSAND_MOCK_API=true` ([console contract](apps-ownsand-console-foundation.md#build-and-test)).
 - Server output goes to `.e2e/logs/app.log`.
 - The suites test the development server. They do not test the production build, Cloudflare Pages `_headers`, the Cloudflare Pages single-page-application fallback (served only when the output has no top-level `404.html`), or deployed origins.
 
@@ -90,3 +91,4 @@ The root `test:e2e` Turbo task is uncached because results depend on a browser, 
 - [apps-delino-accounts-foundation.md](apps-delino-accounts-foundation.md)
 - [apps-delino-site-foundation.md](apps-delino-site-foundation.md)
 - [apps-delino-docs-foundation.md](apps-delino-docs-foundation.md)
+- [apps-ownsand-console-foundation.md](apps-ownsand-console-foundation.md)
