@@ -829,6 +829,14 @@ describe("SegmentedControl", () => {
     expect(grid.getAttribute("aria-checked")).toBe("true");
     expect(list.getAttribute("aria-checked")).toBe("false");
   });
+
+  // happy-dom does not compute the cascade, so this checks the stylesheet
+  // text. The optional UI SDK stylesheet draws a 1px border on the track and
+  // the indicator, which the borderless design must reset.
+  test("resets the UI SDK border on the track and the indicator", () => {
+    expect(block(".dui-segmented-control")).toContain("border: 0;");
+    expect(block(".dui-segmented-control-indicator")).toContain("border: 0;");
+  });
 });
 
 describe("Toggle", () => {
