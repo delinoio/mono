@@ -755,6 +755,7 @@ test("repository deployables use the documented targets", () => {
       ["delino-accounts", "delino-accounts", "apps/delino-accounts/dist"],
       ["delino-docs", "delino-docs", "apps/delino-docs/dist"],
       ["delino-site", "delino-site", "apps/delino-site/dist"],
+      ["ownsand-console", "ownsand-console", "apps/ownsand/dist"],
     ],
   );
 });

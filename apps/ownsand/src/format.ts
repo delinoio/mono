@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: Apache-2.0
+import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
+import { Code, ConnectError } from "@connectrpc/connect";
+import {
+  AgentUpdateState,
+  AgentVersionPolicyMode,
+  ApiKeyState,
+  Arch,
+  BaseImage,
+  DeviceState,
+  EnrollmentTokenState,
+  GuestOs,
+  HostOs,
+  InvitationState,
+  NetworkMode,
+  Role,
+  SandboxEndReason,
+  SandboxState,
+  SnapshotExportState,
+  SnapshotState,
+} from "ownsand-sdk/gen/common_pb";
+
+/** Display labels of the enums the console shows. */
+export const labels = {
+  role: {
+    [Role.UNSPECIFIED]: "Unknown",
+    [Role.OWNER]: "Owner",
+    [Role.ADMIN]: "Admin",
+    [Role.MEMBER]: "Member",
+  },
+  sandboxState: {
+    [SandboxState.UNSPECIFIED]: "Unknown",
+    [SandboxState.CREATING]: "Creating",
+    [SandboxState.RUNNING]: "Running",
+    [SandboxState.PAUSED]: "Paused",
+    [SandboxState.DELETING]: "Deleting",
+    [SandboxState.DELETED]: "Deleted",
+    [SandboxState.FAILED]: "Failed",
+    [SandboxState.UNREACHABLE]: "Unreachable",
+  },
+  endReason: {
+    [SandboxEndReason.UNSPECIFIED]: "Unknown",
+    [SandboxEndReason.DELETED_BY_CALLER]: "Deleted by a caller",
+    [SandboxEndReason.IDLE_TTL_EXPIRED]: "Idle TTL ended",
+    [SandboxEndReason.MAX_TTL_EXPIRED]: "Maximum TTL ended",
+    [SandboxEndReason.DEVICE_REMOVED]: "Device removed",
+    [SandboxEndReason.ORGANIZATION_DELETED]: "Organization deleted",
+    [SandboxEndReason.CREATE_FAILED]: "Create failed",
+    [SandboxEndReason.LOST_ON_DEVICE]: "Lost on the device",
+  },
+  deviceState: {
+    [DeviceState.UNSPECIFIED]: "Unknown",
+    [DeviceState.ONLINE]: "Online",
+    [DeviceState.OFFLINE]: "Offline",
+    [DeviceState.REMOVED]: "Removed",
+  },
+  hostOs: {
+    [HostOs.UNSPECIFIED]: "Unknown",
+    [HostOs.LINUX]: "Linux",
+    [HostOs.MACOS]: "macOS",
+    [HostOs.WINDOWS]: "Windows",
+  },
+  guestOs: {
+    [GuestOs.UNSPECIFIED]: "Unknown",
+    [GuestOs.LINUX]: "Linux",
+    [GuestOs.MACOS]: "macOS",
+    [GuestOs.WINDOWS]: "Windows",
+  },
+  arch: {
+    [Arch.UNSPECIFIED]: "Unknown",
+    [Arch.AMD64]: "x86-64",
+    [Arch.ARM64]: "ARM64",
+  },
+  baseImage: {
+    [BaseImage.UNSPECIFIED]: "Unknown",
+    [BaseImage.LINUX]: "Linux",
+    [BaseImage.MACOS]: "macOS",
+    [BaseImage.WINDOWS]: "Windows",
+  },
+  network: {
+    [NetworkMode.UNSPECIFIED]: "Outbound",
+    [NetworkMode.OUTBOUND]: "Outbound",
+    [NetworkMode.NONE]: "No network",
+  },
+  updateState: {
+    [AgentUpdateState.UNSPECIFIED]: "Unknown",
+    [AgentUpdateState.UP_TO_DATE]: "Up to date",
+    [AgentUpdateState.PENDING_IDLE]: "Waits for idle",
+    [AgentUpdateState.DOWNLOADING]: "Downloading",
+    [AgentUpdateState.INSTALLING]: "Installing",
+    [AgentUpdateState.FAILED]: "Update failed",
+    [AgentUpdateState.REVOKED_PENDING_IDLE]: "Revoked version, waits for idle",
+  },
+  tokenState: {
+    [EnrollmentTokenState.UNSPECIFIED]: "Unknown",
+    [EnrollmentTokenState.PENDING]: "Not used",
+    [EnrollmentTokenState.USED]: "Used",
+    [EnrollmentTokenState.REVOKED]: "Revoked",
+    [EnrollmentTokenState.EXPIRED]: "Expired",
+  },
+  invitationState: {
+    [InvitationState.UNSPECIFIED]: "Unknown",
+    [InvitationState.PENDING]: "Pending",
+    [InvitationState.ACCEPTED]: "Accepted",
+    [InvitationState.REVOKED]: "Revoked",
+    [InvitationState.EXPIRED]: "Expired",
+  },
+  apiKeyState: {
+    [ApiKeyState.UNSPECIFIED]: "Unknown",
+    [ApiKeyState.ACTIVE]: "Active",
+    [ApiKeyState.REVOKED]: "Revoked",
+  },
+  snapshotState: {
+    [SnapshotState.UNSPECIFIED]: "Unknown",
+    [SnapshotState.CREATING]: "Creating",
+    [SnapshotState.READY]: "Ready",
+    [SnapshotState.FAILED]: "Failed",
+    [SnapshotState.DELETING]: "Deleting",
+  },
+  exportState: {
+    [SnapshotExportState.UNSPECIFIED]: "Unknown",
+    [SnapshotExportState.NOT_EXPORTED]: "Only on its device",
+    [SnapshotExportState.EXPORTING]: "Exporting",
+    [SnapshotExportState.EXPORTED]: "Exported",
+    [SnapshotExportState.EXPORT_FAILED]: "Export failed",
+  },
+  policyMode: {
+    [AgentVersionPolicyMode.UNSPECIFIED]: "Unknown",
+    [AgentVersionPolicyMode.FOLLOW_DEFAULT]: "Follow the default version",
+    [AgentVersionPolicyMode.PIN]: "Pin a version",
+    [AgentVersionPolicyMode.HOLD]: "Hold updates",
+  },
+} as const;
+
+/** Valid vCPU overcommit percentages: 100 to 400 in steps of 25. */
+export const OVERCOMMIT_PERCENTAGES: readonly number[] = Array.from(
+  { length: 13 },
+  (_, i) => 100 + i * 25,
+);
+
+/** Effective vCPU limit: floor(vCPU limit × percent / 100), in integers. */
+export function effectiveVcpuLimit(
+  vcpuCount: number,
+  overcommitPercent: number,
+): number {
+  return Number((BigInt(vcpuCount) * BigInt(overcommitPercent)) / 100n);
+}
+
+/** Formats a memory size in MiB. */
+export function formatMib(mib: bigint | number): string {
+  const n = Number(mib);
+  if (n >= 1024 && n % 1024 === 0) return `${n / 1024} GiB`;
+  if (n >= 1024) return `${(n / 1024).toFixed(1)} GiB`;
+  return `${n} MiB`;
+}
+
+/** Formats a byte count. */
+export function formatBytes(bytes: bigint | number): string {
+  const n = Number(bytes);
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+}
+
+/** Formats a protobuf Duration as hours and minutes. */
+export function formatDuration(duration: Duration | undefined): string {
+  if (duration === undefined) return "—";
+  const total = Number(duration.seconds);
+  const days = Math.floor(total / 86_400);
+  const hours = Math.floor((total % 86_400) / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const parts: string[] = [];
+  if (days > 0) parts.push(`${days} d`);
+  if (hours > 0) parts.push(`${hours} h`);
+  if (minutes > 0) parts.push(`${minutes} min`);
+  if (parts.length === 0) parts.push(`${total % 60} s`);
+  return parts.join(" ");
+}
+
+/** Formats a protobuf Timestamp in the user's locale. */
+export function formatTime(ts: Timestamp | undefined): string {
+  if (ts === undefined) return "—";
+  const ms = Number(ts.seconds) * 1000 + Math.floor(ts.nanos / 1e6);
+  return new Date(ms).toLocaleString(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  });
+}
+
+/**
+ * A short, plain message for an RPC error. It never includes request data
+ * or credentials, only the server's message for validation errors.
+ */
+export function errorMessage(error: unknown): string {
+  if (!(error instanceof ConnectError)) {
+    return "Something went wrong. Try again.";
+  }
+  switch (error.code) {
+    case Code.Unauthenticated:
+      return "Your session ended. Sign in again.";
+    case Code.PermissionDenied:
+      return "You do not have permission to do this.";
+    case Code.NotFound:
+      return "It was not found, or you no longer have access to it.";
+    case Code.AlreadyExists:
+      return error.rawMessage || "It already exists.";
+    case Code.Unavailable:
+      return "OwnSand is not available right now. Try again in a moment.";
+    case Code.ResourceExhausted:
+      return "Too many requests. Wait a moment and try again.";
+    case Code.InvalidArgument:
+    case Code.FailedPrecondition:
+      return error.rawMessage || "The request is not valid.";
+    default:
+      return "Something went wrong. Try again.";
+  }
+}

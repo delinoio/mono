@@ -1,0 +1,266 @@
+// SPDX-License-Identifier: Apache-2.0
+import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
+import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
+import { Select, SelectOption } from "delino-ui/select";
+import { toast } from "delino-ui/toast";
+import { InvitationState, Role } from "ownsand-sdk/gen/common_pb";
+import { type Member, MemberService } from "ownsand-sdk/gen/member_pb";
+import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
+import { useState } from "react";
+import { invalidateServices } from "../api.ts";
+import { useAuth } from "../auth.tsx";
+import { useOrg } from "../components/shell.tsx";
+import {
+  ConfirmDialog,
+  Empty,
+  ErrorNotice,
+  FormDialog,
+  Loading,
+  PageHeader,
+  SecretDialog,
+} from "../components/ui.tsx";
+import { errorMessage, formatTime, labels } from "../format.ts";
+import { invitationLink } from "../invitation.ts";
+import { can, canManageMember, Permission } from "../roles.ts";
+import { useRouter } from "../router.tsx";
+
+function displayName(m: Member): string {
+  return m.displayName !== "" ? m.displayName : m.userId;
+}
+
+/** Route `members`: members, roles, leaving and invitations. */
+export function MembersPage() {
+  const { organizationId, role } = useOrg();
+  const { userId } = useAuth();
+  const { navigate } = useRouter();
+  const queryClient = useQueryClient();
+  const refresh = () =>
+    invalidateServices(queryClient, MemberService, OrganizationService);
+  const members = useQuery(MemberService.method.listMembers, {
+    organizationId,
+    pageSize: 200,
+  });
+  const updateRole = useMutation(MemberService.method.updateMemberRole, {
+    onSuccess: refresh,
+  });
+  const removeMember = useMutation(MemberService.method.removeMember, {
+    onSuccess: refresh,
+  });
+  const [removing, setRemoving] = useState<Member>();
+  const [leaving, setLeaving] = useState(false);
+
+  return (
+    <>
+      <PageHeader
+        title="Members"
+        description="People who can use this organization. Profiles come from your Delino account."
+        action={
+          can(role, Permission.LeaveOrganization) ? (
+            <Button
+              variant={ButtonVariant.Secondary}
+              onClick={() => setLeaving(true)}
+            >
+              Leave organization
+            </Button>
+          ) : undefined
+        }
+      />
+      {members.isPending ? (
+        <Loading label="Loading members" />
+      ) : members.error ? (
+        <ErrorNotice
+          error={members.error}
+          onRetry={() => void members.refetch()}
+        />
+      ) : (
+        <ul className="list" aria-label="Members">
+          {members.data.members.map((m) => {
+            const manageable = canManageMember(role, userId, m);
+            return (
+              <li key={m.userId} className="list-row">
+                <div className="list-main">
+                  <span className="list-title">
+                    {displayName(m)}
+                    {m.userId === userId ? (
+                      <span className="muted"> (you)</span>
+                    ) : null}
+                  </span>
+                  <span className="muted">Joined {formatTime(m.joinTime)}</span>
+                </div>
+                {manageable ? (
+                  <div className="list-actions">
+                    <Select
+                      label={`Role of ${displayName(m)}`}
+                      value={String(m.role)}
+                      onValueChange={async (v) => {
+                        if (v === null || Number(v) === m.role) return;
+                        try {
+                          await updateRole.mutateAsync({
+                            organizationId,
+                            userId: m.userId,
+                            role: Number(v) as Role,
+                          });
+                          toast.success("The role is changed.");
+                        } catch (error) {
+                          toast.error(errorMessage(error));
+                        }
+                      }}
+                    >
+                      <SelectOption value={String(Role.ADMIN)}>
+                        Admin
+                      </SelectOption>
+                      <SelectOption value={String(Role.MEMBER)}>
+                        Member
+                      </SelectOption>
+                    </Select>
+                    <Button
+                      variant={ButtonVariant.Danger}
+                      size={ButtonSize.Small}
+                      onClick={() => setRemoving(m)}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                ) : (
+                  <span className="role">{labels.role[m.role]}</span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+      {can(role, Permission.ManageInvitations) ? <Invitations /> : null}
+      <ConfirmDialog
+        open={removing !== undefined}
+        onOpenChange={(open) => !open && setRemoving(undefined)}
+        title={`Remove ${removing ? displayName(removing) : ""}?`}
+        description="They lose access to this organization. Its sandboxes keep running."
+        confirmLabel="Remove member"
+        onConfirm={() =>
+          removeMember.mutateAsync({ organizationId, userId: removing!.userId })
+        }
+      />
+      <ConfirmDialog
+        open={leaving}
+        onOpenChange={setLeaving}
+        title="Leave this organization?"
+        description="You lose access to its devices and sandboxes. An admin can invite you again."
+        confirmLabel="Leave organization"
+        onConfirm={async () => {
+          await removeMember.mutateAsync({
+            organizationId,
+            userId: userId ?? "",
+          });
+          navigate("/");
+        }}
+      />
+    </>
+  );
+}
+
+function Invitations() {
+  const { organizationId } = useOrg();
+  const queryClient = useQueryClient();
+  const refresh = () => invalidateServices(queryClient, MemberService);
+  const list = useQuery(MemberService.method.listInvitations, {
+    organizationId,
+    pageSize: 200,
+  });
+  const create = useMutation(MemberService.method.createInvitation, {
+    onSuccess: refresh,
+  });
+  const revoke = useMutation(MemberService.method.revokeInvitation, {
+    onSuccess: refresh,
+  });
+  const [creating, setCreating] = useState(false);
+  const [inviteRole, setInviteRole] = useState(String(Role.MEMBER));
+  const [link, setLink] = useState<string>();
+  const pending =
+    list.data?.invitations.filter((i) => i.state === InvitationState.PENDING) ??
+    [];
+
+  return (
+    <section className="section" aria-labelledby="invitations-title">
+      <div className="section-header">
+        <h2 id="invitations-title">Invitations</h2>
+        <Button
+          variant={ButtonVariant.Secondary}
+          onClick={() => setCreating(true)}
+        >
+          Invite someone
+        </Button>
+      </div>
+      {list.isPending ? (
+        <Loading label="Loading invitations" />
+      ) : list.error ? (
+        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
+      ) : pending.length === 0 ? (
+        <Empty title="No pending invitations" />
+      ) : (
+        <ul className="list" aria-label="Pending invitations">
+          {pending.map((i) => (
+            <li key={i.invitationId} className="list-row">
+              <div className="list-main">
+                <span className="list-title">
+                  {labels.role[i.role]} invitation{" "}
+                  <code>{i.secretPrefix}…</code>
+                </span>
+                <span className="muted">
+                  Expires {formatTime(i.expireTime)}
+                </span>
+              </div>
+              <Button
+                variant={ButtonVariant.Secondary}
+                size={ButtonSize.Small}
+                onClick={async () => {
+                  try {
+                    await revoke.mutateAsync({
+                      organizationId,
+                      invitationId: i.invitationId,
+                    });
+                    toast.success("The invitation is revoked.");
+                  } catch (error) {
+                    toast.error(errorMessage(error));
+                  }
+                }}
+              >
+                Revoke
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+      <FormDialog
+        open={creating}
+        onOpenChange={setCreating}
+        title="Invite someone"
+        description="You get a one-time link that works for 7 days. Send it to the person you invite."
+        submitLabel="Create link"
+        onSubmit={async () => {
+          const res = await create.mutateAsync({
+            organizationId,
+            role: Number(inviteRole) as Role,
+          });
+          setCreating(false);
+          setLink(invitationLink(window.location.origin, res.invitationSecret));
+        }}
+      >
+        <Select
+          label="Role"
+          value={inviteRole}
+          onValueChange={(v) => v && setInviteRole(v)}
+        >
+          <SelectOption value={String(Role.MEMBER)}>Member</SelectOption>
+          <SelectOption value={String(Role.ADMIN)}>Admin</SelectOption>
+        </Select>
+      </FormDialog>
+      <SecretDialog
+        title="Your invitation link"
+        label="Invitation link"
+        secret={link}
+        onClose={() => setLink(undefined)}
+      />
+    </section>
+  );
+}
