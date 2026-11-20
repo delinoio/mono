@@ -103,8 +103,9 @@ Job matching:
 
 GitHub, not tide, assigns a queued job to a runner with matching labels. A runner that tide started for one job can take another job with the same label. Therefore:
 
-- The dispatcher starts runners per runner profile. The oldest `QUEUED` requests of a profile count as covered while the profile has the same number of runners in `CREATING`, `PREPARING` or `WAITING_FOR_WORK`. The dispatcher dispatches only uncovered requests.
-- Each runner registers with the GitHub runner name `tide-<runner_id>`. A `workflow_job` `in_progress` event names this runner. The server then binds the job's request to that runner and marks both `RUNNING` and `BUSY`.
+- A runner pool is one pair of a GitHub installation and a runner profile. tide registers organization-level runners, so a runner of one GitHub organization can never take a job of another GitHub organization, even with the same label. Each `GITHUB_JOB` request and each `GITHUB_JOB` runner records its GitHub installation, and every rule below counts runners and requests per runner pool.
+- The dispatcher starts runners per runner pool. The oldest `QUEUED` requests of a runner pool count as covered while the pool has the same number of runners in `CREATING`, `PREPARING` or `WAITING_FOR_WORK`. The dispatcher dispatches only uncovered requests.
+- Each runner registers in the GitHub organization of its installation, with the runner group of that installation and the GitHub runner name `tide-<runner_id>`. A `workflow_job` `in_progress` event names this runner. The server then binds the job's request to that runner and marks both `RUNNING` and `BUSY`.
 - A `workflow_job` `completed` event ends the request. When the job never started (for example, the workflow was cancelled), the request ends with `CANCELED`. When a profile then has more runners waiting for a job than uncovered requests, the server removes the newest surplus runners: it removes the GitHub runner registration and then deletes the sandbox. When GitHub refuses the removal because the runner took a job meanwhile, the runner stays.
 - GitHub does not retry failed webhook deliveries by itself. Every 5 minutes, the lease holder lists the recent deliveries of the app webhook and requests a redelivery of each failed delivery of the last 24 hours.
 
@@ -188,7 +189,7 @@ An agent integration holds the vendor credentials and settings of one vendor acc
 6. When OwnSand ends the sandbox for another reason (TTL, device removal, `LOST_ON_DEVICE`), the runner changes to `FAILED` with the OwnSand end reason. An `AGENT_SESSION` request of that runner ends with `FAILED`; the vendor decides whether the session runs again. A `GITHUB_JOB` request ends when GitHub sends the `completed` event.
 7. A failure in steps 1 to 3 changes the runner to `FAILED`, deletes the sandbox and returns its request to `QUEUED` with its original queue time. After 3 failed attempts for the same request, the request ends with `FAILED` and the end reason `RUNNER_START_FAILED`.
 
-- Deleting a `GITHUB_JOB` runner that waits for a job first removes its GitHub runner registration.
+- Deleting a `GITHUB_JOB` runner that waits for a job first removes its GitHub runner registration in the GitHub organization of its installation.
 - An admin can delete any runner with `DeleteRunner`. tide deletes the sandbox; the work in it ends.
 
 ### Runner installation

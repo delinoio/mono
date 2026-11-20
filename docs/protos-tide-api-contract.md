@@ -92,8 +92,8 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 
 ### Request and runner messages
 
-- `Request`: `request_id`, `runner_profile_id`, `kind`, `source_key` (the GitHub job ID or vendor request key as text, for display), `state`, `end_reason`, `priority`, `queued_at`, `started_at`, `ended_at`, `runner_id` when a runner serves it, and for `GITHUB_JOB` the repository full name, the workflow run ID and the job name.
-- `Runner`: `runner_id`, `runner_profile_id`, `kind`, `state`, `end_reason`, `ownsand_sandbox_id`, `ownsand_device_id`, `request_id` when it serves one, `created_at`, `ended_at` and, when it ended with an OwnSand end reason, that reason as text.
+- `Request`: `request_id`, `runner_profile_id`, `kind`, `source_key` (the GitHub job ID or vendor request key as text, for display), `state`, `end_reason`, `priority`, `queued_at`, `started_at`, `ended_at`, `runner_id` when a runner serves it, and for `GITHUB_JOB` the `github_installation_id`, the repository full name, the workflow run ID and the job name.
+- `Runner`: `runner_id`, `runner_profile_id`, `kind`, `state`, `end_reason`, `ownsand_sandbox_id`, `ownsand_device_id`, `request_id` when it serves one, `github_installation_id` for `GITHUB_JOB`, `created_at`, `ended_at` and, when it ended with an OwnSand end reason, that reason as text.
 
 ### Enums
 
