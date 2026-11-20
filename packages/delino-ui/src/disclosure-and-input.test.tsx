@@ -464,6 +464,56 @@ describe("Slider", () => {
     expect(values).toEqual([[21]]);
   });
 
+  function expectOneDefaultThumb(container: HTMLElement) {
+    const thumbs = screen.getAllByRole("slider");
+    expect(thumbs.length).toBe(1);
+    const thumb = screen.getByRole("slider", { name: "Price" });
+    expect(thumb.getAttribute("value")).toBe("0");
+    expect((thumb as HTMLInputElement).value).toBe("0");
+
+    const hidden = container.querySelector('input[type="hidden"]');
+    expect((hidden as HTMLInputElement | null)?.value).toBe("0");
+
+    const indicator = container.querySelector(".dui-slider-indicator");
+    const style = indicator?.getAttribute("style") ?? "";
+    expect(style).not.toContain("NaN");
+    expect(style).toContain("--slider-indicator-size: 0%");
+
+    const label = container.querySelector("label");
+    const labelFor = label?.getAttribute("for");
+    expect(labelFor).toBeTruthy();
+    expect(container.querySelector(`[id="${labelFor}"]`)).not.toBeNull();
+  }
+
+  test("renders one thumb for a controlled empty array value", () => {
+    const { container } = render(
+      <Slider label="Price" value={[]} onValueChange={() => {}} showValue />,
+    );
+
+    expectOneDefaultThumb(container);
+    expect(container.querySelector(".dui-slider-value")?.textContent).toBe("0");
+  });
+
+  test("renders one thumb for an uncontrolled empty array defaultValue", () => {
+    const { container } = render(<Slider label="Price" defaultValue={[]} />);
+
+    expectOneDefaultThumb(container);
+  });
+
+  test("shows one thumb with the new value after an empty array value is replaced", () => {
+    const { rerender } = render(
+      <Slider label="Price" value={[]} onValueChange={() => {}} />,
+    );
+    expect(screen.getAllByRole("slider").length).toBe(1);
+
+    rerender(<Slider label="Price" value={[20]} onValueChange={() => {}} />);
+
+    expect(screen.getAllByRole("slider").length).toBe(1);
+    expect(
+      (screen.getByRole("slider", { name: "Price" }) as HTMLInputElement).value,
+    ).toBe("20");
+  });
+
   test("keeps naming each thumb of a range by thumbLabels", () => {
     render(
       <Slider

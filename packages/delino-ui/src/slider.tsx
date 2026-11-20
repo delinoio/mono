@@ -29,10 +29,21 @@ export type SliderProps = Omit<
   thumbLabels?: readonly string[];
 };
 
+function isEmptyArray(value: unknown): boolean {
+  return Array.isArray(value) && value.length === 0;
+}
+
 /**
  * A labeled slider built from UI SDK `Field` and `Slider`. Pass a number as
  * `value` or `defaultValue` for one thumb, or an array of more than one value for a
  * range with one thumb per value. An array of one value is one thumb. Arrow keys move the focused thumb.
+ *
+ * An empty array in `value` or `defaultValue` counts as no value, because a
+ * slider has at least one thumb. A controlled `value={[]}` therefore behaves
+ * like an uncontrolled slider that starts at the UI SDK default (`min`, or 0).
+ * `onValueChange` then reports a number, not an array, because the UI SDK state
+ * is a number when no value is given. A later re-render with `value={[20]}`
+ * shows one thumb with the value 20.
  */
 export function Slider({
   label,
@@ -41,9 +52,15 @@ export function Slider({
   thumbLabels,
   className,
   disabled,
+  value: valueProp,
+  defaultValue: defaultValueProp,
   ...props
 }: SliderProps) {
-  const initial = props.value ?? props.defaultValue;
+  const value = isEmptyArray(valueProp) ? undefined : valueProp;
+  const defaultValue = isEmptyArray(defaultValueProp)
+    ? undefined
+    : defaultValueProp;
+  const initial = value ?? defaultValue;
   const thumbCount = Array.isArray(initial) ? initial.length : 1;
   // The UI SDK treats only an array of more than one value as a range. A
   // one-value array is a single thumb that the field label names.
@@ -59,6 +76,8 @@ export function Slider({
       <SliderRoot
         className={mergeClassName("dui-slider", className)}
         disabled={disabled}
+        value={value}
+        defaultValue={defaultValue}
         {...props}
       >
         <div className="dui-slider-header">
