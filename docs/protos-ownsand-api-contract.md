@@ -39,53 +39,53 @@ The schemas are the single source of truth for the public API, the agent channel
 
 The control plane serves every public service at `https://ownsand.api.delino.io`. Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationService.ListOrganizations` and `MemberService.AcceptInvitation` takes an `organization_id`. The [control plane contract](servers-ownsand-api-foundation.md#authorization) owns the role that each RPC requires.
 
-| Service               | RPC                        | Kind             | Purpose                                                                                      |
-| --------------------- | -------------------------- | ---------------- | -------------------------------------------------------------------------------------------- |
-| `OrganizationService` | `CreateOrganization`       | unary            | Create an organization. The caller becomes its `owner`.                                      |
-|                       | `GetOrganization`          | unary            | Read one organization.                                                                       |
-|                       | `ListOrganizations`        | unary            | List the organizations of the signed-in user.                                                |
-|                       | `DeleteOrganization`       | unary            | Delete the organization and start its clean-up.                                              |
-|                       | `TransferOwnership`        | unary            | Make another member the `owner`. The previous owner becomes `admin`.                         |
-| `MemberService`       | `CreateInvitation`         | unary            | Create a one-time invitation with a role (`admin` or `member`). Returns the secret once.     |
-|                       | `ListInvitations`          | unary            | List pending invitations without secrets.                                                    |
-|                       | `RevokeInvitation`         | unary            | Revoke a pending invitation.                                                                 |
-|                       | `AcceptInvitation`         | unary            | Join the organization with an invitation secret, as the signed-in user.                      |
-|                       | `ListMembers`              | unary            | List members, roles and display names (empty when unavailable).                              |
-|                       | `UpdateMemberRole`         | unary            | Change a member role between `admin` and `member`.                                           |
-|                       | `RemoveMember`             | unary            | Remove a member. An `admin` or `member` may also remove itself; the `owner` cannot.          |
-| `DeviceService`       | `CreateEnrollmentToken`    | unary            | Create a one-time enrollment token with an expiry. Returns the secret once.                  |
-|                       | `ListEnrollmentTokens`     | unary            | List enrollment tokens without secrets.                                                      |
-|                       | `RevokeEnrollmentToken`    | unary            | Revoke an unused enrollment token.                                                           |
-|                       | `ListDevices`              | unary            | List devices with state, capabilities, limits and allocation.                                |
-|                       | `GetDevice`                | unary            | Read one device.                                                                             |
-|                       | `UpdateDeviceLimits`       | unary            | Set the upper limits of vCPU, memory and disk that sandboxes on the device may use together. |
-|                       | `RemoveDevice`             | unary            | Revoke the device credentials and request local clean-up.                                    |
-|                       | `GetAgentVersionPolicy`    | unary            | Read the agent version policy of the organization.                                           |
-|                       | `UpdateAgentVersionPolicy` | unary            | Follow the default target, pin a version or hold updates.                                    |
-| `ApiKeyService`       | `CreateApiKey`             | unary            | Create an organization API key. Returns the secret once.                                     |
-|                       | `ListApiKeys`              | unary            | List API keys without secrets.                                                               |
-|                       | `RevokeApiKey`             | unary            | Revoke an API key.                                                                           |
-| `SandboxService`      | `CreateSandbox`            | unary            | Create a sandbox. See [the create request](#create-request).                                 |
-|                       | `GetSandbox`               | unary            | Read one sandbox.                                                                            |
-|                       | `ListSandboxes`            | unary            | List sandboxes, with optional device and state filters; ended sandboxes only on request.     |
-|                       | `DeleteSandbox`            | unary            | Delete a sandbox.                                                                            |
-|                       | `PauseSandbox`             | unary            | Pause a running sandbox.                                                                     |
-|                       | `ResumeSandbox`            | unary            | Resume a paused sandbox.                                                                     |
-| `SnapshotService`     | `CreateSnapshot`           | unary            | Take a snapshot of a sandbox on its device.                                                  |
-|                       | `GetSnapshot`              | unary            | Read one snapshot with its location and export state.                                        |
-|                       | `ListSnapshots`            | unary            | List snapshots.                                                                              |
-|                       | `DeleteSnapshot`           | unary            | Delete a snapshot. Fails with `failed_precondition` while a template references it.          |
-|                       | `ExportSnapshot`           | unary            | Export a snapshot to R2 so that other devices with the same OS and architecture can use it.  |
-|                       | `CreateTemplate`           | unary            | Make a named template from a snapshot.                                                       |
-|                       | `ListTemplates`            | unary            | List templates.                                                                              |
-|                       | `DeleteTemplate`           | unary            | Delete a template. The source snapshot stays.                                                |
-| `DataPathService`     | `GetIceServers`            | unary            | Return the STUN server URLs that a caller uses to gather candidates before `OpenSession`.    |
-|                       | `OpenSession`              | unary            | Signal a peer-to-peer data channel: send the caller's SDP offer, return the agent's answer.  |
-|                       | `AuthorizeRelay`           | unary            | Grant relay access to one operation on a sandbox: return a relay grant ID.                   |
-| `RelayService`        | `Exec`                     | server-streaming | Relay: run a command and stream stdout, stderr and the exit code.                            |
-|                       | `AttachExec`               | server-streaming | Relay: continue the event stream of a running or finished exec from given output offsets.    |
-|                       | `ReadFile`                 | server-streaming | Relay: stream the contents of a guest file from an offset.                                   |
-|                       | `WriteFile`                | unary            | Relay: write one chunk of a guest file at an offset. See [file transfer](#file-transfer).    |
+| Service               | RPC                        | Kind             | Purpose                                                                                     |
+| --------------------- | -------------------------- | ---------------- | ------------------------------------------------------------------------------------------- |
+| `OrganizationService` | `CreateOrganization`       | unary            | Create an organization. The caller becomes its `owner`.                                     |
+|                       | `GetOrganization`          | unary            | Read one organization.                                                                      |
+|                       | `ListOrganizations`        | unary            | List the organizations of the signed-in user.                                               |
+|                       | `DeleteOrganization`       | unary            | Delete the organization and start its clean-up.                                             |
+|                       | `TransferOwnership`        | unary            | Make another member the `owner`. The previous owner becomes `admin`.                        |
+| `MemberService`       | `CreateInvitation`         | unary            | Create a one-time invitation with a role (`admin` or `member`). Returns the secret once.    |
+|                       | `ListInvitations`          | unary            | List pending invitations without secrets.                                                   |
+|                       | `RevokeInvitation`         | unary            | Revoke a pending invitation.                                                                |
+|                       | `AcceptInvitation`         | unary            | Join the organization with an invitation secret, as the signed-in user.                     |
+|                       | `ListMembers`              | unary            | List members, roles and display names (empty when unavailable).                             |
+|                       | `UpdateMemberRole`         | unary            | Change a member role between `admin` and `member`.                                          |
+|                       | `RemoveMember`             | unary            | Remove a member. An `admin` or `member` may also remove itself; the `owner` cannot.         |
+| `DeviceService`       | `CreateEnrollmentToken`    | unary            | Create a one-time enrollment token with an expiry. Returns the secret once.                 |
+|                       | `ListEnrollmentTokens`     | unary            | List enrollment tokens without secrets.                                                     |
+|                       | `RevokeEnrollmentToken`    | unary            | Revoke an unused enrollment token.                                                          |
+|                       | `ListDevices`              | unary            | List devices with state, capabilities, limits and allocation.                               |
+|                       | `GetDevice`                | unary            | Read one device.                                                                            |
+|                       | `UpdateDeviceLimits`       | unary            | Set the device limits. See [device limits](#device-limits).                                 |
+|                       | `RemoveDevice`             | unary            | Revoke the device credentials and request local clean-up.                                   |
+|                       | `GetAgentVersionPolicy`    | unary            | Read the agent version policy of the organization.                                          |
+|                       | `UpdateAgentVersionPolicy` | unary            | Follow the default target, pin a version or hold updates.                                   |
+| `ApiKeyService`       | `CreateApiKey`             | unary            | Create an organization API key. Returns the secret once.                                    |
+|                       | `ListApiKeys`              | unary            | List API keys without secrets.                                                              |
+|                       | `RevokeApiKey`             | unary            | Revoke an API key.                                                                          |
+| `SandboxService`      | `CreateSandbox`            | unary            | Create a sandbox. See [the create request](#create-request).                                |
+|                       | `GetSandbox`               | unary            | Read one sandbox.                                                                           |
+|                       | `ListSandboxes`            | unary            | List sandboxes, with optional device and state filters; ended sandboxes only on request.    |
+|                       | `DeleteSandbox`            | unary            | Delete a sandbox.                                                                           |
+|                       | `PauseSandbox`             | unary            | Pause a running sandbox.                                                                    |
+|                       | `ResumeSandbox`            | unary            | Resume a paused sandbox.                                                                    |
+| `SnapshotService`     | `CreateSnapshot`           | unary            | Take a snapshot of a sandbox on its device.                                                 |
+|                       | `GetSnapshot`              | unary            | Read one snapshot with its location and export state.                                       |
+|                       | `ListSnapshots`            | unary            | List snapshots.                                                                             |
+|                       | `DeleteSnapshot`           | unary            | Delete a snapshot. Fails with `failed_precondition` while a template references it.         |
+|                       | `ExportSnapshot`           | unary            | Export a snapshot to R2 so that other devices with the same OS and architecture can use it. |
+|                       | `CreateTemplate`           | unary            | Make a named template from a snapshot.                                                      |
+|                       | `ListTemplates`            | unary            | List templates.                                                                             |
+|                       | `DeleteTemplate`           | unary            | Delete a template. The source snapshot stays.                                               |
+| `DataPathService`     | `GetIceServers`            | unary            | Return the STUN server URLs that a caller uses to gather candidates before `OpenSession`.   |
+|                       | `OpenSession`              | unary            | Signal a peer-to-peer data channel: send the caller's SDP offer, return the agent's answer. |
+|                       | `AuthorizeRelay`           | unary            | Grant relay access to one operation on a sandbox: return a relay grant ID.                  |
+| `RelayService`        | `Exec`                     | server-streaming | Relay: run a command and stream stdout, stderr and the exit code.                           |
+|                       | `AttachExec`               | server-streaming | Relay: continue the event stream of a running or finished exec from given output offsets.   |
+|                       | `ReadFile`                 | server-streaming | Relay: stream the contents of a guest file from an offset.                                  |
+|                       | `WriteFile`                | unary            | Relay: write one chunk of a guest file at an offset. See [file transfer](#file-transfer).   |
 
 ### Sandbox state rules
 
@@ -114,6 +114,12 @@ The control plane serves every public service at `https://ownsand.api.delino.io`
 - `placement`: optional `device_id`, or optional `host_os` and `arch` filters. `guest_os` is derived from the source. With `device_id`, the scheduler does not select another device: the request fails with `unavailable` or `failed_precondition` according to the error-code rule of the [control plane scheduler](servers-ownsand-api-foundation.md#scheduler).
 - `network`: `NETWORK_MODE_OUTBOUND` (the default when the field is absent) or `NETWORK_MODE_NONE`. A present `network` message with an unspecified mode fails with `invalid_argument`. The field is a message so that later policies can extend it without a new RPC.
 - `labels`: optional string map (at most 32 entries; keys at most 63 bytes, values at most 255 bytes). Labels must not contain secrets; every member and API key of the organization can read them, and the console shows them. Components never log labels.
+
+### Device limits
+
+- Device limits are `vcpu_count`, `memory_mib`, `disk_gib` and `vcpu_overcommit_percent`. The first three are the upper limits of vCPU, memory and disk that sandboxes on the device may use together. `vcpu_overcommit_percent` lets the scheduler allocate more vCPUs than `vcpu_count`; the [control plane vCPU overcommit rule](servers-ownsand-api-foundation.md#vcpu-overcommit) owns its valid values and effect.
+- `UpdateDeviceLimits` sets all four values together. Every value is required. `vcpu_overcommit_percent` uses an integer percentage, not a floating-point ratio, so that equal values compare exactly.
+- The `Device` message carries the device limits, the effective vCPU limit and the allocated vCPU, memory and disk.
 
 ### Exec
 
