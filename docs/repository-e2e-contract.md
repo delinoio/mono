@@ -2,13 +2,13 @@
 
 ## Scope
 
-This contract owns browser end-to-end (e2e) tests for web apps under `apps/`. It applies to `delino-accounts`, `delino-site` and `delino-docs`. Unit tests, API server tests and native platform tests are out of scope.
+This contract owns browser end-to-end (e2e) tests for web apps under `apps/`. It applies to `delino-accounts`, `delino-site`, `delino-docs` and `ownsand-console`. Unit tests, API server tests and native platform tests are out of scope.
 
 ## Framework
 
 - Use the [`e2e`](https://www.npmjs.com/package/e2e) npm package (SDK, runner and CLI) with the `@e2e-dev/web` engine. The engine drives Chromium through a pinned `playwright-core`; do not add `playwright` or `@playwright/test`.
 - Use the `ai` package (Vercel AI SDK) for the model behind `agent.*` steps.
-- Pin `e2e`, `@e2e-dev/web` and `ai` to exact versions in each app's `devDependencies`. Keep the three apps on the same versions. `e2e` is pre-1.0, so review its changelog for config and API changes before an upgrade.
+- Pin `e2e`, `@e2e-dev/web` and `ai` to exact versions in each app's `devDependencies`. Keep every app on the same versions. `e2e` is pre-1.0, so review its changelog for config and API changes before an upgrade.
 - The runtime is Node.js from root `.nvmrc`. `e2e` requires Node.js 24.8 or newer.
 
 ## Layout
@@ -90,3 +90,4 @@ The root `test:e2e` Turbo task is uncached because results depend on a browser, 
 - [apps-delino-accounts-foundation.md](apps-delino-accounts-foundation.md)
 - [apps-delino-site-foundation.md](apps-delino-site-foundation.md)
 - [apps-delino-docs-foundation.md](apps-delino-docs-foundation.md)
+- [apps-ownsand-console-foundation.md](apps-ownsand-console-foundation.md)
