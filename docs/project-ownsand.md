@@ -17,7 +17,7 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `servers/ownsand-api/`: Go control plane on the shared DigitalOcean Droplet, served at `https://ownsand.api.delino.io`. It also serves the relay fallback of the data path and STUN on UDP port 3478.
 - `cmds/ownsand-agent/` (`planned`): Go device agent that runs on each enrolled host.
 - `cmds/ownsand-guest/` (`planned`): Go helper that runs inside each sandbox guest and serves exec and file requests from the device agent.
-- `cmds/ownsand/` (`planned`): Go command-line interface for people and programs.
+- `cmds/ownsand/`: Go command-line interface for people and programs.
 - `apps/ownsand/` (`planned`): Rsbuild React web console served at `https://ownsand.delino.io`.
 - `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
 - `packages/ownsand-sdk/`: TypeScript SDK and the generated TypeScript bindings.
