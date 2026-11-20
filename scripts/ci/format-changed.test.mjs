@@ -3368,6 +3368,19 @@ test("explicit comparison skips a non-UTF-8 gitlink and still rejects a non-UTF-
   const head = f.git("rev-parse", "HEAD");
   assert.deepEqual(changedFormatFiles(f.cwd, base, head), []);
   assert.deepEqual(changedFormatFiles(f.cwd, base, head, true), []);
+  // Restage the gitlink with an object different from the one HEAD records
+  // ("1" x 40) so `git diff --cached` lists it and the staged selector's
+  // gitlink exemption is exercised, not bypassed by an index that equals HEAD.
+  recordRaw(f, gitlinkMode, gitlink, "2".repeat(40));
+  const stagedNames = execFileSync(
+    "git",
+    ["diff", "--cached", "--name-only", "--no-renames", "-z"],
+    { cwd: f.cwd, env: f.env },
+  );
+  assert.ok(
+    stagedNames.includes(gitlink),
+    "the restaged non-UTF-8 gitlink is listed by the staged diff",
+  );
   assert.deepEqual(stagedFormatFiles(f.cwd), []);
   const comparison = spawnSync(
     process.execPath,
