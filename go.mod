@@ -7,6 +7,7 @@ require (
 	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/pion/stun/v3 v3.1.7
+	golang.org/x/sys v0.49.0
 	google.golang.org/protobuf v1.36.12
 )
 
@@ -20,6 +21,5 @@ require (
 	github.com/wlynxg/anet v0.0.5 // indirect
 	golang.org/x/crypto v0.58.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
-	golang.org/x/sys v0.49.0 // indirect
 	golang.org/x/text v0.43.0 // indirect
 )
