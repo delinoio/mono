@@ -3,15 +3,33 @@
 package runtimes
 
 import (
-	"fmt"
 	"log/slog"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/fcrt"
 )
 
-// newFirecracker is replaced by the Linux Firecracker runtime.
-func newFirecracker(config.Config, *store.Store, *slog.Logger) (vmruntime.Runtime, error) {
-	return nil, fmt.Errorf("%w: the Firecracker runtime is not part of this build", vmruntime.ErrUnsupported)
+// LinuxImageDir is the directory of the Linux base image in the state
+// directory.
+const LinuxImageDir = "linux"
+
+func newFirecracker(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Runtime, error) {
+	kernel, rootfs := cfg.LinuxKernel, cfg.LinuxRootfs
+	if kernel == "" {
+		kernel = st.Path(store.ImagesDir, LinuxImageDir, "vmlinux")
+	}
+	if rootfs == "" {
+		rootfs = st.Path(store.ImagesDir, LinuxImageDir, "rootfs.ext4")
+	}
+	return fcrt.NewRuntime(fcrt.Options{
+		Binary:  cfg.FirecrackerBinary,
+		Kernel:  kernel,
+		Rootfs:  rootfs,
+		VMsDir:  st.Path(store.VMsDir),
+		Network: netpolicy.NewManager(logger),
+		Logger:  logger,
+	})
 }
