@@ -17,7 +17,7 @@ set -euo pipefail
 # Exact tool versions. protoc-gen-go and protoc-gen-connect-go are pinned in
 # protos/buf.gen.yaml.
 readonly BUF_MODULE="github.com/bufbuild/buf/cmd/buf"
-readonly BUF_VERSION="v1.74.0"
+readonly BUF_VERSION="v1.72.0"
 
 root="$(git rev-parse --show-toplevel)"
 readonly root
