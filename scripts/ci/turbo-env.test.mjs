@@ -36,6 +36,14 @@ const expectedPassThroughEnv = {
   "accounts-api#dev": ["ADDR", "LOG_LEVEL"],
   "delino-accounts#dev": ["PUBLIC_API_ORIGIN"],
   "delidev#dev": ["TAURI_DEV_HOST"],
+  "ownsand-api#dev": [
+    "ADDR",
+    "CORS_ALLOWED_ORIGINS",
+    "DATABASE_URL",
+    "LOGTO_ENDPOINT",
+    "LOG_LEVEL",
+    "OWNSAND_API_RESOURCE",
+  ],
   "delino-docs#dev": null,
   "delino-site#dev": null,
 };

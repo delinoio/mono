@@ -218,6 +218,8 @@ importers:
 
   servers/accounts-api: {}
 
+  servers/ownsand-api: {}
+
 packages:
 
   '@ai-sdk/gateway@4.0.146':
