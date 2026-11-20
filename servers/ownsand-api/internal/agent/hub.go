@@ -264,6 +264,14 @@ func (h *Hub) Command(ctx context.Context, deviceID string, cmd *ownsandv1.Agent
 	case *ownsandv1.AgentCommand_ExportSnapshot:
 		w.kind, w.snapshotID = commandExportSnapshot, x.ExportSnapshot.GetSnapshotId()
 	}
+	if w.kind == commandCreateSandbox {
+		// The agent checks a create against the stricter of the command's
+		// limits and its last configuration. A limits change reaches the
+		// agent through the control event poll, which can arrive after a
+		// create that the scheduler placed with the new limits, so the
+		// configuration goes first on the ordered channel.
+		h.SendConfiguration(ctx, c)
+	}
 	h.mu.Lock()
 	h.waiters[cmd.CommandId] = w
 	h.mu.Unlock()

@@ -160,6 +160,29 @@ func sandboxClient(h *harness, cred string) ownsandv1connect.SandboxServiceClien
 	return ownsandv1connect.NewSandboxServiceClient(h.client, h.url, bearer(cred))
 }
 
+// TestCreateAfterLimitsChange checks that the agent gets the new limits
+// before a create that the scheduler placed with them: the agent rejects a
+// create above the limits of its last configuration.
+func TestCreateAfterLimitsChange(t *testing.T) {
+	h := newHarness(t)
+	f := h.newFixture()
+	a := h.enrollAgent(f.org, f.ownerSub)
+	if cfg := a.connect(nil); cfg.GetLimits().GetVcpuCount() != 0 {
+		t.Fatalf("initial limits: %v", cfg.GetLimits())
+	}
+	h.setLimits(f, a.deviceID, &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 8192, DiskGib: 50})
+	if _, err := sandboxClient(h, f.apiKey).CreateSandbox(context.Background(), createReq(f.org, nil)); err != nil {
+		t.Fatal(err)
+	}
+	env := a.expect(func(e *ownsandv1.AgentEnvelope) bool { return e.GetConfiguration() != nil || e.GetCommand() != nil })
+	if env.GetConfiguration().GetLimits().GetVcpuCount() != 4 {
+		t.Fatalf("the create command arrived before the new limits: %v", env)
+	}
+	if a.command().GetCreateSandbox() == nil {
+		t.Fatal("no create command")
+	}
+}
+
 func TestSandboxLifecycle(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
