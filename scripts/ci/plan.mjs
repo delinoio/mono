@@ -61,9 +61,25 @@ export function isWorkspaceManifest(path) {
   ).test(path);
 }
 
-// Go sources and module files select the repository Go checks.
+// Protobuf schema inputs: the schemas, the buf configuration and the
+// generation script. The Go job lints them, checks breaking changes and fails
+// when the committed Go bindings differ from the generated output.
+const protoInputs = new Set([
+  "protos/buf.yaml",
+  "protos/buf.gen.yaml",
+  "protos/buf.lock",
+  "scripts/protos.sh",
+]);
+
+// Go sources, module files and protobuf schema inputs select the repository
+// Go checks.
 export function isGoInput(path) {
-  return path.endsWith(".go") || /(^|\/)go\.(mod|sum)$/.test(path);
+  return (
+    path.endsWith(".go") ||
+    /(^|\/)go\.(mod|sum)$/.test(path) ||
+    path.endsWith(".proto") ||
+    protoInputs.has(path)
+  );
 }
 
 // Root Rust toolchain and formatter configuration.
