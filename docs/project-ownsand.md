@@ -20,8 +20,8 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `cmds/ownsand/` (`planned`): Go command-line interface for people and programs.
 - `apps/ownsand/` (`planned`): Rsbuild React web console served at `https://ownsand.delino.io`.
 - `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
-- `packages/ownsand-sdk/` (`planned`): TypeScript SDK.
-- `packages/ownsand-sdk-go/` (`planned`): Go SDK.
+- `packages/ownsand-sdk/`: TypeScript SDK and the generated TypeScript bindings.
+- `packages/ownsand-sdk-go/`: Go SDK and the shared data path primitives.
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.
 
@@ -109,7 +109,7 @@ Record each decision in the owning domain contract before the implementation tha
 - The transport of the long-lived agent channel: a Connect bidirectional stream through the Caddy h2c route or a WebSocket upgrade on the same origin ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
 - The per-device admin settings UI ([console contract](apps-ownsand-console-foundation.md#interfaces-and-contracts)).
 - The database migration tool and the backup policy ([control plane contract](servers-ownsand-api-foundation.md#storage)).
-- The npm package name and publication workflow of the TypeScript SDK. The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
+- The registry name and publication workflow of the TypeScript SDK (the workspace package `@delino/ownsand-sdk` is private). The repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
 - Every new third-party dependency. The [protos contract](protos-ownsand-api-contract.md#runtime-and-language) records the code generation tool and the approved Connect and protobuf runtimes. The owner also approved a Postgres driver (pgx), pion (WebRTC and STUN) and the TypeScript Connect and protobuf runtimes; each is recorded in the change that adds it, with a [dependency security](repository-dependency-security-contract.md) review. Hypervisor bindings for Virtualization.framework and Hyper-V still need owner approval.
 
 ## Change Policy

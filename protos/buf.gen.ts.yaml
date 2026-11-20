@@ -1,0 +1,11 @@
+version: v2
+plugins:
+  # TypeScript bindings for the TypeScript SDK and the web console. The plugin
+  # version is pinned by packages/ownsand-sdk/package.json; run
+  # `pnpm install` before generating.
+  - local: ../packages/ownsand-sdk/node_modules/.bin/protoc-gen-es
+    out: ../packages/ownsand-sdk/src/gen
+    opt:
+      - target=ts
+      - import_extension=ts
+    include_imports: false

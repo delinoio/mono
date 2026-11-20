@@ -143,6 +143,13 @@ jobs:
           fi
           go vet ./...
           go test ./...
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      # The TypeScript protobuf plugin is a dependency of the TypeScript SDK.
+      - run: pnpm install --frozen-lockfile --ignore-scripts --filter @delino/ownsand-sdk
       - name: Check protobuf bindings
         shell: bash
         run: scripts/protos/generate.sh --check

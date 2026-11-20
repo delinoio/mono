@@ -14,9 +14,9 @@ The schemas are the single source of truth for the public API, the agent channel
 
 - Language: Protocol Buffers (proto3), compiled for Connect RPC.
 - Go bindings: committed to the repository in the root Go module `github.com/delinoio/mono`. Go consumers import them directly and do not run code generation.
-- TypeScript bindings: generated for the [TypeScript SDK](packages-ownsand-sdk-foundation.md) and the [web console](apps-ownsand-console-foundation.md). The SDK contract owns where the generated TypeScript code lives.
+- TypeScript bindings: generated with `protoc-gen-es` for the [TypeScript SDK](packages-ownsand-sdk-foundation.md) and the [web console](apps-ownsand-console-foundation.md), committed in `packages/ownsand-sdk/src/gen/`. The SDK contract owns that location.
 - Code generation tool: [buf](https://buf.build/docs/) `v1.74.0` with the local plugins `protoc-gen-go` (`google.golang.org/protobuf` `v1.36.12`) and `protoc-gen-connect-go` (`connectrpc.com/connect` `v1.21.1`). Every tool runs through `go run <module>@<version>`, so the tools use the Go module cache and are not requirements of the root `go.mod`. The owner approved buf, the Go plugins and the Go runtime libraries `google.golang.org/protobuf` and `connectrpc.com/connect`.
-- Generation command: `scripts/protos/generate.sh` from any directory of the repository. It runs `buf lint` and `buf generate` in `protos/`. `scripts/protos/generate.sh --check` also fails when the committed bindings differ from the generated output or when generated files are not committed.
+- Generation command: `scripts/protos/generate.sh` from any directory of the repository. It runs `buf lint` and `buf generate` in `protos/`. `scripts/protos/generate.sh` also generates the TypeScript bindings with `protos/buf.gen.ts.yaml` after `pnpm install`. `scripts/protos/generate.sh --check` also fails when the committed Go or TypeScript bindings differ from the generated output or when generated files are not committed.
 
 ## Users and Operators
 

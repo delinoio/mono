@@ -61,15 +61,17 @@ export function isWorkspaceManifest(path) {
   ).test(path);
 }
 
-// Go sources, module files, protobuf schemas and the buf configuration under
-// `protos/` select the repository Go checks, which also verify that the
-// committed Go bindings match the schemas.
+// Go sources, module files, protobuf schemas, the buf configuration under
+// `protos/` and the generated TypeScript bindings select the repository Go
+// checks, which also verify that the committed Go and TypeScript bindings
+// match the schemas.
 export function isGoInput(path) {
   return (
     path.endsWith(".go") ||
     /(^|\/)go\.(mod|sum)$/.test(path) ||
     /^protos\/.*\.proto$/.test(path) ||
-    /^protos\/buf(\.gen)?\.yaml$/.test(path)
+    /^protos\/buf(\.gen(\.ts)?)?\.yaml$/.test(path) ||
+    path.startsWith("packages/ownsand-sdk/src/gen/")
   );
 }
 

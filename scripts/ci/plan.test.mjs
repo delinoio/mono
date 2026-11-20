@@ -437,6 +437,8 @@ test("Go sources, module files and protobuf schemas select Go checks", async (t)
     "protos/delino/example/v1/example.proto",
     "protos/buf.yaml",
     "protos/buf.gen.yaml",
+    "protos/buf.gen.ts.yaml",
+    "packages/ownsand-sdk/src/gen/delino/ownsand/v1/common_pb.ts",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);

@@ -4,14 +4,15 @@
 
 This contract owns the two OwnSand SDKs of [`ownsand`](project-ownsand.md):
 
-- `packages/ownsand-sdk/` (`planned`): TypeScript SDK, component `ownsand-sdk-ts`.
-- `packages/ownsand-sdk-go/` (`planned`): Go SDK, component `ownsand-sdk-go`, import path `github.com/delinoio/mono/packages/ownsand-sdk-go`.
+- `packages/ownsand-sdk/`: TypeScript SDK, component `ownsand-sdk-ts`, workspace package `@delino/ownsand-sdk` (private; not published to a registry).
+- `packages/ownsand-sdk-go/`: Go SDK, component `ownsand-sdk-go`, import path `github.com/delinoio/mono/packages/ownsand-sdk-go`.
+- `packages/ownsand-sdk-go/datapath/`: data path primitives that the control plane, the device agent, the guest helper and both SDKs share: UUID v7 identifiers and the expired operation ID check, the relay request digest of the [protos contract](protos-ownsand-api-contract.md#relay-grants), the varint length-prefixed `DataFrame` codec and the frame size limits. Its `testdata/digest_vectors.json` pins the digests of fixed bindings; the TypeScript SDK tests read the same file, which is the required test that the Go and TypeScript encodings give the same digest.
 
 Both SDKs give programs and the [CLI](cmds-ownsand-cli-foundation.md) one client for the public API of the [protos contract](protos-ownsand-api-contract.md), including the data path. Both use Apache-2.0.
 
 ## Runtime and Language
 
-- TypeScript SDK: ES modules for Node.js 24 (the `.nvmrc` baseline). It uses Connect for ECMAScript with the TypeScript bindings generated from the schemas. Record where the generated TypeScript code lives with the first schema. Browser support is not part of this version; the web console uses the generated bindings with `@connectrpc/connect-query` directly.
+- TypeScript SDK: ES modules for Node.js 24 (the `.nvmrc` baseline). It uses Connect for ECMAScript with the TypeScript bindings generated from the schemas. The generated TypeScript code lives in `packages/ownsand-sdk/src/gen/` and is committed. `scripts/protos/generate.sh` generates it with `protoc-gen-es` (`@bufbuild/protoc-gen-es` `2.17.0`, a development dependency of the package) and `protos/buf.gen.ts.yaml`; the CI drift check of the [protos contract](protos-ownsand-api-contract.md#build-and-test) covers it. The package exports the bindings as `@delino/ownsand-sdk/gen/<file>_pb`, which the web console imports. Browser support is not part of this version; the web console uses the generated bindings with `@connectrpc/connect-query` directly.
 - Go SDK: Go in the root module. It uses the committed Go bindings in `protos/delino/ownsand/v1/` and does not generate code.
 - Node.js has no built-in WebRTC implementation, so the TypeScript SDK's peer-to-peer data path needs a WebRTC library. The library is an open decision and a new dependency. Until it is approved, the TypeScript SDK uses the relay only.
 - The Go SDK uses pion for the peer-to-peer data path. pion is a new dependency that needs owner approval.
@@ -81,7 +82,7 @@ The SDKs log nothing by default. An optional logger receives RPC names, sandbox 
 - Upstream: the [control plane](servers-ownsand-api-foundation.md) (API, relay and STUN) and the [protos contract](protos-ownsand-api-contract.md).
 - Peers: the [device agent](cmds-ownsand-agent-foundation.md#data-path).
 - Downstream: the [CLI](cmds-ownsand-cli-foundation.md) uses the Go SDK.
-- Publication: the npm package name and publication workflow of the TypeScript SDK are an [open decision](project-ownsand.md#open-decisions); the repository publishes no packages to a registry today. The Go SDK needs no publication, because it is part of the root Go module.
+- Publication: the workspace package name is `@delino/ownsand-sdk` and the package is private. The registry name and the publication workflow are an [open decision](project-ownsand.md#open-decisions); the repository publishes no packages to a registry today. The Go SDK needs no publication, because it is part of the root Go module.
 - New dependencies: Connect and protobuf runtimes for both languages, pion for Go and a WebRTC library for Node.js. Each needs owner approval.
 
 ## Change Triggers
