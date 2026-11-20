@@ -155,9 +155,17 @@ func (l *logInterceptor) log(ctx context.Context, procedure string, info *rpcInf
 	l.logger.LogAttrs(ctx, slog.LevelInfo, "rpc", attrs...)
 }
 
+// codeString is the Connect code that the logs record for err. A handler
+// that ends because its caller went away returns the bare context error,
+// which connect.CodeOf reports as unknown.
 func codeString(err error) string {
-	if err == nil {
+	switch {
+	case err == nil:
 		return "ok"
+	case errors.Is(err, context.Canceled):
+		return connect.CodeCanceled.String()
+	case errors.Is(err, context.DeadlineExceeded):
+		return connect.CodeDeadlineExceeded.String()
 	}
 	return connect.CodeOf(err).String()
 }
