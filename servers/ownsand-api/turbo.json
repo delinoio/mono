@@ -1,0 +1,33 @@
+{
+  "$schema": "https://turborepo.com/schema.json",
+  "extends": ["//"],
+  "tasks": {
+    "dev": {
+      "passThroughEnv": [
+        "ADDR",
+        "LOG_LEVEL",
+        "OWNSAND_DATABASE_URL",
+        "OWNSAND_RUN_MIGRATIONS",
+        "OWNSAND_LOGTO_ISSUER",
+        "OWNSAND_LOGTO_JWKS_URL",
+        "OWNSAND_LOGTO_JWKS_FILE",
+        "OWNSAND_LOGTO_AUDIENCE",
+        "OWNSAND_NONCE_KEY",
+        "OWNSAND_NONCE_KEY_PREVIOUS",
+        "OWNSAND_CORS_ORIGINS",
+        "OWNSAND_TRUST_PROXY_CLIENT_ADDRESS"
+      ]
+    },
+    "build": {
+      "cache": false,
+      "passThroughEnv": ["CGO_ENABLED", "GOOS", "GOARCH"]
+    },
+    "lint": {
+      "cache": false
+    },
+    "test": {
+      "cache": false,
+      "passThroughEnv": ["OWNSAND_TEST_DATABASE_URL", "TMPDIR"]
+    }
+  }
+}
