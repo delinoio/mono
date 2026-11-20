@@ -13,8 +13,16 @@
 #
 # Environment:
 #   SHA                  deployed revision.
-#   RUNNER_TEMP          directory with `servers/<name>.tar.gz` build contexts
-#                        and room for scratch files.
+#   RUNNER_TEMP          directory with the `servers/<name>.tar.gz` images
+#                        that `build-servers` saved as `<name>:<SHA>`, and
+#                        room for scratch files.
+#   DROPLET_REGISTRY     container registry repository prefix for `servers`,
+#                        for example `registry.digitalocean.com/<registry>`.
+#                        The job must be logged in to the registry.
+#   DROPLET_SSH_CONFIG   SSH client configuration file for `servers` that
+#                        defines the host alias `droplet`.
+#   DROPLET_DEPLOY       remote deploy script that runs on the Droplet
+#                        (default scripts/ci/droplet-deploy.sh).
 #   GITHUB_STEP_SUMMARY  optional summary file.
 #   DEPLOY_GUARD         stale-plan check command
 #                        (default scripts/ci/check-pending-changesets.sh).
@@ -34,6 +42,7 @@ fi
 here="$(cd "$(dirname "$0")" && pwd)"
 guard="${DEPLOY_GUARD:-$here/check-pending-changesets.sh}"
 provider="${DEPLOY_PROVIDER:-$here/deploy-provider.sh}"
+remote_deploy="${DROPLET_DEPLOY:-$here/droplet-deploy.sh}"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 # Requires a nonempty JSON array of objects that have every given field, so
@@ -51,25 +60,42 @@ check_plan() {
   "$guard" < /dev/null
 }
 
+# Pushes each server image to the registry and replaces its container on the
+# Droplet. `droplet-deploy.sh` waits for the health check on the Droplet, so
+# its exit code is the verdict.
 deploy_servers() {
-  require_targets SERVERS "${SERVERS:-}" name version service
+  require_targets SERVERS "${SERVERS:-}" name version service hostname port
+  if [[ ! "${DROPLET_REGISTRY:-}" =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$ ]]; then
+    echo "::error::DROPLET_REGISTRY is not a registry repository prefix: ${DROPLET_REGISTRY:-<empty>}" >&2
+    exit 1
+  fi
+  if [[ ! -f "${DROPLET_SSH_CONFIG:-}" ]]; then
+    echo "::error::DROPLET_SSH_CONFIG is not an SSH client configuration file: ${DROPLET_SSH_CONFIG:-<empty>}" >&2
+    exit 1
+  fi
   echo "## Servers" >> "$summary"
-  local name version service context id
-  while IFS=$'\t' read -r -u 3 name version service; do
-    context="$RUNNER_TEMP/context-$name"
-    mkdir -p "$context"
-    tar -xzf "$RUNNER_TEMP/servers/$name.tar.gz" -C "$context"
-    echo "::group::Deploy $name@$version to Railway service $service"
+  local name version service hostname port ref digest image
+  while IFS=$'\t' read -r -u 3 name version service hostname port; do
+    echo "::group::Deploy $name@$version to Droplet service $service"
+    docker load --quiet --input "$RUNNER_TEMP/servers/$name.tar.gz" < /dev/null
+    ref="$DROPLET_REGISTRY/$service:$SHA"
+    docker tag "$name:$SHA" "$ref" < /dev/null
+    docker push --quiet "$ref" < /dev/null
+    # Deploy by digest, so the Droplet runs exactly the pushed image even
+    # when the tag moves.
+    digest="$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' < /dev/null \
+      | jq -r '.digest')"
+    if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      echo "::error::The registry returned no digest for $ref: ${digest:-<empty>}" >&2
+      exit 1
+    fi
+    image="$DROPLET_REGISTRY/$service@$digest"
     check_plan
-    # The exit code of `railway up` is not a verdict; wait for an explicit
-    # terminal status of the deployment.
-    id="$(railway up "$context" --path-as-root --no-gitignore --detach --json \
-      --service "$service" --message "$name@$version ($SHA)" < /dev/null \
-      | "$provider" railway-id)"
-    "$provider" wait-railway "$service" "$id"
+    ssh -F "$DROPLET_SSH_CONFIG" droplet bash -s -- \
+      "$service" "$image" "$port" "$hostname" < "$remote_deploy"
     echo "::endgroup::"
-    echo "- $name@$version: Railway service \`$service\`, deployment \`$id\`" >> "$summary"
-  done 3< <(jq -r '.[] | [.name, .version, .service] | @tsv' <<< "$SERVERS")
+    echo "- $name@$version: Droplet service \`$service\` at \`https://$hostname\`, image \`$image\`" >> "$summary"
+  done 3< <(jq -r '.[] | [.name, .version, .service, .hostname, .port] | @tsv' <<< "$SERVERS")
 }
 
 # Builds every site in plan order. The workflow runs this in a step without

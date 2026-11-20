@@ -86,7 +86,7 @@
 - When a new project does not specify its primary language, default to Golang.
 - Prefer Rspack-family build tools when possible, including Rsbuild and Rspress for app and documentation surfaces.
 - Static sites under `apps/` should use Rsbuild/Rspress-style toolchains and deploy to Cloudflare Pages by default. Existing documented exceptions remain valid until their project contract changes.
-- Backend services under `servers/` should deploy to Railway, and persistent relational databases should use PlanetScale Postgres, unless a project contract documents an exception.
+- Backend services under `servers/` should deploy to the shared DigitalOcean Droplet, and persistent relational databases should use PlanetScale Postgres, unless a project contract documents an exception.
 - File handling should default to Cloudflare R2 object storage plus signed URLs for upload and download access unless a project contract documents another storage or access pattern.
 
 ## Documentation-First Policy

@@ -16,7 +16,7 @@
 - Follow root `AGENTS.md` and the owning project/domain contracts.
 
 - Write Go code and comments in English; use `log/slog` structured logging and never log secrets or sensitive payloads.
-- Each server deployed to Railway declares a `deploy` field in its `package.json` and keeps a `Dockerfile` and `railway.json` in its package root. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow). A server that its project contract deploys to another host has no `railway.json` and declares no `deploy` field until the deployment workflow supports its target.
+- Each server deployed to the shared DigitalOcean Droplet declares a `deploy` field in its `package.json`, keeps a `Dockerfile` in its package root, reads its listen address from `ADDR` and serves `GET /healthz`. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow). A server that needs a public port other than its reverse proxy route (for example a UDP port) declares no `deploy` field until the deployment workflow supports that port.
 - Server Go code uses the root Go module `github.com/delinoio/mono`; do not add a `go.mod` under `servers/`. Each server has a workspace `package.json` whose scripts wrap the Go toolchain and also run the server's launcher tests. Before finishing, run these from the repository root: `pnpm exec turbo run test --filter=accounts-api` (`go test ./...` followed by the launcher tests), `go vet ./...`, and `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` (it must print nothing; bare `gofmt` reads standard input and checks no file).
 
 ## Owning contracts
@@ -28,5 +28,4 @@
 - [Repository licensing](../docs/repository-license-contract.md)
 - `servers/accounts-api/`: [project index](../docs/project-delino-accounts.md) and [API server foundation contract](../docs/servers-accounts-api-foundation.md)
 - `servers/ownsand-api/` (`planned`): [project index](../docs/project-ownsand.md) and [control plane foundation contract](../docs/servers-ownsand-api-foundation.md)
-- `servers/ownsand-relay/` (`planned`): [project index](../docs/project-ownsand.md) and [relay server foundation contract](../docs/servers-ownsand-relay-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

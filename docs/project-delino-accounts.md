@@ -37,7 +37,7 @@ The project has two deployables. The web app is a static single-page application
 - New persisted entities use UUID v7 identifiers.
 - `delino-accounts` is the shared account management and billing system for every Delino service, according to the [authentication](repository-auth-contract.md#account-management) and [billing](repository-billing-contract.md#billing-ownership) contracts. Other services link users to `https://accounts.delino.io` and call `https://accounts.api.delino.io`. They do not keep their own account management, payment-provider integration or balances.
 - Deviation from repository defaults: the web app uses Rsbuild instead of Rspress because it is an authenticated application, not a documentation or marketing site. It still deploys to Cloudflare Pages as static output.
-- The API server deploys to Railway and its database is PlanetScale Postgres, according to the repository defaults. The [API server contract](servers-accounts-api-foundation.md) records the details.
+- The API server deploys to the shared DigitalOcean Droplet and its database is PlanetScale Postgres, according to the repository defaults. The [API server contract](servers-accounts-api-foundation.md) records the details.
 - Open decisions: the payment provider, the database migration tool and the backup policy are not selected yet. Record each decision in the API server contract before the implementation that depends on it.
 
 ## Change Policy

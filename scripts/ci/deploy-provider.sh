@@ -1,28 +1,26 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Provider helpers of `.github/workflows/deploy.yml`. The exit codes of
-# `railway up` and `wrangler pages deploy` are not deployment verdicts: both
-# CLIs can exit 0 before the deployment has a final status. These helpers read
-# the deployment ID and wait for an explicit terminal status.
+# Provider helpers of `.github/workflows/deploy.yml`. The exit code of
+# `wrangler pages deploy` is not a deployment verdict: the CLI can exit 0
+# before the deployment has a final status. These helpers read the deployment
+# ID and wait for an explicit terminal status. Droplet server deployments need
+# no helper: `droplet-deploy.sh` waits for the health check itself and its
+# exit code is the verdict.
 #
 # Usage:
-#   deploy-provider.sh railway-id < railway-up-json-output
 #   deploy-provider.sh pages-id <wrangler-output-file>
-#   deploy-provider.sh wait-railway <service> <deployment-id>
 #   deploy-provider.sh wait-pages <project> <deployment-id>
 #
 # Environment:
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID  for wait-pages.
 #   DEPLOY_POLL_INTERVAL  seconds between status reads (default 10).
-#   DEPLOY_POLL_TIMEOUT   seconds before giving up (default 1800 for Railway,
-#                         600 for Pages).
+#   DEPLOY_POLL_TIMEOUT   seconds before giving up (default 600).
 #   DEPLOY_POLL_ERRORS    failed status reads in a row before giving up
 #                         (default 5).
 set -euo pipefail
 
-# `;;&` in the command dispatch needs Bash 4; the other deploy scripts need
-# 4.4, so keep one minimum.
+# The other deploy scripts need Bash 4.4, so keep one minimum.
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
   echo "::error::$0 needs Bash 4.4 or newer, not $BASH_VERSION." >&2
   exit 2
@@ -38,19 +36,6 @@ for candidate in timeout gtimeout; do
   fi
 done
 max_errors="${DEPLOY_POLL_ERRORS:-5}"
-
-# Prints the last `deploymentId` of the `railway up --detach --json` output on
-# stdin. Lines that are not JSON objects are ignored.
-# Errors go to stderr, because the workflow captures stdout as the ID.
-railway_id() {
-  local id
-  id="$(jq -R -r 'fromjson? | objects | .deploymentId | select(type == "string" and length > 0)' | tail -n 1)"
-  if [[ -z "$id" ]]; then
-    echo "::error::railway up returned no deployment id." >&2
-    return 1
-  fi
-  echo "$id"
-}
 
 # Prints the last `pages-deploy` deployment ID of a Wrangler output file
 # (`WRANGLER_OUTPUT_FILE_PATH`, newline-delimited JSON). Lines that are not
@@ -110,21 +95,7 @@ nap() {
   sleep "$(( interval < left ? interval : left ))"
 }
 
-# Status reads. `$1` is the service or project and `$2` the deployment ID.
-railway_status() {
-  local service="$1" id="$2"
-  railway deployment list --service "$service" --limit 20 --json < /dev/null \
-    | jq -r --arg id "$id" '.[] | select(.id == $id) | .status'
-}
-
-railway_classify() {
-  case "$1" in
-    SUCCESS) echo success ;;
-    FAILED | CRASHED | REMOVED | REMOVING | SKIPPED) echo failure ;;
-    *) echo pending ;;
-  esac
-}
-
+# Status read. `$1` is the project and `$2` the deployment ID.
 pages_status() {
   local project="$1" id="$2"
   curl -fsS --retry 3 \
@@ -147,18 +118,18 @@ pages_classify() {
 # Prints the usage line and exits with status 2. The `*)` branch of the command
 # dispatch and the argument-count check below share it.
 usage() {
-  echo "usage: $0 railway-id | pages-id <file> | wait-railway <service> <id> | wait-pages <project> <id>" >&2
+  echo "usage: $0 pages-id <file> | wait-pages <project> <id>" >&2
   exit 2
 }
 
 command="${1:-}"
 # `set -u` would stop a missing positional argument with a Bash diagnostic and
 # exit status 1, so count the arguments of each subcommand before dispatch.
-# `read-railway` and `read-pages` are the internal status reads of `poll` and
-# stay out of the usage line.
+# `read-pages` is the internal status read of `poll` and stays out of the
+# usage line.
 case "$command" in
   pages-id) required_arguments=1 ;;
-  read-railway | read-pages | wait-railway | wait-pages) required_arguments=2 ;;
+  read-pages | wait-pages) required_arguments=2 ;;
   *) required_arguments=0 ;;
 esac
 if (( $# <= required_arguments )); then
@@ -166,27 +137,13 @@ if (( $# <= required_arguments )); then
 fi
 
 case "$command" in
-  railway-id) railway_id ;;
   pages-id) pages_id "$2" ;;
-  read-railway) railway_status "$2" "$3" ;;
   read-pages) pages_status "$2" "$3" ;;
-  wait-railway | wait-pages)
+  wait-pages)
     if [[ -z "$timeout_command" ]]; then
       echo "::error::$0 $command needs GNU coreutils timeout (or gtimeout)." >&2
       exit 2
     fi
-    ;;&
-  wait-railway)
-    service="$2" id="$3"
-    if ! poll "Railway deployment $id of $service" "${DEPLOY_POLL_TIMEOUT:-1800}" read-railway railway_classify "$service" "$id"; then
-      # Best-effort diagnostics with a short limit, so an unresponsive API
-      # cannot hold the deployment queue after the verdict.
-      "$timeout_command" 30 railway logs "$id" --service "$service" --build --lines 200 < /dev/null || true
-      "$timeout_command" 30 railway logs "$id" --service "$service" --deployment --lines 200 < /dev/null || true
-      exit 1
-    fi
-    ;;
-  wait-pages)
     project="$2" id="$3"
     poll "Pages deployment $id of $project" "${DEPLOY_POLL_TIMEOUT:-600}" read-pages pages_classify "$project" "$id"
     ;;

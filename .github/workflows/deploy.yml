@@ -1,7 +1,7 @@
 name: Deploy
 # Deploys the packages selected by the pending changesets on `main`, in
-# dependency order: servers (Railway) first, then static sites (Cloudflare
-# Pages). The PlanetScale Postgres database has no migration job yet; see
+# dependency order: servers (the shared DigitalOcean Droplet) first, then
+# static sites (Cloudflare Pages). The PlanetScale Postgres database has no migration job yet; see
 # docs/repository-workflow-contract.md#deployment-workflow.
 on:
   workflow_dispatch:
@@ -118,27 +118,28 @@ jobs:
       - name: Build
         env:
           NAME: ${{ matrix.server.name }}
-          # Railway runs linux/amd64 containers on a distroless static base.
+          # The Droplet runs linux/amd64 containers on a distroless static base.
           CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: amd64
         run: pnpm exec turbo run build --filter="$NAME"
-      - name: Assemble the Railway build context
+      - name: Build the container image
+        # No deployment environment and no secrets here: the deploy job
+        # receives only the saved image.
         env:
           DIR: ${{ matrix.server.dir }}
           NAME: ${{ matrix.server.name }}
+          SHA: ${{ needs.plan.outputs.sha }}
         shell: bash
         run: |
           set -euo pipefail
-          for file in Dockerfile railway.json; do
-            if [[ ! -f "$DIR/$file" ]]; then
-              echo "::error::$NAME has no $DIR/$file."
-              exit 1
-            fi
-          done
+          if [[ ! -f "$DIR/Dockerfile" ]]; then
+            echo "::error::$NAME has no $DIR/Dockerfile."
+            exit 1
+          fi
           context="$RUNNER_TEMP/context"
           mkdir -p "$context"
-          cp "$DIR/Dockerfile" "$DIR/railway.json" "$context/"
+          cp "$DIR/Dockerfile" "$context/"
           # The runtime image must carry the FSL-1.1-ALv2 terms and notice
           # (docs/repository-license-contract.md).
           cp servers/LICENSE "$context/LICENSE"
@@ -146,8 +147,8 @@ jobs:
           # (BSD-3-Clause), whose notice must ship with it.
           cp "$(go env GOROOT)/LICENSE" "$context/GO-LICENSE"
           cp -R "$DIR/dist" "$context/dist"
-          # A tar archive keeps the executable mode, which artifacts drop.
-          tar -czf "$RUNNER_TEMP/$NAME.tar.gz" -C "$context" .
+          docker build --platform linux/amd64 --tag "$NAME:$SHA" "$context"
+          docker save "$NAME:$SHA" | gzip > "$RUNNER_TEMP/$NAME.tar.gz"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: server-${{ matrix.server.name }}
@@ -164,11 +165,6 @@ jobs:
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_servers == 'true' }}
     runs-on: ubuntu-latest
     environment: servers
-    env:
-      # Railway CLI release asset, verified against the SHA-256 that GitHub
-      # publishes for it. Update both values together.
-      RAILWAY_CLI_VERSION: 5.69.0
-      RAILWAY_CLI_SHA256: 1bd0612e743adf69b13bee7a6e49dd9bf2f0efb5f97b90f90d1b15b122a840e5
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -178,6 +174,7 @@ jobs:
             scripts/ci/check-pending-changesets.sh
             scripts/ci/deploy-provider.sh
             scripts/ci/deploy-targets.sh
+            scripts/ci/droplet-deploy.sh
           sparse-checkout-cone-mode: false
       - name: Check that the plan is still current
         env:
@@ -192,21 +189,50 @@ jobs:
           pattern: server-*
           path: ${{ runner.temp }}/servers
           merge-multiple: true
-      - name: Install the Railway CLI
+      - name: Log in to the registry and configure SSH
+        env:
+          DIGITALOCEAN_ACCESS_TOKEN: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
+          DIGITALOCEAN_REGISTRY: ${{ secrets.DIGITALOCEAN_REGISTRY }}
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_SSH_PRIVATE_KEY: ${{ secrets.DROPLET_SSH_PRIVATE_KEY }}
+          DROPLET_SSH_KNOWN_HOSTS: ${{ secrets.DROPLET_SSH_KNOWN_HOSTS }}
         shell: bash
         run: |
           set -euo pipefail
-          asset="railway-v${RAILWAY_CLI_VERSION}-x86_64-unknown-linux-musl.tar.gz"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$asset" \
-            "https://github.com/railwayapp/cli/releases/download/v${RAILWAY_CLI_VERSION}/$asset"
-          echo "$RAILWAY_CLI_SHA256  $RUNNER_TEMP/$asset" | sha256sum --check --strict
-          mkdir -p "$RUNNER_TEMP/bin"
-          tar -xzf "$RUNNER_TEMP/$asset" -C "$RUNNER_TEMP/bin" railway
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/bin/railway" --version
+          for secret in DIGITALOCEAN_ACCESS_TOKEN DIGITALOCEAN_REGISTRY DROPLET_HOST DROPLET_SSH_PRIVATE_KEY DROPLET_SSH_KNOWN_HOSTS; do
+            if [[ -z "${!secret:-}" ]]; then
+              echo "::error::The servers environment has no $secret secret."
+              exit 1
+            fi
+          done
+          # DigitalOcean Container Registry accepts the API token as both the
+          # user name and the password.
+          docker login registry.digitalocean.com --username "$DIGITALOCEAN_ACCESS_TOKEN" \
+            --password-stdin <<< "$DIGITALOCEAN_ACCESS_TOKEN"
+          ssh_dir="$RUNNER_TEMP/ssh"
+          mkdir -p "$ssh_dir"
+          chmod 700 "$ssh_dir"
+          ( umask 077; printf '%s\n' "$DROPLET_SSH_PRIVATE_KEY" > "$ssh_dir/id" )
+          printf '%s\n' "$DROPLET_SSH_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          # Only the pinned host key is accepted, and no prompt can wait for
+          # input.
+          cat > "$ssh_dir/config" <<EOF
+          Host droplet
+            HostName $DROPLET_HOST
+            User deploy
+            IdentityFile $ssh_dir/id
+            IdentitiesOnly yes
+            UserKnownHostsFile $ssh_dir/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 30
+            ServerAliveInterval 15
+            ServerAliveCountMax 4
+          EOF
+          echo "DROPLET_SSH_CONFIG=$ssh_dir/config" >> "$GITHUB_ENV"
+          echo "DROPLET_REGISTRY=registry.digitalocean.com/$DIGITALOCEAN_REGISTRY" >> "$GITHUB_ENV"
       - name: Deploy in dependency order
         env:
-          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
           SERVERS: ${{ needs.plan.outputs.servers }}
           SHA: ${{ needs.plan.outputs.sha }}
           # The stale-plan check runs again right before each upload.
@@ -216,11 +242,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          set -euo pipefail
-          if [[ -z "${RAILWAY_TOKEN:-}" ]]; then
-            echo "::error::The servers environment has no RAILWAY_TOKEN secret."
-            exit 1
-          fi
           scripts/ci/deploy-targets.sh servers
 
   build-static-sites:

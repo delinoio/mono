@@ -27,16 +27,25 @@ const root = fileURLToPath(new URL("../..", import.meta.url));
 
 const pkg = (dir, manifest) => ({ dir, manifest });
 
+// A complete Droplet `deploy` field for the service.
+const droplet = (service, fields = {}) => ({
+  target: DeployTarget.Droplet,
+  service,
+  hostname: `${service}.example.com`,
+  port: 8080,
+  ...fields,
+});
+
 const workspace = [
   pkg("packages/ui", { name: "ui" }),
   pkg("servers/api", {
     name: "api",
-    deploy: { target: DeployTarget.Railway, service: "api-svc" },
+    deploy: droplet("api-svc"),
   }),
   pkg("servers/billing", {
     name: "billing",
     dependencies: { api: "workspace:*" },
-    deploy: { target: DeployTarget.Railway, service: "billing" },
+    deploy: droplet("billing"),
   }),
   pkg("apps/web", {
     name: "web",
@@ -148,8 +157,10 @@ test("deployables follow workspace dependency order within each kind", () => {
     name: "api",
     dir: "servers/api",
     kind: DeployKind.Server,
-    target: DeployTarget.Railway,
+    target: DeployTarget.Droplet,
     service: "api-svc",
+    hostname: "api-svc.example.com",
+    port: "8080",
     version: "0.1.0",
   });
   assert.equal(result.staticSites[0].output, "apps/web/dist");
@@ -170,24 +181,99 @@ test("a changeset id that is not a plain file name fails", () => {
 });
 
 test("two deployables with the same destination fail", () => {
-  for (const [target, field] of [
-    [DeployTarget.CloudflarePages, "project"],
-    [DeployTarget.Railway, "service"],
-  ]) {
-    const root = target === DeployTarget.Railway ? "servers" : "apps";
+  const cases = [
+    [
+      "apps",
+      { target: DeployTarget.CloudflarePages, project: "shared" },
+      { target: DeployTarget.CloudflarePages, project: "shared" },
+      /one and two both deploy to cloudflare-pages:shared/,
+    ],
+    [
+      "servers",
+      droplet("shared", { hostname: "one.example.com" }),
+      droplet("shared", { hostname: "two.example.com" }),
+      /one and two both deploy to droplet:shared/,
+    ],
+    [
+      "servers",
+      droplet("one", { hostname: "api.example.com" }),
+      droplet("two", { hostname: "api.example.com" }),
+      /one and two both deploy to droplet-hostname:api\.example\.com/,
+    ],
+  ];
+  for (const [root, first, second, message] of cases) {
     const shared = [
-      pkg(`${root}/one`, {
-        name: "one",
-        deploy: { target, [field]: "shared" },
-      }),
-      pkg(`${root}/two`, {
-        name: "two",
-        deploy: { target, [field]: "shared" },
-      }),
+      pkg(`${root}/one`, { name: "one", deploy: first }),
+      pkg(`${root}/two`, { name: "two", deploy: second }),
     ];
+    assert.throws(() => plan(status(["one", "1.0.0"]), shared), message);
+  }
+});
+
+test("two Droplet services may use the same container port", () => {
+  const servers = [
+    pkg("servers/one", { name: "one", deploy: droplet("one") }),
+    pkg("servers/two", { name: "two", deploy: droplet("two") }),
+  ];
+  const result = plan(status(["one", "1.0.0"], ["two", "1.0.0"]), servers);
+  assert.deepEqual(
+    result.servers.map((d) => [d.name, d.port]),
+    [
+      ["one", "8080"],
+      ["two", "8080"],
+    ],
+  );
+});
+
+test("invalid Droplet service names, host names and ports fail", () => {
+  const cases = [
+    [{ service: "Api" }, /deploy\.service must match/],
+    [{ service: "api.v2" }, /deploy\.service must match/],
+    [{ service: "-api" }, /deploy\.service must match/],
+    [{ service: "api;rm" }, /deploy\.service must match/],
+    [{ hostname: undefined }, /deploy\.hostname is required/],
+    [{ hostname: "" }, /deploy\.hostname is required/],
+    [{ hostname: "localhost" }, /deploy\.hostname must be/],
+    [{ hostname: "API.example.com" }, /deploy\.hostname must be/],
+    [{ hostname: "api.example.com." }, /deploy\.hostname must be/],
+    [{ hostname: "*.example.com" }, /deploy\.hostname must be/],
+    [{ hostname: "api example.com" }, /deploy\.hostname must be/],
+    [{ hostname: ["api.example.com"] }, /deploy\.hostname is required/],
+    [{ port: undefined }, /deploy\.port must be an integer from 1024 to 65535/],
+    [{ port: "8080" }, /deploy\.port must be/],
+    [{ port: 80 }, /deploy\.port must be/],
+    [{ port: 65536 }, /deploy\.port must be/],
+    [{ port: 8080.5 }, /deploy\.port must be/],
+  ];
+  for (const [fields, message] of cases) {
+    const deploy = droplet("api", fields);
+    for (const [key, value] of Object.entries(fields)) {
+      if (value === undefined) delete deploy[key];
+    }
+    const label = JSON.stringify(fields);
     assert.throws(
-      () => plan(status(["one", "1.0.0"]), shared),
-      /one and two both deploy to .*:shared/,
+      () => plan(status(), [pkg("servers/api", { name: "api", deploy })]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, label);
+        assert.match(error.message, message, label);
+        return true;
+      },
+      label,
+    );
+  }
+  for (const fields of [
+    { service: "a" },
+    { service: "api-2" },
+    { hostname: "a-b.c.example" },
+    { port: 1024 },
+    { port: 65535 },
+  ]) {
+    assert.doesNotThrow(
+      () =>
+        plan(status(), [
+          pkg("servers/api", { name: "api", deploy: droplet("api", fields) }),
+        ]),
+      JSON.stringify(fields),
     );
   }
 });
@@ -203,7 +289,7 @@ test("a deploy target outside its workspace root fails", () => {
   const bad = [
     pkg("apps/api", {
       name: "api",
-      deploy: { target: DeployTarget.Railway, service: "api" },
+      deploy: droplet("api"),
     }),
   ];
   assert.throws(
@@ -216,7 +302,7 @@ test("a scoped deployable package name fails", () => {
   const scoped = [
     pkg("servers/api", {
       name: "@delino/api",
-      deploy: { target: DeployTarget.Railway, service: "api" },
+      deploy: droplet("api"),
     }),
   ];
   assert.throws(
@@ -227,7 +313,7 @@ test("a scoped deployable package name fails", () => {
 
 test("a non-string deployable package name fails with the package directory", () => {
   const targets = [
-    ["servers/api", { target: DeployTarget.Railway, service: "api" }],
+    ["servers/api", droplet("api")],
     ["apps/web", { target: DeployTarget.CloudflarePages, project: "web" }],
   ];
   const names = [undefined, null, 123, true, ["api"]];
@@ -261,7 +347,7 @@ test("string deployable names that fail the pattern still fail", () => {
         plan(status(), [
           pkg("servers/api", {
             name,
-            deploy: { target: DeployTarget.Railway, service: "api" },
+            deploy: droplet("api"),
           }),
         ]),
       /a deployable package name must match/,
@@ -273,10 +359,28 @@ test("string deployable names that fail the pattern still fail", () => {
 test("check and the --check CLI reject a nameless deployable", () => {
   const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
   const cases = [
-    ["servers/api", { deploy: { target: "railway", service: "api" } }],
     [
       "servers/api",
-      { name: null, deploy: { target: "railway", service: "api" } },
+      {
+        deploy: {
+          target: "droplet",
+          service: "api",
+          hostname: "api.example.com",
+          port: 8080,
+        },
+      },
+    ],
+    [
+      "servers/api",
+      {
+        name: null,
+        deploy: {
+          target: "droplet",
+          service: "api",
+          hostname: "api.example.com",
+          port: 8080,
+        },
+      },
     ],
     [
       "apps/web",
@@ -288,7 +392,15 @@ test("check and the --check CLI reject a nameless deployable", () => {
     ],
     [
       "servers/api",
-      { name: ["api"], deploy: { target: "railway", service: "api" } },
+      {
+        name: ["api"],
+        deploy: {
+          target: "droplet",
+          service: "api",
+          hostname: "api.example.com",
+          port: 8080,
+        },
+      },
     ],
   ];
   const message =
@@ -327,7 +439,7 @@ test("check and the --check CLI reject a nameless deployable", () => {
 });
 
 const invalidTargetMessage =
-  /^(web|api): deploy\.target must be one of railway, cloudflare-pages$/;
+  /^(web|api): deploy\.target must be one of droplet, cloudflare-pages$/;
 
 test("an unknown deploy target fails", () => {
   const bad = [pkg("servers/api", { name: "api", deploy: { target: "fly" } })];
@@ -352,12 +464,12 @@ const invalidTargets = [
   "valueOf",
   "hasOwnProperty",
   "__proto__",
-  ["railway"],
+  ["droplet"],
   ["cloudflare-pages"],
   "",
   null,
   7,
-  { toString: () => "railway" },
+  { toString: () => "droplet" },
 ];
 
 test("a non-target deploy.target value fails with the invalid-target diagnostic", () => {
@@ -397,7 +509,7 @@ test("valid targets still plan and keep the root restriction", () => {
   const result = plan(status(["api", "1.0.0"], ["web", "1.0.0"]), workspace);
   assert.deepEqual(
     result.servers.map((d) => [d.name, d.target]),
-    [["api", DeployTarget.Railway]],
+    [["api", DeployTarget.Droplet]],
   );
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.target]),
@@ -406,12 +518,12 @@ test("valid targets still plan and keep the root restriction", () => {
   const wrongRoot = [
     pkg("apps/web", {
       name: "web",
-      deploy: { target: DeployTarget.Railway, service: "web" },
+      deploy: droplet("web"),
     }),
   ];
   assert.throws(
     () => plan(status(["web", "1.0.0"]), wrongRoot),
-    /web: deploy\.target railway is allowed only under servers\//,
+    /web: deploy\.target droplet is allowed only under servers\//,
   );
 });
 
@@ -419,7 +531,7 @@ test("missing service or project names fail", () => {
   const server = [
     pkg("servers/api", {
       name: "api",
-      deploy: { target: DeployTarget.Railway },
+      deploy: { target: DeployTarget.Droplet },
     }),
   ];
   assert.throws(() => plan(status(["api", "1.0.0"]), server), /deploy.service/);
@@ -462,7 +574,7 @@ test("ties break alphabetically within a stage after an earlier stage", () => {
   const mixed = [
     pkg("servers/z-api", {
       name: "z-api",
-      deploy: { target: DeployTarget.Railway, service: "z-api" },
+      deploy: droplet("z-api"),
     }),
     pkg("apps/a-site", {
       name: "a-site",
@@ -493,11 +605,11 @@ test("workspace aliases order the aliased package first", () => {
     pkg("servers/a", {
       name: "a",
       dependencies: { provider: "workspace:z@*" },
-      deploy: { target: DeployTarget.Railway, service: "a" },
+      deploy: droplet("a"),
     }),
     pkg("servers/z", {
       name: "z",
-      deploy: { target: DeployTarget.Railway, service: "z" },
+      deploy: droplet("z"),
     }),
   ];
   const result = plan(status(["a", "1.0.0"], ["z", "1.0.0"]), servers);
@@ -533,17 +645,17 @@ test("only workspace: specs link workspace packages", () => {
       // A registry alias and a plain range under a workspace package name do
       // not link the workspace package (linkWorkspacePackages is off).
       dependencies: { b: "npm:lodash@4.17.21", c: "^1.0.0" },
-      deploy: { target: DeployTarget.Railway, service: "a" },
+      deploy: droplet("a"),
     }),
     pkg("servers/b", {
       name: "b",
       dependencies: { a: "workspace:*" },
-      deploy: { target: DeployTarget.Railway, service: "b" },
+      deploy: droplet("b"),
     }),
     pkg("servers/c", {
       name: "c",
       dependencies: { a: "workspace:^" },
-      deploy: { target: DeployTarget.Railway, service: "c" },
+      deploy: droplet("c"),
     }),
   ];
   const result = plan(
@@ -615,12 +727,12 @@ test("a workspace dependency cycle fails", () => {
     pkg("servers/a", {
       name: "a",
       dependencies: { b: "workspace:*" },
-      deploy: { target: DeployTarget.Railway, service: "a" },
+      deploy: droplet("a"),
     }),
     pkg("servers/b", {
       name: "b",
       dependencies: { a: "workspace:*" },
-      deploy: { target: DeployTarget.Railway, service: "b" },
+      deploy: droplet("b"),
     }),
   ];
   assert.throws(
@@ -690,7 +802,7 @@ test("main writes GitHub outputs and a summary", () => {
 test("check and the --check CLI reject non-target deploy.target values", () => {
   const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
   const cases = [
-    ["servers/api", "api", { target: ["railway"], project: "p" }],
+    ["servers/api", "api", { target: ["droplet"], project: "p" }],
     ["servers/api", "api", { target: "__proto__", service: "s" }],
     ["apps/web", "web", { target: "constructor", project: "web" }],
     ["apps/web", "web", { target: ["cloudflare-pages"], project: "web" }],
