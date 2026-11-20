@@ -6,6 +6,12 @@ export const DEFAULT_API_ORIGIN = "https://ownsand.api.delino.io";
 /** The Logto API resource indicator of the control plane. */
 export const API_RESOURCE = "https://ownsand.api.delino.io";
 
+/**
+ * The API resource scope that the control plane requires in every user
+ * access token. The console always requests it.
+ */
+export const REQUIRED_API_SCOPE = "ownsand:use";
+
 /** Account settings live in delino-accounts. */
 export const ACCOUNTS_URL = "https://accounts.delino.io";
 
@@ -108,9 +114,12 @@ export function readConsoleConfig(
       : {
           endpoint: resolveOrigin("PUBLIC_LOGTO_ENDPOINT", endpoint, endpoint),
           appId,
-          scopes: (env.PUBLIC_LOGTO_SCOPES ?? "")
-            .split(/\s+/)
-            .filter((scope) => scope !== ""),
+          scopes: [
+            REQUIRED_API_SCOPE,
+            ...(env.PUBLIC_LOGTO_SCOPES ?? "")
+              .split(/\s+/)
+              .filter((scope) => scope !== "" && scope !== REQUIRED_API_SCOPE),
+          ],
         };
   return { apiOrigin, authMode: AuthMode.Logto, logto };
 }

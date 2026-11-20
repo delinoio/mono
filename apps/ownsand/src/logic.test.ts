@@ -47,8 +47,19 @@ describe("console configuration", () => {
     expect(config.logto).toEqual({
       endpoint: "https://tenant.logto.app",
       appId: "app123",
-      scopes: ["read:sandboxes", "write:sandboxes"],
+      scopes: ["ownsand:use", "read:sandboxes", "write:sandboxes"],
     });
+  });
+
+  test("always requests the ownsand:use scope", () => {
+    const config = readConsoleConfig(
+      {
+        PUBLIC_LOGTO_ENDPOINT: "https://tenant.logto.app",
+        PUBLIC_LOGTO_APP_ID: "app123",
+      },
+      { production: true },
+    );
+    expect(config.logto?.scopes).toEqual(["ownsand:use"]);
   });
 
   test.each([
