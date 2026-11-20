@@ -160,7 +160,7 @@ function gitPaths(cwd, args) {
 // single newline that terminates Git's output is removed: the path itself may
 // legitimately end in whitespace (a checkout directory named `checkout `), and
 // trimming it would point every selector at a directory that does not exist.
-function repositoryRoot(start) {
+export function repositoryRoot(start) {
   try {
     return git(start, "rev-parse", "--show-toplevel").replace(/\n$/u, "");
   } catch (error) {

@@ -1409,3 +1409,129 @@ test("planner CLI reports a non-UTF-8 checkout path accurately", (t) => {
   assert.equal(existsSync(join(parent, "output")), false);
   assert.equal(existsSync(join(parent, "summary")), false);
 });
+
+// Fixture for the subdirectory tests: the base commit holds a file in every
+// start directory, so each directory exists in the working tree and in the
+// base. `diff.relative` is set by the repository-local configuration, which
+// `isolateGitEnvironment` does not disable.
+function subdirectoryFixture(t, relative) {
+  const f = fixture(t);
+  f.write("servers/x/main.go", "package main\n");
+  f.write("crates/foo/src/lib.rs", "// base\n");
+  f.write("cmds/tool/main.go", "package main\n");
+  f.write(".nvmrc", "20\n");
+  f.base = f.commit();
+  if (relative) f.git("config", "diff.relative", "true");
+  return f;
+}
+
+const startDirectories = ["servers", "crates", "cmds/tool"];
+
+for (const relative of [true, false]) {
+  const mode = relative ? "with" : "without";
+
+  test(`planner selects the same paths from a subdirectory ${mode} diff.relative`, (t) => {
+    const f = subdirectoryFixture(t, relative);
+    const comparisons = [
+      {
+        name: "go file under servers",
+        change: () => f.write("servers/x/main.go", "package main\n// change\n"),
+        expected: { go: true, fixtures: false, e2e: false, quality: false },
+      },
+      {
+        name: "shared runtime file at the root",
+        change: () => f.write(".nvmrc", "22\n"),
+        expected: { go: false, fixtures: true, e2e: true, quality: true },
+      },
+      {
+        name: "rust and go files in sibling directories",
+        change: () => {
+          f.write("crates/foo/src/lib.rs", "// change\n");
+          f.write("cmds/tool/main.go", "package main\n// change\n");
+        },
+        expected: { go: true, rust: true },
+      },
+    ];
+    for (const { name, change, expected } of comparisons) {
+      const previous = f.git("rev-parse", "HEAD");
+      change();
+      const head = f.commit();
+      const fromRoot = plan(f.cwd, previous, head);
+      for (const [key, value] of Object.entries(expected)) {
+        assert.equal(fromRoot[key], value, `${name}: root ${key}`);
+      }
+      for (const directory of startDirectories) {
+        assert.deepEqual(
+          plan(join(f.cwd, directory), previous, head),
+          fromRoot,
+          `${name}: from ${directory}`,
+        );
+      }
+    }
+  });
+
+  test(`planner CLI publishes the same outputs from a subdirectory ${mode} diff.relative`, (t) => {
+    const f = subdirectoryFixture(t, relative);
+    f.write(".nvmrc", "22\n");
+    f.write("servers/x/main.go", "package main\n// change\n");
+    const head = f.commit();
+    const run = (directory, name) => {
+      const output = join(f.cwd, `${name}-output`);
+      const summary = join(f.cwd, `${name}-summary`);
+      const result = spawnSync(
+        process.execPath,
+        [join(root, "scripts/ci/plan.mjs")],
+        {
+          cwd: directory,
+          env: plannerEnvironment({
+            CI_BASE: f.base,
+            CI_HEAD: head,
+            GITHUB_OUTPUT: output,
+            GITHUB_STEP_SUMMARY: summary,
+          }),
+          encoding: "utf8",
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      return {
+        output: readFileSync(output, "utf8"),
+        record: JSON.parse(result.stdout),
+      };
+    };
+    const fromRoot = run(f.cwd, "root");
+    assert.equal(
+      fromRoot.output,
+      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\n",
+    );
+    for (const directory of startDirectories) {
+      assert.deepEqual(
+        run(join(f.cwd, directory), directory.replaceAll("/", "-")),
+        fromRoot,
+        `from ${directory}`,
+      );
+    }
+  });
+}
+
+test("planner main() publishes the same outputs from a subdirectory with diff.relative", (t) => {
+  const f = subdirectoryFixture(t, true);
+  f.write(".nvmrc", "22\n");
+  const head = f.commit();
+  const publish = (directory, name) => {
+    const output = join(f.cwd, `${name}-output`);
+    main(
+      {
+        CI_BASE: f.base,
+        CI_HEAD: head,
+        GITHUB_OUTPUT: output,
+        GITHUB_STEP_SUMMARY: join(f.cwd, `${name}-summary`),
+      },
+      directory,
+    );
+    return readFileSync(output, "utf8");
+  };
+  assert.equal(
+    publish(join(f.cwd, "servers"), "subdirectory"),
+    publish(f.cwd, "root"),
+  );
+});
