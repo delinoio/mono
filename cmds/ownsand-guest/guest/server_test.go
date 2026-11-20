@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net"
 	"net/http"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -59,8 +58,9 @@ func newHarness(t *testing.T, mutate func(*Config)) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sock := filepath.Join(t.TempDir(), "guest.sock")
-	l, err := net.Listen("unix", sock)
+	// Loopback TCP: a unix socket path under a deep TMPDIR can exceed the
+	// 108-byte limit.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -81,7 +81,7 @@ func newHarness(t *testing.T, mutate func(*Config)) *harness {
 		Protocols: &protocols,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 			var d net.Dialer
-			return d.DialContext(ctx, "unix", sock)
+			return d.DialContext(ctx, "tcp", l.Addr().String())
 		},
 	}}
 	return &harness{t: t, srv: srv, client: ownsandv1connect.NewGuestServiceClient(hc, "http://guest"), clock: clock}

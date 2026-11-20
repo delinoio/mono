@@ -5,7 +5,6 @@ package guestlisten
 import (
 	"errors"
 	"net"
-	"path/filepath"
 	"testing"
 )
 
@@ -36,7 +35,10 @@ func TestParse(t *testing.T) {
 }
 
 func TestListenUnixRemovesStaleSocket(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "g.sock")
+	// A short relative path: a unix socket path under a deep TMPDIR can
+	// exceed the 108-byte limit.
+	t.Chdir(t.TempDir())
+	path := "g.sock"
 	for range 2 {
 		l, err := Listen("unix://" + path)
 		if err != nil {
