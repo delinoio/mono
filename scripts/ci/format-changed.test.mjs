@@ -1015,16 +1015,20 @@ const runExplicitCli = (f, base, head) => {
   );
 };
 
-test("explicit comparison skips an excluded path that is missing from the working tree", (t) => {
+test("local and explicit selection skip an excluded path that is missing from the working tree", (t) => {
   const { f, base, head } = missingRangeFixture(t);
-  f.git("update-index", "--skip-worktree", "pnpm-lock.yaml", "vendor/lib.ts");
   rmSync(join(f.cwd, "pnpm-lock.yaml"));
   rmSync(join(f.cwd, "vendor"), { recursive: true });
+  // Without an index flag, Git still reports both gone paths as unstaged
+  // deletions, so only the local silent skip keeps them out of the result.
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), []);
+  f.git("update-index", "--skip-worktree", "pnpm-lock.yaml", "vendor/lib.ts");
+  // With skip-worktree set, Git reports no names for the gone paths, so this
+  // covers the sparse-checkout state and not the skip itself.
+  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), []);
   const expected = ["c.ts", "kept.ts"];
   assert.deepEqual(changedFormatFiles(f.cwd, base, head), expected);
   assert.deepEqual(changedFormatFiles(f.cwd, base, head, false), expected);
-  // The local selection keeps its silent skip.
-  assert.deepEqual(changedFormatFiles(f.cwd, head, head, true), []);
   for (const result of runExplicitCli(f, base, head)) {
     const output = result.stdout + result.stderr;
     assert.equal(result.status, 0, output);
