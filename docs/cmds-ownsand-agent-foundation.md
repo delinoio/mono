@@ -5,7 +5,7 @@
 This contract owns two components of [`ownsand`](project-ownsand.md):
 
 - `cmds/ownsand-agent/` (`planned`): the device agent `ownsand-agent`. It runs as a system service on each enrolled Linux, macOS or Windows host, keeps an outbound channel to the control plane, runs sandboxes in VMs, enforces the network policy and TTLs, takes and moves snapshots, serves the data path and updates itself.
-- `cmds/ownsand-guest/` (`planned`): the guest helper `ownsand-guest`. It runs inside every sandbox guest and serves exec and file requests from the agent.
+- `cmds/ownsand-guest/`: the guest helper `ownsand-guest`. It runs inside every sandbox guest and serves exec and file requests from the agent. Packages: `guest` (the `GuestService`), `guestlisten` (the listener abstraction) and `execlog` (kept exec output and the exec event sequence, shared with the agent).
 
 Both components use Apache-2.0 and must not import code from `servers/`.
 
@@ -62,6 +62,17 @@ Every sandbox is a VM. The agent never runs sandbox code in a host process or co
 - `ownsand-guest` starts with the guest and listens on the hypervisor socket of the platform: vsock on Firecracker-class microVMs, a Virtualization.framework virtio socket device on macOS hosts and a Hyper-V socket on Windows hosts. It does not listen on any guest network interface.
 - The agent sends `DataFrame` exec and file requests to the guest helper and forwards its responses to the data path. The guest helper serves the `GuestService` of the [protos contract](protos-ownsand-api-contract.md#guest-channel).
 - The guest helper is part of every base image. For locally built macOS and Windows images, the image build installs it.
+
+#### Guest helper implementation (recorded decisions)
+
+- Listener: `guestlisten` parses a listener spec. `vsock://:<port>` listens on vsock with any CID (Linux guests, and macOS guests, whose Virtualization.framework virtio socket device appears as `AF_VSOCK`); the default spec is `vsock://:1024`, and the agent connects to vsock port `1024`. `hvsock://<service-id>` is the plug-in point of the Hyper-V socket of Windows hosts and fails with an unsupported error until the Windows runtime implements it. `unix://<path>` and `tcp://<host:port>` exist only for the agent's `process` test runtime and for tests; a guest image never uses them.
+- Transport: the helper serves `GuestService` with Connect over HTTP/2 without TLS (prior knowledge) on the accepted connections, with gzip disabled. The agent opens one `Serve` call per operation, so HTTP/2 stream flow control applies back-pressure to each operation separately; the helper also accepts several `stream_id` values on one call.
+- Configuration (flag, then environment variable): `--listen` (`OWNSAND_GUEST_LISTEN`, default `vsock://:1024`), `--state-dir` (`OWNSAND_GUEST_STATE_DIR`, default `/var/lib/ownsand-guest`, or `C:\ProgramData\ownsand-guest` on Windows; it holds the read snapshots and must be on the guest disk), `--clock` (`OWNSAND_GUEST_CLOCK`: `set` sets the system clock on `SetClock`; `ignore` accepts `SetClock` without a change and is used only by the `process` test runtime, whose helper runs on the host), `--log-level` (`OWNSAND_GUEST_LOG_LEVEL`) and `--version`. The helper logs JSON to standard error, and never logs commands, environment values, output, paths or file contents.
+- Exec: the command runs as a child of the helper with the helper's own environment plus the request `env` on top, in `working_directory` (the helper's directory when it is empty), in its own process group on Linux and macOS guests. The event sequence always starts with `started`, also when the command could not start: `started` is followed by exactly one of `exited`, `failed` or `sandbox_ended`. Start failures map to `ExecFailureReason` (`PROGRAM_NOT_FOUND` for a missing program, `PERMISSION_DENIED` for a file that cannot be executed, `WORKING_DIRECTORY_INVALID`, `RESOURCE_EXHAUSTED` for `EAGAIN` and `ENOMEM`, otherwise `OTHER`). The timeout sends `SIGTERM` to the process group and `SIGKILL` 10 seconds later on Linux and macOS guests; on Windows guests it runs `taskkill /T /F` on the process tree (a job object is open technical work for the Windows guest image). After the command exits, the helper waits at most 2 seconds for output pipes that a background child keeps open. The helper keeps the last 8 MiB of each output stream and the result for 10 minutes after the end, so the agent can attach again after a guest connection loss; a repeated `EXEC_REQUEST` with a known `exec_id` attaches from offset 0 (the agent checks the binding before it forwards a request). The helper sends a keepalive exec event after 30 seconds without another event.
+- File read: the private snapshot of a `read_id` lives in `<state-dir>/reads/`. On Linux the helper tries a `FICLONE` reflink first (btrfs, XFS); otherwise, and on macOS and Windows guests, it makes a full copy and compares the file identity, size and modification time before and after the copy, and fails with `aborted` when they changed. A snapshot that failed is forgotten when its last call ends, so a retry of the `read_id` tries again. A `read_id` bound to another path fails with `already_exists`; an offset beyond the snapshot size fails with `out_of_range`. Snapshots of an earlier helper process are deleted at start.
+- File write: the temporary file of a `write_id` is `.<name>.ownsand-<write_id>.tmp` in the target directory, so the final rename stays on one file system. The parent directory must exist (`failed_precondition` otherwise). A finish `mode` of 0 means `0644`; the mode is ignored on Windows guests. A chunk after a successful finish fails with `failed_precondition`, except a repeated identical finish.
+- Expiry: the helper removes expired execs, read snapshots and writes every 30 seconds, and remembers expired `read_id` and `write_id` values for 30 minutes so a late call fails with `not_found`. The agent's own admission window and 30-minute memory stay the primary rule.
+- Windows guests: `SetClock` returns `unimplemented` until the Windows guest image implements it with `SetSystemTime`.
 
 ### Network policy
 
@@ -156,6 +167,7 @@ When `Authenticate` reports that the device is unknown and the agent has no reco
 - Upstream: the [control plane](servers-ownsand-api-foundation.md) (API, agent channel, relay connections and STUN), Cloudflare R2 signed URLs, the release manifest host.
 - Platform: KVM and the microVM runtime, Virtualization.framework, Hyper-V Host Compute Service.
 - Protocol schemas: [protos contract](protos-ownsand-api-contract.md).
+- Go modules (root `go.mod`, owner-approved with the OwnSand implementation): `golang.org/x/sys` `v0.49.0` (released 2026-10-06) for vsock sockets, `FICLONE` reflinks and the guest clock. Record the `govulncheck ./...` result of each dependency change in the pull request.
 
 ## Change Triggers
 
