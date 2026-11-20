@@ -2213,7 +2213,20 @@ test("formatter CLI runs main through a symlinked script path", (t) => {
       env: f.env,
       encoding: "utf8",
     });
-    assert.match(result.stderr + result.stdout, /"event":"ci_format/, script);
+    // The unformatted staged file makes check mode exit 1. A throw inside
+    // main() exits 2 and prints an error record instead of the result record.
+    assert.equal(
+      result.status,
+      1,
+      `${script}\n${result.stdout}${result.stderr}`,
+    );
+    assert.match(result.stdout, /"event":"ci_format"/, script);
+    assert.match(
+      result.stdout,
+      /"event":"ci_format_result","status":1/,
+      script,
+    );
+    assert.doesNotMatch(result.stderr, /ci_format_error/, script);
   }
 });
 
