@@ -1,0 +1,127 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "delino/ownsand/v1/organization.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// MemberService manages members and invitations. AcceptInvitation takes no
+// organization_id; the invitation names the organization.
+service MemberService {
+  // Create a one-time invitation with the role ADMIN or MEMBER. Returns the
+  // secret once.
+  rpc CreateInvitation(CreateInvitationRequest) returns (CreateInvitationResponse);
+  // List pending invitations without secrets.
+  rpc ListInvitations(ListInvitationsRequest) returns (ListInvitationsResponse);
+  // Revoke a pending invitation.
+  rpc RevokeInvitation(RevokeInvitationRequest) returns (RevokeInvitationResponse);
+  // Join the organization with an invitation secret, as the signed-in user.
+  rpc AcceptInvitation(AcceptInvitationRequest) returns (AcceptInvitationResponse);
+  // List members, roles and display names.
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+  // Change a member role between ADMIN and MEMBER.
+  rpc UpdateMemberRole(UpdateMemberRoleRequest) returns (UpdateMemberRoleResponse);
+  // Remove a member. An admin or member may also remove itself.
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+}
+
+message Member {
+  string organization_id = 1;
+  // Logto `sub`, unchanged.
+  string user_id = 2;
+  Role role = 3;
+  // Display name from the delino-accounts API. Empty when unavailable.
+  string display_name = 4;
+  google.protobuf.Timestamp join_time = 5;
+}
+
+// Invitation metadata. It never carries the secret.
+message Invitation {
+  string invitation_id = 1;
+  string organization_id = 2;
+  Role role = 3;
+  InvitationState state = 4;
+  Principal created_by = 5;
+  google.protobuf.Timestamp create_time = 6;
+  // 7 days after create_time.
+  google.protobuf.Timestamp expire_time = 7;
+  // Short non-secret prefix of the secret, for display.
+  string secret_prefix = 8;
+}
+
+message CreateInvitationRequest {
+  string organization_id = 1;
+  // ADMIN or MEMBER.
+  Role role = 2;
+}
+
+message CreateInvitationResponse {
+  Invitation invitation = 1;
+  // `osi_` followed by 32 random bytes in unpadded base64url. Returned once.
+  // Secret: never log.
+  string invitation_secret = 2;
+}
+
+message ListInvitationsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListInvitationsResponse {
+  repeated Invitation invitations = 1;
+  string next_page_token = 2;
+}
+
+message RevokeInvitationRequest {
+  string organization_id = 1;
+  string invitation_id = 2;
+}
+
+message RevokeInvitationResponse {
+  Invitation invitation = 1;
+}
+
+message AcceptInvitationRequest {
+  // Secret: never log.
+  string invitation_secret = 1;
+}
+
+message AcceptInvitationResponse {
+  Organization organization = 1;
+  Member member = 2;
+}
+
+message ListMembersRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListMembersResponse {
+  repeated Member members = 1;
+  string next_page_token = 2;
+}
+
+message UpdateMemberRoleRequest {
+  string organization_id = 1;
+  string user_id = 2;
+  // ADMIN or MEMBER.
+  Role role = 3;
+}
+
+message UpdateMemberRoleResponse {
+  Member member = 1;
+}
+
+message RemoveMemberRequest {
+  string organization_id = 1;
+  string user_id = 2;
+}
+
+message RemoveMemberResponse {}

@@ -1,0 +1,330 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// Exec and file messages and the data path framing. The peer-to-peer data
+// channel, the relay and the guest channel carry the same DataFrame messages.
+// Every payload in this file except the relay control frames is sandbox
+// content: components never log ExecRequest.command, ExecRequest.env, exec
+// output or file data.
+
+// Kind of a DataFrame payload. Each value names exactly one payload field.
+enum DataFrameKind {
+  DATA_FRAME_KIND_UNSPECIFIED = 0;
+  // Relay only. Opens a relay stream for a grant.
+  DATA_FRAME_KIND_RELAY_STREAM_OPEN = 1;
+  // Relay only. The control plane ended the relay RPC of the stream.
+  DATA_FRAME_KIND_RELAY_STREAM_CLOSE = 2;
+  // Relay only. Adds credit to the receiver's send window of the stream.
+  DATA_FRAME_KIND_RELAY_WINDOW_UPDATE = 3;
+  // Relay connection only, on stream_id 0.
+  DATA_FRAME_KIND_RELAY_KEEPALIVE = 4;
+  // Relay connection only, on stream_id 0, sent by each side when Connect
+  // opens.
+  DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS = 5;
+  DATA_FRAME_KIND_SESSION_END = 6;
+  // Agent to control plane on the relay. Uses no credit.
+  DATA_FRAME_KIND_REQUEST_ACCEPTED = 7;
+  DATA_FRAME_KIND_EXEC_REQUEST = 8;
+  DATA_FRAME_KIND_EXEC_ATTACH_REQUEST = 9;
+  DATA_FRAME_KIND_EXEC_EVENT = 10;
+  DATA_FRAME_KIND_FILE_READ_REQUEST = 11;
+  // A file chunk, the final size message or a keepalive of a file read.
+  DATA_FRAME_KIND_FILE_READ_EVENT = 12;
+  DATA_FRAME_KIND_FILE_WRITE_CHUNK = 13;
+  DATA_FRAME_KIND_FILE_WRITE_RESULT = 14;
+  DATA_FRAME_KIND_ERROR = 15;
+}
+
+// Why a command could not start.
+enum ExecFailureReason {
+  EXEC_FAILURE_REASON_UNSPECIFIED = 0;
+  // The program in command[0] does not exist.
+  EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND = 1;
+  // The program exists but the guest helper cannot run it.
+  EXEC_FAILURE_REASON_PERMISSION_DENIED = 2;
+  // The working directory does not exist or is not a directory.
+  EXEC_FAILURE_REASON_WORKING_DIRECTORY_INVALID = 3;
+  // The guest has no resources to start the process.
+  EXEC_FAILURE_REASON_RESOURCE_EXHAUSTED = 4;
+  // Any other start failure; the message has the detail.
+  EXEC_FAILURE_REASON_OTHER = 5;
+}
+
+// One environment variable of an exec request inside a RelayRequestBinding.
+message EnvironmentEntry {
+  string key = 1;
+  string value = 2;
+}
+
+// Run a command in a sandbox. Also the RelayService.Exec request and the
+// EXEC_REQUEST frame payload.
+message ExecRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  // UUID v7 that the caller generates before it sends the request.
+  string exec_id = 3;
+  // Argument array; the first element is the program. Sandbox content: never
+  // log.
+  repeated string command = 4;
+  // Sandbox content: never log.
+  map<string, string> env = 5;
+  string working_directory = 6;
+  // Absent means no timeout.
+  google.protobuf.Duration timeout = 7;
+  // 32 random bytes that the caller generates for each operation.
+  bytes binding_salt = 8;
+}
+
+// Continue the event stream of an exec. Also the RelayService.AttachExec
+// request and the EXEC_ATTACH_REQUEST frame payload.
+message AttachExecRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  string exec_id = 3;
+  // Next stdout byte offset that the caller needs.
+  int64 stdout_offset = 4;
+  // Next stderr byte offset that the caller needs.
+  int64 stderr_offset = 5;
+}
+
+message ExecStarted {
+  string exec_id = 1;
+  google.protobuf.Timestamp start_time = 2;
+}
+
+// The requested offsets are older than the kept output.
+message ExecOutputTruncated {
+  // First available stdout offset.
+  int64 stdout_offset = 1;
+  // First available stderr offset.
+  int64 stderr_offset = 2;
+}
+
+// One stdout or stderr chunk of at most 64 KiB. Sandbox content: never log.
+message ExecOutput {
+  // Byte offset of data in its stream.
+  int64 offset = 1;
+  bytes data = 2;
+}
+
+message ExecExited {
+  // Exactly one of exit_code or signal.
+  oneof status {
+    // int64 so that 32-bit Windows exit codes keep their value.
+    int64 exit_code = 1;
+    // Number of the signal that ended the command.
+    int32 signal = 2;
+  }
+  // True when the exec timeout stopped the command.
+  bool timed_out = 3;
+  google.protobuf.Timestamp end_time = 4;
+}
+
+// The command could not start.
+message ExecFailed {
+  ExecFailureReason reason = 1;
+  // Human-readable detail for the caller. Components never log it, because
+  // it can name sandbox paths.
+  string message = 2;
+}
+
+// The sandbox ended before the exec result could be delivered.
+message ExecSandboxEnded {
+  SandboxEndReason reason = 1;
+}
+
+// An AttachExec on a paused sandbox delivered the kept output of an exec that
+// has not ended.
+message ExecPaused {}
+
+// One event of an exec. See the exec section of the protos contract for the
+// order.
+message ExecEvent {
+  oneof event {
+    // Relay only: the agent accepted the request.
+    RequestAccepted accepted = 1;
+    ExecStarted started = 2;
+    ExecOutputTruncated output_truncated = 3;
+    ExecOutput stdout = 4;
+    ExecOutput stderr = 5;
+    ExecExited exited = 6;
+    ExecFailed failed = 7;
+    ExecSandboxEnded sandbox_ended = 8;
+    Keepalive keepalive = 9;
+    ExecPaused paused = 10;
+  }
+}
+
+// Read a guest file. Also the RelayService.ReadFile request and the
+// FILE_READ_REQUEST frame payload. Every call carries the path and the salt.
+message ReadFileRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  // UUID v7 that the caller generates right before the first call.
+  string read_id = 3;
+  // Absolute guest path. Sandbox content: never log.
+  string path = 4;
+  bytes binding_salt = 5;
+  // Start offset. Zero on the first call.
+  int64 offset = 6;
+}
+
+// One chunk of at most 1 MiB. Sandbox content: never log.
+message FileChunk {
+  int64 offset = 1;
+  bytes data = 2;
+}
+
+// Final message of a file read.
+message FileReadEnd {
+  int64 size_bytes = 1;
+}
+
+// One message of a file read stream.
+message FileReadEvent {
+  oneof event {
+    // Relay only: the agent accepted the request.
+    RequestAccepted accepted = 1;
+    Keepalive keepalive = 2;
+    FileChunk chunk = 3;
+    FileReadEnd end = 4;
+  }
+}
+
+// Finish fields of the last WriteFile call of a write_id.
+message WriteFileFinish {
+  // Total file size. The written ranges must cover exactly [0, size_bytes).
+  int64 size_bytes = 1;
+  // File mode bits, for example 0644. Ignored on Windows guests.
+  uint32 mode = 2;
+}
+
+// Write one chunk of a guest file. Also the RelayService.WriteFile request
+// and the FILE_WRITE_CHUNK frame payload.
+message WriteFileRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+  // UUID v7 that the caller generates right before the first call.
+  string write_id = 3;
+  // Absolute guest target path. Required on the first call of a write_id.
+  // Sandbox content: never log.
+  string path = 4;
+  // Required on the first call of a write_id.
+  bytes binding_salt = 5;
+  int64 offset = 6;
+  // At most 1 MiB. Sandbox content: never log.
+  bytes data = 7;
+  // Set on the last call.
+  WriteFileFinish finish = 8;
+}
+
+// Result of one WriteFile call. Also the FILE_WRITE_RESULT frame payload.
+message WriteFileResponse {
+  string write_id = 1;
+  // Offset and length of the chunk that this call wrote.
+  int64 offset = 2;
+  int64 length = 3;
+  // True when the call finished the write and renamed the file into place.
+  bool finished = 4;
+  // Set when finished is true.
+  int64 size_bytes = 5;
+}
+
+// Relay only: open a relay stream for a grant.
+message RelayStreamOpen {
+  string grant_id = 1;
+  // First credit window, in bytes of encoded DataFrame messages, that the
+  // control plane grants the agent for frames toward the caller. At least
+  // one maximum frame (1 MiB plus 64 KiB).
+  int64 initial_window_bytes = 2;
+}
+
+// Relay only: the control plane ended the relay RPC of the stream.
+message RelayStreamClose {}
+
+// Relay only: add credit to the receiver's send window of a stream.
+message RelayWindowUpdate {
+  // Bytes of encoded DataFrame messages that the window gains. Greater than
+  // zero.
+  int64 increment_bytes = 1;
+}
+
+// Relay connection only, on stream_id 0.
+message RelayKeepalive {
+  // Ask the other side to answer at once with a keepalive.
+  bool echo_requested = 1;
+}
+
+// Relay connection only, on stream_id 0: the frame kinds that the sender
+// supports. No list means the first-version set.
+message SupportedFrameKinds {
+  repeated DataFrameKind kinds = 1;
+}
+
+// The agent ended a data channel or a relay stream.
+message SessionEnd {
+  SessionEndReason reason = 1;
+}
+
+// One frame of the data path. An encoded DataFrame is at most 1 MiB plus
+// 64 KiB.
+message DataFrame {
+  // On a peer-to-peer session the caller chooses it, unique within the
+  // session. On the relay the control plane allocates it in increasing
+  // order from 1 and never reuses it on one connection. stream_id 0 with an
+  // empty sandbox_id is reserved for connection-level relay frames.
+  uint64 stream_id = 1;
+  // The sandbox that the control plane authorized.
+  string sandbox_id = 2;
+  // Names the payload field that is set. A receiver that does not know the
+  // kind ignores it on stream_id 0 and ends the stream with an error frame
+  // otherwise.
+  DataFrameKind kind = 3;
+  oneof payload {
+    RelayStreamOpen relay_stream_open = 10;
+    RelayStreamClose relay_stream_close = 11;
+    RelayWindowUpdate relay_window_update = 12;
+    RelayKeepalive relay_keepalive = 13;
+    SupportedFrameKinds supported_frame_kinds = 14;
+    SessionEnd session_end = 15;
+    RequestAccepted request_accepted = 16;
+    ExecRequest exec_request = 17;
+    AttachExecRequest exec_attach_request = 18;
+    ExecEvent exec_event = 19;
+    ReadFileRequest file_read_request = 20;
+    FileReadEvent file_read_event = 21;
+    WriteFileRequest file_write_chunk = 22;
+    WriteFileResponse file_write_result = 23;
+    ErrorDetail error = 24;
+  }
+}
+
+// Input of a relay request digest: request_digest = SHA-256 of the protobuf
+// binary encoding of this message, with fields in field-number order and no
+// unknown fields. Fields that the operation kind does not use stay empty.
+message RelayRequestBinding {
+  bytes binding_salt = 1;
+  string sandbox_id = 2;
+  RelayOperationKind operation_kind = 3;
+  // exec_id, read_id or write_id.
+  string operation_id = 4;
+  // EXEC only.
+  repeated string command = 5;
+  // EXEC only, sorted by key bytes.
+  repeated EnvironmentEntry env = 6;
+  // EXEC only.
+  string working_directory = 7;
+  // EXEC only. Absent when the request has no timeout.
+  google.protobuf.Duration timeout = 8;
+  // READ_FILE and WRITE_FILE only: the absolute guest path.
+  string path = 9;
+}

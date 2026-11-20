@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// DeviceService manages enrollment tokens, devices, device limits and the
+// agent version policy.
+service DeviceService {
+  // Create a one-time enrollment token with an expiry. Returns the secret once.
+  rpc CreateEnrollmentToken(CreateEnrollmentTokenRequest) returns (CreateEnrollmentTokenResponse);
+  // List enrollment tokens without secrets.
+  rpc ListEnrollmentTokens(ListEnrollmentTokensRequest) returns (ListEnrollmentTokensResponse);
+  // Revoke an unused enrollment token.
+  rpc RevokeEnrollmentToken(RevokeEnrollmentTokenRequest) returns (RevokeEnrollmentTokenResponse);
+  // List devices with state, capabilities, limits and allocation.
+  rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
+  // Read one device.
+  rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
+  // Set all four device limits.
+  rpc UpdateDeviceLimits(UpdateDeviceLimitsRequest) returns (UpdateDeviceLimitsResponse);
+  // Revoke the device credentials and request local clean-up.
+  rpc RemoveDevice(RemoveDeviceRequest) returns (RemoveDeviceResponse);
+  // Read the agent version policy of the organization.
+  rpc GetAgentVersionPolicy(GetAgentVersionPolicyRequest) returns (GetAgentVersionPolicyResponse);
+  // Follow the default target, pin a version or hold updates.
+  rpc UpdateAgentVersionPolicy(UpdateAgentVersionPolicyRequest) returns (UpdateAgentVersionPolicyResponse);
+}
+
+// Enrollment token metadata. It never carries the secret.
+message EnrollmentToken {
+  string enrollment_token_id = 1;
+  string organization_id = 2;
+  EnrollmentTokenState state = 3;
+  Principal created_by = 4;
+  google.protobuf.Timestamp create_time = 5;
+  google.protobuf.Timestamp expire_time = 6;
+  // Set when the token enrolled a device.
+  google.protobuf.Timestamp use_time = 7;
+  string device_id = 8;
+  // Short non-secret prefix of the secret, for display.
+  string token_prefix = 9;
+}
+
+// Result of one hypervisor check that a device agent runs.
+message HypervisorCheck {
+  // Stable lowercase identifier of the check, for example `kvm-access`.
+  string check_id = 1;
+  bool passed = 2;
+  // Human-readable detail. Never contains secrets.
+  string detail = 3;
+}
+
+// Capabilities that a device agent reports.
+message DeviceCapabilities {
+  int32 logical_cpu_count = 1;
+  int64 memory_mib = 2;
+  // Free disk in the agent state directory.
+  int64 free_disk_bytes = 3;
+  repeated GuestOs guest_oses = 4;
+  repeated BaseImage built_base_images = 5;
+  // True only on Apple silicon Macs.
+  bool macos_guests_supported = 6;
+  // Opaque Virtualization.framework hardware model data representations.
+  repeated bytes macos_hardware_models = 7;
+  repeated HypervisorCheck hypervisor_checks = 8;
+}
+
+// Resources that the sandboxes of a device use together.
+message DeviceAllocation {
+  int32 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+  // macOS guests in CREATING, RUNNING, PAUSED or DELETING state.
+  int32 macos_guest_count = 4;
+}
+
+message Device {
+  string device_id = 1;
+  string organization_id = 2;
+  // Host name that the agent reported at enrollment.
+  string name = 3;
+  DeviceState state = 4;
+  HostOs host_os = 5;
+  Arch arch = 6;
+  string agent_version = 7;
+  AgentUpdateState update_state = 8;
+  DeviceCapabilities capabilities = 9;
+  DeviceLimits limits = 10;
+  // floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100).
+  int32 effective_vcpu_limit = 11;
+  DeviceAllocation allocation = 12;
+  google.protobuf.Timestamp create_time = 13;
+  google.protobuf.Timestamp last_seen_time = 14;
+  // Time of the first PENDING_IDLE report of the current update, if any.
+  google.protobuf.Timestamp pending_idle_since = 15;
+}
+
+message CreateEnrollmentTokenRequest {
+  string organization_id = 1;
+  // Lifetime of the token. Greater than zero and at most 24 hours.
+  google.protobuf.Duration ttl = 2;
+}
+
+message CreateEnrollmentTokenResponse {
+  EnrollmentToken token = 1;
+  // `ose_` followed by 32 random bytes in unpadded base64url. Returned once.
+  // Secret: never log.
+  string enrollment_token = 2;
+}
+
+message ListEnrollmentTokensRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListEnrollmentTokensResponse {
+  repeated EnrollmentToken tokens = 1;
+  string next_page_token = 2;
+}
+
+message RevokeEnrollmentTokenRequest {
+  string organization_id = 1;
+  string enrollment_token_id = 2;
+}
+
+message RevokeEnrollmentTokenResponse {
+  EnrollmentToken token = 1;
+}
+
+message ListDevicesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  // Optional state filter. Absent means all devices that are not removed.
+  optional DeviceState state = 4;
+}
+
+message ListDevicesResponse {
+  repeated Device devices = 1;
+  string next_page_token = 2;
+}
+
+message GetDeviceRequest {
+  string organization_id = 1;
+  string device_id = 2;
+}
+
+message GetDeviceResponse {
+  Device device = 1;
+}
+
+message UpdateDeviceLimitsRequest {
+  string organization_id = 1;
+  string device_id = 2;
+  // Every value is required.
+  DeviceLimits limits = 3;
+}
+
+message UpdateDeviceLimitsResponse {
+  Device device = 1;
+}
+
+message RemoveDeviceRequest {
+  string organization_id = 1;
+  string device_id = 2;
+}
+
+message RemoveDeviceResponse {
+  Device device = 1;
+}
+
+message AgentVersionPolicy {
+  string organization_id = 1;
+  AgentVersionPolicyMode mode = 2;
+  // Set only for PIN.
+  string pinned_version = 3;
+  google.protobuf.Timestamp update_time = 4;
+  Principal updated_by = 5;
+}
+
+message GetAgentVersionPolicyRequest {
+  string organization_id = 1;
+}
+
+message GetAgentVersionPolicyResponse {
+  AgentVersionPolicy policy = 1;
+}
+
+message UpdateAgentVersionPolicyRequest {
+  string organization_id = 1;
+  AgentVersionPolicyMode mode = 2;
+  // Required for PIN, empty otherwise. A revoked version fails with
+  // invalid_argument.
+  string pinned_version = 3;
+}
+
+message UpdateAgentVersionPolicyResponse {
+  AgentVersionPolicy policy = 1;
+}

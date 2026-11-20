@@ -1,0 +1,140 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// SnapshotService manages snapshots, their export and templates.
+service SnapshotService {
+  // Take a snapshot of a sandbox on its device. Returns at once in CREATING.
+  rpc CreateSnapshot(CreateSnapshotRequest) returns (CreateSnapshotResponse);
+  // Read one snapshot with its location and export state.
+  rpc GetSnapshot(GetSnapshotRequest) returns (GetSnapshotResponse);
+  // List snapshots.
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse);
+  // Delete a snapshot. Fails with failed_precondition while a template
+  // references it.
+  rpc DeleteSnapshot(DeleteSnapshotRequest) returns (DeleteSnapshotResponse);
+  // Export a snapshot to R2. Returns at once in EXPORTING.
+  rpc ExportSnapshot(ExportSnapshotRequest) returns (ExportSnapshotResponse);
+  // Make a named template from a snapshot.
+  rpc CreateTemplate(CreateTemplateRequest) returns (CreateTemplateResponse);
+  // List templates.
+  rpc ListTemplates(ListTemplatesRequest) returns (ListTemplatesResponse);
+  // Delete a template. The source snapshot stays.
+  rpc DeleteTemplate(DeleteTemplateRequest) returns (DeleteTemplateResponse);
+}
+
+message Snapshot {
+  string snapshot_id = 1;
+  string organization_id = 2;
+  string source_sandbox_id = 3;
+  // Device that holds the local copy. Empty when no device holds one (an
+  // exported snapshot whose device was removed).
+  string device_id = 4;
+  SnapshotState state = 5;
+  SnapshotExportState export_state = 6;
+  GuestOs guest_os = 7;
+  HostOs host_os = 8;
+  Arch arch = 9;
+  // Resources of the source sandbox. A sandbox from this snapshot needs at
+  // least resources.disk_gib.
+  Resources resources = 10;
+  NetworkMode network_mode = 11;
+  // True when the snapshot holds memory state.
+  bool has_memory_state = 12;
+  int64 size_bytes = 13;
+  // Opaque Virtualization.framework hardware model of a macOS snapshot.
+  bytes macos_hardware_model = 14;
+  Principal created_by = 15;
+  google.protobuf.Timestamp create_time = 16;
+}
+
+message Template {
+  string template_id = 1;
+  string organization_id = 2;
+  string name = 3;
+  string snapshot_id = 4;
+  Principal created_by = 5;
+  google.protobuf.Timestamp create_time = 6;
+}
+
+message CreateSnapshotRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message CreateSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message GetSnapshotRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+}
+
+message GetSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message ListSnapshotsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  optional string sandbox_id = 4;
+  optional string device_id = 5;
+}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSnapshotRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+}
+
+message DeleteSnapshotResponse {}
+
+message ExportSnapshotRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+}
+
+message ExportSnapshotResponse {
+  Snapshot snapshot = 1;
+}
+
+message CreateTemplateRequest {
+  string organization_id = 1;
+  string snapshot_id = 2;
+  string name = 3;
+}
+
+message CreateTemplateResponse {
+  Template template = 1;
+}
+
+message ListTemplatesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListTemplatesResponse {
+  repeated Template templates = 1;
+  string next_page_token = 2;
+}
+
+message DeleteTemplateRequest {
+  string organization_id = 1;
+  string template_id = 2;
+}
+
+message DeleteTemplateResponse {}

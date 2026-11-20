@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: Apache-2.0
+# buf module of the repository protobuf schemas. scripts/protos.sh runs the
+# pinned buf CLI with this configuration.
+version: v2
+modules:
+  - path: .
+lint:
+  use:
+    - STANDARD
+breaking:
+  use:
+    - FILE

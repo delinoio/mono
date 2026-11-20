@@ -428,12 +428,17 @@ test("workspace roots cross-check detects extra roots in any spelling", async (t
   }
 });
 
-test("Go sources and module files select Go checks", async (t) => {
+test("Go sources, module files and protobuf inputs select Go checks", async (t) => {
   for (const path of [
     "servers/example/main.go",
     "servers/example/go.mod",
     "cmds/example/go.sum",
     "go.mod",
+    "protos/delino/example/v1/example.proto",
+    "protos/buf.yaml",
+    "protos/buf.gen.yaml",
+    "protos/buf.lock",
+    "scripts/protos.sh",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -444,6 +449,8 @@ test("Go sources and module files select Go checks", async (t) => {
   const f = fixture(t);
   f.write("servers/example/README.md");
   f.write("servers/example/go.mod.example");
+  f.write("protos/AGENTS.md");
+  f.write("docs/buf.yaml");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
@@ -958,6 +965,23 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
   assert.match(
     workflow,
     /\.go\.result == "skipped" and \$go_planned == "false"/,
+  );
+});
+
+// The Go job runs the protobuf drift and breaking-change checks with the
+// planner's comparison base, so it needs the full history.
+test("CI workflow checks protobuf schemas in the Go job", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+  const goJob = workflow.slice(
+    workflow.indexOf("\n  go:\n"),
+    workflow.indexOf("\n  rust:\n"),
+  );
+  assert.match(goJob, /fetch-depth: 0/);
+  assert.match(goJob, /scripts\/protos\.sh check/);
+  assert.match(goJob, /scripts\/protos\.sh breaking "\$COMPARISON_BASE"/);
+  assert.match(
+    goJob,
+    /COMPARISON_BASE: \$\{\{ needs\.changes\.outputs\.base \}\}/,
   );
 });
 

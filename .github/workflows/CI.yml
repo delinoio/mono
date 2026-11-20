@@ -126,6 +126,8 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          # The protobuf breaking-change check reads the comparison base.
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
@@ -143,6 +145,21 @@ jobs:
           fi
           go vet ./...
           go test ./...
+      - name: Check protobuf schemas and generated Go bindings
+        shell: bash
+        env:
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+        run: |
+          set -euo pipefail
+          scripts/protos.sh check
+          # A root push compares against an empty-tree commit that only the
+          # changes job created; it has no schemas to compare.
+          if git cat-file -e "${COMPARISON_BASE}^{commit}" 2>/dev/null; then
+            scripts/protos.sh breaking "$COMPARISON_BASE"
+          else
+            echo "Comparison base $COMPARISON_BASE is not in this checkout; breaking-change check skipped."
+            echo "Protobuf breaking-change check: skipped, comparison base not in checkout" >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Record validation result
         if: always()
         env:
@@ -151,7 +168,7 @@ jobs:
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...; scripts/protos.sh check; scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Runtime, deployment and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
   rust:

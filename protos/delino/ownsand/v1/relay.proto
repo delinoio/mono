@@ -1,0 +1,52 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/data_frame.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// RelayService is the relay fallback of the data path. Every request carries
+// the caller's credential in `Authorization: Bearer` and the grant ID from
+// AuthorizeRelay in the `Ownsand-Relay-Grant-Id` header.
+service RelayService {
+  // Run a command and stream its events.
+  rpc Exec(ExecRequest) returns (stream ExecResponse);
+  // Continue the event stream of a running or finished exec.
+  rpc AttachExec(AttachExecRequest) returns (stream AttachExecResponse);
+  // Stream the contents of a guest file from an offset.
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+  // Write one chunk of a guest file at an offset.
+  rpc WriteFile(WriteFileRequest) returns (WriteFileResponse);
+}
+
+message ExecResponse {
+  ExecEvent event = 1;
+}
+
+message AttachExecResponse {
+  ExecEvent event = 1;
+}
+
+message ReadFileResponse {
+  FileReadEvent event = 1;
+}
+
+// RelayAgentService carries DataFrame messages between the control plane and
+// one device agent. It is device-facing and authenticated with the `osd_`
+// device session credential. It needs HTTP/2 from end to end.
+service RelayAgentService {
+  rpc Connect(stream ConnectRequest) returns (stream ConnectResponse);
+}
+
+// Agent to control plane: one DataFrame.
+message ConnectRequest {
+  DataFrame frame = 1;
+}
+
+// Control plane to agent: one DataFrame.
+message ConnectResponse {
+  DataFrame frame = 1;
+}

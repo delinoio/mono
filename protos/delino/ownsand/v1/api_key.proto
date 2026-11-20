@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// ApiKeyService manages organization API keys.
+service ApiKeyService {
+  // Create an organization API key. Returns the secret once.
+  rpc CreateApiKey(CreateApiKeyRequest) returns (CreateApiKeyResponse);
+  // List API keys without secrets.
+  rpc ListApiKeys(ListApiKeysRequest) returns (ListApiKeysResponse);
+  // Revoke an API key.
+  rpc RevokeApiKey(RevokeApiKeyRequest) returns (RevokeApiKeyResponse);
+}
+
+// API key metadata. It never carries the secret.
+message ApiKey {
+  string api_key_id = 1;
+  string organization_id = 2;
+  string name = 3;
+  ApiKeyState state = 4;
+  Principal created_by = 5;
+  google.protobuf.Timestamp create_time = 6;
+  google.protobuf.Timestamp revoke_time = 7;
+  // Short non-secret prefix of the secret, for display.
+  string key_prefix = 8;
+}
+
+message CreateApiKeyRequest {
+  string organization_id = 1;
+  string name = 2;
+}
+
+message CreateApiKeyResponse {
+  ApiKey api_key = 1;
+  // `osk_` followed by 32 random bytes in unpadded base64url. Returned once.
+  // Secret: never log.
+  string api_key_secret = 2;
+}
+
+message ListApiKeysRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListApiKeysResponse {
+  repeated ApiKey api_keys = 1;
+  string next_page_token = 2;
+}
+
+message RevokeApiKeyRequest {
+  string organization_id = 1;
+  string api_key_id = 2;
+}
+
+message RevokeApiKeyResponse {
+  ApiKey api_key = 1;
+}

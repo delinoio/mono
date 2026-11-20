@@ -1,0 +1,156 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.ownsand.v1;
+
+import "delino/ownsand/v1/common.proto";
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1";
+
+// SandboxService manages the sandbox lifecycle. Exec and file operations use
+// the data path (DataPathService and RelayService).
+service SandboxService {
+  // Create a sandbox. Returns the sandbox in CREATING without waiting.
+  rpc CreateSandbox(CreateSandboxRequest) returns (CreateSandboxResponse);
+  // Read one sandbox.
+  rpc GetSandbox(GetSandboxRequest) returns (GetSandboxResponse);
+  // List sandboxes, with optional device and state filters.
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+  // Delete a sandbox. Waits up to 60 seconds for the agent result.
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+  // Pause a running sandbox. Waits up to 60 seconds for the agent result.
+  rpc PauseSandbox(PauseSandboxRequest) returns (PauseSandboxResponse);
+  // Resume a paused sandbox. Waits up to 60 seconds for the agent result.
+  rpc ResumeSandbox(ResumeSandboxRequest) returns (ResumeSandboxResponse);
+}
+
+// Source of a sandbox: exactly one of the fields.
+message SandboxSource {
+  oneof source {
+    BaseImage base_image = 1;
+    string snapshot_id = 2;
+    string template_id = 3;
+  }
+}
+
+// Placement filters of a create request. guest_os is derived from the source.
+message Placement {
+  // With device_id, the scheduler does not select another device.
+  optional string device_id = 1;
+  optional HostOs host_os = 2;
+  optional Arch arch = 3;
+}
+
+// Network policy of a sandbox. A present message with NETWORK_MODE_UNSPECIFIED
+// fails with invalid_argument; an absent message means OUTBOUND.
+message Network {
+  NetworkMode mode = 1;
+}
+
+message Sandbox {
+  string sandbox_id = 1;
+  string organization_id = 2;
+  string device_id = 3;
+  SandboxState state = 4;
+  // Set only when state is UNREACHABLE.
+  optional SandboxState last_known_state = 5;
+  // Set only when state is DELETED or FAILED.
+  optional SandboxEndReason end_reason = 6;
+  SandboxSource source = 7;
+  // Set for a template source: the snapshot that the template referenced.
+  string source_snapshot_id = 8;
+  Resources resources = 9;
+  GuestOs guest_os = 10;
+  HostOs host_os = 11;
+  Arch arch = 12;
+  Network network = 13;
+  // Labels never contain secrets. Components never log them.
+  map<string, string> labels = 14;
+  google.protobuf.Duration idle_ttl = 15;
+  google.protobuf.Duration max_ttl = 16;
+  // The idle deadline that the agent last reported.
+  google.protobuf.Timestamp idle_deadline = 17;
+  // create_time plus max_ttl.
+  google.protobuf.Timestamp max_deadline = 18;
+  SandboxRestorePath restore_path = 19;
+  Principal created_by = 20;
+  google.protobuf.Timestamp create_time = 21;
+  google.protobuf.Timestamp end_time = 22;
+}
+
+message CreateSandboxRequest {
+  string organization_id = 1;
+  // UUID v7 that the caller generates for each logical create and reuses for
+  // every retry.
+  string idempotency_key = 2;
+  SandboxSource source = 3;
+  Resources resources = 4;
+  // Required. Greater than zero and not greater than max_ttl.
+  google.protobuf.Duration idle_ttl = 5;
+  // Required. Greater than zero and at most 7 days.
+  google.protobuf.Duration max_ttl = 6;
+  Placement placement = 7;
+  // Absent means NETWORK_MODE_OUTBOUND.
+  Network network = 8;
+  // At most 32 entries; keys at most 63 bytes, values at most 255 bytes.
+  map<string, string> labels = 9;
+}
+
+message CreateSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message GetSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message GetSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message ListSandboxesRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  optional string device_id = 4;
+  // Optional state filter. DELETED and FAILED sandboxes are listed only when
+  // this filter names them or include_ended is true.
+  optional SandboxState state = 5;
+  bool include_ended = 6;
+}
+
+message ListSandboxesResponse {
+  repeated Sandbox sandboxes = 1;
+  string next_page_token = 2;
+}
+
+message DeleteSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message DeleteSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message PauseSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message PauseSandboxResponse {
+  Sandbox sandbox = 1;
+}
+
+message ResumeSandboxRequest {
+  string organization_id = 1;
+  string sandbox_id = 2;
+}
+
+message ResumeSandboxResponse {
+  Sandbox sandbox = 1;
+}
