@@ -173,6 +173,27 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	}
 }
 
+// TestRelayGrantReleasedWhenDetachedExecEnds checks that the grant of an
+// exec whose caller closed the stream is released when the exec ends, not
+// only after the 60-second idle time.
+func TestRelayGrantReleasedWhenDetachedExecEnds(t *testing.T) {
+	e := newRelayEnv(t, Timing{}, RelayLimits{})
+	req := e.execReq("/bin/sh", "-c", "sleep 1; echo done")
+	g := e.execGrant(req)
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	if f := rc.nextOn(1); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+		t.Fatalf("expected the accepted notice, got %v", f)
+	}
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamClose{}))
+	time.Sleep(200 * time.Millisecond)
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the grant was released while the exec still ran")
+	}
+	waitFor(t, "grant release after the exec ended", func() bool { return e.ch.released(g.GetGrantId()) })
+}
+
 func TestRelayExecAndRelease(t *testing.T) {
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/echo", "hi")

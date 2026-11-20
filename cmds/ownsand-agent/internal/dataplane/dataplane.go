@@ -25,6 +25,8 @@ import (
 // Dispatcher serves operation requests.
 type Dispatcher interface {
 	Handle(ctx context.Context, req ops.Request, sink ops.Sink) ops.Outcome
+	// ExecEnded reports whether an accepted exec has ended.
+	ExecEnded(execID string) bool
 }
 
 // SandboxStates reports sandbox states.
