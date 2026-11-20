@@ -200,13 +200,23 @@ func (s MemberService) AcceptInvitation(ctx context.Context, req *connect.Reques
 		return nil, err
 	}
 	value := req.Msg.GetInvitationSecret()
+	limitKey := "invitation:" + secret.DisplayPrefix(value)
+	if s.InvitationFailures != nil && !s.InvitationFailures.Peek(limitKey) {
+		return nil, connect.NewError(connect.CodeResourceExhausted, errors.New("too many failed invitation attempts; retry later"))
+	}
+	fail := func() error {
+		if s.InvitationFailures != nil {
+			s.InvitationFailures.Allow(limitKey)
+		}
+		return errInvitationInvalid
+	}
 	if secret.Classify(value) != secret.KindInvitation {
-		return nil, errInvitationInvalid
+		return nil, fail()
 	}
 	org, m, err := s.Store.AcceptInvitation(ctx, secret.Hash(value), p.ID, requestID())
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		return nil, errInvitationInvalid
+		return nil, fail()
 	case errors.Is(err, store.ErrAlreadyExists):
 		return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the caller is already a member of the organization"))
 	case err != nil:

@@ -336,3 +336,17 @@ func TestHealthzAndCORS(t *testing.T) {
 		t.Fatal("disallowed origin got CORS headers")
 	}
 }
+
+func TestAcceptInvitationFailureLimit(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	c := h.clients(userToken("guesser"))
+	value := secret.New(secret.KindInvitation)
+	var last error
+	for i := 0; i < 11; i++ {
+		_, last = c.member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: value}))
+	}
+	if connect.CodeOf(last) != connect.CodeResourceExhausted {
+		t.Fatalf("after 11 failures: %v", last)
+	}
+}

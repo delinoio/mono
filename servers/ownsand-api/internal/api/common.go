@@ -17,6 +17,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/store"
 )
 
@@ -26,6 +27,9 @@ type Server struct {
 	Logger       *slog.Logger
 	DisplayNames accounts.DisplayNameSource
 	Now          func() time.Time
+	// InvitationFailures limits failed AcceptInvitation calls per invitation
+	// secret display prefix.
+	InvitationFailures *ratelimit.Limiter
 }
 
 func (s *Server) now() time.Time {

@@ -64,7 +64,7 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger, opts Options) 
 	}
 	a := &App{Config: cfg, Store: st, Logger: logger}
 	a.Authn = &auth.Authenticator{Store: st, Tokens: tokens, Failures: ratelimit.New(credentialFailureRate, credentialFailureBurst, nil)}
-	a.API = &api.Server{Store: st, Logger: logger, DisplayNames: names}
+	a.API = &api.Server{Store: st, Logger: logger, DisplayNames: names, InvitationFailures: ratelimit.New(credentialFailureRate, credentialFailureBurst, nil)}
 	interceptor := &rpc.Interceptor{Authn: a.Authn, Logger: logger}
 	opt := connect.WithInterceptors(interceptor)
 	routes := []server.Route{}
