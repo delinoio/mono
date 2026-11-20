@@ -242,8 +242,11 @@ func (s *Service) handleHeartbeat(ctx context.Context, conn *hub.Conn, hb *ownsa
 	// The first PENDING_IDLE report starts pending_idle_since, which survives
 	// restarts and lease handovers; any other state clears it.
 	var state int16
-	err := s.DB.Pool.QueryRow(ctx, `UPDATE devices SET last_seen_time = $2, update_state = $3, update_target_version = $4,
-		pending_idle_since = CASE WHEN $3 = 2 THEN COALESCE(pending_idle_since, $2) ELSE NULL END
+	// $3 is cast explicitly: Postgres deduces one type per parameter, and the
+	// column assignment (smallint) and the comparison with 2 (integer) would
+	// otherwise deduce two.
+	err := s.DB.Pool.QueryRow(ctx, `UPDATE devices SET last_seen_time = $2, update_state = $3::smallint, update_target_version = $4,
+		pending_idle_since = CASE WHEN $3::smallint = 2 THEN COALESCE(pending_idle_since, $2) ELSE NULL END
 		WHERE device_id = $1 RETURNING state`,
 		conn.DeviceID, now, int16(hb.GetUpdateState()), hb.GetUpdateTargetVersion()).Scan(&state)
 	if errors.Is(err, pgx.ErrNoRows) || (err == nil && ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_REMOVED) {

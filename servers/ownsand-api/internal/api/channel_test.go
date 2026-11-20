@@ -35,6 +35,36 @@ func setupAgent(t *testing.T, env *testenv.Env, org *testenv.Org, limits *ownsan
 	return dev, agent
 }
 
+// TestHeartbeatStoresUpdateState checks that a heartbeat stores the update
+// state and starts and clears pending_idle_since.
+func TestHeartbeatStoresUpdateState(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	dev, agent := setupAgent(t, env, org, nil)
+	pendingSince := func() (int16, bool) {
+		var state int16
+		var since *time.Time
+		if err := env.DB.Pool.QueryRow(context.Background(), "SELECT update_state, pending_idle_since FROM devices WHERE device_id = $1", dev.ID).Scan(&state, &since); err != nil {
+			t.Fatal(err)
+		}
+		return state, since != nil
+	}
+	send := func(seq uint64, st ownsandv1.AgentUpdateState) {
+		agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{Sequence: seq, UpdateState: st, UpdateTargetVersion: "1.2.3"}}})
+		agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == seq })
+	}
+	send(1, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE)
+	testenv.Eventually(t, "pending idle stored", func() bool {
+		state, since := pendingSince()
+		return state == int16(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE) && since
+	})
+	send(2, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE)
+	testenv.Eventually(t, "pending idle cleared", func() bool {
+		state, since := pendingSince()
+		return state == int16(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE) && !since
+	})
+}
+
 func createReq(orgID string) *ownsandv1.CreateSandboxRequest {
 	key, _ := uuidv7.NewString()
 	return &ownsandv1.CreateSandboxRequest{
