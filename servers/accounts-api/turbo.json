@@ -3,7 +3,21 @@
   "extends": ["//"],
   "tasks": {
     "dev": {
-      "passThroughEnv": ["ADDR", "LOG_LEVEL"]
+      "passThroughEnv": [
+        "ADDR",
+        "LOG_LEVEL",
+        "DATABASE_URL",
+        "RUN_MIGRATIONS",
+        "LOGTO_ISSUER",
+        "LOGTO_AUDIENCE",
+        "LOGTO_MANAGEMENT_ENDPOINT",
+        "LOGTO_M2M_CLIENT_ID",
+        "LOGTO_M2M_CLIENT_SECRET",
+        "CORS_ORIGINS",
+        "WEB_ORIGIN",
+        "RESEND_API_KEY",
+        "EMAIL_FROM"
+      ]
     },
     "build": {
       "cache": false,
@@ -13,7 +27,8 @@
       "cache": false
     },
     "test": {
-      "cache": false
+      "cache": false,
+      "passThroughEnv": ["ACCOUNTS_TEST_DATABASE_URL"]
     }
   }
 }

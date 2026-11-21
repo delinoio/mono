@@ -124,11 +124,37 @@ function stopLauncher(run) {
 // of the launcher itself. The launcher's children are not in that group, so
 // cleanup (`stopLauncher`) kills them by pid. The temporary build output goes
 // to a test-owned TMPDIR.
+// Configuration that lets the real server start without external services.
+// The server opens its database pool lazily and skips the migrations with
+// RUN_MIGRATIONS=false, so the unreachable database (port 1 refuses
+// connections) is never contacted: these tests cover the launcher and the
+// process lifecycle, not the billing APIs, which the Go integration tests
+// cover with a real Postgres. Logto, the Logto Management API and Resend are
+// contacted only by RPCs, which these tests do not call.
+const serverEnv = Object.freeze({
+  DATABASE_URL: "postgres://accounts@127.0.0.1:1/accounts?connect_timeout=1",
+  RUN_MIGRATIONS: "false",
+  LOGTO_ISSUER: "http://127.0.0.1:1/oidc",
+  LOGTO_MANAGEMENT_ENDPOINT: "http://127.0.0.1:1",
+  LOGTO_M2M_CLIENT_ID: "launcher-test",
+  LOGTO_M2M_CLIENT_SECRET: "launcher-test-secret",
+  RESEND_API_KEY: "re_launcher_test",
+  EMAIL_FROM: "billing@example.com",
+});
+
 function startLauncher(t, { port, env = {}, pathPrefix } = {}) {
   const tmp = mkdtempSync(join(tmpdir(), "accounts-api-dev-test-"));
-  const childEnv = { ...process.env, ADDR: `127.0.0.1:${port}`, TMPDIR: tmp };
+  const childEnv = {
+    ...process.env,
+    ...serverEnv,
+    ADDR: `127.0.0.1:${port}`,
+    TMPDIR: tmp,
+  };
   delete childEnv.LOG_LEVEL;
   Object.assign(childEnv, env);
+  for (const [name, value] of Object.entries(childEnv)) {
+    if (value === undefined) delete childEnv[name];
+  }
   if (pathPrefix) {
     childEnv.PATH = `${pathPrefix}${delimiter}${process.env.PATH}`;
   }
@@ -216,6 +242,79 @@ function fakeGoBuildingCountingServer(t) {
 
 const countEvents = (output, event) =>
   output.split("\n").filter((line) => line.includes(`"${event}"`)).length;
+
+test(
+  "skips without DATABASE_URL and starts no build",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const port = await freePort();
+    const run = startLauncher(t, {
+      port,
+      env: { DATABASE_URL: undefined },
+      // A build would fail with this status; the launcher must not run it.
+      pathPrefix: fakeGo(t, "exit 3"),
+    });
+    const { code } = await run.exited;
+
+    assert.equal(code, 0, run.stderr);
+    assert.match(run.stderr, /"accounts_api_dev_skipped"/);
+    assert.doesNotMatch(run.stdout, /"server_started"/);
+    await assertNoListener(port);
+    assert.deepEqual(readdirSync(run.tmp), [], "a build directory was created");
+  },
+);
+
+// A fake `go` whose "build" writes a program that prints the origins it
+// received and exits.
+function fakeGoBuildingEnvPrinter(t) {
+  const program = `#!${process.execPath}
+console.log(JSON.stringify({ event: "env", cors: process.env.CORS_ORIGINS, web: process.env.WEB_ORIGIN }));
+`;
+  return fakeGo(
+    t,
+    [
+      'while [ $# -gt 0 ]; do if [ "$1" = "-o" ]; then out="$2"; fi; shift; done',
+      `cat > "$out" <<'PROGRAM'\n${program}PROGRAM`,
+      'chmod 755 "$out"',
+    ].join("\n"),
+  );
+}
+
+const envRecord = (output) =>
+  JSON.parse(output.split("\n").find((line) => line.includes('"event":"env"')));
+
+test(
+  "development origins are the defaults and explicit values win",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const defaults = startLauncher(t, {
+      port: await freePort(),
+      env: { CORS_ORIGINS: undefined, WEB_ORIGIN: undefined },
+      pathPrefix: fakeGoBuildingEnvPrinter(t),
+    });
+    assert.equal((await defaults.exited).code, 0, defaults.stderr);
+    assert.deepEqual(envRecord(defaults.stdout), {
+      event: "env",
+      cors: "https://accounts.delino.io,http://127.0.0.1:13100,https://accounts.delino.localhost,http://accounts.delino.localhost",
+      web: "https://accounts.delino.localhost",
+    });
+
+    const explicit = startLauncher(t, {
+      port: await freePort(),
+      env: {
+        CORS_ORIGINS: "https://a.example",
+        WEB_ORIGIN: "https://b.example",
+      },
+      pathPrefix: fakeGoBuildingEnvPrinter(t),
+    });
+    assert.equal((await explicit.exited).code, 0, explicit.stderr);
+    assert.deepEqual(envRecord(explicit.stdout), {
+      event: "env",
+      cors: "https://a.example",
+      web: "https://b.example",
+    });
+  },
+);
 
 test(
   "a process-group SIGINT reaches the server once and the drain completes",

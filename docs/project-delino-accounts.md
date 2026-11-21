@@ -12,7 +12,7 @@ Provide one place where Delino users manage their account information and their 
 
 - `apps/delino-accounts/`: Rsbuild React web app served at `https://accounts.delino.io`.
 - `servers/accounts-api/`: Go API server served at `https://accounts.api.delino.io`.
-- `protos/delino/accounts/` (`planned`): Connect RPC schemas for the account and billing APIs, in the protobuf package `delino.accounts.v1`.
+- `protos/delino/accounts/`: Connect RPC schemas for the account and billing APIs, in the protobuf package `delino.accounts.v1`.
 
 The project has two deployables. The web app is a static single-page application with no server runtime. The API server owns all account and billing state. The project has no `cmds`, `crates` or `packages` paths. The schemas (and their generated bindings) are not a deployable.
 
@@ -36,7 +36,7 @@ The project has two deployables. The web app is a static single-page application
 - Authentication follows the [repository authentication contract](repository-auth-contract.md). The web app is a Logto single-page application. The API server is a Logto API resource with the indicator `https://accounts.api.delino.io` and validates Logto access tokens. User RPCs need the scope `accounts:billing`. Services call the usage-report API with a Logto machine-to-machine access token for the same API resource and the scope `accounts:report-usage`; this is a Logto access token, so it needs no authentication contract exception. The Logto user ID (`sub`) is the owner key of all account and billing records.
 - Billing amounts follow the [repository billing contract](repository-billing-contract.md): USD only, signed 64-bit integers in micro-USD with a `_usd_micros` suffix.
 - New persisted entities use UUID v7 identifiers.
-- Billing model (recorded decisions, `planned` in the runtime): [API server contract](servers-accounts-api-foundation.md) and [protos contract](protos-delino-accounts-api-contract.md) own the details.
+- Billing model (recorded decisions; billing accounts, members, roles and email invitations are implemented in the API server, and the rest is `planned` in the runtime): [API server contract](servers-accounts-api-foundation.md) and [protos contract](protos-delino-accounts-api-contract.md) own the details.
   - A billing account is a separate entity with the roles `owner`, `admin` and `viewer`. Any Logto user can create one and becomes its `owner`. Owners and admins invite members by email through Resend.
   - One billing account can pay for several organizations of several Delino services. Each organization of a service links to at most one billing account.
   - Billing accounts hold prepaid USD credits. Paddle is the payment provider and merchant of record. Charges are tax-exclusive, and Paddle cents convert to micro-USD by multiplying by 10,000 (exact). A required $10/month subscription adds a $10 credit grant with each payment; manual top-ups ($25 to $10,000) and optional automatic top-ups add more. Credit is added only by verified, deduplicated Paddle webhooks.

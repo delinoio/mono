@@ -33,7 +33,22 @@ const shellEnv = {
 // Expected `passThroughEnv` of each workspace `dev` task. `null` means that the
 // task declares none, so Turbo's strict mode removes every shell variable.
 const expectedPassThroughEnv = {
-  "accounts-api#dev": ["ADDR", "LOG_LEVEL"],
+  // Turbo reports the pass-through list sorted.
+  "accounts-api#dev": [
+    "ADDR",
+    "CORS_ORIGINS",
+    "DATABASE_URL",
+    "EMAIL_FROM",
+    "LOGTO_AUDIENCE",
+    "LOGTO_ISSUER",
+    "LOGTO_M2M_CLIENT_ID",
+    "LOGTO_M2M_CLIENT_SECRET",
+    "LOGTO_MANAGEMENT_ENDPOINT",
+    "LOG_LEVEL",
+    "RESEND_API_KEY",
+    "RUN_MIGRATIONS",
+    "WEB_ORIGIN",
+  ],
   "delino-accounts#dev": ["PORTLESS", "PORTLESS_*", "PUBLIC_API_ORIGIN"],
   "delidev#dev": ["TAURI_DEV_HOST"],
   // The frontend `dev` scripts run portless, which reads only its own

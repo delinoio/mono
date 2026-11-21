@@ -1,0 +1,320 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.accounts.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/accounts/v1;accountsv1";
+
+// Billing accounts, their members and email invitations of the
+// delino-accounts API. The owning contract is
+// docs/protos-delino-accounts-api-contract.md.
+//
+// Rules for every service of the package `delino.accounts.v1`:
+//
+// - accounts-api serves the services at `https://accounts.api.delino.io`.
+// - Credentials are Logto access tokens for the API resource
+//   `https://accounts.api.delino.io`. A missing, expired or otherwise invalid
+//   token, and an ID token, fail with `unauthenticated`. A valid token
+//   without the scope that a service requires fails with `permission_denied`.
+// - BillingAccountService, CreditService and BillingUsageService are user
+//   services: they need the scope `accounts:billing` and a user token. The
+//   Logto `sub` of the token is the caller. UsageService is a service API: it
+//   needs the scope `accounts:report-usage` on a machine-to-machine token.
+// - Identifiers that accounts-api generates are UUID v7 values in canonical
+//   text form in `string` fields named `<entity>_id`. The server accepts
+//   either hex case and always returns lowercase text. A malformed identifier
+//   fails with `invalid_argument`. User ID fields (`user_id`) hold the Logto
+//   `sub` unchanged as an opaque string. Fields named `paddle_*_id` hold Paddle
+//   identifiers unchanged.
+// - Money fields are signed `int64` micro-USD values (1 USD = 1,000,000) with
+//   the suffix `_usd_micros`. Paddle amounts are whole USD cents, so every
+//   amount that a user enters must be a whole number of cents (a multiple of
+//   10,000 micro-USD); other values fail with `invalid_argument`.
+// - Times use `google.protobuf.Timestamp`.
+// - Every enum has a zero value `<ENUM>_UNSPECIFIED`. The server rejects
+//   `UNSPECIFIED` in a required enum field with `invalid_argument`.
+// - List RPCs take `page_size` (0 selects the default 50; values above 200
+//   are lowered to 200; a negative value fails with `invalid_argument`) and
+//   an opaque `page_token` from the previous response. A token that the
+//   server did not issue for the same request fails with `invalid_argument`.
+//   An empty `next_page_token` means that no more results exist.
+// - For a request that names a billing account, a caller that is not a member
+//   of that account gets `not_found`, also when the account exists, so that
+//   callers cannot discover other billing accounts. A member whose role does
+//   not allow the action gets `permission_denied`. A deleted billing account
+//   is `not_found` for every RPC.
+// - Error messages never contain secrets, tokens or payment data.
+
+// Role of a user in a billing account.
+enum BillingAccountRole {
+  BILLING_ACCOUNT_ROLE_UNSPECIFIED = 0;
+  // Every action, including deleting the billing account and transferring
+  // ownership. A billing account has exactly one owner.
+  BILLING_ACCOUNT_ROLE_OWNER = 1;
+  // Manages members and invitations, the payment method, the subscription,
+  // manual and automatic top-up, alerts and organization links.
+  BILLING_ACCOUNT_ROLE_ADMIN = 2;
+  // Reads the balance, the ledger, usage and linked organizations.
+  BILLING_ACCOUNT_ROLE_VIEWER = 3;
+}
+
+// State of a billing account invitation.
+enum InvitationState {
+  INVITATION_STATE_UNSPECIFIED = 0;
+  INVITATION_STATE_PENDING = 1;
+  INVITATION_STATE_ACCEPTED = 2;
+  INVITATION_STATE_REVOKED = 3;
+  INVITATION_STATE_EXPIRED = 4;
+}
+
+// BillingAccountService manages billing accounts, their members and email
+// invitations. Every RPC needs a user token with the scope
+// `accounts:billing`. CreateBillingAccount, ListBillingAccounts and
+// AcceptInvitation need no membership; every other RPC needs a membership in
+// the named billing account.
+service BillingAccountService {
+  // Create a billing account. Any signed-in user may call it; the caller
+  // becomes its owner. A new billing account has a zero balance, no
+  // subscription and automatic top-up off.
+  rpc CreateBillingAccount(CreateBillingAccountRequest) returns (CreateBillingAccountResponse);
+  // Read one billing account. Every member may call it.
+  rpc GetBillingAccount(GetBillingAccountRequest) returns (GetBillingAccountResponse);
+  // List the billing accounts in which the caller has a membership, ordered
+  // by billing_account_id (creation order).
+  rpc ListBillingAccounts(ListBillingAccountsRequest) returns (ListBillingAccountsResponse);
+  // Rename a billing account. Owner and admin only.
+  rpc UpdateBillingAccount(UpdateBillingAccountRequest) returns (UpdateBillingAccountResponse);
+  // Delete a billing account. Owner only. Fails with `failed_precondition`
+  // while the balance is negative or an organization of any service is
+  // linked. Deletion cancels the Paddle subscription at once, forfeits the
+  // remaining credit and ends every membership and pending invitation. The
+  // ledger, credit grants, usage records and audit events are kept for 7
+  // years.
+  rpc DeleteBillingAccount(DeleteBillingAccountRequest) returns (DeleteBillingAccountResponse);
+  // Invite a person by email with the role ADMIN or VIEWER. Owner and admin
+  // only. accounts-api sends the invitation email with a one-time link. The
+  // invitation expires 7 days after it is created. Fails with
+  // `already_exists` while a pending invitation for the same email address
+  // exists in the billing account.
+  rpc CreateInvitation(CreateInvitationRequest) returns (CreateInvitationResponse);
+  // List the pending invitations of a billing account, newest first. Owner
+  // and admin only.
+  rpc ListInvitations(ListInvitationsRequest) returns (ListInvitationsResponse);
+  // Revoke a pending invitation. Owner and admin only. Fails with
+  // `failed_precondition` when the invitation is not pending.
+  rpc RevokeInvitation(RevokeInvitationRequest) returns (RevokeInvitationResponse);
+  // Join a billing account with the token from an invitation email, as the
+  // signed-in user. Any signed-in user may call it. The primary email address
+  // of the caller's Logto account must equal the invited address (compared
+  // with ASCII case folding); otherwise the call fails with
+  // `permission_denied` and the invitation stays pending. An unknown token
+  // fails with `not_found`. An accepted, revoked or expired invitation fails
+  // with `failed_precondition`. A caller that is already a member gets
+  // `already_exists`, and the invitation stays pending.
+  rpc AcceptInvitation(AcceptInvitationRequest) returns (AcceptInvitationResponse);
+  // List the members of a billing account and their roles, ordered by join
+  // time. Every member may call it.
+  rpc ListMembers(ListMembersRequest) returns (ListMembersResponse);
+  // Change the role of a member between ADMIN and VIEWER. Owner and admin
+  // only. The owner's role cannot be changed (`failed_precondition`);
+  // ownership moves only with TransferOwnership.
+  rpc UpdateMemberRole(UpdateMemberRoleRequest) returns (UpdateMemberRoleResponse);
+  // Remove a member. The owner and admins may remove any admin or viewer.
+  // Every admin and viewer may remove itself. The owner cannot be removed
+  // (`failed_precondition`). A change of members does not change the
+  // organization links of the billing account.
+  rpc RemoveMember(RemoveMemberRequest) returns (RemoveMemberResponse);
+  // Make another member the owner. Owner only. The previous owner becomes
+  // ADMIN. A user that is not a member fails with `not_found`; the caller's
+  // own user ID fails with `invalid_argument`.
+  rpc TransferOwnership(TransferOwnershipRequest) returns (TransferOwnershipResponse);
+}
+
+// A billing account. It holds the prepaid credit balance, the subscription
+// and the payment method, and it pays for linked organizations of Delino
+// services.
+message BillingAccount {
+  // UUID v7.
+  string billing_account_id = 1;
+  // Display name. 1 to 100 Unicode code points after the server removes white
+  // space at the start and the end; no control characters.
+  string name = 2;
+  // Role of the calling user in the billing account. In
+  // UsageService.ListManageableBillingAccounts, the role of the user that the
+  // request names.
+  BillingAccountRole caller_role = 3;
+  google.protobuf.Timestamp create_time = 4;
+}
+
+// A member of a billing account.
+message BillingAccountMember {
+  string billing_account_id = 1;
+  // Logto `sub`, unchanged.
+  string user_id = 2;
+  BillingAccountRole role = 3;
+  // Display name from the Logto user profile. Empty when unavailable.
+  string display_name = 4;
+  // Time when the user became a member.
+  google.protobuf.Timestamp create_time = 5;
+}
+
+// Invitation metadata. It never carries the invitation token.
+message BillingAccountInvitation {
+  // UUID v7.
+  string invitation_id = 1;
+  string billing_account_id = 2;
+  // Invited email address, as the inviter entered it after the server
+  // removed white space at the start and the end.
+  string email = 3;
+  // ADMIN or VIEWER. The owner role is never invited.
+  BillingAccountRole role = 4;
+  InvitationState state = 5;
+  // Logto `sub` of the member that created the invitation.
+  string inviter_user_id = 6;
+  google.protobuf.Timestamp create_time = 7;
+  // 7 days after create_time.
+  google.protobuf.Timestamp expire_time = 8;
+}
+
+message CreateBillingAccountRequest {
+  // Required. 1 to 100 Unicode code points after the server removes white
+  // space at the start and the end; no control characters. Other values fail
+  // with `invalid_argument`.
+  string name = 1;
+}
+
+message CreateBillingAccountResponse {
+  BillingAccount billing_account = 1;
+}
+
+message GetBillingAccountRequest {
+  string billing_account_id = 1;
+}
+
+message GetBillingAccountResponse {
+  BillingAccount billing_account = 1;
+}
+
+message ListBillingAccountsRequest {
+  // Default 50, maximum 200.
+  int32 page_size = 1;
+  string page_token = 2;
+}
+
+message ListBillingAccountsResponse {
+  repeated BillingAccount billing_accounts = 1;
+  string next_page_token = 2;
+}
+
+message UpdateBillingAccountRequest {
+  string billing_account_id = 1;
+  // Required. Same rules as CreateBillingAccountRequest.name.
+  string name = 2;
+}
+
+message UpdateBillingAccountResponse {
+  BillingAccount billing_account = 1;
+}
+
+message DeleteBillingAccountRequest {
+  string billing_account_id = 1;
+}
+
+message DeleteBillingAccountResponse {}
+
+message CreateInvitationRequest {
+  string billing_account_id = 1;
+  // Required. An email address (`local@domain`) of at most 254 bytes. Other
+  // values fail with `invalid_argument`.
+  string email = 2;
+  // ADMIN or VIEWER. OWNER and UNSPECIFIED fail with `invalid_argument`.
+  BillingAccountRole role = 3;
+}
+
+message CreateInvitationResponse {
+  // The invitation token goes only into the invitation email; no response
+  // returns it.
+  BillingAccountInvitation invitation = 1;
+}
+
+message ListInvitationsRequest {
+  string billing_account_id = 1;
+  // Default 50, maximum 200.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListInvitationsResponse {
+  // Pending invitations only.
+  repeated BillingAccountInvitation invitations = 1;
+  string next_page_token = 2;
+}
+
+message RevokeInvitationRequest {
+  string billing_account_id = 1;
+  string invitation_id = 2;
+}
+
+message RevokeInvitationResponse {
+  BillingAccountInvitation invitation = 1;
+}
+
+message AcceptInvitationRequest {
+  // Token from the invitation email link: `bai_` followed by 32 random bytes
+  // in unpadded base64url. accounts-api stores only its SHA-256 hash.
+  // Secret: never log.
+  string invitation_token = 1;
+}
+
+message AcceptInvitationResponse {
+  BillingAccount billing_account = 1;
+  BillingAccountMember member = 2;
+}
+
+message ListMembersRequest {
+  string billing_account_id = 1;
+  // Default 50, maximum 200.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListMembersResponse {
+  repeated BillingAccountMember members = 1;
+  string next_page_token = 2;
+}
+
+message UpdateMemberRoleRequest {
+  string billing_account_id = 1;
+  // Logto `sub` of a member. A user that is not a member fails with
+  // `not_found`.
+  string user_id = 2;
+  // ADMIN or VIEWER. OWNER and UNSPECIFIED fail with `invalid_argument`.
+  BillingAccountRole role = 3;
+}
+
+message UpdateMemberRoleResponse {
+  BillingAccountMember member = 1;
+}
+
+message RemoveMemberRequest {
+  string billing_account_id = 1;
+  // Logto `sub` of a member. A user that is not a member fails with
+  // `not_found`.
+  string user_id = 2;
+}
+
+message RemoveMemberResponse {}
+
+message TransferOwnershipRequest {
+  string billing_account_id = 1;
+  // Logto `sub` of an existing member that becomes the owner.
+  string user_id = 2;
+}
+
+message TransferOwnershipResponse {
+  // The billing account after the transfer; caller_role is ADMIN.
+  BillingAccount billing_account = 1;
+}

@@ -4,13 +4,13 @@
 
 This contract owns the Connect RPC schemas of [`delino-accounts`](project-delino-accounts.md):
 
-- `protos/delino/accounts/v1/` (`planned`): `.proto` files of the protobuf package `delino.accounts.v1`.
-- The generated Go bindings (`planned`), committed next to the schemas: message code in the Go package `github.com/delinoio/mono/protos/delino/accounts/v1` (package name `accountsv1`) and Connect handlers and clients in its `accountsv1connect` subpackage.
+- `protos/delino/accounts/v1/`: `.proto` files of the protobuf package `delino.accounts.v1`.
+- The generated Go bindings, committed next to the schemas: message code in the Go package `github.com/delinoio/mono/protos/delino/accounts/v1` (package name `accountsv1`) and Connect handlers and clients in its `accountsv1connect` subpackage.
 - The generated TypeScript bindings (`planned`) for the [web app](apps-delino-accounts-foundation.md) in `apps/delino-accounts/src/gen/`, with their template `apps/delino-accounts/buf.gen.yaml`. `scripts/protos.sh` generates and checks them together with the Go bindings, as it does for the OwnSand schemas.
 
 The schemas share `protos/buf.yaml`, `protos/buf.gen.yaml` and `scripts/protos.sh` with the OwnSand schemas. The [OwnSand protos contract](protos-ownsand-api-contract.md#build-and-test) owns these tools and their versions.
 
-The schemas do not exist yet. The change that adds the first schema changes the `planned` paths above, and the protos path in the [project index](project-delino-accounts.md#domain-ownership-map), to actual paths, and adds `delino/accounts` to the generation and drift check of `scripts/protos.sh`.
+`scripts/protos.sh` generates and checks the Go bindings of every schema under `protos/`, so the accounts schemas need no separate Go target. The TypeScript bindings stay `planned` until the web app consumes the schemas; that change adds the `delino/accounts` TypeScript target to the generation and drift check of `scripts/protos.sh`.
 
 Schema files:
 

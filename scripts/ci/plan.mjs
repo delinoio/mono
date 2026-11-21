@@ -132,9 +132,13 @@ const goWorkspaceInputs = new Set([
   "pnpm-workspace.yaml",
 ]);
 
-// The ownsand-api schema migrations, embedded into the service and applied by
-// the Postgres-backed tests and the end-to-end suite that the go-test job runs.
-const ownsandApiMigrations = "servers/ownsand-api/internal/db/migrations/";
+// The accounts-api and ownsand-api schema migrations, embedded into each
+// service and applied by the Postgres-backed tests (and the OwnSand end-to-end
+// suite) that the go-test job runs.
+const goMigrations = [
+  "servers/accounts-api/internal/db/migrations/",
+  "servers/ownsand-api/internal/db/migrations/",
+];
 
 // The relay request digest vectors are read by the Go relaybinding tests and by
 // the TypeScript SDK digest test of `packages/ownsand-sdk`, so a change selects
@@ -157,7 +161,7 @@ export function isGoInput(path) {
     protoInputs.has(path) ||
     goWorkspaceInputs.has(path) ||
     path.startsWith(ownsandSdkPackage) ||
-    path.startsWith(ownsandApiMigrations) ||
+    goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
     goTestdata.test(path)
   );

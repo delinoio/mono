@@ -19,9 +19,21 @@
 // the launcher stops the launcher only and leaves the server running as an
 // orphan that keeps its listening port. Stop such a server by its pid.
 //
+// The server needs Postgres and the billing configuration. When DATABASE_URL
+// is unset, the launcher prints an `accounts_api_dev_skipped` record and exits
+// with status 0 instead of failing, so the root `pnpm dev` keeps running the
+// other development servers on machines without a database or Infisical. When
+// CORS_ORIGINS is unset, it allows the web app's development origins in
+// addition to the production origin: http://127.0.0.1:13100 (the fixed port of
+// `dev:app` and `PORTLESS=0`) and https://accounts.delino.localhost and
+// http://accounts.delino.localhost (the portless URL with the default proxy and
+// with an unprivileged proxy). When WEB_ORIGIN is unset, invitation links point
+// to https://accounts.delino.localhost. A proxy on a custom PORTLESS_PORT adds
+// that port to the URL; set CORS_ORIGINS and WEB_ORIGIN to it there.
+//
 // Child processes use explicit argument arrays and `shell: false` according to
-// the repository environment contract. Configuration (`ADDR`, `LOG_LEVEL`),
-// standard streams and the working directory reach the server unchanged.
+// the repository environment contract. Other configuration, standard streams
+// and the working directory reach the server unchanged.
 import { spawn } from "node:child_process";
 import { mkdtemp, rm } from "node:fs/promises";
 import { constants, tmpdir } from "node:os";
@@ -37,6 +49,13 @@ const ForwardedSignal = Object.freeze({
   Quit: "SIGQUIT",
 });
 const signalExitCode = (signal) => 128 + constants.signals[signal];
+const DevelopmentWebOrigins = Object.freeze([
+  "http://127.0.0.1:13100",
+  "https://accounts.delino.localhost",
+  "http://accounts.delino.localhost",
+]);
+const ProductionWebOrigin = "https://accounts.delino.io";
+const DevelopmentInvitationOrigin = "https://accounts.delino.localhost";
 
 // Children run in their own process group (and session) on POSIX. A terminal
 // Ctrl-C signals the whole foreground group; with the child in that group it
@@ -69,13 +88,14 @@ const handlers = Object.values(ForwardedSignal).map((signal) => {
 
 // Runs one child with inherited stdio and resolves with its exit status once
 // it has exited: its exit code, or the shell convention for a fatal signal.
-function run(command, args) {
+function run(command, args, env) {
   return new Promise((resolvePromise, reject) => {
     const child = spawn(command, args, {
       cwd: packageDir,
       stdio: "inherit",
       shell: false,
       detached: ownProcessGroup,
+      env,
     });
     activeChild = child;
     child.once("error", (error) => {
@@ -93,6 +113,23 @@ function run(command, args) {
 const stoppedStatus = () => signalExitCode(received);
 
 async function main() {
+  // An empty value counts as unset, as it does for the server.
+  if (!process.env.DATABASE_URL?.trim()) {
+    console.error(
+      JSON.stringify({
+        event: "accounts_api_dev_skipped",
+        reason: "DATABASE_URL is not set",
+      }),
+    );
+    return 0;
+  }
+  const env = { ...process.env };
+  if (!env.CORS_ORIGINS?.trim()) {
+    env.CORS_ORIGINS = [ProductionWebOrigin, ...DevelopmentWebOrigins].join(
+      ",",
+    );
+  }
+  if (!env.WEB_ORIGIN?.trim()) env.WEB_ORIGIN = DevelopmentInvitationOrigin;
   const buildDir = await mkdtemp(join(tmpdir(), "accounts-api-dev-"));
   try {
     // A signal during the `mkdtemp` await above found no child to forward to
@@ -103,19 +140,17 @@ async function main() {
     // VCS discovery can fail with "error obtaining VCS status". Remove it
     // together with the `build` script flag as documented in
     // docs/servers-accounts-api-foundation.md.
-    const buildStatus = await run("go", [
-      "build",
-      "-buildvcs=false",
-      "-o",
-      binary,
-      "./cmd/accounts-api",
-    ]);
+    const buildStatus = await run(
+      "go",
+      ["build", "-buildvcs=false", "-o", binary, "./cmd/accounts-api"],
+      env,
+    );
     // A signal during the build stops the launcher even when the build still
     // finished: the server must never start after a termination request.
     if (received) return stoppedStatus();
     if (buildStatus !== 0) return buildStatus;
 
-    const serverStatus = await run(binary, []);
+    const serverStatus = await run(binary, [], env);
     return received ? stoppedStatus() : serverStatus;
   } finally {
     // Reached only after the last child has exited, so nothing uses the binary.
