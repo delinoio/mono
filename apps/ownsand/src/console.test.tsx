@@ -357,6 +357,65 @@ describe("invitations", () => {
     ).toBeTruthy();
   });
 
+  /** Delays AcceptInvitation until the returned function releases it. */
+  function delayedAcceptTransport() {
+    const mock = createMockTransport();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "AcceptInvitation") {
+          await gate;
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, release };
+  }
+
+  test("does not navigate when an earlier accept succeeds after a new link opened", async () => {
+    const { transport, release } = delayedAcceptTransport();
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await act(async () => {
+      window.location.hash = `secret=${MOCK_ACME_INVITATION_SECRET}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    release();
+    await settle(60);
+    expect(window.location.pathname).toBe("/invitations/accept");
+    expect(
+      screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+  });
+
+  test("does not navigate when an earlier accept succeeds after the user left the page", async () => {
+    const { transport, release } = delayedAcceptTransport();
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Not now" }));
+    });
+    expect(window.location.pathname).not.toBe("/invitations/accept");
+    const leftPath = window.location.pathname;
+    release();
+    await settle(60);
+    expect(window.location.pathname).toBe(leftPath);
+  });
+
   test("shows the missing-secret screen when the page opens without a secret", async () => {
     renderConsole("/invitations/accept");
     expect(await screen.findByText(/needs an invitation link/)).toBeTruthy();
