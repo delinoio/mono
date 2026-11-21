@@ -14,6 +14,8 @@
 
 - Keep repository and domain rules in the appropriate `AGENTS.md` files.
 
+- Web app development servers run through portless: the `dev` script is `portless`, the real server command is the `dev:app` script, and the app's Turbo `dev` task passes `PORTLESS` and `PORTLESS_*` through. Follow [Frontend development URLs](../docs/repository-environment-contract.md#frontend-development-urls).
+
 - Write all source and comments in English.
 
 ## Owning contracts
