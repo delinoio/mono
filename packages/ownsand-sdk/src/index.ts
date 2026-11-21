@@ -19,6 +19,7 @@ export {
 } from "./digest.ts";
 export {
   DataPathError,
+  InvalidFrameError,
   OwnSandConfigError,
   OwnSandError,
   OwnSandValidationError,

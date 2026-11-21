@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { encodeMessages, FrameCodecError, FrameDecoder } from "../codec.ts";
-import { connectErrorFromDetail, OwnSandError } from "../errors.ts";
+import {
+  encodeMessages,
+  FrameCodecError,
+  FrameDecoder,
+  validateFrame,
+} from "../codec.ts";
+import {
+  connectErrorFromDetail,
+  InvalidFrameError,
+  OwnSandError,
+} from "../errors.ts";
 import { SessionEndReason } from "../gen/delino/ownsand/v1/common_pb.ts";
 import {
   type AttachExecRequest,
@@ -388,6 +397,27 @@ export class PeerSession {
         });
         this.#terminate(new SessionEndedError(reason));
         return;
+      }
+      const invalid = validateFrame(frame);
+      if (invalid !== undefined) {
+        // A frame of a newer schema or one that breaks a framing rule fails
+        // only its own stream, so the operation ends with the error instead
+        // of waiting for a frame that it can use. On stream_id 0 and on a
+        // stream that is not open there is nothing to fail, so the frame is
+        // ignored. Frames that the stream already queued are delivered first.
+        const queue = this.#streams.get(frame.streamId);
+        if (queue !== undefined) {
+          safeLog(this.#ctx.logger, {
+            event: LogEvent.InvalidFrame,
+            sandboxId: this.#ctx.sandboxId,
+            reason: invalid.message,
+          });
+          queue.fail(
+            new InvalidFrameError(invalid.message, { cause: invalid }),
+          );
+          this.#streams.delete(frame.streamId);
+        }
+        continue;
       }
       this.#streams.get(frame.streamId)?.push(frame);
     }
