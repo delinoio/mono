@@ -181,12 +181,34 @@ func (a *Agent) exportSnapshot(ctx context.Context, cmd *ownsandv1.ExportSnapsho
 	return &ownsandv1.ExportSnapshotResult{Parts: parts, SizeBytes: size}, nil
 }
 
+// importSnapshot downloads, verifies and publishes a snapshot copy. Imports
+// of the same snapshot ID run one at a time (LockSnapshotImport), so that:
+//
+//   - the ready check, the removal of leftovers, the download, the extraction
+//     into the snapshot directory and the publication form one critical
+//     section for the ID;
+//   - a command that waited for the lock finds the copy that the earlier
+//     command published and returns it without a second download;
+//   - a failed import removes the snapshot directory only while it holds the
+//     lock and before any copy was published, so it never deletes a copy
+//     that a ready entry points to.
+//
+// Imports of different IDs, and every other command, stay concurrent.
 func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapshotCommand) (*ownsandv1.SnapshotStateEntry, error) {
 	entry := cmd.GetSnapshot()
 	if err := validate.UUIDv7("snapshot_id", entry.GetSnapshotId()); err != nil {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, Message: err.Error()}
 	}
-	if _, e, ok := a.Sandboxes.SnapshotContent(entry.GetSnapshotId()); ok {
+	snapshotID := entry.GetSnapshotId()
+	unlock, err := a.Sandboxes.LockSnapshotImport(ctx, snapshotID)
+	if err != nil {
+		a.logger.Warn("snapshot import stopped while it waited for another import of the same snapshot", "snapshot_id", snapshotID, "error", err)
+		return nil, err
+	}
+	defer unlock()
+	// Check for a ready copy only after the lock: an import that held the
+	// lock before may have published it while this command waited.
+	if _, e, ok := a.Sandboxes.SnapshotContent(snapshotID); ok {
 		return e, nil
 	}
 	var total int64
@@ -196,23 +218,34 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	if free, err := sysinfo.FreeDiskBytes(a.st.Dir()); err == nil && free < 2*total {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "free disk does not fit the snapshot import"}
 	}
-	dir, err := a.Sandboxes.ImportDir(entry.GetSnapshotId())
+	dir, err := a.Sandboxes.ImportDir(snapshotID)
 	if err != nil {
 		return nil, err
 	}
 	end := a.Sandboxes.BeginTransfer()
 	defer end()
+	// published becomes true once the ready entry points to the content. Until
+	// then the directory holds only this import's partial output, so every
+	// failure path removes it (the staging directory lives inside it). The
+	// removal runs before unlock, because defers run last in, first out.
+	published := false
+	defer func() {
+		if !published {
+			os.RemoveAll(dir)
+		}
+	}()
+	// Remove leftovers of an earlier attempt that a crash interrupted. No
+	// ready copy exists here: the check above ran under the lock.
 	os.RemoveAll(dir)
-	if err := a.transfer.Import(ctx, entry.GetSnapshotId(), cmd.GetParts(), filepath.Join(dir, "content")); err != nil {
-		os.RemoveAll(dir)
-		a.logger.Error("snapshot import failed", "snapshot_id", entry.GetSnapshotId(), "error", err)
+	if err := a.transfer.Import(ctx, snapshotID, cmd.GetParts(), filepath.Join(dir, "content")); err != nil {
+		a.logger.Error("snapshot import failed", "snapshot_id", snapshotID, "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS, Message: "snapshot import failed its download or hash check"}
 	}
 	e, err := a.Sandboxes.AddImportedSnapshot(entry)
 	if err != nil {
-		os.RemoveAll(dir)
 		return nil, err
 	}
-	a.logger.Info("snapshot imported", "snapshot_id", entry.GetSnapshotId())
+	published = true
+	a.logger.Info("snapshot imported", "snapshot_id", snapshotID)
 	return e, nil
 }

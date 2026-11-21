@@ -357,6 +357,56 @@ func (m *Manager) BeginTransfer() func() {
 	}
 }
 
+// importLock is the lock of one snapshot ID. held is a one-slot semaphore, so
+// that a waiting import can give up when its context ends. refs counts the
+// imports that hold or wait for the lock and is guarded by Manager.mu; the
+// entry leaves Manager.importLocks when it reaches zero.
+type importLock struct {
+	held chan struct{}
+	refs int
+}
+
+// LockSnapshotImport serializes the imports of one snapshot ID on the
+// device: it blocks until no other import of that ID holds the lock, and the
+// returned function releases it. Imports of different IDs do not block each
+// other. The caller holds the lock from its check for a ready copy until the
+// copy is published with AddImportedSnapshot or its partial content is
+// removed, so that a second import of the same ID sees the published copy
+// (and reuses it) or the cleaned destination, and never deletes or rewrites
+// content that another import publishes. The wait ends with an
+// ABORTED error when ctx ends first.
+func (m *Manager) LockSnapshotImport(ctx context.Context, id string) (func(), error) {
+	m.mu.Lock()
+	l := m.importLocks[id]
+	if l == nil {
+		l = &importLock{held: make(chan struct{}, 1)}
+		m.importLocks[id] = l
+	}
+	l.refs++
+	m.mu.Unlock()
+	drop := func() {
+		m.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(m.importLocks, id)
+		}
+		m.mu.Unlock()
+	}
+	select {
+	case l.held <- struct{}{}:
+	case <-ctx.Done():
+		drop()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot import was canceled while it waited for another import of the same snapshot")
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			<-l.held
+			drop()
+		})
+	}, nil
+}
+
 // ImportDir returns the snapshot directory that an import fills; its
 // content goes into the "content" subdirectory.
 func (m *Manager) ImportDir(id string) (string, error) {

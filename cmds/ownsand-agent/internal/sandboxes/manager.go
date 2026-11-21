@@ -118,14 +118,17 @@ type Manager struct {
 	snapshots map[string]*snapshot
 	// pending holds the snapshots whose capture runs now, by ID. They are
 	// not in snapshots, so they are not usable and not reported.
-	pending   map[string]*pendingSnapshot
-	limits    *ownsandv1.DeviceLimits
-	transfers int
-	reports   map[uint64]map[string]uint64
-	outbox    Outbox
-	execs     ExecTracker
-	gate      CreateGate
-	closed    bool
+	pending map[string]*pendingSnapshot
+	// importLocks serializes the imports of one snapshot ID; see
+	// LockSnapshotImport.
+	importLocks map[string]*importLock
+	limits      *ownsandv1.DeviceLimits
+	transfers   int
+	reports     map[uint64]map[string]uint64
+	outbox      Outbox
+	execs       ExecTracker
+	gate        CreateGate
+	closed      bool
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
 	// VM exits). Add is called only under mu while closed is false, so
 	// that Close can wait for them.
@@ -159,7 +162,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	}
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
-		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, reports: map[uint64]map[string]uint64{},
+		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {

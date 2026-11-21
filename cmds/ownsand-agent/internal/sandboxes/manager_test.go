@@ -1219,3 +1219,78 @@ func waitFor(t *testing.T, cond func() bool) {
 	}
 	t.Fatal("condition not met in time")
 }
+
+func TestLockSnapshotImportSerializesOneIDOnly(t *testing.T) {
+	e := newEnv(t)
+	idA, _ := uuidv7.NewString()
+	idB, _ := uuidv7.NewString()
+	unlockA, err := e.m.LockSnapshotImport(context.Background(), idA)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Another ID takes its own lock at once.
+	unlockB, err := e.m.LockSnapshotImport(context.Background(), idB)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlockB()
+	// The same ID waits for the holder.
+	acquired := make(chan func(), 1)
+	go func() {
+		unlock, err := e.m.LockSnapshotImport(context.Background(), idA)
+		if err != nil {
+			t.Error(err)
+			close(acquired)
+			return
+		}
+		acquired <- unlock
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second import of the same ID did not wait")
+	case <-time.After(100 * time.Millisecond):
+	}
+	unlockA()
+	unlockA() // A second release is a no-op.
+	select {
+	case unlock := <-acquired:
+		unlock()
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiting import did not acquire the released lock")
+	}
+	e.m.mu.Lock()
+	left := len(e.m.importLocks)
+	e.m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d import locks remain after every release", left)
+	}
+}
+
+func TestLockSnapshotImportWaitEndsWithItsContext(t *testing.T) {
+	e := newEnv(t)
+	id, _ := uuidv7.NewString()
+	unlock, err := e.m.LockSnapshotImport(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = e.m.LockSnapshotImport(ctx, id)
+	var ce *CommandError
+	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("canceled wait = %v", err)
+	}
+	// The canceled waiter does not break the holder's lock or leak its entry.
+	unlock()
+	e.m.mu.Lock()
+	left := len(e.m.importLocks)
+	e.m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d import locks remain after every release", left)
+	}
+	again, err := e.m.LockSnapshotImport(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again()
+}
