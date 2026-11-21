@@ -181,7 +181,7 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	m.used[idx] = true
 	m.mu.Unlock()
 	link, _ := LinkFor(idx)
-	tap := TapName(sandboxID)
+	tap := TapName(idx)
 	fail := func(err error) (Link, string, error) {
 		// The link stays reserved while a tap device with the link address
 		// may still exist.
