@@ -390,3 +390,48 @@ func TestUploadURLsNeedOwningChannel(t *testing.T) {
 	requestUploadURLs(agent, snapID, "not-owner")
 	requireDenied(t, waitGrant(agent, "not-owner"))
 }
+
+// TestDuplicateExportPartNumbersFailTheExport checks that a result that
+// repeats a part number fails the attempt as an invalid part with a clean-up
+// job, stores no manifest, and leaves the snapshot free for a retry that
+// reaches EXPORTED with unique parts.
+func TestDuplicateExportPartNumbersFailTheExport(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	c := org.OwnerClient
+	snapID, agent := exportingSnapshot(t, env, org)
+	first := waitExportCommands(t, agent, 1)[0]
+
+	sum := sha256.Sum256([]byte("part"))
+	part := func(n int32) *ownsandv1.SnapshotPart {
+		return &ownsandv1.SnapshotPart{PartNumber: n, SizeBytes: 1 << 20, Sha256: sum[:]}
+	}
+	sendExportResult(agent, first, []*ownsandv1.SnapshotPart{part(1), part(1), part(2)})
+	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
+	logs := env.Logs.String()
+	for _, want := range []string{`"msg":"export_failed"`, `"reason":"invalid_part"`, `"command_id":"` + first + `"`} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("logs lack %s", want)
+		}
+	}
+	if _, ok := cleanupJobs(t, env)[attemptPrefixOf(org.ID, snapID, first)]; !ok {
+		t.Fatalf("no clean-up job for the failed attempt: %v", cleanupJobs(t, env))
+	}
+	if got := manifestHashes(t, env, snapID); len(got) != 0 {
+		t.Fatalf("the failed attempt stored %d parts", len(got))
+	}
+
+	// A fresh export of unique parts completes.
+	answerExports(agent)
+	if got := exportSnapshotRPC(t, c, org.ID, snapID); got != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING {
+		t.Fatalf("retry state = %v", got)
+	}
+	ids := waitExportCommands(t, agent, 2)
+	if ids[1] == first {
+		t.Fatal("the retry reused the command ID")
+	}
+	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)
+	if got := len(manifestHashes(t, env, snapID)); got != 2 {
+		t.Fatalf("part manifest has %d parts, want 2", got)
+	}
+}
