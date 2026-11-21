@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package ops serves the DataFrame operations of the data path (exec, exec
 // attach, file read and file write) for both transports, the peer-to-peer

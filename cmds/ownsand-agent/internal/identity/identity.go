@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package identity holds the device key pair and the signatures of the
 // agent channel: Ed25519 over a purpose label followed by the nonce.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package config holds the agent configuration. Every setting comes from a
 // command-line flag or an OWNSAND_AGENT_* environment variable; the

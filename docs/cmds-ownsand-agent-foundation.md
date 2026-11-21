@@ -7,7 +7,7 @@ This contract owns two components of [`ownsand`](project-ownsand.md):
 - `cmds/ownsand-agent/`: the device agent `ownsand-agent`. It runs as a system service on each enrolled Linux, macOS or Windows host, keeps an outbound channel to the control plane, runs sandboxes in VMs, enforces the network policy and TTLs, takes and moves snapshots, serves the data path and updates itself.
 - `cmds/ownsand-guest/`: the guest helper `ownsand-guest`. It runs inside every sandbox guest and serves exec and file requests from the agent. Packages: `guest` (the `GuestService`), `guestlisten` (the listener abstraction) and `execlog` (kept exec output and the exec event sequence, shared with the agent).
 
-Both components use Apache-2.0 and must not import code from `servers/`.
+Both components use `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md#fsl-11-alv2-directories); `cmds/ownsand-agent/LICENSE` and `cmds/ownsand-guest/LICENSE` contain the terms. They must not import code from `servers/`, and the OwnSand CLI and the SDKs must not import code from them.
 
 ## Runtime and Language
 
