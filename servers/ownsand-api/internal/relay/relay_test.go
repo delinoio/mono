@@ -172,3 +172,124 @@ func TestRunDoesNotSendAfterClose(t *testing.T) {
 		t.Fatalf("%d sends started after Run returned", late)
 	}
 }
+
+func acceptedFrame(s *Stream) *ownsandv1.DataFrame {
+	return datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RequestAccepted{})
+}
+
+func openStream(t *testing.T, c *Conn) *Stream {
+	t.Helper()
+	s, err := c.Open(context.Background(), "grant", "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+func TestStreamQueueBoundsFramesWithoutCredit(t *testing.T) {
+	limits := testLimits
+	limits.MaxQueuedControlFrames = 3
+	c := NewConn(context.Background(), "device", 1, limits)
+	s := openStream(t, c)
+	for i := 0; i < limits.MaxQueuedControlFrames; i++ {
+		if err := c.dispatch(acceptedFrame(s)); err != nil {
+			t.Fatalf("frame %d: %v", i, err)
+		}
+	}
+	if err := c.dispatch(acceptedFrame(s)); !errors.Is(err, ErrControlFlood) {
+		t.Fatalf("frame beyond the limit = %v, want ErrControlFlood", err)
+	}
+	// Dequeuing a frame frees a slot.
+	if _, err := s.Next(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.dispatch(acceptedFrame(s)); err != nil {
+		t.Fatalf("frame after a dequeue: %v", err)
+	}
+	// The count belongs to the stream: another stream has its own budget.
+	other := openStream(t, c)
+	if err := c.dispatch(acceptedFrame(other)); err != nil {
+		t.Fatalf("frame on another stream: %v", err)
+	}
+}
+
+func TestStreamQueueBoundsBytesWithoutCredit(t *testing.T) {
+	limits := testLimits
+	limits.MaxQueuedControlFrames = 100
+	limits.MaxQueuedControlBytes = 1 << 10
+	c := NewConn(context.Background(), "device", 1, limits)
+	s := openStream(t, c)
+	big := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ErrorDetail{Message: string(make([]byte, 2<<10))})
+	if err := c.dispatch(big); !errors.Is(err, ErrControlFlood) {
+		t.Fatalf("frame beyond the byte limit = %v, want ErrControlFlood", err)
+	}
+	small := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ErrorDetail{Message: string(make([]byte, 600))})
+	if err := c.dispatch(small); err != nil {
+		t.Fatalf("first frame within the limit: %v", err)
+	}
+	if err := c.dispatch(small); !errors.Is(err, ErrControlFlood) {
+		t.Fatalf("second frame beyond the byte limit = %v, want ErrControlFlood", err)
+	}
+	if _, err := s.Next(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.dispatch(small); err != nil {
+		t.Fatalf("frame after a dequeue: %v", err)
+	}
+}
+
+func TestCompliantExchangeStaysWithinDefaultLimits(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, DefaultLimits())
+	s := openStream(t, c)
+	// Nobody dequeues: a slow handler holds the whole exchange in the queue.
+	if err := c.dispatch(acceptedFrame(s)); err != nil {
+		t.Fatal(err)
+	}
+	// Credit-bearing frames are bounded by the receive window, not by the
+	// control limits.
+	for i := 0; i < 1000; i++ {
+		f := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("x")}}})
+		if err := c.dispatch(f); err != nil {
+			t.Fatalf("credit frame %d: %v", i, err)
+		}
+	}
+	end := datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.SessionEnd{})
+	if err := c.dispatch(end); err != nil {
+		t.Fatalf("terminal frame: %v", err)
+	}
+}
+
+func TestDefaultLimitsApplyToZeroValues(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, Limits{StreamBuffer: datapath.MinWindowSize, MaxStreamsPerConn: 1, MaxStreamsPerGrant: 1})
+	if c.limits.MaxQueuedControlFrames != DefaultLimits().MaxQueuedControlFrames || c.limits.MaxQueuedControlBytes != DefaultLimits().MaxQueuedControlBytes {
+		t.Fatalf("limits = %+v, want the defaults", c.limits)
+	}
+}
+
+func TestRunClosesConnectionOnControlFlood(t *testing.T) {
+	limits := testLimits
+	limits.IdleTimeout = time.Minute
+	limits.MaxQueuedControlFrames = 3
+	c := NewConn(context.Background(), "device", 1, limits)
+	s := openStream(t, c)
+	frames := make(chan *ownsandv1.DataFrame, limits.MaxQueuedControlFrames+1)
+	for i := 0; i <= limits.MaxQueuedControlFrames; i++ {
+		frames <- acceptedFrame(s)
+	}
+	recv := func() (*ownsandv1.DataFrame, error) {
+		select {
+		case f := <-frames:
+			return f, nil
+		case <-c.Done():
+			return nil, c.Err()
+		}
+	}
+	done := runConn(c, recv, func(*ownsandv1.DataFrame) error { return nil })
+	if err := waitRun(t, done, time.Second); !errors.Is(err, ErrControlFlood) {
+		t.Fatalf("Run = %v, want ErrControlFlood", err)
+	}
+	if _, err := s.Next(context.Background(), nil); err != nil && !errors.Is(err, ErrControlFlood) {
+		// Queued frames drain first; the stream error follows.
+		t.Fatalf("stream error = %v", err)
+	}
+}
