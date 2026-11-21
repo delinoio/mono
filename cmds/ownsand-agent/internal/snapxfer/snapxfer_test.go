@@ -141,3 +141,56 @@ func TestImportRejectsSymlinkEscape(t *testing.T) {
 		t.Fatalf("staging directory left behind: %v", err)
 	}
 }
+
+func TestPartCountLimit(t *testing.T) {
+	const partSize = int64(64 << 20)
+	cases := []struct {
+		size, want int64
+	}{
+		{0, 1},
+		{1, 1},
+		{partSize * maxParts, maxParts},
+		{partSize*maxParts + 1, maxParts + 1},
+	}
+	for _, c := range cases {
+		if got := partCount(c.size, partSize); got != c.want {
+			t.Errorf("partCount(%d) = %d, want %d", c.size, got, c.want)
+		}
+	}
+}
+
+type failTransport struct{ requests int }
+
+func (f *failTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	f.requests++
+	return nil, io.ErrUnexpectedEOF
+}
+
+type countingURLs struct{ calls int }
+
+func (c *countingURLs) RequestURLs(context.Context, string, ownsandv1.SignedUrlOperation, []int32) ([]*ownsandv1.SignedPartUrl, error) {
+	c.calls++
+	return nil, io.ErrUnexpectedEOF
+}
+
+func TestExportRejectsTooManyPartsBeforeUpload(t *testing.T) {
+	dir := t.TempDir()
+	// The tar adds 512-byte blocks, so a 12 KiB file exceeds 10,000 bytes.
+	if err := os.WriteFile(filepath.Join(dir, "big"), make([]byte, 12<<10), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	urls := &countingURLs{}
+	rt := &failTransport{}
+	tr := &Transfer{HTTP: &http.Client{Transport: rt}, URLs: urls, Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), TempDir: t.TempDir()}
+	_, _, err := tr.Export(context.Background(), "snap", dir, 1)
+	if !errors.Is(err, ErrTooManyParts) {
+		t.Fatalf("err = %v, want ErrTooManyParts", err)
+	}
+	var tooMany *TooManyPartsError
+	if !errors.As(err, &tooMany) || tooMany.Limit != maxParts || tooMany.PartCount <= maxParts {
+		t.Fatalf("unexpected error details: %+v", tooMany)
+	}
+	if urls.calls != 0 || rt.requests != 0 {
+		t.Fatalf("URL requests = %d, HTTP requests = %d, want 0", urls.calls, rt.requests)
+	}
+}
