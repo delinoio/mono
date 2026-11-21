@@ -27,6 +27,41 @@ describe("sign-in", () => {
   });
 });
 
+describe("routing", () => {
+  test("shows Page not found for a malformed percent escape and recovers", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await expect(
+      screen.getByRole("heading", "Organizations", { level: 1 }),
+    ).toBeVisible();
+
+    // The development server answers a raw malformed URL with 400 before the
+    // app loads, so the failure is reachable only through client-side
+    // navigation. Push the malformed path and fire popstate, as a history
+    // traversal does, so the console parses it in the browser.
+    await browser.evaluate(() => {
+      window.history.pushState(null, "", "/orgs/%/sandboxes");
+      window.dispatchEvent(new PopStateEvent("popstate"));
+      return true;
+    });
+
+    await expect(
+      screen.getByRole("heading", "Page not found", { level: 1 }),
+    ).toBeVisible();
+
+    await screen.getByRole("link", "Go to your organizations").tap();
+
+    await expect(browser).toHaveURL("/");
+    await expect(
+      screen.getByRole("heading", "Organizations", { level: 1 }),
+    ).toBeVisible();
+  });
+});
+
 describe("organizations", () => {
   test("creates an organization from a dialog that focuses its only input", async ({
     app,
