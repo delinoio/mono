@@ -267,3 +267,46 @@ func TestExecutableInstaller(t *testing.T) {
 		t.Fatalf("executable %q", b)
 	}
 }
+
+func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
+	cases := []struct {
+		name      string
+		target    string
+		wantErr   bool
+		wantState ownsandv1.AgentUpdateState
+	}{
+		{"same version", "1.0.0", false, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE},
+		{"failed target", "9.9.9", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRelease(t, nil)
+			busy := &atomic.Bool{}
+			busy.Store(true)
+			u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+			if err := update(u, "1.1.0", false); err != nil {
+				t.Fatal(err)
+			}
+			if err := update(u, tc.target, false); (err != nil) != tc.wantErr {
+				t.Fatalf("superseding command: %v", err)
+			}
+			if s, _ := u.State(); s != tc.wantState {
+				t.Fatalf("state %v", s)
+			}
+			busy.Store(false)
+			if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
+				t.Fatalf("installed a superseded artifact: %v %v", ok, err)
+			}
+			if st, _ := u.opts.Store.LoadAgent(); st != nil && st.PendingUpdate != nil {
+				t.Fatalf("pending update recorded: %+v", st.PendingUpdate)
+			}
+			// Control: a valid later target still installs.
+			if err := update(u, "1.1.0", false); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 {
+				t.Fatalf("control install: %v %v", ok, err)
+			}
+		})
+	}
+}
