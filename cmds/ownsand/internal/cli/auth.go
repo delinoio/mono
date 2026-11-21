@@ -83,7 +83,12 @@ func (a *app) login(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
+	sessionID, err := credstore.NewSessionID()
+	if err != nil {
+		return err
+	}
 	creds := &credstore.Credentials{
+		SessionID:         sessionID,
 		LogtoEndpoint:     cfg.Endpoint,
 		AppID:             cfg.AppID,
 		Resource:          cfg.Resource,
@@ -155,24 +160,46 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 		cfg.Resource = creds.Resource
 	}
 	var mu sync.Mutex
+	// staleErr is set once the stored session was cleared or replaced; the
+	// source then refuses to use or publish the tokens it holds.
+	var staleErr error
 	return func(ctx context.Context) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
+		if staleErr != nil {
+			return "", staleErr
+		}
 		if creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin {
 			return creds.AccessToken, nil
 		}
+		// The network request runs without the store lock. The stored
+		// session is compared under the lock when the result is published.
 		tok, err := cfg.Refresh(ctx, creds.RefreshToken)
 		if err != nil {
 			return "", fmt.Errorf("refresh the Logto token (run 'ownsand login' again if it was revoked): %w", err)
 		}
-		creds.AccessToken = tok.AccessToken
-		creds.AccessTokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+		next := *creds
+		next.AccessToken = tok.AccessToken
+		next.AccessTokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
 		if tok.RefreshToken != "" {
-			creds.RefreshToken = tok.RefreshToken
+			next.RefreshToken = tok.RefreshToken
 		}
-		if err := st.Save(creds); err != nil {
+		switch err := st.SaveIfSession(creds.SessionID, &next); {
+		case err == nil:
+		case errors.Is(err, credstore.ErrNotFound):
+			// Do not recreate the file: the user signed out while the
+			// refresh was in flight.
+			a.logger.Debug("ownsand discarded a refreshed Logto token: the stored credentials were removed")
+			staleErr = errors.New("the stored credentials were removed while the Logto token refreshed (signed out); run 'ownsand login' to sign in again")
+			return "", staleErr
+		case errors.Is(err, credstore.ErrReplaced):
+			a.logger.Debug("ownsand discarded a refreshed Logto token: the stored credentials were replaced")
+			staleErr = errors.New("the stored credentials were replaced while the Logto token refreshed (signed in again); run the command again to load them")
+			return "", staleErr
+		default:
 			return "", err
 		}
+		*creds = next
 		a.logger.Debug("ownsand refreshed the Logto access token")
 		return creds.AccessToken, nil
 	}, nil
