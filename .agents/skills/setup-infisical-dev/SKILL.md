@@ -29,7 +29,8 @@ Write all messages to the user in the language of the user's request.
 Run these checks in the repository root of the current checkout (`git rev-parse --show-toplevel`). The launcher reads the project configuration only from there.
 
 1. **CLI.** Run `infisical --version`. If the command is missing, tell the user to install the [Infisical CLI](https://infisical.com/docs/cli/overview), and stop until the user confirms the installation.
-2. **Project configuration.** Look for `.infisical.yaml` or the legacy `.infisical.json` in the repository root.
+2. **Project configuration.** Look for `.infisical.yaml` in the repository root. The launcher does not read the `.infisical.json` file of older CLI versions.
+   - If the root has only `.infisical.json`, ask the user to update the CLI and to run `infisical init` again in the repository root.
    - If the file is missing in a linked worktree, find the main checkout with `git worktree list --porcelain` (the first `worktree` entry). If the main checkout has the file, copy it to the root of the current checkout and tell the user that you copied it.
    - If no checkout has the file, ask the user to run `infisical init` in the repository root and to select the development project. The command is interactive; in Claude Code the user can run it with `! infisical init`.
    - Read the file. If it sets `general.domain` or `domain`, show the host to the user and continue only when the user confirms that the team operates that instance. The CLI sends its credentials to that host.
