@@ -24,7 +24,8 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Run
 	case config.RuntimeKindFirecracker:
 		return newFirecracker(cfg, st, logger)
 	case config.RuntimeKindVirtualization:
-		return vzrt.New()
+		kernel, rootfs := linuxImage(cfg, st)
+		return vzrt.New(vzrt.Options{Kernel: kernel, Rootfs: rootfs, VMsDir: st.Path(store.VMsDir), Logger: logger})
 	case config.RuntimeKindHyperV:
 		return hcsrt.New()
 	}

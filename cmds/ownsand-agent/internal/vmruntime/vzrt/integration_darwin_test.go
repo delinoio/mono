@@ -1,0 +1,254 @@
+// SPDX-License-Identifier: Apache-2.0
+
+//go:build darwin && cgo
+
+package vzrt_test
+
+import (
+	"context"
+	"crypto/rand"
+	"io"
+	"log/slog"
+	"net"
+	"os"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/vzrt"
+	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
+	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+)
+
+// Environment of the opt-in integration test. It boots real
+// Virtualization.framework VMs, so the test binary must be signed with the
+// com.apple.security.virtualization entitlement:
+//
+//	go test -c -o vzrt.test ./cmds/ownsand-agent/internal/vmruntime/vzrt
+//	codesign --sign - --force --entitlements cmds/ownsand-agent/entitlements.plist vzrt.test
+//	OWNSAND_VZ_TEST_KERNEL=... OWNSAND_VZ_TEST_ROOTFS=... ./vzrt.test -test.v
+//
+// The kernel and the root file system come from
+// cmds/ownsand-agent/images/linux/build-image.sh for the host architecture.
+// OWNSAND_VZ_TEST_OUTBOUND=1 also runs the OUTBOUND network policy checks,
+// which need internet access.
+const (
+	envKernel   = "OWNSAND_VZ_TEST_KERNEL"
+	envRootfs   = "OWNSAND_VZ_TEST_ROOTFS"
+	envOutbound = "OWNSAND_VZ_TEST_OUTBOUND"
+)
+
+const orgID = "0192f4b6-7c3a-7def-8abc-0123456789ab"
+
+type sink struct {
+	mu     sync.Mutex
+	frames []*ownsandv1.DataFrame
+}
+
+func (s *sink) Send(_ context.Context, f *ownsandv1.DataFrame) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.frames = append(s.frames, proto.Clone(f).(*ownsandv1.DataFrame))
+	return nil
+}
+
+type env struct {
+	t *testing.T
+	m *sandboxes.Manager
+	d *ops.Dispatcher
+}
+
+func (e *env) create(snapshotID string, memMiB int64, network ownsandv1.NetworkMode, memoryRestore bool) *ownsandv1.SandboxStateEntry {
+	e.t.Helper()
+	id, _ := uuidv7.NewString()
+	now := time.Now()
+	cmd := &ownsandv1.CreateSandboxCommand{
+		SandboxId:            id,
+		Source:               &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
+		Resources:            &ownsandv1.Resources{VcpuCount: 2, MemoryMib: memMiB, DiskGib: 2},
+		NetworkMode:          network,
+		GuestOs:              ownsandv1.GuestOs_GUEST_OS_LINUX,
+		IdleTtl:              durationpb.New(time.Hour),
+		MaxTtl:               durationpb.New(time.Hour),
+		CreateTime:           timestamppb.New(now),
+		MaxDeadline:          timestamppb.New(now.Add(time.Hour)),
+		Limits:               &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 8192, DiskGib: 16, VcpuOvercommitPercent: 100},
+		MemoryRestoreAllowed: memoryRestore,
+	}
+	if snapshotID != "" {
+		cmd.Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: snapshotID}
+	}
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err != nil {
+		e.t.Fatalf("create: %v", err)
+	}
+	if entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		e.t.Fatalf("create: sandbox %v", entry)
+	}
+	return entry
+}
+
+func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExited) {
+	e.t.Helper()
+	id, _ := uuidv7.NewString()
+	salt := make([]byte, 32)
+	rand.Read(salt)
+	s := &sink{}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	e.d.Handle(ctx, ops.Request{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
+		OrganizationId: orgID, SandboxId: sandboxID, ExecId: id, Command: cmd, BindingSalt: salt,
+	}), SandboxID: sandboxID}, s)
+	var out strings.Builder
+	var exited *ownsandv1.ExecExited
+	for _, f := range s.frames {
+		out.Write(f.GetExecEvent().GetStdout().GetData())
+		out.Write(f.GetExecEvent().GetStderr().GetData())
+		if ex := f.GetExecEvent().GetExited(); ex != nil {
+			exited = ex
+		}
+		if f.GetError() != nil {
+			e.t.Fatalf("exec error %v", f.GetError())
+		}
+	}
+	return out.String(), exited
+}
+
+// hostLANAddress returns an IPv4 address of a host interface that is not
+// loopback, which the OUTBOUND policy must block.
+func hostLANAddress() string {
+	addrs, _ := net.InterfaceAddrs()
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok && ipn.IP.To4() != nil && !ipn.IP.IsLoopback() && !ipn.IP.IsLinkLocalUnicast() {
+			return ipn.IP.String()
+		}
+	}
+	return ""
+}
+
+func TestVirtualizationIntegration(t *testing.T) {
+	kernel, rootfs := os.Getenv(envKernel), os.Getenv(envRootfs)
+	if kernel == "" || rootfs == "" {
+		t.Skipf("set %s and %s and sign the test binary to boot real VMs", envKernel, envRootfs)
+	}
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if os.Getenv("OWNSAND_TEST_VERBOSE") != "" {
+		logger = slog.New(slog.NewTextHandler(os.Stderr, nil))
+	}
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt, err := vzrt.New(vzrt.Options{Kernel: kernel, Rootfs: rootfs, VMsDir: st.Path(store.VMsDir), Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	caps := rt.Capabilities(context.Background())
+	if len(caps.BaseImages) != 1 {
+		t.Fatalf("capabilities %+v", caps.Checks)
+	}
+	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: rt, Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := ops.New(m, st, ops.Options{Logger: logger})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.SetExecTracker(d)
+	t.Cleanup(func() {
+		d.Close()
+		m.Close()
+		rt.Close()
+	})
+	e := &env{t: t, m: m, d: d}
+
+	start := time.Now()
+	sb := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, false)
+	t.Logf("cold boot took %v", time.Since(start))
+	if sb.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE {
+		t.Fatalf("sandbox %v", sb)
+	}
+	out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo hello; uname -sm; echo state > /root/marker; df -k / | tail -1; ls /sys/class/net")
+	if ex.GetExitCode() != 0 || !strings.Contains(out, "hello\nLinux aarch64\n") && !strings.Contains(out, "hello\nLinux x86_64\n") {
+		t.Fatalf("exec output %q exited %v", out, ex)
+	}
+	t.Logf("guest: %s", strings.TrimSpace(out))
+	// The root file system grew to the 2 GiB disk at boot.
+	fields := strings.Fields(strings.Split(out, "\n")[2])
+	if len(fields) < 2 || len(fields[1]) < 7 {
+		t.Fatalf("root file system did not grow: %q", out)
+	}
+	// A NONE sandbox has no network device.
+	if strings.Contains(out, "eth0") {
+		t.Fatalf("NONE sandbox has a network device: %q", out)
+	}
+	if _, err := m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Resume(context.Background(), &ownsandv1.ResumeSandboxCommand{SandboxId: sb.GetSandboxId()}); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
+		t.Fatalf("after resume %q", out)
+	}
+	snapID, _ := uuidv7.NewString()
+	snap, err := m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sb.GetSandboxId()})
+	if err != nil {
+		t.Fatalf("snapshot %v %v", snap, err)
+	}
+	t.Logf("snapshot has memory state: %v", snap.GetHasMemoryState())
+	start = time.Now()
+	restored := e.create(snapID, 512, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
+	t.Logf("restore from snapshot took %v (%v)", time.Since(start), restored.GetRestorePath())
+	if snap.GetHasMemoryState() && restored.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_MEMORY_STATE {
+		t.Fatalf("restore path %v", restored.GetRestorePath())
+	}
+	if out, _ := e.exec(restored.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
+		t.Fatalf("restored sandbox %q", out)
+	}
+	cold := e.create(snapID, 1024, ownsandv1.NetworkMode_NETWORK_MODE_NONE, true)
+	if cold.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+		t.Fatalf("cold restore path %v", cold.GetRestorePath())
+	}
+	if out, _ := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
+		t.Fatalf("cold-booted sandbox %q", out)
+	}
+	ids := []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId()}
+
+	if os.Getenv(envOutbound) != "" {
+		ob := e.create("", 512, ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, false)
+		ids = append(ids, ob.GetSandboxId())
+		out, ex := e.exec(ob.GetSandboxId(), "/bin/sh", "-c", "cat /etc/resolv.conf; wget -q -T 10 -O /dev/null http://example.com/ && echo INTERNET_OK")
+		if !strings.Contains(out, "INTERNET_OK") {
+			t.Fatalf("OUTBOUND sandbox cannot reach the internet: %q %v", out, ex)
+		}
+		for _, target := range []string{hostLANAddress(), "127.0.0.1", "169.254.169.254", "10.0.0.1"} {
+			if target == "" {
+				continue
+			}
+			out, _ := e.exec(ob.GetSandboxId(), "/bin/sh", "-c", "wget -q -T 3 -O /dev/null http://"+target+"/ && echo REACHED || echo BLOCKED")
+			if !strings.Contains(out, "BLOCKED") {
+				t.Fatalf("OUTBOUND sandbox reached %s: %q", target, out)
+			}
+		}
+	}
+
+	for _, id := range ids {
+		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("delete %v %v", en, err)
+		}
+	}
+	if ids, _ := rt.Running(context.Background()); len(ids) != 0 {
+		t.Fatalf("VMs still run: %v", ids)
+	}
+}
