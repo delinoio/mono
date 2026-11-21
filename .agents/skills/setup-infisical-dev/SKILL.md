@@ -1,6 +1,6 @@
 ---
 name: setup-infisical-dev
-description: Configure the Infisical `dev` environment so that the repository development servers start with the variables they need. Fill each value the agent can determine from the repository, and ask the user for each value that only the user can supply. Use when the user asks to set up, fill or fix the Infisical development variables, for example "개발 서버 실행할 수 있게 infisical에 변수들 구성해줘".
+description: Configure the Infisical `dev` environment so that the repository development servers start with the variables they need. Fill each value the agent can determine from the repository, and ask the user for each value that only the user can supply. Use when the user asks to set up, fill or fix the Infisical development variables, for example "configure the Infisical variables so that the development servers run".
 ---
 
 # Set Up Infisical Development Variables
