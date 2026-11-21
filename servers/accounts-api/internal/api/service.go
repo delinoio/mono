@@ -20,6 +20,7 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/go/uuidv7"
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
@@ -42,6 +43,9 @@ type Deps struct {
 	Now func() time.Time
 	// WebOrigin is the origin of the web app in invitation links.
 	WebOrigin string
+	// UsageClients maps each machine-to-machine client ID to the services
+	// whose UsageService RPCs it may call (USAGE_SERVICE_CLIENTS).
+	UsageClients map[string][]accountsv1.ServiceId
 }
 
 // Service is the shared state of the Connect services.
@@ -53,6 +57,8 @@ type Service struct {
 	logger    *slog.Logger
 	now       func() time.Time
 	webOrigin string
+
+	usageClients map[string][]accountsv1.ServiceId
 }
 
 // New returns the shared service state.
@@ -68,6 +74,8 @@ func New(deps Deps) *Service {
 		logger:    deps.Logger,
 		now:       deps.Now,
 		webOrigin: deps.WebOrigin,
+
+		usageClients: deps.UsageClients,
 	}
 }
 
@@ -81,6 +89,8 @@ func (s *Service) Mounts(interceptors ...connect.Interceptor) []server.Mount {
 	}
 	add(accountsv1connect.NewBillingAccountServiceHandler(&BillingAccountHandler{s}, opts...))
 	add(accountsv1connect.NewCreditServiceHandler(&CreditHandler{s}, opts...))
+	add(accountsv1connect.NewBillingUsageServiceHandler(&BillingUsageHandler{s}, opts...))
+	add(accountsv1connect.NewUsageServiceHandler(&UsageHandler{s}, opts...))
 	return mounts
 }
 

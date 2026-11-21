@@ -151,6 +151,13 @@ func (s *Service) applyEvent(ctx context.Context, ev paddle.Event) (eventOutcome
 		if err != nil {
 			return err
 		}
+		if out.BillingAccountID != "" {
+			// A credit, refund or subscription change can change the
+			// billing status of the linked organizations.
+			if err := s.syncStatuses(ctx, tx, out.BillingAccountID, now); err != nil {
+				return err
+			}
+		}
 		_, err = tx.Exec(ctx, `UPDATE paddle_events SET result = $2, billing_account_id = NULLIF($3, '')::uuid
 			WHERE paddle_event_id = $1`, ev.EventID, out.Result, out.BillingAccountID)
 		return err

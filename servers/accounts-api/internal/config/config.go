@@ -10,9 +10,11 @@ import (
 	"net/mail"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
@@ -38,6 +40,7 @@ const (
 	EnvPaddleWebhookSecret     = "PADDLE_WEBHOOK_SECRET"
 	EnvPaddlePriceID           = "PADDLE_SUBSCRIPTION_PRICE_ID"
 	EnvPaddleTopUpProductID    = "PADDLE_TOP_UP_PRODUCT_ID"
+	EnvUsageServiceClients     = "USAGE_SERVICE_CLIENTS"
 )
 
 // DefaultAudience is the Logto API resource indicator of accounts-api.
@@ -155,6 +158,11 @@ type Config struct {
 	PaddleSubscriptionPriceID string
 	// PaddleTopUpProductID is the product of top-up charges.
 	PaddleTopUpProductID string
+
+	// UsageServiceClients maps the Logto application ID of each
+	// machine-to-machine client of UsageService to the services that it may
+	// use. A client without an entry may call no UsageService RPC.
+	UsageServiceClients map[string][]accountsv1.ServiceId
 }
 
 // Paddle catalog ID formats (https://developer.paddle.com/api-reference/about/paddle-ids).
@@ -301,7 +309,64 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		return Config{}, fmt.Errorf("%s must be a Paddle product ID (pro_...)", EnvPaddleTopUpProductID)
 	}
 
+	if value := lookupNonEmpty(lookup, EnvUsageServiceClients); value != "" {
+		if cfg.UsageServiceClients, err = parseUsageServiceClients(value); err != nil {
+			return Config{}, err
+		}
+	}
+
 	return cfg, nil
+}
+
+// clientID reports whether value can be a Logto application ID: 1 to 128
+// visible ASCII characters other than the separators `,` and `=`. The
+// server compares it with the `client_id` claim unchanged.
+func clientID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for i := 0; i < len(value); i++ {
+		if c := value[i]; c <= ' ' || c > '~' || c == ',' || c == '=' {
+			return false
+		}
+	}
+	return true
+}
+
+// parseUsageServiceClients reads `<application ID>=<service>` entries
+// separated by commas, such as `abc123=ownsand`. The service is the stable
+// lowercase ServiceId identifier. A client that may use several services
+// has one entry for each.
+func parseUsageServiceClients(value string) (map[string][]accountsv1.ServiceId, error) {
+	out := map[string][]accountsv1.ServiceId{}
+	for _, item := range strings.Split(value, ",") {
+		item = strings.Trim(item, asciiWhiteSpace)
+		if item == "" {
+			continue
+		}
+		client, service, ok := strings.Cut(item, "=")
+		client, service = strings.Trim(client, asciiWhiteSpace), strings.Trim(service, asciiWhiteSpace)
+		if !ok || !clientID(client) {
+			return nil, fmt.Errorf("%s must hold entries such as <Logto application ID>=ownsand", EnvUsageServiceClients)
+		}
+		id, ok := serviceFromKey(service)
+		if !ok {
+			return nil, fmt.Errorf("%s names an unknown service %q", EnvUsageServiceClients, service)
+		}
+		if !slices.Contains(out[client], id) {
+			out[client] = append(out[client], id)
+		}
+	}
+	return out, nil
+}
+
+// serviceFromKey returns the ServiceId of a stable lowercase identifier.
+func serviceFromKey(key string) (accountsv1.ServiceId, bool) {
+	v, ok := accountsv1.ServiceId_value["SERVICE_ID_"+strings.ToUpper(key)]
+	if !ok || v == 0 || asciiLower(key) != key {
+		return accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED, false
+	}
+	return accountsv1.ServiceId(v), true
 }
 
 // httpURL checks that value is an absolute http or https URL without a query

@@ -303,6 +303,9 @@ func (s *Service) changeSubscription(ctx context.Context, tx pgx.Tx, accountID, 
 	if _, err := s.applyPaddleSubscription(ctx, tx, acct, entity, now); err != nil {
 		return Subscription{}, err
 	}
+	if err := s.syncStatuses(ctx, tx, accountID, now); err != nil {
+		return Subscription{}, err
+	}
 	return LoadSubscription(ctx, tx, accountID, false)
 }
 

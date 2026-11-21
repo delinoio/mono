@@ -174,6 +174,8 @@ func newHandler(cfg config.Config, database *db.DB, logger *slog.Logger, appMetr
 		Audience:    cfg.LogtoAudience,
 		CORSOrigins: cfg.CORSOrigins,
 		WebOrigin:   cfg.WebOrigin,
+
+		UsageClients: cfg.UsageServiceClients,
 	}), billingService, nil
 }
 

@@ -32,6 +32,10 @@ const (
 	AuditTopUpRequested           AuditKind = "top_up_requested"
 	AuditAutoTopUpSettingsUpdated AuditKind = "auto_top_up_settings_updated"
 	AuditAlertSettingsUpdated     AuditKind = "alert_settings_updated"
+
+	AuditOrganizationLinked      AuditKind = "organization_linked"
+	AuditOrganizationLinkRenamed AuditKind = "organization_link_renamed"
+	AuditOrganizationUnlinked    AuditKind = "organization_unlinked"
 )
 
 // auditEvent is one billing audit event. Details never hold secrets or email

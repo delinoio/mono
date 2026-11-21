@@ -59,6 +59,8 @@ type Policy map[string]Requirement
 var DefaultPolicy = Policy{
 	accountsv1connect.BillingAccountServiceName: {Scope: ScopeBilling, Kind: TokenKindUser},
 	accountsv1connect.CreditServiceName:         {Scope: ScopeBilling, Kind: TokenKindUser},
+	accountsv1connect.BillingUsageServiceName:   {Scope: ScopeBilling, Kind: TokenKindUser},
+	accountsv1connect.UsageServiceName:          {Scope: ScopeReportUsage, Kind: TokenKindMachineToMachine},
 }
 
 // Validator validates a raw bearer token.

@@ -130,17 +130,25 @@ func (r FailureReason) CountsAsFailure() bool {
 type NotificationKind string
 
 const (
-	NotifyPaymentFailed      NotificationKind = "payment_failed"
-	NotifyAutoTopUpDisabled  NotificationKind = "auto_top_up_disabled"
-	NotifyLowBalance         NotificationKind = "low_balance"
-	NotifyCreditExpiry       NotificationKind = "credit_expiry"
-	notifyDetailTopUpKind                     = "top_up_kind"
-	notifyDetailAmount                        = "amount_usd_micros"
-	notifyDetailReason                        = "reason"
-	notifyDetailThreshold                     = "threshold_usd_micros"
-	notifyDetailBalance                       = "balance_usd_micros"
-	notifyDetailExpireTime                    = "expire_time"
-	notifyDetailPaymentScope                  = "scope"
-	notifyScopeSubscription                   = "subscription"
-	notifyScopeTopUp                          = "top_up"
+	NotifyPaymentFailed     NotificationKind = "payment_failed"
+	NotifyAutoTopUpDisabled NotificationKind = "auto_top_up_disabled"
+	NotifyLowBalance        NotificationKind = "low_balance"
+	NotifyCreditExpiry      NotificationKind = "credit_expiry"
+	// NotifyOrganizationBlocked and NotifyOrganizationSuspended report that
+	// a linked organization became BLOCKED or SUSPENDED.
+	NotifyOrganizationBlocked    NotificationKind = "organization_blocked"
+	NotifyOrganizationSuspended  NotificationKind = "organization_suspended"
+	notifyDetailTopUpKind                         = "top_up_kind"
+	notifyDetailAmount                            = "amount_usd_micros"
+	notifyDetailReason                            = "reason"
+	notifyDetailThreshold                         = "threshold_usd_micros"
+	notifyDetailBalance                           = "balance_usd_micros"
+	notifyDetailExpireTime                        = "expire_time"
+	notifyDetailPaymentScope                      = "scope"
+	notifyScopeSubscription                       = "subscription"
+	notifyScopeTopUp                              = "top_up"
+	notifyDetailService                           = "service"
+	notifyDetailOrganizationID                    = "organization_id"
+	notifyDetailOrganizationName                  = "organization_name"
+	notifyDetailSuspendTime                       = "suspend_time"
 )

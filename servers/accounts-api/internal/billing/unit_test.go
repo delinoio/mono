@@ -204,3 +204,77 @@ func TestMapPaddleStatus(t *testing.T) {
 		t.Error("unknown status mapped")
 	}
 }
+
+func TestServiceAndMeterKeys(t *testing.T) {
+	if key, ok := ServiceKey(accountsv1.ServiceId_SERVICE_ID_OWNSAND); !ok || key != "ownsand" {
+		t.Fatalf("ServiceKey(OWNSAND) = %q, %v", key, ok)
+	}
+	for _, bad := range []accountsv1.ServiceId{accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED, 99} {
+		if _, ok := ServiceKey(bad); ok {
+			t.Errorf("ServiceKey(%d) is ok", bad)
+		}
+	}
+	for _, bad := range []string{"", "OWNSAND", "unspecified", "tide"} {
+		if _, ok := ServiceFromKey(bad); ok {
+			t.Errorf("ServiceFromKey(%q) is ok", bad)
+		}
+	}
+	want := map[accountsv1.Meter]string{
+		accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS: "ownsand.relay_egress",
+		accountsv1.Meter_METER_OWNSAND_R2_STORAGE:   "ownsand.r2_storage",
+		accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC:  "ownsand.class_a_rpc",
+		accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC:  "ownsand.class_b_rpc",
+	}
+	for m, key := range want {
+		got, svc, ok := MeterKey(m)
+		if !ok || got != key || svc != accountsv1.ServiceId_SERVICE_ID_OWNSAND {
+			t.Errorf("MeterKey(%s) = %q, %s, %v", m, got, svc, ok)
+		}
+		if back, ok := MeterFromKey(key); !ok || back != m {
+			t.Errorf("MeterFromKey(%q) = %s, %v", key, back, ok)
+		}
+	}
+	if _, _, ok := MeterKey(accountsv1.Meter_METER_UNSPECIFIED); ok {
+		t.Error("MeterKey(UNSPECIFIED) is ok")
+	}
+	for _, bad := range []string{"", "ownsand", "ownsand.unknown", "OWNSAND.RELAY_EGRESS", "unspecified."} {
+		if _, ok := MeterFromKey(bad); ok {
+			t.Errorf("MeterFromKey(%q) is ok", bad)
+		}
+	}
+	got := ServiceMeters(accountsv1.ServiceId_SERVICE_ID_OWNSAND)
+	if len(got) != 4 || got[0] != accountsv1.Meter_METER_OWNSAND_RELAY_EGRESS || got[3] != accountsv1.Meter_METER_OWNSAND_CLASS_B_RPC {
+		t.Fatalf("ServiceMeters(OWNSAND) = %v", got)
+	}
+}
+
+func TestDesiredStatus(t *testing.T) {
+	t0 := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	if s := evaluateStanding(SubscriptionActive, 1); !s.Good || s.Reason != ReasonNone {
+		t.Fatalf("active with credit = %+v", s)
+	}
+	if s := evaluateStanding(SubscriptionActive, 0); s.Good || s.Reason != ReasonNonPositiveBalance {
+		t.Fatalf("active without credit = %+v", s)
+	}
+	for _, sub := range []SubscriptionStatus{SubscriptionNone, SubscriptionPending, SubscriptionPastDue, SubscriptionCanceled} {
+		if s := evaluateStanding(sub, -5); s.Good || s.Reason != ReasonNoActiveSubscription {
+			t.Fatalf("%s = %+v", sub, s)
+		}
+	}
+	bad := standing{Reason: ReasonNonPositiveBalance}
+	// The later of the non-payment start and the link time starts the block.
+	status, _, since, suspend := desiredStatus(bad, t0, t0.Add(time.Hour), t0.Add(2*time.Hour))
+	if status != StatusBlocked || !since.Equal(t0.Add(time.Hour)) || !suspend.Equal(t0.Add(time.Hour+SuspendAfter)) {
+		t.Fatalf("blocked = %s %v %v", status, since, suspend)
+	}
+	if status, _, _, _ := desiredStatus(bad, t0, t0.Add(-time.Hour), t0.Add(SuspendAfter-time.Microsecond)); status != StatusBlocked {
+		t.Fatalf("before the suspension time: %s", status)
+	}
+	if status, _, _, _ := desiredStatus(bad, t0, t0.Add(-time.Hour), t0.Add(SuspendAfter)); status != StatusSuspended {
+		t.Fatalf("at the suspension time: %s", status)
+	}
+	if status, reason, since, suspend := desiredStatus(standing{Good: true, Reason: ReasonNone}, t0, t0, t0.Add(SuspendAfter*2)); status != StatusAllowed ||
+		reason != ReasonNone || since != nil || suspend != nil {
+		t.Fatalf("good standing = %s %s %v %v", status, reason, since, suspend)
+	}
+}

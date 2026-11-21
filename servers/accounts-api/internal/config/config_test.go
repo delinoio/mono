@@ -468,3 +468,28 @@ func TestPaddleConfig(t *testing.T) {
 		t.Fatalf("missing key: %v", err)
 	}
 }
+
+func TestUsageServiceClients(t *testing.T) {
+	cfg, err := Load(lookupFrom(nil))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if len(cfg.UsageServiceClients) != 0 {
+		t.Errorf("UsageServiceClients = %v, want none by default", cfg.UsageServiceClients)
+	}
+	cfg, err = Load(lookupFrom(map[string]string{
+		EnvUsageServiceClients: " app1=ownsand , app2 = ownsand,,app1=ownsand",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := fmt.Sprint(cfg.UsageServiceClients); got != "map[app1:[SERVICE_ID_OWNSAND] app2:[SERVICE_ID_OWNSAND]]" {
+		t.Errorf("UsageServiceClients = %s", got)
+	}
+	for _, value := range []string{"app1", "=ownsand", "app1=", "app1=OWNSAND", "app1=unspecified", "app1=tide", "app 1=ownsand", "app1=ownsand=x"} {
+		if _, err := Load(lookupFrom(map[string]string{EnvUsageServiceClients: value})); err == nil ||
+			!strings.Contains(err.Error(), EnvUsageServiceClients) {
+			t.Errorf("Load(%q) error = %v, want an error that names %s", value, err, EnvUsageServiceClients)
+		}
+	}
+}

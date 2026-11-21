@@ -33,6 +33,9 @@ type Metrics struct {
 	emails        *prometheus.CounterVec
 	creditGrants  *prometheus.CounterVec
 	autoTopUpOff  prometheus.Counter
+	usageReports  *prometheus.CounterVec
+	statusChanges *prometheus.CounterVec
+	linkedOrgs    *prometheus.GaugeVec
 }
 
 // New returns the metrics with the Go runtime and process collectors.
@@ -63,11 +66,24 @@ func New() *Metrics {
 			Name: "accounts_auto_top_up_disabled_total",
 			Help: "Automatic top-up settings turned off after consecutive failures.",
 		}),
+		usageReports: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "accounts_usage_reports_total",
+			Help: "Usage reports by service and result.",
+		}, []string{"service", "result"}),
+		statusChanges: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "accounts_billing_status_changes_total",
+			Help: "Billing status changes of linked organizations by the new status.",
+		}, []string{"status"}),
+		linkedOrgs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "accounts_linked_organizations",
+			Help: "Organizations that are linked to a billing account now, by billing status.",
+		}, []string{"status"}),
 	}
 	m.registry.MustRegister(
 		collectors.NewGoCollector(),
 		collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
 		m.webhooks, m.topUpAttempts, m.topUpResults, m.emails, m.creditGrants, m.autoTopUpOff,
+		m.usageReports, m.statusChanges, m.linkedOrgs,
 	)
 	return m
 }
@@ -111,6 +127,27 @@ func (m *Metrics) CreditGrant(source string) {
 func (m *Metrics) AutoTopUpDisabled() {
 	if m != nil {
 		m.autoTopUpOff.Inc()
+	}
+}
+
+// UsageReport counts one usage report.
+func (m *Metrics) UsageReport(service, result string) {
+	if m != nil {
+		m.usageReports.WithLabelValues(service, result).Inc()
+	}
+}
+
+// StatusChange counts one billing status change of a linked organization.
+func (m *Metrics) StatusChange(status string) {
+	if m != nil {
+		m.statusChanges.WithLabelValues(status).Inc()
+	}
+}
+
+// LinkedOrganizations sets the number of linked organizations with status.
+func (m *Metrics) LinkedOrganizations(status string, n int64) {
+	if m != nil {
+		m.linkedOrgs.WithLabelValues(status).Set(float64(n))
 	}
 }
 

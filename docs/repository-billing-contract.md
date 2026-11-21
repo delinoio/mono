@@ -30,7 +30,7 @@ Every service uses [`delino-accounts`](project-delino-accounts.md) for billing.
 
 ## Shared billing accounts and prepaid credits
 
-The [`delino-accounts` API server contract](servers-accounts-api-foundation.md) and [protos contract](protos-delino-accounts-api-contract.md) own the details. Billing accounts, prepaid credits, the Paddle integration and the billing emails are implemented in `accounts-api`; usage reports and billing statuses are `planned`.
+The [`delino-accounts` API server contract](servers-accounts-api-foundation.md) and [protos contract](protos-delino-accounts-api-contract.md) own the details. Billing accounts, prepaid credits, the Paddle integration, the billing emails, usage reports, organization links and billing statuses are implemented in `accounts-api`.
 
 - Billing accounts: `delino-accounts` keeps shared billing accounts with the roles `owner`, `admin` and `viewer`. Any Logto user can create one. One billing account can pay for organizations of several services. Each organization of a service links to at most one billing account. A user links an organization in the consuming service and must manage both the organization and the billing account.
 - Prepaid credits: services charge from prepaid USD credits in the billing account, never by a direct payment per charge. Usage is always deducted, also below zero; a negative balance is debt.
