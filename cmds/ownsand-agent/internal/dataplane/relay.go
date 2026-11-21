@@ -304,30 +304,41 @@ func (r *relay) probe(c *rconn) {
 	}()
 }
 
-// loop keeps one relay connection while the channel has a live grant. The
-// decision to stop and the reset of r.running happen under one lock, so a
-// grant that arrives meanwhile starts a new loop.
+// loop keeps one relay connection while the current channel has a live
+// grant. It follows r.ch: a grant of a new channel that arrives while the
+// loop still serves the previous channel does not start a second loop, so
+// this loop dials for the new channel next. The decision to stop and the
+// reset of r.running happen under one lock, so a grant that arrives
+// meanwhile starts a new loop.
 func (r *relay) loop(ch agent.Channel) {
 	b := backoff.Backoff{Min: 200 * time.Millisecond, Max: r.d.timing.ReconnectMax}
 	for {
 		r.mu.Lock()
-		closed := false
-		select {
-		case <-ch.Done():
-			closed = true
-		case <-r.ctx.Done():
-			closed = true
-		default:
+		cur := r.ch
+		closed := cur == nil
+		if !closed {
+			select {
+			case <-cur.Done():
+				closed = true
+			case <-r.ctx.Done():
+				closed = true
+			default:
+			}
 		}
-		if closed || r.ch != ch || !r.hasLiveGrantLocked(time.Now()) {
+		if closed || !r.hasLiveGrantLocked(time.Now()) {
 			r.running = false
 			r.mu.Unlock()
 			return
 		}
 		r.mu.Unlock()
+		if cur != ch {
+			r.d.logger.Info("relay connection follows the new agent channel", "generation", cur.Generation())
+			ch = cur
+			b.Reset()
+		}
 		probeLost, err := r.connectOnce(ch)
 		switch {
-		case errors.Is(err, errIdle):
+		case errors.Is(err, errIdle), errors.Is(err, errChannelChanged):
 			continue
 		case err != nil && !probeLost:
 			r.d.logger.Warn("relay connection ended", "error", err)
@@ -344,7 +355,10 @@ func (r *relay) loop(ch agent.Channel) {
 	}
 }
 
-var errIdle = errors.New("dataplane: relay connection idle")
+var (
+	errIdle           = errors.New("dataplane: relay connection idle")
+	errChannelChanged = errors.New("dataplane: agent channel changed before the relay connection opened")
+)
 
 // connectOnce runs one relay connection until it ends. It reports whether
 // the echo probe ended it.
@@ -361,19 +375,27 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	// after they were sent.
 	ctx, cancel := context.WithCancel(r.ctx)
 	defer cancel()
-	stream := r.client.Connect(ctx)
-	cpclient.SetBearer(stream.RequestHeader(), cred)
-	guestclient.CloseOnDone(ctx, stream)
 	c := &rconn{gen: ch.Generation(), out: make(chan *ownsandv1.DataFrame, 256), ctx: ctx, cancel: cancel,
 		streams: map[uint64]*rstream{}, kinds: map[ownsandv1.DataFrameKind]bool{}}
 	now := time.Now().UnixNano()
 	c.lastRecv.Store(now)
 	c.lastSend.Store(now)
+	// The channel can change while the credential is fetched. A
+	// connection of a replaced channel would serve no grant, and
+	// channelLost closes only the installed connection, so the loop
+	// dials again for the current channel instead.
 	r.mu.Lock()
+	if r.ch != ch {
+		r.mu.Unlock()
+		return false, errChannelChanged
+	}
 	r.conn = c
 	r.idleFrom = time.Now()
 	r.mu.Unlock()
 	defer r.connClosed(c)
+	stream := r.client.Connect(ctx)
+	cpclient.SetBearer(stream.RequestHeader(), cred)
+	guestclient.CloseOnDone(ctx, stream)
 
 	writerDone := make(chan struct{})
 	go func() {

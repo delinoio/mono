@@ -6,6 +6,9 @@ package dataplane
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -71,9 +74,13 @@ type relayEnv struct {
 	cp    *testcp.Server
 	conns chan *relayConn
 	ch    *fakeChannel
+	// beforeAuth, when set, runs before each device session credential
+	// and fails the authentication with its error.
+	beforeAuth atomic.Pointer[func(context.Context) error]
 }
 
 func newRelayEnv(t *testing.T, timing Timing, limits RelayLimits) *relayEnv {
+	e := &relayEnv{}
 	w := newWorld(t)
 	cp := testcp.New(t)
 	conns := make(chan *relayConn, 16)
@@ -94,14 +101,22 @@ func newRelayEnv(t *testing.T, timing Timing, limits RelayLimits) *relayEnv {
 	}
 	dp := New(Options{
 		Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), Timing: timing, Limits: limits,
-		Auth:   authFunc(func(context.Context) (string, error) { return cp.IssueCredential("device"), nil }),
+		Auth: authFunc(func(ctx context.Context) (string, error) {
+			if hook := e.beforeAuth.Load(); hook != nil {
+				if err := (*hook)(ctx); err != nil {
+					return "", err
+				}
+			}
+			return cp.IssueCredential("device"), nil
+		}),
 		HTTP:   hc,
 		APIURL: cp.URL,
 	})
 	t.Cleanup(dp.Close)
 	ch := newChannel(1)
 	dp.ChannelOpened(ch)
-	return &relayEnv{world: w, dp: dp, cp: cp, conns: conns, ch: ch}
+	e.world, e.dp, e.cp, e.conns, e.ch = w, dp, cp, conns, ch
+	return e
 }
 
 func (e *relayEnv) conn() *relayConn {
@@ -421,5 +436,52 @@ func TestRelayReceiveTimeoutProbeAndIdle(t *testing.T) {
 	case <-rc3.ctx.Done():
 	case <-time.After(5 * time.Second):
 		t.Fatal("idle relay connection kept")
+	}
+}
+
+// A grant of a new channel that arrives while the relay loop of the
+// previous channel still authenticates gets a relay connection: the
+// running loop dials for the new channel, whether the old attempt fails
+// (and backs off) or succeeds after the channel changed.
+func TestRelayLoopFollowsNewChannel(t *testing.T) {
+	for _, authFails := range []bool{true, false} {
+		t.Run(fmt.Sprintf("auth_fails=%v", authFails), func(t *testing.T) {
+			e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+			entered := make(chan struct{}, 1)
+			gate := make(chan struct{})
+			hook := func(ctx context.Context) error {
+				select {
+				case entered <- struct{}{}:
+				default:
+				}
+				select {
+				case <-gate:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+				if authFails {
+					return errors.New("authentication failed")
+				}
+				return nil
+			}
+			e.beforeAuth.Store(&hook)
+			e.execGrant(e.execReq("/bin/true"))
+			select {
+			case <-entered:
+			case <-time.After(5 * time.Second):
+				t.Fatal("relay loop did not authenticate")
+			}
+			// The channel is replaced while the loop of the old channel
+			// waits in its authentication.
+			e.dp.ChannelLost(e.ch)
+			e.ch.Close()
+			e.ch = newChannel(2)
+			e.dp.ChannelOpened(e.ch)
+			g := e.execGrant(e.execReq("/bin/true"))
+			e.beforeAuth.Store(nil)
+			close(gate)
+			rc := e.conn()
+			e.openOK(rc, 1, g.GetGrantId())
+		})
 	}
 }
