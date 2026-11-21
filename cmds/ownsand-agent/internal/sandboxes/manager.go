@@ -213,22 +213,40 @@ func (m *Manager) Epoch() string { return m.epoch }
 // reconcile handles records whose VM is gone after an agent restart: every
 // VM is bound to the agent process, so a record in creating, running or
 // paused state has lost its VM. A passed TTL wins over LOST_ON_DEVICE. VMs
-// that survived (a failed binding) are stopped.
+// that survived (a failed binding) are stopped. The runtime also removes the
+// files of every live record before the record ends, because a lost VM
+// leaves its directory and disk on the device. When the removal fails, the
+// record stays live and persisted, so the next start (or a TTL tick) tries
+// again, and the terminal state is not reported before the files are gone.
 func (m *Manager) reconcile(ctx context.Context) error {
 	running, err := m.rt.Running(ctx)
 	if err != nil {
 		return fmt.Errorf("sandboxes: list runtime VMs: %w", err)
 	}
+	// cleaned holds the sandboxes whose runtime Delete already succeeded.
+	cleaned := map[string]bool{}
 	for _, id := range running {
 		m.logger.Warn("stopping a VM that outlived its agent process", "sandbox_id", id)
 		if err := m.rt.Delete(ctx, id); err != nil {
 			m.logger.Error("stop surviving VM failed", "sandbox_id", id, "error", err)
+			continue
 		}
+		cleaned[id] = true
 	}
 	now := m.now()
 	for _, sb := range m.sandboxes {
 		if !sb.rec.Live() {
 			continue
+		}
+		id := sb.rec.SandboxID
+		if !cleaned[id] {
+			// Delete is idempotent: it removes the runtime files of a
+			// sandbox whose VM is already gone.
+			if err := m.rt.Delete(ctx, id); err != nil {
+				m.logger.Error("remove runtime files of a lost sandbox failed; the record stays live for a retry", "sandbox_id", id, "error", err)
+				continue
+			}
+			cleaned[id] = true
 		}
 		reason := sb.rec.ttlReason(now)
 		state := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
@@ -240,7 +258,7 @@ func (m *Manager) reconcile(ctx context.Context) error {
 			state = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
 			reason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
 		}
-		m.logger.Info("sandbox ended while the agent was stopped", "sandbox_id", sb.rec.SandboxID, "state", state.String(), "end_reason", reason.String())
+		m.logger.Info("sandbox ended while the agent was stopped", "sandbox_id", id, "state", state.String(), "end_reason", reason.String())
 		if err := m.commitLocked(sb, func(r *Record) {
 			r.State = state
 			r.EndReason = reason
@@ -775,6 +793,10 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 	case from:
 	default:
 		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is %s", state)
+	}
+	if vm == nil {
+		// A record kept live for a pending restart cleanup has no VM.
+		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox VM is not available")
 	}
 	if pause {
 		if err := m.rt.Pause(ctx, vm); err != nil {

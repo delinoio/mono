@@ -340,3 +340,26 @@ func TestCreateOutboundPreflightChecksTools(t *testing.T) {
 		t.Fatalf("NONE create without tools: %v", err)
 	}
 }
+
+// TestDeleteRemovesFilesOfSandboxWithoutProcess checks the idempotent file
+// removal that the agent relies on at start for a sandbox that lost its VM:
+// the VM directory exists, but no firecracker process or tracked VM does.
+func TestDeleteRemovesFilesOfSandboxWithoutProcess(t *testing.T) {
+	vmsDir := t.TempDir()
+	r := &Runtime{opts: Options{VMsDir: vmsDir}, logger: quiet(), vms: map[string]*vm{}}
+	dir := r.vmDir("01a1fd14-c825-72ac-926c-3bd6b87a8ba5")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "disk.ext4"), []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // the second call checks idempotence
+		if err := r.Delete(context.Background(), "01a1fd14-c825-72ac-926c-3bd6b87a8ba5"); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("VM directory kept: %v", err)
+	}
+}
