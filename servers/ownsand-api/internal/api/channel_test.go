@@ -663,3 +663,130 @@ func TestChannelNeedsLease(t *testing.T) {
 	}
 	_ = dev
 }
+
+// importFixture exports a snapshot from device A and returns a second
+// connected device B that has no copy of it, so a create on B imports first.
+func importFixture(t *testing.T, env *testenv.Env, org *testenv.Org) (snapID string, devB *testenv.Device, agentB *testenv.FakeAgent) {
+	t.Helper()
+	ctx := context.Background()
+	c := org.OwnerClient
+	_, agentA := setupAgent(t, env, org, nil)
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	snap, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapID = snap.Msg.GetSnapshot().GetSnapshotId()
+	testenv.Eventually(t, "snapshot ready", func() bool {
+		s, err := c.Snapshot.GetSnapshot(ctx, connect.NewRequest(&ownsandv1.GetSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
+		return err == nil && s.Msg.GetSnapshot().GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY
+	})
+	if _, err := c.Snapshot.ExportSnapshot(ctx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID})); err != nil {
+		t.Fatal(err)
+	}
+	testenv.Eventually(t, "snapshot exported", func() bool {
+		s, err := c.Snapshot.GetSnapshot(ctx, connect.NewRequest(&ownsandv1.GetSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
+		return err == nil && s.Msg.GetSnapshot().GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED
+	})
+	_ = agentA
+	devB, agentB = setupAgent(t, env, org, nil)
+	return snapID, devB, agentB
+}
+
+func importCreateReq(orgID, snapID, deviceID string) *ownsandv1.CreateSandboxRequest {
+	req := createReq(orgID)
+	req.Source = &ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_SnapshotId{SnapshotId: snapID}}
+	req.Placement = &ownsandv1.Placement{DeviceId: &deviceID}
+	return req
+}
+
+// TestImportWaitExpiryFailsCreate checks that an expired import wait on a
+// connected device fails the create, releases its reservation and keeps a
+// late import success from reviving it.
+func TestImportWaitExpiryFailsCreate(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: 300 * time.Millisecond}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	c := org.OwnerClient
+	snapID, devB, agentB := importFixture(t, env, org)
+
+	var mu sync.Mutex
+	var importCmdID string
+	agentB.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		if cmd.GetImportSnapshot() != nil {
+			mu.Lock()
+			importCmdID = cmd.GetCommandId()
+			mu.Unlock()
+			return nil // withhold the result while the channel stays connected
+		}
+		return fa.DefaultAnswer(cmd)
+	})
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := created.Msg.GetSandbox().GetSandboxId()
+	sb := waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	if sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("end reason = %v", sb.GetEndReason())
+	}
+	d, _ := c.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: devB.ID}))
+	if d.Msg.GetDevice().GetAllocation().GetVcpuCount() != 0 {
+		t.Fatalf("reservation not released: %v", d.Msg.GetDevice().GetAllocation())
+	}
+	// A late success records the copy but does not create or revive.
+	mu.Lock()
+	cmdID := importCmdID
+	mu.Unlock()
+	if cmdID == "" {
+		t.Fatal("agent never received the import command")
+	}
+	agentB.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
+		CommandId: cmdID, Result: &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{}},
+	}}})
+	testenv.Eventually(t, "late copy recorded", func() bool {
+		var n int
+		_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM snapshot_copies WHERE snapshot_id = $1 AND device_id = $2", snapID, devB.ID).Scan(&n)
+		return n == 1
+	})
+	time.Sleep(300 * time.Millisecond)
+	for _, cmd := range agentB.Commands() {
+		if cmd.GetCreateSandbox().GetSandboxId() == id {
+			t.Fatal("create dispatched for the failed sandbox")
+		}
+	}
+	if got := getSandbox(t, c, org.ID, id); got.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED {
+		t.Fatalf("state after late result = %v", got.GetState())
+	}
+	// The released capacity accepts a new request (the copy now exists).
+	again, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	if err != nil {
+		t.Fatalf("create after release: %v", err)
+	}
+	_ = again
+}
+
+// TestImportBeforeWaitExpiryCreates is the control: a timely import result
+// leads to the create command and RUNNING.
+func TestImportBeforeWaitExpiryCreates(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: 5 * time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	c := org.OwnerClient
+	snapID, devB, agentB := importFixture(t, env, org)
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, org.ID, created.Msg.GetSandbox().GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	agentB.WaitFor("create after import", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetCreateSandbox().GetSandboxId() == created.Msg.GetSandbox().GetSandboxId()
+	})
+}
