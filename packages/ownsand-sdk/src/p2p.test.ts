@@ -941,14 +941,14 @@ describe("peer-to-peer data path", () => {
       expect(rtc.frames).toHaveLength(2);
     });
 
-    test("a session-end frame still ends the session, also with a framing violation", async () => {
+    test("a session-end frame on stream 0 does not end the session", async () => {
       let requests = 0;
-      const { h } = p2pSetup((frame, peer) => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
         if (frame.kind === DataFrameKind.EXEC_REQUEST) {
           requests++;
           execEvent(peer, frame.streamId, ev.started());
-          // SESSION_END on stream 0 breaks no rule that stops it from ending
-          // the session: it is handled before frame validation.
+          // SESSION_END on stream 0 fails ValidateFrame, so it is handled like
+          // any other invalid frame: it is ignored and the session stays open.
           peer.send({
             streamId: 0n,
             kind: DataFrameKind.SESSION_END,
@@ -957,18 +957,139 @@ describe("peer-to-peer data path", () => {
               value: { reason: SessionEndReason.EXPIRED },
             },
           });
-        }
-        if (frame.kind === DataFrameKind.EXEC_ATTACH_REQUEST) {
-          execEvent(peer, frame.streamId, ev.started());
           execEvent(peer, frame.streamId, ev.exited(0));
         }
       });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const first = await h.clock.run(sandbox.run({ command: ["x"] }));
+      expect(first.result.kind).toBe(ExecResultKind.Exited);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      // A following run reuses the session.
+      const second = await h.clock.run(sandbox.run({ command: ["y"] }));
+      expect(second.result.kind).toBe(ExecResultKind.Exited);
+      expect(requests).toBe(2);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.connections).toHaveLength(1);
+    });
+
+    test("a session-end frame without its payload fails only its open stream", async () => {
+      const records: LogRecord[] = [];
+      let goodStream: bigint | undefined;
+      const { h, rtc } = p2pSetup(
+        (frame, peer) => {
+          if (frame.payload.case !== "execRequest") return;
+          const command = frame.payload.value.command[0];
+          if (command === "good") {
+            goodStream = frame.streamId;
+            execEvent(peer, frame.streamId, ev.started());
+            execEvent(peer, frame.streamId, ev.stdout(0, "ok"));
+          } else {
+            // A session-end frame with no payload or with a payload of another
+            // kind, on an open non-zero stream, while the good stream is open.
+            peer.send({
+              streamId: frame.streamId,
+              kind: DataFrameKind.SESSION_END,
+              payload: { case: undefined },
+            });
+            execEvent(peer, goodStream!, ev.exited(0));
+          }
+        },
+        { logger: (record) => records.push(record) },
+      );
+      const sandbox = h.client.sandbox(SANDBOX);
+      const good = sandbox.run({ command: ["good"] });
+      await Promise.resolve();
+      const bad = sandbox.run({ command: ["bad"] }).catch((e) => e);
+      const [run, error] = await h.clock.run(Promise.all([good, bad]));
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(text(run.stdout)).toBe("ok");
+      expect(run.result.kind).toBe(ExecResultKind.Exited);
+      expect(
+        records.filter((r) => r.event === LogEvent.InvalidFrame),
+      ).toHaveLength(1);
+      expect(records.some((r) => r.event === LogEvent.SessionEnded)).toBe(
+        false,
+      );
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.connections).toHaveLength(1);
+    });
+
+    test("a session-end frame with another payload fails only its open stream", async () => {
+      const { h } = p2pSetup((frame, peer) => {
+        if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+          peer.send(execFrame(frame.streamId, DataFrameKind.SESSION_END));
+        }
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("an invalid session-end frame on a stream that is not open is ignored", async () => {
+      const records: LogRecord[] = [];
+      const { h, rtc } = p2pSetup(
+        (frame, peer) => {
+          if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            peer.send(execFrame(77n, DataFrameKind.SESSION_END));
+            execEvent(peer, frame.streamId, ev.started());
+            execEvent(peer, frame.streamId, ev.exited(0));
+          }
+        },
+        { logger: (record) => records.push(record) },
+      );
+      const sandbox = h.client.sandbox(SANDBOX);
+      const first = await h.clock.run(sandbox.run({ command: ["a"] }));
+      expect(first.result.kind).toBe(ExecResultKind.Exited);
+      const second = await h.clock.run(sandbox.run({ command: ["b"] }));
+      expect(second.result.kind).toBe(ExecResultKind.Exited);
+      expect(
+        records.filter((r) => r.event === LogEvent.InvalidFrame),
+      ).toHaveLength(0);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.connections).toHaveLength(1);
+    });
+
+    test("a valid session-end frame on a non-zero stream still ends the session", async () => {
+      const records: LogRecord[] = [];
+      let requests = 0;
+      const { h } = p2pSetup(
+        (frame, peer) => {
+          if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            requests++;
+            execEvent(peer, frame.streamId, ev.started());
+            peer.send({
+              streamId: frame.streamId,
+              kind: DataFrameKind.SESSION_END,
+              payload: {
+                case: "sessionEnd",
+                value: { reason: SessionEndReason.EXPIRED },
+              },
+            });
+          }
+          if (frame.kind === DataFrameKind.EXEC_ATTACH_REQUEST) {
+            execEvent(peer, frame.streamId, ev.started());
+            execEvent(peer, frame.streamId, ev.exited(0));
+          }
+        },
+        { logger: (record) => records.push(record) },
+      );
       const run = await h.clock.run(
         h.client.sandbox(SANDBOX).run({ command: ["x"] }),
       );
       expect(run.result.kind).toBe(ExecResultKind.Exited);
       expect(requests).toBe(1);
       expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+      const ended = records.filter((r) => r.event === LogEvent.SessionEnded);
+      expect(ended).toHaveLength(1);
+      expect(ended[0]!.reason).toBe("EXPIRED");
     });
 
     test("logs the invalid frame without frame content", async () => {

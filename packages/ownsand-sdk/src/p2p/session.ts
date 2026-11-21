@@ -468,19 +468,6 @@ export class PeerSession {
       return;
     }
     for (const frame of frames) {
-      if (frame.kind === DataFrameKind.SESSION_END) {
-        const reason =
-          frame.payload.case === "sessionEnd"
-            ? frame.payload.value.reason
-            : SessionEndReason.UNSPECIFIED;
-        safeLog(this.#ctx.logger, {
-          event: LogEvent.SessionEnded,
-          sandboxId: this.#ctx.sandboxId,
-          reason: SessionEndReason[reason],
-        });
-        this.#terminate(new SessionEndedError(reason));
-        return;
-      }
       const invalid = validateFrame(frame);
       if (invalid !== undefined) {
         // A frame of a newer schema or one that breaks a framing rule fails
@@ -501,6 +488,21 @@ export class PeerSession {
           this.#streams.delete(frame.streamId);
         }
         continue;
+      }
+      // Only a session-end frame that passed validation ends the session; an
+      // invalid one was handled above like any other invalid frame.
+      if (frame.kind === DataFrameKind.SESSION_END) {
+        const reason =
+          frame.payload.case === "sessionEnd"
+            ? frame.payload.value.reason
+            : SessionEndReason.UNSPECIFIED;
+        safeLog(this.#ctx.logger, {
+          event: LogEvent.SessionEnded,
+          sandboxId: this.#ctx.sandboxId,
+          reason: SessionEndReason[reason],
+        });
+        this.#terminate(new SessionEndedError(reason));
+        return;
       }
       this.#enqueue(frame);
     }
