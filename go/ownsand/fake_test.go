@@ -90,6 +90,16 @@ type p2pAction struct {
 	endAfter  int // send a session-end frame after N output events
 	reason    ownsandv1.SessionEndReason
 	failAfter int // close the data channel without a session-end frame
+	// endNow answers an exec request with a session-end frame before any
+	// frame, so the session ends before the agent accepted the request.
+	endNow bool
+	// failNow closes the data channel at an exec request without any frame
+	// and without a session-end frame.
+	failNow bool
+	// endAfterStarted sends a session-end frame right after the started
+	// event of an exec, with no output: a quiet exec whose session expires
+	// after the agent accepted the continuation.
+	endAfterStarted bool
 	// raw, when set, answers the request with this frame only.
 	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
@@ -1030,10 +1040,25 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 	}
 	outputs := 0
 	sendExec := func(ev *ownsandv1.ExecEvent) error {
+		if act.endNow || act.failNow {
+			if act.endNow {
+				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
+				time.Sleep(20 * time.Millisecond)
+			}
+			_ = s.pc.Close()
+			return errSessionGone
+		}
 		if err := s.send(frame(ev)); err != nil {
 			return err
 		}
 		switch ev.GetEvent().(type) {
+		case *ownsandv1.ExecEvent_Started:
+			if act.endAfterStarted {
+				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
+				time.Sleep(20 * time.Millisecond)
+				_ = s.pc.Close()
+				return errSessionGone
+			}
 		case *ownsandv1.ExecEvent_Stdout, *ownsandv1.ExecEvent_Stderr:
 			outputs++
 			if act.endAfter > 0 && outputs >= act.endAfter {
