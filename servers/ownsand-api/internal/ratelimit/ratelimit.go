@@ -8,6 +8,7 @@ package ratelimit
 
 import (
 	"math"
+	"slices"
 	"sync"
 	"time"
 )
@@ -91,12 +92,18 @@ func (l *Limiter) evictLocked(now time.Time) {
 	if len(l.buckets) < maxKeys {
 		return
 	}
-	n := 0
-	for key := range l.buckets {
-		delete(l.buckets, key)
-		n++
-		if n >= maxKeys/2 {
-			return
-		}
+	// Drop the buckets with the oldest last-charge time. Sorting is O(n log n)
+	// but runs only when the cap is hit with no refilled bucket to reclaim.
+	type entry struct {
+		key  string
+		last time.Time
+	}
+	entries := make([]entry, 0, len(l.buckets))
+	for key, b := range l.buckets {
+		entries = append(entries, entry{key: key, last: b.last})
+	}
+	slices.SortFunc(entries, func(a, b entry) int { return a.last.Compare(b.last) })
+	for _, e := range entries[:maxKeys/2] {
+		delete(l.buckets, e.key)
 	}
 }
