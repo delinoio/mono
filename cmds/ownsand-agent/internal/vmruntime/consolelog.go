@@ -77,25 +77,29 @@ func OpenCappedLog(path string, limit int64, logger *slog.Logger, sandboxID stri
 		return nil, fmt.Errorf("vmruntime: unsupported console log kind %d", int(kind))
 	}
 	subject := kind.subject()
+	// Trim an oversized file before opening it for append. On Windows, Go opens
+	// O_APPEND handles with append-only access, which cannot truncate the
+	// file, so the trim must not go through the handle that is kept for
+	// writing.
+	trimmedFrom := int64(-1)
+	if st, err := os.Stat(path); err == nil && st.Size() > limit {
+		if err := os.Truncate(path, limit); err != nil {
+			return nil, fmt.Errorf("vmruntime: trim %s: %w", filepath.Base(path), err)
+		}
+		trimmedFrom = st.Size()
+	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	fail := func(err error) (*CappedLog, error) {
-		f.Close()
-		return nil, err
-	}
 	st, err := f.Stat()
 	if err != nil {
-		return fail(fmt.Errorf("vmruntime: stat %s: %w", filepath.Base(path), err))
+		f.Close()
+		return nil, fmt.Errorf("vmruntime: stat %s: %w", filepath.Base(path), err)
 	}
 	size := st.Size()
-	if size > limit {
-		if err := f.Truncate(limit); err != nil {
-			return fail(fmt.Errorf("vmruntime: trim %s: %w", filepath.Base(path), err))
-		}
-		logger.Warn("oversized "+subject+" trimmed to the cap", "sandbox_id", sandboxID, "size_bytes", size, "limit_bytes", limit)
-		size = limit
+	if trimmedFrom >= 0 {
+		logger.Warn("oversized "+subject+" trimmed to the cap", "sandbox_id", sandboxID, "size_bytes", trimmedFrom, "limit_bytes", limit)
 	}
 	return &CappedLog{logger: logger, sandboxID: sandboxID, subject: subject, f: f, limit: limit, written: size}, nil
 }
