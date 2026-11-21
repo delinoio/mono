@@ -103,6 +103,11 @@ func stateErr(state ownsandv1.SandboxState, rpc string) error {
 	return errPrecondition(fmt.Sprintf("%s is not allowed in state %s", rpc, state))
 }
 
+// snapshotFailTimeout bounds the database update that ends a snapshot or
+// export attempt whose command could not be queued. The request context
+// cannot be used for it because its end is a common cause of the failure.
+const snapshotFailTimeout = 5 * time.Second
+
 func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Request[ownsandv1.CreateSnapshotRequest]) (*connect.Response[ownsandv1.CreateSnapshotResponse], error) {
 	orgID := req.Msg.GetOrganizationId()
 	p, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes)
@@ -155,7 +160,21 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{
 			SnapshotId: snap.pb.GetSnapshotId(), SandboxId: snap.pb.GetSourceSandboxId(),
 		}}}); err != nil {
-		_, _ = h.DB.Pool.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1", snap.pb.GetSnapshotId(), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED))
+		// The send failed before the command was queued, often because the
+		// request context ended, so the failure transition must not use it.
+		// It acts only while the record is still CREATING, so it never
+		// overwrites a state that another writer set.
+		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotFailTimeout)
+		defer cancel()
+		tag, execErr := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", snap.pb.GetSnapshotId(),
+			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
+		attrs := []any{slog.String("snapshot_id", snap.pb.GetSnapshotId()), slog.String("channel_id", conn.ID), slog.Any("send_error", err),
+			slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0)}
+		if execErr != nil {
+			h.Logger.ErrorContext(dbCtx, "snapshot_create_fail_transition_failed", append(attrs, slog.Any("error", execErr))...)
+		} else {
+			h.Logger.WarnContext(dbCtx, "snapshot_create_send_failed", attrs...)
+		}
 		return nil, errUnavailable("the agent channel closed")
 	}
 	return connect.NewResponse(&ownsandv1.CreateSnapshotResponse{Snapshot: snap.pb}), nil
@@ -531,10 +550,20 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			}}}); err != nil {
 			// The attempt fails only while the row still names it: a
 			// concurrent retry owns the row by now and keeps its state.
-			tag, execErr := h.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
+			// The send failed before the command was queued, often because
+			// the request context ended, so the update uses a bounded
+			// context that does not depend on it.
+			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotFailTimeout)
+			defer cancel()
+			tag, execErr := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
 				sn.pb.GetSnapshotId(), commandID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING))
-			h.Logger.WarnContext(ctx, "export_failed", slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID),
-				slog.String("channel_id", conn.ID), slog.String("reason", "send_failed"), slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0))
+			attrs := []any{slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID), slog.String("channel_id", conn.ID),
+				slog.String("reason", "send_failed"), slog.Any("send_error", err), slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0)}
+			if execErr != nil {
+				h.Logger.ErrorContext(dbCtx, "export_fail_transition_failed", append(attrs, slog.Any("error", execErr))...)
+			} else {
+				h.Logger.WarnContext(dbCtx, "export_failed", attrs...)
+			}
 			return nil, errUnavailable("the agent channel closed")
 		}
 	}
