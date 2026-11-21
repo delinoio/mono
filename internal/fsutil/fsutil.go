@@ -6,6 +6,7 @@ package fsutil
 
 import (
 	"archive/tar"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -85,12 +86,43 @@ func TreeSize(dir string) (int64, error) {
 	return total, err
 }
 
+// ctxReader fails a read with the context error once ctx is done, so a copy
+// through it stops at the next chunk boundary instead of at the end of the
+// stream.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
+}
+
+// CopyContext copies src to dst like io.Copy but stops with the context
+// error at the next chunk once ctx is done.
+func CopyContext(ctx context.Context, dst io.Writer, src io.Reader) (int64, error) {
+	return io.Copy(dst, ctxReader{ctx: ctx, r: src})
+}
+
 // WriteTar writes the tree under dir to w as a tar stream with relative
 // names. It keeps regular files, directories and symbolic links.
 func WriteTar(w io.Writer, dir string) error {
+	return WriteTarContext(context.Background(), w, dir)
+}
+
+// WriteTarContext is WriteTar that stops with the context error between
+// entries and between the chunks of a file once ctx is done. The stream that
+// it wrote before the stop is incomplete and must be discarded.
+func WriteTarContext(ctx context.Context, w io.Writer, dir string) error {
 	tw := tar.NewWriter(w)
 	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		rel, err := filepath.Rel(dir, path)
@@ -123,7 +155,7 @@ func WriteTar(w io.Writer, dir string) error {
 			if err != nil {
 				return err
 			}
-			_, err = io.Copy(tw, f)
+			_, err = CopyContext(ctx, tw, f)
 			f.Close()
 			return err
 		}
@@ -141,13 +173,23 @@ func WriteTar(w io.Writer, dir string) error {
 // write outside dir, including through symbolic links that the same archive
 // created earlier; such an entry fails with an error.
 func ReadTar(r io.Reader, dir string) error {
+	return ReadTarContext(context.Background(), r, dir)
+}
+
+// ReadTarContext is ReadTar that stops with the context error between
+// entries and between the chunks of a file once ctx is done. The files that
+// it extracted before the stop stay in dir; the caller removes them.
+func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return err
 	}
 	defer root.Close()
-	tr := tar.NewReader(r)
+	tr := tar.NewReader(ctxReader{ctx: ctx, r: r})
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
 			return nil

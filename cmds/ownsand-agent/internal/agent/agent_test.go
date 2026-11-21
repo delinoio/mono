@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -614,6 +615,48 @@ func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	// returns the ready entry and leaves the content alone.
 	if res := f.h.command(f.command(id, true)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 		t.Fatalf("later import = %v", res)
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestImportStopsWithItsChannelContext checks that an import whose channel
+// context ends during a download publishes nothing: no ready snapshot, no
+// content directory and no leftover files, and that an import of the same
+// snapshot afterwards still succeeds.
+func TestImportStopsWithItsChannelContext(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var downloads atomic.Int32
+	f := newImportFixture(t, func(r *http.Request) int {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
+			// The channel closes while the import still downloads.
+			cancel()
+		}
+		return 0
+	})
+	cmd := f.stage(t, id, false).GetImportSnapshot()
+	if len(cmd.GetParts()) < 3 {
+		t.Fatalf("the fixture needs at least 3 parts, has %d", len(cmd.GetParts()))
+	}
+	if _, err := f.h.agent.importSnapshot(ctx, cmd); err == nil {
+		t.Fatal("import succeeded with a closed channel context")
+	}
+	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+		t.Fatal("a cancelled import left a ready snapshot")
+	}
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after a cancelled import: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); len(left) != 0 {
+		t.Fatalf("temporary archives left: %v", left)
+	}
+	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
+		t.Fatalf("import after the cancelled one = %v", res)
 	}
 	f.requireRestorable(t, id)
 }
