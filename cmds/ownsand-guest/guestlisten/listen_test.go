@@ -1,10 +1,14 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package guestlisten
 
 import (
 	"errors"
+	"fmt"
 	"net"
+	"os"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -63,6 +67,54 @@ func TestListenUnixRemovesStaleSocket(t *testing.T) {
 		// Leave the socket file behind like a crashed helper would.
 		l.(*net.UnixListener).SetUnlinkOnClose(false)
 		l.Close()
+	}
+}
+
+func TestListenUnixKeepsNonSocketEntries(t *testing.T) {
+	t.Chdir(t.TempDir())
+	if err := os.WriteFile("keep", []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir("dir", 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("keep", "link"); err != nil {
+		t.Skipf("symlink unsupported: %v", err)
+	}
+	for _, name := range []string{"keep", "dir", "link"} {
+		_, err := Listen("unix://" + name)
+		if !errors.Is(err, ErrAddressOccupied) {
+			t.Fatalf("%s: err = %v", name, err)
+		}
+		if strings.Contains(err.Error(), name) {
+			t.Fatalf("%s: error contains the path: %v", name, err)
+		}
+		if _, statErr := os.Lstat(name); statErr != nil {
+			t.Fatalf("%s was removed: %v", name, statErr)
+		}
+	}
+	if got, err := os.ReadFile("keep"); err != nil || string(got) != "data" {
+		t.Fatalf("keep content %q %v", got, err)
+	}
+}
+
+func TestListenUnixAbstractAddress(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("abstract unix addresses exist on Linux only")
+	}
+	t.Chdir(t.TempDir())
+	name := fmt.Sprintf("ownsand-guest-test-%d", os.Getpid())
+	// A regular file with the abstract name must stay untouched.
+	if err := os.WriteFile("@"+name, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	l, err := Listen("unix://@" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	if got, err := os.ReadFile("@" + name); err != nil || string(got) != "data" {
+		t.Fatalf("file content %q %v", got, err)
 	}
 }
 

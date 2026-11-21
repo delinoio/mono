@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
@@ -29,7 +29,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -379,5 +379,56 @@ func TestSnapshotExportImport(t *testing.T) {
 	b3.SnapshotId = bad
 	if res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{Snapshot: b3, Parts: parts}}}); res.GetError() == nil {
 		t.Fatal("tampered import accepted")
+	}
+}
+
+// TestEnrollRetriesAfterOriginWriteFailure checks that a failed agent.json
+// write leaves only the pending-key identity, so a retry with the same token
+// and key completes the enrollment.
+func TestEnrollRetriesAfterOriginWriteFailure(t *testing.T) {
+	cp := testcp.New(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := cpclient.New(cp.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory at agent.json makes the atomic rename fail.
+	blocker := st.Path(store.AgentFile)
+	if err := os.MkdirAll(filepath.Join(blocker, "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); err == nil {
+		t.Fatal("enroll succeeded with a blocked agent.json")
+	}
+	pending, err := st.LoadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.DeviceID != "" || pending.PrivateKeySeed == nil {
+		t.Fatalf("pending identity: %+v", pending)
+	}
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	id, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger())
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if id.DeviceID == "" || string(id.PrivateKeySeed) != string(pending.PrivateKeySeed) {
+		t.Fatalf("retry identity: %+v", id)
+	}
+	loaded, err := st.LoadIdentity()
+	if err != nil || loaded.DeviceID != id.DeviceID {
+		t.Fatalf("loaded identity: %+v, %v", loaded, err)
+	}
+	a, err := st.LoadAgent()
+	if err != nil || a.APIURL != client.APIURL {
+		t.Fatalf("agent state: %+v, %v", a, err)
+	}
+	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); !errors.Is(err, ErrAlreadyEnrolled) {
+		t.Fatalf("third enroll: %v", err)
 	}
 }

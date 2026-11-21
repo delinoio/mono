@@ -45,7 +45,7 @@ The Rspress theme variables `--rp-c-brand`, `--rp-c-brand-dark`, `--rp-c-brand-d
 
 The dark-mode `--rp-c-brand`, `--rp-c-brand-light` and `--rp-c-brand-lighter` values must each reach 4.5:1 (WCAG 2.1 normal text) against every Rspress dark surface: `#121212`, `#292e37`, `#343a46` and `#000000`. The light-mode brand blue does not meet this on those surfaces, which is why the dark ramp exists.
 
-The e2e suite checks this minimum on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. It also checks that the light-mode brand and the hero gradient colors do not change. It does not measure the light-mode link color `--rp-c-brand-dark`, which reaches 6.20:1 on the darkest light surface (`--rp-c-bg-mute`) and is protected only by the check that it does not change between modes.
+The e2e suite checks this minimum on the resolved Rspress surface variables (`--rp-c-bg`, `--rp-c-bg-soft`, `--rp-c-bg-mute` and `--rp-c-bg-alt`) after adding the `rp-dark` class to `html`. It fails when any checked variable is undefined, because an undefined variable would otherwise resolve to the inherited text color and pass. It pins the dark `--rp-c-brand`, `--rp-c-brand-light` and `--rp-c-brand-lighter` values (`#8aa0ff`, `#a3b4ff` and `#c0ccff`). It also checks that the light-mode brand and the hero gradient colors do not change. It does not measure the light-mode link color `--rp-c-brand-dark`, which reaches 6.20:1 on the darkest light surface (`--rp-c-bg-mute`) and is protected only by the check that it does not change between modes.
 
 ## Storage
 
@@ -66,11 +66,11 @@ The site has no runtime server logs. Build diagnostics come from the Rspress CLI
 Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
-- `pnpm --filter delino-site dev`: development server at `http://127.0.0.1:3600`. The server fails when the port is in use and does not start on another port. `PORT` does not change the port.
+- `pnpm --filter delino-site dev`: development server at `http://127.0.0.1:13600`. The server fails when the port is in use and does not start on another port. `PORT` does not change the port.
 - `pnpm exec turbo run build --filter=delino-site`: production build into `apps/delino-site/dist/`.
 - `pnpm exec turbo run typecheck --filter=delino-site`: TypeScript type check, including the e2e config and tests.
-- `pnpm exec turbo run test:e2e --filter=delino-site`: browser end-to-end tests against the development server on a free loopback port. The suite also starts `rspress dev` without a port flag while a loopback listener holds port 3600, and with an explicit port that a listener holds, and expects a non-zero exit with the `Port <n> is occupied` message. See the [e2e contract](repository-e2e-contract.md).
-- `pnpm --filter delino-site preview`: serve the production build at `http://127.0.0.1:3600`. Preview uses the same port as the development server and fails when the port is in use, so the development server and preview of one site cannot run together.
+- `pnpm exec turbo run test:e2e --filter=delino-site`: browser end-to-end tests against the development server on a free loopback port. The suite also starts `rspress dev` without a port flag while a loopback listener holds port 13600, and with an explicit port that a listener holds, and expects a non-zero exit with the `Port <n> is occupied` message. See the [e2e contract](repository-e2e-contract.md).
+- `pnpm --filter delino-site preview`: serve the production build at `http://127.0.0.1:13600`. Preview uses the same port as the development server and fails when the port is in use, so the development server and preview of one site cannot run together.
 
 Remove `apps/delino-site/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI builds and type-checks this site in the `workspace-packages` job of the [workflow contract](repository-workflow-contract.md#validation) but does not deploy it. The [deployment workflow](repository-workflow-contract.md#deployment-workflow) builds and deploys it when a pending changeset releases it.
 

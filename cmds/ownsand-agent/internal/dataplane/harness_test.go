@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
@@ -24,7 +24,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

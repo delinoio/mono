@@ -1,9 +1,7 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build !windows
 
-// Package hcsrt is the Windows runtime (Hyper-V through the Host Compute
-// Service).
 package hcsrt
 
 import (
@@ -13,6 +11,6 @@ import (
 )
 
 // New fails: the Host Compute Service exists on Windows only.
-func New() (vmruntime.Runtime, error) {
+func New(Options) (vmruntime.Runtime, error) {
 	return nil, fmt.Errorf("%w: the Hyper-V runtime needs a Windows host", vmruntime.ErrUnsupported)
 }

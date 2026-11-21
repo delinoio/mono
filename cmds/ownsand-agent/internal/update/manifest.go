@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package update implements the signed agent update flow: it downloads the
 // signed release manifest and the release artifact of the platform,
@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	"github.com/delinoio/mono/internal/semver"
 )
 
 // BuiltinKeys are the release public keys built into the agent. A release
@@ -107,7 +107,7 @@ func Verify(manifest, signature []byte, keys []ed25519.PublicKey) (*Manifest, er
 // Revoked reports whether v is a revoked version.
 func (m *Manifest) Revoked(v string) bool {
 	for _, r := range m.RevokedVersions {
-		if c, err := version.CompareStrings(r, v); err == nil && c == 0 {
+		if c, err := semver.CompareStrings(r, v); err == nil && c == 0 {
 			return true
 		}
 	}
@@ -117,7 +117,7 @@ func (m *Manifest) Revoked(v string) bool {
 // Artifact returns the artifact of platform for version v.
 func (m *Manifest) Artifact(v, platform string) (Artifact, error) {
 	for _, r := range m.Releases {
-		if c, err := version.CompareStrings(r.Version, v); err != nil || c != 0 {
+		if c, err := semver.CompareStrings(r.Version, v); err != nil || c != 0 {
 			continue
 		}
 		for _, a := range r.Artifacts {

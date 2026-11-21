@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guestlisten opens the listener of the guest helper. The guest
 // helper listens on the hypervisor socket of the platform (vsock on
@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -43,6 +44,11 @@ var DefaultSpec = fmt.Sprintf("vsock://:%d", DefaultVsockPort)
 
 // ErrUnsupported reports a transport that this platform does not provide.
 var ErrUnsupported = errors.New("guestlisten: transport not supported on this platform")
+
+// ErrAddressOccupied reports a unix listener path that holds an entry other
+// than a socket. The listener never deletes such an entry. The message omits
+// the path.
+var ErrAddressOccupied = errors.New("guestlisten: unix socket path is occupied by a non-socket entry")
 
 // Spec is a parsed listener spec.
 type Spec struct {
@@ -89,15 +95,39 @@ func Listen(spec string) (net.Listener, error) {
 	case SchemeHvsock:
 		return listenHvsock(s.Address)
 	case SchemeUnix:
-		// Remove a stale socket file of an earlier run.
-		if err := os.Remove(s.Address); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("guestlisten: remove stale socket: %w", err)
+		if err := prepareUnixAddress(s.Address); err != nil {
+			return nil, err
 		}
 		return net.Listen("unix", s.Address)
 	case SchemeTCP:
 		return net.Listen("tcp", s.Address)
 	}
 	return nil, fmt.Errorf("guestlisten: unknown scheme %q", s.Scheme)
+}
+
+// prepareUnixAddress clears the filesystem path of a unix listener. It
+// removes only a stale socket file of an earlier run and never deletes any
+// other kind of entry. A Linux abstract address (leading "@") has no
+// filesystem entry, so it needs no cleanup. The returned errors never contain
+// the path, because the caller logs them.
+func prepareUnixAddress(address string) error {
+	if runtime.GOOS == "linux" && strings.HasPrefix(address, "@") {
+		return nil
+	}
+	info, err := os.Lstat(address)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return errors.New("guestlisten: inspect unix socket path failed")
+	}
+	if info.Mode().Type() != os.ModeSocket {
+		return ErrAddressOccupied
+	}
+	if err := os.Remove(address); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.New("guestlisten: remove stale unix socket failed")
+	}
+	return nil
 }
 
 // listenHvsock is the plug-in point of the Hyper-V socket transport of

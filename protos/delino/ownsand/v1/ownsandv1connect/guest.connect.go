@@ -53,7 +53,7 @@ type GuestServiceClient interface {
 	// Serve DataFrame exec and file requests. The agent sends request frames
 	// (EXEC_REQUEST, EXEC_ATTACH_REQUEST, FILE_READ_REQUEST, FILE_WRITE_CHUNK)
 	// and the guest helper answers with EXEC_EVENT, FILE_READ_EVENT,
-	// FILE_WRITE_RESULT, REQUEST_ACCEPTED and ERROR frames of the same
+	// FILE_WRITE_RESULT and ERROR frames of the same
 	// stream_id.
 	Serve(context.Context) *connect.BidiStreamForClient[v1.ServeRequest, v1.ServeResponse]
 }
@@ -122,7 +122,7 @@ type GuestServiceHandler interface {
 	// Serve DataFrame exec and file requests. The agent sends request frames
 	// (EXEC_REQUEST, EXEC_ATTACH_REQUEST, FILE_READ_REQUEST, FILE_WRITE_CHUNK)
 	// and the guest helper answers with EXEC_EVENT, FILE_READ_EVENT,
-	// FILE_WRITE_RESULT, REQUEST_ACCEPTED and ERROR frames of the same
+	// FILE_WRITE_RESULT and ERROR frames of the same
 	// stream_id.
 	Serve(context.Context, *connect.BidiStream[v1.ServeRequest, v1.ServeResponse]) error
 }

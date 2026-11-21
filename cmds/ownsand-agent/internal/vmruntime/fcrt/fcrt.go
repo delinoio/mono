@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package fcrt is the Linux sandbox runtime: one Firecracker microVM per
 // sandbox on KVM. The agent talks to the Firecracker API socket with a

@@ -6,7 +6,7 @@ import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
 // The fixed development port that `rspress.config.ts` declares.
-const FIXED_PORT = 3500;
+const FIXED_PORT = 13500;
 const LOOPBACK_HOST = "127.0.0.1";
 const EXIT_TIMEOUT_MS = 60_000;
 const APP_DIRECTORY = fileURLToPath(new URL("..", import.meta.url));

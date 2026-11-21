@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package guest
 
@@ -17,12 +17,17 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
+	"github.com/delinoio/mono/internal/procgroup"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // KillGrace is the time between SIGTERM and SIGKILL when an exec timeout
 // ends on Linux and macOS guests.
 const KillGrace = 10 * time.Second
+
+// groupPollInterval is how often the pending SIGKILL of a timed-out exec
+// checks that the process group still has a member.
+const groupPollInterval = 50 * time.Millisecond
 
 // pipeWaitDelay bounds how long the helper waits for the output pipes after
 // the command exits, because a background child may keep them open.
@@ -41,8 +46,13 @@ type execManager struct {
 	retention time.Duration
 	capacity  int
 	killGrace time.Duration
+	// groupPoll is how often a pending SIGKILL checks that its process group
+	// still has a member.
+	groupPoll time.Duration
 	logger    *slog.Logger
 	wg        sync.WaitGroup
+	// escalations tracks the pending SIGKILL goroutines, which outlive run.
+	escalations sync.WaitGroup
 }
 
 func newExecManager(now func() time.Time, logger *slog.Logger) *execManager {
@@ -52,6 +62,7 @@ func newExecManager(now func() time.Time, logger *slog.Logger) *execManager {
 		retention: execlog.Retention,
 		capacity:  execlog.KeptOutputBytes,
 		killGrace: KillGrace,
+		groupPoll: groupPollInterval,
 		logger:    logger,
 	}
 }
@@ -111,16 +122,33 @@ func failedEvent(reason ownsandv1.ExecFailureReason, msg string) *ownsandv1.Exec
 // commandEnv returns the helper's own environment with the request
 // variables on top, sorted for a stable order.
 func commandEnv(env map[string]string) []string {
+	return mergeEnv(os.Environ(), env, envKeyFold)
+}
+
+// mergeEnv layers the request variables over the inherited KEY=VALUE entries.
+// fold maps a key to its comparison form: the identity where the operating
+// system treats keys case-sensitively, strings.ToLower on Windows, where the
+// environment is case-insensitive and os/exec keeps the last of several
+// spellings after sorting. An inherited entry whose folded key matches a
+// request key is dropped, so the request value wins and keeps its spelling.
+func mergeEnv(inherited []string, req map[string]string, fold func(string) string) []string {
+	requested := make(map[string]struct{}, len(req))
+	for k := range req {
+		requested[fold(k)] = struct{}{}
+	}
 	merged := map[string]string{}
-	for _, kv := range os.Environ() {
+	for _, kv := range inherited {
+		// Start at index 1 so Windows drive keys such as "=C:" parse.
 		for i := 1; i < len(kv); i++ {
 			if kv[i] == '=' {
-				merged[kv[:i]] = kv[i+1:]
+				if _, overridden := requested[fold(kv[:i])]; !overridden {
+					merged[kv[:i]] = kv[i+1:]
+				}
 				break
 			}
 		}
 	}
-	for k, v := range env {
+	for k, v := range req {
 		merged[k] = v
 	}
 	out := make([]string, 0, len(merged))
@@ -160,7 +188,7 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	cmd.Stdout = outputWriter(l.WriteStdout)
 	cmd.Stderr = outputWriter(l.WriteStderr)
 	cmd.WaitDelay = pipeWaitDelay
-	setProcessGroup(cmd)
+	procgroup.Set(cmd)
 	if err := cmd.Start(); err != nil {
 		ev := startFailure(err)
 		l.Start(now)
@@ -172,32 +200,40 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	logger.Info("exec started", "pid", cmd.Process.Pid)
 
 	var timedOut atomic.Bool
-	var timers []*time.Timer
+	var timeoutTimer *time.Timer
 	var timersMu sync.Mutex
+	// waited is set under timersMu once cmd.Wait returned; a timeout that
+	// fires later belongs to a command that already ended and does nothing.
+	waited := false
 	m.mu.Lock()
 	grace := m.killGrace
+	poll := m.groupPoll
 	m.mu.Unlock()
 	if timeout := req.GetTimeout(); timeout != nil && timeout.AsDuration() > 0 {
 		timersMu.Lock()
-		timers = append(timers, time.AfterFunc(timeout.AsDuration(), func() {
+		timeoutTimer = time.AfterFunc(timeout.AsDuration(), func() {
+			timersMu.Lock()
+			defer timersMu.Unlock()
+			if waited {
+				return
+			}
 			timedOut.Store(true)
 			logger.Info("exec timeout reached; terminating")
 			terminate(cmd.Process)
 			if forceAfterTerminate {
-				timersMu.Lock()
-				timers = append(timers, time.AfterFunc(grace, func() {
-					logger.Info("exec did not stop after SIGTERM; killing")
-					kill(cmd.Process)
-				}))
-				timersMu.Unlock()
+				m.escalate(cmd.Process, grace, poll, logger)
 			}
-		}))
+		})
 		timersMu.Unlock()
 	}
 	waitErr := cmd.Wait()
 	timersMu.Lock()
-	for _, t := range timers {
-		t.Stop()
+	waited = true
+	// A command that ended before its timeout leaves no timer behind. After a
+	// timeout on Linux and macOS the escalation started by the timeout keeps
+	// running on its own, without delaying the exited event.
+	if timeoutTimer != nil {
+		timeoutTimer.Stop()
 	}
 	timersMu.Unlock()
 	exited := &ownsandv1.ExecExited{TimedOut: timedOut.Load(), EndTime: timestamppb.New(m.now())}
@@ -214,4 +250,44 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	}
 	l.Finish(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: exited}}, m.now())
 	logger.Info("exec exited", "exit_code", code, "signal", signal, "timed_out", exited.GetTimedOut())
+}
+
+// escalate sends SIGKILL to the process group of p after grace, unless the
+// group has no member left by then. The direct child may exit on SIGTERM while
+// another member of its group ignores it, so the escalation outlives
+// cmd.Wait. The group id stays reserved only while a member lives: once the
+// group is empty the id can name an unrelated process group. The escalation
+// therefore polls the group and ends as soon as it is empty, so that the
+// SIGKILL is never sent to a reused id after the original group is gone. A
+// pid reuse inside one poll interval remains theoretically possible, but a
+// reuse needs a full pid wrap-around.
+func (m *execManager) escalate(p *os.Process, grace, poll time.Duration, logger *slog.Logger) {
+	if poll <= 0 || poll > grace {
+		poll = grace
+	}
+	if poll <= 0 {
+		poll = time.Millisecond
+	}
+	m.escalations.Add(1)
+	go func() {
+		defer m.escalations.Done()
+		deadline := time.NewTimer(grace)
+		defer deadline.Stop()
+		tick := time.NewTicker(poll)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				if !processGroupAlive(p) {
+					return
+				}
+			case <-deadline.C:
+				if processGroupAlive(p) {
+					logger.Info("exec process group did not stop after SIGTERM; killing")
+					kill(p)
+				}
+				return
+			}
+		}
+	}()
 }

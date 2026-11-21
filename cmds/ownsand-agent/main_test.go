@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package main
 
@@ -63,5 +63,14 @@ func TestCLIMisc(t *testing.T) {
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", t.TempDir())
 	if code := run([]string{"run"}, nil, &out, &errb); code != exitNotEnrolled {
 		t.Fatalf("run without enrollment: %d", code)
+	}
+	// Under launchd (hidden marker flag) a missing enrollment exits 0, so
+	// that KeepAlive SuccessfulExit=false does not restart the agent; the
+	// public exit code of plain `run` stays 3 (checked above).
+	if code := run([]string{"run", "--service-manager", "launchd"}, nil, &out, &errb); code != exitOK {
+		t.Fatalf("launchd run without enrollment: %d", code)
+	}
+	if code := run([]string{"run", "--service-manager", "bogus"}, nil, &out, &errb); code != exitUsage {
+		t.Fatalf("unknown service manager: %d", code)
 	}
 }

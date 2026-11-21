@@ -235,42 +235,60 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		}
 		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: existing.proto()}), nil
 	}
-	src, err := h.resolveSource(ctx, h.DB.Pool, orgID, m.GetSource())
-	if err != nil {
-		return nil, h.internal(ctx, "create sandbox", err)
-	}
-	sreq := scheduler.Request{
-		VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
-		NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
-		DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
-	}
-	lineage := ""
-	if src != nil {
-		sn := src.snapshot.pb
-		if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
-			return nil, errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
-		}
-		sreq.GuestOS = sn.GetGuestOs()
-		sreq.Snapshot = &scheduler.Snapshot{
-			ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
-			Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
-			HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
-			MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
-			MacOSHardwareModel: sn.GetMacosHardwareModel(),
-		}
-		if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
-			lineage = src.snapshot.lineage
-		}
-	} else {
-		sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
-	}
-
 	sandboxID := newID()
 	now := h.now()
-	var created *sandboxRow
+	var src *resolvedSource
+	var sreq scheduler.Request
+	var created, replayed *sandboxRow
 	var decision scheduler.Decision
 	var limits *ownsandv1.DeviceLimits
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// A miss on the pool is not final: an identical request may be
+		// reserving the same key right now. Serialize on the key, then look
+		// it up again in this transaction before anything that can fail with
+		// a capacity error. The lock is transaction-scoped and keyed by the
+		// organization and key; orgID is a fixed-length UUID, so the joined
+		// text is unambiguous. Only this handler takes it, and it never waits
+		// for it while holding a device row lock (the device lock comes
+		// later in this transaction), so the lock order stays acyclic.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))", orgID, m.GetIdempotencyKey()); err != nil {
+			return err
+		}
+		existing, err := h.lookupIdempotent(ctx, tx, orgID, m.GetIdempotencyKey(), hash)
+		if err != nil || existing != nil {
+			// Another request committed the key first: return its sandbox
+			// without a reservation, audit event or command.
+			replayed = existing
+			return err
+		}
+		if src, err = h.resolveSource(ctx, tx, orgID, m.GetSource()); err != nil {
+			return err
+		}
+		sreq = scheduler.Request{
+			VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
+			NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
+			DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
+		}
+		lineage := ""
+		if src != nil {
+			sn := src.snapshot.pb
+			if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
+				return errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
+			}
+			sreq.GuestOS = sn.GetGuestOs()
+			sreq.Snapshot = &scheduler.Snapshot{
+				ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
+				Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
+				HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
+				MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
+				MacOSHardwareModel: sn.GetMacosHardwareModel(),
+			}
+			if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
+				lineage = src.snapshot.lineage
+			}
+		} else {
+			sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
+		}
 		devices, err := h.placementDevices(ctx, tx, orgID, lineage)
 		if err != nil {
 			return err
@@ -348,6 +366,9 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, h.internal(ctx, "create sandbox", err)
 	}
+	if replayed != nil {
+		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: replayed.proto()}), nil
+	}
 	h.Logger.InfoContext(ctx, "sandbox_created", slog.String("sandbox_id", sandboxID), slog.String("device_id", decision.DeviceID),
 		slog.Bool("memory_restore", decision.MemoryRestore), slog.Bool("import", decision.NeedsImport))
 
@@ -408,22 +429,60 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	}}}
 	wait := s.Hub.Commands.Register(importCmd.CommandId)
 	defer s.Hub.Commands.Cancel(importCmd.CommandId)
+	// The assignment is recorded before the command is sent, so the agent's
+	// first download URL request finds it. It is cleared when the import
+	// ends: on a result, a send failure, the wait timeout or a closed channel
+	// (every return below) and as soon as the result arrives.
+	releaseImport := s.imports.register(conn, sn.GetSnapshotId(), importCmd.CommandId)
+	defer releaseImport()
 	if _, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdImportSnapshot, orgID: info.orgID, snapshotID: sn.GetSnapshotId()}, importCmd); err != nil {
 		return
 	}
 	select {
 	case res := <-wait:
+		releaseImport()
 		if res.GetError() != nil {
 			_ = s.failCreateRejected(context.WithoutCancel(ctx), info.sandboxID)
 			s.watch.fire(info.sandboxID)
 			return
 		}
 	case <-ctx.Done():
+		// A closed channel keeps reconnect reconciliation as the owner of the
+		// sandbox. An expired wait on a live connection would otherwise leave
+		// the CREATING reservation committed forever, so fail the create.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.failImportTimeout(ctx, conn, info)
+		}
 		return
 	}
 	if _, err := s.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
 		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", info.sandboxID), slog.Any("error", err))
 	}
+}
+
+// importFailTimeout bounds the database update that fails a create whose
+// import wait expired; the expired wait context cannot be used for it.
+const importFailTimeout = 5 * time.Second
+
+// failImportTimeout moves a sandbox whose import wait expired to FAILED with
+// CREATE_FAILED through the guarded rejection transition and notifies
+// watchers. It does not retry the import. A late import success cannot revive
+// the sandbox because the transition only acts on CREATING and the create
+// command is never sent after the import goroutine returned.
+func (s *Service) failImportTimeout(ctx context.Context, conn *hub.Conn, info commandInfo) {
+	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importFailTimeout)
+	defer cancel()
+	err := s.failCreateRejected(dbCtx, info.sandboxID)
+	attrs := []any{
+		slog.String("sandbox_id", info.sandboxID),
+		slog.Duration("import_wait", s.Timing.ImportWait),
+	}
+	if err != nil {
+		s.Logger.ErrorContext(dbCtx, "import_timeout_fail_create_failed", append(attrs, slog.Any("error", err))...)
+		return
+	}
+	s.Logger.WarnContext(dbCtx, "import_timeout_create_failed", attrs...)
+	s.watch.fire(info.sandboxID)
 }
 
 func (h SandboxHandler) GetSandbox(ctx context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
@@ -509,19 +568,33 @@ func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string, done
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	for {
-		changed := s.watch.watch(sandboxID)
-		sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		if err != nil || done(sb) {
+		sb, err, finished := s.waitSandboxOnce(ctx, orgID, sandboxID, done, poll.C, deadline.C)
+		if finished {
 			return sb, err
 		}
-		select {
-		case <-changed:
-		case <-poll.C:
-		case <-deadline.C:
-			return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	}
+}
+
+// waitSandboxOnce is one iteration of waitSandbox. It subscribes before it
+// reads, so a change between the read and the wait is not lost, and it
+// unregisters the subscription on every exit.
+func (s *Service) waitSandboxOnce(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool, poll, deadline <-chan time.Time) (sb *sandboxRow, err error, finished bool) {
+	changed, unregister := s.watch.watch(sandboxID)
+	defer unregister()
+	sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+	if err != nil || done(sb) {
+		return sb, err, true
+	}
+	select {
+	case <-changed:
+		return nil, nil, false
+	case <-poll:
+		return nil, nil, false
+	case <-deadline:
+		sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+		return sb, err, true
+	case <-ctx.Done():
+		return nil, ctx.Err(), true
 	}
 }
 

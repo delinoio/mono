@@ -100,6 +100,52 @@ describe("peer-to-peer data path", () => {
     expect(rtc.frames[1]!.streamId).toBe(2n);
   });
 
+  test("a caller aborted while the shared session setup is pending sends no frame", async () => {
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    const first = sandbox.run({ command: ["a"] });
+    const second = sandbox
+      .run({ command: ["b"], signal: controller.signal })
+      .catch((e) => e);
+    // Setup is pending (ICE gathering takes virtual time).
+    await Promise.resolve();
+    controller.abort(reason);
+    const [run, error] = await h.clock.run(Promise.all([first, second]));
+    expect(error).toBe(reason);
+    expect(run.result.kind).toBe(ExecResultKind.Exited);
+    expect(rtc.frames).toHaveLength(1);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+  });
+
+  test("two callers with live signals both send a frame on the shared session", async () => {
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const controller = new AbortController();
+    const results = await h.clock.run(
+      Promise.all([
+        sandbox.run({ command: ["a"] }),
+        sandbox.run({ command: ["b"], signal: controller.signal }),
+      ]),
+    );
+    expect(results.map((r) => r.result.kind)).toEqual([
+      ExecResultKind.Exited,
+      ExecResultKind.Exited,
+    ]);
+    expect(rtc.frames).toHaveLength(2);
+  });
+
   test("falls back to the relay when the data channel does not open within 10 seconds", async () => {
     const { h } = p2pSetup(() => {}, { neverOpen: true });
     h.api.stream(RelayService, "Exec", function* () {

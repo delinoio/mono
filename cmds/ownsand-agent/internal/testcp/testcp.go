@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package testcp is an in-process fake of the control plane's
 // device-facing services (AgentService and RelayAgentService) for agent
@@ -26,7 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )

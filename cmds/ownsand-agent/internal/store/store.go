@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package store owns the agent state directory. The identity file (device
 // ID and Ed25519 private key) is kept apart from every other record, so the
@@ -26,6 +26,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 )
@@ -312,9 +313,16 @@ func (s *Store) DeleteSnapshot(id string) error {
 	return os.RemoveAll(dir)
 }
 
+// transferArchivePattern matches the temporary archives that snapxfer creates
+// in snapshots/ with os.CreateTemp: ".export-<id>-<digits>.tar" and
+// ".import-<id>-<digits>.tar". Keep it in step with the prefixes in snapxfer.
+var transferArchivePattern = regexp.MustCompile(`^\.(export|import)-.+-[0-9]+\.tar$`)
+
 // LoadSnapshots decodes every snapshot record with decode. A snapshot
 // directory without a record is removed: it is a partial import or
-// snapshot.
+// snapshot. A regular file that matches a snapshot transfer archive name is
+// removed too: a killed process leaves it, because snapxfer removes it only
+// with a deferred call. Other files stay.
 func (s *Store) LoadSnapshots(decode func(data []byte) error) error {
 	entries, err := os.ReadDir(s.Path(SnapshotsDir))
 	if err != nil {
@@ -322,6 +330,11 @@ func (s *Store) LoadSnapshots(decode func(data []byte) error) error {
 	}
 	for _, e := range entries {
 		if !e.IsDir() {
+			if e.Type().IsRegular() && transferArchivePattern.MatchString(e.Name()) {
+				if err := os.Remove(s.Path(SnapshotsDir, e.Name())); err != nil && !errors.Is(err, fs.ErrNotExist) {
+					return fmt.Errorf("store: remove abandoned transfer archive %s: %w", e.Name(), err)
+				}
+			}
 			continue
 		}
 		data, err := os.ReadFile(s.Path(SnapshotsDir, e.Name(), snapshotRecord))

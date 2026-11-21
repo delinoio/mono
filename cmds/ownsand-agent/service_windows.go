@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package main
 
@@ -6,9 +6,11 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 
+	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/mgr"
 
@@ -69,7 +71,19 @@ func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 }
 
 func serviceDefinition(exe string) string {
-	return service.WindowsCommand(exe) + "\n"
+	return service.WindowsDefinition(exe, serviceEnv())
+}
+
+// setServiceEnvironment writes the REG_MULTI_SZ Environment value of the
+// service key: the service control manager passes it to the service process
+// as its environment.
+func setServiceEnvironment(entries []string) error {
+	k, err := registry.OpenKey(registry.LOCAL_MACHINE, service.WindowsServiceRegistryKey, registry.SET_VALUE)
+	if err != nil {
+		return err
+	}
+	defer k.Close()
+	return k.SetStringsValue(service.WindowsEnvironmentValue, entries)
 }
 
 func serviceInstall(stdout, stderr io.Writer) int {
@@ -90,6 +104,19 @@ func serviceInstall(stdout, stderr io.Writer) int {
 		return exitError
 	}
 	defer s.Close()
+	// A Windows service does not inherit the installing shell environment,
+	// so the OWNSAND_AGENT_* variables go into the service Environment value
+	// before the service can start. Only names and the count are logged:
+	// values can hold secrets such as release keys.
+	env := serviceEnv()
+	if err := service.InstallWindowsEnvironment(env, setServiceEnvironment, s.Delete); err != nil {
+		slog.New(slog.NewJSONHandler(stderr, nil)).With("component", "ownsand-agent").Error("service environment write failed", "service", service.Name, "variable_count", len(env), "variables", environmentNames(env), "error", err.Error())
+		fmt.Fprintln(stderr, "ownsand-agent:", err)
+		return exitError
+	}
+	if len(env) > 0 {
+		slog.New(slog.NewJSONHandler(stderr, nil)).With("component", "ownsand-agent").Info("service environment written", "service", service.Name, "variable_count", len(env), "variables", environmentNames(env))
+	}
 	fmt.Fprintf(stdout, "Installed the %s service. Start it with:\n  sc.exe start %s\n", service.Name, service.Name)
 	return exitOK
 }

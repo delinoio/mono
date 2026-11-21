@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package sandboxes keeps the sandbox and snapshot records of the device,
 // runs the sandbox commands of the agent channel through a runtime,
@@ -23,8 +23,8 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -84,7 +84,10 @@ type sandbox struct {
 	guest        *guestclient.Client
 	createCancel context.CancelFunc
 	// ending is true while the agent itself stops the VM.
-	ending         bool
+	ending bool
+	// stopped is true once an end attempt stopped the VM and told the exec
+	// tracker, so a retry after a later failure does not repeat them.
+	stopped        bool
 	idleDirty      bool
 	lastIdleReport time.Time
 }
@@ -113,6 +116,9 @@ type Manager struct {
 	epoch     string
 	sandboxes map[string]*sandbox
 	snapshots map[string]*snapshot
+	// pending holds the snapshots whose capture runs now, by ID. They are
+	// not in snapshots, so they are not usable and not reported.
+	pending   map[string]*pendingSnapshot
 	limits    *ownsandv1.DeviceLimits
 	transfers int
 	reports   map[uint64]map[string]uint64
@@ -153,7 +159,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	}
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
-		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, reports: map[uint64]map[string]uint64{},
+		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {
@@ -452,6 +458,22 @@ func validateCreate(cmd *ownsandv1.CreateSandboxCommand) error {
 	return nil
 }
 
+// existingCreateLocked handles a create for an id that already has a record.
+// found is false when the id is unknown. A deleted or terminal record yields a
+// failed-precondition error; a live record yields its current entry, like a
+// repeated create command. The caller must hold m.mu.
+func (m *Manager) existingCreateLocked(id string) (entry *ownsandv1.SandboxStateEntry, err error, found bool) {
+	sb, ok := m.sandboxes[id]
+	if !ok {
+		return nil, nil, false
+	}
+	entry = sb.rec.Entry(m.epoch)
+	if sb.rec.DeleteMarker || sb.rec.Terminal() {
+		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox was deleted before its create"), true
+	}
+	return entry, nil, true
+}
+
 // Create runs a create command. It returns the sandbox entry and, when the
 // create was rejected or failed, an error.
 func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxCommand) (*ownsandv1.SandboxStateEntry, error) {
@@ -460,15 +482,9 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	}
 	id := cmd.GetSandboxId()
 	m.mu.Lock()
-	if sb, ok := m.sandboxes[id]; ok {
-		entry := sb.rec.Entry(m.epoch)
-		deleted := sb.rec.DeleteMarker || sb.rec.Terminal()
+	if entry, err, found := m.existingCreateLocked(id); found {
 		m.mu.Unlock()
-		if deleted {
-			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox was deleted before its create")
-		}
-		// A repeated create command returns the current state.
-		return entry, nil
+		return entry, err
 	}
 	gate := m.gate
 	m.mu.Unlock()
@@ -483,6 +499,13 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	defer release()
 
 	m.mu.Lock()
+	// The gate may block with m.mu released, so a concurrent delete (marker or
+	// terminal record) or a duplicate create may have recorded this id. Repeat
+	// the existence check before any limit check, record write or VM start.
+	if entry, err, found := m.existingCreateLocked(id); found {
+		m.mu.Unlock()
+		return entry, err
+	}
 	if err := m.checkLimitsLocked(cmd); err != nil {
 		m.mu.Unlock()
 		return nil, err
@@ -619,7 +642,11 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 }
 
 // endLocked stops the VM and records the end. The caller holds sb.cmdMu.
-func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.SandboxState, reason ownsandv1.SandboxEndReason) (*ownsandv1.SandboxStateEntry, error) {
+// When the attempt fails, it clears sb.ending so that a later Tick (TTL) or
+// Delete retries the end; the record may stay in DELETING until then. The
+// retry runs under sb.cmdMu, so ends still cannot overlap. A retry does not
+// repeat the exec tracker notification.
+func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.SandboxState, reason ownsandv1.SandboxEndReason) (entry *ownsandv1.SandboxStateEntry, err error) {
 	m.mu.Lock()
 	sb.ending = true
 	guest := sb.guest
@@ -630,25 +657,40 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 		return entry, nil
 	}
 	m.mu.Unlock()
+	defer func() {
+		if err == nil {
+			return
+		}
+		m.mu.Lock()
+		if !m.closed && !sb.rec.Terminal() {
+			sb.ending = false
+		}
+		m.mu.Unlock()
+	}()
 	if _, err := m.update(sb, func(r *Record) {
 		r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
 		r.EndReason = reason
 	}); err != nil {
 		return nil, err
 	}
-	if err := m.rt.Delete(ctx, sb.rec.SandboxID); err != nil {
-		m.logger.Error("runtime delete failed", "sandbox_id", sb.rec.SandboxID, "error", err)
-		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox VM could not be stopped")
-	}
-	if execs != nil {
-		execs.SandboxEnded(sb.rec.SandboxID, reason)
-	}
-	if guest != nil {
-		guest.Close()
-	}
 	m.mu.Lock()
-	sb.vm, sb.guest = nil, nil
+	stopped := sb.stopped
 	m.mu.Unlock()
+	if !stopped {
+		if err := m.rt.Delete(ctx, sb.rec.SandboxID); err != nil {
+			m.logger.Error("runtime delete failed", "sandbox_id", sb.rec.SandboxID, "error", err)
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox VM could not be stopped")
+		}
+		if execs != nil {
+			execs.SandboxEnded(sb.rec.SandboxID, reason)
+		}
+		if guest != nil {
+			guest.Close()
+		}
+		m.mu.Lock()
+		sb.vm, sb.guest, sb.stopped = nil, nil, true
+		m.mu.Unlock()
+	}
 	return m.update(sb, func(r *Record) {
 		r.State = state
 		r.EndReason = reason

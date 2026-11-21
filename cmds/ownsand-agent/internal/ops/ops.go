@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package ops serves the DataFrame operations of the data path (exec, exec
 // attach, file read and file write) for both transports, the peer-to-peer
@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +24,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
 	"github.com/delinoio/mono/go/ownsand/datapath"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -96,7 +97,11 @@ type execOp struct {
 	digest    []byte
 	idTime    time.Time
 	log       *execlog.Log
-	cancel    context.CancelFunc
+	// ctx bounds the guest forwarding; cancel ends it. The forwarding
+	// goroutine cancels it when forwardExec returns; the kept result in log
+	// is independent of it.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type fileOp struct {
@@ -167,7 +172,16 @@ func New(sb Sandboxes, st *store.Store, opts Options) (*Dispatcher, error) {
 	now := d.now()
 	for _, p := range saved {
 		if now.Sub(p.IDTime) < persistedExecRetention {
-			d.lost[p.ExecID] = p
+			// Requests are required to spell exec_id in lowercase, but an
+			// earlier agent version accepted any case and may have persisted
+			// a mixed-case record. Reserve its lowercase spelling, so that
+			// the lowercase request cannot start the command a second time.
+			// The persisted record keeps the spelling it was written with.
+			key := strings.ToLower(p.ExecID)
+			if _, taken := d.lost[key]; taken && p.ExecID != key {
+				continue
+			}
+			d.lost[key] = p
 		}
 	}
 	if len(saved) > 0 {

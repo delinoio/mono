@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guest implements the GuestService of the guest helper: the
 // readiness check, the clock setting and the DataFrame exec and file
@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -297,26 +296,83 @@ wait:
 		s.sendError(out, f, errorf(ownsandv1.ErrorCode_ERROR_CODE_OUT_OF_RANGE, "offset is beyond the end of the file"))
 		return
 	}
-	file, err := os.Open(e.snapshot)
+	// The snapshot is opened and read on a worker goroutine, so a stalled
+	// disk never blocks the keepalive ticker or the cancellation of this
+	// handler. The worker only reads; every frame is sent from this
+	// goroutine, so nothing is sent after the end or an error frame.
+	chunks := make(chan readChunk)
+	stop := make(chan struct{})
+	defer close(stop)
+	go s.readChunks(e, req.GetOffset(), chunks, stop)
+	for {
+		select {
+		case c, ok := <-chunks:
+			if !ok {
+				_ = send(&ownsandv1.FileReadEnd{SizeBytes: e.size})
+				return
+			}
+			if c.err != nil {
+				s.sendError(out, f, c.err)
+				return
+			}
+			if send(c.chunk) != nil {
+				return
+			}
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if send(nil) != nil {
+				return
+			}
+		}
+	}
+}
+
+// readChunk is one result of the chunk worker: a chunk or the error that
+// ends the read.
+type readChunk struct {
+	chunk *ownsandv1.FileChunk
+	err   error
+}
+
+// readChunks opens the snapshot of e and publishes its chunks from offset to
+// the end of the snapshot in order, then closes out. It publishes at most
+// one error, as its last result. It stops when stop is closed and always
+// closes the file it opened, also when it finishes a read that the handler
+// no longer waits for.
+func (s *Server) readChunks(e *readEntry, offset int64, out chan<- readChunk, stop <-chan struct{}) {
+	defer close(out)
+	publish := func(c readChunk) bool {
+		select {
+		case out <- c:
+			return true
+		case <-stop:
+			return false
+		}
+	}
+	file, err := s.reads.open(e.snapshot)
 	if err != nil {
-		s.sendError(out, f, fsError("read snapshot", err))
+		publish(readChunk{err: fsError("read snapshot", err)})
 		return
 	}
 	defer file.Close()
 	buf := make([]byte, datapath.MaxFileChunkSize)
-	for off := req.GetOffset(); off < e.size; {
+	for off := offset; off < e.size; {
+		select {
+		case <-stop:
+			return
+		default:
+		}
 		n, err := file.ReadAt(buf[:min(int64(len(buf)), e.size-off)], off)
 		if n == 0 && err != nil {
-			s.sendError(out, f, fsError("read snapshot", err))
+			publish(readChunk{err: fsError("read snapshot", err)})
 			return
 		}
-		chunk := &ownsandv1.FileChunk{Offset: off, Data: append([]byte(nil), buf[:n]...)}
-		if send(chunk) != nil {
+		if !publish(readChunk{chunk: &ownsandv1.FileChunk{Offset: off, Data: append([]byte(nil), buf[:n]...)}}) {
 			return
 		}
 		off += int64(n)
 	}
-	_ = send(&ownsandv1.FileReadEnd{SizeBytes: e.size})
 }
 
 // Handler returns the HTTP handler of the GuestService. Compression is off:

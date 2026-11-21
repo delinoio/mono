@@ -44,9 +44,12 @@ func (c *Control) Kick() {
 
 // LeaseAcquired starts the event processor at the newest event: events
 // older than the lease belong to channels of the previous holder, and the
-// state reports of reconnecting agents trigger pending deletes again.
-func (c *Control) LeaseAcquired() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// state reports of reconnecting agents trigger pending deletes again. The
+// lease cancels ctx at the confirmed expiry of the ownership period, so the
+// database read cannot delay the loss transition; a failed read leaves the
+// cursor unset and the event processor repeats it while the lease is held.
+func (c *Control) LeaseAcquired(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	id, err := events.LatestID(ctx, c.S.DB.Pool)
 	if err != nil {
@@ -105,7 +108,7 @@ func (c *Control) processEvents(ctx context.Context) {
 	cursor := c.cursor
 	c.mu.Unlock()
 	if cursor < 0 {
-		c.LeaseAcquired()
+		c.LeaseAcquired(ctx)
 		return
 	}
 	for {
@@ -180,6 +183,16 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 	}
 }
 
+// expireCommands removes the command records whose channel closed longer
+// ago than the command grace period. It changes no durable state and
+// synthesizes no command failure: the result of an expired command was lost,
+// and the agent's next state report reconciles the sandbox as usual.
+func (s *Service) expireCommands(ctx context.Context) {
+	if n := s.commands.expire(s.now(), s.commandGrace()); n > 0 {
+		s.Logger.InfoContext(ctx, "agent_commands_expired", slog.Int("commands", n), slog.Duration("grace", s.commandGrace()))
+	}
+}
+
 // runOfflineSweep marks devices offline that are ONLINE in the database
 // but have no channel on the lease holder and were not heard from for the
 // heartbeat timeout (for example after a lease handover or a crash).
@@ -192,10 +205,17 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		// The sweep also drops the expired command records. It runs without
+		// the lease: a record outlives the lease only when its channel closed
+		// at the lease release, and it must expire then too.
+		c.S.expireCommands(ctx)
 		if !c.held() {
 			continue
 		}
-		var live []string
+		// A non-nil slice: pgx binds a nil slice as SQL NULL, which turns
+		// NOT (x = ANY(NULL)) into NULL and matches no row when the channel
+		// registry is empty.
+		live := []string{}
 		for _, conn := range c.S.Hub.All() {
 			live = append(live, conn.DeviceID)
 		}

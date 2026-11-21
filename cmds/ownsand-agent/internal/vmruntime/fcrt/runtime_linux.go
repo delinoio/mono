@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package fcrt
 
@@ -24,6 +24,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/launcher"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -57,14 +58,31 @@ func New(opts Options) (*Runtime, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	logger := opts.Logger
+	return newRuntime(opts, func() {
+		if hasNetAdmin() {
+			netpolicy.CleanupHost(logger)
+		}
+	})
+}
+
+// newRuntime builds the runtime with an injectable startup cleanup. With a
+// network manager it calls startupCleanup once, before the refresh loop
+// starts; without a manager it calls neither. New passes the privileged
+// host clean-up, so that tests can pass a fake and never reach the live
+// host network, whatever the capabilities of the test process are.
+func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
 	if opts.Binary == "" {
 		opts.Binary = "firecracker"
 	}
 	if p, err := exec.LookPath(opts.Binary); err == nil {
 		opts.Binary = p
 	}
-	if opts.Network != nil && hasNetAdmin() {
-		netpolicy.CleanupHost(opts.Logger)
+	if opts.Network != nil {
+		startupCleanup()
 	}
 	r := &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}}
 	if opts.Network != nil {
@@ -329,7 +347,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 // startProcess starts firecracker for v, bound to the agent process.
 func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
-	logf, err := os.OpenFile(filepath.Join(v.dir, logFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logf, err := openCappedLog(filepath.Join(v.dir, logFile), consoleLogLimit, r.logger, v.id)
 	if err != nil {
 		return err
 	}
@@ -337,7 +355,13 @@ func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
 	os.Remove(filepath.Join(v.dir, vsockSocket))
 	cmd := exec.Command(r.opts.Binary, "--api-sock", apiSocket, "--id", idPrefix+v.id)
 	cmd.Dir = v.dir
+	// One writer value for both streams: os/exec then uses a single pipe and
+	// one copying goroutine, and Wait returns after the copy ended, so the
+	// close below never races a write.
 	cmd.Stdout, cmd.Stderr = logf, logf
+	// Output goes through a pipe now, so a stray descendant that keeps the
+	// pipe open must not keep Wait (and v.exited) from returning.
+	cmd.WaitDelay = 5 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := launcher.Start(cmd); err != nil {
 		logf.Close()
@@ -474,7 +498,7 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
-	if err := syncGuest(ctx, v); err != nil {
+	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
 	}
 	return r.setState(ctx, m, "Paused", true)

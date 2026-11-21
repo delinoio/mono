@@ -23,7 +23,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
@@ -98,6 +98,9 @@ type Env struct {
 	Logger *slog.Logger
 	// Objects is the in-memory object store of snapshot exports.
 	Objects *objectstore.Memory
+
+	opts app.Options
+	stop func()
 }
 
 // Option changes the app options before New wires the app.
@@ -141,25 +144,52 @@ func New(t testing.TB, opts ...Option) *Env {
 	for _, opt := range opts {
 		opt(&o)
 	}
-	a, err := app.New(o)
+	env := &Env{T: t, DB: database, Clock: clock, Logs: logs, Logger: logger, Objects: objects, opts: o}
+	env.start()
+	return env
+}
+
+// start wires and runs an app from the stored options over the
+// environment's database and replaces App and Server with it.
+func (e *Env) start() {
+	e.T.Helper()
+	a, err := app.New(e.opts)
 	if err != nil {
-		t.Fatalf("wire app: %v", err)
+		e.T.Fatalf("wire app: %v", err)
 	}
 	srv := httptest.NewUnstartedServer(a.Handler())
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
-	t.Cleanup(srv.Close)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		a.Run(ctx)
 	}()
-	t.Cleanup(func() {
-		cancel()
-		<-done
-	})
-	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, Logger: logger, Objects: objects}
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			// Run releases the lease and closes every agent channel when
+			// ctx ends.
+			cancel()
+			<-done
+			srv.Close()
+		})
+	}
+	e.T.Cleanup(stop)
+	e.App, e.Server, e.stop = a, srv, stop
+}
+
+// Restart replaces the control plane with a new instance over the same
+// database and object store, as a control plane process restart does: the
+// old instance releases its lease and closes every agent channel, and its
+// in-memory state (agent channels, remembered commands) is gone. Clients
+// and fake agents created before the restart are bound to the old server;
+// create them again, or Connect a fake agent again, after it.
+func (e *Env) Restart() {
+	e.T.Helper()
+	e.stop()
+	e.start()
 }
 
 // UserToken returns a fake Logto access token for userID.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package update
 
@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	"github.com/delinoio/mono/internal/semver"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -115,7 +115,7 @@ func New(opts Options) (*Updater, error) {
 	}
 	if st != nil && st.PendingUpdate != nil {
 		pending := *st.PendingUpdate
-		if c, err := version.CompareStrings(pending.TargetVersion, opts.Running); err == nil && c == 0 {
+		if c, err := semver.CompareStrings(pending.TargetVersion, opts.Running); err == nil && c == 0 {
 			opts.Logger.Info("agent update installed", "version", opts.Running, "previous_version", pending.PreviousVersion)
 		} else {
 			u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
@@ -170,6 +170,17 @@ func (u *Updater) setState(s ownsandv1.AgentUpdateState, target string) {
 	u.opts.Logger.Info("agent update state", "update_state", s.String(), "target_version", target)
 }
 
+// clearPendingLocked drops the queued artifact and removes its downloaded
+// file. The caller holds u.mu. revokedRunning is kept: it describes the
+// running version, not the queued artifact.
+func (u *Updater) clearPendingLocked() {
+	if u.artifact == "" {
+		return
+	}
+	os.Remove(filepath.Clean(u.artifact))
+	u.artifact = ""
+}
+
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -197,7 +208,7 @@ func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, e
 // installation waits until the device is idle; Run performs it.
 func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand) error {
 	target := cmd.GetTargetVersion()
-	if _, err := version.Parse(target); err != nil {
+	if _, err := semver.Parse(target); err != nil {
 		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
 		return err
 	}
@@ -206,8 +217,11 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 		u.mu.Unlock()
 		return ErrInstalling
 	}
+	// A new command supersedes the queued artifact, whatever its outcome:
+	// a failed or same-version target must not install the stale artifact.
+	u.clearPendingLocked()
 	u.mu.Unlock()
-	if c, _ := version.CompareStrings(target, u.opts.Running); c == 0 {
+	if c, _ := semver.CompareStrings(target, u.opts.Running); c == 0 {
 		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 		return nil
 	}
@@ -225,7 +239,7 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 	// The control plane decides lower targets: a pinned version or a
 	// revocation recovery. The agent cannot see the organization policy,
 	// so it installs the verified target that the control plane sent.
-	if c, _ := version.CompareStrings(target, u.opts.Running); c < 0 {
+	if c, _ := semver.CompareStrings(target, u.opts.Running); c < 0 {
 		u.opts.Logger.Info("agent update installs a lower version", "target_version", target, "revocation_recovery", cmd.GetRevocationRecovery())
 	}
 	u.mu.Lock()
@@ -321,7 +335,9 @@ func (u *Updater) fail(target string) {
 	u.mu.Lock()
 	u.installing = false
 	u.artifact = ""
-	u.revokedRunning = false
+	// revokedRunning is deliberately kept: it describes the running version
+	// from a verified manifest, not the failed install attempt, so creates stay
+	// blocked until a later install replaces the revoked version.
 	u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
 	u.target = target
 	u.mu.Unlock()

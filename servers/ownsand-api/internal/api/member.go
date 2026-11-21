@@ -187,7 +187,7 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		return nil, errRateLimited(retry)
 	}
 	if addr := clientAddr(ctx); addr != "" {
-		if ok, retry := h.Limits.PerClient.Allow("invitation:"+addr, 1); !ok {
+		if ok, retry := h.Limits.PerClient.Allow(addr, 1); !ok {
 			return nil, errRateLimited(retry)
 		}
 	}
@@ -221,9 +221,17 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		}
 		now := h.now()
 		membershipID := newID()
-		if _, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, $3, $4, $5)",
-			membershipID, orgID, p.ID, role, now); err != nil {
+		// Two concurrent acceptances by the same user can both pass the
+		// existence check above. ON CONFLICT turns the loser's unique
+		// violation into zero affected rows, so it gets already_exists
+		// instead of an internal error. Other SQL errors stay internal.
+		tag, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (organization_id, user_id) DO NOTHING",
+			membershipID, orgID, p.ID, role, now)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return errAlreadyExists("the caller is already a member of the organization")
 		}
 		if _, err := tx.Exec(ctx, "UPDATE invitations SET accept_time = $2, accepted_by = $3 WHERE invitation_id = $1", invID, now, p.ID); err != nil {
 			return err

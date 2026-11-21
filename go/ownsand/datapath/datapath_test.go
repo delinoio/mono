@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -15,7 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -370,6 +371,32 @@ func TestSplitMessages(t *testing.T) {
 	}
 }
 
+func TestSplitMessagesHugeMaxSize(t *testing.T) {
+	// len+maxSize-1 would overflow int for this limit.
+	stream := []byte("ab")
+	got := SplitMessages(stream, math.MaxInt)
+	if len(got) != 1 || string(got[0]) != "ab" || cap(got[0]) != 2 {
+		t.Fatalf("got %q cap %d", got, cap(got[0]))
+	}
+	if &got[0][0] != &stream[0] {
+		t.Fatal("message does not share the input memory")
+	}
+}
+
+func TestSplitMessagesBoundaries(t *testing.T) {
+	// Exact division leaves no empty trailing message.
+	got := SplitMessages([]byte("abcd"), 2)
+	if len(got) != 2 || string(got[0]) != "ab" || string(got[1]) != "cd" {
+		t.Fatalf("got %q", got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("zero maxSize did not panic")
+		}
+	}()
+	SplitMessages([]byte("ab"), 0)
+}
+
 func TestSendWindow(t *testing.T) {
 	w, err := NewSendWindow(100)
 	if err != nil {
@@ -410,6 +437,67 @@ func TestSendWindow(t *testing.T) {
 	}
 	if _, err := NewSendWindow(-1); err == nil {
 		t.Fatal("negative initial window accepted")
+	}
+}
+
+func TestSendWindowAddRejectsOverflowingIncrement(t *testing.T) {
+	w, err := NewSendWindow(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Add(math.MaxInt64); !errors.Is(err, ErrInvalidWindowUpdate) {
+		t.Fatalf("Add(MaxInt64): %v", err)
+	}
+	if w.Available() != 1 {
+		t.Fatalf("available %d after rejected update", w.Available())
+	}
+	if err := w.Add(MaxWindowSize - 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Add(1); !errors.Is(err, ErrInvalidWindowUpdate) {
+		t.Fatalf("Add past cap: %v", err)
+	}
+	if w.Available() != MaxWindowSize {
+		t.Fatalf("available %d, want cap", w.Available())
+	}
+}
+
+func TestSendWindowConsumeEndedContext(t *testing.T) {
+	w, err := NewSendWindow(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.Consume(ctx, 40); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Consume with canceled context: %v", err)
+	}
+	if w.Available() != 100 {
+		t.Fatalf("available %d, credit deducted for canceled context", w.Available())
+	}
+	if err := w.Consume(context.Background(), 40); err != nil || w.Available() != 60 {
+		t.Fatalf("active consume: %v, available %d", err, w.Available())
+	}
+
+	// A waiter that is canceled and woken by a window update at the same
+	// time must not deduct the new credit.
+	waiter, err := NewSendWindow(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, wcancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- waiter.Consume(wctx, 50) }()
+	time.Sleep(10 * time.Millisecond)
+	wcancel()
+	if err := waiter.Add(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter: %v", err)
+	}
+	if waiter.Available() != 110 {
+		t.Fatalf("available %d, want 110", waiter.Available())
 	}
 }
 
@@ -521,6 +609,7 @@ func TestCheckOperationID(t *testing.T) {
 		{"an hour old", idAt(now.Add(-time.Hour)), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, AdmissionReasonExpired},
 		{"exactly 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture)), 0, 0},
 		{"over 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture + time.Millisecond)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
+		{"far future saturates the age", idAt(time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
 		{"not a UUID", "exec-1", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 		{"UUID v4", "0192f4b6-7c3a-4def-8abc-0123456789ab", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 	}

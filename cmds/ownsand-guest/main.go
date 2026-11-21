@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Command ownsand-guest is the OwnSand guest helper. It runs inside every
 // sandbox guest, listens on the hypervisor socket and serves the
@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/delinoio/mono/cmds/internal/loglevel"
 	"github.com/delinoio/mono/cmds/ownsand-guest/guest"
 	"github.com/delinoio/mono/cmds/ownsand-guest/guestlisten"
 )
@@ -58,8 +59,8 @@ func run(args []string) int {
 		fmt.Println(version)
 		return 0
 	}
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+	level, err := loglevel.Parse(*logLevel)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "ownsand-guest: invalid log level %q\n", *logLevel)
 		return 2
 	}
@@ -78,6 +79,14 @@ func run(args []string) int {
 	if err != nil {
 		logger.Error("start failed", "error", err)
 		return 1
+	}
+	// The network tunnel of the Hyper-V runtime lives in the helper that
+	// the init process of a Linux guest restarts, so a failed relay comes
+	// back with the helper.
+	if isInitChild() {
+		if err := startTunnel(logger); err != nil {
+			logger.Error("network tunnel failed", "error", err)
+		}
 	}
 	l, err := guestlisten.Listen(*listen)
 	if err != nil {

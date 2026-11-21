@@ -13,6 +13,7 @@ package validate
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -21,7 +22,7 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -91,6 +92,23 @@ func UUIDv7(field, value string) error {
 	return nil
 }
 
+// ExecID checks that value is a canonical UUID v7 in the lowercase text form
+// that uuidv7.UUID.String returns. uuidv7.Parse accepts either hex case, but
+// the agent and the relay grant compare exec IDs as raw text, so two
+// spellings of one UUID would be two different execs. The rule applies to
+// exec_id of ExecRequest and AttachExecRequest and to operation_id of the
+// EXEC and ATTACH_EXEC relay grants; other UUID fields keep the case
+// tolerant UUIDv7 check.
+func ExecID(field, value string) error {
+	if err := UUIDv7(field, value); err != nil {
+		return err
+	}
+	if value != strings.ToLower(value) {
+		return fail(field, "must be a canonical lowercase UUID v7")
+	}
+	return nil
+}
+
 // ExecFieldsSize returns the encoded size of the command, env and
 // working_directory fields of req.
 func ExecFieldsSize(req *ownsandv1.ExecRequest) int {
@@ -105,8 +123,9 @@ func ExecFieldsSize(req *ownsandv1.ExecRequest) int {
 // plane) and again after it is decoded (agent): the IDs, a non-empty command
 // whose first element is not empty, the 256 KiB limit of the encoded
 // command, env and working_directory, a non-negative valid timeout and a
-// 32-byte binding salt. It does not check the admission window of exec_id;
-// the agent does that with datapath.CheckOperationID.
+// 32-byte binding salt. exec_id must be lowercase (see ExecID). It does not
+// check the admission window of exec_id; the agent does that with
+// datapath.CheckOperationID.
 func ExecRequest(req *ownsandv1.ExecRequest) error {
 	if err := UUIDv7("organization_id", req.GetOrganizationId()); err != nil {
 		return err
@@ -114,7 +133,7 @@ func ExecRequest(req *ownsandv1.ExecRequest) error {
 	if err := UUIDv7("sandbox_id", req.GetSandboxId()); err != nil {
 		return err
 	}
-	if err := UUIDv7("exec_id", req.GetExecId()); err != nil {
+	if err := ExecID("exec_id", req.GetExecId()); err != nil {
 		return err
 	}
 	if len(req.GetCommand()) == 0 || req.GetCommand()[0] == "" {
@@ -150,11 +169,14 @@ func AttachExecRequest(req *ownsandv1.AttachExecRequest) error {
 	if err := UUIDv7("sandbox_id", req.GetSandboxId()); err != nil {
 		return err
 	}
-	if err := UUIDv7("exec_id", req.GetExecId()); err != nil {
+	if err := ExecID("exec_id", req.GetExecId()); err != nil {
 		return err
 	}
-	if req.GetStdoutOffset() < 0 || req.GetStderrOffset() < 0 {
-		return fail("stdout_offset", "offsets must not be negative")
+	if req.GetStdoutOffset() < 0 {
+		return fail("stdout_offset", "must not be negative")
+	}
+	if req.GetStderrOffset() < 0 {
+		return fail("stderr_offset", "must not be negative")
 	}
 	return nil
 }
@@ -234,9 +256,17 @@ func guestPath(field, path string) error {
 	return nil
 }
 
+// isAbsoluteGuestPath reports whether path is absolute for either guest OS:
+// a POSIX path, a Windows drive path (`C:\` or `C:/`), a UNC path that starts
+// with two separators (mixed separators allowed) or a root local device path
+// (`\??\C:\`). A single leading backslash (`\file.txt`) is root-relative on
+// Windows, not absolute, so it is rejected.
 func isAbsoluteGuestPath(path string) bool {
-	if path[0] == '/' || path[0] == '\\' {
+	if path[0] == '/' {
 		return true
+	}
+	if path[0] == '\\' {
+		return len(path) >= 2 && (path[1] == '\\' || path[1] == '/') || strings.HasPrefix(path, `\??\`)
 	}
 	// A Windows drive path such as `C:\` or `C:/`.
 	return len(path) >= 3 && isLetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')
@@ -310,8 +340,14 @@ func Resources(r *ownsandv1.Resources) error {
 
 // SandboxSource checks that exactly one source is set and that it is valid.
 func SandboxSource(s *ownsandv1.SandboxSource) error {
+	const sourceRequired = "exactly one of base_image, snapshot_id or template_id is required"
+	// A type switch matches a typed nil wrapper pointer, so each case rejects
+	// nil before it dereferences the wrapper.
 	switch src := s.GetSource().(type) {
 	case *ownsandv1.SandboxSource_BaseImage:
+		if src == nil {
+			return fail("source", sourceRequired)
+		}
 		if src.BaseImage == ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED {
 			return fail("source.base_image", "must not be unspecified")
 		}
@@ -320,11 +356,17 @@ func SandboxSource(s *ownsandv1.SandboxSource) error {
 		}
 		return nil
 	case *ownsandv1.SandboxSource_SnapshotId:
+		if src == nil {
+			return fail("source", sourceRequired)
+		}
 		return UUIDv7("source.snapshot_id", src.SnapshotId)
 	case *ownsandv1.SandboxSource_TemplateId:
+		if src == nil {
+			return fail("source", sourceRequired)
+		}
 		return UUIDv7("source.template_id", src.TemplateId)
 	}
-	return fail("source", "exactly one of base_image, snapshot_id or template_id is required")
+	return fail("source", sourceRequired)
 }
 
 // NetworkMode returns the network mode of a create request: OUTBOUND when

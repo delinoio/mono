@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
@@ -29,7 +29,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -186,6 +186,16 @@ func stdout(frames []*ownsandv1.DataFrame) string {
 	return b.String()
 }
 
+// started reports whether a frame says that a command started.
+func started(frames []*ownsandv1.DataFrame) bool {
+	for _, f := range frames {
+		if f.GetExecEvent().GetStarted() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func last(frames []*ownsandv1.DataFrame) *ownsandv1.DataFrame { return frames[len(frames)-1] }
 
 func TestExecAtMostOnce(t *testing.T) {
@@ -209,6 +219,24 @@ func TestExecAtMostOnce(t *testing.T) {
 	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS || !out.Terminal {
 		t.Fatalf("other request with the same exec_id: %+v", out)
 	}
+	// Another spelling of the same exec_id is rejected before admission, so
+	// the command does not run a second time: its output would be "run\nrun\n".
+	upper := proto.Clone(req).(*ownsandv1.ExecRequest)
+	upper.ExecId = strings.ToUpper(req.GetExecId())
+	if upper.GetExecId() == req.GetExecId() {
+		t.Fatal("test exec_id has no letter to change the case of")
+	}
+	out, frames, accepted = e.handle(upper, nil)
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !out.Terminal || accepted || started(frames) {
+		t.Fatalf("uppercase exec_id: %+v accepted %v started %v", out, accepted, started(frames))
+	}
+	attachUpper := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: upper.GetExecId()}
+	if out, _, _ = e.handle(attachUpper, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
+		t.Fatalf("attach with an uppercase exec_id: %+v", out)
+	}
+	if out, frames, _ = e.handle(req, nil); !out.Finished || stdout(frames) != "run\n" {
+		t.Fatalf("lowercase retry after the uppercase request: %+v %q", out, stdout(frames))
+	}
 	// The record survives an agent restart; the command never runs again.
 	d2, err := ops.New(e.m, e.st, ops.Options{Now: e.clk.Now, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
 	if err != nil {
@@ -224,6 +252,76 @@ func TestExecAtMostOnce(t *testing.T) {
 	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS {
 		t.Fatalf("other after restart: %+v", out)
 	}
+}
+
+// TestExecLegacyMixedCaseRecord covers an execs.json record that an earlier
+// agent version wrote with a mixed-case exec_id: after the agent loads it,
+// the lowercase spelling cannot start a command either.
+func TestExecLegacyMixedCaseRecord(t *testing.T) {
+	e := newEnv(t)
+	req := e.execReq("/bin/sh", "-c", "echo run >> count; cat count")
+	mixed := mixedCase(t, req.GetExecId())
+	records := []map[string]any{{
+		"exec_id":    mixed,
+		"sandbox_id": e.sandbox,
+		"digest":     relaybinding.ExecDigest(req),
+		"id_time":    time.Now(),
+	}}
+	if err := e.st.SaveExecs(records); err != nil {
+		t.Fatal(err)
+	}
+	d2, err := ops.New(e.m, e.st, ops.Options{Now: e.clk.Now, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer d2.Close()
+	handle := func(payload proto.Message) (ops.Outcome, []*ownsandv1.DataFrame) {
+		s := &sink{}
+		out := d2.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, payload), SandboxID: e.sandbox}, s)
+		return out, s.frames
+	}
+	// The identical request is a retry of a record whose output is gone.
+	out, frames := handle(req)
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND || started(frames) {
+		t.Fatalf("lowercase spelling of a legacy record: %+v started %v", out, started(frames))
+	}
+	other := proto.Clone(req).(*ownsandv1.ExecRequest)
+	other.Command = []string{"/bin/true"}
+	if out, frames = handle(other); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS || started(frames) {
+		t.Fatalf("changed request with the lowercase spelling: %+v started %v", out, started(frames))
+	}
+	if !d2.ExecEnded(req.GetExecId()) {
+		t.Fatal("the legacy record must count as an ended exec under its lowercase ID")
+	}
+	// The mixed-case spelling is rejected by validation and never reaches
+	// the record.
+	mixedReq := proto.Clone(req).(*ownsandv1.ExecRequest)
+	mixedReq.ExecId = mixed
+	if out, _ = handle(mixedReq); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
+		t.Fatalf("mixed-case spelling: %+v", out)
+	}
+	// The record keeps the spelling it was written with.
+	var saved []struct {
+		ExecID string `json:"exec_id"`
+	}
+	if err := e.st.LoadExecs(&saved); err != nil || len(saved) != 1 || saved[0].ExecID != mixed {
+		t.Fatalf("persisted records %+v: %v", saved, err)
+	}
+}
+
+// mixedCase returns id with its first hex letter in uppercase and its last
+// hex letter in lowercase.
+func mixedCase(t *testing.T, id string) string {
+	t.Helper()
+	b := []byte(id)
+	for i, c := range b {
+		if c >= 'a' && c <= 'f' {
+			b[i] = c - 'a' + 'A'
+			return string(b)
+		}
+	}
+	t.Fatalf("exec_id %q has no hex letter", id)
+	return ""
 }
 
 func TestExecAdmissionWindow(t *testing.T) {
@@ -435,4 +533,60 @@ func TestReadAndWrite(t *testing.T) {
 	if out, _, _ := e.handle(r, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
 		t.Fatalf("expired read: %+v", out)
 	}
+}
+
+func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
+	e := newEnv(t)
+	// Control: a running exec keeps its context live.
+	running := e.execReq("/bin/sh", "-c", "sleep 60")
+	rs := &sink{}
+	rdone := make(chan ops.Outcome, 1)
+	go func() {
+		rdone <- e.d.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, running), SandboxID: e.sandbox}, rs)
+	}()
+	for !e.d.HasRunningExec(e.sandbox) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err, kept := e.d.ExecContextErr(running.GetExecId()); !kept || err != nil {
+		t.Fatalf("running exec context: kept %v err %v", kept, err)
+	}
+
+	// A finished exec cancels its context and keeps its result.
+	req := e.execReq("/bin/sh", "-c", "echo done")
+	if out, _, _ := e.handle(req, nil); !out.Finished {
+		t.Fatalf("exec: %+v", out)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err, kept := e.d.ExecContextErr(req.GetExecId())
+		if !kept {
+			t.Fatal("finished exec is not kept")
+		}
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exec context not canceled after forwarding ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	attach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: req.GetExecId()}
+	out, frames, _ := e.handle(attach, nil)
+	if !out.Finished || stdout(frames) != "done\n" {
+		t.Fatalf("attach after cancel: %+v %q", out, stdout(frames))
+	}
+	e.clk.Advance(11 * time.Minute)
+	e.d.Sweep()
+	if out, _, _ := e.handle(attach, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+		t.Fatalf("attach after sweep: %+v", out)
+	}
+
+	// The running exec is still live, and SandboxEnded cancels it.
+	if err, _ := e.d.ExecContextErr(running.GetExecId()); err != nil {
+		t.Fatalf("running exec context canceled early: %v", err)
+	}
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	<-rdone
 }

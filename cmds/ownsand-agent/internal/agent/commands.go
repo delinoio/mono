@@ -1,14 +1,16 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package agent
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -134,6 +136,11 @@ func (a *Agent) exportSnapshot(ctx context.Context, cmd *ownsandv1.ExportSnapsho
 	defer end()
 	parts, size, err := a.transfer.Export(ctx, cmd.GetSnapshotId(), dir, cmd.GetPartSizeBytes())
 	if err != nil {
+		var tooMany *snapxfer.TooManyPartsError
+		if errors.As(err, &tooMany) {
+			a.logger.Error("snapshot export failed", "snapshot_id", cmd.GetSnapshotId(), "part_count", tooMany.PartCount, "limit", tooMany.Limit, "error", err)
+			return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: fmt.Sprintf("snapshot needs %d parts; the limit is %d", tooMany.PartCount, tooMany.Limit)}
+		}
 		a.logger.Error("snapshot export failed", "snapshot_id", cmd.GetSnapshotId(), "error", err)
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, Message: "snapshot export failed"}
 	}
