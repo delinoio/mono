@@ -13,8 +13,12 @@
 // com.apple.security.virtualization entitlement (see
 // cmds/ownsand-agent/entitlements.plist). A binary built without cgo (for
 // example, cross-compiled on Linux in CI) reports a failing
-// `virtualization-framework` check and rejects creates. macOS guests are
-// not part of this version.
+// `virtualization-framework` check and rejects creates.
+//
+// On Apple silicon the runtime also boots macOS guests from the macOS base
+// image that `ownsand-agent image build` installs (see package images), with
+// the macOS boot loader, the image's hardware model and a new machine
+// identifier for every cold boot.
 //
 // See docs/cmds-ownsand-agent-foundation.md.
 package vzrt
@@ -27,6 +31,7 @@ const GuestPort = 1024
 // File names inside a VM directory and a snapshot directory.
 const (
 	diskFile      = "disk.img"
+	auxFile       = "aux.img"
 	consoleFile   = "console.log"
 	snapState     = "vm.state"
 	snapDisk      = "disk.img"
@@ -39,6 +44,7 @@ const (
 	checkEntitlement = "virtualization-entitlement"
 	checkImage       = "linux-base-image"
 	checkNetwork     = "outbound-network"
+	checkMacOSImage  = "macos-base-image"
 )
 
 // Options configure the runtime.
