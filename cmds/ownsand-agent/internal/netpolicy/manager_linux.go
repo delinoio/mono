@@ -17,11 +17,6 @@ import (
 	"time"
 )
 
-// RefreshInterval is how often the agent recomputes the blocked prefixes
-// from the routing table and the interface addresses, so it follows
-// interface, address and route changes.
-const RefreshInterval = 30 * time.Second
-
 type attachment struct {
 	link Link
 	tap  string
@@ -85,23 +80,9 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 		}
 		routes = append(routes, rs...)
 	}
-	var onLink []netip.Prefix
-	ifaces, err := net.Interfaces()
+	onLink, err := InterfacePrefixes(func(name string) bool { return strings.HasPrefix(name, TapPrefix) })
 	if err != nil {
 		return nil, nil, err
-	}
-	for _, iface := range ifaces {
-		if strings.HasPrefix(iface.Name, TapPrefix) {
-			continue
-		}
-		addrs, _ := iface.Addrs()
-		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok {
-				if p, err := netip.ParsePrefix(ipn.String()); err == nil {
-					onLink = append(onLink, p.Masked())
-				}
-			}
-		}
 	}
 	return routes, onLink, nil
 }
