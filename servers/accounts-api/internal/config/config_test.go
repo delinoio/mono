@@ -8,7 +8,32 @@ import (
 	"testing"
 )
 
+// requiredValues are valid values of every required variable. lookupFrom
+// adds them so that a test only names the variables it checks.
+var requiredValues = map[string]string{
+	EnvDatabaseURL:             "postgres://accounts@127.0.0.1:5432/accounts",
+	EnvLogtoIssuer:             "https://tenant.logto.app/oidc",
+	EnvLogtoManagementEndpoint: "https://tenant.logto.app",
+	EnvLogtoM2MClientID:        "m2m-client",
+	EnvLogtoM2MClientSecret:    "m2m-secret",
+	EnvResendAPIKey:            "re_test",
+	EnvEmailFrom:               "Delino <billing@delino.io>",
+}
+
+// lookupFrom returns a lookup over values on top of requiredValues. A value
+// in values replaces the required value; use rawLookup to leave one unset.
 func lookupFrom(values map[string]string) func(string) (string, bool) {
+	merged := map[string]string{}
+	for name, value := range requiredValues {
+		merged[name] = value
+	}
+	for name, value := range values {
+		merged[name] = value
+	}
+	return rawLookup(merged)
+}
+
+func rawLookup(values map[string]string) func(string) (string, bool) {
 	return func(name string) (string, bool) {
 		value, ok := values[name]
 		return value, ok
@@ -286,5 +311,110 @@ func TestLoadAcceptsASCIILogLevelInAnyCase(t *testing.T) {
 				t.Errorf("LogLevel = %q, want %q", cfg.LogLevel, want)
 			}
 		})
+	}
+}
+
+func TestLoadBillingDefaults(t *testing.T) {
+	cfg, err := Load(lookupFrom(nil))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.RunMigrations {
+		t.Error("RunMigrations = false, want true")
+	}
+	if cfg.LogtoAudience != DefaultAudience {
+		t.Errorf("LogtoAudience = %q, want %q", cfg.LogtoAudience, DefaultAudience)
+	}
+	if len(cfg.CORSOrigins) != 1 || cfg.CORSOrigins[0] != DefaultWebOrigin {
+		t.Errorf("CORSOrigins = %q, want [%q]", cfg.CORSOrigins, DefaultWebOrigin)
+	}
+	if cfg.WebOrigin != DefaultWebOrigin {
+		t.Errorf("WebOrigin = %q, want %q", cfg.WebOrigin, DefaultWebOrigin)
+	}
+	if cfg.DatabaseURL != requiredValues[EnvDatabaseURL] || cfg.LogtoM2MClientSecret != "m2m-secret" || cfg.ResendAPIKey != "re_test" {
+		t.Errorf("required values were not loaded: %+v", cfg)
+	}
+}
+
+func TestLoadBillingOverrides(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvRunMigrations:           "false",
+		EnvLogtoIssuer:             "https://tenant.logto.app/oidc/",
+		EnvLogtoAudience:           "https://accounts.api.example",
+		EnvLogtoManagementEndpoint: "https://tenant.logto.app/",
+		EnvCORSOrigins:             " https://accounts.delino.io , http://127.0.0.1:13100,",
+		EnvWebOrigin:               "http://127.0.0.1:13100",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.RunMigrations {
+		t.Error("RunMigrations = true, want false")
+	}
+	if cfg.LogtoIssuer != "https://tenant.logto.app/oidc" {
+		t.Errorf("LogtoIssuer = %q", cfg.LogtoIssuer)
+	}
+	if cfg.LogtoManagementEndpoint != "https://tenant.logto.app" {
+		t.Errorf("LogtoManagementEndpoint = %q", cfg.LogtoManagementEndpoint)
+	}
+	if cfg.LogtoAudience != "https://accounts.api.example" {
+		t.Errorf("LogtoAudience = %q", cfg.LogtoAudience)
+	}
+	if strings.Join(cfg.CORSOrigins, " ") != "https://accounts.delino.io http://127.0.0.1:13100" {
+		t.Errorf("CORSOrigins = %q", cfg.CORSOrigins)
+	}
+	if cfg.WebOrigin != "http://127.0.0.1:13100" {
+		t.Errorf("WebOrigin = %q", cfg.WebOrigin)
+	}
+}
+
+func TestLoadRequiresBillingValues(t *testing.T) {
+	for name := range requiredValues {
+		t.Run(name, func(t *testing.T) {
+			values := map[string]string{}
+			for n, v := range requiredValues {
+				if n != name {
+					values[n] = v
+				}
+			}
+			_, err := Load(rawLookup(values))
+			if err == nil || err.Error() != name+" is required" {
+				t.Fatalf("Load() error = %v, want %q", err, name+" is required")
+			}
+			values[name] = " \t "
+			if _, err := Load(rawLookup(values)); err == nil {
+				t.Fatal("Load() accepted a value of only white space")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsInvalidBillingValues(t *testing.T) {
+	for name, values := range map[string]map[string]string{
+		"run migrations":          {EnvRunMigrations: "yes please"},
+		"issuer scheme":           {EnvLogtoIssuer: "ftp://tenant.logto.app/oidc"},
+		"issuer query":            {EnvLogtoIssuer: "https://tenant.logto.app/oidc?x=1"},
+		"management relative":     {EnvLogtoManagementEndpoint: "tenant.logto.app"},
+		"cors path":               {EnvCORSOrigins: "https://accounts.delino.io/app"},
+		"cors only commas":        {EnvCORSOrigins: ",,"},
+		"cors fragment":           {EnvCORSOrigins: "https://accounts.delino.io#"},
+		"web origin path":         {EnvWebOrigin: "https://accounts.delino.io/billing"},
+		"email from not an email": {EnvEmailFrom: "billing"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(lookupFrom(values)); err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+		})
+	}
+}
+
+func TestLoadErrorsDoNotContainSecrets(t *testing.T) {
+	_, err := Load(lookupFrom(map[string]string{EnvLogtoIssuer: "https://user:hunter2@tenant.logto.app/oidc"}))
+	if err == nil {
+		t.Fatal("Load() accepted an issuer with user info")
+	}
+	if strings.Contains(err.Error(), "hunter2") {
+		t.Fatalf("error %q contains the secret", err)
 	}
 }

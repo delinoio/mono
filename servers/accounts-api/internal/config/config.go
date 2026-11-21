@@ -7,6 +7,9 @@ package config
 import (
 	"fmt"
 	"log/slog"
+	"net/mail"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/delinoio/mono/servers/internal/listenaddr"
@@ -14,9 +17,27 @@ import (
 
 // Environment variable names read by the server.
 const (
-	EnvAddr     = "ADDR"
-	EnvLogLevel = "LOG_LEVEL"
+	EnvAddr                    = "ADDR"
+	EnvLogLevel                = "LOG_LEVEL"
+	EnvDatabaseURL             = "DATABASE_URL"
+	EnvRunMigrations           = "RUN_MIGRATIONS"
+	EnvLogtoIssuer             = "LOGTO_ISSUER"
+	EnvLogtoAudience           = "LOGTO_AUDIENCE"
+	EnvLogtoManagementEndpoint = "LOGTO_MANAGEMENT_ENDPOINT"
+	EnvLogtoM2MClientID        = "LOGTO_M2M_CLIENT_ID"
+	EnvLogtoM2MClientSecret    = "LOGTO_M2M_CLIENT_SECRET"
+	EnvCORSOrigins             = "CORS_ORIGINS"
+	EnvWebOrigin               = "WEB_ORIGIN"
+	EnvResendAPIKey            = "RESEND_API_KEY"
+	EnvEmailFrom               = "EMAIL_FROM"
 )
+
+// DefaultAudience is the Logto API resource indicator of accounts-api.
+const DefaultAudience = "https://accounts.api.delino.io"
+
+// DefaultWebOrigin is the production origin of the delino-accounts web app. It
+// is the default browser origin for CORS and the origin of invitation links.
+const DefaultWebOrigin = "https://accounts.delino.io"
 
 // DefaultAddr listens on loopback only so that a local run is never exposed
 // to the network by accident.
@@ -73,16 +94,57 @@ func parseLogLevel(value string) (LogLevel, error) {
 	}
 }
 
-// Config is the validated server configuration.
+// Config is the validated server configuration. The fields that hold
+// secrets (DatabaseURL, LogtoM2MClientSecret and ResendAPIKey) must never be
+// logged.
 type Config struct {
 	Addr     string
 	LogLevel LogLevel
+
+	// DatabaseURL is the Postgres connection URL. Secret.
+	DatabaseURL string
+	// RunMigrations applies the embedded goose migrations at startup.
+	RunMigrations bool
+
+	// LogtoIssuer is the Logto issuer, `<tenant endpoint>/oidc`, without a
+	// trailing slash.
+	LogtoIssuer string
+	// LogtoAudience is the expected `aud` of access tokens.
+	LogtoAudience string
+	// LogtoManagementEndpoint is the default Logto endpoint of the tenant
+	// (`https://<tenant-id>.logto.app`), without a trailing slash. The
+	// Management API lives under `/api` there, and its token comes from
+	// `/oidc/token`.
+	LogtoManagementEndpoint string
+	LogtoM2MClientID        string
+	// LogtoM2MClientSecret is the secret of the Management API
+	// machine-to-machine application. Secret.
+	LogtoM2MClientSecret string
+
+	// CORSOrigins are the browser origins that may call the API.
+	CORSOrigins []string
+	// WebOrigin is the origin of the web app in invitation email links.
+	WebOrigin string
+
+	// ResendAPIKey is the Resend API key. Secret.
+	ResendAPIKey string
+	// EmailFrom is the sender address of billing emails.
+	EmailFrom string
 }
 
 // Load reads the configuration through lookup, which has the signature of
-// os.LookupEnv. Unset or empty values select the documented defaults.
+// os.LookupEnv. Unset or empty values select the documented defaults, and a
+// required variable that is unset or empty is an error. Error messages name
+// the variable but never contain its value when the value can be a secret.
 func Load(lookup func(string) (string, bool)) (Config, error) {
-	cfg := Config{Addr: DefaultAddr, LogLevel: LogLevelInfo}
+	cfg := Config{
+		Addr:          DefaultAddr,
+		LogLevel:      LogLevelInfo,
+		RunMigrations: true,
+		LogtoAudience: DefaultAudience,
+		CORSOrigins:   []string{DefaultWebOrigin},
+		WebOrigin:     DefaultWebOrigin,
+	}
 
 	if value := lookupNonEmpty(lookup, EnvAddr); value != "" {
 		if err := listenaddr.Validate(EnvAddr, value); err != nil {
@@ -99,7 +161,104 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.LogLevel = level
 	}
 
+	required := func(name string) (string, error) {
+		value := lookupNonEmpty(lookup, name)
+		if value == "" {
+			return "", fmt.Errorf("%s is required", name)
+		}
+		return value, nil
+	}
+	var err error
+
+	if cfg.DatabaseURL, err = required(EnvDatabaseURL); err != nil {
+		return Config{}, err
+	}
+	if value := lookupNonEmpty(lookup, EnvRunMigrations); value != "" {
+		run, err := strconv.ParseBool(value)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvRunMigrations)
+		}
+		cfg.RunMigrations = run
+	}
+
+	if cfg.LogtoIssuer, err = required(EnvLogtoIssuer); err != nil {
+		return Config{}, err
+	}
+	if cfg.LogtoIssuer, err = httpURL(EnvLogtoIssuer, cfg.LogtoIssuer); err != nil {
+		return Config{}, err
+	}
+	if value := lookupNonEmpty(lookup, EnvLogtoAudience); value != "" {
+		cfg.LogtoAudience = value
+	}
+	if cfg.LogtoManagementEndpoint, err = required(EnvLogtoManagementEndpoint); err != nil {
+		return Config{}, err
+	}
+	if cfg.LogtoManagementEndpoint, err = httpURL(EnvLogtoManagementEndpoint, cfg.LogtoManagementEndpoint); err != nil {
+		return Config{}, err
+	}
+	if cfg.LogtoM2MClientID, err = required(EnvLogtoM2MClientID); err != nil {
+		return Config{}, err
+	}
+	if cfg.LogtoM2MClientSecret, err = required(EnvLogtoM2MClientSecret); err != nil {
+		return Config{}, err
+	}
+
+	if value := lookupNonEmpty(lookup, EnvCORSOrigins); value != "" {
+		cfg.CORSOrigins = nil
+		for _, item := range strings.Split(value, ",") {
+			item = strings.Trim(item, asciiWhiteSpace)
+			if item == "" {
+				continue
+			}
+			origin, err := parseOrigin(EnvCORSOrigins, item)
+			if err != nil {
+				return Config{}, err
+			}
+			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)
+		}
+		if len(cfg.CORSOrigins) == 0 {
+			return Config{}, fmt.Errorf("%s must list at least one origin", EnvCORSOrigins)
+		}
+	}
+	if value := lookupNonEmpty(lookup, EnvWebOrigin); value != "" {
+		if cfg.WebOrigin, err = parseOrigin(EnvWebOrigin, value); err != nil {
+			return Config{}, err
+		}
+	}
+
+	if cfg.ResendAPIKey, err = required(EnvResendAPIKey); err != nil {
+		return Config{}, err
+	}
+	if cfg.EmailFrom, err = required(EnvEmailFrom); err != nil {
+		return Config{}, err
+	}
+	if _, err := mail.ParseAddress(cfg.EmailFrom); err != nil {
+		return Config{}, fmt.Errorf("%s must be an email address such as billing@delino.io or Delino <billing@delino.io>", EnvEmailFrom)
+	}
+
 	return cfg, nil
+}
+
+// httpURL checks that value is an absolute http or https URL without a query
+// or fragment and returns it without a trailing slash.
+func httpURL(name, value string) (string, error) {
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+		u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
+		return "", fmt.Errorf("%s must be an http or https URL", name)
+	}
+	return strings.TrimRight(value, "/"), nil
+}
+
+// parseOrigin checks that value is a browser origin: an http or https scheme
+// and a host with an optional port, without a path, query or fragment.
+func parseOrigin(name, value string) (string, error) {
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
+		return "", fmt.Errorf("%s must hold origins such as https://accounts.delino.io", name)
+	}
+	return value, nil
 }
 
 // asciiWhiteSpace is the set of ASCII white space characters that are removed
