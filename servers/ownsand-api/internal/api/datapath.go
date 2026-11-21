@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
@@ -401,6 +402,14 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	if err := validateID("operation_id", m.GetOperationId()); err != nil {
 		return nil, err
+	}
+	// The agent compares exec IDs as raw text, so the grant of an exec must
+	// carry the lowercase spelling that its requests are required to use.
+	switch m.GetOperationKind() {
+	case ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC:
+		if err := validate.ExecID("operation_id", m.GetOperationId()); err != nil {
+			return nil, errInvalid(err)
+		}
 	}
 	allowed := []ownsandv1.SandboxState{ownsandv1.SandboxState_SANDBOX_STATE_RUNNING}
 	switch m.GetOperationKind() {
