@@ -55,6 +55,8 @@ func TestExecRequest(t *testing.T) {
 	}{
 		{"missing exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = "" }, "exec_id"},
 		{"v4 exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = "0192f4b6-7c3a-4def-8abc-000000000003" }, "exec_id"},
+		{"uppercase exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = strings.ToUpper(opID) }, "exec_id"},
+		{"mixed-case exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = "0192f4b6-7c3a-7DEF-8abc-000000000003" }, "exec_id"},
 		{"bad sandbox", func(r *ownsandv1.ExecRequest) { r.SandboxId = "x" }, "sandbox_id"},
 		{"bad organization", func(r *ownsandv1.ExecRequest) { r.OrganizationId = "" }, "organization_id"},
 		{"no command", func(r *ownsandv1.ExecRequest) { r.Command = nil }, "command"},
@@ -105,6 +107,27 @@ func TestExecRequestSizeLimit(t *testing.T) {
 	}
 }
 
+func TestExecIDRequiresLowercase(t *testing.T) {
+	if err := ExecID("exec_id", opID); err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(opID)
+	err := ExecID("exec_id", upper)
+	wantInvalid(t, "uppercase", err, "exec_id")
+	if strings.Contains(err.Error(), upper) {
+		t.Errorf("error must omit the value: %v", err)
+	}
+	wantInvalid(t, "empty", ExecID("exec_id", ""), "exec_id")
+	wantInvalid(t, "v4", ExecID("exec_id", "0192f4b6-7c3a-4def-8abc-000000000003"), "exec_id")
+	// Other UUID fields stay case tolerant.
+	if err := UUIDv7("sandbox_id", upper); err != nil {
+		t.Errorf("UUIDv7 must accept uppercase: %v", err)
+	}
+	if err := ExecRequest(func() *ownsandv1.ExecRequest { r := validExec(); r.SandboxId = upper; return r }()); err != nil {
+		t.Errorf("uppercase sandbox_id: %v", err)
+	}
+}
+
 func TestAttachReadWrite(t *testing.T) {
 	if err := AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID}); err != nil {
 		t.Fatal(err)
@@ -112,6 +135,7 @@ func TestAttachReadWrite(t *testing.T) {
 	if err := AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: 1 << 40, StderrOffset: 7}); err != nil {
 		t.Fatal(err)
 	}
+	wantInvalid(t, "attach uppercase exec_id", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: strings.ToUpper(opID)}), "exec_id")
 	wantInvalid(t, "negative stderr offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StderrOffset: -1}), "stderr_offset")
 	wantInvalid(t, "negative stdout offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: -1}), "stdout_offset")
 	wantInvalid(t, "both offsets negative", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: -1, StderrOffset: -1}), "stdout_offset")
