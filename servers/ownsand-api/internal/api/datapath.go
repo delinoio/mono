@@ -98,8 +98,10 @@ type RelayTiming struct {
 	Keepalive time.Duration
 	// Acceptance is the wait for the agent's accepted notice (30 s).
 	Acceptance time.Duration
-	// RequestDeadline bounds forwarding the request frame (5 min), and the
-	// whole WriteFile call.
+	// RequestDeadline bounds the request upload and forwarding the request
+	// frame (5 min), and the whole WriteFile call. It counts from the
+	// stream_id allocation at the relay request gate, before Connect reads
+	// the request body.
 	RequestDeadline time.Duration
 	// GrantAck bounds the wait for a relay grant acknowledgement (10 s) and
 	// Signaling the wait for an SDP answer (30 s).
