@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -23,6 +24,74 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
+
+// logBuffer captures subprocess output. exec.Cmd copies a non-file Stderr
+// from its own goroutine until Wait returns, so a plain strings.Builder
+// races with any snapshot taken before Wait; every access holds one mutex.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+const logCaptureHelperEnv = "OWNSAND_AGENT_TEST_LOG_HELPER"
+
+// TestLogCaptureHelperProcess is not a real test: TestLogCapture re-executes
+// the test binary to run it as a subprocess that writes to stderr.
+func TestLogCaptureHelperProcess(t *testing.T) {
+	if os.Getenv(logCaptureHelperEnv) != "1" {
+		t.Skip("helper subprocess only")
+	}
+	for i := 0; i < 2000; i++ {
+		os.Stderr.WriteString("helper log line\n")
+		time.Sleep(50 * time.Microsecond)
+	}
+	os.Stderr.WriteString("helper done\n")
+}
+
+// TestLogCapture takes log snapshots while a subprocess is still writing
+// stderr, as the failure paths of TestBinaryWithProcessRuntime do. It must
+// not report a race under go test -race.
+func TestLogCapture(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLogCaptureHelperProcess$")
+	cmd.Env = append(os.Environ(), logCaptureHelperEnv+"=1")
+	logs := &logBuffer{}
+	cmd.Stderr = logs
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	deadline := time.After(30 * time.Second)
+	for finished := false; !finished; {
+		_ = logs.String()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("helper exit: %v\n%s", err, logs.String())
+			}
+			finished = true
+		case <-deadline:
+			cmd.Process.Kill()
+			t.Fatalf("helper did not finish\n%s", logs.String())
+		default:
+		}
+	}
+	if !strings.Contains(logs.String(), "helper done") {
+		t.Fatalf("captured logs miss the final line\n%s", logs.String())
+	}
+}
 
 // TestBinaryWithProcessRuntime runs the built agent and guest helper
 // binaries with the process test runtime, configured only through
@@ -52,8 +121,8 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	}
 	run := exec.Command(filepath.Join(bin, "ownsand-agent"), "run")
 	run.Env = env
-	var logs strings.Builder
-	run.Stderr = &logs
+	logs := &logBuffer{}
+	run.Stderr = logs
 	if err := run.Start(); err != nil {
 		t.Fatal(err)
 	}
