@@ -23,11 +23,27 @@
 // When it fails, this script prints a `portless_proxy_start_failed` record and
 // exits with its status, so Turbo does not start apps that would fail.
 //
+// Second workaround: a proxy that an older portless started (for example a
+// global installation) keeps running across `pnpm dev` runs, and `portless
+// proxy start` accepts it. portless 0.15.8 watches the routes file itself, and
+// portless 0.18.1 replaces that file with a rename, so after the first route
+// change the old proxy never reloads its routes. It then answers 404 for every
+// app that registers later and sends requests to stale ports. Before the
+// start, this script therefore reads the PID of the running proxy from the
+// portless state directory, finds the portless package that the process runs
+// and, when its version is older than the pinned version, runs `portless proxy
+// stop` from the pinned installation. The version check works only where `ps`
+// is available (not on Windows), and it treats a proxy whose version it cannot
+// read as current. Remove this check when the repository no longer supports a
+// proxy from a portless version that watches the routes file itself, or when
+// portless restarts an outdated proxy by itself.
+//
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
 import { spawnSync } from "node:child_process";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { existsSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 // Values of `PORTLESS` that make `portless run` start the app without the
@@ -39,6 +55,8 @@ const PreflightEvent = Object.freeze({
   NoPortlessApp: "portless_proxy_preflight_skipped",
   Starting: "portless_proxy_start",
   Failed: "portless_proxy_start_failed",
+  Outdated: "portless_proxy_outdated",
+  StopFailed: "portless_proxy_stop_failed",
 });
 
 const repositoryRoot = resolve(
@@ -79,16 +97,118 @@ function findPortlessCli() {
       missingInstall ??= appDir;
       continue;
     }
-    const { bin } = readJson(portlessManifestPath);
+    const { bin, version } = readJson(portlessManifestPath);
     const binPath = typeof bin === "string" ? bin : bin?.portless;
     if (typeof binPath === "string") {
-      return { cli: join(portlessDir, binPath), appDir };
+      return { cli: join(portlessDir, binPath), appDir, version };
     }
   }
   if (missingInstall !== null) {
     return { cli: null, appDir: missingInstall };
   }
   return null;
+}
+
+// Returns [major, minor, patch] of a version string, or null.
+function parseVersion(version) {
+  const match = /^(\d+)\.(\d+)\.(\d+)/.exec(String(version));
+  return match === null ? null : match.slice(1, 4).map(Number);
+}
+
+function isOlderVersion(version, than) {
+  const a = parseVersion(version);
+  const b = parseVersion(than);
+  if (a === null || b === null) return false;
+  for (let i = 0; i < 3; i += 1) {
+    if (a[i] !== b[i]) return a[i] < b[i];
+  }
+  return false;
+}
+
+// Returns the version of the portless package that contains `path`, or null.
+function portlessVersionOf(path) {
+  let dir;
+  try {
+    dir = dirname(realpathSync(path));
+  } catch {
+    return null;
+  }
+  for (;;) {
+    const manifestPath = join(dir, "package.json");
+    if (existsSync(manifestPath)) {
+      try {
+        const manifest = readJson(manifestPath);
+        if (manifest.name === "portless") return manifest.version ?? null;
+      } catch {
+        // Not a readable manifest; continue with the parent directory.
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+// Returns { pid, version } of the proxy that the portless state directory
+// records, or null when no proxy is recorded or its version is unknown.
+// The state directory matches `resolveStateDir` in portless 0.18.1.
+function findRunningProxy() {
+  if (process.platform === "win32") return null;
+  const stateDir =
+    process.env.PORTLESS_STATE_DIR || join(homedir(), ".portless");
+  let pid;
+  try {
+    pid = Number.parseInt(
+      readFileSync(join(stateDir, "proxy.pid"), "utf8"),
+      10,
+    );
+  } catch {
+    return null;
+  }
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const ps = spawnSync("ps", ["-o", "command=", "-p", String(pid)], {
+    encoding: "utf8",
+    shell: false,
+  });
+  if (ps.status !== 0 || typeof ps.stdout !== "string") return null;
+  // The proxy runs as `node <portless cli> proxy start ...`. A path that
+  // contains a space is split here, and the version stays unknown.
+  for (const arg of ps.stdout.trim().split(/\s+/)) {
+    if (!isAbsolute(arg)) continue;
+    const version = portlessVersionOf(arg);
+    if (version !== null) return { pid, version };
+  }
+  return null;
+}
+
+// Stops a running proxy that is older than the pinned portless. Returns 0 when
+// no such proxy runs or it stopped, otherwise the exit status for the script.
+function stopOutdatedProxy(found) {
+  const running = findRunningProxy();
+  if (running === null || !isOlderVersion(running.version, found.version)) {
+    return 0;
+  }
+  log({
+    event: PreflightEvent.Outdated,
+    pid: running.pid,
+    runningVersion: running.version,
+    pinnedVersion: found.version,
+  });
+  const result = spawnSync(process.execPath, [found.cli, "proxy", "stop"], {
+    cwd: found.appDir,
+    stdio: "inherit",
+    shell: false,
+  });
+  if (result.error === undefined && result.status === 0) return 0;
+  log({
+    event: PreflightEvent.StopFailed,
+    pid: running.pid,
+    status: result.status,
+    signal: result.signal,
+    reason: result.error?.message,
+    hint: `Stop the portless ${running.version} proxy from an interactive terminal with \`pnpm --filter delino-docs exec portless proxy stop\` or \`sudo kill ${running.pid}\`, then run \`pnpm dev\` again.`,
+  });
+  return result.status || 1;
 }
 
 function main() {
@@ -118,6 +238,9 @@ function main() {
     });
     return 1;
   }
+
+  const stopStatus = stopOutdatedProxy(found);
+  if (stopStatus !== 0) return stopStatus;
 
   log({ event: PreflightEvent.Starting, app: found.appDir });
   const result = spawnSync(process.execPath, [found.cli, "proxy", "start"], {
