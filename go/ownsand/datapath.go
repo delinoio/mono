@@ -15,13 +15,23 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
+// errHandleClosed is returned by a peer-to-peer operation on a handle that
+// was closed, and by one whose session setup was still running at Close.
+var errHandleClosed = errors.New("ownsand: sandbox handle closed")
+
 // dataPath selects the transport of one sandbox handle: one peer-to-peer
 // session shared by all operations, or the relay after an ICE failure or a
 // session that could not open.
 type dataPath struct {
 	s *Sandbox
 
-	openMu sync.Mutex // serializes session opening
+	// openSlot (capacity 1) serializes session setup. It is a channel and
+	// not a mutex, so an operation that waits for the setup of another
+	// operation can stop waiting when its own context ends.
+	openSlot chan struct{}
+	// done is closed by close. It wakes the operations that wait for the
+	// setup slot and cancels the setup that is in flight.
+	done chan struct{}
 
 	mu     sync.Mutex
 	sess   *p2pSession
@@ -30,57 +40,100 @@ type dataPath struct {
 	closed bool
 }
 
+func newDataPath(s *Sandbox) *dataPath {
+	return &dataPath{s: s, openSlot: make(chan struct{}, 1), done: make(chan struct{})}
+}
+
+// acquireOpen waits for the setup slot. It returns the context error of the
+// waiting operation as soon as ctx ends, and errHandleClosed when the handle
+// closes first, without waiting for the setup that holds the slot.
+func (d *dataPath) acquireOpen(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case d.openSlot <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-d.done:
+		return errHandleClosed
+	}
+}
+
+func (d *dataPath) releaseOpen() { <-d.openSlot }
+
 // route returns the session to use, or nil for the relay. It opens a new
 // session only when an operation needs one, so an idle handle never keeps
-// the sandbox active.
+// the sandbox active. A closed handle rejects a peer-to-peer operation with
+// errHandleClosed before it calls the control plane; the relay-only
+// transport never reaches this check.
+//
+// One setup at a time runs for the handle. An operation that needs a session
+// while another operation sets it up waits for that setup, and stops waiting
+// (with its own context error) when its context ends; the setup continues
+// for the other operations. When the operation that runs the setup ends
+// first (its context ended, or the handle closed), the waiting operations
+// run the setup again, one at a time.
 func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 	c := d.s.c
 	if c.transport == TransportRelay {
 		d.setInUse(ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY)
 		return nil, nil
 	}
-	d.mu.Lock()
-	if d.relay {
-		d.mu.Unlock()
-		return nil, nil
+	if sess, relay, err := d.lookup(); sess != nil || relay || err != nil {
+		return sess, err
 	}
-	if d.sess != nil && !d.sess.isDone() {
-		sess := d.sess
-		d.mu.Unlock()
-		return sess, nil
-	}
-	d.mu.Unlock()
 
-	d.openMu.Lock()
-	defer d.openMu.Unlock()
-	d.mu.Lock()
-	if d.relay {
-		d.mu.Unlock()
-		return nil, nil
+	if err := d.acquireOpen(ctx); err != nil {
+		return nil, err
 	}
-	if d.sess != nil && !d.sess.isDone() {
-		sess := d.sess
-		d.mu.Unlock()
-		return sess, nil
+	defer d.releaseOpen()
+	if sess, relay, err := d.lookup(); sess != nil || relay || err != nil {
+		return sess, err
 	}
-	d.mu.Unlock()
+
+	// Close cancels the setup that is in flight, so a closed handle does not
+	// wait for a setup that nobody can use.
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		select {
+		case <-d.done:
+			cancel(errHandleClosed)
+		case <-stop:
+		}
+	}()
 
 	start := time.Now()
-	sess, err := openP2PSession(ctx, c, d.s.org, d.s.id)
-	if err == nil {
-		d.mu.Lock()
-		if d.closed {
-			d.mu.Unlock()
-			sess.close()
-			return nil, errors.New("ownsand: sandbox handle closed")
-		}
+	sess, err := openP2PSession(sctx, c, d.s.org, d.s.id)
+	if c.p2p.setupDone != nil {
+		c.p2p.setupDone()
+	}
+	// A session that the setup produced after Close is closed and never
+	// installed.
+	d.mu.Lock()
+	closed := d.closed
+	if err == nil && !closed {
 		d.sess = sess
 		d.inUse = ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER
-		d.mu.Unlock()
+	}
+	d.mu.Unlock()
+	if closed {
+		if err == nil {
+			sess.close()
+		}
+		return nil, errHandleClosed
+	}
+	if err == nil {
 		c.logger.DebugContext(ctx, "ownsand data path session opened", "sandbox_id", d.s.id, "session_id", sess.sessionID, "transport", "peer-to-peer", "duration", time.Since(start))
 		return sess, nil
 	}
 	if ctx.Err() != nil {
+		// The caller's context ended first; it stays authoritative and
+		// starts no relay recovery.
 		return nil, ctx.Err()
 	}
 	var openErr *errP2POpen
@@ -150,8 +203,32 @@ func (d *dataPath) current() ownsandv1.DataPathTransport {
 	return d.inUse
 }
 
+// lookup returns the installed session, or reports that the handle uses the
+// relay, or that it is closed. It returns all zero values when a session must
+// open.
+func (d *dataPath) lookup() (sess *p2pSession, relay bool, err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case d.closed:
+		return nil, false, errHandleClosed
+	case d.relay:
+		return nil, true, nil
+	case d.sess != nil && !d.sess.isDone():
+		return d.sess, false, nil
+	}
+	return nil, false, nil
+}
+
+// close marks the handle closed, closes the installed session and cancels a
+// setup in flight, whose session (if it still opens) is closed instead of
+// installed. It is idempotent.
 func (d *dataPath) close() {
 	d.mu.Lock()
+	if !d.closed {
+		d.closed = true
+		close(d.done)
+	}
 	sess := d.sess
 	d.sess = nil
 	d.mu.Unlock()
