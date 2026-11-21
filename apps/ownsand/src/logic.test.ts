@@ -10,7 +10,12 @@ import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
 import { CreateSandboxRequestSchema } from "ownsand-sdk/gen/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
 import { clearInvitationOnLeave } from "./App.tsx";
-import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
+import {
+  AuthMode,
+  DEFAULT_API_ORIGIN,
+  normalizeMockFlag,
+  readConsoleConfig,
+} from "./config.ts";
 import {
   effectiveVcpuLimit,
   formatDuration,
@@ -94,6 +99,38 @@ describe("console configuration", () => {
         { production: false },
       ),
     ).toThrow("true or false");
+  });
+});
+
+describe("mock mode decision", () => {
+  test("a padded value selects the mock mode and normalizes to true", () => {
+    const env = { PUBLIC_OWNSAND_MOCK_API: " true " };
+    expect(readConsoleConfig(env, { production: false }).authMode).toBe(
+      AuthMode.Mock,
+    );
+    // src/index.tsx compares the inlined value with "true".
+    expect(normalizeMockFlag(env.PUBLIC_OWNSAND_MOCK_API)).toBe("true");
+  });
+
+  test("false, empty and unset values stay out of the mock mode", () => {
+    for (const value of ["false", " false ", "", "  ", undefined]) {
+      expect(normalizeMockFlag(value)).not.toBe("true");
+      expect(
+        readConsoleConfig(
+          { PUBLIC_OWNSAND_MOCK_API: value },
+          { production: false },
+        ).authMode,
+      ).toBe(AuthMode.Logto);
+    }
+  });
+
+  test("a padded mock value is still rejected in a production build", () => {
+    expect(() =>
+      readConsoleConfig(
+        { PUBLIC_OWNSAND_MOCK_API: " true " },
+        { production: true },
+      ),
+    ).toThrow(/production/);
   });
 });
 

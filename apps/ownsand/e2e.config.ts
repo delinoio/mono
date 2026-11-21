@@ -23,7 +23,12 @@ export default {
           // variables to the app command. The suite runs against the
           // in-browser fake API with a fake signed-in user, because it has no
           // control plane and no Logto tenant.
-          env: { PUBLIC_OWNSAND_MOCK_API: "true" },
+          //
+          // The value is deliberately padded with spaces. The build must
+          // trim it so the mock sign-in and the mock transport agree; if the
+          // trimming in rsbuild.config.ts is reverted, sign-in succeeds but
+          // the console calls the real API and the seeded data never loads.
+          env: { PUBLIC_OWNSAND_MOCK_API: " true " },
           log: ".e2e/logs/app.log",
         },
       },
