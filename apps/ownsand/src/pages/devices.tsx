@@ -18,11 +18,11 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  toastError,
 } from "../components/ui.tsx";
 import {
   deviceAllocatedVcpu,
   effectiveVcpuLimit,
-  errorMessage,
   formatBytes,
   formatMib,
   formatTime,
@@ -193,7 +193,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
       });
       toast.success("The device limits are saved.");
     } catch (error) {
-      toast.error(errorMessage(error));
+      toastError(error);
     }
   };
 

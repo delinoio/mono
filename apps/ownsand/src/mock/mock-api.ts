@@ -17,15 +17,29 @@ import {
   ApiKeyService,
 } from "ownsand-sdk/gen/api_key_pb";
 import {
+  BillingAccountRole,
+  BillingMeter,
+  type BillingMeterUsage,
+  BillingMeterUsageSchema,
+  BillingPhase,
+  BillingService,
+  LinkableBillingAccountSchema,
+  type OrganizationBilling,
+  OrganizationBillingSchema,
+} from "ownsand-sdk/gen/billing_pb";
+import {
   AgentUpdateState,
   AgentVersionPolicyMode,
   ApiKeyState,
   Arch,
   BaseImage,
+  BillingReason,
   type DeviceLimits,
   DeviceLimitsSchema,
   DeviceState,
   EnrollmentTokenState,
+  ErrorCode,
+  ErrorDetailSchema,
   GuestOs,
   HostOs,
   InvitationState,
@@ -72,6 +86,7 @@ import {
   type Template,
   TemplateSchema,
 } from "ownsand-sdk/gen/snapshot_pb";
+import { ACCOUNTS_URL } from "../config.ts";
 import { effectiveVcpuLimit, MAX_INT32 } from "../format.ts";
 import { uuidV7 } from "../uuid.ts";
 
@@ -98,9 +113,85 @@ export const MOCK_IDS = {
   unreachableSandbox: "0193a000-0000-7000-8000-0000000000a4",
   snapshot: "0193a000-0000-7000-8000-0000000000b1",
   template: "0193a000-0000-7000-8000-0000000000c1",
+  acmeBillingAccount: "0193a000-0000-7000-8000-0000000000e1",
+  labBillingAccount: "0193a000-0000-7000-8000-0000000000e2",
 } as const;
 
+/** Billing states that the mock API can seed for an organization. */
+export enum MockBillingState {
+  /** Linked to a billing account in good standing. */
+  AllowedLinked = "allowed_linked",
+  /** No billing account linked, blocked since a day ago. */
+  BlockedUnlinked = "blocked_unlinked",
+  /** Linked to a billing account with debt, blocked since a day ago. */
+  BlockedLinked = "blocked_linked",
+  /** Linked to a billing account with debt, blocked since four days ago. */
+  Suspended = "suspended",
+}
+
+/** A delino-accounts billing account as the mock API knows it. */
+export interface MockBillingAccount {
+  billingAccountId: string;
+  name: string;
+  /** The mock user's role in the billing account. */
+  role: BillingAccountRole;
+  balanceUsdMicros: bigint;
+  subscriptionActive: boolean;
+}
+
+/** The billing accounts of the mock user. */
+export const MOCK_BILLING_ACCOUNTS: readonly MockBillingAccount[] = [
+  {
+    billingAccountId: MOCK_IDS.acmeBillingAccount,
+    name: "Acme Robotics billing",
+    role: BillingAccountRole.OWNER,
+    balanceUsdMicros: 42_517_300n,
+    subscriptionActive: true,
+  },
+  {
+    billingAccountId: MOCK_IDS.labBillingAccount,
+    name: "Research lab credits",
+    role: BillingAccountRole.ADMIN,
+    // Debt: a balance below zero.
+    balanceUsdMicros: -1_234_567n,
+    subscriptionActive: true,
+  },
+];
+
+/**
+ * Usage of a linked seeded organization this month, for every meter in
+ * BillingMeter order, with amounts from the control plane formulas. The
+ * RPC costs are below $0.01.
+ */
+const SEEDED_USAGE: readonly (readonly [BillingMeter, bigint, bigint])[] = [
+  // 12.5 GiB of relay egress at $0.09 per GiB.
+  [BillingMeter.RELAY_EGRESS, 13_421_772_800n, 1_125_000n],
+  // 3 GiB stored for 10 days at $0.03 per GiB-month (730 hours).
+  [BillingMeter.R2_STORAGE, 3n * 2n ** 30n * 864_000n, 29_590n],
+  // 1,240 Class A calls at $4.50 per million.
+  [BillingMeter.CLASS_A_RPC, 1_240n, 5_580n],
+  // 18,400 Class B calls at $0.36 per million.
+  [BillingMeter.CLASS_B_RPC, 18_400n, 6_624n],
+];
+
+const METERS = [
+  BillingMeter.RELAY_EGRESS,
+  BillingMeter.R2_STORAGE,
+  BillingMeter.CLASS_A_RPC,
+  BillingMeter.CLASS_B_RPC,
+] as const;
+
+/** The default billing state of each seeded organization. */
+const DEFAULT_BILLING: Readonly<Record<string, MockBillingState>> = {
+  [MOCK_IDS.acme]: MockBillingState.AllowedLinked,
+  [MOCK_IDS.northwind]: MockBillingState.Suspended,
+  [MOCK_IDS.contoso]: MockBillingState.BlockedUnlinked,
+};
+
 const HOUR = 3600;
+const DAY_MS = 24 * HOUR * 1000;
+/** A non-paying organization becomes suspended 3 days after its block. */
+const SUSPEND_AFTER_MS = 3 * DAY_MS;
 const now = () => Date.now();
 const ts = (offsetSeconds = 0): Timestamp =>
   timestampFromMs(now() + offsetSeconds * 1000);
@@ -124,6 +215,68 @@ interface OrgState {
   snapshots: Snapshot[];
   templates: Template[];
   policy: AgentVersionPolicy;
+  billing: {
+    /** The linked billing account, if any. */
+    billingAccountId: string | undefined;
+    /** Start of the non-payment in ms, if the organization is in one. */
+    blockedSinceMs: number | undefined;
+    /** Usage this month, one entry per meter in BillingMeter order. */
+    usage: BillingMeterUsage[];
+  };
+}
+
+function zeroUsage(): BillingMeterUsage[] {
+  return METERS.map((meter) =>
+    create(BillingMeterUsageSchema, {
+      meter,
+      quantity: 0n,
+      amountUsdMicros: 0n,
+    }),
+  );
+}
+
+function seededUsage(): BillingMeterUsage[] {
+  return SEEDED_USAGE.map(([meter, quantity, amountUsdMicros]) =>
+    create(BillingMeterUsageSchema, { meter, quantity, amountUsdMicros }),
+  );
+}
+
+/** Applies a seeded billing state to an organization. */
+function applyBillingState(org: OrgState, state: MockBillingState): void {
+  switch (state) {
+    case MockBillingState.AllowedLinked:
+      org.billing = {
+        billingAccountId: MOCK_IDS.acmeBillingAccount,
+        blockedSinceMs: undefined,
+        usage: seededUsage(),
+      };
+      return;
+    case MockBillingState.BlockedUnlinked:
+      org.billing = {
+        billingAccountId: undefined,
+        blockedSinceMs: now() - DAY_MS,
+        usage: zeroUsage(),
+      };
+      return;
+    case MockBillingState.BlockedLinked:
+      org.billing = {
+        billingAccountId: MOCK_IDS.labBillingAccount,
+        blockedSinceMs: now() - DAY_MS,
+        usage: seededUsage(),
+      };
+      return;
+    case MockBillingState.Suspended:
+      org.billing = {
+        billingAccountId: MOCK_IDS.labBillingAccount,
+        blockedSinceMs: now() - 4 * DAY_MS,
+        usage: seededUsage(),
+      };
+      // Like the suspension worker: running sandboxes are paused.
+      for (const s of org.sandboxes) {
+        if (s.state === SandboxState.RUNNING) s.state = SandboxState.PAUSED;
+      }
+      return;
+  }
 }
 
 function member(
@@ -161,6 +314,12 @@ function emptyOrg(id: string, name: string): OrgState {
       organizationId: id,
       mode: AgentVersionPolicyMode.FOLLOW_DEFAULT,
     }),
+    // A new organization has no link, so it is blocked from its creation.
+    billing: {
+      billingAccountId: undefined,
+      blockedSinceMs: now(),
+      usage: zeroUsage(),
+    },
   };
 }
 
@@ -377,12 +536,113 @@ function seed(): Map<string, OrgState> {
   return orgs;
 }
 
+/** Options of a fake control plane, for tests. */
+export interface MockTransportOptions {
+  /** The signed-in user; a seeded member ID selects that member's role. */
+  userId?: string;
+  /** Billing states that replace the defaults of seeded organizations. */
+  billing?: Readonly<Record<string, MockBillingState>>;
+  /**
+   * The billing accounts that ListLinkableBillingAccounts returns and that
+   * the user can link, instead of MOCK_BILLING_ACCOUNTS.
+   */
+  linkableBillingAccounts?: readonly MockBillingAccount[];
+}
+
 /** Creates a transport backed by a fresh fake control plane. */
 export function createMockTransport(
-  options: { userId?: string } = {},
+  options: MockTransportOptions = {},
 ): Transport {
   const userId = options.userId ?? MOCK_USER;
   const orgs = seed();
+  for (const [orgId, state] of Object.entries({
+    ...DEFAULT_BILLING,
+    ...options.billing,
+  })) {
+    const org = orgs.get(orgId);
+    if (org !== undefined) applyBillingState(org, state);
+  }
+  const linkable = (
+    options.linkableBillingAccounts ?? MOCK_BILLING_ACCOUNTS
+  ).filter(
+    (a) =>
+      a.role === BillingAccountRole.OWNER ||
+      a.role === BillingAccountRole.ADMIN,
+  );
+  // Copies, so a test's accounts are never changed.
+  const billingAccounts = new Map<string, MockBillingAccount>(
+    [...MOCK_BILLING_ACCOUNTS, ...(options.linkableBillingAccounts ?? [])].map(
+      (a) => [a.billingAccountId, { ...a }],
+    ),
+  );
+
+  /** The billing phase of an organization, computed like the control plane. */
+  const billingOf = (org: OrgState): OrganizationBilling => {
+    const { billingAccountId, blockedSinceMs } = org.billing;
+    const account =
+      billingAccountId === undefined
+        ? undefined
+        : billingAccounts.get(billingAccountId);
+    const linked = account !== undefined;
+    const paying =
+      account !== undefined &&
+      account.subscriptionActive &&
+      account.balanceUsdMicros > 0n;
+    if (paying) {
+      return create(OrganizationBillingSchema, {
+        phase: BillingPhase.ALLOWED,
+        reason: BillingReason.UNSPECIFIED,
+        linked: true,
+      });
+    }
+    const since = blockedSinceMs ?? now();
+    const suspended = now() >= since + SUSPEND_AFTER_MS;
+    return create(OrganizationBillingSchema, {
+      phase: suspended ? BillingPhase.SUSPENDED : BillingPhase.BLOCKED,
+      reason: suspended
+        ? BillingReason.SUSPENDED
+        : linked
+          ? BillingReason.BLOCKED
+          : BillingReason.ACCOUNT_REQUIRED,
+      linked,
+      blockedSince: timestampFromMs(since),
+      suspendTime: timestampFromMs(since + SUSPEND_AFTER_MS),
+    });
+  };
+  /**
+   * Billing enforcement of the resource-creating RPCs: a blocked or
+   * suspended organization fails with resource_exhausted and an ErrorDetail
+   * with the billing reason, like the control plane.
+   */
+  const requireBillingAllowed = (org: OrgState) => {
+    const billing = billingOf(org);
+    if (billing.phase === BillingPhase.ALLOWED) return;
+    const message =
+      billing.reason === BillingReason.ACCOUNT_REQUIRED
+        ? `This organization has no linked billing account. Link one and pay at ${ACCOUNTS_URL}.`
+        : billing.reason === BillingReason.BLOCKED
+          ? `The billing account of this organization has no active subscription or no balance. Pay at ${ACCOUNTS_URL}.`
+          : `This organization is suspended for non-payment. Pay at ${ACCOUNTS_URL}.`;
+    throw new ConnectError(message, Code.ResourceExhausted, undefined, [
+      {
+        desc: ErrorDetailSchema,
+        value: {
+          code: ErrorCode.RESOURCE_EXHAUSTED,
+          message,
+          billingReason: billing.reason,
+        },
+      },
+    ]);
+  };
+  /** Removes the billing link; the block starts now unless it started earlier. */
+  const unlink = (org: OrgState) => {
+    if (org.billing.billingAccountId === undefined) return;
+    const wasPaying = billingOf(org).phase === BillingPhase.ALLOWED;
+    org.billing.billingAccountId = undefined;
+    if (wasPaying || org.billing.blockedSinceMs === undefined) {
+      org.billing.blockedSinceMs = now();
+    }
+  };
 
   const membership = (orgId: string): { org: OrgState; role: Role } => {
     const org = orgs.get(orgId);
@@ -505,6 +765,8 @@ export function createMockTransport(
           if (m.userId === userId) m.role = Role.ADMIN;
         }
         target.role = Role.OWNER;
+        // An ownership transfer removes the billing link.
+        unlink(org);
         return {};
       },
     });
@@ -625,6 +887,7 @@ export function createMockTransport(
       createEnrollmentToken(req) {
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
+        requireBillingAllowed(org);
         const ttl = Number(req.ttl?.seconds ?? 0n);
         if (ttl <= 0 || ttl > 24 * HOUR) {
           throw new ConnectError(
@@ -815,6 +1078,7 @@ export function createMockTransport(
     router.service(SandboxService, {
       createSandbox(req) {
         const { org } = membership(req.organizationId);
+        requireBillingAllowed(org);
         // Map entries serialize in insertion order, so sort labels first to make
         // the comparison independent of label order (the real API hashes a
         // deterministic encoding).
@@ -925,6 +1189,7 @@ export function createMockTransport(
       },
       resumeSandbox(req) {
         const { org } = membership(req.organizationId);
+        requireBillingAllowed(org);
         const s = findSandbox(org, req.sandboxId);
         if (
           s.state !== SandboxState.RUNNING &&
@@ -943,6 +1208,7 @@ export function createMockTransport(
     router.service(SnapshotService, {
       createSnapshot(req) {
         const { org } = membership(req.organizationId);
+        requireBillingAllowed(org);
         const s = findSandbox(org, req.sandboxId);
         if (
           s.state !== SandboxState.RUNNING &&
@@ -1000,12 +1266,14 @@ export function createMockTransport(
       },
       exportSnapshot(req) {
         const { org } = membership(req.organizationId);
+        requireBillingAllowed(org);
         const s = findSnapshot(org, req.snapshotId);
         s.exportState = SnapshotExportState.EXPORTED;
         return { snapshot: s };
       },
       createTemplate(req) {
         const { org } = membership(req.organizationId);
+        requireBillingAllowed(org);
         findSnapshot(org, req.snapshotId);
         if (req.name.trim() === "")
           throw new ConnectError("name is required", Code.InvalidArgument);
@@ -1030,6 +1298,81 @@ export function createMockTransport(
           (t) => t.templateId !== req.templateId,
         );
         return {};
+      },
+    });
+
+    router.service(BillingService, {
+      getBillingStatus(req) {
+        const { org } = membership(req.organizationId);
+        return { billing: billingOf(org) };
+      },
+      getBillingUsage(req) {
+        const { org, role } = membership(req.organizationId);
+        requireAdmin(role);
+        const account =
+          org.billing.billingAccountId === undefined
+            ? undefined
+            : billingAccounts.get(org.billing.billingAccountId);
+        if (account === undefined) {
+          throw new ConnectError(
+            "the organization has no linked billing account",
+            Code.FailedPrecondition,
+          );
+        }
+        const today = new Date(now());
+        return {
+          billingAccountId: account.billingAccountId,
+          billingAccountName: account.name,
+          balanceUsdMicros: account.balanceUsdMicros,
+          monthStart: timestampFromMs(
+            Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), 1),
+          ),
+          meterUsages: org.billing.usage,
+        };
+      },
+      listLinkableBillingAccounts(req) {
+        const { role } = membership(req.organizationId);
+        requireOwner(role);
+        return {
+          billingAccounts: linkable.map((a) =>
+            create(LinkableBillingAccountSchema, {
+              billingAccountId: a.billingAccountId,
+              name: a.name,
+              role: a.role,
+            }),
+          ),
+        };
+      },
+      linkBillingAccount(req) {
+        const { org, role } = membership(req.organizationId);
+        requireOwner(role);
+        const account = linkable.find(
+          (a) => a.billingAccountId === req.billingAccountId,
+        );
+        if (account === undefined) {
+          throw new ConnectError("billing account not found", Code.NotFound);
+        }
+        const current = org.billing.billingAccountId;
+        if (current !== undefined && current !== account.billingAccountId) {
+          throw new ConnectError(
+            "the organization is linked to another billing account; unlink it first",
+            Code.AlreadyExists,
+          );
+        }
+        org.billing.billingAccountId = account.billingAccountId;
+        const billing = billingOf(org);
+        // A paying account ends the non-payment; otherwise the earlier
+        // block start is kept, so relinking never restarts the 3 days.
+        if (billing.phase === BillingPhase.ALLOWED) {
+          org.billing.blockedSinceMs = undefined;
+        }
+        return { billing, billingAccountName: account.name };
+      },
+      unlinkBillingAccount(req) {
+        const { org, role } = membership(req.organizationId);
+        requireOwner(role);
+        unlink(org);
+        return { billing: billingOf(org) };
       },
     });
   });

@@ -19,8 +19,9 @@ import {
   Loading,
   PageHeader,
   SecretDialog,
+  toastError,
 } from "../components/ui.tsx";
-import { errorMessage, formatTime, labels } from "../format.ts";
+import { formatTime, labels } from "../format.ts";
 import { invitationLink } from "../invitation.ts";
 import { can, canManageMember, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
@@ -103,7 +104,7 @@ export function MembersPage() {
                           });
                           toast.success("The role is changed.");
                         } catch (error) {
-                          toast.error(errorMessage(error));
+                          toastError(error);
                         }
                       }}
                     >
@@ -221,7 +222,7 @@ function Invitations() {
                     });
                     toast.success("The invitation is revoked.");
                   } catch (error) {
-                    toast.error(errorMessage(error));
+                    toastError(error);
                   }
                 }}
               >

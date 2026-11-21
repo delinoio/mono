@@ -22,14 +22,9 @@ import {
   PageHeader,
   SandboxStateBadge,
   ShortId,
+  toastError,
 } from "../components/ui.tsx";
-import {
-  errorMessage,
-  formatDuration,
-  formatMib,
-  formatTime,
-  labels,
-} from "../format.ts";
+import { formatDuration, formatMib, formatTime, labels } from "../format.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
 import { LabelList } from "./sandboxes.tsx";
 
@@ -95,7 +90,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
       await run();
       toast.success(done);
     } catch (error) {
-      toast.error(errorMessage(error));
+      toastError(error);
     }
   };
   const ids = { organizationId, sandboxId };

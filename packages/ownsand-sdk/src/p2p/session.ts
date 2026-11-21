@@ -11,6 +11,7 @@ import {
 import {
   connectErrorFromDetail,
   InvalidFrameError,
+  isBillingError,
   OwnSandError,
   PeerStreamOverrunError,
 } from "../errors.ts";
@@ -218,8 +219,10 @@ export class PeerSession {
         }
         if (
           error instanceof ConnectError &&
-          AUTHORIZATION_CODES.has(error.code)
+          (AUTHORIZATION_CODES.has(error.code) || isBillingError(error))
         ) {
+          // A billing rejection also rejects the relay, so it ends the
+          // operation instead of a fall back to the relay.
           throw error;
         }
         if (

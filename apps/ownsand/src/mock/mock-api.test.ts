@@ -2,15 +2,23 @@
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import {
+  BillingMeter,
+  BillingPhase,
+  BillingService,
+} from "ownsand-sdk/gen/billing_pb";
+import {
   BaseImage,
+  BillingReason,
   DeviceState,
+  ErrorDetailSchema,
   SandboxEndReason,
   SandboxState,
 } from "ownsand-sdk/gen/common_pb";
 import { DeviceService } from "ownsand-sdk/gen/device_pb";
+import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
 import { SandboxService } from "ownsand-sdk/gen/sandbox_pb";
 import { uuidV7 } from "../uuid.ts";
-import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
+import { createMockTransport, MOCK_IDS, MockBillingState } from "./mock-api.ts";
 
 describe("mock device list", () => {
   const organizationId = MOCK_IDS.acme;
@@ -178,5 +186,174 @@ describe("mock idempotent createSandbox", () => {
       labels: { env: "dev", team: "ci" },
     });
     expect(retry.sandbox?.sandboxId).toBe(first.sandbox?.sandboxId);
+  });
+});
+
+describe("mock billing", () => {
+  const organizationId = MOCK_IDS.acme;
+  const ADMIN = "user-admin-jun";
+  const MEMBER = "user-member-ada";
+  const billing = (state: MockBillingState, userId?: string) =>
+    createClient(
+      BillingService,
+      createMockTransport({ userId, billing: { [organizationId]: state } }),
+    );
+  const codeOf = async (call: Promise<unknown>) =>
+    ((await call.catch((e: unknown) => e)) as ConnectError).code;
+
+  test("seeds each billing state", async () => {
+    const cases = [
+      [
+        MockBillingState.AllowedLinked,
+        BillingPhase.ALLOWED,
+        BillingReason.UNSPECIFIED,
+        true,
+      ],
+      [
+        MockBillingState.BlockedUnlinked,
+        BillingPhase.BLOCKED,
+        BillingReason.ACCOUNT_REQUIRED,
+        false,
+      ],
+      [
+        MockBillingState.BlockedLinked,
+        BillingPhase.BLOCKED,
+        BillingReason.BLOCKED,
+        true,
+      ],
+      [
+        MockBillingState.Suspended,
+        BillingPhase.SUSPENDED,
+        BillingReason.SUSPENDED,
+        true,
+      ],
+    ] as const;
+    for (const [state, phase, reason, linked] of cases) {
+      const res = await billing(state, MEMBER).getBillingStatus({
+        organizationId,
+      });
+      expect(res.billing?.phase).toBe(phase);
+      expect(res.billing?.reason).toBe(reason);
+      expect(res.billing?.linked).toBe(linked);
+      expect(res.billing?.suspendTime === undefined).toBe(
+        phase === BillingPhase.ALLOWED,
+      );
+    }
+  });
+
+  test("returns this month's usage for every meter in order, with debt", async () => {
+    const res = await billing(
+      MockBillingState.BlockedLinked,
+      ADMIN,
+    ).getBillingUsage({ organizationId });
+    expect(res.balanceUsdMicros).toBeLessThan(0n);
+    expect(res.meterUsages.map((u) => u.meter)).toEqual([
+      BillingMeter.RELAY_EGRESS,
+      BillingMeter.R2_STORAGE,
+      BillingMeter.CLASS_A_RPC,
+      BillingMeter.CLASS_B_RPC,
+    ]);
+    expect(
+      res.meterUsages.some(
+        (u) => u.amountUsdMicros > 0n && u.amountUsdMicros < 10_000n,
+      ),
+    ).toBe(true);
+  });
+
+  test("applies the role matrix", async () => {
+    const state = MockBillingState.AllowedLinked;
+    expect(
+      await codeOf(billing(state, MEMBER).getBillingUsage({ organizationId })),
+    ).toBe(Code.PermissionDenied);
+    expect(
+      await codeOf(
+        billing(state, ADMIN).listLinkableBillingAccounts({ organizationId }),
+      ),
+    ).toBe(Code.PermissionDenied);
+    expect(
+      await codeOf(
+        billing(state, ADMIN).unlinkBillingAccount({ organizationId }),
+      ),
+    ).toBe(Code.PermissionDenied);
+    expect(
+      await codeOf(
+        billing(state, "user-stranger").getBillingStatus({ organizationId }),
+      ),
+    ).toBe(Code.NotFound);
+  });
+
+  test("fails usage without a link", async () => {
+    expect(
+      await codeOf(
+        billing(MockBillingState.BlockedUnlinked).getBillingUsage({
+          organizationId,
+        }),
+      ),
+    ).toBe(Code.FailedPrecondition);
+  });
+
+  test("links, rejects another link and unlinks into a block at once", async () => {
+    const client = billing(MockBillingState.BlockedUnlinked);
+    const before = await client.getBillingStatus({ organizationId });
+    const { billingAccounts } = await client.listLinkableBillingAccounts({
+      organizationId,
+    });
+    expect(billingAccounts.length).toBeGreaterThan(0);
+    const linked = await client.linkBillingAccount({
+      organizationId,
+      billingAccountId: MOCK_IDS.acmeBillingAccount,
+    });
+    expect(linked.billing?.phase).toBe(BillingPhase.ALLOWED);
+    expect(linked.billingAccountName).toBe("Acme Robotics billing");
+    expect(
+      await codeOf(
+        client.linkBillingAccount({
+          organizationId,
+          billingAccountId: MOCK_IDS.labBillingAccount,
+        }),
+      ),
+    ).toBe(Code.AlreadyExists);
+    const unlinked = await client.unlinkBillingAccount({ organizationId });
+    expect(unlinked.billing?.phase).toBe(BillingPhase.BLOCKED);
+    expect(unlinked.billing?.reason).toBe(BillingReason.ACCOUNT_REQUIRED);
+    // The new block starts at the unlink, after the earlier one ended.
+    expect(unlinked.billing!.blockedSince!.seconds).toBeGreaterThan(
+      before.billing!.blockedSince!.seconds,
+    );
+  });
+
+  test("keeps an earlier block start when a blocked organization unlinks", async () => {
+    const client = billing(MockBillingState.BlockedLinked);
+    const before = await client.getBillingStatus({ organizationId });
+    const after = await client.unlinkBillingAccount({ organizationId });
+    expect(after.billing?.reason).toBe(BillingReason.ACCOUNT_REQUIRED);
+    expect(after.billing?.blockedSince).toEqual(before.billing?.blockedSince);
+  });
+
+  test("an ownership transfer removes the link", async () => {
+    const transport = createMockTransport();
+    await createClient(OrganizationService, transport).transferOwnership({
+      organizationId,
+      userId: ADMIN,
+    });
+    const res = await createClient(BillingService, transport).getBillingStatus({
+      organizationId,
+    });
+    expect(res.billing?.linked).toBe(false);
+    expect(res.billing?.reason).toBe(BillingReason.ACCOUNT_REQUIRED);
+  });
+
+  test("rejects resource creation of a blocked organization with a billing reason", async () => {
+    const transport = createMockTransport({
+      billing: { [organizationId]: MockBillingState.BlockedLinked },
+    });
+    const error = (await createClient(SandboxService, transport)
+      .resumeSandbox({ organizationId, sandboxId: MOCK_IDS.pausedSandbox })
+      .catch((e: unknown) => e)) as ConnectError;
+    expect(error.code).toBe(Code.ResourceExhausted);
+    expect(error.rawMessage).toContain("https://accounts.delino.io");
+    expect(error.findDetails(ErrorDetailSchema)[0]?.billingReason).toBe(
+      BillingReason.BLOCKED,
+    );
   });
 });

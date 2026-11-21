@@ -195,6 +195,72 @@ describe("roles", () => {
   });
 });
 
+describe("billing", () => {
+  test("shows the suspension banner to a member", async ({ app, screen }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    // The mock API seeds Northwind as suspended.
+    await app.open(`/orgs/${NORTHWIND}/sandboxes`);
+
+    const banner = screen.getByRole("region", "This organization is suspended");
+    await expect(banner).toBeVisible();
+    await expect(banner).toContainText("Running sandboxes are paused");
+    await expect(
+      banner.getByRole("link", "Manage billing at accounts.delino.io"),
+    ).toHaveAttribute("href", "https://accounts.delino.io");
+    await expect(screen.getByRole("region", "Billing")).toBeHidden();
+  });
+
+  test("shows the billing account and this month's usage to the owner", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    const section = screen.getByRole("region", "Billing");
+    await expect(section).toContainText("Acme Robotics billing");
+    await expect(section).toContainText("$42.52");
+    await expect(section).toContainText("Class A RPCs");
+    await expect(section).toContainText("$0.00558");
+    await expect(
+      screen.getByRole("region", "This organization is blocked"),
+    ).toBeHidden();
+  });
+
+  test("unlinks after a confirmation and links again", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/settings`);
+
+    await screen.getByRole("button", "Unlink billing account").tap();
+    const confirm = screen.getByRole("alertdialog");
+    await expect(confirm).toContainText("becomes blocked at once");
+    await confirm.getByRole("button", "Unlink billing account").tap();
+    await expect(confirm).toBeHidden();
+    await expect(
+      screen.getByRole("region", "This organization is blocked"),
+    ).toBeVisible();
+
+    await screen.getByRole("button", "Link a billing account").tap();
+    const dialog = screen.getByRole("dialog", "Link a billing account");
+    await expect(
+      dialog.getByRole("radio", "Acme Robotics billing · Owner"),
+    ).toBeFocused();
+    await browser.keyboard.press("Space");
+    await dialog.getByRole("button", "Link").tap();
+    await expect(dialog).toBeHidden();
+    await expect(
+      screen.getByRole("region", "This organization is blocked"),
+    ).toBeHidden();
+  });
+});
+
 describe("invitations", () => {
   test("accepts an invitation link through sign-in and removes the secret from the address", async ({
     app,

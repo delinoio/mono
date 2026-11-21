@@ -2,12 +2,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import {
+  billingReasonOf,
   DataPathError,
   InvalidFrameError,
   OwnSandConfigError,
 } from "./errors.ts";
 import { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 import {
+  BillingReason,
   DataPathTransport,
   SessionEndReason,
 } from "./gen/delino/ownsand/v1/common_pb.ts";
@@ -25,6 +27,7 @@ import {
   type FakeWebRtcOptions,
   fakeWebRtc,
 } from "./testing/fake-webrtc.ts";
+import { ownsandError } from "./testing/fake-api.ts";
 import {
   attachMsg,
   ev,
@@ -611,6 +614,30 @@ describe("peer-to-peer data path", () => {
         )
         .catch((e) => e);
       expect(error.code).toBe(code);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+  }
+
+  for (const transport of [undefined, DataPathTransport.PEER_TO_PEER]) {
+    test(`ends the operation without the relay when OpenSession fails with a billing error (transport ${transport === undefined ? "auto" : DataPathTransport[transport]})`, async () => {
+      const { h } = p2pSetup(() => {}, { transport });
+      h.api.unary(DataPathService, "OpenSession", () => {
+        throw ownsandError(
+          Code.ResourceExhausted,
+          "suspended; see https://accounts.delino.io",
+          { billingReason: BillingReason.SUSPENDED },
+        );
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(billingReasonOf(error)).toBe(BillingReason.SUSPENDED);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
     });
   }

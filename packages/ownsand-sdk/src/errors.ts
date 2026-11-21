@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
 import {
+  BillingReason,
   type ErrorDetail,
   ErrorDetailSchema,
 } from "./gen/delino/ownsand/v1/common_pb.ts";
@@ -82,6 +83,48 @@ export function errorDetailOf(error: unknown): ErrorDetail | undefined {
   return error.findDetails(ErrorDetailSchema)[0];
 }
 
+/** Most `cause` links that `billingReasonOf` follows. */
+const MAX_CAUSE_DEPTH = 8;
+
+/**
+ * Returns the billing reason of an error: the `billingReason` of the
+ * ErrorDetail of a `resource_exhausted` ConnectError, also when an SDK error
+ * such as a `DataPathError` wraps it as its `cause`. It returns
+ * `BillingReason.UNSPECIFIED` for every other error.
+ *
+ * Billing enforcement of the control plane rejects a call with such an error
+ * when the organization has no linked billing account (`ACCOUNT_REQUIRED`),
+ * is blocked for non-payment (`BLOCKED`) or is suspended (`SUSPENDED`). The
+ * error is terminal: the SDK never retries it, and the caller must not retry
+ * the call until the billing of the organization changes. Its `rawMessage`
+ * names the reason and contains the billing link https://accounts.delino.io.
+ */
+export function billingReasonOf(error: unknown): BillingReason {
+  let current: unknown = error;
+  for (let depth = 0; depth <= MAX_CAUSE_DEPTH; depth++) {
+    if (current instanceof ConnectError) {
+      if (current.code !== Code.ResourceExhausted) {
+        return BillingReason.UNSPECIFIED;
+      }
+      return errorDetailOf(current)?.billingReason ?? BillingReason.UNSPECIFIED;
+    }
+    if (!(current instanceof Error) || current.cause === undefined) {
+      return BillingReason.UNSPECIFIED;
+    }
+    current = current.cause;
+  }
+  return BillingReason.UNSPECIFIED;
+}
+
+/**
+ * Reports whether an error is a billing error: a `resource_exhausted` error
+ * with a billing reason (see `billingReasonOf`). Every reason other than
+ * `UNSPECIFIED` counts, also a value that a newer server adds.
+ */
+export function isBillingError(error: unknown): boolean {
+  return billingReasonOf(error) !== BillingReason.UNSPECIFIED;
+}
+
 /** How the relay recovery rules treat a failed call. */
 export enum FailureClass {
   /** Ends the operation at once with the error. */
@@ -126,7 +169,12 @@ export function classifyFailure(error: unknown): FailureClass {
     case Code.Unavailable:
       return FailureClass.Unavailable;
     case Code.ResourceExhausted:
-      return FailureClass.ResourceExhausted;
+      // A billing error is terminal everywhere, also under relay recovery
+      // and in the createSandbox retry: only a change of the organization's
+      // billing can lift it.
+      return isBillingError(error)
+        ? FailureClass.Terminal
+        : FailureClass.ResourceExhausted;
     case Code.Aborted:
       return errorDetailOf(error) === undefined
         ? FailureClass.Interruption

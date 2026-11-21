@@ -25,8 +25,9 @@ import {
   Loading,
   PageHeader,
   ShortId,
+  toastError,
 } from "../components/ui.tsx";
-import { errorMessage, formatBytes, formatTime, labels } from "../format.ts";
+import { formatBytes, formatTime, labels } from "../format.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
 
 /** Route `snapshots`: snapshots, their export, and templates. */
@@ -125,7 +126,7 @@ export function SnapshotsPage() {
                           });
                           toast.success("The export started.");
                         } catch (error) {
-                          toast.error(errorMessage(error));
+                          toastError(error);
                         }
                       }}
                     >

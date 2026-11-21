@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { billingReasonOf } from "./api.ts";
+import { BillingAccountRole, BillingMeter } from "ownsand-sdk/gen/billing_pb";
 import {
   AgentUpdateState,
   AgentVersionPolicyMode,
@@ -19,6 +21,7 @@ import {
   SnapshotExportState,
   SnapshotState,
 } from "ownsand-sdk/gen/common_pb";
+import { ACCOUNTS_URL } from "./config.ts";
 
 /** Display labels of the enums the console shows. */
 export const labels = {
@@ -123,6 +126,19 @@ export const labels = {
     [SnapshotExportState.EXPORTING]: "Exporting",
     [SnapshotExportState.EXPORTED]: "Exported",
     [SnapshotExportState.EXPORT_FAILED]: "Export failed",
+  },
+  billingMeter: {
+    [BillingMeter.UNSPECIFIED]: "Unknown meter",
+    [BillingMeter.RELAY_EGRESS]: "Relay egress",
+    [BillingMeter.R2_STORAGE]: "R2 snapshot storage",
+    [BillingMeter.CLASS_A_RPC]: "Class A RPCs",
+    [BillingMeter.CLASS_B_RPC]: "Class B RPCs",
+  },
+  billingAccountRole: {
+    [BillingAccountRole.UNSPECIFIED]: "Unknown role",
+    [BillingAccountRole.OWNER]: "Owner",
+    [BillingAccountRole.ADMIN]: "Admin",
+    [BillingAccountRole.VIEWER]: "Viewer",
   },
   policyMode: {
     [AgentVersionPolicyMode.UNSPECIFIED]: "Unknown",
@@ -239,6 +255,14 @@ export function errorMessage(error: unknown): string {
     case Code.Unavailable:
       return "OwnSand is not available right now. Try again in a moment.";
     case Code.ResourceExhausted:
+      // A billing rejection is terminal: show the server's message, which
+      // names the reason and links to the billing site.
+      if (billingReasonOf(error) !== undefined) {
+        return (
+          error.rawMessage ||
+          `Billing does not allow this action. Check the billing at ${ACCOUNTS_URL}.`
+        );
+      }
       return "Too many requests. Wait a moment and try again.";
     case Code.InvalidArgument:
     case Code.FailedPrecondition:
@@ -246,4 +270,132 @@ export function errorMessage(error: unknown): string {
     default:
       return "Something went wrong. Try again.";
   }
+}
+
+/**
+ * Divides `n` by the positive `d` and rounds half away from zero, in exact
+ * bigint arithmetic. Billing display rounding uses this mode only.
+ */
+function divideRoundHalfAway(n: bigint, d: bigint): bigint {
+  const quotient = n / d;
+  const remainder = n % d;
+  const twice = 2n * (remainder < 0n ? -remainder : remainder);
+  if (twice < d) return quotient;
+  return n < 0n ? quotient - 1n : quotient + 1n;
+}
+
+/** Inserts a comma between every group of three digits. */
+function groupThousands(digits: string): string {
+  return digits.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}
+
+/**
+ * The decimal text of n / d with exactly `decimals` fraction digits,
+ * rounded half away from zero. A value that rounds to zero has no sign.
+ */
+function scaledDecimal(
+  n: bigint,
+  d: bigint,
+  decimals: number,
+): { negative: boolean; whole: string; fraction: string } {
+  const scale = 10n ** BigInt(decimals);
+  const scaled = divideRoundHalfAway(n * scale, d);
+  const negative = scaled < 0n;
+  const magnitude = negative ? -scaled : scaled;
+  return {
+    negative,
+    whole: groupThousands((magnitude / scale).toString()),
+    fraction: (magnitude % scale).toString().padStart(decimals, "0"),
+  };
+}
+
+const MICROS_PER_USD = 1_000_000n;
+
+/**
+ * Usage costs whose magnitude is below this amount ($0.01) show with up to
+ * 6 decimals, because 2 decimals would hide them.
+ */
+export const SMALL_COST_USD_MICROS = 10_000n;
+
+/**
+ * Formats a micro-USD amount (an int64 `_usd_micros` value) as USD with 2
+ * decimals, for example `$1,234.57`, or `-$0.01` for debt. The amount stays
+ * a bigint; display rounding is half away from zero.
+ */
+export function formatUsdMicros(amountUsdMicros: bigint): string {
+  const { negative, whole, fraction } = scaledDecimal(
+    amountUsdMicros,
+    MICROS_PER_USD,
+    2,
+  );
+  return `${negative ? "-" : ""}$${whole}.${fraction}`;
+}
+
+/**
+ * Formats the cost of a usage meter. Zero and a cost of at least $0.01 in
+ * magnitude show like `formatUsdMicros`. A smaller nonzero cost shows
+ * exactly, with up to 6 decimals and without trailing zeros, for example
+ * `$0.005` or `$0.000001`; it needs no rounding, and at least 3 decimals
+ * remain because the first two are zero.
+ */
+export function formatUsageCostUsdMicros(amountUsdMicros: bigint): string {
+  const negative = amountUsdMicros < 0n;
+  const magnitude = negative ? -amountUsdMicros : amountUsdMicros;
+  if (magnitude === 0n || magnitude >= SMALL_COST_USD_MICROS) {
+    return formatUsdMicros(amountUsdMicros);
+  }
+  const fraction = magnitude.toString().padStart(6, "0").replace(/0+$/, "");
+  return `${negative ? "-" : ""}$0.${fraction}`;
+}
+
+/**
+ * Byte-seconds in one GiB-month: 2^30 bytes for 730 hours (2,628,000
+ * seconds), the month of the R2 storage price (1 GiB-month = 730
+ * GiB-hours).
+ */
+export const BYTE_SECONDS_PER_GIB_MONTH = 2n ** 30n * 3_600n * 730n;
+
+/**
+ * Formats an R2 storage quantity in byte-seconds as GiB-months with 3
+ * decimals, rounded half away from zero. A positive quantity that rounds to
+ * zero shows as "less than 0.001 GiB-months".
+ */
+export function formatGibMonths(byteSeconds: bigint): string {
+  const { negative, whole, fraction } = scaledDecimal(
+    byteSeconds,
+    BYTE_SECONDS_PER_GIB_MONTH,
+    3,
+  );
+  if (byteSeconds > 0n && whole === "0" && fraction === "000") {
+    return "less than 0.001 GiB-months";
+  }
+  return `${negative ? "-" : ""}${whole}.${fraction} GiB-months`;
+}
+
+const BYTE_UNITS = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] as const;
+
+/**
+ * Formats an exact byte count, such as relay egress, in the largest binary
+ * unit in which it shows as at least 1.00, with 2 decimals rounded half away
+ * from zero. Fewer than 1,024 bytes show as an integer.
+ */
+export function formatByteCount(bytes: bigint): string {
+  const negative = bytes < 0n;
+  const magnitude = negative ? -bytes : bytes;
+  const sign = negative ? "-" : "";
+  for (let unit = BYTE_UNITS.length - 1; unit > 0; unit--) {
+    const divisor = 1024n ** BigInt(unit);
+    if (divideRoundHalfAway(magnitude * 100n, divisor) >= 100n) {
+      const { whole, fraction } = scaledDecimal(magnitude, divisor, 2);
+      return `${sign}${whole}.${fraction} ${BYTE_UNITS[unit]}`;
+    }
+  }
+  return `${sign}${groupThousands(magnitude.toString())} B`;
+}
+
+/** Formats an exact count, such as RPC calls, with thousands separators. */
+export function formatCount(count: bigint): string {
+  const negative = count < 0n;
+  const magnitude = negative ? -count : count;
+  return `${negative ? "-" : ""}${groupThousands(magnitude.toString())}`;
 }

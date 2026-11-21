@@ -4,8 +4,18 @@ import { TransportProvider } from "@connectrpc/connect-query";
 import { type QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { ToastRegion } from "delino-ui/toast";
-import { type ReactNode, useCallback, useMemo, useState } from "react";
-import { createApiTransport, createQueryClient } from "./api.ts";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
+import {
+  createApiTransport,
+  createQueryClient,
+  watchBillingErrors,
+} from "./api.ts";
 import {
   type Auth,
   AuthContextProvider,
@@ -125,6 +135,7 @@ function ApiProviders({
     () => transport ?? createApiTransport(config.apiOrigin, getAccessToken),
     [transport, config.apiOrigin, getAccessToken],
   );
+  useEffect(() => watchBillingErrors(queryClient), [queryClient]);
   return (
     <TransportProvider transport={resolved}>
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>

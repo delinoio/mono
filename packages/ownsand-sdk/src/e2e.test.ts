@@ -4,14 +4,21 @@
 // real device agent over the relay. It runs only when the OwnSand
 // end-to-end suite (servers/ownsand-api/e2e) starts it and sets the
 // OWNSAND_E2E_* variables below; otherwise it is skipped.
+import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
+import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
+import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
 import {
   BaseImage,
+  BillingReason,
+  billingReasonOf,
   DataPathTransport,
   ExecEventType,
   ExecResultKind,
+  isBillingError,
   NetworkMode,
   OwnSandClient,
+  type Sandbox,
   SandboxState,
   SnapshotState,
 } from "./index.ts";
@@ -21,6 +28,9 @@ const apiUrl = env.OWNSAND_E2E_API_URL ?? "";
 const apiKey = env.OWNSAND_E2E_API_KEY ?? "";
 const org = env.OWNSAND_E2E_ORG ?? "";
 const enabled = apiUrl !== "" && apiKey !== "" && org !== "";
+// The billing control endpoint of the end-to-end suite. It changes the
+// billing status of the organization through the fake delino-accounts.
+const billingUrl = env.OWNSAND_E2E_BILLING_URL ?? "";
 
 const decoder = new TextDecoder();
 
@@ -34,6 +44,101 @@ function randomBytes(n: number): Uint8Array {
 
 function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+/**
+ * Billing statuses that the billing control endpoint applies. The values
+ * are the path segments of servers/ownsand-api/e2e/tssdk_test.go.
+ */
+enum BillingControlStatus {
+  Suspended = "suspended",
+  Allowed = "allowed",
+}
+
+/** Applies a billing status to the organization at once. */
+async function setBilling(status: BillingControlStatus): Promise<void> {
+  const res = await fetch(`${billingUrl}/billing/${status}`, {
+    method: "POST",
+  });
+  if (!res.ok) {
+    throw new Error(
+      `billing control ${status}: ${res.status} ${await res.text()}`,
+    );
+  }
+}
+
+/** Polls the sandbox until it reaches the state, for at most a minute. */
+async function waitForState(
+  sandbox: Sandbox,
+  want: SandboxState,
+): Promise<void> {
+  const deadline = Date.now() + 60_000;
+  for (;;) {
+    const { state } = await sandbox.get();
+    if (state === want) return;
+    if (Date.now() > deadline) {
+      throw new Error(
+        `sandbox did not reach ${SandboxState[want]}: last ${SandboxState[state]}`,
+      );
+    }
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+const AUTHORIZE_RELAY_PATH = `/${DataPathService.typeName}/${DataPathService.method.authorizeRelay.name}`;
+const RELAY_SERVICE_PREFIX = `/${RelayService.typeName}/`;
+
+/** Counts the API requests of a client by URL path. */
+class RequestCounter {
+  readonly #paths: string[] = [];
+
+  readonly fetch: typeof globalThis.fetch = (input, init) => {
+    const url =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.href
+          : input.url;
+    this.#paths.push(new URL(url).pathname);
+    return globalThis.fetch(input, init);
+  };
+
+  /** Forgets the requests counted so far. */
+  reset(): void {
+    this.#paths.length = 0;
+  }
+
+  /** The number of requests whose path starts with the prefix. */
+  count(prefix: string): number {
+    return this.#paths.filter((path) => path.startsWith(prefix)).length;
+  }
+}
+
+/**
+ * Runs a relay operation of a suspended organization and checks that it
+ * fails at once with the terminal billing error: one rejected
+ * `AuthorizeRelay` and no retry and no relay call.
+ */
+async function expectSuspended(
+  requests: RequestCounter,
+  operation: () => Promise<unknown>,
+): Promise<void> {
+  requests.reset();
+  let caught: unknown;
+  try {
+    await operation();
+  } catch (error) {
+    caught = error;
+  }
+  expect(caught).toBeInstanceOf(ConnectError);
+  expect((caught as ConnectError).code).toBe(Code.ResourceExhausted);
+  expect(billingReasonOf(caught)).toBe(BillingReason.SUSPENDED);
+  expect(isBillingError(caught)).toBe(true);
+  expect((caught as ConnectError).message).toContain(
+    "https://accounts.delino.io",
+  );
+  expect(requests.count(AUTHORIZE_RELAY_PATH)).toBe(1);
+  expect(requests.count(RELAY_SERVICE_PREFIX)).toBe(0);
 }
 
 (enabled ? describe : describe.skip)(
@@ -127,6 +232,64 @@ function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
           expect([SandboxState.DELETING, SandboxState.DELETED]).toContain(
             deleted.state,
           );
+        }
+      },
+      3 * 60_000,
+    );
+
+    (billingUrl === "" ? test.skip : test)(
+      "ends relay operations of a suspended organization without a retry",
+      async () => {
+        const requests = new RequestCounter();
+        const client = new OwnSandClient({
+          origin: apiUrl,
+          apiKey,
+          organizationId: org,
+          transport: DataPathTransport.RELAY,
+          webrtc: false,
+          fetch: requests.fetch,
+          env: {},
+        });
+        const sandbox = await client.createSandbox({
+          source: { baseImage: BaseImage.LINUX },
+          resources: { vcpuCount: 1, memoryMib: 512, diskGib: 1 },
+          idleTtl: 30 * 60_000,
+          maxTtl: 2 * 60 * 60_000,
+          network: NetworkMode.NONE,
+        });
+        try {
+          expect((await sandbox.waitUntilStable({ pollMs: 200 })).state).toBe(
+            SandboxState.RUNNING,
+          );
+          const pwd = await sandbox.run({ command: ["/bin/pwd"] });
+          const root = decoder.decode(pwd.stdout).trim().replace(/\/$/, "");
+          const path = `${root}/billing.bin`;
+          const data = randomBytes(4096);
+          await sandbox.writeFile(path, data);
+
+          // The suspension pauses the running sandbox and rejects the data
+          // path. Each relay operation ends with its first AuthorizeRelay.
+          await setBilling(BillingControlStatus.Suspended);
+          await waitForState(sandbox, SandboxState.PAUSED);
+          await expectSuspended(requests, () =>
+            sandbox.run({ command: ["/bin/echo", "suspended"] }),
+          );
+          await expectSuspended(requests, () => sandbox.readFileBytes(path));
+
+          // The recovery resumes the sandbox that billing paused, and the
+          // same operations work again.
+          await setBilling(BillingControlStatus.Allowed);
+          await waitForState(sandbox, SandboxState.RUNNING);
+          const run = await sandbox.run({
+            command: ["/bin/echo", "recovered"],
+          });
+          expect(decoder.decode(run.stdout)).toBe("recovered\n");
+          expect(run.result.kind).toBe(ExecResultKind.Exited);
+          expect(sameBytes(await sandbox.readFileBytes(path), data)).toBe(true);
+        } finally {
+          await setBilling(BillingControlStatus.Allowed);
+          await sandbox.delete();
+          sandbox.close();
         }
       },
       3 * 60_000,

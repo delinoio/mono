@@ -90,6 +90,10 @@ func (c *Client) Snapshots() *SnapshotService { return &SnapshotService{c} }
 // itself; programs need it only for custom data path handling.
 func (c *Client) DataPath() *DataPathService { return &DataPathService{c} }
 
+// Billing returns the BillingService wrapper. Payments, top-ups and billing
+// account management stay on https://accounts.delino.io.
+func (c *Client) Billing() *BillingService { return &BillingService{c} }
+
 // OrganizationService wraps delino.ownsand.v1.OrganizationService.
 type OrganizationService struct{ c *Client }
 
@@ -324,4 +328,39 @@ func (s *DataPathService) OpenSession(ctx context.Context, req *ownsandv1.OpenSe
 // AuthorizeRelay grants relay access to one operation.
 func (s *DataPathService) AuthorizeRelay(ctx context.Context, req *ownsandv1.AuthorizeRelayRequest) (*ownsandv1.AuthorizeRelayResponse, error) {
 	return unary(ctx, s.c, s.c.dataPath.AuthorizeRelay, req)
+}
+
+// BillingService wraps delino.ownsand.v1.BillingService. Its RPCs are never
+// billed and never rejected by billing enforcement.
+type BillingService struct{ c *Client }
+
+// GetStatus reads the billing phase of the organization. Every member and
+// API key of the organization may call it.
+func (s *BillingService) GetStatus(ctx context.Context, req *ownsandv1.GetBillingStatusRequest) (*ownsandv1.GetBillingStatusResponse, error) {
+	return unary(ctx, s.c, s.c.billing.GetBillingStatus, req)
+}
+
+// GetUsage reads the linked billing account, its balance and this UTC
+// month's usage and cost for each meter. Organization owner and admin only;
+// an organization without a link fails with failed_precondition.
+func (s *BillingService) GetUsage(ctx context.Context, req *ownsandv1.GetBillingUsageRequest) (*ownsandv1.GetBillingUsageResponse, error) {
+	return unary(ctx, s.c, s.c.billing.GetBillingUsage, req)
+}
+
+// ListLinkableAccounts lists the billing accounts in which the caller is
+// owner or admin. Organization owner only.
+func (s *BillingService) ListLinkableAccounts(ctx context.Context, req *ownsandv1.ListLinkableBillingAccountsRequest) (*ownsandv1.ListLinkableBillingAccountsResponse, error) {
+	return unary(ctx, s.c, s.c.billing.ListLinkableBillingAccounts, req)
+}
+
+// LinkAccount links the organization to a billing account. Organization
+// owner only.
+func (s *BillingService) LinkAccount(ctx context.Context, req *ownsandv1.LinkBillingAccountRequest) (*ownsandv1.LinkBillingAccountResponse, error) {
+	return unary(ctx, s.c, s.c.billing.LinkBillingAccount, req)
+}
+
+// UnlinkAccount removes the billing account link; the organization becomes
+// blocked at once. Organization owner only.
+func (s *BillingService) UnlinkAccount(ctx context.Context, req *ownsandv1.UnlinkBillingAccountRequest) (*ownsandv1.UnlinkBillingAccountResponse, error) {
+	return unary(ctx, s.c, s.c.billing.UnlinkBillingAccount, req)
 }

@@ -17,8 +17,9 @@ import {
   PageHeader,
   SecretDialog,
   ShortId,
+  toastError,
 } from "../components/ui.tsx";
-import { errorMessage, formatTime, labels } from "../format.ts";
+import { formatTime, labels } from "../format.ts";
 
 /** Token lifetimes that the console offers; the maximum is 24 hours. */
 const TTL_HOURS = [1, 6, 12, 24] as const;
@@ -86,7 +87,7 @@ export function EnrollmentTokensPage() {
                       });
                       toast.success("The token is revoked.");
                     } catch (error) {
-                      toast.error(errorMessage(error));
+                      toastError(error);
                     }
                   }}
                 >

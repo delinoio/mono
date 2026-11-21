@@ -26,6 +26,7 @@ import {
   MOCK_IDS,
   MOCK_INVITATION_SECRET,
   MOCK_USER,
+  MockBillingState,
 } from "./mock/mock-api.ts";
 
 /** The seeded Acme invitation, which the mock user cannot accept: already a member. */
@@ -707,5 +708,339 @@ describe("sign-in callback", () => {
     renderConsole("/callback", { signedIn: false });
     await settle(60);
     expect(window.location.pathname).toBe("/");
+  });
+});
+
+/** The seeded Acme members of each role. */
+const ACME_ROLES = [
+  ["owner", MOCK_USER],
+  ["admin", "user-admin-jun"],
+  ["member", "user-member-ada"],
+] as const;
+
+const BILLING_STATES = [
+  MockBillingState.AllowedLinked,
+  MockBillingState.BlockedUnlinked,
+  MockBillingState.BlockedLinked,
+  MockBillingState.Suspended,
+] as const;
+
+/** A mock transport that counts the calls of each method. */
+function countingTransport(mock: Transport) {
+  const calls: Record<string, number> = {};
+  const transport: Transport = {
+    ...mock,
+    unary(method, ...rest) {
+      calls[method.name] = (calls[method.name] ?? 0) + 1;
+      return mock.unary(method, ...rest);
+    },
+  };
+  return { transport, calls };
+}
+
+describe("billing banner", () => {
+  for (const [roleName, userId] of ACME_ROLES) {
+    for (const state of BILLING_STATES) {
+      test(`the ${roleName} in ${state}`, async () => {
+        renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+          transport: createMockTransport({
+            userId,
+            billing: { [MOCK_IDS.acme]: state },
+          }),
+        });
+        await screen.findByRole("heading", { name: "Sandboxes", level: 1 });
+        await settle(60);
+        const banner = screen.queryByRole("region", {
+          name: /This organization is/,
+        });
+        if (state === MockBillingState.AllowedLinked) {
+          expect(banner).toBeNull();
+          return;
+        }
+        expect(banner).not.toBeNull();
+        const text = banner!.textContent!;
+        const link = within(banner!).getByRole("link", {
+          name: "Manage billing at accounts.delino.io",
+        });
+        expect(link.getAttribute("href")).toBe("https://accounts.delino.io");
+        if (state === MockBillingState.Suspended) {
+          expect(text).toContain("This organization is suspended");
+          expect(text).toContain("Running sandboxes are paused");
+          expect(text).toContain("Suspended since");
+        } else {
+          expect(text).toContain("This organization is blocked");
+          expect(text).toContain("OwnSand rejects creating sandboxes");
+          expect(text).toContain("is suspended on");
+        }
+        if (state === MockBillingState.BlockedUnlinked) {
+          expect(text).toContain("No billing account is linked");
+          expect(
+            within(banner!).queryByRole("link", {
+              name: "Link a billing account",
+            }) !== null,
+          ).toBe(roleName === "owner");
+          expect(text.includes("The organization owner must link")).toBe(
+            roleName !== "owner",
+          );
+        }
+        if (state === MockBillingState.BlockedLinked) {
+          expect(text).toContain("Payment is missing");
+        }
+      });
+    }
+  }
+
+  test("shows on every organization page", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedLinked },
+      }),
+    });
+    expect(
+      await screen.findByRole("region", {
+        name: "This organization is blocked",
+      }),
+    ).toBeTruthy();
+  });
+});
+
+describe("billing errors", () => {
+  test("a mutation rejected by billing shows the message and link once and refreshes the status", async () => {
+    const { transport, calls } = countingTransport(
+      createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedLinked },
+      }),
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
+    await screen.findByRole("region", { name: "This organization is blocked" });
+    await screen.findByText(/ose_91c2/);
+    const statusReads = calls.GetBillingStatus ?? 0;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+    });
+    const dialog = await screen.findByRole("dialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create token" }),
+      );
+    });
+    await settle(100);
+    const notice = dialog.querySelector(".notice-error") as HTMLElement;
+    expect(notice.textContent).toContain(
+      "has no active subscription or no balance",
+    );
+    expect(
+      within(notice)
+        .getByRole("link", { name: "https://accounts.delino.io" })
+        .getAttribute("href"),
+    ).toBe("https://accounts.delino.io");
+    expect(within(notice).queryByRole("button", { name: "Try again" })).toBe(
+      null,
+    );
+    // Never retried, and the banner's status is read again.
+    expect(calls.CreateEnrollmentToken).toBe(1);
+    expect(calls.GetBillingStatus ?? 0).toBeGreaterThan(statusReads);
+  });
+});
+
+describe("billing settings", () => {
+  for (const [roleName, userId] of ACME_ROLES) {
+    for (const state of BILLING_STATES) {
+      test(`the ${roleName} in ${state}`, async () => {
+        const { transport, calls } = countingTransport(
+          createMockTransport({ userId, billing: { [MOCK_IDS.acme]: state } }),
+        );
+        renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, { transport });
+        await screen.findByRole("heading", { name: "Agent version policy" });
+        await settle(60);
+        const section = screen.queryByRole("region", { name: "Billing" });
+        if (roleName === "member") {
+          expect(section).toBeNull();
+          expect(calls.GetBillingUsage).toBeUndefined();
+          return;
+        }
+        expect(section).not.toBeNull();
+        const text = section!.textContent!;
+        const owner = roleName === "owner";
+        if (state === MockBillingState.BlockedUnlinked) {
+          // Without a link, the section never asks for the usage.
+          expect(calls.GetBillingUsage).toBeUndefined();
+          expect(
+            within(section!).queryByRole("button", {
+              name: "Link a billing account",
+            }) !== null,
+          ).toBe(owner);
+          expect(text.includes("The organization owner must link one")).toBe(
+            !owner,
+          );
+          return;
+        }
+        await within(section!).findByRole("table", {
+          name: "Usage this month",
+        });
+        const rows = within(section!)
+          .getAllByRole("row")
+          .slice(1)
+          .map((r) => r.textContent);
+        expect(rows).toEqual([
+          "Relay egress12.50 GiB$1.13",
+          "R2 snapshot storage0.986 GiB-months$0.03",
+          "Class A RPCs1,240 calls$0.00558",
+          "Class B RPCs18,400 calls$0.006624",
+        ]);
+        expect(text).toContain("$1.17");
+        if (state === MockBillingState.AllowedLinked) {
+          expect(text).toContain("Acme Robotics billing");
+          expect(text).toContain("$42.52");
+        } else {
+          expect(text).toContain("Research lab credits");
+          expect(text).toContain("-$1.23 (debt)");
+        }
+        expect(
+          within(section!).getByRole("link", { name: "accounts.delino.io" }),
+        ).toBeTruthy();
+        expect(
+          within(section!).queryByRole("button", {
+            name: "Unlink billing account",
+          }) !== null,
+        ).toBe(owner);
+      });
+    }
+  }
+
+  async function openLinkDialog() {
+    const section = await screen.findByRole("region", { name: "Billing" });
+    // Find outside act: a findBy wait inside act logs act warnings.
+    const open = await within(section).findByRole("button", {
+      name: "Link a billing account",
+    });
+    await act(async () => {
+      fireEvent.click(open);
+    });
+    await settle(60);
+    return screen.findByRole("dialog", { name: "Link a billing account" });
+  }
+
+  test("the owner links a billing account and the block ends", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedUnlinked },
+      }),
+    });
+    await screen.findByRole("region", { name: "This organization is blocked" });
+    const dialog = await openLinkDialog();
+    const first = within(dialog).getByRole("radio", {
+      name: /Acme Robotics billing · Owner/,
+    });
+    expect(document.activeElement).toBe(first);
+    expect(
+      within(dialog).getByRole("radio", {
+        name: /Research lab credits · Admin/,
+      }),
+    ).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(first);
+    });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Link" }));
+    });
+    await settle(100);
+    expect(screen.queryByRole("dialog")).toBeNull();
+    const section = screen.getByRole("region", { name: "Billing" });
+    expect(
+      (await within(section).findByText("Acme Robotics billing")).textContent,
+    ).toBe("Acme Robotics billing");
+    await settle(60);
+    expect(
+      screen.queryByRole("region", { name: /This organization is/ }),
+    ).toBeNull();
+  });
+
+  test("Escape closes the link dialog", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedUnlinked },
+      }),
+    });
+    const dialog = await openLinkDialog();
+    await within(dialog).findAllByRole("radio");
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    await settle(60);
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  test("explains where to create a billing account when none can be linked", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedUnlinked },
+        linkableBillingAccounts: [],
+      }),
+    });
+    const dialog = await openLinkDialog();
+    await within(dialog).findByText(/not an owner or admin of any billing/);
+    expect(
+      within(dialog)
+        .getByRole("link", { name: "accounts.delino.io" })
+        .getAttribute("href"),
+    ).toBe("https://accounts.delino.io");
+    expect(
+      (
+        within(dialog).getByRole("button", {
+          name: "Link",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+  });
+
+  test("the owner unlinks after a confirmation and the organization is blocked at once", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`);
+    const section = await screen.findByRole("region", { name: "Billing" });
+    const unlink = await within(section).findByRole("button", {
+      name: "Unlink billing account",
+    });
+    await act(async () => {
+      fireEvent.click(unlink);
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain("becomes blocked at once");
+    const buttons = within(dialog).getAllByRole("button");
+    expect(buttons[0].textContent).toBe("Cancel");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Unlink billing account" }),
+      );
+    });
+    await settle(100);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(
+      await screen.findByRole("region", {
+        name: "This organization is blocked",
+      }),
+    ).toBeTruthy();
+    expect(
+      await within(section).findByRole("button", {
+        name: "Link a billing account",
+      }),
+    ).toBeTruthy();
+  });
+
+  test("the ownership transfer confirmation says that it removes the billing link", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`);
+    await screen.findByRole("region", { name: "Billing" });
+    await settle(60);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("combobox", { name: "New owner" }));
+    });
+    const option = await screen.findByRole("option", { name: "Jun Park" });
+    await act(async () => {
+      fireEvent.click(option);
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    expect(dialog.textContent).toContain("removes the billing link");
   });
 });

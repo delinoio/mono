@@ -52,6 +52,13 @@ type fakeServer struct {
 	creat []*ownsandv1.CreateSandboxRequest
 	// execIDs are the exec IDs of the relay Exec requests, in order.
 	execIDs []string
+	// billing and usage are the BillingService state; usage is served only
+	// while billing.linked is true.
+	billing *ownsandv1.OrganizationBilling
+	usage   *ownsandv1.GetBillingUsageResponse
+	// reject, when set, is the error of CreateSandbox, AuthorizeRelay and
+	// the relay RPCs, as billing enforcement returns it.
+	reject error
 }
 
 func newFakeServer(t testing.TB) *fakeServer {
@@ -64,6 +71,7 @@ func newFakeServer(t testing.TB) *fakeServer {
 	mux.Handle(ownsandv1connect.NewSandboxServiceHandler(&fakeSandbox{f: f}))
 	mux.Handle(ownsandv1connect.NewDataPathServiceHandler(&fakeDataPath{f: f}))
 	mux.Handle(ownsandv1connect.NewRelayServiceHandler(&fakeRelay{f: f}))
+	mux.Handle(ownsandv1connect.NewBillingServiceHandler(&fakeBilling{f: f}))
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.auths = append(f.auths, r.Header.Get("Authorization"))
@@ -78,6 +86,12 @@ func newFakeServer(t testing.TB) *fakeServer {
 	t.Cleanup(srv.Close)
 	f.srv = srv
 	return f
+}
+
+func (f *fakeServer) rejected() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reject
 }
 
 func (f *fakeServer) callNames() []string {
@@ -171,7 +185,11 @@ type fakeSandbox struct {
 func (h *fakeSandbox) CreateSandbox(_ context.Context, r *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
 	h.f.mu.Lock()
 	h.f.creat = append(h.f.creat, r.Msg)
+	reject := h.f.reject
 	h.f.mu.Unlock()
+	if reject != nil {
+		return nil, reject
+	}
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: &ownsandv1.Sandbox{SandboxId: h.f.sb, OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}}), nil
 }
 
@@ -185,6 +203,9 @@ type fakeDataPath struct {
 }
 
 func (h *fakeDataPath) AuthorizeRelay(context.Context, *connect.Request[ownsandv1.AuthorizeRelayRequest]) (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
+	if err := h.f.rejected(); err != nil {
+		return nil, err
+	}
 	return connect.NewResponse(&ownsandv1.AuthorizeRelayResponse{GrantId: newID(h.f.t), ExpireTime: timestamppb.New(time.Now().Add(15 * time.Minute)), ExpiresIn: durationpb.New(15 * time.Minute)}), nil
 }
 
