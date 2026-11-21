@@ -56,6 +56,10 @@ type fakeRuntime struct {
 	paused    map[string]bool
 	createErr error
 	block     chan struct{}
+	// snapStarted, when set, receives one value when Snapshot starts;
+	// Snapshot then waits for snapBlock.
+	snapStarted chan struct{}
+	snapBlock   chan struct{}
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -96,6 +100,10 @@ func (r *fakeRuntime) Resume(_ context.Context, vm vmruntime.VM) error {
 	return nil
 }
 func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	if r.snapStarted != nil {
+		r.snapStarted <- struct{}{}
+		<-r.snapBlock
+	}
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, "disk"), []byte("disk"), 0o600)
 	return vmruntime.SnapshotInfo{SizeBytes: 4}, nil
@@ -578,6 +586,46 @@ func TestPauseResumeAndSnapshot(t *testing.T) {
 	}
 	if report := e.m.StateReport(2, nil); len(report.GetSnapshots()) != 1 {
 		t.Fatal("snapshot missing from the state report")
+	}
+}
+
+func TestDeleteSnapshotWhileTaking(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	e.rt.snapStarted = make(chan struct{}, 1)
+	e.rt.snapBlock = make(chan struct{})
+	snapID, _ := uuidv7.NewString()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		done <- err
+	}()
+	<-e.rt.snapStarted
+	// The delete arrives while the disk is being captured: it succeeds at
+	// once, and the create discards the copy instead of publishing it.
+	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
+		t.Fatalf("delete while taking = %v", err)
+	}
+	close(e.rt.snapBlock)
+	var ce *CommandError
+	if err := <-done; !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("create after a concurrent delete = %v, want aborted", err)
+	}
+	if e.m.HasSnapshot(snapID) {
+		t.Fatal("snapshot deleted while it was taken is still recorded")
+	}
+	if dir, err := e.m.ImportDir(snapID); err != nil {
+		t.Fatal(err)
+	} else if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after the discarded create: %v", err)
+	}
+	// A later create of the same ID is not affected by the old delete.
+	e.rt.snapStarted = nil
+	if _, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id}); err != nil {
+		t.Fatalf("create again = %v", err)
+	}
+	if !e.m.HasSnapshot(snapID) {
+		t.Fatal("second create not recorded")
 	}
 }
 

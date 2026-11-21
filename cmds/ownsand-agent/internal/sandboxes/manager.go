@@ -113,13 +113,17 @@ type Manager struct {
 	epoch     string
 	sandboxes map[string]*sandbox
 	snapshots map[string]*snapshot
-	limits    *ownsandv1.DeviceLimits
-	transfers int
-	reports   map[uint64]map[string]uint64
-	outbox    Outbox
-	execs     ExecTracker
-	gate      CreateGate
-	closed    bool
+	// takingSnapshots holds the IDs of snapshots that CreateSnapshot is
+	// taking now; the value is true when a delete arrived meanwhile, so
+	// that the create discards the copy instead of publishing it.
+	takingSnapshots map[string]bool
+	limits          *ownsandv1.DeviceLimits
+	transfers       int
+	reports         map[uint64]map[string]uint64
+	outbox          Outbox
+	execs           ExecTracker
+	gate            CreateGate
+	closed          bool
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
 	// VM exits). Add is called only under mu while closed is false, so
 	// that Close can wait for them.
@@ -153,7 +157,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	}
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
-		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, reports: map[uint64]map[string]uint64{},
+		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, takingSnapshots: map[string]bool{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {

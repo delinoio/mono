@@ -93,12 +93,24 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	if err := validate.UUIDv7("snapshot_id", cmd.GetSnapshotId()); err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
 	}
+	id := cmd.GetSnapshotId()
 	m.mu.Lock()
-	if snap, ok := m.snapshots[cmd.GetSnapshotId()]; ok {
+	if snap, ok := m.snapshots[id]; ok {
 		m.mu.Unlock()
 		return snap.entry(), nil
 	}
 	sb, ok := m.sandboxes[cmd.GetSandboxId()]
+	if ok {
+		// A delete that arrives before the copy is recorded marks this entry
+		// (commands are dispatched concurrently, and the control plane may
+		// delete a snapshot that is still being taken).
+		m.takingSnapshots[id] = false
+		defer func() {
+			m.mu.Lock()
+			delete(m.takingSnapshots, id)
+			m.mu.Unlock()
+		}()
+	}
 	m.mu.Unlock()
 	if !ok {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "sandbox is unknown on this device")
@@ -145,6 +157,12 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot record could not be saved")
 	}
 	m.mu.Lock()
+	if m.takingSnapshots[id] {
+		m.mu.Unlock()
+		m.logger.Info("snapshot discarded because it was deleted while it was being taken", "snapshot_id", id)
+		_ = m.removeSnapshot(id)
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot was deleted while it was being taken")
+	}
 	m.snapshots[snap.rec.SnapshotID] = snap
 	m.mu.Unlock()
 	m.logger.Info("snapshot ready", "snapshot_id", snap.rec.SnapshotID, "size_bytes", snap.rec.SizeBytes, "has_memory_state", snap.rec.HasMemoryState)
@@ -204,9 +222,10 @@ func (m *Manager) removeSnapshot(id string) error {
 // DeleteSnapshot deletes the local copy of a snapshot whose record the
 // control plane deleted. It succeeds when the device holds no copy. While
 // a create or an export reads the copy, the snapshot takes no new users and
-// the last of the current users deletes it; the command succeeds at once,
-// because the control plane sends it only once while the agent channel
-// stays connected.
+// the last of the current users deletes it. While CreateSnapshot takes the
+// snapshot, that create discards the copy when it ends. The command succeeds
+// at once in both cases, because the control plane sends it only once while
+// the agent channel stays connected.
 func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 	id := cmd.GetSnapshotId()
 	if err := validate.UUIDv7("snapshot_id", id); err != nil {
@@ -215,7 +234,14 @@ func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 	m.mu.Lock()
 	snap, ok := m.snapshots[id]
 	if !ok {
+		_, taking := m.takingSnapshots[id]
+		if taking {
+			m.takingSnapshots[id] = true
+		}
 		m.mu.Unlock()
+		if taking {
+			m.logger.Info("snapshot delete deferred until it is taken", "snapshot_id", id)
+		}
 		return nil
 	}
 	if snap.users > 0 {
