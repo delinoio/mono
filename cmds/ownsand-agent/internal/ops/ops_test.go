@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
@@ -29,7 +29,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -435,4 +435,60 @@ func TestReadAndWrite(t *testing.T) {
 	if out, _, _ := e.handle(r, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
 		t.Fatalf("expired read: %+v", out)
 	}
+}
+
+func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
+	e := newEnv(t)
+	// Control: a running exec keeps its context live.
+	running := e.execReq("/bin/sh", "-c", "sleep 60")
+	rs := &sink{}
+	rdone := make(chan ops.Outcome, 1)
+	go func() {
+		rdone <- e.d.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, running), SandboxID: e.sandbox}, rs)
+	}()
+	for !e.d.HasRunningExec(e.sandbox) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err, kept := e.d.ExecContextErr(running.GetExecId()); !kept || err != nil {
+		t.Fatalf("running exec context: kept %v err %v", kept, err)
+	}
+
+	// A finished exec cancels its context and keeps its result.
+	req := e.execReq("/bin/sh", "-c", "echo done")
+	if out, _, _ := e.handle(req, nil); !out.Finished {
+		t.Fatalf("exec: %+v", out)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err, kept := e.d.ExecContextErr(req.GetExecId())
+		if !kept {
+			t.Fatal("finished exec is not kept")
+		}
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exec context not canceled after forwarding ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	attach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: req.GetExecId()}
+	out, frames, _ := e.handle(attach, nil)
+	if !out.Finished || stdout(frames) != "done\n" {
+		t.Fatalf("attach after cancel: %+v %q", out, stdout(frames))
+	}
+	e.clk.Advance(11 * time.Minute)
+	e.d.Sweep()
+	if out, _, _ := e.handle(attach, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+		t.Fatalf("attach after sweep: %+v", out)
+	}
+
+	// The running exec is still live, and SandboxEnded cancels it.
+	if err, _ := e.d.ExecContextErr(running.GetExecId()); err != nil {
+		t.Fatalf("running exec context canceled early: %v", err)
+	}
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	<-rdone
 }

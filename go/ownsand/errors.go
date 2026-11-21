@@ -118,6 +118,12 @@ var errAttemptDeadline = errors.New("ownsand: WriteFile attempt passed its deadl
 // so the window then ends the operation with it.
 var errAuthorizeDeadline = errors.New("ownsand: AuthorizeRelay got no response within the recovery window")
 
+// errCreateDeadline is the cancellation cause of a CreateSandbox retry that
+// was still in flight when the retry window ended. CreateSandbox then returns
+// the last failure of the window; the cause only tells the SDK deadline apart
+// from a caller cancellation.
+var errCreateDeadline = errors.New("ownsand: CreateSandbox retry got no response within the retry window")
+
 // classify returns the failure kind of err and the retry delay of a
 // resource_exhausted error, if the error detail carries one. ctx is the
 // caller context: a cancelled caller is always terminal.

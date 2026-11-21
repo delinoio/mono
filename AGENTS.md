@@ -17,7 +17,7 @@
 - Do not add issue or pull-request links or identifying numbers, including Linear `DELI-<number>` identifiers, to repository instruction files or documentation. Describe requirements directly and link to the owning repository-local contracts. Domain, service and technical-documentation links remain allowed; record issue/PR traceability in pull requests, Linear issues or CI records instead.
 
 - Use the `@docs/` directory as the source of truth for project contracts and implementation documents.
-- License repository-owned source and future distributions under Apache-2.0, except `servers/`, which uses FSL-1.1-ALv2 with an Apache-2.0 future license. Keep imported code and bundled fonts under their original licenses with notices intact; follow `docs/repository-license-contract.md`.
+- License repository-owned source and future distributions under Apache-2.0, except `servers/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/`, which use FSL-1.1-ALv2 with an Apache-2.0 future license. Apache-2.0 code must not import FSL-1.1-ALv2 code. Keep imported code and bundled fonts under their original licenses with notices intact; follow `docs/repository-license-contract.md`.
 - All repository-wide rules must be defined in the appropriate AGENTS.md.
 - Every repository-owned directory named `dist` is ignored generated output and must never be tracked. Generate required `dist` content explicitly before compilation, testing, or packaging, and remove generated `dist` directories from the final worktree.
 - Track repository asset files of at least 512 KiB through exact-path Git LFS attributes. Checkouts that compile, test, or package those assets must hydrate LFS objects first; preserve source licenses and notices. Follow `docs/repository-workflow-contract.md`.
@@ -42,6 +42,7 @@
 - Follow `docs/repository-dependency-security-contract.md` for dependency security updates, validation evidence, and unresolved upstream constraints. Keep unresolved advisories visible; a fixed runtime pin or an unavailable patch is not a vulnerability fix.
 - All Go code belongs to the single root Go module `github.com/delinoio/mono` defined in root `go.mod`. Do not add nested `go.mod` or `go.work` files.
 - Put Go packages that external users import under root `go/` (one tree per `go/<name>/`); keep repository-only Go code in its owning project directory. Generated protobuf Go bindings stay under `protos/`. Follow `docs/repository-workflow-contract.md#public-go-packages`.
+- Put generic repository-only Go packages that several projects or components share under root `internal/` (Apache-2.0), or under `servers/internal/` (FSL-1.1-ALv2) when only servers use them. Follow `docs/repository-workflow-contract.md#shared-internal-go-packages`.
 - Prioritize Connect RPC-based communication for business flows over Tauri-specific bindings.
 - Prefer React Query for frontend server-state management when it is available.
 - When using React Query with Connect RPC, use `@connectrpc/connect-query` from `https://github.com/connectrpc/connect-query-es`.
@@ -54,10 +55,11 @@
 - `docs/`: Source of truth for project contracts and repository documentation.
 - `apps/`: User-facing apps and documentation web surfaces.
 - `crates/`: Rust crates and Rust-based tooling.
-- `cmds/`: Go command-line tools and device-side programs.
+- `cmds/`: Go command-line tools and device-side programs. The device agent and guest helper are licensed under FSL-1.1-ALv2; the other commands use Apache-2.0.
 - `servers/`: Backend services, licensed under FSL-1.1-ALv2.
 - `protos/`: Versioned protocol schemas and committed Go bindings.
 - `go/`: Go packages that external users import, in the root Go module.
+- `internal/`: Generic Go packages that only this repository imports, shared across projects.
 - `packages/`: Shared generated and runtime packages.
 - `packaging/`: Package-manager template assets for release automation.
 - `.agents/skills/`: Workspace-local Codex skills and reusable agent workflows.

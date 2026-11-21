@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package guest
 
@@ -6,9 +6,13 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -151,6 +155,148 @@ func TestReadKeepaliveWhilePreparing(t *testing.T) {
 	if ev := s.recv().GetFileReadEvent(); ev.GetKeepalive() == nil {
 		t.Fatalf("first event %v", ev)
 	}
+}
+
+// gatedSnapshot wraps a snapshot file and blocks its second ReadAt call
+// until release is closed, like a disk that stalls on the second chunk.
+type gatedSnapshot struct {
+	snapshotFile
+	reads     atomic.Int32
+	started   chan struct{}
+	release   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (g *gatedSnapshot) ReadAt(p []byte, off int64) (int, error) {
+	if g.reads.Add(1) == 2 {
+		close(g.started)
+		<-g.release
+	}
+	return g.snapshotFile.ReadAt(p, off)
+}
+
+func (g *gatedSnapshot) Close() error {
+	g.closeOnce.Do(func() { close(g.closed) })
+	return g.snapshotFile.Close()
+}
+
+// gateSnapshots makes the read manager of h open gated snapshot files and
+// returns the gate of the first one.
+func gateSnapshots(h *harness) *gatedSnapshot {
+	g := &gatedSnapshot{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+	h.srv.reads.openSnapshot = func(path string) (snapshotFile, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		g.snapshotFile = f
+		return g, nil
+	}
+	return g
+}
+
+// readEntryOpen returns the number of open calls of a read_id.
+func (m *readManager) readEntryOpen(readID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.entries[readID]; ok {
+		return e.open
+	}
+	return 0
+}
+
+// A stalled chunk read must not stop the keepalives, and the stream
+// continues with the right offset after the read returns.
+func TestReadKeepaliveWhileChunkPending(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
+	g := gateSnapshots(h)
+	path := filepath.Join(t.TempDir(), "f")
+	content := randomBytes(t, 2<<20+100)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	s := h.open(ctx)
+	defer s.s.CloseRequest()
+	s.send(1, readReq(t, path))
+	var chunk *ownsandv1.FileChunk
+	for chunk == nil {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetEnd() != nil {
+			t.Fatal("end before the first chunk")
+		}
+		chunk = ev.GetChunk()
+	}
+	if chunk.GetOffset() != 0 || !bytes.Equal(chunk.GetData(), content[:len(chunk.GetData())]) {
+		t.Fatalf("first chunk offset %d size %d", chunk.GetOffset(), len(chunk.GetData()))
+	}
+	got := append([]byte(nil), chunk.GetData()...)
+	waitStarted(t, g.started)
+	// The second read is stalled: keepalives arrive meanwhile, and no
+	// chunk can.
+	for i := 0; i < 3; i++ {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetKeepalive() == nil {
+			t.Fatalf("event while the read is stalled: %v", ev)
+		}
+	}
+	close(g.release)
+	for {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetKeepalive() != nil {
+			continue
+		}
+		if ev.GetEnd() != nil {
+			if ev.GetEnd().GetSizeBytes() != int64(len(content)) {
+				t.Fatalf("end size %d", ev.GetEnd().GetSizeBytes())
+			}
+			break
+		}
+		c := ev.GetChunk()
+		if c.GetOffset() != int64(len(got)) {
+			t.Fatalf("chunk offset %d, want %d", c.GetOffset(), len(got))
+		}
+		got = append(got, c.GetData()...)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("read %d bytes, content differs", len(got))
+	}
+	waitClosed(t, g.closed)
+}
+
+// A cancellation ends the call while a chunk read is stalled; the late
+// worker closes its handle when the read returns.
+func TestReadCancelWhileChunkPending(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
+	g := gateSnapshots(h)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, randomBytes(t, 2<<20+100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := h.open(ctx)
+	req := readReq(t, path)
+	s.send(1, req)
+	waitStarted(t, g.started)
+	cancel()
+	// The call ends while the gate is closed.
+	deadline := time.Now().Add(10 * time.Second)
+	for h.srv.reads.readEntryOpen(req.GetReadId()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the call did not end while the chunk read was stalled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-g.closed:
+		t.Fatal("snapshot closed while its read is still stalled")
+	default:
+	}
+	close(g.release)
+	waitClosed(t, g.closed)
 }
 
 func TestReadRetention(t *testing.T) {
@@ -314,5 +460,217 @@ func TestMergeSpan(t *testing.T) {
 	}
 	if len(r) != 2 || r[0] != (span{0, 20}) || r[1] != (span{30, 50}) {
 		t.Fatalf("ranges %v", r)
+	}
+}
+
+// blockedReadManager returns a read manager whose copy blocks in the copy
+// hook until release is closed. started receives one value per copy that
+// reaches the hook.
+func blockedReadManager(t *testing.T) (m *readManager, started chan struct{}, release chan struct{}) {
+	t.Helper()
+	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started = make(chan struct{}, 4)
+	release = make(chan struct{})
+	m.forceCopy = true
+	m.copyHook = func() {
+		started <- struct{}{}
+		<-release
+	}
+	return m, started, release
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the snapshot")
+	}
+}
+
+func waitStarted(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	waitClosed(t, ch)
+}
+
+func (m *readManager) hasEntry(readID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.entries[readID]
+	return ok
+}
+
+// A failure published after the last call ended removes the entry, so the
+// next call for the read_id makes a new snapshot.
+func TestReadFailureAfterLastCallEndedIsForgotten(t *testing.T) {
+	m, started, release := blockedReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-failure-after-end"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	m.end(readID, e)
+	// The source changes during the copy, so the copy check fails.
+	if err := os.WriteFile(path, []byte("after, longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err == nil {
+		t.Fatal("expected the snapshot to fail")
+	}
+	if m.hasEntry(readID) {
+		t.Fatal("failed entry stayed after the last call ended")
+	}
+	m.copyHook = nil
+	e2, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.end(readID, e2)
+	if e2 == e {
+		t.Fatal("retry reused the failed entry")
+	}
+	waitClosed(t, e2.ready)
+	if e2.err != nil || e2.size != int64(len("after, longer")) {
+		t.Fatalf("retry: size %d err %v", e2.size, e2.err)
+	}
+}
+
+// A call that still waits receives the failure, and the entry goes away when
+// that call ends.
+func TestReadFailureReachesWaitingCall(t *testing.T) {
+	m, started, release := blockedReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-failure-waiting"
+	first, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	second, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("second call did not share the entry")
+	}
+	m.end(readID, first)
+	if err := os.WriteFile(path, []byte("after, longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitClosed(t, second.ready)
+	if second.err == nil {
+		t.Fatal("waiting call did not receive the failure")
+	}
+	if !m.hasEntry(readID) {
+		t.Fatal("entry was removed while a call was still waiting")
+	}
+	m.end(readID, second)
+	if m.hasEntry(readID) {
+		t.Fatal("failed entry stayed after its last call ended")
+	}
+}
+
+// A snapshot that succeeds after the last call ended stays for the
+// retention time, so a later call reads the original snapshot.
+func TestReadSuccessAfterLastCallEndedIsKept(t *testing.T) {
+	m, started, release := blockedReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-success-after-end"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	m.end(readID, e)
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err != nil {
+		t.Fatalf("snapshot failed: %v", e.err)
+	}
+	if !m.hasEntry(readID) {
+		t.Fatal("successful entry was removed after the last call ended")
+	}
+	// The source changes; a later call still sees the original snapshot.
+	if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e2, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2 != e {
+		t.Fatal("retry did not reuse the snapshot")
+	}
+	got, err := os.ReadFile(e2.snapshot)
+	if err != nil || string(got) != "0123456789" || e2.size != 10 {
+		t.Fatalf("snapshot %q size %d err %v", got, e2.size, err)
+	}
+	// The snapshot stays until the retention time after the last call.
+	m.end(readID, e2)
+	m.sweep(e2.lastEnd.Add(m.retention - time.Minute))
+	if !m.hasEntry(readID) {
+		t.Fatal("snapshot was swept before the retention time")
+	}
+	m.sweep(e2.lastEnd.Add(m.retention))
+	if m.hasEntry(readID) {
+		t.Fatal("snapshot was kept after the retention time")
+	}
+}
+
+func TestReadCopyZeroSizeProcfs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("procfs exists only on Linux")
+	}
+	const path = "/proc/cpuinfo"
+	st, err := os.Stat(path)
+	if err != nil || st.Size() != 0 {
+		t.Skipf("%s is missing or reports a size: %v", path, err)
+	}
+	h := newHarness(t, nil)
+	h.srv.reads.forceCopy = true
+	req := readReq(t, path)
+	data, size, errd := h.readAll(req)
+	if errd != nil || len(data) == 0 || size != int64(len(data)) {
+		t.Fatalf("procfs read: %d bytes size %d err %v", len(data), size, errd)
+	}
+	// A resumed read returns the suffix of the snapshot.
+	req.Offset = 1
+	suffix, size2, errd := h.readAll(req)
+	if errd != nil || size2 != size || !bytes.Equal(suffix, data[1:]) {
+		t.Fatalf("resumed procfs read: %d bytes size %d err %v", len(suffix), size2, errd)
+	}
+}
+
+func TestReadCopyEmptyFileAndSizeChange(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.reads.forceCopy = true
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if data, size, errd := h.readAll(readReq(t, empty)); errd != nil || len(data) != 0 || size != 0 {
+		t.Fatalf("empty file: %d bytes size %d err %v", len(data), size, errd)
+	}
+	// An ordinary empty file that grows during the copy is still aborted.
+	h.srv.reads.copyHook = func() { os.WriteFile(empty, []byte("grown"), 0o644) }
+	if _, _, errd := h.readAll(readReq(t, empty)); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("empty file that grew: %v", errd)
 	}
 }

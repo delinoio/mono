@@ -20,7 +20,7 @@ Planned layout, following the `accounts-api` server conventions:
 - Deployment target: a Docker container on the shared DigitalOcean Droplet, deployed by the [deployment workflow](repository-workflow-contract.md#deployment-workflow) with the `deploy` target `droplet`, like `accounts-api`. Production origin: `https://tide.api.delino.io`. The Caddy reverse proxy terminates TLS and proxies to the container. tide needs no public port other than HTTPS.
 - Container image: the image contains the `claude` binary at a pinned version of at least 2.1.224, because the [Claude Code adapter](#claude-code) runs the Claude Code orchestrator in the container.
 - Database: PlanetScale Postgres, according to the repository defaults.
-- Development ports (`planned`): `127.0.0.1:8400` for HTTP and `127.0.0.1:9400` for metrics. Add them to the [environment contract](repository-environment-contract.md) in the change that adds the development launcher.
+- Development ports (`planned`): `127.0.0.1:18400` for HTTP and `127.0.0.1:19400` for metrics. Add them to the [environment contract](repository-environment-contract.md) in the change that adds the development launcher.
 
 ## Users and Operators
 

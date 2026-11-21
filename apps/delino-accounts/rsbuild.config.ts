@@ -20,7 +20,7 @@ export default defineConfig({
   server: {
     // Fixed loopback port; fail instead of picking another port on conflict.
     host: "127.0.0.1",
-    port: 3100,
+    port: 13100,
     strictPort: true,
   },
 });

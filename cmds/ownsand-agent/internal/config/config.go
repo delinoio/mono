@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package config holds the agent configuration. Every setting comes from a
 // command-line flag or an OWNSAND_AGENT_* environment variable; the
@@ -15,6 +15,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+
+	"github.com/delinoio/mono/cmds/internal/loglevel"
 )
 
 // Environment variables of the agent.
@@ -163,9 +165,11 @@ func FromEnv(lookup Lookup) (Config, error) {
 		cfg.Runtime = kind
 	}
 	if v := get(EnvLogLevel); v != "" {
-		if err := cfg.LogLevel.UnmarshalText([]byte(v)); err != nil {
+		level, err := loglevel.Parse(v)
+		if err != nil {
 			return Config{}, fmt.Errorf("config: invalid %s %q", EnvLogLevel, v)
 		}
+		cfg.LogLevel = level
 	}
 	keys, err := ParsePublicKeys(get(EnvReleasePublicKeys))
 	if err != nil {

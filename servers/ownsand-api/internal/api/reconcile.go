@@ -10,7 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 )
@@ -140,6 +140,10 @@ type reconcileResult struct {
 	// was deleted while the device was offline or before it learned the
 	// delete-snapshot command.
 	snapshotDeletes []string
+	// removed is set when the device was already removed (or is gone) when
+	// the report took the device row lock. The transaction then changed
+	// nothing, and the channel must not acknowledge the report.
+	removed bool
 }
 
 // reconcileStateReport applies a full state report of the device: each
@@ -147,10 +151,32 @@ type reconcileResult struct {
 // omits, the snapshots and the built base images. It marks the device
 // online in the same transaction, so the device is eligible only after its
 // report was applied.
-func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, report *ownsandv1.StateReport) (reconcileResult, error) {
+//
+// Lock order: the transaction locks the device row first and keeps the lock
+// to commit, then the sandbox rows, like removeDeviceTx, which updates the
+// device row before it ends the device's sandboxes. A removal that commits
+// first makes the report a no-op (reconcileResult.removed); a report that
+// commits first is followed by the removal, which ends the sandboxes.
+//
+// channelID is the ID of the channel that sent the report. An export that a
+// retained, listed snapshot still has in EXPORTING and that another channel
+// (or no recorded channel) owns lost its owner: the command or its result
+// was lost with the earlier channel or control plane process, so the
+// report fails the export.
+func (s *Service) reconcileStateReport(ctx context.Context, deviceID, channelID string, report *ownsandv1.StateReport) (reconcileResult, error) {
 	var out reconcileResult
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		out = reconcileResult{}
+		var state int16
+		var capabilities []byte
+		err := tx.QueryRow(ctx, "SELECT state, capabilities FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&state, &capabilities)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_REMOVED) {
+			out.removed = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		listed := map[string]bool{}
 		for _, e := range report.GetSandboxes() {
 			listed[e.GetSandboxId()] = true
@@ -197,7 +223,7 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 			}
 			out.changed = append(out.changed, r.ID)
 		}
-		if err := s.reconcileSnapshotsTx(ctx, tx, deviceID, report.GetSnapshots()); err != nil {
+		if err := s.reconcileSnapshotsTx(ctx, tx, deviceID, channelID, report.GetSnapshots()); err != nil {
 			return err
 		}
 		unknown, err := unknownSnapshotsTx(ctx, tx, report.GetSnapshots())
@@ -205,7 +231,7 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 			return err
 		}
 		out.snapshotDeletes = unknown
-		if err := s.mergeBuiltImagesTx(ctx, tx, deviceID, report.GetBuiltBaseImages()); err != nil {
+		if err := s.mergeBuiltImagesTx(ctx, tx, deviceID, capabilities, report.GetBuiltBaseImages()); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, "UPDATE devices SET state = $2, state_epoch = $3, last_seen_time = $4 WHERE device_id = $1 AND state <> $5",
@@ -219,24 +245,27 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 // list: an original copy of an exported snapshot keeps its record without a
 // device, any other snapshot record is deleted with its templates, and an
 // imported copy loses its copy row. Listed snapshots that the server still
-// has in CREATING take the reported fields.
-func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID string, entries []*ownsandv1.SnapshotStateEntry) error {
+// has in CREATING take the reported fields, and a listed snapshot whose
+// export is EXPORTING under another channel than channelID (or under no
+// recorded channel) becomes EXPORT_FAILED with a clean-up job for the
+// attempt's objects.
+func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID, channelID string, entries []*ownsandv1.SnapshotStateEntry) error {
 	listed := map[string]*ownsandv1.SnapshotStateEntry{}
 	for _, e := range entries {
 		listed[e.GetSnapshotId()] = e
 	}
-	rows, err := tx.Query(ctx, "SELECT snapshot_id::text, organization_id::text, state, export_state FROM snapshots WHERE device_id = $1 FOR UPDATE", deviceID)
+	rows, err := tx.Query(ctx, "SELECT snapshot_id::text, organization_id::text, state, export_state, COALESCE(export_command_id::text, ''), COALESCE(export_channel_id::text, '') FROM snapshots WHERE device_id = $1 FOR UPDATE", deviceID)
 	if err != nil {
 		return err
 	}
 	type snap struct {
-		id, org       string
-		state, export int16
+		id, org, command, channel string
+		state, export             int16
 	}
 	var snaps []snap
 	for rows.Next() {
 		var sn snap
-		if err := rows.Scan(&sn.id, &sn.org, &sn.state, &sn.export); err != nil {
+		if err := rows.Scan(&sn.id, &sn.org, &sn.state, &sn.export, &sn.command, &sn.channel); err != nil {
 			rows.Close()
 			return err
 		}
@@ -251,6 +280,15 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 		if ok {
 			if ownsandv1.SnapshotState(sn.state) == ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING && e.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
 				if err := applySnapshotEntryTx(ctx, tx, sn.id, e); err != nil {
+					return err
+				}
+			}
+			if ownsandv1.SnapshotExportState(sn.export) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING && sn.channel != channelID {
+				reason := "owner_channel_replaced"
+				if sn.channel == "" {
+					reason = "owner_unknown"
+				}
+				if err := s.failExportTx(ctx, tx, sn.org, sn.id, sn.command, reason); err != nil {
 					return err
 				}
 			}
@@ -270,7 +308,7 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 			}
 			continue
 		}
-		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id, ownsandv1.SnapshotExportState(sn.export)); err != nil {
+		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id); err != nil {
 			return err
 		}
 	}
@@ -351,12 +389,10 @@ func nilIfEmpty(b []byte) any {
 }
 
 // mergeBuiltImagesTx stores the built base images of a state report in the
-// device capabilities.
-func (s *Service) mergeBuiltImagesTx(ctx context.Context, tx pgx.Tx, deviceID string, images []ownsandv1.BaseImage) error {
-	var raw []byte
-	if err := tx.QueryRow(ctx, "SELECT capabilities FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&raw); err != nil {
-		return err
-	}
+// device capabilities. The caller holds the device row lock and passes the
+// stored capabilities that it read under that lock (raw), so the merge does
+// not lock the row again.
+func (s *Service) mergeBuiltImagesTx(ctx context.Context, tx pgx.Tx, deviceID string, raw []byte, images []ownsandv1.BaseImage) error {
 	caps := &ownsandv1.DeviceCapabilities{}
 	if len(raw) > 0 {
 		if err := proto.Unmarshal(raw, caps); err != nil {

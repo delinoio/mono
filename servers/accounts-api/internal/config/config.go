@@ -7,10 +7,9 @@ package config
 import (
 	"fmt"
 	"log/slog"
-	"net"
-	"net/netip"
-	"strconv"
 	"strings"
+
+	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
 
 // Environment variable names read by the server.
@@ -21,7 +20,7 @@ const (
 
 // DefaultAddr listens on loopback only so that a local run is never exposed
 // to the network by accident.
-const DefaultAddr = "127.0.0.1:8100"
+const DefaultAddr = "127.0.0.1:18100"
 
 // LogLevel is the accepted set of log level values.
 type LogLevel string
@@ -86,7 +85,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	cfg := Config{Addr: DefaultAddr, LogLevel: LogLevelInfo}
 
 	if value := lookupNonEmpty(lookup, EnvAddr); value != "" {
-		if err := validateAddr(value); err != nil {
+		if err := listenaddr.Validate(EnvAddr, value); err != nil {
 			return Config{}, err
 		}
 		cfg.Addr = value
@@ -115,66 +114,4 @@ const asciiWhiteSpace = "\t\n\v\f\r "
 func lookupNonEmpty(lookup func(string) (string, bool), name string) string {
 	value, _ := lookup(name)
 	return strings.Trim(value, asciiWhiteSpace)
-}
-
-func validateAddr(value string) error {
-	host, port, err := net.SplitHostPort(value)
-	if err != nil {
-		return fmt.Errorf("%s must be a host:port address: %w", EnvAddr, err)
-	}
-	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-		return fmt.Errorf("%s port must be a number from 0 to 65535; got %q", EnvAddr, port)
-	}
-	if err := validateHost(host); err != nil {
-		return err
-	}
-	return nil
-}
-
-const (
-	maxHostnameLength = 253
-	maxLabelLength    = 63
-)
-
-// validateHost checks the syntax of the host part of ADDR without resolving
-// it, so a DNS failure stays a listen-time error. An empty host (all
-// interfaces), an IP address (including an IPv6 zone) or an RFC 1123
-// hostname is accepted.
-func validateHost(host string) error {
-	if host == "" {
-		return nil
-	}
-	if _, err := netip.ParseAddr(host); err == nil {
-		return nil
-	}
-	if isHostname(host) {
-		return nil
-	}
-	return fmt.Errorf("%s host must be a hostname or IP address; got %q", EnvAddr, host)
-}
-
-// isHostname reports whether name is an RFC 1123 hostname: dot-separated
-// labels of 1 to 63 ASCII letters, digits or hyphens that neither start nor
-// end with a hyphen, at most 253 characters, with an optional trailing dot.
-func isHostname(name string) bool {
-	name = strings.TrimSuffix(name, ".")
-	if name == "" || len(name) > maxHostnameLength {
-		return false
-	}
-	for _, label := range strings.Split(name, ".") {
-		if label == "" || len(label) > maxLabelLength {
-			return false
-		}
-		if label[0] == '-' || label[len(label)-1] == '-' {
-			return false
-		}
-		for i := 0; i < len(label); i++ {
-			c := label[i]
-			isAlnum := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
-			if !isAlnum && c != '-' {
-				return false
-			}
-		}
-	}
-	return true
 }

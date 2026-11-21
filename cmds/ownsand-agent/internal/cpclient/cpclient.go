@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package cpclient connects the agent to the control plane: the HTTP/2
 // client (TLS h2 for https origins, h2c with prior knowledge for http

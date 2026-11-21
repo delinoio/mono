@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package ops serves the DataFrame operations of the data path (exec, exec
 // attach, file read and file write) for both transports, the peer-to-peer
@@ -23,7 +23,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
 	"github.com/delinoio/mono/go/ownsand/datapath"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -96,7 +96,11 @@ type execOp struct {
 	digest    []byte
 	idTime    time.Time
 	log       *execlog.Log
-	cancel    context.CancelFunc
+	// ctx bounds the guest forwarding; cancel ends it. The forwarding
+	// goroutine cancels it when forwardExec returns; the kept result in log
+	// is independent of it.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type fileOp struct {
