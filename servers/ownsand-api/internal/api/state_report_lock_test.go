@@ -200,7 +200,7 @@ func TestRemovalAfterStateReportWins(t *testing.T) {
 	reported := f.reportAsync(report)
 	waitForLockWaiter(t, f.env, "FROM devices WHERE device_id = $1 FOR UPDATE")
 	removal := f.removeAsync()
-	waitForLockWaiter(t, f.env, "UPDATE devices SET state")
+	waitForLockWaiter(t, f.env, "FROM devices d WHERE", "FOR UPDATE OF d")
 	release()
 	f.waitRemoval(t, removal)
 

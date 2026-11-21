@@ -397,17 +397,39 @@ func (h DeviceHandler) RemoveDevice(ctx context.Context, req *connect.Request[ow
 		if err := validateID("device_id", deviceID); err != nil {
 			return err
 		}
-		device, err = h.loadDevice(ctx, tx, orgID, deviceID)
+		orgID, err = normalizeID("organization_id", orgID)
 		if err != nil {
 			return err
 		}
-		if device.GetState() == ownsandv1.DeviceState_DEVICE_STATE_REMOVED {
-			return nil
+		// Lock order: organization row (FOR KEY SHARE), then the device row
+		// (FOR UPDATE), then the sandbox rows, as the state report takes
+		// them. Concurrent removals of one device serialize on the device
+		// row, and the second one finds the tombstone the first one wrote.
+		// A deletion of the organization holds the organization row
+		// FOR UPDATE, so a removal that waits for it finds no organization.
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", orgID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound("organization")
 		}
-		if err := h.removeDeviceTx(ctx, tx, orgID, deviceID, p, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DEVICE_REMOVED, true); err != nil {
+		if err != nil {
 			return err
 		}
-		removed = true
+		var state int16
+		err = tx.QueryRow(ctx, `SELECT d.state FROM devices d WHERE d.organization_id = $1 AND d.device_id = $2 AND `+fmt.Sprintf(visibleDevice, 3)+` FOR UPDATE OF d`,
+			orgID, deviceID, h.now()).Scan(&state)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errNotFound("device")
+		}
+		if err != nil {
+			return err
+		}
+		if ownsandv1.DeviceState(state) != ownsandv1.DeviceState_DEVICE_STATE_REMOVED {
+			if err := h.removeDeviceTx(ctx, tx, orgID, deviceID, p, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DEVICE_REMOVED, true); err != nil {
+				return err
+			}
+			removed = true
+		}
 		device, err = h.loadDevice(ctx, tx, orgID, deviceID)
 		return err
 	})
@@ -427,10 +449,17 @@ func (h DeviceHandler) RemoveDevice(ctx context.Context, req *connect.Request[ow
 // without a local copy.
 func (s *Service) removeDeviceTx(ctx context.Context, tx pgx.Tx, orgID, deviceID string, actor auth.Principal, endReason ownsandv1.SandboxEndReason, auditDevice bool) error {
 	now := s.now()
-	if _, err := tx.Exec(ctx, `UPDATE devices SET state = $3, remove_time = $4, tombstone_expire_time = $5
-		WHERE organization_id = $1 AND device_id = $2`,
-		orgID, deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED), now, now.Add(tombstoneLifetime)); err != nil {
+	// The state guard keeps the first removal's tombstone timestamps and
+	// makes a repeated removal write nothing: callers lock the device row
+	// first, so this is defensive.
+	tag, err := tx.Exec(ctx, `UPDATE devices SET state = $3, remove_time = $4, tombstone_expire_time = $5
+		WHERE organization_id = $1 AND device_id = $2 AND state <> $3`,
+		orgID, deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED), now, now.Add(tombstoneLifetime))
+	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil
 	}
 	if _, err := tx.Exec(ctx, "DELETE FROM device_sessions WHERE device_id = $1", deviceID); err != nil {
 		return err
