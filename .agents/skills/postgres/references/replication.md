@@ -12,7 +12,7 @@ Use physical (byte-for-byte) replication via WAL stream from primary to standbys
 
 ## Replication Slots
 
-Postgres supports Physical slots (streaming) and logical slots (logical replication). Slots prevent WAL deletion even if standby is offline — can exhaust `pg_wal/` disk. Use `max_slot_wal_keep_size` to cap retained WAL per slot. Use `idle_replication_slot_timeout` (PG 17+) to auto-invalidate idle slots. `wal_keep_size` is a simpler alternative to slots for WAL retention. Drop inactive slots immediately to prevent disk exhaustion.
+Postgres supports Physical slots (streaming) and logical slots (logical replication). Slots prevent WAL deletion even if standby is offline — can exhaust `pg_wal/` disk. Use `max_slot_wal_keep_size` to cap retained WAL per slot. Use `idle_replication_slot_timeout` (PG 18+) to auto-invalidate idle slots. `wal_keep_size` is a simpler alternative to slots for WAL retention. Drop inactive slots immediately to prevent disk exhaustion.
 
 Slot lag (MB behind): `SELECT slot_name, pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)/1024/1024 AS mb_behind FROM pg_replication_slots;`
 
