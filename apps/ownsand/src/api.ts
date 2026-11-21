@@ -16,6 +16,13 @@ import {
 } from "ownsand-sdk/gen/common_pb";
 
 /**
+ * The ListOrganizations request of the console. The control plane returns 50
+ * organizations for an empty request, so every surface sends this one input
+ * to read the documented first 200 and to share one React Query key.
+ */
+export const LIST_ORGANIZATIONS_REQUEST = { pageSize: 200 } as const;
+
+/**
  * The Connect transport of the console: binary Connect protocol to the
  * absolute API origin, with the Logto access token of the signed-in user.
  */

@@ -458,14 +458,17 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         return { organization: withRole(org.organization, role) };
       },
-      listOrganizations() {
+      listOrganizations(req) {
+        // Mirror the control plane page size: 50 by default, at most 200.
+        const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
         const organizations = [...orgs.values()]
           .map((org) => ({
             org,
             m: org.members.find((x) => x.userId === userId),
           }))
           .filter((x) => x.m !== undefined)
-          .map((x) => withRole(x.org.organization, x.m!.role));
+          .map((x) => withRole(x.org.organization, x.m!.role))
+          .slice(0, pageSize);
         return { organizations };
       },
       deleteOrganization(req) {

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
 import { useMutation, useQuery } from "@connectrpc/connect-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
@@ -20,7 +21,10 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 /** Route `organizations`: the organization list, creation and invitations. */
 export function OrganizationsPage() {
   const { navigate } = useRouter();
-  const orgs = useQuery(OrganizationService.method.listOrganizations, {});
+  const orgs = useQuery(
+    OrganizationService.method.listOrganizations,
+    LIST_ORGANIZATIONS_REQUEST,
+  );
   const create = useMutation(OrganizationService.method.createOrganization);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
