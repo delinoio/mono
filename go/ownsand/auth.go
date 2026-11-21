@@ -120,7 +120,18 @@ func (c *Client) redact(err error, secret string) error {
 	var ce *connect.Error
 	if errors.As(err, &ce) {
 		msg := strings.ReplaceAll(ce.Message(), secret, "[REDACTED]")
-		out := connect.NewError(ce.Code(), errors.New(msg))
+		// connect.NewError drops the wire flag, and classify treats a wire
+		// error as an explicit server status, so rebuild a wire error as a
+		// wire error and a local error as a local error.
+		var out *connect.Error
+		if connect.IsWireError(ce) {
+			out = connect.NewWireError(ce.Code(), errors.New(msg))
+		} else {
+			out = connect.NewError(ce.Code(), errors.New(msg))
+		}
+		for k, v := range ce.Meta() {
+			out.Meta()[k] = v
+		}
 		for _, d := range ce.Details() {
 			out.AddDetail(d)
 		}

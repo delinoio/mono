@@ -311,3 +311,43 @@ func TestParseTransport(t *testing.T) {
 		t.Fatal("want an error")
 	}
 }
+
+func TestRedactKeepsWireProvenance(t *testing.T) {
+	c := &Client{}
+	detail, err := connect.NewErrorDetail(&ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wire := range []bool{true, false} {
+		raw := errors.New("bad credential " + testAPIKey)
+		var in *connect.Error
+		if wire {
+			in = connect.NewWireError(connect.CodeUnauthenticated, raw)
+		} else {
+			in = connect.NewError(connect.CodeUnauthenticated, raw)
+		}
+		in.AddDetail(detail)
+		in.Meta().Set("X-Test", "1")
+		out := c.redact(in, testAPIKey)
+		if strings.Contains(out.Error(), testAPIKey) {
+			t.Fatalf("wire=%v: error contains the credential: %v", wire, out)
+		}
+		var ce *connect.Error
+		if !errors.As(out, &ce) {
+			t.Fatalf("wire=%v: not a connect error", wire)
+		}
+		if connect.IsWireError(out) != wire {
+			t.Fatalf("wire=%v: IsWireError=%v", wire, connect.IsWireError(out))
+		}
+		if ce.Code() != connect.CodeUnauthenticated || len(ce.Details()) != 1 || ce.Meta().Get("X-Test") != "1" {
+			t.Fatalf("wire=%v: code, details or meta lost: %v", wire, ce)
+		}
+		wantKind, _ := classify(context.Background(), in)
+		if gotKind, _ := classify(context.Background(), out); gotKind != wantKind {
+			t.Fatalf("wire=%v: classify %v, want %v", wire, gotKind, wantKind)
+		}
+	}
+	if kind, _ := classify(context.Background(), c.redact(connect.NewWireError(connect.CodeUnauthenticated, errors.New(testAPIKey)), testAPIKey)); kind != failTerminal {
+		t.Fatalf("redacted terminal wire error classified %v", kind)
+	}
+}

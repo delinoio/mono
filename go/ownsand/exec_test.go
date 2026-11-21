@@ -1063,3 +1063,43 @@ func TestStalledAuthorizeRelayEndsWithTheWindow(t *testing.T) {
 		})
 	}
 }
+
+func TestRelayTerminalWireErrorWithCredentialEndsOnce(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.relayScript = func(string, int) relayAction {
+		return relayAction{err: connect.NewError(connect.CodeUnauthenticated, errors.New("rejected "+testAPIKey))}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+	if err == nil || strings.Contains(err.Error(), testAPIKey) {
+		t.Fatalf("exec error: %v", err)
+	}
+	if connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("code %v", connect.CodeOf(err))
+	}
+	if n := len(cp.authRequests()); n != 1 {
+		t.Fatalf("AuthorizeRelay calls = %d, want 1", n)
+	}
+	cp.mu.Lock()
+	n := cp.relayCalls["Exec"]
+	cp.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("Exec streams = %d, want 1", n)
+	}
+}
+
+func TestRelayUnavailableWithCredentialStillRecovers(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 0)
+	cp.relayScript = func(method string, n int) relayAction {
+		if n <= 1 {
+			return relayAction{err: connect.NewError(connect.CodeUnavailable, errors.New("down "+testAPIKey))}
+		}
+		return relayAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	res, r := runExec(t, s)
+	checkLines(t, res, r, 3)
+}
