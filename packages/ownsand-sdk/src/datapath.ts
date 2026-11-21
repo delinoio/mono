@@ -183,9 +183,14 @@ export class DataPathSelector {
     }
   }
 
-  /** The agent ended the session; the next operation opens a new one. */
-  sessionEnded(): void {
-    this.#session = undefined;
+  /**
+   * The agent ended `session`; the next operation opens a new one. A late end
+   * of a session that the handle already replaced keeps the replacement.
+   */
+  sessionEnded(session: PeerSession): void {
+    if (this.#session === session) {
+      this.#session = undefined;
+    }
   }
 
   /** Closes the session of the handle, if any. */

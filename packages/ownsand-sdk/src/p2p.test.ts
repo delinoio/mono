@@ -449,6 +449,59 @@ describe("peer-to-peer data path", () => {
     expect(rtc.channels[0]!.readyState).toBe("closed");
   });
 
+  test("a late session end from a retired session keeps the replacement session", async () => {
+    const peers: FakeAgentPeer[] = [];
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        const request = (frame as DataFrame & { payload: { value: any } })
+          .payload.value;
+        execEvent(peer, frame.streamId, ev.started());
+        if (request.command[0] === "a") {
+          // Command "a" keeps running until its session ends.
+          execEvent(peer, frame.streamId, ev.stdout(0, "a"));
+          peers.push(peer);
+        } else {
+          execEvent(peer, frame.streamId, ev.exited(0));
+        }
+      }
+      if (frame.kind === DataFrameKind.EXEC_ATTACH_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    // Consumer one starts on session one and then stops reading.
+    const first = sandbox.exec({ command: ["a"] });
+    const events = first[Symbol.asyncIterator]();
+    expect((await h.clock.run(events.next())).done).toBe(false);
+    expect(peers).toHaveLength(1);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    // The agent ends session one while consumer one is not reading.
+    peers[0]!.endSession(SessionEndReason.EXPIRED);
+    await h.clock.advance(10);
+    // A second call replaces the session.
+    await h.clock.run(sandbox.exec({ command: ["b"] }).wait());
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    // Consumer one resumes and reports the end of the retired session. It
+    // continues on the replacement and opens no third session.
+    await h.clock.run(
+      (async () => {
+        for (;;) {
+          const next = await events.next();
+          if (next.done) return;
+        }
+      })(),
+    );
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(rtc.connections).toHaveLength(2);
+    expect(rtc.channels[1]!.readyState).toBe("open");
+    // A third operation still uses the replacement.
+    await h.clock.run(sandbox.run({ command: ["c"] }));
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(rtc.connections).toHaveLength(2);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+  });
+
   test("ends the operation when a new session cannot be authorized", async () => {
     const { h } = p2pSetup(() => {});
     h.api.unary(DataPathService, "OpenSession", () => {
