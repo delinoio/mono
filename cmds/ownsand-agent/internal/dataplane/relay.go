@@ -388,13 +388,57 @@ var (
 	errChannelChanged = errors.New("dataplane: agent channel changed before the relay connection opened")
 )
 
+// channelDone reports whether the agent channel closed.
+func channelDone(ch agent.Channel) bool {
+	select {
+	case <-ch.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// acquireCredential gets a device session credential for a relay
+// connection of channel ch. The request is bound to the channel: when the
+// channel closes while the request is pending, the request context is
+// canceled and errChannelChanged is returned, so the loop does not wait for
+// a response that no connection may use and can dial for the next channel
+// at once. Any other failure is returned as is and keeps the back-off. The
+// cancellation covers only the credential request; an established
+// connection ends through channelLost, which flushes its session-end
+// frames first.
+func (r *relay) acquireCredential(ch agent.Channel) (string, error) {
+	authCtx, cancel := context.WithCancel(r.ctx)
+	watchDone := make(chan struct{})
+	defer func() {
+		// Stop the watcher before returning so it never outlives the call.
+		cancel()
+		<-watchDone
+	}()
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ch.Done():
+			cancel()
+		case <-authCtx.Done():
+		}
+	}()
+	cred, err := r.d.opts.Auth.NewDeviceSession(authCtx)
+	if err != nil && channelDone(ch) && r.ctx.Err() == nil {
+		r.d.logger.Info("relay credential request canceled by agent channel loss",
+			"generation", ch.Generation(), "outcome", "canceled_by_channel_loss")
+		return "", errChannelChanged
+	}
+	return cred, err
+}
+
 // connectOnce runs one relay connection until it ends. It reports whether
 // the echo probe ended it.
 func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	if r.client == nil {
 		return false, errors.New("dataplane: no relay client")
 	}
-	cred, err := r.d.opts.Auth.NewDeviceSession(r.ctx)
+	cred, err := r.acquireCredential(ch)
 	if err != nil {
 		return false, err
 	}
@@ -409,12 +453,15 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	c.lastRecv.Store(now)
 	c.lastSend.Store(now)
 	// The channel can change while the credential is fetched. A
-	// connection of a replaced channel would serve no grant, and
+	// connection of a replaced or closed channel would serve no grant, and
 	// channelLost closes only the installed connection, so the loop
-	// dials again for the current channel instead.
+	// dials again for the current channel instead. A credential that
+	// arrived after the channel closed is dropped without a dial.
 	r.mu.Lock()
-	if r.ch != ch {
+	if r.ch != ch || channelDone(ch) {
 		r.mu.Unlock()
+		r.d.logger.Info("relay credential dropped: its agent channel is no longer current",
+			"generation", ch.Generation(), "outcome", "stale_credential_dropped")
 		return false, errChannelChanged
 	}
 	r.conn = c
