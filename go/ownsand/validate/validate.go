@@ -310,8 +310,14 @@ func Resources(r *ownsandv1.Resources) error {
 
 // SandboxSource checks that exactly one source is set and that it is valid.
 func SandboxSource(s *ownsandv1.SandboxSource) error {
+	const sourceRequired = "exactly one of base_image, snapshot_id or template_id is required"
+	// A type switch matches a typed nil wrapper pointer, so each case rejects
+	// nil before it dereferences the wrapper.
 	switch src := s.GetSource().(type) {
 	case *ownsandv1.SandboxSource_BaseImage:
+		if src == nil {
+			return fail("source", sourceRequired)
+		}
 		if src.BaseImage == ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED {
 			return fail("source.base_image", "must not be unspecified")
 		}
@@ -320,11 +326,17 @@ func SandboxSource(s *ownsandv1.SandboxSource) error {
 		}
 		return nil
 	case *ownsandv1.SandboxSource_SnapshotId:
+		if src == nil {
+			return fail("source", sourceRequired)
+		}
 		return UUIDv7("source.snapshot_id", src.SnapshotId)
 	case *ownsandv1.SandboxSource_TemplateId:
+		if src == nil {
+			return fail("source", sourceRequired)
+		}
 		return UUIDv7("source.template_id", src.TemplateId)
 	}
-	return fail("source", "exactly one of base_image, snapshot_id or template_id is required")
+	return fail("source", sourceRequired)
 }
 
 // NetworkMode returns the network mode of a create request: OUTBOUND when
