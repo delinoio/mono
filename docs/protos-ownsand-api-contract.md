@@ -233,7 +233,7 @@ Schema decisions:
 
 ### Billing
 
-Status: `planned`. The [project index](project-ownsand.md#billing) owns the prices and the enforcement phases, and the [control plane contract](servers-ownsand-api-foundation.md#billing) owns metering and enforcement.
+Status: the control plane meters calls with this classification; `BillingService` handlers and the billing errors are `planned`. The [project index](project-ownsand.md#billing) owns the prices and the enforcement phases, and the [control plane contract](servers-ownsand-api-foundation.md#billing) owns metering and enforcement.
 
 RPC classification: the control plane counts each public RPC that is authenticated and ends with an OK status in its class. Rejected calls are never billed.
 

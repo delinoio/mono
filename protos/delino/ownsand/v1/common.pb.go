@@ -1343,6 +1343,67 @@ func (ErrorCode) EnumDescriptor() ([]byte, []int) {
 	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{22}
 }
 
+// Why billing enforcement rejected a public RPC. Each value except
+// UNSPECIFIED is terminal: clients must not retry the RPC until the
+// organization's billing changes, and they show the billing link
+// `https://accounts.delino.io` that the error message carries.
+type BillingReason int32
+
+const (
+	BillingReason_BILLING_REASON_UNSPECIFIED BillingReason = 0
+	// The organization has no linked billing account.
+	BillingReason_BILLING_REASON_ACCOUNT_REQUIRED BillingReason = 1
+	// The linked billing account has no active subscription or a balance of
+	// zero or less. Resource creation is blocked.
+	BillingReason_BILLING_REASON_BLOCKED BillingReason = 2
+	// Non-payment continued for 3 days. Running sandboxes are paused, and the
+	// data path is blocked too.
+	BillingReason_BILLING_REASON_SUSPENDED BillingReason = 3
+)
+
+// Enum value maps for BillingReason.
+var (
+	BillingReason_name = map[int32]string{
+		0: "BILLING_REASON_UNSPECIFIED",
+		1: "BILLING_REASON_ACCOUNT_REQUIRED",
+		2: "BILLING_REASON_BLOCKED",
+		3: "BILLING_REASON_SUSPENDED",
+	}
+	BillingReason_value = map[string]int32{
+		"BILLING_REASON_UNSPECIFIED":      0,
+		"BILLING_REASON_ACCOUNT_REQUIRED": 1,
+		"BILLING_REASON_BLOCKED":          2,
+		"BILLING_REASON_SUSPENDED":        3,
+	}
+)
+
+func (x BillingReason) Enum() *BillingReason {
+	p := new(BillingReason)
+	*p = x
+	return p
+}
+
+func (x BillingReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (BillingReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_delino_ownsand_v1_common_proto_enumTypes[23].Descriptor()
+}
+
+func (BillingReason) Type() protoreflect.EnumType {
+	return &file_delino_ownsand_v1_common_proto_enumTypes[23]
+}
+
+func (x BillingReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use BillingReason.Descriptor instead.
+func (BillingReason) EnumDescriptor() ([]byte, []int) {
+	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{23}
+}
+
 // An authenticated principal.
 type Principal struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
@@ -1608,7 +1669,8 @@ func (x *DeviceLimitsInput) GetVcpuOvercommitPercent() int32 {
 	return 0
 }
 
-// Error detail of a frame or an agent channel result. The message never
+// Error detail of a frame or an agent channel result, and the Connect error
+// detail of a public RPC that billing enforcement rejects. The message never
 // contains secrets or sandbox content.
 type ErrorDetail struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
@@ -1619,8 +1681,13 @@ type ErrorDetail struct {
 	// Set when a session-end reason caused the error, for example
 	// GRANT_INVALID on a relay RPC that ends with UNAVAILABLE.
 	SessionEndReason SessionEndReason `protobuf:"varint,4,opt,name=session_end_reason,json=sessionEndReason,proto3,enum=delino.ownsand.v1.SessionEndReason" json:"session_end_reason,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Set when billing enforcement rejected the RPC, together with the code
+	// RESOURCE_EXHAUSTED and a message that links to
+	// `https://accounts.delino.io`. Unlike a capacity RESOURCE_EXHAUSTED, a
+	// billing error has no retry_after and is never retried.
+	BillingReason BillingReason `protobuf:"varint,5,opt,name=billing_reason,json=billingReason,proto3,enum=delino.ownsand.v1.BillingReason" json:"billing_reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *ErrorDetail) Reset() {
@@ -1679,6 +1746,13 @@ func (x *ErrorDetail) GetSessionEndReason() SessionEndReason {
 		return x.SessionEndReason
 	}
 	return SessionEndReason_SESSION_END_REASON_UNSPECIFIED
+}
+
+func (x *ErrorDetail) GetBillingReason() BillingReason {
+	if x != nil {
+		return x.BillingReason
+	}
+	return BillingReason_BILLING_REASON_UNSPECIFIED
 }
 
 // Sent when the agent accepted an Exec, AttachExec or ReadFile request. It
@@ -1845,13 +1919,14 @@ const file_delino_ownsand_v1_common_proto_rawDesc = "" +
 	"\v_vcpu_countB\r\n" +
 	"\v_memory_mibB\v\n" +
 	"\t_disk_gibB\x1a\n" +
-	"\x18_vcpu_overcommit_percent\"\xe8\x01\n" +
+	"\x18_vcpu_overcommit_percent\"\xb1\x02\n" +
 	"\vErrorDetail\x120\n" +
 	"\x04code\x18\x01 \x01(\x0e2\x1c.delino.ownsand.v1.ErrorCodeR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12:\n" +
 	"\vretry_after\x18\x03 \x01(\v2\x19.google.protobuf.DurationR\n" +
 	"retryAfter\x12Q\n" +
-	"\x12session_end_reason\x18\x04 \x01(\x0e2#.delino.ownsand.v1.SessionEndReasonR\x10sessionEndReason\"\x11\n" +
+	"\x12session_end_reason\x18\x04 \x01(\x0e2#.delino.ownsand.v1.SessionEndReasonR\x10sessionEndReason\x12G\n" +
+	"\x0ebilling_reason\x18\x05 \x01(\x0e2 .delino.ownsand.v1.BillingReasonR\rbillingReason\"\x11\n" +
 	"\x0fRequestAccepted\"\v\n" +
 	"\tKeepalive\"A\n" +
 	"\x0fSandboxRevision\x12\x14\n" +
@@ -2004,7 +2079,12 @@ const file_delino_ownsand_v1_common_proto_rawDesc = "" +
 	"\x13ERROR_CODE_INTERNAL\x10\r\x12\x1a\n" +
 	"\x16ERROR_CODE_UNAVAILABLE\x10\x0e\x12\x18\n" +
 	"\x14ERROR_CODE_DATA_LOSS\x10\x0f\x12\x1e\n" +
-	"\x1aERROR_CODE_UNAUTHENTICATED\x10\x10B=Z;github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1b\x06proto3"
+	"\x1aERROR_CODE_UNAUTHENTICATED\x10\x10*\x8e\x01\n" +
+	"\rBillingReason\x12\x1e\n" +
+	"\x1aBILLING_REASON_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fBILLING_REASON_ACCOUNT_REQUIRED\x10\x01\x12\x1a\n" +
+	"\x16BILLING_REASON_BLOCKED\x10\x02\x12\x1c\n" +
+	"\x18BILLING_REASON_SUSPENDED\x10\x03B=Z;github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1b\x06proto3"
 
 var (
 	file_delino_ownsand_v1_common_proto_rawDescOnce sync.Once
@@ -2018,7 +2098,7 @@ func file_delino_ownsand_v1_common_proto_rawDescGZIP() []byte {
 	return file_delino_ownsand_v1_common_proto_rawDescData
 }
 
-var file_delino_ownsand_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 23)
+var file_delino_ownsand_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 24)
 var file_delino_ownsand_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_delino_ownsand_v1_common_proto_goTypes = []any{
 	(Role)(0),                   // 0: delino.ownsand.v1.Role
@@ -2044,26 +2124,28 @@ var file_delino_ownsand_v1_common_proto_goTypes = []any{
 	(RelayOperationKind)(0),     // 20: delino.ownsand.v1.RelayOperationKind
 	(RelayGrantResult)(0),       // 21: delino.ownsand.v1.RelayGrantResult
 	(ErrorCode)(0),              // 22: delino.ownsand.v1.ErrorCode
-	(*Principal)(nil),           // 23: delino.ownsand.v1.Principal
-	(*Resources)(nil),           // 24: delino.ownsand.v1.Resources
-	(*DeviceLimits)(nil),        // 25: delino.ownsand.v1.DeviceLimits
-	(*DeviceLimitsInput)(nil),   // 26: delino.ownsand.v1.DeviceLimitsInput
-	(*ErrorDetail)(nil),         // 27: delino.ownsand.v1.ErrorDetail
-	(*RequestAccepted)(nil),     // 28: delino.ownsand.v1.RequestAccepted
-	(*Keepalive)(nil),           // 29: delino.ownsand.v1.Keepalive
-	(*SandboxRevision)(nil),     // 30: delino.ownsand.v1.SandboxRevision
-	(*durationpb.Duration)(nil), // 31: google.protobuf.Duration
+	(BillingReason)(0),          // 23: delino.ownsand.v1.BillingReason
+	(*Principal)(nil),           // 24: delino.ownsand.v1.Principal
+	(*Resources)(nil),           // 25: delino.ownsand.v1.Resources
+	(*DeviceLimits)(nil),        // 26: delino.ownsand.v1.DeviceLimits
+	(*DeviceLimitsInput)(nil),   // 27: delino.ownsand.v1.DeviceLimitsInput
+	(*ErrorDetail)(nil),         // 28: delino.ownsand.v1.ErrorDetail
+	(*RequestAccepted)(nil),     // 29: delino.ownsand.v1.RequestAccepted
+	(*Keepalive)(nil),           // 30: delino.ownsand.v1.Keepalive
+	(*SandboxRevision)(nil),     // 31: delino.ownsand.v1.SandboxRevision
+	(*durationpb.Duration)(nil), // 32: google.protobuf.Duration
 }
 var file_delino_ownsand_v1_common_proto_depIdxs = []int32{
 	13, // 0: delino.ownsand.v1.Principal.kind:type_name -> delino.ownsand.v1.PrincipalKind
 	22, // 1: delino.ownsand.v1.ErrorDetail.code:type_name -> delino.ownsand.v1.ErrorCode
-	31, // 2: delino.ownsand.v1.ErrorDetail.retry_after:type_name -> google.protobuf.Duration
+	32, // 2: delino.ownsand.v1.ErrorDetail.retry_after:type_name -> google.protobuf.Duration
 	18, // 3: delino.ownsand.v1.ErrorDetail.session_end_reason:type_name -> delino.ownsand.v1.SessionEndReason
-	4,  // [4:4] is the sub-list for method output_type
-	4,  // [4:4] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	23, // 4: delino.ownsand.v1.ErrorDetail.billing_reason:type_name -> delino.ownsand.v1.BillingReason
+	5,  // [5:5] is the sub-list for method output_type
+	5,  // [5:5] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_delino_ownsand_v1_common_proto_init() }
@@ -2077,7 +2159,7 @@ func file_delino_ownsand_v1_common_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_ownsand_v1_common_proto_rawDesc), len(file_delino_ownsand_v1_common_proto_rawDesc)),
-			NumEnums:      23,
+			NumEnums:      24,
 			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,

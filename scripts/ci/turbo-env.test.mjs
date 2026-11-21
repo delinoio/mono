@@ -72,6 +72,9 @@ const expectedPassThroughEnv = {
   "delino-docs#dev": ["PORTLESS", "PORTLESS_*"],
   // Turbo reports the pass-through list sorted.
   "ownsand-api#dev": [
+    "ACCOUNTS_API_ORIGIN",
+    "ACCOUNTS_M2M_CLIENT_ID",
+    "ACCOUNTS_M2M_CLIENT_SECRET",
     "ADDR",
     "ALLOW_DIRECT_CLIENT_ADDRESS",
     "CORS_ORIGINS",
@@ -80,7 +83,9 @@ const expectedPassThroughEnv = {
     "LOGTO_ISSUER",
     "LOGTO_JWKS_FILE",
     "LOGTO_JWKS_URL",
+    "LOGTO_TOKEN_ENDPOINT",
     "LOG_LEVEL",
+    "METRICS_ADDR",
     "NONCE_KEY",
     "NONCE_KEY_PREVIOUS",
     "R2_ACCESS_KEY_ID",

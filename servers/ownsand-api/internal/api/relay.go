@@ -81,11 +81,15 @@ type relayAgentControllerKey struct{}
 // writer, but only the controller can make a blocked response write fail:
 // returning from the handler does not cancel a write that waits for the
 // peer's flow control, and the HTTP/2 server would finish the response while
-// that write still uses it. Wrap the RelayAgentService handler with it.
+// that write still uses it. Wrap the RelayAgentService handler with it. It
+// also counts the bytes written to the response, which the relay egress of
+// WriteFile request frames is measured with.
 func RelayAgentWriteInterrupt(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx := context.WithValue(r.Context(), relayAgentControllerKey{}, http.NewResponseController(w))
-		next.ServeHTTP(w, r.WithContext(ctx))
+		written := &atomic.Int64{}
+		ctx = context.WithValue(ctx, agentWireBytesKey{}, written)
+		next.ServeHTTP(&agentWireWriter{ResponseWriter: w, n: written}, r.WithContext(ctx))
 	})
 }
 
@@ -106,6 +110,7 @@ func relaySendInterrupt(ctx context.Context) func() error {
 // while a send still writes to the response.
 func serveRelayConn(ctx context.Context, conn *relay.Conn, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
 	conn.SetSendInterrupt(relaySendInterrupt(ctx))
+	conn.SetWireBytes(agentWireBytes(ctx))
 	return conn.Run(func() (*ownsandv1.DataFrame, error) {
 		req, err := stream.Receive()
 		if err != nil {
@@ -383,10 +388,12 @@ type streamEvents struct {
 // sendRequest forwards the request frame within the agent's credit and the
 // request deadline, which the request gate counted from the stream_id
 // allocation, so the upload of the request body already used part of it.
-func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time) error {
+// onWritten, when set, receives the bytes of the frame on the agent
+// connection once the relay wrote it.
+func (p *DataPlane) sendRequest(ctx context.Context, c *relayCall, f *ownsandv1.DataFrame, deadline time.Time, onWritten func(int64)) error {
 	rctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if err := c.stream.Send(rctx, f); err != nil {
+	if err := c.stream.SendMetered(rctx, f, onWritten); err != nil {
 		if errors.Is(err, relay.ErrConnClosed) {
 			return errUnavailable("the relay connection closed")
 		}
@@ -424,7 +431,7 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, deadline time
 	}()
 	// Keepalives also cover the request upload and the wait for credit.
 	uploadDone := make(chan error, 1)
-	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline) }()
+	go func() { uploadDone <- p.sendRequest(ctx, c, request, deadline, nil) }()
 	tick := min(p.Timing.Keepalive, p.Timing.Acceptance) / 4
 	ticker := time.NewTicker(tick)
 	defer ticker.Stop()
@@ -568,6 +575,7 @@ func (h RelayHandler) Exec(ctx context.Context, req *connect.Request[ownsandv1.E
 	if err != nil {
 		return err
 	}
+	startRelayEgress(ctx, c.grant.OrgID)
 	return h.serveStream(ctx, c, deadline, datapath.MustNewFrame(0, "", m), execEvents(func(e *ownsandv1.ExecEvent) error {
 		return stream.Send(&ownsandv1.ExecResponse{Event: e})
 	}))
@@ -583,6 +591,7 @@ func (h RelayHandler) AttachExec(ctx context.Context, req *connect.Request[ownsa
 	if err != nil {
 		return err
 	}
+	startRelayEgress(ctx, c.grant.OrgID)
 	return h.serveStream(ctx, c, deadline, datapath.MustNewFrame(0, "", m), execEvents(func(e *ownsandv1.ExecEvent) error {
 		return stream.Send(&ownsandv1.AttachExecResponse{Event: e})
 	}))
@@ -598,6 +607,7 @@ func (h RelayHandler) ReadFile(ctx context.Context, req *connect.Request[ownsand
 	if err != nil {
 		return err
 	}
+	startRelayEgress(ctx, c.grant.OrgID)
 	send := func(e *ownsandv1.FileReadEvent) error { return stream.Send(&ownsandv1.ReadFileResponse{Event: e}) }
 	return h.serveStream(ctx, c, deadline, datapath.MustNewFrame(0, "", m), streamEvents{
 		payload: func(f *ownsandv1.DataFrame) (any, bool, bool) {
@@ -636,7 +646,11 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 	// finish within the request deadline of the call.
 	cctx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	if err := h.sendRequest(cctx, c, datapath.MustNewFrame(0, "", m), deadline); err != nil {
+	// Relay egress toward the agent: the WriteFile request frame leaves the
+	// Droplet on the agent's relay connection.
+	orgID := c.grant.OrgID
+	egress := func(n int64) { h.S.recordUsage(orgID, ownsandv1.BillingMeter_BILLING_METER_RELAY_EGRESS, n) }
+	if err := h.sendRequest(cctx, c, datapath.MustNewFrame(0, "", m), deadline, egress); err != nil {
 		return nil, err
 	}
 	for {

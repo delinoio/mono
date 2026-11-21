@@ -239,6 +239,22 @@ enum ErrorCode {
   ERROR_CODE_UNAUTHENTICATED = 16;
 }
 
+// Why billing enforcement rejected a public RPC. Each value except
+// UNSPECIFIED is terminal: clients must not retry the RPC until the
+// organization's billing changes, and they show the billing link
+// `https://accounts.delino.io` that the error message carries.
+enum BillingReason {
+  BILLING_REASON_UNSPECIFIED = 0;
+  // The organization has no linked billing account.
+  BILLING_REASON_ACCOUNT_REQUIRED = 1;
+  // The linked billing account has no active subscription or a balance of
+  // zero or less. Resource creation is blocked.
+  BILLING_REASON_BLOCKED = 2;
+  // Non-payment continued for 3 days. Running sandboxes are paused, and the
+  // data path is blocked too.
+  BILLING_REASON_SUSPENDED = 3;
+}
+
 // An authenticated principal.
 message Principal {
   PrincipalKind kind = 1;
@@ -281,7 +297,8 @@ message DeviceLimitsInput {
   optional int32 vcpu_overcommit_percent = 4;
 }
 
-// Error detail of a frame or an agent channel result. The message never
+// Error detail of a frame or an agent channel result, and the Connect error
+// detail of a public RPC that billing enforcement rejects. The message never
 // contains secrets or sandbox content.
 message ErrorDetail {
   ErrorCode code = 1;
@@ -291,6 +308,11 @@ message ErrorDetail {
   // Set when a session-end reason caused the error, for example
   // GRANT_INVALID on a relay RPC that ends with UNAVAILABLE.
   SessionEndReason session_end_reason = 4;
+  // Set when billing enforcement rejected the RPC, together with the code
+  // RESOURCE_EXHAUSTED and a message that links to
+  // `https://accounts.delino.io`. Unlike a capacity RESOURCE_EXHAUSTED, a
+  // billing error has no retry_after and is never retried.
+  BillingReason billing_reason = 5;
 }
 
 // Sent when the agent accepted an Exec, AttachExec or ReadFile request. It

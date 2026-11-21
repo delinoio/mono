@@ -15,6 +15,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+
+	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
@@ -42,6 +48,10 @@ const (
 	idleTimeout       = 120 * time.Second
 	writeByteTimeout  = 30 * time.Second
 )
+
+// usageFlushTimeout bounds the last usage counter write after the HTTP
+// drain.
+const usageFlushTimeout = 10 * time.Second
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
@@ -73,6 +83,18 @@ func run() error {
 		}
 	}
 
+	// The registry of the internal metrics listener. The metering metrics
+	// register on it whether or not the listener runs.
+	registry := prometheus.NewRegistry()
+	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
+	var usageClient accountsv1connect.UsageServiceClient
+	if cfg.Accounts.Enabled {
+		tokens := accounts.NewTokenSource(accounts.TokenConfig{
+			Endpoint: cfg.Accounts.TokenEndpoint, ClientID: cfg.Accounts.ClientID, ClientSecret: cfg.Accounts.ClientSecret,
+		})
+		usageClient = accounts.NewUsageClient(nil, cfg.Accounts.APIOrigin, tokens)
+	}
+
 	var objects objectstore.Store
 	if cfg.R2.Enabled {
 		objects = &objectstore.R2{Endpoint: cfg.R2.Endpoint, Bucket: cfg.R2.Bucket, AccessKeyID: cfg.R2.AccessKeyID, SecretAccessKey: cfg.R2.SecretAccessKey}
@@ -94,6 +116,8 @@ func run() error {
 		STUNURLs:              cfg.STUNURLs,
 		Objects:               objects,
 		SnapshotPartSizeBytes: cfg.SnapshotPartSizeBytes,
+		UsageClient:           usageClient,
+		Metrics:               registry,
 	})
 	if err != nil {
 		return err
@@ -107,6 +131,14 @@ func run() error {
 	if err != nil {
 		_ = listener.Close()
 		return err
+	}
+	var metricsListener net.Listener
+	if cfg.MetricsAddr != "" {
+		if metricsListener, err = net.Listen("tcp", cfg.MetricsAddr); err != nil {
+			_ = listener.Close()
+			_ = udp.Close()
+			return err
+		}
 	}
 	stunServer := stun.New(logger, cfg.STUNRateBytesPerSecond, cfg.STUNRateBurstBytes)
 	srv := newServer(a.Handler(), logger)
@@ -132,8 +164,45 @@ func run() error {
 	}
 	defer stopAndWait()
 
-	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)), slog.String("client_address_mode", string(cfg.ClientAddressMode)))
-	return serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
+	var metricsSrv *http.Server
+	metricsAddr := ""
+	if metricsListener != nil {
+		metricsSrv = newMetricsServer(registry, logger)
+		metricsAddr = metricsListener.Addr().String()
+		go func() {
+			if err := metricsSrv.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics_server_failed", slog.Any("error", err))
+			}
+		}()
+	}
+
+	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)),
+		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr), slog.Bool("usage_reporting", cfg.Accounts.Enabled))
+	err = serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
+	// RPCs that ended during the drain recorded usage after the metering
+	// worker stopped; write it before the process exits.
+	flushCtx, cancel := context.WithTimeout(context.Background(), usageFlushTimeout)
+	defer cancel()
+	if ferr := a.FlushUsage(flushCtx); ferr != nil {
+		logger.Error("usage_final_flush_failed", slog.Any("error", ferr))
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Close()
+	}
+	return err
+}
+
+// newMetricsServer returns the internal Prometheus listener. It serves only
+// GET /metrics and is never mounted on the public handler.
+func newMetricsServer(registry *prometheus.Registry, logger *slog.Logger) *http.Server {
+	mux := http.NewServeMux()
+	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}))
+	return &http.Server{
+		Handler:           mux,
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
+	}
 }
 
 // newServer returns the HTTP server. It serves HTTP/1.1 and HTTP/2 without

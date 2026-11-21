@@ -230,3 +230,47 @@ func TestSTUNAddrDefaults(t *testing.T) {
 		t.Errorf("Dockerfile does not set %s=0.0.0.0:3478", EnvSTUNAddr)
 	}
 }
+
+func TestLoadAccountsAndMetrics(t *testing.T) {
+	cfg, err := Load(env(minimal()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Without the machine-to-machine credential, usage reporting is off and
+	// the metrics listener is off.
+	if cfg.Accounts.Enabled || cfg.Accounts.APIOrigin != DefaultAccountsAPIOrigin || cfg.MetricsAddr != "" {
+		t.Fatalf("defaults = %+v %q", cfg.Accounts, cfg.MetricsAddr)
+	}
+	v := minimal()
+	v[EnvAccountsAPIOrigin] = "http://127.0.0.1:18100/"
+	v[EnvLogtoTokenEndpoint] = "https://tenant.logto.app/oidc/token"
+	v[EnvAccountsM2MClientID] = "m2m-id"
+	v[EnvAccountsM2MClientSecret] = "m2m-secret"
+	v[EnvMetricsAddr] = "0.0.0.0:9090"
+	cfg, err = Load(env(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Accounts.Enabled || cfg.Accounts.APIOrigin != "http://127.0.0.1:18100" || cfg.Accounts.TokenEndpoint != "https://tenant.logto.app/oidc/token" ||
+		cfg.Accounts.ClientID != "m2m-id" || cfg.Accounts.ClientSecret != "m2m-secret" || cfg.MetricsAddr != "0.0.0.0:9090" {
+		t.Fatalf("cfg = %+v %q", cfg.Accounts, cfg.MetricsAddr)
+	}
+	for name, mutate := range map[string]func(map[string]string){
+		"missing client id":     func(v map[string]string) { delete(v, EnvAccountsM2MClientID) },
+		"missing client secret": func(v map[string]string) { delete(v, EnvAccountsM2MClientSecret) },
+		"missing endpoint":      func(v map[string]string) { delete(v, EnvLogtoTokenEndpoint) },
+		"bad endpoint":          func(v map[string]string) { v[EnvLogtoTokenEndpoint] = "tenant/oidc/token" },
+		"origin with path":      func(v map[string]string) { v[EnvAccountsAPIOrigin] = "https://accounts.api.delino.io/v1" },
+		"origin without scheme": func(v map[string]string) { v[EnvAccountsAPIOrigin] = "accounts.api.delino.io" },
+		"bad metrics addr":      func(v map[string]string) { v[EnvMetricsAddr] = "9090" },
+	} {
+		w := map[string]string{}
+		for k, val := range v {
+			w[k] = val
+		}
+		mutate(w)
+		if _, err := Load(env(w)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}
