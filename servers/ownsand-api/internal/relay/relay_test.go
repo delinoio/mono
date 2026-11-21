@@ -300,11 +300,35 @@ func TestRunClosesConnectionOnControlFlood(t *testing.T) {
 // returns the number of filler frames.
 func fillOutbound(c *Conn) int {
 	n := 0
-	for len(c.out) < cap(c.out) {
-		c.out <- datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})
-		n++
+	for {
+		select {
+		case c.slots <- struct{}{}:
+			c.out <- outFrame{frame: datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})}
+			n++
+		default:
+			return n
+		}
 	}
-	return n
+}
+
+// takeOut dequeues the next frame like the writer does (without a send).
+func takeOut(c *Conn) *ownsandv1.DataFrame {
+	of := <-c.out
+	c.dequeued(of)
+	c.sent(of)
+	return of.frame
+}
+
+// tryTakeOut is takeOut without waiting; ok is false when the queue is empty.
+func tryTakeOut(c *Conn) (f *ownsandv1.DataFrame, ok bool) {
+	select {
+	case of := <-c.out:
+		c.dequeued(of)
+		c.sent(of)
+		return of.frame, true
+	default:
+		return nil, false
+	}
 }
 
 // openResult is the outcome of an Open that runs in its own goroutine.
@@ -367,7 +391,7 @@ func TestOpenEnqueuesInStreamIDOrderWhileQueueIsFull(t *testing.T) {
 		t.Fatalf("StreamCount while the first Open waits = %d, want 1", got)
 	}
 	for i := 0; i < filler; i++ {
-		<-c.out
+		takeOut(c)
 	}
 	a, b := waitOpen(t, first, time.Second), waitOpen(t, second, time.Second)
 	if a.err != nil || b.err != nil {
@@ -377,13 +401,12 @@ func TestOpenEnqueuesInStreamIDOrderWhileQueueIsFull(t *testing.T) {
 		t.Fatalf("stream IDs = %d, %d, want 1, 2", a.s.ID, b.s.ID)
 	}
 	for _, want := range []uint64{1, 2} {
-		select {
-		case f := <-c.out:
-			if f.GetStreamId() != want || f.GetRelayStreamOpen() == nil {
-				t.Fatalf("queued frame = stream %d kind %v, want stream open %d", f.GetStreamId(), datapath.PayloadKind(f), want)
-			}
-		default:
+		f, ok := tryTakeOut(c)
+		if !ok {
 			t.Fatalf("stream open %d is not queued", want)
+		}
+		if f.GetStreamId() != want || f.GetRelayStreamOpen() == nil {
+			t.Fatalf("queued frame = stream %d kind %v, want stream open %d", f.GetStreamId(), datapath.PayloadKind(f), want)
 		}
 	}
 }
@@ -495,7 +518,7 @@ func TestOpenCancelWhileQueueIsFull(t *testing.T) {
 	}
 
 	for i := 0; i < filler; i++ {
-		<-c.out
+		takeOut(c)
 	}
 	s, err := c.Open(context.Background(), "grant-a", "sandbox")
 	if err != nil {
@@ -505,7 +528,7 @@ func TestOpenCancelWhileQueueIsFull(t *testing.T) {
 		t.Fatalf("stream_id after a canceled Open = %d, want above the canceled stream_id 1", s.ID)
 	}
 	// The canceled stream's open frame never reached the queue.
-	f := <-c.out
+	f := takeOut(c)
 	if f.GetStreamId() != s.ID {
 		t.Fatalf("first queued frame has stream_id %d, want %d", f.GetStreamId(), s.ID)
 	}
@@ -593,12 +616,11 @@ func TestLastLargeReceiveCountsOnlyLargeStreamFrames(t *testing.T) {
 func drainOut(c *Conn) []*ownsandv1.DataFrame {
 	var frames []*ownsandv1.DataFrame
 	for {
-		select {
-		case f := <-c.out:
-			frames = append(frames, f)
-		default:
+		f, ok := tryTakeOut(c)
+		if !ok {
 			return frames
 		}
+		frames = append(frames, f)
 	}
 }
 
