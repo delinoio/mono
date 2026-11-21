@@ -110,8 +110,9 @@ const ownsandSdkPackage = "packages/ownsand-sdk/";
 // The Go job installs the workspace dependencies with the Node.js runtime of
 // `.nvmrc` before the Go tests, so the workspace manifests and the lockfile
 // change what the TypeScript SDK end-to-end test and the protobuf generators
-// run with.
+// run with. The workflow defines the job's steps, services and caches.
 const goWorkspaceInputs = new Set([
+  ".github/workflows/CI.yml",
   ".nvmrc",
   "package.json",
   "pnpm-lock.yaml",
@@ -136,8 +137,13 @@ export function isGoInput(path) {
   );
 }
 
-// Root Rust toolchain and formatter configuration.
-const rustInputs = new Set(["rust-toolchain", ".rustfmt.toml"]);
+// Root Rust toolchain and formatter configuration, and the workflow that
+// defines the Rust job's packages, toolchain installation and caches.
+const rustInputs = new Set([
+  ".github/workflows/CI.yml",
+  "rust-toolchain",
+  ".rustfmt.toml",
+]);
 
 // Rust sources, Cargo manifests and lockfiles, the root toolchain files and
 // every path of a Tauri app crate select the Rust checks. A Tauri crate also

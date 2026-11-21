@@ -450,6 +450,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "packages/ownsand-sdk/src/e2e.test.ts",
     "packages/ownsand-sdk/rstest.config.ts",
     "packages/ownsand-sdk/tsconfig.json",
+    ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
     "pnpm-lock.yaml",
@@ -471,6 +472,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("packages/delino-ui/package.json");
   f.write("rstest.config.ts");
   f.write("servers/ownsand-api/README.md");
+  f.write(".github/workflows/deploy.yml");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
@@ -486,6 +488,7 @@ test("Rust sources, Cargo files, toolchain files and Tauri crates select Rust ch
     "Cargo.lock",
     "rust-toolchain",
     ".rustfmt.toml",
+    ".github/workflows/CI.yml",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
