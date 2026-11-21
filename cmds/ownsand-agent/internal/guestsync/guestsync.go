@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guestsync flushes the page cache of a sandbox guest through its
 // guest helper, for the pause and snapshot rules of the runtimes.

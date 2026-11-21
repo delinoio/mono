@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package vzrt is the macOS sandbox runtime: one Virtualization.framework
 // VM per sandbox, through the github.com/Code-Hex/vz/v3 binding (cgo). It

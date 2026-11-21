@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package sandboxes keeps the sandbox and snapshot records of the device,
 // runs the sandbox commands of the agent channel through a runtime,
