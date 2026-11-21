@@ -557,6 +557,47 @@ func TestFileReadDanglingSymlink(t *testing.T) {
 	}
 }
 
+func TestFileReadDanglingSymlinkThroughSymlinkedDirectory(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	// alias -> real/sub and real/sub/link -> ../target: the target of link is
+	// real/target. A lexical join would pick the unrelated file "target" that
+	// lies beside alias.
+	dir := t.TempDir()
+	sub := filepath.Join(dir, "real", "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("real", "sub"), filepath.Join(dir, "alias")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink(filepath.Join("..", "target"), filepath.Join(sub, "link")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	unrelated := filepath.Join(dir, "target")
+	if err := os.WriteFile(unrelated, []byte("unrelated"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.run("file", "read", "--to", filepath.Join(dir, "alias", "link"), r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if b, err := os.ReadFile(unrelated); err != nil || string(b) != "unrelated" {
+		t.Fatalf("the download changed an unrelated file: %q %v", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "real", "target")); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("target content %q %v", b, err)
+	}
+	if info, err := os.Lstat(filepath.Join(sub, "link")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the download replaced the symbolic link")
+	}
+	if entries, _ := os.ReadDir(filepath.Join(dir, "real")); len(entries) != 2 {
+		t.Fatalf("temporary files left: %v", entries)
+	}
+}
+
 func TestFileReadDanglingSymlinkMissingDirectory(t *testing.T) {
 	r := newRunner(t)
 	r.stdin = "downloaded contents"

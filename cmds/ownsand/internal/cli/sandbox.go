@@ -701,6 +701,25 @@ const maxSymlinkHops = 255
 func resolveMissingTarget(to string) (string, error) {
 	path := to
 	for range maxSymlinkHops {
+		// Resolve the symbolic links in the directory part first. A relative
+		// link target that contains ".." is relative to the real directory of
+		// the link. Joining it with the lexical directory would collapse ".."
+		// before a symlinked directory (alias -> real/sub) is resolved and pick
+		// the wrong destination. filepath.Split keeps the directory part
+		// uncleaned, so that EvalSymlinks sees any ".." that an absolute link
+		// target contains and resolves it as the kernel does.
+		if dir, base := filepath.Split(path); dir != "" {
+			realDir, err := filepath.EvalSymlinks(dir)
+			if errors.Is(err, os.ErrNotExist) {
+				// The directory is missing: the temporary file cannot be
+				// created there, so the caller reports the failure.
+				return path, nil
+			}
+			if err != nil {
+				return "", err
+			}
+			path = filepath.Join(realDir, base)
+		}
 		info, err := os.Lstat(path)
 		if err != nil || info.Mode()&os.ModeSymlink == 0 {
 			// A missing path, or a path that is not a link, ends the chain.
@@ -712,6 +731,8 @@ func resolveMissingTarget(to string) (string, error) {
 			return "", err
 		}
 		if !filepath.IsAbs(target) {
+			// path already has real directory components (see above), so
+			// ".." in the target is applied to the real directory.
 			target = filepath.Join(filepath.Dir(path), target)
 		}
 		path = target
