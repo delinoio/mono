@@ -3,6 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { execBinding, requestDigest } from "./digest.ts";
 import { DataPathError } from "./errors.ts";
+import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import {
   DataPathTransport,
   RelayOperationKind,
@@ -579,6 +580,108 @@ describe("exec over the relay", () => {
     expect(error).toBeDefined();
     // One continuation of about 90 seconds already exceeds the window.
     expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+  });
+
+  describe("a recovery continuation that the agent does not accept", () => {
+    const failFirstExec = (h: ReturnType<typeof setup>) =>
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        yield new Disconnect();
+      });
+
+    test("ends at the remaining window while only keepalives arrive", async () => {
+      const h = setup();
+      failFirstExec(h);
+      let continuation: AbortSignal | undefined;
+      h.api.stream(RelayService, "AttachExec", async function* (_req, call) {
+        continuation = call.signal;
+        // A keepalive every 10 seconds, never `accepted`, never idle for 90.
+        for (;;) {
+          yield attachMsg(ev.keepalive());
+          yield new Sleep(10_000);
+        }
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+      expect(error.code).toBe(Code.Unavailable);
+      // The window started at the failure at 0 s; the budget ends at 60 s.
+      expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+      expect(h.clock.now()).toBeLessThan(MIN + 1_000);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+      expect(continuation?.aborted).toBe(true);
+    });
+
+    test("ends at the remaining window while no frame arrives", async () => {
+      const h = setup();
+      failFirstExec(h);
+      h.api.stream(RelayService, "AttachExec", async function* () {
+        yield new Hang();
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+      // Before the fix, the 90-second idle watcher ended this stream.
+      expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+      expect(h.clock.now()).toBeLessThan(MIN + 1_000);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+    });
+
+    test("keeps running past the window when accepted arrives in time", async () => {
+      const h = setup();
+      failFirstExec(h);
+      h.api.stream(RelayService, "AttachExec", async function* () {
+        yield new Sleep(30_000);
+        yield attachMsg(ev.accepted());
+        // Silent for longer than the window, with keepalives.
+        for (let i = 0; i < 12; i++) {
+          yield new Sleep(10_000);
+          yield attachMsg(ev.keepalive());
+        }
+        yield attachMsg(ev.exited(0));
+      });
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      );
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(h.clock.now()).toBeGreaterThan(MIN + 30_000);
+    });
+
+    test("does not bound the first attempt outside recovery", async () => {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", async function* () {
+        for (let i = 0; i < 9; i++) {
+          yield execMsg(ev.keepalive());
+          yield new Sleep(10_000);
+        }
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      );
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(h.clock.now()).toBeGreaterThanOrEqual(90_000);
+    });
   });
 
   test("an accepted continuation pauses the recovery clock and only data resets it", async () => {
