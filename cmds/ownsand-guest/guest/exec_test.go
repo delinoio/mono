@@ -6,6 +6,9 @@ package guest
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -112,6 +115,130 @@ func TestExecTimeoutTerminatesThenKills(t *testing.T) {
 	ex = evs[len(evs)-1].GetExited()
 	if !ex.GetTimedOut() || ex.GetSignal() != int32(syscall.SIGKILL) {
 		t.Fatalf("exited after ignored SIGTERM: %v", ex)
+	}
+}
+
+// pidRunning reports whether pid is a live process. A zombie that nothing
+// reaped counts as dead, because the kill already took effect.
+func pidRunning(pid int) bool {
+	if err := syscall.Kill(pid, 0); err != nil {
+		return false
+	}
+	if stat, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat"); err == nil {
+		if i := strings.LastIndexByte(string(stat), ')'); i >= 0 && strings.HasPrefix(strings.TrimSpace(string(stat)[i+1:]), "Z") {
+			return false
+		}
+	}
+	return true
+}
+
+// readPidFile waits for the fixture to write the pid of its background child.
+func readPidFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(path); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("pid file %s was not written", path)
+	return 0
+}
+
+func TestExecTimeoutKillsGroupAfterParentExits(t *testing.T) {
+	h := newHarness(t, nil)
+	grace := time.Second
+	h.srv.execs.mu.Lock()
+	h.srv.execs.killGrace = grace
+	h.srv.execs.mu.Unlock()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	// The leader exits on SIGTERM while its background child ignores SIGTERM.
+	// The child has no output pipe, so cmd.Wait returns when the leader exits.
+	script := `trap 'exit 0' TERM
+sh -c 'trap "" TERM; echo $$ > "$1"; while :; do sleep 0.05; done' sh "$PID_FILE" >/dev/null 2>&1 &
+while :; do sleep 0.05; done`
+	req := execReq(t, "/bin/sh", "-c", script)
+	req.Env = map[string]string{"PID_FILE": pidFile}
+	req.Timeout = durationpb.New(500 * time.Millisecond)
+	evs := h.runExec(req)
+	childPid := readPidFile(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
+	exitedAt := time.Now()
+	ex := evs[len(evs)-1].GetExited()
+	if !ex.GetTimedOut() || ex.GetExitCode() != 0 {
+		t.Fatalf("exited %v", ex)
+	}
+	// The exited event does not wait for the group, so the child still runs.
+	if !pidRunning(childPid) {
+		t.Fatal("child ended before the grace period")
+	}
+	deadline := exitedAt.Add(grace + 5*time.Second)
+	for pidRunning(childPid) {
+		if time.Now().After(deadline) {
+			t.Fatal("child ignoring SIGTERM survived the grace period")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if since := time.Since(exitedAt); since < grace/2 {
+		t.Fatalf("child was killed after %v, before the grace period", since)
+	}
+}
+
+// A pending SIGKILL must not outlive its process group: once every member is
+// gone the group id can be reused by an unrelated process group, so the
+// escalation ends at that point and not at the end of the grace period.
+func TestExecTimeoutDropsKillWhenGroupEmpties(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.execs.mu.Lock()
+	h.srv.execs.killGrace = 30 * time.Second
+	h.srv.execs.groupPoll = 20 * time.Millisecond
+	h.srv.execs.mu.Unlock()
+	// The leader exits on SIGTERM. Its background child ignores SIGTERM, as
+	// does the sleep it runs, and ends by itself 0.4 seconds later.
+	script := `trap 'exit 0' TERM
+sh -c 'trap "" TERM; sleep 0.4' >/dev/null 2>&1 &
+while :; do sleep 0.05; done`
+	req := execReq(t, "/bin/sh", "-c", script)
+	req.Timeout = durationpb.New(200 * time.Millisecond)
+	evs := h.runExec(req)
+	if ex := evs[len(evs)-1].GetExited(); !ex.GetTimedOut() {
+		t.Fatalf("exited %v", ex)
+	}
+	done := make(chan struct{})
+	go func() {
+		h.srv.execs.escalations.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pending SIGKILL outlived its empty process group")
+	}
+}
+
+func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.execs.mu.Lock()
+	h.srv.execs.killGrace = 100 * time.Millisecond
+	h.srv.execs.mu.Unlock()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	req := execReq(t, "/bin/sh", "-c", `sleep 30 >/dev/null 2>&1 & echo $! > "$PID_FILE"`)
+	req.Env = map[string]string{"PID_FILE": pidFile}
+	req.Timeout = durationpb.New(200 * time.Millisecond)
+	evs := h.runExec(req)
+	childPid := readPidFile(t, pidFile)
+	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
+	ex := evs[len(evs)-1].GetExited()
+	if ex.GetTimedOut() || ex.GetExitCode() != 0 {
+		t.Fatalf("exited %v", ex)
+	}
+	// Neither the timeout nor the escalation may run for a finished command.
+	time.Sleep(time.Second)
+	if !pidRunning(childPid) {
+		t.Fatal("a command that ended before its timeout had its process group killed")
 	}
 }
 
