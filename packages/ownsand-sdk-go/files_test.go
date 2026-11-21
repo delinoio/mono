@@ -120,9 +120,30 @@ func TestReadFileNotFoundIsVisible(t *testing.T) {
 	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
 		s := cp.handle(t, cp.client(t, tr))
 		_, err := s.ReadFileBytes(context.Background(), "/missing")
+		// Callers see the code through the public Connect error API on
+		// both transports, not only through SDK internals.
 		var dp *DataPathError
-		if !errors.As(err, &dp) || errorCode(dp.Err) != connect.CodeNotFound {
+		if !errors.As(err, &dp) || connect.CodeOf(err) != connect.CodeNotFound {
 			t.Fatalf("%v: want not_found, got %v", tr, err)
+		}
+		var ce *connect.Error
+		if !errors.As(err, &ce) || ce.Code() != connect.CodeNotFound {
+			t.Fatalf("%v: want a *connect.Error, got %v", tr, err)
+		}
+		if tr == TransportPeerToPeer {
+			// The error frame's ErrorDetail is a Connect error detail, as
+			// the control plane attaches it on the relay.
+			var detail *ownsandv1.ErrorDetail
+			for _, d := range ce.Details() {
+				if v, derr := d.Value(); derr == nil {
+					if ed, ok := v.(*ownsandv1.ErrorDetail); ok {
+						detail = ed
+					}
+				}
+			}
+			if detail == nil || detail.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+				t.Fatalf("%v: want the ErrorDetail as a Connect detail, got %v", tr, ce.Details())
+			}
 		}
 	}
 }

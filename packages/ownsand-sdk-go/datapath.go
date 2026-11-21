@@ -87,7 +87,7 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 	if !errors.As(err, &openErr) {
 		// OpenSession or GetIceServers failed. An authorization error ends
 		// the operations; other errors mean the session cannot open.
-		switch errorCode(err) {
+		switch connect.CodeOf(err) {
 		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeInvalidArgument, connect.CodeCanceled:
 			return nil, err
 		case connect.CodeFailedPrecondition:
@@ -104,7 +104,7 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 	if c.transport == TransportPeerToPeer {
 		return nil, err
 	}
-	c.logger.DebugContext(ctx, "ownsand data path falls back to the relay", "sandbox_id", d.s.id, "code", errorCode(err).String())
+	c.logger.DebugContext(ctx, "ownsand data path falls back to the relay", "sandbox_id", d.s.id, "code", connect.CodeOf(err).String())
 	d.mu.Lock()
 	d.relay = true
 	d.inUse = ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY

@@ -43,36 +43,34 @@ func (e *DataPathError) Unwrap() error { return e.Err }
 
 // frameError is an error that the agent reported explicitly in an error
 // frame on the peer-to-peer data channel. Like a Connect wire error it is a
-// valid terminal status, not a transport interruption.
+// valid terminal status, not a transport interruption; the marker keeps
+// that classification. It unwraps to a *connect.Error with the frame's code,
+// message and ErrorDetail, so callers see the same public error shape on
+// both transports: connect.CodeOf and (*connect.Error).Details work as on
+// the relay.
 type frameError struct {
-	detail *ownsandv1.ErrorDetail
+	ce *connect.Error
 }
 
-func (e *frameError) Error() string {
-	return fmt.Sprintf("%s: %s", connect.Code(e.detail.GetCode()), e.detail.GetMessage())
-}
+func (e *frameError) Error() string { return e.ce.Error() }
 
-// asConnectError returns a Connect error with the code and detail of an
-// error frame, so callers see one error shape on both transports.
+func (e *frameError) Unwrap() error { return e.ce }
+
+// errorFromDetail returns the error of an error frame.
 func errorFromDetail(d *ownsandv1.ErrorDetail) error {
-	return &frameError{detail: d}
-}
-
-// errorCode returns the Connect code of err, also for frame errors.
-func errorCode(err error) connect.Code {
-	var fe *frameError
-	if errors.As(err, &fe) {
-		return connect.Code(fe.detail.GetCode())
+	code := connect.Code(d.GetCode())
+	if d.GetCode() == ownsandv1.ErrorCode_ERROR_CODE_UNSPECIFIED {
+		code = connect.CodeUnknown
 	}
-	return connect.CodeOf(err)
+	ce := connect.NewError(code, errors.New(d.GetMessage()))
+	if ed, err := connect.NewErrorDetail(d); err == nil {
+		ce.AddDetail(ed)
+	}
+	return &frameError{ce: ce}
 }
 
 // errorDetail returns the ErrorDetail of err, if it carries one.
 func errorDetail(err error) *ownsandv1.ErrorDetail {
-	var fe *frameError
-	if errors.As(err, &fe) {
-		return fe.detail
-	}
 	var ce *connect.Error
 	if errors.As(err, &ce) {
 		for _, d := range ce.Details() {
@@ -139,7 +137,7 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 		}
 		return failTerminal, 0
 	}
-	switch errorCode(err) {
+	switch connect.CodeOf(err) {
 	case connect.CodeUnavailable:
 		return failUnavailable, 0
 	case connect.CodeResourceExhausted:

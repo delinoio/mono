@@ -324,7 +324,7 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			continue
 		}
 		if at.authErr {
-			if errorCode(err) == connect.CodeFailedPrecondition {
+			if connect.CodeOf(err) == connect.CodeFailedPrecondition {
 				if ended := s.endedState(ctx); ended != nil {
 					return op.sandboxEnded(ended), nil
 				}
@@ -333,7 +333,7 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 		}
 		kind, delay := classify(ctx, err)
 		if kind == failTerminal {
-			switch errorCode(err) {
+			switch connect.CodeOf(err) {
 			case connect.CodeNotFound:
 				if !at.sentExec && !op.started && op.req != nil {
 					// AttachExec before started found no exec: send the
