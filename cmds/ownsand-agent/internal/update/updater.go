@@ -29,7 +29,8 @@ const (
 	maxArtifactBytes = 512 << 20
 )
 
-// ErrInstalling rejects creates once the installation started.
+// ErrInstalling rejects creates and snapshot transfers once the installation
+// started.
 var ErrInstalling = errors.New("update: an agent update is installing")
 
 // ErrRunningRevoked rejects creates while the running version is revoked.
@@ -80,8 +81,9 @@ type Options struct {
 	Platform    string
 	Running     string
 	Installer   Installer
-	// Busy reports sandboxes in creating, running or paused state or a
-	// running snapshot transfer.
+	// Busy reports sandboxes in creating, running or paused state. Snapshot
+	// transfers are not part of it: they reserve the device with
+	// Updater.BeginTransfer.
 	Busy func() bool
 	// Restart ends the agent process after an installation, so the service
 	// manager starts the new executable.
@@ -100,6 +102,7 @@ type Updater struct {
 	revokedRunning bool
 	installing     bool
 	creating       int
+	transfers      int
 	wake           chan struct{}
 	// issued is the last order handed out by NextOrder; applied is the order
 	// of the newest update or withdrawal command that took effect. Commands
@@ -163,6 +166,30 @@ func (u *Updater) BeginCreate() (func(), error) {
 		u.creating--
 		u.mu.Unlock()
 		u.poke()
+	}, nil
+}
+
+// BeginTransfer admits a snapshot export or import. Transfers and the
+// installation are mutually exclusive: the reservation and the installing
+// flag change under the same mutex, so a transfer that is admitted blocks the
+// installation until its release function ran, and once the installation
+// started, BeginTransfer returns ErrInstalling before the caller does any
+// transfer I/O.
+func (u *Updater) BeginTransfer() (func(), error) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.installing {
+		return nil, ErrInstalling
+	}
+	u.transfers++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			u.mu.Lock()
+			u.transfers--
+			u.mu.Unlock()
+			u.poke()
+		})
 	}, nil
 }
 
@@ -427,10 +454,10 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) (*M
 }
 
 // TryInstall installs a verified update when the device is idle and no
-// create runs. It reports whether it installed.
+// create or snapshot transfer runs. It reports whether it installed.
 func (u *Updater) TryInstall() (bool, error) {
 	u.mu.Lock()
-	if u.artifact == "" || u.installing || u.creating > 0 || (u.opts.Busy != nil && u.opts.Busy()) {
+	if u.artifact == "" || u.installing || u.creating > 0 || u.transfers > 0 || (u.opts.Busy != nil && u.opts.Busy()) {
 		u.mu.Unlock()
 		return false, nil
 	}
