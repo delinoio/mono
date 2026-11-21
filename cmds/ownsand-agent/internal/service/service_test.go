@@ -5,13 +5,16 @@ package service
 import (
 	"encoding/xml"
 	"errors"
+	"fmt"
+	"strconv"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestDefinitions(t *testing.T) {
 	unit := SystemdUnit("/usr/local/bin/ownsand-agent", []string{"OWNSAND_AGENT_RUNTIME=firecracker"})
-	for _, want := range []string{"ExecStart=/usr/local/bin/ownsand-agent run", "KillMode=control-group", "RestartPreventExitStatus=3", `Environment="OWNSAND_AGENT_RUNTIME=firecracker"`} {
+	for _, want := range []string{`ExecStart="/usr/local/bin/ownsand-agent" run`, "KillMode=control-group", "RestartPreventExitStatus=3", `Environment="OWNSAND_AGENT_RUNTIME=firecracker"`} {
 		if !strings.Contains(unit, want) {
 			t.Errorf("systemd unit lacks %q", want)
 		}
@@ -244,4 +247,139 @@ func TestInstallWindowsEnvironment(t *testing.T) {
 			t.Fatalf("error text: %v", err)
 		}
 	})
+}
+
+// decodeSystemdWord decodes one double-quoted systemd word that starts at the
+// beginning of s and returns the text after the closing quote. It follows the
+// rules of systemd.syntax(7) for the escapes that strconv.Quote writes, then
+// expands specifiers like systemd does: %% is a literal percent sign and any
+// other %X is an unresolved specifier, which makes systemd drop the
+// assignment. A $ stays literal: systemd substitutes no variables in
+// Environment= values or in the executable of ExecStart=.
+func decodeSystemdWord(s string) (string, string, error) {
+	if !strings.HasPrefix(s, `"`) {
+		return "", "", fmt.Errorf("word %q does not start with a quote", s)
+	}
+	// Unquote the C-style escapes first; the quoted text ends at the first
+	// unescaped quote.
+	end := -1
+	for i := 1; i < len(s); i++ {
+		if s[i] == '\\' {
+			i++
+			continue
+		}
+		if s[i] == '"' {
+			end = i
+			break
+		}
+	}
+	if end < 0 {
+		return "", "", fmt.Errorf("word %q has no closing quote", s)
+	}
+	raw, err := strconv.Unquote(s[:end+1])
+	if err != nil {
+		return "", "", err
+	}
+	var b strings.Builder
+	for i := 0; i < len(raw); i++ {
+		switch raw[i] {
+		case '%':
+			if i+1 >= len(raw) || raw[i+1] != '%' {
+				return "", "", fmt.Errorf("unresolved specifier in %q", raw)
+			}
+			b.WriteByte('%')
+			i++
+		default:
+			b.WriteByte(raw[i])
+		}
+	}
+	return b.String(), s[end+1:], nil
+}
+
+func TestSystemdUnitEnvironmentQuotesSpecifiers(t *testing.T) {
+	values := []string{
+		"OWNSAND_AGENT_API_URL=https://h/a%20b",
+		"A=100%",
+		"B=%%",
+		"C=%h/%t/%n",
+		"D=%",
+		"E=a b",
+		`F=say "hi"`,
+		`G=C:\data\%USERPROFILE%`,
+		"H=line1\nline2\ttab\x01",
+		"I=héllo 世界 😀",
+		"J=$FOO ${BAR} $$",
+		"K=",
+	}
+	unit := SystemdUnit("/usr/bin/ownsand-agent", values)
+	var got []string
+	for _, line := range strings.Split(unit, "\n") {
+		rest, ok := strings.CutPrefix(line, "Environment=")
+		if !ok {
+			continue
+		}
+		v, tail, err := decodeSystemdWord(rest)
+		if err != nil || tail != "" {
+			t.Fatalf("Environment line %q: decoded %q, tail %q, err %v", line, v, tail, err)
+		}
+		got = append(got, v)
+	}
+	if len(got) != len(values) {
+		t.Fatalf("decoded %d Environment lines, want %d:\n%s", len(got), len(values), unit)
+	}
+	for i, want := range values {
+		if got[i] != want {
+			t.Errorf("Environment line %d decodes to %q, want %q", i, got[i], want)
+		}
+		if !utf8.ValidString(got[i]) {
+			t.Errorf("Environment line %d decodes to invalid UTF-8", i)
+		}
+	}
+}
+
+func TestSystemdUnitEnvironmentWithoutPercentIsUnchanged(t *testing.T) {
+	unit := SystemdUnit("/usr/bin/ownsand-agent", []string{"A=b c", `B=q"\`})
+	for _, want := range []string{"Environment=\"A=b c\"\n", "Environment=" + strconv.Quote(`B=q"\`) + "\n"} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("systemd unit lacks %q:\n%s", want, unit)
+		}
+	}
+}
+
+func TestSystemdUnitExecStartQuotesExecutable(t *testing.T) {
+	for _, exe := range []string{
+		"/usr/local/bin/ownsand-agent",
+		"/opt/OwnSand Agent/ownsand-agent",
+		"/opt/100%/own sand/agent",
+		"/opt/%h/agent",
+		"/opt/$HOME/$$x/agent",
+		`/opt/back\slash "q"/agent`,
+		"/opt/-dash/@at/agent",
+		"/opt/世界 é/agent",
+	} {
+		unit := SystemdUnit(exe, nil)
+		var line string
+		for _, l := range strings.Split(unit, "\n") {
+			if rest, ok := strings.CutPrefix(l, "ExecStart="); ok {
+				line = rest
+			}
+		}
+		word, tail, err := decodeSystemdWord(line)
+		if err != nil {
+			t.Errorf("exe %q: ExecStart=%s: %v", exe, line, err)
+			continue
+		}
+		if word != exe {
+			t.Errorf("exe %q: ExecStart executable decodes to %q", exe, word)
+		}
+		// The command line has exactly one more word, the argument run.
+		if tail != " run" {
+			t.Errorf("exe %q: ExecStart arguments are %q, want %q", exe, tail, " run")
+		}
+		for _, want := range []string{"Restart=always\n", "RestartSec=5\n", "KillMode=control-group\n", "StateDirectory=ownsand-agent\n", "StateDirectoryMode=0700\n"} {
+			if !strings.Contains(unit, want) {
+				t.Errorf("exe %q: systemd unit lacks %q", exe, want)
+			}
+		}
+	}
 }
