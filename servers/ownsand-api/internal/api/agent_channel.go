@@ -289,6 +289,16 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	if err != nil {
 		return err
 	}
+	if res.removed {
+		// The device was removed before the report took the device lock, so
+		// nothing was applied. Like a heartbeat of a removed device, close the
+		// channel without an acknowledgement; the agent gets the removal
+		// notice at its next Authenticate.
+		s.Logger.InfoContext(ctx, "agent_state_report_device_removed", slog.String("device_id", conn.DeviceID),
+			slog.Int("sandboxes", len(r.GetSandboxes())), slog.Bool("removed", true))
+		conn.Close(errDeviceRemoved)
+		return nil
+	}
 	ack := &ownsandv1.StateReportAck{ReportSequence: r.GetReportSequence()}
 	for _, e := range r.GetSandboxes() {
 		ack.Sandboxes = append(ack.Sandboxes, &ownsandv1.SandboxUpdateAck{SandboxId: e.GetSandboxId(), Revision: e.GetRevision()})
