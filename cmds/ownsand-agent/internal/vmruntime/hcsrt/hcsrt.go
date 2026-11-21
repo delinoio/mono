@@ -57,6 +57,9 @@ type Options struct {
 	// vmlinux and the ext4 root file system.
 	Kernel string
 	Rootfs string
+	// WindowsImage is the Windows base image directory (images/windows;
+	// see package images).
+	WindowsImage string
 	// VMsDir holds the VM directories (<state>/vms).
 	VMsDir string
 	Logger *slog.Logger

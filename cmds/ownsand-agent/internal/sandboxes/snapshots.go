@@ -129,16 +129,17 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
 	}
 	snap := &snapshot{dir: filepath.Join(dir, contentDir), rec: SnapshotRecord{
-		SnapshotID:      cmd.GetSnapshotId(),
-		SourceSandboxID: cmd.GetSandboxId(),
-		State:           ownsandv1.SnapshotState_SNAPSHOT_STATE_READY,
-		GuestOS:         rec.GuestOS,
-		VCPUCount:       rec.VCPUCount,
-		MemoryMiB:       rec.MemoryMiB,
-		DiskGiB:         rec.DiskGiB,
-		NetworkMode:     rec.NetworkMode,
-		HasMemoryState:  info.HasMemoryState,
-		SizeBytes:       info.SizeBytes,
+		SnapshotID:         cmd.GetSnapshotId(),
+		SourceSandboxID:    cmd.GetSandboxId(),
+		State:              ownsandv1.SnapshotState_SNAPSHOT_STATE_READY,
+		GuestOS:            rec.GuestOS,
+		VCPUCount:          rec.VCPUCount,
+		MemoryMiB:          rec.MemoryMiB,
+		DiskGiB:            rec.DiskGiB,
+		NetworkMode:        rec.NetworkMode,
+		HasMemoryState:     info.HasMemoryState,
+		SizeBytes:          info.SizeBytes,
+		MacOSHardwareModel: info.MacOSHardwareModel,
 	}}
 	if err := m.st.SaveSnapshot(snap.rec.SnapshotID, snap.rec); err != nil {
 		os.RemoveAll(dir)
@@ -296,4 +297,22 @@ func (m *Manager) AddImportedSnapshot(entry *ownsandv1.SnapshotStateEntry) (*own
 	m.snapshots[snap.rec.SnapshotID] = snap
 	m.mu.Unlock()
 	return snap.entry(), nil
+}
+
+// MacOSHardwareModels returns the distinct hardware models of the usable
+// local macOS snapshots.
+func (m *Manager) MacOSHardwareModels() [][]byte {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var models [][]byte
+	seen := map[string]bool{}
+	for _, snap := range m.snapshots {
+		model := snap.rec.MacOSHardwareModel
+		if !snap.usable() || snap.rec.GuestOS != ownsandv1.GuestOs_GUEST_OS_MACOS || len(model) == 0 || seen[string(model)] {
+			continue
+		}
+		seen[string(model)] = true
+		models = append(models, model)
+	}
+	return models
 }

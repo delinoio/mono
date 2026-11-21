@@ -10,6 +10,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -148,6 +149,14 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	}
 	if _, e, ok := a.Sandboxes.SnapshotContent(entry.GetSnapshotId()); ok {
 		return e, nil
+	}
+	if entry.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
+		// A macOS snapshot boots only on a Mac that supports its hardware
+		// model; check it again before the download.
+		checker, ok := a.rt.(vmruntime.MacOSHardwareModelChecker)
+		if !ok || !checker.MacOSHardwareModelSupported(entry.GetMacosHardwareModel()) {
+			return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, Message: "this device does not support the macOS hardware model of the snapshot"}
+		}
 	}
 	var total int64
 	for _, p := range cmd.GetParts() {

@@ -48,6 +48,18 @@ type Spec struct {
 type SnapshotInfo struct {
 	HasMemoryState bool
 	SizeBytes      int64
+	// MacOSHardwareModel is the opaque Virtualization.framework hardware
+	// model of a macOS guest snapshot, and nil for other guests.
+	MacOSHardwareModel []byte
+}
+
+// MacOSHardwareModelChecker is implemented by runtimes that run macOS
+// guests. The agent uses it to report the hardware models of its local
+// macOS snapshots and to check an import before it downloads.
+type MacOSHardwareModelChecker interface {
+	// MacOSHardwareModelSupported reports whether this host can run a macOS
+	// guest with the hardware model.
+	MacOSHardwareModelSupported(model []byte) bool
 }
 
 // Capabilities are the runtime facts of the capability report.

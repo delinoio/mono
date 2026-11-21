@@ -44,7 +44,11 @@ Commands:
   enroll         Enroll the device with a one-time enrollment token (stdin or --token-file).
   run            Run the agent service.
   status         Print the enrollment, connection, sandbox and update state.
-  image build    Build the macOS or Windows base image locally.
+  image build    Build the macOS or Windows base image locally (needs root
+                 or an Administrator): --os macos|windows (default: the host
+                 OS), --ipsw <file> (macOS; default: the latest supported
+                 restore image), --iso <file> and --edition <index|name>
+                 (Windows), --disk-gib, --cpus, --memory-mib, --guest-binary.
   reset --yes    Delete all local sandboxes, snapshots, images and the device key.
   service print  Print the service definition of this host OS.
   service install
@@ -99,6 +103,15 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	tokenFile := fs.String("token-file", "", "file that holds the enrollment token (enroll)")
 	name := fs.String("name", "", "device name (enroll; default: host name)")
 	yes := fs.Bool("yes", false, "confirm the reset")
+	var ib imageBuildFlags
+	fs.StringVar(&ib.os, "os", "", "guest OS of the image (image build: macos or windows)")
+	fs.StringVar(&ib.ipsw, "ipsw", "", "macOS restore image (image build)")
+	fs.StringVar(&ib.iso, "iso", "", "Windows installation ISO (image build)")
+	fs.StringVar(&ib.edition, "edition", "", "Windows image index or name in the ISO (image build)")
+	fs.Int64Var(&ib.diskGiB, "disk-gib", 0, "image disk size in GiB (image build)")
+	fs.IntVar(&ib.cpus, "cpus", 0, "vCPUs of the build VM (image build)")
+	fs.Int64Var(&ib.memoryMiB, "memory-mib", 0, "memory of the build VM in MiB (image build)")
+	fs.StringVar(&ib.guestBinary, "guest-binary", "", "guest helper executable for the guest OS (image build)")
 	if err := fs.Parse(rest); err != nil {
 		return exitUsage
 	}
@@ -116,8 +129,7 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "reset":
 		return reset(cfg, *yes, stdout, stderr)
 	case "image build":
-		fmt.Fprintln(stderr, "ownsand-agent: image build is not implemented in this version: the macOS (Apple IPSW) and Windows (ISO) base image builds are open technical work, and Linux base images are not built locally")
-		return exitError
+		return imageBuild(cfg, ib, stdout, stderr, c)
 	case "service print":
 		return servicePrint(stdout, stderr)
 	case "service install":

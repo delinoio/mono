@@ -47,6 +47,9 @@ type Options struct {
 	// of the host architecture and the ext4 root file system.
 	Kernel string
 	Rootfs string
+	// MacOSImage is the macOS base image directory (images/macos; see
+	// package images).
+	MacOSImage string
 	// VMsDir holds the VM directories (<state>/vms).
 	VMsDir string
 	Logger *slog.Logger
