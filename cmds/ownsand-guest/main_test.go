@@ -62,3 +62,23 @@ func TestRunAcceptsASCIICaseFoldedLogLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestRunListenFailureLogOmitsSocketPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// The parent directory does not exist, so the bind fails.
+	code, stderr := runCapturingStderr(t, []string{
+		"--listen", "unix://no-such-dir-secret/guest-secret.sock",
+		"--state-dir", "state", "--clock", "ignore",
+	})
+	if code != 1 {
+		t.Fatalf("exit code %d, want 1; stderr %q", code, stderr)
+	}
+	if !strings.Contains(stderr, "listen failed") || !strings.Contains(stderr, "bind unix socket") {
+		t.Fatalf("stderr %q does not report the bind failure", stderr)
+	}
+	for _, leak := range []string{"no-such-dir-secret", "guest-secret"} {
+		if strings.Contains(stderr, leak) {
+			t.Fatalf("stderr contains %q: %q", leak, stderr)
+		}
+	}
+}
