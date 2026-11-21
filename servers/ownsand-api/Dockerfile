@@ -12,5 +12,10 @@ COPY dist/ownsand-api /usr/local/bin/ownsand-api
 COPY LICENSE /usr/share/licenses/ownsand-api/LICENSE
 # BSD-3-Clause notice of the statically linked Go standard library and runtime.
 COPY GO-LICENSE /usr/share/licenses/ownsand-api/GO-LICENSE
+# A loopback-bound STUN listener cannot receive datagrams that Docker forwards
+# from a published UDP port, so the image listens on the wildcard address. The
+# standalone binary keeps its loopback default; an explicit STUN_ADDR wins.
+ENV STUN_ADDR=0.0.0.0:3478
+EXPOSE 3478/udp
 USER nonroot:nonroot
 ENTRYPOINT ["/usr/local/bin/ownsand-api"]
