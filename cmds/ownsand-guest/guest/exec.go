@@ -122,16 +122,33 @@ func failedEvent(reason ownsandv1.ExecFailureReason, msg string) *ownsandv1.Exec
 // commandEnv returns the helper's own environment with the request
 // variables on top, sorted for a stable order.
 func commandEnv(env map[string]string) []string {
+	return mergeEnv(os.Environ(), env, envKeyFold)
+}
+
+// mergeEnv layers the request variables over the inherited KEY=VALUE entries.
+// fold maps a key to its comparison form: the identity where the operating
+// system treats keys case-sensitively, strings.ToLower on Windows, where the
+// environment is case-insensitive and os/exec keeps the last of several
+// spellings after sorting. An inherited entry whose folded key matches a
+// request key is dropped, so the request value wins and keeps its spelling.
+func mergeEnv(inherited []string, req map[string]string, fold func(string) string) []string {
+	requested := make(map[string]struct{}, len(req))
+	for k := range req {
+		requested[fold(k)] = struct{}{}
+	}
 	merged := map[string]string{}
-	for _, kv := range os.Environ() {
+	for _, kv := range inherited {
+		// Start at index 1 so Windows drive keys such as "=C:" parse.
 		for i := 1; i < len(kv); i++ {
 			if kv[i] == '=' {
-				merged[kv[:i]] = kv[i+1:]
+				if _, overridden := requested[fold(kv[:i])]; !overridden {
+					merged[kv[:i]] = kv[i+1:]
+				}
 				break
 			}
 		}
 	}
-	for k, v := range env {
+	for k, v := range req {
 		merged[k] = v
 	}
 	out := make([]string, 0, len(merged))
