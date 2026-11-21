@@ -103,6 +103,13 @@ type Conn struct {
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
 
+	// openGate serializes Open: a holder allocates a stream_id and enqueues
+	// the stream open frame before the next Open starts, so the stream open
+	// frames reach the agent in increasing stream_id order. It is a channel
+	// and not a mutex so that a waiting Open honors its context and the
+	// connection closing.
+	openGate chan struct{}
+
 	mu        sync.Mutex
 	next      uint64
 	streams   map[uint64]*Stream
@@ -121,7 +128,7 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 	}
 	ctx, cancel := context.WithCancelCause(parent)
 	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan *ownsandv1.DataFrame, outboundQueue),
-		ctx: ctx, cancel: cancel, streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
+		ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
 	now := time.Now().UnixNano()
 	c.lastRecv.Store(now)
 	c.lastSend.Store(now)
@@ -369,12 +376,32 @@ type Stream struct {
 
 // Open allocates a new stream_id (increasing from 1, never reused) and
 // sends the stream open frame with the first credit window.
+//
+// The agent treats the highest stream_id that it has seen as its replay
+// protection and drops a stream open frame whose stream_id is not above it,
+// without a reply. Open therefore holds the connection's open gate from the
+// stream_id allocation until the stream open frame is in the outbound queue
+// (the single writer preserves the queue order), so that concurrent opens
+// reach the agent in increasing stream_id order. An Open that waits for the
+// gate, or for room in a full outbound queue, returns when ctx ends or the
+// connection closes; it then holds no stream slot, and the stream_id of an
+// Open that allocated one is not reused. Only Open waits on the gate: frames
+// of existing streams, including a sender that waits for the agent's
+// credit, never do.
 func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, error) {
 	recv, err := datapath.NewReceiveWindow(c.limits.StreamBuffer)
 	if err != nil {
 		return nil, err
 	}
 	send, _ := datapath.NewSendWindow(0)
+	select {
+	case c.openGate <- struct{}{}:
+	case <-c.ctx.Done():
+		return nil, ErrConnClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-c.openGate }()
 	c.mu.Lock()
 	select {
 	case <-c.ctx.Done():
@@ -392,6 +419,8 @@ func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, er
 	c.perGrant[grantID]++
 	c.mu.Unlock()
 	if err := c.enqueue(ctx, datapath.MustNewFrame(s.ID, sandboxID, &ownsandv1.RelayStreamOpen{GrantId: grantID, InitialWindowBytes: recv.InitialWindow()})); err != nil {
+		// The agent never saw the stream open frame, so no stream close
+		// frame is sent; the stream_id stays used.
 		s.Close(false)
 		return nil, err
 	}
