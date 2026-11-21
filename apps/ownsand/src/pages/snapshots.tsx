@@ -11,7 +11,11 @@ import {
   type Template,
 } from "ownsand-sdk/gen/snapshot_pb";
 import { useState } from "react";
-import { invalidateServices } from "../api.ts";
+import {
+  invalidateServices,
+  POLL_INTERVAL_MS,
+  snapshotSettling,
+} from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -30,10 +34,16 @@ export function SnapshotsPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, SnapshotService);
-  const snapshots = useQuery(SnapshotService.method.listSnapshots, {
-    organizationId,
-    pageSize: 200,
-  });
+  const snapshots = useQuery(
+    SnapshotService.method.listSnapshots,
+    { organizationId, pageSize: 200 },
+    {
+      refetchInterval: (q) =>
+        q.state.data?.snapshots.some(snapshotSettling)
+          ? POLL_INTERVAL_MS
+          : false,
+    },
+  );
   const templates = useQuery(SnapshotService.method.listTemplates, {
     organizationId,
     pageSize: 200,

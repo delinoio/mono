@@ -21,7 +21,11 @@ import { DeviceService } from "ownsand-sdk/gen/device_pb";
 import { type Sandbox, SandboxService } from "ownsand-sdk/gen/sandbox_pb";
 import { SnapshotService } from "ownsand-sdk/gen/snapshot_pb";
 import { useMemo, useState } from "react";
-import { invalidateServices } from "../api.ts";
+import {
+  invalidateServices,
+  POLL_INTERVAL_MS,
+  sandboxSettling,
+} from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
@@ -68,6 +72,10 @@ export function SandboxesPage() {
     {
       pageParamKey: "pageToken",
       getNextPageParam: (last) => last.nextPageToken || undefined,
+      refetchInterval: (q) =>
+        q.state.data?.pages.some((p) => p.sandboxes.some(sandboxSettling))
+          ? POLL_INTERVAL_MS
+          : false,
     },
   );
   const sandboxes = list.data?.pages.flatMap((p) => p.sandboxes) ?? [];

@@ -8,7 +8,11 @@ import { type Sandbox, SandboxService } from "ownsand-sdk/gen/sandbox_pb";
 import { SnapshotService } from "ownsand-sdk/gen/snapshot_pb";
 import { toast } from "delino-ui/toast";
 import { useState } from "react";
-import { invalidateServices } from "../api.ts";
+import {
+  invalidateServices,
+  POLL_INTERVAL_MS,
+  sandboxSettling,
+} from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -47,10 +51,16 @@ function sourceText(s: Sandbox): string {
 export function SandboxPage({ sandboxId }: { sandboxId: string }) {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
-  const query = useQuery(SandboxService.method.getSandbox, {
-    organizationId,
-    sandboxId,
-  });
+  const query = useQuery(
+    SandboxService.method.getSandbox,
+    { organizationId, sandboxId },
+    {
+      refetchInterval: (q) => {
+        const s = q.state.data?.sandbox;
+        return s !== undefined && sandboxSettling(s) ? POLL_INTERVAL_MS : false;
+      },
+    },
+  );
   const devices = useQuery(DeviceService.method.listDevices, {
     organizationId,
     pageSize: 200,

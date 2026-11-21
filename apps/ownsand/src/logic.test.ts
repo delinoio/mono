@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, test } from "@rstest/core";
-import { Role } from "ownsand-sdk/gen/common_pb";
+import {
+  Role,
+  SandboxState,
+  SnapshotExportState,
+  SnapshotState,
+} from "ownsand-sdk/gen/common_pb";
+import { sandboxSettling, snapshotSettling } from "./api.ts";
 import { clearInvitationOnLeave } from "./App.tsx";
 import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
 import {
@@ -246,5 +252,28 @@ describe("router", () => {
   test("unknown paths are not found", () => {
     expect(parseRoute("/orgs/o1/unknown").id).toBe(RouteId.NotFound);
     expect(parseRoute("/elsewhere").id).toBe(RouteId.NotFound);
+  });
+});
+
+describe("polling", () => {
+  test("polls only while a sandbox or snapshot is in an asynchronous state", () => {
+    expect(sandboxSettling({ state: SandboxState.CREATING })).toBe(true);
+    expect(sandboxSettling({ state: SandboxState.DELETING })).toBe(true);
+    expect(sandboxSettling({ state: SandboxState.RUNNING })).toBe(false);
+    expect(sandboxSettling({ state: SandboxState.UNREACHABLE })).toBe(false);
+    const ready = {
+      state: SnapshotState.READY,
+      exportState: SnapshotExportState.NOT_EXPORTED,
+    };
+    expect(snapshotSettling(ready)).toBe(false);
+    expect(snapshotSettling({ ...ready, state: SnapshotState.CREATING })).toBe(
+      true,
+    );
+    expect(
+      snapshotSettling({
+        ...ready,
+        exportState: SnapshotExportState.EXPORTING,
+      }),
+    ).toBe(true);
   });
 });
