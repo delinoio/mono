@@ -47,7 +47,7 @@ The schemas are the single source of truth for the public API, the agent channel
 ### General rules
 
 - Package: `delino.ownsand.v1`. A breaking change needs a new package version (`v2`). Within `v1`, do not reuse or renumber fields, do not change field types, and reserve the numbers and names of removed fields.
-- Identifiers that OwnSand or its callers generate are UUID v7 values in canonical text form in `string` fields named `<entity>_id`. User ID fields (`user_id`) hold the Logto `sub` unchanged as an opaque string and are not validated as UUIDs.
+- Identifiers that OwnSand or its callers generate are UUID v7 values in canonical text form in `string` fields named `<entity>_id`. The server accepts either hex case in these fields, treats two spellings of one UUID as the same identifier (it compares and rate-limits by value) and always returns lowercase text. User ID fields (`user_id`) hold the Logto `sub` unchanged as an opaque string and are not validated as UUIDs.
 - Times use `google.protobuf.Timestamp`. Durations use `google.protobuf.Duration`.
 - Every enum has a zero value `<ENUM>_UNSPECIFIED`. The server rejects `UNSPECIFIED` in a required enum field with `invalid_argument`. Optional enum fields, such as list filters and placement filters, use proto3 `optional`; an absent optional field means no filter.
 - Sizes use `int64` fields with a unit suffix: `memory_mib`, `disk_gib`, `size_bytes`.
