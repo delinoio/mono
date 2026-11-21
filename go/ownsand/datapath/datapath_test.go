@@ -521,6 +521,7 @@ func TestCheckOperationID(t *testing.T) {
 		{"an hour old", idAt(now.Add(-time.Hour)), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, AdmissionReasonExpired},
 		{"exactly 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture)), 0, 0},
 		{"over 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture + time.Millisecond)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
+		{"far future saturates the age", idAt(time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
 		{"not a UUID", "exec-1", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 		{"UUID v4", "0192f4b6-7c3a-4def-8abc-0123456789ab", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 	}
