@@ -9,35 +9,36 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
 
 // Environment variable names read by the server.
 const (
 	EnvAddr                    = "ADDR"
 	EnvLogLevel                = "LOG_LEVEL"
-	EnvDatabaseURL             = "OWNSAND_DATABASE_URL"
-	EnvLogtoIssuer             = "OWNSAND_LOGTO_ISSUER"
-	EnvLogtoJWKSURL            = "OWNSAND_LOGTO_JWKS_URL"
-	EnvLogtoJWKSFile           = "OWNSAND_LOGTO_JWKS_FILE"
-	EnvLogtoAudience           = "OWNSAND_LOGTO_AUDIENCE"
-	EnvNonceKey                = "OWNSAND_NONCE_KEY"
-	EnvNonceKeyPrevious        = "OWNSAND_NONCE_KEY_PREVIOUS"
-	EnvCORSOrigins             = "OWNSAND_CORS_ORIGINS"
-	EnvTrustProxyClientAddress = "OWNSAND_TRUST_PROXY_CLIENT_ADDRESS"
-	EnvRunMigrations           = "OWNSAND_RUN_MIGRATIONS"
-	EnvSTUNURLs                = "OWNSAND_STUN_URLS"
-	EnvR2Endpoint              = "OWNSAND_R2_ENDPOINT"
-	EnvR2Bucket                = "OWNSAND_R2_BUCKET"
-	EnvR2AccessKeyID           = "OWNSAND_R2_ACCESS_KEY_ID"
-	EnvR2SecretAccessKey       = "OWNSAND_R2_SECRET_ACCESS_KEY"
-	EnvSnapshotPartSizeBytes   = "OWNSAND_SNAPSHOT_PART_SIZE_BYTES"
-	EnvSTUNAddr                = "OWNSAND_STUN_ADDR"
-	EnvSTUNRateBytesPerSecond  = "OWNSAND_STUN_RATE_LIMIT_BYTES_PER_SECOND"
-	EnvSTUNRateBurstBytes      = "OWNSAND_STUN_RATE_LIMIT_BURST_BYTES"
+	EnvDatabaseURL             = "DATABASE_URL"
+	EnvLogtoIssuer             = "LOGTO_ISSUER"
+	EnvLogtoJWKSURL            = "LOGTO_JWKS_URL"
+	EnvLogtoJWKSFile           = "LOGTO_JWKS_FILE"
+	EnvLogtoAudience           = "LOGTO_AUDIENCE"
+	EnvNonceKey                = "NONCE_KEY"
+	EnvNonceKeyPrevious        = "NONCE_KEY_PREVIOUS"
+	EnvCORSOrigins             = "CORS_ORIGINS"
+	EnvTrustProxyClientAddress = "TRUST_PROXY_CLIENT_ADDRESS"
+	EnvRunMigrations           = "RUN_MIGRATIONS"
+	EnvSTUNURLs                = "STUN_URLS"
+	EnvR2Endpoint              = "R2_ENDPOINT"
+	EnvR2Bucket                = "R2_BUCKET"
+	EnvR2AccessKeyID           = "R2_ACCESS_KEY_ID"
+	EnvR2SecretAccessKey       = "R2_SECRET_ACCESS_KEY"
+	EnvSnapshotPartSizeBytes   = "SNAPSHOT_PART_SIZE_BYTES"
+	EnvSTUNAddr                = "STUN_ADDR"
+	EnvSTUNRateBytesPerSecond  = "STUN_RATE_LIMIT_BYTES_PER_SECOND"
+	EnvSTUNRateBurstBytes      = "STUN_RATE_LIMIT_BURST_BYTES"
 )
 
 // Defaults.
@@ -154,7 +155,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	if v := get(EnvAddr); v != "" {
-		if err := validateAddr(EnvAddr, v); err != nil {
+		if err := listenaddr.Validate(EnvAddr, v); err != nil {
 			return Config{}, err
 		}
 		cfg.Addr = v
@@ -264,7 +265,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	cfg.STUNAddr = DefaultSTUNAddr
 	if v := get(EnvSTUNAddr); v != "" {
-		if err := validateAddr(EnvSTUNAddr, v); err != nil {
+		if err := listenaddr.Validate(EnvSTUNAddr, v); err != nil {
 			return Config{}, err
 		}
 		cfg.STUNAddr = v
@@ -318,17 +319,6 @@ func validateURL(name, value string) error {
 	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
-	}
-	return nil
-}
-
-func validateAddr(name, value string) error {
-	_, port, err := net.SplitHostPort(value)
-	if err != nil {
-		return fmt.Errorf("%s must be a host:port address: %w", name, err)
-	}
-	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-		return fmt.Errorf("%s port must be a number from 0 to 65535", name)
 	}
 	return nil
 }

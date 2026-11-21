@@ -5,7 +5,7 @@
 This contract owns the tide SDKs of [`tide`](project-tide.md):
 
 - `packages/tide-sdk/` (`planned`), component `tide-sdk-ts`: TypeScript SDK.
-- `packages/tide-sdk-go/` (`planned`), component `tide-sdk-go`: Go SDK in the root Go module.
+- `go/tide/` (`planned`), component `tide-sdk-go`: Go SDK in the root Go module, import path `github.com/delinoio/mono/go/tide`. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
 
 The SDKs give programs and the [CLI](cmds-tide-cli-foundation.md) typed access to the public services of the [protos contract](protos-tide-api-contract.md).
 

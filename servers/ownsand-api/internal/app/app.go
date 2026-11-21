@@ -15,7 +15,7 @@ import (
 
 	"connectrpc.com/connect"
 
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
@@ -92,7 +92,7 @@ func New(opts Options) (*App, error) {
 		if _, err := rand.Read(key); err != nil {
 			return nil, err
 		}
-		opts.Logger.Warn("nonce_key_ephemeral", slog.String("detail", "OWNSAND_NONCE_KEY is unset; nonces are valid only in this process"))
+		opts.Logger.Warn("nonce_key_ephemeral", slog.String("detail", "NONCE_KEY is unset; nonces are valid only in this process"))
 	}
 	limits := api.DefaultLimits(opts.Now)
 	if opts.Limits != nil {

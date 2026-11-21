@@ -27,9 +27,9 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/relaybinding"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/ownsand/datapath"
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

@@ -404,6 +404,88 @@ describe("Slider", () => {
     expect((maximum as HTMLInputElement).value).toBe("80");
   });
 
+  test("names each range thumb by the label and its position without thumbLabels", () => {
+    render(<Slider label="Price" defaultValue={[20, 80]} />);
+
+    const first = screen.getByRole("slider", { name: "Price 1 of 2" });
+    const second = screen.getByRole("slider", { name: "Price 2 of 2" });
+    expect((first as HTMLInputElement).value).toBe("20");
+    expect((second as HTMLInputElement).value).toBe("80");
+    expect(first.hasAttribute("aria-label")).toBe(false);
+    expect(screen.getAllByRole("slider").length).toBe(2);
+  });
+
+  test("numbers the fallback names of a range of three thumbs", () => {
+    render(<Slider label="Price" defaultValue={[10, 50, 90]} />);
+
+    for (const position of [1, 2, 3]) {
+      expect(
+        screen.getByRole("slider", { name: `Price ${position} of 3` }),
+      ).toBeTruthy();
+    }
+  });
+
+  test("keeps an explicit thumb name and names the other thumb by position", () => {
+    render(
+      <Slider label="Price" defaultValue={[20, 80]} thumbLabels={["Min"]} />,
+    );
+
+    const first = screen.getByRole("slider", { name: "Min" });
+    const second = screen.getByRole("slider", { name: "Price 2 of 2" });
+    expect((first as HTMLInputElement).value).toBe("20");
+    expect((second as HTMLInputElement).value).toBe("80");
+    expect(first.getAttribute("aria-label")).toBe("Min");
+    expect(first.hasAttribute("aria-labelledby")).toBe(false);
+  });
+
+  test("treats an empty thumb name as missing", () => {
+    render(
+      <Slider
+        label="Price"
+        defaultValue={[20, 80]}
+        thumbLabels={["", "Max"]}
+      />,
+    );
+
+    expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Max" })).toBeTruthy();
+  });
+
+  test("names fallback thumbs by a React node label", () => {
+    render(
+      <Slider
+        label={
+          <>
+            Nightly <em>price</em>
+          </>
+        }
+        defaultValue={[20, 80]}
+      />,
+    );
+
+    expect(
+      screen.getByRole("slider", { name: "Nightly price 1 of 2" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("slider", { name: "Nightly price 2 of 2" }),
+    ).toBeTruthy();
+  });
+
+  test("names a controlled range thumb by position", () => {
+    render(<Slider label="Price" value={[20, 80]} onValueChange={() => {}} />);
+
+    expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
+  });
+
+  test("names a scalar thumb with the label alone", () => {
+    render(<Slider label="Volume" defaultValue={40} />);
+
+    const thumb = screen.getByRole("slider", { name: "Volume" });
+    expect(thumb.hasAttribute("aria-label")).toBe(false);
+    expect(screen.queryByRole("slider", { name: /of/ })).toBeNull();
+  });
+
   test("moves with the arrow keys", async () => {
     const values: (number | number[])[] = [];
     render(
@@ -512,6 +594,138 @@ describe("Slider", () => {
     expect(
       (screen.getByRole("slider", { name: "Price" }) as HTMLInputElement).value,
     ).toBe("20");
+  });
+
+  describe("when an empty array replaces a value", () => {
+    function thumbValues() {
+      return screen
+        .getAllByRole("slider")
+        .map((thumb) => (thumb as HTMLInputElement).value);
+    }
+
+    test("resets a range to one default thumb", async () => {
+      const values: (number | number[])[] = [];
+      const onValueChange = (value: number | number[]) => values.push(value);
+      const { container, rerender } = render(
+        <Slider
+          label="Price"
+          value={[20, 80]}
+          onValueChange={onValueChange}
+          showValue
+        />,
+      );
+      expect(thumbValues()).toEqual(["20", "80"]);
+
+      rerender(
+        <Slider
+          label="Price"
+          value={[]}
+          onValueChange={onValueChange}
+          showValue
+        />,
+      );
+
+      expectOneDefaultThumb(container);
+      expect(container.querySelector(".dui-slider-value")?.textContent).toBe(
+        "0",
+      );
+
+      await act(async () => {
+        fireEvent.keyDown(screen.getByRole("slider", { name: "Price" }), {
+          key: "ArrowRight",
+        });
+      });
+      expect(values).toEqual([1]);
+    });
+
+    test("resets to min", () => {
+      const { rerender } = render(
+        <Slider
+          label="Price"
+          value={[20, 80]}
+          min={10}
+          onValueChange={() => {}}
+        />,
+      );
+
+      rerender(
+        <Slider label="Price" value={[]} min={10} onValueChange={() => {}} />,
+      );
+
+      expect(thumbValues()).toEqual(["10"]);
+    });
+
+    test("resets to defaultValue", () => {
+      const { rerender } = render(
+        <Slider
+          label="Price"
+          value={[20, 80]}
+          defaultValue={40}
+          onValueChange={() => {}}
+        />,
+      );
+
+      rerender(
+        <Slider
+          label="Price"
+          value={[]}
+          defaultValue={40}
+          onValueChange={() => {}}
+        />,
+      );
+
+      expect(thumbValues()).toEqual(["40"]);
+    });
+
+    test("resets a number value to 0", () => {
+      const { rerender } = render(
+        <Slider label="Price" value={40} onValueChange={() => {}} />,
+      );
+      expect(thumbValues()).toEqual(["40"]);
+
+      rerender(<Slider label="Price" value={[]} onValueChange={() => {}} />);
+
+      expect(thumbValues()).toEqual(["0"]);
+    });
+
+    test("shows a range again after the empty array", () => {
+      const { rerender } = render(
+        <Slider label="Price" value={[20, 80]} onValueChange={() => {}} />,
+      );
+      rerender(<Slider label="Price" value={[]} onValueChange={() => {}} />);
+      expect(thumbValues()).toEqual(["0"]);
+
+      rerender(
+        <Slider label="Price" value={[20, 80]} onValueChange={() => {}} />,
+      );
+
+      expect(thumbValues()).toEqual(["20", "80"]);
+    });
+
+    test("shows one thumb again after a one-value array", () => {
+      const { rerender } = render(
+        <Slider label="Price" value={[20, 80]} onValueChange={() => {}} />,
+      );
+      rerender(<Slider label="Price" value={[]} onValueChange={() => {}} />);
+
+      rerender(<Slider label="Price" value={[20]} onValueChange={() => {}} />);
+
+      expect(thumbValues()).toEqual(["20"]);
+    });
+
+    test("keeps an uncontrolled slider position across an empty array defaultValue", async () => {
+      const { rerender } = render(<Slider label="Price" defaultValue={40} />);
+      await act(async () => {
+        fireEvent.keyDown(screen.getByRole("slider", { name: "Price" }), {
+          key: "ArrowRight",
+        });
+      });
+      expect(thumbValues()).toEqual(["41"]);
+
+      rerender(<Slider label="Price" defaultValue={[]} />);
+
+      expect(thumbValues()).toEqual(["41"]);
+    });
   });
 
   test("keeps naming each thumb of a range by thumbLabels", () => {

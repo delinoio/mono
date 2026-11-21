@@ -14,8 +14,11 @@
 #     the given public key as its only SSH key,
 #   - creates /srv/delino (server env files, reverse proxy routes, deployment
 #     state) and the `delino` Docker network,
-#   - starts the Caddy reverse proxy, which terminates TLS for every server
-#     host name with automatic Let's Encrypt certificates.
+#   - brings the Caddy reverse proxy to the running state with
+#     start-caddy.sh: it creates the container, starts a stopped one, or
+#     reloads a running one, and recreates it only when the pinned image
+#     changes. Caddy terminates TLS for every server host name with
+#     automatic Let's Encrypt certificates.
 #
 # It does not configure the DigitalOcean Cloud Firewall, the registry login
 # or the server env files; docs/repository-workflow-contract.md lists those
@@ -119,21 +122,12 @@ if ! docker network inspect "$network" > /dev/null 2>&1; then
 fi
 
 log "Start the Caddy reverse proxy"
-# Recreate the container only when its image changed, so the certificates in
-# the `caddy-data` volume and the open connections stay.
-current="$(docker inspect --format '{{.Config.Image}}' caddy 2> /dev/null || true)"
-if [[ "$current" != "$caddy_image" ]]; then
-  docker rm --force caddy > /dev/null 2>&1 || true
-  docker run --detach --name caddy \
-    --network "$network" \
-    --restart unless-stopped \
-    --publish 80:80 --publish 443:443 --publish 443:443/udp \
-    --volume "$root/caddy:/etc/caddy:ro" \
-    --volume caddy-data:/data \
-    --volume caddy-config:/config \
-    "$caddy_image"
-else
-  docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile
-fi
+# start-caddy.sh creates a missing container, recreates one that runs another
+# image, starts a stopped one that has the pinned image and reloads a running
+# one that has it. The container is recreated only when its image changed, so
+# the certificates in the `caddy-data` volume and the open connections stay.
+# The helper is resolved from this script, so provisioning works from any
+# current directory.
+"$(dirname "${BASH_SOURCE[0]}")/start-caddy.sh" "$caddy_image" "$root" "$network"
 
 log "Done. Next: log in to the registry as $deploy_user, create the server env files and configure the Cloud Firewall."

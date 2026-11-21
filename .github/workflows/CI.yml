@@ -15,9 +15,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Each job timeout is at least three times the longest observed run without
+  # caches, so a hung service, download or test fails the job instead of
+  # running until the six-hour default.
   changes:
     name: Plan affected CI jobs
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       base: ${{ steps.comparison.outputs.base }}
       head: ${{ steps.comparison.outputs.head }}
@@ -27,6 +31,8 @@ jobs:
       go: ${{ steps.plan.outputs.go }}
       rust: ${{ steps.plan.outputs.rust }}
       e2e: ${{ steps.plan.outputs.e2e }}
+      workspace: ${{ steps.plan.outputs.workspace }}
+      workflows: ${{ steps.plan.outputs.workflows }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -80,6 +86,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.quality == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -89,7 +96,8 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Check formatting
         if: needs.changes.outputs.format == 'true'
@@ -97,9 +105,11 @@ jobs:
           TURBO_SCM_BASE: ${{ needs.changes.outputs.base }}
           TURBO_SCM_HEAD: ${{ needs.changes.outputs.head }}
         run: pnpm format:check
-      - name: Test formatting and hooks
+      # The workspace package tests run in the workspace-packages and
+      # workspace-servers jobs.
+      - name: Test formatting, hooks and CI scripts
         if: needs.changes.outputs.fixtures == 'true'
-        run: pnpm test
+        run: pnpm test:tooling
       - name: Validate pending changesets
         # Runs `changeset version` when a changeset is pending; it rewrites
         # files of this throwaway checkout, so it runs last.
@@ -114,15 +124,89 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo "Planned: format=$FORMAT_PLANNED; fixtures=$FIXTURES_PLANNED" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test; scripts/ci/validate-changesets.sh (pending changeset validation)' >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Runtime, account, native platform and release acceptance: not performed; CI does not build or deploy app projects yet.' >> "$GITHUB_STEP_SUMMARY"
-  go:
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo "Planned: format=$FORMAT_PLANNED; fixtures=$FIXTURES_PLANNED"
+            echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test:tooling; scripts/ci/validate-changesets.sh (pending changeset validation)'
+            echo "Result: $RESULT"
+            echo 'Runtime, account, native platform and release acceptance: not performed. The workspace-packages job builds the app packages; CI does not deploy them.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  go-fmt:
+    name: Go formatting
+    # Formatting checks every tracked Go file, builds nothing and takes
+    # seconds, so this job does not wait for the planner. It runs for every
+    # event, and ci-result requires it to succeed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # gofmt output can change between Go releases, so use the go.mod
+      # toolchain instead of the runner's preinstalled Go.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # gofmt compiles nothing, so it needs no module or build cache.
+          cache: false
+      - name: Check Go formatting
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted="$(git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l)"
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::gofmt reports unformatted files"
+            echo "$unformatted"
+            exit 1
+          fi
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          VALIDATION_REVISION: ${{ github.sha }}
+        run: |
+          {
+            echo "Validation revision: $VALIDATION_REVISION"
+            echo 'Commands in the root Go module: gofmt -l on tracked .go files'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+  go-vet:
+    name: Go vet
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # The go-test job owns the cache under the `go.sum` key. setup-go
+          # cannot restore without saving, and both jobs would save different
+          # caches under one key.
+          cache: false
+      - name: Vet Go module
+        run: go vet ./...
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Go module: go vet ./...'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+  go-test:
+    name: Go tests
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Postgres for the Postgres-backed ownsand-api tests and the OwnSand
     # end-to-end suite (servers/ownsand-api/e2e). The credentials exist only
     # inside this job.
@@ -141,38 +225,77 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Caches the Go module and build caches, keyed by the `go.sum` hash.
+          # Only this job saves them under that key; the go-vet and workspace
+          # jobs do not use them, and the protos job keys its cache by other
+          # files, so no two jobs race to save different caches under one key.
+          cache: true
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
+      # Installed before the Go tests: the OwnSand end-to-end suite runs the
+      # TypeScript SDK test with rstest.
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Test Go module
+        env:
+          OWNSAND_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
+          OWNSAND_E2E: "1"
+        # -count=1 bypasses cached test results, so every run executes the
+        # tests; the restored build cache only skips recompilation.
+        run: go test -count=1 ./...
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; go test -count=1 ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime)'
+            echo "Result: $RESULT"
+            echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor. The go-fmt and go-vet jobs check formatting and vet findings, and the protos job checks the protobuf schemas and bindings.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  protos:
+    needs: changes
+    # Every protobuf input is also a Go input, so the planner's `go` output
+    # selects this job. It runs next to the go-test job instead of after it.
+    if: needs.changes.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
           # The protobuf breaking-change check reads the comparison base.
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          cache: false
+          # Caches the buf CLI and protoc plugin builds that `go run` makes.
+          # The key hashes the files that pin their versions, not `go.sum`,
+          # so this cache and the go-test job cache have different keys and the
+          # two jobs never race to save one key.
+          cache: true
+          cache-dependency-path: |
+            scripts/protos.sh
+            protos/buf.gen.yaml
       # scripts/protos.sh check also generates the TypeScript bindings with the
       # protoc-gen-es version that packages/ownsand-sdk pins.
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
-      # Installed before the Go tests: the OwnSand end-to-end suite runs the
-      # TypeScript SDK test with rstest.
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
-      - name: Check Go module
-        shell: bash
-        env:
-          OWNSAND_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
-          OWNSAND_E2E: "1"
-        run: |
-          set -euo pipefail
-          unformatted="$(git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l)"
-          if [[ -n "$unformatted" ]]; then
-            echo "::error::gofmt reports unformatted files"
-            echo "$unformatted"
-            exit 1
-          fi
-          go vet ./...
-          go test ./...
       - name: Check protobuf schemas and generated Go and TypeScript bindings
         shell: bash
         env:
@@ -195,14 +318,49 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; gofmt -l on tracked .go files; go vet ./...; go test ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime); scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor.' >> "$GITHUB_STEP_SUMMARY"
-  rust:
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; scripts/protos.sh check (buf lint, buf format and the Go and TypeScript binding drift check); scripts/protos.sh breaking <base>'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+  rust-fmt:
+    name: Rust formatting
+    # Formatting checks every tracked Rust file, builds nothing and takes
+    # seconds, so this job does not wait for the planner. It runs for every
+    # event, and ci-result requires it to succeed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+          rustc --version
+          cargo --version
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          VALIDATION_REVISION: ${{ github.sha }}
+        run: |
+          {
+            echo "Validation revision: $VALIDATION_REVISION"
+            echo 'Commands in the root Cargo workspace: cargo fmt --all --check'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+  rust-clippy:
+    name: Rust clippy
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -218,16 +376,24 @@ jobs:
         run: |
           set -euo pipefail
           toolchain="$(tr -d '[:space:]' < rust-toolchain)"
-          rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
           rustc --version
           cargo --version
-      - name: Check Rust workspace
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
+          # The `cef-dll-sys` build script downloads the CEF distribution into
+          # `$CEF_PATH/<version>` when that directory is missing, and reuses it
+          # otherwise. Keep it outside `target/` so the Rust cache stores it.
+          echo "CEF_PATH=$HOME/.cache/cef" >> "$GITHUB_ENV"
+      - name: Restore Rust and CEF cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-directories: ~/.cache/cef
+          # The cache key includes the job ID, so the clippy and test jobs,
+          # which write different `target/` content, keep separate entries.
+          # Only main pushes save the cache. Pull requests restore the main
+          # cache and do not use the repository cache quota for their builds.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint Rust workspace with clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Record validation result
         if: always()
         env:
@@ -235,14 +401,69 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Cargo workspace: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked' >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Cargo workspace: cargo clippy --workspace --all-targets --locked -- -D warnings'
+            echo "Result: $RESULT"
+            echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  rust-test:
+    name: Rust tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Linux build packages
+        # Tauri and `tauri-runtime-cef` link GTK 4 on Linux. The `cef` crate
+        # build script downloads the CEF distribution itself.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-4-dev
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc --version
+          cargo --version
+          # The `cef-dll-sys` build script downloads the CEF distribution into
+          # `$CEF_PATH/<version>` when that directory is missing, and reuses it
+          # otherwise. Keep it outside `target/` so the Rust cache stores it.
+          echo "CEF_PATH=$HOME/.cache/cef" >> "$GITHUB_ENV"
+      - name: Restore Rust and CEF cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-directories: ~/.cache/cef
+          # The cache key includes the job ID, so the clippy and test jobs,
+          # which write different `target/` content, keep separate entries.
+          # Only main pushes save the cache. Pull requests restore the main
+          # cache and do not use the repository cache quota for their builds.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Cargo workspace: cargo test --workspace --locked'
+            echo "Result: $RESULT"
+            echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
   e2e:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       E2E_TELEMETRY_DISABLED: "1"
     steps:
@@ -253,7 +474,8 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Install Chromium
         run: pnpm --filter delino-accounts exec e2e-web install chromium --with-deps
@@ -297,30 +519,203 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; e2e-web install chromium --with-deps; pnpm test:e2e -- --reporter list,junit [--exclude-tag agent]' >> "$GITHUB_STEP_SUMMARY"
-          echo "Agent-tagged tests: ${AGENT_TESTS:-not run}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Scope: development servers in headless Chromium. Production build, Cloudflare Pages, account and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; e2e-web install chromium --with-deps; pnpm test:e2e -- --reporter list,junit [--exclude-tag agent]'
+            echo "Agent-tagged tests: ${AGENT_TESTS:-not run}"
+            echo "Result: $RESULT"
+            echo 'Scope: development servers in headless Chromium. Production build, Cloudflare Pages, account and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  workspace-packages:
+    name: Workspace packages
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # No package outside servers/ calls Go today. The go.mod toolchain is set
+      # up anyway, so a package that starts to call Go does not silently use
+      # the preinstalled runner Go of another version.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # The go-test job owns the Go cache. setup-go cannot restore without
+          # saving, and both jobs would save different caches under one key.
+          cache: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build, lint, typecheck and test workspace packages outside servers/
+        # Every selected package runs: `--affected` selects no package when
+        # only a root input such as `package.json`, `turbo.json` or `go.mod`
+        # changes. The workspace-packages and workspace-servers filters are
+        # complements, so together they select every package, including a
+        # package added under a new workspace root. `--continue` reports the
+        # failures of every package in one run.
+        run: pnpm exec turbo run build lint typecheck test --continue '--filter=!./servers/*'
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo "Commands: pnpm install --frozen-lockfile --ignore-scripts; pnpm exec turbo run build lint typecheck test --continue '--filter=!./servers/*'"
+            echo "Result: $RESULT"
+            echo 'Scope: package build output, lint, typecheck and unit tests without a database. Deployment, Tauri bundles, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  workspace-servers:
+    name: Workspace servers
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # The server packages wrap the Go toolchain in their package scripts.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # The go-test job owns the Go cache. setup-go cannot restore without
+          # saving, and both jobs would save different caches under one key.
+          cache: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build, lint, typecheck and test server packages
+        # Every selected package runs: `--affected` selects no package when
+        # only a root input such as `package.json`, `turbo.json` or `go.mod`
+        # changes. The workspace-packages and workspace-servers filters are
+        # complements, so together they select every package, including a
+        # package added under a new workspace root. `--continue` reports the
+        # failures of every package in one run.
+        run: pnpm exec turbo run build lint typecheck test --continue '--filter=./servers/*'
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo "Commands: pnpm install --frozen-lockfile --ignore-scripts; pnpm exec turbo run build lint typecheck test --continue '--filter=./servers/*'"
+            echo "Result: $RESULT"
+            echo 'Scope: package build output, lint, typecheck and unit tests without a database. Deployment, Tauri bundles, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  workflows:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Lint workflows with actionlint
+        # actionlint also runs the shellcheck of the Ubuntu runner image on
+        # every `run:` script.
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - name: Audit workflows with zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          version: 1.32.0
+          # Report findings as annotations and fail the step; do not upload
+          # SARIF, which would need `security-events: write`.
+          advanced-security: false
+          annotations: true
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 (with the runner shellcheck); zizmor 1.32.0 through zizmorcore/zizmor-action v0.8.1 with online audits'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
   ci-result:
     if: always()
-    needs: [changes, quality, go, rust, e2e]
+    needs:
+      [
+        changes,
+        quality,
+        go-fmt,
+        go-vet,
+        go-test,
+        protos,
+        rust-fmt,
+        rust-clippy,
+        rust-test,
+        e2e,
+        workspace-packages,
+        workspace-servers,
+        workflows,
+      ]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check validation results
         env:
-          QUALITY_PLANNED: ${{ needs.changes.outputs.quality }}
-          GO_PLANNED: ${{ needs.changes.outputs.go }}
-          RUST_PLANNED: ${{ needs.changes.outputs.rust }}
-          E2E_PLANNED: ${{ needs.changes.outputs.e2e }}
           NEEDS_RESULTS: ${{ toJSON(needs) }}
           VALIDATION_REVISION: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
+          # The planner output that selects each validation job. Keep exactly
+          # one entry for each job in `needs` other than `changes`: the check
+          # fails when the two job lists differ, so a new job cannot pass
+          # without an entry. A skipped job passes only when the planner did
+          # not select its output. `always` marks a job that runs without the
+          # planner; that job must succeed.
+          job_outputs='{
+            "quality": "quality",
+            "go-fmt": "always",
+            "go-vet": "go",
+            "go-test": "go",
+            "protos": "go",
+            "rust-fmt": "always",
+            "rust-clippy": "rust",
+            "rust-test": "rust",
+            "e2e": "e2e",
+            "workspace-packages": "workspace",
+            "workspace-servers": "workspace",
+            "workflows": "workflows"
+          }'
           echo "Validation revision: $VALIDATION_REVISION" >> "$GITHUB_STEP_SUMMARY"
           echo "$NEEDS_RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' | tee -a "$GITHUB_STEP_SUMMARY"
-          if echo "$NEEDS_RESULTS" | jq -e --arg planned "$QUALITY_PLANNED" --arg go_planned "$GO_PLANNED" --arg rust_planned "$RUST_PLANNED" --arg e2e_planned "$E2E_PLANNED" 'all(.[]; .result == "success" or .result == "skipped") and .changes.result == "success" and (.quality.result == "success" or (.quality.result == "skipped" and $planned == "false")) and (.go.result == "success" or (.go.result == "skipped" and $go_planned == "false")) and (.rust.result == "success" or (.rust.result == "skipped" and $rust_planned == "false")) and (.e2e.result == "success" or (.e2e.result == "skipped" and $e2e_planned == "false"))' > /dev/null; then
+          if echo "$NEEDS_RESULTS" | jq -e --argjson outputs "$job_outputs" '
+            .changes.result == "success"
+            and ((keys - ["changes"]) == ($outputs | keys))
+            and (.changes.outputs as $planned
+              | del(.changes)
+              | to_entries
+              | all(.value.result == "success"
+                or (.value.result == "skipped"
+                  and $outputs[.key] != "always"
+                  and $planned[$outputs[.key]] == "false")))
+          ' > /dev/null; then
             echo 'CI result: success' | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo 'CI result: failure' | tee -a "$GITHUB_STEP_SUMMARY"

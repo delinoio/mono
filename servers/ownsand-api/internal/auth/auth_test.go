@@ -21,7 +21,7 @@ import (
 	jose "github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 )
 
 func TestSecrets(t *testing.T) {
@@ -215,5 +215,118 @@ func TestLogtoValidatorJWKSFile(t *testing.T) {
 	})
 	if sub, err := v.Validate(context.Background(), token); err != nil || sub != "e2e-user" {
 		t.Fatalf("file jwks: %q %v", sub, err)
+	}
+}
+
+// jwksOutage serves a key set that tests switch between healthy, failing
+// with 503 and malformed.
+type jwksOutage struct {
+	f       tokenFactory
+	fetches atomic.Int32
+	mode    atomic.Int32 // 0 valid, 1 status 503, 2 malformed JSON
+	extra   atomic.Pointer[tokenFactory]
+}
+
+func (o *jwksOutage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	o.fetches.Add(1)
+	switch o.mode.Load() {
+	case 1:
+		w.WriteHeader(http.StatusServiceUnavailable)
+	case 2:
+		_, _ = w.Write([]byte("{not json"))
+	default:
+		set := jose.JSONWebKeySet{}
+		for _, f := range []*tokenFactory{&o.f, o.extra.Load()} {
+			if f != nil {
+				set.Keys = append(set.Keys, jose.JSONWebKey{Key: &f.key.PublicKey, KeyID: f.kid, Algorithm: string(jose.ES384), Use: "sig"})
+			}
+		}
+		b, _ := json.Marshal(set)
+		_, _ = w.Write(b)
+	}
+}
+
+func outageClaims(f tokenFactory, now time.Time) map[string]any {
+	return map[string]any{
+		"iss": f.issuer, "aud": "https://ownsand.api.delino.io", "sub": "user-1",
+		"exp": now.Add(24 * time.Hour).Unix(), "scope": RequiredScope,
+	}
+}
+
+func TestLogtoValidatorBacksOffFailedRefresh(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	o := &jwksOutage{f: tokenFactory{key: key, kid: "k1", issuer: "https://tenant.logto.app/oidc"}}
+	srv := httptest.NewServer(o)
+	defer srv.Close()
+	now := time.Now()
+	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
+	ctx := context.Background()
+	known := func() string { return o.f.sign(t, "at+jwt", outageClaims(o.f, now)) }
+	otherKey, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	other := tokenFactory{key: otherKey, kid: "k2", issuer: o.f.issuer}
+	unknown := func() string { return other.sign(t, "at+jwt", outageClaims(other, now)) }
+
+	if _, err := v.Validate(ctx, known()); err != nil {
+		t.Fatal(err)
+	}
+	// The cache goes stale and the endpoint fails: exactly one extra fetch
+	// serves known keys, an unknown key and repeats within the cooldown.
+	now = now.Add(11 * time.Minute)
+	o.mode.Store(1)
+	for i := 0; i < 2; i++ {
+		if sub, err := v.Validate(ctx, known()); err != nil || sub != "user-1" {
+			t.Fatalf("known key during outage: %q %v", sub, err)
+		}
+	}
+	if _, err := v.Validate(ctx, unknown()); err != ErrInvalidToken {
+		t.Fatalf("unknown key during cooldown: %v", err)
+	}
+	if got := o.fetches.Load(); got != 2 {
+		t.Fatalf("fetches during cooldown = %d, want 2", got)
+	}
+	// Claim checks still apply to a cached key during the cooldown.
+	expired := outageClaims(o.f, now)
+	expired["exp"] = now.Add(-time.Hour).Unix()
+	if _, err := v.Validate(ctx, o.f.sign(t, "at+jwt", expired)); err == nil {
+		t.Fatal("expired token accepted during cooldown")
+	}
+	// After the cooldown the next validation fetches again; with the
+	// endpoint healthy a token with a new key validates.
+	now = now.Add(jwksMinRefresh)
+	o.extra.Store(&other)
+	o.mode.Store(0)
+	if sub, err := v.Validate(ctx, unknown()); err != nil || sub != "user-1" {
+		t.Fatalf("new key after cooldown: %q %v", sub, err)
+	}
+	if got := o.fetches.Load(); got != 3 {
+		t.Fatalf("fetches after cooldown = %d, want 3", got)
+	}
+}
+
+func TestLogtoValidatorBacksOffEmptyKeySet(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	o := &jwksOutage{f: tokenFactory{key: key, kid: "k1", issuer: "https://tenant.logto.app/oidc"}}
+	o.mode.Store(2)
+	srv := httptest.NewServer(o)
+	defer srv.Close()
+	now := time.Now()
+	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
+	ctx := context.Background()
+	token := func() string { return o.f.sign(t, "at+jwt", outageClaims(o.f, now)) }
+	for i := 0; i < 3; i++ {
+		if _, err := v.Validate(ctx, token()); err != ErrInvalidToken {
+			t.Fatalf("validation %d with no key set: %v", i, err)
+		}
+	}
+	if got := o.fetches.Load(); got != 1 {
+		t.Fatalf("fetches within cooldown = %d, want 1", got)
+	}
+	now = now.Add(jwksMinRefresh)
+	o.mode.Store(0)
+	if _, err := v.Validate(ctx, token()); err != nil {
+		t.Fatalf("recovered key set: %v", err)
+	}
+	if got := o.fetches.Load(); got != 2 {
+		t.Fatalf("fetches after cooldown = %d, want 2", got)
 	}
 }

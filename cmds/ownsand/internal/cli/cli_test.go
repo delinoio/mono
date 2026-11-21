@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
-	ownsand "github.com/delinoio/mono/packages/ownsand-sdk-go"
+	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
 type result struct {

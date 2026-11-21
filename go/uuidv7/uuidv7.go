@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package uuidv7 generates and parses UUID version 7 identifiers
-// (RFC 9562) in canonical text form. OwnSand uses them for every persisted
-// entity and for the caller-generated exec_id, read_id, write_id,
-// idempotency_key and authorization_id values.
+// (RFC 9562) in canonical text form. Repository services use them as the
+// default identifier of persisted entities; OwnSand also uses them for the
+// caller-generated exec_id, read_id, write_id, idempotency_key and
+// authorization_id values.
 package uuidv7
 
 import (

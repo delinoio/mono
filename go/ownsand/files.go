@@ -11,10 +11,10 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/relaybinding"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/validate"
+	"github.com/delinoio/mono/go/ownsand/datapath"
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
+	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

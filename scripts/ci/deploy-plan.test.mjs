@@ -356,6 +356,281 @@ test("string deployable names that fail the pattern still fail", () => {
   }
 });
 
+// A deployable of each kind with the package name, for the name rule tests.
+const namedDeployables = (name) => ({
+  [DeployTarget.Droplet]: pkg("servers/api", {
+    name,
+    deploy: droplet("api"),
+  }),
+  [DeployTarget.CloudflarePages]: pkg("apps/web", {
+    name,
+    deploy: { target: DeployTarget.CloudflarePages, project: "web" },
+  }),
+});
+
+test("a deployable name with consecutive dots fails for every target", () => {
+  const targets = namedDeployables("a..b");
+  for (const target of Object.keys(targets)) {
+    assert.throws(
+      () => plan(status(), [targets[target]]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, target);
+        assert.match(
+          error.message,
+          /^a\.\.b: a deployable package name must match/,
+          target,
+        );
+        return true;
+      },
+      target,
+    );
+  }
+});
+
+test("a droplet deployable name must be a container image repository name", () => {
+  for (const name of ["a.", "a-", "a._b", "a_.b", "a___b"]) {
+    assert.throws(
+      () => plan(status(), [namedDeployables(name)[DeployTarget.Droplet]]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, name);
+        assert.ok(error.message.startsWith(`${name}: `), name);
+        assert.match(error.message, /container image repository name/, name);
+        return true;
+      },
+      name,
+    );
+  }
+});
+
+test("deployable names with single separators are accepted", () => {
+  for (const name of ["a.b", "a_b", "a__b", "a-b", "a--b"]) {
+    const targets = namedDeployables(name);
+    for (const target of Object.keys(targets)) {
+      assert.doesNotThrow(
+        () => plan(status(), [targets[target]]),
+        `${target} ${name}`,
+      );
+    }
+  }
+});
+
+test("a static-site deployable name keeps the looser separator rule", () => {
+  for (const name of ["a.", "a._b"]) {
+    assert.doesNotThrow(
+      () =>
+        plan(status(), [namedDeployables(name)[DeployTarget.CloudflarePages]]),
+      name,
+    );
+  }
+});
+
+test("check and the --check CLI reject a deployable name with consecutive dots", () => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  const cases = [
+    ["servers/a..b", droplet("api")],
+    ["apps/a..b", { target: DeployTarget.CloudflarePages, project: "web" }],
+  ];
+  for (const [dir, deploy] of cases) {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-dots-"));
+    try {
+      mkdirSync(join(workDir, ".changeset"));
+      writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+      mkdirSync(join(workDir, dir), { recursive: true });
+      writeFileSync(
+        join(workDir, dir, "package.json"),
+        JSON.stringify({ name: "a..b", deploy }),
+      );
+      assert.throws(() => check(workDir), /a\.\.b: a deployable package name/);
+      const run = spawnSync(process.execPath, [cli, "--check", workDir], {
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 2, dir);
+      const event = JSON.parse(run.stderr.trim());
+      assert.equal(event.event, "deploy_plan_error", dir);
+      assert.match(
+        event.message,
+        /^a\.\.b: a deployable package name must match/,
+        dir,
+      );
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+});
+
+// Names that `git check-ref-format refs/tags/<name>@<version>` rejects, plus
+// `-a`, which `git tag` reads as an option.
+const untaggableNames = [
+  "a..b",
+  "a b",
+  "a~b",
+  "a:b",
+  "a@{b",
+  "a*b",
+  "a[b",
+  "a\\b",
+  "a?b",
+  "a^b",
+  "a/.b",
+  "a//b",
+  "a/b.lock/c",
+  "-a",
+  "/a",
+  "a\tb",
+];
+
+const taggableNames = [
+  "a.b",
+  "a.",
+  "a-",
+  "a.lock",
+  "@scope/name",
+  "a/b.c/d",
+  "a_b",
+  "a__b",
+  "0a",
+];
+
+test("a release whose name cannot form a Git tag fails", () => {
+  for (const name of untaggableNames) {
+    assert.throws(
+      () => plan(status([name, "1.1.0"]), [pkg("packages/x", { name })]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, name);
+        assert.match(error.message, /must form a valid Git tag/, name);
+        // The diagnostic names the package and the tag it cannot form.
+        assert.ok(error.message.startsWith(`${name}: `), name);
+        assert.ok(
+          error.message.includes(JSON.stringify(`${name}@1.1.0`)),
+          name,
+        );
+        return true;
+      },
+      name,
+    );
+  }
+});
+
+test("a none release whose name cannot form a Git tag fails", () => {
+  assert.throws(
+    () =>
+      plan(status(["a..b", "1.0.0", ReleaseType.None]), [
+        pkg("packages/a..b", { name: "a..b" }),
+      ]),
+    (error) => {
+      assert.ok(error instanceof DeployPlanError);
+      assert.match(
+        error.message,
+        /^a\.\.b: a release name must form a valid Git tag/,
+      );
+      return true;
+    },
+  );
+});
+
+test("a release whose name can form a Git tag keeps the plan fields", () => {
+  for (const name of taggableNames) {
+    const result = plan(status([name, "1.1.0"]), [pkg("packages/x", { name })]);
+    assert.deepEqual(result.releases, [{ name, version: "1.1.0" }], name);
+    assert.deepEqual(result.servers, [], name);
+    assert.deepEqual(result.staticSites, [], name);
+  }
+});
+
+test("a deployable that fails its own name rule keeps that diagnostic", () => {
+  const targets = namedDeployables("a..b");
+  for (const target of Object.keys(targets)) {
+    assert.throws(
+      () => plan(status(["a..b", "1.1.0"]), [targets[target]]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, target);
+        assert.match(
+          error.message,
+          /^a\.\.b: a deployable package name must match/,
+          target,
+        );
+        return true;
+      },
+      target,
+    );
+  }
+});
+
+test("the release name rule does not apply to a package without a release", () => {
+  assert.doesNotThrow(() =>
+    plan(status(), [pkg("packages/a..b", { name: "a..b" })]),
+  );
+});
+
+test("check and the --check CLI reject a package name that cannot form a release tag", () => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  const setup = (name, version) => {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-tag-"));
+    mkdirSync(join(workDir, ".changeset"));
+    writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+    mkdirSync(join(workDir, "packages", name), { recursive: true });
+    writeFileSync(
+      join(workDir, "packages", name, "package.json"),
+      JSON.stringify({ name, version, private: true }),
+    );
+    return workDir;
+  };
+  const rejected = setup("a..b", "1.0.0");
+  try {
+    assert.throws(
+      () => check(rejected),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError);
+        assert.match(
+          error.message,
+          /^a\.\.b: a release name must form a valid Git tag/,
+        );
+        assert.ok(error.message.includes('"a..b@1.0.0"'));
+        return true;
+      },
+    );
+    const run = spawnSync(process.execPath, [cli, "--check", rejected], {
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 2);
+    const event = JSON.parse(run.stderr.trim());
+    assert.equal(event.event, "deploy_plan_error");
+    assert.match(
+      event.message,
+      /^a\.\.b: a release name must form a valid Git tag/,
+    );
+  } finally {
+    rmSync(rejected, { recursive: true, force: true });
+  }
+  const accepted = setup("a.b", "1.0.0");
+  try {
+    assert.deepEqual(check(accepted), ["brave-cats"]);
+    const run = spawnSync(process.execPath, [cli, "--check", accepted], {
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(JSON.parse(run.stdout.trim()).event, "deploy_plan_check");
+  } finally {
+    rmSync(accepted, { recursive: true, force: true });
+  }
+});
+
+test("check skips a non-deployable package whose name is not a string", () => {
+  for (const manifest of [{}, { name: 123 }, { name: null }]) {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-noname-"));
+    try {
+      mkdirSync(join(workDir, "packages", "x"), { recursive: true });
+      writeFileSync(
+        join(workDir, "packages", "x", "package.json"),
+        JSON.stringify(manifest),
+      );
+      assert.doesNotThrow(() => check(workDir), JSON.stringify(manifest));
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("check and the --check CLI reject a nameless deployable", () => {
   const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
   const cases = [
@@ -544,6 +819,66 @@ test("missing service or project names fail", () => {
   assert.throws(() => plan(status(["web", "1.0.0"]), site), /deploy.project/);
 });
 
+test("a Pages project name must be one the provider accepts", () => {
+  const site = (project) => [
+    pkg("apps/web", {
+      name: "web",
+      deploy: { target: DeployTarget.CloudflarePages, project },
+    }),
+  ];
+  for (const project of [
+    "bad name",
+    "Bad-Name",
+    "bad_name",
+    "bad.name",
+    "bad/name",
+    " bad",
+    "bad ",
+    "-bad",
+    "bad-",
+  ]) {
+    assert.throws(
+      () => plan(status(["web", "1.0.0"]), site(project)),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, project);
+        assert.match(error.message, /^web: deploy\.project/, project);
+        return true;
+      },
+      project,
+    );
+  }
+  for (const project of ["web", "a", "a-site", "site2", "a-b-c"]) {
+    const result = plan(status(["web", "1.0.0"]), site(project));
+    assert.equal(result.staticSites[0].project, project);
+  }
+});
+
+test("check rejects an invalid Pages project name before any build", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-project-"));
+  try {
+    mkdirSync(join(workDir, ".changeset"));
+    writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+    mkdirSync(join(workDir, "apps/web"), { recursive: true });
+    writeFileSync(
+      join(workDir, "apps/web", "package.json"),
+      JSON.stringify({
+        name: "web",
+        deploy: { target: "cloudflare-pages", project: "Bad_Name" },
+      }),
+    );
+    assert.throws(
+      () => check(workDir),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError);
+        assert.match(error.message, /^web: deploy\.project/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 test("ties break alphabetically among packages that are ready", () => {
   const sites = [
     pkg("apps/a", {
@@ -706,6 +1041,39 @@ test("a static site output must be a directory inside the package", () => {
     plan(status(["web", "1.0.0"]), site("./build/")).staticSites[0].output,
     "apps/web/build",
   );
+});
+
+test("a static site output with characters the deploy loops cannot carry fails", () => {
+  const site = (output) => [
+    pkg("apps/web", {
+      name: "web",
+      deploy: { target: DeployTarget.CloudflarePages, project: "web", output },
+    }),
+  ];
+  for (const output of [
+    "a\tb",
+    "a\nb",
+    "a\rb",
+    "a\u0007b",
+    "a\u007fb",
+    "a\\b",
+  ]) {
+    assert.throws(
+      () => plan(status(["web", "1.0.0"]), site(output)),
+      /web: deploy\.output must not contain/,
+      JSON.stringify(output),
+    );
+  }
+  for (const [output, expected] of [
+    ["dist", "apps/web/dist"],
+    ["./build/", "apps/web/build"],
+    ["build/site", "apps/web/build/site"],
+  ]) {
+    assert.equal(
+      plan(status(["web", "1.0.0"]), site(output)).staticSites[0].output,
+      expected,
+    );
+  }
 });
 
 test("a static site output outside the package fails", () => {

@@ -91,6 +91,8 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
   f.write("assets/image.svg");
   assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
@@ -100,6 +102,8 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
 });
 
@@ -119,6 +123,8 @@ test("documentation changes select formatting without fixtures", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
 });
 
@@ -138,6 +144,8 @@ test("documentation and source paths select formatting in any extension case", (
       go: false,
       rust: false,
       e2e: false,
+      workspace: false,
+      workflows: false,
     });
   }
   // An unsupported extension stays unformatted whatever its case.
@@ -159,6 +167,7 @@ test("every shared fixture input selects tests", async (t) => {
     "rstack.config.ts",
     "lefthook.yml",
     "scripts/install-git-hooks.sh",
+    "scripts/droplet/start-caddy.sh",
     "scripts/ci/plan.mjs",
     "scripts/ci/format-changed.test.mjs",
     "turbo.json",
@@ -446,6 +455,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "packages/ownsand-sdk/src/e2e.test.ts",
     "packages/ownsand-sdk/rstest.config.ts",
     "packages/ownsand-sdk/tsconfig.json",
+    ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
     "pnpm-lock.yaml",
@@ -467,6 +477,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("packages/delino-ui/package.json");
   f.write("rstest.config.ts");
   f.write("servers/ownsand-api/README.md");
+  f.write(".github/workflows/deploy.yml");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
@@ -482,6 +493,7 @@ test("Rust sources, Cargo files, toolchain files and Tauri crates select Rust ch
     "Cargo.lock",
     "rust-toolchain",
     ".rustfmt.toml",
+    ".github/workflows/CI.yml",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -531,6 +543,79 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
   assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
 });
 
+test("workspace package paths and root task inputs select workspace tasks", async (t) => {
+  for (const path of [
+    "apps/delino-accounts/src/App.tsx",
+    "packages/delino-ui/src/slider.tsx",
+    "packages/ownsand-sdk/rstest.config.ts",
+    "servers/accounts-api/scripts/dev.test.mjs",
+    "servers/ownsand-api/internal/api/server.go",
+    ".github/workflows/CI.yml",
+    ".nvmrc",
+    "go.mod",
+    "go.sum",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "turbo.json",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.equal(plan(f.cwd, f.base, f.commit()).workspace, true);
+    });
+  }
+  // Files directly inside a workspace root are not inside a package, and
+  // paths outside the workspace roots are not workspace task inputs.
+  const f = fixture(t);
+  f.write("apps/AGENTS.md");
+  f.write("packages/README.md");
+  f.write("servers/LICENSE");
+  f.write("docs/packages-delino-ui-foundation.md");
+  f.write("crates/example/src/lib.rs");
+  f.write("cmds/tool/main.go");
+  f.write("scripts/ci/example.mjs");
+  f.write(".github/workflows/deploy.yml");
+  assert.equal(plan(f.cwd, f.base, f.commit()).workspace, false);
+});
+
+test("workflows and local actions select the workflow lint", async (t) => {
+  for (const path of [
+    ".github/workflows/CI.yml",
+    ".github/workflows/deploy.yml",
+    ".github/workflows/new.yaml",
+    ".github/actions/setup/action.yml",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.equal(plan(f.cwd, f.base, f.commit()).workflows, true);
+    });
+  }
+  const f = fixture(t);
+  f.write(".github/AGENTS.md");
+  f.write("docs/repository-workflow-contract.md");
+  f.write("scripts/ci/plan.mjs");
+  f.write("workflows/example.yml");
+  assert.equal(plan(f.cwd, f.base, f.commit()).workflows, false);
+});
+
+test("deleted workflows still select the workflow lint", (t) => {
+  const f = fixture(t);
+  f.write(".github/workflows/old.yml");
+  const base = f.commit();
+  f.git("rm", "--quiet", ".github/workflows/old.yml");
+  assert.equal(plan(f.cwd, base, f.commit()).workflows, true);
+});
+
+test("deleted workspace package files still select workspace tasks", (t) => {
+  const f = fixture(t);
+  f.write("packages/delino-ui/src/old.tsx");
+  const base = f.commit();
+  f.git("rm", "--quiet", "packages/delino-ui/src/old.tsx");
+  assert.equal(plan(f.cwd, base, f.commit()).workspace, true);
+});
+
 test("deleted Go files still select Go checks", (t) => {
   const f = fixture(t);
   f.write("servers/example/old.go");
@@ -553,6 +638,8 @@ test("deleted inputs and renamed paths still select affected fixtures", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
 });
 
@@ -568,6 +655,8 @@ test("deleted documentation has no remaining formatting input", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
 });
 
@@ -595,7 +684,7 @@ test("planner publishes booleans and records exact comparison and checkout", (t)
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
   );
   const record = JSON.parse(
     readFileSync(summary, "utf8").slice("CI plan: ".length),
@@ -640,6 +729,8 @@ test("planner accepts more than 1 MiB of changed paths", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
 });
 
@@ -675,7 +766,7 @@ test("planner CLI runs through physical and symlinked script paths", (t) => {
     assert.match(result.stdout, /"event":"ci_plan"/, script);
     assert.equal(
       readFileSync(output, "utf8"),
-      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
       script,
     );
   }
@@ -732,18 +823,22 @@ for (const row of eventMatrix) {
     const mainPush = row.main === true;
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\n`,
+      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\nworkspace=${mainPush}\nworkflows=${mainPush}\n`,
     );
     const record = JSON.parse(logged.join(""));
     assert.equal(record.go, mainPush);
     assert.equal(record.rust, mainPush);
     assert.equal(record.fixtures, mainPush);
     assert.equal(record.e2e, mainPush);
+    assert.equal(record.workspace, mainPush);
+    assert.equal(record.workflows, mainPush);
     const reason = mainPush ? OutputReason.MainPush : OutputReason.Diff;
     assert.equal(record.goReason, reason);
     assert.equal(record.rustReason, reason);
     assert.equal(record.fixturesReason, reason);
     assert.equal(record.e2eReason, reason);
+    assert.equal(record.workspaceReason, reason);
+    assert.equal(record.workflowsReason, reason);
     assert.deepEqual(
       JSON.parse(readFileSync(summary, "utf8").slice("CI plan: ".length)),
       record,
@@ -768,6 +863,8 @@ test("a later documentation-only main push still selects the fixtures and e2e of
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
+    workflows: false,
   });
   const run = (event, ref) => {
     const output = join(f.cwd, `output-${event}`.replaceAll("/", "_"));
@@ -789,11 +886,11 @@ test("a later documentation-only main push still selects the fixtures and e2e of
   };
   assert.equal(
     run(MAIN_PUSH_EVENT, MAIN_REF),
-    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\n",
+    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\n",
   );
   assert.equal(
     run("pull_request", "refs/pull/1/merge"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
   );
 });
 
@@ -858,9 +955,12 @@ test("fixture and e2e changes keep the diff reason on a main push", (t) => {
     f.cwd,
   );
   const record = JSON.parse(logged.at(-1));
-  // The diff selects fixtures and e2e on its own; only go and rust are forced.
+  // The diff selects fixtures, e2e and the workspace tasks on its own; only go
+  // and rust are forced.
   assert.equal(record.fixturesReason, OutputReason.Diff);
   assert.equal(record.e2eReason, OutputReason.Diff);
+  assert.equal(record.workspace, true);
+  assert.equal(record.workspaceReason, OutputReason.Diff);
   assert.equal(record.goReason, OutputReason.MainPush);
   assert.equal(record.rustReason, OutputReason.MainPush);
 });
@@ -882,7 +982,7 @@ test("main push selects every whole-suite check for an empty comparison", (t) =>
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\n",
+    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\n",
   );
 });
 
@@ -915,7 +1015,7 @@ test("planner CLI forces whole-suite checks for a main push and keeps pull reque
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\n`,
+      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\nworkspace=${forced}\nworkflows=${forced}\n`,
       event,
     );
   }
@@ -964,40 +1064,221 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
   );
 });
 
-// Read-only text check: the single `go` planner output must keep driving both
-// the Go job and the aggregate, so the planner's main-push selection is
-// enforced by ci-result without a workflow edit.
-test("CI workflow reads the planner go output for the Go job and the aggregate", () => {
+// Splits CI.yml into its jobs, keyed by job ID, in file order. A job body is
+// every following line that is empty or indented by at least four spaces.
+function workflowJobs() {
   const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  assert.match(workflow, /^\s+go: \$\{\{ steps\.plan\.outputs\.go \}\}$/m);
-  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.go == 'true'$/m);
-  assert.match(
-    workflow,
-    /^\s+GO_PLANNED: \$\{\{ needs\.changes\.outputs\.go \}\}$/m,
+  const jobsStart = workflow.indexOf("\njobs:\n");
+  assert.notEqual(jobsStart, -1, "CI.yml has no jobs section");
+  const jobs = new Map();
+  for (const match of workflow
+    .slice(jobsStart)
+    .matchAll(/^ {2}([a-z][a-z0-9-]*):\n((?:(?: {4}.*)?\n)*)/gm)) {
+    jobs.set(match[1], match[2]);
+  }
+  return jobs;
+}
+
+// The table value of a job that runs for every event without the planner.
+const ALWAYS_RUN = "always";
+
+// The planner output that selects each validation job, as the `job_outputs`
+// table of `ci-result` records it.
+const expectedJobOutputs = {
+  quality: "quality",
+  "go-fmt": ALWAYS_RUN,
+  "go-vet": "go",
+  "go-test": "go",
+  protos: "go",
+  "rust-fmt": ALWAYS_RUN,
+  "rust-clippy": "rust",
+  "rust-test": "rust",
+  e2e: "e2e",
+  "workspace-packages": "workspace",
+  "workspace-servers": "workspace",
+  workflows: "workflows",
+};
+
+function ciResultTable(jobs) {
+  const match = /job_outputs='(\{[^']*\})'/.exec(jobs.get("ci-result"));
+  assert.ok(match, "ci-result has no job_outputs table");
+  return JSON.parse(match[1]);
+}
+
+// Read-only text check: each validation job runs only when the planner output
+// in the ci-result table selects it, and ci-result needs every validation
+// job. The planner's main-push selection is therefore enforced by ci-result
+// without a workflow edit.
+test("CI workflow aggregates every validation job by the planner output that selects it", () => {
+  const jobs = workflowJobs();
+  const changes = jobs.get("changes");
+  const ciResult = jobs.get("ci-result");
+  const validationJobs = [...jobs.keys()].filter(
+    (id) => id !== "changes" && id !== "ci-result",
   );
-  assert.match(
-    workflow,
-    /\.go\.result == "skipped" and \$go_planned == "false"/,
+  const table = ciResultTable(jobs);
+  assert.deepEqual(table, expectedJobOutputs);
+  assert.deepEqual(Object.keys(table).sort(), [...validationJobs].sort());
+  const needs = /^ {4}needs:\s*\[([a-z0-9,\s-]+)\]/m.exec(ciResult);
+  assert.ok(needs, "ci-result has no needs list");
+  assert.deepEqual(needs[1].split(/[\s,]+/).filter(Boolean), [
+    "changes",
+    ...validationJobs,
+  ]);
+  assert.match(ciResult, /^ {4}if: always\(\)$/m);
+  for (const [id, job] of jobs) {
+    assert.match(job, /^ {4}timeout-minutes: \d+$/m, id);
+  }
+  // The planner must never publish the marker as an output name.
+  assert.doesNotMatch(changes, new RegExp(`^ {6}${ALWAYS_RUN}:`, "m"));
+  for (const id of validationJobs) {
+    const output = table[id];
+    const job = jobs.get(id);
+    if (output === ALWAYS_RUN) {
+      assert.doesNotMatch(job, /^ {4}(needs|if):/m, id);
+      continue;
+    }
+    assert.match(job, /^ {4}needs: changes$/m, id);
+    assert.match(
+      job,
+      new RegExp(
+        `^ {4}if: needs\\.changes\\.outputs\\.${output} == 'true'$`,
+        "m",
+      ),
+      id,
+    );
+    assert.match(
+      changes,
+      new RegExp(
+        `^ {6}${output}: \\$\\{\\{ steps\\.plan\\.outputs\\.${output} \\}\\}$`,
+        "m",
+      ),
+      id,
+    );
+  }
+});
+
+// Runs the ci-result jq check of CI.yml against a `needs` object.
+function ciResultPasses(jobs, needs) {
+  const ciResult = jobs.get("ci-result");
+  const table = /job_outputs='(\{[^']*\})'/.exec(ciResult)[1];
+  const program =
+    /--argjson outputs "\$job_outputs" '([^']*)' > \/dev\/null/.exec(ciResult);
+  assert.ok(program, "ci-result has no jq check");
+  const result = spawnSync(
+    "jq",
+    ["-e", "--argjson", "outputs", table, program[1]],
+    { input: JSON.stringify(needs), encoding: "utf8" },
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  return result.status === 0;
+}
+
+// Runs the aggregate check itself. Every GitHub-hosted Ubuntu runner has jq;
+// a local run without jq skips this test.
+test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
+  if (spawnSync("jq", ["--version"]).error) {
+    t.skip("jq is not installed");
+    return;
+  }
+  const jobs = workflowJobs();
+  const table = ciResultTable(jobs);
+  // Planner outputs, plus the marker as an output: a skipped job that runs
+  // without the planner must fail even if the planner published the marker.
+  const outputs = [...new Set(Object.values(table))];
+  const needsOf = (results, planned, changes = "success") => ({
+    changes: { result: changes, outputs: planned },
+    ...Object.fromEntries(
+      Object.entries(results).map(([id, result]) => [
+        id,
+        { result, outputs: {} },
+      ]),
+    ),
+  });
+  const allSelected = Object.fromEntries(outputs.map((o) => [o, "true"]));
+  const noneSelected = Object.fromEntries(outputs.map((o) => [o, "false"]));
+  const allSucceeded = Object.fromEntries(
+    Object.keys(table).map((id) => [id, "success"]),
+  );
+  const allSkipped = Object.fromEntries(
+    Object.keys(table).map((id) => [id, "skipped"]),
+  );
+  assert.equal(ciResultPasses(jobs, needsOf(allSucceeded, allSelected)), true);
+  for (const [id, output] of Object.entries(table)) {
+    if (output === ALWAYS_RUN) {
+      // A job that runs without the planner must succeed even when the
+      // planner selects nothing.
+      assert.equal(
+        ciResultPasses(
+          jobs,
+          needsOf({ ...allSucceeded, [id]: "skipped" }, noneSelected),
+        ),
+        false,
+        `${id} skipped`,
+      );
+    } else {
+      assert.equal(
+        ciResultPasses(
+          jobs,
+          needsOf(
+            { ...allSucceeded, [id]: "skipped" },
+            { ...allSelected, [output]: "false" },
+          ),
+        ),
+        true,
+        `${id} skipped without selection`,
+      );
+    }
+    for (const result of ["skipped", "failure", "cancelled"]) {
+      assert.equal(
+        ciResultPasses(
+          jobs,
+          needsOf({ ...allSucceeded, [id]: result }, allSelected),
+        ),
+        false,
+        `${id} ${result} with selection`,
+      );
+    }
+  }
+  assert.equal(
+    ciResultPasses(
+      jobs,
+      needsOf({ ...allSucceeded, extra: "success" }, allSelected),
+    ),
+    false,
+    "a needed job without a table entry",
+  );
+  const [firstJob] = Object.keys(table);
+  const { [firstJob]: _omitted, ...missingOne } = allSucceeded;
+  assert.equal(
+    ciResultPasses(jobs, needsOf(missingOne, allSelected)),
+    false,
+    "a table entry without a needed job",
+  );
+  assert.equal(
+    ciResultPasses(jobs, needsOf(allSkipped, {}, "failure")),
+    false,
+    "a failed planner",
   );
 });
 
-// The Go job runs the protobuf drift and breaking-change checks with the
+// The protos job runs the protobuf drift and breaking-change checks with the
 // planner's comparison base, so it needs the full history.
-test("CI workflow checks protobuf schemas in the Go job", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  const goJob = workflow.slice(
-    workflow.indexOf("\n  go:\n"),
-    workflow.indexOf("\n  rust:\n"),
-  );
-  assert.match(goJob, /fetch-depth: 0/);
-  assert.match(goJob, /scripts\/protos\.sh check/);
-  assert.match(goJob, /scripts\/protos\.sh breaking "\$COMPARISON_BASE"/);
+test("CI workflow checks protobuf schemas in the protos job", () => {
+  const jobs = workflowJobs();
+  assert.doesNotMatch(jobs.get("go-test"), /scripts\/protos\.sh/);
+  const protosJob = jobs.get("protos");
+  assert.match(protosJob, /fetch-depth: 0/);
+  assert.match(protosJob, /scripts\/protos\.sh check/);
+  assert.match(protosJob, /scripts\/protos\.sh breaking "\$COMPARISON_BASE"/);
   assert.match(
-    goJob,
+    protosJob,
     /COMPARISON_BASE: \$\{\{ needs\.changes\.outputs\.base \}\}/,
   );
 });
@@ -1037,63 +1318,90 @@ test("Rust changes select rust for every event and keep the diff reason", (t) =>
   }
 });
 
-// Read-only text check: the single `rust` planner output must keep driving
-// both the Rust job and the aggregate, so the planner's main-push selection is
-// enforced by ci-result without a workflow edit.
-test("CI workflow reads the planner rust output for the Rust job and the aggregate", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  assert.match(workflow, /^\s+rust: \$\{\{ steps\.plan\.outputs\.rust \}\}$/m);
-  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.rust == 'true'$/m);
+// Read-only text check: each Rust check runs in its own job. The formatting
+// job installs only rustfmt and no build packages; the clippy and test jobs
+// build the workspace with the Rust cache.
+test("CI workflow runs each Rust check in its own job", () => {
+  const jobs = workflowJobs();
+  const fmtJob = jobs.get("rust-fmt");
+  assert.match(fmtJob, /^\s+run: cargo fmt --all --check$/m);
+  assert.match(fmtJob, /--profile minimal --component rustfmt$/m);
+  assert.doesNotMatch(fmtJob, /libgtk-4-dev|rust-cache|cargo (clippy|test)/);
+  const clippyJob = jobs.get("rust-clippy");
   assert.match(
-    workflow,
-    /^\s+RUST_PLANNED: \$\{\{ needs\.changes\.outputs\.rust \}\}$/m,
+    clippyJob,
+    /^\s+run: cargo clippy --workspace --all-targets --locked -- -D warnings$/m,
+  );
+  const testJob = jobs.get("rust-test");
+  assert.match(testJob, /^\s+run: cargo test --workspace --locked$/m);
+  for (const job of [clippyJob, testJob]) {
+    assert.match(job, /libgtk-4-dev/);
+    assert.match(job, /Swatinem\/rust-cache@[0-9a-f]{40}/);
+    assert.match(job, /CEF_PATH=\$HOME\/\.cache\/cef/);
+  }
+});
+
+// Read-only text check: each Go check runs in its own job. Only the test job
+// starts Postgres and installs the workspace dependencies that the OwnSand
+// end-to-end suite needs, and only it saves the `go.sum` Go cache.
+test("CI workflow runs each Go check in its own job", () => {
+  const jobs = workflowJobs();
+  const fmtJob = jobs.get("go-fmt");
+  assert.match(fmtJob, /gofmt -l/);
+  assert.match(fmtJob, /^\s+cache: false$/m);
+  const vetJob = jobs.get("go-vet");
+  assert.match(vetJob, /^\s+run: go vet \.\/\.\.\.$/m);
+  assert.match(vetJob, /^\s+cache: false$/m);
+  const testJob = jobs.get("go-test");
+  assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
+  assert.match(testJob, /^\s+cache: true$/m);
+  assert.match(testJob, /^ {4}services:\n {6}postgres:$/m);
+  assert.match(testJob, /^\s+OWNSAND_E2E: "1"$/m);
+  assert.match(testJob, /pnpm install --frozen-lockfile --ignore-scripts/);
+  for (const job of [fmtJob, vetJob]) {
+    assert.doesNotMatch(job, /services:|go test|pnpm install/);
+  }
+});
+
+// Read-only text check: the fixtures step runs only when the planner selects
+// fixtures, and it does not repeat the workspace package tests that the
+// workspace-packages and workspace-servers jobs run.
+test("CI workflow runs the fixtures in the quality job", () => {
+  const jobs = workflowJobs();
+  assert.match(
+    jobs.get("changes"),
+    /^ {6}fixtures: \$\{\{ steps\.plan\.outputs\.fixtures \}\}$/m,
+  );
+  const qualityJob = jobs.get("quality");
+  assert.match(
+    qualityJob,
+    /^\s+if: needs\.changes\.outputs\.fixtures == 'true'$/m,
+  );
+  assert.match(qualityJob, /run: pnpm test:tooling$/m);
+  assert.doesNotMatch(qualityJob, /run: pnpm test$/m);
+});
+
+// Read-only text check: the workspace-packages and workspace-servers filters
+// are complements, so together they select every workspace package.
+test("CI workflow runs every workspace package in the workspace jobs", () => {
+  const jobs = workflowJobs();
+  const command = "pnpm exec turbo run build lint typecheck test --continue";
+  assert.match(
+    jobs.get("workspace-packages"),
+    new RegExp(`^\\s+run: ${command} '--filter=!\\./servers/\\*'$`, "m"),
   );
   assert.match(
-    workflow,
-    /\.rust\.result == "skipped" and \$rust_planned == "false"/,
+    jobs.get("workspace-servers"),
+    new RegExp(`^\\s+run: ${command} '--filter=\\./servers/\\*'$`, "m"),
   );
 });
 
-// Read-only text check: the `quality`, `fixtures` and `e2e` planner outputs
-// must keep driving their jobs and the aggregate, so the planner's main-push
-// selection is enforced by ci-result without a workflow edit.
-test("CI workflow reads the planner quality, fixtures and e2e outputs for their jobs and the aggregate", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  for (const output of ["quality", "fixtures", "e2e"]) {
-    assert.match(
-      workflow,
-      new RegExp(
-        `^\\s+${output}: \\$\\{\\{ steps\\.plan\\.outputs\\.${output} \\}\\}$`,
-        "m",
-      ),
-      output,
-    );
-  }
-  assert.match(
-    workflow,
-    /^\s+if: needs\.changes\.outputs\.quality == 'true'$/m,
-  );
-  assert.match(
-    workflow,
-    /^\s+if: needs\.changes\.outputs\.fixtures == 'true'$/m,
-  );
-  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.e2e == 'true'$/m);
-  assert.match(
-    workflow,
-    /^\s+QUALITY_PLANNED: \$\{\{ needs\.changes\.outputs\.quality \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /^\s+E2E_PLANNED: \$\{\{ needs\.changes\.outputs\.e2e \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /\.quality\.result == "skipped" and \$planned == "false"/,
-  );
-  assert.match(
-    workflow,
-    /\.e2e\.result == "skipped" and \$e2e_planned == "false"/,
-  );
+// Read-only text check: the workflows job lints and audits the workflows with
+// pinned tools.
+test("CI workflow lints and audits the workflows", () => {
+  const workflowsJob = workflowJobs().get("workflows");
+  assert.match(workflowsJob, /actionlint@v\d+\.\d+\.\d+/);
+  assert.match(workflowsJob, /zizmorcore\/zizmor-action@[0-9a-f]{40}/);
 });
 
 test("planner skips a non-UTF-8 gitlink instead of failing", (t) => {
@@ -1207,6 +1515,8 @@ test("planner selects formatting for non-UTF-8 names whether or not Rstack exclu
       go: false,
       rust: false,
       e2e: false,
+      workspace: false,
+      workflows: false,
     });
   }
 });
@@ -1399,7 +1709,7 @@ test("planner CLI still exits 0 with one ci_plan record and no error record on s
   assert.match(result.stdout, /"event":"ci_plan"/u);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
   );
 });
 
@@ -1542,7 +1852,7 @@ for (const relative of [true, false]) {
     const fromRoot = run(f.cwd, "root");
     assert.equal(
       fromRoot.output,
-      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\n",
+      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\nworkspace=true\nworkflows=false\n",
     );
     for (const directory of startDirectories) {
       assert.deepEqual(

@@ -18,8 +18,8 @@ export const REQUEST_DIGEST_SIZE = 32;
  * The fields of a `RelayRequestBinding`. The request digest is the SHA-256 of
  * its protobuf encoding with fields in field-number order. The relay grants
  * section of docs/protos-ownsand-api-contract.md owns the rule; the Go
- * implementation is packages/ownsand-sdk-go/relaybinding, and both must
- * reproduce relaybinding/testdata/request-digest-vectors.json.
+ * implementation is go/ownsand/relaybinding, and both must reproduce
+ * relaybinding/testdata/request-digest-vectors.json.
  */
 export interface RelayRequestBindingFields {
   bindingSalt: Uint8Array;
