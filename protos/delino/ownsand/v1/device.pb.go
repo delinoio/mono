@@ -386,15 +386,23 @@ type Device struct {
 	UpdateState  AgentUpdateState    `protobuf:"varint,8,opt,name=update_state,json=updateState,proto3,enum=delino.ownsand.v1.AgentUpdateState" json:"update_state,omitempty"`
 	Capabilities *DeviceCapabilities `protobuf:"bytes,9,opt,name=capabilities,proto3" json:"capabilities,omitempty"`
 	Limits       *DeviceLimits       `protobuf:"bytes,10,opt,name=limits,proto3" json:"limits,omitempty"`
-	// floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100).
+	// floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100), capped at
+	// 2147483647 (the largest int32 value). Kept for v1 compatibility with
+	// clients that read this field; effective_vcpu_limit_count carries the exact
+	// value.
 	EffectiveVcpuLimit int32                  `protobuf:"varint,11,opt,name=effective_vcpu_limit,json=effectiveVcpuLimit,proto3" json:"effective_vcpu_limit,omitempty"`
 	Allocation         *DeviceAllocation      `protobuf:"bytes,12,opt,name=allocation,proto3" json:"allocation,omitempty"`
 	CreateTime         *timestamppb.Timestamp `protobuf:"bytes,13,opt,name=create_time,json=createTime,proto3" json:"create_time,omitempty"`
 	LastSeenTime       *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=last_seen_time,json=lastSeenTime,proto3" json:"last_seen_time,omitempty"`
 	// Time of the first PENDING_IDLE report of the current update, if any.
 	PendingIdleSince *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=pending_idle_since,json=pendingIdleSince,proto3" json:"pending_idle_since,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
+	// that the scheduler uses for placement. It is 0 for a device with zero
+	// limits. A server that predates this field never sets it; a client then
+	// derives the value from limits.
+	EffectiveVcpuLimitCount int64 `protobuf:"varint,16,opt,name=effective_vcpu_limit_count,json=effectiveVcpuLimitCount,proto3" json:"effective_vcpu_limit_count,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Device) Reset() {
@@ -530,6 +538,13 @@ func (x *Device) GetPendingIdleSince() *timestamppb.Timestamp {
 		return x.PendingIdleSince
 	}
 	return nil
+}
+
+func (x *Device) GetEffectiveVcpuLimitCount() int64 {
+	if x != nil {
+		return x.EffectiveVcpuLimitCount
+	}
+	return 0
 }
 
 type CreateEnrollmentTokenRequest struct {
@@ -1575,7 +1590,7 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\n" +
 	"memory_mib\x18\x02 \x01(\x03R\tmemoryMib\x12\x19\n" +
 	"\bdisk_gib\x18\x03 \x01(\x03R\adiskGib\x12*\n" +
-	"\x11macos_guest_count\x18\x04 \x01(\x05R\x0fmacosGuestCount\"\xaa\x06\n" +
+	"\x11macos_guest_count\x18\x04 \x01(\x05R\x0fmacosGuestCount\"\xe7\x06\n" +
 	"\x06Device\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12'\n" +
 	"\x0forganization_id\x18\x02 \x01(\tR\x0eorganizationId\x12\x12\n" +
@@ -1595,7 +1610,8 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\vcreate_time\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"createTime\x12@\n" +
 	"\x0elast_seen_time\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\flastSeenTime\x12H\n" +
-	"\x12pending_idle_since\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x10pendingIdleSince\"t\n" +
+	"\x12pending_idle_since\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x10pendingIdleSince\x12;\n" +
+	"\x1aeffective_vcpu_limit_count\x18\x10 \x01(\x03R\x17effectiveVcpuLimitCount\"t\n" +
 	"\x1cCreateEnrollmentTokenRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\x84\x01\n" +

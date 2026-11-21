@@ -93,13 +93,21 @@ message Device {
   AgentUpdateState update_state = 8;
   DeviceCapabilities capabilities = 9;
   DeviceLimits limits = 10;
-  // floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100).
+  // floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100), capped at
+  // 2147483647 (the largest int32 value). Kept for v1 compatibility with
+  // clients that read this field; effective_vcpu_limit_count carries the exact
+  // value.
   int32 effective_vcpu_limit = 11;
   DeviceAllocation allocation = 12;
   google.protobuf.Timestamp create_time = 13;
   google.protobuf.Timestamp last_seen_time = 14;
   // Time of the first PENDING_IDLE report of the current update, if any.
   google.protobuf.Timestamp pending_idle_since = 15;
+  // The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
+  // that the scheduler uses for placement. It is 0 for a device with zero
+  // limits. A server that predates this field never sets it; a client then
+  // derives the value from limits.
+  int64 effective_vcpu_limit_count = 16;
 }
 
 message CreateEnrollmentTokenRequest {

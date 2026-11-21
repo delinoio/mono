@@ -127,7 +127,7 @@ Sandboxes that wait for most of their life (for example, coding-agent sessions t
 - One sandbox can never have more vCPUs than the vCPU limit itself. A create request with a larger `vcpu_count` fails with `failed_precondition` on that device, also when the effective vCPU limit is larger.
 - Memory and disk are never overcommitted. Their limits apply unchanged.
 - Lowering `vcpu_overcommit_percent` below the current allocation follows the same rule as lower limits: running sandboxes keep running, and the device gets no new sandbox until its free capacity covers a request.
-- `ListDevices` and `GetDevice` return the vCPU limit, `vcpu_overcommit_percent`, the effective vCPU limit and the allocated vCPUs, so that callers can see the overcommitted capacity.
+- `UpdateDeviceLimits`, `ListDevices` and `GetDevice` return the vCPU limit, `vcpu_overcommit_percent`, the effective vCPU limit and the allocated vCPUs, so that callers can see the overcommitted capacity. The server computes the effective vCPU limit once, in 64-bit integers, with the shared rule above and reports the exact value in `Device.effective_vcpu_limit_count` (0 for a device with zero limits, such as a newly enrolled device). It also fills the `int32` field `Device.effective_vcpu_limit` that v1 keeps for compatibility: the same value when it fits and 2147483647 when the exact value is larger, so the field never wraps to a negative number. See [the device limits contract](protos-ownsand-api-contract.md#device-limits). The device record stores only the limits, so this needs no database migration.
 
 ### TTL
 

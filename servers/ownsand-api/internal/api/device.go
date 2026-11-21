@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -225,7 +226,12 @@ func scanDevice(row pgx.Row) (*ownsandv1.Device, error) {
 		}
 	}
 	d.Limits = &limits
-	d.EffectiveVcpuLimit = int32(validate.EffectiveVCPULimit(&limits))
+	// The exact value goes in the int64 field. The int32 field stays for v1
+	// clients and is capped, because a plain conversion would wrap a valid
+	// limit above 2147483647 to a negative number.
+	effective := validate.EffectiveVCPULimit(&limits)
+	d.EffectiveVcpuLimitCount = effective
+	d.EffectiveVcpuLimit = int32(min(effective, math.MaxInt32))
 	d.Allocation = &alloc
 	d.CreateTime = ts(created)
 	d.LastSeenTime = tsPtr(lastSeen)

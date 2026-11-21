@@ -181,6 +181,32 @@ describe("devices", () => {
     expect(screen.getByRole("button", { name: "Remove device" })).toBeTruthy();
   });
 
+  test("shows an effective vCPU limit above the int32 range exactly", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    const vcpu = await screen.findByLabelText("vCPU limit");
+    await settle();
+    await act(async () => {
+      fireEvent.input(vcpu, { target: { value: "2000000000" } });
+      fireEvent.blur(vcpu);
+    });
+    await settle();
+    // 2000000000 vCPUs at the existing 150 percent exceed the int32 range.
+    const effective = screen.getByRole("status", {
+      name: "Effective vCPU limit",
+    });
+    expect(effective.textContent).toContain("3000000000");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    });
+    await settle(60);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Devices" }));
+    });
+    expect(
+      await screen.findByText("10 of 3000000000 (2000000000 × 1.5)"),
+    ).toBeTruthy();
+  });
+
   test("a removed device disappears from the device list", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
     await act(async () => {

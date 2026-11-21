@@ -438,13 +438,25 @@ func (a *app) memberRemove(ctx context.Context, name string, args []string) erro
 
 // ---- device ----
 
+// effectiveVCPULimit returns the exact effective vCPU limit of d. A server
+// that predates effective_vcpu_limit_count leaves it zero and its int32
+// effective_vcpu_limit field wraps for limits above 2147483647, so a zero
+// count is derived from the returned limits with the shared rule. That is also
+// the correct 0 for a device with zero limits.
+func effectiveVCPULimit(d *ownsandv1.Device) int64 {
+	if n := d.GetEffectiveVcpuLimitCount(); n != 0 {
+		return n
+	}
+	return validate.EffectiveVCPULimit(d.GetLimits())
+}
+
 func deviceRows(ds []*ownsandv1.Device) [][]string {
 	var rows [][]string
 	for _, d := range ds {
 		l := d.GetLimits()
 		rows = append(rows, []string{
 			d.GetDeviceId(), d.GetName(), enumName(d.GetState()), enumName(d.GetHostOs()) + "/" + enumName(d.GetArch()),
-			fmt.Sprintf("%d/%d vCPU %d/%d MiB %d/%d GiB", d.GetAllocation().GetVcpuCount(), d.GetEffectiveVcpuLimit(), d.GetAllocation().GetMemoryMib(), l.GetMemoryMib(), d.GetAllocation().GetDiskGib(), l.GetDiskGib()),
+			fmt.Sprintf("%d/%d vCPU %d/%d MiB %d/%d GiB", d.GetAllocation().GetVcpuCount(), effectiveVCPULimit(d), d.GetAllocation().GetMemoryMib(), l.GetMemoryMib(), d.GetAllocation().GetDiskGib(), l.GetDiskGib()),
 			d.GetAgentVersion(),
 		})
 	}
