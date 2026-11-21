@@ -45,6 +45,9 @@ type session struct {
 	// endReason is the reason that the first end call carried.
 	endReason ownsandv1.SessionEndReason
 	decoder   *datapath.Decoder
+	// remainingAtAnswer is the lifetime that was left when the offer was
+	// answered; the session-end log event reports it.
+	remainingAtAnswer time.Duration
 
 	// stop closes when the session starts to end. It interrupts operation
 	// sends that wait for the buffer to drain, so the bounded session-end
@@ -68,8 +71,19 @@ func answerError(sessionID string, code ownsandv1.ErrorCode, msg string) *ownsan
 // candidate (non-trickle). pion checks during the DTLS handshake that the
 // peer's certificate matches the fingerprint of this offer, so the data
 // channel accepts only the caller that the control plane authorized.
+//
+// The session lifetime starts when the offer arrives: Offer fixes one
+// monotonic deadline from expires_in (or from the expire_time fallback) before
+// it sets up the peer connection, so the time spent to gather candidates
+// counts against the lifetime. An offer whose deadline passes during setup
+// gets an error answer and leaves no session.
 func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv1.SignalingOffer) *ownsandv1.SignalingAnswer {
 	logger := d.logger.With("session_id", offer.GetSessionId(), "sandbox_id", offer.GetSandboxId())
+	// Both forms of the lifetime become one deadline at this point. The
+	// time.Time value carries a monotonic reading, so a wall clock step does
+	// not move the deadline.
+	received := time.Now()
+	deadline := offerDeadline(offer, received)
 	d.mu.Lock()
 	closed, stun := d.closed, append([]string(nil), d.stunURLs...)
 	_, dup := d.sessions[offer.GetSessionId()]
@@ -83,11 +97,7 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	if state, ok := d.opts.Sandboxes.State(offer.GetSandboxId()); !ok || state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is not running on this device")
 	}
-	expiresIn := offer.GetExpiresIn().AsDuration()
-	if offer.GetExpiresIn() == nil && offer.GetExpireTime() != nil {
-		expiresIn = time.Until(offer.GetExpireTime().AsTime())
-	}
-	if expiresIn <= 0 {
+	if !deadline.After(received) {
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session already expired")
 	}
 
@@ -154,6 +164,17 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 		logger.Warn("session ended before it was answered", "cancellation_reason", reason.String())
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
 	}
+	// expired answers an offer whose lifetime ran out during setup. It ends
+	// the session, which closes the peer connection and removes the session
+	// from the map. An end that another cause started first keeps its reason.
+	expired := func() *ownsandv1.SignalingAnswer {
+		s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED)
+		if s.endedBy() != ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED {
+			return ended()
+		}
+		logger.Warn("session expired before it was answered", "setup_overrun_ms", time.Since(deadline).Milliseconds())
+		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session already expired")
+	}
 	// A channel that closed before or during the answer ends the session.
 	// ChannelLost covers the sessions in the map by channel generation;
 	// this also covers a channel whose loss was reported before the
@@ -186,8 +207,14 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	}
 	timeout := time.NewTimer(gatherTimeout)
 	defer timeout.Stop()
+	// The session lifetime also bounds the setup: an offer that expires
+	// while its candidates are gathered ends at its deadline.
+	expiry := time.NewTimer(time.Until(deadline))
+	defer expiry.Stop()
 	select {
 	case <-gathered:
+	case <-expiry.C:
+		return expired()
 	case <-timeout.C:
 		return fail("candidate gathering", errors.New("timed out"))
 	case <-ctx.Done():
@@ -201,7 +228,16 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	if s.isEnded() {
 		return ended()
 	}
-	go s.watch(expiresIn)
+	// The gathered select above may pick the candidates although the
+	// deadline passed in the same instant.
+	remaining := time.Until(deadline)
+	if remaining <= 0 {
+		return expired()
+	}
+	s.mu.Lock()
+	s.remainingAtAnswer = remaining
+	s.mu.Unlock()
+	go s.watch(deadline)
 	// A channel that closed while the offer was answered ends the session.
 	go func() {
 		select {
@@ -210,8 +246,26 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 		case <-sctx.Done():
 		}
 	}()
-	logger.Info("session answered", "transport", ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER.String(), "expires_in_s", int64(expiresIn.Seconds()))
+	logger.Info("session answered", "transport", ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER.String(), "remaining_lifetime_ms", remaining.Milliseconds())
 	return &ownsandv1.SignalingAnswer{SessionId: s.id, Sdp: pc.LocalDescription().SDP}
+}
+
+// offerDeadline returns the deadline of the session lifetime that the offer
+// carries, measured from received. It uses expires_in and falls back to the
+// absolute expire_time. The result is not after received when the lifetime
+// already ran out.
+func offerDeadline(offer *ownsandv1.SignalingOffer, received time.Time) time.Time {
+	expiresIn := offer.GetExpiresIn().AsDuration()
+	if offer.GetExpiresIn() == nil && offer.GetExpireTime() != nil {
+		expiresIn = offer.GetExpireTime().AsTime().Sub(received)
+	}
+	return received.Add(expiresIn)
+}
+
+func (s *session) endedBy() ownsandv1.SessionEndReason {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.endReason
 }
 
 func (s *session) isEnded() bool {
@@ -375,10 +429,10 @@ func (s *session) write(ctx context.Context, f *ownsandv1.DataFrame, stop <-chan
 	return nil
 }
 
-// watch ends the session at its absolute expiry and after the idle time
-// without frames and without an open request.
-func (s *session) watch(expiresIn time.Duration) {
-	expiry := time.NewTimer(expiresIn)
+// watch ends the session at its absolute expiry deadline and after the idle
+// time without frames and without an open request.
+func (s *session) watch(deadline time.Time) {
+	expiry := time.NewTimer(time.Until(deadline))
 	defer expiry.Stop()
 	tick := time.NewTicker(min(s.d.timing.SessionIdle/4, 30*time.Second))
 	defer tick.Stop()
@@ -417,6 +471,7 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 		open = append(open, id)
 	}
 	dc := s.dc
+	remainingAtAnswer := s.remainingAtAnswer
 	s.mu.Unlock()
 	if reason != ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED && dc != nil {
 		// Closing stop above made every waiting operation send return, so
@@ -445,5 +500,5 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 		delete(s.d.sessions, s.id)
 	}
 	s.d.mu.Unlock()
-	s.d.logger.Info("session ended", "session_id", s.id, "reason", reason.String(), "open_streams", len(open))
+	s.d.logger.Info("session ended", "session_id", s.id, "reason", reason.String(), "open_streams", len(open), "remaining_lifetime_at_answer_ms", remainingAtAnswer.Milliseconds())
 }
