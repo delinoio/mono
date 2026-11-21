@@ -11,7 +11,7 @@
 - [Dependency security](repository-dependency-security-contract.md)
 - [Issue tracking](repository-issue-tracker-contract.md)
 - [Authentication](repository-auth-contract.md)
-- [Billing currency and precision](repository-billing-contract.md)
+- [Billing currency, precision and shared billing accounts](repository-billing-contract.md)
 - [End-to-end testing](repository-e2e-contract.md)
 
 ## Templates

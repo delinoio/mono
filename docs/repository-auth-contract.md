@@ -35,6 +35,19 @@ Backend services must validate every Logto access token before they trust it. Fo
 - For organization-level API resources, check that the `organization_id` claim matches the organization in the request.
 - Do not accept ID tokens as API credentials.
 
+## Service-to-service calls
+
+- A backend service that calls another Delino API server-to-server uses a Logto machine-to-machine access token (the client credentials grant of its own machine-to-machine application in the shared tenant). The token's audience is the target API resource, and it carries the scope that the target operation requires. It is a Logto access token, so it needs no [documented exception](#documented-exceptions).
+- The target validates it like every access token. Logto client credentials tokens carry the application ID as `sub`, equal to `client_id`. A target that has operations only for services accepts only such machine-to-machine tokens there, and rejects machine-to-machine tokens on operations for users.
+- The target trusts the machine credential and its scope, not an end user. A calling service checks its own authorization of the user before it calls on the user's behalf.
+- Record each machine-to-machine scope in the contract of the target API server, and each consuming service in that contract before it calls the API. Recorded scopes:
+
+| API resource                     | Scope                   | Operations                                                                                         | Consuming services        | Owning contract                                                          |
+| -------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------ |
+| `https://accounts.api.delino.io` | `accounts:report-usage` | `UsageService`: usage reports, billing statuses, organization links and organization billing reads | `ownsand-api` (`planned`) | [API server contract](servers-accounts-api-foundation.md#authentication) |
+
+- Machine-to-machine client secrets are secrets and follow the [environment contract](repository-environment-contract.md).
+
 ## Documented exceptions
 
 A project may accept a credential other than a Logto access token only when its project index records the exception, its scope and its controls, and this section lists it. An exception never adds an identity provider, a password store or a sign-in flow for people.
