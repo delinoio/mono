@@ -84,7 +84,7 @@ RestartPreventExitStatus=%d
 KillMode=control-group
 StateDirectory=ownsand-agent
 StateDirectoryMode=0700
-`, exe, ExitNotEnrolled)
+`, systemdQuote(exe), ExitNotEnrolled)
 	for _, e := range env {
 		fmt.Fprintf(&b, "Environment=%s\n", systemdQuote(e))
 	}
@@ -99,6 +99,11 @@ WantedBy=multi-user.target
 // reads the C-style escapes that strconv.Quote writes (\\, \", \n, \xNN, \uNNNN),
 // and it expands specifiers (%h, %t, ...) in Environment= values and command
 // lines even inside quotes, so every % is doubled to keep the literal text.
+// A $ stays as it is: systemd does not expand it in Environment= values, nor
+// in the executable of ExecStart= (the first word is used as the path to
+// execute without variable substitution), and a doubled $$ there would stay
+// literal and break the path. A quoted executable also cannot be read as one
+// of the ExecStart= prefixes (@, -, :, +, !) or split at spaces.
 func systemdQuote(s string) string {
 	return strings.ReplaceAll(strconv.Quote(s), "%", "%%")
 }
