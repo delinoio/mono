@@ -14,6 +14,10 @@ func TestCLIEnrollStatusReset(t *testing.T) {
 	cp := testcp.New(t)
 	dir := t.TempDir()
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+	// The process runtime makes reset skip the host network cleanup, so that
+	// the test never deletes tap devices or the nftables table of the machine
+	// that runs it, whatever runtime the parent environment selects.
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
 	t.Setenv("NO_COLOR", "1")
 	var out, errb bytes.Buffer
 	if code := run([]string{"status"}, nil, &out, &errb); code != exitNotEnrolled {
