@@ -735,6 +735,7 @@ func (r *Runtime) killOwned(procs []*ownedProcess) error {
 // handles.
 func (r *Runtime) ownedProcesses(sandboxID string) ([]*ownedProcess, error) {
 	ids := []string{sandboxID}
+	var listErr error
 	if sandboxID == "" {
 		ids = nil
 		if r.opts.VMsDir != "" {
@@ -744,6 +745,7 @@ func (r *Runtime) ownedProcesses(sandboxID string) ([]*ownedProcess, error) {
 				}
 			} else if !errors.Is(err, os.ErrNotExist) {
 				r.logger.Error("list VM directories failed", "error", err)
+				listErr = err
 			}
 		}
 	} else if r.opts.VMsDir == "" {
@@ -753,6 +755,11 @@ func (r *Runtime) ownedProcesses(sandboxID string) ([]*ownedProcess, error) {
 	reasons := map[string]launchSkipReason{}
 	verified := map[int]bool{}
 	var errs []error
+	if listErr != nil {
+		// An incomplete inventory must not look authoritative: the caller
+		// would treat the VMs it missed as gone.
+		errs = append(errs, fmt.Errorf("fcrt: list VM directories: %w", listErr))
+	}
 	for _, id := range ids {
 		p, reason, err := verifyLaunch(r.host, r.vmDir(id), id)
 		if errors.Is(err, errVerifyIO) {

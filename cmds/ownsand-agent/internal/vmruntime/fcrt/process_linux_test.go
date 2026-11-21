@@ -585,6 +585,20 @@ func TestRunningListsOnlyVerifiedOrphans(t *testing.T) {
 	}
 }
 
+func TestRunningFailsWhenVMDirectoryCannotBeListed(t *testing.T) {
+	f := newFixture(t)
+	// A regular file in place of the directory makes ReadDir fail with
+	// ENOTDIR, an operational error that is not "does not exist".
+	file := filepath.Join(t.TempDir(), "vms")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.r.opts.VMsDir = file
+	if ids, err := f.r.Running(context.Background()); err == nil {
+		t.Fatalf("Running returned %v without an error", ids)
+	}
+}
+
 func TestWriteLaunchRecord(t *testing.T) {
 	f := newFixture(t)
 	dir, _ := f.orphan("sb1", 10)
