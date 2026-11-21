@@ -168,6 +168,7 @@ test("every shared fixture input selects tests", async (t) => {
     "lefthook.yml",
     "scripts/install-git-hooks.sh",
     "scripts/droplet/start-caddy.sh",
+    "scripts/dev/start-portless-proxy.mjs",
     "scripts/ci/plan.mjs",
     "scripts/ci/format-changed.test.mjs",
     "turbo.json",
