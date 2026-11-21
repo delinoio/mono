@@ -241,15 +241,38 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 
 // Resume continues the process groups of the exec workers and then the
 // helper's process group.
+//
+// A failed Resume keeps the sandbox stopped: the caller keeps the sandbox in
+// the paused state when Resume fails, and a later Pause of that state does not
+// reach the runtime, so a helper that ran again while its workers stayed
+// stopped would be recorded as paused. The helper is still stopped from the
+// Pause, so no worker starts while Resume enumerates the process tree. When
+// the enumeration fails, Resume leaves the helper stopped. When a signal
+// fails, Resume stops the groups that it continued again, and it leaves the
+// helper stopped. A retry of Resume then continues the whole sandbox.
 func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return err
 	}
-	// Continue the helper even when the enumeration of the workers fails, so
-	// that a failed Resume never leaves the helper stopped.
-	workersErr := r.signalDescendants(ctx, v, sigCont)
-	return errors.Join(workersErr, signalGroup(v.cmd, sigCont))
+	groups, err := r.execGroups(ctx, v)
+	if err != nil {
+		return err
+	}
+	err = r.signalGroups(v, groups, sigCont)
+	if err == nil {
+		err = signalGroup(v.cmd, sigCont)
+	}
+	if err != nil {
+		// SIGSTOP to a group that is still stopped changes nothing, so the
+		// rollback can signal every enumerated group. SIGSTOP does not use ctx.
+		rollbackErr := errors.Join(r.signalGroups(v, groups, sigStop), signalGroup(v.cmd, sigStop))
+		if rollbackErr != nil {
+			r.logger.Error("process sandbox resume rollback failed; the sandbox may run partly", "sandbox_id", v.id, "error", rollbackErr)
+		}
+		return errors.Join(err, rollbackErr)
+	}
+	return nil
 }
 
 // signalDescendants sends sig to the process group of every process below

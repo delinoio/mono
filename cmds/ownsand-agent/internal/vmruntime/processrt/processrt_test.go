@@ -319,3 +319,42 @@ func TestPauseFailureContinuesHelper(t *testing.T) {
 	}
 	waitState(t, "helper after Resume", helperPID, "S", "R")
 }
+
+// TestResumeFailureKeepsSandboxStopped checks that a Resume that fails while
+// it lists the exec process groups (a canceled context fails the `ps`
+// command) leaves the helper and the workers stopped. The sandbox manager
+// keeps the sandbox in the paused state when Resume fails, so a helper that
+// ran again would be recorded as paused, and its exec timeouts could kill the
+// stopped workers. A retry of Resume must continue the whole sandbox.
+func TestResumeFailureKeepsSandboxStopped(t *testing.T) {
+	rt := newRuntime(t)
+	v := createSandbox(t, rt)
+	shell, sleeper := startWorker(t, v)
+	helper, err := rt.lookup(v.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperPID := helper.cmd.Process.Pid
+
+	if err := rt.Pause(context.Background(), v); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rt.Resume(canceled, v); err == nil {
+		t.Fatal("Resume with a canceled context succeeded; want an error")
+	}
+	waitState(t, "helper after the failed Resume", helperPID, "T")
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after the failed Resume", pid, "T")
+	}
+
+	// The retry continues the helper and the workers.
+	if err := rt.Resume(context.Background(), v); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "helper after the retried Resume", helperPID, "S", "R")
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after the retried Resume", pid, "S", "R")
+	}
+}
