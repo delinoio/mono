@@ -297,14 +297,14 @@ func (a *Authenticator) apiKey(ctx context.Context, token, client string) (auth.
 		return auth.Principal{}, errRateLimited(retry)
 	}
 	if client != "" {
-		if ok, retry := s.Limits.PerClient.Peek("apikey:" + client); !ok {
+		if ok, retry := s.Limits.PerClient.Peek(client); !ok {
 			return auth.Principal{}, errRateLimited(retry)
 		}
 	}
 	fail := func() (auth.Principal, error) {
 		s.Limits.PerPrefix.Allow("apikey:"+prefix, 1)
 		if client != "" {
-			s.Limits.PerClient.Allow("apikey:"+client, 1)
+			s.Limits.PerClient.Allow(client, 1)
 		}
 		return auth.Principal{}, errUnauthenticated("invalid API key")
 	}

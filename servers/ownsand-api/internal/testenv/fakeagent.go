@@ -131,6 +131,13 @@ func (a *FakeAgent) AddSnapshot(e *ownsandv1.SnapshotStateEntry) {
 	a.mu.Unlock()
 }
 
+// ForgetSnapshot removes a local snapshot, as after the agent lost the copy.
+func (a *FakeAgent) ForgetSnapshot(id string) {
+	a.mu.Lock()
+	delete(a.snapshots, id)
+	a.mu.Unlock()
+}
+
 // HasSnapshot reports whether the fake holds a local snapshot.
 func (a *FakeAgent) HasSnapshot(id string) bool {
 	a.mu.Lock()

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package launcher starts VM processes so that they end with the agent
 // process. On Linux every VM process gets a parent-death signal (SIGKILL).

@@ -1,10 +1,13 @@
-SCOPE: THIS FILE APPLIES ONLY TO SOURCE UNDER servers/
+SCOPE: THIS FILE APPLIES ONLY TO SOURCE UNDER servers/, cmds/ownsand-agent/
+AND cmds/ownsand-guest/
 
-This file is a copy of servers/LICENSE. It is kept at the repository root so
-that the repository license summary lists both licenses. The terms below apply
-only to source under servers/. All other repository-owned content is licensed
-under the Apache License, Version 2.0; see LICENSE. Imported material keeps its
-original license and notices.
+This file is a copy of servers/LICENSE, cmds/ownsand-agent/LICENSE and
+cmds/ownsand-guest/LICENSE, which have the same text. It is kept at the
+repository root so that the repository license summary lists both licenses.
+The terms below apply only to source under servers/, cmds/ownsand-agent/ and
+cmds/ownsand-guest/. All other repository-owned content is licensed under the
+Apache License, Version 2.0; see LICENSE. Imported material keeps its original
+license and notices.
 
 --------------------------------------------------------------------------------
 

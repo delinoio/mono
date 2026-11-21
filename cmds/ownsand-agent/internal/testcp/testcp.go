@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package testcp is an in-process fake of the control plane's
 // device-facing services (AgentService and RelayAgentService) for agent

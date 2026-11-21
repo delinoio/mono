@@ -205,7 +205,10 @@ type sandboxWatch struct {
 	m  map[string][]chan struct{}
 }
 
-func (w *sandboxWatch) watch(id string) <-chan struct{} {
+// watch registers for the next change of the sandbox. The channel is closed
+// by fire. The caller must call unregister when it stops waiting, whatever the
+// reason; unregister is safe to call after fire and more than once.
+func (w *sandboxWatch) watch(id string) (changed <-chan struct{}, unregister func()) {
 	ch := make(chan struct{})
 	w.mu.Lock()
 	if w.m == nil {
@@ -213,7 +216,37 @@ func (w *sandboxWatch) watch(id string) <-chan struct{} {
 	}
 	w.m[id] = append(w.m[id], ch)
 	w.mu.Unlock()
-	return ch
+	return ch, func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		chans := w.m[id]
+		for i, c := range chans {
+			if c != ch {
+				continue
+			}
+			// Copy so a concurrent fire that took the old slice is not affected.
+			rest := make([]chan struct{}, 0, len(chans)-1)
+			rest = append(rest, chans[:i]...)
+			rest = append(rest, chans[i+1:]...)
+			if len(rest) == 0 {
+				delete(w.m, id)
+			} else {
+				w.m[id] = rest
+			}
+			return
+		}
+	}
+}
+
+// count reports the number of live registrations, for tests.
+func (w *sandboxWatch) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, chans := range w.m {
+		n += len(chans)
+	}
+	return n
 }
 
 func (w *sandboxWatch) fire(id string) {

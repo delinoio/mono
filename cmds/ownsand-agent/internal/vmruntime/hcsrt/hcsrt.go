@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package hcsrt is the Windows sandbox runtime: one Hyper-V VM per sandbox,
 // created through the Host Compute Service (HCS) API of computecore.dll. It

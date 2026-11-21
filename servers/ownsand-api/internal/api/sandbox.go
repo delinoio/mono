@@ -429,22 +429,60 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	}}}
 	wait := s.Hub.Commands.Register(importCmd.CommandId)
 	defer s.Hub.Commands.Cancel(importCmd.CommandId)
+	// The assignment is recorded before the command is sent, so the agent's
+	// first download URL request finds it. It is cleared when the import
+	// ends: on a result, a send failure, the wait timeout or a closed channel
+	// (every return below) and as soon as the result arrives.
+	releaseImport := s.imports.register(conn, sn.GetSnapshotId(), importCmd.CommandId)
+	defer releaseImport()
 	if _, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdImportSnapshot, orgID: info.orgID, snapshotID: sn.GetSnapshotId()}, importCmd); err != nil {
 		return
 	}
 	select {
 	case res := <-wait:
+		releaseImport()
 		if res.GetError() != nil {
 			_ = s.failCreateRejected(context.WithoutCancel(ctx), info.sandboxID)
 			s.watch.fire(info.sandboxID)
 			return
 		}
 	case <-ctx.Done():
+		// A closed channel keeps reconnect reconciliation as the owner of the
+		// sandbox. An expired wait on a live connection would otherwise leave
+		// the CREATING reservation committed forever, so fail the create.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.failImportTimeout(ctx, conn, info)
+		}
 		return
 	}
 	if _, err := s.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
 		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", info.sandboxID), slog.Any("error", err))
 	}
+}
+
+// importFailTimeout bounds the database update that fails a create whose
+// import wait expired; the expired wait context cannot be used for it.
+const importFailTimeout = 5 * time.Second
+
+// failImportTimeout moves a sandbox whose import wait expired to FAILED with
+// CREATE_FAILED through the guarded rejection transition and notifies
+// watchers. It does not retry the import. A late import success cannot revive
+// the sandbox because the transition only acts on CREATING and the create
+// command is never sent after the import goroutine returned.
+func (s *Service) failImportTimeout(ctx context.Context, conn *hub.Conn, info commandInfo) {
+	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importFailTimeout)
+	defer cancel()
+	err := s.failCreateRejected(dbCtx, info.sandboxID)
+	attrs := []any{
+		slog.String("sandbox_id", info.sandboxID),
+		slog.Duration("import_wait", s.Timing.ImportWait),
+	}
+	if err != nil {
+		s.Logger.ErrorContext(dbCtx, "import_timeout_fail_create_failed", append(attrs, slog.Any("error", err))...)
+		return
+	}
+	s.Logger.WarnContext(dbCtx, "import_timeout_create_failed", attrs...)
+	s.watch.fire(info.sandboxID)
 }
 
 func (h SandboxHandler) GetSandbox(ctx context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
@@ -530,19 +568,33 @@ func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string, done
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	for {
-		changed := s.watch.watch(sandboxID)
-		sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		if err != nil || done(sb) {
+		sb, err, finished := s.waitSandboxOnce(ctx, orgID, sandboxID, done, poll.C, deadline.C)
+		if finished {
 			return sb, err
 		}
-		select {
-		case <-changed:
-		case <-poll.C:
-		case <-deadline.C:
-			return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	}
+}
+
+// waitSandboxOnce is one iteration of waitSandbox. It subscribes before it
+// reads, so a change between the read and the wait is not lost, and it
+// unregisters the subscription on every exit.
+func (s *Service) waitSandboxOnce(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool, poll, deadline <-chan time.Time) (sb *sandboxRow, err error, finished bool) {
+	changed, unregister := s.watch.watch(sandboxID)
+	defer unregister()
+	sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+	if err != nil || done(sb) {
+		return sb, err, true
+	}
+	select {
+	case <-changed:
+		return nil, nil, false
+	case <-poll:
+		return nil, nil, false
+	case <-deadline:
+		sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+		return sb, err, true
+	case <-ctx.Done():
+		return nil, ctx.Err(), true
 	}
 }
 

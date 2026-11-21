@@ -82,8 +82,8 @@ Prerequisites:
 Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
-- `pnpm --filter delidev dev`: frontend development server at `http://127.0.0.1:3200` without the native shell. The server fails when the port is in use.
-- `pnpm --filter delidev tauri dev`: desktop app on CEF. The Tauri CLI starts `pnpm dev` and loads `http://127.0.0.1:3200`. On macOS the CLI runs the app from an `.app` bundle.
+- `pnpm --filter delidev dev`: frontend development server at `http://127.0.0.1:13200` without the native shell. The server fails when the port is in use.
+- `pnpm --filter delidev tauri dev`: desktop app on CEF. The Tauri CLI starts `pnpm dev` and loads `http://127.0.0.1:13200`. On macOS the CLI runs the app from an `.app` bundle.
 - `pnpm --filter delidev tauri build`: desktop bundles. The CLI ships `libcef`, its resources and the `en-US` locale with the app.
 - `pnpm exec turbo run typecheck build --filter=delidev`: frontend type check and production build into `apps/delidev/dist/`.
 - `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test`: Rust checks of the root workspace on the host desktop target.

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package config holds the agent configuration. Every setting comes from a
 // command-line flag or an OWNSAND_AGENT_* environment variable; the
@@ -32,6 +32,24 @@ const (
 	EnvLinuxKernel        = "OWNSAND_AGENT_LINUX_KERNEL"
 	EnvLinuxRootfs        = "OWNSAND_AGENT_LINUX_ROOTFS"
 )
+
+// EnvNames lists every environment variable of the agent. The service
+// definitions carry these variables into the service environment; add a
+// new variable to this list together with its constant. The first seven
+// names keep the order in which service definitions have always listed
+// them.
+var EnvNames = []string{
+	EnvStateDir,
+	EnvAPIURL,
+	EnvRuntime,
+	EnvGuestBinary,
+	EnvReleaseManifestURL,
+	EnvReleasePublicKeys,
+	EnvLogLevel,
+	EnvFirecrackerBinary,
+	EnvLinuxKernel,
+	EnvLinuxRootfs,
+}
 
 // DefaultAPIURL is the production control plane origin.
 const DefaultAPIURL = "https://ownsand.api.delino.io"

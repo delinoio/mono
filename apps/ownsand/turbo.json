@@ -8,7 +8,9 @@
         "PUBLIC_LOGTO_ENDPOINT",
         "PUBLIC_LOGTO_APP_ID",
         "PUBLIC_LOGTO_SCOPES",
-        "PUBLIC_OWNSAND_MOCK_API"
+        "PUBLIC_OWNSAND_MOCK_API",
+        "PORTLESS",
+        "PORTLESS_*"
       ]
     },
     "build": {

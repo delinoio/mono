@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package dataplane
 
@@ -220,7 +220,12 @@ func (r *relay) finishStream(st *rstream, out *ops.Outcome) {
 }
 
 // endGrantStreams ends every open stream of a grant with a session-end
-// frame.
+// frame. It never waits on the outbound queue: revoke and the grant
+// replacement run on the agent channel receive loop, and the deadline sweep
+// runs on the housekeeping goroutine, so a wait on a stalled writer would
+// block the agent channel or every grant sweep. A connection that cannot
+// take the terminal frame is closed instead, and the reconnect rules of the
+// relay loop apply.
 func (r *relay) endGrantStreams(g *grant, reason ownsandv1.SessionEndReason) {
 	r.mu.Lock()
 	streams := make([]*rstream, 0, len(g.streams))
@@ -229,9 +234,31 @@ func (r *relay) endGrantStreams(g *grant, reason ownsandv1.SessionEndReason) {
 	}
 	r.mu.Unlock()
 	for _, st := range streams {
-		r.sendFrame(st.conn, st.id, g.sandboxID, &ownsandv1.SessionEnd{Reason: reason})
+		r.sendSessionEnd(st, g, reason)
 		r.finishStream(st, nil)
 	}
+}
+
+// sendSessionEnd offers the session-end frame of a stream without waiting.
+// When the queue has no free slot, the connection is canceled: the caller
+// of the stream learns of the end from the closed connection, and
+// connClosed finishes the remaining streams of the connection. Streams
+// whose frame was queued keep their frame order; the fallback is logged
+// once per connection.
+func (r *relay) sendSessionEnd(st *rstream, g *grant, reason ownsandv1.SessionEndReason) {
+	c := st.conn
+	if c.ctx.Err() != nil {
+		// The connection is already closing; no frame can follow.
+		return
+	}
+	if c.tryEnqueue(datapath.MustNewFrame(st.id, g.sandboxID, &ownsandv1.SessionEnd{Reason: reason})) {
+		return
+	}
+	if c.queueFullLogged.CompareAndSwap(false, true) {
+		r.d.logger.Warn("relay outbound queue is full; closing the connection instead of queueing a session end",
+			"generation", c.gen, "termination_reason", reason.String(), "grant_id", g.id)
+	}
+	c.cancel()
 }
 
 // revoke ends a grant at once.

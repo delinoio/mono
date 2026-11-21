@@ -57,7 +57,9 @@ type Limits struct {
 	// key validations per key prefix.
 	PerPrefix *ratelimit.Limiter
 	// PerClient limits the same RPCs per client address when a trusted
-	// client address is known.
+	// client address is known. It holds one bucket per address, keyed by the
+	// bare address, that the device RPCs, AcceptInvitation and failed API key
+	// validations share.
 	PerClient *ratelimit.Limiter
 }
 
@@ -106,11 +108,21 @@ type Service struct {
 
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID
+	// imports holds the snapshot imports that importThenCreate waits for;
+	// only a channel with an entry gets download URLs for that snapshot.
+	imports activeImports
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.
 type LeaseHolder interface {
 	Held() bool
+	// WhileHeld runs fn only while the instance holds the lease, with the
+	// ownership lock held, and reports whether it ran. The transition that
+	// clears ownership takes the same lock before it closes the agent
+	// channels, so a channel registered in fn is either closed by that
+	// transition or never registered. fn must do no I/O and must not call
+	// the lease.
+	WhileHeld(fn func()) bool
 }
 
 // DataPathHooks receives the data path parts of the agent channel.

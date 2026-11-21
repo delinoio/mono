@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build !windows
 
@@ -17,18 +17,6 @@ import (
 
 func runService(cfg config.Config) int {
 	return runInteractive(cfg)
-}
-
-// serviceEnv carries the agent settings of the current environment into
-// the service definition.
-func serviceEnv() []string {
-	var env []string
-	for _, name := range []string{config.EnvStateDir, config.EnvAPIURL, config.EnvRuntime, config.EnvGuestBinary, config.EnvReleaseManifestURL, config.EnvReleasePublicKeys, config.EnvLogLevel} {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
-			env = append(env, name+"="+v)
-		}
-	}
-	return env
 }
 
 func serviceDefinition(exe string) string {

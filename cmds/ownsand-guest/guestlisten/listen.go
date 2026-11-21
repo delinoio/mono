@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guestlisten opens the listener of the guest helper. The guest
 // helper listens on the hypervisor socket of the platform (vsock on
