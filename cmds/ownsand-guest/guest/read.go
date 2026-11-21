@@ -81,6 +81,9 @@ type readManager struct {
 	// skips the reflink attempt; tests use them.
 	copyHook  func()
 	forceCopy bool
+	// openHook runs between the first stat of the source path and the open
+	// of it; tests use it to swap the path deterministically.
+	openHook func()
 	// openSnapshot opens a snapshot file for reading chunks; nil means
 	// os.Open. Tests replace it to stall a chunk read.
 	openSnapshot func(path string) (snapshotFile, error)
@@ -196,11 +199,19 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 	if !before.Mode().IsRegular() {
 		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "read: path is not a regular file")
 	}
+	if m.openHook != nil {
+		m.openHook()
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return 0, 0, fsError("read", err)
 	}
 	defer in.Close()
+	// The pathname may have been swapped between the stat and the open, so
+	// the descriptor that is copied must itself be the validated file.
+	if inInfo, err := in.Stat(); err != nil || !inInfo.Mode().IsRegular() || !os.SameFile(before, inInfo) {
+		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+	}
 	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return 0, 0, fsError("read snapshot", err)
@@ -211,6 +222,9 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 		if err != nil {
 			return 0, 0, fsError("read snapshot", err)
 		}
+		if !sourceUnchanged(before, in, src) {
+			return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+		}
 		return SnapshotKindReflink, st.Size(), nil
 	}
 	n, err := io.Copy(out, in)
@@ -220,13 +234,10 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 	if m.copyHook != nil {
 		m.copyHook()
 	}
-	after, err := os.Stat(src)
-	if err != nil {
+	if !sourceUnchanged(before, in, src) {
 		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
-	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
-		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
-	}
+	after := before
 	// The copied byte count must equal the stat size, except for a procfs
 	// file: it reports st_size 0 although a read returns bytes, so its
 	// snapshot size is the byte count of the copy.
@@ -234,6 +245,26 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
 	return SnapshotKindCopy, n, nil
+}
+
+// sourceUnchanged reports whether both the open descriptor and the pathname
+// still identify the file that was validated before the copy, with the same
+// size and modification time.
+func sourceUnchanged(before os.FileInfo, in *os.File, src string) bool {
+	inInfo, err := in.Stat()
+	if err != nil {
+		return false
+	}
+	pathInfo, err := os.Stat(src)
+	if err != nil {
+		return false
+	}
+	for _, after := range []os.FileInfo{inInfo, pathInfo} {
+		if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+			return false
+		}
+	}
+	return true
 }
 
 // sweep deletes snapshots whose last call ended more than the retention
