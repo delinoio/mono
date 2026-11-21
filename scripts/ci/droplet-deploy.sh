@@ -148,11 +148,12 @@ discard_replacement() {
   docker rm --force "$1" > /dev/null || true
 }
 
-# Waits until the container answers `GET /healthz` with a success status.
-# Fails at once when the container stops.
+# Waits until the container answers `GET /healthz` with a 2xx status. A
+# redirect does not count: `curl --fail` accepts 3xx, and redirects are not
+# followed. Fails at once when the container stops.
 wait_healthy() {
   local container="$1" network="$2" port="$3" timeout="$4"
-  local deadline=$((SECONDS + timeout)) status address
+  local deadline=$((SECONDS + timeout)) status address code
   while (( SECONDS < deadline )); do
     status="$(docker inspect --format '{{.State.Status}}' "$container")"
     if [[ "$status" != running ]]; then
@@ -160,8 +161,10 @@ wait_healthy() {
       return 1
     fi
     address="$(docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container")"
-    if [[ -n "$address" ]] && curl --fail --silent --show-error --output /dev/null \
-      --max-time 5 "http://$address:$port/healthz" 2> /dev/null; then
+    # `code` is declared above so that the assignment keeps the status of curl.
+    if [[ -n "$address" ]] && code="$(curl --fail --silent --show-error --output /dev/null \
+      --write-out '%{http_code}' --max-time 5 "http://$address:$port/healthz" 2> /dev/null)" \
+      && [[ "$code" =~ ^2[0-9][0-9]$ ]]; then
       echo "$container passed the health check."
       return 0
     fi
