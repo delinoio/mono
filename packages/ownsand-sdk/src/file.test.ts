@@ -2,13 +2,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
-import { DataPathError } from "./errors.ts";
+import { DataPathError, OwnSandValidationError } from "./errors.ts";
 import { RelayOperationKind } from "./gen/delino/ownsand/v1/common_pb.ts";
 import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
 import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
 import { chunkSource } from "./operations/write.ts";
 import { Disconnect, ownsandError, Trickle } from "./testing/fake-api.ts";
 import { file, SANDBOX, setup, text } from "./testing/harness.ts";
+import { validateGuestPath } from "./validate.ts";
 
 const MIN = 60_000;
 
@@ -399,6 +400,50 @@ describe("file write", () => {
     expect(() => h.client.sandbox(SANDBOX).readFile("x")).toThrow("absolute");
     expect(h.api.calls).toHaveLength(0);
   });
+
+  test.each(["\\file.txt", "\\x", "\\", "\\?x"])(
+    "rejects root-relative Windows path %j without echoing it",
+    async (path) => {
+      const h = setup();
+      const err = await h.client
+        .sandbox(SANDBOX)
+        .writeFile(path, "x")
+        .then(
+          () => undefined,
+          (e: unknown) => e,
+        );
+      expect(err).toBeInstanceOf(OwnSandValidationError);
+      expect((err as OwnSandValidationError).field).toBe("path");
+      expect((err as Error).message).toContain("absolute");
+      expect((err as Error).message).not.toContain("file.txt");
+      expect(() => h.client.sandbox(SANDBOX).readFile(path)).toThrow(
+        "absolute",
+      );
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test.each([
+    "/x",
+    "C:\\x",
+    "C:/x",
+    "\\\\server\\share",
+    "\\/server/share",
+    "\\??\\C:\\x",
+    "\\\\?\\C:\\x",
+    "\\\\",
+    "\\??\\",
+    "//x",
+  ])("accepts absolute guest path %j", (path) => {
+    expect(() => validateGuestPath("path", path)).not.toThrow();
+  });
+
+  test.each(["", "relative/file", "C:", "C:x"])(
+    "rejects non-absolute guest path %j",
+    (path) => {
+      expect(() => validateGuestPath("path", path)).toThrow();
+    },
+  );
 });
 
 describe("chunkSource", () => {
