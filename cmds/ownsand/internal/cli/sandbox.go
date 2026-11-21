@@ -17,8 +17,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	ownsand "github.com/delinoio/mono/packages/ownsand-sdk-go"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/validate"
+	ownsand "github.com/delinoio/mono/go/ownsand"
+	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

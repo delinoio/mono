@@ -20,8 +20,8 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
-	ownsand "github.com/delinoio/mono/packages/ownsand-sdk-go"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/validate"
+	ownsand "github.com/delinoio/mono/go/ownsand"
+	"github.com/delinoio/mono/go/ownsand/validate"
 )
 
 // Environment variables of the CLI. OWNSAND_API_KEY and OWNSAND_ORG are the

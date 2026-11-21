@@ -20,7 +20,7 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
+	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )

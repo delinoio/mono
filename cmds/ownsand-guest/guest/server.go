@@ -27,7 +27,7 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
+	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
