@@ -57,15 +57,8 @@ export function resolveAccountsApiOrigin(value: string | undefined): string {
     throw new Error("PUBLIC_API_ORIGIN must not contain credentials");
   }
   if (url.protocol !== "https:" && url.protocol !== "http:") {
-    // Without a `scheme://` prefix the parser can treat arbitrary leading text
-    // as the protocol (`token123:secret@host` parses as protocol `token123:`
-    // with empty credentials), so the credential check above cannot catch it.
-    // Echo the protocol only when the raw value really starts with a scheme.
-    if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(raw)) {
-      throw new Error(
-        `PUBLIC_API_ORIGIN must use http or https, got ${url.protocol}`,
-      );
-    }
+    // The scheme text can itself be a credential (`sk-proj-abc123://host`,
+    // `token123:secret@host`), so the message never echoes it.
     throw new Error("PUBLIC_API_ORIGIN must use http or https");
   }
   // `url.search` and `url.hash` are empty both when a component is absent and
