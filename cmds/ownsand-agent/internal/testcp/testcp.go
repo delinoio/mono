@@ -74,6 +74,17 @@ type Server struct {
 	relayHook  func(ctx context.Context, deviceID string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error
 	relayCreds []string
 	urlBase    string
+	stallNext  bool
+}
+
+// StallNextChannelReads makes the fake never read from the next agent
+// channel that opens. The HTTP/2 flow-control window of that channel then
+// fills up, and the agent's writer blocks in a send, as it does against a
+// stalled control plane. Later channels read normally.
+func (s *Server) StallNextChannelReads() {
+	s.mu.Lock()
+	s.stallNext = true
+	s.mu.Unlock()
 }
 
 // SetSignedURLBase makes the fake answer signed URL requests with URLs
@@ -220,6 +231,8 @@ func (s *Server) Channel(ctx context.Context, stream *connect.BidiStream[ownsand
 	}
 	s.channel = ch
 	s.channels++
+	stall := s.stallNext
+	s.stallNext = false
 	s.mu.Unlock()
 	var senders sync.WaitGroup
 	defer senders.Wait()
@@ -242,16 +255,18 @@ func (s *Server) Channel(ctx context.Context, stream *connect.BidiStream[ownsand
 		}
 	}()
 	recvErr := make(chan error, 1)
-	go func() {
-		for {
-			req, err := stream.Receive()
-			if err != nil {
-				recvErr <- err
-				return
+	if !stall {
+		go func() {
+			for {
+				req, err := stream.Receive()
+				if err != nil {
+					recvErr <- err
+					return
+				}
+				s.record(ch, req.GetEnvelope())
 			}
-			s.record(ch, req.GetEnvelope())
-		}
-	}()
+		}()
+	}
 	select {
 	case <-ch.done:
 		return connect.NewError(connect.CodeUnavailable, errors.New("channel closed by the control plane"))

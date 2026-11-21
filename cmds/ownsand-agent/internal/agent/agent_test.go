@@ -91,18 +91,28 @@ func enrollDevice(t *testing.T, cp *testcp.Server) (*store.Store, *store.Identit
 
 func start(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity) *harness {
 	t.Helper()
+	return startWith(t, cp, st, id, nil)
+}
+
+// startWith starts the agent like start, after tweak changed its options.
+func startWith(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity, tweak func(*Options)) *harness {
+	t.Helper()
 	logger := quietLogger()
 	rt, err := processrt.New(guestBinary, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client, _ := cpclient.New(cp.URL, nil)
-	a, err := New(context.Background(), Options{
+	opts := Options{
 		Store: st, Identity: id, Control: client, Runtime: rt, Logger: logger,
 		HeartbeatInterval: 50 * time.Millisecond, AckTimeout: 500 * time.Millisecond,
 		BackoffMin: 20 * time.Millisecond, BackoffMax: 100 * time.Millisecond,
 		Update: update.Options{Platform: "linux-amd64", Running: "1.0.0", Installer: update.ExecutableInstaller{Path: filepath.Join(t.TempDir(), "exe")}},
-	})
+	}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	a, err := New(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
