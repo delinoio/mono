@@ -269,6 +269,7 @@ export class PeerSession {
           kind,
           payload,
         }),
+        signal,
       );
       for await (const frame of queue) {
         if (frame.payload.case === "error") {
@@ -299,13 +300,23 @@ export class PeerSession {
    * stream, so the messages of two frames must never interleave. A frame
    * spans many messages and waits for the send buffer between them; the
    * sends of concurrent requests therefore run one after another, and each
-   * holds the turn for all messages of its frame.
+   * holds the turn for all messages of its frame. A caller can abort while
+   * its frame waits for the turn, so the turn re-checks the signal before it
+   * sends the first message and skips a cancelled frame; a frame that is
+   * already in progress always completes, because a partial frame would
+   * corrupt the byte stream.
    */
-  async #send(frame: DataFrame): Promise<void> {
+  async #send(
+    frame: DataFrame,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
     // Encode before the turn so that the critical section is only I/O.
     const messages = encodeMessages(frame);
     const previous = this.#sendTail;
-    const turn = previous.then(() => this.#writeMessages(messages));
+    const turn = previous.then(() => {
+      throwIfAborted(signal);
+      return this.#writeMessages(messages);
+    });
     // The next sender waits for this turn to finish, whether it failed or
     // not; the failure itself reaches only the caller of this frame.
     this.#sendTail = turn.catch(() => {});

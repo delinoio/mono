@@ -445,6 +445,73 @@ describe("peer-to-peer data path", () => {
       expect(rtc.frames).toHaveLength(2);
     });
 
+    test("a caller aborted while its frame waits for the send turn sends nothing", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      // The first write holds the send turn while it waits for the buffer.
+      const holder = sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7));
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      // The exec frame queues behind it; the caller aborts before its turn.
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const cancelled = sandbox
+        .run({ command: ["rm", "-rf", "/data"], signal: controller.signal })
+        .catch((e) => e);
+      await h.clock.settle();
+      controller.abort(reason);
+      await h.clock.settle();
+      channel.drain(0);
+      const written = await h.clock.run(holder);
+      expect(written.sizeBytes).toBe(BigInt(40 << 10));
+      expect(await h.clock.run(cancelled)).toBe(reason);
+      // Only the three messages of the first write went out; the cancelled
+      // exec request was never transmitted.
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      expect(
+        rtc.frames.some((frame) => frame.kind === DataFrameKind.EXEC_REQUEST),
+      ).toBe(false);
+    });
+
+    test("an abort during a frame in progress lets that frame finish", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        channel.bufferedAmount = FULL;
+      };
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const write = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10).fill(7), {
+          signal: controller.signal,
+        })
+        .catch((e) => e);
+      await h.clock.settle();
+      // The frame starts: its first message goes out, then it waits again.
+      channel.drain();
+      await h.clock.settle();
+      expect(messages).toBe(1);
+      controller.abort(reason);
+      for (let i = 0; i < 10 && messages < 3; i++) {
+        channel.drain();
+        await h.clock.settle();
+      }
+      // The frame is complete on the wire even though its caller aborted, so
+      // the decoder never sees a partial frame.
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      expect(await h.clock.run(write)).toBe(reason);
+    });
+
     test("a session end while a sender waits stops it from sending", async () => {
       const p = p2pSetup(writeAgent());
       const { h, rtc } = p;
