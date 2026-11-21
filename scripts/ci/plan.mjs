@@ -78,8 +78,9 @@ const workspaceTaskInputs = new Set([
 ]);
 
 // Any path inside a workspace package, or a root input of its tasks, selects
-// the `workspace` job. That job runs the build, lint, typecheck and test tasks
-// of every workspace package, because `turbo run --affected` selects no package
+// the `workspace-packages` and `workspace-servers` jobs. Together they run the
+// build, lint, typecheck and test tasks of every workspace package, because
+// `turbo run --affected` selects no package
 // when only a root input such as `package.json`, `turbo.json` or `go.mod`
 // changes (checked with turbo 2.11.11).
 export function isWorkspaceInput(path) {

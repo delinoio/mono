@@ -138,7 +138,7 @@ The `build` script passes `-buildvcs=false`, so the binary carries no VCS stampi
 
 Go tasks are uncached in Turbo because the Go toolchain and module cache are not declared task inputs. Remove `servers/accounts-api/dist/` after validation.
 
-CI runs the repository Go checks in the root Go module when Go sources or Go module files change: `gofmt` check, `go vet ./...` and `go test ./...`. See the [workflow contract](repository-workflow-contract.md). The `workspace` job also runs the package `build`, `lint` and `test` scripts, which include the `scripts/*.test.mjs` tests of the development launcher. CI does not build container images or deploy the server.
+CI runs the repository Go checks in the root Go module when Go sources or Go module files change: `gofmt` check, `go vet ./...` and `go test ./...`. See the [workflow contract](repository-workflow-contract.md). The `workspace-servers` job also runs the package `build`, `lint` and `test` scripts, which include the `scripts/*.test.mjs` tests of the development launcher. CI does not build container images or deploy the server.
 
 ### Development Launcher
 

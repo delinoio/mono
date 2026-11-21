@@ -1098,7 +1098,8 @@ const expectedJobOutputs = {
   "rust-clippy": "rust",
   "rust-test": "rust",
   e2e: "e2e",
-  workspace: "workspace",
+  "workspace-packages": "workspace",
+  "workspace-servers": "workspace",
   workflows: "workflows",
 };
 
@@ -1364,7 +1365,7 @@ test("CI workflow runs each Go check in its own job", () => {
 
 // Read-only text check: the fixtures step runs only when the planner selects
 // fixtures, and it does not repeat the workspace package tests that the
-// workspace job runs.
+// workspace-packages and workspace-servers jobs run.
 test("CI workflow runs the fixtures in the quality job", () => {
   const jobs = workflowJobs();
   assert.match(
@@ -1380,18 +1381,19 @@ test("CI workflow runs the fixtures in the quality job", () => {
   assert.doesNotMatch(qualityJob, /run: pnpm test$/m);
 });
 
-// Read-only text check: the workspace shards are complements, so together they
-// select every workspace package.
-test("CI workflow runs every workspace package in the workspace shards", () => {
-  const workspaceJob = workflowJobs().get("workspace");
+// Read-only text check: the workspace-packages and workspace-servers filters
+// are complements, so together they select every workspace package.
+test("CI workflow runs every workspace package in the workspace jobs", () => {
+  const jobs = workflowJobs();
+  const command = "pnpm exec turbo run build lint typecheck test --continue";
   assert.match(
-    workspaceJob,
-    /pnpm exec turbo run build lint typecheck test --continue "--filter=\$filter"/,
+    jobs.get("workspace-packages"),
+    new RegExp(`^\\s+run: ${command} '--filter=!\\./servers/\\*'$`, "m"),
   );
-  assert.match(workspaceJob, /^\s+fail-fast: false$/m);
-  assert.match(workspaceJob, /^\s+shard: \[packages, servers\]$/m);
-  assert.match(workspaceJob, /^\s+packages\) filter='!\.\/servers\/\*' ;;$/m);
-  assert.match(workspaceJob, /^\s+servers\) filter='\.\/servers\/\*' ;;$/m);
+  assert.match(
+    jobs.get("workspace-servers"),
+    new RegExp(`^\\s+run: ${command} '--filter=\\./servers/\\*'$`, "m"),
+  );
 });
 
 // Read-only text check: the workflows job lints and audits the workflows with
