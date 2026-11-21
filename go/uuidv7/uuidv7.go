@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 // Package uuidv7 generates and parses UUID version 7 identifiers
-// (RFC 9562) in canonical text form. OwnSand uses them for every persisted
-// entity and for the caller-generated exec_id, read_id, write_id,
-// idempotency_key and authorization_id values.
+// (RFC 9562) in canonical text form. Repository services use them as the
+// default identifier of persisted entities; OwnSand also uses them for the
+// caller-generated exec_id, read_id, write_id, idempotency_key and
+// authorization_id values.
 package uuidv7
 
 import (
@@ -36,6 +37,10 @@ type Generator struct {
 	random  io.Reader
 	lastMs  uint64
 	counter uint16
+	// started records that the generator has issued a value, so that a first
+	// clock reading of 0 ms (the Unix epoch) is not mistaken for "no previous
+	// value" through lastMs alone.
+	started bool
 }
 
 // NewGenerator returns a generator that reads the clock from now and
@@ -79,7 +84,8 @@ func (g *Generator) New() (UUID, error) {
 	}
 	current := uint64(ms)
 	switch {
-	case current > g.lastMs:
+	case !g.started || current > g.lastMs:
+		g.started = true
 		g.lastMs = current
 		// Start the counter in the lower half of its range, so that many
 		// values fit in one millisecond before it overflows.

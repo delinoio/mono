@@ -6,26 +6,23 @@ package guest
 
 import (
 	"os"
-	"os/exec"
 	"syscall"
+
+	"github.com/delinoio/mono/internal/procgroup"
 )
 
 // forceAfterTerminate: Linux and macOS guests send SIGTERM first and SIGKILL
 // after KillGrace.
 const forceAfterTerminate = true
 
-// setProcessGroup starts the command in its own process group, so a timeout
-// stops the command together with its children.
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
+// terminate and kill signal the process group that procgroup.Set created,
+// so a timeout stops the command together with its children.
 func terminate(p *os.Process) {
-	_ = syscall.Kill(-p.Pid, syscall.SIGTERM)
+	_ = procgroup.Signal(p, syscall.SIGTERM)
 }
 
 func kill(p *os.Process) {
-	_ = syscall.Kill(-p.Pid, syscall.SIGKILL)
+	_ = procgroup.Signal(p, syscall.SIGKILL)
 }
 
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {

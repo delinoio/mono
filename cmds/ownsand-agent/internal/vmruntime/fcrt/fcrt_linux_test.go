@@ -203,12 +203,22 @@ func TestCreateFailureReleasesVM(t *testing.T) {
 	}
 }
 
-// The runtime runs the network policy refresh loop of its manager and
-// stops it on Close.
+// The runtime runs the startup clean-up once and then the network policy
+// refresh loop of its manager, and stops the loop on Close. The test passes
+// an in-memory clean-up and a manager without attachments, so it never
+// reaches the live host network, whatever the capabilities of the test
+// process are. Never call New here: with CAP_NET_ADMIN it would delete the
+// tap devices and the nftables table of the host.
 func TestRuntimeRunsNetworkRefresh(t *testing.T) {
-	r, err := New(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()})
+	cleanups := 0
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()}, func() {
+		cleanups++
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cleanups != 1 {
+		t.Fatalf("startup clean-up ran %d times, want 1", cleanups)
 	}
 	if r.refreshDone == nil {
 		t.Fatal("refresh loop not started")
@@ -225,5 +235,26 @@ func TestRuntimeRunsNetworkRefresh(t *testing.T) {
 	case <-r.refreshDone:
 	default:
 		t.Fatal("refresh loop still runs after Close")
+	}
+}
+
+// Without a network manager the startup skips the clean-up and the refresh
+// loop.
+func TestRuntimeWithoutNetworkSkipsCleanupAndRefresh(t *testing.T) {
+	cleanups := 0
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Logger: quiet()}, func() {
+		cleanups++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanups != 0 {
+		t.Fatalf("startup clean-up ran %d times without a network manager, want 0", cleanups)
+	}
+	if r.refreshDone != nil || r.stopRefresh != nil {
+		t.Fatal("refresh loop started without a network manager")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
 	}
 }

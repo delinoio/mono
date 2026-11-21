@@ -61,16 +61,19 @@ func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, na
 		logger.Error("enrollment failed", "code", connect.CodeOf(err).String())
 		return nil, fmt.Errorf("agent: enroll: %w", err)
 	}
-	id.DeviceID = resp.Msg.GetDeviceId()
-	id.OrganizationID = resp.Msg.GetOrganizationId()
-	if err := st.SaveIdentity(id); err != nil {
-		return nil, err
-	}
+	// The identity with a device ID is the "enrolled" marker, so persist the
+	// origin that run needs first. A failure at either write leaves the
+	// pending-key identity, and a retry enrolls again with the same key.
 	if _, err := st.UpdateAgent(func(a *store.AgentState) error {
 		a.APIURL = cp.APIURL
 		a.Removal = store.RemovalRecord{}
 		return nil
 	}); err != nil {
+		return nil, err
+	}
+	id.DeviceID = resp.Msg.GetDeviceId()
+	id.OrganizationID = resp.Msg.GetOrganizationId()
+	if err := st.SaveIdentity(id); err != nil {
 		return nil, err
 	}
 	logger.Info("enrolled", "device_id", id.DeviceID, "organization_id", id.OrganizationID)
