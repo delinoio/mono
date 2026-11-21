@@ -12,7 +12,7 @@ Provide one place where Delino users manage their account information and their 
 
 - `apps/delino-accounts/`: Rsbuild React web app served at `https://accounts.delino.io`.
 - `servers/accounts-api/`: Go API server served at `https://accounts.api.delino.io`.
-- `protos/delino/accounts/` (`planned`): Connect RPC schemas for the account and billing APIs, in the protobuf package `delino.accounts.v1`.
+- `protos/delino/accounts/`: Connect RPC schemas for the account and billing APIs, in the protobuf package `delino.accounts.v1`.
 
 The project has two deployables. The web app is a static single-page application with no server runtime. The API server owns all account and billing state. The project has no `cmds`, `crates` or `packages` paths. The schemas (and their generated bindings) are not a deployable.
 
