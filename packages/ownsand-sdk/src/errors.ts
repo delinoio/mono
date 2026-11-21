@@ -62,6 +62,18 @@ export class InvalidFrameError extends DataPathError {
   }
 }
 
+/**
+ * The consumer of a peer-to-peer stream did not keep up: the frames that the
+ * agent sent and the consumer had not taken yet passed the per-stream limit
+ * of frames or bytes. It fails only that stream and the session stays open.
+ * It is not a `DataPathError`, so `classifyFailure` treats it as a transport
+ * interruption and the operation continues on a new stream from the offsets
+ * that it delivered.
+ */
+export class PeerStreamOverrunError extends OwnSandError {
+  override name = "PeerStreamOverrunError";
+}
+
 /** Returns the OwnSand ErrorDetail of a Connect error, if it has one. */
 export function errorDetailOf(error: unknown): ErrorDetail | undefined {
   if (!(error instanceof ConnectError)) {

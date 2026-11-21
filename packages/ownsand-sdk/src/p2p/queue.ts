@@ -1,18 +1,36 @@
 // SPDX-License-Identifier: Apache-2.0
 
-/** An unbounded single-consumer async queue with an end or a failure. */
+/**
+ * A single-consumer async queue with an end or a failure. It does not limit
+ * its size itself; it reports how many items and bytes are queued so that the
+ * producer, which cannot wait (a data channel receive callback), can fail
+ * the stream instead of growing the queue without bound.
+ */
 export class AsyncQueue<T> implements AsyncIterable<T> {
-  readonly #items: T[] = [];
+  readonly #items: { item: T; size: number }[] = [];
+  #bytes = 0;
   #waiter: (() => void) | undefined;
   #done = false;
   #error: unknown;
   #failed = false;
 
-  push(item: T): void {
+  /** The number of queued items that the consumer has not taken yet. */
+  get length(): number {
+    return this.#items.length;
+  }
+
+  /** The sum of the sizes of the queued items. */
+  get bytes(): number {
+    return this.#bytes;
+  }
+
+  /** Queues an item; `size` is its weight in bytes for `bytes`. */
+  push(item: T, size = 0): void {
     if (this.#done || this.#failed) {
       return;
     }
-    this.#items.push(item);
+    this.#items.push({ item, size });
+    this.#bytes += size;
     this.#wake();
   }
 
@@ -38,8 +56,10 @@ export class AsyncQueue<T> implements AsyncIterable<T> {
 
   async *[Symbol.asyncIterator](): AsyncIterator<T> {
     for (;;) {
-      if (this.#items.length > 0) {
-        yield this.#items.shift()!;
+      const next = this.#items.shift();
+      if (next !== undefined) {
+        this.#bytes -= next.size;
+        yield next.item;
         continue;
       }
       if (this.#failed) {
