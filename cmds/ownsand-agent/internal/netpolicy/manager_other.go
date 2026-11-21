@@ -33,5 +33,5 @@ func (m *Manager) Refresh() error { return errUnsupported }
 // Run does nothing on this host OS.
 func (m *Manager) Run(context.Context) {}
 
-// CleanupHost does nothing on this host OS.
-func CleanupHost(*slog.Logger) {}
+// CleanupHost does nothing on this host OS and reports no error.
+func CleanupHost(*slog.Logger) error { return nil }

@@ -6,10 +6,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/netip"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -659,4 +661,119 @@ func TestRefreshKeepsRulesWhenRouteDumpFails(t *testing.T) {
 	}
 	cancel()
 	<-done
+}
+
+// fakeCleanupHost drives cleanupHost without root: taps lists the sandbox
+// tap devices, failures maps a command line to its error, and absent names
+// the taps that no longer exist after a failed deletion.
+type fakeCleanupHost struct {
+	taps     []string
+	listErr  error
+	failures map[string]error
+	absent   map[string]bool
+	cmds     []string
+}
+
+func (f *fakeCleanupHost) ops() hostCleanupOps {
+	return hostCleanupOps{
+		listTaps: func() ([]string, error) { return f.taps, f.listErr },
+		run: func(name string, args ...string) error {
+			line := name + " " + strings.Join(args, " ")
+			f.cmds = append(f.cmds, line)
+			return f.failures[line]
+		},
+		tapExists: func(tap string) bool { return !f.absent[tap] },
+	}
+}
+
+func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
+
+// Every tap and the table are deleted, and the clean-up reports no error.
+func TestCleanupHostDeletesEverything(t *testing.T) {
+	f := &fakeCleanupHost{taps: []string{"osb-00000000001", "osb-00000000002"}}
+	if err := cleanupHost(discardLogger(), f.ops()); err != nil {
+		t.Fatalf("cleanupHost: %v", err)
+	}
+	want := []string{"ip link del osb-00000000001", "ip link del osb-00000000002", "nft delete table inet ownsand"}
+	if !slices.Equal(f.cmds, want) {
+		t.Fatalf("commands %q, want %q", f.cmds, want)
+	}
+}
+
+// A failed tap deletion does not stop the other taps or the table; the error
+// names each failed resource.
+func TestCleanupHostReportsFailuresAndAttemptsEverything(t *testing.T) {
+	f := &fakeCleanupHost{
+		taps: []string{"osb-00000000001", "osb-00000000002"},
+		failures: map[string]error{
+			"ip link del osb-00000000001":   errors.New("operation not permitted"),
+			"nft delete table inet ownsand": errors.New("nft: operation not permitted"),
+		},
+	}
+	err := cleanupHost(discardLogger(), f.ops())
+	if err == nil {
+		t.Fatal("cleanupHost reported no error")
+	}
+	for _, want := range []string{"delete tap device osb-00000000001", "delete nftables table inet ownsand"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("error %q does not name %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "osb-00000000002") {
+		t.Fatalf("error %q names a tap that was deleted", err)
+	}
+	if len(f.cmds) != 3 {
+		t.Fatalf("commands %q: every resource must be attempted", f.cmds)
+	}
+}
+
+// A resource that is already absent counts as cleaned: a tap that vanished
+// during the deletion, and a table that nft reports as missing.
+func TestCleanupHostAbsentResourcesAreClean(t *testing.T) {
+	for _, tableErr := range []error{
+		errors.New("netpolicy: nft delete table inet ownsand: exit status 1: Error: Could not process rule: No such file or directory"),
+		fmt.Errorf("netpolicy: nft: %w", exec.ErrNotFound),
+		errors.New("table does not exist"),
+	} {
+		f := &fakeCleanupHost{
+			taps: []string{"osb-00000000001"},
+			failures: map[string]error{
+				"ip link del osb-00000000001":   errors.New("Cannot find device"),
+				"nft delete table inet ownsand": tableErr,
+			},
+			absent: map[string]bool{"osb-00000000001": true},
+		}
+		if err := cleanupHost(discardLogger(), f.ops()); err != nil {
+			t.Fatalf("table error %q: cleanupHost: %v", tableErr, err)
+		}
+	}
+}
+
+// A failed interface listing is reported, and the table is still deleted.
+func TestCleanupHostListFailure(t *testing.T) {
+	f := &fakeCleanupHost{listErr: errors.New("netlink failed")}
+	err := cleanupHost(discardLogger(), f.ops())
+	if err == nil || !strings.Contains(err.Error(), "list tap devices") {
+		t.Fatalf("error %v", err)
+	}
+	if !slices.Equal(f.cmds, []string{"nft delete table inet ownsand"}) {
+		t.Fatalf("commands %q", f.cmds)
+	}
+}
+
+// A retry after a partial failure succeeds once the remaining resource is
+// removable.
+func TestCleanupHostRetryAfterPartialFailure(t *testing.T) {
+	f := &fakeCleanupHost{
+		taps:     []string{"osb-00000000001"},
+		failures: map[string]error{"ip link del osb-00000000001": errors.New("operation not permitted")},
+	}
+	if err := cleanupHost(discardLogger(), f.ops()); err == nil {
+		t.Fatal("first attempt reported no error")
+	}
+	f.failures = nil
+	f.cmds = nil
+	if err := cleanupHost(discardLogger(), f.ops()); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
 }
