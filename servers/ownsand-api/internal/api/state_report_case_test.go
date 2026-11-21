@@ -206,3 +206,39 @@ func TestStateReportOrdersRevisionEpochsByValue(t *testing.T) {
 		t.Fatalf("an earlier uppercase epoch changed the record to %v %s", got.state, got.epoch)
 	}
 }
+
+// TestStateReportOrdersStoredUppercaseEpochsByValue checks that an epoch
+// stored in uppercase (written by an earlier version that stored the reported
+// spelling unchanged) is compared by value: a retried report with the same
+// epoch and a lower counter must not roll the sandbox back.
+func TestStateReportOrdersStoredUppercaseEpochsByValue(t *testing.T) {
+	f := newStateReportLockFixture(t)
+	ctx := context.Background()
+	epoch := epochAt(t, 0x01ab00000000)
+	if strings.ToUpper(epoch) == epoch {
+		t.Fatalf("test epoch has no letters to change case: %s", epoch)
+	}
+	if _, err := f.env.DB.Pool.Exec(ctx, "UPDATE sandboxes SET revision_epoch = $2, revision_counter = 7 WHERE sandbox_id = $1", f.sandboxID, strings.ToUpper(epoch)); err != nil {
+		t.Fatal(err)
+	}
+	send := func(state ownsandv1.SandboxState, counter uint64) {
+		t.Helper()
+		entry := f.agent.Sandbox(f.sandboxID)
+		entry.State = state
+		entry.Revision = &ownsandv1.SandboxRevision{Epoch: strings.ToUpper(epoch), Counter: counter}
+		report := &ownsandv1.StateReport{StateEpoch: epochAt(t, 0x01ac00000000), Sandboxes: []*ownsandv1.SandboxStateEntry{entry}}
+		if _, err := f.env.App.Service.ReconcileStateReportForTest(ctx, f.dev.ID, report); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A lower counter of the same epoch is stale, whatever the stored spelling.
+	send(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, 1)
+	if got := readSandboxRecord(t, f.env, f.sandboxID); got.state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING || got.counter != 7 {
+		t.Fatalf("a stale counter changed the record to %v counter %d, want RUNNING counter 7", got.state, got.counter)
+	}
+	// A higher counter of the same epoch applies and stores the canonical spelling.
+	send(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, 8)
+	if got := readSandboxRecord(t, f.env, f.sandboxID); got.state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED || got.epoch != epoch || got.counter != 8 {
+		t.Fatalf("after the newer counter: %v %s/%d, want PAUSED %s/8", got.state, got.epoch, got.counter, epoch)
+	}
+}

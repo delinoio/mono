@@ -105,7 +105,9 @@ func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID str
 		return res, nil
 	}
 	rev := e.GetRevision()
-	if compareRevision(epoch, rev.GetCounter(), r.Epoch, r.Counter) > 0 {
+	// A stored epoch may still be in the spelling an earlier version wrote, so
+	// canonicalize it before the byte-wise comparison.
+	if compareRevision(epoch, rev.GetCounter(), canonicalUUID(r.Epoch), r.Counter) > 0 {
 		res.applied = true
 		var idle any
 		if e.GetIdleDeadline() != nil {
