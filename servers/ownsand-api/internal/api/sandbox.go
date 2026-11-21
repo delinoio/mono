@@ -235,42 +235,60 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		}
 		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: existing.proto()}), nil
 	}
-	src, err := h.resolveSource(ctx, h.DB.Pool, orgID, m.GetSource())
-	if err != nil {
-		return nil, h.internal(ctx, "create sandbox", err)
-	}
-	sreq := scheduler.Request{
-		VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
-		NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
-		DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
-	}
-	lineage := ""
-	if src != nil {
-		sn := src.snapshot.pb
-		if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
-			return nil, errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
-		}
-		sreq.GuestOS = sn.GetGuestOs()
-		sreq.Snapshot = &scheduler.Snapshot{
-			ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
-			Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
-			HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
-			MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
-			MacOSHardwareModel: sn.GetMacosHardwareModel(),
-		}
-		if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
-			lineage = src.snapshot.lineage
-		}
-	} else {
-		sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
-	}
-
 	sandboxID := newID()
 	now := h.now()
-	var created *sandboxRow
+	var src *resolvedSource
+	var sreq scheduler.Request
+	var created, replayed *sandboxRow
 	var decision scheduler.Decision
 	var limits *ownsandv1.DeviceLimits
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// A miss on the pool is not final: an identical request may be
+		// reserving the same key right now. Serialize on the key, then look
+		// it up again in this transaction before anything that can fail with
+		// a capacity error. The lock is transaction-scoped and keyed by the
+		// organization and key; orgID is a fixed-length UUID, so the joined
+		// text is unambiguous. Only this handler takes it, and it never waits
+		// for it while holding a device row lock (the device lock comes
+		// later in this transaction), so the lock order stays acyclic.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))", orgID, m.GetIdempotencyKey()); err != nil {
+			return err
+		}
+		existing, err := h.lookupIdempotent(ctx, tx, orgID, m.GetIdempotencyKey(), hash)
+		if err != nil || existing != nil {
+			// Another request committed the key first: return its sandbox
+			// without a reservation, audit event or command.
+			replayed = existing
+			return err
+		}
+		if src, err = h.resolveSource(ctx, tx, orgID, m.GetSource()); err != nil {
+			return err
+		}
+		sreq = scheduler.Request{
+			VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
+			NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
+			DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
+		}
+		lineage := ""
+		if src != nil {
+			sn := src.snapshot.pb
+			if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
+				return errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
+			}
+			sreq.GuestOS = sn.GetGuestOs()
+			sreq.Snapshot = &scheduler.Snapshot{
+				ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
+				Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
+				HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
+				MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
+				MacOSHardwareModel: sn.GetMacosHardwareModel(),
+			}
+			if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
+				lineage = src.snapshot.lineage
+			}
+		} else {
+			sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
+		}
 		devices, err := h.placementDevices(ctx, tx, orgID, lineage)
 		if err != nil {
 			return err
@@ -347,6 +365,9 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	}
 	if err != nil {
 		return nil, h.internal(ctx, "create sandbox", err)
+	}
+	if replayed != nil {
+		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: replayed.proto()}), nil
 	}
 	h.Logger.InfoContext(ctx, "sandbox_created", slog.String("sandbox_id", sandboxID), slog.String("device_id", decision.DeviceID),
 		slog.Bool("memory_restore", decision.MemoryRestore), slog.Bool("import", decision.NeedsImport))

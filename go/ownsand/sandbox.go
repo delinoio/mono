@@ -4,6 +4,7 @@ package ownsand
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -11,8 +12,8 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -108,7 +109,34 @@ func (c *Client) CreateSandbox(ctx context.Context, p CreateSandboxParams) (*San
 	}
 	rec := newRecovery(c.timing.createRetryWindow)
 	for {
-		res, err := c.sandboxes.CreateSandbox(ctx, connect.NewRequest(req))
+		// The first attempt is not bounded: the window starts with the
+		// first lost response. Each retry is bounded by the time left in
+		// the window, because a response that stalls on an open connection
+		// must not outlive it (the default HTTP client has no overall
+		// timeout). A timer cancels the attempt instead of a context
+		// deadline, so Connect sends no timeout header and the server
+		// cannot answer it first with a terminal deadline_exceeded status.
+		attemptCtx, cancel := ctx, context.CancelCauseFunc(func(error) {})
+		var timer *time.Timer
+		if rec.inRecovery() {
+			left := rec.remaining()
+			if left <= 0 {
+				return nil, rec.err()
+			}
+			attemptCtx, cancel = context.WithCancelCause(ctx)
+			timer = time.AfterFunc(left, func() { cancel(errCreateDeadline) })
+		}
+		res, err := c.sandboxes.CreateSandbox(attemptCtx, connect.NewRequest(req))
+		if timer != nil {
+			timer.Stop()
+		}
+		timedOut := err != nil && ctx.Err() == nil && errors.Is(context.Cause(attemptCtx), errCreateDeadline)
+		cancel(context.Canceled)
+		if timedOut {
+			// The window ended during the attempt: end with the last
+			// failure of the window, not with the cancellation.
+			return nil, rec.err()
+		}
 		if err == nil {
 			c.logger.DebugContext(ctx, "ownsand sandbox created", "sandbox_id", res.Msg.GetSandbox().GetSandboxId())
 			return c.handle(org, res.Msg.GetSandbox()), nil

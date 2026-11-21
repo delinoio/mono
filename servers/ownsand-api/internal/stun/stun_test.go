@@ -92,3 +92,59 @@ func TestRejectsNonBinding(t *testing.T) {
 		t.Fatal("indication answered")
 	}
 }
+
+func TestRejectsReservedHeaderBits(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5}
+	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest, pionstun.Fingerprint)
+	if resp, err := Respond(req.Raw, src); err != nil {
+		t.Fatalf("valid request rejected: %v", err)
+	} else {
+		m := &pionstun.Message{Raw: resp}
+		var xor pionstun.XORMappedAddress
+		if err := m.Decode(); err != nil || m.Type != pionstun.BindingSuccess || m.TransactionID != req.TransactionID ||
+			xor.GetFrom(m) != nil || !xor.IP.Equal(src.IP) || xor.Port != src.Port || !m.Contains(pionstun.AttrFingerprint) {
+			t.Fatalf("bad response %v %v", m, err)
+		}
+	}
+	for _, bits := range []byte{0x40, 0x80, 0xC0} {
+		raw := append([]byte(nil), req.Raw...)
+		raw[0] |= bits
+		if resp, err := Respond(raw, src); err == nil || resp != nil {
+			t.Fatalf("bits %#x answered: %v %v", bits, resp, err)
+		}
+	}
+}
+
+func TestServeCountsReservedHeaderBitsInvalid(t *testing.T) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := New(slog.New(slog.NewJSONHandler(io.Discard, nil)), 2048, 8192)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, pc) }()
+	defer func() { cancel(); <-done }()
+
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest, pionstun.Fingerprint)
+	req.Raw[0] |= 0x80
+	if _, err := client.WriteTo(req.Raw, pc.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _, err := client.ReadFrom(make([]byte, 1500)); err == nil {
+		t.Fatalf("got %d response bytes", n)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for s.invalid.Load() != 1 {
+		if time.Now().After(deadline) {
+			t.Fatalf("invalid = %d, want 1", s.invalid.Load())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

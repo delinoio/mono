@@ -611,9 +611,19 @@ export function createMockTransport(
       },
       listDevices(req) {
         const { org } = membership(req.organizationId);
+        // Mirrors the real API: an absent state means every device that is not
+        // removed, and an explicit UNSPECIFIED state is invalid.
+        if (req.state === DeviceState.UNSPECIFIED) {
+          throw new ConnectError(
+            "invalid state: must be a device state",
+            Code.InvalidArgument,
+          );
+        }
         return {
-          devices: org.devices.filter(
-            (d) => req.state === undefined || d.state === req.state,
+          devices: org.devices.filter((d) =>
+            req.state === undefined
+              ? d.state !== DeviceState.REMOVED
+              : d.state === req.state,
           ),
         };
       },
@@ -734,7 +744,11 @@ export function createMockTransport(
         const existing = org.sandboxes.find(
           (s) => s.labels["mock-idempotency-key"] === req.idempotencyKey,
         );
-        if (existing !== undefined) return { sandbox: existing };
+        // A retry returns the same view as the first call: without the
+        // fake's idempotency bookkeeping label.
+        if (existing !== undefined) {
+          return { sandbox: withoutMockLabels(existing) };
+        }
         const device =
           org.devices.find((d) => d.deviceId === req.placement?.deviceId) ??
           org.devices.find((d) => d.state === DeviceState.ONLINE);
