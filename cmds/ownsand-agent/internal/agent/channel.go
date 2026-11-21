@@ -163,7 +163,7 @@ func (a *Agent) runChannel(ctx context.Context) error {
 			return err
 		}
 		if env := resp.GetEnvelope(); env != nil {
-			a.dispatch(cctx, c, env)
+			a.dispatch(cctx, ctx, c, env)
 		}
 	}
 }
@@ -259,8 +259,10 @@ func (a *Agent) macOSHardwareModels(models [][]byte) [][]byte {
 	return models
 }
 
-// dispatch handles one envelope of the control plane.
-func (a *Agent) dispatch(ctx context.Context, c *conn, env *ownsandv1.AgentEnvelope) {
+// dispatch handles one envelope of the control plane. chanCtx ends with the
+// channel connection that delivered env; agentCtx ends only when the agent
+// stops, installs an update or removes the device.
+func (a *Agent) dispatch(chanCtx, agentCtx context.Context, c *conn, env *ownsandv1.AgentEnvelope) {
 	switch m := env.GetMessage().(type) {
 	case *ownsandv1.AgentEnvelope_HeartbeatAck:
 		c.mu.Lock()
@@ -282,7 +284,7 @@ func (a *Agent) dispatch(ctx context.Context, c *conn, env *ownsandv1.AgentEnvel
 		if isUpdateCommand(m.Command) {
 			order = a.updater.NextOrder()
 		}
-		go a.handleCommand(ctx, m.Command, order)
+		go a.handleCommand(chanCtx, agentCtx, m.Command, order)
 	case *ownsandv1.AgentEnvelope_Configuration:
 		cfg := m.Configuration
 		a.Sandboxes.SetLimits(cfg.GetLimits())
@@ -294,7 +296,7 @@ func (a *Agent) dispatch(ctx context.Context, c *conn, env *ownsandv1.AgentEnvel
 	case *ownsandv1.AgentEnvelope_Signaling:
 		if offer := m.Signaling.GetOffer(); offer != nil {
 			go func() {
-				answer := a.dataPath.Offer(ctx, c, offer)
+				answer := a.dataPath.Offer(chanCtx, c, offer)
 				c.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Signaling{Signaling: &ownsandv1.SignalingMessage{
 					Message: &ownsandv1.SignalingMessage_Answer{Answer: answer},
 				}}})

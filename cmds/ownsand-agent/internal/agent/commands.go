@@ -78,13 +78,24 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 	return &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, Message: err.Error()}
 }
 
-// handleCommand runs one command and sends its result on the current
-// channel. A result that cannot be sent is lost; the control plane then
-// learns the state from the next state report.
+// handleCommand runs one command and sends its result on the channel that is
+// current when the command ends. A result that cannot be sent is lost; the
+// control plane then learns the state from the next state report.
+//
+// chanCtx ends with the channel connection that delivered the command; agentCtx
+// ends only when the agent stops, installs an update or removes the device.
+// Commands that change a sandbox belong to the device and run on agentCtx, so
+// that a channel loss does not cancel them (a canceled create would record the
+// sandbox as failed). Snapshot creation stays on chanCtx: a pending capture is
+// not in the state report, so the control plane marks it FAILED on reconnect,
+// and no update message reports a late completion. Snapshot transfers and
+// agent updates are bound to one channel in the control plane and end with
+// chanCtx. Remove this limit when pending snapshots are reported and
+// completion has its own update path.
 //
 // order is the update order that dispatch took when it received an update or
 // withdrawal command; it is zero for every other command.
-func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand, order uint64) {
+func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.AgentCommand, order uint64) {
 	kind := commandKind(cmd)
 	logger := a.logger.With("command_id", cmd.GetCommandId(), "command", kind)
 	logger.Info("command received")
@@ -93,37 +104,37 @@ func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand, 
 	switch c := cmd.GetCommand().(type) {
 	case *ownsandv1.AgentCommand_CreateSandbox:
 		var e *ownsandv1.SandboxStateEntry
-		e, err = a.Sandboxes.Create(ctx, c.CreateSandbox)
+		e, err = a.Sandboxes.Create(agentCtx, c.CreateSandbox)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_CreateSandbox{CreateSandbox: &ownsandv1.CreateSandboxResult{Sandbox: e}}
 		}
 	case *ownsandv1.AgentCommand_DeleteSandbox:
 		var e *ownsandv1.SandboxStateEntry
-		e, err = a.Sandboxes.Delete(ctx, c.DeleteSandbox)
+		e, err = a.Sandboxes.Delete(agentCtx, c.DeleteSandbox)
 		setSandboxResult(res, e)
 	case *ownsandv1.AgentCommand_PauseSandbox:
 		var e *ownsandv1.SandboxStateEntry
-		e, err = a.Sandboxes.Pause(ctx, c.PauseSandbox)
+		e, err = a.Sandboxes.Pause(agentCtx, c.PauseSandbox)
 		setSandboxResult(res, e)
 	case *ownsandv1.AgentCommand_ResumeSandbox:
 		var e *ownsandv1.SandboxStateEntry
-		e, err = a.Sandboxes.Resume(ctx, c.ResumeSandbox)
+		e, err = a.Sandboxes.Resume(agentCtx, c.ResumeSandbox)
 		setSandboxResult(res, e)
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
-		e, err = a.Sandboxes.CreateSnapshot(ctx, c.CreateSnapshot)
+		e, err = a.Sandboxes.CreateSnapshot(chanCtx, c.CreateSnapshot)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotResult{Snapshot: e}}
 		}
 	case *ownsandv1.AgentCommand_ExportSnapshot:
 		var r *ownsandv1.ExportSnapshotResult
-		r, err = a.exportSnapshot(ctx, c.ExportSnapshot)
+		r, err = a.exportSnapshot(chanCtx, c.ExportSnapshot)
 		if r != nil {
 			res.Result = &ownsandv1.AgentCommandResult_ExportSnapshot{ExportSnapshot: r}
 		}
 	case *ownsandv1.AgentCommand_ImportSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
-		e, err = a.importSnapshot(ctx, c.ImportSnapshot)
+		e, err = a.importSnapshot(chanCtx, c.ImportSnapshot)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{Snapshot: e}}
 		}
@@ -136,7 +147,7 @@ func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand, 
 		}
 		return
 	case *ownsandv1.AgentCommand_UpdateAgent:
-		err = a.updater.HandleOrdered(ctx, c.UpdateAgent, order)
+		err = a.updater.HandleOrdered(chanCtx, c.UpdateAgent, order)
 		err = updateCommandError(err)
 	case *ownsandv1.AgentCommand_WithdrawAgentUpdate:
 		err = updateCommandError(a.updater.WithdrawOrdered(order))
@@ -151,7 +162,11 @@ func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand, 
 	} else {
 		logger.Info("command succeeded")
 	}
-	a.send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: res}})
+	if !a.send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: res}}) {
+		// The control plane recovers the outcome from the next state report or
+		// sandbox update.
+		logger.Warn("command result not sent")
+	}
 }
 
 func setSandboxResult(res *ownsandv1.AgentCommandResult, e *ownsandv1.SandboxStateEntry) {
