@@ -11,21 +11,22 @@ This contract owns the Connect RPC schemas of [`ownsand`](project-ownsand.md):
 
 Schema files:
 
-| File                 | Content                                                                                                                      |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `common.proto`       | Shared enums, `Principal`, `Resources`, `DeviceLimits`, `ErrorDetail`, `RequestAccepted`, `Keepalive` and `SandboxRevision`. |
-| `organization.proto` | `OrganizationService`.                                                                                                       |
-| `member.proto`       | `MemberService`.                                                                                                             |
-| `device.proto`       | `DeviceService`, `Device`, `DeviceCapabilities` and `DeviceAllocation`.                                                      |
-| `api_key.proto`      | `ApiKeyService`.                                                                                                             |
-| `sandbox.proto`      | `SandboxService`.                                                                                                            |
-| `snapshot.proto`     | `SnapshotService` with templates.                                                                                            |
-| `data_path.proto`    | `DataPathService`.                                                                                                           |
-| `data_frame.proto`   | `DataFrame` and every payload, the exec and file messages and `RelayRequestBinding`.                                         |
-| `relay.proto`        | `RelayService` and `RelayAgentService`.                                                                                      |
-| `agent.proto`        | `AgentService` and `AgentEnvelope` with every case.                                                                          |
-| `guest.proto`        | `GuestService`.                                                                                                              |
-| `audit.proto`        | `AuditAction`, `AuditTargetKind` and the `AuditEvent` record. No RPC returns audit events in `v1`.                           |
+| File                        | Content                                                                                                                                                                                                       |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `common.proto`              | Shared enums, `Principal`, `Resources`, `DeviceLimits`, `ErrorDetail`, `RequestAccepted`, `Keepalive` and `SandboxRevision`.                                                                                  |
+| `organization.proto`        | `OrganizationService`.                                                                                                                                                                                        |
+| `member.proto`              | `MemberService`.                                                                                                                                                                                              |
+| `device.proto`              | `DeviceService`, `Device`, `DeviceCapabilities` and `DeviceAllocation`.                                                                                                                                       |
+| `api_key.proto`             | `ApiKeyService`.                                                                                                                                                                                              |
+| `sandbox.proto`             | `SandboxService`.                                                                                                                                                                                             |
+| `snapshot.proto`            | `SnapshotService` with templates.                                                                                                                                                                             |
+| `data_path.proto`           | `DataPathService`.                                                                                                                                                                                            |
+| `data_frame.proto`          | `DataFrame` and every payload, the exec and file messages and `RelayRequestBinding`.                                                                                                                          |
+| `relay.proto`               | `RelayService` and `RelayAgentService`.                                                                                                                                                                       |
+| `agent.proto`               | `AgentService` and `AgentEnvelope` with every case.                                                                                                                                                           |
+| `guest.proto`               | `GuestService`.                                                                                                                                                                                               |
+| `audit.proto`               | `AuditAction`, `AuditTargetKind` and the `AuditEvent` record. No RPC returns audit events in `v1`.                                                                                                            |
+| `billing.proto` (`planned`) | `BillingService`, `BillingPhase`, `BillingMeter` and the billing status and usage messages. See [Billing](#billing). `common.proto` adds `BillingReason` and `ErrorDetail.billing_reason` in the same change. |
 
 The schemas are the single source of truth for the public API, the agent channel and the data path framing. The control plane, the device agent, the guest helper, the CLI, the web console and both SDKs consume them. The schemas and the generated code use Apache-2.0.
 
@@ -54,61 +55,66 @@ The schemas are the single source of truth for the public API, the agent channel
 - List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`.
 - Errors use Connect error codes. Detail messages never contain secrets or sandbox content.
 - Request and response messages follow the buf `STANDARD` lint rules: each RPC has its own `<Rpc>Request` and `<Rpc>Response` message. A streaming RPC that carries a shared message wraps it in one field (for example `ExecResponse.event`, `ConnectRequest.frame` and `ChannelRequest.envelope`); the wrapper adds a few bytes to each stream message, which the 1 MiB plus 64 KiB frame limit does not count.
-- `ErrorCode` carries an error inside frames and agent channel results. Its numeric values equal the Connect error codes. `ErrorDetail` carries the code, a message without secrets or sandbox content, an optional retry delay and, when a session end caused the error, the `SessionEndReason`.
+- `ErrorCode` carries an error inside frames and agent channel results. Its numeric values equal the Connect error codes. `ErrorDetail` carries the code, a message without secrets or sandbox content, an optional retry delay, when a session end caused the error, the `SessionEndReason`, and (`planned`) when billing rejected the call, the `BillingReason` (see [Billing](#billing)).
 - Every public RPC, including `RelayService`, is unary or server-streaming, so that clients without client or bidirectional streams can use it. See [the project transport rule](project-ownsand.md#protocol-and-api). Only the device-facing `RelayAgentService.Connect` and `AgentService.Channel` are bidirectional. `AgentService.Channel` is a Connect bidirectional stream (a recorded decision; only its WebSocket fallback stays open), as the [control plane agent channel section](servers-ownsand-api-foundation.md#agent-channel) records. Both need HTTP/2 from end to end, which the [control plane contract](servers-ownsand-api-foundation.md#runtime-and-language) requires from the proxy route.
 
 ### Public services
 
-The control plane serves every public service at `https://ownsand.api.delino.io`. Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationService.ListOrganizations` and `MemberService.AcceptInvitation` takes an `organization_id`. The [control plane contract](servers-ownsand-api-foundation.md#authorization) owns the role that each RPC requires.
+The control plane serves every public service at `https://ownsand.api.delino.io`. Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationService.ListOrganizations` and `MemberService.AcceptInvitation` takes an `organization_id`. `BillingService` is `planned`. The [control plane contract](servers-ownsand-api-foundation.md#authorization) owns the role that each RPC requires.
 
-| Service               | RPC                        | Kind             | Purpose                                                                                           |
-| --------------------- | -------------------------- | ---------------- | ------------------------------------------------------------------------------------------------- |
-| `OrganizationService` | `CreateOrganization`       | unary            | Create an organization. The caller becomes its `owner`.                                           |
-|                       | `GetOrganization`          | unary            | Read one organization.                                                                            |
-|                       | `ListOrganizations`        | unary            | List the organizations of the signed-in user.                                                     |
-|                       | `DeleteOrganization`       | unary            | Delete the organization and start its clean-up.                                                   |
-|                       | `TransferOwnership`        | unary            | Make another member the `owner`. The previous owner becomes `admin`.                              |
-| `MemberService`       | `CreateInvitation`         | unary            | Create a one-time invitation with a role (`admin` or `member`). Returns the secret once.          |
-|                       | `ListInvitations`          | unary            | List pending invitations without secrets.                                                         |
-|                       | `RevokeInvitation`         | unary            | Revoke a pending invitation.                                                                      |
-|                       | `AcceptInvitation`         | unary            | Join the organization with an invitation secret, as the signed-in user.                           |
-|                       | `ListMembers`              | unary            | List members, roles and display names (empty when unavailable).                                   |
-|                       | `UpdateMemberRole`         | unary            | Change a member role between `admin` and `member`.                                                |
-|                       | `RemoveMember`             | unary            | Remove a member. An `admin` or `member` may also remove itself; the `owner` cannot.               |
-| `DeviceService`       | `CreateEnrollmentToken`    | unary            | Create a one-time enrollment token with an expiry. Returns the secret once.                       |
-|                       | `ListEnrollmentTokens`     | unary            | List enrollment tokens without secrets.                                                           |
-|                       | `RevokeEnrollmentToken`    | unary            | Revoke an unused enrollment token.                                                                |
-|                       | `ListDevices`              | unary            | List devices with state, capabilities, limits and allocation.                                     |
-|                       | `GetDevice`                | unary            | Read one device.                                                                                  |
-|                       | `ReplaceDeviceLimits`      | unary            | Replace all four device limits; every value must be present. See [device limits](#device-limits). |
-|                       | `UpdateDeviceLimits`       | unary            | Legacy: set the device limits with implicit presence. See [device limits](#device-limits).        |
-|                       | `RemoveDevice`             | unary            | Revoke the device credentials and request local clean-up.                                         |
-|                       | `GetAgentVersionPolicy`    | unary            | Read the agent version policy of the organization.                                                |
-|                       | `UpdateAgentVersionPolicy` | unary            | Follow the default target, pin a version or hold updates.                                         |
-| `ApiKeyService`       | `CreateApiKey`             | unary            | Create an organization API key. Returns the secret once.                                          |
-|                       | `ListApiKeys`              | unary            | List API keys without secrets.                                                                    |
-|                       | `RevokeApiKey`             | unary            | Revoke an API key.                                                                                |
-| `SandboxService`      | `CreateSandbox`            | unary            | Create a sandbox. See [the create request](#create-request).                                      |
-|                       | `GetSandbox`               | unary            | Read one sandbox.                                                                                 |
-|                       | `ListSandboxes`            | unary            | List sandboxes, with optional device and state filters; ended sandboxes only on request.          |
-|                       | `DeleteSandbox`            | unary            | Delete a sandbox.                                                                                 |
-|                       | `PauseSandbox`             | unary            | Pause a running sandbox.                                                                          |
-|                       | `ResumeSandbox`            | unary            | Resume a paused sandbox.                                                                          |
-| `SnapshotService`     | `CreateSnapshot`           | unary            | Take a snapshot of a sandbox on its device.                                                       |
-|                       | `GetSnapshot`              | unary            | Read one snapshot with its location and export state.                                             |
-|                       | `ListSnapshots`            | unary            | List snapshots.                                                                                   |
-|                       | `DeleteSnapshot`           | unary            | Delete a snapshot. Fails with `failed_precondition` while a template references it.               |
-|                       | `ExportSnapshot`           | unary            | Export a snapshot to R2 so that other devices with the same OS and architecture can use it.       |
-|                       | `CreateTemplate`           | unary            | Make a named template from a snapshot.                                                            |
-|                       | `ListTemplates`            | unary            | List templates.                                                                                   |
-|                       | `DeleteTemplate`           | unary            | Delete a template. The source snapshot stays.                                                     |
-| `DataPathService`     | `GetIceServers`            | unary            | Return the STUN server URLs that a caller uses to gather candidates before `OpenSession`.         |
-|                       | `OpenSession`              | unary            | Signal a peer-to-peer data channel: send the caller's SDP offer, return the agent's answer.       |
-|                       | `AuthorizeRelay`           | unary            | Grant relay access to one operation on a sandbox: return a relay grant ID.                        |
-| `RelayService`        | `Exec`                     | server-streaming | Relay: run a command and stream stdout, stderr and the exit code.                                 |
-|                       | `AttachExec`               | server-streaming | Relay: continue the event stream of a running or finished exec from given output offsets.         |
-|                       | `ReadFile`                 | server-streaming | Relay: stream the contents of a guest file from an offset.                                        |
-|                       | `WriteFile`                | unary            | Relay: write one chunk of a guest file at an offset. See [file transfer](#file-transfer).         |
+| Service               | RPC                           | Kind             | Purpose                                                                                           |
+| --------------------- | ----------------------------- | ---------------- | ------------------------------------------------------------------------------------------------- |
+| `OrganizationService` | `CreateOrganization`          | unary            | Create an organization. The caller becomes its `owner`.                                           |
+|                       | `GetOrganization`             | unary            | Read one organization.                                                                            |
+|                       | `ListOrganizations`           | unary            | List the organizations of the signed-in user.                                                     |
+|                       | `DeleteOrganization`          | unary            | Delete the organization and start its clean-up.                                                   |
+|                       | `TransferOwnership`           | unary            | Make another member the `owner`. The previous owner becomes `admin`.                              |
+| `MemberService`       | `CreateInvitation`            | unary            | Create a one-time invitation with a role (`admin` or `member`). Returns the secret once.          |
+|                       | `ListInvitations`             | unary            | List pending invitations without secrets.                                                         |
+|                       | `RevokeInvitation`            | unary            | Revoke a pending invitation.                                                                      |
+|                       | `AcceptInvitation`            | unary            | Join the organization with an invitation secret, as the signed-in user.                           |
+|                       | `ListMembers`                 | unary            | List members, roles and display names (empty when unavailable).                                   |
+|                       | `UpdateMemberRole`            | unary            | Change a member role between `admin` and `member`.                                                |
+|                       | `RemoveMember`                | unary            | Remove a member. An `admin` or `member` may also remove itself; the `owner` cannot.               |
+| `DeviceService`       | `CreateEnrollmentToken`       | unary            | Create a one-time enrollment token with an expiry. Returns the secret once.                       |
+|                       | `ListEnrollmentTokens`        | unary            | List enrollment tokens without secrets.                                                           |
+|                       | `RevokeEnrollmentToken`       | unary            | Revoke an unused enrollment token.                                                                |
+|                       | `ListDevices`                 | unary            | List devices with state, capabilities, limits and allocation.                                     |
+|                       | `GetDevice`                   | unary            | Read one device.                                                                                  |
+|                       | `ReplaceDeviceLimits`         | unary            | Replace all four device limits; every value must be present. See [device limits](#device-limits). |
+|                       | `UpdateDeviceLimits`          | unary            | Legacy: set the device limits with implicit presence. See [device limits](#device-limits).        |
+|                       | `RemoveDevice`                | unary            | Revoke the device credentials and request local clean-up.                                         |
+|                       | `GetAgentVersionPolicy`       | unary            | Read the agent version policy of the organization.                                                |
+|                       | `UpdateAgentVersionPolicy`    | unary            | Follow the default target, pin a version or hold updates.                                         |
+| `ApiKeyService`       | `CreateApiKey`                | unary            | Create an organization API key. Returns the secret once.                                          |
+|                       | `ListApiKeys`                 | unary            | List API keys without secrets.                                                                    |
+|                       | `RevokeApiKey`                | unary            | Revoke an API key.                                                                                |
+| `SandboxService`      | `CreateSandbox`               | unary            | Create a sandbox. See [the create request](#create-request).                                      |
+|                       | `GetSandbox`                  | unary            | Read one sandbox.                                                                                 |
+|                       | `ListSandboxes`               | unary            | List sandboxes, with optional device and state filters; ended sandboxes only on request.          |
+|                       | `DeleteSandbox`               | unary            | Delete a sandbox.                                                                                 |
+|                       | `PauseSandbox`                | unary            | Pause a running sandbox.                                                                          |
+|                       | `ResumeSandbox`               | unary            | Resume a paused sandbox.                                                                          |
+| `SnapshotService`     | `CreateSnapshot`              | unary            | Take a snapshot of a sandbox on its device.                                                       |
+|                       | `GetSnapshot`                 | unary            | Read one snapshot with its location and export state.                                             |
+|                       | `ListSnapshots`               | unary            | List snapshots.                                                                                   |
+|                       | `DeleteSnapshot`              | unary            | Delete a snapshot. Fails with `failed_precondition` while a template references it.               |
+|                       | `ExportSnapshot`              | unary            | Export a snapshot to R2 so that other devices with the same OS and architecture can use it.       |
+|                       | `CreateTemplate`              | unary            | Make a named template from a snapshot.                                                            |
+|                       | `ListTemplates`               | unary            | List templates.                                                                                   |
+|                       | `DeleteTemplate`              | unary            | Delete a template. The source snapshot stays.                                                     |
+| `DataPathService`     | `GetIceServers`               | unary            | Return the STUN server URLs that a caller uses to gather candidates before `OpenSession`.         |
+|                       | `OpenSession`                 | unary            | Signal a peer-to-peer data channel: send the caller's SDP offer, return the agent's answer.       |
+|                       | `AuthorizeRelay`              | unary            | Grant relay access to one operation on a sandbox: return a relay grant ID.                        |
+| `RelayService`        | `Exec`                        | server-streaming | Relay: run a command and stream stdout, stderr and the exit code.                                 |
+|                       | `AttachExec`                  | server-streaming | Relay: continue the event stream of a running or finished exec from given output offsets.         |
+|                       | `ReadFile`                    | server-streaming | Relay: stream the contents of a guest file from an offset.                                        |
+|                       | `WriteFile`                   | unary            | Relay: write one chunk of a guest file at an offset. See [file transfer](#file-transfer).         |
+| `BillingService`      | `GetBillingStatus`            | unary            | Read the billing phase, reason, link state, block start and suspension time of the organization.  |
+|                       | `GetBillingUsage`             | unary            | Read the linked billing account, its balance and this UTC month's usage and cost for each meter.  |
+|                       | `ListLinkableBillingAccounts` | unary            | List the billing accounts in which the caller is `owner` or `admin` in `delino-accounts`.         |
+|                       | `LinkBillingAccount`          | unary            | Link the organization to a billing account.                                                       |
+|                       | `UnlinkBillingAccount`        | unary            | Remove the billing account link of the organization.                                              |
 
 ### Sandbox state rules
 
@@ -225,6 +231,44 @@ Schema decisions:
 - `Authenticate` returns a `oneof` of the `DeviceSession` (the `osd_` credential and its expiry) and the `RemovalNotice`, and fails with `not_found` for an unknown device; `ConfirmRemoval` also fails with `not_found` for an unknown device. The signed message is the purpose label (`ownsand-authenticate` or `ownsand-confirm-removal`) followed by the nonce.
 - Snapshot parts: `SnapshotPart` has the part number (from 1), the size and the SHA-256. The export result reports the parts, and the import command carries them. The agent asks for part URLs with `signed_url_request` and does not choose object keys: the grant's URLs address the objects of the current export attempt (or of the successful attempt for a download), so the agent needs no attempt ID and the messages did not change.
 
+### Billing
+
+Status: `planned`. The [project index](project-ownsand.md#billing) owns the prices and the enforcement phases, and the [control plane contract](servers-ownsand-api-foundation.md#billing) owns metering and enforcement.
+
+RPC classification: the control plane counts each public RPC that is authenticated and ends with an OK status in its class. Rejected calls are never billed.
+
+| Service               | Class A ($4.50 / million calls)                                                                                                           | Class B ($0.36 / million calls)                                             | Not billed                                                     |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `OrganizationService` | `DeleteOrganization`, `TransferOwnership`                                                                                                 | `GetOrganization`                                                           | `CreateOrganization`, `ListOrganizations` (no organization)    |
+| `MemberService`       | `CreateInvitation`, `RevokeInvitation`, `UpdateMemberRole`, `RemoveMember`                                                                | `ListInvitations`, `ListMembers`                                            | `AcceptInvitation` (no organization in the request)            |
+| `DeviceService`       | `CreateEnrollmentToken`, `RevokeEnrollmentToken`, `ReplaceDeviceLimits`, `UpdateDeviceLimits`, `RemoveDevice`, `UpdateAgentVersionPolicy` | `ListEnrollmentTokens`, `ListDevices`, `GetDevice`, `GetAgentVersionPolicy` |                                                                |
+| `ApiKeyService`       | `CreateApiKey`, `RevokeApiKey`                                                                                                            | `ListApiKeys`                                                               |                                                                |
+| `SandboxService`      | `CreateSandbox`, `DeleteSandbox`, `PauseSandbox`, `ResumeSandbox`                                                                         | `GetSandbox`, `ListSandboxes`                                               |                                                                |
+| `SnapshotService`     | `CreateSnapshot`, `DeleteSnapshot`, `ExportSnapshot`, `CreateTemplate`, `DeleteTemplate`                                                  | `GetSnapshot`, `ListSnapshots`, `ListTemplates`                             |                                                                |
+| `DataPathService`     | `OpenSession`, `AuthorizeRelay`                                                                                                           | `GetIceServers`                                                             |                                                                |
+| `RelayService`        | `Exec`, `AttachExec`, `ReadFile`, `WriteFile` (each call, also each `WriteFile` chunk and each stream continuation)                       |                                                                             |                                                                |
+| `AgentService`        | `Enroll` (authenticated by its enrollment token; billed to the token's organization)                                                      |                                                                             | `CreateChallenge`, `Authenticate`, `ConfirmRemoval`, `Channel` |
+| `RelayAgentService`   |                                                                                                                                           |                                                                             | `Connect`                                                      |
+| `GuestService`        |                                                                                                                                           |                                                                             | every RPC (never reaches the control plane)                    |
+| `BillingService`      |                                                                                                                                           |                                                                             | every RPC                                                      |
+
+- A new public RPC is classified in this table in the change that adds it. The control plane test that covers every generated procedure fails until the RPC is classified.
+- The general rule behind the table: Create, Delete, Update, Replace, Revoke, Remove, Pause, Resume, Export, Transfer, Accept and Enroll calls and the data path starts are Class A; `Get*`, `List*` and `GetIceServers` are Class B; a call without one organization as its billing subject is not billed.
+
+Billing errors:
+
+- A call that billing enforcement rejects fails with the Connect code `resource_exhausted` and an `ErrorDetail` (field `billing_reason`, number 5) with one `BillingReason` value. The project names map to the enum values: `BILLING_ACCOUNT_REQUIRED` is `BILLING_REASON_ACCOUNT_REQUIRED` (blocked, no billing account is linked), `BILLING_BLOCKED` is `BILLING_REASON_BLOCKED` (blocked, the linked billing account has no active subscription or a balance of 0 or less) and `BILLING_SUSPENDED` is `BILLING_REASON_SUSPENDED` (suspended, for every rejected RPC of either list).
+- The message names the reason and includes the link `https://accounts.delino.io`. A billing error has no `retry_after`.
+- Callers must treat a `resource_exhausted` error with a `billing_reason` as terminal and must not retry it. A `resource_exhausted` error without a `billing_reason` keeps its existing meaning (a rate limit or the agent's capacity).
+- Binary protobuf and Connect JSON errors carry the same detail.
+
+`BillingService` messages:
+
+- `GetBillingStatus` returns `OrganizationBilling`: `phase` (`BillingPhase`), `reason` (`BillingReason`, unset while `ALLOWED`), `linked`, `blocked_since` and `suspend_time`.
+- `GetBillingUsage` returns the `billing_account_id`, the `billing_account_name`, `balance_usd_micros` (signed; a negative balance is debt) and, for each `BillingMeter`, the `quantity` and `amount_usd_micros` of the current UTC calendar month. Quantity units: bytes for `RELAY_EGRESS`, byte-seconds for `R2_STORAGE` and calls for `CLASS_A_RPC` and `CLASS_B_RPC`. Amounts are `int64` micro-USD values according to the [billing contract](repository-billing-contract.md).
+- `ListLinkableBillingAccounts` returns the ID, name and role of each billing account in which the caller is `owner` or `admin` in `delino-accounts`.
+- `LinkBillingAccount` takes `organization_id` and `billing_account_id`. `UnlinkBillingAccount` takes `organization_id`.
+
 ### Guest channel
 
 `GuestService` runs inside the guest over the hypervisor socket that the [agent contract](cmds-ownsand-agent-foundation.md#guest-helper) defines. It serves `DataFrame` exec and file requests and a readiness check. It never reaches the control plane.
@@ -235,36 +279,39 @@ Schema decisions:
 
 ### Enums
 
-| Enum                     | Values (without the enum prefix)                                                                                                        |
-| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `Role`                   | `OWNER`, `ADMIN`, `MEMBER`                                                                                                              |
-| `HostOs`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
-| `Arch`                   | `AMD64`, `ARM64`                                                                                                                        |
-| `GuestOs`                | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
-| `BaseImage`              | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
-| `DeviceState`            | `ONLINE`, `OFFLINE`, `REMOVED`                                                                                                          |
-| `SandboxState`           | `CREATING`, `RUNNING`, `PAUSED`, `DELETING`, `DELETED`, `FAILED`, `UNREACHABLE`                                                         |
-| `SandboxEndReason`       | `DELETED_BY_CALLER`, `IDLE_TTL_EXPIRED`, `MAX_TTL_EXPIRED`, `DEVICE_REMOVED`, `ORGANIZATION_DELETED`, `CREATE_FAILED`, `LOST_ON_DEVICE` |
-| `SnapshotState`          | `CREATING`, `READY`, `FAILED`, `DELETING`                                                                                               |
-| `SnapshotExportState`    | `NOT_EXPORTED`, `EXPORTING`, `EXPORTED`, `EXPORT_FAILED`                                                                                |
-| `NetworkMode`            | `OUTBOUND`, `NONE`                                                                                                                      |
-| `AgentVersionPolicyMode` | `FOLLOW_DEFAULT`, `PIN`, `HOLD`                                                                                                         |
-| `PrincipalKind`          | `USER`, `API_KEY`, `DEVICE`, `SYSTEM`                                                                                                   |
-| `AuditTargetKind`        | `ORGANIZATION`, `MEMBERSHIP`, `INVITATION`, `DEVICE`, `ENROLLMENT_TOKEN`, `API_KEY`, `SANDBOX`, `AGENT_VERSION_POLICY`                  |
-| `EnrollmentTokenState`   | `PENDING`, `USED`, `REVOKED`, `EXPIRED`                                                                                                 |
-| `InvitationState`        | `PENDING`, `ACCEPTED`, `REVOKED`, `EXPIRED`                                                                                             |
-| `ApiKeyState`            | `ACTIVE`, `REVOKED`                                                                                                                     |
-| `AgentUpdateState`       | `UP_TO_DATE`, `PENDING_IDLE`, `DOWNLOADING`, `INSTALLING`, `FAILED`, `REVOKED_PENDING_IDLE`                                             |
-| `SessionEndReason`       | `IDLE`, `EXPIRED`, `REVOKED`, `AGENT_CHANNEL_LOST`, `GRANT_INVALID` and `GRANT_REPLACED` (relay only)                                   |
-| `DataPathTransport`      | `PEER_TO_PEER`, `RELAY`                                                                                                                 |
-| `RelayOperationKind`     | `EXEC` (`Exec` and `AttachExec`), `ATTACH_EXEC` (`AttachExec` only, without a digest), `READ_FILE`, `WRITE_FILE`                        |
-| `RelayGrantResult`       | `ACCEPTED`, `REJECTED_GRANT_LIMIT`                                                                                                      |
-| `DataFrameKind`          | One value per payload in [data path framing](#data-path-framing)                                                                        |
-| `AuditAction`            | The values in the [control plane audit table](servers-ownsand-api-foundation.md#audit-events)                                           |
-| `SandboxRestorePath`     | `BASE_IMAGE`, `DISK_COLD_BOOT`, `MEMORY_STATE`                                                                                          |
-| `ExecFailureReason`      | `PROGRAM_NOT_FOUND`, `PERMISSION_DENIED`, `WORKING_DIRECTORY_INVALID`, `RESOURCE_EXHAUSTED`, `OTHER`                                    |
-| `ErrorCode`              | The Connect error codes, with the same numbers (`CANCELED` = 1 to `UNAUTHENTICATED` = 16)                                               |
-| `SignedUrlOperation`     | `UPLOAD`, `DOWNLOAD`                                                                                                                    |
+| Enum                        | Values (without the enum prefix)                                                                                                        |
+| --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `Role`                      | `OWNER`, `ADMIN`, `MEMBER`                                                                                                              |
+| `HostOs`                    | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `Arch`                      | `AMD64`, `ARM64`                                                                                                                        |
+| `GuestOs`                   | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `BaseImage`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `DeviceState`               | `ONLINE`, `OFFLINE`, `REMOVED`                                                                                                          |
+| `SandboxState`              | `CREATING`, `RUNNING`, `PAUSED`, `DELETING`, `DELETED`, `FAILED`, `UNREACHABLE`                                                         |
+| `SandboxEndReason`          | `DELETED_BY_CALLER`, `IDLE_TTL_EXPIRED`, `MAX_TTL_EXPIRED`, `DEVICE_REMOVED`, `ORGANIZATION_DELETED`, `CREATE_FAILED`, `LOST_ON_DEVICE` |
+| `SnapshotState`             | `CREATING`, `READY`, `FAILED`, `DELETING`                                                                                               |
+| `SnapshotExportState`       | `NOT_EXPORTED`, `EXPORTING`, `EXPORTED`, `EXPORT_FAILED`                                                                                |
+| `NetworkMode`               | `OUTBOUND`, `NONE`                                                                                                                      |
+| `AgentVersionPolicyMode`    | `FOLLOW_DEFAULT`, `PIN`, `HOLD`                                                                                                         |
+| `PrincipalKind`             | `USER`, `API_KEY`, `DEVICE`, `SYSTEM`                                                                                                   |
+| `AuditTargetKind`           | `ORGANIZATION`, `MEMBERSHIP`, `INVITATION`, `DEVICE`, `ENROLLMENT_TOKEN`, `API_KEY`, `SANDBOX`, `AGENT_VERSION_POLICY`                  |
+| `EnrollmentTokenState`      | `PENDING`, `USED`, `REVOKED`, `EXPIRED`                                                                                                 |
+| `InvitationState`           | `PENDING`, `ACCEPTED`, `REVOKED`, `EXPIRED`                                                                                             |
+| `ApiKeyState`               | `ACTIVE`, `REVOKED`                                                                                                                     |
+| `AgentUpdateState`          | `UP_TO_DATE`, `PENDING_IDLE`, `DOWNLOADING`, `INSTALLING`, `FAILED`, `REVOKED_PENDING_IDLE`                                             |
+| `SessionEndReason`          | `IDLE`, `EXPIRED`, `REVOKED`, `AGENT_CHANNEL_LOST`, `GRANT_INVALID` and `GRANT_REPLACED` (relay only)                                   |
+| `DataPathTransport`         | `PEER_TO_PEER`, `RELAY`                                                                                                                 |
+| `RelayOperationKind`        | `EXEC` (`Exec` and `AttachExec`), `ATTACH_EXEC` (`AttachExec` only, without a digest), `READ_FILE`, `WRITE_FILE`                        |
+| `RelayGrantResult`          | `ACCEPTED`, `REJECTED_GRANT_LIMIT`                                                                                                      |
+| `DataFrameKind`             | One value per payload in [data path framing](#data-path-framing)                                                                        |
+| `AuditAction`               | The values in the [control plane audit table](servers-ownsand-api-foundation.md#audit-events)                                           |
+| `SandboxRestorePath`        | `BASE_IMAGE`, `DISK_COLD_BOOT`, `MEMORY_STATE`                                                                                          |
+| `ExecFailureReason`         | `PROGRAM_NOT_FOUND`, `PERMISSION_DENIED`, `WORKING_DIRECTORY_INVALID`, `RESOURCE_EXHAUSTED`, `OTHER`                                    |
+| `ErrorCode`                 | The Connect error codes, with the same numbers (`CANCELED` = 1 to `UNAUTHENTICATED` = 16)                                               |
+| `SignedUrlOperation`        | `UPLOAD`, `DOWNLOAD`                                                                                                                    |
+| `BillingReason` (`planned`) | `ACCOUNT_REQUIRED`, `BLOCKED`, `SUSPENDED`                                                                                              |
+| `BillingPhase` (`planned`)  | `ALLOWED`, `BLOCKED`, `SUSPENDED`                                                                                                       |
+| `BillingMeter` (`planned`)  | `RELAY_EGRESS`, `R2_STORAGE`, `CLASS_A_RPC`, `CLASS_B_RPC`                                                                              |
 
 A sandbox that is `UNREACHABLE` also reports its last known state in `last_known_state`. `DELETED` and `FAILED` sandboxes report a `SandboxEndReason`. `LOST_ON_DEVICE` means that the sandbox's VM or its record no longer exists on the device, for example after a host reboot.
 
@@ -301,6 +348,7 @@ The schemas define no logging. Components log RPC names, identifiers, enum value
 
 - Update the control plane, agent, CLI, console and SDK contracts when an RPC, message or enum that they use changes.
 - Update [project-ownsand.md](project-ownsand.md) when the package version, the transport rule or the data path changes.
+- Update the [Billing](#billing) classification, the [project index](project-ownsand.md#billing) and the [control plane contract](servers-ownsand-api-foundation.md#billing) with every new public RPC and every billing reason change.
 - Update `protos/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
 ## References
@@ -308,4 +356,5 @@ The schemas define no logging. Components log RPC names, identifiers, enum value
 - [project-ownsand.md](project-ownsand.md)
 - [repository-defaults.md](repository-defaults.md)
 - [repository-dependency-security-contract.md](repository-dependency-security-contract.md)
+- [repository-billing-contract.md](repository-billing-contract.md)
 - [Connect protocol](https://connectrpc.com/docs/protocol)
