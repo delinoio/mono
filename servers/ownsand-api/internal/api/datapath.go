@@ -64,6 +64,29 @@ type DataPlane struct {
 	mu          sync.Mutex
 	sessions    map[string]*session
 	revocations map[string]revocation
+	// grantSender replaces the agent channel enqueue of a relay grant; nil
+	// uses hub.Conn.Send. Tests set it to inject an enqueue failure on a live
+	// channel, which a running channel produces only when the outbound queue
+	// is full and the caller's context ends.
+	grantSender func(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error
+}
+
+// SetGrantSender replaces how AuthorizeRelay enqueues a relay grant for the
+// agent (tests only); nil restores hub.Conn.Send.
+func (p *DataPlane) SetGrantSender(fn func(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.grantSender = fn
+}
+
+func (p *DataPlane) sendGrant(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error {
+	p.mu.Lock()
+	fn := p.grantSender
+	p.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, conn, env)
+	}
+	return conn.Send(ctx, env)
 }
 
 // RelayTiming holds the relay stream durations; tests shorten them.
@@ -348,6 +371,22 @@ func errorFromDetail(d *ownsandv1.ErrorDetail) error {
 	return e
 }
 
+// enqueueErrorCategory names why queueing a message for the agent failed, for
+// logs: the channel closed, or the caller's context ended before the queue
+// accepted it.
+func enqueueErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, hub.ErrChannelClosed):
+		return "channel_closed"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline_exceeded"
+	default:
+		return "other"
+	}
+}
+
 func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Request[ownsandv1.AuthorizeRelayRequest]) (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
 	m := req.Msg
 	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes)
@@ -419,7 +458,15 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 		if g.Replaces != "" {
 			msg.ReplacesGrantId = &g.Replaces
 		}
-		if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrant{RelayGrant: msg}}); err != nil {
+		if err := h.sendGrant(ctx, conn, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrant{RelayGrant: msg}}); err != nil {
+			// The grant never entered the outbound queue, so the agent cannot
+			// acknowledge it. Release the exact reservation (and the
+			// predecessor's pending-successor link) before the caller sees the
+			// failure; a grant that was queued is never removed here.
+			removed := h.Grants.RemoveUndelivered(g.ID)
+			h.S.Logger.WarnContext(ctx, "relay_grant_enqueue_failed", slog.String("grant_id", g.ID), slog.String("sandbox_id", g.SandboxID),
+				slog.String("operation_kind", g.Kind.String()), slog.Bool("replacement", g.Replaces != ""),
+				slog.String("error_category", enqueueErrorCategory(err)), slog.Bool("reservation_removed", removed))
 			return nil, errUnavailable("the agent channel closed")
 		}
 	}
@@ -438,6 +485,10 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	case grants.OutcomeAccepted:
 	case grants.OutcomeRejectedLimit:
 		return nil, errRateLimited(time.Second)
+	case grants.OutcomeDeliveryFailed:
+		// Another call of the same authorization_id failed to queue the grant;
+		// the reservation is gone, so a retry sends it again.
+		return nil, errUnavailable("the relay grant could not be delivered to the agent")
 	default:
 		// The pending grant was removed without an acknowledgement (the agent
 		// channel closed, a revocation, a release or the expiry): not a

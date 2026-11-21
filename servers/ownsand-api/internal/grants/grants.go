@@ -54,6 +54,9 @@ const (
 	// the agent released it, a revocation matched it, it stopped being
 	// admittable, or the agent sent another non-accepting result.
 	OutcomeRemoved
+	// OutcomeDeliveryFailed: the lease holder could not queue the grant for
+	// the agent (RemoveUndelivered), so the agent never saw it.
+	OutcomeDeliveryFailed
 )
 
 // Request is an AuthorizeRelay after authorization.
@@ -278,6 +281,29 @@ func (r *Registry) Ack(grantID string, result ownsandv1.RelayGrantResult, replac
 	}
 	g.Replaces = ""
 	close(g.done)
+}
+
+// RemoveUndelivered removes the pending grant grantID after the lease holder
+// failed to queue it for the agent, so a retry with the same authorization ID
+// reserves and sends again. It records OutcomeDeliveryFailed before it wakes
+// the waiters of the grant. A replacement leaves its predecessor installed and
+// frees the predecessor's pending-successor link. It reports false and changes
+// nothing when the grant is gone or no longer pending: a grant that the agent
+// acknowledged stays installed.
+func (r *Registry) RemoveUndelivered(grantID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g := r.byID[grantID]
+	if g == nil || g.State != Pending {
+		return false
+	}
+	select {
+	case <-g.done:
+		return false
+	default:
+	}
+	r.removeLocked(grantID, OutcomeDeliveryFailed)
+	return true
 }
 
 // Release removes a grant that the agent released.
