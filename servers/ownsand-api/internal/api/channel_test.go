@@ -4,8 +4,11 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,9 +17,11 @@ import (
 
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -265,6 +270,94 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 	if audits != 1 {
 		t.Fatalf("system audit events for B = %d", audits)
 	}
+	if n := env.App.Service.WatcherCount(); n != 0 {
+		t.Fatalf("watchers after the offline delete = %d", n)
+	}
+}
+
+// TestOfflineDeleteLeavesNoWatchers checks that DeleteSandbox on an offline
+// device, which waits through at least one poll, leaves no sandbox watch
+// registration behind and keeps the pending delete.
+func TestOfflineDeleteLeavesNoWatchers(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 1500 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	_, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, _ := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	id := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	agent.Close()
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE)
+	for i := 0; i < 3; i++ {
+		start := time.Now()
+		del, err := c.Sandbox.DeleteSandbox(ctx, connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: id}))
+		if err != nil || del.Msg.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE {
+			t.Fatalf("delete %d: %v %v", i, del, err)
+		}
+		if time.Since(start) < time.Second {
+			t.Fatalf("delete %d returned before a poll: %v", i, time.Since(start))
+		}
+		if n := env.App.Service.WatcherCount(); n != 0 {
+			t.Fatalf("watchers after delete %d = %d", i, n)
+		}
+	}
+	var pending bool
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT delete_pending FROM sandboxes WHERE sandbox_id = $1", id).Scan(&pending); err != nil || !pending {
+		t.Fatalf("delete_pending = %v, %v", pending, err)
+	}
+}
+
+// TestWaitSandboxCancelledWaiterLeavesOtherWaiter checks that cancelling one
+// waiter unregisters it and that a terminal update still wakes the other.
+func TestWaitSandboxCancelledWaiterLeavesOtherWaiter(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 20 * time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	_, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, _ := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	id := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	// The agent never answers the delete, so both calls wait.
+	agent.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		if cmd.GetDeleteSandbox() != nil {
+			return nil
+		}
+		return fa.DefaultAnswer(cmd)
+	})
+	req := func() *connect.Request[ownsandv1.DeleteSandboxRequest] {
+		return connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: id})
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() { _, err := c.Sandbox.DeleteSandbox(cancelCtx, req()); firstDone <- err }()
+	type result struct {
+		resp *connect.Response[ownsandv1.DeleteSandboxResponse]
+		err  error
+	}
+	secondDone := make(chan result, 1)
+	go func() { r, err := c.Sandbox.DeleteSandbox(ctx, req()); secondDone <- result{r, err} }()
+	testenv.Eventually(t, "two watchers", func() bool { return env.App.Service.WatcherCount() == 2 })
+	cancel()
+	if err := <-firstDone; err == nil {
+		t.Fatal("cancelled delete succeeded")
+	}
+	testenv.Eventually(t, "one watcher", func() bool { return env.App.Service.WatcherCount() == 1 })
+	deleted := agent.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
+	agent.SendUpdate(deleted)
+	select {
+	case r := <-secondDone:
+		if r.err != nil || r.resp.Msg.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("second delete: %v %v", r.resp, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second waiter was not woken")
+	}
+	testenv.Eventually(t, "no watchers", func() bool { return env.App.Service.WatcherCount() == 0 })
 }
 
 func TestRevisionRuleAndAbsorbingStates(t *testing.T) {
@@ -811,14 +904,257 @@ func TestChannelNeedsLease(t *testing.T) {
 	if err != nil || held {
 		t.Fatalf("second instance lease: %v %v", held, err)
 	}
-	// The API key of the device's own organization and a device credential
-	// for another RPC are rejected on the channel.
-	stream := env.Clients(org.APIKey).Agent.Channel(context.Background())
-	_ = stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
-	if _, err := stream.Receive(); testenv.Code(err) != connect.CodePermissionDenied {
+	secondServer := httptest.NewUnstartedServer(second.Handler())
+	secondServer.EnableHTTP2 = true
+	secondServer.StartTLS()
+	t.Cleanup(secondServer.Close)
+	secondInstance := &instance{app: second, server: secondServer}
+	cred := env.SessionCredential(dev)
+
+	// A valid device stream to the instance without the lease ends
+	// unavailable before any configuration arrives.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream := secondInstance.channel(ctx, cred)
+	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
+		t.Fatal(err)
+	}
+	if r := awaitReceive(t, "the refusal", receive(stream)); testenv.Code(r.err) != connect.CodeUnavailable || r.msg != nil {
+		t.Fatalf("device stream on the instance without the lease: %v %v", r.msg, r.err)
+	}
+
+	// Control: the same credential on the lease holder receives the
+	// configuration.
+	holder := (&instance{app: env.App, server: env.Server}).channel(ctx, cred)
+	if err := holder.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := awaitReceive(t, "the configuration from the holder", receive(holder))
+	if cfg.err != nil || cfg.msg.GetEnvelope().GetConfiguration() == nil {
+		t.Fatalf("first message from the lease holder: %v %v", cfg.msg, cfg.err)
+	}
+
+	// The API key of the device's own organization is rejected on the
+	// channel of the lease holder.
+	keyStream := env.Clients(org.APIKey).Agent.Channel(context.Background())
+	_ = keyStream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	if _, err := keyStream.Receive(); testenv.Code(err) != connect.CodePermissionDenied {
 		t.Fatalf("api key on the channel: %v", err)
 	}
-	_ = dev
+}
+
+// gateLease is a LeaseHolder test double with the ownership semantics of
+// the real lease: WhileHeld holds the ownership lock while fn runs and the
+// loss transition takes the same lock before it closes the channels. The
+// gate pauses an admission before it reaches the lock.
+type gateLease struct {
+	mu   sync.Mutex
+	held bool
+	hub  interface{ CloseAll(error) }
+
+	// entered receives once when an admission reaches the gate; the
+	// admission continues after proceed is closed.
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (g *gateLease) Held() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.held
+}
+
+func (g *gateLease) WhileHeld(fn func()) bool {
+	if g.entered != nil {
+		g.entered <- struct{}{}
+		<-g.proceed
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.held {
+		return false
+	}
+	fn()
+	return true
+}
+
+// lose clears ownership under the lock and then closes every channel, like
+// Lease.set(false) followed by OnLose.
+func (g *gateLease) lose() {
+	g.mu.Lock()
+	g.held = false
+	g.mu.Unlock()
+	g.hub.CloseAll(errors.New("lease lost"))
+}
+
+// alwaysHeld is the lease of a successor instance that holds the lease.
+type alwaysHeld struct{}
+
+func (alwaysHeld) Held() bool { return true }
+
+func (alwaysHeld) WhileHeld(fn func()) bool {
+	fn()
+	return true
+}
+
+// instance is a second control plane instance on the database of env. It is
+// not run (no lease loop, no workers); lease replaces its lease.
+type instance struct {
+	app    *app.App
+	server *httptest.Server
+}
+
+func newInstance(t *testing.T, env *testenv.Env, lease api.LeaseHolder) *instance {
+	t.Helper()
+	a, err := app.New(app.Options{DB: env.DB, Logger: env.Logger, Now: env.Clock.Now, STUNURLs: []string{"stun:127.0.0.1:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, ok := lease.(*gateLease); ok {
+		g.hub = a.Service.Hub
+	}
+	a.Service.Lease = lease
+	srv := httptest.NewUnstartedServer(a.Handler())
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return &instance{app: a, server: srv}
+}
+
+// channel opens the agent channel of the device on the instance.
+func (i *instance) channel(ctx context.Context, cred string) *connect.BidiStreamForClient[ownsandv1.ChannelRequest, ownsandv1.ChannelResponse] {
+	client := ownsandv1connect.NewAgentServiceClient(i.server.Client(), i.server.URL)
+	stream := client.Channel(ctx)
+	stream.RequestHeader().Set("Authorization", "Bearer "+cred)
+	return stream
+}
+
+type receiveResult struct {
+	msg *ownsandv1.ChannelResponse
+	err error
+}
+
+// receive reads the next message in the background so a test can time out.
+func receive(stream *connect.BidiStreamForClient[ownsandv1.ChannelRequest, ownsandv1.ChannelResponse]) <-chan receiveResult {
+	out := make(chan receiveResult, 1)
+	go func() {
+		msg, err := stream.Receive()
+		out <- receiveResult{msg, err}
+	}()
+	return out
+}
+
+func awaitReceive(t *testing.T, what string, ch <-chan receiveResult) receiveResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		return receiveResult{}
+	}
+}
+
+// TestChannelAdmissionAfterLeaseLoss checks that an admission that passed
+// the pre-lock stage after ownership was cleared and the channels were
+// closed is answered unavailable, sends no configuration and leaves the hub
+// unchanged.
+func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	cred := env.SessionCredential(dev)
+
+	gate := &gateLease{held: true, entered: make(chan struct{}, 1), proceed: make(chan struct{})}
+	former := newInstance(t, env, gate)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := former.channel(ctx, cred)
+	_ = stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	first := receive(stream)
+
+	// The admission is paused at the ownership step; the instance loses the
+	// lease and finishes its loss transition meanwhile.
+	select {
+	case <-gate.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the admission did not reach the ownership step")
+	}
+	gate.lose()
+	close(gate.proceed)
+
+	r := awaitReceive(t, "the admission result", first)
+	if r.err == nil {
+		t.Fatalf("the former holder admitted the channel and sent %v", r.msg)
+	}
+	if testenv.Code(r.err) != connect.CodeUnavailable {
+		t.Fatalf("admission after lease loss: %v", r.err)
+	}
+	if former.app.Service.Hub.Get(dev.ID) != nil || len(former.app.Service.Hub.All()) != 0 {
+		t.Fatal("the hub holds a channel that was admitted after lease loss")
+	}
+}
+
+// TestChannelRegisteredBeforeLeaseLossCloses checks that a channel that is
+// registered when the real lease is lost closes during the loss transition,
+// and that the device then connects to the successor and gets its
+// configuration and heartbeat acknowledgements.
+func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	if err := env.App.Lease.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	agent := env.NewFakeAgent(dev)
+	agent.Connect()
+	conn := env.App.Service.Hub.Get(dev.ID)
+	if conn == nil {
+		t.Fatal("the holder has no channel for the device")
+	}
+
+	// The holder releases the lease, for example when it starts to drain.
+	env.App.Lease.Release()
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the channel stayed open after the lease was lost")
+	}
+	select {
+	case <-agent.Closed():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent did not see the channel close")
+	}
+	// A new admission to the former holder is refused.
+	late := env.Clients(env.SessionCredential(dev)).Agent.Channel(context.Background())
+	_ = late.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	if _, err := late.Receive(); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("admission to the former holder: %v", err)
+	}
+
+	// The successor holds the lease: the device reconnects there.
+	successor := newInstance(t, env, alwaysHeld{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := successor.channel(ctx, env.SessionCredential(dev))
+	// The client request starts with its first message.
+	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := awaitReceive(t, "the configuration", receive(stream))
+	if cfg.err != nil || cfg.msg.GetEnvelope().GetConfiguration() == nil {
+		t.Fatalf("first message from the successor: %v %v", cfg.msg, cfg.err)
+	}
+	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{
+		Sequence: 7, UpdateState: ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE,
+	}}}}); err != nil {
+		t.Fatal(err)
+	}
+	ack := awaitReceive(t, "the heartbeat acknowledgement", receive(stream))
+	if ack.err != nil || ack.msg.GetEnvelope().GetHeartbeatAck().GetSequence() != 7 {
+		t.Fatalf("heartbeat acknowledgement from the successor: %v %v", ack.msg, ack.err)
+	}
 }
 
 // importFixture exports a snapshot from device A and returns a second
@@ -946,4 +1282,49 @@ func TestImportBeforeWaitExpiryCreates(t *testing.T) {
 	agentB.WaitFor("create after import", func(e *ownsandv1.AgentEnvelope) bool {
 		return e.GetCommand().GetCreateSandbox().GetSandboxId() == created.Msg.GetSandbox().GetSandboxId()
 	})
+}
+
+// offsetClock is the real clock plus an offset that a test moves forward.
+type offsetClock struct{ offset atomic.Int64 }
+
+func (c *offsetClock) Now() time.Time { return time.Now().Add(time.Duration(c.offset.Load())) }
+
+func (c *offsetClock) Advance(d time.Duration) { c.offset.Add(int64(d)) }
+
+// TestChannelClosesAtLeaseExpiry checks that a holder that cannot confirm a
+// renewal stops serving at the confirmed expiry: the connected agent channel
+// closes, the instance no longer holds the lease and a new admission is
+// refused. The test moves the local lease deadline clock past the TTL; the
+// next scheduled renewal is 10 seconds away, so nothing renews in between.
+func TestChannelClosesAtLeaseExpiry(t *testing.T) {
+	clock := &offsetClock{}
+	env := testenv.New(t, func(o *app.Options) { o.LeaseDeadlineNow = clock.Now })
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	agent := env.NewFakeAgent(dev)
+	agent.Connect()
+	conn := env.App.Service.Hub.Get(dev.ID)
+	if conn == nil {
+		t.Fatal("the holder has no channel for the device")
+	}
+
+	clock.Advance(lease.TTL)
+	if env.App.Lease.Held() {
+		t.Fatal("the instance holds the lease at the confirmed expiry")
+	}
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the channel stayed open after the lease expired")
+	}
+	select {
+	case <-agent.Closed():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent did not see the channel close")
+	}
+	late := env.Clients(env.SessionCredential(dev)).Agent.Channel(context.Background())
+	_ = late.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	if _, err := late.Receive(); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("admission after the lease expired: %v", err)
+	}
 }

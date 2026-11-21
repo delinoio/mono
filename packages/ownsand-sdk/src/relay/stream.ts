@@ -21,16 +21,29 @@ export interface CallOptions {
   headers: Record<string, string>;
 }
 
-function linkedController(signal: AbortSignal | undefined): AbortController {
+/**
+ * Creates a controller that aborts with the caller signal's reason. The
+ * caller must call `dispose` when the call ends; otherwise the abort listener
+ * stays on a long-lived caller signal for every call.
+ */
+export function linkedController(signal: AbortSignal | undefined): {
+  controller: AbortController;
+  dispose: () => void;
+} {
   const controller = new AbortController();
-  if (signal?.aborted) {
-    controller.abort(signal.reason);
-  } else {
-    signal?.addEventListener("abort", () => controller.abort(signal.reason), {
-      once: true,
-    });
+  if (!signal) {
+    return { controller, dispose: () => {} };
   }
-  return controller;
+  if (signal.aborted) {
+    controller.abort(signal.reason);
+    return { controller, dispose: () => {} };
+  }
+  const onAbort = () => controller.abort(signal.reason);
+  signal.addEventListener("abort", onAbort, { once: true });
+  return {
+    controller,
+    dispose: () => signal.removeEventListener("abort", onAbort),
+  };
 }
 
 /**
@@ -45,7 +58,7 @@ export async function* watchedRelayStream<T>(
   open: (options: CallOptions) => AsyncIterable<T>,
 ): AsyncGenerator<T> {
   const clock = ctx.clock;
-  const call = linkedController(callerSignal);
+  const { controller: call, dispose: unlink } = linkedController(callerSignal);
   const stopWatch = new AbortController();
   let lastActivity = clock.now();
   let holding = false;
@@ -100,6 +113,7 @@ export async function* watchedRelayStream<T>(
     registration.dispose();
     call.abort(new OwnSandError("relay stream closed"));
     await watcher;
+    unlink();
   }
 }
 
@@ -111,7 +125,7 @@ export async function relayCallWithDeadline<T>(
   deadlineMs: number,
   call: (options: CallOptions) => Promise<T>,
 ): Promise<T> {
-  const controller = linkedController(callerSignal);
+  const { controller, dispose: unlink } = linkedController(callerSignal);
   const stopTimer = new AbortController();
   let deadlinePassed = false;
   const timer = ctx.clock
@@ -136,5 +150,6 @@ export async function relayCallWithDeadline<T>(
   } finally {
     stopTimer.abort();
     await timer;
+    unlink();
   }
 }

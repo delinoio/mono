@@ -7,10 +7,12 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -407,6 +409,92 @@ func TestWriteFile(t *testing.T) {
 	}
 }
 
+func TestWireToFileMode(t *testing.T) {
+	cases := []struct {
+		wire uint32
+		want fs.FileMode
+	}{
+		{0, 0o644},
+		{0o170000, 0o644}, // bits above 0o7777 are masked, leaving 0
+		{0o600, 0o600},
+		{0o755, 0o755},
+		{0o4755, 0o755 | fs.ModeSetuid},
+		{0o2755, 0o755 | fs.ModeSetgid},
+		{0o1755, 0o755 | fs.ModeSticky},
+		{0o7777, 0o777 | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky},
+		{0o4000, fs.ModeSetuid},
+	}
+	for _, c := range cases {
+		if got := wireToFileMode(c.wire); got != c.want {
+			t.Errorf("wireToFileMode(%#o) = %v, want %v", c.wire, got, c.want)
+		}
+	}
+}
+
+func TestWriteSpecialModeBits(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file modes are ignored on Windows guests")
+	}
+	cases := []struct {
+		name string
+		mode uint32
+		want fs.FileMode
+	}{
+		{"setuid", 0o4755, 0o755 | fs.ModeSetuid},
+		{"setgid", 0o2755, 0o755 | fs.ModeSetgid},
+		{"sticky", 0o1755, 0o755 | fs.ModeSticky},
+		{"plain", 0o755, 0o755},
+		{"private", 0o600, 0o600},
+		{"default", 0, 0o644},
+	}
+	const special = fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			// The OS may drop a special bit (setgid without group membership,
+			// sticky on some systems, nosuid mounts). Skip when a control chmod
+			// of the same bits on a scratch file does not stick.
+			control := filepath.Join(t.TempDir(), "control")
+			if err := os.WriteFile(control, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(control, c.want); err != nil {
+				t.Skipf("control chmod: %v", err)
+			}
+			if st, err := os.Stat(control); err != nil || st.Mode()&(special|fs.ModePerm) != c.want {
+				t.Skipf("OS does not keep mode %v on a control file", c.want)
+			}
+			h := newHarness(t, nil)
+			target := filepath.Join(t.TempDir(), "out.bin")
+			id := newID(t)
+			req := &ownsandv1.WriteFileRequest{
+				SandboxId: testSandbox, WriteId: id, Path: target, BindingSalt: make([]byte, 32),
+				Data:   []byte("x"),
+				Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1, Mode: c.mode},
+			}
+			if resp, errd := h.write(req); errd != nil || !resp.GetFinished() {
+				t.Fatalf("finish %v %v", resp, errd)
+			}
+			st, err := os.Stat(target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := st.Mode() & (special | fs.ModePerm); got != c.want {
+				t.Fatalf("mode %v, want %v", got, c.want)
+			}
+			// A repeated finish returns the stored result without touching the file.
+			if err := os.Chmod(target, 0o640); err != nil {
+				t.Fatal(err)
+			}
+			if _, errd := h.write(req); errd != nil {
+				t.Fatalf("repeated finish: %v", errd)
+			}
+			if st, _ := os.Stat(target); st.Mode()&(special|fs.ModePerm) != 0o640 {
+				t.Fatalf("repeated finish changed the mode to %v", st.Mode())
+			}
+		})
+	}
+}
+
 func TestWriteEmptyFileAndErrors(t *testing.T) {
 	h := newHarness(t, nil)
 	dir := t.TempDir()
@@ -672,5 +760,116 @@ func TestReadCopyEmptyFileAndSizeChange(t *testing.T) {
 	h.srv.reads.copyHook = func() { os.WriteFile(empty, []byte("grown"), 0o644) }
 	if _, _, errd := h.readAll(readReq(t, empty)); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
 		t.Fatalf("empty file that grew: %v", errd)
+	}
+}
+
+// writeLongName writes a small file whose name has nameLen bytes and checks
+// the staging behavior around the finish.
+func writeLongName(t *testing.T, h *harness, dir string, nameLen int) {
+	t.Helper()
+	target := filepath.Join(dir, strings.Repeat("a", nameLen))
+	id := newID(t)
+	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: id, Path: target, BindingSalt: make([]byte, 32), Data: []byte("hello")}
+	if _, errd := h.write(req); errd != nil {
+		t.Fatalf("%d-byte name, first chunk: %v", nameLen, errd)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("%d-byte name: target exists before finish", nameLen)
+	}
+	if _, err := os.Stat(tempPath(target, id)); err != nil {
+		t.Fatalf("%d-byte name: temporary file missing: %v", nameLen, err)
+	}
+	req.Data = nil
+	req.Finish = &ownsandv1.WriteFileFinish{SizeBytes: 5}
+	req.Offset = 5
+	if _, errd := h.write(req); errd != nil {
+		t.Fatalf("%d-byte name, finish: %v", nameLen, errd)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "hello" {
+		t.Fatalf("%d-byte name: target %q %v", nameLen, got, err)
+	}
+	if _, err := os.Stat(tempPath(target, id)); !os.IsNotExist(err) {
+		t.Fatalf("%d-byte name: temporary file left", nameLen)
+	}
+}
+
+func TestWriteLongTargetNames(t *testing.T) {
+	h := newHarness(t, nil)
+	dir := t.TempDir()
+	for _, n := range []int{205, 206, 255} {
+		writeLongName(t, h, dir, n)
+	}
+}
+
+func TestWriteTempNameNeverEqualsTarget(t *testing.T) {
+	h := newHarness(t, nil)
+	dir := t.TempDir()
+	id := newID(t)
+	target := filepath.Join(dir, ".ownsand-"+id+".tmp")
+	if tempPath(target, id) == target {
+		t.Fatal("temporary path equals target")
+	}
+	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: id, Path: target, BindingSalt: make([]byte, 32), Data: []byte("new")}
+	if _, errd := h.write(req); errd != nil {
+		t.Fatal(errd)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "old" {
+		t.Fatalf("target changed before finish: %q", got)
+	}
+	req.Data, req.Offset = nil, 3
+	req.Finish = &ownsandv1.WriteFileFinish{SizeBytes: 3}
+	for i := 0; i < 2; i++ { // the repeated finish returns the same result
+		if _, errd := h.write(req); errd != nil {
+			t.Fatalf("finish %d: %v", i, errd)
+		}
+	}
+	if got, _ := os.ReadFile(target); string(got) != "new" {
+		t.Fatalf("target after finish: %q", got)
+	}
+}
+
+// On a case-insensitive file system, a target that differs from the
+// temporary name only in letter case names the same file, so the temporary
+// name must differ from the target name under case folding too.
+func TestWriteTempNameDiffersFromTargetUnderCaseFolding(t *testing.T) {
+	dir := t.TempDir()
+	id := newID(t)
+	for _, base := range []string{
+		".ownsand-" + id + ".tmp",
+		strings.ToUpper(".ownsand-" + id + ".tmp"),
+		".OwnSand-" + id + ".Tmp",
+	} {
+		target := filepath.Join(dir, base)
+		if got := filepath.Base(tempPath(target, id)); strings.EqualFold(got, base) {
+			t.Fatalf("temporary name %q equals target name %q under case folding", got, base)
+		}
+	}
+}
+
+func TestWriteLongWriteIDIsBounded(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "f")
+	long := strings.Repeat("x", 1000)
+	if n := len(filepath.Base(tempPath(target, long))); n > 255 {
+		t.Fatalf("temporary name has %d bytes", n)
+	}
+}
+
+func TestWriteExpiryOfLongTargetRemovesTemporaryFile(t *testing.T) {
+	h := newHarness(t, nil)
+	target := filepath.Join(t.TempDir(), strings.Repeat("b", 255))
+	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("partial")}
+	if _, errd := h.write(req); errd != nil {
+		t.Fatal(errd)
+	}
+	h.clock.Advance(16 * time.Minute)
+	h.srv.Sweep()
+	if _, err := os.Stat(tempPath(target, req.GetWriteId())); !os.IsNotExist(err) {
+		t.Fatal("temporary file kept after expiry")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatal("target exists after expiry")
 	}
 }

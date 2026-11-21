@@ -8,7 +8,10 @@ import {
   FrameDecoder,
   MAX_DATA_CHANNEL_MESSAGE_SIZE,
   MAX_FRAME_SIZE,
+  MalformedFrameError,
   payloadKind,
+  UnknownKindError,
+  validateFrame,
 } from "./codec.ts";
 import {
   DataFrameKind,
@@ -98,5 +101,115 @@ describe("data channel codec", () => {
     expect(() => decoder.push(Uint8Array.from([2, 0xff, 0xff]))).toThrow(
       FrameCodecError,
     );
+  });
+});
+
+describe("validateFrame", () => {
+  const SANDBOX = "0192f4b6-7c3a-7def-8abc-0123456789ab";
+  const exec = {
+    case: "execEvent" as const,
+    value: { event: { case: "keepalive" as const, value: {} } },
+  };
+  const keepalive = { case: "relayKeepalive" as const, value: {} };
+  const frame = (init: Parameters<typeof create<typeof DataFrameSchema>>[1]) =>
+    create(DataFrameSchema, init);
+
+  test("accepts valid frames", () => {
+    expect(
+      validateFrame(
+        frame({
+          streamId: 1n,
+          sandboxId: SANDBOX,
+          kind: DataFrameKind.EXEC_EVENT,
+          payload: exec,
+        }),
+      ),
+    ).toBeUndefined();
+    expect(validateFrame(chunkFrame(2n, 1))).toBeUndefined();
+    expect(
+      validateFrame(
+        frame({
+          streamId: 0n,
+          kind: DataFrameKind.RELAY_KEEPALIVE,
+          payload: keepalive,
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
+  test("rejects an unspecified kind as malformed", () => {
+    const err = validateFrame(frame({ streamId: 1n, payload: exec }));
+    expect(err).toBeInstanceOf(MalformedFrameError);
+    expect(err!.message).toContain("unspecified");
+  });
+
+  test("reports a kind of a newer schema as unknown", () => {
+    const err = validateFrame(
+      frame({ streamId: 3n, kind: 99 as DataFrameKind, payload: exec }),
+    );
+    expect(err).toBeInstanceOf(UnknownKindError);
+    expect((err as UnknownKindError).kind).toBe(99);
+    expect((err as UnknownKindError).streamId).toBe(3n);
+    // The first kind above the known range is unknown, the last known one is not.
+    expect(
+      validateFrame(
+        frame({
+          streamId: 1n,
+          kind: (DataFrameKind.ERROR + 1) as DataFrameKind,
+        }),
+      ),
+    ).toBeInstanceOf(UnknownKindError);
+    expect(
+      validateFrame(
+        frame({
+          streamId: 1n,
+          kind: -1 as DataFrameKind,
+        }),
+      ),
+    ).toBeInstanceOf(UnknownKindError);
+  });
+
+  test("rejects a kind that does not match its payload", () => {
+    const err = validateFrame(
+      frame({ streamId: 1n, kind: DataFrameKind.ERROR, payload: exec }),
+    );
+    expect(err).toBeInstanceOf(MalformedFrameError);
+    expect(err!.message).toContain("EXEC_EVENT");
+    expect(
+      validateFrame(frame({ streamId: 1n, kind: DataFrameKind.EXEC_EVENT })),
+    ).toBeInstanceOf(MalformedFrameError);
+  });
+
+  test("applies the stream_id rules", () => {
+    // A connection kind needs stream 0 and an empty sandbox_id.
+    expect(
+      validateFrame(
+        frame({
+          streamId: 1n,
+          kind: DataFrameKind.RELAY_KEEPALIVE,
+          payload: keepalive,
+        }),
+      ),
+    ).toBeInstanceOf(MalformedFrameError);
+    expect(
+      validateFrame(
+        frame({
+          streamId: 0n,
+          sandboxId: SANDBOX,
+          kind: DataFrameKind.RELAY_KEEPALIVE,
+          payload: keepalive,
+        }),
+      ),
+    ).toBeInstanceOf(MalformedFrameError);
+    // Every other kind needs a stream other than 0.
+    expect(
+      validateFrame(
+        frame({
+          streamId: 0n,
+          kind: DataFrameKind.EXEC_EVENT,
+          payload: exec,
+        }),
+      ),
+    ).toBeInstanceOf(MalformedFrameError);
   });
 });

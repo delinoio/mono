@@ -568,19 +568,33 @@ func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string, done
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	for {
-		changed := s.watch.watch(sandboxID)
-		sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		if err != nil || done(sb) {
+		sb, err, finished := s.waitSandboxOnce(ctx, orgID, sandboxID, done, poll.C, deadline.C)
+		if finished {
 			return sb, err
 		}
-		select {
-		case <-changed:
-		case <-poll.C:
-		case <-deadline.C:
-			return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		}
+	}
+}
+
+// waitSandboxOnce is one iteration of waitSandbox. It subscribes before it
+// reads, so a change between the read and the wait is not lost, and it
+// unregisters the subscription on every exit.
+func (s *Service) waitSandboxOnce(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool, poll, deadline <-chan time.Time) (sb *sandboxRow, err error, finished bool) {
+	changed, unregister := s.watch.watch(sandboxID)
+	defer unregister()
+	sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+	if err != nil || done(sb) {
+		return sb, err, true
+	}
+	select {
+	case <-changed:
+		return nil, nil, false
+	case <-poll:
+		return nil, nil, false
+	case <-deadline:
+		sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+		return sb, err, true
+	case <-ctx.Done():
+		return nil, ctx.Err(), true
 	}
 }
 
