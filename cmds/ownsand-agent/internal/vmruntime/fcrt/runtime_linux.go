@@ -47,6 +47,10 @@ type Runtime struct {
 	// closes when it returned. Both are nil without a network manager.
 	stopRefresh context.CancelFunc
 	refreshDone chan struct{}
+	// hasNetAdmin and lookPath are seams so that tests can stub the host
+	// capability and the executable lookup; New sets the real ones.
+	hasNetAdmin func() bool
+	lookPath    func(string) (string, error)
 }
 
 var _ vmruntime.Runtime = (*Runtime)(nil)
@@ -84,7 +88,7 @@ func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
 	if opts.Network != nil {
 		startupCleanup()
 	}
-	r := &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}}
+	r := &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}, hasNetAdmin: hasNetAdmin, lookPath: exec.LookPath}
 	if opts.Network != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		r.stopRefresh, r.refreshDone = cancel, make(chan struct{})
@@ -98,6 +102,28 @@ func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
 
 // Kind returns RuntimeKindFirecracker.
 func (r *Runtime) Kind() config.RuntimeKind { return config.RuntimeKindFirecracker }
+
+// outboundProblem returns why OUTBOUND sandboxes cannot run, or "" when the
+// network manager, CAP_NET_ADMIN and the ip and nft executables that the
+// network policy runs (found through PATH, like the policy does) are present.
+func (r *Runtime) outboundProblem() string {
+	if r.opts.Network == nil {
+		return "no network manager"
+	}
+	if !r.hasNetAdmin() {
+		return "CAP_NET_ADMIN is missing"
+	}
+	var missing []string
+	for _, tool := range []string{"ip", "nft"} {
+		if _, err := r.lookPath(tool); err != nil {
+			missing = append(missing, tool)
+		}
+	}
+	if len(missing) > 0 {
+		return "missing executables: " + strings.Join(missing, ", ")
+	}
+	return ""
+}
 
 // hasNetAdmin reports whether the process has CAP_NET_ADMIN.
 func hasNetAdmin() bool {
@@ -157,11 +183,10 @@ func (r *Runtime) Capabilities(ctx context.Context) vmruntime.Capabilities {
 	} else {
 		check("linux-base-image", false, "kernel or root file system is missing")
 	}
-	netOK := r.opts.Network != nil && hasNetAdmin()
-	if netOK {
-		check("outbound-network", true, "CAP_NET_ADMIN for tap devices and nftables")
+	if problem := r.outboundProblem(); problem == "" {
+		check("outbound-network", true, "CAP_NET_ADMIN, ip and nft for tap devices and nftables")
 	} else {
-		check("outbound-network", false, "OUTBOUND sandboxes need CAP_NET_ADMIN, ip and nft")
+		check("outbound-network", false, "OUTBOUND sandboxes need CAP_NET_ADMIN, ip and nft: "+problem)
 	}
 	if kvm && fc {
 		caps.GuestOSes = []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_LINUX}
@@ -249,8 +274,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if spec.GuestOS != ownsandv1.GuestOs_GUEST_OS_LINUX {
 		return nil, fmt.Errorf("%w: Firecracker runs only Linux guests", vmruntime.ErrUnsupported)
 	}
-	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND && (r.opts.Network == nil || !hasNetAdmin()) {
-		return nil, fmt.Errorf("%w: OUTBOUND sandboxes need CAP_NET_ADMIN", vmruntime.ErrUnsupported)
+	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
+		if problem := r.outboundProblem(); problem != "" {
+			return nil, fmt.Errorf("%w: OUTBOUND sandboxes need CAP_NET_ADMIN, ip and nft: %s", vmruntime.ErrUnsupported, problem)
+		}
 	}
 	if spec.Snapshot == nil && !(fileExists(r.opts.Kernel) && fileExists(r.opts.Rootfs)) {
 		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
