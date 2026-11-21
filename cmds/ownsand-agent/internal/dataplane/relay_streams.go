@@ -58,6 +58,19 @@ func (r *relay) onFrame(c *rconn, f *ownsandv1.DataFrame) {
 			// Releases the output subscription; the operation continues.
 			r.finishStream(st, nil)
 		}
+	case *ownsandv1.DataFrame_Error:
+		// The control plane ended the stream with an error frame (for example
+		// for a frame kind that it does not know). Like a stream close frame,
+		// it releases the output subscription and the operation continues. The
+		// agent sends nothing back, because the control plane already closed
+		// the stream, and does not mark the grant done, because the frame
+		// reports no outcome of the operation.
+		r.mu.Lock()
+		st := c.streams[f.GetStreamId()]
+		r.mu.Unlock()
+		if st != nil {
+			r.finishStream(st, nil)
+		}
 	case *ownsandv1.DataFrame_RelayWindowUpdate:
 		r.mu.Lock()
 		st := c.streams[f.GetStreamId()]

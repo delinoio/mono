@@ -171,6 +171,8 @@ test("every shared fixture input selects tests", async (t) => {
     "scripts/dev/start-portless-proxy.mjs",
     "scripts/ci/plan.mjs",
     "scripts/ci/format-changed.test.mjs",
+    "scripts/dev/with-infisical.mjs",
+    "scripts/dev/with-infisical.test.mjs",
     "turbo.json",
     "apps/delino-accounts/turbo.json",
     "servers/accounts-api/turbo.json",

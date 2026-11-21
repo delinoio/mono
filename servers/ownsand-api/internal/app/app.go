@@ -10,6 +10,7 @@ import (
 	"crypto/rand"
 	"log/slog"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -158,8 +159,14 @@ func New(opts Options) (*App, error) {
 	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...))
-	add(ownsandv1connect.NewRelayServiceHandler(api.RelayHandler{DataPlane: plane}, handlerOpts...))
-	add(ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane}, handlerOpts...))
+	// The relay gate opens the relay stream and arms the request deadline
+	// before Connect reads the request body; RelayReadDeadlines gives it the
+	// means to interrupt a body read that blocks.
+	relayOpts := append(slices.Clone(handlerOpts), connect.WithRequestGate(plane.RelayGate(authn, opts.ClientAddressMode)))
+	relayPath, relayHandler := ownsandv1connect.NewRelayServiceHandler(api.RelayHandler{DataPlane: plane}, relayOpts...)
+	add(relayPath, api.RelayReadDeadlines(relayHandler))
+	relayAgentPath, relayAgentHandler := ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane}, handlerOpts...)
+	add(relayAgentPath, api.RelayAgentWriteInterrupt(relayAgentHandler))
 
 	return &App{
 		opts:    opts,

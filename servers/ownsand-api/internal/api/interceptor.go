@@ -65,6 +65,9 @@ type rpcInfo struct {
 	principal      auth.Principal
 	organizationID string
 	clientAddr     string
+	// entered is set when the logging interceptor runs, which tells the
+	// relay request gate whether the RPC ever reached the interceptor chain.
+	entered bool
 }
 
 type rpcInfoKey struct{}
@@ -143,7 +146,16 @@ type logInterceptor struct {
 	addressMode config.ClientAddressMode
 }
 
+// start returns ctx with the RPC's log fields. The relay request gate starts
+// them before the interceptor chain runs, and the chain then continues with
+// the same fields and request ID.
 func (l *logInterceptor) start(ctx context.Context, peer connect.Peer, header http.Header) (context.Context, *rpcInfo) {
+	if info := rpcInfoFrom(ctx); info != nil {
+		info.mu.Lock()
+		info.entered = true
+		info.mu.Unlock()
+		return ctx, info
+	}
 	info := &rpcInfo{requestID: newID(), clientAddr: ClientAddress(peer.Addr, header, l.addressMode)}
 	return context.WithValue(ctx, rpcInfoKey{}, info), info
 }
@@ -209,6 +221,12 @@ type authInterceptor struct {
 func (a *authInterceptor) authenticate(ctx context.Context, procedure string, header http.Header) (context.Context, error) {
 	policy := policyFor(procedure)
 	if policy == policyNone {
+		return ctx, nil
+	}
+	// The relay request gate authenticates before the request body is read
+	// and applies the same credential policy; only that gate stores a
+	// principal before this interceptor runs, so it is not authenticated twice.
+	if _, ok := auth.PrincipalFrom(ctx); ok {
 		return ctx, nil
 	}
 	p, err := a.authn.Authenticate(ctx, header.Get("Authorization"), clientAddr(ctx))

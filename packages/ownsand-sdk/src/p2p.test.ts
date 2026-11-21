@@ -241,6 +241,102 @@ describe("peer-to-peer data path", () => {
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
   });
 
+  test("uses the relay once when OpenSession reports a sandbox that is not running", async () => {
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    h.api.unary(DataPathService, "OpenSession", (_req, call) => {
+      if (call.index === 0) {
+        throw new ConnectError(
+          "sandbox is not running",
+          Code.FailedPrecondition,
+        );
+      }
+      return {
+        sessionId: `session-${call.index + 1}`,
+        sdpAnswer: "v=0 fake-answer",
+        expiresIn: { seconds: 3600n },
+      };
+    });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const result = await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    // The handle stayed on peer-to-peer: the next operation opens a session.
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    expect(rtc.frames).toHaveLength(1);
+  });
+
+  test("a forced PEER_TO_PEER transport returns the failed_precondition of OpenSession", async () => {
+    const { h } = p2pSetup(() => {}, {
+      transport: DataPathTransport.PEER_TO_PEER,
+    });
+    h.api.unary(DataPathService, "OpenSession", () => {
+      throw new ConnectError("sandbox is not running", Code.FailedPrecondition);
+    });
+    const error = await h.clock
+      .run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      )
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.FailedPrecondition);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
+  test("moves the handle to the relay when OpenSession fails with another error", async () => {
+    const { h } = p2pSetup(() => {});
+    h.api.unary(DataPathService, "OpenSession", () => {
+      throw new ConnectError("agent unreachable", Code.Unavailable);
+    });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+  });
+
+  for (const code of [
+    Code.Unauthenticated,
+    Code.PermissionDenied,
+    Code.InvalidArgument,
+  ]) {
+    test(`ends the operation when OpenSession fails with ${Code[code]}`, async () => {
+      const { h } = p2pSetup(() => {});
+      h.api.unary(DataPathService, "OpenSession", () => {
+        throw new ConnectError("rejected", code);
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error.code).toBe(code);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+  }
+
   test("a forced RELAY transport never calls OpenSession", async () => {
     const { h, rtc } = p2pSetup(() => {}, {
       transport: DataPathTransport.RELAY,
@@ -619,6 +715,257 @@ describe("peer-to-peer data path", () => {
       expect(logged).toHaveLength(1);
       expect(logged[0]!.sandboxId).toBe(SANDBOX);
       expect(logged[0]!.reason).toContain("unknown frame kind 99");
+    });
+  });
+
+  describe("slow consumers", () => {
+    /** Deterministic file content, so that a gap or a duplicate shows. */
+    function source(size: number): Uint8Array {
+      const bytes = new Uint8Array(size);
+      for (let i = 0; i < size; i++) {
+        bytes[i] = (i * 31 + (i >> 8)) & 255;
+      }
+      return bytes;
+    }
+
+    /**
+     * An agent that streams `file` from the requested offset in chunks. With
+     * `paced`, it sends one frame per event loop turn, as a network does, so
+     * that a consumer that keeps up can take each frame before the next.
+     */
+    function readAgent(
+      file: Uint8Array,
+      chunkSize: number,
+      onExec?: (frame: DataFrame, peer: FakeAgentPeer) => void,
+      paced = false,
+    ): FakeAgent {
+      return (frame, peer) => {
+        if (frame.payload.case === "execRequest") {
+          onExec?.(frame, peer);
+          return;
+        }
+        if (frame.payload.case !== "fileReadRequest") return;
+        const start = Number(frame.payload.value.offset);
+        const sends: (() => void)[] = [];
+        for (let at = start; at < file.length; at += chunkSize) {
+          sends.push(() =>
+            peer.send({
+              streamId: frame.streamId,
+              sandboxId: SANDBOX,
+              kind: DataFrameKind.FILE_READ_EVENT,
+              payload: {
+                case: "fileReadEvent",
+                value: {
+                  event: {
+                    case: "chunk",
+                    value: {
+                      offset: BigInt(at),
+                      data: file.subarray(
+                        at,
+                        Math.min(at + chunkSize, file.length),
+                      ),
+                    },
+                  },
+                },
+              },
+            }),
+          );
+        }
+        sends.push(() =>
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_READ_EVENT,
+            payload: {
+              case: "fileReadEvent",
+              value: {
+                event: {
+                  case: "end",
+                  value: { sizeBytes: BigInt(file.length) },
+                },
+              },
+            },
+          }),
+        );
+        const step = (i: number) => {
+          sends[i]!();
+          if (i + 1 < sends.length) setImmediate(() => step(i + 1));
+        };
+        if (paced) step(0);
+        else for (const send of sends) send();
+      };
+    }
+
+    function readOffsets(rtc: FakeWebRtc): bigint[] {
+      return rtc.frames.flatMap((f) =>
+        f.payload.case === "fileReadRequest" ? [f.payload.value.offset] : [],
+      );
+    }
+
+    function concat(parts: Uint8Array[]): Uint8Array {
+      const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let at = 0;
+      for (const part of parts) {
+        out.set(part, at);
+        at += part.length;
+      }
+      return out;
+    }
+
+    /** A promise that a test resolves by hand. */
+    function gate() {
+      let open!: () => void;
+      const promise = new Promise<void>((resolve) => (open = resolve));
+      return { promise, open };
+    }
+
+    /**
+     * Reads `/big`; the consumer waits for `until` after its first chunk, as
+     * a slow consumer does.
+     */
+    function slowRead(
+      sandbox: ReturnType<FakeWebRtcHarness["h"]["client"]["sandbox"]>,
+      until: Promise<void>,
+    ) {
+      const chunks: Uint8Array[] = [];
+      const done = (async () => {
+        for await (const chunk of sandbox.readFile("/big")) {
+          chunks.push(chunk);
+          if (chunks.length === 1) await until;
+        }
+        return concat(chunks);
+      })();
+      return { chunks, done };
+    }
+
+    type FakeWebRtcHarness = ReturnType<typeof p2pSetup>;
+
+    test.each([
+      { name: "the byte limit", size: 20 << 20, chunk: 512 << 10 },
+      { name: "the frame limit", size: 200 << 10, chunk: 1 << 10 },
+    ])(
+      "a slow file read passes $name, fails its stream and continues from the delivered offset",
+      async ({ size, chunk }) => {
+        const file = source(size);
+        const records: LogRecord[] = [];
+        const overrun = gate();
+        const p = p2pSetup(readAgent(file, chunk), {
+          logger: (record) => {
+            records.push(record);
+            if (record.event === LogEvent.StreamOverrun) overrun.open();
+          },
+        });
+        const { chunks, done } = slowRead(
+          p.h.client.sandbox(SANDBOX),
+          overrun.promise,
+        );
+        const bytes = await p.h.clock.run(done);
+        // No gap and no duplicate: the bytes equal the source.
+        expect(bytes.length).toBe(file.length);
+        expect(Buffer.compare(bytes, file)).toBe(0);
+        const overruns = records.filter(
+          (r) => r.event === LogEvent.StreamOverrun,
+        );
+        expect(overruns.length).toBeGreaterThanOrEqual(1);
+        for (const record of overruns) {
+          // The queue never held more than its limits.
+          expect(record.queuedFrames!).toBeLessThanOrEqual(64);
+          expect(record.queuedBytes!).toBeLessThanOrEqual(8 << 20);
+        }
+        // Recovery used new streams on the same session from delivered offsets.
+        const offsets = readOffsets(p.rtc);
+        expect(offsets[0]).toBe(0n);
+        expect(offsets.length).toBeGreaterThanOrEqual(2);
+        for (let i = 1; i < offsets.length; i++) {
+          expect(offsets[i]!).toBeGreaterThan(offsets[i - 1]!);
+        }
+        // The first stream delivered every chunk that its queue held, and the
+        // next request starts right after them.
+        const firstQueued = overruns[0]!.queuedFrames!;
+        expect(offsets[1]! % BigInt(chunk)).toBe(0n);
+        expect(offsets[1]!).toBeGreaterThanOrEqual(BigInt(firstQueued * chunk));
+        expect(chunks.length).toBeGreaterThan(firstQueued);
+        expect(p.h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(p.h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      },
+    );
+
+    test("a concurrent exec on the session is unaffected by a slow read", async () => {
+      const file = source(2 << 20);
+      const overrun = gate();
+      let execPeer: FakeAgentPeer | undefined;
+      let execStream = 0n;
+      const p = p2pSetup(
+        readAgent(file, 4 << 10, (frame, peer) => {
+          execPeer = peer;
+          execStream = frame.streamId;
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.stdout(0, "out"));
+        }),
+        {
+          logger: (record) => {
+            if (record.event === LogEvent.StreamOverrun) overrun.open();
+          },
+        },
+      );
+      const sandbox = p.h.client.sandbox(SANDBOX);
+      const exec = sandbox.run({ command: ["sleep-ish"] });
+      await p.h.clock.settle();
+      // The read consumer stays blocked until the exec has finished.
+      const execDone = gate();
+      const read = slowRead(sandbox, execDone.promise);
+      await p.h.clock.run(overrun.promise);
+      expect(read.chunks).toHaveLength(1);
+      execEvent(execPeer!, execStream, ev.exited(0));
+      const run = await p.h.clock.run(exec);
+      expect(text(run.stdout)).toBe("out");
+      expect(run.result.kind).toBe(ExecResultKind.Exited);
+      execDone.open();
+      const bytes = await p.h.clock.run(read.done);
+      expect(Buffer.compare(bytes, file)).toBe(0);
+      // The exec stream never failed or restarted.
+      const execRequests = p.rtc.frames.filter(
+        (f) => f.payload.case === "execRequest",
+      );
+      expect(execRequests).toHaveLength(1);
+      expect(p.h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("a consumer that keeps up never overruns", async () => {
+      // 10 MiB in total: more than one stream queue holds.
+      const file = source(10 << 20);
+      const records: LogRecord[] = [];
+      const p = p2pSetup(readAgent(file, 512 << 10, undefined, true), {
+        logger: (record) => records.push(record),
+      });
+      const bytes = await p.h.clock.run(
+        p.h.client.sandbox(SANDBOX).readFileBytes("/big"),
+      );
+      expect(Buffer.compare(bytes, file)).toBe(0);
+      expect(records.filter((r) => r.event === LogEvent.StreamOverrun)).toEqual(
+        [],
+      );
+      expect(readOffsets(p.rtc)).toEqual([0n]);
+    });
+
+    test("a burst below both limits is queued without failing the stream", async () => {
+      // 64 frames of 1 KiB: the chunks and the end frame reach 64 frames at
+      // the most, below 8 MiB.
+      const file = source(63 << 10);
+      const records: LogRecord[] = [];
+      const wait = gate();
+      const p = p2pSetup(readAgent(file, 1 << 10), {
+        logger: (record) => records.push(record),
+      });
+      const { done } = slowRead(p.h.client.sandbox(SANDBOX), wait.promise);
+      await p.h.clock.settle();
+      wait.open();
+      const bytes = await p.h.clock.run(done);
+      expect(Buffer.compare(bytes, file)).toBe(0);
+      expect(records.filter((r) => r.event === LogEvent.StreamOverrun)).toEqual(
+        [],
+      );
+      expect(readOffsets(p.rtc)).toEqual([0n]);
     });
   });
 

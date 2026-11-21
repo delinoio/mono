@@ -23,8 +23,6 @@ const fixtureInputs = new Set([
   "scripts/install-git-hooks.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.
   "scripts/droplet/start-caddy.sh",
-  // The portless preflight fixture runs the root `dev` preflight.
-  "scripts/dev/start-portless-proxy.mjs",
 ]);
 
 // Shared runtime and workspace inputs that change every app e2e suite.
@@ -205,6 +203,9 @@ export function plan(cwd, base, head) {
     (path) =>
       fixtureInputs.has(path) ||
       path.startsWith("scripts/ci/") ||
+      // The development scripts (the root `dev` portless preflight and the
+      // Infisical launcher) have fixtures in `test:tooling`.
+      path.startsWith("scripts/dev/") ||
       // A pending changeset is validated in the quality job, so that an
       // invalid one cannot reach main and stop every deployment.
       path.startsWith(".changeset/") ||

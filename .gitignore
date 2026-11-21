@@ -211,6 +211,7 @@ tmp/
 
 # Repository development environment (always local and never committed)
 /.infisical.json
+/.infisical.yaml
 /.dev-environment/
 
 # e2e run output, replay cache, logs and sessions

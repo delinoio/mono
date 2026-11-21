@@ -198,6 +198,45 @@ func TestRelayGrantReleasedWhenDetachedExecEnds(t *testing.T) {
 	waitFor(t, "grant release after the exec ended", func() bool { return e.ch.released(g.GetGrantId()) })
 }
 
+// TestRelayErrorFrameFromControlPlaneEndsTheStreamQuietly checks that an
+// error frame of the control plane ends the stream like a stream close frame:
+// the agent sends no frame back and does not mark the grant done, so the exec
+// continues and its grant is released only when the exec ends.
+func TestRelayErrorFrameFromControlPlaneEndsTheStreamQuietly(t *testing.T) {
+	e := newRelayEnv(t, Timing{}, RelayLimits{})
+	req := e.execReq("/bin/sh", "-c", "sleep 1; echo done")
+	g := e.execGrant(req)
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	if f := rc.nextOn(1); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+		t.Fatalf("expected the accepted notice, got %v", f)
+	}
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.ErrorDetail{
+		Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown frame kind 99 on stream 1"}))
+	time.Sleep(200 * time.Millisecond)
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the grant was released while the exec still ran")
+	}
+	waitFor(t, "grant release after the exec ended", func() bool { return e.ch.released(g.GetGrantId()) })
+	for {
+		select {
+		case f := <-rc.frames:
+			if f.GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE {
+				continue
+			}
+			if f.GetError() != nil || f.GetSessionEnd() != nil || f.GetRelayStreamClose() != nil {
+				t.Fatalf("the agent replied to the error frame: %v", f)
+			}
+			if ev := f.GetExecEvent(); ev.GetStdout() != nil || ev.GetExited() != nil {
+				t.Fatalf("the agent kept forwarding output to the ended stream: %v", f)
+			}
+		default:
+			return
+		}
+	}
+}
+
 func TestRelayExecAndRelease(t *testing.T) {
 	e := newRelayEnv(t, Timing{}, RelayLimits{})
 	req := e.execReq("/bin/echo", "hi")

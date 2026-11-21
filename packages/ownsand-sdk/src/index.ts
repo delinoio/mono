@@ -23,6 +23,7 @@ export {
   OwnSandConfigError,
   OwnSandError,
   OwnSandValidationError,
+  PeerStreamOverrunError,
 } from "./errors.ts";
 export { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 export {
