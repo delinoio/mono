@@ -63,7 +63,10 @@ type fakeRuntime struct {
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
-	starts      int // Create calls, counted before any block or error
+	// pauseErr and resumeErr, when set, make Pause and Resume fail.
+	pauseErr  error
+	resumeErr error
+	starts    int // Create calls, counted before any block or error
 }
 
 func (r *fakeRuntime) startCount() int {
@@ -101,12 +104,18 @@ func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntim
 	return v, nil
 }
 func (r *fakeRuntime) Pause(_ context.Context, vm vmruntime.VM) error {
+	if r.pauseErr != nil {
+		return r.pauseErr
+	}
 	r.mu.Lock()
 	r.paused[vm.SandboxID()] = true
 	r.mu.Unlock()
 	return nil
 }
 func (r *fakeRuntime) Resume(_ context.Context, vm vmruntime.VM) error {
+	if r.resumeErr != nil {
+		return r.resumeErr
+	}
 	r.mu.Lock()
 	r.paused[vm.SandboxID()] = false
 	r.mu.Unlock()
@@ -807,6 +816,35 @@ func TestPauseResumeAndSnapshot(t *testing.T) {
 	}
 	if report := e.m.StateReport(2, nil); len(report.GetSnapshots()) != 1 {
 		t.Fatal("snapshot missing from the state report")
+	}
+}
+
+// TestFailedPauseAndResumeKeepTheRecordedState checks that the manager records
+// PAUSED or RUNNING only when the runtime reports success, for example when a
+// runtime refuses a pause or a resume because the helper of the sandbox exited.
+func TestFailedPauseAndResumeKeepTheRecordedState(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	var ce *CommandError
+
+	e.rt.pauseErr = errors.New("injected pause failure")
+	if _, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL {
+		t.Fatalf("failed pause = %v; want an internal error", err)
+	}
+	if got := e.m.StateReport(1, nil).GetSandboxes()[0].GetState(); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("state after the failed pause = %v; want RUNNING", got)
+	}
+
+	e.rt.pauseErr = nil
+	if _, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil {
+		t.Fatal(err)
+	}
+	e.rt.resumeErr = errors.New("injected resume failure")
+	if _, err := e.m.Resume(context.Background(), &ownsandv1.ResumeSandboxCommand{SandboxId: id}); !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL {
+		t.Fatalf("failed resume = %v; want an internal error", err)
+	}
+	if got := e.m.StateReport(2, nil).GetSandboxes()[0].GetState(); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("state after the failed resume = %v; want PAUSED", got)
 	}
 }
 
