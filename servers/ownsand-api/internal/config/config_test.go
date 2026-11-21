@@ -102,6 +102,36 @@ func TestLoadR2AndSTUN(t *testing.T) {
 	}
 }
 
+func TestLoadSTUNURLs(t *testing.T) {
+	for _, tc := range []struct {
+		name, urls string
+		ok         bool
+	}{
+		{"hostname and port", "stun:localhost:13478", true},
+		{"hostname default port", "stun:example.com", true},
+		{"bracketed IPv6", "stun:[::1]:3478", true},
+		{"list", "stun:a:3478, stun:[::1]:3478", true},
+		{"hostless", "stun:", false},
+		{"hostless after valid", "stun:a:3478, stun:", false},
+		{"hostless with port", "stun::3478", false},
+		{"query", "stun:a:3478?transport=udp", false},
+		{"turn", "turn:a:3478", false},
+		{"stuns", "stuns:a:5349", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := minimal()
+			v[EnvSTUNURLs] = tc.urls
+			_, err := Load(env(v))
+			if tc.ok != (err == nil) {
+				t.Fatalf("Load(%q) err = %v, want ok=%v", tc.urls, err, tc.ok)
+			}
+			if want := EnvSTUNURLs + " must list stun: URLs with a host"; err != nil && err.Error() != want {
+				t.Fatalf("error = %q, want %q (no URL echo)", err, want)
+			}
+		})
+	}
+}
+
 func TestLoadClientAddressMode(t *testing.T) {
 	for _, tc := range []struct {
 		name         string

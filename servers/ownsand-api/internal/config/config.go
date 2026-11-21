@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 
+	pionstun "github.com/pion/stun/v3"
+
 	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
 
@@ -299,8 +301,8 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if v := get(EnvSTUNURLs); v != "" {
 		cfg.STUNURLs = nil
 		for _, u := range splitList(v) {
-			if !strings.HasPrefix(u, "stun:") {
-				return Config{}, fmt.Errorf("%s must list stun: URLs", EnvSTUNURLs)
+			if !validSTUNURL(u) {
+				return Config{}, fmt.Errorf("%s must list stun: URLs with a host", EnvSTUNURLs)
 			}
 			cfg.STUNURLs = append(cfg.STUNURLs, u)
 		}
@@ -389,4 +391,15 @@ func validateURL(name, value string) error {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil
+}
+
+// validSTUNURL reports whether u is a stun: URL that the same parser as Pion
+// WebRTC accepts and that names a host. A hostless or otherwise malformed URL
+// would be published to agents and make their peer connection setup fail.
+func validSTUNURL(u string) bool {
+	if !strings.HasPrefix(u, "stun:") {
+		return false
+	}
+	uri, err := pionstun.ParseURI(u)
+	return err == nil && uri.Scheme == pionstun.SchemeTypeSTUN && uri.Host != ""
 }
