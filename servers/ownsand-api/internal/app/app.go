@@ -77,15 +77,20 @@ type Options struct {
 	RelayLimits *relay.Limits
 	RelayTiming *api.RelayTiming
 
-	// UsageClient reports metered usage to delino-accounts. When it is nil,
-	// usage is still metered and sealed into the outbox, and the reporter
-	// stays idle.
+	// UsageClient is the delino-accounts UsageService client: it reports
+	// metered usage, polls billing statuses and changes billing links. When
+	// it is nil, usage is still metered and sealed into the outbox, the
+	// reporter and the status poll stay idle, and the billing RPCs that need
+	// delino-accounts fail with unavailable.
 	UsageClient accountsv1connect.UsageServiceClient
-	// BillingStatuses receives the billing statuses of accepted usage
-	// reports; nil drops them.
-	BillingStatuses billing.StatusSink
 	// BillingTiming overrides the metering intervals (tests).
 	BillingTiming *billing.Timing
+	// BillingStatusTiming overrides the billing status worker intervals
+	// (tests).
+	BillingStatusTiming *billing.StatusTiming
+	// BillingEnforceInterval is the interval of the suspension worker; zero
+	// selects the default (tests).
+	BillingEnforceInterval time.Duration
 	// Metrics registers the control plane metrics; nil registers none.
 	Metrics prometheus.Registerer
 }
@@ -99,6 +104,10 @@ type App struct {
 	Plane   *api.DataPlane
 	// Metering meters billable usage and reports it.
 	Metering *billing.Metering
+	// Billing is the billing status cache and its worker.
+	Billing *billing.Statuses
+	// Enforcer pauses and resumes sandboxes for billing.
+	Enforcer *api.BillingEnforcer
 	handler  http.Handler
 }
 
@@ -153,9 +162,16 @@ func New(opts Options) (*App, error) {
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
 		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
 	svc.Lease = l
+	statuses := billing.NewStatuses(billing.StatusOptions{
+		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
+		Metrics: opts.Metrics, Timing: opts.BillingStatusTiming,
+	})
+	svc.Billing = statuses
+	enforcer := api.NewBillingEnforcer(svc, opts.BillingEnforceInterval)
+	statuses.OnChange(enforcer.Kick)
 	metering := billing.New(billing.Options{
 		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
-		Statuses: opts.BillingStatuses, Metrics: opts.Metrics, Timing: opts.BillingTiming,
+		Statuses: statuses, Metrics: opts.Metrics, Timing: opts.BillingTiming,
 	})
 	svc.Usage = metering
 	relayLimits := relay.DefaultLimits()
@@ -181,6 +197,7 @@ func New(opts Options) (*App, error) {
 	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...))
+	add(ownsandv1connect.NewBillingServiceHandler(api.BillingHandler{Service: svc}, handlerOpts...))
 	// The relay gate opens the relay stream and arms the request deadline
 	// before Connect reads the request body; RelayReadDeadlines gives it the
 	// means to interrupt a body read that blocks.
@@ -197,6 +214,8 @@ func New(opts Options) (*App, error) {
 		Control:  control,
 		Plane:    plane,
 		Metering: metering,
+		Billing:  statuses,
+		Enforcer: enforcer,
 		handler:  server.NewHandler(server.Options{Logger: opts.Logger, CORSOrigins: opts.CORSOrigins, Mounts: mounts}),
 	}, nil
 }
@@ -208,7 +227,7 @@ func (a *App) Handler() http.Handler { return a.handler }
 // metering worker writes the remaining usage counts before Run returns.
 func (a *App) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(6)
 	go func() {
 		defer wg.Done()
 		janitor.Run(ctx, a.opts.DB, a.opts.Logger, a.opts.Now, a.opts.JanitorInterval)
@@ -226,6 +245,14 @@ func (a *App) Run(ctx context.Context) {
 	go func() {
 		defer wg.Done()
 		a.Metering.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		a.Billing.Run(ctx)
+	}()
+	go func() {
+		defer wg.Done()
+		a.Enforcer.Run(ctx)
 	}()
 	wg.Wait()
 }

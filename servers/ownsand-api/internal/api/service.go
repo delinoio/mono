@@ -23,6 +23,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
@@ -109,6 +110,9 @@ type Service struct {
 	// Usage records billable usage (RPC calls and relay egress); nil turns
 	// metering off.
 	Usage UsageRecorder
+	// Billing is the billing status cache that the gated RPCs and
+	// BillingService read; nil turns billing enforcement off.
+	Billing *billing.Statuses
 
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID

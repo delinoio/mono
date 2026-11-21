@@ -39,7 +39,7 @@ The [`delino-accounts` API server contract](servers-accounts-api-foundation.md) 
 - Usage reports: a service reports each usage aggregate with the amount that it computed from its own prices, with its documented rounding, and with the idempotency key (service, organization, meter, window start). A repeated key deducts nothing again. Services call the usage-report API with a Logto machine-to-machine access token and the scope `accounts:report-usage`, according to the [authentication contract](repository-auth-contract.md#service-to-service-calls).
 - Billing status: `delino-accounts` returns the status `ALLOWED`, `BLOCKED` or `SUSPENDED` of each linked organization. Each service documents in its own contract how it enforces these statuses and how it treats organizations without a link.
 - Retention: usage records, the ledger, credit grants and billing audit events are kept for 7 years. Deleting a billing account or an organization keeps these records.
-- Consuming services: [`ownsand`](project-ownsand.md#billing) (`planned`).
+- Consuming services: [`ownsand`](project-ownsand.md#billing).
 
 ## References
 

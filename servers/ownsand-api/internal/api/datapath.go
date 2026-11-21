@@ -377,6 +377,9 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 	if err != nil {
 		return nil, err
 	}
+	if err := h.S.checkBilling(ctx, h.S.DB.Pool, orgID, restrictWhenSuspended); err != nil {
+		return nil, err
+	}
 	if m.GetSdpOffer() == "" || len(m.GetSdpOffer()) > 64<<10 {
 		return nil, errInvalidf("invalid sdp_offer: must be 1 byte to 64 KiB")
 	}
@@ -477,6 +480,9 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
+		return nil, err
+	}
+	if err := h.S.checkBilling(ctx, h.S.DB.Pool, orgID, restrictWhenSuspended); err != nil {
 		return nil, err
 	}
 	if ok, retry := h.limiter.Allow(fmt.Sprintf("%d/%s", pr.Kind, pr.ID), 1); !ok {

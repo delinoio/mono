@@ -14,6 +14,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 )
 
@@ -44,6 +45,11 @@ func (h OrganizationHandler) CreateOrganization(ctx context.Context, req *connec
 		}
 		if _, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, $3, $4, $5)",
 			newID(), orgID, p.ID, int16(ownsandv1.Role_ROLE_OWNER), now); err != nil {
+			return err
+		}
+		// A new organization has no billing link: it is blocked with
+		// ACCOUNT_REQUIRED until its owner links a billing account.
+		if err := billing.InsertStatus(ctx, tx, orgID, now); err != nil {
 			return err
 		}
 		return h.writeAudit(ctx, tx, auditEvent{
@@ -122,11 +128,19 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		return nil, err
 	}
 	var removedDevices []string
+	var unlink billing.Change
+	var unlinkPending bool
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		// The organization lock also serializes the deletion with concurrent
 		// creates in the organization and with an ownership transfer.
 		p, _, err := h.authorizeOwnerLocked(ctx, tx, orgID)
 		if err != nil {
+			return err
+		}
+		// The billing link goes with the organization; usage that is still
+		// in the outbox is reported, and its debt stays on the billing
+		// account.
+		if unlink, unlinkPending, err = h.removeBillingLinkTx(ctx, tx, orgID, billing.SourceDelete); err != nil {
 			return err
 		}
 		removedDevices, err = h.deleteOrganizationTx(ctx, tx, orgID, p)
@@ -138,6 +152,7 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 	for _, deviceID := range removedDevices {
 		h.afterDeviceRemoved(ctx, deviceID)
 	}
+	h.finishBillingUnlink(ctx, orgID, unlink, unlinkPending)
 	return connect.NewResponse(&ownsandv1.DeleteOrganizationResponse{}), nil
 }
 
@@ -278,6 +293,8 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 	if target == "" {
 		return nil, errInvalidf("invalid user_id: is required")
 	}
+	var unlink billing.Change
+	var unlinkPending bool
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorizeOwnerLocked(ctx, tx, orgID)
 		if err != nil {
@@ -300,6 +317,11 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 		if _, err := tx.Exec(ctx, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2", orgID, target, int16(ownsandv1.Role_ROLE_OWNER)); err != nil {
 			return err
 		}
+		// The billing link belongs to the former owner's billing account:
+		// the organization stays blocked until the new owner links one.
+		if unlink, unlinkPending, err = h.removeBillingLinkTx(ctx, tx, orgID, billing.SourceTransfer); err != nil {
+			return err
+		}
 		return h.writeAudit(ctx, tx, auditEvent{
 			OrganizationID: orgID, Action: ownsandv1.AuditAction_AUDIT_ACTION_OWNERSHIP_TRANSFERRED, Actor: p,
 			TargetKind: ownsandv1.AuditTargetKind_AUDIT_TARGET_KIND_MEMBERSHIP, TargetID: membershipID,
@@ -308,5 +330,6 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 	if err != nil {
 		return nil, h.internal(ctx, "transfer ownership", err)
 	}
+	h.finishBillingUnlink(ctx, orgID, unlink, unlinkPending)
 	return connect.NewResponse(&ownsandv1.TransferOwnershipResponse{}), nil
 }

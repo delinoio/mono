@@ -124,6 +124,11 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 			return errEnrollmentInvalid()
 		}
 		setRPCOrganization(ctx, orgID)
+		// Billing enforcement for the token's organization; the token was
+		// validated above, and no record changed yet.
+		if err := h.checkBilling(ctx, tx, orgID, restrictWhenBlocked); err != nil {
+			return err
+		}
 		if used != nil {
 			// A retry with the same token and public key gets the same device,
 			// so an agent that lost the first response can continue.

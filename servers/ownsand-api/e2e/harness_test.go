@@ -26,13 +26,17 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsand "github.com/delinoio/mono/go/ownsand"
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 )
 
@@ -68,6 +72,11 @@ type stack struct {
 	api    *proc
 	// work is the directory of the agent state directories.
 	work string
+	// accounts is the fake delino-accounts API of usage reporting and
+	// billing, and billingAccountID the billing account that the
+	// organization is linked to, in which the user is the billing owner.
+	accounts         *accountstest.Server
+	billingAccountID string
 }
 
 // requireE2E skips unless the suite is enabled and a database is set.
@@ -382,6 +391,12 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 			"SNAPSHOT_PART_SIZE_BYTES=5242880",
 		)
 	}
+	// Billing: the control plane reports usage to, polls statuses from and
+	// links organizations through a fake delino-accounts. The organization
+	// below is linked to a billing account in good standing, so the suite
+	// runs as an organization in good standing.
+	s.accounts = accountstest.New(t, nil)
+	apiEnv = append(apiEnv, s.accounts.Env()...)
 	s.apiEnv = apiEnv
 	s.work = work
 	s.api = startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))
@@ -394,6 +409,11 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 		t.Fatalf("CreateOrganization: %v", err)
 	}
 	s.orgID = org.GetOrganization().GetOrganizationId()
+	s.billingAccountID = e2eBillingAccountID
+	s.accounts.AddAccount(s.billingAccountID, "e2e", map[string]accountsv1.BillingAccountRole{s.userSub: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	if b := s.linkBilling(ctx); b.GetPhase() != ownsandv1.BillingPhase_BILLING_PHASE_ALLOWED {
+		t.Fatalf("billing phase after the link = %v", b.GetPhase())
+	}
 	user = s.userClient(ownsand.TransportAuto)
 
 	runtimeEnv := o.agentEnv
@@ -410,6 +430,46 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	}
 	s.apiKey = k.GetApiKeySecret()
 	return s
+}
+
+// e2eBillingAccountID is the billing account of the suite's organization.
+const e2eBillingAccountID = "01900000-0000-7000-8000-0000000e2e01"
+
+// bearerToken adds a bearer credential to each unary request.
+type bearerToken func() string
+
+func (b bearerToken) WrapUnary(next connect.UnaryFunc) connect.UnaryFunc {
+	return func(ctx context.Context, req connect.AnyRequest) (connect.AnyResponse, error) {
+		req.Header().Set("Authorization", "Bearer "+b())
+		return next(ctx, req)
+	}
+}
+
+func (b bearerToken) WrapStreamingClient(next connect.StreamingClientFunc) connect.StreamingClientFunc {
+	return next
+}
+
+func (b bearerToken) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.StreamingHandlerFunc {
+	return next
+}
+
+// billingClient returns a BillingService client of the user. The Go SDK has
+// no billing client in this layer, so the suite calls the service
+// directly.
+func (s *stack) billingClient() ownsandv1connect.BillingServiceClient {
+	return ownsandv1connect.NewBillingServiceClient(http.DefaultClient, s.apiURL, connect.WithInterceptors(bearerToken(s.userToken)))
+}
+
+// linkBilling links the organization to the suite's billing account (again)
+// and returns the billing status from the response; a repeated link applies
+// the current status that the fake delino-accounts returns.
+func (s *stack) linkBilling(ctx context.Context) *ownsandv1.OrganizationBilling {
+	s.t.Helper()
+	resp, err := s.billingClient().LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: s.orgID, BillingAccountId: s.billingAccountID}))
+	if err != nil {
+		s.t.Fatalf("LinkBillingAccount: %v", err)
+	}
+	return resp.Msg.GetBilling()
 }
 
 // startAgent enrolls agent i with a new enrollment token, runs it, waits

@@ -10,7 +10,9 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -146,15 +148,58 @@ func matrixCases(env *testenv.Env, org *testenv.Org) []rpcCase {
 			_, err := c.Device.UpdateAgentVersionPolicy(ctx, connect.NewRequest(&ownsandv1.UpdateAgentVersionPolicyRequest{OrganizationId: o, Mode: ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD}))
 			return err
 		}, ok, ok, deny, deny},
+		// BillingService. The organization is linked to matrixBillingAccount
+		// in the fake delino-accounts, where its owner is the billing owner.
+		{"GetBillingStatus", func(ctx context.Context, c *testenv.Clients, o string) error {
+			_, err := c.Billing.GetBillingStatus(ctx, connect.NewRequest(&ownsandv1.GetBillingStatusRequest{OrganizationId: o}))
+			return err
+		}, ok, ok, ok, ok},
+		{"GetBillingUsage", func(ctx context.Context, c *testenv.Clients, o string) error {
+			_, err := c.Billing.GetBillingUsage(ctx, connect.NewRequest(&ownsandv1.GetBillingUsageRequest{OrganizationId: o}))
+			return err
+		}, ok, ok, deny, deny},
+		{"ListLinkableBillingAccounts", func(ctx context.Context, c *testenv.Clients, o string) error {
+			_, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: o}))
+			return err
+		}, ok, deny, deny, deny},
+		{"LinkBillingAccount", func(ctx context.Context, c *testenv.Clients, o string) error {
+			// Linking the linked billing account again changes nothing.
+			_, err := c.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: o, BillingAccountId: matrixBillingAccount}))
+			return err
+		}, ok, deny, deny, deny},
+		// Last: the owner's unlink blocks the organization.
+		{"UnlinkBillingAccount", func(ctx context.Context, c *testenv.Clients, o string) error {
+			_, err := c.Billing.UnlinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{OrganizationId: o}))
+			return err
+		}, ok, deny, deny, deny},
+	}
+}
+
+// matrixBillingAccount is the billing account of the matrix organization.
+const matrixBillingAccount = "01900000-0000-7000-8000-0000000000a1"
+
+// linkMatrixBilling links the organization to matrixBillingAccount through
+// the fake delino-accounts, with the organization owner as billing owner.
+func linkMatrixBilling(t *testing.T, fake *accountstest.Server, org *testenv.Org) {
+	t.Helper()
+	ctx := context.Background()
+	fake.AddAccount(matrixBillingAccount, "Matrix", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	if _, err := org.OwnerClient.Billing.UnlinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{OrganizationId: org.ID})); err != nil {
+		t.Fatalf("unlink the seeded billing link: %v", err)
+	}
+	if _, err := org.OwnerClient.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: matrixBillingAccount})); err != nil {
+		t.Fatalf("link billing: %v", err)
 	}
 }
 
 // TestAuthorizationMatrix checks every organization-scoped RPC of the
-// organization, member, API key and device services with each principal
-// kind, including cross-organization access.
+// organization, member, API key, device and billing services with each
+// principal kind, including cross-organization access.
 func TestAuthorizationMatrix(t *testing.T) {
-	env := testenv.New(t)
+	fake := accountstest.New(t, nil)
+	env := testenv.New(t, testenv.WithAccounts(fake))
 	org := env.NewOrg("alice")
+	linkMatrixBilling(t, fake, org)
 	other := env.NewOrg("mallory")
 	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
 	deviceCred := env.SessionCredential(dev)
