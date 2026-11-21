@@ -164,8 +164,14 @@ describe("design", () => {
         screen.getByRole("heading", "Sandboxes", { level: 1 }),
       ).toBeVisible();
 
+      await expect(screen.getByRole("button", "Create sandbox")).toBeVisible();
+
+      // Prominence is visual: the semantic tree has no button styles, so a
+      // judge that reads the tree cannot decide it. Judge the screenshot
+      // alone.
       await agent.assert(
         "the page has exactly one prominent primary button, named Create sandbox",
+        { vision: "only" },
       );
     },
   );

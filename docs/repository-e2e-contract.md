@@ -40,6 +40,7 @@ Each app that has e2e tests owns these paths:
 - Prefer deterministic locator steps (`screen`, `browser`, `expect`) for exact values and navigation.
 - Tag every test that calls `agent` with `agent` (`{ tags: ["agent"] }`). Such tests need model access; runs without a model key exclude them with `--exclude-tag agent`.
 - End every `agent.act` with a locator or engine assertion, so the replay cache can record it.
+- Pass `vision: "only"` to an agent judgment (`agent.assert`, `agent.waitFor` or `agent.extract`) about how the page looks, such as prominence, color or layout. The default judge sees only the semantic tree, which has no styles, and returns an inconclusive result for such a judgment.
 - Do not put secrets in test code. Declare them under `credentials` or `secrets` in the config.
 
 ## Model
