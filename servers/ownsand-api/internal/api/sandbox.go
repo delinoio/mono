@@ -242,6 +242,9 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, err
 	}
+	if err := h.checkBilling(ctx, h.DB.Pool, canonicalID(orgID), restrictWhenBlocked); err != nil {
+		return nil, err
+	}
 	if err := validate.CreateSandboxRequest(m); err != nil {
 		return nil, errInvalid(err)
 	}
@@ -697,6 +700,9 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 }
 
 // pauseOrResume runs PauseSandbox (pause true) or ResumeSandbox.
+// ResumeSandbox is rejected while billing blocks the organization; a
+// caller's pause removes the billing pause mark, so a sandbox that a caller
+// paused stays paused after a billing recovery.
 func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
 	orgID, err := normalizeID("organization_id", rawOrgID)
 	if err != nil {
@@ -705,13 +711,38 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
+	if !pause {
+		if err := h.checkBilling(ctx, h.DB.Pool, orgID, restrictWhenBlocked); err != nil {
+			return nil, err
+		}
+	}
 	sandboxID, err := normalizeID("sandbox_id", rawSandboxID)
 	if err != nil {
 		return nil, err
 	}
-	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)
+	onSend := func() error { return nil }
+	if pause {
+		onSend = func() error {
+			_, err := h.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1 AND paused_by_billing", sandboxID)
+			return err
+		}
+	}
+	sb, err := h.pauseOrResumeSandbox(ctx, orgID, sandboxID, pause, onSend)
 	if err != nil {
-		return nil, h.internal(ctx, "load sandbox", err)
+		return nil, err
+	}
+	return sb.proto(), nil
+}
+
+// pauseOrResumeSandbox pauses (pause true) or resumes an authorized sandbox
+// through its device's agent channel and waits up to the command wait for
+// the result. PauseSandbox, ResumeSandbox and the billing suspension worker
+// share it. onSend runs right before the command is sent, only when the
+// sandbox is in the source state. orgID and sandboxID must be canonical.
+func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID string, pause bool, onSend func() error) (*sandboxRow, error) {
+	sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+	if err != nil {
+		return nil, s.internal(ctx, "load sandbox", err)
 	}
 	from, to, rpc := ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, "PauseSandbox"
 	info := commandInfo{kind: cmdPauseSandbox, orgID: orgID, sandboxID: sandboxID}
@@ -723,21 +754,24 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 	}
 	state, _ := sb.shownState()
 	if state == to {
-		return sb.proto(), nil
+		return sb, nil
 	}
 	if state != from {
 		return nil, stateErr(state, rpc)
 	}
-	conn := h.Hub.Live(sb.DeviceID)
+	conn := s.Hub.Live(sb.DeviceID)
 	if conn == nil {
 		return nil, errUnavailable("the sandbox's device has no live agent channel")
 	}
-	wait := h.Hub.Commands.Register(cmd.CommandId)
-	defer h.Hub.Commands.Cancel(cmd.CommandId)
-	if _, err := h.sendCommand(ctx, conn, info, cmd); err != nil {
+	if err := onSend(); err != nil {
+		return nil, s.internal(ctx, "prepare "+rpc, err)
+	}
+	wait := s.Hub.Commands.Register(cmd.CommandId)
+	defer s.Hub.Commands.Cancel(cmd.CommandId)
+	if _, err := s.sendCommand(ctx, conn, info, cmd); err != nil {
 		return nil, errUnavailable("the agent channel closed")
 	}
-	timer := time.NewTimer(h.Timing.CommandWait)
+	timer := time.NewTimer(s.Timing.CommandWait)
 	defer timer.Stop()
 	select {
 	case res := <-wait:
@@ -753,11 +787,11 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 		return nil, ctx.Err()
 	case <-conn.Done():
 	}
-	sb, err = loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)
+	sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
 	if err != nil {
-		return nil, h.internal(ctx, "load sandbox", err)
+		return nil, s.internal(ctx, "load sandbox", err)
 	}
-	return sb.proto(), nil
+	return sb, nil
 }
 
 func (h SandboxHandler) PauseSandbox(ctx context.Context, req *connect.Request[ownsandv1.PauseSandboxRequest]) (*connect.Response[ownsandv1.PauseSandboxResponse], error) {

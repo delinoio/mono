@@ -294,6 +294,12 @@ func (p *DataPlane) open(ctx context.Context, procedure string, header http.Head
 	if _, _, err := p.S.authorize(ctx, p.S.DB.Pool, g.OrgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
+	// Exec, AttachExec, ReadFile and WriteFile are rejected while the
+	// grant's organization is suspended; a stream that is already open is
+	// not ended.
+	if err := p.S.checkBilling(ctx, p.S.DB.Pool, g.OrgID, restrictWhenSuspended); err != nil {
+		return nil, err
+	}
 	hc := p.S.Hub.Get(g.DeviceID)
 	if hc == nil || hc.Generation != g.ChannelGen {
 		return nil, errGrantInvalid()

@@ -43,7 +43,7 @@ The project has two deployables. The web app is a static single-page application
   - Credit grants expire 12 months after purchase and are consumed first-expiring first (FIFO). A new grant pays off debt first. Usage is always deducted, also below zero.
   - Services report usage with their own computed amounts and the idempotency key (service, organization, meter, window start), and read the `ALLOWED`, `BLOCKED` or `SUSPENDED` status of each linked organization.
   - Usage records, the ledger, credit grants and billing audit events are kept for 7 years.
-- Consuming services: [`ownsand`](project-ownsand.md#billing) reports usage and enforces billing statuses; the API server side is implemented, and the `ownsand-api` client is `planned` in its own contract.
+- Consuming services: [`ownsand`](project-ownsand.md#billing) reports usage and enforces billing statuses.
 - `delino-accounts` is the shared account management and billing system for every Delino service, according to the [authentication](repository-auth-contract.md#account-management) and [billing](repository-billing-contract.md#billing-ownership) contracts. Other services link users to `https://accounts.delino.io` and call `https://accounts.api.delino.io`. They do not keep their own account management, payment-provider integration or balances.
 - Deviation from repository defaults: the web app uses Rsbuild instead of Rspress because it is an authenticated application, not a documentation or marketing site. It still deploys to Cloudflare Pages as static output.
 - The API server deploys to the shared DigitalOcean Droplet and its database is PlanetScale Postgres, according to the repository defaults. The [API server contract](servers-accounts-api-foundation.md) records the details.

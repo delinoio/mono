@@ -31,6 +31,14 @@ const (
 	// ActionUseSandboxes: sandboxes, exec, files, pause, resume, snapshots,
 	// templates, data path sessions, relay authorization and relay RPCs.
 	ActionUseSandboxes
+	// ActionManageBilling: link and unlink a billing account, list the
+	// linkable billing accounts.
+	ActionManageBilling
+	// ActionReadBillingUsage: read the linked billing account, its balance
+	// and this month's usage.
+	ActionReadBillingUsage
+	// ActionReadBillingStatus: read the billing status.
+	ActionReadBillingStatus
 )
 
 // AllActions lists every action, for exhaustive tests.
@@ -38,20 +46,21 @@ func AllActions() []Action {
 	return []Action{
 		ActionOwnerOnly, ActionManageMembers, ActionLeave, ActionManageDevices, ActionManageAPIKeys,
 		ActionReadOrganization, ActionReadDevices, ActionUseSandboxes,
+		ActionManageBilling, ActionReadBillingUsage, ActionReadBillingStatus,
 	}
 }
 
 // RoleAllowed reports whether a member with role may perform action.
 func RoleAllowed(role ownsandv1.Role, action Action) bool {
 	switch action {
-	case ActionOwnerOnly:
+	case ActionOwnerOnly, ActionManageBilling:
 		return role == ownsandv1.Role_ROLE_OWNER
-	case ActionManageMembers, ActionManageDevices, ActionManageAPIKeys:
+	case ActionManageMembers, ActionManageDevices, ActionManageAPIKeys, ActionReadBillingUsage:
 		return role == ownsandv1.Role_ROLE_OWNER || role == ownsandv1.Role_ROLE_ADMIN
 	case ActionLeave:
 		// The owner must transfer ownership before leaving.
 		return role == ownsandv1.Role_ROLE_ADMIN || role == ownsandv1.Role_ROLE_MEMBER
-	case ActionReadOrganization, ActionReadDevices, ActionUseSandboxes:
+	case ActionReadOrganization, ActionReadDevices, ActionUseSandboxes, ActionReadBillingStatus:
 		return role == ownsandv1.Role_ROLE_OWNER || role == ownsandv1.Role_ROLE_ADMIN || role == ownsandv1.Role_ROLE_MEMBER
 	}
 	return false
@@ -60,5 +69,5 @@ func RoleAllowed(role ownsandv1.Role, action Action) bool {
 // APIKeyAllowed reports whether an API key of the organization may perform
 // action.
 func APIKeyAllowed(action Action) bool {
-	return action == ActionReadDevices || action == ActionUseSandboxes
+	return action == ActionReadDevices || action == ActionUseSandboxes || action == ActionReadBillingStatus
 }

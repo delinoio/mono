@@ -26,6 +26,7 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
@@ -195,6 +196,12 @@ func (e *Env) Restart() {
 	e.start()
 }
 
+// WithAccounts points usage reporting, the billing status poll and the
+// billing RPCs at a fake delino-accounts API.
+func WithAccounts(f *accountstest.Server) Option {
+	return func(o *app.Options) { o.UsageClient = f.Client() }
+}
+
 // UserToken returns a fake Logto access token for userID.
 func UserToken(userID string) string { return userTokenPrefix + userID }
 
@@ -246,6 +253,7 @@ type Clients struct {
 	DataPath     ownsandv1connect.DataPathServiceClient
 	Relay        ownsandv1connect.RelayServiceClient
 	RelayAgent   ownsandv1connect.RelayAgentServiceClient
+	Billing      ownsandv1connect.BillingServiceClient
 }
 
 // ClientsWith returns clients that send token as the bearer credential (no
@@ -270,6 +278,7 @@ func (e *Env) ClientsWithHTTP(httpClient *http.Client, token string, extra http.
 		DataPath:     ownsandv1connect.NewDataPathServiceClient(httpClient, url, opts...),
 		Relay:        ownsandv1connect.NewRelayServiceClient(httpClient, url, opts...),
 		RelayAgent:   ownsandv1connect.NewRelayAgentServiceClient(httpClient, url, opts...),
+		Billing:      ownsandv1connect.NewBillingServiceClient(httpClient, url, opts...),
 	}
 }
 
@@ -297,9 +306,41 @@ type Org struct {
 	OwnerClient *Clients
 }
 
-// NewOrg creates an organization owned by owner, invites an admin and a
-// member and creates an API key.
+// NewOrg creates an organization owned by owner in good billing standing
+// (see AllowBilling), invites an admin and a member and creates an API key.
 func (e *Env) NewOrg(owner string) *Org {
+	e.T.Helper()
+	org := e.NewUnlinkedOrg(owner)
+	e.AllowBilling(org.ID)
+	return org
+}
+
+// TestBillingAccountID is the billing account that AllowBilling links.
+const TestBillingAccountID = "01900000-0000-7000-8000-00000000b111"
+
+// AllowBilling links the organization to TestBillingAccountID in the status
+// cache with the status ALLOWED, without delino-accounts, so the tests that
+// do not test billing run as an organization in good standing.
+//
+// Workaround (test-only): the sync time is set far in the future, so the
+// fake clock of a test can advance by more than the 1-hour fail-open age
+// without logging billing_status_stale warnings. Billing tests that need a
+// real sync time link through a fake delino-accounts instead; remove this
+// when every test environment links through one.
+func (e *Env) AllowBilling(orgID string) {
+	e.T.Helper()
+	if _, err := e.DB.Pool.Exec(context.Background(), `UPDATE organization_billing SET billing_account_id = $2, phase = $3, reason = $4,
+		blocked_since = NULL, suspend_time = NULL, status_sync_time = $5, status_sequence = 0, update_time = $6 WHERE organization_id = $1`,
+		orgID, TestBillingAccountID, int16(ownsandv1.BillingPhase_BILLING_PHASE_ALLOWED), int16(ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED),
+		time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), e.Clock.Now()); err != nil {
+		e.T.Fatalf("allow billing: %v", err)
+	}
+}
+
+// NewUnlinkedOrg is NewOrg without a billing link: the organization is
+// blocked with ACCOUNT_REQUIRED from its creation, as a new organization
+// is.
+func (e *Env) NewUnlinkedOrg(owner string) *Org {
 	e.T.Helper()
 	ctx := context.Background()
 	oc := e.User(owner)

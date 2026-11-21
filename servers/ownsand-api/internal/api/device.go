@@ -78,6 +78,9 @@ func (h DeviceHandler) CreateEnrollmentToken(ctx context.Context, req *connect.R
 		if err != nil {
 			return err
 		}
+		if err := h.checkBilling(ctx, tx, orgID, restrictWhenBlocked); err != nil {
+			return err
+		}
 		if err := validate.EnrollmentTokenTTL(req.Msg.GetTtl()); err != nil {
 			return errInvalid(err)
 		}

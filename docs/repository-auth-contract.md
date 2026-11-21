@@ -42,9 +42,9 @@ Backend services must validate every Logto access token before they trust it. Fo
 - The target trusts the machine credential and its scope, not an end user. A calling service checks its own authorization of the user before it calls on the user's behalf.
 - Record each machine-to-machine scope in the contract of the target API server, and each consuming service in that contract before it calls the API. Recorded scopes:
 
-| API resource                     | Scope                   | Operations                                                                                         | Consuming services        | Owning contract                                                          |
-| -------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------- | ------------------------- | ------------------------------------------------------------------------ |
-| `https://accounts.api.delino.io` | `accounts:report-usage` | `UsageService`: usage reports, billing statuses, organization links and organization billing reads | `ownsand-api` (`planned`) | [API server contract](servers-accounts-api-foundation.md#authentication) |
+| API resource                     | Scope                   | Operations                                                                                         | Consuming services | Owning contract                                                          |
+| -------------------------------- | ----------------------- | -------------------------------------------------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------ |
+| `https://accounts.api.delino.io` | `accounts:report-usage` | `UsageService`: usage reports, billing statuses, organization links and organization billing reads | `ownsand-api`      | [API server contract](servers-accounts-api-foundation.md#authentication) |
 
 - Machine-to-machine client secrets are secrets and follow the [environment contract](repository-environment-contract.md).
 

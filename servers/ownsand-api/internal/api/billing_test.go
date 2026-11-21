@@ -1,0 +1,782 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package api_test
+
+import (
+	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"errors"
+	"strings"
+	"testing"
+	"time"
+
+	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
+	"github.com/delinoio/mono/go/uuidv7"
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
+)
+
+const (
+	billingAccountA = "01900000-0000-7000-8000-0000000000c1"
+	billingAccountB = "01900000-0000-7000-8000-0000000000c2"
+	billingAccountC = "01900000-0000-7000-8000-0000000000c3"
+)
+
+// billingEnv starts a control plane with a fake delino-accounts on the
+// test clock. The background status and suspension workers run rarely, so
+// the tests drive the poll and the suspension passes.
+func billingEnv(t *testing.T) (*testenv.Env, *accountstest.Server) {
+	t.Helper()
+	var env *testenv.Env
+	fake := accountstest.New(t, func() time.Time { return env.Clock.Now() })
+	env = testenv.New(t, testenv.WithAccounts(fake), func(o *app.Options) {
+		o.BillingStatusTiming = &billing.StatusTiming{Poll: time.Hour, Tick: time.Hour, UnlinkBackoffMin: time.Second, UnlinkBackoffMax: 5 * time.Minute}
+		o.BillingEnforceInterval = time.Hour
+		// No usage report in the background: its statuses would refresh the
+		// sync time that the fail-open test lets age.
+		o.BillingTiming = &billing.Timing{Flush: time.Hour, Tick: time.Hour, Report: time.Hour, BackoffMin: time.Second, BackoffMax: time.Minute}
+	})
+	return env, fake
+}
+
+// linkedOrg creates an organization whose owner links it to a new billing
+// account in good standing in which the owner is the billing owner.
+func linkedOrg(t *testing.T, env *testenv.Env, fake *accountstest.Server, owner, account string) *testenv.Org {
+	t.Helper()
+	fake.AddAccount(account, "Account of "+owner, map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	org := env.NewUnlinkedOrg(owner)
+	resp, err := org.OwnerClient.Billing.LinkBillingAccount(context.Background(), connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: account}))
+	if err != nil {
+		t.Fatalf("link billing account: %v", err)
+	}
+	if resp.Msg.GetBilling().GetPhase() != billing.PhaseAllowed || resp.Msg.GetBillingAccountName() != "Account of "+owner {
+		t.Fatalf("link response = %v", resp.Msg)
+	}
+	return org
+}
+
+func pollBilling(t *testing.T, env *testenv.Env) {
+	t.Helper()
+	if err := env.App.Billing.Poll(context.Background()); err != nil {
+		t.Fatalf("poll billing statuses: %v", err)
+	}
+}
+
+func enforceBilling(t *testing.T, env *testenv.Env) {
+	t.Helper()
+	if err := env.App.Enforcer.Pass(context.Background()); err != nil {
+		t.Fatalf("billing enforcement pass: %v", err)
+	}
+}
+
+func billingStatus(t *testing.T, c *testenv.Clients, orgID string) *ownsandv1.OrganizationBilling {
+	t.Helper()
+	resp, err := c.Billing.GetBillingStatus(context.Background(), connect.NewRequest(&ownsandv1.GetBillingStatusRequest{OrganizationId: orgID}))
+	if err != nil {
+		t.Fatalf("GetBillingStatus: %v", err)
+	}
+	return resp.Msg.GetBilling()
+}
+
+// billingReasonOf returns the billing reason of a billing error and checks
+// its shape: resource_exhausted, an ErrorDetail with the code, a message
+// with the accounts link and no retry delay. It returns UNSPECIFIED for any
+// other error.
+func billingReasonOf(t *testing.T, name string, err error) ownsandv1.BillingReason {
+	t.Helper()
+	d := errDetail(err)
+	if d.GetBillingReason() == ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED {
+		return ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED
+	}
+	if testenv.Code(err) != connect.CodeResourceExhausted || d.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED ||
+		!strings.Contains(d.GetMessage(), "https://accounts.delino.io") || d.GetRetryAfter() != nil {
+		t.Fatalf("%s: billing error shape: %v (detail %v)", name, err, d)
+	}
+	var ce *connect.Error
+	if !errors.As(err, &ce) || !strings.Contains(ce.Message(), "https://accounts.delino.io") {
+		t.Fatalf("%s: message without the accounts link: %v", name, err)
+	}
+	return d.GetBillingReason()
+}
+
+// drainStream returns the error of a server stream.
+func drainStream[T any](s *connect.ServerStreamForClient[T], err error) error {
+	if err != nil {
+		return err
+	}
+	for s.Receive() {
+	}
+	return s.Err()
+}
+
+// gateFixture holds what the gated calls need.
+type gateFixture struct {
+	env       *testenv.Env
+	org       *testenv.Org
+	sandboxID string
+	// pausedID is a sandbox that a caller paused; PauseSandbox on it
+	// changes nothing.
+	pausedID string
+	// enrollToken was created while the organization was allowed.
+	enrollToken string
+	// grantID is an exec grant of the API key that no call used.
+	grantID string
+}
+
+type gatedCall struct {
+	name string
+	call func(ctx context.Context) error
+}
+
+// blockedCalls are the RPCs that BLOCKED rejects.
+func (g *gateFixture) blockedCalls() []gatedCall {
+	c := g.org.OwnerClient
+	o := g.org.ID
+	missing := "01900000-0000-7000-8000-00000000dead"
+	return []gatedCall{
+		{"CreateSandbox", func(ctx context.Context) error {
+			_, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(o)))
+			return err
+		}},
+		{"ResumeSandbox", func(ctx context.Context) error {
+			_, err := c.Sandbox.ResumeSandbox(ctx, connect.NewRequest(&ownsandv1.ResumeSandboxRequest{OrganizationId: o, SandboxId: g.sandboxID}))
+			return err
+		}},
+		{"CreateSnapshot", func(ctx context.Context) error {
+			_, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: o, SandboxId: missing}))
+			return err
+		}},
+		{"ExportSnapshot", func(ctx context.Context) error {
+			_, err := c.Snapshot.ExportSnapshot(ctx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: o, SnapshotId: missing}))
+			return err
+		}},
+		{"CreateTemplate", func(ctx context.Context) error {
+			_, err := c.Snapshot.CreateTemplate(ctx, connect.NewRequest(&ownsandv1.CreateTemplateRequest{OrganizationId: o, SnapshotId: missing, Name: "t"}))
+			return err
+		}},
+		{"CreateEnrollmentToken", func(ctx context.Context) error {
+			_, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: o, Ttl: durationpb.New(time.Hour)}))
+			return err
+		}},
+		{"Enroll", func(ctx context.Context) error {
+			pub, _, _ := ed25519.GenerateKey(rand.Reader)
+			_, err := g.env.Clients("").Agent.Enroll(ctx, connect.NewRequest(&ownsandv1.EnrollRequest{
+				EnrollmentToken: g.enrollToken, PublicKey: pub, Name: "late", HostOs: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, AgentVersion: "1.0.0",
+			}))
+			return err
+		}},
+	}
+}
+
+// suspendedCalls are the RPCs that only SUSPENDED rejects. The relay RPCs
+// use an unused grant; the gate rejects them before the grant is matched
+// to the request.
+func (g *gateFixture) suspendedCalls() []gatedCall {
+	key := g.env.Clients(g.org.APIKey)
+	relay := g.env.ClientsWith(g.org.APIKey, grantHeader(g.grantID)).Relay
+	o, sb := g.org.ID, g.sandboxID
+	id := func() string { v, _ := uuidv7.NewString(); return v }
+	return []gatedCall{
+		{"Exec", func(ctx context.Context) error {
+			return drainStream(relay.Exec(ctx, connect.NewRequest(newExec(o, sb))))
+		}},
+		{"AttachExec", func(ctx context.Context) error {
+			return drainStream(relay.AttachExec(ctx, connect.NewRequest(&ownsandv1.AttachExecRequest{OrganizationId: o, SandboxId: sb, ExecId: id()})))
+		}},
+		{"ReadFile", func(ctx context.Context) error {
+			return drainStream(relay.ReadFile(ctx, connect.NewRequest(&ownsandv1.ReadFileRequest{OrganizationId: o, SandboxId: sb, ReadId: id(), Path: "/tmp/x"})))
+		}},
+		{"WriteFile", func(ctx context.Context) error {
+			_, err := relay.WriteFile(ctx, connect.NewRequest(&ownsandv1.WriteFileRequest{OrganizationId: o, SandboxId: sb, WriteId: id(), Path: "/tmp/x", Data: []byte("x")}))
+			return err
+		}},
+		{"OpenSession", func(ctx context.Context) error {
+			_, err := key.DataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{OrganizationId: o, SandboxId: sb, SdpOffer: "v=0"}))
+			return err
+		}},
+		{"AuthorizeRelay", func(ctx context.Context) error {
+			req := newExec(o, sb)
+			_, err := key.DataPath.AuthorizeRelay(ctx, connect.NewRequest(&ownsandv1.AuthorizeRelayRequest{OrganizationId: o, SandboxId: sb,
+				OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: id()}))
+			return err
+		}},
+	}
+}
+
+// openCalls are RPCs that billing never rejects, BillingService included.
+func (g *gateFixture) openCalls() []gatedCall {
+	c := g.org.OwnerClient
+	o := g.org.ID
+	return []gatedCall{
+		{"GetSandbox", func(ctx context.Context) error {
+			_, err := c.Sandbox.GetSandbox(ctx, connect.NewRequest(&ownsandv1.GetSandboxRequest{OrganizationId: o, SandboxId: g.sandboxID}))
+			return err
+		}},
+		{"ListSandboxes", func(ctx context.Context) error {
+			_, err := c.Sandbox.ListSandboxes(ctx, connect.NewRequest(&ownsandv1.ListSandboxesRequest{OrganizationId: o}))
+			return err
+		}},
+		{"PauseSandbox", func(ctx context.Context) error {
+			_, err := c.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: o, SandboxId: g.pausedID}))
+			return err
+		}},
+		{"ListSnapshots", func(ctx context.Context) error {
+			_, err := c.Snapshot.ListSnapshots(ctx, connect.NewRequest(&ownsandv1.ListSnapshotsRequest{OrganizationId: o}))
+			return err
+		}},
+		{"ListDevices", func(ctx context.Context) error {
+			_, err := c.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: o}))
+			return err
+		}},
+		{"GetIceServers", func(ctx context.Context) error {
+			_, err := c.DataPath.GetIceServers(ctx, connect.NewRequest(&ownsandv1.GetIceServersRequest{OrganizationId: o}))
+			return err
+		}},
+		{"CreateApiKey", func(ctx context.Context) error {
+			_, err := c.APIKey.CreateApiKey(ctx, connect.NewRequest(&ownsandv1.CreateApiKeyRequest{OrganizationId: o, Name: "while-billing-restricted"}))
+			return err
+		}},
+		{"GetBillingStatus", func(ctx context.Context) error {
+			_, err := c.Billing.GetBillingStatus(ctx, connect.NewRequest(&ownsandv1.GetBillingStatusRequest{OrganizationId: o}))
+			return err
+		}},
+		{"GetBillingUsage", func(ctx context.Context) error {
+			_, err := c.Billing.GetBillingUsage(ctx, connect.NewRequest(&ownsandv1.GetBillingUsageRequest{OrganizationId: o}))
+			return err
+		}},
+		{"ListLinkableBillingAccounts", func(ctx context.Context) error {
+			_, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: o}))
+			return err
+		}},
+	}
+}
+
+// expectGates checks every gated and open call in the phase: the calls in
+// rejected fail with reason, every other call has no billing error.
+func (g *gateFixture) expectGates(t *testing.T, rejected map[string]bool, reason ownsandv1.BillingReason) {
+	t.Helper()
+	ctx := context.Background()
+	all := append(append(g.blockedCalls(), g.suspendedCalls()...), g.openCalls()...)
+	for _, c := range all {
+		if !rejected[c.name] {
+			continue
+		}
+		if got := billingReasonOf(t, c.name, c.call(ctx)); got != reason {
+			t.Errorf("%s: billing reason = %v, want %v", c.name, got, reason)
+		}
+	}
+	for _, c := range g.openCalls() {
+		if err := c.call(ctx); err != nil {
+			t.Errorf("%s failed: %v", c.name, err)
+		}
+	}
+}
+
+func names(calls ...[]gatedCall) map[string]bool {
+	out := map[string]bool{}
+	for _, cs := range calls {
+		for _, c := range cs {
+			out[c.name] = true
+		}
+	}
+	return out
+}
+
+func pausedByBilling(t *testing.T, env *testenv.Env, sandboxID string) bool {
+	t.Helper()
+	var marked bool
+	if err := env.DB.Pool.QueryRow(context.Background(), "SELECT paused_by_billing FROM sandboxes WHERE sandbox_id = $1", sandboxID).Scan(&marked); err != nil {
+		t.Fatal(err)
+	}
+	return marked
+}
+
+func pauseCommands(agent *testenv.FakeAgent, sandboxID string) int {
+	n := 0
+	for _, c := range agent.Commands() {
+		if c.GetPauseSandbox().GetSandboxId() == sandboxID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestBillingPhasesOfLinkedOrganization follows a linked organization from
+// ALLOWED through BLOCKED and SUSPENDED back to ALLOWED: each phase rejects
+// exactly its RPCs with its reason, the suspension pauses the running
+// sandboxes and marks them, and the recovery resumes only those.
+func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	org := linkedOrg(t, env, fake, "alice", billingAccountA)
+	_, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	create := func() string {
+		created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := created.Msg.GetSandbox().GetSandboxId()
+		waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+		return id
+	}
+	running := create()
+	userPaused := create()
+	if _, err := c.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: org.ID, SandboxId: userPaused})); err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, c, org.ID, userPaused, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+	tok, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := &gateFixture{env: env, org: org, sandboxID: running, pausedID: userPaused, enrollToken: tok.Msg.GetEnrollmentToken()}
+	if b := billingStatus(t, env.User(org.Member), org.ID); b.GetPhase() != billing.PhaseAllowed || !b.GetLinked() {
+		t.Fatalf("allowed status = %v", b)
+	}
+
+	// BLOCKED: the linked billing account ran out of credit.
+	blockedAt := env.Clock.Now()
+	fake.SetAccountStatus(billingAccountA, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, blockedAt)
+	pollBilling(t, env)
+	b := billingStatus(t, env.User(org.Member), org.ID)
+	if b.GetPhase() != billing.PhaseBlocked || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_BLOCKED || !b.GetBlockedSince().AsTime().Equal(blockedAt) ||
+		!b.GetSuspendTime().AsTime().Equal(blockedAt.Add(72*time.Hour)) {
+		t.Fatalf("blocked status = %v", b)
+	}
+	// The suspended-only RPCs still work: a relay grant, an exec over the
+	// relay and a data channel session.
+	relay := agent.ConnectRelay(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		if f.GetExecRequest() != nil {
+			serveExec(s, f)
+		}
+	})
+	relay.WaitFrame("supported frame kinds", func(f *ownsandv1.DataFrame) bool { return f.GetSupportedFrameKinds() != nil })
+	key := env.Clients(org.APIKey)
+	execReq := newExec(org.ID, running)
+	grant, err := authorizeExec(t, key, execReq)
+	if err != nil {
+		t.Fatalf("AuthorizeRelay while blocked: %v", err)
+	}
+	if err := drainStream(env.ClientsWith(org.APIKey, grantHeader(grant.GetGrantId())).Relay.Exec(ctx, connect.NewRequest(execReq))); err != nil {
+		t.Fatalf("Exec while blocked: %v", err)
+	}
+	if _, err := key.DataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{OrganizationId: org.ID, SandboxId: running, SdpOffer: "v=0"})); err != nil {
+		t.Fatalf("OpenSession while blocked: %v", err)
+	}
+	unused, err := authorizeExec(t, key, newExec(org.ID, running))
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.grantID = unused.GetGrantId()
+	g.expectGates(t, names(g.blockedCalls()), ownsandv1.BillingReason_BILLING_REASON_BLOCKED)
+	enforceBilling(t, env)
+	if pauseCommands(agent, running) != 0 || pausedByBilling(t, env, running) {
+		t.Fatal("a blocked organization's sandbox was paused")
+	}
+
+	// SUSPENDED: 3 days of non-payment, which delino-accounts reports.
+	fake.SetAccountStatus(billingAccountA, accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED, blockedAt)
+	pollBilling(t, env)
+	enforceBilling(t, env)
+	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+	if !pausedByBilling(t, env, running) || pausedByBilling(t, env, userPaused) {
+		t.Fatalf("billing marks: running=%v userPaused=%v", pausedByBilling(t, env, running), pausedByBilling(t, env, userPaused))
+	}
+	if b := billingStatus(t, key, org.ID); b.GetPhase() != billing.PhaseSuspended || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_SUSPENDED {
+		t.Fatalf("suspended status = %v", b)
+	}
+	g.expectGates(t, names(g.blockedCalls(), g.suspendedCalls()), ownsandv1.BillingReason_BILLING_REASON_SUSPENDED)
+	// Passes are idempotent: a paused sandbox gets no second pause.
+	pauses := pauseCommands(agent, running)
+	enforceBilling(t, env)
+	if got := pauseCommands(agent, running); got != pauses {
+		t.Fatalf("pause commands after a second pass = %d, want %d", got, pauses)
+	}
+	// A sandbox that becomes RUNNING again while the organization stays
+	// suspended (for example after its device reconnected) is paused again.
+	agent.SendUpdate(agent.SetSandbox(running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, 0))
+	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	enforceBilling(t, env)
+	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+	if !strings.Contains(env.Logs.String(), `"msg":"billing_sandbox_paused"`) {
+		t.Fatal("billing_sandbox_paused not logged")
+	}
+
+	// Recovery: only the sandbox that billing paused resumes.
+	fake.SetAccountStatus(billingAccountA, accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, time.Time{})
+	pollBilling(t, env)
+	enforceBilling(t, env)
+	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	testenv.Eventually(t, "the billing mark is cleared", func() bool { return !pausedByBilling(t, env, running) })
+	if s := getSandbox(t, c, org.ID, userPaused); s.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("the caller-paused sandbox is %v", s.GetState())
+	}
+	if b := billingStatus(t, c, org.ID); b.GetPhase() != billing.PhaseAllowed || b.GetBlockedSince() != nil {
+		t.Fatalf("recovered status = %v", b)
+	}
+	g.expectGates(t, nil, 0)
+	// The device is full (two sandboxes hold its vCPUs), so the create
+	// fails, but not for billing.
+	if _, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); billingReasonOf(t, "CreateSandbox", err) != ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED {
+		t.Fatalf("CreateSandbox after the recovery: %v", err)
+	}
+	for _, msg := range []string{`"msg":"billing_sandbox_resumed"`, `"msg":"billing_status_changed"`, `"to_phase":"suspended"`, `"to_phase":"allowed"`} {
+		if !strings.Contains(env.Logs.String(), msg) {
+			t.Fatalf("log %s missing", msg)
+		}
+	}
+}
+
+// TestBillingUnlinkedOrganization checks the local status of an
+// organization without a link: blocked with ACCOUNT_REQUIRED from its
+// creation, suspended 3 days later, and a link to a billing account in
+// non-payment keeps the earlier block start.
+func TestBillingUnlinkedOrganization(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	created := env.Clock.Now()
+	org := env.NewUnlinkedOrg("bob")
+	c := org.OwnerClient
+	b := billingStatus(t, env.User(org.Member), org.ID)
+	if b.GetPhase() != billing.PhaseBlocked || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED || b.GetLinked() ||
+		!b.GetBlockedSince().AsTime().Equal(created) || !b.GetSuspendTime().AsTime().Equal(created.Add(72*time.Hour)) {
+		t.Fatalf("new organization status = %v", b)
+	}
+	g := &gateFixture{env: env, org: org, sandboxID: "01900000-0000-7000-8000-00000000beef"}
+	for _, call := range g.blockedCalls() {
+		if call.name == "Enroll" {
+			continue // no enrollment token can exist
+		}
+		if got := billingReasonOf(t, call.name, call.call(ctx)); got != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED {
+			t.Errorf("%s: reason %v", call.name, got)
+		}
+	}
+	if _, err := c.Billing.GetBillingUsage(ctx, connect.NewRequest(&ownsandv1.GetBillingUsageRequest{OrganizationId: org.ID})); testenv.Code(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("GetBillingUsage without a link: %v", err)
+	}
+
+	env.Clock.Advance(72 * time.Hour)
+	if b := billingStatus(t, c, org.ID); b.GetPhase() != billing.PhaseSuspended || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_SUSPENDED {
+		t.Fatalf("status after 3 days = %v", b)
+	}
+	_, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}))
+	if got := billingReasonOf(t, "CreateEnrollmentToken", err); got != ownsandv1.BillingReason_BILLING_REASON_SUSPENDED {
+		t.Fatalf("reason after 3 days = %v", got)
+	}
+	if err := env.App.Billing.Advance(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(env.Logs.String(), `"source":"time"`) {
+		t.Fatal("the time-based suspension was not logged")
+	}
+
+	// A link to a billing account that is also in non-payment keeps the
+	// block start of the organization.
+	fake.AddAccount(billingAccountB, "Unpaid", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN})
+	fake.SetAccountStatus(billingAccountB, accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, env.Clock.Now().Add(-time.Hour))
+	resp, err := c.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: billingAccountB}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := resp.Msg.GetBilling(); b.GetPhase() != billing.PhaseSuspended || !b.GetLinked() || !b.GetBlockedSince().AsTime().Equal(created) {
+		t.Fatalf("link in non-payment = %v", b)
+	}
+	if _, name, _ := fake.Link(org.ID); name != "org of bob" {
+		t.Fatalf("organization_name sent = %q", name)
+	}
+	// Unlinking keeps the block start too.
+	un, err := c.Billing.UnlinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b := un.Msg.GetBilling(); b.GetPhase() != billing.PhaseSuspended || b.GetLinked() || !b.GetBlockedSince().AsTime().Equal(created) {
+		t.Fatalf("unlink in non-payment = %v", b)
+	}
+	// A billing account in good standing recovers the organization.
+	fake.AddAccount(billingAccountC, "Paid", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	resp, err = c.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: billingAccountC}))
+	if err != nil || resp.Msg.GetBilling().GetPhase() != billing.PhaseAllowed {
+		t.Fatalf("link in good standing = %v, %v", resp, err)
+	}
+	if _, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)})); err != nil {
+		t.Fatalf("CreateEnrollmentToken after the link: %v", err)
+	}
+}
+
+// TestBillingFailOpen checks that a linked organization whose cached status
+// is more than 1 hour old is allowed by the RPC gates, with a warning, and
+// that the fail open never resumes a billing-paused sandbox.
+func TestBillingFailOpen(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	org := linkedOrg(t, env, fake, "carol", billingAccountA)
+	c := org.OwnerClient
+	_, _ = setupAgent(t, env, org, nil)
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	fake.SetAccountStatus(billingAccountA, accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED, env.Clock.Now().Add(-72*time.Hour))
+	pollBilling(t, env)
+	enforceBilling(t, env)
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+	tokenReq := &ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}
+	if _, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(tokenReq)); billingReasonOf(t, "CreateEnrollmentToken", err) != ownsandv1.BillingReason_BILLING_REASON_SUSPENDED {
+		t.Fatalf("suspended: %v", err)
+	}
+
+	// delino-accounts becomes unreachable; at 1 hour the cache is still
+	// enforced, after it the gates fail open.
+	fake.Fail(accountstest.MethodListBillingStatusChanges, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	env.Clock.Advance(time.Hour)
+	if err := env.App.Billing.Poll(ctx); err == nil {
+		t.Fatal("the poll succeeded while delino-accounts is down")
+	}
+	if b := billingStatus(t, c, org.ID); b.GetPhase() != billing.PhaseSuspended {
+		t.Fatalf("status at 1 hour = %v", b)
+	}
+	env.Clock.Advance(time.Second)
+	if b := billingStatus(t, c, org.ID); b.GetPhase() != billing.PhaseAllowed || !b.GetLinked() || b.GetBlockedSince() != nil {
+		t.Fatalf("fail-open status = %v", b)
+	}
+	for range 2 {
+		if _, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(tokenReq)); err != nil {
+			t.Fatalf("CreateEnrollmentToken while failing open: %v", err)
+		}
+	}
+	if n := strings.Count(env.Logs.String(), `"msg":"billing_status_stale"`); n != 1 {
+		t.Fatalf("billing_status_stale logged %d times, want 1 (rate-limited)", n)
+	}
+	// The fail open never resumes the billing-paused sandbox.
+	enforceBilling(t, env)
+	if !pausedByBilling(t, env, sandboxID) {
+		t.Fatal("the fail open cleared the billing mark")
+	}
+	var state int16
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT agent_state FROM sandboxes WHERE sandbox_id = $1", sandboxID).Scan(&state); err != nil || ownsandv1.SandboxState(state) != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("sandbox state = %v, %v", ownsandv1.SandboxState(state), err)
+	}
+
+	// A successful poll confirms the status again and restores the gates.
+	fake.Fail(accountstest.MethodListBillingStatusChanges, nil)
+	pollBilling(t, env)
+	if _, err := c.Device.CreateEnrollmentToken(ctx, connect.NewRequest(tokenReq)); billingReasonOf(t, "CreateEnrollmentToken", err) != ownsandv1.BillingReason_BILLING_REASON_SUSPENDED {
+		t.Fatalf("after a fresh poll: %v", err)
+	}
+}
+
+// TestBillingOwnershipTransferAndDeletionUnlink checks that an ownership
+// transfer and an organization deletion remove the billing link at once,
+// and that an unlink that delino-accounts could not take is retried before
+// the new owner's link.
+func TestBillingOwnershipTransferAndDeletionUnlink(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	org := linkedOrg(t, env, fake, "dave", billingAccountA)
+	fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	transferAt := env.Clock.Now()
+	if _, err := org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: org.ID, UserId: org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	newOwner := env.User(org.Admin)
+	b := billingStatus(t, newOwner, org.ID)
+	if b.GetPhase() != billing.PhaseBlocked || b.GetLinked() || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED || !b.GetBlockedSince().AsTime().Equal(transferAt) {
+		t.Fatalf("status after the transfer = %v", b)
+	}
+	if _, err := newOwner.Device.CreateEnrollmentToken(ctx, connect.NewRequest(&ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)})); billingReasonOf(t, "CreateEnrollmentToken", err) != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED {
+		t.Fatalf("after the transfer: %v", err)
+	}
+	if account, _, ok := fake.Link(org.ID); !ok || account != billingAccountA {
+		t.Fatal("the fake lost the link although the unlink failed")
+	}
+	var pending int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM billing_pending_unlinks WHERE organization_id = $1", org.ID).Scan(&pending); err != nil || pending != 1 {
+		t.Fatalf("pending unlinks = %d, %v", pending, err)
+	}
+	// The former owner can no longer link.
+	if _, err := org.OwnerClient.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: billingAccountA})); testenv.Code(err) != connect.CodePermissionDenied {
+		t.Fatalf("former owner link: %v", err)
+	}
+	// The new owner's link needs the pending unlink first.
+	fake.AddAccount(billingAccountB, "New owner", map[string]accountsv1.BillingAccountRole{org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	linkB := &ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: billingAccountB}
+	if _, err := newOwner.Billing.LinkBillingAccount(ctx, connect.NewRequest(linkB)); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("link with a pending unlink while delino-accounts is down: %v", err)
+	}
+	fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	resp, err := newOwner.Billing.LinkBillingAccount(ctx, connect.NewRequest(linkB))
+	if err != nil || resp.Msg.GetBilling().GetPhase() != billing.PhaseAllowed {
+		t.Fatalf("new owner link = %v, %v", resp, err)
+	}
+	if account, _, _ := fake.Link(org.ID); account != billingAccountB {
+		t.Fatalf("fake link = %q", account)
+	}
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM billing_pending_unlinks").Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("pending unlinks after the link = %d, %v", pending, err)
+	}
+
+	// Deletion removes the link: at once when delino-accounts answers ...
+	org2 := linkedOrg(t, env, fake, "erin", billingAccountC)
+	if _, err := org2.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org2.ID})); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := fake.Link(org2.ID); ok {
+		t.Fatal("the deleted organization is still linked")
+	}
+	// ... and through the retry when it does not.
+	org3 := linkedOrg(t, env, fake, "frank", "01900000-0000-7000-8000-0000000000c4")
+	fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if _, err := org3.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org3.ID})); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := fake.Link(org3.ID); !ok {
+		t.Fatal("the fake lost the link although the unlink failed")
+	}
+	fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	env.Clock.Advance(time.Minute)
+	if err := env.App.Billing.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok := fake.Link(org3.ID); ok {
+		t.Fatal("the retried unlink did not reach delino-accounts")
+	}
+}
+
+// TestBillingRPCs checks the BillingService answers and their errors.
+func TestBillingRPCs(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	org := env.NewUnlinkedOrg("gina")
+	c := org.OwnerClient
+	fake.AddAccount(billingAccountA, "Owned", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	fake.AddAccount(billingAccountB, "Administered", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN})
+	fake.AddAccount(billingAccountC, "Viewed", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER})
+
+	list, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := list.Msg.GetBillingAccounts()
+	if len(got) != 2 || got[0].GetBillingAccountId() != billingAccountA || got[0].GetRole() != ownsandv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER ||
+		got[1].GetBillingAccountId() != billingAccountB || got[1].GetRole() != ownsandv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN || got[1].GetName() != "Administered" {
+		t.Fatalf("linkable accounts = %v", got)
+	}
+	page, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID, PageSize: 1}))
+	if err != nil || len(page.Msg.GetBillingAccounts()) != 1 || page.Msg.GetNextPageToken() == "" {
+		t.Fatalf("first page = %v, %v", page, err)
+	}
+
+	link := func(account string) error {
+		_, err := c.Billing.LinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: org.ID, BillingAccountId: account}))
+		return err
+	}
+	for _, tc := range []struct {
+		account string
+		want    connect.Code
+	}{
+		{billingAccountC, connect.CodePermissionDenied},
+		{"01900000-0000-7000-8000-00000000ffff", connect.CodeNotFound},
+		{"not-a-uuid", connect.CodeInvalidArgument},
+	} {
+		if err := link(tc.account); testenv.Code(err) != tc.want {
+			t.Fatalf("link %s: %v, want %v", tc.account, err, tc.want)
+		}
+	}
+	if err := link(billingAccountA); err != nil {
+		t.Fatal(err)
+	}
+	if err := link(billingAccountB); testenv.Code(err) != connect.CodeAlreadyExists {
+		t.Fatalf("link to another account: %v", err)
+	}
+	if err := link(billingAccountA); err != nil {
+		t.Fatalf("repeated link: %v", err)
+	}
+
+	// Usage of the current month, one entry per meter in order.
+	window := billing.WindowStart(env.Clock.Now())
+	if _, err := fake.Client().ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{Reports: []*accountsv1.UsageReport{
+		{Service: billing.ServiceID, OrganizationId: org.ID, Meter: accountsv1.Meter_METER_OWNSAND_CLASS_A_RPC, WindowStart: timestamppb.New(window), Quantity: 10, AmountUsdMicros: 45},
+	}})); err != nil {
+		t.Fatal(err)
+	}
+	usage, err := env.User(org.Admin).Billing.GetBillingUsage(ctx, connect.NewRequest(&ownsandv1.GetBillingUsageRequest{OrganizationId: org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u := usage.Msg
+	if u.GetBillingAccountId() != billingAccountA || u.GetBillingAccountName() != "Owned" || u.GetBalanceUsdMicros() != 10_000_000-45 || len(u.GetMeterUsages()) != 4 {
+		t.Fatalf("usage = %v", u)
+	}
+	for i, m := range billing.Meters {
+		mu := u.GetMeterUsages()[i]
+		wantQ, wantA := int64(0), int64(0)
+		if m == ownsandv1.BillingMeter_BILLING_METER_CLASS_A_RPC {
+			wantQ, wantA = 10, 45
+		}
+		if mu.GetMeter() != m || mu.GetQuantity() != wantQ || mu.GetAmountUsdMicros() != wantA {
+			t.Fatalf("meter %d = %v", i, mu)
+		}
+	}
+
+	// delino-accounts is down: the RPCs that need it are unavailable, the
+	// status still answers from the cache.
+	down := connect.NewError(connect.CodeInternal, errors.New("boom"))
+	fake.Fail(accountstest.MethodGetOrganizationBilling, down)
+	fake.Fail(accountstest.MethodListManageableBillingAccounts, down)
+	fake.Fail(accountstest.MethodUnlinkOrganization, down)
+	if _, err := c.Billing.GetBillingUsage(ctx, connect.NewRequest(&ownsandv1.GetBillingUsageRequest{OrganizationId: org.ID})); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("usage while down: %v", err)
+	}
+	if _, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID})); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("list while down: %v", err)
+	}
+	if _, err := c.Billing.UnlinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{OrganizationId: org.ID})); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("unlink while down: %v", err)
+	}
+	if b := billingStatus(t, c, org.ID); b.GetPhase() != billing.PhaseAllowed || !b.GetLinked() {
+		t.Fatalf("status while down = %v", b)
+	}
+	fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+
+	// Unlink blocks at once and is idempotent.
+	unlinkAt := env.Clock.Now()
+	for range 2 {
+		resp, err := c.Billing.UnlinkBillingAccount(ctx, connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{OrganizationId: org.ID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b := resp.Msg.GetBilling(); b.GetPhase() != billing.PhaseBlocked || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED || !b.GetBlockedSince().AsTime().Equal(unlinkAt) {
+			t.Fatalf("unlink = %v", b)
+		}
+	}
+	if fake.Calls(accountstest.MethodUnlinkOrganization) != 2 { // one failed, one accepted; the repeated unlink sends nothing
+		t.Fatalf("UnlinkOrganization calls = %d", fake.Calls(accountstest.MethodUnlinkOrganization))
+	}
+}
+
+// TestBillingErrorDetailCodecs checks that a billing rejection carries the
+// billing reason in the binary protobuf and in the Connect JSON encoding.
+func TestBillingErrorDetailCodecs(t *testing.T) {
+	env, _ := billingEnv(t)
+	org := env.NewUnlinkedOrg("hank")
+	req := &ownsandv1.CreateEnrollmentTokenRequest{OrganizationId: org.ID, Ttl: durationpb.New(time.Hour)}
+	_, binErr := org.OwnerClient.Device.CreateEnrollmentToken(context.Background(), connect.NewRequest(req))
+	_, jsonErr := env.JSONDeviceClient(testenv.UserToken(org.Owner)).CreateEnrollmentToken(context.Background(), connect.NewRequest(req))
+	for name, err := range map[string]error{"binary": binErr, "json": jsonErr} {
+		if got := billingReasonOf(t, name, err); got != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED {
+			t.Fatalf("%s: reason = %v (err %v)", name, got, err)
+		}
+	}
+}

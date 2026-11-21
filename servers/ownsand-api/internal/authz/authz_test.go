@@ -20,6 +20,11 @@ func TestMatrix(t *testing.T) {
 		ActionReadOrganization: {true, true, true, false},
 		ActionReadDevices:      {true, true, true, true},
 		ActionUseSandboxes:     {true, true, true, true},
+		// Billing: link, unlink and list linkable billing accounts; read
+		// the usage; read the status.
+		ActionManageBilling:     {true, false, false, false},
+		ActionReadBillingUsage:  {true, true, false, false},
+		ActionReadBillingStatus: {true, true, true, true},
 	}
 	if len(want) != len(AllActions()) {
 		t.Fatalf("the test covers %d of %d actions", len(want), len(AllActions()))

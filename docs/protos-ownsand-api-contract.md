@@ -11,22 +11,22 @@ This contract owns the Connect RPC schemas of [`ownsand`](project-ownsand.md):
 
 Schema files:
 
-| File                        | Content                                                                                                                                                                                                                                                            |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `common.proto`              | Shared enums, `Principal`, `Resources`, `DeviceLimits`, `ErrorDetail`, `RequestAccepted`, `Keepalive` and `SandboxRevision`.                                                                                                                                       |
-| `organization.proto`        | `OrganizationService`.                                                                                                                                                                                                                                             |
-| `member.proto`              | `MemberService`.                                                                                                                                                                                                                                                   |
-| `device.proto`              | `DeviceService`, `Device`, `DeviceCapabilities` and `DeviceAllocation`.                                                                                                                                                                                            |
-| `api_key.proto`             | `ApiKeyService`.                                                                                                                                                                                                                                                   |
-| `sandbox.proto`             | `SandboxService`.                                                                                                                                                                                                                                                  |
-| `snapshot.proto`            | `SnapshotService` with templates.                                                                                                                                                                                                                                  |
-| `data_path.proto`           | `DataPathService`.                                                                                                                                                                                                                                                 |
-| `data_frame.proto`          | `DataFrame` and every payload, the exec and file messages and `RelayRequestBinding`.                                                                                                                                                                               |
-| `relay.proto`               | `RelayService` and `RelayAgentService`.                                                                                                                                                                                                                            |
-| `agent.proto`               | `AgentService` and `AgentEnvelope` with every case.                                                                                                                                                                                                                |
-| `guest.proto`               | `GuestService`.                                                                                                                                                                                                                                                    |
-| `audit.proto`               | `AuditAction`, `AuditTargetKind` and the `AuditEvent` record. No RPC returns audit events in `v1`.                                                                                                                                                                 |
-| `billing.proto` (`planned`) | `BillingService`, `BillingPhase`, `BillingMeter`, `BillingAccountRole`, `OrganizationBilling`, `BillingMeterUsage` and `LinkableBillingAccount`. See [Billing](#billing). `common.proto` adds `BillingReason` and `ErrorDetail.billing_reason` in the same change. |
+| File                 | Content                                                                                                                                                                                                                                                            |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `common.proto`       | Shared enums, `Principal`, `Resources`, `DeviceLimits`, `ErrorDetail`, `RequestAccepted`, `Keepalive` and `SandboxRevision`.                                                                                                                                       |
+| `organization.proto` | `OrganizationService`.                                                                                                                                                                                                                                             |
+| `member.proto`       | `MemberService`.                                                                                                                                                                                                                                                   |
+| `device.proto`       | `DeviceService`, `Device`, `DeviceCapabilities` and `DeviceAllocation`.                                                                                                                                                                                            |
+| `api_key.proto`      | `ApiKeyService`.                                                                                                                                                                                                                                                   |
+| `sandbox.proto`      | `SandboxService`.                                                                                                                                                                                                                                                  |
+| `snapshot.proto`     | `SnapshotService` with templates.                                                                                                                                                                                                                                  |
+| `data_path.proto`    | `DataPathService`.                                                                                                                                                                                                                                                 |
+| `data_frame.proto`   | `DataFrame` and every payload, the exec and file messages and `RelayRequestBinding`.                                                                                                                                                                               |
+| `relay.proto`        | `RelayService` and `RelayAgentService`.                                                                                                                                                                                                                            |
+| `agent.proto`        | `AgentService` and `AgentEnvelope` with every case.                                                                                                                                                                                                                |
+| `guest.proto`        | `GuestService`.                                                                                                                                                                                                                                                    |
+| `audit.proto`        | `AuditAction`, `AuditTargetKind` and the `AuditEvent` record. No RPC returns audit events in `v1`.                                                                                                                                                                 |
+| `billing.proto`      | `BillingService`, `BillingPhase`, `BillingMeter`, `BillingAccountRole`, `OrganizationBilling`, `BillingMeterUsage` and `LinkableBillingAccount`. See [Billing](#billing). `common.proto` adds `BillingReason` and `ErrorDetail.billing_reason` in the same change. |
 
 The schemas are the single source of truth for the public API, the agent channel and the data path framing. The control plane, the device agent, the guest helper, the CLI, the web console and both SDKs consume them. The schemas and the generated code use Apache-2.0.
 
@@ -55,12 +55,12 @@ The schemas are the single source of truth for the public API, the agent channel
 - List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`.
 - Errors use Connect error codes. Detail messages never contain secrets or sandbox content.
 - Request and response messages follow the buf `STANDARD` lint rules: each RPC has its own `<Rpc>Request` and `<Rpc>Response` message. A streaming RPC that carries a shared message wraps it in one field (for example `ExecResponse.event`, `ConnectRequest.frame` and `ChannelRequest.envelope`); the wrapper adds a few bytes to each stream message, which the 1 MiB plus 64 KiB frame limit does not count.
-- `ErrorCode` carries an error inside frames and agent channel results. Its numeric values equal the Connect error codes. `ErrorDetail` carries the code, a message without secrets or sandbox content, an optional retry delay, when a session end caused the error, the `SessionEndReason`, and (`planned`) when billing rejected the call, the `BillingReason` (see [Billing](#billing)).
+- `ErrorCode` carries an error inside frames and agent channel results. Its numeric values equal the Connect error codes. `ErrorDetail` carries the code, a message without secrets or sandbox content, an optional retry delay, when a session end caused the error, the `SessionEndReason`, and when billing rejected the call, the `BillingReason` (see [Billing](#billing)).
 - Every public RPC, including `RelayService`, is unary or server-streaming, so that clients without client or bidirectional streams can use it. See [the project transport rule](project-ownsand.md#protocol-and-api). Only the device-facing `RelayAgentService.Connect` and `AgentService.Channel` are bidirectional. `AgentService.Channel` is a Connect bidirectional stream (a recorded decision; only its WebSocket fallback stays open), as the [control plane agent channel section](servers-ownsand-api-foundation.md#agent-channel) records. Both need HTTP/2 from end to end, which the [control plane contract](servers-ownsand-api-foundation.md#runtime-and-language) requires from the proxy route.
 
 ### Public services
 
-The control plane serves every public service at `https://ownsand.api.delino.io`. Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationService.ListOrganizations` and `MemberService.AcceptInvitation` takes an `organization_id`. `BillingService` is `planned`. The [control plane contract](servers-ownsand-api-foundation.md#authorization) owns the role that each RPC requires.
+The control plane serves every public service at `https://ownsand.api.delino.io`. Every public RPC except `OrganizationService.CreateOrganization`, `OrganizationService.ListOrganizations` and `MemberService.AcceptInvitation` takes an `organization_id`. The [control plane contract](servers-ownsand-api-foundation.md#authorization) owns the role that each RPC requires.
 
 | Service               | RPC                           | Kind             | Purpose                                                                                                                                        |
 | --------------------- | ----------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -233,7 +233,7 @@ Schema decisions:
 
 ### Billing
 
-Status: the control plane meters calls with this classification; `BillingService` handlers and the billing errors are `planned`. The [project index](project-ownsand.md#billing) owns the prices and the enforcement phases, and the [control plane contract](servers-ownsand-api-foundation.md#billing) owns metering and enforcement.
+Status: the control plane meters calls with this classification, serves `BillingService` and returns the billing errors. The [project index](project-ownsand.md#billing) owns the prices and the enforcement phases, and the [control plane contract](servers-ownsand-api-foundation.md#billing) owns metering and enforcement.
 
 RPC classification: the control plane counts each public RPC that is authenticated and ends with an OK status in its class. Rejected calls are never billed.
 
@@ -284,40 +284,40 @@ Billing errors:
 
 ### Enums
 
-| Enum                             | Values (without the enum prefix)                                                                                                        |
-| -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `Role`                           | `OWNER`, `ADMIN`, `MEMBER`                                                                                                              |
-| `HostOs`                         | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
-| `Arch`                           | `AMD64`, `ARM64`                                                                                                                        |
-| `GuestOs`                        | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
-| `BaseImage`                      | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
-| `DeviceState`                    | `ONLINE`, `OFFLINE`, `REMOVED`                                                                                                          |
-| `SandboxState`                   | `CREATING`, `RUNNING`, `PAUSED`, `DELETING`, `DELETED`, `FAILED`, `UNREACHABLE`                                                         |
-| `SandboxEndReason`               | `DELETED_BY_CALLER`, `IDLE_TTL_EXPIRED`, `MAX_TTL_EXPIRED`, `DEVICE_REMOVED`, `ORGANIZATION_DELETED`, `CREATE_FAILED`, `LOST_ON_DEVICE` |
-| `SnapshotState`                  | `CREATING`, `READY`, `FAILED`, `DELETING`                                                                                               |
-| `SnapshotExportState`            | `NOT_EXPORTED`, `EXPORTING`, `EXPORTED`, `EXPORT_FAILED`                                                                                |
-| `NetworkMode`                    | `OUTBOUND`, `NONE`                                                                                                                      |
-| `AgentVersionPolicyMode`         | `FOLLOW_DEFAULT`, `PIN`, `HOLD`                                                                                                         |
-| `PrincipalKind`                  | `USER`, `API_KEY`, `DEVICE`, `SYSTEM`                                                                                                   |
-| `AuditTargetKind`                | `ORGANIZATION`, `MEMBERSHIP`, `INVITATION`, `DEVICE`, `ENROLLMENT_TOKEN`, `API_KEY`, `SANDBOX`, `AGENT_VERSION_POLICY`                  |
-| `EnrollmentTokenState`           | `PENDING`, `USED`, `REVOKED`, `EXPIRED`                                                                                                 |
-| `InvitationState`                | `PENDING`, `ACCEPTED`, `REVOKED`, `EXPIRED`                                                                                             |
-| `ApiKeyState`                    | `ACTIVE`, `REVOKED`                                                                                                                     |
-| `AgentUpdateState`               | `UP_TO_DATE`, `PENDING_IDLE`, `DOWNLOADING`, `INSTALLING`, `FAILED`, `REVOKED_PENDING_IDLE`                                             |
-| `SessionEndReason`               | `IDLE`, `EXPIRED`, `REVOKED`, `AGENT_CHANNEL_LOST`, `GRANT_INVALID` and `GRANT_REPLACED` (relay only)                                   |
-| `DataPathTransport`              | `PEER_TO_PEER`, `RELAY`                                                                                                                 |
-| `RelayOperationKind`             | `EXEC` (`Exec` and `AttachExec`), `ATTACH_EXEC` (`AttachExec` only, without a digest), `READ_FILE`, `WRITE_FILE`                        |
-| `RelayGrantResult`               | `ACCEPTED`, `REJECTED_GRANT_LIMIT`                                                                                                      |
-| `DataFrameKind`                  | One value per payload in [data path framing](#data-path-framing)                                                                        |
-| `AuditAction`                    | The values in the [control plane audit table](servers-ownsand-api-foundation.md#audit-events)                                           |
-| `SandboxRestorePath`             | `BASE_IMAGE`, `DISK_COLD_BOOT`, `MEMORY_STATE`                                                                                          |
-| `ExecFailureReason`              | `PROGRAM_NOT_FOUND`, `PERMISSION_DENIED`, `WORKING_DIRECTORY_INVALID`, `RESOURCE_EXHAUSTED`, `OTHER`                                    |
-| `ErrorCode`                      | The Connect error codes, with the same numbers (`CANCELED` = 1 to `UNAUTHENTICATED` = 16)                                               |
-| `SignedUrlOperation`             | `UPLOAD`, `DOWNLOAD`                                                                                                                    |
-| `BillingReason` (`planned`)      | `ACCOUNT_REQUIRED`, `BLOCKED`, `SUSPENDED`                                                                                              |
-| `BillingPhase` (`planned`)       | `ALLOWED`, `BLOCKED`, `SUSPENDED`                                                                                                       |
-| `BillingMeter` (`planned`)       | `RELAY_EGRESS`, `R2_STORAGE`, `CLASS_A_RPC`, `CLASS_B_RPC`                                                                              |
-| `BillingAccountRole` (`planned`) | `OWNER`, `ADMIN`, `VIEWER` (the role in a `delino-accounts` billing account)                                                            |
+| Enum                     | Values (without the enum prefix)                                                                                                        |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
+| `Role`                   | `OWNER`, `ADMIN`, `MEMBER`                                                                                                              |
+| `HostOs`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `Arch`                   | `AMD64`, `ARM64`                                                                                                                        |
+| `GuestOs`                | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `BaseImage`              | `LINUX`, `MACOS`, `WINDOWS`                                                                                                             |
+| `DeviceState`            | `ONLINE`, `OFFLINE`, `REMOVED`                                                                                                          |
+| `SandboxState`           | `CREATING`, `RUNNING`, `PAUSED`, `DELETING`, `DELETED`, `FAILED`, `UNREACHABLE`                                                         |
+| `SandboxEndReason`       | `DELETED_BY_CALLER`, `IDLE_TTL_EXPIRED`, `MAX_TTL_EXPIRED`, `DEVICE_REMOVED`, `ORGANIZATION_DELETED`, `CREATE_FAILED`, `LOST_ON_DEVICE` |
+| `SnapshotState`          | `CREATING`, `READY`, `FAILED`, `DELETING`                                                                                               |
+| `SnapshotExportState`    | `NOT_EXPORTED`, `EXPORTING`, `EXPORTED`, `EXPORT_FAILED`                                                                                |
+| `NetworkMode`            | `OUTBOUND`, `NONE`                                                                                                                      |
+| `AgentVersionPolicyMode` | `FOLLOW_DEFAULT`, `PIN`, `HOLD`                                                                                                         |
+| `PrincipalKind`          | `USER`, `API_KEY`, `DEVICE`, `SYSTEM`                                                                                                   |
+| `AuditTargetKind`        | `ORGANIZATION`, `MEMBERSHIP`, `INVITATION`, `DEVICE`, `ENROLLMENT_TOKEN`, `API_KEY`, `SANDBOX`, `AGENT_VERSION_POLICY`                  |
+| `EnrollmentTokenState`   | `PENDING`, `USED`, `REVOKED`, `EXPIRED`                                                                                                 |
+| `InvitationState`        | `PENDING`, `ACCEPTED`, `REVOKED`, `EXPIRED`                                                                                             |
+| `ApiKeyState`            | `ACTIVE`, `REVOKED`                                                                                                                     |
+| `AgentUpdateState`       | `UP_TO_DATE`, `PENDING_IDLE`, `DOWNLOADING`, `INSTALLING`, `FAILED`, `REVOKED_PENDING_IDLE`                                             |
+| `SessionEndReason`       | `IDLE`, `EXPIRED`, `REVOKED`, `AGENT_CHANNEL_LOST`, `GRANT_INVALID` and `GRANT_REPLACED` (relay only)                                   |
+| `DataPathTransport`      | `PEER_TO_PEER`, `RELAY`                                                                                                                 |
+| `RelayOperationKind`     | `EXEC` (`Exec` and `AttachExec`), `ATTACH_EXEC` (`AttachExec` only, without a digest), `READ_FILE`, `WRITE_FILE`                        |
+| `RelayGrantResult`       | `ACCEPTED`, `REJECTED_GRANT_LIMIT`                                                                                                      |
+| `DataFrameKind`          | One value per payload in [data path framing](#data-path-framing)                                                                        |
+| `AuditAction`            | The values in the [control plane audit table](servers-ownsand-api-foundation.md#audit-events)                                           |
+| `SandboxRestorePath`     | `BASE_IMAGE`, `DISK_COLD_BOOT`, `MEMORY_STATE`                                                                                          |
+| `ExecFailureReason`      | `PROGRAM_NOT_FOUND`, `PERMISSION_DENIED`, `WORKING_DIRECTORY_INVALID`, `RESOURCE_EXHAUSTED`, `OTHER`                                    |
+| `ErrorCode`              | The Connect error codes, with the same numbers (`CANCELED` = 1 to `UNAUTHENTICATED` = 16)                                               |
+| `SignedUrlOperation`     | `UPLOAD`, `DOWNLOAD`                                                                                                                    |
+| `BillingReason`          | `ACCOUNT_REQUIRED`, `BLOCKED`, `SUSPENDED`                                                                                              |
+| `BillingPhase`           | `ALLOWED`, `BLOCKED`, `SUSPENDED`                                                                                                       |
+| `BillingMeter`           | `RELAY_EGRESS`, `R2_STORAGE`, `CLASS_A_RPC`, `CLASS_B_RPC`                                                                              |
+| `BillingAccountRole`     | `OWNER`, `ADMIN`, `VIEWER` (the role in a `delino-accounts` billing account)                                                            |
 
 A sandbox that is `UNREACHABLE` also reports its last known state in `last_known_state`. `DELETED` and `FAILED` sandboxes report a `SandboxEndReason`. `LOST_ON_DEVICE` means that the sandbox's VM or its record no longer exists on the device, for example after a host reboot.
 
@@ -342,7 +342,7 @@ The schemas define no logging. Components log RPC names, identifiers, enum value
 - Lint: `buf lint` with the `STANDARD` rules in `protos/buf.yaml`.
 - Breaking changes: `scripts/protos.sh breaking <base>` runs `buf breaking` with the `FILE` rules against the schemas of the Git revision `<base>`, extracted with `git archive`. A base without `protos/buf.yaml` has nothing to compare.
 - Drift check: `scripts/protos.sh check` runs the lint, checks the formatting with `buf format --diff --exit-code`, generates the Go and the TypeScript bindings into a temporary directory and fails when the set or the content of the committed generated files of either language, in either TypeScript package, differs from the generated output. The CI `protos` job, which the `go` planner output selects, installs the workspace dependencies and runs `check` and `breaking` against the comparison base whenever a `.proto` file, `protos/buf.yaml`, `protos/buf.gen.yaml`, `protos/buf.lock`, `scripts/protos.sh`, `packages/ownsand-sdk/buf.gen.yaml`, `packages/ownsand-sdk/package.json`, a file under `packages/ownsand-sdk/src/gen/`, `apps/delino-accounts/buf.gen.yaml`, `apps/delino-accounts/package.json`, a file under `apps/delino-accounts/src/gen/` or a Go input changes, according to the [workflow contract](repository-workflow-contract.md#validation). CI therefore fails when the committed Go or TypeScript bindings differ from the generated output.
-- `protos/delino/ownsand/v1/schema_test.go` checks the `DataFrameKind` to payload naming rule, the `_UNSPECIFIED` zero value of every enum, the `ErrorCode` numbers and the `AuditAction` values. With billing (`planned`) it also checks that `BillingReason` has exactly the three values of [Billing](#billing) (clients treat every value as terminal, so a new value needs a contract change), that every `BillingMeter` value has exactly one OwnSand `Meter` value of the [`delino-accounts` schemas](protos-delino-accounts-api-contract.md#enums) with the same name and the reverse (the control plane maps meters by name when it reports usage), and that every field whose name mentions `usd` is a singular `int64` that ends with `_usd_micros`.
+- `protos/delino/ownsand/v1/schema_test.go` checks the `DataFrameKind` to payload naming rule, the `_UNSPECIFIED` zero value of every enum, the `ErrorCode` numbers and the `AuditAction` values. It also checks that `BillingReason` has exactly the three values of [Billing](#billing) (clients treat every value as terminal, so a new value needs a contract change), that every `BillingMeter` value has exactly one OwnSand `Meter` value of the [`delino-accounts` schemas](protos-delino-accounts-api-contract.md#enums) with the same name and the reverse (the control plane maps meters by name when it reports usage), and that every field whose name mentions `usd` is a singular `int64` that ends with `_usd_micros`.
 - Go consumers run `gofmt`, `go vet ./...` and `go test ./...` from the repository root according to `cmds/AGENTS.md` and `servers/AGENTS.md`.
 
 ## Dependencies and Integrations

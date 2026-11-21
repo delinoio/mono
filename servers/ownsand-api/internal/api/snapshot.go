@@ -117,6 +117,9 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, err
 	}
+	if err := h.checkBilling(ctx, h.DB.Pool, orgID, restrictWhenBlocked); err != nil {
+		return nil, err
+	}
 	sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
 	if err != nil {
 		return nil, err
@@ -602,6 +605,9 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
+	if err := h.checkBilling(ctx, h.DB.Pool, orgID, restrictWhenBlocked); err != nil {
+		return nil, err
+	}
 	snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
 	if err != nil {
 		return nil, err
@@ -711,6 +717,9 @@ func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Reques
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
 		if err != nil {
+			return err
+		}
+		if err := h.checkBilling(ctx, tx, orgID, restrictWhenBlocked); err != nil {
 			return err
 		}
 		snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())

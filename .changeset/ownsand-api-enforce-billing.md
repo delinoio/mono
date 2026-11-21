@@ -1,0 +1,5 @@
+---
+"ownsand-api": minor
+---
+
+Enforce billing for every organization: an organization without a linked `delino-accounts` billing account, or whose billing account is in non-payment, cannot create sandboxes, snapshots, templates or enrollment tokens, resume sandboxes, export snapshots or enroll devices (`resource_exhausted` with the billing reason `ACCOUNT_REQUIRED` or `BLOCKED`), and after 3 days its running sandboxes are paused and exec, file transfers, data channel sessions and relay grants are rejected too (`SUSPENDED`); a confirmed recovery resumes only the sandboxes that billing paused. Existing organizations are blocked from the deployment until their owner links a billing account. Add `BillingService` (billing status, this month's usage, the linkable billing accounts, link and unlink). Ownership transfers and organization deletions remove the link. Statuses come from usage report responses and a 1-minute poll of `accounts-api`; a linked organization whose status is more than 1 hour old is allowed by the RPC gates. New metrics: `ownsand_billing_organizations`, `ownsand_billing_status_poll_failures_total` and `ownsand_billing_pending_unlinks`.
