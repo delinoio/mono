@@ -506,6 +506,101 @@ func TestFileReadFailureKeepsDestination(t *testing.T) {
 	}
 }
 
+func TestFileReadDanglingSymlink(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target")
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the download replaced the dangling symbolic link")
+	}
+	if b, err := os.ReadFile(target); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("target content %q %v", b, err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 2 {
+		t.Fatalf("temporary files left: %v", entries)
+	}
+
+	// A relative link in a chain resolves against the directory of the link.
+	sub := filepath.Join(dir, "sub")
+	if err := os.Mkdir(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(sub, "inner")
+	if err := os.Symlink(filepath.Join("..", "chain-target"), inner); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	outer := filepath.Join(dir, "outer")
+	if err := os.Symlink(inner, outer); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.run("file", "read", "--to", outer, r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to chain: %+v", res)
+	}
+	for _, l := range []string{outer, inner} {
+		if info, err := os.Lstat(l); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("the download replaced the symbolic link %s", l)
+		}
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "chain-target")); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("chain target content %q %v", b, err)
+	}
+}
+
+func TestFileReadDanglingSymlinkMissingDirectory(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(filepath.Join(dir, "missing", "target"), link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code == 0 {
+		t.Fatalf("read --to a link into a missing directory succeeded: %+v", res)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the failed download replaced the symbolic link")
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+		t.Fatalf("temporary files left: %v", entries)
+	}
+}
+
+func TestFileReadSymlinkLoop(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	dir := t.TempDir()
+	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+	if err := os.Symlink(b, a); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if err := os.Symlink(a, b); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.run("file", "read", "--to", a, r.f.sb, "/tmp/x"); res.code == 0 {
+		t.Fatalf("read --to a link loop succeeded: %+v", res)
+	}
+	if info, err := os.Lstat(a); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the failed download replaced the symbolic link")
+	}
+}
+
 func TestListOutputAndColor(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("api-key", "list")

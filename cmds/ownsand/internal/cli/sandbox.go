@@ -626,7 +626,8 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 type downloadTarget struct {
 	f *os.File
 	// path is the destination with symbolic links resolved, so that the
-	// rename replaces the target of a link and keeps the link.
+	// rename replaces the target of a link (or creates a missing target) and
+	// keeps the link.
 	path string
 	// tmp is the temporary file name, empty when f is the destination.
 	tmp string
@@ -648,6 +649,13 @@ func openDownloadTarget(to string) (*downloadTarget, error) {
 		}
 	case !errors.Is(err, os.ErrNotExist):
 		return nil, err
+	default:
+		// os.Stat also fails for a symbolic link whose target is missing.
+		// Follow such a link by hand, so that the rename creates the target
+		// and keeps the link.
+		if path, err = resolveMissingTarget(to); err != nil {
+			return nil, err
+		}
 	}
 	dir, base := filepath.Split(path)
 	for range 100 {
@@ -676,6 +684,39 @@ func openDownloadTarget(to string) (*downloadTarget, error) {
 		return &downloadTarget{f: f, path: path, tmp: tmp}, nil
 	}
 	return nil, fmt.Errorf("create a temporary file beside %s: too many name collisions", to)
+}
+
+// maxSymlinkHops bounds the links that resolveMissingTarget follows. It is
+// the same limit that Linux uses for a path lookup (40) rounded up, so that
+// a link loop fails with an error and not with an endless loop.
+const maxSymlinkHops = 255
+
+// resolveMissingTarget returns the path that a download to to must create,
+// when os.Stat reported that to does not exist. For a plain missing path that
+// is to itself. When to is a symbolic link whose target is missing (a dangling
+// link, possibly through a chain of links), it is the path of the missing
+// target, so that the download creates the target and keeps every link. A
+// target in a directory that does not exist is returned as is: the temporary
+// file cannot be created there, so the download fails before it touches a link.
+func resolveMissingTarget(to string) (string, error) {
+	path := to
+	for range maxSymlinkHops {
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			// A missing path, or a path that is not a link, ends the chain.
+			// The caller reports a later failure when it creates the file.
+			return path, nil
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return "", err
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		path = target
+	}
+	return "", fmt.Errorf("resolve %s: too many levels of symbolic links", to)
 }
 
 // finish closes the target and, when readErr is nil, puts the contents in
