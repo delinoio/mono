@@ -216,6 +216,18 @@ func (u *Updater) clearPendingLocked() {
 	u.artifact = ""
 }
 
+// recordRunningRevocation stores whether a verified manifest revokes the
+// running version, on behalf of the command with the given order. A command
+// that a newer one superseded leaves the value to the newer command.
+func (u *Updater) recordRunningRevocation(order uint64, revoked bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.applied != order {
+		return
+	}
+	u.revokedRunning = revoked
+}
+
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -376,6 +388,11 @@ func (u *Updater) download(ctx context.Context, target string, order uint64) (*M
 	if err != nil {
 		return nil, "", err
 	}
+	// The signed manifest is the evidence that the running version is revoked,
+	// so record it now and not when the artifact is published: a withdrawal
+	// that arrives during the artifact download must already see it and leave
+	// the revocation recovery alone.
+	u.recordRunningRevocation(order, m.Revoked(u.opts.Running))
 	if m.Revoked(target) {
 		return nil, "", ErrRevoked
 	}

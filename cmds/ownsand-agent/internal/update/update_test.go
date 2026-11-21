@@ -470,3 +470,41 @@ func TestWithdrawAfterInstallStartedAndWhileRevoked(t *testing.T) {
 		t.Fatalf("recovery install: %v %v", ok, err)
 	}
 }
+
+// TestWithdrawDuringDownloadKeepsSignedRevocation covers a withdrawal that
+// arrives while the artifact downloads, after the signed manifest revoking the
+// running version was verified. The server release table may not show that
+// revocation yet, so the agent must trust the manifest: the withdrawal changes
+// nothing and the recovery update is queued.
+func TestWithdrawDuringDownloadKeepsSignedRevocation(t *testing.T) {
+	r := newRelease(t, func(m *Manifest, _ *[]byte) { m.RevokedVersions = append(m.RevokedVersions, "1.0.0") })
+	busy := &atomic.Bool{}
+	busy.Store(true)
+	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+	gate := gateTransport{base: r.srv.Client().Transport, started: make(chan struct{}, 1), release: make(chan struct{})}
+	u.opts.HTTP = &http.Client{Transport: gate}
+
+	updateOrder := u.NextOrder()
+	done := make(chan error, 1)
+	go func() {
+		done <- u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0", RevocationRecovery: true}, updateOrder)
+	}()
+	<-gate.started
+	if err := u.WithdrawOrdered(u.NextOrder()); !errors.Is(err, ErrRunningRevoked) {
+		t.Fatalf("withdrawal during the download of a revocation recovery: %v", err)
+	}
+	if _, err := u.BeginCreate(); !errors.Is(err, ErrRunningRevoked) {
+		t.Fatalf("create while the manifest revokes the running version: %v", err)
+	}
+	close(gate.release)
+	if err := <-done; err != nil {
+		t.Fatalf("the recovery download finished with %v", err)
+	}
+	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE || target != "1.1.0" {
+		t.Fatalf("state %v %q", s, target)
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 || restarts.Load() != 1 {
+		t.Fatalf("recovery install: %v %v", ok, err)
+	}
+}
