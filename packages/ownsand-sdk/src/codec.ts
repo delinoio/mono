@@ -54,6 +54,88 @@ export class FrameCodecError extends Error {
   override name = "FrameCodecError";
 }
 
+/** The stream_id of connection-level frames. */
+export const CONNECTION_STREAM_ID = 0n;
+
+/** A frame that breaks a framing rule of `validateFrame`. */
+export class FrameValidationError extends Error {
+  override name = "FrameValidationError";
+}
+
+/** A frame that is malformed: its kind and payload disagree or a stream_id rule breaks. */
+export class MalformedFrameError extends FrameValidationError {
+  override name = "MalformedFrameError";
+}
+
+/**
+ * A frame whose kind this schema version does not know (a newer schema). On
+ * stream_id 0 a receiver ignores it; on any other stream it ends the stream.
+ */
+export class UnknownKindError extends FrameValidationError {
+  override name = "UnknownKindError";
+  readonly kind: number;
+  readonly streamId: bigint;
+
+  constructor(kind: number, streamId: bigint) {
+    super(`unknown frame kind ${kind} on stream ${streamId}`);
+    this.kind = kind;
+    this.streamId = streamId;
+  }
+}
+
+/** Reports whether the kind is a DataFrameKind of this schema version other than UNSPECIFIED. */
+export function isKnownKind(kind: number): boolean {
+  return kind >= DataFrameKind.RELAY_STREAM_OPEN && kind <= DataFrameKind.ERROR;
+}
+
+/** Reports whether the kind is sent only on stream_id 0 of a relay connection. */
+export function isConnectionKind(kind: number): boolean {
+  return (
+    kind === DataFrameKind.RELAY_KEEPALIVE ||
+    kind === DataFrameKind.SUPPORTED_FRAME_KINDS
+  );
+}
+
+/**
+ * Checks the framing rules that do not depend on the transport, equal to the
+ * Go `datapath.ValidateFrame`: the kind is set, known and equal to the kind
+ * of the payload, connection-level kinds use stream_id 0 with an empty
+ * sandbox_id, and other kinds use a stream_id other than 0. It returns an
+ * `UnknownKindError` for a kind of a newer schema, a `MalformedFrameError`
+ * for any other violation, and `undefined` for a valid frame.
+ */
+export function validateFrame(
+  frame: DataFrame,
+): FrameValidationError | undefined {
+  const kind: number = frame.kind;
+  if (kind === DataFrameKind.UNSPECIFIED) {
+    return new MalformedFrameError("frame kind is unspecified");
+  }
+  if (!isKnownKind(kind)) {
+    return new UnknownKindError(kind, frame.streamId);
+  }
+  const got = payloadKind(frame);
+  if (got !== kind) {
+    return new MalformedFrameError(
+      `frame kind ${DataFrameKind[kind]} carries payload ${DataFrameKind[got]}`,
+    );
+  }
+  if (isConnectionKind(kind)) {
+    if (frame.streamId !== CONNECTION_STREAM_ID || frame.sandboxId !== "") {
+      return new MalformedFrameError(
+        `${DataFrameKind[kind]} must use stream_id 0 without a sandbox_id`,
+      );
+    }
+    return undefined;
+  }
+  if (frame.streamId === CONNECTION_STREAM_ID) {
+    return new MalformedFrameError(
+      `${DataFrameKind[kind]} must not use stream_id 0`,
+    );
+  }
+  return undefined;
+}
+
 /** Encodes a frame with its varint length prefix. */
 export function encodeFrame(frame: DataFrame): Uint8Array {
   const body = toBinary(DataFrameSchema, frame);

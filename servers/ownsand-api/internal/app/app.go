@@ -19,6 +19,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/janitor"
@@ -41,8 +42,10 @@ type Options struct {
 	NonceKey         []byte
 	NonceKeyPrevious []byte
 
-	CORSOrigins             []string
-	TrustProxyClientAddress bool
+	CORSOrigins []string
+	// ClientAddressMode selects the source of the client address for rate
+	// limits. The zero value gives requests no client address.
+	ClientAddressMode config.ClientAddressMode
 
 	DisplayNames api.DisplayNameSource
 	// Limits overrides the default rate limits (tests).
@@ -61,6 +64,9 @@ type Options struct {
 	// InstanceID names this instance in the lease; empty selects a new
 	// UUID v7.
 	InstanceID string
+	// LeaseDeadlineNow is the clock of the local lease ownership deadline;
+	// nil selects the real clock (tests).
+	LeaseDeadlineNow func() time.Time
 
 	// RelayLimits and RelayTiming override the relay limits and durations
 	// (tests).
@@ -127,7 +133,7 @@ func New(opts Options) (*App, error) {
 	}
 	control := api.NewControl(svc)
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
-		OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
+		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
 	svc.Lease = l
 	relayLimits := relay.DefaultLimits()
 	if opts.RelayLimits != nil {
@@ -139,7 +145,7 @@ func New(opts Options) (*App, error) {
 	}
 	plane := api.NewDataPlane(svc, relayLimits, relayTiming)
 	authn := &api.Authenticator{Service: svc, Logto: opts.Logto}
-	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.TrustProxyClientAddress)...)}
+	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.ClientAddressMode)...)}
 
 	var mounts []server.Mount
 	add := func(path string, h http.Handler) { mounts = append(mounts, server.Mount{Path: path, Handler: h}) }
@@ -147,7 +153,8 @@ func New(opts Options) (*App, error) {
 	add(ownsandv1connect.NewMemberServiceHandler(api.MemberHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewApiKeyServiceHandler(api.APIKeyHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewDeviceServiceHandler(api.DeviceHandler{Service: svc}, handlerOpts...))
-	add(ownsandv1connect.NewAgentServiceHandler(api.AgentHandler{Service: svc}, handlerOpts...))
+	agentPath, agentHandler := ownsandv1connect.NewAgentServiceHandler(api.AgentHandler{Service: svc}, handlerOpts...)
+	add(agentPath, api.WithStreamControl(agentHandler))
 	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...))
 	add(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...))

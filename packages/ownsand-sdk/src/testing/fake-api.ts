@@ -214,17 +214,40 @@ export class FakeApi {
           new ConnectError(`no fake for ${path}`, Code.Unimplemented),
         );
       }
+      // Like a real fetch, a unary call whose signal aborts rejects with the
+      // signal's reason even while the handler has not answered, so a stalled
+      // handler (one that never settles) does not outlive its caller.
+      let onAbort: (() => void) | undefined;
+      const aborted = new Promise<never>((_, reject) => {
+        if (signal.aborted) {
+          reject(signal.reason);
+          return;
+        }
+        onAbort = () => reject(signal.reason);
+        signal.addEventListener("abort", onAbort, { once: true });
+      });
+      aborted.catch(() => {});
       try {
-        const response = await handler(request, call);
+        const response = await Promise.race([
+          (async () => handler(request, call))(),
+          aborted,
+        ]);
         return new Response(
           toBinary(method.output, toMessage(method.output, response)),
           { status: 200, headers: { "content-type": "application/proto" } },
         );
       } catch (error) {
+        if (signal.aborted && error === signal.reason) {
+          throw error;
+        }
         if (error instanceof LostResponse) {
           throw new TypeError("fetch failed: connection reset");
         }
         return this.#unaryError(ConnectError.from(error));
+      } finally {
+        if (onAbort !== undefined) {
+          signal.removeEventListener("abort", onAbort);
+        }
       }
     }
     // Server streaming: one enveloped request message.
