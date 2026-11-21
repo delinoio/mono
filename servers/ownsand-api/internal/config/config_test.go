@@ -132,3 +132,45 @@ func TestLoadClientAddressMode(t *testing.T) {
 		})
 	}
 }
+
+func TestLoadRejectsNonASCIILogLevelThatFoldsToLevelName(t *testing.T) {
+	for name, value := range map[string]string{
+		"U+0130 NFO":            "\u0130NFO",
+		"U+0130 nfo":            "\u0130nfo",
+		"U+0130 NFO with space": " \u0130NFO ",
+		"loud":                  "loud",
+		"KNFO":                  "KNFO",
+		"dotless i nfo":         "\u0131nfo",
+	} {
+		v := minimal()
+		v[EnvLogLevel] = value
+		_, err := Load(env(v))
+		if err == nil || err.Error() != "LOG_LEVEL must be one of debug, info, warn, error" {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+func TestLoadAcceptsASCIILogLevelInAnyCase(t *testing.T) {
+	for value, want := range map[string]LogLevel{
+		"DEBUG": LogLevelDebug,
+		"WARN":  LogLevelWarn,
+		"Error": LogLevelError,
+		"INFO":  LogLevelInfo,
+		"iNfO":  LogLevelInfo,
+		" Warn": LogLevelWarn,
+		"":      LogLevelInfo,
+		" \t ":  LogLevelInfo,
+	} {
+		v := minimal()
+		v[EnvLogLevel] = value
+		cfg, err := Load(env(v))
+		if err != nil {
+			t.Errorf("%q: %v", value, err)
+			continue
+		}
+		if cfg.LogLevel != want {
+			t.Errorf("%q: level = %q, want %q", value, cfg.LogLevel, want)
+		}
+	}
+}

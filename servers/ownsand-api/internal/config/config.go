@@ -98,6 +98,24 @@ func ResolveClientAddressMode(trustProxy, allowDirect bool) ClientAddressMode {
 	}
 }
 
+// asciiLower returns value with only the ASCII letters A-Z converted to lower
+// case. It deliberately does not use strings.ToLower, which applies Unicode
+// case mapping: U+0130 (capital I with dot above) followed by "NFO" would
+// lower-case to "info" and pass validation, although the value is not one of
+// the documented level names.
+func asciiLower(value string) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
+
 // LogLevel is the accepted set of log level values.
 type LogLevel string
 
@@ -201,7 +219,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.Addr = v
 	}
 	if v := get(EnvLogLevel); v != "" {
-		switch level := LogLevel(strings.ToLower(v)); level {
+		switch level := LogLevel(asciiLower(v)); level {
 		case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
 			cfg.LogLevel = level
 		default:

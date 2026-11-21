@@ -294,6 +294,8 @@ The server reads its configuration from environment variables. `servers/ownsand-
 
 `ADDR` and `STUN_ADDR` must be `host:port` addresses with a port from 0 to 65535. The host must be empty (all interfaces), an IP address (IPv6 in brackets, with an optional zone) or an RFC 1123 hostname. Configuration validation checks only the syntax and does not resolve the host, so a hostname that does not resolve still fails when the server listens. `accounts-api` applies the same rule to its `ADDR` through the shared `servers/internal/listenaddr` package.
 
+The server removes only ASCII white space (space, tab, line feed, vertical tab, form feed and carriage return) from the start and end of `LOG_LEVEL`. A value that consists only of ASCII white space counts as unset and selects the default. The server matches `LOG_LEVEL` against the level names with ASCII letter case folding only (`INFO` and `iNfO` select `info`). Any other character makes the value not valid, so a value that lower-cases to a level name only under Unicode case mapping, such as `İNFO` (U+0130 followed by `NFO`), stops the server at startup like any other invalid value.
+
 Running the server locally for end-to-end tests: start Postgres, then run `pnpm --filter ownsand-api dev` (or the built binary, with `ALLOW_DIRECT_CLIENT_ADDRESS=true` when the test needs client address limits, because the development launcher sets it to `true` by default and the binary does not) with `DATABASE_URL`, `LOGTO_ISSUER` set to the test issuer and `LOGTO_JWKS_FILE` set to the test key set, as described in [Authentication](#authentication). The server applies its migrations at startup and serves `GET /healthz` when it is ready.
 
 ## Security
