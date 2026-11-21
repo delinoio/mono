@@ -48,10 +48,11 @@ export async function* chunkSource(
   source: WriteSource,
   size: number = MAX_FILE_CHUNK_SIZE,
 ): AsyncGenerator<{ data: Uint8Array; last: boolean }> {
-  // Unconsumed pieces plus a read offset into the first one. Each chunk is
-  // copied once, so the total copy volume is linear in the input size. The
-  // caller's buffers are never aliased: an unacknowledged chunk can be resent
-  // after a failure while the caller mutates its own buffer.
+  // Unconsumed pieces plus a read offset into the first one. Each piece and
+  // each chunk is copied once, so the total copy volume is linear in the
+  // input size. The caller's buffers are never aliased: an unacknowledged
+  // chunk can be resent after a failure while the caller mutates its own
+  // buffer.
   const pieces: Uint8Array[] = [];
   let offset = 0;
   let pendingLength = 0;
@@ -75,7 +76,11 @@ export async function* chunkSource(
   };
   for await (const piece of iterateSource(source)) {
     if (piece.length === 0) continue;
-    pieces.push(piece);
+    // Own the piece before the loop asks the source for another one: a source
+    // can reuse its buffer between yields, and the caller can change a buffer
+    // while a chunk waits to be sent. Each byte is copied here once and in
+    // `take` once, so the copy volume stays linear in the input size.
+    pieces.push(piece.slice());
     pendingLength += piece.length;
     while (pendingLength >= size) {
       if (held !== undefined) {

@@ -362,6 +362,36 @@ describe("chunkSource", () => {
     ]);
   });
 
+  test("keeps pending bytes when the source reuses its buffer between pieces", async () => {
+    // A source such as a file reader can refill one buffer for every piece.
+    // The bytes that wait for the next chunk must not change with the refill.
+    const reused = new Uint8Array(2);
+    async function* refill() {
+      for (const value of [1, 2, 3]) {
+        reused.fill(value);
+        yield reused;
+      }
+    }
+    const chunks: { data: number[]; last: boolean }[] = [];
+    for await (const c of chunkSource(refill(), 4)) {
+      chunks.push({ data: [...c.data], last: c.last });
+    }
+    expect(chunks).toEqual([
+      { data: [1, 1, 2, 2], last: false },
+      { data: [3, 3], last: true },
+    ]);
+  });
+
+  test("keeps a yielded chunk when the caller overwrites its buffer afterwards", async () => {
+    const input = new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2, 3]);
+    const seen: number[][] = [];
+    for await (const c of chunkSource(input, 4)) {
+      seen.push([...c.data]);
+      input.fill(9);
+    }
+    expect(seen).toEqual([[1, 1, 1, 1], [2, 2, 2, 2], [3]]);
+  });
+
   test("copies a bounded volume for large single-piece and split inputs", async () => {
     const size = 1024;
     const total = 64 * 1024 * 1024;
