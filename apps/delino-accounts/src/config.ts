@@ -12,9 +12,134 @@ const PARSER_EDGE_STRIP = new RegExp(
   "g",
 );
 
+/** The Logto API resource indicator of accounts-api. */
+export const API_RESOURCE = "https://accounts.api.delino.io";
+
+/** The API resource scope that every user RPC of accounts-api requires. */
+export const REQUIRED_API_SCOPE = "accounts:billing";
+
 /** Build-time environment that carries `PUBLIC_API_ORIGIN`. */
 export interface AccountsBuildEnv {
   readonly PUBLIC_API_ORIGIN?: string;
+}
+
+/** Every build-time variable of the web app. All are public. */
+export interface AccountsAppBuildEnv extends AccountsBuildEnv {
+  readonly PUBLIC_LOGTO_ENDPOINT?: string;
+  readonly PUBLIC_LOGTO_APP_ID?: string;
+  readonly PUBLIC_PADDLE_CLIENT_TOKEN?: string;
+  readonly PUBLIC_PADDLE_ENVIRONMENT?: string;
+}
+
+/** Paddle environments that `PUBLIC_PADDLE_ENVIRONMENT` selects. */
+export enum PaddleEnvironment {
+  Sandbox = "sandbox",
+  Production = "production",
+}
+
+export interface LogtoSettings {
+  endpoint: string;
+  appId: string;
+  scopes: string[];
+}
+
+export interface PaddleSettings {
+  /** The Paddle client-side token. Public, not a secret. */
+  clientToken: string;
+  environment: PaddleEnvironment;
+}
+
+export interface AccountsConfig {
+  apiOrigin: string;
+  /** Undefined when the Logto registration is not configured. */
+  logto: LogtoSettings | undefined;
+  /** Undefined when the Paddle checkout is not configured. */
+  paddle: PaddleSettings | undefined;
+}
+
+/**
+ * Reads and validates the whole web app configuration. `rsbuild.config.ts`
+ * calls it with `process.env` to fail the build early, and
+ * `src/build-config.ts` calls it with `import.meta.env`.
+ *
+ * - Without both `PUBLIC_LOGTO_ENDPOINT` and `PUBLIC_LOGTO_APP_ID`, sign-in
+ *   is not configured and the billing pages show a notice.
+ * - Without `PUBLIC_PADDLE_CLIENT_TOKEN`, the subscription checkout is not
+ *   configured. With a token, `PUBLIC_PADDLE_ENVIRONMENT` is required and
+ *   must match the token: Paddle sandbox tokens start with `test_` and live
+ *   tokens with `live_`.
+ *
+ * Error messages never echo the raw values.
+ */
+export function readAccountsConfig(env: AccountsAppBuildEnv): AccountsConfig {
+  const apiOrigin = readAccountsApiOrigin(env);
+  const endpoint = (env.PUBLIC_LOGTO_ENDPOINT ?? "").trim();
+  const appId = (env.PUBLIC_LOGTO_APP_ID ?? "").trim();
+  if ((endpoint === "") !== (appId === "")) {
+    throw new Error(
+      "PUBLIC_LOGTO_ENDPOINT and PUBLIC_LOGTO_APP_ID must be set together",
+    );
+  }
+  const logto =
+    endpoint === ""
+      ? undefined
+      : {
+          endpoint: resolveLogtoEndpoint(endpoint),
+          appId,
+          scopes: [REQUIRED_API_SCOPE],
+        };
+  return { apiOrigin, logto, paddle: readPaddleSettings(env) };
+}
+
+function resolveLogtoEndpoint(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new Error("PUBLIC_LOGTO_ENDPOINT is not a valid URL");
+  }
+  if (url.username !== "" || url.password !== "") {
+    throw new Error("PUBLIC_LOGTO_ENDPOINT must not contain credentials");
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("PUBLIC_LOGTO_ENDPOINT must use http or https");
+  }
+  if (url.pathname !== "/" || value.includes("?") || value.includes("#")) {
+    throw new Error(
+      "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
+    );
+  }
+  return url.origin;
+}
+
+function readPaddleSettings(
+  env: AccountsAppBuildEnv,
+): PaddleSettings | undefined {
+  const clientToken = (env.PUBLIC_PADDLE_CLIENT_TOKEN ?? "").trim();
+  const rawEnvironment = (env.PUBLIC_PADDLE_ENVIRONMENT ?? "").trim();
+  let environment: PaddleEnvironment | undefined;
+  if (rawEnvironment === PaddleEnvironment.Sandbox) {
+    environment = PaddleEnvironment.Sandbox;
+  } else if (rawEnvironment === PaddleEnvironment.Production) {
+    environment = PaddleEnvironment.Production;
+  } else if (rawEnvironment !== "") {
+    throw new Error("PUBLIC_PADDLE_ENVIRONMENT must be sandbox or production");
+  }
+  if (clientToken === "") {
+    return undefined;
+  }
+  if (environment === undefined) {
+    throw new Error(
+      "PUBLIC_PADDLE_ENVIRONMENT must be set with PUBLIC_PADDLE_CLIENT_TOKEN",
+    );
+  }
+  const prefix = environment === PaddleEnvironment.Sandbox ? "test_" : "live_";
+  if (!clientToken.startsWith(prefix) || /\s/.test(clientToken)) {
+    throw new Error(
+      `PUBLIC_PADDLE_CLIENT_TOKEN must be a Paddle ${environment} client-side token (${prefix}...)`,
+    );
+  }
+  return { clientToken, environment };
 }
 
 /**

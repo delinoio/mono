@@ -56,7 +56,15 @@ const expectedPassThroughEnv = {
     "USAGE_SERVICE_CLIENTS",
     "WEB_ORIGIN",
   ],
-  "delino-accounts#dev": ["PORTLESS", "PORTLESS_*", "PUBLIC_API_ORIGIN"],
+  "delino-accounts#dev": [
+    "PORTLESS",
+    "PORTLESS_*",
+    "PUBLIC_API_ORIGIN",
+    "PUBLIC_LOGTO_APP_ID",
+    "PUBLIC_LOGTO_ENDPOINT",
+    "PUBLIC_PADDLE_CLIENT_TOKEN",
+    "PUBLIC_PADDLE_ENVIRONMENT",
+  ],
   "delidev#dev": ["TAURI_DEV_HOST"],
   // The frontend `dev` scripts run portless, which reads only its own
   // `PORTLESS` and `PORTLESS_*` settings from the shell. portless sets `PORT`

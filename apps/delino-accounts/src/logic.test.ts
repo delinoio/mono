@@ -1,0 +1,250 @@
+// SPDX-License-Identifier: Apache-2.0
+import { describe, expect, test } from "@rstest/core";
+import {
+  checkAccountName,
+  checkAlertThreshold,
+  checkAutoTopUp,
+  checkEmail,
+  checkTopUpAmount,
+} from "./forms.ts";
+import {
+  addMonths,
+  formatMonth,
+  formatQuantity,
+  meterLabel,
+} from "./format.ts";
+import { BillingAccountRole } from "./gen/delino/accounts/v1/billing_account_pb.ts";
+import { Meter } from "./gen/delino/accounts/v1/usage_pb.ts";
+import {
+  PENDING_INVITATION_KEY,
+  pendingInvitation,
+  takeTokenFromAddress,
+  tokenFromFragment,
+} from "./invitation.ts";
+import { can, canManageMember, Permission } from "./roles.ts";
+import { parseRoute, RouteId, routePath } from "./router.tsx";
+import { uuidV7 } from "./uuid.ts";
+
+describe("routes", () => {
+  test.each([
+    ["/", { id: RouteId.Home }],
+    ["/billing", { id: RouteId.Billing }],
+    ["/billing/", { id: RouteId.Billing }],
+    ["/billing/invitations/accept", { id: RouteId.BillingInvitation }],
+    ["/billing/invitations", { id: RouteId.NotFound }],
+    ["/billing/abc", { id: RouteId.BillingAccount, billingAccountId: "abc" }],
+    ["/billing/abc/def", { id: RouteId.NotFound }],
+    ["/callback", { id: RouteId.Callback }],
+    ["/account", { id: RouteId.NotFound }],
+    ["/billing/%E0%A4%A", { id: RouteId.NotFound }],
+  ])("parses %s", (path, route) => {
+    expect(parseRoute(path)).toEqual(route);
+  });
+
+  test("builds paths that parse back to the same route", () => {
+    for (const route of [
+      { id: RouteId.Home },
+      { id: RouteId.Billing },
+      { id: RouteId.BillingInvitation },
+      { id: RouteId.Callback },
+      { id: RouteId.BillingAccount, billingAccountId: "a/b c" },
+    ] as const) {
+      expect(parseRoute(routePath(route))).toEqual(route);
+    }
+  });
+});
+
+describe("roles", () => {
+  const { OWNER, ADMIN, VIEWER, UNSPECIFIED } = BillingAccountRole;
+
+  test.each([
+    [Permission.DeleteAccount, [OWNER]],
+    [Permission.TransferOwnership, [OWNER]],
+    [Permission.ManagePayments, [OWNER, ADMIN]],
+    [Permission.ManageMembers, [OWNER, ADMIN]],
+    [Permission.ReadInvoices, [OWNER, ADMIN]],
+    [Permission.Leave, [ADMIN, VIEWER]],
+  ])("%s is allowed only for %j", (permission, allowed) => {
+    for (const role of [OWNER, ADMIN, VIEWER, UNSPECIFIED]) {
+      expect(can(role, permission)).toBe(
+        (allowed as BillingAccountRole[]).includes(role),
+      );
+    }
+    expect(can(undefined, permission)).toBe(false);
+  });
+
+  test("owners and admins manage admins and viewers, never the owner", () => {
+    expect(canManageMember(OWNER, ADMIN)).toBe(true);
+    expect(canManageMember(ADMIN, VIEWER)).toBe(true);
+    expect(canManageMember(ADMIN, OWNER)).toBe(false);
+    expect(canManageMember(OWNER, OWNER)).toBe(false);
+    expect(canManageMember(VIEWER, VIEWER)).toBe(false);
+  });
+});
+
+describe("forms", () => {
+  test("checks billing account names like the server", () => {
+    expect(checkAccountName("  Acme  ")).toEqual({ ok: true, value: "Acme" });
+    expect(checkAccountName("é".repeat(100)).ok).toBe(true);
+    // 100 code points, 200 UTF-16 units.
+    expect(checkAccountName("😀".repeat(100)).ok).toBe(true);
+    expect(checkAccountName("😀".repeat(101)).ok).toBe(false);
+    expect(checkAccountName("").ok).toBe(false);
+    expect(checkAccountName("a\u0007b").ok).toBe(false);
+  });
+
+  test("checks invitation email addresses", () => {
+    expect(checkEmail(" a@example.com ")).toEqual({
+      ok: true,
+      value: "a@example.com",
+    });
+    expect(checkEmail("a@b@c").ok).toBe(false);
+    expect(checkEmail("nobody").ok).toBe(false);
+    expect(checkEmail(`${"a".repeat(250)}@b.co`).ok).toBe(false);
+  });
+
+  test("checks the manual top-up limits with bigint micro-USD", () => {
+    expect(checkTopUpAmount("25")).toEqual({ ok: true, value: 25_000_000n });
+    expect(checkTopUpAmount("10,000.00")).toEqual({
+      ok: true,
+      value: 10_000_000_000n,
+    });
+    expect(checkTopUpAmount("24.99").ok).toBe(false);
+    expect(checkTopUpAmount("10000.01").ok).toBe(false);
+    expect(checkTopUpAmount("30.005").ok).toBe(false);
+  });
+
+  test("checks automatic top-up settings when enabled", () => {
+    expect(
+      checkAutoTopUp({
+        enabled: true,
+        threshold: "10",
+        amount: "25",
+        monthlyCap: "25",
+      }),
+    ).toEqual({
+      ok: true,
+      value: {
+        enabled: true,
+        thresholdUsdMicros: 10_000_000n,
+        amountUsdMicros: 25_000_000n,
+        monthlyCapUsdMicros: 25_000_000n,
+      },
+    });
+    const result = checkAutoTopUp({
+      enabled: true,
+      threshold: "9.99",
+      amount: "24.99",
+      monthlyCap: "",
+    });
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(Object.keys(result.errors).sort()).toEqual([
+        "amount",
+        "monthlyCap",
+        "threshold",
+      ]);
+    }
+  });
+
+  test("keeps disabled automatic top-up values with zero for empty fields", () => {
+    expect(
+      checkAutoTopUp({
+        enabled: false,
+        threshold: "",
+        amount: "5",
+        monthlyCap: "",
+      }),
+    ).toEqual({
+      ok: true,
+      value: {
+        enabled: false,
+        thresholdUsdMicros: 0n,
+        amountUsdMicros: 5_000_000n,
+        monthlyCapUsdMicros: 0n,
+      },
+    });
+    expect(
+      checkAutoTopUp({
+        enabled: false,
+        threshold: "1.001",
+        amount: "",
+        monthlyCap: "",
+      }).ok,
+    ).toBe(false);
+  });
+
+  test("accepts an alert threshold of $0 and whole cents only", () => {
+    expect(checkAlertThreshold("0")).toEqual({ ok: true, value: 0n });
+    expect(checkAlertThreshold("10.5")).toEqual({
+      ok: true,
+      value: 10_500_000n,
+    });
+    expect(checkAlertThreshold("-1").ok).toBe(false);
+    expect(checkAlertThreshold("0.001").ok).toBe(false);
+  });
+});
+
+describe("format", () => {
+  test("moves and names UTC months", () => {
+    expect(addMonths({ year: 2026, month: 1 }, -1)).toEqual({
+      year: 2025,
+      month: 12,
+    });
+    expect(addMonths({ year: 2026, month: 12 }, 1)).toEqual({
+      year: 2027,
+      month: 1,
+    });
+    expect(formatMonth({ year: 2026, month: 11 })).toBe("November 2026");
+  });
+
+  test("formats quantities with the unit of the meter", () => {
+    expect(formatQuantity(1_048_576n, Meter.OWNSAND_RELAY_EGRESS)).toBe(
+      "1,048,576 bytes",
+    );
+    expect(formatQuantity(5n, undefined)).toBe("5");
+    expect(meterLabel("ownsand.class_b_rpc")).toBe("Class B API calls");
+    expect(meterLabel("other.meter")).toBe("other.meter");
+  });
+});
+
+describe("invitation token", () => {
+  test("reads the token from the fragment and removes the fragment", () => {
+    const replaced: string[] = [];
+    const token = takeTokenFromAddress(
+      {
+        hash: "#token=bai_abc",
+        pathname: "/billing/invitations/accept",
+        search: "",
+      },
+      { replaceState: (_d, _t, url) => void replaced.push(String(url)) },
+    );
+    expect(token).toBe("bai_abc");
+    expect(replaced).toEqual(["/billing/invitations/accept"]);
+    expect(tokenFromFragment("#other=1")).toBeUndefined();
+    expect(tokenFromFragment("#token=")).toBeUndefined();
+  });
+
+  test("stores the pending token under one key and clears it", () => {
+    const map = new Map<string, string>();
+    const storage = {
+      getItem: (k: string) => map.get(k) ?? null,
+      setItem: (k: string, v: string) => void map.set(k, v),
+      removeItem: (k: string) => void map.delete(k),
+    };
+    pendingInvitation.save("bai_x", storage);
+    expect([...map.keys()]).toEqual([PENDING_INVITATION_KEY]);
+    expect(pendingInvitation.read(storage)).toBe("bai_x");
+    pendingInvitation.clear(storage);
+    expect(pendingInvitation.read(storage)).toBeUndefined();
+  });
+});
+
+describe("uuidV7", () => {
+  test("encodes the time and the version", () => {
+    const id = uuidV7(0x0193a1b2c3d4);
+    expect(id).toMatch(
+      /^0193a1b2-c3d4-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  });
+});

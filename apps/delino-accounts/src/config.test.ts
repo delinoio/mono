@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, test } from "@rstest/core";
 import {
+  API_RESOURCE,
   DEFAULT_ACCOUNTS_API_ORIGIN,
+  PaddleEnvironment,
   readAccountsApiOrigin,
+  readAccountsConfig,
+  REQUIRED_API_SCOPE,
   resolveAccountsApiOrigin,
 } from "./config.ts";
 
@@ -254,5 +258,111 @@ describe("resolveAccountsApiOrigin", () => {
     expect(message).not.toContain("pass");
     expect(message).not.toContain("user");
     expect(message).not.toContain("secret-path");
+  });
+});
+
+describe("readAccountsConfig", () => {
+  test("reads the API origin and leaves sign-in and checkout unconfigured by default", () => {
+    expect(readAccountsConfig({})).toEqual({
+      apiOrigin: DEFAULT_ACCOUNTS_API_ORIGIN,
+      logto: undefined,
+      paddle: undefined,
+    });
+  });
+
+  test("requests the accounts:billing scope for the accounts-api resource", () => {
+    const config = readAccountsConfig({
+      PUBLIC_LOGTO_ENDPOINT: " https://auth.delino.io/ ",
+      PUBLIC_LOGTO_APP_ID: " app-id ",
+    });
+    expect(config.logto).toEqual({
+      endpoint: "https://auth.delino.io",
+      appId: "app-id",
+      scopes: [REQUIRED_API_SCOPE],
+    });
+    expect(REQUIRED_API_SCOPE).toBe("accounts:billing");
+    expect(API_RESOURCE).toBe("https://accounts.api.delino.io");
+  });
+
+  test.each([
+    [{ PUBLIC_LOGTO_ENDPOINT: "https://auth.delino.io" }, "set together"],
+    [{ PUBLIC_LOGTO_APP_ID: "app" }, "set together"],
+    [
+      {
+        PUBLIC_LOGTO_ENDPOINT: "https://auth.delino.io/oidc",
+        PUBLIC_LOGTO_APP_ID: "a",
+      },
+      "PUBLIC_LOGTO_ENDPOINT must be an origin",
+    ],
+    [
+      {
+        PUBLIC_LOGTO_ENDPOINT: "https://u:p@auth.delino.io",
+        PUBLIC_LOGTO_APP_ID: "a",
+      },
+      "PUBLIC_LOGTO_ENDPOINT must not contain credentials",
+    ],
+  ])("rejects an invalid Logto registration %#", (env, message) => {
+    expect(() => readAccountsConfig(env)).toThrow(message);
+  });
+
+  test("reads the Paddle checkout settings", () => {
+    expect(
+      readAccountsConfig({
+        PUBLIC_PADDLE_CLIENT_TOKEN: "test_abc123",
+        PUBLIC_PADDLE_ENVIRONMENT: "sandbox",
+      }).paddle,
+    ).toEqual({
+      clientToken: "test_abc123",
+      environment: PaddleEnvironment.Sandbox,
+    });
+    expect(
+      readAccountsConfig({
+        PUBLIC_PADDLE_CLIENT_TOKEN: "live_abc123",
+        PUBLIC_PADDLE_ENVIRONMENT: "production",
+      }).paddle,
+    ).toEqual({
+      clientToken: "live_abc123",
+      environment: PaddleEnvironment.Production,
+    });
+    expect(
+      readAccountsConfig({ PUBLIC_PADDLE_ENVIRONMENT: "sandbox" }).paddle,
+    ).toBeUndefined();
+  });
+
+  test.each([
+    [{ PUBLIC_PADDLE_ENVIRONMENT: "live" }, "must be sandbox or production"],
+    [{ PUBLIC_PADDLE_CLIENT_TOKEN: "test_abc" }, "must be set with"],
+    [
+      {
+        PUBLIC_PADDLE_CLIENT_TOKEN: "live_abc",
+        PUBLIC_PADDLE_ENVIRONMENT: "sandbox",
+      },
+      "sandbox client-side token",
+    ],
+    [
+      {
+        PUBLIC_PADDLE_CLIENT_TOKEN: "test_abc",
+        PUBLIC_PADDLE_ENVIRONMENT: "production",
+      },
+      "production client-side token",
+    ],
+    [
+      {
+        PUBLIC_PADDLE_CLIENT_TOKEN: "pdl_secret_key",
+        PUBLIC_PADDLE_ENVIRONMENT: "sandbox",
+      },
+      "sandbox client-side token",
+    ],
+  ])("rejects invalid Paddle settings %#", (env, message) => {
+    let error = "";
+    try {
+      readAccountsConfig(env);
+    } catch (e) {
+      error = (e as Error).message;
+    }
+    expect(error).toContain(message);
+    // The message never echoes the token.
+    expect(error).not.toContain("abc");
+    expect(error).not.toContain("secret");
   });
 });

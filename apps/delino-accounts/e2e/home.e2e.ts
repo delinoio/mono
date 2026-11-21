@@ -35,15 +35,45 @@ describe("home", () => {
     );
   });
 
+  test("links the billing section to the billing pages", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/");
+
+    await expect(screen.getByRole("link", "Manage billing")).toHaveAttribute(
+      "href",
+      "/billing",
+    );
+  });
+
   test(
-    "marks every section as coming soon",
+    "marks only the Account section as coming soon",
     { tags: ["agent"] },
     async ({ app, agent }) => {
       await app.open("/");
 
       await agent.assert(
-        "both the Account and the Billing sections are marked as coming soon",
+        "the Account section is marked as coming soon, and the Billing section offers a link to manage billing instead",
       );
     },
   );
+});
+
+describe("billing", () => {
+  // The e2e app command sets no Logto registration, so the billing routes
+  // load through the single-page-application fallback and show the notice.
+  test("asks for sign-in configuration on a direct billing route", async ({
+    app,
+    screen,
+  }) => {
+    await app.open("/billing");
+
+    await expect(
+      screen.getByRole("heading", "Sign in to manage billing", { level: 1 }),
+    ).toBeVisible();
+    await expect(
+      screen.getByText("Sign-in is not configured for this build."),
+    ).toBeVisible();
+  });
 });
