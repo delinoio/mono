@@ -25,10 +25,10 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/fsutil"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/launcher"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
+	"github.com/delinoio/mono/internal/fsutil"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
