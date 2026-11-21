@@ -128,25 +128,40 @@ func run(name string, args ...string) error {
 	return nil
 }
 
+// ipRouteDump runs `ip -4 -o route show table all` and returns its output.
+// Tests replace it so that the route source runs without the `ip` command.
+var ipRouteDump = func() ([]byte, error) {
+	cmd := exec.Command("ip", "-4", "-o", "route", "show", "table", "all")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("netpolicy: ip -4 -o route show table all: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return stdout.Bytes(), nil
+}
+
 // HostRoutes reads the IPv4 and IPv6 routes and the interface prefixes of
-// the host, without the agent's own tap devices.
+// the host, without the agent's own tap devices. The IPv4 routes come from
+// `ip -4 -o route show table all`, so routes of the policy routing tables
+// count like routes of the main table; /proc/net/route lists only the main
+// table. A failed route dump is an error: the caller keeps the rules it
+// applied last and reports the failure.
 func HostRoutes() ([]Route, []netip.Prefix, error) {
-	var routes []Route
-	for _, src := range []struct {
-		path  string
-		parse func(r *os.File) ([]Route, error)
-	}{
-		{"/proc/net/route", func(f *os.File) ([]Route, error) { return ParseProcRoute(f) }},
-		{"/proc/net/ipv6_route", func(f *os.File) ([]Route, error) { return ParseProcIPv6Route(f) }},
-	} {
-		f, err := os.Open(src.path)
-		if errors.Is(err, os.ErrNotExist) {
-			continue
-		}
-		if err != nil {
-			return nil, nil, err
-		}
-		rs, err := src.parse(f)
+	dump, err := ipRouteDump()
+	if err != nil {
+		return nil, nil, err
+	}
+	routes, err := ParseIPRouteShow(bytes.NewReader(dump))
+	if err != nil {
+		return nil, nil, err
+	}
+	f, err := os.Open("/proc/net/ipv6_route")
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+	case err != nil:
+		return nil, nil, err
+	default:
+		rs, err := ParseProcIPv6Route(f)
 		f.Close()
 		if err != nil {
 			return nil, nil, err
