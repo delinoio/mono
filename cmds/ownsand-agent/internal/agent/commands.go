@@ -83,10 +83,14 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 //
 // chanCtx ends with the channel connection that delivered the command; agentCtx
 // ends only when the agent stops, installs an update or removes the device.
-// Commands that change a sandbox or create a snapshot belong to the device and
-// run on agentCtx, so that a channel loss does not cancel them (a canceled
-// create would record the sandbox as failed). Snapshot transfers and agent
-// updates are bound to one channel in the control plane and end with chanCtx.
+// Commands that change a sandbox belong to the device and run on agentCtx, so
+// that a channel loss does not cancel them (a canceled create would record the
+// sandbox as failed). Snapshot creation stays on chanCtx: a pending capture is
+// not in the state report, so the control plane marks it FAILED on reconnect,
+// and no update message reports a late completion. Snapshot transfers and
+// agent updates are bound to one channel in the control plane and end with
+// chanCtx. Remove this limit when pending snapshots are reported and
+// completion has its own update path.
 //
 // order is the update order that dispatch took when it received an update or
 // withdrawal command; it is zero for every other command.
@@ -117,7 +121,7 @@ func (a *Agent) handleCommand(chanCtx, agentCtx context.Context, cmd *ownsandv1.
 		setSandboxResult(res, e)
 	case *ownsandv1.AgentCommand_CreateSnapshot:
 		var e *ownsandv1.SnapshotStateEntry
-		e, err = a.Sandboxes.CreateSnapshot(agentCtx, c.CreateSnapshot)
+		e, err = a.Sandboxes.CreateSnapshot(chanCtx, c.CreateSnapshot)
 		if e != nil {
 			res.Result = &ownsandv1.AgentCommandResult_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotResult{Snapshot: e}}
 		}

@@ -1178,3 +1178,41 @@ func TestCommandResultWithoutChannelIsLogged(t *testing.T) {
 		t.Fatalf("got %d records, want 1", found)
 	}
 }
+
+// snapshotCtxRuntime records the context error that Snapshot sees.
+type snapshotCtxRuntime struct {
+	vmruntime.Runtime
+	ctxErr chan error
+}
+
+func (r *snapshotCtxRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	r.ctxErr <- ctx.Err()
+	return r.Runtime.Snapshot(ctx, vm, dir)
+}
+
+// TestSnapshotCaptureEndsWithItsChannel checks that a snapshot capture stays
+// bound to the channel context: a pending capture is not in the state report,
+// so the control plane fails it after a reconnect, and nothing reports a late
+// completion. Remove this test together with that limit.
+func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	rt := &snapshotCtxRuntime{ctxErr: make(chan error, 1)}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt.Runtime = o.Runtime
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create %v", res)
+	}
+	snapID, _ := uuidv7.NewString()
+	chanCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
+	if err := <-rt.ctxErr; err == nil {
+		t.Fatal("snapshot capture ran on a context that outlives its channel")
+	}
+}
