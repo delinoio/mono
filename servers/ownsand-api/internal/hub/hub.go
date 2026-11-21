@@ -13,19 +13,31 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // outboundQueue is the number of envelopes that may wait for the writer of
-// one channel. A full queue means the agent does not read; Send then waits
-// until the context ends.
+// one channel. A full queue means the agent does not read.
 const outboundQueue = 256
+
+// DefaultQueueFullWait is how long Send waits for room in a full outbound
+// queue before it declares the channel saturated and closes it. A caller
+// can legitimately queue more than outboundQueue envelopes in a burst (for
+// example the delete commands after a state report), so the wait gives the
+// writer time to drain; a stalled agent does not drain and is cut off
+// after the wait instead of blocking the caller for ever.
+const DefaultQueueFullWait = 5 * time.Second
 
 // ErrNoChannel reports a device without a current agent channel on this
 // instance.
 var ErrNoChannel = errors.New("the device has no agent channel on this instance")
+
+// ErrQueueFull is the close cause of a channel whose outbound queue stayed
+// full for the queue-full wait: the agent does not read its channel.
+var ErrQueueFull = errors.New("the agent channel closed because its outbound queue stayed full")
 
 // ErrChannelClosed reports a channel that closed while a caller used it.
 var ErrChannelClosed = errors.New("the agent channel closed")
@@ -46,6 +58,8 @@ type Conn struct {
 	out    chan *ownsandv1.AgentEnvelope
 	ctx    context.Context
 	cancel context.CancelCauseFunc
+	// queueFullWait is the bounded wait of Send on a full queue.
+	queueFullWait time.Duration
 	// reconciled is set when the server applied the reconnection state
 	// report; only then is the device online and eligible.
 	reconciled atomic.Bool
@@ -75,7 +89,12 @@ func (c *Conn) Reconciled() bool { return c.reconciled.Load() }
 func (c *Conn) SetReconciled() { c.reconciled.Store(true) }
 
 // Send queues env for the agent. It fails when the channel closed or ctx
-// ended first.
+// ended first. When the outbound queue is full, Send waits for the queue
+// full wait for room; if the writer frees none, the agent does not read, so
+// Send closes the channel with ErrQueueFull and returns that error. The
+// close takes the normal disconnect path of the channel handler, so the
+// caller (the channel handler or the shared control event worker) is never
+// blocked by a stalled agent beyond that wait.
 func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 	select {
 	case <-c.ctx.Done():
@@ -85,10 +104,21 @@ func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 	select {
 	case c.out <- env:
 		return nil
+	default:
+	}
+	timer := time.NewTimer(c.queueFullWait)
+	defer timer.Stop()
+	select {
+	case c.out <- env:
+		return nil
 	case <-c.ctx.Done():
 		return ErrChannelClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-timer.C:
+		// Close keeps the first cause, so an earlier close reason wins.
+		c.Close(ErrQueueFull)
+		return ErrQueueFull
 	}
 }
 
@@ -117,6 +147,10 @@ type Hub struct {
 	// listeners run when a channel closes (for example to end the relay
 	// connections and grants bound to it).
 	closeListeners []func(*Conn)
+	// QueueFullWait is the bounded wait of Send on a full outbound queue
+	// for channels registered later; tests shorten it. Set it before the
+	// first Register.
+	QueueFullWait time.Duration
 	// fences holds the per-device fences that are in use (see lockDevice).
 	fences map[string]*deviceFence
 
@@ -126,7 +160,7 @@ type Hub struct {
 
 // New returns an empty hub.
 func New() *Hub {
-	return &Hub{conns: map[string]*Conn{}, fences: map[string]*deviceFence{}, Commands: NewWaiters[string, *ownsandv1.AgentCommandResult]()}
+	return &Hub{conns: map[string]*Conn{}, fences: map[string]*deviceFence{}, QueueFullWait: DefaultQueueFullWait, Commands: NewWaiters[string, *ownsandv1.AgentCommandResult]()}
 }
 
 // deviceFence serializes the registration of a new channel of one device
@@ -219,7 +253,7 @@ func (h *Hub) register(parent context.Context, deviceID, orgID string) *Conn {
 	}
 	h.mu.Lock()
 	h.gen++
-	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, ID: id, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel}
+	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, ID: id, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel, queueFullWait: h.QueueFullWait}
 	old := h.conns[deviceID]
 	h.conns[deviceID] = c
 	h.mu.Unlock()
