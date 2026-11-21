@@ -143,6 +143,41 @@ describe("exec over the relay", () => {
     expect(await handle.wait()).toBe(result);
   });
 
+  test("overlapping wait() calls share one drain and keep the terminal result", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["true"] });
+    const [first, second] = await h.clock.run(
+      Promise.all([handle.wait(), handle.wait()]),
+    );
+    expect(first.kind).toBe(ExecResultKind.Exited);
+    expect(second).toBe(first);
+    expect(await handle.wait()).toBe(first);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+  });
+
+  test("wait() during an unfinished iteration keeps the result that iteration reaches", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["true"] });
+    const [events, result] = await h.clock.run(
+      Promise.all([collect(handle), handle.wait()]),
+    );
+    expect(events.length).toBeLessThanOrEqual(2);
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(await handle.wait()).toBe(result);
+  });
+
   test("reports a command that could not start, a timeout and a sandbox end as distinct results", async () => {
     const h = setup();
     let n = 0;
