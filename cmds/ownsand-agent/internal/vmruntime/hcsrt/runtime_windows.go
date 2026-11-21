@@ -413,8 +413,11 @@ func (r *Runtime) attachNetwork(ctx context.Context, v *vm) error {
 		return err
 	}
 	v.mu.Lock()
+	// done is owned by this call and the tunnel worker. stopVM clears
+	// v.netDone, so the worker must never read it.
+	done := make(chan struct{})
 	v.net = stack
-	v.netDone = make(chan struct{})
+	v.netDone = done
 	v.mu.Unlock()
 	tctx, cancel := context.WithTimeout(ctx, tunnelTimeout)
 	defer cancel()
@@ -426,21 +429,23 @@ func (r *Runtime) attachNetwork(ctx context.Context, v *vm) error {
 		}
 		select {
 		case <-tctx.Done():
-			close(v.netDone)
+			close(done)
 			return fmt.Errorf("hcsrt: connect the network tunnel: %w", err)
 		case <-v.exited:
-			close(v.netDone)
+			close(done)
 			return errors.New("hcsrt: the VM stopped before the network tunnel connected")
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	go r.runTunnel(v, stack, conn)
+	go r.runTunnel(v, stack, conn, done)
 	return nil
 }
 
-// runTunnel serves the tunnel connections of v until the VM stops.
-func (r *Runtime) runTunnel(v *vm, stack *netstack.Network, conn net.Conn) {
-	defer close(v.netDone)
+// runTunnel serves the tunnel connections of v until the VM stops and then
+// closes done. done is a parameter, not read from v, because stopVM clears
+// v.netDone and may run before this goroutine starts.
+func (r *Runtime) runTunnel(v *vm, stack *netstack.Network, conn net.Conn, done chan struct{}) {
+	defer close(done)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
