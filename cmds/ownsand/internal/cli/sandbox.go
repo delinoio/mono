@@ -339,9 +339,10 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 	defer s.Close()
 
 	jsonMode := a.fmt == FormatJSON
+	jw := &execJSONWriter{a: a, binary: *binary}
 	onEvent := func(ev ownsand.ExecEvent) error {
 		if jsonMode {
-			return writeJSON(a.env.Stdout, a.jsonEvent(ev, *binary))
+			return jw.event(ev)
 		}
 		switch ev.Kind {
 		case ownsand.ExecEventStdout:
@@ -378,6 +379,9 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 			err = &ownsand.DataPathError{Operation: "exec", Err: err}
 		}
 		if jsonMode {
+			if werr := jw.flushAll(); werr != nil {
+				return werr
+			}
 			if werr := writeJSON(a.env.Stdout, execJSONEvent{Event: "data_path_error", Message: describeError(err)}); werr != nil {
 				return werr
 			}
@@ -387,6 +391,9 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 	}
 	a.logger.Debug("ownsand exec ended", "exec_id", res.ExecID, "result", res.Kind.String(), "transport", res.Transport.String())
 	if jsonMode {
+		if err := jw.flushAll(); err != nil {
+			return err
+		}
 		if err := writeJSON(a.env.Stdout, a.jsonResult(res)); err != nil {
 			return err
 		}
@@ -408,19 +415,139 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 	return &exitError{code: execExitStatus(res, nil)}
 }
 
-func (a *app) jsonEvent(ev ownsand.ExecEvent, binary bool) execJSONEvent {
-	out := execJSONEvent{Event: ev.Kind.String(), ExecID: ev.ExecID}
+// execJSONWriter writes the exec events of sandbox exec --format json.
+type execJSONWriter struct {
+	a      *app
+	binary bool
+	execID string
+	// stdout and stderr decode the text of each stream without --binary.
+	stdout, stderr utf8Stream
+}
+
+func (w *execJSONWriter) stream(k ownsand.ExecEventKind) *utf8Stream {
+	if k == ownsand.ExecEventStderr {
+		return &w.stderr
+	}
+	return &w.stdout
+}
+
+func (w *execJSONWriter) event(ev ownsand.ExecEvent) error {
+	if ev.ExecID != "" {
+		w.execID = ev.ExecID
+	}
 	switch ev.Kind {
 	case ownsand.ExecEventStdout, ownsand.ExecEventStderr:
-		off := ev.Offset
-		out.Offset = &off
-		if binary {
+		if w.binary {
 			s := base64.StdEncoding.EncodeToString(ev.Data)
-			out.DataBase64 = &s
-		} else {
-			s := strings.ToValidUTF8(string(ev.Data), string(utf8.RuneError))
-			out.Data = &s
+			return w.writeOutput(ev.Kind, ev.Offset, nil, &s)
 		}
+		u := w.stream(ev.Kind)
+		if u.started && ev.Offset != u.next {
+			// Bytes are missing before this chunk: a held-back partial
+			// character cannot be completed.
+			if err := w.flush(ev.Kind); err != nil {
+				return err
+			}
+		}
+		off, text := u.decode(ev.Offset, ev.Data)
+		if text == "" {
+			// The chunk holds only the start of a character; the next
+			// chunk carries it.
+			return nil
+		}
+		return w.writeOutput(ev.Kind, off, &text, nil)
+	case ownsand.ExecEventOutputTruncated:
+		if !ev.MissingStdout.Empty() {
+			if err := w.flush(ownsand.ExecEventStdout); err != nil {
+				return err
+			}
+		}
+		if !ev.MissingStderr.Empty() {
+			if err := w.flush(ownsand.ExecEventStderr); err != nil {
+				return err
+			}
+		}
+	}
+	return writeJSON(w.a.env.Stdout, w.a.jsonEvent(ev))
+}
+
+func (w *execJSONWriter) writeOutput(k ownsand.ExecEventKind, off int64, text, b64 *string) error {
+	return writeJSON(w.a.env.Stdout, execJSONEvent{Event: k.String(), ExecID: w.execID, Offset: &off, Data: text, DataBase64: b64})
+}
+
+// flush writes a held-back incomplete character of one stream as a
+// replacement character.
+func (w *execJSONWriter) flush(k ownsand.ExecEventKind) error {
+	off, text, ok := w.stream(k).flush()
+	if !ok {
+		return nil
+	}
+	return w.writeOutput(k, off, &text, nil)
+}
+
+// flushAll flushes both streams when the output ends.
+func (w *execJSONWriter) flushAll() error {
+	if err := w.flush(ownsand.ExecEventStdout); err != nil {
+		return err
+	}
+	return w.flush(ownsand.ExecEventStderr)
+}
+
+// utf8Stream decodes one output stream as UTF-8 text. The guest splits
+// output into chunks without regard to character boundaries, so a
+// multibyte character can span two chunks: an incomplete character at the
+// end of a chunk is held back until the next contiguous chunk arrives, and
+// it is replaced with U+FFFD only when the stream ends or bytes are missing
+// after it. Other invalid bytes are replaced with U+FFFD.
+type utf8Stream struct {
+	pending []byte
+	// next is the offset after the last byte received.
+	next    int64
+	started bool
+}
+
+// decode returns the offset of the first byte that text represents and the
+// text of the complete characters in the pending bytes and data.
+func (u *utf8Stream) decode(off int64, data []byte) (int64, string) {
+	start := off - int64(len(u.pending))
+	buf := make([]byte, 0, len(u.pending)+len(data))
+	buf = append(append(buf, u.pending...), data...)
+	cut := incompleteRuneStart(buf)
+	u.pending = append(u.pending[:0], buf[cut:]...)
+	u.next, u.started = off+int64(len(data)), true
+	return start, strings.ToValidUTF8(string(buf[:cut]), string(utf8.RuneError))
+}
+
+// flush returns the held-back bytes as replacement text.
+func (u *utf8Stream) flush() (int64, string, bool) {
+	if len(u.pending) == 0 {
+		return 0, "", false
+	}
+	off := u.next - int64(len(u.pending))
+	text := strings.ToValidUTF8(string(u.pending), string(utf8.RuneError))
+	u.pending = u.pending[:0]
+	return off, text, true
+}
+
+// incompleteRuneStart returns the index of an incomplete but so far valid
+// UTF-8 sequence at the end of b, or len(b) when b ends with a complete
+// character or with invalid bytes.
+func incompleteRuneStart(b []byte) int {
+	for i := len(b) - 1; i >= 0 && i >= len(b)-utf8.UTFMax+1; i-- {
+		if utf8.RuneStart(b[i]) {
+			if !utf8.FullRune(b[i:]) {
+				return i
+			}
+			break
+		}
+	}
+	return len(b)
+}
+
+// jsonEvent converts an exec event other than an output chunk.
+func (a *app) jsonEvent(ev ownsand.ExecEvent) execJSONEvent {
+	out := execJSONEvent{Event: ev.Kind.String(), ExecID: ev.ExecID}
+	switch ev.Kind {
 	case ownsand.ExecEventOutputTruncated:
 		if !ev.MissingStdout.Empty() {
 			out.MissingStdout = &jsonRange{From: ev.MissingStdout.From, To: ev.MissingStdout.To}

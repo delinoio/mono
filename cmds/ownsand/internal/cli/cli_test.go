@@ -176,6 +176,36 @@ func TestExecJSONEvents(t *testing.T) {
 	}
 }
 
+func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
+	r := newRunner(t)
+	lines := func(res result) []string {
+		var out []string
+		for _, l := range strings.Split(strings.TrimSpace(res.stdout), "\n") {
+			var v map[string]any
+			if err := json.Unmarshal([]byte(l), &v); err != nil {
+				t.Fatalf("%q: %v", l, err)
+			}
+			switch v["event"] {
+			case "stdout", "stderr":
+				out = append(out, fmt.Sprintf("%s@%v:%s", v["event"], v["offset"], v["data"]))
+			default:
+				out = append(out, v["event"].(string))
+			}
+		}
+		return out
+	}
+	res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", "split")
+	want := []string{"started", "stdout@0:h", "stdout@1:é ", "stdout@4:€", "stderr@0:x", "stderr@1:\ufffd", "exited"}
+	if got := lines(res); res.code != 0 || fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("split: %d %q, want %q", res.code, got, want)
+	}
+	res = r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", "splitgap")
+	want = []string{"started", "stdout@0:a", "stdout@1:\ufffd", "output_truncated", "stdout@5:\ufffdz", "exited"}
+	if got := lines(res); fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("splitgap: %q, want %q", got, want)
+	}
+}
+
 func TestSecretsPrintedOnceOnStdout(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("api-key", "create", "--name", "ci")

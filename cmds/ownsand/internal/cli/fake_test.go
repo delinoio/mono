@@ -225,6 +225,17 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 		events = append(events, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Failed{Failed: &ownsandv1.ExecFailed{Reason: ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND, Message: "not found"}}})
 	case "ended":
 		events = append(events, &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_SandboxEnded{SandboxEnded: &ownsandv1.ExecSandboxEnded{Reason: ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED}}})
+	case "split":
+		// Multibyte characters span chunk boundaries; stderr ends in the
+		// middle of a character.
+		events = append(events, stdout(0, "h\xc3"), stdout(2, "\xa9 \xe2\x82"), stdout(6, "\xac"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stderr{Stderr: &ownsandv1.ExecOutput{Offset: 0, Data: []byte("x\xe2")}}},
+			exited(0, false))
+	case "splitgap":
+		// Bytes are lost after the start of a character.
+		events = append(events, stdout(0, "a\xe2\x82"),
+			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5}}},
+			stdout(5, "\xacz"), exited(0, false))
 	case "trunc":
 		events = append(events, stdout(0, "ab"),
 			&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_OutputTruncated{OutputTruncated: &ownsandv1.ExecOutputTruncated{StdoutOffset: 5}}},
