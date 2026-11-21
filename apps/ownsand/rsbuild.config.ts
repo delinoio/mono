@@ -30,7 +30,7 @@ export default defineConfig({
   server: {
     // Fixed loopback port; fail instead of picking another port on conflict.
     host: "127.0.0.1",
-    port: 3300,
+    port: 13300,
     strictPort: true,
     // Single-page application: every route serves index.html.
     historyApiFallback: true,

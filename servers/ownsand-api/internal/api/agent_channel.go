@@ -328,7 +328,7 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 }
 
 func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *ownsandv1.StateReport) error {
-	res, err := s.reconcileStateReport(ctx, conn.DeviceID, r)
+	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
 		return err
 	}
@@ -391,7 +391,7 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
 	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
-	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()))
+	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
 	if !ok {
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
@@ -422,7 +422,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	case cmdCreateSnapshot:
 		err = s.applySnapshotResult(ctx, info, res)
 	case cmdExportSnapshot:
-		err = s.applyExportResult(ctx, info, res)
+		err = s.applyExportResult(ctx, info, res.GetCommandId(), res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
 			_, err = s.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)

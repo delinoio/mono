@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package snapxfer exports snapshots to R2 and imports them with signed
 // URLs. A snapshot travels as one tar stream of its content directory,

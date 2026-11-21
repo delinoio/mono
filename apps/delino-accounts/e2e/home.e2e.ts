@@ -6,7 +6,7 @@ import { expect } from "e2e";
 // command. A value other than the production default proves that the
 // build-time variable reaches the client bundle: the default would also appear
 // if the variable were ignored.
-const E2E_API_ORIGIN = "http://127.0.0.1:18100";
+const E2E_API_ORIGIN = "http://127.0.0.1:28100";
 
 describe("home", () => {
   test("shows the account and billing sections", async ({ app, screen }) => {

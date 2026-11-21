@@ -59,10 +59,10 @@ The API server is the system of record for account and billing information. It i
 
 ## Configuration
 
-| Variable    | Required | Default          | Values                           |
-| ----------- | -------- | ---------------- | -------------------------------- |
-| `ADDR`      | no       | `127.0.0.1:8100` | `host:port` listen address       |
-| `LOG_LEVEL` | no       | `info`           | `debug`, `info`, `warn`, `error` |
+| Variable    | Required | Default           | Values                           |
+| ----------- | -------- | ----------------- | -------------------------------- |
+| `ADDR`      | no       | `127.0.0.1:18100` | `host:port` listen address       |
+| `LOG_LEVEL` | no       | `info`            | `debug`, `info`, `warn`, `error` |
 
 - The server validates the configuration at startup and exits with a non-zero status when a value is not valid.
 - The server removes only ASCII white space (space, tab, line feed, vertical tab, form feed and carriage return) from the start and end of `ADDR` and `LOG_LEVEL`. A value that consists only of ASCII white space counts as unset and selects the default. Unicode white space, such as U+00A0 (no-break space) and U+3000 (ideographic space), is not removed, so a value that contains it is not valid, also when the whole value consists of such characters. The server matches `LOG_LEVEL` against the level names with ASCII letter case folding only (`INFO` and `iNfO` select `info`). Any other character makes the value not valid, so a value that lower-cases to a level name only under Unicode case mapping, such as `İNFO` (U+0130 followed by `NFO`), stops the server at startup like any other invalid value.

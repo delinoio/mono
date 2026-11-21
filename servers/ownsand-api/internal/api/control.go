@@ -209,7 +209,10 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 		if !c.held() {
 			continue
 		}
-		var live []string
+		// A non-nil slice: pgx binds a nil slice as SQL NULL, which turns
+		// NOT (x = ANY(NULL)) into NULL and matches no row when the channel
+		// registry is empty.
+		live := []string{}
 		for _, conn := range c.S.Hub.All() {
 			live = append(live, conn.DeviceID)
 		}
