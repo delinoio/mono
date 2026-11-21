@@ -37,6 +37,28 @@ const (
 	Installed
 )
 
+// Outcome is how a grant left the pending state. It is written under the
+// registry mutex before the done channel closes.
+type Outcome int
+
+const (
+	// OutcomeNone: the grant is still pending.
+	OutcomeNone Outcome = iota
+	// OutcomeAccepted: the agent accepted the grant.
+	OutcomeAccepted
+	// OutcomeRejectedLimit: the agent rejected the grant because of its
+	// per-device grant limit (REJECTED_GRANT_LIMIT).
+	OutcomeRejectedLimit
+	// OutcomeRemoved: the registry removed the pending grant without an
+	// accepting or limit-rejecting acknowledgement: the agent channel closed,
+	// the agent released it, a revocation matched it, it stopped being
+	// admittable, or the agent sent another non-accepting result.
+	OutcomeRemoved
+	// OutcomeDeliveryFailed: the lease holder could not queue the grant for
+	// the agent (RemoveUndelivered), so the agent never saw it.
+	OutcomeDeliveryFailed
+)
+
 // Request is an AuthorizeRelay after authorization.
 type Request struct {
 	AuthorizationID string
@@ -71,16 +93,17 @@ type Grant struct {
 	// acknowledgement names the swap; Successor is the pending successor.
 	Replaces  string
 	Successor string
-	// done is closed when the outcome (installed or rejected) is known.
-	done     chan struct{}
-	rejected bool
+	// done is closed when the outcome is known; outcome is written before.
+	done    chan struct{}
+	outcome Outcome
 }
 
-// Done is closed when the agent accepted or rejected the grant.
+// Done is closed when the grant is accepted, rejected or removed.
 func (g *Grant) Done() <-chan struct{} { return g.done }
 
-// Rejected reports whether the agent rejected the grant.
-func (g *Grant) Rejected() bool { return g.rejected }
+// Outcome reports how the grant left the pending state; it is OutcomeNone
+// until Done is closed. Read it only after Done is closed.
+func (g *Grant) Outcome() Outcome { return g.outcome }
 
 // Errors of Reserve.
 var (
@@ -127,12 +150,15 @@ func admittable(g *Grant, now time.Time) bool {
 func (r *Registry) sweepLocked(now time.Time) {
 	for id, g := range r.byID {
 		if !r.revocableLocked(g, now) || (g.State == Pending && !now.Before(g.ExpireAt.Add(AdmissionTolerance))) {
-			r.removeLocked(id)
+			r.removeLocked(id, OutcomeRemoved)
 		}
 	}
 }
 
-func (r *Registry) removeLocked(id string) {
+// removeLocked removes a grant. A grant that is still pending ends with
+// outcome: OutcomeRejectedLimit only for the agent's explicit limit
+// rejection, OutcomeRemoved for every other removal.
+func (r *Registry) removeLocked(id string, outcome Outcome) {
 	g := r.byID[id]
 	if g == nil {
 		return
@@ -154,7 +180,7 @@ func (r *Registry) removeLocked(id string) {
 	select {
 	case <-g.done:
 	default:
-		g.rejected = true
+		g.outcome = outcome
 		close(g.done)
 	}
 }
@@ -236,17 +262,48 @@ func (r *Registry) Ack(grantID string, result ownsandv1.RelayGrantResult, replac
 	if g == nil || g.State != Pending {
 		return
 	}
-	if result != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
-		r.removeLocked(grantID)
+	switch result {
+	case ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED:
+	case ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT:
+		r.removeLocked(grantID, OutcomeRejectedLimit)
+		return
+	default:
+		// Any other non-accepting result is a protocol oddity; the caller
+		// sees the grant as removed, not as a capacity rejection.
+		r.removeLocked(grantID, OutcomeRemoved)
 		return
 	}
 	g.State = Installed
+	g.outcome = OutcomeAccepted
 	g.AckAt = r.Now()
 	if replacedID != "" && replacedID == g.Replaces {
-		r.removeLocked(replacedID)
+		r.removeLocked(replacedID, OutcomeRemoved)
 	}
 	g.Replaces = ""
 	close(g.done)
+}
+
+// RemoveUndelivered removes the pending grant grantID after the lease holder
+// failed to queue it for the agent, so a retry with the same authorization ID
+// reserves and sends again. It records OutcomeDeliveryFailed before it wakes
+// the waiters of the grant. A replacement leaves its predecessor installed and
+// frees the predecessor's pending-successor link. It reports false and changes
+// nothing when the grant is gone or no longer pending: a grant that the agent
+// acknowledged stays installed.
+func (r *Registry) RemoveUndelivered(grantID string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	g := r.byID[grantID]
+	if g == nil || g.State != Pending {
+		return false
+	}
+	select {
+	case <-g.done:
+		return false
+	default:
+	}
+	r.removeLocked(grantID, OutcomeDeliveryFailed)
+	return true
 }
 
 // Release removes a grant that the agent released.
@@ -254,7 +311,7 @@ func (r *Registry) Release(grantID, deviceID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if g := r.byID[grantID]; g != nil && g.DeviceID == deviceID {
-		r.removeLocked(grantID)
+		r.removeLocked(grantID, OutcomeRemoved)
 	}
 }
 
@@ -283,7 +340,7 @@ func (r *Registry) RemoveChannel(deviceID string, gen uint64) {
 	defer r.mu.Unlock()
 	for id, g := range r.byID {
 		if g.DeviceID == deviceID && g.ChannelGen == gen {
-			r.removeLocked(id)
+			r.removeLocked(id, OutcomeRemoved)
 		}
 	}
 }
@@ -298,7 +355,7 @@ func (r *Registry) RemoveMatching(match func(*Grant) bool) []*Grant {
 		if r.revocableLocked(g, now) && match(g) {
 			cp := *g
 			out = append(out, &cp)
-			r.removeLocked(id)
+			r.removeLocked(id, OutcomeRemoved)
 		}
 	}
 	return out

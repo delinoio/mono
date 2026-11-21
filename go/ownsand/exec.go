@@ -14,8 +14,8 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -235,6 +235,11 @@ type attempt struct {
 	result   *ExecResult
 	err      error // io.EOF for a stream that ended cleanly without a result
 	accepted bool
+	// served reports that the agent served the request on a peer-to-peer
+	// session: it sent the accepted frame or any exec event. The agent
+	// sends no accepted frame on a session, only on the relay, so an exec
+	// event is the evidence of an accepted continuation there.
+	served   bool
 	data     bool
 	paused   bool
 	sentExec bool
@@ -317,6 +322,17 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			err = errNotAccepted
 		}
 		if sess != nil && s.dp.handleSessionError(sess, err) {
+			var ended *errSessionEnded
+			if (at.accepted || at.served) && errors.As(err, &ended) {
+				// A routine session end (idle, the 1-hour expiry) of a
+				// continuation that the agent accepted shows that the
+				// operation recovered on its new session. It is not a
+				// failure, so a quiet exec can outlive any number of
+				// session expiries. Only failed sessions (a data channel
+				// failure, an end before the agent accepted) count.
+				sessionErrors = 0
+				continue
+			}
 			sessionErrors++
 			if sessionErrors > 5 {
 				return nil, op.dpErr(err, false)
@@ -406,6 +422,7 @@ func (op *execOp) p2pAttempt(ctx context.Context, sess *p2pSession) attempt {
 		}
 		switch f.GetKind() {
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_EXEC_EVENT:
+			at.served = true
 			if done := op.handleEvent(f.GetExecEvent(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER); done {
 				return at
 			}

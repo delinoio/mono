@@ -9,10 +9,11 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/url"
 	"strconv"
 	"strings"
+
+	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
 
 // Environment variable names read by the server.
@@ -194,7 +195,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 
 	if v := get(EnvAddr); v != "" {
-		if err := validateAddr(EnvAddr, v); err != nil {
+		if err := listenaddr.Validate(EnvAddr, v); err != nil {
 			return Config{}, err
 		}
 		cfg.Addr = v
@@ -303,8 +304,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvSnapshotPartSizeBytes); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
-		// Each part is one R2 object; 5 MiB to 5 GiB keeps the part count
-		// below 10,000 for disks up to 50 TiB and inside the object size limit.
+		// Each part is one R2 object. A snapshot may have at most 10,000
+		// parts, so the largest snapshot is the part size times 10,000: about
+		// 48.8 GiB at 5 MiB and 625 GiB at the 64 MiB default. The agent
+		// rejects a larger snapshot before it uploads any part.
 		if err != nil || n < 5<<20 || n > 5<<30 {
 			return Config{}, fmt.Errorf("%s must be 5 MiB to 5 GiB", EnvSnapshotPartSizeBytes)
 		}
@@ -312,7 +315,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	cfg.STUNAddr = DefaultSTUNAddr
 	if v := get(EnvSTUNAddr); v != "" {
-		if err := validateAddr(EnvSTUNAddr, v); err != nil {
+		if err := listenaddr.Validate(EnvSTUNAddr, v); err != nil {
 			return Config{}, err
 		}
 		cfg.STUNAddr = v
@@ -366,17 +369,6 @@ func validateURL(name, value string) error {
 	u, err := url.Parse(value)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
-	}
-	return nil
-}
-
-func validateAddr(name, value string) error {
-	_, port, err := net.SplitHostPort(value)
-	if err != nil {
-		return fmt.Errorf("%s must be a host:port address: %w", name, err)
-	}
-	if _, err := strconv.ParseUint(port, 10, 16); err != nil {
-		return fmt.Errorf("%s port must be a number from 0 to 65535", name)
 	}
 	return nil
 }
