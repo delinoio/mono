@@ -98,10 +98,17 @@ func TestExecRequestSizeLimit(t *testing.T) {
 	r.Env = map[string]string{"BIG": strings.Repeat("v", MaxExecFieldsSize)}
 	wantInvalid(t, "env over limit", ExecRequest(r), "command")
 	// Fields outside the three do not count.
-	r = validExec()
+	r = &ownsandv1.ExecRequest{
+		Command:          []string{"/bin/sh", "-c", "true"},
+		Env:              map[string]string{"A": "B"},
+		WorkingDirectory: "/",
+	}
 	before := ExecFieldsSize(r)
-	r.BindingSalt = make([]byte, 32)
 	r.OrganizationId = orgID
+	r.SandboxId = sandboxID
+	r.ExecId = opID
+	r.Timeout = durationpb.New(time.Minute)
+	r.BindingSalt = make([]byte, 32)
 	if ExecFieldsSize(r) != before {
 		t.Fatal("other fields counted")
 	}
