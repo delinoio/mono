@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -70,7 +71,10 @@ func DefaultLimits() Limits {
 // the peer's flow control does not, and Run returns without it.
 const writerGrace = 100 * time.Millisecond
 
-// outboundQueue bounds the frames waiting for the connection writer.
+// outboundQueue bounds the ordinary frames waiting for the connection writer.
+// Every admitted stream also owns one reserved place for its final frame (see
+// Conn.out), so the physical queue holds outboundQueue plus
+// Limits.MaxStreamsPerConn frames at most.
 const outboundQueue = 1024
 
 // Errors.
@@ -95,7 +99,17 @@ type Conn struct {
 	Generation uint64
 	limits     Limits
 
-	out    chan *ownsandv1.DataFrame
+	// out is the outbound queue drained by the single writer. Its capacity is
+	// outboundQueue plus MaxStreamsPerConn. An ordinary frame takes one of the
+	// outboundQueue tokens of slots first and returns the token when the writer
+	// dequeues it, so ordinary frames never use more than outboundQueue places.
+	// A stream's final frame (stream close or error) bypasses the tokens and
+	// uses the place that the stream reserved by being admitted: Open admits a
+	// stream only while the open streams and the finals that wait for the
+	// writer stay within MaxStreamsPerConn, so the physical queue always has
+	// room for every final and closeWith never blocks or drops one.
+	out    chan outFrame
+	slots  chan struct{}
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
@@ -115,11 +129,26 @@ type Conn struct {
 	// connection closing.
 	openGate chan struct{}
 
-	mu        sync.Mutex
-	next      uint64
-	streams   map[uint64]*Stream
+	mu      sync.Mutex
+	next    uint64
+	streams map[uint64]*Stream
+	// pendingFinals counts the final frames that wait for the writer (in out
+	// or in its hands). They keep their admission slot, in pendingFinals for
+	// the connection and in perGrant for the grant, until the writer is done
+	// with them.
+	pendingFinals int
+	// perGrant counts, for each grant, the open streams plus the pending
+	// final frames.
 	perGrant  map[string]int
 	peerKinds map[ownsandv1.DataFrameKind]bool
+}
+
+// outFrame is a frame in the outbound queue. final marks a stream's final
+// frame, which owns a reserved place instead of an ordinary token.
+type outFrame struct {
+	frame   *ownsandv1.DataFrame
+	final   bool
+	grantID string
 }
 
 // NewConn returns a connection for the device bound to an agent channel
@@ -132,8 +161,9 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 		limits.MaxQueuedControlBytes = defaultMaxQueuedControlBytes
 	}
 	ctx, cancel := context.WithCancelCause(parent)
-	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan *ownsandv1.DataFrame, outboundQueue),
-		ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
+	reserved := max(limits.MaxStreamsPerConn, 0)
+	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan outFrame, outboundQueue+reserved),
+		slots: make(chan struct{}, outboundQueue), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
 	now := time.Now().UnixNano()
 	c.lastRecv.Store(now)
 	c.lastSend.Store(now)
@@ -194,14 +224,46 @@ func (c *Conn) LastLargeReceive() time.Time {
 	return time.Unix(0, n)
 }
 
+// enqueue queues an ordinary frame. It waits for one of the outboundQueue
+// tokens, and returns when ctx ends or the connection closes.
 func (c *Conn) enqueue(ctx context.Context, f *ownsandv1.DataFrame) error {
 	select {
-	case c.out <- f:
-		return nil
+	case c.slots <- struct{}{}:
 	case <-c.ctx.Done():
 		return ErrConnClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	// The token guarantees room: ordinary frames never exceed outboundQueue,
+	// and the queue also holds the reserved places of the finals.
+	c.out <- outFrame{frame: f}
+	return nil
+}
+
+// dequeued runs when the writer took of from the queue. An ordinary frame
+// returns its token at once, so enqueue can proceed while the frame is sent.
+func (c *Conn) dequeued(of outFrame) {
+	if !of.final {
+		<-c.slots
+	}
+}
+
+// sent runs when the writer is done with of (sent or failed). A final frame
+// then releases the admission slots of its stream.
+func (c *Conn) sent(of outFrame) {
+	if !of.final {
+		return
+	}
+	c.mu.Lock()
+	c.releaseFinalLocked(of.grantID)
+	c.mu.Unlock()
+}
+
+// releaseFinalLocked releases the admission slots that a final frame kept.
+func (c *Conn) releaseFinalLocked(grantID string) {
+	c.pendingFinals--
+	if c.perGrant[grantID]--; c.perGrant[grantID] <= 0 {
+		delete(c.perGrant, grantID)
 	}
 }
 
@@ -267,8 +329,11 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		defer ticker.Stop()
 		for {
 			select {
-			case f := <-c.out:
-				if err := guardedSend(f); err != nil {
+			case of := <-c.out:
+				c.dequeued(of)
+				err := guardedSend(of.frame)
+				c.sent(of)
+				if err != nil {
 					c.Close(err)
 					return
 				}
@@ -445,7 +510,7 @@ func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, er
 		return nil, ErrConnClosed
 	default:
 	}
-	if len(c.streams) >= c.limits.MaxStreamsPerConn || c.perGrant[grantID] >= c.limits.MaxStreamsPerGrant {
+	if len(c.streams)+c.pendingFinals >= c.limits.MaxStreamsPerConn || c.perGrant[grantID] >= c.limits.MaxStreamsPerGrant {
 		c.mu.Unlock()
 		return nil, ErrTooManyStreams
 	}
@@ -586,10 +651,13 @@ func (s *Stream) Close(sendClose bool) {
 }
 
 // closeWith removes the stream from its connection like Close and enqueues
-// final, when not nil, as the last frame of the stream. The enqueue is best
-// effort and never blocks, because the callers include the receive loop: a
-// closed connection ends the stream on the agent too. A stream that already
-// closed sends nothing.
+// final, when not nil, as the last frame of the stream. The enqueue never
+// blocks, because the callers include the receive loop, and never drops the
+// frame: the stream reserved a place for it when Open admitted it. The stream
+// keeps its connection and grant admission slots until the writer is done with
+// final, so the pending finals stay bounded by MaxStreamsPerConn. A closed
+// connection ends the stream on the agent too, so then no frame is queued. A
+// stream that already closed sends nothing.
 func (s *Stream) closeWith(final *ownsandv1.DataFrame) {
 	s.mu.Lock()
 	if s.closed {
@@ -605,16 +673,27 @@ func (s *Stream) closeWith(final *ownsandv1.DataFrame) {
 	if c.streams[s.ID] == s {
 		delete(c.streams, s.ID)
 	}
+	if final != nil && c.ctx.Err() == nil {
+		// Keep the admission slots, and with them the reserved place.
+		c.pendingFinals++
+		select {
+		case c.out <- outFrame{frame: final, final: true, grantID: s.GrantID}:
+			c.mu.Unlock()
+			return
+		default:
+			// Unreachable while the admission invariant holds: log it and
+			// release the slots instead of leaking them.
+			c.releaseFinalLocked(s.GrantID)
+			c.mu.Unlock()
+			slog.Error("relay final frame dropped: the outbound queue has no reserved place",
+				slog.String("device_id", c.DeviceID), slog.Uint64("stream_id", s.ID), slog.String("grant_id", s.GrantID))
+			return
+		}
+	}
 	if c.perGrant[s.GrantID]--; c.perGrant[s.GrantID] <= 0 {
 		delete(c.perGrant, s.GrantID)
 	}
 	c.mu.Unlock()
-	if final != nil {
-		select {
-		case c.out <- final:
-		default:
-		}
-	}
 }
 
 // Registry maps devices to their current relay connection.
