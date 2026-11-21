@@ -466,8 +466,17 @@ func (r *Runtime) setState(ctx context.Context, m vmruntime.VM, state string, pa
 	return nil
 }
 
-// Pause stops the vCPUs and keeps the memory.
+// Pause flushes the guest page cache and then stops the vCPUs and keeps the
+// memory. The flush makes a later disk copy of the paused VM (Snapshot of
+// an already paused sandbox) hold every write completed before the pause.
 func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
+	v, err := r.lookup(m.SandboxID())
+	if err != nil {
+		return err
+	}
+	if err := syncGuest(ctx, v); err != nil {
+		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
+	}
 	return r.setState(ctx, m, "Paused", true)
 }
 
@@ -491,10 +500,8 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	v.mu.Lock()
 	wasPaused := v.paused
 	v.mu.Unlock()
+	// A paused VM was flushed by its Pause; Pause flushes a running one.
 	if !wasPaused {
-		if err := syncGuest(ctx, v); err != nil {
-			r.logger.Warn("guest sync before snapshot failed", "sandbox_id", v.id, "error", err)
-		}
 		if err := r.Pause(ctx, m); err != nil {
 			return vmruntime.SnapshotInfo{}, err
 		}
