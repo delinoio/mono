@@ -143,27 +143,23 @@ describe("resolveAccountsApiOrigin", () => {
     expect(resolveAccountsApiOrigin(value)).toBe(origin);
   });
 
-  test("names the scheme of a real non-http scheme", () => {
-    expect(() =>
-      resolveAccountsApiOrigin("ftp://accounts.api.delino.io"),
-    ).toThrow("PUBLIC_API_ORIGIN must use http or https, got ftp:");
-  });
-
   test.each([
+    "sk-proj-abc123://accounts.api.delino.io",
+    "token123://host",
+    "ftp://accounts.api.delino.io",
+    "user:pass@host",
     "token123:secret@host",
     "abc123:pass@host",
     "TOKEN123:secret@host",
     "accounts.api.delino.io:8100",
-  ])("does not echo the text before the first colon of %s", (value) => {
+  ])("reports only the scheme requirement for %s", (value) => {
     let message = "";
     try {
       resolveAccountsApiOrigin(value);
     } catch (error) {
       message = (error as Error).message;
     }
-    expect(message).toContain("PUBLIC_API_ORIGIN must use http or https");
-    expect(message).not.toMatch(/token123|abc123|secret|pass|accounts|8100/i);
-    expect(message).not.toContain("got");
+    expect(message).toBe("PUBLIC_API_ORIGIN must use http or https");
   });
 
   // The URL parser removes leading and trailing C0 control characters and

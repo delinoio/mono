@@ -18,7 +18,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

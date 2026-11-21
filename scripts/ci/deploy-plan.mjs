@@ -53,7 +53,55 @@ export const ReleaseType = Object.freeze({
   None: "none",
 });
 
-const deployableName = /^[a-z0-9][a-z0-9._-]*$/;
+// The release script tags each release `<name>@<version>`, and Git rejects a
+// reference name that contains `..`, so a deployable name must not contain two
+// consecutive dots. A trailing dot stays valid, because the version follows it.
+const deployableName = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]*$/;
+
+// The release step tags every release whose version advances as
+// `<name>@<version>`, deployable or not, so the name of any package that can be
+// released must form a valid Git ref. Git rejects a ref that contains `..`,
+// `@{`, an ASCII control character, a space, or one of `~ ^ : ? * [ \`, that
+// has an empty path component, or that has a component starting with `.` or,
+// except the last one, ending with `.lock`. `git tag` also reads a leading `-`
+// as an option. The version is a Changesets semver, so only the name can break
+// these rules. This mirrors `git check-ref-format refs/tags/<name>@<version>`
+// without a Git dependency in the planner.
+const forbiddenTagCharacters = /[\u0000- \u007f~^:?*[\\]/;
+
+// Throws when `<name>@<version>` cannot be a Git tag. `version` is only used
+// in the diagnostic, so `check()` passes the manifest version or a placeholder.
+function checkReleaseTagName(name, version) {
+  const components = name.split("/");
+  const last = components.length - 1;
+  const valid =
+    !forbiddenTagCharacters.test(name) &&
+    !name.startsWith("-") &&
+    !name.includes("..") &&
+    !name.includes("@{") &&
+    !name.startsWith("/") &&
+    !name.includes("//") &&
+    components.every(
+      (component, index) =>
+        !component.startsWith(".") &&
+        (index === last || !component.endsWith(".lock")),
+    );
+  if (!valid) {
+    throw new DeployPlanError(
+      `${name}: a release name must form a valid Git tag, but ${JSON.stringify(
+        `${name}@${version}`,
+      )} cannot be one`,
+    );
+  }
+}
+
+// The deploy workflow builds the image of a Droplet deployable with
+// `docker build --tag <name>:<sha>`, so the package name is a container image
+// repository name: lowercase alphanumeric runs joined by one separator, where
+// a separator is `.`, `_`, `__` or one or more `-`. This is the repository
+// path component grammar of the OCI distribution specification. A static-site
+// deployable has no image and keeps the looser `deployableName` rule.
+const dropletImageName = /^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$/;
 
 // A Droplet service name is a container name, a Docker network alias that
 // the reverse proxy resolves, and a file name on the Droplet, so it allows no
@@ -64,6 +112,12 @@ const dropletServiceName = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 // requests a certificate for it, so it must have at least two labels.
 const dropletHostname =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
+// A Cloudflare Pages project name is passed to `wrangler pages deploy
+// --project-name`. The provider accepts only lowercase letters, digits and
+// hyphens, beginning and ending with a letter or digit, so the planner rejects
+// other names before any build or upload. It sets no length limit here.
+const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
 // The container listens on this port inside its own network namespace. Ports
 // below 1024 need privileges that the non-root server images do not have.
@@ -110,7 +164,8 @@ function deployable(pkg) {
     );
   }
   // The workflow uses the package name in file paths, artifact names and
-  // tags, so a deployable name must not contain a scope or a slash.
+  // tags, so a deployable name must not contain a scope or a slash, and the
+  // release tag excludes consecutive dots (see `deployableName`).
   if (!deployableName.test(name)) {
     throw new DeployPlanError(
       `${name}: a deployable package name must match ${deployableName}`,
@@ -123,6 +178,11 @@ function deployable(pkg) {
   }
   const base = { name, dir: pkg.dir, kind: rule.kind, target: deploy.target };
   if (deploy.target === DeployTarget.Droplet) {
+    if (!dropletImageName.test(name)) {
+      throw new DeployPlanError(
+        `${name}: a droplet deployable package name must be a container image repository name matching ${dropletImageName}`,
+      );
+    }
     if (typeof deploy.service !== "string" || deploy.service === "") {
       throw new DeployPlanError(`${name}: deploy.service is required`);
     }
@@ -159,6 +219,11 @@ function deployable(pkg) {
   if (typeof deploy.project !== "string" || deploy.project === "") {
     throw new DeployPlanError(`${name}: deploy.project is required`);
   }
+  if (!pagesProjectName.test(deploy.project)) {
+    throw new DeployPlanError(
+      `${name}: deploy.project must contain only lowercase letters, digits and hyphens, and must begin and end with a letter or digit`,
+    );
+  }
   const raw = deploy.output ?? "dist";
   // The output must be a directory inside the package, never the package
   // root itself (`""` or `"."`) or a path outside it.
@@ -173,6 +238,14 @@ function deployable(pkg) {
   ) {
     throw new DeployPlanError(
       `${name}: deploy.output must be a directory inside the package`,
+    );
+  }
+  // The deploy workflow carries the output through tab-separated and
+  // line-separated transports (`jq @tsv` and `mapfile`), which corrupt tabs,
+  // line breaks, other control characters and backslashes.
+  if (/[\u0000-\u001f\u007f\\]/.test(output)) {
+    throw new DeployPlanError(
+      `${name}: deploy.output must not contain control characters or a backslash`,
     );
   }
   return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
@@ -301,7 +374,20 @@ export function check(repoRoot) {
     ...list(join(changesetDir, "pre"), "pre/"),
   ];
   for (const id of ids) checkChangesetId(id);
-  plan({ changesets: [], releases: [] }, readWorkspacePackages(repoRoot));
+  const packages = readWorkspacePackages(repoRoot);
+  plan({ changesets: [], releases: [] }, packages);
+  // The plan above has no releases, so it cannot see a release name. Check the
+  // name of every workspace package here, so the pull request that adds or
+  // renames a package fails before a later release could. A deployable with a
+  // non-string name has already failed in the plan; another package with no
+  // usable name is not in scope, so it is skipped.
+  for (const { manifest } of packages) {
+    if (typeof manifest.name !== "string") continue;
+    checkReleaseTagName(
+      manifest.name,
+      typeof manifest.version === "string" ? manifest.version : "<version>",
+    );
+  }
   return ids;
 }
 
@@ -355,6 +441,10 @@ export function plan(status, packages) {
       .filter(Boolean)
       .map((d) => [d.name, { ...d, version: versions.get(d.name) }]),
   );
+  // After the deployable map, so a deployable that fails its own name rule
+  // keeps that diagnostic. A `none` release is checked too, because a later
+  // run can advance the same package and tag it.
+  for (const [name, version] of versions) checkReleaseTagName(name, version);
   // Order each deployment stage on its own: dependencies in an earlier stage
   // are already deployed, so the alphabetical tie-break applies within the
   // stage.

@@ -11,7 +11,7 @@ import (
 	"errors"
 	"time"
 
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/ownsand/uuidv7"
 )
 
 // NonceLifetime is the lifetime of a device challenge nonce.

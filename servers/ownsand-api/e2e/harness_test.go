@@ -27,7 +27,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	ownsand "github.com/delinoio/mono/packages/ownsand-sdk-go"
+	ownsand "github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 )
@@ -251,22 +251,22 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	apiEnv := []string{
 		"ADDR=" + addr,
 		"LOG_LEVEL=debug",
-		"OWNSAND_DATABASE_URL=" + dbtest.NewURL(t),
-		"OWNSAND_LOGTO_ISSUER=" + testIssuer,
-		"OWNSAND_LOGTO_JWKS_FILE=" + jwksFile,
-		"OWNSAND_STUN_ADDR=" + stunAddr,
-		"OWNSAND_STUN_URLS=stun:" + stunAddr,
+		"DATABASE_URL=" + dbtest.NewURL(t),
+		"LOGTO_ISSUER=" + testIssuer,
+		"LOGTO_JWKS_FILE=" + jwksFile,
+		"STUN_ADDR=" + stunAddr,
+		"STUN_URLS=stun:" + stunAddr,
 	}
 	if o.objects {
 		s.objects = newFakeS3(t)
 		apiEnv = append(apiEnv,
-			"OWNSAND_R2_ENDPOINT="+s.objects.url,
-			"OWNSAND_R2_BUCKET="+fakeBucket,
-			"OWNSAND_R2_ACCESS_KEY_ID=e2e-access-key",
-			"OWNSAND_R2_SECRET_ACCESS_KEY=e2e-secret-key",
+			"R2_ENDPOINT="+s.objects.url,
+			"R2_BUCKET="+fakeBucket,
+			"R2_ACCESS_KEY_ID=e2e-access-key",
+			"R2_SECRET_ACCESS_KEY=e2e-secret-key",
 			// The minimum part size, so a snapshot of a few MiB has
 			// several parts.
-			"OWNSAND_SNAPSHOT_PART_SIZE_BYTES=5242880",
+			"SNAPSHOT_PART_SIZE_BYTES=5242880",
 		)
 	}
 	startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))

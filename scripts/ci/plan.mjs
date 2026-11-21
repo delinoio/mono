@@ -21,6 +21,8 @@ const fixtureInputs = new Set([
   "rstack.config.ts",
   "lefthook.yml",
   "scripts/install-git-hooks.sh",
+  // The Droplet fixtures run this helper against a stubbed `docker`.
+  "scripts/droplet/start-caddy.sh",
 ]);
 
 // Shared runtime and workspace inputs that change every app e2e suite.

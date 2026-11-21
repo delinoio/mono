@@ -8,7 +8,7 @@ import {
   SliderTrack,
   SliderValue,
 } from "@ui-sdk/react/slider";
-import type * as React from "react";
+import * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 
 export type SliderProps = Omit<
@@ -24,7 +24,9 @@ export type SliderProps = Omit<
   /**
    * The accessible names of the thumbs of a range, such as
    * `["Minimum price", "Maximum price"]`. A range has more than one value.
-   * A single thumb is named by `label`, including a one-value array.
+   * A range thumb with no entry, or an empty entry, is named by `label` and
+   * its one-based position, such as "Price 1 of 2". A single thumb is named by
+   * `label`, including a one-value array.
    */
   thumbLabels?: readonly string[];
 };
@@ -44,6 +46,9 @@ function isEmptyArray(value: unknown): boolean {
  * `onValueChange` then reports a number, not an array, because the UI SDK state
  * is a number when no value is given. A later re-render with `value={[20]}`
  * shows one thumb with the value 20.
+ *
+ * When `value={[]}` replaces a number or a non-empty array, the slider resets
+ * to that default, as if it mounted again with no value.
  */
 export function Slider({
   label,
@@ -56,7 +61,31 @@ export function Slider({
   defaultValue: defaultValueProp,
   ...props
 }: SliderProps) {
-  const value = isEmptyArray(valueProp) ? undefined : valueProp;
+  const valueIsEmpty = isEmptyArray(valueProp);
+  const value = valueIsEmpty ? undefined : valueProp;
+  const hasValue = value !== undefined;
+  // Workaround: the UI SDK keeps its last state when `value` becomes
+  // undefined, and this wrapper maps an empty array to undefined. After a
+  // non-empty value is replaced by `[]`, the SDK state (for example the range
+  // 20 and 80) would then differ from the one default thumb rendered here.
+  // Remounting the SDK root through a new key makes it start again from `min`
+  // or `defaultValue`. The key changes only when a value is replaced by an
+  // empty array, so a fresh mount, `[]` to a value and an uncontrolled slider
+  // keep their state. The remount drops the focus of the thumb. The state is
+  // adjusted during render, which React supports for state derived from props.
+  // Remove when the UI SDK resets its state when a controlled value becomes
+  // undefined.
+  const [resetState, setResetState] = React.useState({
+    hadValue: hasValue,
+    epoch: 0,
+  });
+  let resetEpoch = resetState.epoch;
+  if (resetState.hadValue !== hasValue) {
+    if (resetState.hadValue && valueIsEmpty) {
+      resetEpoch += 1;
+    }
+    setResetState({ hadValue: hasValue, epoch: resetEpoch });
+  }
   const defaultValue = isEmptyArray(defaultValueProp)
     ? undefined
     : defaultValueProp;
@@ -65,6 +94,15 @@ export function Slider({
   // The UI SDK treats only an array of more than one value as a range. A
   // one-value array is a single thumb that the field label names.
   const isRange = Array.isArray(initial) && initial.length > 1;
+  // A range thumb without an explicit name is named by the visible label and
+  // its position. The names reference the rendered label by id, so a React node
+  // label works and the names stay correct on the server and the client.
+  const labelId = React.useId();
+  const positionIdPrefix = React.useId();
+  const hasThumbLabel = (index: number) => {
+    const thumbLabel = thumbLabels?.[index];
+    return typeof thumbLabel === "string" && thumbLabel !== "";
+  };
   const hasDescription =
     description !== undefined &&
     description !== null &&
@@ -74,6 +112,7 @@ export function Slider({
   return (
     <Field className="dui-text-field" disabled={disabled}>
       <SliderRoot
+        key={resetEpoch}
         className={mergeClassName("dui-slider", className)}
         disabled={disabled}
         value={value}
@@ -81,7 +120,12 @@ export function Slider({
         {...props}
       >
         <div className="dui-slider-header">
-          <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
+          <FieldLabel
+            className="dui-text-field-label"
+            id={isRange ? labelId : undefined}
+          >
+            {label}
+          </FieldLabel>
           {showValue ? <SliderValue className="dui-slider-value" /> : null}
         </div>
         <SliderControl className="dui-slider-control">
@@ -94,12 +138,37 @@ export function Slider({
                 key={index}
                 index={index}
                 className="dui-slider-thumb"
-                aria-label={isRange ? thumbLabels?.[index] : undefined}
+                // An explicit name keeps `aria-label`. Without one, the thumb is
+                // named by the label and the hidden position text below;
+                // `aria-labelledby` would override `aria-label`, so the two are
+                // never set together.
+                aria-label={
+                  isRange && hasThumbLabel(index)
+                    ? thumbLabels?.[index]
+                    : undefined
+                }
+                aria-labelledby={
+                  isRange && !hasThumbLabel(index)
+                    ? `${labelId} ${positionIdPrefix}-${index}`
+                    : undefined
+                }
               />
             ))}
           </SliderTrack>
         </SliderControl>
       </SliderRoot>
+      {isRange
+        ? Array.from({ length: thumbCount }, (_, index) =>
+            hasThumbLabel(index) ? null : (
+              // Hidden text that only `aria-labelledby` of a thumb reads.
+              <span
+                key={index}
+                id={`${positionIdPrefix}-${index}`}
+                hidden
+              >{`${index + 1} of ${thumbCount}`}</span>
+            ),
+          )
+        : null}
       {/* Workaround: the UI SDK Field predicts the description id in
           aria-describedby before the field binds on the client, so static
           markup would point at a missing element. Always render the

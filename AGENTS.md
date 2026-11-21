@@ -41,6 +41,7 @@
 - Do not guess; rather search for the web.
 - Follow `docs/repository-dependency-security-contract.md` for dependency security updates, validation evidence, and unresolved upstream constraints. Keep unresolved advisories visible; a fixed runtime pin or an unavailable patch is not a vulnerability fix.
 - All Go code belongs to the single root Go module `github.com/delinoio/mono` defined in root `go.mod`. Do not add nested `go.mod` or `go.work` files.
+- Put Go packages that external users import under root `go/` (one tree per `go/<name>/`); keep repository-only Go code in its owning project directory. Generated protobuf Go bindings stay under `protos/`. Follow `docs/repository-workflow-contract.md#public-go-packages`.
 - Prioritize Connect RPC-based communication for business flows over Tauri-specific bindings.
 - Prefer React Query for frontend server-state management when it is available.
 - When using React Query with Connect RPC, use `@connectrpc/connect-query` from `https://github.com/connectrpc/connect-query-es`.
@@ -56,6 +57,7 @@
 - `cmds/`: Go command-line tools and device-side programs.
 - `servers/`: Backend services, licensed under FSL-1.1-ALv2.
 - `protos/`: Versioned protocol schemas and committed Go bindings.
+- `go/`: Go packages that external users import, in the root Go module.
 - `packages/`: Shared generated and runtime packages.
 - `packaging/`: Package-manager template assets for release automation.
 - `.agents/skills/`: Workspace-local Codex skills and reusable agent workflows.

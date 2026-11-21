@@ -13,8 +13,8 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/relaybinding"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
+	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"

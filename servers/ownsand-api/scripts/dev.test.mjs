@@ -36,9 +36,9 @@ function start(env) {
   return { child, exited, output: () => output };
 }
 
-test("skips without OWNSAND_DATABASE_URL", { timeout: Timeout }, async () => {
+test("skips without DATABASE_URL", { timeout: Timeout }, async () => {
   const env = { ...process.env };
-  delete env.OWNSAND_DATABASE_URL;
+  delete env.DATABASE_URL;
   const run = start(env);
   const { code } = await run.exited;
   assert.equal(code, 0);
@@ -53,9 +53,9 @@ test(
     const run = start({
       ...process.env,
       ADDR: `127.0.0.1:${port}`,
-      OWNSAND_DATABASE_URL: databaseURL,
-      OWNSAND_LOGTO_ISSUER: "http://127.0.0.1:9/oidc",
-      OWNSAND_STUN_ADDR: "127.0.0.1:0",
+      DATABASE_URL: databaseURL,
+      LOGTO_ISSUER: "http://127.0.0.1:9/oidc",
+      STUN_ADDR: "127.0.0.1:0",
     });
     const deadline = Date.now() + 90_000;
     let healthy = false;
