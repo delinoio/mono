@@ -134,6 +134,10 @@ type fakeCP struct {
 	created     map[string]*ownsandv1.Sandbox
 	createCalls int
 	dropCreates int
+	// stallCreates holds that many CreateSandbox requests open without a
+	// response, after the dropped ones, until the caller gives up.
+	stallCreates int
+	createKeys   []string // idempotency_key of each CreateSandbox request
 
 	expiresIn   time.Duration
 	clockOffset time.Duration // added to expire_time: a server clock that differs from the caller's
@@ -340,11 +344,12 @@ func (f *fakeSandboxes) record() *ownsandv1.Sandbox {
 	return sb
 }
 
-func (f *fakeSandboxes) CreateSandbox(_ context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+func (f *fakeSandboxes) CreateSandbox(ctx context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
 	cp := f.cp
 	cp.mu.Lock()
 	cp.createCalls++
 	key := req.Msg.GetIdempotencyKey()
+	cp.createKeys = append(cp.createKeys, key)
 	sb, ok := cp.created[key]
 	if !ok {
 		sb = &ownsandv1.Sandbox{SandboxId: mustID(cp.t), OrganizationId: req.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
@@ -358,6 +363,18 @@ func (f *fakeSandboxes) CreateSandbox(_ context.Context, req *connect.Request[ow
 	if drop {
 		// The reservation exists but the response is lost.
 		panic(http.ErrAbortHandler)
+	}
+	cp.mu.Lock()
+	stall := cp.stallCreates > 0
+	if stall {
+		cp.stallCreates--
+	}
+	cp.mu.Unlock()
+	if stall {
+		// The response never comes; the request ends when the caller
+		// closes the connection.
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: sb}), nil
 }
