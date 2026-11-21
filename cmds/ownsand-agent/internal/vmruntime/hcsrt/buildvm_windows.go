@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/Microsoft/go-winio"
@@ -48,6 +49,7 @@ type BuildVM struct {
 	logger    *slog.Logger
 	stop      chan struct{}
 	console   chan struct{}
+	closeOnce sync.Once
 }
 
 // CheckHost reports whether this process can create Hyper-V VMs.
@@ -172,8 +174,11 @@ func (b *BuildVM) WaitExit(ctx context.Context, timeout time.Duration) error {
 	}
 }
 
-// Close terminates the VM, if it still runs, and releases it.
-func (b *BuildVM) Close() {
+// Close terminates the VM, if it still runs, and releases it. It is
+// idempotent.
+func (b *BuildVM) Close() { b.closeOnce.Do(b.close) }
+
+func (b *BuildVM) close() {
 	select {
 	case <-b.sys.exited:
 	default:
