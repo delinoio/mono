@@ -261,6 +261,12 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 			replayed = existing
 			return err
 		}
+		// Lock the organization row before any device row, as
+		// DeleteOrganization does: the sandbox insert below takes FOR KEY
+		// SHARE on it through its foreign key.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		if src, err = h.resolveSource(ctx, tx, orgID, m.GetSource()); err != nil {
 			return err
 		}

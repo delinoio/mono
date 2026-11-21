@@ -170,6 +170,27 @@ func lockOrganization(ctx context.Context, tx pgx.Tx, orgID string) error {
 	return err
 }
 
+// lockOrganizationShare takes FOR KEY SHARE on the organization row (held
+// until the transaction ends). DeleteOrganization takes the row FOR UPDATE
+// first and then updates the devices, sandboxes and snapshots of the
+// organization, and the foreign key of every row that an RPC inserts for the
+// organization takes FOR KEY SHARE on it. An RPC that locks child rows
+// before its insert reaches that foreign key would wait for the deletion
+// while the deletion waits for those child rows: a deadlock. Such an RPC
+// calls this helper before it locks any child row, which gives it the same
+// order as the deletion. Callers that only insert or update child rows share
+// the lock with each other, so they still run concurrently. An organization
+// that a concurrent deletion removed while the caller waited yields
+// not_found and stops the transaction. orgID must be validated.
+func lockOrganizationShare(ctx context.Context, tx pgx.Tx, orgID string) error {
+	var locked int
+	err := tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", orgID).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errNotFound("organization")
+	}
+	return err
+}
+
 // deleteOrganizationTx marks the organization deleted and deletes its
 // records, except the device removal tombstones, the audit events and the
 // R2 clean-up job state. It removes every device of the organization as
