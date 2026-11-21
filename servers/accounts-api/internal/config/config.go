@@ -30,6 +30,7 @@ const (
 	EnvWebOrigin               = "WEB_ORIGIN"
 	EnvResendAPIKey            = "RESEND_API_KEY"
 	EnvEmailFrom               = "EMAIL_FROM"
+	EnvMetricsAddr             = "METRICS_ADDR"
 )
 
 // DefaultAudience is the Logto API resource indicator of accounts-api.
@@ -130,6 +131,10 @@ type Config struct {
 	ResendAPIKey string
 	// EmailFrom is the sender address of billing emails.
 	EmailFrom string
+
+	// MetricsAddr is the `host:port` of the internal Prometheus listener;
+	// empty turns the listener off.
+	MetricsAddr string
 }
 
 // Load reads the configuration through lookup, which has the signature of
@@ -234,6 +239,13 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if _, err := mail.ParseAddress(cfg.EmailFrom); err != nil {
 		return Config{}, fmt.Errorf("%s must be an email address such as billing@delino.io or Delino <billing@delino.io>", EnvEmailFrom)
+	}
+
+	if value := lookupNonEmpty(lookup, EnvMetricsAddr); value != "" {
+		if err := listenaddr.Validate(EnvMetricsAddr, value); err != nil {
+			return Config{}, err
+		}
+		cfg.MetricsAddr = value
 	}
 
 	return cfg, nil

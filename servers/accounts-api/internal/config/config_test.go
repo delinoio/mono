@@ -418,3 +418,19 @@ func TestLoadErrorsDoNotContainSecrets(t *testing.T) {
 		t.Fatalf("error %q contains the secret", err)
 	}
 }
+
+func TestMetricsAddr(t *testing.T) {
+	cfg, err := Load(lookupFrom(nil))
+	if err != nil || cfg.MetricsAddr != "" {
+		t.Fatalf("default METRICS_ADDR = %q, %v; want empty", cfg.MetricsAddr, err)
+	}
+	cfg, err = Load(lookupFrom(map[string]string{EnvMetricsAddr: " :9100 "}))
+	if err != nil || cfg.MetricsAddr != ":9100" {
+		t.Fatalf("METRICS_ADDR = %q, %v", cfg.MetricsAddr, err)
+	}
+	for _, value := range []string{"9100", "host:port", "http://127.0.0.1:9100"} {
+		if _, err := Load(lookupFrom(map[string]string{EnvMetricsAddr: value})); err == nil || !strings.Contains(err.Error(), EnvMetricsAddr) {
+			t.Errorf("METRICS_ADDR=%q: err = %v, want an error that names %s", value, err, EnvMetricsAddr)
+		}
+	}
+}

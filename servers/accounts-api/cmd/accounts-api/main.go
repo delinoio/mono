@@ -20,6 +20,7 @@ import (
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
+	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 	"github.com/delinoio/mono/servers/accounts-api/internal/server"
 )
 
@@ -79,6 +80,9 @@ func run() error {
 		logger.Info("db_migrations_skipped", slog.String("reason", config.EnvRunMigrations+" is false"))
 	}
 
+	// The metrics exist also without METRICS_ADDR, so the code that records
+	// them never checks whether the listener runs.
+	appMetrics := metrics.New()
 	handler, err := newHandler(cfg, database, logger)
 	if err != nil {
 		return err
@@ -89,10 +93,39 @@ func run() error {
 		return err
 	}
 
+	// The background tasks (the internal metrics listener) run until the
+	// HTTP server has drained, and run waits for them before it returns.
+	background, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+	var backgroundErrs []<-chan error
+	if cfg.MetricsAddr != "" {
+		metricsListener, err := net.Listen("tcp", cfg.MetricsAddr)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+		backgroundErrs = append(backgroundErrs, runAsync(func() error {
+			return metrics.Serve(background, metricsListener, appMetrics, logger)
+		}))
+	}
+
 	srv := newServer(handler, logger)
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)))
-	return serve(ctx, stop, srv, listener, logger, shutdownTimeout)
+	serveErr := serve(ctx, stop, srv, listener, logger, shutdownTimeout)
+	stopBackground()
+	errs := []error{serveErr}
+	for _, errc := range backgroundErrs {
+		errs = append(errs, <-errc)
+	}
+	return errors.Join(errs...)
+}
+
+// runAsync runs fn in a goroutine and returns the channel of its result.
+func runAsync(fn func() error) <-chan error {
+	errc := make(chan error, 1)
+	go func() { errc <- fn() }()
+	return errc
 }
 
 // newHandler builds the production handler from the configuration.

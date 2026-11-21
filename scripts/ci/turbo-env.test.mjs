@@ -45,6 +45,7 @@ const expectedPassThroughEnv = {
     "LOGTO_M2M_CLIENT_SECRET",
     "LOGTO_MANAGEMENT_ENDPOINT",
     "LOG_LEVEL",
+    "METRICS_ADDR",
     "RESEND_API_KEY",
     "RUN_MIGRATIONS",
     "WEB_ORIGIN",

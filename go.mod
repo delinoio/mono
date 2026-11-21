@@ -13,6 +13,7 @@ require (
 	github.com/pion/stun/v3 v3.1.7
 	github.com/pion/webrtc/v4 v4.2.26
 	github.com/pressly/goose/v3 v3.30.1
+	github.com/prometheus/client_golang v1.25.0
 	github.com/resend/resend-go/v3 v3.17.0
 	github.com/sirupsen/logrus v1.10.2
 	golang.org/x/net v0.62.0
@@ -23,6 +24,8 @@ require (
 
 require (
 	github.com/Code-Hex/go-infinity-channel v1.0.0 // indirect
+	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/google/btree v1.1.2 // indirect
 	github.com/google/gopacket v1.1.19 // indirect
 	github.com/google/uuid v1.6.0 // indirect
@@ -32,6 +35,7 @@ require (
 	github.com/jackc/puddle/v2 v2.2.3 // indirect
 	github.com/mfridman/interpolate v0.2.0 // indirect
 	github.com/miekg/dns v1.1.73 // indirect
+	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/pierrec/lz4/v4 v4.1.33 // indirect
 	github.com/pion/datachannel v1.6.3 // indirect
 	github.com/pion/dtls/v3 v3.1.15 // indirect
@@ -48,6 +52,9 @@ require (
 	github.com/pion/transport/v4 v4.1.0 // indirect
 	github.com/pion/transport/v5 v5.1.4 // indirect
 	github.com/pion/turn/v5 v5.1.3 // indirect
+	github.com/prometheus/client_model v0.6.3 // indirect
+	github.com/prometheus/common v0.72.0 // indirect
+	github.com/prometheus/procfs v0.23.0 // indirect
 	github.com/sethvargo/go-retry v0.5.0 // indirect
 	github.com/u-root/uio v0.0.0-20240224005618-d2acac8f3701 // indirect
 	github.com/wlynxg/anet v0.0.5 // indirect
