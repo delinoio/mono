@@ -14,11 +14,11 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/backoff"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/go/ownsand/datapath"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
+	"github.com/delinoio/mono/internal/backoff"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )

@@ -76,6 +76,12 @@ func (w *SendWindow) Consume(ctx context.Context, n int64) error {
 	}
 	for {
 		w.mu.Lock()
+		// An ended context never deducts credit, even when a wake-up or
+		// available credit would otherwise let this call proceed.
+		if err := ctx.Err(); err != nil {
+			w.mu.Unlock()
+			return err
+		}
 		if n <= w.available {
 			w.available -= n
 			w.mu.Unlock()
@@ -99,7 +105,9 @@ func (w *SendWindow) Add(increment int64) error {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if w.available+increment > MaxWindowSize {
+	// Compare against the remaining room: available+increment can overflow
+	// int64 for a huge increment and slip past the cap.
+	if increment > MaxWindowSize-w.available {
 		return fmt.Errorf("%w: window would exceed %d bytes", ErrInvalidWindowUpdate, MaxWindowSize)
 	}
 	w.available += increment
