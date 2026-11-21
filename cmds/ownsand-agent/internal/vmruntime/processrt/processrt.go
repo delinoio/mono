@@ -22,6 +22,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
@@ -29,6 +30,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/launcher"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/internal/fsutil"
+	"github.com/delinoio/mono/internal/procgroup"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -153,7 +155,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	cmd.Env = append(os.Environ(), "HOME="+root)
 	cmd.Stdout = os.Stderr
 	cmd.Stderr = os.Stderr
-	setProcessGroup(cmd)
+	procgroup.Set(cmd)
 	if err := launcher.Start(cmd); err != nil {
 		os.RemoveAll(spec.Dir)
 		return nil, fmt.Errorf("processrt: start guest helper: %w", err)
@@ -278,4 +280,13 @@ func (r *Runtime) Close() error {
 		errs = append(errs, r.Delete(context.Background(), id))
 	}
 	return errors.Join(errs...)
+}
+
+// signalGroup signals the process group of cmd that procgroup.Set created.
+// A command that has not started is a no-op.
+func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	return procgroup.Signal(cmd.Process, sig)
 }

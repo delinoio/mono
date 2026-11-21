@@ -12,10 +12,6 @@ import (
 // forceAfterTerminate: Windows guests terminate the process tree at once.
 const forceAfterTerminate = false
 
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
-}
-
 // terminate ends the process tree with taskkill, which every supported
 // Windows edition includes. A job object would also catch children that
 // detach from the tree; replace this with a job object when the Windows
