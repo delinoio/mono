@@ -439,6 +439,9 @@ test("Go sources, module files and protobuf inputs select Go checks", async (t) 
     "protos/buf.gen.yaml",
     "protos/buf.lock",
     "scripts/protos.sh",
+    "packages/ownsand-sdk/buf.gen.yaml",
+    "packages/ownsand-sdk/package.json",
+    "packages/ownsand-sdk/src/gen/delino/ownsand/v1/common_pb.ts",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -451,6 +454,7 @@ test("Go sources, module files and protobuf inputs select Go checks", async (t) 
   f.write("servers/example/go.mod.example");
   f.write("protos/AGENTS.md");
   f.write("docs/buf.yaml");
+  f.write("packages/ownsand-sdk/src/client.ts");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 

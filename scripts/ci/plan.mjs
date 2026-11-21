@@ -61,15 +61,21 @@ export function isWorkspaceManifest(path) {
   ).test(path);
 }
 
-// Protobuf schema inputs: the schemas, the buf configuration and the
-// generation script. The Go job lints them, checks breaking changes and fails
-// when the committed Go bindings differ from the generated output.
+// Protobuf schema inputs: the schemas, the buf configuration, the generation
+// script and the TypeScript generation template and plugin pin of the OwnSand
+// SDK. The Go job lints them, checks breaking changes and fails when the
+// committed Go or TypeScript bindings differ from the generated output.
 const protoInputs = new Set([
   "protos/buf.yaml",
   "protos/buf.gen.yaml",
   "protos/buf.lock",
   "scripts/protos.sh",
+  "packages/ownsand-sdk/buf.gen.yaml",
+  "packages/ownsand-sdk/package.json",
 ]);
+
+// Committed TypeScript bindings that the drift check compares.
+const generatedTsBindings = "packages/ownsand-sdk/src/gen/";
 
 // Go sources, module files and protobuf schema inputs select the repository
 // Go checks.
@@ -78,7 +84,8 @@ export function isGoInput(path) {
     path.endsWith(".go") ||
     /(^|\/)go\.(mod|sum)$/.test(path) ||
     path.endsWith(".proto") ||
-    protoInputs.has(path)
+    protoInputs.has(path) ||
+    path.startsWith(generatedTsBindings)
   );
 }
 

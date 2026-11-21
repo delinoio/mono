@@ -133,6 +133,14 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
+      # scripts/protos.sh check also generates the TypeScript bindings with the
+      # protoc-gen-es version that packages/ownsand-sdk pins.
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Check Go module
         shell: bash
         run: |
@@ -145,7 +153,7 @@ jobs:
           fi
           go vet ./...
           go test ./...
-      - name: Check protobuf schemas and generated Go bindings
+      - name: Check protobuf schemas and generated Go and TypeScript bindings
         shell: bash
         env:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
@@ -168,7 +176,7 @@ jobs:
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...; scripts/protos.sh check; scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...; pnpm install --frozen-lockfile --ignore-scripts; scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Runtime, deployment and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
   rust:
