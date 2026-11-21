@@ -93,12 +93,20 @@ func TestValidateFrame(t *testing.T) {
 		{"kind mismatch", &ownsandv1.DataFrame{StreamId: 1, Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_EXEC_EVENT, Payload: &ownsandv1.DataFrame_RequestAccepted{RequestAccepted: &ownsandv1.RequestAccepted{}}}, ErrMalformedFrame},
 		{"keepalive on a stream", MustNewFrame(3, "", &ownsandv1.RelayKeepalive{}), ErrMalformedFrame},
 		{"keepalive with sandbox", MustNewFrame(0, sandboxID, &ownsandv1.RelayKeepalive{}), ErrMalformedFrame},
+		{"typed nil exec request", &ownsandv1.DataFrame{StreamId: 1, Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_EXEC_REQUEST, Payload: (*ownsandv1.DataFrame_ExecRequest)(nil)}, ErrMalformedFrame},
+		{"typed nil keepalive", &ownsandv1.DataFrame{StreamId: 0, Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: (*ownsandv1.DataFrame_RelayKeepalive)(nil)}, ErrMalformedFrame},
 		{"payload on stream 0", MustNewFrame(0, sandboxID, &ownsandv1.ExecEvent{}), ErrMalformedFrame},
 	}
 	for _, tc := range cases {
 		if err := ValidateFrame(tc.frame); !errors.Is(err, tc.want) {
 			t.Errorf("%s: err = %v, want %v", tc.name, err, tc.want)
 		}
+	}
+	if got := PayloadKind(&ownsandv1.DataFrame{Payload: (*ownsandv1.DataFrame_ExecRequest)(nil)}); got != ownsandv1.DataFrameKind_DATA_FRAME_KIND_UNSPECIFIED {
+		t.Errorf("typed nil PayloadKind = %s", got)
+	}
+	if err := ValidateFrame(MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
+		t.Errorf("populated keepalive: %v", err)
 	}
 	var unknown *UnknownKindError
 	err := ValidateFrame(&ownsandv1.DataFrame{StreamId: 4, Kind: ownsandv1.DataFrameKind(99)})
