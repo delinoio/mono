@@ -458,6 +458,9 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "packages/ownsand-sdk/src/e2e.test.ts",
     "packages/ownsand-sdk/rstest.config.ts",
     "packages/ownsand-sdk/tsconfig.json",
+    "apps/delino-accounts/buf.gen.yaml",
+    "apps/delino-accounts/package.json",
+    "apps/delino-accounts/src/gen/delino/accounts/v1/credit_pb.ts",
     ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
@@ -484,6 +487,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("docs/buf.yaml");
   f.write("packages/ownsand-sdk-example/src/client.ts");
   f.write("packages/delino-ui/package.json");
+  f.write("apps/delino-accounts/src/App.tsx");
   f.write("rstest.config.ts");
   f.write("servers/ownsand-api/README.md");
   f.write(".github/workflows/deploy.yml");

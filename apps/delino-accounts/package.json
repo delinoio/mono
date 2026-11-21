@@ -22,10 +22,12 @@
     "script": "dev:app"
   },
   "dependencies": {
+    "@bufbuild/protobuf": "2.16.0",
     "react": "19.3.1",
     "react-dom": "19.3.1"
   },
   "devDependencies": {
+    "@bufbuild/protoc-gen-es": "2.16.0",
     "@e2e-dev/web": "0.16.1",
     "@rsbuild/core": "2.3.2",
     "@rsbuild/plugin-react": "2.1.1",

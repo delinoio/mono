@@ -1706,6 +1706,7 @@ test("Rstack owns exclusions and retains Markdown prose and embedded code", asyn
   const f = fixture(t);
   const ignored = [
     "packages/example/src/gen/client.ts",
+    "apps/delino-accounts/src/gen/delino/accounts/v1/credit_pb.ts",
     "vendor/code.ts",
     "data/fixtures/input.json",
     "data/testdata/input.json",

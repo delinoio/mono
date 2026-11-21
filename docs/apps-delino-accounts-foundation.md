@@ -10,7 +10,7 @@ This contract owns the `delino-accounts-web` component of [`delino-accounts`](pr
 - `apps/delino-accounts/public/`: static files copied to the build root, including the Cloudflare Pages `_headers` file. The directory must not contain a top-level `404.html` or a `_redirects` file with a rule that rewrites to `/index.html`; `src/static-hosting.test.ts` enforces this.
 - `apps/delino-accounts/turbo.json`: package-local Turbo task configuration.
 - `apps/delino-accounts/e2e.config.ts` and `apps/delino-accounts/e2e/`: end-to-end test config and tests, according to the [e2e contract](repository-e2e-contract.md).
-- `apps/delino-accounts/src/gen/` and `apps/delino-accounts/buf.gen.yaml` (`planned`): the generated TypeScript bindings of the [protos contract](protos-delino-accounts-api-contract.md) and their template.
+- `apps/delino-accounts/src/gen/` and `apps/delino-accounts/buf.gen.yaml`: the generated TypeScript bindings of the [protos contract](protos-delino-accounts-api-contract.md) and their template.
 
 ## Runtime and Language
 
@@ -96,6 +96,7 @@ Billing tests (`planned`): component tests for each billing page, the validation
 ## Dependencies and Integrations
 
 - `@rsbuild/core`, `@rsbuild/plugin-react`, `react`, `react-dom` and `@rstest/core`, pinned in `apps/delino-accounts/package.json`.
+- Generated bindings: `@bufbuild/protobuf` `2.16.0` (runtime) and `@bufbuild/protoc-gen-es` `2.16.0` (development; the generator that `scripts/protos.sh` runs from this package), equal to the versions of the [OwnSand SDK](packages-ownsand-sdk-foundation.md#dependencies-and-integrations).
 - Billing pages (`planned`): the Connect, Connect-Query, React Query, protobuf and Logto packages at the exact versions that the [OwnSand console](apps-ownsand-console-foundation.md#dependencies-and-integrations) pins, `@bufbuild/protoc-gen-es` for the generated bindings, and a Paddle.js package for the checkout. The change that adds each package records its exact version here and the [dependency security](repository-dependency-security-contract.md) results in the pull request.
 - Paddle (`planned`): the checkout of the subscription; the payment provider of the [API server](servers-accounts-api-foundation.md#payments-and-credits).
 - `e2e`, `@e2e-dev/web` and `ai` for end-to-end tests, pinned in `apps/delino-accounts/package.json`.

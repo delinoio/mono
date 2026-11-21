@@ -14,6 +14,7 @@ define.fmt({
     "**/fixtures/**",
     "protos/gen/**",
     "packages/*/src/gen/**",
+    "apps/delino-accounts/src/gen/**",
     "**/*.generated.*",
     "**/pnpm-lock.yaml",
     "**/package-lock.json",

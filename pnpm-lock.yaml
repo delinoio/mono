@@ -60,6 +60,9 @@ importers:
 
   apps/delino-accounts:
     dependencies:
+      '@bufbuild/protobuf':
+        specifier: 2.16.0
+        version: 2.16.0
       react:
         specifier: 19.3.1
         version: 19.3.1
@@ -67,6 +70,9 @@ importers:
         specifier: 19.3.1
         version: 19.3.1(react@19.3.1)
     devDependencies:
+      '@bufbuild/protoc-gen-es':
+        specifier: 2.16.0
+        version: 2.16.0(@bufbuild/protobuf@2.16.0)
       '@e2e-dev/web':
         specifier: 0.16.1
         version: 0.16.1(@e2e-dev/core@0.24.0(ai@7.0.173(zod@4.6.7)))(e2e@0.24.0(ai@7.0.173(zod@4.6.7)))

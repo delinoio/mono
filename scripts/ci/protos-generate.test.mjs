@@ -3,8 +3,8 @@
 // Tests `scripts/protos.sh generate` in a throwaway Git repository with a fake
 // `go` executable that stands in for `go run buf@<version>`. The tests check
 // that a failing generator leaves every committed binding of both languages
-// byte for byte unchanged, and that a successful run replaces the bindings
-// and removes the stale files of both languages.
+// and every TypeScript target byte for byte unchanged, and that a successful
+// run replaces the bindings and removes the stale files of both languages.
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
 import {
@@ -32,8 +32,10 @@ const skip = process.platform === "win32" && "scripts/protos.sh needs bash";
 
 // Fake `go`. `go run <module>@<version> <buf args>` behaves like buf:
 // `format` succeeds, and `generate --output <dir>` writes one new binding per
-// language (the TypeScript template run is the one with --template). The
-// FAKE_GO_FAIL variable selects a failing generator: `go` or `ts`.
+// language (the TypeScript template runs are the ones with --template; each
+// writes under the schema path that --path names). The FAKE_GO_FAIL variable
+// selects a failing generator: `go`, `ts` (every TypeScript target) or
+// `ts-accounts` (only the delino/accounts target, which runs second).
 const fakeGo = `#!/usr/bin/env bash
 set -euo pipefail
 shift 2
@@ -48,20 +50,23 @@ if [[ "$subcommand" != "generate" ]]; then
 fi
 out=""
 ts=0
+schemas=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --output) out="$2"; shift 2 ;;
     --template) ts=1; shift 2 ;;
+    --path) schemas="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
 if [[ "$ts" -eq 1 ]]; then
-  if [[ "\${FAKE_GO_FAIL:-}" == "ts" ]]; then
-    echo "fake go: TypeScript generator failure" >&2
+  if [[ "\${FAKE_GO_FAIL:-}" == "ts" ]] ||
+    [[ "\${FAKE_GO_FAIL:-}" == "ts-accounts" && "$schemas" == "delino/accounts" ]]; then
+    echo "fake go: TypeScript generator failure for $schemas" >&2
     exit 1
   fi
-  mkdir -p "$out/src/gen/delino/ownsand/v1"
-  echo "new ts" > "$out/src/gen/delino/ownsand/v1/new_pb.ts"
+  mkdir -p "$out/src/gen/$schemas/v1"
+  echo "new ts $schemas" > "$out/src/gen/$schemas/v1/new_pb.ts"
 else
   if [[ "\${FAKE_GO_FAIL:-}" == "go" ]]; then
     echo "fake go: Go generator failure" >&2
@@ -78,8 +83,14 @@ function write(file, content) {
   writeFileSync(file, content);
 }
 
+// TypeScript targets of the script: package directory and its schema path.
+const tsPackages = [
+  ["packages", "ownsand-sdk"],
+  ["apps", "delino-accounts"],
+];
+
 // Creates a repository with the real script, committed (old) bindings of both
-// languages, and the fake go in a bin directory.
+// languages and every TypeScript target, and the fake go in a bin directory.
 function fixture({ plugin = true } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "protos-generate-"));
   const repo = join(dir, "repo");
@@ -117,26 +128,27 @@ function fixture({ plugin = true } = {}) {
     ),
     "old go connect\n",
   );
-  write(join(repo, "packages", "ownsand-sdk", "buf.gen.yaml"), "version: v2\n");
-  write(
-    join(repo, "packages", "ownsand-sdk", "src", "gen", "delino", "a_pb.ts"),
-    "old ts a\n",
-  );
-  write(
-    join(repo, "packages", "ownsand-sdk", "src", "gen", "stale_pb.ts"),
-    "old ts stale\n",
-  );
-  if (plugin) {
-    const pluginFile = join(
-      repo,
-      "packages",
-      "ownsand-sdk",
-      "node_modules",
-      ".bin",
-      "protoc-gen-es",
+  for (const pkg of tsPackages) {
+    write(join(repo, ...pkg, "buf.gen.yaml"), "version: v2\n");
+    write(
+      join(repo, ...pkg, "src", "gen", "delino", "a_pb.ts"),
+      `old ts a ${pkg[1]}\n`,
     );
-    write(pluginFile, "#!/bin/sh\n");
-    chmodSync(pluginFile, 0o755);
+    write(
+      join(repo, ...pkg, "src", "gen", "stale_pb.ts"),
+      `old ts stale ${pkg[1]}\n`,
+    );
+    if (plugin === true || plugin === pkg[1]) {
+      const pluginFile = join(
+        repo,
+        ...pkg,
+        "node_modules",
+        ".bin",
+        "protoc-gen-es",
+      );
+      write(pluginFile, "#!/bin/sh\n");
+      chmodSync(pluginFile, 0o755);
+    }
   }
   write(join(bin, "go"), fakeGo);
   chmodSync(join(bin, "go"), 0o755);
@@ -170,7 +182,9 @@ function bindings(repo) {
     }
   };
   add(join(repo, "protos"), (f) => /\.(pb|connect)\.go$/.test(f));
-  add(join(repo, "packages", "ownsand-sdk", "src", "gen"), () => true);
+  for (const pkg of tsPackages) {
+    add(join(repo, ...pkg, "src", "gen"), () => true);
+  }
   return result;
 }
 
@@ -188,7 +202,7 @@ function assertPreserved(f, result, diagnostic) {
   assert.notEqual(run.status, 0, run.stdout);
   assert.match(run.stderr, diagnostic);
   assert.deepEqual(bindings(f.repo), before);
-  assert.equal(before.size, 5);
+  assert.equal(before.size, 7);
   assert.deepEqual(readdirSync(f.scratch), []);
 }
 
@@ -235,6 +249,34 @@ test(
 );
 
 test(
+  "a failing second TypeScript target preserves every binding",
+  { skip },
+  (t) => {
+    const f = fixture();
+    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    assertPreserved(
+      f,
+      () => generate(f, { FAKE_GO_FAIL: "ts-accounts" }),
+      /TypeScript generator failure for delino\/accounts/,
+    );
+  },
+);
+
+test(
+  "a missing protoc-gen-es of the web app preserves every binding",
+  { skip },
+  (t) => {
+    const f = fixture({ plugin: "ownsand-sdk" });
+    t.after(() => rmSync(f.dir, { recursive: true, force: true }));
+    assertPreserved(
+      f,
+      () => generate(f),
+      /delino-accounts\/node_modules\/\.bin\/protoc-gen-es is missing/,
+    );
+  },
+);
+
+test(
   "a successful run replaces the bindings and removes stale files",
   { skip },
   (t) => {
@@ -256,7 +298,20 @@ test(
             "v1",
             "new_pb.ts",
           ),
-          "new ts\n",
+          "new ts delino/ownsand\n",
+        ],
+        [
+          join(
+            "apps",
+            "delino-accounts",
+            "src",
+            "gen",
+            "delino",
+            "accounts",
+            "v1",
+            "new_pb.ts",
+          ),
+          "new ts delino/accounts\n",
         ],
         [join("protos", "delino", "ownsand", "v1", "new.pb.go"), "new go\n"],
         [
