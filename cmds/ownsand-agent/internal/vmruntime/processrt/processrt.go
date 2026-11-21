@@ -64,7 +64,9 @@ var _ vmruntime.Runtime = (*Runtime)(nil)
 
 // New returns a process runtime that runs guestBinary. An empty
 // guestBinary means `ownsand-guest` next to the agent executable, then on
-// PATH.
+// PATH. A relative guestBinary resolves against the working directory of the
+// agent at this call; the runtime stores the absolute path because Create
+// starts the helper with the sandbox root as its working directory.
 func New(guestBinary string, logger *slog.Logger) (*Runtime, error) {
 	if !supported {
 		return nil, fmt.Errorf("%w: the process test runtime needs a Linux or macOS host", vmruntime.ErrUnsupported)
@@ -75,6 +77,11 @@ func New(guestBinary string, logger *slog.Logger) (*Runtime, error) {
 	if guestBinary == "" {
 		return nil, errors.New("processrt: guest helper binary not found; set " + config.EnvGuestBinary)
 	}
+	absBinary, err := filepath.Abs(guestBinary)
+	if err != nil {
+		return nil, fmt.Errorf("processrt: resolve guest helper binary %s: %w", guestBinary, err)
+	}
+	guestBinary = absBinary
 	if st, err := os.Stat(guestBinary); err != nil || st.IsDir() {
 		return nil, fmt.Errorf("processrt: guest helper binary %s is not a file", guestBinary)
 	}

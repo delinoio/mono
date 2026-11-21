@@ -174,6 +174,37 @@ func newRuntime(t *testing.T) *Runtime {
 	return rt
 }
 
+// TestRelativeGuestBinaryResolvesAgainstAgentDirectory checks that a relative
+// helper path is validated and launched against the same base, although the
+// helper starts with the sandbox root as its working directory.
+func TestRelativeGuestBinaryResolvesAgainstAgentDirectory(t *testing.T) {
+	data, err := os.ReadFile(guestBinary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentDir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(agentDir, "bin"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(agentDir, "bin", "ownsand-guest"), data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(agentDir)
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	if _, err := New(filepath.Join("bin", "missing-guest"), logger); err == nil {
+		t.Fatal("New accepted a missing relative helper")
+	}
+	rt, err := New(filepath.Join("bin", "ownsand-guest"), logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rt.Close() })
+	v := createSandbox(t, rt)
+	if err := rt.Delete(context.Background(), v.SandboxID()); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func createSandbox(t *testing.T, rt *Runtime) vmruntime.VM {
 	t.Helper()
 	id, err := uuidv7.NewString()
