@@ -17,19 +17,27 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// restart simulates a helper restart on the same state directory and clock:
-// it closes the files that the old server holds open (the process exit does
-// that) and starts a new server.
-func restart(t *testing.T, h *harness, mutate func(*Config)) *harness {
-	t.Helper()
+// releaseWriteFiles closes the staging files that the server holds open, as
+// the exit of the helper process does. A test must call it before it removes
+// or renames a staging file itself: Windows refuses to delete a file that a
+// process still holds open (the helper opens it without FILE_SHARE_DELETE).
+func releaseWriteFiles(h *harness) {
 	h.srv.writes.mu.Lock()
+	defer h.srv.writes.mu.Unlock()
 	for _, e := range h.srv.writes.entries {
 		if e.file != nil {
 			e.file.Close()
 			e.file = nil
 		}
 	}
-	h.srv.writes.mu.Unlock()
+}
+
+// restart simulates a helper restart on the same state directory and clock:
+// it closes the files that the old server holds open (the process exit does
+// that) and starts a new server.
+func restart(t *testing.T, h *harness, mutate func(*Config)) *harness {
+	t.Helper()
+	releaseWriteFiles(h)
 	stateDir, now := h.srv.cfg.StateDir, h.clock.Now
 	h2 := newHarness(t, func(c *Config) {
 		c.StateDir = stateDir
@@ -175,12 +183,7 @@ func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
 	tmp := tempPath(target, req.GetWriteId())
-	h.srv.writes.mu.Lock()
-	for _, e := range h.srv.writes.entries {
-		e.file.Close()
-		e.file = nil
-	}
-	h.srv.writes.mu.Unlock()
+	releaseWriteFiles(h)
 	// Replace the staging file by another file. The old file stays until the
 	// new one exists, so that the file system cannot give its inode number to
 	// the replacement.
@@ -211,6 +214,7 @@ func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
 func TestWriteRecoveryDropsRecordsWithoutStagingFile(t *testing.T) {
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
+	releaseWriteFiles(h)
 	if err := os.Remove(tempPath(target, req.GetWriteId())); err != nil {
 		t.Fatal(err)
 	}
