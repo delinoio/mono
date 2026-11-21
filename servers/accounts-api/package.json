@@ -11,7 +11,7 @@
   },
   "scripts": {
     "build": "go build -buildvcs=false -o dist/accounts-api ./cmd/accounts-api",
-    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/accounts-api -- node scripts/dev.mjs",
+    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/servers/accounts-api -- node scripts/dev.mjs",
     "lint": "go vet ./...",
     "test": "go test ./... && node --test \"scripts/*.test.mjs\""
   }

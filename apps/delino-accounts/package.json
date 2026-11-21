@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "rsbuild build",
-    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/delino-accounts -- node node_modules/portless/dist/cli.js run --prefix=",
+    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/apps/delino-accounts -- node node_modules/portless/dist/cli.js run --prefix=",
     "dev:app": "rsbuild dev",
     "preview": "rsbuild preview",
     "test": "rstest run",

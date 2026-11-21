@@ -170,7 +170,7 @@ export function parseArguments(argv) {
   }
   if (!validFolder(folder)) {
     throw new UsageError(
-      `invalid Infisical folder ${JSON.stringify(folder)}; use an absolute path such as /accounts-api`,
+      `invalid Infisical folder ${JSON.stringify(folder)}; use an absolute path such as /servers/accounts-api`,
     );
   }
   return { folder, command };

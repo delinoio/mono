@@ -18,16 +18,18 @@ Package `dev` scripts that read configuration run their development command thro
 node ../../scripts/dev/with-infisical.mjs --path=/<folder> -- <command> [args...]
 ```
 
-| Package           | `dev` command after `--`                               | Infisical folder   |
-| ----------------- | ------------------------------------------------------ | ------------------ |
-| `accounts-api`    | `node scripts/dev.mjs`                                 | `/accounts-api`    |
-| `ownsand-api`     | `node scripts/dev.mjs`                                 | `/ownsand-api`     |
-| `delino-accounts` | `node node_modules/portless/dist/cli.js run --prefix=` | `/delino-accounts` |
-| `ownsand-console` | `node node_modules/portless/dist/cli.js run --prefix=` | `/ownsand-console` |
+| Package           | Directory              | `dev` command after `--`                               | Infisical folder        |
+| ----------------- | ---------------------- | ------------------------------------------------------ | ----------------------- |
+| `accounts-api`    | `servers/accounts-api` | `node scripts/dev.mjs`                                 | `/servers/accounts-api` |
+| `ownsand-api`     | `servers/ownsand-api`  | `node scripts/dev.mjs`                                 | `/servers/ownsand-api`  |
+| `delino-accounts` | `apps/delino-accounts` | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/delino-accounts` |
+| `ownsand-console` | `apps/ownsand`         | `node node_modules/portless/dist/cli.js run --prefix=` | `/apps/ownsand`         |
+
+The Infisical folder of a package is its directory relative to the repository root, with a leading `/`. The folder tree therefore mirrors the repository layout: `/servers/` holds server folders and `/apps/` holds frontend folders. The folder follows the directory, not the package name; for example, `ownsand-console` lives in `apps/ownsand` and uses `/apps/ownsand`. When a package directory moves or is renamed, move its Infisical folder and update `--path` in the same change.
 
 For the frontends behind portless (see [Frontend development URLs](#frontend-development-urls)), the launcher wraps portless in `dev`, not the `dev:app` script: portless reads the `dev:app` script text to add `--port` and `--host` to `rsbuild dev`, and a launcher command in front of `rsbuild` would stop that detection. The injected variables reach `dev:app` through the environment of portless, also with `PORTLESS=0`. Running `dev:app` alone does not inject them.
 
-`delino-site`, `delino-docs` and the `delidev` frontend read no configuration that Infisical supplies, so their `dev` scripts do not use the launcher. A package that starts to read configuration adds the launcher with its own folder, named after the package, in the same change, and adds a row to this table.
+`delino-site`, `delino-docs` and the `delidev` frontend read no configuration that Infisical supplies, so their `dev` scripts do not use the launcher. A package that starts to read configuration adds the launcher with its own folder, the package directory as described above, in the same change, and adds a row to this table.
 
 Injection mode:
 

@@ -7,6 +7,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   writeFileSync,
@@ -184,8 +185,14 @@ const exported = (entries) => JSON.stringify(entries);
 
 test("parseArguments accepts one folder and a command", () => {
   assert.deepEqual(
-    parseArguments(["--path=/accounts-api", "--", "node", "dev.mjs", "--x"]),
-    { folder: "/accounts-api", command: ["node", "dev.mjs", "--x"] },
+    parseArguments([
+      "--path=/servers/accounts-api",
+      "--",
+      "node",
+      "dev.mjs",
+      "--x",
+    ]),
+    { folder: "/servers/accounts-api", command: ["node", "dev.mjs", "--x"] },
   );
   assert.deepEqual(parseArguments(["--path=/", "--", "node"]), {
     folder: "/",
@@ -200,6 +207,43 @@ test("parseArguments accepts one folder and a command", () => {
     parseArguments(["--path=/a", "--", "x", "--", "--path=/b"]),
     { folder: "/a", command: ["x", "--", "--path=/b"] },
   );
+});
+
+// Every package `dev` script that uses the launcher reads the Infisical folder
+// equal to its package directory, so the folder tree mirrors the repository
+// layout. See docs/repository-environment-contract.md#local-development-injection.
+test("each launcher folder is the package directory", () => {
+  const repositoryRoot = fileURLToPath(new URL("../..", import.meta.url));
+  const launcherPrefix = "node ../../scripts/dev/with-infisical.mjs ";
+  const found = [];
+  for (const parent of ["apps", "servers", "packages"]) {
+    if (!existsSync(join(repositoryRoot, parent))) continue;
+    for (const entry of readdirSync(join(repositoryRoot, parent), {
+      withFileTypes: true,
+    })) {
+      const manifestPath = join(
+        repositoryRoot,
+        parent,
+        entry.name,
+        "package.json",
+      );
+      if (!entry.isDirectory() || !existsSync(manifestPath)) continue;
+      const dev = JSON.parse(readFileSync(manifestPath, "utf8")).scripts?.dev;
+      if (typeof dev !== "string" || !dev.startsWith(launcherPrefix)) continue;
+      const directory = `${parent}/${entry.name}`;
+      const { folder } = parseArguments(
+        dev.slice(launcherPrefix.length).split(" "),
+      );
+      assert.equal(folder, `/${directory}`, `${directory} dev script`);
+      found.push(directory);
+    }
+  }
+  assert.deepEqual(found.sort(), [
+    "apps/delino-accounts",
+    "apps/ownsand",
+    "servers/accounts-api",
+    "servers/ownsand-api",
+  ]);
 });
 
 test("parseArguments rejects invalid launcher arguments", async (t) => {
@@ -361,7 +405,7 @@ test(
           },
         });
         const result = await startLauncher(f, [
-          "--path=/accounts-api",
+          "--path=/servers/accounts-api",
           ...commandArgs(3),
         ]).exited;
         assert.equal(result.code, 3, result.stderr);
@@ -369,7 +413,7 @@ test(
         // configuration, with the pinned arguments.
         // The CLI does not see the servers' LOG_LEVEL; the command does.
         assert.deepEqual(JSON.parse(readFileSync(f.infisicalArgs, "utf8")), {
-          args: exportArguments("/accounts-api"),
+          args: exportArguments("/servers/accounts-api"),
           cwd: f.root,
           LOG_LEVEL: null,
         });
@@ -385,7 +429,7 @@ test(
           {
             event: "dev_env_infisical",
             environment: "dev",
-            folder: "/accounts-api",
+            folder: "/servers/accounts-api",
             config,
             variables: 1,
             reservedSkipped: 1,
