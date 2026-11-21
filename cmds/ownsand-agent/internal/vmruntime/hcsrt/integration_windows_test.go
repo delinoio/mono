@@ -222,6 +222,11 @@ func TestHyperVIntegration(t *testing.T) {
 		t.Fatalf("exec output %q exited %v", out, ex)
 	}
 	t.Logf("guest: %s", strings.TrimSpace(out))
+	// The runtime copies the COM1 output (the kernel console) of the VM to
+	// console.log as a client of the port's named pipe.
+	if b, err := os.ReadFile(filepath.Join(vmsDir, sb.GetSandboxId(), "console.log")); err != nil || !strings.Contains(string(b), "Linux version") {
+		t.Fatalf("console.log has no kernel output (%d bytes): %v", len(b), err)
+	}
 	// The root file system grew to the 2 GiB disk at boot (the base image
 	// is 512 MiB): more than 1.5 GiB in 1 KiB blocks.
 	fields := strings.Fields(strings.Split(out, "\n")[2])
