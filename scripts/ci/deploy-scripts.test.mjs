@@ -1646,6 +1646,7 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 // the IDs of running containers of the service. Stub behavior:
 //   STUB_STATUS   `docker inspect` container status (default running).
 //   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
+//   STUB_PS_EXIT exit code of `docker ps` (default 0).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
@@ -1685,7 +1686,9 @@ function runDroplet(
     bin,
     "docker",
     `case "$1" in
-  ps) printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
+  ps)
+    [[ "\${STUB_PS_EXIT:-0}" == 0 ]] || exit "\$STUB_PS_EXIT"
+    printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
   inspect)
     case "$3" in
       *State.Status*) echo "\${STUB_STATUS:-running}" ;;
@@ -1846,6 +1849,23 @@ test(
       result.read("state/api.previous"),
       `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`,
     );
+  },
+);
+
+test(
+  "droplet deploy fails before it starts a container when the container list cannot be read",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_PS_EXIT: "1" },
+    });
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /::error::could not list the existing containers/,
+    );
+    assert.deepEqual(commands(result.calls), ["docker pull", "docker ps"]);
   },
 );
 
