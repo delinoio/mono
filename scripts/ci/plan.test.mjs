@@ -1090,7 +1090,9 @@ const ALWAYS_RUN = "always";
 // table of `ci-result` records it.
 const expectedJobOutputs = {
   quality: "quality",
-  go: "go",
+  "go-fmt": ALWAYS_RUN,
+  "go-vet": "go",
+  "go-test": "go",
   protos: "go",
   "rust-fmt": ALWAYS_RUN,
   "rust-clippy": "rust",
@@ -1269,7 +1271,7 @@ test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
 // planner's comparison base, so it needs the full history.
 test("CI workflow checks protobuf schemas in the protos job", () => {
   const jobs = workflowJobs();
-  assert.doesNotMatch(jobs.get("go"), /scripts\/protos\.sh/);
+  assert.doesNotMatch(jobs.get("go-test"), /scripts\/protos\.sh/);
   const protosJob = jobs.get("protos");
   assert.match(protosJob, /fetch-depth: 0/);
   assert.match(protosJob, /scripts\/protos\.sh check/);
@@ -1335,6 +1337,28 @@ test("CI workflow runs each Rust check in its own job", () => {
     assert.match(job, /libgtk-4-dev/);
     assert.match(job, /Swatinem\/rust-cache@[0-9a-f]{40}/);
     assert.match(job, /CEF_PATH=\$HOME\/\.cache\/cef/);
+  }
+});
+
+// Read-only text check: each Go check runs in its own job. Only the test job
+// starts Postgres and installs the workspace dependencies that the OwnSand
+// end-to-end suite needs, and only it saves the `go.sum` Go cache.
+test("CI workflow runs each Go check in its own job", () => {
+  const jobs = workflowJobs();
+  const fmtJob = jobs.get("go-fmt");
+  assert.match(fmtJob, /gofmt -l/);
+  assert.match(fmtJob, /^\s+cache: false$/m);
+  const vetJob = jobs.get("go-vet");
+  assert.match(vetJob, /^\s+run: go vet \.\/\.\.\.$/m);
+  assert.match(vetJob, /^\s+cache: false$/m);
+  const testJob = jobs.get("go-test");
+  assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
+  assert.match(testJob, /^\s+cache: true$/m);
+  assert.match(testJob, /^ {4}services:\n {6}postgres:$/m);
+  assert.match(testJob, /^\s+OWNSAND_E2E: "1"$/m);
+  assert.match(testJob, /pnpm install --frozen-lockfile --ignore-scripts/);
+  for (const job of [fmtJob, vetJob]) {
+    assert.doesNotMatch(job, /services:|go test|pnpm install/);
   }
 });
 
