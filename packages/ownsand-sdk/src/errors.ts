@@ -47,6 +47,21 @@ export class DataPathError extends OwnSandError {
   }
 }
 
+/**
+ * The agent sent a frame on an open stream that the framing rules reject: a
+ * kind that is unspecified or of a newer schema, a kind that does not match
+ * its payload, or a stream_id rule violation. It ends only the operation of
+ * that stream. `classifyFailure` treats it as terminal: a retry would receive
+ * the same frame again, so the operation must not recover from it.
+ */
+export class InvalidFrameError extends DataPathError {
+  override name = "InvalidFrameError";
+
+  constructor(message: string, options: { cause?: unknown } = {}) {
+    super(message, { code: Code.Internal, cause: options.cause });
+  }
+}
+
 /** Returns the OwnSand ErrorDetail of a Connect error, if it has one. */
 export function errorDetailOf(error: unknown): ErrorDetail | undefined {
   if (!(error instanceof ConnectError)) {
@@ -79,6 +94,11 @@ export enum FailureClass {
  * example from the guest helper for a file that changed during a read).
  */
 export function classifyFailure(error: unknown): FailureClass {
+  // Every other DataPathError is an interruption (the write path relies on
+  // that for its deadline retry), so this terminal subclass is checked first.
+  if (error instanceof InvalidFrameError) {
+    return FailureClass.Terminal;
+  }
   if (!(error instanceof ConnectError)) {
     return FailureClass.Interruption;
   }

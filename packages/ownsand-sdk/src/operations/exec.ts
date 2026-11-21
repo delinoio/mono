@@ -380,7 +380,7 @@ export async function* runExec(
       mode = Mode.Exec;
       continue;
     }
-    if (onRelay) grants.discard();
+    if (onRelay) grants.discardFor(failure);
     await recoverOrThrow(ctx, window, failure, signal);
     mode = Mode.Attach;
   }

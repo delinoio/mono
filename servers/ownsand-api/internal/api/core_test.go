@@ -21,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -885,7 +886,7 @@ func TestChallengeRateLimit(t *testing.T) {
 // refills one token per second on the test clock and generous per-device and
 // per-prefix limits, so only the shared per-client bucket can reject.
 func clientBucketLimits(o *app.Options) {
-	o.TrustProxyClientAddress = true
+	o.ClientAddressMode = config.ClientAddressVerifiedProxy
 	o.Limits = &api.Limits{
 		PerDevice: ratelimit.New(1000, 1000, o.Now),
 		PerPrefix: ratelimit.New(1000, 1000, o.Now),
@@ -1052,3 +1053,81 @@ func TestClientRateLimitUnresolvedAddressAndOtherLimits(t *testing.T) {
 }
 
 func errorsAs(err error, target **connect.Error) bool { return errors.As(err, target) }
+
+// addressBurstLimits returns limits with a one-token client bucket and
+// generous per-device and per-prefix limits, so only the per-client bucket can
+// reject, and a per-device challenge budget of two.
+func addressBurstLimits(mode config.ClientAddressMode) func(*app.Options) {
+	return func(o *app.Options) {
+		o.ClientAddressMode = mode
+		o.Limits = &api.Limits{
+			PerDevice: ratelimit.New(0.001, 2, o.Now),
+			PerPrefix: ratelimit.New(1000, 1000, o.Now),
+			PerClient: ratelimit.New(0.001, 1, o.Now),
+		}
+	}
+}
+
+// TestClientAddressModes checks which requests the per-client bucket limits
+// in each mode, with a one-token bucket and requests that name distinct
+// devices from one TCP peer behind a proxy.
+func TestClientAddressModes(t *testing.T) {
+	ctx := context.Background()
+	challenge := func(c *testenv.Clients) error {
+		id, _ := uuidv7.NewString()
+		_, err := c.Agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id}))
+		return err
+	}
+	for _, tc := range []struct {
+		name   string
+		mode   config.ClientAddressMode
+		header http.Header
+		// limited reports whether the second request from the same peer is
+		// rejected by the client bucket.
+		limited bool
+	}{
+		{"none ignores the peer", config.ClientAddressNone, nil, false},
+		{"none ignores forwarded headers", config.ClientAddressNone, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, false},
+		{"direct uses the peer", config.ClientAddressDirect, nil, true},
+		{"direct ignores forwarded headers", config.ClientAddressDirect, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, true},
+		{"verified proxy uses the forwarded address", config.ClientAddressVerifiedProxy, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, true},
+		{"verified proxy without the header has no address", config.ClientAddressVerifiedProxy, nil, false},
+		{"verified proxy with an invalid final value has no address", config.ClientAddressVerifiedProxy, http.Header{"X-Forwarded-For": []string{"203.0.113.9, not-an-ip"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t, addressBurstLimits(tc.mode))
+			c := env.ClientsWith("", tc.header)
+			if err := challenge(c); err != nil {
+				t.Fatalf("first request: %v", err)
+			}
+			err := challenge(c)
+			if tc.limited {
+				if rateLimitRetry(t, err) <= 0 {
+					t.Fatalf("second request: want resource_exhausted with a retry delay, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("second request from a distinct device: %v", err)
+			}
+		})
+	}
+}
+
+// TestChallengeLimitWithoutClientAddress checks that the per-device budget
+// still applies when requests have no client address.
+func TestChallengeLimitWithoutClientAddress(t *testing.T) {
+	env := testenv.New(t, addressBurstLimits(config.ClientAddressNone))
+	ctx := context.Background()
+	id, _ := uuidv7.NewString()
+	agent := env.Clients("").Agent
+	for i := 0; i < 2; i++ {
+		if _, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id})); err != nil {
+			t.Fatalf("challenge %d: %v", i, err)
+		}
+	}
+	_, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id}))
+	if rateLimitRetry(t, err) <= 0 {
+		t.Fatalf("third challenge: want resource_exhausted with a retry delay, got %v", err)
+	}
+}

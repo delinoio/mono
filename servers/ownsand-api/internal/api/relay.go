@@ -16,6 +16,7 @@ import (
 	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/grants"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
@@ -127,6 +128,20 @@ type relayCall struct {
 	bytes     int64
 }
 
+// rejectGrant charges one token of the caller's failed grant check bucket for
+// a relay RPC that the grant check rejected with rejection (a missing or
+// non-admittable grant, a grant of another principal or a request that does
+// not match the grant). It returns rejection while the bucket has tokens and
+// a resource_exhausted error with the retry delay when it is empty. A valid
+// grant never charges the bucket.
+func (p *DataPlane) rejectGrant(pr auth.Principal, rejection error) error {
+	key := fmt.Sprintf("relay:%d/%s", pr.Kind, pr.ID)
+	if ok, retry := p.failures.Allow(key, 1); !ok {
+		return errRateLimited(retry)
+	}
+	return rejection
+}
+
 // begin authenticates a relay RPC: it checks the grant in the header, the
 // principal, the authorization matrix and the request fields against the
 // grant, waits up to 10 seconds for the agent relay connection and opens a
@@ -138,21 +153,17 @@ func (p *DataPlane) begin(ctx context.Context, procedure string, header http.Hea
 	}
 	g := p.Grants.Admittable(header.Get(RelayGrantHeader))
 	if g == nil {
-		key := fmt.Sprintf("relay:%d/%s", pr.Kind, pr.ID)
-		if ok, retry := p.failures.Allow(key, 1); !ok {
-			return nil, errRateLimited(retry)
-		}
-		return nil, errGrantInvalid()
+		return nil, p.rejectGrant(pr, errGrantInvalid())
 	}
 	if g.Principal != pr {
-		return nil, errPermission("the relay grant belongs to another principal")
+		return nil, p.rejectGrant(pr, errPermission("the relay grant belongs to another principal"))
 	}
 	if _, _, err := p.S.authorize(ctx, p.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
 	kindOK := g.Kind == kind || (kind == ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC && g.Kind == ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC)
 	if g.OrgID != orgID || g.SandboxID != sandboxID || !kindOK || g.OperationID != opID {
-		return nil, errPermission("the request does not match the relay grant")
+		return nil, p.rejectGrant(pr, errPermission("the request does not match the relay grant"))
 	}
 	hc := p.S.Hub.Get(g.DeviceID)
 	if hc == nil || hc.Generation != g.ChannelGen {

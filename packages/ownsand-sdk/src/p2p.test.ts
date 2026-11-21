@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
-import { OwnSandConfigError } from "./errors.ts";
+import {
+  DataPathError,
+  InvalidFrameError,
+  OwnSandConfigError,
+} from "./errors.ts";
+import { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 import {
   DataPathTransport,
   SessionEndReason,
@@ -12,7 +17,7 @@ import {
   DataFrameKind,
 } from "./gen/delino/ownsand/v1/data_frame_pb.ts";
 import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
-import { ExecResultKind } from "./operations/exec.ts";
+import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
 import {
   type FakeAgent,
   type FakeAgentPeer,
@@ -30,7 +35,11 @@ import {
 
 function p2pSetup(
   agent: FakeAgent,
-  options: { neverOpen?: boolean; transport?: DataPathTransport } = {},
+  options: {
+    neverOpen?: boolean;
+    transport?: DataPathTransport;
+    logger?: Logger;
+  } = {},
 ) {
   let rtc: FakeWebRtc | undefined;
   const h = setup((clock) => {
@@ -38,6 +47,7 @@ function p2pSetup(
     return {
       webrtc: { RTCPeerConnection: rtc.RTCPeerConnection },
       transport: options.transport,
+      logger: options.logger,
     };
   });
   h.api.unary(DataPathService, "GetIceServers", () => ({
@@ -326,5 +336,502 @@ describe("peer-to-peer data path", () => {
       )
       .catch((e) => e);
     expect(error.code).toBe(Code.FailedPrecondition);
+  });
+
+  describe("invalid frames", () => {
+    const UNKNOWN_KIND = 99 as DataFrameKind;
+
+    /** A valid EXEC_EVENT payload under a kind of its own choosing. */
+    function execFrame(streamId: bigint, kind: DataFrameKind) {
+      return {
+        streamId,
+        sandboxId: SANDBOX,
+        kind,
+        payload: {
+          case: "execEvent" as const,
+          value: { event: ev.stdout(1, "x") },
+        },
+      };
+    }
+
+    async function collect(handle: AsyncIterable<{ type: ExecEventType }>) {
+      const types: ExecEventType[] = [];
+      try {
+        for await (const e of handle) types.push(e.type);
+      } catch (error) {
+        return { types, error };
+      }
+      return { types, error: undefined };
+    }
+
+    test("an unknown kind on an open stream ends only that operation after the earlier frames", async () => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.stdout(0, "a"));
+          peer.send(execFrame(frame.streamId, UNKNOWN_KIND));
+          // A later frame of the failed stream is ignored.
+          execEvent(peer, frame.streamId, ev.exited(0));
+        }
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const { types, error } = await h.clock.run(
+        collect(sandbox.exec({ command: ["x"] })),
+      );
+      expect(types).toEqual([ExecEventType.Started, ExecEventType.Stdout]);
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect((error as InvalidFrameError).code).toBe(Code.Internal);
+      expect((error as InvalidFrameError).message).toContain(
+        "unknown frame kind 99",
+      );
+      // Terminal: no retry, no new request, no relay and no new session.
+      expect(rtc.frames).toHaveLength(1);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("an unspecified kind or a kind that does not match its payload ends its stream", async () => {
+      const kinds = [
+        DataFrameKind.UNSPECIFIED,
+        DataFrameKind.ERROR,
+        DataFrameKind.FILE_READ_EVENT,
+      ];
+      for (const kind of kinds) {
+        const { h, rtc } = p2pSetup((frame, peer) => {
+          if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            peer.send(execFrame(frame.streamId, kind));
+          }
+        });
+        const error = await h.clock
+          .run(
+            h.client
+              .sandbox(SANDBOX)
+              .exec({ command: ["x"] })
+              .wait(),
+          )
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(InvalidFrameError);
+        expect(rtc.frames).toHaveLength(1);
+      }
+    });
+
+    test("a frame that breaks the stream_id rules ends its stream", async () => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+          // A connection-level kind on a stream that is open.
+          peer.send({
+            streamId: frame.streamId,
+            kind: DataFrameKind.RELAY_KEEPALIVE,
+            payload: { case: "relayKeepalive", value: {} },
+          });
+        }
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      expect(error.message).toContain("RELAY_KEEPALIVE");
+      expect(rtc.frames).toHaveLength(1);
+    });
+
+    test("a file read ends with the error after the chunks that arrived before it", async () => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.payload.case === "fileReadRequest") {
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_READ_EVENT,
+            payload: {
+              case: "fileReadEvent",
+              value: {
+                event: {
+                  case: "chunk",
+                  value: { offset: 0n, data: new TextEncoder().encode("hi") },
+                },
+              },
+            },
+          });
+          // An error payload under the kind of an exec event.
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.EXEC_EVENT,
+            payload: { case: "error", value: { code: 9, message: "boom" } },
+          });
+        }
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const chunks: string[] = [];
+      let error: unknown;
+      await h.clock.run(
+        (async () => {
+          try {
+            for await (const c of sandbox.readFile("/a")) {
+              chunks.push(text(c));
+            }
+          } catch (e) {
+            error = e;
+          }
+        })(),
+      );
+      expect(chunks).toEqual(["hi"]);
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      // The payload error was not delivered as the agent's Connect error.
+      expect((error as InvalidFrameError).code).toBe(Code.Internal);
+      expect(rtc.frames).toHaveLength(1);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("a file write ends at once without a retry", async () => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.payload.case === "fileWriteChunk") {
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: UNKNOWN_KIND,
+            payload: {
+              case: "fileWriteResult",
+              value: { writeId: "", offset: 0n, length: 0n },
+            },
+          });
+        }
+      });
+      const error = await h.clock
+        .run(h.client.sandbox(SANDBOX).writeFile("/b", "hello"))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      expect(rtc.frames).toHaveLength(1);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("other streams and the session stay usable", async () => {
+      let goodStream: bigint | undefined;
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.payload.case !== "execRequest") return;
+        const command = frame.payload.value.command[0];
+        if (command === "good") {
+          goodStream = frame.streamId;
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.stdout(0, "ok"));
+        } else if (command === "bad") {
+          // The invalid frame arrives while the good stream is still open.
+          peer.send(execFrame(frame.streamId, UNKNOWN_KIND));
+          execEvent(peer, goodStream!, ev.exited(0));
+        } else {
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.exited(0));
+        }
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const good = sandbox.run({ command: ["good"] });
+      await Promise.resolve();
+      const bad = sandbox.run({ command: ["bad"] }).catch((e) => e);
+      const [run, error] = await h.clock.run(Promise.all([good, bad]));
+      expect(text(run.stdout)).toBe("ok");
+      expect(run.result.kind).toBe(ExecResultKind.Exited);
+      expect(error).toBeInstanceOf(InvalidFrameError);
+      const again = await h.clock.run(sandbox.run({ command: ["next"] }));
+      expect(again.result.kind).toBe(ExecResultKind.Exited);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.connections).toHaveLength(1);
+    });
+
+    test("an invalid frame on stream 0 or on a stream that is not open is ignored", async () => {
+      const { h, rtc } = p2pSetup((frame, peer) => {
+        if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+          peer.send(execFrame(0n, UNKNOWN_KIND));
+          peer.send(execFrame(0n, DataFrameKind.ERROR));
+          peer.send(execFrame(77n, UNKNOWN_KIND));
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.exited(0));
+          // The stream finished; this frame has no open stream.
+          queueMicrotask(() =>
+            queueMicrotask(() =>
+              peer.send(execFrame(frame.streamId, UNKNOWN_KIND)),
+            ),
+          );
+        }
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const first = await h.clock.run(sandbox.run({ command: ["a"] }));
+      expect(first.result.kind).toBe(ExecResultKind.Exited);
+      const second = await h.clock.run(sandbox.run({ command: ["b"] }));
+      expect(second.result.kind).toBe(ExecResultKind.Exited);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      expect(rtc.frames).toHaveLength(2);
+    });
+
+    test("a session-end frame still ends the session, also with a framing violation", async () => {
+      let requests = 0;
+      const { h } = p2pSetup((frame, peer) => {
+        if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+          requests++;
+          execEvent(peer, frame.streamId, ev.started());
+          // SESSION_END on stream 0 breaks no rule that stops it from ending
+          // the session: it is handled before frame validation.
+          peer.send({
+            streamId: 0n,
+            kind: DataFrameKind.SESSION_END,
+            payload: {
+              case: "sessionEnd",
+              value: { reason: SessionEndReason.EXPIRED },
+            },
+          });
+        }
+        if (frame.kind === DataFrameKind.EXEC_ATTACH_REQUEST) {
+          execEvent(peer, frame.streamId, ev.started());
+          execEvent(peer, frame.streamId, ev.exited(0));
+        }
+      });
+      const run = await h.clock.run(
+        h.client.sandbox(SANDBOX).run({ command: ["x"] }),
+      );
+      expect(run.result.kind).toBe(ExecResultKind.Exited);
+      expect(requests).toBe(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    });
+
+    test("logs the invalid frame without frame content", async () => {
+      const records: LogRecord[] = [];
+      const { h } = p2pSetup(
+        (frame, peer) => {
+          if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            peer.send(execFrame(frame.streamId, UNKNOWN_KIND));
+          }
+        },
+        { logger: (record) => records.push(record) },
+      );
+      await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch(() => {});
+      const logged = records.filter((r) => r.event === LogEvent.InvalidFrame);
+      expect(logged).toHaveLength(1);
+      expect(logged[0]!.sandboxId).toBe(SANDBOX);
+      expect(logged[0]!.reason).toContain("unknown frame kind 99");
+    });
+  });
+
+  describe("send back-pressure", () => {
+    /** Above the 1 MiB high-water mark of the session. */
+    const FULL = 2 << 20;
+
+    function writeAgent(): FakeAgent {
+      return (frame, peer) => {
+        if (frame.payload.case === "fileWriteChunk") {
+          const req = frame.payload.value;
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_WRITE_RESULT,
+            payload: {
+              case: "fileWriteResult",
+              value: {
+                writeId: req.writeId,
+                offset: req.offset,
+                length: BigInt(req.data.length),
+                finished: req.finish !== undefined,
+                sizeBytes: req.finish?.sizeBytes ?? 0n,
+              },
+            },
+          });
+        }
+      };
+    }
+
+    /**
+     * Opens the session of one sandbox handle with a small write and returns
+     * the handle and its channel. Each handle owns its own session.
+     */
+    async function warmUp(p: ReturnType<typeof p2pSetup>) {
+      const sandbox = p.h.client.sandbox(SANDBOX);
+      await p.h.clock.run(sandbox.writeFile("/warm", "x"));
+      expect(p.rtc.channels).toHaveLength(1);
+      expect(p.rtc.frames).toHaveLength(1);
+      return { sandbox, channel: p.rtc.channels[0]! };
+    }
+
+    test("concurrent multi-fragment writes never interleave their frames", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      // Every message that the SDK sends refills the buffer, so a sender
+      // must wait again between the fragments of one frame.
+      let messages = 0;
+      channel.bufferedAmount = FULL;
+      channel.afterSend = () => {
+        messages++;
+        channel.bufferedAmount = FULL;
+      };
+      // 40 KiB each: three data channel messages per frame.
+      const dataA = new Uint8Array(40 << 10).fill(0xa1);
+      const dataB = new Uint8Array(40 << 10).fill(0xb2);
+      const a = sandbox.writeFile("/a", dataA);
+      const b = sandbox.writeFile("/b", dataB);
+      await h.clock.settle();
+      // Back-pressure: nothing is sent while the buffer is full.
+      expect(messages).toBe(0);
+      expect(rtc.frames).toHaveLength(1);
+      const done = Promise.all([a, b]);
+      let finished = false;
+      done.then(
+        () => (finished = true),
+        () => (finished = true),
+      );
+      for (let i = 0; i < 40 && !finished; i++) {
+        // The buffer drains one message at a time and refills on the send.
+        channel.drain();
+        await h.clock.settle();
+      }
+      const [writtenA, writtenB] = await h.clock.run(done);
+      expect(writtenA.sizeBytes).toBe(BigInt(dataA.length));
+      expect(writtenB.sizeBytes).toBe(BigInt(dataB.length));
+      // Both frames reached the decoder complete and in order.
+      expect(messages).toBe(6);
+      expect(rtc.frames).toHaveLength(3);
+      const [, first, second] = rtc.frames;
+      for (const frame of [first!, second!]) {
+        expect(frame.payload.case).toBe("fileWriteChunk");
+      }
+      const chunks = [first!, second!].map(
+        (frame) =>
+          (frame.payload as { value: { data: Uint8Array } }).value.data,
+      );
+      expect(new Set([first!.streamId, second!.streamId]).size).toBe(2);
+      expect(chunks[0]!.length).toBe(40 << 10);
+      expect(chunks[1]!.length).toBe(40 << 10);
+      expect(chunks[0]!.every((byte) => byte === chunks[0]![0])).toBe(true);
+      expect(chunks[1]!.every((byte) => byte === chunks[1]![0])).toBe(true);
+      expect(new Set([chunks[0]![0], chunks[1]![0]])).toEqual(
+        new Set([0xa1, 0xb2]),
+      );
+    });
+
+    test("a single request waits for the buffer and then completes", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      const write = sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7));
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      // A drained event while the buffer still reports a full queue does not
+      // release the sender.
+      channel.drain(FULL);
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      channel.drain(0);
+      const written = await h.clock.run(write);
+      expect(written.sizeBytes).toBe(BigInt(40 << 10));
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+    });
+
+    test("a caller aborted while its frame waits for the send turn sends nothing", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      // The first write holds the send turn while it waits for the buffer.
+      const holder = sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7));
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      // The exec frame queues behind it; the caller aborts before its turn.
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const cancelled = sandbox
+        .run({ command: ["rm", "-rf", "/data"], signal: controller.signal })
+        .catch((e) => e);
+      await h.clock.settle();
+      controller.abort(reason);
+      await h.clock.settle();
+      channel.drain(0);
+      const written = await h.clock.run(holder);
+      expect(written.sizeBytes).toBe(BigInt(40 << 10));
+      expect(await h.clock.run(cancelled)).toBe(reason);
+      // Only the three messages of the first write went out; the cancelled
+      // exec request was never transmitted.
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      expect(
+        rtc.frames.some((frame) => frame.kind === DataFrameKind.EXEC_REQUEST),
+      ).toBe(false);
+    });
+
+    test("an abort during a frame in progress lets that frame finish", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        channel.bufferedAmount = FULL;
+      };
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const write = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10).fill(7), {
+          signal: controller.signal,
+        })
+        .catch((e) => e);
+      await h.clock.settle();
+      // The frame starts: its first message goes out, then it waits again.
+      channel.drain();
+      await h.clock.settle();
+      expect(messages).toBe(1);
+      controller.abort(reason);
+      for (let i = 0; i < 10 && messages < 3; i++) {
+        channel.drain();
+        await h.clock.settle();
+      }
+      // The frame is complete on the wire even though its caller aborted, so
+      // the decoder never sees a partial frame.
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      expect(await h.clock.run(write)).toBe(reason);
+    });
+
+    test("a session end while a sender waits stops it from sending", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      const waiting = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      rtc.peers[0]!.endSession(SessionEndReason.UNSPECIFIED);
+      await h.clock.settle();
+      // The session is gone: neither sender writes to the dead channel.
+      expect(messages).toBe(0);
+      // Each write recovers on a new session and completes there.
+      const results = await h.clock.run(Promise.all([waiting, queued]));
+      for (const result of results) {
+        expect(result).not.toBeInstanceOf(Error);
+      }
+      expect(rtc.channels).toHaveLength(2);
+      expect(messages).toBe(0);
+    });
   });
 });
