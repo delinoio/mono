@@ -26,6 +26,9 @@ const (
 	EnvReleaseManifestURL = "OWNSAND_AGENT_RELEASE_MANIFEST_URL"
 	EnvReleasePublicKeys  = "OWNSAND_AGENT_RELEASE_PUBLIC_KEYS"
 	EnvLogLevel           = "OWNSAND_AGENT_LOG_LEVEL"
+	EnvFirecrackerBinary  = "OWNSAND_AGENT_FIRECRACKER_BINARY"
+	EnvLinuxKernel        = "OWNSAND_AGENT_LINUX_KERNEL"
+	EnvLinuxRootfs        = "OWNSAND_AGENT_LINUX_ROOTFS"
 )
 
 // DefaultAPIURL is the production control plane origin.
@@ -44,6 +47,12 @@ const (
 	// never serve real workloads. End-to-end tests use it where no
 	// hypervisor is available.
 	RuntimeKindProcess
+	// RuntimeKindVirtualization is the macOS runtime
+	// (Virtualization.framework); not implemented in this version.
+	RuntimeKindVirtualization
+	// RuntimeKindHyperV is the Windows runtime (Hyper-V through the Host
+	// Compute Service); not implemented in this version.
+	RuntimeKindHyperV
 )
 
 func (k RuntimeKind) String() string {
@@ -52,6 +61,10 @@ func (k RuntimeKind) String() string {
 		return "firecracker"
 	case RuntimeKindProcess:
 		return "process"
+	case RuntimeKindVirtualization:
+		return "virtualization"
+	case RuntimeKindHyperV:
+		return "hyperv"
 	}
 	return "unspecified"
 }
@@ -63,15 +76,23 @@ func ParseRuntimeKind(s string) (RuntimeKind, error) {
 		return RuntimeKindFirecracker, nil
 	case "process":
 		return RuntimeKindProcess, nil
+	case "virtualization":
+		return RuntimeKindVirtualization, nil
+	case "hyperv":
+		return RuntimeKindHyperV, nil
 	}
-	return RuntimeKindUnspecified, fmt.Errorf("config: unknown runtime %q (want firecracker or process)", s)
+	return RuntimeKindUnspecified, fmt.Errorf("config: unknown runtime %q (want firecracker, virtualization, hyperv or process)", s)
 }
 
-// DefaultRuntime returns the production runtime of the host OS, or
-// unspecified when this agent version has none.
+// DefaultRuntime returns the production runtime of the host OS.
 func DefaultRuntime() RuntimeKind {
-	if runtime.GOOS == "linux" {
+	switch runtime.GOOS {
+	case "linux":
 		return RuntimeKindFirecracker
+	case "darwin":
+		return RuntimeKindVirtualization
+	case "windows":
+		return RuntimeKindHyperV
 	}
 	return RuntimeKindUnspecified
 }
@@ -89,6 +110,11 @@ type Config struct {
 	// ReleasePublicKeys are added to the built-in release keys.
 	ReleasePublicKeys []ed25519.PublicKey
 	LogLevel          slog.Level
+	// Firecracker runtime: the firecracker executable and the Linux base
+	// image. Empty image paths mean images/linux/ in the state directory.
+	FirecrackerBinary string
+	LinuxKernel       string
+	LinuxRootfs       string
 }
 
 // DefaultStateDir returns the state directory of the host OS.
@@ -122,6 +148,9 @@ func FromEnv(lookup Lookup) (Config, error) {
 		GuestBinary:        get(EnvGuestBinary),
 		ReleaseManifestURL: get(EnvReleaseManifestURL),
 		Runtime:            DefaultRuntime(),
+		FirecrackerBinary:  get(EnvFirecrackerBinary),
+		LinuxKernel:        get(EnvLinuxKernel),
+		LinuxRootfs:        get(EnvLinuxRootfs),
 	}
 	if cfg.StateDir == "" {
 		cfg.StateDir = DefaultStateDir()
