@@ -26,7 +26,7 @@ Apache-2.0 code must not import FSL-1.1-ALv2 code. Code in FSL-1.1-ALv2 director
 
 ## Imported material
 
-Imported agent skills retain their upstream licenses, attribution and notices. A repository-wide default does not relicense imported material. Keep original licenses and copyright notices for any future imported source, fonts and assets.
+Imported agent skills retain their upstream licenses, attribution and notices. A repository-wide default does not relicense imported material. Keep the upstream `LICENSE` file in each imported skill directory. When upstream publishes none, keep a `NOTICE` file in that directory that names the source repository, skill path and commit as recorded in `skills-lock.json` and cites the upstream license declaration, without an invented copyright holder, year or license text; the `NOTICE` file does not change the upstream license. Keep original licenses and copyright notices for any future imported source, fonts and assets. Follow `repository-workflow-contract.md` for the import procedure.
 
 ## Distribution
 
