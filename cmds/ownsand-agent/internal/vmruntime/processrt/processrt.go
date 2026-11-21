@@ -209,6 +209,12 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 // signal to the helper's group does not reach the exec workers. Pause stops
 // the helper's group first, so that the helper cannot start another worker
 // while Pause enumerates the process tree, and then stops each worker group.
+//
+// A failed Pause rolls back: the caller keeps the sandbox in the running
+// state when Pause fails, and a later Resume of that state does not reach the
+// runtime, so a half-stopped sandbox would stay frozen. The rollback
+// continues the helper and every worker group that Pause enumerated, and it
+// does not use ctx, because ctx can be the reason that Pause failed.
 func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
@@ -217,7 +223,20 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err := signalGroup(v.cmd, sigStop); err != nil {
 		return err
 	}
-	return r.signalDescendants(ctx, v, sigStop)
+	groups, err := r.execGroups(ctx, v)
+	if err == nil {
+		err = r.signalGroups(v, groups, sigStop)
+	}
+	if err != nil {
+		// groups is empty when the enumeration failed, so only the helper
+		// was stopped. A group that was not stopped ignores SIGCONT.
+		rollbackErr := errors.Join(r.signalGroups(v, groups, sigCont), signalGroup(v.cmd, sigCont))
+		if rollbackErr != nil {
+			r.logger.Error("process sandbox pause rollback failed; the sandbox may stay stopped", "sandbox_id", v.id, "error", rollbackErr)
+		}
+		return errors.Join(err, rollbackErr)
+	}
+	return nil
 }
 
 // Resume continues the process groups of the exec workers and then the
@@ -234,25 +253,42 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 }
 
 // signalDescendants sends sig to the process group of every process below
-// the helper, except the helper's own group. It finds the processes through
-// their parent links, so a worker that detached from the helper's process
-// tree (a double fork that the init process adopted) is not found; see the
-// process runtime entry in docs/cmds-ownsand-agent-foundation.md.
+// the helper, except the helper's own group.
 func (r *Runtime) signalDescendants(ctx context.Context, v *vm, sig syscall.Signal) error {
+	groups, err := r.execGroups(ctx, v)
+	if err != nil {
+		return err
+	}
+	return r.signalGroups(v, groups, sig)
+}
+
+// execGroups returns the process groups of the processes below the helper,
+// except the helper's own group. It finds the processes through their parent
+// links, so a worker that detached from the helper's process tree (a double
+// fork that the init process adopted) is not found; see the process runtime
+// entry in docs/cmds-ownsand-agent-foundation.md.
+func (r *Runtime) execGroups(ctx context.Context, v *vm) ([]int, error) {
 	if v.cmd == nil || v.cmd.Process == nil {
-		return nil
+		return nil, nil
 	}
 	select {
 	case <-v.exited:
 		// The helper was reaped, so its process ID may belong to another
 		// process now.
-		return nil
+		return nil, nil
 	default:
 	}
 	groups, err := descendantGroups(ctx, v.cmd.Process.Pid)
 	if err != nil {
-		return fmt.Errorf("processrt: list exec process groups of sandbox %s: %w", v.id, err)
+		return nil, fmt.Errorf("processrt: list exec process groups of sandbox %s: %w", v.id, err)
 	}
+	return groups, nil
+}
+
+// signalGroups sends sig to each process group in groups and joins the
+// errors. It continues after an error, so that one failure does not leave the
+// other groups unsignaled.
+func (r *Runtime) signalGroups(v *vm, groups []int, sig syscall.Signal) error {
 	var errs []error
 	for _, pgid := range groups {
 		if err := signalGroupID(pgid, sig); err != nil {
