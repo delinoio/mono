@@ -9,6 +9,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -121,5 +122,153 @@ func TestListenUnixAbstractAddress(t *testing.T) {
 func TestHvsockNotImplemented(t *testing.T) {
 	if _, err := Listen("hvsock://00000000-0000-0000-0000-000000000000"); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("hvsock: %v", err)
+	}
+}
+
+// serveOnce accepts connections on l until it closes and answers each with
+// one byte.
+func serveOnce(l net.Listener) {
+	for {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		c.Write([]byte("x"))
+		c.Close()
+	}
+}
+
+func requireAnswers(t *testing.T, path string) {
+	t.Helper()
+	c, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatalf("dial the live listener: %v", err)
+	}
+	defer c.Close()
+	buf := make([]byte, 1)
+	if _, err := c.Read(buf); err != nil || buf[0] != 'x' {
+		t.Fatalf("live listener answer %q %v", buf, err)
+	}
+}
+
+func TestListenUnixPreservesLiveListener(t *testing.T) {
+	t.Chdir(t.TempDir())
+	path := "g.sock"
+	first, err := Listen("unix://" + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	go serveOnce(first)
+	before, err := os.Lstat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	second, err := Listen("unix://" + path)
+	if err == nil {
+		second.Close()
+		t.Fatal("a second listener took the path of a live listener")
+	}
+	if !errors.Is(err, ErrAddressInUse) {
+		t.Fatalf("err = %v, want ErrAddressInUse", err)
+	}
+	if strings.Contains(err.Error(), path) {
+		t.Fatalf("error contains the path: %v", err)
+	}
+	after, err := os.Lstat(path)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("socket file was replaced: %v", err)
+	}
+	requireAnswers(t, path)
+}
+
+func TestListenUnixRecoversAfterLiveListenerEnds(t *testing.T) {
+	t.Chdir(t.TempDir())
+	path := "g.sock"
+	first, err := Listen("unix://" + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go serveOnce(first)
+	if l, err := Listen("unix://" + path); err == nil {
+		l.Close()
+		t.Fatal("live listener lost its path")
+	}
+	// A crashed helper leaves its socket file behind.
+	first.(*net.UnixListener).SetUnlinkOnClose(false)
+	first.Close()
+	second, err := Listen("unix://" + path)
+	if err != nil {
+		t.Fatalf("stale socket was not recovered: %v", err)
+	}
+	defer second.Close()
+	go serveOnce(second)
+	requireAnswers(t, path)
+}
+
+func TestListenUnixBindErrorOmitsPath(t *testing.T) {
+	t.Chdir(t.TempDir())
+	// The parent directory does not exist, so the pre-bind cleanup passes
+	// and the bind itself fails.
+	const spec = "unix://no-such-dir-secret/guest-secret.sock"
+	l, err := Listen(spec)
+	if err == nil {
+		l.Close()
+		t.Fatal("bind in a missing directory succeeded")
+	}
+	if !errors.Is(err, ErrBindFailed) {
+		t.Fatalf("err = %v, want ErrBindFailed", err)
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("err = %v does not keep the OS cause", err)
+	}
+	for _, leak := range []string{"no-such-dir-secret", "guest-secret", ".sock"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Fatalf("error contains %q: %v", leak, err)
+		}
+	}
+	if !strings.Contains(err.Error(), "bind unix socket") {
+		t.Fatalf("error does not name the operation: %v", err)
+	}
+}
+
+func TestBindErrorMapsAddressInUse(t *testing.T) {
+	err := bindError(&net.OpError{Op: "listen", Net: "unix", Addr: &net.UnixAddr{Name: "secret.sock", Net: "unix"}, Err: os.NewSyscallError("bind", syscall.EADDRINUSE)})
+	if !errors.Is(err, ErrAddressInUse) || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestListenUnixProbeFailureKeepsSocketFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the mode bits of a socket file do not restrict a connection on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the socket file permission")
+	}
+	t.Chdir(t.TempDir())
+	path := "g.sock"
+	first, err := Listen("unix://" + path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	go serveOnce(first)
+	if err := os.Chmod(path, 0); err != nil {
+		t.Skipf("chmod unsupported: %v", err)
+	}
+	// connect(2) on a unix socket needs write permission, so the probe
+	// fails with EACCES, which does not prove the file stale.
+	l, err := Listen("unix://" + path)
+	if err == nil {
+		l.Close()
+		t.Fatal("listener replaced a socket file that the probe could not check")
+	}
+	if !errors.Is(err, ErrProbeFailed) || strings.Contains(err.Error(), path) {
+		t.Fatalf("err = %v", err)
+	}
+	if _, statErr := os.Lstat(path); statErr != nil {
+		t.Fatalf("socket file removed: %v", statErr)
 	}
 }
