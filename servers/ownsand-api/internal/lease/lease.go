@@ -34,10 +34,9 @@ const (
 
 // Reasons of the lease_lost log.
 const (
-	reasonExpired       = "expired"
-	reasonRenewalFailed = "renewal_failed"
-	reasonNotHolder     = "not_holder"
-	reasonReleased      = "released"
+	reasonExpired   = "expired"
+	reasonNotHolder = "not_holder"
+	reasonReleased  = "released"
 )
 
 // Lease is one instance's view of the lease.
@@ -286,7 +285,8 @@ func (l *Lease) watch(ctx context.Context) {
 }
 
 // renewOnce takes or renews the lease once. A renewal of a held lease is
-// bounded by the confirmed expiry, because a result after it is useless.
+// bounded by the confirmed expiry, because a result after it is useless. A
+// failed renewal keeps the lease until that expiry.
 func (l *Lease) renewOnce(ctx context.Context) {
 	epoch, expireAt, held := l.snapshot()
 	if held && !l.deadlineNow().Before(expireAt) {
@@ -310,12 +310,16 @@ func (l *Lease) renewOnce(ctx context.Context) {
 	if ctx.Err() != nil {
 		return
 	}
-	reason := reasonNotHolder
 	if err != nil {
+		// An error does not confirm that another holder owns the lease, so
+		// it changes no state: a held lease stays held until the confirmed
+		// expiry, which the watcher enforces, and a later successful
+		// renewal moves that expiry. Only a definitive refusal ends
+		// ownership at once.
 		l.Logger.Warn("lease_renew_failed", slog.Any("error", err))
-		ok, reason = false, reasonRenewalFailed
+		return
 	}
-	l.applyRenewal(epoch, ok, reason, start.Add(TTL))
+	l.applyRenewal(epoch, ok, reasonNotHolder, start.Add(TTL))
 }
 
 // Run keeps the lease until ctx ends and then releases it.

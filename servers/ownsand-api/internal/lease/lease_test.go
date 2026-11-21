@@ -3,9 +3,12 @@
 package lease
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -370,5 +373,100 @@ func TestLeaseReleaseDrain(t *testing.T) {
 	}
 	if held, err := b.TryAcquire(context.Background()); err != nil || !held {
 		t.Fatalf("the other instance could not take the released lease: %v %v", held, err)
+	}
+}
+
+// newRenewTestLease returns a lease with a test clock, a text log buffer and
+// a renewal stub that returns the result of next.
+func newRenewTestLease(next func() (bool, error)) (*Lease, *testClock, *atomic.Int32, *bytes.Buffer) {
+	clock := newTestClock()
+	l, lost := newTestLease()
+	var logs bytes.Buffer
+	l.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	l.DeadlineNow = clock.Now
+	l.renew = func(context.Context) (bool, error) { return next() }
+	l.init()
+	return l, clock, lost, &logs
+}
+
+// TestRenewalErrorKeepsLeaseUntilConfirmedExpiry checks that a failed
+// renewal does not end ownership, that ownership still ends at the
+// unchanged confirmed expiry, and that a later success moves the expiry.
+func TestRenewalErrorKeepsLeaseUntilConfirmedExpiry(t *testing.T) {
+	fail := true
+	l, clock, lost, logs := newRenewTestLease(func() (bool, error) {
+		if fail {
+			return false, errors.New("connection reset")
+		}
+		return true, nil
+	})
+	start := clock.Now()
+	acquireFor(t, l, start.Add(TTL))
+	_, confirmed, _ := l.snapshot()
+
+	clock.Advance(RenewInterval)
+	l.renewOnce(context.Background())
+	if !l.Held() || lost.Load() != 0 {
+		t.Fatalf("held %v, OnLose ran %d times after a renewal error", l.Held(), lost.Load())
+	}
+	if _, got, _ := l.snapshot(); !got.Equal(confirmed) {
+		t.Fatalf("expiry moved to %v, want %v", got, confirmed)
+	}
+	if !strings.Contains(logs.String(), "lease_renew_failed") || strings.Contains(logs.String(), "lease_lost") {
+		t.Fatalf("unexpected logs: %s", logs.String())
+	}
+
+	// A success after the error and before the expiry moves the expiry.
+	fail = false
+	clock.Advance(RenewInterval)
+	renewedAt := clock.Now()
+	l.renewOnce(context.Background())
+	if _, got, _ := l.snapshot(); !got.Equal(renewedAt.Add(TTL)) {
+		t.Fatalf("expiry %v, want %v", got, renewedAt.Add(TTL))
+	}
+	clock.Advance(TTL - time.Second)
+	if !l.Held() || lost.Load() != 0 {
+		t.Fatalf("ownership did not survive the original deadline: held %v, OnLose %d", l.Held(), lost.Load())
+	}
+
+	// Without a further success, ownership ends once, with reason expired.
+	fail = true
+	l.renewOnce(context.Background())
+	clock.Advance(time.Second)
+	l.expireIfDue()
+	l.expireIfDue()
+	if l.Held() || lost.Load() != 1 {
+		t.Fatalf("held %v, OnLose ran %d times, want released once", l.Held(), lost.Load())
+	}
+	if !strings.Contains(logs.String(), "reason=expired") {
+		t.Fatalf("missing lease_lost reason=expired: %s", logs.String())
+	}
+}
+
+// TestRenewalRefusalLosesLeaseAtOnce checks that a definitive (false, nil)
+// refusal still ends ownership immediately and is not a renewal failure.
+func TestRenewalRefusalLosesLeaseAtOnce(t *testing.T) {
+	l, clock, lost, logs := newRenewTestLease(func() (bool, error) { return false, nil })
+	acquireFor(t, l, clock.Now().Add(TTL))
+	clock.Advance(RenewInterval)
+	l.renewOnce(context.Background())
+	if l.Held() || lost.Load() != 1 {
+		t.Fatalf("held %v, OnLose ran %d times, want lost once", l.Held(), lost.Load())
+	}
+	if !strings.Contains(logs.String(), "reason=not_holder") || strings.Contains(logs.String(), "lease_renew_failed") {
+		t.Fatalf("unexpected logs: %s", logs.String())
+	}
+}
+
+// TestRenewalErrorWhileNotHeldChangesNothing checks that a failed
+// acquisition attempt leaves the lease unheld and runs no callback.
+func TestRenewalErrorWhileNotHeldChangesNothing(t *testing.T) {
+	l, _, lost, logs := newRenewTestLease(func() (bool, error) { return false, errors.New("down") })
+	l.renewOnce(context.Background())
+	if l.Held() || lost.Load() != 0 {
+		t.Fatalf("held %v, OnLose ran %d times", l.Held(), lost.Load())
+	}
+	if strings.Contains(logs.String(), "lease_lost") {
+		t.Fatalf("unexpected lease_lost log: %s", logs.String())
 	}
 }
