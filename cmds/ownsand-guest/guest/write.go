@@ -22,6 +22,29 @@ import (
 // defaultFileMode applies when a finish carries mode 0.
 const defaultFileMode = 0o644
 
+// wireToFileMode translates the POSIX mode bits of a finish (permission bits
+// plus setuid 0o4000, setgid 0o2000 and sticky 0o1000) into a Go file mode.
+// Go's Chmod reads fs.ModeSetuid, fs.ModeSetgid and fs.ModeSticky, not the raw
+// POSIX bits, so a plain cast would drop the special bits. A mode of 0 (after
+// masking to 0o7777) means defaultFileMode.
+func wireToFileMode(wire uint32) fs.FileMode {
+	wire &= 0o7777
+	if wire == 0 {
+		return defaultFileMode
+	}
+	mode := fs.FileMode(wire & 0o777)
+	if wire&0o4000 != 0 {
+		mode |= fs.ModeSetuid
+	}
+	if wire&0o2000 != 0 {
+		mode |= fs.ModeSetgid
+	}
+	if wire&0o1000 != 0 {
+		mode |= fs.ModeSticky
+	}
+	return mode
+}
+
 // span is a written byte range [start, end).
 type span struct{ start, end int64 }
 
@@ -259,10 +282,7 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if !covered {
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "written ranges do not cover exactly [0, size_bytes)")
 	}
-	mode := fs.FileMode(finish.GetMode() & 0o7777)
-	if mode == 0 {
-		mode = defaultFileMode
-	}
+	mode := wireToFileMode(finish.GetMode())
 	if err := e.file.Truncate(size); err != nil {
 		return fsError("write", err)
 	}
