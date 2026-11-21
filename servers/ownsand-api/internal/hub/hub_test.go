@@ -157,14 +157,36 @@ func TestRegisterAdmittedWaitsForFenceOutsideOwnershipLock(t *testing.T) {
 
 	inFn := make(chan struct{})
 	releaseFn := make(chan struct{})
-	go h.IfNoChannel("dev", func() {
-		close(inFn)
-		<-releaseFn
+	fnDone := make(chan struct{})
+	registrarDone := make(chan struct{})
+	// A fatal assertion ends the test with runtime.Goexit before the normal
+	// release, so the cleanup releases the fence callback and waits for both
+	// workers; otherwise they would stay blocked after the test fails.
+	release := sync.OnceFunc(func() { close(releaseFn) })
+	t.Cleanup(func() {
+		release()
+		for name, done := range map[string]chan struct{}{"fence holder": fnDone, "registrar": registrarDone} {
+			select {
+			case <-done:
+			case <-time.After(10 * time.Second):
+				t.Errorf("the %s goroutine did not finish after the device fence was released", name)
+			}
+		}
 	})
+	go func() {
+		defer close(fnDone)
+		h.IfNoChannel("dev", func() {
+			close(inFn)
+			<-releaseFn
+		})
+	}()
 	<-inFn
 
 	registered := make(chan *Conn, 1)
-	go func() { registered <- h.RegisterAdmitted(context.Background(), "dev", "org", own.admit) }()
+	go func() {
+		defer close(registrarDone)
+		registered <- h.RegisterAdmitted(context.Background(), "dev", "org", own.admit)
+	}()
 
 	// The admission waits for the fence; the ownership lock stays free for
 	// the lease renewal and the loss transition, and fn was not run.
@@ -195,7 +217,7 @@ func TestRegisterAdmittedWaitsForFenceOutsideOwnershipLock(t *testing.T) {
 		t.Fatal("a channel was registered while the device fence was held")
 	}
 
-	close(releaseFn)
+	release()
 	select {
 	case c := <-registered:
 		if c == nil || h.Get("dev") != c {
