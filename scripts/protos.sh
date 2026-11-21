@@ -64,12 +64,35 @@ generated_ts_files() {
 
 generate() {
   buf format --write
-  # Remove the old generated files first, so that a removed schema file
-  # leaves no stale binding behind.
+  # Generate both languages into a temporary directory first. The committed
+  # bindings are replaced only after both generators succeeded, so a failing
+  # generator or a missing TypeScript plugin leaves every committed binding
+  # untouched. buf_generate_ts exits the script on a missing plugin; the EXIT
+  # trap still removes the temporary directory then.
+  local tmp
+  tmp="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" EXIT
+  local go_out="$tmp/go" ts_out="$tmp/ts"
+  mkdir -p "$go_out" "$ts_out"
+  buf generate --output "$go_out"
+  buf_generate_ts "$ts_out"
+  if [[ -z "$(generated_files "$go_out")" || -z "$(generated_ts_files "$ts_out/src/gen")" ]]; then
+    echo "protos: a generator produced no files; the committed bindings are unchanged" >&2
+    exit 1
+  fi
+
+  # Replace the committed bindings. Removing the old generated files first
+  # leaves no stale binding behind for a removed schema file.
+  local file
   (cd "$protos_dir" && find . -type f \( -name '*.pb.go' -o -name '*.connect.go' \) -delete)
-  buf generate
+  while IFS= read -r file; do
+    mkdir -p "$protos_dir/$(dirname "$file")"
+    cp "$go_out/$file" "$protos_dir/$file"
+  done < <(generated_files "$go_out")
   rm -rf "$ts_gen_dir"
-  buf_generate_ts "$ts_package_dir"
+  mkdir -p "$ts_gen_dir"
+  cp -R "$ts_out/src/gen/." "$ts_gen_dir/"
   echo "protos: regenerated Go and TypeScript bindings with buf ${BUF_VERSION}"
 }
 
