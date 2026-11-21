@@ -185,27 +185,63 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 		return Outcome{}, err
 	}
 	d := h.d
-	d.mu.Lock()
-	op, known := d.execs[req.GetExecId()]
-	if known {
-		d.mu.Unlock()
-		if !bytes.Equal(op.digest, digest) {
-			return Outcome{}, fail(ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS, "exec_id is already used by another request")
-		}
+	// Admission and the start of a sandbox end are ordered by the sandbox
+	// manager: while a sandbox is ending, WithRunning does not call the
+	// function, so an exec cannot register after SandboxEnded took its
+	// snapshot of the execs and then wait for a guest that never comes back.
+	var (
+		op       *execOp
+		existing bool
+		admitErr error
+	)
+	if !d.sb.WithRunning(req.GetSandboxId(), func() { op, existing, admitErr = h.admitExec(req, digest) }) {
+		return Outcome{}, fail(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is not in a state that allows this request")
+	}
+	if admitErr != nil {
+		return Outcome{}, admitErr
+	}
+	if existing {
 		// A retry of the same request attaches from offset 0.
 		h.accepted()
 		return h.streamExec(ctx, op, 0, 0, false)
 	}
-	if lost, ok := d.lost[req.GetExecId()]; ok {
-		d.mu.Unlock()
-		if !bytes.Equal(lost.Digest, digest) {
-			return Outcome{}, fail(ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS, "exec_id is already used by another request")
+	d.logger.Info("exec accepted", "exec_id", req.GetExecId(), "sandbox_id", req.GetSandboxId())
+	d.sb.Touch(req.GetSandboxId())
+	d.wg.Add(1)
+	go func() {
+		defer d.wg.Done()
+		// Release the child context from d.ctx once forwarding is over (final
+		// event, guest error final or d.ctx end). The kept result in op.log
+		// stays available until Sweep.
+		defer op.cancel()
+		d.forwardExec(op.ctx, op, req)
+	}()
+	h.accepted()
+	return h.streamExec(ctx, op, 0, 0, false)
+}
+
+// admitExec registers a new exec or finds the record of a retry. It runs
+// inside Sandboxes.WithRunning, so it takes d.mu below the sandbox manager's
+// lock and must not call the sandbox manager. existing is true when op is the
+// record of an earlier request with the same digest.
+func (h *handler) admitExec(req *ownsandv1.ExecRequest, digest []byte) (op *execOp, existing bool, err error) {
+	d := h.d
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if op, known := d.execs[req.GetExecId()]; known {
+		if !bytes.Equal(op.digest, digest) {
+			return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS, "exec_id is already used by another request")
 		}
-		return Outcome{}, fail(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "the exec result is no longer kept; its outcome is unknown")
+		return op, true, nil
+	}
+	if lost, ok := d.lost[req.GetExecId()]; ok {
+		if !bytes.Equal(lost.Digest, digest) {
+			return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS, "exec_id is already used by another request")
+		}
+		return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "the exec result is no longer kept; its outcome is unknown")
 	}
 	if err := h.admitLocked(req.GetExecId()); err != nil {
-		d.mu.Unlock()
-		return Outcome{}, err
+		return nil, false, err
 	}
 	execCtx, cancel := context.WithCancel(d.ctx)
 	op = &execOp{
@@ -221,25 +257,11 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 		// The at-most-once rule needs the record on disk before the
 		// command runs.
 		delete(d.execs, req.GetExecId())
-		d.mu.Unlock()
 		cancel()
 		d.logger.Error("persist exec record failed", "exec_id", req.GetExecId(), "error", err)
-		return Outcome{}, fail(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent could not record the exec")
+		return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent could not record the exec")
 	}
-	d.mu.Unlock()
-	d.logger.Info("exec accepted", "exec_id", req.GetExecId(), "sandbox_id", req.GetSandboxId())
-	d.sb.Touch(req.GetSandboxId())
-	d.wg.Add(1)
-	go func() {
-		defer d.wg.Done()
-		// Release the child context from d.ctx once forwarding is over (final
-		// event, guest error final or d.ctx end). The kept result in op.log
-		// stays available until Sweep.
-		defer cancel()
-		d.forwardExec(execCtx, op, req)
-	}()
-	h.accepted()
-	return h.streamExec(ctx, op, 0, 0, false)
+	return op, false, nil
 }
 
 func (h *handler) attach(ctx context.Context, req *ownsandv1.AttachExecRequest) (Outcome, error) {

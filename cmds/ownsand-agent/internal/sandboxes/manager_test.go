@@ -331,6 +331,25 @@ func TestCreateDeleteLifecycle(t *testing.T) {
 	}
 }
 
+func TestWithRunning(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	called := false
+	if !e.m.WithRunning(id, func() { called = true }) || !called {
+		t.Fatal("WithRunning skipped a running sandbox")
+	}
+	unknown, _ := uuidv7.NewString()
+	if e.m.WithRunning(unknown, func() { t.Fatal("called for an unknown sandbox") }) {
+		t.Fatal("WithRunning accepted an unknown sandbox")
+	}
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil {
+		t.Fatal(err)
+	}
+	if e.m.WithRunning(id, func() { t.Fatal("called for a deleted sandbox") }) {
+		t.Fatal("WithRunning accepted a deleted sandbox")
+	}
+}
+
 func entry2src() *ownsandv1.CreateSandboxCommand_BaseImage {
 	return &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX}
 }

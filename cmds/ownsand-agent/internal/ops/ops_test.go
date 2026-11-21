@@ -73,7 +73,18 @@ type env struct {
 	sandbox string
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, envOptions{}) }
+
+// envOptions tune the fixture of one test.
+type envOptions struct {
+	// managerNow is the clock of the sandbox manager; nil uses the real clock.
+	managerNow func() time.Time
+	// wrap lets a test observe or pause the calls of the dispatcher into the
+	// sandbox manager; nil passes the manager itself.
+	wrap func(*sandboxes.Manager) ops.Sandboxes
+}
+
+func newEnvWith(t *testing.T, o envOptions) *env {
 	t.Helper()
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -84,12 +95,16 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: rt, Logger: logger})
+	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: rt, Logger: logger, Now: o.managerNow})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &env{t: t, st: st, m: m, clk: &clock{}}
-	e.d, err = ops.New(m, st, ops.Options{Now: e.clk.Now, Logger: logger})
+	var dispatcherSandboxes ops.Sandboxes = m
+	if o.wrap != nil {
+		dispatcherSandboxes = o.wrap(m)
+	}
+	e.d, err = ops.New(dispatcherSandboxes, st, ops.Options{Now: e.clk.Now, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,6 +376,105 @@ func TestExecSandboxEnded(t *testing.T) {
 	out := <-done
 	if !out.Finished || last(s.frames).GetExecEvent().GetSandboxEnded().GetReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("outcome %+v last %v", out, last(s.frames))
+	}
+}
+
+// pausedSandboxes pauses the first State call of the dispatcher after it read
+// the state of the sandbox, so that a test can end the sandbox between the
+// state check of an exec and its admission.
+type pausedSandboxes struct {
+	*sandboxes.Manager
+	once     sync.Once
+	observed chan struct{}
+	release  chan struct{}
+}
+
+func newPausedSandboxes(m *sandboxes.Manager) *pausedSandboxes {
+	return &pausedSandboxes{Manager: m, observed: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (p *pausedSandboxes) State(id string) (ownsandv1.SandboxState, bool) {
+	state, ok := p.Manager.State(id)
+	p.once.Do(func() {
+		close(p.observed)
+		<-p.release
+	})
+	return state, ok
+}
+
+// TestExecAdmissionRacesSandboxEnd covers an exec that read a running state
+// and then lost the race with the end of its sandbox: the exec is refused and
+// leaves no record and no forwarding goroutine behind.
+func TestExecAdmissionRacesSandboxEnd(t *testing.T) {
+	ends := []struct {
+		name string
+		// end ends the sandbox and returns when the manager has recorded the end.
+		end func(t *testing.T, e *env, mgrClk *clock)
+	}{
+		{"delete", func(t *testing.T, e *env, _ *clock) {
+			if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"ttl", func(t *testing.T, e *env, mgrClk *clock) {
+			mgrClk.Advance(3 * time.Hour)
+			e.m.Tick(context.Background(), false)
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if state, _ := e.m.State(e.sandbox); state == ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("sandbox did not end after its TTL")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}},
+	}
+	for _, tc := range ends {
+		t.Run(tc.name, func(t *testing.T) {
+			var gate *pausedSandboxes
+			mgrClk := &clock{}
+			e := newEnvWith(t, envOptions{
+				managerNow: mgrClk.Now,
+				wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+					gate = newPausedSandboxes(m)
+					return gate
+				},
+			})
+			req := e.execReq("/bin/sh", "-c", "sleep 60")
+			type result struct {
+				out      ops.Outcome
+				frames   []*ownsandv1.DataFrame
+				accepted bool
+			}
+			done := make(chan result, 1)
+			go func() {
+				out, frames, accepted := e.handle(req, nil)
+				done <- result{out, frames, accepted}
+			}()
+			<-gate.observed
+			tc.end(t, e, mgrClk)
+			close(gate.release)
+			var r result
+			select {
+			case r = <-done:
+			case <-time.After(20 * time.Second):
+				t.Fatal("exec of an ended sandbox did not return")
+			}
+			if r.accepted || r.out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION || !r.out.Terminal {
+				t.Fatalf("outcome %+v accepted %v", r.out, r.accepted)
+			}
+			if e.d.HasRunningExec(e.sandbox) {
+				t.Fatal("exec registered for an ended sandbox")
+			}
+			if _, kept := e.d.ExecContextErr(req.GetExecId()); kept {
+				t.Fatal("exec record kept for an ended sandbox")
+			}
+			if e.d.ExecEnded(req.GetExecId()) {
+				t.Fatal("exec reported as accepted and ended")
+			}
+		})
 	}
 }
 

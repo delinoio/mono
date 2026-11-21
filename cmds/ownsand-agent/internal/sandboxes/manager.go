@@ -317,6 +317,24 @@ func (m *Manager) State(id string) (ownsandv1.SandboxState, bool) {
 	return sb.rec.State, true
 }
 
+// WithRunning calls fn while the sandbox is running and not ending, holding
+// m.mu, and returns false without calling fn otherwise. Every end path sets
+// sb.ending under m.mu before it notifies the exec tracker, so an exec that
+// registers in fn is visible to that notification, and an exec that comes
+// later sees the end and is refused. fn must not call the Manager. It may take
+// the exec tracker's lock: Tick already calls the tracker under m.mu, and
+// the tracker never calls the Manager while it holds that lock.
+func (m *Manager) WithRunning(id string, fn func()) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sb, ok := m.sandboxes[id]
+	if !ok || sb.ending || sb.rec.State != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		return false
+	}
+	fn()
+	return true
+}
+
 // Guest returns the guest helper client of a sandbox with a VM.
 func (m *Manager) Guest(id string) (*guestclient.Client, bool) {
 	m.mu.Lock()
