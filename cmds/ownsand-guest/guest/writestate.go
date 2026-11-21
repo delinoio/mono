@@ -167,10 +167,15 @@ func (m *writeManager) persistRecord(e *writeEntry, durable bool) {
 	}
 }
 
+// lstatStaging looks up a recovered staging file; tests replace it to fail
+// the lookup.
+var lstatStaging = os.Lstat
+
 // loadRecords registers the writes of an earlier helper process. A record
-// whose file is gone is dropped; a record that cannot be read is removed;
-// the time of the last chunk is clamped to now, because the guest clock may
-// have been set backwards since the record was written.
+// whose file is confirmed gone is dropped; a record whose file lookup fails
+// for another reason is kept and registered; a record that cannot be read is
+// removed; the time of the last chunk is clamped to now, because the guest
+// clock may have been set backwards since the record was written.
 func (m *writeManager) loadRecords() error {
 	if m.dir == "" {
 		return nil
@@ -204,16 +209,19 @@ func (m *writeManager) loadRecords() error {
 			}
 			continue
 		}
-		if _, err := os.Lstat(rec.TmpPath); err != nil {
+		if _, err := lstatStaging(rec.TmpPath); err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
 				m.logger.Info("drop write record without staging file", "write_id", rec.WriteID)
-			} else {
-				m.logger.Warn("drop write record: staging file not readable", "write_id", rec.WriteID, "error", sanitizedError(err))
+				if err := m.removeRecord(rec.WriteID); err != nil {
+					m.logger.Warn("remove write record failed", "write_id", rec.WriteID, "error", sanitizedError(err))
+				}
+				continue
 			}
-			if err := m.removeRecord(rec.WriteID); err != nil {
-				m.logger.Warn("remove write record failed", "write_id", rec.WriteID, "error", sanitizedError(err))
-			}
-			continue
+			// Any other error (a transient I/O error, a permission denial) does
+			// not show that the staging file is gone. Keep the record and
+			// register the write, so the sweep retries the cleanup; dropping the
+			// record would orphan a staging file that still exists.
+			m.logger.Warn("write record: staging file lookup failed, keeping the record", "write_id", rec.WriteID, "error", sanitizedError(err))
 		}
 		last := time.Unix(0, rec.LastNano)
 		if last.After(now) {

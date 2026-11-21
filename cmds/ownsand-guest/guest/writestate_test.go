@@ -322,6 +322,43 @@ func TestWriteFinishedRecordFailureIsRetriedBySweep(t *testing.T) {
 	}
 }
 
+// A staging file lookup that fails for a reason other than a missing file
+// (a transient I/O error, a permission denial) does not show that the file is
+// gone. The record is kept and the write is registered, so the sweep retries
+// the cleanup after the lookup works again.
+func TestWriteRecoveryKeepsRecordWhenStagingLookupFails(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	tmp := tempPath(target, req.GetWriteId())
+	releaseWriteFiles(h)
+
+	orig := lstatStaging
+	t.Cleanup(func() { lstatStaging = orig })
+	lstatStaging = func(path string) (os.FileInfo, error) {
+		return nil, &fs.PathError{Op: "lstat", Path: path, Err: errors.New("input/output error")}
+	}
+	h2 := restart(t, h, nil)
+	lstatStaging = orig
+
+	if got := recordFiles(t, h2); len(got) != 1 {
+		t.Fatalf("records after a failed lookup: %v", got)
+	}
+	h2.srv.writes.mu.Lock()
+	_, registered := h2.srv.writes.entries[req.GetWriteId()]
+	h2.srv.writes.mu.Unlock()
+	if !registered {
+		t.Fatal("the write was not registered as recovered")
+	}
+	h2.clock.Advance(16 * time.Minute)
+	h2.srv.Sweep()
+	if exists(tmp) {
+		t.Fatal("staging file kept after the sweep that follows a failed lookup")
+	}
+	if got := recordFiles(t, h2); len(got) != 0 {
+		t.Fatalf("record kept after cleanup: %v", got)
+	}
+}
+
 func TestWriteCleanupRetriesAfterFailure(t *testing.T) {
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)
