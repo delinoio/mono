@@ -39,9 +39,11 @@ func TestNewReadsEnvironment(t *testing.T) {
 	if _, err := New(Options{APIKey: "osk_x", TokenSource: func(context.Context) (string, error) { return "", nil }}); err == nil {
 		t.Fatal("want an error for two credentials")
 	}
-	for _, bad := range []string{"ftp://x", "https://x/path", "x"} {
+	for _, bad := range []string{"ftp://x", "https://x/path", "x", "https://x#f", "https://x#", "https://x?", "https://x/?", "https://x?a=b", "https://u:p@x"} {
 		if _, err := New(Options{BaseURL: bad, APIKey: "osk_x"}); err == nil {
 			t.Fatalf("base URL %q accepted", bad)
+		} else if strings.Contains(err.Error(), bad) {
+			t.Fatalf("error echoes the base URL: %v", err)
 		}
 	}
 }
