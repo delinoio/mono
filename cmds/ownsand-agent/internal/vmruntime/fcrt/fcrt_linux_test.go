@@ -151,3 +151,53 @@ func TestCapabilitiesWithoutFirecracker(t *testing.T) {
 		t.Fatal("create without a base image accepted")
 	}
 }
+
+func openFDs(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return len(entries)
+}
+
+// A create whose boot fails releases the VM registration and the directory
+// handle: the sandbox manager never calls Delete for a FAILED sandbox.
+func TestCreateFailureReleasesVM(t *testing.T) {
+	falseBin, err := exec.LookPath("false")
+	if err != nil {
+		t.Skip("false not installed")
+	}
+	img := t.TempDir()
+	kernel, rootfs := filepath.Join(img, "vmlinux"), filepath.Join(img, "rootfs.ext4")
+	for _, p := range []string{kernel, rootfs} {
+		if err := os.WriteFile(p, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r, err := New(Options{Binary: falseBin, Kernel: kernel, Rootfs: rootfs, Logger: quiet()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := openFDs(t)
+	for i := 0; i < 3; i++ {
+		dir := filepath.Join(t.TempDir(), "vm")
+		_, err := r.Create(context.Background(), vmruntime.Spec{SandboxID: "x", Dir: dir, GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX,
+			NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE, Resources: &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 128}})
+		if err == nil {
+			t.Fatal("create with a failing firecracker succeeded")
+		}
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("VM directory kept: %v", err)
+		}
+	}
+	r.mu.Lock()
+	n := len(r.vms)
+	r.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d failed VMs still registered", n)
+	}
+	if after := openFDs(t); after != before {
+		t.Fatalf("open descriptors %d before, %d after failed creates", before, after)
+	}
+}

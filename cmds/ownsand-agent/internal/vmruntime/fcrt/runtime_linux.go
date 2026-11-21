@@ -235,8 +235,17 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	}
 	v := &vm{id: spec.SandboxID, dir: spec.Dir, dirFile: dirFile, network: spec.NetworkMode,
 		vcpu: spec.Resources.GetVcpuCount(), memMiB: spec.Resources.GetMemoryMib()}
+	// cleanup releases everything of a failed create: the sandbox manager
+	// records the sandbox as FAILED and never calls Delete for it, so the
+	// registration and the directory handle must not outlive this call.
 	cleanup := func() {
 		r.stop(v)
+		r.mu.Lock()
+		if r.vms[spec.SandboxID] == v {
+			delete(r.vms, spec.SandboxID)
+		}
+		r.mu.Unlock()
+		v.dirFile.Close()
 		os.RemoveAll(spec.Dir)
 	}
 
