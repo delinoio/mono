@@ -20,7 +20,7 @@ const (
 
 // DefaultAddr listens on loopback only so that a local run is never exposed
 // to the network by accident.
-const DefaultAddr = "127.0.0.1:8100"
+const DefaultAddr = "127.0.0.1:18100"
 
 // LogLevel is the accepted set of log level values.
 type LogLevel string
