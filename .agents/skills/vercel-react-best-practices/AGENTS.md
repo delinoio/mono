@@ -952,6 +952,7 @@ export async function GET(request: Request) {
 
   return new ImageResponse(
     <div style={{ fontFamily: 'Inter' }}>
+      {/* @ts-expect-error Satori accepts ArrayBuffer/typed arrays for <img src> at runtime */}
       <img src={logoData} />
       Hello World
     </div>,
@@ -981,6 +982,7 @@ export async function GET(request: Request) {
 
   return new ImageResponse(
     <div style={{ fontFamily: 'Inter' }}>
+      {/* @ts-expect-error Satori accepts ArrayBuffer/typed arrays for <img src> at runtime */}
       <img src={logo} />
       Hello World
     </div>,
@@ -1009,6 +1011,7 @@ const logoData = readFileSync(
 export async function GET(request: Request) {
   return new ImageResponse(
     <div style={{ fontFamily: 'Inter' }}>
+      {/* @ts-expect-error Satori accepts ArrayBuffer/typed arrays for <img src> at runtime */}
       <img src={logoData} />
       Hello World
     </div>,
