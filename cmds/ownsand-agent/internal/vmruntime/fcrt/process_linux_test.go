@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -28,7 +29,15 @@ const helperEnv = "FCRT_TEST_FIRECRACKER_HELPER"
 
 func TestMain(m *testing.M) {
 	if os.Getenv(helperEnv) == "1" {
-		select {}
+		// A bare `select {}` is killed by Go's deadlock detector when the
+		// binary is built with CGO_ENABLED=0 (no runnable goroutines and no
+		// pending timers). Waiting on a signal channel keeps the signal
+		// handling goroutine alive. Only SIGUSR2 is caught, so SIGTERM and
+		// SIGKILL still end the helper as they would end firecracker.
+		block := make(chan os.Signal, 1)
+		signal.Notify(block, syscall.SIGUSR2)
+		<-block
+		os.Exit(0)
 	}
 	os.Exit(m.Run())
 }
