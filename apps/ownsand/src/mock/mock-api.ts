@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import {
   type Duration,
   type Timestamp,
@@ -61,6 +61,7 @@ import {
 } from "ownsand-sdk/gen/organization_pb";
 import {
   type Sandbox,
+  CreateSandboxRequestSchema,
   SandboxSchema,
   SandboxService,
 } from "ownsand-sdk/gen/sandbox_pb";
@@ -114,6 +115,12 @@ interface OrgState {
   tokens: EnrollmentToken[];
   apiKeys: ApiKey[];
   sandboxes: Sandbox[];
+  /**
+   * Create idempotency bookkeeping, kept apart from the user-visible sandbox
+   * labels. Maps an idempotency key to the sandbox it created and to the
+   * encoded request it is bound to, like the real API.
+   */
+  createKeys: Map<string, { sandboxId: string; request: string }>;
   snapshots: Snapshot[];
   templates: Template[];
   policy: AgentVersionPolicy;
@@ -147,6 +154,7 @@ function emptyOrg(id: string, name: string): OrgState {
     tokens: [],
     apiKeys: [],
     sandboxes: [],
+    createKeys: new Map(),
     snapshots: [],
     templates: [],
     policy: create(AgentVersionPolicySchema, {
@@ -794,13 +802,20 @@ export function createMockTransport(
     router.service(SandboxService, {
       createSandbox(req) {
         const { org } = membership(req.organizationId);
-        const existing = org.sandboxes.find(
-          (s) => s.labels["mock-idempotency-key"] === req.idempotencyKey,
-        );
-        // A retry returns the same view as the first call: without the
-        // fake's idempotency bookkeeping label.
-        if (existing !== undefined) {
-          return { sandbox: withoutMockLabels(existing) };
+        const request = Array.from(
+          toBinary(CreateSandboxRequestSchema, req),
+          (b) => b.toString(16).padStart(2, "0"),
+        ).join("");
+        const known = org.createKeys.get(req.idempotencyKey);
+        if (known !== undefined) {
+          // Same as the real API: a known key bound to other parameters fails.
+          if (known.request !== request) {
+            throw new ConnectError(
+              "the idempotency_key was used with other parameters",
+              Code.AlreadyExists,
+            );
+          }
+          return { sandbox: findSandbox(org, known.sandboxId) };
         }
         const device =
           org.devices.find((d) => d.deviceId === req.placement?.deviceId) ??
@@ -822,7 +837,7 @@ export function createMockTransport(
           arch: device.arch,
           guestOs: GuestOs.LINUX,
           network: req.network ?? { mode: NetworkMode.OUTBOUND },
-          labels: { ...req.labels, "mock-idempotency-key": req.idempotencyKey },
+          labels: { ...req.labels },
           idleTtl: req.idleTtl,
           maxTtl: req.maxTtl,
           idleDeadline: ts(Number(req.idleTtl?.seconds ?? 0n)),
@@ -830,14 +845,17 @@ export function createMockTransport(
           createdBy: { kind: PrincipalKind.USER, id: userId },
           createTime: ts(),
         });
-        // The fake hides its idempotency bookkeeping from the labels it returns.
         org.sandboxes.unshift(sandbox);
-        return { sandbox: { ...sandbox, labels: { ...req.labels } } };
+        org.createKeys.set(req.idempotencyKey, {
+          sandboxId: sandbox.sandboxId,
+          request,
+        });
+        return { sandbox };
       },
       getSandbox(req) {
         const { org } = membership(req.organizationId);
         const s = findSandbox(org, req.sandboxId);
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
       listSandboxes(req) {
         const { org } = membership(req.organizationId);
@@ -850,8 +868,7 @@ export function createMockTransport(
           .filter((s) => req.state === undefined || s.state === req.state)
           .filter(
             (s) => req.deviceId === undefined || s.deviceId === req.deviceId,
-          )
-          .map(withoutMockLabels);
+          );
         return { sandboxes };
       },
       deleteSandbox(req) {
@@ -865,7 +882,7 @@ export function createMockTransport(
           s.endReason = SandboxEndReason.DELETED_BY_CALLER;
           s.endTime = ts();
         }
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
       pauseSandbox(req) {
         const { org } = membership(req.organizationId);
@@ -880,7 +897,7 @@ export function createMockTransport(
           );
         }
         s.state = SandboxState.PAUSED;
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
       resumeSandbox(req) {
         const { org } = membership(req.organizationId);
@@ -895,7 +912,7 @@ export function createMockTransport(
           );
         }
         s.state = SandboxState.RUNNING;
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
     });
 
@@ -992,9 +1009,4 @@ export function createMockTransport(
       },
     });
   });
-}
-
-function withoutMockLabels(s: Sandbox): Sandbox {
-  const { "mock-idempotency-key": _key, ...labels } = s.labels;
-  return { ...s, labels };
 }
