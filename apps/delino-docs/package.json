@@ -21,12 +21,12 @@
     "react-dom": "19.3.1"
   },
   "devDependencies": {
-    "@e2e-dev/web": "0.16.0",
+    "@e2e-dev/web": "0.16.1",
     "@types/node": "24.19.2",
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "ai": "7.0.173",
-    "e2e": "0.23.1",
+    "e2e": "0.24.0",
     "typescript": "6.0.3"
   }
 }
