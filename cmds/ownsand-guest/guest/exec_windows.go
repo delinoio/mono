@@ -35,6 +35,11 @@ func kill(p *os.Process) {
 // is false; taskkill ends the tree at once.
 func processGroupAlive(*os.Process) bool { return false }
 
+// processExited is not implemented on Windows; the timeout there relies on
+// the waited flag only. Remove this stub once Windows guests detect the
+// direct child's exit before the output pipes drain.
+func processExited(*os.Process) bool { return false }
+
 // exitStatus keeps the full 32-bit exit code; Windows has no signals.
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {
 	if ws, ok := state.Sys().(syscall.WaitStatus); ok {

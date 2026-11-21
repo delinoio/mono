@@ -242,6 +242,37 @@ func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
 	}
 }
 
+func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.execs.mu.Lock()
+	h.srv.execs.killGrace = 100 * time.Millisecond
+	h.srv.execs.mu.Unlock()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	// The descendant inherits stdout, so cmd.Wait drains the pipe for
+	// pipeWaitDelay after the foreground shell exited, across the timeout.
+	req := execReq(t, "/bin/sh", "-c", `sleep 30 & echo $! > "$PID_FILE"`)
+	req.Env = map[string]string{"PID_FILE": pidFile}
+	req.Timeout = durationpb.New(300 * time.Millisecond)
+	// Registered before the run so the descendant dies even on a failure.
+	t.Cleanup(func() {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			if pid, err := strconv.Atoi(strings.TrimSpace(string(b))); err == nil {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+	})
+	evs := h.runExec(req)
+	childPid := readPidFile(t, pidFile)
+	ex := evs[len(evs)-1].GetExited()
+	if ex.GetTimedOut() || ex.GetExitCode() != 0 {
+		t.Fatalf("exited %v", ex)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if !pidRunning(childPid) {
+		t.Fatal("a command that exited before its timeout had its process group signalled")
+	}
+}
+
 func TestExecRunsIndependentlyAndAttach(t *testing.T) {
 	h := newHarness(t, nil)
 	req := execReq(t, "/bin/sh", "-c", "printf hello; sleep 0.3; printf world")
