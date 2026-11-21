@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -106,7 +105,7 @@ type Service struct {
 	DataPath DataPathHooks
 
 	watch    sandboxWatch
-	commands sync.Map // command ID -> commandInfo
+	commands commandStore // pending commands by command ID
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.
@@ -139,6 +138,11 @@ type Timing struct {
 	CleanupPoll time.Duration
 	// ImportWait bounds a snapshot import before the create.
 	ImportWait time.Duration
+	// CommandGrace is how long the server keeps the record of a command
+	// whose channel closed before it was answered (2 minutes); zero means
+	// the default. The sweep that removes expired records runs every
+	// OfflineSweep.
+	CommandGrace time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -150,8 +154,22 @@ func DefaultTiming() Timing {
 		OfflineSweep:     5 * time.Second,
 		CleanupPoll:      30 * time.Second,
 		ImportWait:       2 * time.Hour,
+		CommandGrace:     DefaultCommandGrace,
 	}
 }
+
+// commandGrace returns the retention window of unanswered commands whose
+// channel closed.
+func (s *Service) commandGrace() time.Duration {
+	if s.Timing.CommandGrace > 0 {
+		return s.Timing.CommandGrace
+	}
+	return DefaultCommandGrace
+}
+
+// PendingCommands returns the number of command records that wait for a
+// result, including the records that started to expire (tests).
+func (s *Service) PendingCommands() int { return s.commands.len() }
 
 func (s *Service) notify() {
 	if s.Notify != nil {

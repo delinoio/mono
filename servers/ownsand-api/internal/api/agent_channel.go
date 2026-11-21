@@ -42,8 +42,11 @@ func (k commandKind) String() string {
 // commandInfo is what the server remembers about a sent command, so that it
 // can apply the result without a waiting RPC.
 type commandInfo struct {
-	kind       commandKind
-	deviceID   string
+	kind     commandKind
+	deviceID string
+	// generation is the generation of the channel that carried the command;
+	// when that channel closes, the record starts to expire.
+	generation uint64
 	orgID      string
 	sandboxID  string
 	snapshotID string
@@ -62,9 +65,10 @@ func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandI
 		cmd.CommandId = newID()
 	}
 	info.deviceID = conn.DeviceID
-	s.commands.Store(cmd.CommandId, info)
+	info.generation = conn.Generation
+	s.commands.add(cmd.CommandId, info, conn, s.now())
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}); err != nil {
-		s.commands.Delete(cmd.CommandId)
+		s.commands.remove(cmd.CommandId)
 		return "", err
 	}
 	s.Logger.InfoContext(ctx, "agent_command_sent", slog.String("device_id", conn.DeviceID), slog.String("command_id", cmd.CommandId),
@@ -147,13 +151,21 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 
 	defer func() {
 		conn.Close(hub.ErrChannelClosed)
+		// The commands that this channel carried may still be answered on a
+		// replacement channel of the device, so their records expire after
+		// the grace period instead of being removed. The channel is closed
+		// here, so a concurrent sendCommand either stored its record before
+		// this call (and is marked) or sees the closed channel (and starts
+		// the expiry itself).
+		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.now())
 		select {
 		case <-writerDone:
 		case <-time.After(writerDrainTimeout):
 		}
 		current := h.Hub.Unregister(conn)
 		cause := context.Cause(conn.Context())
-		log.InfoContext(context.WithoutCancel(ctx), "agent_channel_disconnected", slog.Bool("current", current), slog.String("cause", fmt.Sprint(cause)))
+		log.InfoContext(context.WithoutCancel(ctx), "agent_channel_disconnected", slog.Bool("current", current), slog.String("cause", fmt.Sprint(cause)),
+			slog.Int("commands_marked_for_expiry", expiring))
 		if current {
 			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
 		}
@@ -376,13 +388,12 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // handleCommandResult applies the effect of a command result and hands it
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
-	v, ok := s.commands.LoadAndDelete(res.GetCommandId())
+	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
 	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()))
 	if !ok {
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
 	}
-	info := v.(commandInfo)
 	if info.deviceID != conn.DeviceID {
 		log.WarnContext(ctx, "agent_command_result_wrong_device")
 		return
