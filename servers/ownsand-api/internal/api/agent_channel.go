@@ -11,6 +11,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -41,8 +42,11 @@ func (k commandKind) String() string {
 // commandInfo is what the server remembers about a sent command, so that it
 // can apply the result without a waiting RPC.
 type commandInfo struct {
-	kind       commandKind
-	deviceID   string
+	kind     commandKind
+	deviceID string
+	// generation is the generation of the channel that carried the command;
+	// when that channel closes, the record starts to expire.
+	generation uint64
 	orgID      string
 	sandboxID  string
 	snapshotID string
@@ -61,9 +65,10 @@ func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandI
 		cmd.CommandId = newID()
 	}
 	info.deviceID = conn.DeviceID
-	s.commands.Store(cmd.CommandId, info)
+	info.generation = conn.Generation
+	s.commands.add(cmd.CommandId, info, conn, s.now())
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}); err != nil {
-		s.commands.Delete(cmd.CommandId)
+		s.commands.remove(cmd.CommandId)
 		return "", err
 	}
 	s.Logger.InfoContext(ctx, "agent_command_sent", slog.String("device_id", conn.DeviceID), slog.String("command_id", cmd.CommandId),
@@ -146,13 +151,21 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 
 	defer func() {
 		conn.Close(hub.ErrChannelClosed)
+		// The commands that this channel carried may still be answered on a
+		// replacement channel of the device, so their records expire after
+		// the grace period instead of being removed. The channel is closed
+		// here, so a concurrent sendCommand either stored its record before
+		// this call (and is marked) or sees the closed channel (and starts
+		// the expiry itself).
+		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.now())
 		select {
 		case <-writerDone:
 		case <-time.After(writerDrainTimeout):
 		}
 		current := h.Hub.Unregister(conn)
 		cause := context.Cause(conn.Context())
-		log.InfoContext(context.WithoutCancel(ctx), "agent_channel_disconnected", slog.Bool("current", current), slog.String("cause", fmt.Sprint(cause)))
+		log.InfoContext(context.WithoutCancel(ctx), "agent_channel_disconnected", slog.Bool("current", current), slog.String("cause", fmt.Sprint(cause)),
+			slog.Int("commands_marked_for_expiry", expiring))
 		if current {
 			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
 		}
@@ -187,15 +200,43 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 
 // markOffline sets the device offline after its current channel closed.
 // Its non-terminal sandboxes then show as UNREACHABLE.
+//
+// The closing channel was current when Unregister removed it, but a
+// replacement channel may have registered, and its state report may have
+// committed ONLINE, before this write. The write therefore runs under the
+// hub's device fence and only while the device has no registered channel:
+// either the replacement registered first and the write is skipped, or the
+// replacement registers after the check, and its state report cannot
+// commit ONLINE before this transaction commits, because the transaction
+// holds the device row lock until then. The replacement's state report
+// then sets the device ONLINE after the write.
+//
+// Lock order: the device row lock is taken first (as the state report
+// transaction does), and the fence second.
 func (s *Service) markOffline(ctx context.Context, deviceID string) {
-	tag, err := s.DB.Pool.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1 AND state = $3",
-		deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE))
-	if err != nil {
-		s.Logger.WarnContext(ctx, "device_offline_update_failed", slog.String("device_id", deviceID), slog.Any("error", err))
-		return
-	}
-	if tag.RowsAffected() > 0 {
-		s.Logger.InfoContext(ctx, "device_offline", slog.String("device_id", deviceID))
+	log := s.Logger.With(slog.String("device_id", deviceID))
+	var offline, ran bool
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		offline, ran = false, false
+		if _, err := tx.Exec(ctx, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE", deviceID); err != nil {
+			return err
+		}
+		var execErr error
+		ran = s.Hub.IfNoChannel(deviceID, func() {
+			var tag pgconn.CommandTag
+			tag, execErr = tx.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1 AND state = $3",
+				deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE))
+			offline = execErr == nil && tag.RowsAffected() > 0
+		})
+		return execErr
+	})
+	switch {
+	case err != nil:
+		log.WarnContext(ctx, "device_offline_update_failed", slog.Any("error", err))
+	case !ran:
+		log.InfoContext(ctx, "device_offline_skipped", slog.String("reason", "a newer agent channel is registered"))
+	case offline:
+		log.InfoContext(ctx, "device_offline")
 	}
 }
 
@@ -289,6 +330,16 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	if err != nil {
 		return err
 	}
+	if res.removed {
+		// The device was removed before the report took the device lock, so
+		// nothing was applied. Like a heartbeat of a removed device, close the
+		// channel without an acknowledgement; the agent gets the removal
+		// notice at its next Authenticate.
+		s.Logger.InfoContext(ctx, "agent_state_report_device_removed", slog.String("device_id", conn.DeviceID),
+			slog.Int("sandboxes", len(r.GetSandboxes())), slog.Bool("removed", true))
+		conn.Close(errDeviceRemoved)
+		return nil
+	}
 	ack := &ownsandv1.StateReportAck{ReportSequence: r.GetReportSequence()}
 	for _, e := range r.GetSandboxes() {
 		ack.Sandboxes = append(ack.Sandboxes, &ownsandv1.SandboxUpdateAck{SandboxId: e.GetSandboxId(), Revision: e.GetRevision()})
@@ -338,13 +389,12 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // handleCommandResult applies the effect of a command result and hands it
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
-	v, ok := s.commands.LoadAndDelete(res.GetCommandId())
+	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
 	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()))
 	if !ok {
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
 	}
-	info := v.(commandInfo)
 	if info.deviceID != conn.DeviceID {
 		log.WarnContext(ctx, "agent_command_result_wrong_device")
 		return

@@ -253,9 +253,18 @@ func TestStateReportCreatesNoCopyRow(t *testing.T) {
 			t.Fatal(err)
 		}
 		removed.AddSnapshot(readySnapshotEntry(snapID))
-		if n := reportAndWait(t, env, removed); n != 0 {
-			t.Fatalf("recovered_copies = %d", n)
-		}
+		// The report of a removed device is a no-op: the server logs it as
+		// removed, closes the channel without an acknowledgement and writes no
+		// agent_state_report line, so wait for the removal line instead.
+		removed.SendStateReport()
+		testenv.Eventually(t, "state report of the removed device ignored", func() bool {
+			for _, line := range bytes.Split([]byte(env.Logs.String()), []byte("\n")) {
+				if bytes.Contains(line, []byte(`"agent_state_report_device_removed"`)) && bytes.Contains(line, []byte(dev.ID)) {
+					return true
+				}
+			}
+			return false
+		})
 		if got := copyDevices(t, env, snapID); len(got) != 0 {
 			t.Fatalf("copy rows = %v", got)
 		}

@@ -143,6 +143,10 @@ type reconcileResult struct {
 	// recoveredCopies counts the snapshot_copies rows that the report
 	// created for listed copies that the server did not track.
 	recoveredCopies int
+	// removed is set when the device was already removed (or is gone) when
+	// the report took the device row lock. The transaction then changed
+	// nothing, and the channel must not acknowledge the report.
+	removed bool
 }
 
 // reconcileStateReport applies a full state report of the device: each
@@ -150,10 +154,26 @@ type reconcileResult struct {
 // omits, the snapshots and the built base images. It marks the device
 // online in the same transaction, so the device is eligible only after its
 // report was applied.
+//
+// Lock order: the transaction locks the device row first and keeps the lock
+// to commit, then the sandbox rows, like removeDeviceTx, which updates the
+// device row before it ends the device's sandboxes. A removal that commits
+// first makes the report a no-op (reconcileResult.removed); a report that
+// commits first is followed by the removal, which ends the sandboxes.
 func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, report *ownsandv1.StateReport) (reconcileResult, error) {
 	var out reconcileResult
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		out = reconcileResult{}
+		var state int16
+		var capabilities []byte
+		err := tx.QueryRow(ctx, "SELECT state, capabilities FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&state, &capabilities)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_REMOVED) {
+			out.removed = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		listed := map[string]bool{}
 		for _, e := range report.GetSandboxes() {
 			listed[e.GetSandboxId()] = true
@@ -210,7 +230,7 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 			return err
 		}
 		out.snapshotDeletes = unknown
-		if err := s.mergeBuiltImagesTx(ctx, tx, deviceID, report.GetBuiltBaseImages()); err != nil {
+		if err := s.mergeBuiltImagesTx(ctx, tx, deviceID, capabilities, report.GetBuiltBaseImages()); err != nil {
 			return err
 		}
 		_, err = tx.Exec(ctx, "UPDATE devices SET state = $2, state_epoch = $3, last_seen_time = $4 WHERE device_id = $1 AND state <> $5",
@@ -402,12 +422,10 @@ func nilIfEmpty(b []byte) any {
 }
 
 // mergeBuiltImagesTx stores the built base images of a state report in the
-// device capabilities.
-func (s *Service) mergeBuiltImagesTx(ctx context.Context, tx pgx.Tx, deviceID string, images []ownsandv1.BaseImage) error {
-	var raw []byte
-	if err := tx.QueryRow(ctx, "SELECT capabilities FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&raw); err != nil {
-		return err
-	}
+// device capabilities. The caller holds the device row lock and passes the
+// stored capabilities that it read under that lock (raw), so the merge does
+// not lock the row again.
+func (s *Service) mergeBuiltImagesTx(ctx context.Context, tx pgx.Tx, deviceID string, raw []byte, images []ownsandv1.BaseImage) error {
 	caps := &ownsandv1.DeviceCapabilities{}
 	if len(raw) > 0 {
 		if err := proto.Unmarshal(raw, caps); err != nil {

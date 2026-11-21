@@ -56,6 +56,16 @@ type fakeRuntime struct {
 	paused    map[string]bool
 	createErr error
 	block     chan struct{}
+	// deleteFails is the number of Delete calls that fail before one works.
+	deleteFails int
+	deleteCalls int
+	starts      int // Create calls, counted before any block or error
+}
+
+func (r *fakeRuntime) startCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.starts
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -67,6 +77,9 @@ func (r *fakeRuntime) Capabilities(context.Context) vmruntime.Capabilities {
 	return vmruntime.Capabilities{}
 }
 func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
+	r.mu.Lock()
+	r.starts++
+	r.mu.Unlock()
 	if r.block != nil {
 		select {
 		case <-r.block:
@@ -102,6 +115,12 @@ func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (v
 }
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	r.mu.Lock()
+	r.deleteCalls++
+	if r.deleteFails > 0 {
+		r.deleteFails--
+		r.mu.Unlock()
+		return errors.New("injected stop failure")
+	}
 	v := r.vms[id]
 	delete(r.vms, id)
 	r.mu.Unlock()
@@ -309,6 +328,104 @@ func TestDeleteBeforeCreateRejectsCreate(t *testing.T) {
 	}
 }
 
+// blockingGate is a CreateGate whose BeginCreate waits until release is closed.
+// entered receives one value per BeginCreate call that started waiting.
+type blockingGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingGate() *blockingGate {
+	return &blockingGate{entered: make(chan struct{}, 8), release: make(chan struct{})}
+}
+
+func (g *blockingGate) BeginCreate() (func(), error) {
+	g.entered <- struct{}{}
+	<-g.release
+	return func() {}, nil
+}
+
+func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	type result struct {
+		entry *ownsandv1.SandboxStateEntry
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		entry, err := e.m.Create(context.Background(), cmd)
+		done <- result{entry, err}
+	}()
+	<-gate.entered
+	del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
+	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete %v %v", del, err)
+	}
+	close(gate.release)
+	res := <-done
+	var ce *CommandError
+	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("create after concurrent delete: %v", res.err)
+	}
+	if n := e.rt.startCount(); n != 0 {
+		t.Fatalf("VM starts after delete = %d, want 0", n)
+	}
+	e.m.mu.Lock()
+	got := e.m.sandboxes[cmd.GetSandboxId()].rec.State
+	e.m.mu.Unlock()
+	if got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("record state %v, want DELETED", got)
+	}
+}
+
+func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	type result struct {
+		entry *ownsandv1.SandboxStateEntry
+		err   error
+	}
+	done := make(chan result, 2)
+	for range 2 {
+		go func() {
+			entry, err := e.m.Create(context.Background(), cmd)
+			done <- result{entry, err}
+		}()
+	}
+	<-gate.entered
+	<-gate.entered
+	close(gate.release)
+	for range 2 {
+		res := <-done
+		if res.err != nil || res.entry.GetSandboxId() != cmd.GetSandboxId() {
+			t.Fatalf("create: %v %v", res.entry, res.err)
+		}
+	}
+	if n := e.rt.startCount(); n != 1 {
+		t.Fatalf("VM starts = %d, want 1", n)
+	}
+}
+
+func TestCreateGateControlStartsOnce(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	close(gate.release)
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err != nil || entry.GetSandboxId() != cmd.GetSandboxId() {
+		t.Fatalf("create: %v %v", entry, err)
+	}
+	if n := e.rt.startCount(); n != 1 {
+		t.Fatalf("VM starts = %d, want 1", n)
+	}
+}
+
 func TestDeleteCancelsRunningCreate(t *testing.T) {
 	e := newEnv(t)
 	e.rt.block = make(chan struct{})
@@ -402,6 +519,110 @@ func TestTTLExpiry(t *testing.T) {
 	waitState(t, e.m, busy, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
 	if r := endReason(e.m, busy); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
 		t.Fatalf("busy reason %v", r)
+	}
+}
+
+// TestTTLEndRetriesAfterStopFailure checks that a failed stop during TTL
+// termination leaves the sandbox in DELETING and that a later Tick completes
+// the end exactly once.
+func TestTTLEndRetriesAfterStopFailure(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	e.clk.Advance(11 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.rt.mu.Lock()
+		defer e.rt.mu.Unlock()
+		return e.rt.deleteCalls == 1
+	})
+	// The failed attempt must clear the ending flag so Tick can select the
+	// sandbox again. It stays DELETING until the retry.
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state after failed stop %v, want DELETING", s)
+	}
+	e.ex.mu.Lock()
+	_, ended := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if ended {
+		t.Fatal("exec tracker notified before the VM stopped")
+	}
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("end reason %v", r)
+	}
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("runtime Delete calls %d, want 2", calls)
+	}
+	e.ex.mu.Lock()
+	r := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("exec tracker end reason %v", r)
+	}
+	// A further Tick does nothing for the terminal record.
+	e.m.Tick(context.Background(), false)
+	time.Sleep(50 * time.Millisecond)
+	e.rt.mu.Lock()
+	calls = e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("runtime Delete calls after terminal %d, want 2", calls)
+	}
+}
+
+// TestMaxTTLReasonSurvivesRetryOfPausedSandbox checks that a retry after a
+// failed stop keeps MAX_TTL_EXPIRED for a paused sandbox. The record in
+// DELETING no longer says paused, so recomputing the reason would apply the
+// idle deadline that the pause suspended.
+func TestMaxTTLReasonSurvivesRetryOfPausedSandbox(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	if en, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v %v", en, err)
+	}
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	// Only the maximum deadline passed; the idle deadline is stale.
+	e.clk.Advance(2 * time.Hour)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.rt.mu.Lock()
+		defer e.rt.mu.Unlock()
+		return e.rt.deleteCalls == 1
+	})
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state after failed stop %v, want DELETING", s)
+	}
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("end reason after retry %v, want MAX_TTL_EXPIRED", r)
+	}
+	e.ex.mu.Lock()
+	r := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("exec tracker end reason %v, want MAX_TTL_EXPIRED", r)
 	}
 }
 
@@ -646,4 +867,16 @@ func TestDeleteSnapshot(t *testing.T) {
 	if report := e.m.StateReport(2, nil); len(report.GetSnapshots()) != 0 {
 		t.Fatal("deleted snapshot in the state report")
 	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met in time")
 }

@@ -79,7 +79,9 @@ func CheckOperationID(id string, now time.Time) error {
 	switch {
 	case age >= OperationIDMaxAge:
 		return &AdmissionError{Code: ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, Reason: AdmissionReasonExpired}
-	case -age > OperationIDMaxFuture:
+	// Compare age directly: negating a saturated time.Duration (MinInt64 for a
+	// far-future ID) overflows back to MinInt64 and would skip this check.
+	case age < -OperationIDMaxFuture:
 		return &AdmissionError{Code: ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, Reason: AdmissionReasonFuture}
 	}
 	return nil

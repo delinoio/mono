@@ -96,7 +96,11 @@ type execOp struct {
 	digest    []byte
 	idTime    time.Time
 	log       *execlog.Log
-	cancel    context.CancelFunc
+	// ctx bounds the guest forwarding; cancel ends it. The forwarding
+	// goroutine cancels it when forwardExec returns; the kept result in log
+	// is independent of it.
+	ctx    context.Context
+	cancel context.CancelFunc
 }
 
 type fileOp struct {
