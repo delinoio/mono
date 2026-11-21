@@ -180,3 +180,158 @@ func TestNetworkForwardsAllowedAndBlocksPolicyDestinations(t *testing.T) {
 	default:
 	}
 }
+
+type closeRecorder struct{ closed chan struct{} }
+
+func (c *closeRecorder) Close() error {
+	select {
+	case <-c.closed:
+	default:
+		close(c.closed)
+	}
+	return nil
+}
+
+// A flow that starts after Close gets its connections closed and no relay,
+// and Close returns while a forwarded host connection stays open.
+func TestNetworkCloseEndsEveryFlow(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	filter := netpolicy.NewFilter(logger)
+	filter.SetRoutesForTest(func() ([]netpolicy.Route, []netip.Prefix, error) {
+		return []netpolicy.Route{{Prefix: netip.MustParsePrefix("0.0.0.0/0"), Interface: "en0"}}, nil, nil
+	})
+	if err := filter.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	// The host side accepts and never writes or closes.
+	silent, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer silent.Close()
+	go func() {
+		for {
+			c, err := silent.Accept()
+			if err != nil {
+				return
+			}
+			defer c.Close()
+		}
+	}()
+	link, _ := netpolicy.LinkFor(1)
+	mac, _ := RandomMAC()
+	n, err := New(Options{SandboxID: "test", Link: link, GuestMAC: mac, Filter: filter, Logger: logger,
+		dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, silent.Addr().String())
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentSide, guestSide := net.Pipe()
+	go n.Serve(context.Background(), agentSide, FramingLengthPrefixed)
+	g := newGuest(t, link, mac, guestSide)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	c, err := g.dial(ctx, "203.0.113.10:80")
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer c.Close()
+
+	done := make(chan struct{})
+	go func() { n.Close(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Close did not return while a forwarded connection was open")
+	}
+
+	a, b := &closeRecorder{closed: make(chan struct{})}, &closeRecorder{closed: make(chan struct{})}
+	ran := false
+	if n.startProxy(func() { ran = true }, a, b) {
+		t.Fatal("startProxy started a flow on a closed network")
+	}
+	for _, r := range []*closeRecorder{a, b} {
+		select {
+		case <-r.closed:
+		default:
+			t.Fatal("startProxy left a connection of a refused flow open")
+		}
+	}
+	if ran {
+		t.Fatal("startProxy ran the relay of a refused flow")
+	}
+}
+
+// udpPair returns two connected loopback UDP sockets.
+func udpPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	a, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := net.DialUDP("udp", nil, a.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Connect a to b, so both are connected sockets.
+	if _, err := b.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	_, from, err := a.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Close()
+	ac, err := net.DialUDP("udp", a.LocalAddr().(*net.UDPAddr), from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ac.Close(); b.Close() })
+	return ac, b
+}
+
+// A UDP flow whose datagrams go one way stays open while that direction is
+// active, and ends after the idle time without traffic in either direction.
+func TestProxyUDPIdleCountsBothDirections(t *testing.T) {
+	guest, in := udpPair(t)
+	out, host := udpPair(t)
+	const idle = 300 * time.Millisecond
+	ended := make(chan struct{})
+	go func() { proxyUDP(in, out, idle); close(ended) }()
+
+	received := make(chan struct{}, 64)
+	go func() {
+		buf := make([]byte, 16)
+		for {
+			if _, err := host.Read(buf); err != nil {
+				return
+			}
+			received <- struct{}{}
+		}
+	}()
+	// Send guest-to-host only, for about three idle periods.
+	for i := 0; i < 15; i++ {
+		if _, err := guest.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-received:
+		case <-time.After(time.Second):
+			t.Fatalf("datagram %d was not relayed: the flow ended while it was active", i)
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+	select {
+	case <-ended:
+		t.Fatal("the flow ended while one direction was active")
+	default:
+	}
+	select {
+	case <-ended:
+	case <-time.After(5 * idle):
+		t.Fatal("the flow did not end after the idle time")
+	}
+}
