@@ -113,15 +113,7 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	}
 	v := &vm{id: spec.SandboxID, dir: spec.Dir, network: spec.NetworkMode, guestOS: spec.GuestOS,
 		hardwareModel: model, vcpu: spec.Resources.GetVcpuCount(), memMiB: spec.Resources.GetMemoryMib()}
-	cleanup := func() {
-		r.stopVM(v)
-		r.mu.Lock()
-		if r.vms[spec.SandboxID] == v {
-			delete(r.vms, spec.SandboxID)
-		}
-		r.mu.Unlock()
-		os.RemoveAll(spec.Dir)
-	}
+	cleanup := func() { r.discard(v) }
 	prepare := func() error {
 		if err := copyFile(filepath.Join(src, images.MacOSDisk), filepath.Join(spec.Dir, diskFile)); err != nil {
 			return fmt.Errorf("vzrt: prepare disk: %w", err)
@@ -157,7 +149,12 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 			return v, nil
 		}
 		r.logger.Warn("macOS memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		r.stopVM(v)
+		// Never boot the snapshot disk cold while the failed attempt's VM may
+		// still run on the same disk.
+		if stopErr := r.stopVM(v); stopErr != nil {
+			cleanup()
+			return nil, fmt.Errorf("vzrt: stop the VM of the failed memory-state restore: %w", stopErr)
+		}
 		r.mu.Lock()
 		v.machineID = nil
 		r.mu.Unlock()
