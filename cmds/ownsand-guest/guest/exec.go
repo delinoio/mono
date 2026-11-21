@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
+	"github.com/delinoio/mono/internal/procgroup"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -160,7 +161,7 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	cmd.Stdout = outputWriter(l.WriteStdout)
 	cmd.Stderr = outputWriter(l.WriteStderr)
 	cmd.WaitDelay = pipeWaitDelay
-	setProcessGroup(cmd)
+	procgroup.Set(cmd)
 	if err := cmd.Start(); err != nil {
 		ev := startFailure(err)
 		l.Start(now)

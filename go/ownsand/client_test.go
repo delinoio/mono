@@ -204,6 +204,86 @@ func TestCreateSandboxRetriesLostResponseWithSameKey(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxStalledRetryEndsWithWindow(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.mu.Lock()
+	cp.dropCreates = 1
+	cp.stallCreates = 1
+	cp.mu.Unlock()
+	c := cp.client(t, TransportRelay)
+	window := c.timing.createRetryWindow
+	type result struct {
+		sb  *Sandbox
+		err error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	// A caller context without a deadline: only the retry window can end
+	// the stalled retry.
+	go func() {
+		sb, err := c.CreateSandbox(context.Background(), validParams())
+		done <- result{sb, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(window + 5*time.Second):
+		t.Fatal("CreateSandbox did not end with the retry window")
+	}
+	elapsed := time.Since(start)
+	if r.err == nil || r.sb != nil {
+		t.Fatalf("CreateSandbox returned %v, %v; want the last retryable error", r.sb, r.err)
+	}
+	if kind, _ := classify(context.Background(), r.err); kind != failInterrupted {
+		t.Fatalf("error %v is %v, want the last transport interruption", r.err, kind)
+	}
+	if errors.Is(r.err, context.Canceled) || errors.Is(r.err, errCreateDeadline) {
+		t.Fatalf("error %v is the SDK cancellation, want the last failure of the window", r.err)
+	}
+	if elapsed < window*8/10 || elapsed > window+2*time.Second {
+		t.Fatalf("CreateSandbox ended after %v, want about %v", elapsed, window)
+	}
+	cp.mu.Lock()
+	calls, keys := cp.createCalls, append([]string(nil), cp.createKeys...)
+	cp.mu.Unlock()
+	if calls != 2 || len(keys) != 2 || keys[0] == "" || keys[0] != keys[1] {
+		t.Fatalf("calls=%d keys=%q, want 2 attempts with one idempotency key", calls, keys)
+	}
+}
+
+func TestCreateSandboxCancelDuringStalledRetryIsTerminal(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.mu.Lock()
+	cp.dropCreates = 1
+	cp.stallCreates = 1
+	cp.mu.Unlock()
+	c := cp.client(t, TransportRelay)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// Cancel once the stalled retry is in flight.
+		for {
+			cp.mu.Lock()
+			n := cp.createCalls
+			cp.mu.Unlock()
+			if n >= 2 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := c.CreateSandbox(ctx, validParams())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error %v, want the caller's context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed >= c.timing.createRetryWindow {
+		t.Fatalf("cancellation took %v, want before the retry window", elapsed)
+	}
+}
+
 func TestSandboxLifecycle(t *testing.T) {
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)

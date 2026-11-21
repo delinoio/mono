@@ -12,15 +12,14 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/authz"
@@ -106,7 +105,7 @@ type Service struct {
 	DataPath DataPathHooks
 
 	watch    sandboxWatch
-	commands sync.Map // command ID -> commandInfo
+	commands commandStore // pending commands by command ID
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.
@@ -139,6 +138,11 @@ type Timing struct {
 	CleanupPoll time.Duration
 	// ImportWait bounds a snapshot import before the create.
 	ImportWait time.Duration
+	// CommandGrace is how long the server keeps the record of a command
+	// whose channel closed before it was answered (2 minutes); zero means
+	// the default. The sweep that removes expired records runs every
+	// OfflineSweep.
+	CommandGrace time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -150,8 +154,22 @@ func DefaultTiming() Timing {
 		OfflineSweep:     5 * time.Second,
 		CleanupPoll:      30 * time.Second,
 		ImportWait:       2 * time.Hour,
+		CommandGrace:     DefaultCommandGrace,
 	}
 }
+
+// commandGrace returns the retention window of unanswered commands whose
+// channel closed.
+func (s *Service) commandGrace() time.Duration {
+	if s.Timing.CommandGrace > 0 {
+		return s.Timing.CommandGrace
+	}
+	return DefaultCommandGrace
+}
+
+// PendingCommands returns the number of command records that wait for a
+// result, including the records that started to expire (tests).
+func (s *Service) PendingCommands() int { return s.commands.len() }
 
 func (s *Service) notify() {
 	if s.Notify != nil {
@@ -246,6 +264,20 @@ func validateID(field, value string) error {
 	return nil
 }
 
+// normalizeID validates a required UUID v7 field like validateID and returns
+// its lowercase canonical text. The API accepts either hex case, but identity
+// comparisons and rate-limit keys must use the value, not its spelling.
+func normalizeID(field, value string) (string, error) {
+	if err := validateID(field, value); err != nil {
+		return "", err
+	}
+	id, err := uuidv7.Parse(value)
+	if err != nil {
+		return "", errInvalid(err)
+	}
+	return id.String(), nil
+}
+
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without
 // control characters.
 func validateName(field, name string) error {
@@ -281,7 +313,8 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 	if err != nil {
 		return p, 0, err
 	}
-	if err := validateID("organization_id", orgID); err != nil {
+	orgID, err = normalizeID("organization_id", orgID)
+	if err != nil {
 		return p, 0, err
 	}
 	setRPCOrganization(ctx, orgID)

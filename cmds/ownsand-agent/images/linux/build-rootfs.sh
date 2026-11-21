@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: Apache-2.0
 #
-# Builds the minimal Linux base image root file system of the Firecracker
-# runtime: an ext4 image with a static BusyBox userland and the guest helper
-# as /sbin/init. It needs Go, a statically linked busybox and mkfs.ext4
-# (e2fsprogs 1.43 or later for -d); it does not need root.
+# Builds the minimal Linux base image root file system: an ext4 image with a
+# static BusyBox userland and the guest helper as /sbin/init. It needs Go, a
+# statically linked busybox and mkfs.ext4 (e2fsprogs 1.43 or later for -d);
+# it does not need root. build-image.sh runs it in a container for another
+# architecture or on a host without these tools.
+#
+# Environment: GOARCH selects the guest architecture of the guest helper
+# (default: the Go default); GUEST_BINARY names a prebuilt linux guest
+# helper instead of building it; BUSYBOX names the busybox binary (default:
+# busybox on PATH). The busybox architecture must match GOARCH.
 #
 # Usage: build-rootfs.sh <output.ext4> [size-mib]
 set -euo pipefail
@@ -15,12 +21,12 @@ if [ "$#" -lt 1 ]; then
 fi
 out="$1"
 size_mib="${2:-256}"
-repo="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+repo="$(cd "$(dirname "$0")/../../../.." && pwd)"
 work="$(mktemp -d "${TMPDIR:-/tmp}/ownsand-rootfs.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 rootfs="$work/rootfs"
 
-busybox="$(command -v busybox || true)"
+busybox="${BUSYBOX:-$(command -v busybox || true)}"
 if [ -z "$busybox" ]; then
   echo "busybox is required" >&2
   exit 1
@@ -32,7 +38,12 @@ fi
 mkfs="$(command -v mkfs.ext4 || echo /usr/sbin/mkfs.ext4)"
 
 mkdir -p "$rootfs"/{bin,sbin,etc,proc,sys,dev,tmp,run,root,usr/bin,usr/sbin,var/lib/ownsand-guest}
-(cd "$repo" && CGO_ENABLED=0 go build -trimpath -o "$rootfs/sbin/ownsand-guest" ./cmds/ownsand-guest)
+if [ -n "${GUEST_BINARY:-}" ]; then
+  cp "$GUEST_BINARY" "$rootfs/sbin/ownsand-guest"
+  chmod 0755 "$rootfs/sbin/ownsand-guest"
+else
+  (cd "$repo" && CGO_ENABLED=0 GOOS=linux go build -trimpath -buildvcs=false -o "$rootfs/sbin/ownsand-guest" ./cmds/ownsand-guest)
+fi
 ln -s ownsand-guest "$rootfs/sbin/init"
 cp "$busybox" "$rootfs/bin/busybox"
 for applet in $("$busybox" --list); do

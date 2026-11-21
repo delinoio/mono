@@ -44,10 +44,16 @@ func New(logger *slog.Logger, bytesPerSecond, burst int) *Server {
 }
 
 // Respond returns the binding response for a datagram from src, or nil when
-// the datagram is not a binding request.
+// the datagram is not a binding request or has a reserved header bit set.
 func Respond(datagram []byte, src *net.UDPAddr) ([]byte, error) {
 	if !pionstun.IsMessage(datagram) {
 		return nil, errors.New("not a STUN message")
+	}
+	// RFC 8489 sections 5 and 6.3: the two most significant bits of a STUN
+	// message are zero. pion normalizes them away while decoding, so check the
+	// raw header byte here and discard the datagram.
+	if datagram[0]&0xC0 != 0 {
+		return nil, errors.New("reserved header bits set")
 	}
 	req := &pionstun.Message{Raw: append([]byte(nil), datagram...)}
 	if err := req.Decode(); err != nil {

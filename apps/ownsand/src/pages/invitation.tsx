@@ -21,16 +21,21 @@ export function InvitationPage() {
     return fromAddress ?? pendingInvitation.read();
   });
   const accept = useMutation(MemberService.method.acceptInvitation);
+  const resetAccept = accept.reset;
 
   useEffect(() => {
-    // A new link opened while the page is shown.
+    // A new link opened while the page is shown. The error of the previous
+    // link does not apply to it.
     const onHash = () => {
       const next = takeSecretFromAddress(window.location, window.history);
-      if (next !== undefined) setSecret(next);
+      if (next !== undefined) {
+        resetAccept();
+        setSecret(next);
+      }
     };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
-  }, []);
+  }, [resetAccept]);
 
   if (secret === undefined) {
     return (
@@ -87,7 +92,10 @@ export function InvitationPage() {
                 { replace: true },
               );
             } catch {
-              setSecret(undefined);
+              // accept.error shows the failure above. The in-memory secret
+              // stays so that the user can accept again: the server leaves
+              // the invitation unused when AcceptInvitation fails. Only the
+              // stored copy is deleted (below).
             } finally {
               pendingInvitation.clear();
             }

@@ -26,7 +26,7 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 )
@@ -90,6 +90,16 @@ type p2pAction struct {
 	endAfter  int // send a session-end frame after N output events
 	reason    ownsandv1.SessionEndReason
 	failAfter int // close the data channel without a session-end frame
+	// endNow answers an exec request with a session-end frame before any
+	// frame, so the session ends before the agent accepted the request.
+	endNow bool
+	// failNow closes the data channel at an exec request without any frame
+	// and without a session-end frame.
+	failNow bool
+	// endAfterStarted sends a session-end frame right after the started
+	// event of an exec, with no output: a quiet exec whose session expires
+	// after the agent accepted the continuation.
+	endAfterStarted bool
 	// raw, when set, answers the request with this frame only.
 	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
@@ -124,6 +134,10 @@ type fakeCP struct {
 	created     map[string]*ownsandv1.Sandbox
 	createCalls int
 	dropCreates int
+	// stallCreates holds that many CreateSandbox requests open without a
+	// response, after the dropped ones, until the caller gives up.
+	stallCreates int
+	createKeys   []string // idempotency_key of each CreateSandbox request
 
 	expiresIn   time.Duration
 	clockOffset time.Duration // added to expire_time: a server clock that differs from the caller's
@@ -330,11 +344,12 @@ func (f *fakeSandboxes) record() *ownsandv1.Sandbox {
 	return sb
 }
 
-func (f *fakeSandboxes) CreateSandbox(_ context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+func (f *fakeSandboxes) CreateSandbox(ctx context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
 	cp := f.cp
 	cp.mu.Lock()
 	cp.createCalls++
 	key := req.Msg.GetIdempotencyKey()
+	cp.createKeys = append(cp.createKeys, key)
 	sb, ok := cp.created[key]
 	if !ok {
 		sb = &ownsandv1.Sandbox{SandboxId: mustID(cp.t), OrganizationId: req.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
@@ -348,6 +363,18 @@ func (f *fakeSandboxes) CreateSandbox(_ context.Context, req *connect.Request[ow
 	if drop {
 		// The reservation exists but the response is lost.
 		panic(http.ErrAbortHandler)
+	}
+	cp.mu.Lock()
+	stall := cp.stallCreates > 0
+	if stall {
+		cp.stallCreates--
+	}
+	cp.mu.Unlock()
+	if stall {
+		// The response never comes; the request ends when the caller
+		// closes the connection.
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: sb}), nil
 }
@@ -1030,10 +1057,25 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 	}
 	outputs := 0
 	sendExec := func(ev *ownsandv1.ExecEvent) error {
+		if act.endNow || act.failNow {
+			if act.endNow {
+				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
+				time.Sleep(20 * time.Millisecond)
+			}
+			_ = s.pc.Close()
+			return errSessionGone
+		}
 		if err := s.send(frame(ev)); err != nil {
 			return err
 		}
 		switch ev.GetEvent().(type) {
+		case *ownsandv1.ExecEvent_Started:
+			if act.endAfterStarted {
+				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
+				time.Sleep(20 * time.Millisecond)
+				_ = s.pc.Close()
+				return errSessionGone
+			}
 		case *ownsandv1.ExecEvent_Stdout, *ownsandv1.ExecEvent_Stderr:
 			outputs++
 			if act.endAfter > 0 && outputs >= act.endAfter {
