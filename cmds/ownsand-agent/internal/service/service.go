@@ -6,6 +6,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
@@ -140,8 +141,108 @@ func xmlEscape(s string) string {
 	return r.Replace(s)
 }
 
+// Windows registry location of the per-service environment. The service
+// control manager gives a service the REG_MULTI_SZ value Environment of its
+// key (NAME=value entries) as its process environment; a service never
+// inherits the environment of the shell that installed it.
+const (
+	WindowsServiceRegistryKey = `SYSTEM\CurrentControlSet\Services\` + Name
+	WindowsEnvironmentValue   = "Environment"
+)
+
+// windowsSeparators lists the candidate separators of the printed reg.exe
+// command. reg.exe splits a REG_MULTI_SZ /d string at the separator, which
+// is \0 by default; the printed command uses an explicit one-character
+// separator that no entry contains, so that a value such as `D:\0data`
+// is not split at its `\0`. The characters are quoted in the printed
+// command, so command-shell metacharacters are safe.
+const windowsSeparators = "#~|@$*?;:!^&<>{}[]()'`"
+
 // WindowsCommand returns the sc.exe command that registers the Windows
 // service, for operators who do not use `service install`.
 func WindowsCommand(exe string) string {
 	return fmt.Sprintf(`sc.exe create %s binPath= "\"%s\" run" start= auto DisplayName= "OwnSand device agent"`, Name, exe)
+}
+
+// WindowsEnvironmentCommand returns the reg.exe command that sets the
+// Environment value of the service to the NAME=value entries, or an empty
+// string when env is empty. It errors when every candidate separator occurs
+// in an entry.
+func WindowsEnvironmentCommand(env []string) (string, error) {
+	if len(env) == 0 {
+		return "", nil
+	}
+	joined := strings.Join(env, "")
+	sep := ""
+	for _, c := range windowsSeparators {
+		if !strings.ContainsRune(joined, c) {
+			sep = string(c)
+			break
+		}
+	}
+	if sep == "" {
+		return "", errors.New("no reg.exe separator character is free of the environment values")
+	}
+	return fmt.Sprintf(`reg.exe add "HKLM\%s" /v %s /t REG_MULTI_SZ /s "%s" /d %s /f`,
+		WindowsServiceRegistryKey, WindowsEnvironmentValue, sep, windowsQuote(strings.Join(env, sep))), nil
+}
+
+// windowsQuote quotes s as one command-line argument for the C runtime
+// parser that reg.exe uses: it doubles backslashes before a quote or the
+// closing quote and escapes quotes. The command shell still expands %NAME%
+// inside quotes, so a value that contains a percent sign is not safe to paste
+// (`service install` writes the registry directly and is not affected).
+func windowsQuote(s string) string {
+	var b strings.Builder
+	b.WriteByte('"')
+	backslashes := 0
+	for _, r := range s {
+		switch r {
+		case '\\':
+			backslashes++
+			b.WriteRune(r)
+			continue
+		case '"':
+			b.WriteString(strings.Repeat(`\`, backslashes+1))
+		}
+		backslashes = 0
+		b.WriteRune(r)
+	}
+	b.WriteString(strings.Repeat(`\`, backslashes))
+	b.WriteByte('"')
+	return b.String()
+}
+
+// WindowsDefinition returns the printed Windows service definition: the
+// sc.exe create command and, when env is not empty, the reg.exe command that
+// sets the service environment. Without environment variables the output is
+// the sc.exe command alone.
+func WindowsDefinition(exe string, env []string) string {
+	out := WindowsCommand(exe) + "\n"
+	if len(env) == 0 {
+		return out
+	}
+	reg, err := WindowsEnvironmentCommand(env)
+	if err != nil {
+		return out + "REM " + err.Error() + "; use `ownsand-agent service install`, which writes the Environment value directly\n"
+	}
+	return out + reg + "\n"
+}
+
+// InstallWindowsEnvironment writes the service environment after the
+// service is created and before it starts. With no entries it does nothing.
+// When setEnv fails it calls remove, so that a failed install does not leave
+// a service that starts without its environment, and returns the error;
+// the entries are never part of an error message.
+func InstallWindowsEnvironment(env []string, setEnv func([]string) error, remove func() error) error {
+	if len(env) == 0 {
+		return nil
+	}
+	if err := setEnv(env); err != nil {
+		if rerr := remove(); rerr != nil {
+			return fmt.Errorf("write the service Environment value: %w (removing the new service also failed: %v)", err, rerr)
+		}
+		return fmt.Errorf("write the service Environment value: %w (the new service was removed)", err)
+	}
+	return nil
 }
