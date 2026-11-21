@@ -45,7 +45,7 @@ The API server is the system of record for account and billing information. It i
 | ----------- | --------------- | -------------- | ----------------------------------------------------------------------- |
 | `healthz`   | `GET /healthz`  | none           | `200` with `{"status":"ok"}` while the process can serve HTTP requests. |
 
-- Business APIs (`planned`): Connect RPC services generated from `protos/delino/accounts/v1/`. Planned services:
+- Business APIs (`planned`): Connect RPC services generated from `protos/delino/accounts/`. Planned services:
 
 | Service ID       | Responsibility                                                                        |
 | ---------------- | ------------------------------------------------------------------------------------- |
