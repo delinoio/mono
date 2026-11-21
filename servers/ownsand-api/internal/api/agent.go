@@ -72,14 +72,41 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 	hash := auth.HashSecret(token)
 	var resp *ownsandv1.EnrollResponse
 	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock order: organization, then token, the order that
+		// DeleteOrganization follows (organization row lock, then the cascade
+		// to its tokens). Step 1 resolves the organization without a lock, so
+		// the transaction never holds the token lock while it waits for the
+		// organization. Step 2 takes FOR KEY SHARE on the organization: it
+		// lets enrollments of one organization run together, and it conflicts
+		// with the FOR UPDATE of a deletion, so a deletion that already
+		// listed the devices cannot miss this device, and an enrollment that
+		// started after the deletion committed finds no organization. Step 3
+		// locks the token and reads it again; everything is validated there.
+		var preOrgID string
+		err := tx.QueryRow(ctx, "SELECT organization_id::text FROM enrollment_tokens WHERE secret_sha256 = $1", hash).Scan(&preOrgID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errEnrollmentInvalid()
+		}
+		if err != nil {
+			return err
+		}
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", preOrgID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The organization was deleted while this call waited for the lock.
+			return errEnrollmentInvalid()
+		}
+		if err != nil {
+			return err
+		}
 		var tokenID, orgID, deviceID string
 		var stored, usedKey []byte
 		var expires time.Time
 		var used, revoked *time.Time
-		err := tx.QueryRow(ctx, `SELECT enrollment_token_id::text, organization_id::text, secret_sha256, expire_time, use_time, revoke_time,
+		err = tx.QueryRow(ctx, `SELECT enrollment_token_id::text, organization_id::text, secret_sha256, expire_time, use_time, revoke_time,
 			COALESCE(device_id::text, ''), device_public_key FROM enrollment_tokens WHERE secret_sha256 = $1 FOR UPDATE`, hash).
 			Scan(&tokenID, &orgID, &stored, &expires, &used, &revoked, &deviceID, &usedKey)
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !auth.HashEqual(stored, hash)) {
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!auth.HashEqual(stored, hash) || orgID != preOrgID)) {
 			return errEnrollmentInvalid()
 		}
 		if err != nil {
