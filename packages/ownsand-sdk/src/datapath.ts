@@ -4,7 +4,11 @@ import { Code } from "@connectrpc/connect";
 import { DataPathError, OwnSandConfigError } from "./errors.ts";
 import { DataPathTransport } from "./gen/delino/ownsand/v1/common_pb.ts";
 import { LogEvent, safeLog } from "./logger.ts";
-import { PeerSession, PeerUnavailableError } from "./p2p/session.ts";
+import {
+  PeerSession,
+  PeerUnavailableError,
+  SessionNotOpenError,
+} from "./p2p/session.ts";
 import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
 import type { OperationContext } from "./relay/context.ts";
 
@@ -12,7 +16,8 @@ import type { OperationContext } from "./relay/context.ts";
  * Selects the data path of one sandbox handle. With WebRTC available and no
  * forced transport, it opens one peer-to-peer session per handle and moves
  * the handle to the relay after an ICE failure or a session that cannot
- * open. A relay-only handle never calls `OpenSession`.
+ * open. An `OpenSession` `failed_precondition` (a sandbox that is not
+ * `RUNNING`) uses the relay for that attempt only. A relay-only handle never calls `OpenSession`.
  */
 export class DataPathSelector {
   readonly #ctx: OperationContext;
@@ -69,6 +74,17 @@ export class DataPathSelector {
       this.#log(DataPathTransport.PEER_TO_PEER);
       return this.#session;
     } catch (error) {
+      if (error instanceof SessionNotOpenError) {
+        // The sandbox is not RUNNING (for example PAUSED, where an AttachExec
+        // still works on the relay). Use the relay for this attempt only: the
+        // handle stays on peer-to-peer, so the next operation calls
+        // OpenSession again. A forced PEER_TO_PEER transport returns the
+        // failed_precondition error.
+        if (this.#forced === DataPathTransport.PEER_TO_PEER) {
+          throw error.cause;
+        }
+        return undefined;
+      }
       if (error instanceof PeerUnavailableError) {
         this.peerFailed(error);
         return undefined;

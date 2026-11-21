@@ -241,6 +241,102 @@ describe("peer-to-peer data path", () => {
     expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
   });
 
+  test("uses the relay once when OpenSession reports a sandbox that is not running", async () => {
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    h.api.unary(DataPathService, "OpenSession", (_req, call) => {
+      if (call.index === 0) {
+        throw new ConnectError(
+          "sandbox is not running",
+          Code.FailedPrecondition,
+        );
+      }
+      return {
+        sessionId: `session-${call.index + 1}`,
+        sdpAnswer: "v=0 fake-answer",
+        expiresIn: { seconds: 3600n },
+      };
+    });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const result = await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    // The handle stayed on peer-to-peer: the next operation opens a session.
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    expect(rtc.frames).toHaveLength(1);
+  });
+
+  test("a forced PEER_TO_PEER transport returns the failed_precondition of OpenSession", async () => {
+    const { h } = p2pSetup(() => {}, {
+      transport: DataPathTransport.PEER_TO_PEER,
+    });
+    h.api.unary(DataPathService, "OpenSession", () => {
+      throw new ConnectError("sandbox is not running", Code.FailedPrecondition);
+    });
+    const error = await h.clock
+      .run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      )
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.code).toBe(Code.FailedPrecondition);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
+  test("moves the handle to the relay when OpenSession fails with another error", async () => {
+    const { h } = p2pSetup(() => {});
+    h.api.unary(DataPathService, "OpenSession", () => {
+      throw new ConnectError("agent unreachable", Code.Unavailable);
+    });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+  });
+
+  for (const code of [
+    Code.Unauthenticated,
+    Code.PermissionDenied,
+    Code.InvalidArgument,
+  ]) {
+    test(`ends the operation when OpenSession fails with ${Code[code]}`, async () => {
+      const { h } = p2pSetup(() => {});
+      h.api.unary(DataPathService, "OpenSession", () => {
+        throw new ConnectError("rejected", code);
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error.code).toBe(code);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+  }
+
   test("a forced RELAY transport never calls OpenSession", async () => {
     const { h, rtc } = p2pSetup(() => {}, {
       transport: DataPathTransport.RELAY,
