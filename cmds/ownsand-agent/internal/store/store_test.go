@@ -134,3 +134,46 @@ func TestLoadSnapshotsRemovesAbandonedTransferArchives(t *testing.T) {
 		}
 	}
 }
+
+// Reset keeps deleting the other entries when one entry cannot be deleted,
+// so that a stuck log file never keeps identity.json on disk, and it reports
+// the failure.
+func TestResetDeletesIdentityWhenAnotherEntryFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not block deletion on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes entries of a read-only directory")
+	}
+	dir := t.TempDir()
+	// "a-stuck" sorts first, so the failure comes before every other entry,
+	// as the first failing entry of a lexical removal order.
+	stuck := filepath.Join(dir, "a-stuck")
+	if err := os.Mkdir(stuck, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuck, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stuck, 0o700) })
+	for _, name := range []string{AgentFile, IdentityFile, "agent.log"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reset(); err == nil {
+		t.Fatal("Reset did not report the entry that it could not delete")
+	}
+	for _, name := range []string{AgentFile, IdentityFile, "agent.log"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s still exists after Reset: %v", name, err)
+		}
+	}
+}

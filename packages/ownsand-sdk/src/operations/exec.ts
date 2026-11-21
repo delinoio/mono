@@ -172,6 +172,11 @@ export async function* runExec(
             sendExec
               ? ctx.relay.exec(request!, options)
               : ctx.relay.attachExec(attachRequest(), options),
+          {
+            window,
+            isAccepted: (response) =>
+              response.event?.event?.case === "accepted",
+          },
         ),
       );
     } else {

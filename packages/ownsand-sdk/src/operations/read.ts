@@ -74,6 +74,11 @@ export async function* runReadFile(
           grantId,
           signal,
           (options) => ctx.relay.readFile(request, options),
+          {
+            window,
+            isAccepted: (response) =>
+              response.event?.event?.case === "accepted",
+          },
         )) {
           yield response.event;
         }

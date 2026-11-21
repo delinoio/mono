@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { ACTIVITY_HEADER, RELAY_GRANT_HEADER } from "../connection.ts";
-import { OwnSandError } from "../errors.ts";
+import { Code } from "@connectrpc/connect";
+import { DataPathError, OwnSandError } from "../errors.ts";
 import { type OperationContext, Timing } from "./context.ts";
+import type { RecoveryWindow } from "./recovery.ts";
 
 /**
  * A relay stream that received no byte of its response body for the idle
@@ -9,6 +11,32 @@ import { type OperationContext, Timing } from "./context.ts";
  */
 export class StreamIdleError extends OwnSandError {
   override name = "StreamIdleError";
+}
+
+/**
+ * A recovery continuation that the agent did not accept before the recovery
+ * window ended. The SDK cancels the stream; it is a `DataPathError` with the
+ * Connect code `unavailable`, like an `AuthorizeRelay` call that gets no
+ * response within the window. The window has no time left, so the operation
+ * ends with it.
+ */
+export class AcceptanceDeadlineError extends DataPathError {
+  override name = "AcceptanceDeadlineError";
+
+  constructor(message: string, options: { cause?: unknown } = {}) {
+    super(message, { code: Code.Unavailable, cause: options.cause });
+  }
+}
+
+/**
+ * Bounds a recovery continuation by the time left in its recovery window
+ * until the agent accepts the stream. Frames before `accepted` (for example a
+ * relay `keepalive`) do not extend the bound.
+ */
+export interface AcceptanceBound<T> {
+  window: RecoveryWindow;
+  /** Reports whether the response is the `accepted` event. */
+  isAccepted: (value: T) => boolean;
 }
 
 /** A WriteFile attempt that passed its SDK-side deadline. */
@@ -49,13 +77,16 @@ export function linkedController(signal: AbortSignal | undefined): {
 /**
  * Runs one relay server stream with the grant header, byte activity
  * tracking and the idle limit. The idle clock runs only while the SDK waits
- * for the stream, not while the caller holds an event.
+ * for the stream, not while the caller holds an event. While the recovery
+ * window of `bound` is active, the stream also ends when the window's
+ * remaining time passes before the agent accepts it.
  */
 export async function* watchedRelayStream<T>(
   ctx: OperationContext,
   grantId: string,
   callerSignal: AbortSignal | undefined,
   open: (options: CallOptions) => AsyncIterable<T>,
+  bound?: AcceptanceBound<T>,
 ): AsyncGenerator<T> {
   const clock = ctx.clock;
   const { controller: call, dispose: unlink } = linkedController(callerSignal);
@@ -79,6 +110,31 @@ export async function* watchedRelayStream<T>(
       await clock.sleep(wait, stopWatch.signal);
     }
   })().catch(() => {});
+  // The acceptance bound applies only to a continuation in recovery, and ends
+  // when the agent accepts it, the window ends (delivered data) or the stream
+  // closes. The timer re-reads the window, so a clock that pauses or an
+  // ended window never aborts an accepted or recovered stream.
+  const stopDeadline = new AbortController();
+  const deadline =
+    bound?.window.active === true
+      ? (async () => {
+          for (;;) {
+            const left = bound.window.remainingMs();
+            if (!Number.isFinite(left)) {
+              return;
+            }
+            if (left <= 0) {
+              call.abort(
+                new AcceptanceDeadlineError(
+                  "relay continuation not accepted within the recovery window",
+                ),
+              );
+              return;
+            }
+            await clock.sleep(left, stopDeadline.signal);
+          }
+        })().catch(() => {})
+      : undefined;
   try {
     const iterator = open({
       signal: call.signal,
@@ -92,6 +148,14 @@ export async function* watchedRelayStream<T>(
       try {
         result = await iterator.next();
       } catch (error) {
+        if (
+          !callerSignal?.aborted &&
+          call.signal.reason instanceof AcceptanceDeadlineError
+        ) {
+          throw new AcceptanceDeadlineError(call.signal.reason.message, {
+            cause: error,
+          });
+        }
         if (idleFired && !callerSignal?.aborted) {
           throw new StreamIdleError("relay stream idle limit reached", {
             cause: error,
@@ -103,6 +167,9 @@ export async function* watchedRelayStream<T>(
         return;
       }
       lastActivity = clock.now();
+      if (bound?.isAccepted(result.value)) {
+        stopDeadline.abort();
+      }
       holding = true;
       yield result.value;
       holding = false;
@@ -110,9 +177,11 @@ export async function* watchedRelayStream<T>(
     }
   } finally {
     stopWatch.abort();
+    stopDeadline.abort();
     registration.dispose();
     call.abort(new OwnSandError("relay stream closed"));
     await watcher;
+    await deadline;
     unlink();
   }
 }
