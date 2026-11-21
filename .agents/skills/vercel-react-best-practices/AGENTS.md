@@ -2524,13 +2524,13 @@ function ThemeWrapper({ children }: { children: ReactNode }) {
 
 Component first renders with default value (`light`), then updates after hydration, causing a visible flash of incorrect content.
 
-**Correct: no flicker, no hydration mismatch**
+**Correct: no flicker, expected mismatch suppressed**
 
 ```tsx
 function ThemeWrapper({ children }: { children: ReactNode }) {
   return (
     <>
-      <div id="theme-wrapper">
+      <div id="theme-wrapper" suppressHydrationWarning>
         {children}
       </div>
       <script
@@ -2551,7 +2551,7 @@ function ThemeWrapper({ children }: { children: ReactNode }) {
 }
 ```
 
-The inline script executes synchronously before showing the element, ensuring the DOM already has the correct value. No flickering, no hydration mismatch.
+The inline script executes synchronously before showing the element, ensuring the DOM already has the correct value. The script deliberately sets the wrapper's `className` before hydration, so the DOM differs from the initial JSX by that one attribute; `suppressHydrationWarning` on the wrapper silences the expected attribute warning. It covers only that element's own attributes, so do not add it to children.
 
 This pattern is especially useful for theme toggles, user preferences, authentication states, and any client-only data that should render immediately without flashing default values.
 
