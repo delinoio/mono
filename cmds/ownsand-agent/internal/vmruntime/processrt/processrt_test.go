@@ -516,3 +516,48 @@ func TestDeleteRetryAfterListingFailure(t *testing.T) {
 		t.Error("sandbox is still tracked after the retried Delete")
 	}
 }
+
+// TestFailedStartCleanupDoesNotNeedProcessListing checks that a Create whose
+// helper does not become ready kills the helper and removes the sandbox even
+// when the process listing is unavailable. The caller records a failed create
+// as terminal and never deletes the sandbox again, so the runtime must finish
+// the cleanup itself. The helper was never handed out, so it has no exec
+// workers that the listing would have to find.
+func TestFailedStartCleanupDoesNotNeedProcessListing(t *testing.T) {
+	rt := newRuntime(t)
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir, err := os.MkdirTemp("", "pr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	spec := vmruntime.Spec{SandboxID: id, Dir: filepath.Join(dir, "sb"), GuestOS: hostGuestOS, BaseImage: hostBaseImage}
+
+	// A canceled context fails the readiness wait; an empty PATH makes the
+	// `ps` command of the process listing fail.
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	oldPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	_, err = rt.Create(canceled, spec)
+	if restoreErr := os.Setenv("PATH", oldPath); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if err == nil {
+		t.Fatal("Create with a canceled context succeeded; want an error")
+	}
+	if v, err := rt.lookup(id); err == nil {
+		if !v.hasExited() {
+			_ = signalGroup(v.cmd, sigKill)
+		}
+		t.Fatal("sandbox is still tracked after the failed Create; the caller cannot retry the cleanup")
+	}
+	if _, err := os.Stat(spec.Dir); !os.IsNotExist(err) {
+		t.Errorf("sandbox directory after the failed Create: %v; want it removed", err)
+	}
+}

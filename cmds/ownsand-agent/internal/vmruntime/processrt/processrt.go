@@ -222,11 +222,11 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	select {
 	case err := <-readyDone:
 		if err != nil {
-			r.Delete(context.Background(), spec.SandboxID)
+			r.deleteAfterFailedStart(v)
 			return nil, fmt.Errorf("processrt: guest helper not ready: %w", err)
 		}
 	case <-v.exited:
-		r.Delete(context.Background(), spec.SandboxID)
+		r.deleteAfterFailedStart(v)
 		return nil, errors.New("processrt: guest helper exited during start")
 	}
 	r.logger.Info("process sandbox started", "sandbox_id", spec.SandboxID, "pid", cmd.Process.Pid)
@@ -234,10 +234,25 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 }
 
 // deleteAfterFailedStart removes a sandbox whose helper did not become ready.
-// A failed delete keeps the sandbox tracked, so it is logged here.
-func (r *Runtime) deleteAfterFailedStart(sandboxID string) {
-	if err := r.Delete(context.Background(), sandboxID); err != nil {
-		r.logger.Error("process sandbox cleanup after a failed start failed", "sandbox_id", sandboxID, "error", err)
+//
+// The caller records a failed create as terminal and does not delete the
+// sandbox again, so this cleanup has no retry path through Delete and must not
+// depend on the process listing that Delete uses to find exec workers. The
+// helper was never handed out, so no caller could start an exec worker below
+// it, and the cleanup kills the helper's process group directly. A cleanup
+// error is logged and the sandbox stays tracked; Close kills a helper that is still alive.
+func (r *Runtime) deleteAfterFailedStart(v *vm) {
+	if !v.hasExited() {
+		_ = v.signalHelper(sigKill)
+		select {
+		case <-v.exited:
+		case <-time.After(stopTimeout):
+			r.logger.Error("process sandbox cleanup after a failed start failed", "sandbox_id", v.id, "error", "helper did not stop")
+			return
+		}
+	}
+	if err := r.removeSandbox(v); err != nil {
+		r.logger.Error("process sandbox cleanup after a failed start failed", "sandbox_id", v.id, "error", err)
 	}
 }
 
@@ -422,12 +437,18 @@ func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 		}
 		r.logger.Info("process sandbox stopped", "sandbox_id", sandboxID)
 	}
+	return r.removeSandbox(v)
+}
+
+// removeSandbox removes the files of a sandbox whose helper was reaped and
+// then stops tracking it. A failed removal keeps the sandbox tracked.
+func (r *Runtime) removeSandbox(v *vm) error {
 	if err := os.RemoveAll(v.dir); err != nil {
 		return err
 	}
 	r.mu.Lock()
-	if r.vms[sandboxID] == v {
-		delete(r.vms, sandboxID)
+	if r.vms[v.id] == v {
+		delete(r.vms, v.id)
 	}
 	r.mu.Unlock()
 	return nil
