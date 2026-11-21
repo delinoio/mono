@@ -458,6 +458,179 @@ test("check and the --check CLI reject a deployable name with consecutive dots",
   }
 });
 
+// Names that `git check-ref-format refs/tags/<name>@<version>` rejects, plus
+// `-a`, which `git tag` reads as an option.
+const untaggableNames = [
+  "a..b",
+  "a b",
+  "a~b",
+  "a:b",
+  "a@{b",
+  "a*b",
+  "a[b",
+  "a\\b",
+  "a?b",
+  "a^b",
+  "a/.b",
+  "a//b",
+  "a/b.lock/c",
+  "-a",
+  "/a",
+  "a\tb",
+];
+
+const taggableNames = [
+  "a.b",
+  "a.",
+  "a-",
+  "a.lock",
+  "@scope/name",
+  "a/b.c/d",
+  "a_b",
+  "a__b",
+  "0a",
+];
+
+test("a release whose name cannot form a Git tag fails", () => {
+  for (const name of untaggableNames) {
+    assert.throws(
+      () => plan(status([name, "1.1.0"]), [pkg("packages/x", { name })]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, name);
+        assert.match(error.message, /must form a valid Git tag/, name);
+        // The diagnostic names the package and the tag it cannot form.
+        assert.ok(error.message.startsWith(`${name}: `), name);
+        assert.ok(
+          error.message.includes(JSON.stringify(`${name}@1.1.0`)),
+          name,
+        );
+        return true;
+      },
+      name,
+    );
+  }
+});
+
+test("a none release whose name cannot form a Git tag fails", () => {
+  assert.throws(
+    () =>
+      plan(status(["a..b", "1.0.0", ReleaseType.None]), [
+        pkg("packages/a..b", { name: "a..b" }),
+      ]),
+    (error) => {
+      assert.ok(error instanceof DeployPlanError);
+      assert.match(
+        error.message,
+        /^a\.\.b: a release name must form a valid Git tag/,
+      );
+      return true;
+    },
+  );
+});
+
+test("a release whose name can form a Git tag keeps the plan fields", () => {
+  for (const name of taggableNames) {
+    const result = plan(status([name, "1.1.0"]), [pkg("packages/x", { name })]);
+    assert.deepEqual(result.releases, [{ name, version: "1.1.0" }], name);
+    assert.deepEqual(result.servers, [], name);
+    assert.deepEqual(result.staticSites, [], name);
+  }
+});
+
+test("a deployable that fails its own name rule keeps that diagnostic", () => {
+  const targets = namedDeployables("a..b");
+  for (const target of Object.keys(targets)) {
+    assert.throws(
+      () => plan(status(["a..b", "1.1.0"]), [targets[target]]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, target);
+        assert.match(
+          error.message,
+          /^a\.\.b: a deployable package name must match/,
+          target,
+        );
+        return true;
+      },
+      target,
+    );
+  }
+});
+
+test("the release name rule does not apply to a package without a release", () => {
+  assert.doesNotThrow(() =>
+    plan(status(), [pkg("packages/a..b", { name: "a..b" })]),
+  );
+});
+
+test("check and the --check CLI reject a package name that cannot form a release tag", () => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  const setup = (name, version) => {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-tag-"));
+    mkdirSync(join(workDir, ".changeset"));
+    writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+    mkdirSync(join(workDir, "packages", name), { recursive: true });
+    writeFileSync(
+      join(workDir, "packages", name, "package.json"),
+      JSON.stringify({ name, version, private: true }),
+    );
+    return workDir;
+  };
+  const rejected = setup("a..b", "1.0.0");
+  try {
+    assert.throws(
+      () => check(rejected),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError);
+        assert.match(
+          error.message,
+          /^a\.\.b: a release name must form a valid Git tag/,
+        );
+        assert.ok(error.message.includes('"a..b@1.0.0"'));
+        return true;
+      },
+    );
+    const run = spawnSync(process.execPath, [cli, "--check", rejected], {
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 2);
+    const event = JSON.parse(run.stderr.trim());
+    assert.equal(event.event, "deploy_plan_error");
+    assert.match(
+      event.message,
+      /^a\.\.b: a release name must form a valid Git tag/,
+    );
+  } finally {
+    rmSync(rejected, { recursive: true, force: true });
+  }
+  const accepted = setup("a.b", "1.0.0");
+  try {
+    assert.deepEqual(check(accepted), ["brave-cats"]);
+    const run = spawnSync(process.execPath, [cli, "--check", accepted], {
+      encoding: "utf8",
+    });
+    assert.equal(run.status, 0, run.stderr);
+    assert.equal(JSON.parse(run.stdout.trim()).event, "deploy_plan_check");
+  } finally {
+    rmSync(accepted, { recursive: true, force: true });
+  }
+});
+
+test("check skips a non-deployable package whose name is not a string", () => {
+  for (const manifest of [{}, { name: 123 }, { name: null }]) {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-noname-"));
+    try {
+      mkdirSync(join(workDir, "packages", "x"), { recursive: true });
+      writeFileSync(
+        join(workDir, "packages", "x", "package.json"),
+        JSON.stringify(manifest),
+      );
+      assert.doesNotThrow(() => check(workDir), JSON.stringify(manifest));
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("check and the --check CLI reject a nameless deployable", () => {
   const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
   const cases = [

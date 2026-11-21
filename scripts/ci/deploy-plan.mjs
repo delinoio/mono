@@ -58,6 +58,43 @@ export const ReleaseType = Object.freeze({
 // consecutive dots. A trailing dot stays valid, because the version follows it.
 const deployableName = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]*$/;
 
+// The release step tags every release whose version advances as
+// `<name>@<version>`, deployable or not, so the name of any package that can be
+// released must form a valid Git ref. Git rejects a ref that contains `..`,
+// `@{`, an ASCII control character, a space, or one of `~ ^ : ? * [ \`, that
+// has an empty path component, or that has a component starting with `.` or,
+// except the last one, ending with `.lock`. `git tag` also reads a leading `-`
+// as an option. The version is a Changesets semver, so only the name can break
+// these rules. This mirrors `git check-ref-format refs/tags/<name>@<version>`
+// without a Git dependency in the planner.
+const forbiddenTagCharacters = /[\u0000- \u007f~^:?*[\\]/;
+
+// Throws when `<name>@<version>` cannot be a Git tag. `version` is only used
+// in the diagnostic, so `check()` passes the manifest version or a placeholder.
+function checkReleaseTagName(name, version) {
+  const components = name.split("/");
+  const last = components.length - 1;
+  const valid =
+    !forbiddenTagCharacters.test(name) &&
+    !name.startsWith("-") &&
+    !name.includes("..") &&
+    !name.includes("@{") &&
+    !name.startsWith("/") &&
+    !name.includes("//") &&
+    components.every(
+      (component, index) =>
+        !component.startsWith(".") &&
+        (index === last || !component.endsWith(".lock")),
+    );
+  if (!valid) {
+    throw new DeployPlanError(
+      `${name}: a release name must form a valid Git tag, but ${JSON.stringify(
+        `${name}@${version}`,
+      )} cannot be one`,
+    );
+  }
+}
+
 // The deploy workflow builds the image of a Droplet deployable with
 // `docker build --tag <name>:<sha>`, so the package name is a container image
 // repository name: lowercase alphanumeric runs joined by one separator, where
@@ -337,7 +374,20 @@ export function check(repoRoot) {
     ...list(join(changesetDir, "pre"), "pre/"),
   ];
   for (const id of ids) checkChangesetId(id);
-  plan({ changesets: [], releases: [] }, readWorkspacePackages(repoRoot));
+  const packages = readWorkspacePackages(repoRoot);
+  plan({ changesets: [], releases: [] }, packages);
+  // The plan above has no releases, so it cannot see a release name. Check the
+  // name of every workspace package here, so the pull request that adds or
+  // renames a package fails before a later release could. A deployable with a
+  // non-string name has already failed in the plan; another package with no
+  // usable name is not in scope, so it is skipped.
+  for (const { manifest } of packages) {
+    if (typeof manifest.name !== "string") continue;
+    checkReleaseTagName(
+      manifest.name,
+      typeof manifest.version === "string" ? manifest.version : "<version>",
+    );
+  }
   return ids;
 }
 
@@ -391,6 +441,10 @@ export function plan(status, packages) {
       .filter(Boolean)
       .map((d) => [d.name, { ...d, version: versions.get(d.name) }]),
   );
+  // After the deployable map, so a deployable that fails its own name rule
+  // keeps that diagnostic. A `none` release is checked too, because a later
+  // run can advance the same package and tag it.
+  for (const [name, version] of versions) checkReleaseTagName(name, version);
   // Order each deployment stage on its own: dependencies in an earlier stage
   // are already deployed, so the alphabetical tie-break applies within the
   // stage.
