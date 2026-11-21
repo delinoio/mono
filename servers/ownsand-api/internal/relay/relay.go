@@ -77,6 +77,7 @@ const outboundQueue = 1024
 var (
 	ErrConnClosed     = errors.New("the agent relay connection closed")
 	ErrReplaced       = errors.New("a newer agent relay connection replaced this one")
+	ErrStaleChannel   = errors.New("the agent channel of this relay connection is no longer current")
 	ErrTooManyStreams = errors.New("too many relay streams")
 	ErrWindowExceeded = errors.New("the agent sent beyond its credit window")
 	ErrControlFlood   = errors.New("the agent queued too many frames without credit on one stream")
@@ -629,9 +630,18 @@ func NewRegistry() *Registry {
 }
 
 // Register makes c the device's connection and closes an older one, whose
-// RPCs end with unavailable.
-func (r *Registry) Register(c *Conn) {
+// RPCs end with unavailable. current reports whether the agent channel that c
+// is bound to is still the device's current channel; it runs under the
+// registry lock, so a stale channel cannot replace a newer connection between
+// the caller's channel lookup and the swap. When it returns false, Register
+// changes nothing and returns ErrStaleChannel. current must not call back
+// into the registry. A nil current accepts every connection.
+func (r *Registry) Register(c *Conn, current func() bool) error {
 	r.mu.Lock()
+	if current != nil && !current() {
+		r.mu.Unlock()
+		return ErrStaleChannel
+	}
 	old := r.conns[c.DeviceID]
 	r.conns[c.DeviceID] = c
 	ch := r.changed
@@ -641,6 +651,7 @@ func (r *Registry) Register(c *Conn) {
 	if old != nil {
 		old.Close(ErrReplaced)
 	}
+	return nil
 }
 
 // Unregister removes c when it is still current.
