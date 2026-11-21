@@ -1,5 +1,5 @@
 Copyright 2026 Delino
 
-Repository-owned source is licensed under Apache License 2.0. Vendored source and bundled fonts retain their own license and copyright notices in their respective directories.
+Repository-owned source is licensed under Apache License 2.0. Vendored source, imported agent skills under `.agents/skills/` and bundled fonts retain their own license and copyright notices in their respective directories.
 
 Source under `servers/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/` is licensed under the Functional Source License, Version 1.1, ALv2 Future License (FSL-1.1-ALv2). See the `LICENSE` file in each of these directories; `LICENSE-FSL` is a root copy that applies only to these directories. Each version becomes available under Apache License 2.0 on the second anniversary of the date it is made available.

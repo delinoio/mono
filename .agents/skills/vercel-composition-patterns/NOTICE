@@ -1,0 +1,9 @@
+This directory contains an agent skill imported from an upstream project. It is not repository-owned source and is not relicensed by the repository-wide license.
+
+Source repository: https://github.com/vercel-labs/agent-skills
+Skill path: skills/composition-patterns/SKILL.md
+Commit: 5a37a6329fbad3666c3207392a6a7c0110e92efb
+
+License: the upstream skill declares the MIT license in the `license` field of its `SKILL.md` frontmatter. The upstream repository publishes no LICENSE file and no copyright notice at this commit, so none is copied here, and this notice does not state a copyright holder or year.
+
+The source repository, skill path and commit match the entry for this skill in the root `skills-lock.json`.
