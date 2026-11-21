@@ -90,7 +90,8 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Check formatting
         if: needs.changes.outputs.format == 'true'
@@ -149,14 +150,18 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-          cache: false
+          # Caches the Go module and build caches, keyed by the `go.sum` hash.
+          # Only this job saves them; the workspace job does not use them, so
+          # the two jobs do not race to save different caches under one key.
+          cache: true
       # scripts/protos.sh check also generates the TypeScript bindings with the
       # protoc-gen-es version that packages/ownsand-sdk pins.
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       # Installed before the Go tests: the OwnSand end-to-end suite runs the
       # TypeScript SDK test with rstest.
       - run: pnpm install --frozen-lockfile --ignore-scripts
@@ -174,7 +179,9 @@ jobs:
             exit 1
           fi
           go vet ./...
-          go test ./...
+          # -count=1 bypasses cached test results, so every run executes the
+          # tests; the restored build cache only skips recompilation.
+          go test -count=1 ./...
       - name: Check protobuf schemas and generated Go and TypeScript bindings
         shell: bash
         env:
@@ -198,7 +205,7 @@ jobs:
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; gofmt -l on tracked .go files; go vet ./...; go test ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime); scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; gofmt -l on tracked .go files; go vet ./...; go test -count=1 ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime); scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor.' >> "$GITHUB_STEP_SUMMARY"
   rust:
@@ -223,6 +230,17 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy
           rustc --version
           cargo --version
+          # The `cef-dll-sys` build script downloads the CEF distribution into
+          # `$CEF_PATH/<version>` when that directory is missing, and reuses it
+          # otherwise. Keep it outside `target/` so the Rust cache stores it.
+          echo "CEF_PATH=$HOME/.cache/cef" >> "$GITHUB_ENV"
+      - name: Restore Rust and CEF cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-directories: ~/.cache/cef
+          # Only main pushes save the cache. Pull requests restore the main
+          # cache and do not use the repository cache quota for their builds.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check Rust workspace
         shell: bash
         run: |
@@ -255,7 +273,8 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Install Chromium
         run: pnpm --filter delino-accounts exec e2e-web install chromium --with-deps
@@ -316,12 +335,15 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
+          # The go job owns the Go cache. setup-go cannot restore without
+          # saving, and both jobs would save different caches under one key.
           cache: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
-          package-manager-cache: false
+          # Caches the pnpm store, keyed by the `pnpm-lock.yaml` hash.
+          cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Build, lint, typecheck and test workspace packages
         # Every package runs: `--affected` selects no package when only a root
