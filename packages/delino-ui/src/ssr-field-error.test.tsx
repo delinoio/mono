@@ -165,6 +165,8 @@ describe.each([
 
 type DescriptionCase = {
   name: string;
+  /** Matches the opening tag of the element that carries `aria-describedby`. */
+  control: RegExp;
   /** Renders the component with the given description. */
   field: (description: React.ReactNode) => React.ReactElement;
 };
@@ -172,28 +174,33 @@ type DescriptionCase = {
 const DESCRIPTION_CASES: DescriptionCase[] = [
   {
     name: "TextField",
+    control: /<input[^>]*>/,
     field: (description) => (
       <TextField label="Name" description={description} />
     ),
   },
   {
     name: "Textarea",
+    control: /<textarea[^>]*>/,
     field: (description) => <Textarea label="Bio" description={description} />,
   },
   {
     name: "PasswordInput",
+    control: /<input[^>]*>/,
     field: (description) => (
       <PasswordInput label="Password" description={description} />
     ),
   },
   {
     name: "NumberInput",
+    control: /<input[^>]*>/,
     field: (description) => (
       <NumberInput label="Tickets" description={description} />
     ),
   },
   {
     name: "Select",
+    control: /<button[^>]*role="combobox"[^>]*>/,
     field: (description) => (
       <Select label="Role" description={description}>
         <SelectOption value="admin">Admin</SelectOption>
@@ -202,6 +209,7 @@ const DESCRIPTION_CASES: DescriptionCase[] = [
   },
   {
     name: "RadioGroup",
+    control: /<div[^>]*role="radiogroup"[^>]*>/,
     field: (description) => (
       <RadioGroup label="Plan" description={description}>
         <RadioGroupItem value="monthly">Monthly</RadioGroupItem>
@@ -210,12 +218,14 @@ const DESCRIPTION_CASES: DescriptionCase[] = [
   },
   {
     name: "Slider",
+    control: /<input[^>]*role="slider"[^>]*>/,
     field: (description) => (
       <Slider label="Volume" defaultValue={40} description={description} />
     ),
   },
   {
     name: "Switch",
+    control: /<button[^>]*role="switch"[^>]*>/,
     field: (description) => <Switch label="Alerts" description={description} />,
   },
 ];
@@ -261,6 +271,12 @@ describe.each(DESCRIPTION_CASES)(
       )?.[0];
       expect(element).toBeDefined();
       expect(element).not.toContain("hidden");
+      const descriptionId = element?.match(/\sid="([^"]+)"/)?.[1];
+      expect(descriptionId).toBeTruthy();
+      const control = markup.match(descriptionCase.control)?.[0];
+      expect(control).toBeDefined();
+      const describedBy = control?.match(/\saria-describedby="([^"]*)"/)?.[1];
+      expect(describedBy?.split(/\s+/)).toContain(descriptionId);
       expect(danglingDescribedByIds(markup)).toEqual([]);
     });
   },
