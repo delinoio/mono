@@ -15,9 +15,69 @@ import (
 	"time"
 )
 
+// DNSTransport names a transport of the DNS forwarder.
+type DNSTransport string
+
+const (
+	DNSTransportUDP DNSTransport = "udp"
+	DNSTransportTCP DNSTransport = "tcp"
+)
+
+// Default limits of concurrent forwarding work for one forwarder (one
+// sandbox). Each UDP query holds one upstream socket and each TCP connection
+// holds one guest and one upstream connection, so the limits bound the
+// sockets and goroutines that one guest can make the host open. The two
+// transports have separate limits, so a flood on one never starves the other.
+const (
+	DefaultDNSMaxUDPQueries = 64
+	DefaultDNSMaxTCPConns   = 32
+)
+
+// dnsRejectLogInterval is the minimum time between two rejection log records
+// of one transport. Rejections in between only increase the count that the
+// next record reports.
+const dnsRejectLogInterval = 5 * time.Second
+
+// dnsLimits holds the concurrency limits of one forwarder.
+type dnsLimits struct {
+	maxUDPQueries int
+	maxTCPConns   int
+}
+
+// dnsRejectLog logs rejections of one transport at most once per interval,
+// with the number of rejections since the previous record. It never logs a
+// payload.
+type dnsRejectLog struct {
+	mu       sync.Mutex
+	last     time.Time
+	rejected int
+}
+
+// note counts one rejection and logs when the interval has passed.
+func (r *dnsRejectLog) note(logger *slog.Logger, transport DNSTransport, limit int) {
+	r.mu.Lock()
+	r.rejected++
+	now := time.Now()
+	if !r.last.IsZero() && now.Sub(r.last) < dnsRejectLogInterval {
+		r.mu.Unlock()
+		return
+	}
+	count := r.rejected
+	r.rejected = 0
+	r.last = now
+	r.mu.Unlock()
+	logger.Warn("dns forwarder at capacity; rejected work",
+		slog.String("transport", string(transport)),
+		slog.Int("rejected", count),
+		slog.Int("limit", limit))
+}
+
 // DNSForwarder serves DNS to one guest at its gateway address and resolves
 // through the host resolver. It forwards whole messages without parsing
-// them, over UDP and TCP.
+// them, over UDP and TCP. It runs at most a fixed number of concurrent UDP
+// queries and TCP connections: a UDP query beyond the limit is dropped (the
+// guest resolver retries) and a TCP connection beyond the limit is closed
+// before any upstream work starts.
 type DNSForwarder struct {
 	udp      *net.UDPConn
 	tcp      *net.TCPListener
@@ -27,6 +87,11 @@ type DNSForwarder struct {
 	closed   chan struct{}
 	mu       sync.Mutex
 	conns    map[net.Conn]bool
+	udpSlots chan struct{}
+	tcpSlots chan struct{}
+	udpRej   dnsRejectLog
+	tcpRej   dnsRejectLog
+	limits   dnsLimits
 }
 
 // HostResolver returns the first name server of /etc/resolv.conf as
@@ -51,6 +116,11 @@ func HostResolver(path string) string {
 
 // StartDNS listens on listen (UDP and TCP) and forwards to upstream.
 func StartDNS(listen netip.AddrPort, upstream string, logger *slog.Logger) (*DNSForwarder, error) {
+	return startDNS(listen, upstream, logger, dnsLimits{maxUDPQueries: DefaultDNSMaxUDPQueries, maxTCPConns: DefaultDNSMaxTCPConns})
+}
+
+// startDNS is StartDNS with explicit concurrency limits (tests set small ones).
+func startDNS(listen netip.AddrPort, upstream string, logger *slog.Logger, limits dnsLimits) (*DNSForwarder, error) {
 	udp, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(listen))
 	if err != nil {
 		return nil, err
@@ -60,7 +130,8 @@ func StartDNS(listen netip.AddrPort, upstream string, logger *slog.Logger) (*DNS
 		udp.Close()
 		return nil, err
 	}
-	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), conns: map[net.Conn]bool{}}
+	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), conns: map[net.Conn]bool{},
+		udpSlots: make(chan struct{}, limits.maxUDPQueries), tcpSlots: make(chan struct{}, limits.maxTCPConns), limits: limits}
 	f.wg.Add(2)
 	go f.serveUDP()
 	go f.serveTCP()
@@ -98,10 +169,18 @@ func (f *DNSForwarder) serveUDP() {
 		if err != nil {
 			return
 		}
+		// Admit before copying the query or opening an upstream socket.
+		select {
+		case f.udpSlots <- struct{}{}:
+		default:
+			f.udpRej.note(f.logger, DNSTransportUDP, f.limits.maxUDPQueries)
+			continue
+		}
 		query := append([]byte(nil), buf[:n]...)
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
+			defer func() { <-f.udpSlots }()
 			c, err := net.DialTimeout("udp", f.upstream, 5*time.Second)
 			if err != nil {
 				return
@@ -128,12 +207,21 @@ func (f *DNSForwarder) serveTCP() {
 		if err != nil {
 			return
 		}
+		// Admit before dialing the upstream; close the excess connection.
+		select {
+		case f.tcpSlots <- struct{}{}:
+		default:
+			c.Close()
+			f.tcpRej.note(f.logger, DNSTransportTCP, f.limits.maxTCPConns)
+			continue
+		}
 		f.mu.Lock()
 		f.conns[c] = true
 		f.mu.Unlock()
 		f.wg.Add(1)
 		go func() {
 			defer f.wg.Done()
+			defer func() { <-f.tcpSlots }()
 			defer func() {
 				f.mu.Lock()
 				delete(f.conns, c)
