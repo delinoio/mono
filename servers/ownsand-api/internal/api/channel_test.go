@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -365,6 +367,97 @@ func TestHeartbeatTimeoutAndReplacement(t *testing.T) {
 		d, _ := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
 		return d.Msg.GetDevice().GetState() == ownsandv1.DeviceState_DEVICE_STATE_OFFLINE
 	})
+}
+
+// TestOfflineWriteOfClosedChannelSkipsReplacement checks the per-device fence:
+// a channel that closed as the current channel, whose clean-up is paused
+// after its removal from the hub, must not take the device offline once a
+// replacement channel registered and applied its state report. The last
+// channel's close still marks the device offline.
+func TestOfflineWriteOfClosedChannelSkipsReplacement(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	dev, agentA := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	deviceState := func() ownsandv1.DeviceState {
+		d, err := c.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.Msg.GetDevice().GetState()
+	}
+
+	// Pause the clean-up of channel A after the hub removed it as the
+	// current channel and before its offline write.
+	connA := env.App.Service.Hub.Get(dev.ID)
+	if connA == nil {
+		t.Fatal("no current channel")
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	env.App.Service.Hub.OnClose(func(closed *hub.Conn) {
+		if closed == connA {
+			close(entered)
+			<-release
+		}
+	})
+	released := false
+	releaseOnce := func() {
+		if !released {
+			released = true
+			close(release)
+		}
+	}
+	defer releaseOnce()
+	agentA.Close()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the close of channel A did not reach its listeners")
+	}
+
+	// Replacement B connects and its state report is applied while A's
+	// offline write is still pending.
+	agentB := env.NewFakeAgent(dev)
+	agentB.SetSandbox(sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED)
+	agentB.Connect()
+	agentB.WaitFor("state report ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateAck().GetStateReport() != nil })
+	if st := deviceState(); st != ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
+		t.Fatalf("device before the release = %v", st)
+	}
+
+	// Let A's clean-up run to its end.
+	releaseOnce()
+	testenv.Eventually(t, "the clean-up of channel A decided its offline write", func() bool {
+		return strings.Contains(env.Logs.String(), `"msg":"device_offline"`) || strings.Contains(env.Logs.String(), `"msg":"device_offline_skipped"`) ||
+			strings.Contains(env.Logs.String(), `"msg":"device_offline_update_failed"`)
+	})
+	if strings.Contains(env.Logs.String(), `"msg":"device_offline"`) {
+		t.Fatal("the closed channel A took the device offline")
+	}
+	if st := deviceState(); st != ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
+		t.Fatalf("device after the clean-up of A = %v", st)
+	}
+	if sb := getSandbox(t, c, org.ID, sandboxID); sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("sandbox after the clean-up of A = %v", sb.GetState())
+	}
+	agentB.Heartbeat(42)
+	agentB.WaitFor("heartbeat ack on B", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 42 })
+
+	// The close of the last channel still marks the device offline.
+	agentB.Close()
+	testenv.Eventually(t, "device offline", func() bool { return deviceState() == ownsandv1.DeviceState_DEVICE_STATE_OFFLINE })
+	sb := waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE)
+	if sb.GetLastKnownState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("last known state = %v", sb.GetLastKnownState())
+	}
 }
 
 func TestConcurrentReservation(t *testing.T) {
