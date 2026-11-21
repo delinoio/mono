@@ -327,4 +327,217 @@ describe("peer-to-peer data path", () => {
       .catch((e) => e);
     expect(error.code).toBe(Code.FailedPrecondition);
   });
+
+  describe("send back-pressure", () => {
+    /** Above the 1 MiB high-water mark of the session. */
+    const FULL = 2 << 20;
+
+    function writeAgent(): FakeAgent {
+      return (frame, peer) => {
+        if (frame.payload.case === "fileWriteChunk") {
+          const req = frame.payload.value;
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_WRITE_RESULT,
+            payload: {
+              case: "fileWriteResult",
+              value: {
+                writeId: req.writeId,
+                offset: req.offset,
+                length: BigInt(req.data.length),
+                finished: req.finish !== undefined,
+                sizeBytes: req.finish?.sizeBytes ?? 0n,
+              },
+            },
+          });
+        }
+      };
+    }
+
+    /**
+     * Opens the session of one sandbox handle with a small write and returns
+     * the handle and its channel. Each handle owns its own session.
+     */
+    async function warmUp(p: ReturnType<typeof p2pSetup>) {
+      const sandbox = p.h.client.sandbox(SANDBOX);
+      await p.h.clock.run(sandbox.writeFile("/warm", "x"));
+      expect(p.rtc.channels).toHaveLength(1);
+      expect(p.rtc.frames).toHaveLength(1);
+      return { sandbox, channel: p.rtc.channels[0]! };
+    }
+
+    test("concurrent multi-fragment writes never interleave their frames", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      // Every message that the SDK sends refills the buffer, so a sender
+      // must wait again between the fragments of one frame.
+      let messages = 0;
+      channel.bufferedAmount = FULL;
+      channel.afterSend = () => {
+        messages++;
+        channel.bufferedAmount = FULL;
+      };
+      // 40 KiB each: three data channel messages per frame.
+      const dataA = new Uint8Array(40 << 10).fill(0xa1);
+      const dataB = new Uint8Array(40 << 10).fill(0xb2);
+      const a = sandbox.writeFile("/a", dataA);
+      const b = sandbox.writeFile("/b", dataB);
+      await h.clock.settle();
+      // Back-pressure: nothing is sent while the buffer is full.
+      expect(messages).toBe(0);
+      expect(rtc.frames).toHaveLength(1);
+      const done = Promise.all([a, b]);
+      let finished = false;
+      done.then(
+        () => (finished = true),
+        () => (finished = true),
+      );
+      for (let i = 0; i < 40 && !finished; i++) {
+        // The buffer drains one message at a time and refills on the send.
+        channel.drain();
+        await h.clock.settle();
+      }
+      const [writtenA, writtenB] = await h.clock.run(done);
+      expect(writtenA.sizeBytes).toBe(BigInt(dataA.length));
+      expect(writtenB.sizeBytes).toBe(BigInt(dataB.length));
+      // Both frames reached the decoder complete and in order.
+      expect(messages).toBe(6);
+      expect(rtc.frames).toHaveLength(3);
+      const [, first, second] = rtc.frames;
+      for (const frame of [first!, second!]) {
+        expect(frame.payload.case).toBe("fileWriteChunk");
+      }
+      const chunks = [first!, second!].map(
+        (frame) =>
+          (frame.payload as { value: { data: Uint8Array } }).value.data,
+      );
+      expect(new Set([first!.streamId, second!.streamId]).size).toBe(2);
+      expect(chunks[0]!.length).toBe(40 << 10);
+      expect(chunks[1]!.length).toBe(40 << 10);
+      expect(chunks[0]!.every((byte) => byte === chunks[0]![0])).toBe(true);
+      expect(chunks[1]!.every((byte) => byte === chunks[1]![0])).toBe(true);
+      expect(new Set([chunks[0]![0], chunks[1]![0]])).toEqual(
+        new Set([0xa1, 0xb2]),
+      );
+    });
+
+    test("a single request waits for the buffer and then completes", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      const write = sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7));
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      // A drained event while the buffer still reports a full queue does not
+      // release the sender.
+      channel.drain(FULL);
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      channel.drain(0);
+      const written = await h.clock.run(write);
+      expect(written.sizeBytes).toBe(BigInt(40 << 10));
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+    });
+
+    test("a caller aborted while its frame waits for the send turn sends nothing", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      // The first write holds the send turn while it waits for the buffer.
+      const holder = sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7));
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      // The exec frame queues behind it; the caller aborts before its turn.
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const cancelled = sandbox
+        .run({ command: ["rm", "-rf", "/data"], signal: controller.signal })
+        .catch((e) => e);
+      await h.clock.settle();
+      controller.abort(reason);
+      await h.clock.settle();
+      channel.drain(0);
+      const written = await h.clock.run(holder);
+      expect(written.sizeBytes).toBe(BigInt(40 << 10));
+      expect(await h.clock.run(cancelled)).toBe(reason);
+      // Only the three messages of the first write went out; the cancelled
+      // exec request was never transmitted.
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      expect(
+        rtc.frames.some((frame) => frame.kind === DataFrameKind.EXEC_REQUEST),
+      ).toBe(false);
+    });
+
+    test("an abort during a frame in progress lets that frame finish", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        channel.bufferedAmount = FULL;
+      };
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const write = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10).fill(7), {
+          signal: controller.signal,
+        })
+        .catch((e) => e);
+      await h.clock.settle();
+      // The frame starts: its first message goes out, then it waits again.
+      channel.drain();
+      await h.clock.settle();
+      expect(messages).toBe(1);
+      controller.abort(reason);
+      for (let i = 0; i < 10 && messages < 3; i++) {
+        channel.drain();
+        await h.clock.settle();
+      }
+      // The frame is complete on the wire even though its caller aborted, so
+      // the decoder never sees a partial frame.
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      expect(await h.clock.run(write)).toBe(reason);
+    });
+
+    test("a session end while a sender waits stops it from sending", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      const waiting = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10))
+        .catch((e) => e);
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      rtc.peers[0]!.endSession(SessionEndReason.UNSPECIFIED);
+      await h.clock.settle();
+      // The session is gone: neither sender writes to the dead channel.
+      expect(messages).toBe(0);
+      // Each write recovers on a new session and completes there.
+      const results = await h.clock.run(Promise.all([waiting, queued]));
+      for (const result of results) {
+        expect(result).not.toBeInstanceOf(Error);
+      }
+      expect(rtc.channels).toHaveLength(2);
+      expect(messages).toBe(0);
+    });
+  });
 });

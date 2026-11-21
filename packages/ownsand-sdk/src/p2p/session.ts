@@ -76,6 +76,8 @@ export class PeerSession {
   readonly #streams = new Map<bigint, AsyncQueue<DataFrame>>();
   #nextStreamId = 1n;
   #ended: Error | undefined;
+  /** Tail of the send queue; a frame sends after the previous one finished. */
+  #sendTail: Promise<void> = Promise.resolve();
 
   private constructor(
     ctx: OperationContext,
@@ -267,6 +269,7 @@ export class PeerSession {
           kind,
           payload,
         }),
+        signal,
       );
       for await (const frame of queue) {
         if (frame.payload.case === "error") {
@@ -292,24 +295,59 @@ export class PeerSession {
     }
   }
 
-  async #send(frame: DataFrame): Promise<void> {
-    for (const message of encodeMessages(frame)) {
+  /**
+   * Sends one frame. The data channel carries one length-prefixed byte
+   * stream, so the messages of two frames must never interleave. A frame
+   * spans many messages and waits for the send buffer between them; the
+   * sends of concurrent requests therefore run one after another, and each
+   * holds the turn for all messages of its frame. A caller can abort while
+   * its frame waits for the turn, so the turn re-checks the signal before it
+   * sends the first message and skips a cancelled frame; a frame that is
+   * already in progress always completes, because a partial frame would
+   * corrupt the byte stream.
+   */
+  async #send(
+    frame: DataFrame,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    // Encode before the turn so that the critical section is only I/O.
+    const messages = encodeMessages(frame);
+    const previous = this.#sendTail;
+    const turn = previous.then(() => {
+      throwIfAborted(signal);
+      return this.#writeMessages(messages);
+    });
+    // The next sender waits for this turn to finish, whether it failed or
+    // not; the failure itself reaches only the caller of this frame.
+    this.#sendTail = turn.catch(() => {});
+    await turn;
+  }
+
+  async #writeMessages(messages: Uint8Array[]): Promise<void> {
+    for (const message of messages) {
+      // The wait loops: after it wakes, another condition (a session end or a
+      // buffer that filled again) can hold, so re-check before every send.
+      while (!this.#ended && this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
+        await this.#waitForBufferLow();
+      }
       if (this.#ended) {
         throw this.#ended;
       }
-      if (this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            this.#channel.removeEventListener("bufferedamountlow", done);
-            this.#channel.removeEventListener("close", done);
-            resolve();
-          };
-          this.#channel.addEventListener("bufferedamountlow", done);
-          this.#channel.addEventListener("close", done);
-        });
-      }
       this.#channel.send(message);
     }
+  }
+
+  /** Resolves when the send buffer drains or the channel closes. */
+  #waitForBufferLow(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        this.#channel.removeEventListener("bufferedamountlow", done);
+        this.#channel.removeEventListener("close", done);
+        resolve();
+      };
+      this.#channel.addEventListener("bufferedamountlow", done);
+      this.#channel.addEventListener("close", done);
+    });
   }
 
   #onMessage(event: unknown): void {
