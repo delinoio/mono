@@ -678,3 +678,47 @@ func TestUnknownKindOnStreamZeroIsIgnored(t *testing.T) {
 		t.Fatalf("ordinary close frames = %v, want one stream close frame", frames)
 	}
 }
+
+func TestRegistryRejectsStaleChannelWithoutClosingCurrent(t *testing.T) {
+	r := NewRegistry()
+	current := NewConn(context.Background(), "device", 2, testLimits)
+	if err := r.Register(current, func() bool { return true }); err != nil {
+		t.Fatal(err)
+	}
+	stale := NewConn(context.Background(), "device", 1, testLimits)
+	if err := r.Register(stale, func() bool { return false }); !errors.Is(err, ErrStaleChannel) {
+		t.Fatalf("stale Register = %v, want ErrStaleChannel", err)
+	}
+	select {
+	case <-current.Done():
+		t.Fatal("a stale registration closed the current connection")
+	default:
+	}
+	if got := r.Get("device", 2); got != current {
+		t.Fatal("the current connection is no longer registered")
+	}
+	if got := r.Get("device", 1); got != nil {
+		t.Fatal("the stale connection was registered")
+	}
+}
+
+func TestRegistryReplacesSameGenerationConnection(t *testing.T) {
+	r := NewRegistry()
+	first := NewConn(context.Background(), "device", 3, testLimits)
+	second := NewConn(context.Background(), "device", 3, testLimits)
+	ok := func() bool { return true }
+	if err := r.Register(first, ok); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Register(second, ok); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-first.Done():
+	case <-time.After(time.Second):
+		t.Fatal("the replaced connection stayed open")
+	}
+	if got := r.Get("device", 3); got != second {
+		t.Fatal("the newer connection is not current")
+	}
+}

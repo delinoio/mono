@@ -45,9 +45,20 @@ func (h RelayAgentHandler) Connect(ctx context.Context, stream *connect.BidiStre
 		return errUnavailable("the device has no agent channel on this instance")
 	}
 	conn := relay.NewConn(ctx, p.ID, hc.Generation, h.Limits)
-	h.Relays.Register(conn)
-	defer h.Relays.Unregister(conn)
 	log := h.S.Logger.With(slog.String("device_id", p.ID), slog.Uint64("generation", hc.Generation))
+	// The channel lookup above and the registration are separate steps; a
+	// reconnect can install a newer channel and its relay connection between
+	// them, so the registry rechecks that hc is still current under its lock.
+	err = h.Relays.Register(conn, func() bool {
+		cur := h.S.Hub.Get(p.ID)
+		return cur != nil && cur.Generation == hc.Generation
+	})
+	if err != nil {
+		conn.Close(err)
+		log.WarnContext(ctx, "relay_connection_rejected_stale_channel")
+		return errUnavailable("the agent channel of this device is no longer current")
+	}
+	defer h.Relays.Unregister(conn)
 	log.InfoContext(ctx, "relay_connection_opened")
 	go func() {
 		select {
