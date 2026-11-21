@@ -5,7 +5,6 @@
 package processrt
 
 import (
-	"os/exec"
 	"runtime"
 	"syscall"
 
@@ -26,14 +25,3 @@ var hostGuestOS, hostBaseImage = func() (ownsandv1.GuestOs, ownsandv1.BaseImage)
 	}
 	return ownsandv1.GuestOs_GUEST_OS_LINUX, ownsandv1.BaseImage_BASE_IMAGE_LINUX
 }()
-
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-}
-
-func signalGroup(cmd *exec.Cmd, sig syscall.Signal) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
-	}
-	return syscall.Kill(-cmd.Process.Pid, sig)
-}

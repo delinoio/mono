@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { OwnSandClient } from "./client.ts";
 import {
   ActivityRegistry,
+  createApiTransport,
   DEFAULT_API_ORIGIN,
   guardedFetch,
   resolveApiOrigin,
@@ -12,6 +14,7 @@ import { OwnSandConfigError, OwnSandValidationError } from "./errors.ts";
 import { BaseImage, SandboxState } from "./gen/delino/ownsand/v1/common_pb.ts";
 import { MemberService } from "./gen/delino/ownsand/v1/member_pb.ts";
 import { OrganizationService } from "./gen/delino/ownsand/v1/organization_pb.ts";
+import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
 import { SandboxService } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
 import { type LogRecord } from "./logger.ts";
 import { isUuidV7 } from "./uuidv7.ts";
@@ -164,6 +167,95 @@ describe("credentials", () => {
     expect(error.message).not.toContain(API_KEY);
     expect(error.message).toContain("[redacted]");
     expect(String(error.stack)).not.toContain(API_KEY);
+  });
+
+  test("redacts the per-request access token from concurrent unary errors", async () => {
+    const h = setup();
+    let n = 0;
+    const client = new OwnSandClient({
+      origin: h.api.origin,
+      fetch: h.api.fetch,
+      clock: h.clock,
+      env: {},
+      organizationId: ORG,
+      accessToken: async () => `sentinel-token-${"ABC"[n++ % 3]}`,
+    });
+    h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
+      throw new ConnectError(
+        `rejected ${call.headers.get("authorization")}`,
+        Code.Unauthenticated,
+      );
+    });
+    const errors = await Promise.all(
+      [0, 1, 2].map(() =>
+        client
+          .sandbox(SANDBOX)
+          .get()
+          .catch((e) => e),
+      ),
+    );
+    for (const error of errors) {
+      expect(error.message).toContain("[redacted]");
+      for (const t of ["A", "B", "C"]) {
+        expect(error.message).not.toContain(`sentinel-token-${t}`);
+        expect(String(error.stack)).not.toContain(`sentinel-token-${t}`);
+      }
+    }
+  });
+
+  test("redacts the per-request access token from streaming errors", async () => {
+    const h = setup();
+    const transport = createApiTransport({
+      origin: h.api.origin,
+      credential: { accessToken: async () => "sentinel-token-stream" },
+      organizationId: ORG,
+      fetch: h.api.fetch,
+      logger: undefined,
+      activity: new ActivityRegistry(),
+      now: () => 0,
+    });
+    h.api.stream(RelayService, "Exec", (_req, call) => {
+      throw new ConnectError(
+        `rejected ${call.headers.get("authorization")}`,
+        Code.Unauthenticated,
+      );
+    });
+    const res = await transport.stream(
+      RelayService.method.exec,
+      undefined,
+      undefined,
+      undefined,
+      (async function* () {
+        yield create(RelayService.method.exec.input, {});
+      })(),
+    );
+    const error = await (async () => {
+      try {
+        for await (const _ of res.message) {
+          // Drain until the stream error.
+        }
+      } catch (e) {
+        return e as Error;
+      }
+      return undefined;
+    })();
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error!.message).toContain("[redacted]");
+    expect(error!.message).not.toContain("sentinel-token-stream");
+  });
+
+  test("returns an error without the secret unchanged", async () => {
+    const h = setup();
+    const original = new ConnectError("plain failure", Code.Internal);
+    h.api.unary(SandboxService, "GetSandbox", () => {
+      throw original;
+    });
+    const error = await h.client
+      .sandbox(SANDBOX)
+      .get()
+      .catch((e) => e);
+    expect(error.message).toContain("plain failure");
+    expect(error.code).toBe(Code.Internal);
   });
 
   test("the logger receives RPC names and codes but no credential or content", async () => {

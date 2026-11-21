@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-package fcrt
+// Package guestsync flushes the page cache of a sandbox guest through its
+// guest helper, for the pause and snapshot rules of the runtimes.
+package guestsync
 
 import (
 	"context"
@@ -10,27 +12,27 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/go/ownsand/datapath"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// syncGuest flushes the guest page cache to the disk with `sync` through
-// the guest helper, so a disk copy taken while the VM is paused holds every
-// completed write. The GuestService has no flush RPC; the exec uses an
-// agent-generated exec_id and never reaches a caller.
-func syncGuest(ctx context.Context, v *vm) error {
+// Sync flushes the guest page cache to the disk with `sync` through the
+// guest helper of sandboxID, so a disk copy taken while the VM is paused
+// holds every completed write. The GuestService has no flush RPC; the exec
+// uses an agent-generated exec_id and never reaches a caller.
+func Sync(ctx context.Context, sandboxID string, dial guestclient.Dialer) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	id, err := uuidv7.NewString()
 	if err != nil {
 		return err
 	}
-	client := guestclient.New(v.Dial)
+	client := guestclient.New(dial)
 	defer client.Close()
 	s := client.Serve(ctx)
 	defer s.CloseResponse()
-	if err := s.Send(&ownsandv1.ServeRequest{Frame: datapath.MustNewFrame(1, v.id, &ownsandv1.ExecRequest{
-		SandboxId: v.id, ExecId: id, Command: []string{"sync"},
+	if err := s.Send(&ownsandv1.ServeRequest{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
+		SandboxId: sandboxID, ExecId: id, Command: []string{"sync"},
 	})}); err != nil {
 		return err
 	}

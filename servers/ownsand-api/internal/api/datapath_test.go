@@ -16,10 +16,11 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -443,6 +444,45 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	}
 }
 
+// TestAuthorizeRelayChannelLostWhilePending covers a pending grant whose
+// agent channel closes without an acknowledgement: the caller gets
+// unavailable without a retry delay (not the grant-limit resource_exhausted
+// result) and the pending grant is removed.
+func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
+	env := testenv.New(t)
+	org, agent, sandboxID := runningSandbox(t, env)
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	receivedCh := make(chan *ownsandv1.RelayGrant, 1)
+	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck { receivedCh <- g; return nil })
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := org.OwnerClient.DataPath.AuthorizeRelay(context.Background(), connect.NewRequest(areq))
+		errCh <- err
+	}()
+	received := <-receivedCh
+	// The channel closes while the caller waits, well before the
+	// acknowledgement timeout, so the removal of the pending grant ends the wait.
+	agent.Close()
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("AuthorizeRelay did not return after the agent channel closed")
+	}
+	if testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("channel lost while pending: %v", err)
+	}
+	if errDetail(err).GetRetryAfter() != nil {
+		t.Fatalf("channel loss carries a retry delay: %v", err)
+	}
+	if env.App.Plane.Grants.Get(received.GetGrantId()) != nil {
+		t.Fatal("pending grant kept after the channel closed")
+	}
+}
+
 func TestRelayConnectionRules(t *testing.T) {
 	limits := relay.Limits{StreamBuffer: 2 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: 100 * time.Millisecond, IdleTimeout: 400 * time.Millisecond}
 	env := testenv.New(t, func(o *app.Options) { o.RelayLimits = &limits })
@@ -591,5 +631,174 @@ func TestRelayStreamTimers(t *testing.T) {
 	}
 	if keepalives < 5 {
 		t.Fatalf("keepalives = %d", keepalives)
+	}
+}
+
+// failGrantSender makes the relay grant enqueue fail with err while the
+// returned switch is on, and queues on the live channel otherwise. It
+// reproduces a live channel whose outbound queue cannot take the grant before
+// the caller's context ends.
+func failGrantSender(env *testenv.Env, err error) (fail *atomic.Bool, entered chan struct{}) {
+	fail = &atomic.Bool{}
+	fail.Store(true)
+	entered = make(chan struct{}, 8)
+	env.App.Plane.SetGrantSender(func(ctx context.Context, conn *hub.Conn, e *ownsandv1.AgentEnvelope) error {
+		entered <- struct{}{}
+		if fail.Load() {
+			return err
+		}
+		return conn.Send(ctx, e)
+	})
+	return fail, entered
+}
+
+func grantsReceived(agent *testenv.FakeAgent) (ids []string) {
+	for _, e := range agent.Received() {
+		if g := e.GetRelayGrant(); g != nil {
+			ids = append(ids, g.GetGrantId())
+		}
+	}
+	return ids
+}
+
+// TestAuthorizeRelayEnqueueFailure covers a relay grant that cannot be queued
+// on a live agent channel: the reservation is released, so a retry with the
+// same authorization_id sends the grant again and returns its ID after the
+// agent acknowledges it; the failure is logged with the grant ID and an error
+// category.
+func TestAuthorizeRelayEnqueueFailure(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	c := org.OwnerClient
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	fail, _ := failGrantSender(env, context.Canceled)
+	_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if testenv.Code(err) != connect.CodeUnavailable || errDetail(err).GetRetryAfter() != nil {
+		t.Fatalf("enqueue failure: %v", err)
+	}
+	if n := env.App.Plane.Grants.Len(); n != 0 {
+		t.Fatalf("%d grants after the failed enqueue", n)
+	}
+	if len(grantsReceived(agent)) != 0 {
+		t.Fatal("the agent received a grant that was never queued")
+	}
+	logs := env.Logs.String()
+	if !strings.Contains(logs, `"msg":"relay_grant_enqueue_failed"`) || !strings.Contains(logs, `"error_category":"context_canceled"`) || !strings.Contains(logs, `"grant_id"`) {
+		t.Fatalf("no structured enqueue failure event in the logs")
+	}
+	// The retry reserves and sends again, and returns the ID after the ack.
+	fail.Store(false)
+	retry, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if ids := grantsReceived(agent); len(ids) != 1 || ids[0] != retry.Msg.GetGrantId() {
+		t.Fatalf("grants sent = %v, returned %s", ids, retry.Msg.GetGrantId())
+	}
+	if env.App.Plane.Grants.Len() != 1 || env.App.Plane.Grants.Admittable(retry.Msg.GetGrantId()) == nil {
+		t.Fatal("the retried grant is not the one live grant")
+	}
+	// An identical retry of the installed grant returns the same ID.
+	again, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if err != nil || again.Msg.GetGrantId() != retry.Msg.GetGrantId() {
+		t.Fatalf("identical retry: %v %v", again, err)
+	}
+}
+
+// TestAuthorizeRelayReplacementEnqueueFailure covers a replacement whose
+// grant cannot be queued: the predecessor stays live and can be replaced
+// again, and the retry of the replacement succeeds.
+func TestAuthorizeRelayReplacementEnqueueFailure(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	c := org.OwnerClient
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	first, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := first.Msg.GetGrantId()
+	repID, _ := uuidv7.NewString()
+	rep := proto.Clone(areq).(*ownsandv1.AuthorizeRelayRequest)
+	rep.AuthorizationId = repID
+	rep.ReplacesGrantId = &prev
+	fail, _ := failGrantSender(env, context.Canceled)
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep)); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("replacement enqueue failure: %v", err)
+	}
+	if env.App.Plane.Grants.Admittable(prev) == nil || env.App.Plane.Grants.Len() != 1 {
+		t.Fatalf("the predecessor was not kept alone: len=%d", env.App.Plane.Grants.Len())
+	}
+	if got := env.App.Plane.Grants.Get(prev); got.Successor != "" {
+		t.Fatalf("the predecessor keeps the successor link %q", got.Successor)
+	}
+	// The retry is a replacement again (not aborted by a stale successor).
+	fail.Store(false)
+	repl, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep))
+	if err != nil {
+		t.Fatalf("replacement retry: %v", err)
+	}
+	agent.WaitFor("replacement grant", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetRelayGrant().GetGrantId() == repl.Msg.GetGrantId() && e.GetRelayGrant().GetReplacesGrantId() == prev
+	})
+	testenv.Eventually(t, "predecessor replaced", func() bool {
+		return env.App.Plane.Grants.Get(prev) == nil && env.App.Plane.Grants.Admittable(repl.Msg.GetGrantId()) != nil
+	})
+}
+
+// TestAuthorizeRelayEnqueueFailureWakesWaiters covers a concurrent call of
+// the same authorization_id that waits on the reservation: when the enqueue
+// fails it returns unavailable (retryable, no grant-limit delay), not
+// resource_exhausted.
+func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, _, sandboxID := runningSandbox(t, env)
+	c := org.OwnerClient
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	env.App.Plane.SetGrantSender(func(ctx context.Context, conn *hub.Conn, e *ownsandv1.AgentEnvelope) error {
+		entered <- struct{}{}
+		<-release
+		return context.DeadlineExceeded
+	})
+	errs := make(chan error, 2)
+	go func() {
+		_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+		errs <- err
+	}()
+	<-entered
+	go func() {
+		_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+		errs <- err
+	}()
+	// Let the second call find the pending reservation and wait on it. If it
+	// is slower, it reserves after the removal and fails in the sender too.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if testenv.Code(err) != connect.CodeUnavailable || errDetail(err).GetRetryAfter() != nil {
+				t.Fatalf("call %d: %v", i, err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("a call did not return after the enqueue failure")
+		}
+	}
+	if n := env.App.Plane.Grants.Len(); n != 0 {
+		t.Fatalf("%d grants left", n)
 	}
 }

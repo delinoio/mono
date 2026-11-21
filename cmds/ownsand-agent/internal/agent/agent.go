@@ -15,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/backoff"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/identity"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
@@ -24,6 +23,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
+	"github.com/delinoio/mono/internal/backoff"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
