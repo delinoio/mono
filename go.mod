@@ -13,6 +13,7 @@ require (
 	github.com/pion/stun/v3 v3.1.7
 	github.com/pion/webrtc/v4 v4.2.26
 	github.com/pressly/goose/v3 v3.30.1
+	github.com/resend/resend-go/v3 v3.17.0
 	github.com/sirupsen/logrus v1.10.2
 	golang.org/x/net v0.62.0
 	golang.org/x/sys v0.50.0
