@@ -44,6 +44,12 @@ type timing struct {
 	pollInterval time.Duration
 	// createRetryWindow bounds the retries of a lost CreateSandbox response.
 	createRetryWindow time.Duration
+	// callerDeadlineSkew is how far before the caller's deadline a control
+	// plane deadline_exceeded status still counts as the caller's deadline.
+	// Connect sends the time left to the caller's deadline as a timeout
+	// header (truncated to milliseconds), so the server can end the request
+	// slightly before the caller's own timer fires.
+	callerDeadlineSkew time.Duration
 }
 
 func defaultTiming() timing {
@@ -61,6 +67,7 @@ func defaultTiming() timing {
 		backoffMax:           5 * time.Second,
 		pollInterval:         2 * time.Second,
 		createRetryWindow:    60 * time.Second,
+		callerDeadlineSkew:   250 * time.Millisecond,
 	}
 }
 

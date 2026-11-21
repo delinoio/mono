@@ -1645,7 +1645,9 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
 // the IDs of running containers of the service. Stub behavior:
 //   STUB_STATUS   `docker inspect` container status (default running).
-//   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
+//   STUB_HEALTHY  `curl` completes a request when 1 (default 1); otherwise it
+//                 fails with a transport error and no status.
+//   STUB_HTTP_CODE  HTTP status that a completed `curl` request prints (default 200).
 //   STUB_PS_EXIT exit code of `docker ps` (default 0).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
@@ -1698,7 +1700,11 @@ function runDroplet(
   logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
 esac`,
   );
-  shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
+  shellStub(
+    bin,
+    "curl",
+    '[[ "${STUB_HEALTHY:-1}" == 1 ]] || exit 7; printf "%s" "${STUB_HTTP_CODE:-200}"',
+  );
   for (const [name, body] of Object.entries(stubs)) {
     shellStub(bin, name, body);
   }
@@ -1744,7 +1750,7 @@ test(
       "docker run",
       "docker inspect",
       "docker inspect",
-      "curl --fail",
+      "curl --silent",
       "docker exec",
       "docker stop",
       "docker rm",
@@ -1898,6 +1904,35 @@ test(
     }
   },
 );
+
+test("droplet deploy accepts only a 2xx health status", { skip }, (t) => {
+  for (const code of ["200", "204"]) {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_HTTP_CODE: code },
+    });
+    assert.equal(result.status, 0, code + result.stdout + result.stderr);
+    assert.ok(result.calls.some((call) => call.startsWith("docker stop")));
+  }
+  for (const code of ["302", "307", "404", "500", "000"]) {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_HTTP_CODE: code },
+    });
+    assert.equal(result.status, 1, code);
+    assert.match(result.stderr, /did not pass the health check/, code);
+    assert.ok(
+      result.calls.some((call) => call.startsWith("docker rm --force api-")),
+      code,
+    );
+    assert.ok(
+      !result.calls.some((call) => call.startsWith("docker stop")),
+      code,
+    );
+    assert.equal(result.read("caddy/sites/api.caddy"), undefined, code);
+    assert.equal(result.read("state/api.current"), undefined, code);
+  }
+});
 
 test(
   "droplet deploy restores the route when the proxy rejects it",
