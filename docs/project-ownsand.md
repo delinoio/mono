@@ -79,7 +79,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 ### Licensing and code sharing
 
 - `servers/ownsand-api/` uses `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). Every other OwnSand path uses Apache-2.0.
-- The agent, the guest helper, the CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/ownsand/v1/` or `go/ownsand/`.
+- The agent, the guest helper, the CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/ownsand/v1/`, `go/ownsand/`, `go/uuidv7/` or a root [shared internal Go package](repository-workflow-contract.md#shared-internal-go-packages).
 
 ### Repository rules that apply without change
 
