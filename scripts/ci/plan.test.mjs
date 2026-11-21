@@ -1256,8 +1256,14 @@ test("CI workflow reads the planner workspace output for the workspace job and t
   const workspaceJob = workflow.slice(workflow.indexOf("\n  workspace:\n"));
   assert.match(
     workspaceJob,
-    /pnpm exec turbo run build lint typecheck test --continue/,
+    /pnpm exec turbo run build lint typecheck test --continue "--filter=\$filter"/,
   );
+  // The shards must stay complements so that together they select every
+  // workspace package.
+  assert.match(workspaceJob, /^\s+fail-fast: false$/m);
+  assert.match(workspaceJob, /^\s+shard: \[packages, servers\]$/m);
+  assert.match(workspaceJob, /^\s+packages\) filter='!\.\/servers\/\*' ;;$/m);
+  assert.match(workspaceJob, /^\s+servers\) filter='\.\/servers\/\*' ;;$/m);
   const qualityJob = workflow.slice(
     workflow.indexOf("\n  quality:\n"),
     workflow.indexOf("\n  go:\n"),

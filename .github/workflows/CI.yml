@@ -417,6 +417,14 @@ jobs:
     if: needs.changes.outputs.workspace == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      # The Go server packages and the other packages share no workspace
+      # dependency, so each shard runs on its own runner and the Go builds do
+      # not compete with the JavaScript builds for the CPUs of one runner.
+      # A failed shard does not cancel the other, so one run reports both.
+      fail-fast: false
+      matrix:
+        shard: [packages, servers]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -436,20 +444,40 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Build, lint, typecheck and test workspace packages
+        id: turbo
         # Every package runs: `--affected` selects no package when only a root
-        # input such as `package.json`, `turbo.json` or `go.mod` changes.
+        # input such as `package.json`, `turbo.json` or `go.mod` changes. The
+        # two shard filters are complements, so together they select every
+        # package, including a package added under a new workspace root.
         # `--continue` reports the failures of every package in one run.
-        run: pnpm exec turbo run build lint typecheck test --continue
+        shell: bash
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          case "$SHARD" in
+            packages) filter='!./servers/*' ;;
+            servers) filter='./servers/*' ;;
+            *)
+              echo "::error::Unknown workspace shard: $SHARD"
+              exit 1
+              ;;
+          esac
+          echo "filter=$filter" >> "$GITHUB_OUTPUT"
+          pnpm exec turbo run build lint typecheck test --continue "--filter=$filter"
       - name: Record validation result
         if: always()
         env:
           RESULT: ${{ job.status }}
+          SHARD: ${{ matrix.shard }}
+          FILTER: ${{ steps.turbo.outputs.filter }}
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           {
             echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
-            echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; pnpm exec turbo run build lint typecheck test --continue (every workspace package)'
+            echo "Workspace shard: $SHARD"
+            echo "Commands: pnpm install --frozen-lockfile --ignore-scripts; pnpm exec turbo run build lint typecheck test --continue --filter=${FILTER:-not started}"
             echo "Result: $RESULT"
             echo 'Scope: package build output, lint, typecheck and unit tests without a database. Deployment, Tauri bundles, app launch and release acceptance: not performed.'
           } >> "$GITHUB_STEP_SUMMARY"
