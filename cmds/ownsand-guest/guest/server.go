@@ -50,7 +50,8 @@ const DefaultKeepaliveInterval = 30 * time.Second
 
 // Config configures a Server.
 type Config struct {
-	// StateDir holds the read snapshots. It must be on the guest disk.
+	// StateDir holds the read snapshots and the write records. It must be on
+	// the guest disk, so that the records survive a restart of the helper.
 	StateDir string
 	// Version is the helper version that CheckReady reports.
 	Version string
@@ -77,7 +78,9 @@ type Server struct {
 
 var _ ownsandv1connect.GuestServiceHandler = (*Server)(nil)
 
-// New returns a server. It clears read snapshots of an earlier process.
+// New returns a server. It clears read snapshots of an earlier process and
+// registers the unfinished writes that an earlier process recorded, so that
+// the sweep removes their staging files.
 func New(cfg Config) (*Server, error) {
 	if cfg.StateDir == "" {
 		return nil, errors.New("guest: state directory is required")
@@ -101,13 +104,17 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	writes, err := newWriteManager(filepath.Join(cfg.StateDir, "writes"), cfg.Now, cfg.Logger)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		cfg:    cfg,
 		logger: cfg.Logger,
 		now:    cfg.Now,
 		execs:  newExecManager(cfg.Now, cfg.Logger),
 		reads:  reads,
-		writes: newWriteManager(cfg.Now, cfg.Logger),
+		writes: writes,
 	}, nil
 }
 
