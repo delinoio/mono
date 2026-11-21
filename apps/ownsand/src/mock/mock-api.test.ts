@@ -165,4 +165,18 @@ describe("mock idempotent createSandbox", () => {
       client.createSandbox({ ...request(key), labels: { team: "other" } }),
     ).rejects.toMatchObject({ code: Code.AlreadyExists });
   });
+
+  test("label order does not change the idempotency result", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    const first = await client.createSandbox({
+      ...request(key),
+      labels: { team: "ci", env: "dev" },
+    });
+    const retry = await client.createSandbox({
+      ...request(key),
+      labels: { env: "dev", team: "ci" },
+    });
+    expect(retry.sandbox?.sandboxId).toBe(first.sandbox?.sandboxId);
+  });
 });

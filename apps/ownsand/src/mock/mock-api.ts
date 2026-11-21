@@ -802,8 +802,19 @@ export function createMockTransport(
     router.service(SandboxService, {
       createSandbox(req) {
         const { org } = membership(req.organizationId);
+        // Map entries serialize in insertion order, so sort labels first to make
+        // the comparison independent of label order (the real API hashes a
+        // deterministic encoding).
+        const canonical = create(CreateSandboxRequestSchema, {
+          ...req,
+          labels: Object.fromEntries(
+            Object.entries(req.labels).sort(([a], [b]) =>
+              a < b ? -1 : a > b ? 1 : 0,
+            ),
+          ),
+        });
         const request = Array.from(
-          toBinary(CreateSandboxRequestSchema, req),
+          toBinary(CreateSandboxRequestSchema, canonical),
           (b) => b.toString(16).padStart(2, "0"),
         ).join("");
         const known = org.createKeys.get(req.idempotencyKey);
