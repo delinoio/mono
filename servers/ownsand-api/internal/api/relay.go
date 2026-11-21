@@ -279,10 +279,15 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, request *owns
 			return errUnavailable("the relay connection closed")
 		}
 		now := time.Now()
+		// The deadline holds on every successful receive, not only on an empty
+		// wake: Next returns queued frames before it looks at the wake channel,
+		// so a continuously populated queue would otherwise never rotate. The
+		// frame received at or after the deadline is not forwarded; the caller
+		// resumes from its last delivered offsets.
+		if accepted && !now.Before(rotateAt) {
+			return nil // rotation: OK status without a final event
+		}
 		if f == nil {
-			if accepted && !now.Before(rotateAt) {
-				return nil // rotation: OK status without a final event
-			}
 			if forwarded && !accepted {
 				if last := c.conn.LastReceive().Add(p.Timing.Acceptance); last.After(acceptBy) {
 					acceptBy = last
