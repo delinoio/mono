@@ -55,9 +55,9 @@ export const ReleaseType = Object.freeze({
 
 const deployableName = /^[a-z0-9][a-z0-9._-]*$/;
 
-// A Droplet service name is a container name, a Docker network alias that
-// the reverse proxy resolves, and a file name on the Droplet, so it allows no
-// dots and no other characters that a shell, DNS or a path would interpret.
+// A Droplet service name is a container name prefix, a label value, and a file
+// name on the Droplet, so it allows no dots and no other characters that a
+// shell, DNS or a path would interpret.
 const dropletServiceName = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 
 // A fully qualified host name of lowercase DNS labels. The reverse proxy

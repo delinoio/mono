@@ -11,15 +11,21 @@
 # the previous deployment (`/srv/delino/state/<service>.previous`).
 #
 # Steps: pull the image by digest, start a new container next to the running
-# one under the same network alias, wait until `GET /healthz` returns a
-# success status, write the reverse proxy route and reload the proxy, and only
-# then stop the old container. A failure before the old container stops
-# removes the new container, so the old one keeps serving. The exit code is
-# the deployment verdict.
+# one under its own unique name (it does not join the network alias of the
+# running one), wait until `GET /healthz` returns a success status, write the
+# reverse proxy route to the new container name and reload the proxy, and only
+# then stop the old container. The proxy route selects the old container until
+# the reload succeeds, so a container that is starting or unhealthy never
+# receives a request. A failure before the old container stops removes the new
+# container, so the old one keeps serving. The exit code is the deployment
+# verdict.
 #
 # Arguments:
-#   service   Droplet service name: container name prefix, network alias of
-#             the reverse proxy upstream and env file name.
+#   service   Droplet service name: container name prefix, label value and
+#             env file name. A deployment before this script version also
+#             used it as the network alias of the reverse proxy upstream; the
+#             first deployment with this version switches the route away from
+#             that alias.
 #   image     image reference pinned by digest (`<repository>@sha256:<hex>`).
 #   port      port that the server listens on inside the container. The
 #             script sets `ADDR=:<port>`.
@@ -100,8 +106,13 @@ main() {
   local new
   new="$service-$(date -u +%Y%m%d%H%M%S)-${image: -12}"
   echo "Start $new"
+  # The container name is the upstream of its own route. Docker resolves it on
+  # a user-defined network, and no other container shares it. The replacement
+  # takes no `--network-alias "$service"`: the running container keeps that
+  # alias, and Docker DNS would hand out the replacement address with it while
+  # the replacement still starts or fails its health check.
   docker run --detach --name "$new" \
-    --network "$network" --network-alias "$service" \
+    --network "$network" \
     --label "io.delino.service=$service" --label "io.delino.image=$image" \
     --restart unless-stopped \
     --env-file "$env_file" --env "ADDR=:$port" \
@@ -112,7 +123,7 @@ main() {
     fail "$new did not pass the health check; the previous container keeps serving."
   fi
 
-  if ! write_route "$site" "$service" "$port" "$hostname" "$proxy"; then
+  if ! write_route "$site" "$service" "$new" "$port" "$hostname" "$proxy"; then
     discard_replacement "$new"
     fail "the route of $service was not switched; the previous container keeps serving."
   fi
@@ -174,28 +185,28 @@ wait_healthy() {
   return 1
 }
 
-# Writes the reverse proxy route of the service and reloads the proxy when the
-# route changed. Every step reports its own failure and returns 1: the caller
+# Writes the reverse proxy route of the service to the upstream container and
+# reloads the proxy. The upstream is the unique name of the replacement, so
+# the route differs in every deployment and the proxy always reloads. Every step reports its own failure and returns 1: the caller
 # runs this function as an `if` condition, where Bash disables `set -e`, so a
 # failed file operation would not stop the function otherwise. The route file
 # changes only by one `mv`, which replaces it atomically, so a failure before
 # the reload leaves the previous route in place. Restores the previous route
 # when the proxy rejects the new one.
 write_route() {
-  local site="$1" service="$2" port="$3" hostname="$4" proxy="$5"
+  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6"
   local route
   # `lb_try_duration` retries a failed connection for 10 seconds, so a request
-  # that reaches the old container while it stops is sent to the new one.
+  # that arrives while the new container still opens its listener is not lost.
+  # The proxy reload is graceful: requests that the old container already
+  # accepted finish within the stop timeout of the old container.
   route="$(printf '%s\n' \
     "# Written by scripts/ci/droplet-deploy.sh for $service. Do not edit." \
     "$hostname {" \
-    "	reverse_proxy $service:$port {" \
+    "	reverse_proxy $upstream:$port {" \
     "		lb_try_duration 10s" \
     "	}" \
     "}")"
-  if [[ -f "$site" ]] && [[ "$(< "$site")" == "$route" ]]; then
-    return 0
-  fi
   local dir pending="$site.new" backup=""
   dir="$(dirname "$site")"
   if ! mkdir -p "$dir"; then
@@ -222,7 +233,7 @@ write_route() {
     return 1
   fi
   if docker exec "$proxy" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    echo "Reloaded the reverse proxy with the route https://$hostname -> $service:$port"
+    echo "Reloaded the reverse proxy with the route https://$hostname -> $upstream:$port"
     return 0
   fi
   echo "::error::the reverse proxy did not accept the route of $service." >&2
