@@ -136,6 +136,11 @@ func (s *Service) applyPaddleSubscription(ctx context.Context, tx pgx.Tx, acct *
 	} else if current.PaddleUpdateTime != nil && !entity.UpdatedAt.IsZero() && entity.UpdatedAt.Before(*current.PaddleUpdateTime) {
 		return false, nil
 	}
+	if current.Status == SubscriptionPending && current.PaddleSubscriptionID == "" && status == SubscriptionCanceled {
+		// A late event of an earlier subscription while a new checkout is
+		// open. It must not replace the pending checkout.
+		return false, nil
+	}
 	next := Subscription{
 		Status:               status,
 		PaddleSubscriptionID: entity.ID,

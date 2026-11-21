@@ -3,6 +3,7 @@
 package billing
 
 import (
+	"context"
 	"net/http"
 	"testing"
 	"time"
@@ -276,5 +277,57 @@ func TestCloseAccountCancelsSubscription(t *testing.T) {
 	}
 	if s, _ := f.paddle.Subscription(otherSub); s.Status != paddle.SubscriptionStatusActive {
 		t.Fatal("subscription changed")
+	}
+}
+
+func TestWorkerWakeAndStop(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	runCtx, cancel := context.WithCancel(ctx())
+	done := make(chan struct{})
+	go func() {
+		f.s.RunWorker(runCtx, time.Hour)
+		close(done)
+	}()
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("not queued")
+	}
+	f.s.Wake()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(f.paddle.Charges()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("Wake did not charge the queued top-up")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("RunWorker did not stop")
+	}
+}
+
+func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	oldSub := f.activate(acct)
+	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now()})
+	txnID := f.checkout(acct)
+	// A late, older event of the ended subscription arrives.
+	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now().Add(-time.Hour)})
+	f.webhook("subscription.updated", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now().Add(time.Hour)})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionPending || sub.CheckoutTransactionID != txnID {
+		t.Fatalf("subscription = %+v", sub)
+	}
+	// The new subscription replaces the pending checkout.
+	newSub := f.paddle.NewID("sub")
+	f.webhook("subscription.created", map[string]any{"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": f.clock.Now()})
+	sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub {
+		t.Fatalf("subscription = %+v", sub)
 	}
 }

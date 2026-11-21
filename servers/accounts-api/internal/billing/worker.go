@@ -12,9 +12,9 @@ import (
 // tasks.
 const DefaultWorkerInterval = 30 * time.Second
 
-// workerRunTimeout bounds one run of the tasks. A run is not canceled by the
-// shutdown, so a Paddle call or an email that has started finishes and its
-// result is recorded; the server waits for it.
+// workerRunTimeout bounds one run of the tasks. The shutdown cancels the run
+// between steps; a Paddle charge that has started is not canceled, so its
+// result is recorded, and the server waits for it.
 const workerRunTimeout = 2 * time.Minute
 
 // workerTask is one background task.
@@ -50,7 +50,7 @@ func (s *Service) RunOnce(ctx context.Context) {
 // RunWorker runs the background tasks every interval, and the automatic
 // top-ups at once after Wake, until ctx is done. Several server instances
 // may run it at the same time: every task locks what it changes. It returns
-// after the run in progress has finished.
+// after the step in progress has finished.
 func (s *Service) RunWorker(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		interval = DefaultWorkerInterval
@@ -59,7 +59,7 @@ func (s *Service) RunWorker(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	run := func(fn func(context.Context)) {
-		runCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), workerRunTimeout)
+		runCtx, cancel := context.WithTimeout(ctx, workerRunTimeout)
 		defer cancel()
 		fn(runCtx)
 	}
@@ -73,7 +73,7 @@ func (s *Service) RunWorker(ctx context.Context, interval time.Duration) {
 			run(s.RunOnce)
 		case <-s.wake:
 			run(func(ctx context.Context) {
-				if err := s.ProcessAutoTopUps(ctx); err != nil {
+				if err := s.ProcessAutoTopUps(ctx); err != nil && !(isContextErr(err) && ctx.Err() != nil) {
 					s.logger.ErrorContext(ctx, "billing_worker_task_failed",
 						slog.String("task", "process_auto_top_ups"), slog.Any("error", err))
 				}
