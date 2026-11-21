@@ -657,13 +657,15 @@ func openDownloadTarget(to string) (*downloadTarget, error) {
 			return nil, err
 		}
 	}
-	dir, base := filepath.Split(path)
+	dir, _ := filepath.Split(path)
 	for range 100 {
 		var b [8]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return nil, err
 		}
-		tmp := filepath.Join(dir, "."+base+"."+hex.EncodeToString(b[:])+".tmp")
+		// The staging name does not contain the destination base name, so a
+		// destination name at the filesystem limit still has room for it.
+		tmp := filepath.Join(dir, ".ownsand-"+hex.EncodeToString(b[:])+".tmp")
 		// 0666 before the umask gives a new destination the mode that
 		// os.Create would give it.
 		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)

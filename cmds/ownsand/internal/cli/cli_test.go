@@ -747,3 +747,95 @@ func TestLogtoScopesAlwaysIncludeRequiredScope(t *testing.T) {
 		t.Fatalf("logtoScopes(extra) = %v", got)
 	}
 }
+
+// TestFileReadLongDestinationName checks that the staging file name does not
+// depend on the destination name, so names at the filesystem limit work.
+func TestFileReadLongDestinationName(t *testing.T) {
+	probe := t.TempDir()
+	if f, err := os.Create(filepath.Join(probe, strings.Repeat("p", 255))); err != nil {
+		t.Skipf("the temporary directory cannot hold a 255-byte name: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	r := newRunner(t)
+	r.stdin = "sandbox bytes"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	names := map[string]string{
+		"255":       strings.Repeat("a", 255),
+		"234":       strings.Repeat("b", 234),
+		"multibyte": strings.Repeat("é", 120), // 240 bytes
+		"multi238":  strings.Repeat("é", 119), // 238 bytes
+	}
+	for label, name := range names {
+		t.Run(label+"/new", func(t *testing.T) {
+			dir := t.TempDir()
+			to := filepath.Join(dir, name)
+			if res := r.run("file", "read", "--to", to, r.f.sb, "/tmp/x"); res.code != 0 {
+				t.Fatalf("read --to: %+v", res)
+			}
+			if b, _ := os.ReadFile(to); string(b) != "sandbox bytes" {
+				t.Fatalf("content %q", b)
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+				t.Fatalf("temporary files left: %v", entries)
+			}
+		})
+		t.Run(label+"/existing", func(t *testing.T) {
+			dir := t.TempDir()
+			to := filepath.Join(dir, name)
+			if err := os.WriteFile(to, []byte("previous"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			if res := r.run("file", "read", "--to", to, r.f.sb, "/missing"); res.code != ExitError {
+				t.Fatalf("missing: %+v", res)
+			}
+			if b, _ := os.ReadFile(to); string(b) != "previous" {
+				t.Fatalf("a failed read changed the destination: %q", b)
+			}
+			if res := r.run("file", "read", "--to", to, r.f.sb, "/tmp/x"); res.code != 0 {
+				t.Fatalf("read --to: %+v", res)
+			}
+			if b, _ := os.ReadFile(to); string(b) != "sandbox bytes" {
+				t.Fatalf("content %q", b)
+			}
+			if info, _ := os.Stat(to); runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
+				t.Fatalf("mode %v", info.Mode().Perm())
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+				t.Fatalf("temporary files left: %v", entries)
+			}
+		})
+	}
+	t.Run("link to long target", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, strings.Repeat("t", 255))
+		if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink: %v", err)
+		}
+		if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code != 0 {
+			t.Fatalf("read --to: %+v", res)
+		}
+		if b, _ := os.ReadFile(target); string(b) != "sandbox bytes" {
+			t.Fatalf("content %q", b)
+		}
+		if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatal("the download replaced the symbolic link")
+		}
+	})
+	t.Run("name over the limit", func(t *testing.T) {
+		dir := t.TempDir()
+		res := r.run("file", "read", "--to", filepath.Join(dir, strings.Repeat("a", 256)), r.f.sb, "/tmp/x")
+		if res.code != ExitError || !strings.Contains(res.stderr, "file name too long") {
+			t.Fatalf("over limit: %+v", res)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Fatalf("files created: %v", entries)
+		}
+	})
+}
