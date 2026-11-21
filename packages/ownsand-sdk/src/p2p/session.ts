@@ -210,6 +210,12 @@ export class PeerSession {
         );
         answer = res.sdpAnswer;
       } catch (error) {
+        if (signal?.aborted) {
+          // A cancelled call is not an OpenSession failure: a transport can
+          // report the abort as Canceled, which must not move the handle to
+          // the relay.
+          throw error;
+        }
         if (
           error instanceof ConnectError &&
           AUTHORIZATION_CODES.has(error.code)

@@ -57,6 +57,7 @@ func testTiming() timing {
 		backoffMax:           100 * time.Millisecond,
 		pollInterval:         20 * time.Millisecond,
 		createRetryWindow:    time.Second,
+		callerDeadlineSkew:   250 * time.Millisecond,
 	}
 }
 
@@ -172,6 +173,9 @@ type fakeCP struct {
 	// created by the test before the first request and never replaced.
 	iceGate  chan struct{}
 	openGate chan struct{}
+	// gateErr, when set, is the error that a held request returns right
+	// after it reaches its gate, in place of waiting for the gate.
+	gateErr error
 	// iceServers are the ICE server URLs that GetIceServers returns.
 	iceServers []string
 	iceCalls   int // GetIceServers requests
@@ -483,6 +487,9 @@ func (f *fakeDataPath) hold(ctx context.Context, gate chan struct{}, kind string
 		case f.cp.gateHits <- kind:
 		default:
 		}
+	}
+	if err := f.cp.gateErr; err != nil {
+		return err
 	}
 	select {
 	case <-gate:
