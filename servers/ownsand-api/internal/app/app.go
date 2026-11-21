@@ -19,6 +19,7 @@ import (
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/janitor"
@@ -41,8 +42,10 @@ type Options struct {
 	NonceKey         []byte
 	NonceKeyPrevious []byte
 
-	CORSOrigins             []string
-	TrustProxyClientAddress bool
+	CORSOrigins []string
+	// ClientAddressMode selects the source of the client address for rate
+	// limits. The zero value gives requests no client address.
+	ClientAddressMode config.ClientAddressMode
 
 	DisplayNames api.DisplayNameSource
 	// Limits overrides the default rate limits (tests).
@@ -142,7 +145,7 @@ func New(opts Options) (*App, error) {
 	}
 	plane := api.NewDataPlane(svc, relayLimits, relayTiming)
 	authn := &api.Authenticator{Service: svc, Logto: opts.Logto}
-	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.TrustProxyClientAddress)...)}
+	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.ClientAddressMode)...)}
 
 	var mounts []server.Mount
 	add := func(path string, h http.Handler) { mounts = append(mounts, server.Mount{Path: path, Handler: h}) }

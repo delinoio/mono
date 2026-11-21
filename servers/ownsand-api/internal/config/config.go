@@ -18,27 +18,28 @@ import (
 
 // Environment variable names read by the server.
 const (
-	EnvAddr                    = "ADDR"
-	EnvLogLevel                = "LOG_LEVEL"
-	EnvDatabaseURL             = "DATABASE_URL"
-	EnvLogtoIssuer             = "LOGTO_ISSUER"
-	EnvLogtoJWKSURL            = "LOGTO_JWKS_URL"
-	EnvLogtoJWKSFile           = "LOGTO_JWKS_FILE"
-	EnvLogtoAudience           = "LOGTO_AUDIENCE"
-	EnvNonceKey                = "NONCE_KEY"
-	EnvNonceKeyPrevious        = "NONCE_KEY_PREVIOUS"
-	EnvCORSOrigins             = "CORS_ORIGINS"
-	EnvTrustProxyClientAddress = "TRUST_PROXY_CLIENT_ADDRESS"
-	EnvRunMigrations           = "RUN_MIGRATIONS"
-	EnvSTUNURLs                = "STUN_URLS"
-	EnvR2Endpoint              = "R2_ENDPOINT"
-	EnvR2Bucket                = "R2_BUCKET"
-	EnvR2AccessKeyID           = "R2_ACCESS_KEY_ID"
-	EnvR2SecretAccessKey       = "R2_SECRET_ACCESS_KEY"
-	EnvSnapshotPartSizeBytes   = "SNAPSHOT_PART_SIZE_BYTES"
-	EnvSTUNAddr                = "STUN_ADDR"
-	EnvSTUNRateBytesPerSecond  = "STUN_RATE_LIMIT_BYTES_PER_SECOND"
-	EnvSTUNRateBurstBytes      = "STUN_RATE_LIMIT_BURST_BYTES"
+	EnvAddr                     = "ADDR"
+	EnvLogLevel                 = "LOG_LEVEL"
+	EnvDatabaseURL              = "DATABASE_URL"
+	EnvLogtoIssuer              = "LOGTO_ISSUER"
+	EnvLogtoJWKSURL             = "LOGTO_JWKS_URL"
+	EnvLogtoJWKSFile            = "LOGTO_JWKS_FILE"
+	EnvLogtoAudience            = "LOGTO_AUDIENCE"
+	EnvNonceKey                 = "NONCE_KEY"
+	EnvNonceKeyPrevious         = "NONCE_KEY_PREVIOUS"
+	EnvCORSOrigins              = "CORS_ORIGINS"
+	EnvTrustProxyClientAddress  = "TRUST_PROXY_CLIENT_ADDRESS"
+	EnvAllowDirectClientAddress = "ALLOW_DIRECT_CLIENT_ADDRESS"
+	EnvRunMigrations            = "RUN_MIGRATIONS"
+	EnvSTUNURLs                 = "STUN_URLS"
+	EnvR2Endpoint               = "R2_ENDPOINT"
+	EnvR2Bucket                 = "R2_BUCKET"
+	EnvR2AccessKeyID            = "R2_ACCESS_KEY_ID"
+	EnvR2SecretAccessKey        = "R2_SECRET_ACCESS_KEY"
+	EnvSnapshotPartSizeBytes    = "SNAPSHOT_PART_SIZE_BYTES"
+	EnvSTUNAddr                 = "STUN_ADDR"
+	EnvSTUNRateBytesPerSecond   = "STUN_RATE_LIMIT_BYTES_PER_SECOND"
+	EnvSTUNRateBurstBytes       = "STUN_RATE_LIMIT_BURST_BYTES"
 )
 
 // Defaults.
@@ -63,6 +64,39 @@ const (
 	// minNonceKeySize is the smallest accepted nonce key.
 	minNonceKeySize = 32
 )
+
+// ClientAddressMode selects where the client address of a request comes
+// from. The address keys the per-client rate limits. The mode is resolved
+// once at startup by Load.
+type ClientAddressMode string
+
+const (
+	// ClientAddressNone gives requests no client address, so the per-client
+	// rate limits do not apply. It is the default: behind a reverse proxy
+	// that is not verified, the TCP peer is the proxy and would put every
+	// caller in one bucket.
+	ClientAddressNone ClientAddressMode = "none"
+	// ClientAddressDirect uses the TCP peer address and ignores forwarded
+	// headers. Use it only when callers connect to the server directly.
+	ClientAddressDirect ClientAddressMode = "direct"
+	// ClientAddressVerifiedProxy uses the last entry of the last
+	// X-Forwarded-For header, which is the value that the verified Caddy
+	// reverse proxy appends.
+	ClientAddressVerifiedProxy ClientAddressMode = "verified_proxy"
+)
+
+// ResolveClientAddressMode returns the client address mode for the two
+// settings. The verified proxy takes precedence over direct connections.
+func ResolveClientAddressMode(trustProxy, allowDirect bool) ClientAddressMode {
+	switch {
+	case trustProxy:
+		return ClientAddressVerifiedProxy
+	case allowDirect:
+		return ClientAddressDirect
+	default:
+		return ClientAddressNone
+	}
+}
 
 // LogLevel is the accepted set of log level values.
 type LogLevel string
@@ -123,6 +157,12 @@ type Config struct {
 	// that the Caddy reverse proxy appends) as the client address for rate
 	// limits.
 	TrustProxyClientAddress bool
+	// AllowDirectClientAddress uses the TCP peer address as the client
+	// address when TrustProxyClientAddress is false. Set it only for direct
+	// connections, such as development and tests.
+	AllowDirectClientAddress bool
+	// ClientAddressMode is the mode that the two settings above resolve to.
+	ClientAddressMode ClientAddressMode
 
 	// STUNURLs are the STUN server URLs for callers and agents.
 	STUNURLs []string
@@ -229,6 +269,14 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.TrustProxyClientAddress = b
 	}
+	if v := get(EnvAllowDirectClientAddress); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvAllowDirectClientAddress)
+		}
+		cfg.AllowDirectClientAddress = b
+	}
+	cfg.ClientAddressMode = ResolveClientAddressMode(cfg.TrustProxyClientAddress, cfg.AllowDirectClientAddress)
 
 	if v := get(EnvSTUNURLs); v != "" {
 		cfg.STUNURLs = nil
