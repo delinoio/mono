@@ -443,6 +443,45 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	}
 }
 
+// TestAuthorizeRelayChannelLostWhilePending covers a pending grant whose
+// agent channel closes without an acknowledgement: the caller gets
+// unavailable without a retry delay (not the grant-limit resource_exhausted
+// result) and the pending grant is removed.
+func TestAuthorizeRelayChannelLostWhilePending(t *testing.T) {
+	env := testenv.New(t)
+	org, agent, sandboxID := runningSandbox(t, env)
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	receivedCh := make(chan *ownsandv1.RelayGrant, 1)
+	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck { receivedCh <- g; return nil })
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := org.OwnerClient.DataPath.AuthorizeRelay(context.Background(), connect.NewRequest(areq))
+		errCh <- err
+	}()
+	received := <-receivedCh
+	// The channel closes while the caller waits, well before the
+	// acknowledgement timeout, so the removal of the pending grant ends the wait.
+	agent.Close()
+	var err error
+	select {
+	case err = <-errCh:
+	case <-time.After(10 * time.Second):
+		t.Fatal("AuthorizeRelay did not return after the agent channel closed")
+	}
+	if testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("channel lost while pending: %v", err)
+	}
+	if errDetail(err).GetRetryAfter() != nil {
+		t.Fatalf("channel loss carries a retry delay: %v", err)
+	}
+	if env.App.Plane.Grants.Get(received.GetGrantId()) != nil {
+		t.Fatal("pending grant kept after the channel closed")
+	}
+}
+
 func TestRelayConnectionRules(t *testing.T) {
 	limits := relay.Limits{StreamBuffer: 2 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: 100 * time.Millisecond, IdleTimeout: 400 * time.Millisecond}
 	env := testenv.New(t, func(o *app.Options) { o.RelayLimits = &limits })

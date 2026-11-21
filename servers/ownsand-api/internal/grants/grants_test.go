@@ -110,8 +110,41 @@ func TestLimitsReleaseAndRejection(t *testing.T) {
 	g, _, _ := r2.Reserve(req("r", "u", "op"), newID)
 	r2.Ack(g.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT, "")
 	<-g.Done()
-	if !g.Rejected() || r2.Len() != 0 {
+	if g.Outcome() != OutcomeRejectedLimit || r2.Len() != 0 {
 		t.Fatal("rejected grant kept")
+	}
+	// Removal of a pending grant without an acknowledgement (channel loss,
+	// release, revocation or another non-accepting result) is not a rejection.
+	r3 := New(c.now)
+	lost, _, _ := r3.Reserve(req("lost", "u", "op"), newID)
+	r3.RemoveChannel(lost.DeviceID, lost.ChannelGen)
+	<-lost.Done()
+	if lost.Outcome() != OutcomeRemoved || r3.Len() != 0 {
+		t.Fatalf("channel loss outcome = %v", lost.Outcome())
+	}
+	released, _, _ := r3.Reserve(req("released", "u", "op2"), newID)
+	r3.Release(released.ID, released.DeviceID)
+	<-released.Done()
+	if released.Outcome() != OutcomeRemoved {
+		t.Fatalf("release outcome = %v", released.Outcome())
+	}
+	revoked, _, _ := r3.Reserve(req("revoked", "u", "op3"), newID)
+	r3.RemoveMatching(func(x *Grant) bool { return x.ID == revoked.ID })
+	<-revoked.Done()
+	if revoked.Outcome() != OutcomeRemoved {
+		t.Fatalf("revocation outcome = %v", revoked.Outcome())
+	}
+	odd, _, _ := r3.Reserve(req("odd", "u", "op4"), newID)
+	r3.Ack(odd.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_UNSPECIFIED, "")
+	<-odd.Done()
+	if odd.Outcome() != OutcomeRemoved {
+		t.Fatalf("unspecified result outcome = %v", odd.Outcome())
+	}
+	accepted, _, _ := r3.Reserve(req("accepted", "u", "op5"), newID)
+	r3.Ack(accepted.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED, "")
+	<-accepted.Done()
+	if accepted.Outcome() != OutcomeAccepted {
+		t.Fatalf("accepted outcome = %v", accepted.Outcome())
 	}
 }
 

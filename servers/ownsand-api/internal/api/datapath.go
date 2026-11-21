@@ -434,8 +434,15 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	if g.Rejected() {
+	switch g.Outcome() {
+	case grants.OutcomeAccepted:
+	case grants.OutcomeRejectedLimit:
 		return nil, errRateLimited(time.Second)
+	default:
+		// The pending grant was removed without an acknowledgement (the agent
+		// channel closed, a revocation, a release or the expiry): not a
+		// capacity rejection, so the caller retries without the grant-limit delay.
+		return nil, errUnavailable("the agent channel closed before it acknowledged the relay grant")
 	}
 	now := h.S.now()
 	h.S.Logger.InfoContext(ctx, "relay_grant_issued", slog.String("grant_id", g.ID), slog.String("sandbox_id", g.SandboxID),
