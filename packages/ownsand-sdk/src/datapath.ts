@@ -10,7 +10,16 @@ import {
   SessionNotOpenError,
 } from "./p2p/session.ts";
 import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
-import type { OperationContext } from "./relay/context.ts";
+import { type OperationContext, throwIfAborted } from "./relay/context.ts";
+
+/** One shared peer session setup and the callers that wait for it. */
+interface SessionSetup {
+  /** Aborts the setup when the last waiting caller aborted. */
+  readonly controller: AbortController;
+  readonly promise: Promise<PeerSession | undefined>;
+  /** Callers that still wait for the setup. */
+  waiters: number;
+}
 
 /**
  * Selects the data path of one sandbox handle. With WebRTC available and no
@@ -24,7 +33,7 @@ export class DataPathSelector {
   readonly #Peer: PeerConnectionConstructor | undefined;
   readonly #forced: DataPathTransport | undefined;
   #session: PeerSession | undefined;
-  #opening: Promise<PeerSession | undefined> | undefined;
+  #setup: SessionSetup | undefined;
   #onRelay: boolean;
 
   constructor(
@@ -50,7 +59,13 @@ export class DataPathSelector {
       : DataPathTransport.PEER_TO_PEER;
   }
 
-  /** Returns the peer session to use, or undefined for the relay. */
+  /**
+   * Returns the peer session to use, or undefined for the relay. Concurrent
+   * callers share one session setup. The setup has its own abort signal, so
+   * the first caller's signal does not decide the outcome for the others: it
+   * is cancelled only when every caller that waits for it has aborted. Each
+   * caller still ends promptly with its own abort reason.
+   */
   async select(
     signal: AbortSignal | undefined,
   ): Promise<PeerSession | undefined> {
@@ -60,20 +75,79 @@ export class DataPathSelector {
     if (this.#session !== undefined && !this.#session.closed) {
       return this.#session;
     }
-    this.#opening ??= this.#open(signal).finally(() => {
-      this.#opening = undefined;
-    });
-    return this.#opening;
+    throwIfAborted(signal);
+    const setup = (this.#setup ??= this.#startSetup());
+    return this.#join(setup, signal);
   }
 
-  async #open(
+  #startSetup(): SessionSetup {
+    const controller = new AbortController();
+    const setup: SessionSetup = {
+      controller,
+      waiters: 0,
+      promise: this.#open(controller.signal).finally(() => {
+        if (this.#setup === setup) {
+          this.#setup = undefined;
+        }
+      }),
+    };
+    return setup;
+  }
+
+  /** Waits for a shared setup until it settles or the caller aborts. */
+  #join(
+    setup: SessionSetup,
     signal: AbortSignal | undefined,
   ): Promise<PeerSession | undefined> {
+    setup.waiters++;
+    if (signal === undefined) {
+      // A caller without a signal never aborts, so the setup is never
+      // cancelled while it waits.
+      return setup.promise;
+    }
+    return new Promise<PeerSession | undefined>((resolve, reject) => {
+      const onAbort = () => {
+        if (--setup.waiters === 0) {
+          // No caller waits any more: cancel the setup, and let the next
+          // caller start a fresh one even while this one winds down.
+          if (this.#setup === setup) {
+            this.#setup = undefined;
+          }
+          setup.controller.abort(signal.reason);
+        }
+        reject(signal.reason);
+      };
+      signal.addEventListener("abort", onAbort, { once: true });
+      setup.promise.then(
+        (session) => {
+          signal.removeEventListener("abort", onAbort);
+          resolve(session);
+        },
+        (error: unknown) => {
+          signal.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  async #open(signal: AbortSignal): Promise<PeerSession | undefined> {
     try {
-      this.#session = await PeerSession.open(this.#ctx, this.#Peer!, signal);
+      const session = await PeerSession.open(this.#ctx, this.#Peer!, signal);
+      if (signal.aborted) {
+        // The setup finished at the moment that its last caller aborted.
+        session.close();
+        throw signal.reason;
+      }
+      this.#session = session;
       this.#log(DataPathTransport.PEER_TO_PEER);
-      return this.#session;
+      return session;
     } catch (error) {
+      if (signal.aborted) {
+        // Every caller aborted. The cancelled setup is not a peer failure, so
+        // the handle stays on peer-to-peer.
+        throw error;
+      }
       if (error instanceof SessionNotOpenError) {
         // The sandbox is not RUNNING (for example PAUSED, where an AttachExec
         // still works on the relay). Use the relay for this attempt only: the
@@ -109,9 +183,14 @@ export class DataPathSelector {
     }
   }
 
-  /** The agent ended the session; the next operation opens a new one. */
-  sessionEnded(): void {
-    this.#session = undefined;
+  /**
+   * The agent ended `session`; the next operation opens a new one. A late end
+   * of a session that the handle already replaced keeps the replacement.
+   */
+  sessionEnded(session: PeerSession): void {
+    if (this.#session === session) {
+      this.#session = undefined;
+    }
   }
 
   /** Closes the session of the handle, if any. */

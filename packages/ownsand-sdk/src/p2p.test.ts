@@ -327,6 +327,181 @@ describe("peer-to-peer data path", () => {
     expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
   });
 
+  test("keeps the shared session setup running when the first caller aborts and another caller waits", async () => {
+    const { h, rtc } = p2pSetup(exitingAgent);
+    const sandbox = h.client.sandbox(SANDBOX);
+    const controller = new AbortController();
+    const reason = new Error("first caller cancelled");
+    // The first caller starts the shared setup with its own signal.
+    let abortedAt = -1;
+    const first = sandbox
+      .run({ command: ["a"], signal: controller.signal })
+      .catch((e) => {
+        abortedAt = h.clock.now();
+        return e;
+      });
+    const second = sandbox.run({ command: ["b"] });
+    // Setup is pending (ICE gathering takes virtual time).
+    await Promise.resolve();
+    controller.abort(reason);
+    const [error, run] = await h.clock.run(Promise.all([first, second]));
+    // The aborted caller ends promptly with its own reason...
+    expect(error).toBe(reason);
+    expect(abortedAt).toBe(0);
+    // ...and the other caller still gets the shared session.
+    expect(run.result.kind).toBe(ExecResultKind.Exited);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(rtc.connections).toHaveLength(1);
+    expect(rtc.channels[0]!.readyState).toBe("open");
+    expect(rtc.frames).toHaveLength(1);
+  });
+
+  test("cancels the shared session setup only when every waiting caller aborted, then starts a fresh one", async () => {
+    const { h, rtc } = p2pSetup(exitingAgent);
+    const sandbox = h.client.sandbox(SANDBOX);
+    const a = new AbortController();
+    const b = new AbortController();
+    const reasonA = new Error("a cancelled");
+    const reasonB = new Error("b cancelled");
+    const first = sandbox
+      .run({ command: ["a"], signal: a.signal })
+      .catch((e) => e);
+    const second = sandbox
+      .run({ command: ["b"], signal: b.signal })
+      .catch((e) => e);
+    await h.clock.advance(50);
+    a.abort(reasonA);
+    await h.clock.advance(20);
+    // One caller still waits, so the setup is still running.
+    expect(rtc.channels[0]!.readyState).not.toBe("closed");
+    b.abort(reasonB);
+    const errors = await h.clock.run(Promise.all([first, second]));
+    expect(errors).toEqual([reasonA, reasonB]);
+    // Nothing is left to wait for the setup: it was cancelled before the
+    // offer was sent, and the connection is closed.
+    expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+    expect(rtc.channels[0]!.readyState).toBe("closed");
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    // A later caller starts a new setup.
+    const run = await h.clock.run(sandbox.run({ command: ["c"] }));
+    expect(run.result.kind).toBe(ExecResultKind.Exited);
+    expect(rtc.connections).toHaveLength(2);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+  });
+
+  test("an abort during OpenSession keeps the handle on peer-to-peer and closes the connection", async () => {
+    const { h, rtc } = p2pSetup(exitingAgent, { openSessionMs: 5_000 });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    const pending = sandbox
+      .run({ command: ["a"], signal: controller.signal })
+      .catch((e) => e);
+    // 100 ms of gathering, then OpenSession is in flight.
+    await h.clock.advance(1_000);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    controller.abort(reason);
+    const error = await h.clock.run(pending);
+    expect(error).toBe(reason);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(rtc.channels[0]!.readyState).toBe("closed");
+    // The abort was not a peer failure: the next operation uses the peer
+    // path with a fresh session.
+    const run = await h.clock.run(sandbox.run({ command: ["b"] }));
+    expect(run.result.kind).toBe(ExecResultKind.Exited);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(rtc.connections).toHaveLength(2);
+  });
+
+  test("a Canceled error from OpenSession after an abort is not a peer failure", async () => {
+    const { h, rtc } = p2pSetup(exitingAgent);
+    h.api.unary(DataPathService, "OpenSession", async (_req, call) => {
+      await h.clock.sleep(5_000);
+      if (call.index === 0) {
+        // A transport reports an abort as Canceled, not as the abort reason.
+        throw new ConnectError("canceled", Code.Canceled);
+      }
+      return {
+        sessionId: `session-${call.index + 1}`,
+        sdpAnswer: "v=0 fake-answer",
+        expiresIn: { seconds: 3600n },
+      };
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    const pending = sandbox
+      .run({ command: ["a"], signal: controller.signal })
+      .catch((e) => e);
+    await h.clock.advance(1_000);
+    controller.abort(reason);
+    expect(await h.clock.run(pending)).toBe(reason);
+    // Let the abandoned OpenSession answer with Canceled.
+    await h.clock.advance(10_000);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(rtc.channels[0]!.readyState).toBe("closed");
+  });
+
+  test("a late session end from a retired session keeps the replacement session", async () => {
+    const peers: FakeAgentPeer[] = [];
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        const request = (frame as DataFrame & { payload: { value: any } })
+          .payload.value;
+        execEvent(peer, frame.streamId, ev.started());
+        if (request.command[0] === "a") {
+          // Command "a" keeps running until its session ends.
+          execEvent(peer, frame.streamId, ev.stdout(0, "a"));
+          peers.push(peer);
+        } else {
+          execEvent(peer, frame.streamId, ev.exited(0));
+        }
+      }
+      if (frame.kind === DataFrameKind.EXEC_ATTACH_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    // Consumer one starts on session one and then stops reading.
+    const first = sandbox.exec({ command: ["a"] });
+    const events = first[Symbol.asyncIterator]();
+    expect((await h.clock.run(events.next())).done).toBe(false);
+    expect(peers).toHaveLength(1);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    // The agent ends session one while consumer one is not reading.
+    peers[0]!.endSession(SessionEndReason.EXPIRED);
+    await h.clock.advance(10);
+    // A second call replaces the session.
+    await h.clock.run(sandbox.exec({ command: ["b"] }).wait());
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    // Consumer one resumes and reports the end of the retired session. It
+    // continues on the replacement and opens no third session.
+    await h.clock.run(
+      (async () => {
+        for (;;) {
+          const next = await events.next();
+          if (next.done) return;
+        }
+      })(),
+    );
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(rtc.connections).toHaveLength(2);
+    expect(rtc.channels[1]!.readyState).toBe("open");
+    // A third operation still uses the replacement.
+    await h.clock.run(sandbox.run({ command: ["c"] }));
+    expect(h.api.callsOf("OpenSession")).toHaveLength(2);
+    expect(rtc.connections).toHaveLength(2);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+  });
+
   test("ends the operation when a new session cannot be authorized", async () => {
     const { h } = p2pSetup(() => {});
     h.api.unary(DataPathService, "OpenSession", () => {

@@ -131,10 +131,10 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		c.logger.DebugContext(ctx, "ownsand data path session opened", "sandbox_id", d.s.id, "session_id", sess.sessionID, "transport", "peer-to-peer", "duration", time.Since(start))
 		return sess, nil
 	}
-	if ctx.Err() != nil {
+	if cerr := callerDeadlineEnded(ctx, err, c.timing.callerDeadlineSkew); cerr != nil {
 		// The caller's context ended first; it stays authoritative and
 		// starts no relay recovery.
-		return nil, ctx.Err()
+		return nil, cerr
 	}
 	var openErr *errP2POpen
 	if !errors.As(err, &openErr) {
@@ -163,6 +163,48 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 	d.inUse = ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY
 	d.mu.Unlock()
 	return nil, nil
+}
+
+// callerDeadlineEnded returns the error of the caller's context when the
+// caller's deadline ended a setup step, and nil otherwise. Besides the context
+// error itself it covers a transport-level failure of the control plane that
+// arrives within skew of the caller's deadline while the context still
+// reports no error. Connect sends the time left to the caller's deadline as a
+// timeout header, so the server can answer deadline_exceeded before the
+// caller's own timer fires (more often under CPU load), and a connection that
+// is cut at that moment fails the same way. Such a failure is the caller's
+// deadline and not a setup failure, so it must not start relay recovery. The
+// call then waits for the context to end (at most skew) so that the context
+// error is authoritative. Authorization and argument errors keep their own
+// handling.
+func callerDeadlineEnded(ctx context.Context, err error, skew time.Duration) error {
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	switch connect.CodeOf(err) {
+	case connect.CodeDeadlineExceeded, connect.CodeCanceled, connect.CodeUnavailable, connect.CodeUnknown:
+	default:
+		return nil
+	}
+	var openErr *errP2POpen
+	if errors.As(err, &openErr) {
+		// The setup window, not the caller, ended or failed the setup.
+		return nil
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) > skew {
+		return nil
+	}
+	timer := time.NewTimer(skew)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return context.DeadlineExceeded
 }
 
 // sessionFailed handles a session that failed during an operation: the

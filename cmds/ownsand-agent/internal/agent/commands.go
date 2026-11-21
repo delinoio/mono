@@ -159,13 +159,28 @@ func setSandboxResult(res *ownsandv1.AgentCommandResult, e *ownsandv1.SandboxSta
 	}
 }
 
+// beginTransfer reserves the device for one snapshot export or import. Once
+// the update installation started it fails with UNAVAILABLE, so the caller
+// retries after the agent restarted.
+func (a *Agent) beginTransfer() (func(), error) {
+	end, err := a.updater.BeginTransfer()
+	if err != nil {
+		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, Message: err.Error()}
+	}
+	return end, nil
+}
+
 func (a *Agent) exportSnapshot(ctx context.Context, cmd *ownsandv1.ExportSnapshotCommand) (*ownsandv1.ExportSnapshotResult, error) {
 	dir, release, ok := a.Sandboxes.AcquireSnapshot(cmd.GetSnapshotId())
 	if !ok {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, Message: "snapshot is not ready on this device"}
 	}
 	defer release()
-	end := a.Sandboxes.BeginTransfer()
+	end, err := a.beginTransfer()
+	if err != nil {
+		a.logger.Warn("snapshot export refused", "snapshot_id", cmd.GetSnapshotId(), "error", err)
+		return nil, err
+	}
 	defer end()
 	parts, size, err := a.transfer.Export(ctx, cmd.GetSnapshotId(), dir, cmd.GetPartSizeBytes())
 	if err != nil {
@@ -215,6 +230,15 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	for _, p := range cmd.GetParts() {
 		total += p.GetSizeBytes()
 	}
+	// Reserve the device against the update installation before any transfer
+	// I/O or import directory change. The cached-copy answer above needs no
+	// reservation: it only reads the entry.
+	end, err := a.beginTransfer()
+	if err != nil {
+		a.logger.Warn("snapshot import refused", "snapshot_id", snapshotID, "error", err)
+		return nil, err
+	}
+	defer end()
 	if free, err := sysinfo.FreeDiskBytes(a.st.Dir()); err == nil && free < 2*total {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "free disk does not fit the snapshot import"}
 	}
@@ -222,8 +246,6 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	if err != nil {
 		return nil, err
 	}
-	end := a.Sandboxes.BeginTransfer()
-	defer end()
 	// published becomes true once the ready entry points to the content. Until
 	// then the directory holds only this import's partial output, so every
 	// failure path removes it (the staging directory lives inside it). The
