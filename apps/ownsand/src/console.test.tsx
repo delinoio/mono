@@ -100,6 +100,15 @@ describe("roles", () => {
     expect(nav.textContent).not.toContain("Enrollment tokens");
   });
 
+  test("a member who opens an admin section sees no admin actions", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.northwind}/api-keys`);
+    expect(
+      await screen.findByText("You do not have permission to open this page."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Create API key" })).toBeNull();
+    expect(screen.getByRole("link", { name: "Go to sandboxes" })).toBeTruthy();
+  });
+
   test("an owner sees every section", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`);
     await screen.findByRole("link", { name: "API keys" });

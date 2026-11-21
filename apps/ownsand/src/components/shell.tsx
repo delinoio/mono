@@ -75,6 +75,16 @@ export function visibleSections(role: Role | undefined) {
   return SECTIONS.filter((s) => can(role, s.permission));
 }
 
+/**
+ * Whether a role may open a section. The organization switcher keeps the
+ * current section and a bookmark can name any section, so the shell checks
+ * the role of the destination organization, not only the navigation.
+ */
+export function canOpenSection(role: Role | undefined, id: RouteId): boolean {
+  const section = SECTIONS.find((s) => s.id === id);
+  return section === undefined || can(role, section.permission);
+}
+
 /** The top bar: product name, organization switcher and account links. */
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
@@ -182,7 +192,23 @@ export function OrgShell({
               ))}
             </ul>
           </nav>
-          <main className="content">{children}</main>
+          <main className="content">
+            {canOpenSection(role, current) ? (
+              children
+            ) : (
+              <div className="notice notice-error" role="alert">
+                <p>You do not have permission to open this page.</p>
+                <Link
+                  to={routePath({
+                    id: RouteId.Sandboxes,
+                    organizationId,
+                  })}
+                >
+                  Go to sandboxes
+                </Link>
+              </div>
+            )}
+          </main>
         </div>
       </OrgContext.Provider>
     );
