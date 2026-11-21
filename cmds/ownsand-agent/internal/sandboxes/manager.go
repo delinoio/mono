@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package sandboxes keeps the sandbox and snapshot records of the device,
 // runs the sandbox commands of the agent channel through a runtime,
@@ -116,6 +116,9 @@ type Manager struct {
 	epoch     string
 	sandboxes map[string]*sandbox
 	snapshots map[string]*snapshot
+	// pending holds the snapshots whose capture runs now, by ID. They are
+	// not in snapshots, so they are not usable and not reported.
+	pending   map[string]*pendingSnapshot
 	limits    *ownsandv1.DeviceLimits
 	transfers int
 	reports   map[uint64]map[string]uint64
@@ -156,7 +159,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	}
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
-		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, reports: map[uint64]map[string]uint64{},
+		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
 		if a.StateEpoch == "" {

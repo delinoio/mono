@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package update implements the signed agent update flow: it downloads the
 // signed release manifest and the release artifact of the platform,

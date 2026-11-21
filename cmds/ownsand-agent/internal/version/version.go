@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package version holds the running agent version. Compare versions with
 // github.com/delinoio/mono/internal/semver.

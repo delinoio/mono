@@ -11,7 +11,7 @@ This contract owns the OwnSand web console, component `ownsand-console`, of [`ow
 - Server state: React Query with `@connectrpc/connect-query` and the TypeScript bindings from the [protos contract](protos-ownsand-api-contract.md), imported from the workspace package `ownsand-sdk` (`ownsand-sdk/gen/<file>_pb`). The console imports only the generated bindings, not the SDK client. The transport is `@connectrpc/connect-web` with the binary Connect protocol. Queries retry only `unavailable` (twice); mutations never retry. A mutation invalidates the queries of the services it changes.
 - Routing: a small history-API router in `src/router.tsx` with the route IDs below; no routing library.
 - UI components: [`delino-ui`](packages-delino-ui-foundation.md).
-- Development port: `127.0.0.1:3300` (`strictPort`), recorded in the [environment contract](repository-environment-contract.md#process-boundaries).
+- Development port: `127.0.0.1:13300` (`strictPort`), recorded in the [environment contract](repository-environment-contract.md#process-boundaries).
 
 ## Users and Operators
 

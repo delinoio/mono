@@ -57,6 +57,12 @@ type stack struct {
 	apiKey   string
 	logs     *logSink
 	objects  *fakeS3
+	// apiEnv and api are the environment and process of the control plane,
+	// so a test can kill it and start it again over the same database.
+	apiEnv []string
+	api    *exec.Cmd
+	// work is the directory of the agent state directories.
+	work string
 }
 
 // requireE2E skips unless the suite is enabled and a database is set.
@@ -172,6 +178,26 @@ func (l *logSink) dump(t *testing.T) {
 	}
 }
 
+// processDone maps a started child process to the channel that closes when it
+// exited, so a test can stop one process before the test ends.
+var processDone sync.Map
+
+// killProcess kills a child process that startProcess started and waits for
+// it to exit, as a crash does: the process gets no chance to shut down.
+func killProcess(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+	done, ok := processDone.Load(cmd)
+	if !ok {
+		t.Fatal("killProcess: the process was not started by startProcess")
+	}
+	_ = cmd.Process.Kill()
+	select {
+	case <-done.(chan struct{}):
+	case <-time.After(15 * time.Second):
+		t.Fatal("the killed process did not exit")
+	}
+}
+
 // startProcess starts a child process that is stopped with SIGTERM when the
 // test ends.
 func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *exec.Cmd {
@@ -184,6 +210,7 @@ func startProcess(t *testing.T, logs *logSink, name string, env []string, bin st
 		t.Fatalf("start %s: %v", name, err)
 	}
 	done := make(chan struct{})
+	processDone.Store(cmd, done)
 	go func() { _ = cmd.Wait(); close(done) }()
 	t.Cleanup(func() {
 		_ = cmd.Process.Signal(syscall.SIGTERM)
@@ -211,6 +238,10 @@ type stackOptions struct {
 type agentProc struct {
 	deviceID string
 	stateDir string
+	// env and cmd are the environment and process of the agent, so a test
+	// can kill it and start it again over the same state directory.
+	env []string
+	cmd *exec.Cmd
 }
 
 // newStack starts the control plane, creates an organization with a user
@@ -269,7 +300,9 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 			"SNAPSHOT_PART_SIZE_BYTES=5242880",
 		)
 	}
-	startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))
+	s.apiEnv = apiEnv
+	s.work = work
+	s.api = startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))
 	s.waitHealthy()
 
 	ctx := s.ctx(2 * time.Minute)
@@ -318,7 +351,7 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 	if out, err := enroll.CombinedOutput(); err != nil {
 		t.Fatalf("ownsand-agent enroll: %v\n%s", err, out)
 	}
-	startProcess(t, s.logs, fmt.Sprintf("agent%d", i), agentEnv, filepath.Join(s.bins, "ownsand-agent"), "run")
+	cmd := startProcess(t, s.logs, fmt.Sprintf("agent%d", i), agentEnv, filepath.Join(s.bins, "ownsand-agent"), "run")
 
 	known := map[string]bool{}
 	for _, a := range s.agents {
@@ -329,7 +362,34 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 		Limits: &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 16384, DiskGib: 100, VcpuOvercommitPercent: 100}}); err != nil {
 		t.Fatalf("UpdateDeviceLimits: %v", err)
 	}
-	return agentProc{deviceID: deviceID, stateDir: stateDir}
+	return agentProc{deviceID: deviceID, stateDir: stateDir, env: agentEnv, cmd: cmd}
+}
+
+// killAgent kills agent i, as a crash does.
+func (s *stack) killAgent(i int) {
+	s.t.Helper()
+	killProcess(s.t, s.agents[i].cmd)
+}
+
+// restartAgent starts agent i again over its state directory.
+func (s *stack) restartAgent(i int) {
+	s.t.Helper()
+	a := &s.agents[i]
+	a.cmd = startProcess(s.t, s.logs, fmt.Sprintf("agent%d-restarted", i), a.env, filepath.Join(s.bins, "ownsand-agent"), "run")
+}
+
+// killAPI kills the control plane, as a crash does.
+func (s *stack) killAPI() {
+	s.t.Helper()
+	killProcess(s.t, s.api)
+}
+
+// restartAPI starts the control plane again on the same address over the
+// same database.
+func (s *stack) restartAPI() {
+	s.t.Helper()
+	s.api = startProcess(s.t, s.logs, "api-restarted", s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
+	s.waitHealthy()
 }
 
 func randomSuffix(t *testing.T) string {
