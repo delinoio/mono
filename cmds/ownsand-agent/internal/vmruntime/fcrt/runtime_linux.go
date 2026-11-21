@@ -35,6 +35,8 @@ import (
 const (
 	apiTimeout   = 10 * time.Second
 	readyTimeout = 60 * time.Second
+	// exitTimeout bounds the wait for a killed firecracker process to end.
+	exitTimeout = 10 * time.Second
 )
 
 // Runtime runs Firecracker microVMs.
@@ -43,6 +45,12 @@ type Runtime struct {
 	logger *slog.Logger
 	mu     sync.Mutex
 	vms    map[string]*vm
+	// host reads the process table; signalGroup kills the process group of
+	// a tracked child; stopTimeout bounds the wait for a killed process to
+	// end. Tests replace them with fixtures.
+	host        procHost
+	signalGroup func(pid int) error
+	stopTimeout time.Duration
 	// stopRefresh ends the network policy refresh loop; refreshDone
 	// closes when it returned. Both are nil without a network manager.
 	stopRefresh context.CancelFunc
@@ -90,7 +98,13 @@ func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
 	if opts.Network != nil {
 		startupCleanup()
 	}
-	r := &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}, hasNetAdmin: hasNetAdmin, lookPath: exec.LookPath}
+	r := &Runtime{
+		opts: opts, logger: opts.Logger, vms: map[string]*vm{},
+		hasNetAdmin: hasNetAdmin, lookPath: exec.LookPath,
+		host:        newLinuxProcs(),
+		signalGroup: func(pid int) error { return syscall.Kill(-pid, syscall.SIGKILL) },
+		stopTimeout: exitTimeout,
+	}
 	if opts.Network != nil {
 		ctx, cancel := context.WithCancel(context.Background())
 		r.stopRefresh, r.refreshDone = cancel, make(chan struct{})
@@ -299,8 +313,14 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	// cleanup releases everything of a failed create: the sandbox manager
 	// records the sandbox as FAILED and never calls Delete for it, so the
 	// registration and the directory handle must not outlive this call.
+	// A firecracker process that survives the kill keeps its registration and
+	// directory (with the launch record), so that Close and the next agent
+	// start can still find and stop it.
 	cleanup := func() {
-		r.stop(v)
+		if err := r.stop(v); err != nil {
+			r.logger.Error("failed create left a firecracker process running; keeping its directory", "sandbox_id", v.id, "error", err)
+			return
+		}
 		r.mu.Lock()
 		if r.vms[spec.SandboxID] == v {
 			delete(r.vms, spec.SandboxID)
@@ -351,7 +371,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		// The hypervisor could not read the saved state: boot the snapshot
 		// disk cold.
 		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		r.stop(v)
+		if err := r.stop(v); err != nil {
+			cleanup()
+			return nil, fmt.Errorf("fcrt: stop the failed restore process: %w", err)
+		}
 		if err := growDisk(ctx, filepath.Join(spec.Dir, diskFile), spec.Resources.GetDiskGib()<<30); err != nil {
 			cleanup()
 			return nil, err
@@ -405,6 +428,12 @@ func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
 	v.mu.Lock()
 	v.cmd, v.exited = cmd, exited
 	v.mu.Unlock()
+	// Without the record a later agent process cannot prove that it owns the
+	// process, so a failed write fails the start; the caller stops the
+	// process.
+	if err := writeLaunchRecord(r.host, v.dir, v.id, cmd.Process.Pid); err != nil {
+		return fmt.Errorf("fcrt: write launch record: %w", err)
+	}
 	v.api = newAPIClient(v.path(apiSocket))
 	actx, cancel := context.WithTimeout(ctx, apiTimeout)
 	defer cancel()
@@ -594,39 +623,74 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (inf
 	return info, nil
 }
 
-// stop kills the firecracker process of v and releases its network.
-func (r *Runtime) stop(v *vm) {
+// stop kills the firecracker process of v and releases its network. It
+// returns an error when the process is still alive after the bounded wait;
+// v then keeps its process reference, so that a later stop tries again.
+func (r *Runtime) stop(v *vm) error {
 	v.mu.Lock()
 	cmd, exited := v.cmd, v.exited
-	v.cmd = nil
 	v.mu.Unlock()
+	var err error
 	if cmd != nil && cmd.Process != nil {
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		select {
 		case <-exited:
-		case <-time.After(10 * time.Second):
-			r.logger.Error("firecracker did not stop", "sandbox_id", v.id)
+		default:
+			// Signal only a process that this agent has not reaped yet: after
+			// the wait goroutine reaped it, its PID may name another process.
+			if kerr := r.signalGroup(cmd.Process.Pid); kerr != nil && !errors.Is(kerr, syscall.ESRCH) {
+				r.logger.Error("signal firecracker failed", "sandbox_id", v.id, "pid", cmd.Process.Pid, "error", kerr)
+			}
+			timer := time.NewTimer(r.stopTimeout)
+			select {
+			case <-exited:
+			case <-timer.C:
+				err = fmt.Errorf("fcrt: firecracker process %d of sandbox %s did not stop within %s", cmd.Process.Pid, v.id, r.stopTimeout)
+				r.logger.Error("firecracker did not stop", "sandbox_id", v.id, "pid", cmd.Process.Pid)
+			}
+			timer.Stop()
+		}
+		if err == nil {
+			v.mu.Lock()
+			if v.cmd == cmd {
+				v.cmd = nil
+			}
+			v.mu.Unlock()
 		}
 	}
+	// Detach is idempotent. A guest that survives a failed stop loses its
+	// network anyway.
 	if v.attached {
 		r.opts.Network.Detach(v.id)
 		v.attached = false
 	}
+	return err
 }
 
 // Delete stops the microVM of the sandbox, also one that outlived an
-// earlier agent process, and removes its files.
+// earlier agent process, and removes its files. It succeeds only after the
+// firecracker process ended: while a process survives the bounded wait,
+// Delete returns an error and keeps the registration and the VM directory,
+// and a repeated Delete tries again. Deleting an absent VM succeeds.
 func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	r.mu.Lock()
-	v, ok := r.vms[sandboxID]
-	delete(r.vms, sandboxID)
+	v, tracked := r.vms[sandboxID]
 	r.mu.Unlock()
-	if ok {
-		r.stop(v)
-		v.dirFile.Close()
+	if tracked {
+		if err := r.stop(v); err != nil {
+			return err
+		}
 	}
-	for _, pid := range orphanPIDs()[sandboxID] {
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+	procs := r.ownedProcesses(sandboxID)
+	if err := r.killOwned(procs); err != nil {
+		return err
+	}
+	if tracked {
+		r.mu.Lock()
+		if r.vms[sandboxID] == v {
+			delete(r.vms, sandboxID)
+		}
+		r.mu.Unlock()
+		v.dirFile.Close()
 	}
 	if r.opts.VMsDir != "" {
 		return os.RemoveAll(r.vmDir(sandboxID))
@@ -634,8 +698,102 @@ func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	return nil
 }
 
+// killOwned kills verified processes and waits for each to end. It closes
+// the handles and returns an error naming the processes that survived.
+func (r *Runtime) killOwned(procs []*ownedProcess) error {
+	var errs []error
+	for _, p := range procs {
+		if err := p.handle.kill(); err != nil && !errors.Is(err, errProcessGone) {
+			r.logger.Error("signal firecracker of an earlier agent process failed", "sandbox_id", p.sandboxID, "pid", p.pid, "error", err)
+		}
+		if !p.handle.waitExit(r.stopTimeout) {
+			r.logger.Error("firecracker of an earlier agent process did not stop", "sandbox_id", p.sandboxID, "pid", p.pid)
+			errs = append(errs, fmt.Errorf("fcrt: firecracker process %d of sandbox %s did not stop within %s", p.pid, p.sandboxID, r.stopTimeout))
+		}
+		p.handle.close()
+	}
+	return errors.Join(errs...)
+}
+
+// ownedProcesses returns the live firecracker processes that this agent
+// started and that its VM directories prove, for the sandbox or, with an
+// empty ID, for every VM directory. The launch record is the only proof of
+// ownership: a command line is never enough. A process that carries the
+// --id argument of a sandbox but fails the proof is not returned and is
+// logged with the reason. The caller closes the handles.
+func (r *Runtime) ownedProcesses(sandboxID string) []*ownedProcess {
+	ids := []string{sandboxID}
+	if sandboxID == "" {
+		ids = nil
+		if r.opts.VMsDir != "" {
+			if entries, err := os.ReadDir(r.opts.VMsDir); err == nil {
+				for _, e := range entries {
+					ids = append(ids, e.Name())
+				}
+			} else if !errors.Is(err, os.ErrNotExist) {
+				r.logger.Error("list VM directories failed", "error", err)
+			}
+		}
+	} else if r.opts.VMsDir == "" {
+		ids = nil
+	}
+	var owned []*ownedProcess
+	reasons := map[string]launchSkipReason{}
+	verified := map[int]bool{}
+	for _, id := range ids {
+		p, reason, err := verifyLaunch(r.host, r.vmDir(id), id)
+		if p != nil {
+			owned = append(owned, p)
+			verified[p.pid] = true
+			continue
+		}
+		reasons[id] = reason
+		// A record of a process that ended is the normal leftover of a VM
+		// that stopped with its agent.
+		if reason != skipProcessGone && reason != skipRecordMissing {
+			r.logger.Warn("launch record does not prove a firecracker process", "sandbox_id", id, "reason", string(reason), "error", err)
+		}
+	}
+	r.logUnverified(sandboxID, reasons, verified)
+	return owned
+}
+
+// logUnverified logs the firecracker-looking processes that carry the --id
+// argument of a sandbox and fail the launch proof, so that an operator sees
+// why a process survives the clean-up.
+func (r *Runtime) logUnverified(only string, reasons map[string]launchSkipReason, verified map[int]bool) {
+	pids, err := r.host.listPIDs()
+	if err != nil {
+		return
+	}
+	self := os.Getpid()
+	for _, pid := range pids {
+		if pid == self || verified[pid] {
+			continue
+		}
+		args, err := r.host.cmdline(pid)
+		if err != nil {
+			continue
+		}
+		for i := 0; i+1 < len(args); i++ {
+			if args[i] != "--id" || !strings.HasPrefix(args[i+1], idPrefix) {
+				continue
+			}
+			id := strings.TrimPrefix(args[i+1], idPrefix)
+			if only != "" && id != only {
+				continue
+			}
+			reason, ok := reasons[id]
+			if !ok {
+				reason = skipRecordMissing
+			}
+			r.logger.Warn("not signalling a process without a verified launch record", "sandbox_id", id, "pid", pid, "reason", string(reason))
+		}
+	}
+}
+
 // Running lists the sandboxes with a running microVM, including microVMs
-// of an earlier agent process.
+// of an earlier agent process that a launch record proves.
 func (r *Runtime) Running(context.Context) ([]string, error) {
 	seen := map[string]bool{}
 	r.mu.Lock()
@@ -647,42 +805,15 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 		}
 	}
 	r.mu.Unlock()
-	for id := range orphanPIDs() {
-		seen[id] = true
+	for _, p := range r.ownedProcesses("") {
+		seen[p.sandboxID] = true
+		p.handle.close()
 	}
 	ids := make([]string, 0, len(seen))
 	for id := range seen {
 		ids = append(ids, id)
 	}
 	return ids, nil
-}
-
-// orphanPIDs finds firecracker processes that this agent started (by their
-// --id argument), keyed by sandbox ID.
-func orphanPIDs() map[string][]int {
-	out := map[string][]int{}
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return out
-	}
-	self := os.Getpid()
-	for _, e := range entries {
-		var pid int
-		if _, err := fmt.Sscanf(e.Name(), "%d", &pid); err != nil || pid == self {
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join("/proc", e.Name(), "cmdline"))
-		if err != nil {
-			continue
-		}
-		args := strings.Split(string(raw), "\x00")
-		for i := 0; i+1 < len(args); i++ {
-			if args[i] == "--id" && strings.HasPrefix(args[i+1], idPrefix) && strings.Contains(filepath.Base(args[0]), "firecracker") {
-				out[strings.TrimPrefix(args[i+1], idPrefix)] = append(out[strings.TrimPrefix(args[i+1], idPrefix)], pid)
-			}
-		}
-	}
-	return out
 }
 
 // Close stops every microVM and the network policy refresh loop.
