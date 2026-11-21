@@ -8,11 +8,11 @@
 // waits for it to exit and removes the build output. A signal before the
 // server starts stops the launcher without starting the server.
 //
-// The server needs Postgres. When OWNSAND_DATABASE_URL is unset, the
+// The server needs Postgres. When DATABASE_URL is unset, the
 // launcher prints an `ownsand_api_dev_skipped` record and exits with status 0
 // instead of failing, so the root `pnpm dev` keeps running the other
 // development servers on machines without a database. When
-// OWNSAND_CORS_ORIGINS is unset, it allows the console's development origin
+// CORS_ORIGINS is unset, it allows the console's development origin
 // http://127.0.0.1:3300 in addition to the production origin.
 //
 // Child processes use explicit argument arrays and `shell: false` according
@@ -75,17 +75,17 @@ function run(command, args, env) {
 const stoppedStatus = () => signalExitCode(received);
 
 async function main() {
-  if (!process.env.OWNSAND_DATABASE_URL) {
+  if (!process.env.DATABASE_URL) {
     console.error(
       JSON.stringify({
         event: "ownsand_api_dev_skipped",
-        reason: "OWNSAND_DATABASE_URL is not set",
+        reason: "DATABASE_URL is not set",
       }),
     );
     return 0;
   }
   const env = { ...process.env };
-  env.OWNSAND_CORS_ORIGINS ??= `${ProductionConsoleOrigin},${DevelopmentConsoleOrigin}`;
+  env.CORS_ORIGINS ??= `${ProductionConsoleOrigin},${DevelopmentConsoleOrigin}`;
   const buildDir = await mkdtemp(join(tmpdir(), "ownsand-api-dev-"));
   try {
     if (received) return stoppedStatus();
