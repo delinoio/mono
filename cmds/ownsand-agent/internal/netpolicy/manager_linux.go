@@ -37,11 +37,17 @@ type Manager struct {
 	attached map[string]*attachment
 	used     map[int]bool
 	rules    string
+	// interval and refresh are RefreshInterval and Refresh; tests replace
+	// them.
+	interval time.Duration
+	refresh  func() error
 }
 
 // NewManager returns a manager.
 func NewManager(logger *slog.Logger) *Manager {
-	return &Manager{logger: logger, attached: map[string]*attachment{}, used: map[int]bool{}}
+	m := &Manager{logger: logger, attached: map[string]*attachment{}, used: map[int]bool{}, interval: RefreshInterval}
+	m.refresh = m.Refresh
+	return m
 }
 
 func run(name string, args ...string) error {
@@ -198,9 +204,10 @@ func (m *Manager) Detach(sandboxID string) {
 }
 
 // Run refreshes the policy every RefreshInterval while sandboxes are
-// attached.
+// attached, until ctx ends. The runtime that owns the manager runs it for
+// its lifetime.
 func (m *Manager) Run(ctx context.Context) {
-	t := time.NewTicker(RefreshInterval)
+	t := time.NewTicker(m.interval)
 	defer t.Stop()
 	for {
 		select {
@@ -211,7 +218,7 @@ func (m *Manager) Run(ctx context.Context) {
 			n := len(m.attached)
 			m.mu.Unlock()
 			if n > 0 {
-				if err := m.Refresh(); err != nil {
+				if err := m.refresh(); err != nil {
 					m.logger.Error("network policy refresh failed", "error", err)
 				}
 			}

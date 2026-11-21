@@ -16,6 +16,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -199,5 +200,30 @@ func TestCreateFailureReleasesVM(t *testing.T) {
 	}
 	if after := openFDs(t); after != before {
 		t.Fatalf("open descriptors %d before, %d after failed creates", before, after)
+	}
+}
+
+// The runtime runs the network policy refresh loop of its manager and
+// stops it on Close.
+func TestRuntimeRunsNetworkRefresh(t *testing.T) {
+	r, err := New(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.refreshDone == nil {
+		t.Fatal("refresh loop not started")
+	}
+	select {
+	case <-r.refreshDone:
+		t.Fatal("refresh loop ended before Close")
+	default:
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-r.refreshDone:
+	default:
+		t.Fatal("refresh loop still runs after Close")
 	}
 }

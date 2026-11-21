@@ -42,12 +42,17 @@ type Runtime struct {
 	logger *slog.Logger
 	mu     sync.Mutex
 	vms    map[string]*vm
+	// stopRefresh ends the network policy refresh loop; refreshDone
+	// closes when it returned. Both are nil without a network manager.
+	stopRefresh context.CancelFunc
+	refreshDone chan struct{}
 }
 
 var _ vmruntime.Runtime = (*Runtime)(nil)
 
 // New returns the runtime. It removes the tap devices and the nftables
-// table of an earlier agent process, whose VMs ended with it.
+// table of an earlier agent process, whose VMs ended with it, and runs the
+// network policy refresh loop until Close.
 func New(opts Options) (*Runtime, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -61,7 +66,16 @@ func New(opts Options) (*Runtime, error) {
 	if opts.Network != nil && hasNetAdmin() {
 		netpolicy.CleanupHost(opts.Logger)
 	}
-	return &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}}, nil
+	r := &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}}
+	if opts.Network != nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		r.stopRefresh, r.refreshDone = cancel, make(chan struct{})
+		go func() {
+			defer close(r.refreshDone)
+			opts.Network.Run(ctx)
+		}()
+	}
+	return r, nil
 }
 
 // Kind returns RuntimeKindFirecracker.
@@ -604,8 +618,12 @@ func orphanPIDs() map[string][]int {
 	return out
 }
 
-// Close stops every microVM.
+// Close stops every microVM and the network policy refresh loop.
 func (r *Runtime) Close() error {
+	if r.stopRefresh != nil {
+		r.stopRefresh()
+		<-r.refreshDone
+	}
 	r.mu.Lock()
 	ids := make([]string, 0, len(r.vms))
 	for id := range r.vms {
