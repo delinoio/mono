@@ -91,45 +91,100 @@ func requireE2E(t *testing.T) {
 	}
 }
 
-// moduleRoot returns the directory of the root go.mod.
-func moduleRoot(t *testing.T) string {
-	t.Helper()
+// findModuleRoot returns the directory of the root go.mod. When go env fails,
+// the error includes the stderr of the command, so the cause is not lost.
+func findModuleRoot() (string, error) {
 	out, err := exec.Command("go", "env", "GOMOD").Output()
 	if err != nil {
-		t.Fatalf("go env GOMOD: %v", err)
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			if stderr := strings.TrimSpace(string(exitErr.Stderr)); stderr != "" {
+				return "", fmt.Errorf("go env GOMOD: %w: %s", err, stderr)
+			}
+		}
+		return "", fmt.Errorf("go env GOMOD: %w", err)
 	}
-	return filepath.Dir(strings.TrimSpace(string(out)))
+	return filepath.Dir(strings.TrimSpace(string(out))), nil
 }
 
-// buildBinaries builds the control plane, agent, guest helper and CLI once
-// per test binary run.
-var (
-	buildOnce sync.Once
-	buildDir  string
-	buildErr  error
-)
-
-func buildBinaries(t *testing.T) string {
+// moduleRoot returns the directory of the root go.mod and fails the test when
+// it cannot be resolved.
+func moduleRoot(t *testing.T) string {
 	t.Helper()
-	buildOnce.Do(func() {
-		dir, err := os.MkdirTemp("", "ownsand-e2e-bin-")
-		if err != nil {
-			buildErr = err
-			return
-		}
-		buildDir = dir
+	root, err := findModuleRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+// buildSteps are the steps of one binary build. Tests replace them to check
+// the failure handling without running the Go toolchain.
+type buildSteps struct {
+	// mkdirTemp creates the output directory.
+	mkdirTemp func() (string, error)
+	// moduleRoot resolves the directory of the root go.mod.
+	moduleRoot func() (string, error)
+	// build builds the binaries into dir from the module root.
+	build func(root, dir string) error
+}
+
+// goBuildSteps are the steps that build the real binaries.
+var goBuildSteps = buildSteps{
+	mkdirTemp:  func() (string, error) { return os.MkdirTemp("", "ownsand-e2e-bin-") },
+	moduleRoot: findModuleRoot,
+	build: func(root, dir string) error {
 		cmd := exec.Command("go", "build", "-buildvcs=false", "-o", dir+string(filepath.Separator),
 			"./servers/ownsand-api/cmd/ownsand-api", "./cmds/ownsand-agent", "./cmds/ownsand-guest", "./cmds/ownsand")
-		cmd.Dir = moduleRoot(t)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			buildErr = fmt.Errorf("go build: %v\n%s", err, out)
+		cmd.Dir = root
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return fmt.Errorf("go build: %v\n%s", err, out)
 		}
+		return nil
+	},
+}
+
+// newBinaryBuilder returns a function that runs the steps once and returns the
+// same directory or the same error on every call. A step reports every failure
+// as an error and never ends the calling goroutine: sync.Once treats a
+// runtime.Goexit, such as t.Fatal, as a normal return, so later callers would
+// get an unbuilt directory and no error. A failed build removes its directory.
+func newBinaryBuilder(steps buildSteps) func() (string, error) {
+	return sync.OnceValues(func() (string, error) {
+		dir, err := steps.mkdirTemp()
+		if err != nil {
+			return "", err
+		}
+		root, err := steps.moduleRoot()
+		if err == nil {
+			err = steps.build(root, dir)
+		}
+		if err != nil {
+			_ = os.RemoveAll(dir)
+			return "", err
+		}
+		return dir, nil
 	})
-	if buildErr != nil {
-		t.Fatal(buildErr)
+}
+
+var (
+	// buildDir is the directory of the built binaries, which TestMain removes.
+	// It stays empty until a build succeeded.
+	buildDir     string
+	buildDirOnce sync.Once
+	buildCached  = newBinaryBuilder(goBuildSteps)
+)
+
+// buildBinaries builds the control plane, agent, guest helper and CLI once
+// per test binary run. Every call fails the test when the build failed.
+func buildBinaries(t *testing.T) string {
+	t.Helper()
+	dir, err := buildCached()
+	if err != nil {
+		t.Fatal(err)
 	}
-	return buildDir
+	buildDirOnce.Do(func() { buildDir = dir })
+	return dir
 }
 
 func TestMain(m *testing.M) {
