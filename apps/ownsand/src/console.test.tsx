@@ -164,6 +164,116 @@ describe("API keys", () => {
   });
 });
 
+describe("confirmation dialog errors", () => {
+  /** A transport whose RevokeApiKey fails for the first `failures` calls. */
+  function revokeTransport(failures: number) {
+    const mock = createMockTransport();
+    const state = { calls: 0 };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "RevokeApiKey") {
+          state.calls += 1;
+          if (state.calls <= failures) {
+            throw new ConnectError("revoke failed", Code.Unavailable);
+          }
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  /** The error notice inside a dialog; the live-region announcer also has the alert role. */
+  const noticeIn = (dialog: HTMLElement) =>
+    dialog.querySelector(".notice-error");
+
+  async function openRevoke() {
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /Revoke/ })[0]);
+    });
+    await settle();
+    return screen.findByRole("alertdialog");
+  }
+
+  async function confirmRevoke() {
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Revoke key" }),
+      );
+    });
+    await settle(60);
+  }
+
+  test("a failed action keeps the dialog open with a notice that a retry removes", async () => {
+    const { transport, state } = revokeTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    await openRevoke();
+    await confirmRevoke();
+    expect(noticeIn(screen.getByRole("alertdialog"))).toBeTruthy();
+    // The retry removes the old notice while it runs and closes on success.
+    await confirmRevoke();
+    expect(state.calls).toBe(2);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.querySelector(".notice-error")).toBeNull();
+    expect(document.querySelector(".notice-error")).toBeNull();
+  });
+
+  test("a notice does not survive Cancel and reopening", async () => {
+    const { transport } = revokeTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    await openRevoke();
+    await confirmRevoke();
+    expect(noticeIn(screen.getByRole("alertdialog"))).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+    await settle(60);
+    await screen.findByText(/ci-runner/);
+    const dialog = await openRevoke();
+    expect(noticeIn(dialog)).toBeNull();
+  });
+
+  test("a failure that arrives after Escape does not show on the next opening", async () => {
+    const mock = createMockTransport();
+    let release: (() => void) | undefined;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "RevokeApiKey") {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          throw new ConnectError("revoke failed", Code.Unavailable);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openRevoke();
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Revoke key" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    await settle(60);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await act(async () => {
+      release?.();
+    });
+    await settle(60);
+    const reopened = await openRevoke();
+    expect(noticeIn(reopened)).toBeNull();
+  });
+});
+
 describe("devices", () => {
   test("shows the overcommitted and effective vCPU limit", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices`);

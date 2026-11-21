@@ -196,6 +196,14 @@ export function ConfirmDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<unknown>();
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    // Adjust state while rendering: every time the dialog opens again it
+    // starts without the notice of an earlier failure, including a failure
+    // that arrived after the dialog was already closed.
+    setWasOpen(open);
+    if (open) setError(undefined);
+  }
   return (
     <AlertDialog
       open={open}
@@ -213,6 +221,8 @@ export function ConfirmDialog({
           <Button
             variant={ButtonVariant.Danger}
             onClick={async () => {
+              // A retry removes the notice of the previous failure.
+              setError(undefined);
               try {
                 await onConfirm();
                 onOpenChange(false);
