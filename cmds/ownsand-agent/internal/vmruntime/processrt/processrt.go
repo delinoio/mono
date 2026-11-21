@@ -44,6 +44,14 @@ const (
 // ReadyTimeout bounds the wait for the guest helper to answer.
 const ReadyTimeout = 30 * time.Second
 
+// stopTimeout bounds the wait for a killed helper to be reaped.
+const stopTimeout = 10 * time.Second
+
+// errHelperExited reports that the guest helper of a sandbox was reaped. The
+// operating system may have given its process ID, and so its process group ID,
+// to an unrelated process, so the runtime sends no signal to that group.
+var errHelperExited = errors.New("processrt: guest helper has exited")
+
 // Runtime is the process test runtime.
 type Runtime struct {
 	guestBinary string
@@ -120,6 +128,39 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 	return d.DialContext(ctx, "unix", v.socket)
 }
 
+// hasExited reports whether the helper was reaped.
+func (v *vm) hasExited() bool {
+	select {
+	case <-v.exited:
+		return true
+	default:
+		return false
+	}
+}
+
+// signalHelper sends sig to the helper's process group. It returns
+// errHelperExited without a syscall when the helper was reaped: Cmd.Wait does
+// not clear cmd.Process, so the negative process ID of a reaped helper can
+// address an unrelated process group that reused the ID. A helper that is
+// reaped between the check and the signal is a remaining, very short window
+// that the runtime cannot close, because it does not control when Cmd.Wait
+// reaps the helper.
+func (v *vm) signalHelper(sig syscall.Signal) error {
+	if v.hasExited() {
+		return errHelperExited
+	}
+	return signalGroup(v.cmd, sig)
+}
+
+// ignoreExited drops errHelperExited from err. A rollback that finds the
+// helper gone has nothing left to undo for it.
+func ignoreExited(err error) error {
+	if errors.Is(err, errHelperExited) {
+		return nil
+	}
+	return err
+}
+
 // Create starts the guest helper for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
 	if spec.GuestOS != hostGuestOS {
@@ -192,6 +233,14 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	return v, nil
 }
 
+// deleteAfterFailedStart removes a sandbox whose helper did not become ready.
+// A failed delete keeps the sandbox tracked, so it is logged here.
+func (r *Runtime) deleteAfterFailedStart(sandboxID string) {
+	if err := r.Delete(context.Background(), sandboxID); err != nil {
+		r.logger.Error("process sandbox cleanup after a failed start failed", "sandbox_id", sandboxID, "error", err)
+	}
+}
+
 func (r *Runtime) lookup(id string) (*vm, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -220,8 +269,8 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
-	if err := signalGroup(v.cmd, sigStop); err != nil {
-		return err
+	if err := v.signalHelper(sigStop); err != nil {
+		return fmt.Errorf("processrt: pause sandbox %s: %w", v.id, err)
 	}
 	groups, err := r.execGroups(ctx, v)
 	if err == nil {
@@ -230,7 +279,7 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		// groups is empty when the enumeration failed, so only the helper
 		// was stopped. A group that was not stopped ignores SIGCONT.
-		rollbackErr := errors.Join(r.signalGroups(v, groups, sigCont), signalGroup(v.cmd, sigCont))
+		rollbackErr := errors.Join(r.signalGroups(v, groups, sigCont), ignoreExited(v.signalHelper(sigCont)))
 		if rollbackErr != nil {
 			r.logger.Error("process sandbox pause rollback failed; the sandbox may stay stopped", "sandbox_id", v.id, "error", rollbackErr)
 		}
@@ -255,18 +304,23 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
+	if v.hasExited() {
+		// No signal reaches a reaped helper, and the workers below it are not
+		// resumed on its behalf.
+		return fmt.Errorf("processrt: resume sandbox %s: %w", v.id, errHelperExited)
+	}
 	groups, err := r.execGroups(ctx, v)
 	if err != nil {
 		return err
 	}
 	err = r.signalGroups(v, groups, sigCont)
 	if err == nil {
-		err = signalGroup(v.cmd, sigCont)
+		err = v.signalHelper(sigCont)
 	}
 	if err != nil {
 		// SIGSTOP to a group that is still stopped changes nothing, so the
 		// rollback can signal every enumerated group. SIGSTOP does not use ctx.
-		rollbackErr := errors.Join(r.signalGroups(v, groups, sigStop), signalGroup(v.cmd, sigStop))
+		rollbackErr := errors.Join(r.signalGroups(v, groups, sigStop), ignoreExited(v.signalHelper(sigStop)))
 		if rollbackErr != nil {
 			r.logger.Error("process sandbox resume rollback failed; the sandbox may run partly", "sandbox_id", v.id, "error", rollbackErr)
 		}
@@ -294,12 +348,10 @@ func (r *Runtime) execGroups(ctx context.Context, v *vm) ([]int, error) {
 	if v.cmd == nil || v.cmd.Process == nil {
 		return nil, nil
 	}
-	select {
-	case <-v.exited:
+	if v.hasExited() {
 		// The helper was reaped, so its process ID may belong to another
 		// process now.
 		return nil, nil
-	default:
 	}
 	groups, err := descendantGroups(ctx, v.cmd.Process.Pid)
 	if err != nil {
@@ -340,30 +392,68 @@ func (r *Runtime) Snapshot(_ context.Context, m vmruntime.VM, dir string) (vmrun
 
 // Delete kills the helper's process group and the process groups of the
 // exec workers below the helper, and removes the sandbox files.
+//
+// The runtime keeps the sandbox tracked until the helper is reaped and the
+// sandbox directory is removed. The helper is the only handle to the exec
+// workers below it, so a failure before the helper is killed (the process
+// listing, a signal to a worker group) returns an error and leaves the helper
+// alive and the sandbox tracked, and a retry of Delete completes the cleanup.
+// A failure leaves the helper stopped, because a continued helper could start
+// another worker, and a continued paused sandbox would run partly.
+//
+// The cleanup does not stop when ctx is canceled: a canceled caller is
+// typically an agent that shuts down, and an enumeration that failed for that
+// reason would orphan the workers. The process listing and the wait for the
+// helper have timeouts of their own.
+//
+// A helper that was reaped already (it crashed or was killed from outside)
+// receives no signal, because its process ID may belong to another process
+// now; Delete only removes the sandbox directory then.
 func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 	r.mu.Lock()
 	v, ok := r.vms[sandboxID]
-	delete(r.vms, sandboxID)
 	r.mu.Unlock()
-	if ok {
-		// Stop the helper first so that it cannot start another worker while
-		// the process tree is enumerated, then kill the workers and the helper.
-		// A stop or an enumeration error must not keep the helper alive.
-		_ = signalGroup(v.cmd, sigStop)
-		if err := r.signalDescendants(ctx, v, sigKill); err != nil {
-			r.logger.Warn("process sandbox exec workers may keep running", "sandbox_id", sandboxID, "error", err)
-		}
-		_ = signalGroup(v.cmd, sigCont)
-		_ = signalGroup(v.cmd, sigKill)
-		select {
-		case <-v.exited:
-		case <-time.After(10 * time.Second):
-			return fmt.Errorf("processrt: sandbox %s did not stop", sandboxID)
+	if !ok {
+		return nil
+	}
+	if !v.hasExited() {
+		if err := r.stopHelper(ctx, v); err != nil {
+			return err
 		}
 		r.logger.Info("process sandbox stopped", "sandbox_id", sandboxID)
-		return os.RemoveAll(v.dir)
 	}
+	if err := os.RemoveAll(v.dir); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	if r.vms[sandboxID] == v {
+		delete(r.vms, sandboxID)
+	}
+	r.mu.Unlock()
 	return nil
+}
+
+// stopHelper kills the exec workers below the helper and then the helper, and
+// waits until the helper is reaped. It returns early without killing the
+// helper when it cannot kill the workers.
+func (r *Runtime) stopHelper(ctx context.Context, v *vm) error {
+	// Stop the helper first so that it cannot start another worker while the
+	// process tree is enumerated, then kill the workers and the helper. A stop
+	// error must not keep the helper alive.
+	_ = v.signalHelper(sigStop)
+	// WithoutCancel: see Delete. The listing has its own timeout.
+	if err := r.signalDescendants(context.WithoutCancel(ctx), v, sigKill); err != nil {
+		r.logger.Error("process sandbox exec workers may keep running; delete can be retried", "sandbox_id", v.id, "error", err)
+		return err
+	}
+	_ = v.signalHelper(sigCont)
+	_ = v.signalHelper(sigKill)
+	select {
+	case <-v.exited:
+		return nil
+	case <-time.After(stopTimeout):
+		return fmt.Errorf("processrt: sandbox %s did not stop", v.id)
+	}
 }
 
 // Running lists the sandboxes whose helper runs.

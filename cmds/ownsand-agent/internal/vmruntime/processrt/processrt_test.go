@@ -6,6 +6,7 @@ package processrt
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -356,5 +357,162 @@ func TestResumeFailureKeepsSandboxStopped(t *testing.T) {
 	waitState(t, "helper after the retried Resume", helperPID, "S", "R")
 	for _, pid := range []int{shell, sleeper} {
 		waitState(t, "worker after the retried Resume", pid, "S", "R")
+	}
+}
+
+// killHelperAndWait kills the helper of v by its positive process ID, so that
+// only the helper dies, and waits until the runtime has reaped it. It returns
+// the helper.
+func killHelperAndWait(t *testing.T, rt *Runtime, v vmruntime.VM) *vm {
+	t.Helper()
+	h, err := rt.lookup(v.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(h.cmd.Process.Pid, syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-v.Exited():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the helper did not exit")
+	}
+	return h
+}
+
+// bystanderAsReusedGroup starts an unrelated process that leads a process
+// group of its own and makes h address that group, as if the operating system
+// gave the process ID of the reaped helper to it. It returns the bystander's
+// process ID. A signal that the runtime still sends to the helper's group
+// reaches the bystander.
+func bystanderAsReusedGroup(t *testing.T, h *vm) int {
+	t.Helper()
+	cmd := exec.Command("sleep", "300")
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	h.cmd = &exec.Cmd{Process: cmd.Process}
+	waitState(t, "bystander", cmd.Process.Pid, "S", "R")
+	return cmd.Process.Pid
+}
+
+// TestExitedHelperReceivesNoSignal checks that Pause, Resume and Delete send no
+// signal to the process group of a helper that was reaped, because the
+// operating system may have given that process ID to another process group,
+// and that they report the exited helper instead of a raw ESRCH.
+func TestExitedHelperReceivesNoSignal(t *testing.T) {
+	rt := newRuntime(t)
+	v := createSandbox(t, rt)
+	h := killHelperAndWait(t, rt, v)
+	bystander := bystanderAsReusedGroup(t, h)
+
+	for name, call := range map[string]func() error{
+		"Pause":  func() error { return rt.Pause(context.Background(), v) },
+		"Resume": func() error { return rt.Resume(context.Background(), v) },
+	} {
+		err := call()
+		if !errors.Is(err, errHelperExited) {
+			t.Errorf("%s after the helper exited = %v; want errHelperExited", name, err)
+		}
+		var errno syscall.Errno
+		if errors.As(err, &errno) {
+			t.Errorf("%s after the helper exited = %v; want no syscall error", name, err)
+		}
+		waitState(t, "bystander after "+name, bystander, "S", "R")
+	}
+
+	start := time.Now()
+	if err := rt.Delete(context.Background(), v.SandboxID()); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("Delete of an exited helper took %v; want no wait for the helper", d)
+	}
+	waitState(t, "bystander after Delete", bystander, "S", "R")
+	if _, err := os.Stat(h.dir); !os.IsNotExist(err) {
+		t.Errorf("sandbox directory after Delete: %v; want it removed", err)
+	}
+	if _, err := rt.lookup(v.SandboxID()); err == nil {
+		t.Error("sandbox is still tracked after Delete")
+	}
+}
+
+// TestDeleteWithCanceledContextKillsWorkers checks that a Delete whose caller
+// context is already canceled still kills the exec workers: the process
+// listing that finds them must not use the canceled context, because the
+// workers would lose their only handle when the helper dies.
+func TestDeleteWithCanceledContextKillsWorkers(t *testing.T) {
+	rt := newRuntime(t)
+	v := createSandbox(t, rt)
+	shell, sleeper := startWorker(t, v)
+	h, err := rt.lookup(v.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperPID := h.cmd.Process.Pid
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := rt.Delete(canceled, v.SandboxID()); err != nil {
+		t.Fatal(err)
+	}
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after Delete with a canceled context", pid, "")
+	}
+	waitState(t, "helper after Delete with a canceled context", helperPID, "")
+	if _, err := os.Stat(h.dir); !os.IsNotExist(err) {
+		t.Errorf("sandbox directory after Delete: %v; want it removed", err)
+	}
+}
+
+// TestDeleteRetryAfterListingFailure checks that a Delete that cannot list the
+// exec workers returns an error, keeps the sandbox tracked, leaves the helper
+// alive, and that a retry kills the workers and the helper.
+func TestDeleteRetryAfterListingFailure(t *testing.T) {
+	rt := newRuntime(t)
+	v := createSandbox(t, rt)
+	shell, sleeper := startWorker(t, v)
+	h, err := rt.lookup(v.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	helperPID := h.cmd.Process.Pid
+
+	// An empty PATH makes the `ps` command of the process listing fail.
+	oldPath := os.Getenv("PATH")
+	if err := os.Setenv("PATH", t.TempDir()); err != nil {
+		t.Fatal(err)
+	}
+	err = rt.Delete(context.Background(), v.SandboxID())
+	if restoreErr := os.Setenv("PATH", oldPath); restoreErr != nil {
+		t.Fatal(restoreErr)
+	}
+	if err == nil {
+		t.Fatal("Delete without a working process listing succeeded; want an error")
+	}
+	if _, err := rt.lookup(v.SandboxID()); err != nil {
+		t.Fatalf("sandbox after the failed Delete: %v; want it tracked", err)
+	}
+	if h.hasExited() {
+		t.Fatal("the helper died although the workers were not found")
+	}
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after the failed Delete", pid, "S", "R", "T")
+	}
+
+	if err := rt.Delete(context.Background(), v.SandboxID()); err != nil {
+		t.Fatalf("retried Delete: %v", err)
+	}
+	for _, pid := range []int{shell, sleeper} {
+		waitState(t, "worker after the retried Delete", pid, "")
+	}
+	waitState(t, "helper after the retried Delete", helperPID, "")
+	if _, err := rt.lookup(v.SandboxID()); err == nil {
+		t.Error("sandbox is still tracked after the retried Delete")
 	}
 }
