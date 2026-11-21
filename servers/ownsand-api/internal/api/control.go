@@ -254,6 +254,11 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 		// the lease: a record outlives the lease only when its channel closed
 		// at the lease release, and it must expire then too.
 		c.S.expireCommands(ctx)
+		// Pending revocations are bound to channels of this instance, so
+		// they expire without the lease as well.
+		if c.S.DataPath != nil {
+			c.S.DataPath.SweepExpired(ctx)
+		}
 		if !c.held() {
 			continue
 		}

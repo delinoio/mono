@@ -21,6 +21,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/grants"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
@@ -1285,5 +1286,82 @@ func TestRelayRotationWithQueuedFrames(t *testing.T) {
 	// The events are the accepted notice and the output before the deadline.
 	if len(events) != 2 || events[0].GetAccepted() == nil || string(events[1].GetStdout().GetData()) != "before" {
 		t.Fatalf("events = %v, want only the events before the deadline", events)
+	}
+}
+
+// sweepRevocationsNow runs the periodic revocation sweep and returns the
+// number of pending revocations that remain.
+func sweepRevocationsNow(env *testenv.Env) int {
+	env.App.Plane.SweepExpired(context.Background())
+	return env.App.Plane.PendingRevocations()
+}
+
+// TestUnacknowledgedSessionRevocationExpires checks that a pending session
+// revocation that the agent never acknowledges is deleted at the absolute
+// expiry of the session, and not before, while the channel stays open.
+func TestUnacknowledgedSessionRevocationExpires(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	agent.SetAckRevocations(false)
+	key := env.Clients(org.APIKey)
+	resp, err := key.DataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{OrganizationId: org.ID, SandboxId: sandboxID, SdpOffer: "v=0"}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := org.OwnerClient.APIKey.RevokeApiKey(ctx, connect.NewRequest(&ownsandv1.RevokeApiKeyRequest{OrganizationId: org.ID, ApiKeyId: org.APIKeyID})); err != nil {
+		t.Fatal(err)
+	}
+	agent.WaitFor("session revocation", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetSessionRevocation().GetSessionId() == resp.Msg.GetSessionId()
+	})
+	if n := env.App.Plane.PendingRevocations(); n != 1 {
+		t.Fatalf("pending revocations = %d, want 1", n)
+	}
+	env.Clock.Advance(time.Hour - time.Second)
+	if n := sweepRevocationsNow(env); n != 1 {
+		t.Fatalf("pending revocations one second before the session expiry = %d, want 1", n)
+	}
+	env.Clock.Advance(time.Second)
+	if n := sweepRevocationsNow(env); n != 0 {
+		t.Fatalf("pending revocations at the session expiry = %d, want 0", n)
+	}
+	if !strings.Contains(env.Logs.String(), "session_revocation_expired") {
+		t.Fatal("the expiry of the revocation is not logged")
+	}
+}
+
+// TestUnacknowledgedGrantRevocationExpires checks the same for a relay grant:
+// the revocation lives until the grant stops being revocable (stream deadline
+// plus the delivery margin), and OpenSession sweeps it without the periodic
+// worker.
+func TestUnacknowledgedGrantRevocationExpires(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	agent.SetAckRevocations(false)
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, env.Clients(org.APIKey), req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := org.OwnerClient.APIKey.RevokeApiKey(ctx, connect.NewRequest(&ownsandv1.RevokeApiKeyRequest{OrganizationId: org.ID, ApiKeyId: org.APIKeyID})); err != nil {
+		t.Fatal(err)
+	}
+	agent.WaitFor("grant revocation", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetSessionRevocation().GetRelayGrantId() == grant.GetGrantId()
+	})
+	end := grants.StreamDeadline + grants.DeliveryMargin
+	env.Clock.Advance(end - time.Second)
+	if n := sweepRevocationsNow(env); n != 1 {
+		t.Fatalf("pending revocations one second before the grant stops being revocable = %d, want 1", n)
+	}
+	env.Clock.Advance(time.Second)
+	// An OpenSession of another principal runs the sweep.
+	if _, err := org.OwnerClient.DataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{OrganizationId: org.ID, SandboxId: sandboxID, SdpOffer: "v=0"})); err != nil {
+		t.Fatal(err)
+	}
+	if n := env.App.Plane.PendingRevocations(); n != 0 {
+		t.Fatalf("pending revocations when the grant stops being revocable = %d, want 0", n)
 	}
 }
