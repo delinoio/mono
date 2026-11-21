@@ -436,6 +436,112 @@ func TestRemovedDeviceAfterOrganizationDeletion(t *testing.T) {
 	}
 }
 
+// TestRemovedDeviceRowsHoldNoInventory removes one device with RemoveDevice
+// and another with DeleteOrganization, and checks that both tombstones hold
+// no inventory (also after a late capability and update-field write), keep
+// their identity and expiry, and still answer the signed removal paths.
+func TestRemovedDeviceRowsHoldNoInventory(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	viaRPC := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_MACOS, ownsandv1.Arch_ARCH_ARM64)
+	viaOrg := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	keep := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	for _, d := range []*testenv.Device{viaRPC, viaOrg, keep} {
+		if _, err := org.OwnerClient.Device.UpdateDeviceLimits(ctx, connect.NewRequest(&ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: org.ID, DeviceId: d.ID,
+			Limits: &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 4096, DiskGib: 100, VcpuOvercommitPercent: 150}})); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.DB.Pool.Exec(ctx, `UPDATE devices SET name = 'secret-name', agent_version = '2.3.4', update_state = 2, update_target_version = '2.4.0',
+			pending_idle_since = now(), capabilities = '\x0a00', last_seen_time = now(), state_epoch = $2 WHERE device_id = $1`, d.ID, d.Epoch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inventoryRows := func(id string) (name, version, epoch string, limit, overcommit int32, caps, idle, seen bool) {
+		t.Helper()
+		if err := env.DB.Pool.QueryRow(ctx, `SELECT name, agent_version, state_epoch, limit_vcpu_count, vcpu_overcommit_percent,
+			capabilities IS NOT NULL, pending_idle_since IS NOT NULL, last_seen_time IS NOT NULL FROM devices WHERE device_id = $1`, id).
+			Scan(&name, &version, &epoch, &limit, &overcommit, &caps, &idle, &seen); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if name, version, _, limit, _, caps, _, _ := inventoryRows(viaRPC.ID); name != "secret-name" || version != "2.3.4" || limit != 8 || !caps {
+		t.Fatalf("active device before removal holds no inventory: %q %q %d %v", name, version, limit, caps)
+	}
+
+	removed, err := org.OwnerClient.Device.RemoveDevice(ctx, connect.NewRequest(&ownsandv1.RemoveDeviceRequest{OrganizationId: org.ID, DeviceId: viaRPC.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The RemoveDevice response reads the tombstone: state and IDs stay, the
+	// inventory fields are blank.
+	rd := removed.Msg.GetDevice()
+	if rd.GetState() != ownsandv1.DeviceState_DEVICE_STATE_REMOVED || rd.GetDeviceId() != viaRPC.ID || rd.GetOrganizationId() != org.ID ||
+		rd.GetName() != "" || rd.GetAgentVersion() != "" || rd.GetCapabilities() != nil || rd.GetLimits().GetVcpuCount() != 0 || rd.GetEffectiveVcpuLimit() != 0 {
+		t.Fatalf("RemoveDevice response = %v", rd)
+	}
+	// ListDevices(state=REMOVED) shows the same blank tombstone.
+	removedState := ownsandv1.DeviceState_DEVICE_STATE_REMOVED
+	list, err := org.OwnerClient.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID, State: &removedState}))
+	if err != nil || len(list.Msg.GetDevices()) != 1 || list.Msg.GetDevices()[0].GetName() != "" || list.Msg.GetDevices()[0].GetDeviceId() != viaRPC.ID {
+		t.Fatalf("ListDevices(removed) = %v, %v", list, err)
+	}
+
+	// A late capability report, update fields and built images on the
+	// tombstone cannot restore inventory.
+	if _, err := env.DB.Pool.Exec(ctx, `UPDATE devices SET capabilities = '\x0a00', update_state = 2, update_target_version = '9.9.9', name = 'late',
+		limit_vcpu_count = 16, last_seen_time = now() WHERE device_id = $1`, viaRPC.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{viaRPC.ID, viaOrg.ID, keep.ID} {
+		name, version, epoch, limit, overcommit, caps, idle, seen := inventoryRows(id)
+		if name != "" || version != "" || epoch != "" || limit != 0 || overcommit != 100 || caps || idle || seen {
+			t.Fatalf("tombstone %s holds inventory: %q %q %q %d %d %v %v %v", id, name, version, epoch, limit, overcommit, caps, idle, seen)
+		}
+		var state int16
+		var key []byte
+		var orgID string
+		var removeTime, expire *time.Time
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT state, public_key, organization_id::text, remove_time, tombstone_expire_time FROM devices WHERE device_id = $1", id).
+			Scan(&state, &key, &orgID, &removeTime, &expire); err != nil {
+			t.Fatal(err)
+		}
+		if ownsandv1.DeviceState(state) != ownsandv1.DeviceState_DEVICE_STATE_REMOVED || len(key) != 32 || orgID != org.ID || removeTime == nil || expire == nil {
+			t.Fatalf("tombstone %s identity: state %d, key %d bytes, org %s, remove %v, expire %v", id, state, len(key), orgID, removeTime, expire)
+		}
+	}
+
+	// The removal notice and the signed confirmation work on a scrubbed row.
+	for _, d := range []*testenv.Device{viaRPC, viaOrg} {
+		resp, err := env.Authenticate(d)
+		if err != nil || resp.GetRemovalNotice() == nil || resp.GetSession() != nil {
+			t.Fatalf("authenticate removed device %s: %v, %v", d.ID, resp, err)
+		}
+	}
+	agent := env.Clients("").Agent
+	ch, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: viaRPC.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.ConfirmRemoval(ctx, connect.NewRequest(&ownsandv1.ConfirmRemovalRequest{DeviceId: viaRPC.ID, Nonce: ch.Msg.GetNonce(),
+		Signature: viaRPC.Sign(auth.PurposeConfirmRemoval, ch.Msg.GetNonce())})); err != nil {
+		t.Fatalf("confirm removal: %v", err)
+	}
+	var left int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM devices WHERE device_id = $1", viaRPC.ID).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("tombstone rows after confirmation = %d, %v", left, err)
+	}
+	// An unconfirmed tombstone still expires.
+	env.Clock.Advance(366 * 24 * time.Hour)
+	if _, err := env.Authenticate(viaOrg); testenv.Code(err) != connect.CodeNotFound {
+		t.Fatalf("expired tombstone: %v", err)
+	}
+}
+
 func TestDeviceLimitsAndAllocation(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()
