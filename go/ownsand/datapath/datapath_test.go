@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -370,6 +371,32 @@ func TestSplitMessages(t *testing.T) {
 	}
 }
 
+func TestSplitMessagesHugeMaxSize(t *testing.T) {
+	// len+maxSize-1 would overflow int for this limit.
+	stream := []byte("ab")
+	got := SplitMessages(stream, math.MaxInt)
+	if len(got) != 1 || string(got[0]) != "ab" || cap(got[0]) != 2 {
+		t.Fatalf("got %q cap %d", got, cap(got[0]))
+	}
+	if &got[0][0] != &stream[0] {
+		t.Fatal("message does not share the input memory")
+	}
+}
+
+func TestSplitMessagesBoundaries(t *testing.T) {
+	// Exact division leaves no empty trailing message.
+	got := SplitMessages([]byte("abcd"), 2)
+	if len(got) != 2 || string(got[0]) != "ab" || string(got[1]) != "cd" {
+		t.Fatalf("got %q", got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("zero maxSize did not panic")
+		}
+	}()
+	SplitMessages([]byte("ab"), 0)
+}
+
 func TestSendWindow(t *testing.T) {
 	w, err := NewSendWindow(100)
 	if err != nil {
@@ -521,6 +548,7 @@ func TestCheckOperationID(t *testing.T) {
 		{"an hour old", idAt(now.Add(-time.Hour)), ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, AdmissionReasonExpired},
 		{"exactly 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture)), 0, 0},
 		{"over 5 minutes ahead", idAt(now.Add(OperationIDMaxFuture + time.Millisecond)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
+		{"far future saturates the age", idAt(time.Date(2500, 1, 1, 0, 0, 0, 0, time.UTC)), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, AdmissionReasonFuture},
 		{"not a UUID", "exec-1", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 		{"UUID v4", "0192f4b6-7c3a-4def-8abc-0123456789ab", ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, AdmissionReasonInvalid},
 	}
