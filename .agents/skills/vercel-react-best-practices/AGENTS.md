@@ -528,7 +528,12 @@ export default function RootLayout({ children }) {
 
 **Correct: loads after hydration**
 
+`ssr: false` is not allowed with `next/dynamic` in Server Components, so keep the dynamic import in a Client Component and render it from the Server Component layout.
+
 ```tsx
+// app/analytics.tsx
+'use client'
+
 import dynamic from 'next/dynamic'
 
 const Analytics = dynamic(
@@ -536,12 +541,21 @@ const Analytics = dynamic(
   { ssr: false }
 )
 
+export function DeferredAnalytics() {
+  return <Analytics />
+}
+```
+
+```tsx
+// app/layout.tsx (Server Component)
+import { DeferredAnalytics } from './analytics'
+
 export default function RootLayout({ children }) {
   return (
     <html>
       <body>
         {children}
-        <Analytics />
+        <DeferredAnalytics />
       </body>
     </html>
   )
