@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -75,7 +76,8 @@ func TestCappedLogKeepsPrefixAndConsumesRest(t *testing.T) {
 		t.Fatalf("file = %q, want the first 64 bytes %q (sent %d)", got, want[:64], sent)
 	}
 	st, _ := os.Stat(path)
-	if st.Mode().Perm() != 0o600 {
+	// Windows reports 0666 for every writable file; POSIX modes do not apply.
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %v, want 0600", st.Mode().Perm())
 	}
 	var capEvents int
