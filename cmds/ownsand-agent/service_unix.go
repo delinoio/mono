@@ -23,7 +23,7 @@ func runService(cfg config.Config) int {
 // the service definition.
 func serviceEnv() []string {
 	var env []string
-	for _, name := range []string{config.EnvStateDir, config.EnvAPIURL, config.EnvRuntime, config.EnvGuestBinary, config.EnvReleaseManifestURL, config.EnvReleasePublicKeys, config.EnvLogLevel} {
+	for _, name := range config.EnvNames {
 		if v, ok := os.LookupEnv(name); ok && v != "" {
 			env = append(env, name+"="+v)
 		}
