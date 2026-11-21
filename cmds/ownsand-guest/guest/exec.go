@@ -214,7 +214,11 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 		timeoutTimer = time.AfterFunc(timeout.AsDuration(), func() {
 			timersMu.Lock()
 			defer timersMu.Unlock()
-			if waited {
+			// cmd.Wait can still be draining the output pipes, which a
+			// descendant may hold for up to pipeWaitDelay after the direct
+			// child exited. The command already ended then, so the timeout
+			// must neither mark it timed out nor signal a reaped group.
+			if waited || processExited(cmd.Process) {
 				return
 			}
 			timedOut.Store(true)

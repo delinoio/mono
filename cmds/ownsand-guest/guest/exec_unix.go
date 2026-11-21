@@ -36,6 +36,12 @@ func processGroupAlive(p *os.Process) bool {
 	return !errors.Is(syscall.Kill(-p.Pid, 0), syscall.ESRCH)
 }
 
+// processExited reports whether the direct child was already reaped by
+// cmd.Wait, which happens before the output pipes are drained.
+func processExited(p *os.Process) bool {
+	return errors.Is(p.Signal(syscall.Signal(0)), os.ErrProcessDone)
+}
+
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {
 	if ws, ok := state.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
 		return 0, int32(ws.Signal()), true
