@@ -64,10 +64,21 @@ func scanSnapshot(row pgx.Row) (*snapshotRow, error) {
 }
 
 func loadSnapshot(ctx context.Context, q db.Querier, orgID, snapshotID string, lock bool) (*snapshotRow, error) {
-	sql := "SELECT " + snapshotColumns + " FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2"
 	if lock {
-		sql += " FOR UPDATE"
+		return loadSnapshotLocked(ctx, q, orgID, snapshotID, " FOR UPDATE")
 	}
+	return loadSnapshotLocked(ctx, q, orgID, snapshotID, "")
+}
+
+// loadSnapshotShared loads a snapshot row with FOR SHARE: the row cannot be
+// deleted or updated until the transaction ends, while other FOR SHARE
+// readers proceed.
+func loadSnapshotShared(ctx context.Context, q db.Querier, orgID, snapshotID string) (*snapshotRow, error) {
+	return loadSnapshotLocked(ctx, q, orgID, snapshotID, " FOR SHARE")
+}
+
+func loadSnapshotLocked(ctx context.Context, q db.Querier, orgID, snapshotID, lockClause string) (*snapshotRow, error) {
+	sql := "SELECT " + snapshotColumns + " FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2" + lockClause
 	sn, err := scanSnapshot(q.QueryRow(ctx, sql, orgID, snapshotID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errNotFound("snapshot")
@@ -190,12 +201,25 @@ func partKey(orgID, snapshotID string, part int32) string {
 // or an import (DOWNLOAD, a device of the organization with the same OS and
 // architecture while the snapshot is EXPORTED). URLs expire after 15
 // minutes and are never logged.
+//
+// The eligibility check and the signing run in one transaction that holds
+// the snapshot row with FOR SHARE, so snapshot and organization deletion
+// (whose row DELETE conflicts with that lock) wait for the signer and
+// record their clean-up job afterwards: every URL expires at or before the
+// job's final_sweep_after, and a request that loses the race finds no row
+// and gets no URL. The transaction ends before the grant is written to the
+// agent channel, so a slow channel never holds the lock. The lock order is
+// the snapshot row only: the signer takes no device or organization row
+// lock.
 func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r *ownsandv1.SignedUrlRequest) error {
 	grant := &ownsandv1.SignedUrlGrant{RequestId: r.GetRequestId(), SnapshotId: r.GetSnapshotId(), Operation: r.GetOperation()}
+	send := func() error {
+		return conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SignedUrlGrant{SignedUrlGrant: grant}})
+	}
 	deny := func(code ownsandv1.ErrorCode, msg string) error {
 		grant.Error = &ownsandv1.ErrorDetail{Code: code, Message: msg}
 		grant.PartUrls = nil
-		return conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SignedUrlGrant{SignedUrlGrant: grant}})
+		return send()
 	}
 	if s.Objects == nil {
 		return deny(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot export storage is not configured")
@@ -203,43 +227,64 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 	if !validID(r.GetSnapshotId()) || len(r.GetPartNumbers()) == 0 || len(r.GetPartNumbers()) > maxSnapshotParts {
 		return deny(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid signed URL request")
 	}
-	sn, err := loadSnapshot(ctx, s.DB.Pool, conn.OrganizationID, r.GetSnapshotId(), false)
-	if err != nil {
-		return deny(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "snapshot not found")
+	// denied carries a refusal out of the transaction, which ends before the
+	// grant is sent.
+	var denied *ownsandv1.ErrorDetail
+	refuse := func(code ownsandv1.ErrorCode, msg string) error {
+		denied = &ownsandv1.ErrorDetail{Code: code, Message: msg}
+		return nil
 	}
-	var host, arch int16
-	if err := s.DB.Pool.QueryRow(ctx, "SELECT host_os, arch FROM devices WHERE device_id = $1", conn.DeviceID).Scan(&host, &arch); err != nil {
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		sn, err := loadSnapshotShared(ctx, tx, conn.OrganizationID, r.GetSnapshotId())
+		if err != nil {
+			if connect.CodeOf(err) == connect.CodeNotFound {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "snapshot not found")
+			}
+			return err
+		}
+		var host, arch int16
+		if err := tx.QueryRow(ctx, "SELECT host_os, arch FROM devices WHERE device_id = $1", conn.DeviceID).Scan(&host, &arch); err != nil {
+			return err
+		}
+		var presign func(string, time.Duration) (string, time.Time, error)
+		switch r.GetOperation() {
+		case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_UPLOAD:
+			if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || sn.pb.GetDeviceId() != conn.DeviceID {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not being exported by this device")
+			}
+			presign = s.Objects.PresignPut
+		case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD:
+			if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED ||
+				ownsandv1.HostOs(host) != sn.pb.GetHostOs() || ownsandv1.Arch(arch) != sn.pb.GetArch() {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not exported for this device")
+			}
+			presign = s.Objects.PresignGet
+		default:
+			return refuse(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid operation")
+		}
+		var urls []*ownsandv1.SignedPartUrl
+		for _, n := range r.GetPartNumbers() {
+			if n < 1 || n > maxSnapshotParts {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid part number")
+			}
+			u, exp, err := presign(partKey(conn.OrganizationID, sn.pb.GetSnapshotId(), n), signedURLLifetime)
+			if err != nil {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "signing failed")
+			}
+			urls = append(urls, &ownsandv1.SignedPartUrl{PartNumber: n, Url: u, ExpireTime: ts(exp)})
+		}
+		grant.PartUrls = urls
+		return nil
+	})
+	if err != nil {
 		return err
 	}
-	var presign func(string, time.Duration) (string, time.Time, error)
-	switch r.GetOperation() {
-	case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_UPLOAD:
-		if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || sn.pb.GetDeviceId() != conn.DeviceID {
-			return deny(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not being exported by this device")
-		}
-		presign = s.Objects.PresignPut
-	case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD:
-		if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED ||
-			ownsandv1.HostOs(host) != sn.pb.GetHostOs() || ownsandv1.Arch(arch) != sn.pb.GetArch() {
-			return deny(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not exported for this device")
-		}
-		presign = s.Objects.PresignGet
-	default:
-		return deny(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid operation")
+	if denied != nil {
+		return deny(denied.GetCode(), denied.GetMessage())
 	}
-	for _, n := range r.GetPartNumbers() {
-		if n < 1 || n > maxSnapshotParts {
-			return deny(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid part number")
-		}
-		u, exp, err := presign(partKey(conn.OrganizationID, sn.pb.GetSnapshotId(), n), signedURLLifetime)
-		if err != nil {
-			return deny(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "signing failed")
-		}
-		grant.PartUrls = append(grant.PartUrls, &ownsandv1.SignedPartUrl{PartNumber: n, Url: u, ExpireTime: ts(exp)})
-	}
-	s.Logger.InfoContext(ctx, "signed_urls_issued", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", sn.pb.GetSnapshotId()),
+	s.Logger.InfoContext(ctx, "signed_urls_issued", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", grant.GetSnapshotId()),
 		slog.String("operation", r.GetOperation().String()), slog.Int("parts", len(grant.PartUrls)))
-	return conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SignedUrlGrant{SignedUrlGrant: grant}})
+	return send()
 }
 
 func validID(id string) bool { return validateID("id", id) == nil }
@@ -329,7 +374,7 @@ func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Reques
 		if templates {
 			return errPrecondition("a template references the snapshot")
 		}
-		return h.deleteSnapshotRecordTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.pb.GetExportState())
+		return h.deleteSnapshotRecordTx(ctx, tx, orgID, sn.pb.GetSnapshotId())
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "delete snapshot", err)

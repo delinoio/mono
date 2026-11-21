@@ -290,7 +290,7 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 			}
 			continue
 		}
-		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id, ownsandv1.SnapshotExportState(sn.export)); err != nil {
+		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id); err != nil {
 			return err
 		}
 	}
