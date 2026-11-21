@@ -6,8 +6,11 @@
 // - the SDK never imports code from `servers/`.
 import { readdirSync, readFileSync } from "node:fs";
 import { join, relative } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const root = new URL("../src/", import.meta.url).pathname;
+// URL.pathname is a URL path (percent-encoded, with a leading slash before a
+// Windows drive letter), not a filesystem path, so convert the file URL.
+const root = fileURLToPath(new URL("../src/", import.meta.url));
 const failures = [];
 
 function walk(dir) {
