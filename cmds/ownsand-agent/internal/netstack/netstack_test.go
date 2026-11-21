@@ -263,3 +263,75 @@ func TestNetworkCloseEndsEveryFlow(t *testing.T) {
 		t.Fatal("startProxy ran the relay of a refused flow")
 	}
 }
+
+// udpPair returns two connected loopback UDP sockets.
+func udpPair(t *testing.T) (net.Conn, net.Conn) {
+	t.Helper()
+	a, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := net.DialUDP("udp", nil, a.LocalAddr().(*net.UDPAddr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Connect a to b, so both are connected sockets.
+	if _, err := b.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, 1)
+	_, from, err := a.ReadFromUDP(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.Close()
+	ac, err := net.DialUDP("udp", a.LocalAddr().(*net.UDPAddr), from)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ac.Close(); b.Close() })
+	return ac, b
+}
+
+// A UDP flow whose datagrams go one way stays open while that direction is
+// active, and ends after the idle time without traffic in either direction.
+func TestProxyUDPIdleCountsBothDirections(t *testing.T) {
+	guest, in := udpPair(t)
+	out, host := udpPair(t)
+	const idle = 300 * time.Millisecond
+	ended := make(chan struct{})
+	go func() { proxyUDP(in, out, idle); close(ended) }()
+
+	received := make(chan struct{}, 64)
+	go func() {
+		buf := make([]byte, 16)
+		for {
+			if _, err := host.Read(buf); err != nil {
+				return
+			}
+			received <- struct{}{}
+		}
+	}()
+	// Send guest-to-host only, for about three idle periods.
+	for i := 0; i < 15; i++ {
+		if _, err := guest.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		select {
+		case <-received:
+		case <-time.After(time.Second):
+			t.Fatalf("datagram %d was not relayed: the flow ended while it was active", i)
+		}
+		time.Sleep(60 * time.Millisecond)
+	}
+	select {
+	case <-ended:
+		t.Fatal("the flow ended while one direction was active")
+	default:
+	}
+	select {
+	case <-ended:
+	case <-time.After(5 * idle):
+		t.Fatal("the flow did not end after the idle time")
+	}
+}

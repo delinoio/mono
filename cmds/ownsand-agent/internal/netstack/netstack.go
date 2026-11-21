@@ -29,6 +29,7 @@ import (
 	"net/netip"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containers/gvisor-tap-vsock/pkg/services/dhcp"
@@ -394,22 +395,38 @@ func (n *Network) forwardUDP(r *udp.ForwarderRequest) bool {
 		in.Close()
 		return true
 	}
-	n.startProxy(func() { proxyUDP(in, out) }, in, out)
+	n.startProxy(func() { proxyUDP(in, out, udpIdleTimeout) }, in, out)
 	return true
 }
 
-// proxyUDP relays the datagrams of one flow until it is idle for
-// udpIdleTimeout or a side fails.
-func proxyUDP(in *gonet.UDPConn, out net.Conn) {
+// proxyUDP relays the datagrams of one flow until neither direction
+// carried a datagram for idle, or a side fails. Both directions share one
+// activity time, so a flow whose traffic goes mostly one way stays open
+// while that direction is active.
+func proxyUDP(in, out net.Conn, idle time.Duration) {
+	var last atomic.Int64
+	last.Store(time.Now().UnixNano())
 	done := make(chan struct{}, 2)
 	relay := func(dst, src net.Conn) {
 		buf := make([]byte, 65535)
 		for {
-			_ = src.SetReadDeadline(time.Now().Add(udpIdleTimeout))
-			k, err := src.Read(buf)
-			if err != nil {
+			// The read waits until the flow has been idle for idle since its
+			// last datagram in either direction.
+			deadline := time.Unix(0, last.Load()).Add(idle)
+			if !time.Now().Before(deadline) {
 				break
 			}
+			_ = src.SetReadDeadline(deadline)
+			k, err := src.Read(buf)
+			if err != nil {
+				var ne net.Error
+				if errors.As(err, &ne) && ne.Timeout() {
+					// The other direction may have moved the deadline.
+					continue
+				}
+				break
+			}
+			last.Store(time.Now().UnixNano())
 			if _, err := dst.Write(buf[:k]); err != nil {
 				break
 			}
