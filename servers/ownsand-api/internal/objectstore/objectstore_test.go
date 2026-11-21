@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -53,12 +54,30 @@ func TestPathStyleKey(t *testing.T) {
 }
 
 func TestDeletePrefix(t *testing.T) {
+	const prefix = "organizations/o/"
 	var mu sync.Mutex
 	objects := map[string]bool{}
+	keys := make([]string, 0, 3)
 	for i := 0; i < 3; i++ {
-		objects[fmt.Sprintf("organizations/o/snapshots/s/parts/%d", i+1)] = true
+		key := fmt.Sprintf("organizations/o/snapshots/s/parts/%d", i+1)
+		keys = append(keys, key)
+		objects[key] = true
 	}
 	objects["organizations/other/x"] = true
+	// The fake serves three fixed pages keyed by the continuation token of the
+	// request. An empty token selects the first page; every other token must be
+	// exactly the one the previous page returned.
+	type page struct {
+		key  string
+		next string
+	}
+	pages := map[string]page{
+		"":       {key: keys[0], next: "page-2"},
+		"page-2": {key: keys[1], next: "page-3"},
+		"page-3": {key: keys[2]},
+	}
+	var tokens []string
+	var fixtureErrors []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		if !strings.HasPrefix(req.Header.Get("Authorization"), "AWS4-HMAC-SHA256 Credential=k/") || req.Header.Get("x-amz-date") == "" {
 			w.WriteHeader(http.StatusForbidden)
@@ -68,15 +87,34 @@ func TestDeletePrefix(t *testing.T) {
 		defer mu.Unlock()
 		switch req.Method {
 		case http.MethodGet:
-			prefix := req.URL.Query().Get("prefix")
+			query := req.URL.Query()
+			token := query.Get("continuation-token")
+			tokens = append(tokens, token)
+			// Fail fast instead of looping forever when the client never
+			// advances through the pages.
+			if len(tokens) > len(pages) {
+				fixtureErrors = append(fixtureErrors, "too many list requests")
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if got := query.Get("prefix"); got != prefix {
+				fixtureErrors = append(fixtureErrors, fmt.Sprintf("prefix = %q", got))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			p, ok := pages[token]
+			if !ok {
+				fixtureErrors = append(fixtureErrors, fmt.Sprintf("unexpected continuation token %q", token))
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
 			var b strings.Builder
 			b.WriteString("<ListBucketResult>")
-			// Return one key per page to exercise continuation.
-			for k := range objects {
-				if strings.HasPrefix(k, prefix) {
-					fmt.Fprintf(&b, "<Contents><Key>%s</Key></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>t</NextContinuationToken>", k)
-					break
-				}
+			fmt.Fprintf(&b, "<Contents><Key>%s</Key></Contents>", p.key)
+			if p.next != "" {
+				fmt.Fprintf(&b, "<IsTruncated>true</IsTruncated><NextContinuationToken>%s</NextContinuationToken>", p.next)
+			} else {
+				b.WriteString("<IsTruncated>false</IsTruncated>")
 			}
 			b.WriteString("</ListBucketResult>")
 			_, _ = w.Write([]byte(b.String()))
@@ -87,8 +125,16 @@ func TestDeletePrefix(t *testing.T) {
 	}))
 	defer srv.Close()
 	r := &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}
-	if err := r.DeletePrefix(context.Background(), "organizations/o/"); err != nil {
+	if err := r.DeletePrefix(context.Background(), prefix); err != nil {
 		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fixtureErrors) != 0 {
+		t.Fatalf("fixture errors = %v", fixtureErrors)
+	}
+	if want := []string{"", "page-2", "page-3"}; !slices.Equal(tokens, want) {
+		t.Fatalf("continuation tokens = %q, want %q", tokens, want)
 	}
 	if len(objects) != 1 || !objects["organizations/other/x"] {
 		t.Fatalf("remaining = %v", objects)
