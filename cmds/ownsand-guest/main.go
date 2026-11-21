@@ -79,6 +79,14 @@ func run(args []string) int {
 		logger.Error("start failed", "error", err)
 		return 1
 	}
+	// The network tunnel of the Hyper-V runtime lives in the helper that
+	// the init process of a Linux guest restarts, so a failed relay comes
+	// back with the helper.
+	if isInitChild() {
+		if err := startTunnel(logger); err != nil {
+			logger.Error("network tunnel failed", "error", err)
+		}
+	}
 	l, err := guestlisten.Listen(*listen)
 	if err != nil {
 		logger.Error("listen failed", "error", err)

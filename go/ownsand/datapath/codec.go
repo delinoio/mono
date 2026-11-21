@@ -54,12 +54,19 @@ func AppendFrame(dst []byte, f *ownsandv1.DataFrame) ([]byte, error) {
 }
 
 // SplitMessages splits a data channel byte stream into messages of at most
-// maxSize bytes. The messages share the memory of stream.
+// maxSize bytes. Any positive maxSize is supported, including math.MaxInt.
+// The messages share the memory of stream, and each message's capacity is
+// capped to its length.
 func SplitMessages(stream []byte, maxSize int) [][]byte {
 	if maxSize <= 0 {
 		panic("datapath: SplitMessages needs a positive maxSize")
 	}
-	messages := make([][]byte, 0, (len(stream)+maxSize-1)/maxSize)
+	// Divide first: len(stream)+maxSize-1 overflows int for a huge maxSize.
+	count := len(stream) / maxSize
+	if len(stream)%maxSize != 0 {
+		count++
+	}
+	messages := make([][]byte, 0, count)
 	for len(stream) > 0 {
 		n := min(len(stream), maxSize)
 		messages = append(messages, stream[:n:n])
