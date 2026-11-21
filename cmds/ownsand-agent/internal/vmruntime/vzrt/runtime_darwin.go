@@ -164,6 +164,12 @@ type vm struct {
 	memMiB        int64
 	mu            sync.Mutex
 	paused        bool
+	// pauseFn and resumeFn replace the guest flush with the pause, and the
+	// resume, of the VM object. Only tests set them, to run the runtime's
+	// pause, resume and snapshot paths without a macOS VM and to inject
+	// failures; production leaves them nil.
+	pauseFn  func() error
+	resumeFn func() error
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -587,13 +593,10 @@ func waitState(ctx context.Context, machine *vz.VirtualMachine, want vz.VirtualM
 	return nil
 }
 
-// Pause flushes the guest page cache and then stops the vCPUs and keeps the
-// memory. The flush makes a later disk copy of the paused VM hold every
-// write completed before the pause.
-func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
-	v, err := r.lookup(m.SandboxID())
-	if err != nil {
-		return err
+// pauseMachine flushes the guest page cache and pauses the VM object of v.
+func (r *Runtime) pauseMachine(ctx context.Context, v *vm) error {
+	if v.pauseFn != nil {
+		return v.pauseFn()
 	}
 	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
@@ -605,7 +608,33 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err := machine.Pause(); err != nil {
 		return fmt.Errorf("vzrt: pause: %w", err)
 	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStatePaused); err != nil {
+	return waitState(ctx, machine, vz.VirtualMachineStatePaused)
+}
+
+// resumeMachine resumes the VM object of v and waits until it runs.
+func resumeMachine(ctx context.Context, v *vm) error {
+	if v.resumeFn != nil {
+		return v.resumeFn()
+	}
+	machine, _, err := v.current()
+	if err != nil {
+		return err
+	}
+	if err := machine.Resume(); err != nil {
+		return fmt.Errorf("vzrt: resume: %w", err)
+	}
+	return waitState(ctx, machine, vz.VirtualMachineStateRunning)
+}
+
+// Pause flushes the guest page cache and then stops the vCPUs and keeps the
+// memory. The flush makes a later disk copy of the paused VM hold every
+// write completed before the pause.
+func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
+	v, err := r.lookup(m.SandboxID())
+	if err != nil {
+		return err
+	}
+	if err := r.pauseMachine(ctx, v); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -620,14 +649,7 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
-	machine, _, err := v.current()
-	if err != nil {
-		return err
-	}
-	if err := machine.Resume(); err != nil {
-		return fmt.Errorf("vzrt: resume: %w", err)
-	}
-	if err := waitState(ctx, machine, vz.VirtualMachineStateRunning); err != nil {
+	if err := resumeMachine(ctx, v); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -640,7 +662,7 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 // memory state. OUTBOUND sandboxes get disk-only snapshots: their guest
 // network configuration is in memory and would not match a restored
 // sandbox's network stack.
-func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (info vmruntime.SnapshotInfo, err error) {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return vmruntime.SnapshotInfo{}, err
@@ -657,15 +679,19 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 			return vmruntime.SnapshotInfo{}, err
 		}
 		defer func() {
-			if err := r.Resume(context.Background(), m); err != nil {
-				r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", err)
+			rerr := r.Resume(context.Background(), m)
+			if rerr != nil {
+				r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", rerr)
 			}
+			// A VM left paused while the manager reports it running must
+			// not yield a READY snapshot; a capture error takes priority.
+			info, err = vmruntime.FinishSnapshot(info, err, rerr)
 		}()
 	}
 	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
 		return r.snapshotMacOS(v, dir)
 	}
-	info := vmruntime.SnapshotInfo{}
+	info = vmruntime.SnapshotInfo{}
 	if memoryStateSupported && v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {
 		machine, _, err := v.current()
 		if err != nil {

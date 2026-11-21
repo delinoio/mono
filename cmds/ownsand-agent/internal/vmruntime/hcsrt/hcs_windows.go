@@ -151,6 +151,12 @@ type system struct {
 	exited   chan struct{}
 	exitOnce sync.Once
 	cbKey    uintptr
+	// pauseFn and resumeFn replace the HCS pause and resume calls. Only
+	// tests set them, to run the runtime's pause, resume and snapshot paths
+	// without a Hyper-V VM and to inject failures; production leaves them
+	// nil.
+	pauseFn  func() error
+	resumeFn func() error
 }
 
 // Exit callbacks. windows.NewCallback never releases a callback, so one
@@ -280,11 +286,17 @@ func (s *system) start() error {
 }
 
 func (s *system) pause() error {
+	if s.pauseFn != nil {
+		return s.pauseFn()
+	}
 	_, err := s.call("HcsPauseComputeSystem", procHcsPauseComputeSystem, "")
 	return err
 }
 
 func (s *system) resume() error {
+	if s.resumeFn != nil {
+		return s.resumeFn()
+	}
 	_, err := s.call("HcsResumeComputeSystem", procHcsResumeComputeSystem, "")
 	return err
 }
