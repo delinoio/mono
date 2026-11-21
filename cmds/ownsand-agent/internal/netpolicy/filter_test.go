@@ -16,17 +16,14 @@ func TestFilter(t *testing.T) {
 	if f.Allows(public) {
 		t.Fatal("a filter allows destinations before its first refresh")
 	}
-	f.SetRoutesForTest(func() ([]Route, []netip.Prefix, error) {
-		return []Route{
-				{Prefix: pfx("0.0.0.0/0"), Interface: "en0"},
-				{Prefix: pfx("0.0.0.0/1"), Interface: "utun3"},
-				{Prefix: pfx("128.0.0.0/1"), Interface: "utun3"},
-				{Prefix: pfx("203.0.113.0/24"), Interface: "utun4"},
-			}, []netip.Prefix{
-				pfx("198.51.100.7/24"),
-				pfx("2001:db8:1::5/64"),
-			}, nil
-	})
+	routes := []Route{
+		{Prefix: pfx("0.0.0.0/0"), Interface: "en0"},
+		{Prefix: pfx("0.0.0.0/1"), Interface: "utun3"},
+		{Prefix: pfx("128.0.0.0/1"), Interface: "utun3"},
+		{Prefix: pfx("203.0.113.0/24"), Interface: "utun4"},
+	}
+	onLink := []netip.Prefix{pfx("198.51.100.7/24"), pfx("2001:db8:1::5/64")}
+	f.SetRoutesForTest(func() ([]Route, []netip.Prefix, error) { return routes, onLink, nil })
 	if err := f.Refresh(); err != nil {
 		t.Fatal(err)
 	}
