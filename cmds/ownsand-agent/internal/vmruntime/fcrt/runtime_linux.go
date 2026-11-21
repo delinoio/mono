@@ -24,6 +24,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/launcher"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -474,7 +475,7 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
-	if err := syncGuest(ctx, v); err != nil {
+	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
 	}
 	return r.setState(ctx, m, "Paused", true)
