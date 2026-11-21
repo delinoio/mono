@@ -154,9 +154,23 @@ func (v *vm) SandboxID() string                         { return v.id }
 func (v *vm) RestorePath() ownsandv1.SandboxRestorePath { return v.restore }
 func (v *vm) Exited() <-chan struct{}                   { return v.exited }
 
+// current returns the VM object, or an error after the VM was stopped.
+func (v *vm) current() (*vz.VirtualMachine, <-chan struct{}, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.machine == nil {
+		return nil, nil, fmt.Errorf("vzrt: sandbox %s has no running VM", v.id)
+	}
+	return v.machine, v.exited, nil
+}
+
 // Dial connects to the guest helper through the virtio socket device.
 func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
-	devices := v.machine.SocketDevices()
+	machine, exited, err := v.current()
+	if err != nil {
+		return nil, err
+	}
+	devices := machine.SocketDevices()
 	if len(devices) == 0 {
 		return nil, errors.New("vzrt: the VM has no socket device")
 	}
@@ -180,7 +194,7 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 		return res.conn, res.err
 	case <-ctx.Done():
 	case <-timer.C:
-	case <-v.exited:
+	case <-exited:
 	}
 	// Close a connection that completes after the caller gave up.
 	go func() {
@@ -554,10 +568,14 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
 	}
-	if err := v.machine.Pause(); err != nil {
+	machine, _, err := v.current()
+	if err != nil {
+		return err
+	}
+	if err := machine.Pause(); err != nil {
 		return fmt.Errorf("vzrt: pause: %w", err)
 	}
-	if err := waitState(ctx, v.machine, vz.VirtualMachineStatePaused); err != nil {
+	if err := waitState(ctx, machine, vz.VirtualMachineStatePaused); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -572,10 +590,14 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
-	if err := v.machine.Resume(); err != nil {
+	machine, _, err := v.current()
+	if err != nil {
+		return err
+	}
+	if err := machine.Resume(); err != nil {
 		return fmt.Errorf("vzrt: resume: %w", err)
 	}
-	if err := waitState(ctx, v.machine, vz.VirtualMachineStateRunning); err != nil {
+	if err := waitState(ctx, machine, vz.VirtualMachineStateRunning); err != nil {
 		return err
 	}
 	v.mu.Lock()
@@ -612,7 +634,11 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	}
 	info := vmruntime.SnapshotInfo{}
 	if memoryStateSupported && v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {
-		if err := saveMemory(v.machine, filepath.Join(dir, snapState)); err != nil {
+		machine, _, err := v.current()
+		if err != nil {
+			return vmruntime.SnapshotInfo{}, err
+		}
+		if err := saveMemory(machine, filepath.Join(dir, snapState)); err != nil {
 			// A disk-only snapshot is still complete; a create from it
 			// boots cold.
 			r.logger.Warn("saving the memory state failed; taking a disk-only snapshot", "sandbox_id", v.id, "error", err)
