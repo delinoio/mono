@@ -8,6 +8,7 @@ package service
 import (
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -85,13 +86,21 @@ StateDirectory=ownsand-agent
 StateDirectoryMode=0700
 `, exe, ExitNotEnrolled)
 	for _, e := range env {
-		fmt.Fprintf(&b, "Environment=%q\n", e)
+		fmt.Fprintf(&b, "Environment=%s\n", systemdQuote(e))
 	}
 	b.WriteString(`
 [Install]
 WantedBy=multi-user.target
 `)
 	return b.String()
+}
+
+// systemdQuote quotes s as one double-quoted systemd.syntax(7) word. systemd
+// reads the C-style escapes that strconv.Quote writes (\\, \", \n, \xNN, \uNNNN),
+// and it expands specifiers (%h, %t, ...) in Environment= values and command
+// lines even inside quotes, so every % is doubled to keep the literal text.
+func systemdQuote(s string) string {
+	return strings.ReplaceAll(strconv.Quote(s), "%", "%%")
 }
 
 // LaunchdDaemon returns the launchd property list. KeepAlive restarts the
