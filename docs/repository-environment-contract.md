@@ -42,7 +42,7 @@ Setup for maintainers with access to the development project:
 2. Run `infisical init` in the repository root and select the development project. Current CLI versions write `.infisical.yaml`, older versions `.infisical.json`; Git ignores both. Each checkout and each linked worktree needs its own copy, because the launcher reads only the repository root of the checkout. Do not set `general.domain` (or `domain`) to an instance that the team does not operate: the CLI sends its credentials to that host.
 3. Keep each package's development variables in the `dev` environment, in the package's folder from the table above. A folder holds only the variables of its own package: server credentials never enter a frontend folder, and a frontend folder holds only public `PUBLIC_` build values, because they are inlined into the browser bundle.
 
-The workspace skill [`setup-infisical-dev`](../.agents/skills/setup-infisical-dev/SKILL.md) helps with these steps: it checks the CLI, the login and the project configuration, fills the `dev` folders of the packages in the table above with the values it can determine from the repository, and asks the user for the values that only the user can supply. It follows the rules below.
+A maintainer can explicitly invoke the workspace skill [`setup-infisical-dev`](../.agents/skills/setup-infisical-dev/SKILL.md) for these steps; agents do not start it automatically. The skill checks the CLI, the login and the project configuration, fills the `dev` folders of the packages in the table above with the values it can determine from the repository, and asks the user for the values that only the user can supply. It follows the rules below.
 
 Rules:
 

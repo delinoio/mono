@@ -1,6 +1,7 @@
 ---
 name: setup-infisical-dev
-description: Configure the Infisical `dev` environment so that the repository development servers start with the variables they need. Fill each value the agent can determine from the repository, and ask the user for each value that only the user can supply. Use when the user asks to set up, fill or fix the Infisical development variables, for example "configure the Infisical variables so that the development servers run".
+description: Configure the Infisical `dev` environment so that the repository development servers start with the variables they need. Fill each value the agent can determine from the repository, and ask the user for each value that only the user can supply. Use only when a human explicitly invokes $setup-infisical-dev or asks to run Set Up Infisical Development Variables. Do not activate automatically for environment, configuration or Infisical tasks.
+disable-model-invocation: true
 ---
 
 # Set Up Infisical Development Variables
@@ -8,6 +9,8 @@ description: Configure the Infisical `dev` environment so that the repository de
 This skill fills the Infisical `dev` environment so that `pnpm dev` starts the development servers with their configuration. The agent sets each value that it can determine from the repository. It asks the user for each value that only the user can supply.
 
 The owning contract is [Local development injection](../../../docs/repository-environment-contract.md#local-development-injection). Read that section before you start. When this skill and the contract do not agree, obey the contract.
+
+Run this skill only when a human explicitly invokes it. Do not start it from task similarity, from another skill or from an automation.
 
 Write all messages to the user in the language of the user's request.
 
