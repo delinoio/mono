@@ -284,6 +284,122 @@ func authorize(t *testing.T, c *testenv.Clients, orgID, sandboxID string, kind o
 	return resp.Msg.GetGrantId()
 }
 
+// TestRelayGrantFailureLimit checks that every grant check rejection (an
+// unknown grant, a grant of another principal and a request that does not
+// match the grant) takes a token from one failures bucket per caller, that a
+// valid grant takes none, and that the bucket refills.
+func TestRelayGrantFailureLimit(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	agent.ConnectRelay(serveExec)
+	keyClients := env.Clients(org.APIKey)
+	execWith := func(token, grantID string, r *ownsandv1.ExecRequest) error {
+		stream, err := env.ClientsWith(token, grantHeader(grantID)).Relay.Exec(ctx, connect.NewRequest(r))
+		if err != nil {
+			return err
+		}
+		_, err = collectExec(t, stream)
+		return err
+	}
+	validExec := func() error {
+		// AuthorizeRelay allows 10 calls per second per principal; the short
+		// advance keeps it under that limit and adds less than a tenth of a
+		// token to the failures bucket (one token per 6 seconds).
+		env.Clock.Advance(200 * time.Millisecond)
+		req := newExec(org.ID, sandboxID)
+		grant, err := authorizeExec(t, keyClients, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return execWith(org.APIKey, grant.GetGrantId(), req)
+	}
+	// The grant of the API key, used for the principal and binding mismatch.
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, keyClients, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unknown := func(token string) func() error {
+		return func() error {
+			id, _ := uuidv7.NewString()
+			return execWith(token, id, req)
+		}
+	}
+	otherPrincipal := func() error { return execWith(testenv.UserToken(org.Member), grant.GetGrantId(), req) }
+	otherOperation := func() error { return execWith(org.APIKey, grant.GetGrantId(), newExec(org.ID, sandboxID)) }
+	requireGrantInvalid := func(err error, what string) {
+		t.Helper()
+		if testenv.Code(err) != connect.CodeUnavailable || errDetail(err).GetSessionEndReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_GRANT_INVALID {
+			t.Fatalf("%s: %v %v", what, err, errDetail(err))
+		}
+	}
+	requireDenied := func(err error, what string) {
+		t.Helper()
+		if testenv.Code(err) != connect.CodePermissionDenied {
+			t.Fatalf("%s: %v", what, err)
+		}
+	}
+	requireLimited := func(err error, what string) {
+		t.Helper()
+		if testenv.Code(err) != connect.CodeResourceExhausted || errDetail(err).GetRetryAfter().AsDuration() <= 0 {
+			t.Fatalf("%s: want resource_exhausted with retry_after, got %v %v", what, err, errDetail(err))
+		}
+	}
+
+	// Valid requests never take a token, also beyond the burst of 10.
+	for i := 0; i < 12; i++ {
+		if err := validExec(); err != nil {
+			t.Fatalf("valid request %d: %v", i, err)
+		}
+	}
+
+	// The API key takes the whole burst with a mix of the three rejections:
+	// they share one bucket.
+	for i := 0; i < 4; i++ {
+		requireDenied(otherOperation(), "binding mismatch under the limit")
+	}
+	for i := 0; i < 3; i++ {
+		requireGrantInvalid(unknown(org.APIKey)(), "unknown grant under the limit")
+	}
+	// A valid request between failures does not take a token.
+	if err := validExec(); err != nil {
+		t.Fatalf("valid request between failures: %v", err)
+	}
+	// The member's rejections go to the member's own bucket; the API key's
+	// bucket has 3 tokens left, so 3 further failures of any category pass.
+	for i := 0; i < 3; i++ {
+		requireDenied(otherOperation(), "binding mismatch with the last tokens")
+	}
+	requireLimited(otherOperation(), "binding mismatch with an empty bucket")
+	requireLimited(unknown(org.APIKey)(), "unknown grant with an empty bucket")
+	// Another caller has its own bucket: the member gets permission_denied
+	// for the API key's grant until its own 10 tokens are gone.
+	for i := 0; i < 10; i++ {
+		requireDenied(otherPrincipal(), "principal mismatch under the limit")
+	}
+	requireLimited(otherPrincipal(), "principal mismatch with an empty bucket")
+	requireLimited(unknown(testenv.UserToken(org.Member))(), "member unknown grant with an empty bucket")
+	// A valid grant of the limited API key still opens the stream.
+	if err := validExec(); err != nil {
+		t.Fatalf("valid request with an empty failures bucket: %v", err)
+	}
+	// The retry delay is the refill time of one token: 10 per minute.
+	env.Clock.Advance(6 * time.Second)
+	requireDenied(otherOperation(), "binding mismatch after one token refilled")
+	requireLimited(otherOperation(), "binding mismatch after the refilled token")
+	// The RPC log records the status and no credential or payload.
+	logs := env.Logs.String()
+	if !strings.Contains(logs, `"code":"resource_exhausted"`) || !strings.Contains(logs, `"code":"permission_denied"`) {
+		t.Fatal("the RPC log does not record the rejection statuses")
+	}
+	for _, secret := range []string{"secret-command", "secret-env", org.APIKey, testenv.UserToken(org.Member)} {
+		if strings.Contains(logs, secret) {
+			t.Fatalf("%q appears in the logs", secret)
+		}
+	}
+}
+
 func TestRelayAuthentication(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()
