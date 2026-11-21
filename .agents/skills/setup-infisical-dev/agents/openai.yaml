@@ -1,0 +1,5 @@
+interface:
+  display_name: "Set Up Infisical Development Variables"
+
+policy:
+  allow_implicit_invocation: false
