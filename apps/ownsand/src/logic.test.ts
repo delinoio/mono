@@ -175,6 +175,10 @@ describe("formatting and form rules", () => {
     expect(effectiveVcpuLimit(16, 150)).toBe(24);
     expect(effectiveVcpuLimit(3, 125)).toBe(3);
     expect(effectiveVcpuLimit(0, 400)).toBe(0);
+    // The live input value can be fractional or invalid before it snaps.
+    expect(effectiveVcpuLimit(1.5, 200)).toBe(2);
+    expect(effectiveVcpuLimit(Number.NaN, 200)).toBe(0);
+    expect(effectiveVcpuLimit(-3, 200)).toBe(0);
     expect(OVERCOMMIT_PERCENTAGES[0]).toBe(100);
     expect(OVERCOMMIT_PERCENTAGES.at(-1)).toBe(400);
     expect(OVERCOMMIT_PERCENTAGES).toHaveLength(13);

@@ -138,12 +138,22 @@ export const OVERCOMMIT_PERCENTAGES: readonly number[] = Array.from(
   (_, i) => 100 + i * 25,
 );
 
-/** Effective vCPU limit: floor(vCPU limit × percent / 100), in integers. */
+/** A non-negative integer from a possibly fractional or invalid number. */
+function wholeCount(n: number): bigint {
+  return Number.isFinite(n) && n > 0 ? BigInt(Math.floor(n)) : 0n;
+}
+
+/**
+ * Effective vCPU limit: floor(vCPU limit × percent / 100), in integers.
+ * The device page calls it with the live value of a number input, which can
+ * be fractional (for example, "1.5") until the input snaps it on Enter or
+ * blur, so the inputs are first floored to non-negative integers.
+ */
 export function effectiveVcpuLimit(
   vcpuCount: number,
   overcommitPercent: number,
 ): number {
-  return Number((BigInt(vcpuCount) * BigInt(overcommitPercent)) / 100n);
+  return Number((wholeCount(vcpuCount) * wholeCount(overcommitPercent)) / 100n);
 }
 
 /** Formats a memory size in MiB. */
