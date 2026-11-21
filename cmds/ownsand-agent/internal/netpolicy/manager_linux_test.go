@@ -9,6 +9,8 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -566,4 +568,95 @@ func TestFailedAttachLeavesNoDNSException(t *testing.T) {
 	if n := staged(); n != 0 {
 		t.Fatalf("%d staged assignments after a failed attach", n)
 	}
+}
+
+// useIPRouteDump replaces the `ip` route dump for the test.
+func useIPRouteDump(t *testing.T, dump func() ([]byte, error)) {
+	t.Helper()
+	old := ipRouteDump
+	ipRouteDump = dump
+	t.Cleanup(func() { ipRouteDump = old })
+}
+
+// HostRoutes collects the routes of every IPv4 table, and the block set
+// holds the prefix of a secondary table with its IPv4-mapped and NAT64 forms.
+func TestHostRoutesCollectsSecondaryTables(t *testing.T) {
+	useIPRouteDump(t, func() ([]byte, error) { return []byte(ipRouteShowFixture), nil })
+	routes, onLink, err := HostRoutes()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := Route{Prefix: pfx("198.51.100.0/24"), Interface: "wg0", Table: "100"}
+	if !slices.Contains(routes, want) {
+		t.Fatalf("routes lack %v: %v", want, routes)
+	}
+	v4, v6 := Blocked(routes, onLink)
+	if !has(v4, "198.51.100.0/24") || !has(v6, "::ffff:198.51.100.0/120") || !has(v6, "64:ff9b::c633:6400/120") {
+		t.Fatal("block set lacks the prefix of the secondary table or its mapped and NAT64 forms")
+	}
+}
+
+// A failing route dump is an error of HostRoutes, not an empty route list.
+func TestHostRoutesDumpFailure(t *testing.T) {
+	useIPRouteDump(t, func() ([]byte, error) { return nil, errors.New("ip failed") })
+	if routes, _, err := HostRoutes(); err == nil || routes != nil {
+		t.Fatalf("HostRoutes = %v, %v: want an error", routes, err)
+	}
+}
+
+// The real route dump fails when the `ip` command exits with an error
+// (an `ip` shim on PATH stands in for a host whose route dump fails).
+func TestIPRouteDumpCommandFailure(t *testing.T) {
+	dir := t.TempDir()
+	shim := filepath.Join(dir, "ip")
+	if err := os.WriteFile(shim, []byte("#!/bin/sh\necho 'RTNETLINK answers: Operation not supported' >&2\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	_, err := ipRouteDump()
+	if err == nil || !strings.Contains(err.Error(), "Operation not supported") {
+		t.Fatalf("ipRouteDump error = %v, want the exit error with the stderr text", err)
+	}
+	if _, _, err := HostRoutes(); err == nil {
+		t.Fatal("HostRoutes succeeded with a failing ip command")
+	}
+}
+
+// Refresh returns the route error and keeps the last applied rules.
+func TestRefreshKeepsRulesWhenRouteDumpFails(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	if err := m.Refresh(); err != nil {
+		t.Fatal(err)
+	}
+	if len(applied()) != 1 {
+		t.Fatalf("%d scripts after the first refresh", len(applied()))
+	}
+	before := m.rules
+	useIPRouteDump(t, func() ([]byte, error) { return nil, errors.New("ip failed") })
+	m.hostRoutes = HostRoutes
+	if err := m.Refresh(); err == nil || !strings.Contains(err.Error(), "ip failed") {
+		t.Fatalf("Refresh error = %v, want the route dump error", err)
+	}
+	if len(applied()) != 1 || m.rules != before {
+		t.Fatal("a failed route dump changed the applied rules")
+	}
+	// The periodic refresh logs the failure.
+	m.interval = time.Millisecond
+	m.refresh = m.Refresh
+	m.mu.Lock()
+	m.attached["s"] = &attachment{}
+	m.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(h.log(), "network policy refresh failed") {
+		if time.Now().After(deadline) {
+			t.Fatal("no error log for the failed refresh")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	<-done
 }

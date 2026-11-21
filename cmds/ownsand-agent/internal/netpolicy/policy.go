@@ -5,7 +5,7 @@
 // loopback, link-local, multicast and reserved ranges with their
 // IPv4-mapped and NAT64 forms, and every on-link or non-default-route
 // prefix of the host routing table, where a complementary /1 pair through
-// one interface counts as a default route), the per-sandbox addresses, and
+// one interface of one routing table counts as a default route), the per-sandbox addresses, and
 // the nftables ruleset that enforces it on Linux. The rule generation is
 // pure Go so that it is tested on every host.
 package netpolicy
@@ -47,6 +47,10 @@ var (
 type Route struct {
 	Prefix    netip.Prefix
 	Interface string
+	// Table names the routing table of the route on Linux, where policy
+	// routing rules select among several IPv4 tables. It is empty for the
+	// IPv6 routes and on the other host OSes, which have one table.
+	Table string
 }
 
 // embed4 returns the form of an IPv4 prefix inside a /96 IPv6 prefix.
@@ -61,8 +65,10 @@ func embed4(base netip.Prefix, p netip.Prefix) netip.Prefix {
 func isDefault(r Route) bool { return r.Prefix.Bits() == 0 }
 
 // halfDefaults returns the /1 routes that form a complementary pair
-// through the same interface (for example a full-tunnel VPN); they count
-// as a default route.
+// through the same interface of the same routing table (for example a
+// full-tunnel VPN); they count as a default route. A half whose
+// complement lives in another table stays an ordinary route: a packet
+// that policy routing sends to one table never uses the other half.
 func halfDefaults(routes []Route) map[Route]bool {
 	out := map[Route]bool{}
 	for _, a := range routes {
@@ -70,7 +76,7 @@ func halfDefaults(routes []Route) map[Route]bool {
 			continue
 		}
 		for _, b := range routes {
-			if b.Prefix.Bits() == 1 && a.Interface == b.Interface && a.Prefix.Addr().Is4() == b.Prefix.Addr().Is4() && a.Prefix.Masked() != b.Prefix.Masked() {
+			if b.Prefix.Bits() == 1 && a.Interface == b.Interface && a.Table == b.Table && a.Prefix.Addr().Is4() == b.Prefix.Addr().Is4() && a.Prefix.Masked() != b.Prefix.Masked() {
 				out[a] = true
 			}
 		}

@@ -15,11 +15,11 @@ func has(ps []netip.Prefix, s string) bool { return slices.Contains(ps, pfx(s)) 
 
 func TestBlockedStaticAndRoutes(t *testing.T) {
 	routes := []Route{
-		{pfx("0.0.0.0/0"), "eth0"},
-		{pfx("203.0.113.0/24"), "eth0"},  // on-link LAN with global addresses
-		{pfx("198.51.100.0/24"), "wg0"},  // internal network behind a VPN route
-		{pfx("2001:db8:1::/64"), "eth0"}, // IPv6 LAN with global addresses
-		{pfx("::/0"), "eth0"},
+		{Prefix: pfx("0.0.0.0/0"), Interface: "eth0"},
+		{Prefix: pfx("203.0.113.0/24"), Interface: "eth0"},  // on-link LAN with global addresses
+		{Prefix: pfx("198.51.100.0/24"), Interface: "wg0"},  // internal network behind a VPN route
+		{Prefix: pfx("2001:db8:1::/64"), Interface: "eth0"}, // IPv6 LAN with global addresses
+		{Prefix: pfx("::/0"), Interface: "eth0"},
 	}
 	v4, v6 := Blocked(routes, []netip.Prefix{pfx("192.0.2.0/24")})
 	for _, s := range []string{"10.0.0.0/8", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12", "203.0.113.0/24", "198.51.100.0/24", "192.0.2.0/24", "240.0.0.0/4"} {
@@ -39,16 +39,16 @@ func TestBlockedStaticAndRoutes(t *testing.T) {
 
 func TestFullTunnelVPNPairIsDefault(t *testing.T) {
 	routes := []Route{
-		{pfx("0.0.0.0/1"), "tun0"}, {pfx("128.0.0.0/1"), "tun0"},
-		{pfx("::/1"), "tun0"}, {pfx("8000::/1"), "tun0"},
-		{pfx("10.8.0.0/16"), "tun0"},
+		{Prefix: pfx("0.0.0.0/1"), Interface: "tun0"}, {Prefix: pfx("128.0.0.0/1"), Interface: "tun0"},
+		{Prefix: pfx("::/1"), Interface: "tun0"}, {Prefix: pfx("8000::/1"), Interface: "tun0"},
+		{Prefix: pfx("10.8.0.0/16"), Interface: "tun0"},
 	}
 	v4, v6 := Blocked(routes, nil)
 	if has(v4, "0.0.0.0/1") || has(v4, "128.0.0.0/1") || has(v6, "::/1") {
 		t.Fatal("complementary /1 pair blocked")
 	}
 	// A single /1 without its complement is an ordinary route.
-	v4, _ = Blocked([]Route{{pfx("0.0.0.0/1"), "tun0"}, {pfx("128.0.0.0/1"), "eth0"}}, nil)
+	v4, _ = Blocked([]Route{{Prefix: pfx("0.0.0.0/1"), Interface: "tun0"}, {Prefix: pfx("128.0.0.0/1"), Interface: "eth0"}}, nil)
 	if !has(v4, "0.0.0.0/1") || !has(v4, "128.0.0.0/1") {
 		t.Fatal("/1 routes through different interfaces not blocked")
 	}
@@ -183,19 +183,116 @@ func TestTapName(t *testing.T) {
 	}
 }
 
-func TestParseProcRoutes(t *testing.T) {
-	v4 := `Iface	Destination	Gateway 	Flags	RefCnt	Use	Metric	Mask		MTU	Window	IRTT
-eth0	00000000	0102A8C0	0003	0	0	100	00000000	0	0	0
-eth0	0002A8C0	00000000	0001	0	0	100	00FFFFFF	0	0	0
+// ipRouteShowFixture is a synthetic `ip -4 -o route show table all` dump:
+// the main table, a policy routing table 100, the local table and the route
+// types that carry no reachable destination.
+const ipRouteShowFixture = `default via 192.0.2.254 dev eth0 proto dhcp src 192.0.2.1 metric 100
+192.0.2.0/24 dev eth0 proto kernel scope link src 192.0.2.1 metric 100
+203.0.113.9 dev eth0 scope link
+198.51.100.0/24 dev wg0 table 100 scope link
+0.0.0.0/1 dev wg0 table 100 scope link
+198.18.0.0/24 proto static \    nexthop via 192.0.2.7 dev eth0 weight 1 \    nexthop via 192.0.2.8 dev eth1 weight 1
+unreachable 203.0.113.64/26 table 100
+blackhole 203.0.113.128/26 table 100
+throw 10.9.0.0/16 table 100
+prohibit 100.100.0.0/16
+multicast 224.5.0.0/16 dev wg0 table 100
+broadcast 192.0.2.255 dev eth0 table local proto kernel scope link src 192.0.2.1
+local 192.0.2.1 dev eth0 table local proto kernel scope host src 192.0.2.1
+local 127.0.0.0/8 dev lo table local proto kernel scope host src 127.0.0.1
 `
-	routes, err := ParseProcRoute(strings.NewReader(v4))
-	if err != nil || len(routes) != 2 || routes[1].Prefix != pfx("192.168.2.0/24") || routes[0].Prefix.Bits() != 0 {
-		t.Fatalf("v4 routes %v %v", routes, err)
+
+func TestParseIPRouteShow(t *testing.T) {
+	routes, err := ParseIPRouteShow(strings.NewReader(ipRouteShowFixture))
+	if err != nil {
+		t.Fatal(err)
 	}
+	want := []Route{
+		{Prefix: pfx("0.0.0.0/0"), Interface: "eth0", Table: "main"},
+		{Prefix: pfx("192.0.2.0/24"), Interface: "eth0", Table: "main"},
+		{Prefix: pfx("203.0.113.9/32"), Interface: "eth0", Table: "main"},
+		{Prefix: pfx("198.51.100.0/24"), Interface: "wg0", Table: "100"},
+		{Prefix: pfx("0.0.0.0/1"), Interface: "wg0", Table: "100"},
+		{Prefix: pfx("198.18.0.0/24"), Interface: "eth0", Table: "main"},
+	}
+	if !slices.Equal(routes, want) {
+		t.Fatalf("routes\n got %v\nwant %v", routes, want)
+	}
+}
+
+func TestParseIPRouteShowRejectsBadPrefix(t *testing.T) {
+	for _, line := range []string{"banana dev eth0", "10.0.0.0/33 dev eth0", "2001:db8::/32 dev eth0", "local", ""} {
+		routes, err := ParseIPRouteShow(strings.NewReader(line + "\n"))
+		if line == "" {
+			if err != nil || len(routes) != 0 {
+				t.Errorf("empty line: %v %v", routes, err)
+			}
+			continue
+		}
+		if err == nil {
+			t.Errorf("%q parsed as %v", line, routes)
+		}
+	}
+}
+
+// A prefix that the host reaches only through a policy routing table is
+// blocked with its IPv4-mapped and NAT64 forms; default routes of any table
+// add nothing.
+func TestBlockedIncludesSecondaryTableRoutes(t *testing.T) {
+	routes, err := ParseIPRouteShow(strings.NewReader(ipRouteShowFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v4, v6 := Blocked(routes, nil)
+	for _, s := range []string{"198.51.100.0/24", "203.0.113.9/32", "198.18.0.0/24", "192.0.2.0/24"} {
+		if !has(v4, s) {
+			t.Errorf("v4 lacks %s", s)
+		}
+	}
+	for _, s := range []string{"::ffff:198.51.100.0/120", "64:ff9b::c633:6400/120"} {
+		if !has(v6, s) {
+			t.Errorf("v6 lacks %s", s)
+		}
+	}
+	// A lone 0.0.0.0/1 of table 100 is an ordinary route.
+	if !has(v4, "0.0.0.0/1") {
+		t.Error("v4 lacks the lone 0.0.0.0/1 of table 100")
+	}
+	// Routes without a destination add no prefix.
+	for _, s := range []string{"0.0.0.0/0", "203.0.113.64/26", "203.0.113.128/26", "10.9.0.0/16", "100.100.0.0/16", "192.0.2.255/32", "192.0.2.1/32"} {
+		if has(v4, s) {
+			t.Errorf("v4 holds %s", s)
+		}
+	}
+}
+
+func TestHalfDefaultsNeedSameTableAndInterface(t *testing.T) {
+	// The pair of one table and interface keeps default-route treatment.
+	routes := []Route{
+		{Prefix: pfx("0.0.0.0/1"), Interface: "tun0", Table: "100"},
+		{Prefix: pfx("128.0.0.0/1"), Interface: "tun0", Table: "100"},
+	}
+	v4, _ := Blocked(routes, nil)
+	if has(v4, "0.0.0.0/1") || has(v4, "128.0.0.0/1") {
+		t.Fatal("complementary /1 pair of one table blocked")
+	}
+	// A half whose complement lives in another table stays an ordinary
+	// route, also through the same interface.
+	routes = []Route{
+		{Prefix: pfx("0.0.0.0/1"), Interface: "tun0", Table: "100"},
+		{Prefix: pfx("128.0.0.0/1"), Interface: "tun0", Table: "main"},
+	}
+	v4, _ = Blocked(routes, nil)
+	if !has(v4, "0.0.0.0/1") || !has(v4, "128.0.0.0/1") {
+		t.Fatal("/1 halves of different tables not blocked")
+	}
+}
+
+func TestParseProcIPv6Route(t *testing.T) {
 	v6 := `20010db8000100000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0
 00000000000000000000000000000001 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001       lo
 `
-	routes, err = ParseProcIPv6Route(strings.NewReader(v6))
+	routes, err := ParseProcIPv6Route(strings.NewReader(v6))
 	if err != nil || len(routes) != 1 || routes[0].Prefix != pfx("2001:db8:1::/64") {
 		t.Fatalf("v6 routes %v %v", routes, err)
 	}
