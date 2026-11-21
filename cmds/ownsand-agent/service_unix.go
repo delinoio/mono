@@ -19,18 +19,6 @@ func runService(cfg config.Config) int {
 	return runInteractive(cfg)
 }
 
-// serviceEnv carries the agent settings of the current environment into
-// the service definition.
-func serviceEnv() []string {
-	var env []string
-	for _, name := range config.EnvNames {
-		if v, ok := os.LookupEnv(name); ok && v != "" {
-			env = append(env, name+"="+v)
-		}
-	}
-	return env
-}
-
 func serviceDefinition(exe string) string {
 	if runtime.GOOS == "darwin" {
 		return service.LaunchdDaemon(exe, serviceEnv())
