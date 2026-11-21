@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -642,6 +643,88 @@ func TestFileReadDanglingSymlinkMissingDirectory(t *testing.T) {
 	if entries, _ := os.ReadDir(dir); len(entries) != 1 {
 		t.Fatalf("temporary files left: %v", entries)
 	}
+}
+
+func TestFileReadDanglingSymlinkDotDotAfterSymlink(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	// alias -> real/sub and link -> alias/../out.txt: the kernel resolves
+	// alias first and applies ".." to real/sub, so the target of link is
+	// real/out.txt. A lexical clean would pick the unrelated path "out.txt"
+	// beside link.
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "real", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("real", "sub"), filepath.Join(dir, "alias")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	// Build the target without filepath.Join, which would clean it.
+	if err := os.Symlink("alias"+string(filepath.Separator)+".."+string(filepath.Separator)+"out.txt", link); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "real", "out.txt")); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("target content %q %v", b, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "out.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the download created the lexically cleaned path: %v", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the download replaced the symbolic link")
+	}
+	for _, d := range []string{dir, filepath.Join(dir, "real")} {
+		for _, e := range mustReadDir(t, d) {
+			if strings.HasSuffix(e, ".tmp") {
+				t.Fatalf("temporary file left in %s: %s", d, e)
+			}
+		}
+	}
+}
+
+func TestFileReadDanglingSymlinkDotDotAfterMissingDirectory(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	// missing does not exist, so the kernel fails the lookup of
+	// missing/../out.txt. A lexical clean would turn it into out.txt beside
+	// the link and create that file.
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link")
+	// Build the target without filepath.Join, which would clean it.
+	if err := os.Symlink("missing"+string(filepath.Separator)+".."+string(filepath.Separator)+"out.txt", link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code == 0 {
+		t.Fatalf("read --to a link through a missing directory succeeded: %+v", res)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the failed download replaced the symbolic link")
+	}
+	if entries := mustReadDir(t, dir); len(entries) != 1 {
+		t.Fatalf("the failed download changed the directory: %v", entries)
+	}
+}
+
+func mustReadDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }
 
 func TestFileReadSymlinkLoop(t *testing.T) {
