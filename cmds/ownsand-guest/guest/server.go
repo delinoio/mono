@@ -59,6 +59,9 @@ type Config struct {
 	Logger  *slog.Logger
 	// Now returns the current time; nil means time.Now.
 	Now func() time.Time
+	// setClock changes the system clock; nil means setSystemClock. Tests
+	// replace it so that they never change the host clock.
+	setClock func(time.Time) error
 	// KeepaliveInterval defaults to DefaultKeepaliveInterval.
 	KeepaliveInterval time.Duration
 	// SweepInterval is how often expired operations are removed; it
@@ -90,6 +93,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.setClock == nil {
+		cfg.setClock = setSystemClock
 	}
 	if cfg.KeepaliveInterval <= 0 {
 		cfg.KeepaliveInterval = DefaultKeepaliveInterval
@@ -146,14 +152,18 @@ func (s *Server) SetClock(_ context.Context, req *connect.Request[ownsandv1.SetC
 		s.logger.Info("set clock ignored", "clock_mode", "ignore")
 		return connect.NewResponse(&ownsandv1.SetClockResponse{}), nil
 	}
-	if err := setSystemClock(t); err != nil {
+	// Read the clock before the change: after it, the offset would be ~0.
+	before := s.now()
+	if err := s.cfg.setClock(t); err != nil {
 		s.logger.Warn("set clock failed", "error", err)
 		if errors.Is(err, errors.ErrUnsupported) {
 			return nil, connect.NewError(connect.CodeUnimplemented, err)
 		}
 		return nil, connect.NewError(connect.CodeInternal, errors.New("set clock failed"))
 	}
-	s.logger.Info("clock set", "offset_ms", time.Until(t).Milliseconds())
+	// offset_ms is the applied correction: the requested time minus the
+	// guest clock before the change. It is positive when the guest was behind.
+	s.logger.Info("clock set", "offset_ms", t.Sub(before).Milliseconds())
 	return connect.NewResponse(&ownsandv1.SetClockResponse{}), nil
 }
 
