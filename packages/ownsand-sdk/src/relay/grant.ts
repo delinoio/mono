@@ -96,6 +96,20 @@ export class GrantKeeper {
     this.#grant = undefined;
   }
 
+  /**
+   * Discards the grant after a failed relay call, except when the agent
+   * rejected the call at its capacity (`resource_exhausted`): that failure
+   * says nothing about the grant, so the retry reuses it. `failure` must be
+   * the value that `recoverOrThrow` classifies. `acquire` still renews a kept
+   * grant that has expired or has been idle for too long.
+   */
+  discardFor(failure: unknown): void {
+    if (classifyFailure(failure) === FailureClass.ResourceExhausted) {
+      return;
+    }
+    this.discard();
+  }
+
   /** Marks the start of a stream or call under the current grant. */
   streamStarted(): void {
     if (this.#grant !== undefined) {

@@ -244,10 +244,12 @@ async function sendChunk(
       grants.streamEnded();
     }
     throwIfAborted(signal);
-    grants.discard();
     // The control plane's 5-minute call limit is retryable for a write,
-    // which the write_id rules make safe.
-    await recoverOrThrow(ctx, window, asRetryableDeadline(failure), signal);
+    // which the write_id rules make safe. The grant decision and the
+    // recovery rules must see the same (wrapped) failure.
+    const retryable = asRetryableDeadline(failure);
+    grants.discardFor(retryable);
+    await recoverOrThrow(ctx, window, retryable, signal);
   }
 }
 
