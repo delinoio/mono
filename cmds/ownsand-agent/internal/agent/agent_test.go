@@ -432,3 +432,20 @@ func TestEnrollRetriesAfterOriginWriteFailure(t *testing.T) {
 		t.Fatalf("third enroll: %v", err)
 	}
 }
+
+// TestWithdrawAgentUpdateCommand checks that the agent answers the withdrawal
+// command with success when no update is queued, and keeps reporting the
+// UP_TO_DATE update state.
+func TestWithdrawAgentUpdateCommand(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	h := start(t, cp, st, id)
+	h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_WithdrawAgentUpdate{WithdrawAgentUpdate: &ownsandv1.WithdrawAgentUpdateCommand{}}})
+	if res.GetError() != nil {
+		t.Fatalf("withdrawal failed: %v", res.GetError())
+	}
+	if state, target := h.agent.updater.State(); state != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE || target != "" {
+		t.Fatalf("update state %v %q", state, target)
+	}
+}

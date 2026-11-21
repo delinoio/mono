@@ -12,6 +12,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/snapxfer"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
 	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -38,8 +39,34 @@ func commandKind(cmd *ownsandv1.AgentCommand) string {
 		return "update_agent"
 	case *ownsandv1.AgentCommand_DeleteSnapshot:
 		return "delete_snapshot"
+	case *ownsandv1.AgentCommand_WithdrawAgentUpdate:
+		return "withdraw_agent_update"
 	}
 	return "unknown"
+}
+
+// isUpdateCommand reports whether cmd takes an update order.
+func isUpdateCommand(cmd *ownsandv1.AgentCommand) bool {
+	switch cmd.GetCommand().(type) {
+	case *ownsandv1.AgentCommand_UpdateAgent, *ownsandv1.AgentCommand_WithdrawAgentUpdate:
+		return true
+	}
+	return false
+}
+
+// updateCommandError maps the updater's refusals to error codes: a command
+// that arrives once the installation started or the running version is
+// revoked fails its precondition, and a superseded command is aborted.
+func updateCommandError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, update.ErrInstalling), errors.Is(err, update.ErrRunningRevoked):
+		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, Message: err.Error()}
+	case errors.Is(err, update.ErrSuperseded):
+		return &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_ABORTED, Message: err.Error()}
+	}
+	return err
 }
 
 func errorDetail(err error) *ownsandv1.ErrorDetail {
@@ -53,7 +80,10 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 // handleCommand runs one command and sends its result on the current
 // channel. A result that cannot be sent is lost; the control plane then
 // learns the state from the next state report.
-func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand) {
+//
+// order is the update order that dispatch took when it received an update or
+// withdrawal command; it is zero for every other command.
+func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand, order uint64) {
 	kind := commandKind(cmd)
 	logger := a.logger.With("command_id", cmd.GetCommandId(), "command", kind)
 	logger.Info("command received")
@@ -105,7 +135,10 @@ func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand) 
 		}
 		return
 	case *ownsandv1.AgentCommand_UpdateAgent:
-		err = a.updater.Handle(ctx, c.UpdateAgent)
+		err = a.updater.HandleOrdered(ctx, c.UpdateAgent, order)
+		err = updateCommandError(err)
+	case *ownsandv1.AgentCommand_WithdrawAgentUpdate:
+		err = updateCommandError(a.updater.WithdrawOrdered(order))
 	case *ownsandv1.AgentCommand_DeleteSnapshot:
 		err = a.Sandboxes.DeleteSnapshot(c.DeleteSnapshot)
 	default:

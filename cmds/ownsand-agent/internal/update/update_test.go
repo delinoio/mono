@@ -310,3 +310,163 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 		})
 	}
 }
+
+// gateTransport holds the artifact download until release is closed, and
+// signals started when that download begins.
+type gateTransport struct {
+	base    http.RoundTripper
+	started chan struct{}
+	release chan struct{}
+}
+
+func (g gateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Path == "/agent" {
+		g.started <- struct{}{}
+		<-g.release
+	}
+	return g.base.RoundTrip(req)
+}
+
+func TestWithdrawWhilePendingIdleNeverInstalls(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	busy.Store(true)
+	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE {
+		t.Fatalf("state %v", s)
+	}
+	u.mu.Lock()
+	artifact := u.artifact
+	u.mu.Unlock()
+	if err := u.Withdraw(); err != nil {
+		t.Fatal(err)
+	}
+	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE || target != "" {
+		t.Fatalf("state after withdrawal %v %q", s, target)
+	}
+	if _, err := os.Stat(artifact); !os.IsNotExist(err) {
+		t.Fatalf("queued artifact still on disk: %v", err)
+	}
+	// The device becomes idle: the installer is never called.
+	busy.Store(false)
+	if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
+		t.Fatalf("installed a withdrawn update: %v %v", ok, err)
+	}
+	if st, _ := u.opts.Store.LoadAgent(); st != nil && st.PendingUpdate != nil {
+		t.Fatalf("pending update recorded: %+v", st.PendingUpdate)
+	}
+	// A repeated withdrawal with nothing queued succeeds.
+	if err := u.Withdraw(); err != nil {
+		t.Fatal(err)
+	}
+	// Control: a later authorized update still installs once idle.
+	busy.Store(true)
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 || restarts.Load() != 1 {
+		t.Fatalf("control install: %v %v", ok, err)
+	}
+}
+
+func TestWithdrawDuringDownloadNeverInstalls(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+	gate := gateTransport{base: r.srv.Client().Transport, started: make(chan struct{}, 1), release: make(chan struct{})}
+	u.opts.HTTP = &http.Client{Transport: gate}
+
+	// The commands take their orders in receive order, as the agent does.
+	updateOrder := u.NextOrder()
+	done := make(chan error, 1)
+	go func() {
+		done <- u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, updateOrder)
+	}()
+	<-gate.started
+	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING {
+		t.Fatalf("state %v", s)
+	}
+	if err := u.WithdrawOrdered(u.NextOrder()); err != nil {
+		t.Fatal(err)
+	}
+	close(gate.release)
+	if err := <-done; !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("download finished with %v, want ErrSuperseded", err)
+	}
+	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE || target != "" {
+		t.Fatalf("state %v %q", s, target)
+	}
+	if files, _ := filepath.Glob(filepath.Join(u.opts.Store.Path(store.UpdateDir), "*")); len(files) != 0 {
+		t.Fatalf("discarded download left files: %v", files)
+	}
+	if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
+		t.Fatalf("installed after a withdrawn download: %v %v", ok, err)
+	}
+}
+
+func TestOlderUpdateCommandLosesToNewerOrder(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	busy.Store(true)
+	u, inst, _ := newUpdater(t, r, "1.0.0", busy)
+	older, newer := u.NextOrder(), u.NextOrder()
+	// The withdrawal arrives first in goroutine scheduling but was received
+	// after the update, so it wins and the late update is rejected.
+	if err := u.WithdrawOrdered(newer); err != nil {
+		t.Fatal(err)
+	}
+	if err := u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, older); !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("late older update: %v", err)
+	}
+	busy.Store(false)
+	if ok, _ := u.TryInstall(); ok || inst.installed.Load() != 0 {
+		t.Fatal("installed a superseded update")
+	}
+	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE {
+		t.Fatalf("state %v", s)
+	}
+}
+
+func TestWithdrawAfterInstallStartedAndWhileRevoked(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	busy.Store(true)
+	u, inst, _ := newUpdater(t, r, "1.0.0", busy)
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); !ok || err != nil {
+		t.Fatalf("install: %v %v", ok, err)
+	}
+	// The installation boundary: it cannot be taken back.
+	if err := u.Withdraw(); !errors.Is(err, ErrInstalling) {
+		t.Fatalf("withdrawal during installation: %v", err)
+	}
+	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_INSTALLING || inst.installed.Load() != 1 {
+		t.Fatalf("state %v after a late withdrawal", s)
+	}
+
+	// A revoked running version keeps its recovery: the withdrawal changes
+	// nothing.
+	rr := newRelease(t, func(m *Manifest, _ *[]byte) { m.RevokedVersions = append(m.RevokedVersions, "1.0.0") })
+	u2, inst2, _ := newUpdater(t, rr, "1.0.0", busy)
+	busy.Store(true)
+	if err := update(u2, "1.1.0", true); err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := u2.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE {
+		t.Fatalf("state %v", s)
+	}
+	if err := u2.Withdraw(); !errors.Is(err, ErrRunningRevoked) {
+		t.Fatalf("withdrawal while revoked: %v", err)
+	}
+	busy.Store(false)
+	if ok, err := u2.TryInstall(); !ok || err != nil || inst2.installed.Load() != 1 {
+		t.Fatalf("recovery install: %v %v", ok, err)
+	}
+}
