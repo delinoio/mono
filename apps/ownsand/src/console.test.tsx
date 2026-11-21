@@ -6,6 +6,7 @@ import {
   fireEvent,
   render,
   screen,
+  within,
 } from "@testing-library/react";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
@@ -171,6 +172,24 @@ describe("devices", () => {
     expect(effective.textContent).toContain("24");
     expect(screen.getByRole("button", { name: "Save limits" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Remove device" })).toBeTruthy();
+  });
+
+  test("a removed device disappears from the device list", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Remove device" }),
+      );
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Remove device" }),
+      );
+    });
+    await settle(100);
+    expect(await screen.findByText("studio-mac")).toBeTruthy();
+    expect(screen.queryByText("build-box-1")).toBeNull();
   });
 });
 
