@@ -21,6 +21,7 @@ import (
 
 	"connectrpc.com/connect"
 
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/accounts-api/internal/app"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
@@ -43,6 +44,13 @@ const (
 
 // WebOrigin is the web app origin of invitation links in tests.
 const WebOrigin = "https://accounts.example.test"
+
+// Machine-to-machine clients of UsageService in tests: UsageClientID may use
+// OwnSand, UnmappedClientID may use no service.
+const (
+	UsageClientID    = "ownsand-m2m"
+	UnmappedClientID = "unmapped-m2m"
+)
 
 // Clock is a settable clock. Each read advances it by one millisecond, so
 // consecutive events, such as two joins, have distinct times as they would on
@@ -141,6 +149,8 @@ func New(t testing.TB) *Env {
 		Audience:    authtest.Audience,
 		CORSOrigins: []string{WebOrigin},
 		WebOrigin:   WebOrigin,
+
+		UsageClients: map[string][]accountsv1.ServiceId{UsageClientID: {accountsv1.ServiceId_SERVICE_ID_OWNSAND}},
 	})
 	srv := httptest.NewServer(handler)
 	t.Cleanup(srv.Close)
@@ -181,6 +191,31 @@ func (e *Env) Credit(userID string) accountsv1connect.CreditServiceClient {
 	e.t.Helper()
 	return accountsv1connect.NewCreditServiceClient(http.DefaultClient, e.URL,
 		connect.WithInterceptors(bearer(e.Issuer.UserToken(e.t, userID))))
+}
+
+// Usage returns a UsageService client that sends token; an empty token
+// sends no Authorization header.
+func (e *Env) Usage(token string) accountsv1connect.UsageServiceClient {
+	return accountsv1connect.NewUsageServiceClient(http.DefaultClient, e.URL, connect.WithInterceptors(bearer(token)))
+}
+
+// Service returns a UsageService client with a machine-to-machine token of
+// UsageClientID with the scope `accounts:report-usage`.
+func (e *Env) Service() accountsv1connect.UsageServiceClient {
+	e.t.Helper()
+	return e.Usage(e.Issuer.MachineToken(e.t, UsageClientID, auth.ScopeReportUsage))
+}
+
+// BillingUsage returns a BillingUsageService client that sends a valid user
+// access token of userID.
+func (e *Env) BillingUsage(userID string) accountsv1connect.BillingUsageServiceClient {
+	e.t.Helper()
+	return e.BillingUsageClient(e.Issuer.UserToken(e.t, userID))
+}
+
+// BillingUsageClient returns a BillingUsageService client that sends token.
+func (e *Env) BillingUsageClient(token string) accountsv1connect.BillingUsageServiceClient {
+	return accountsv1connect.NewBillingUsageServiceClient(http.DefaultClient, e.URL, connect.WithInterceptors(bearer(token)))
 }
 
 var eventSeq struct {

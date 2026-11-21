@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/servers/accounts-api/internal/api"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
@@ -36,6 +37,9 @@ type Options struct {
 	Audience    string
 	CORSOrigins []string
 	WebOrigin   string
+	// UsageClients maps machine-to-machine client IDs to the services that
+	// they may use on UsageService.
+	UsageClients map[string][]accountsv1.ServiceId
 }
 
 // Handler returns the root HTTP handler. Interceptor order: the RPC log
@@ -51,6 +55,8 @@ func Handler(opts Options) http.Handler {
 		Logger:    opts.Logger,
 		Now:       opts.Now,
 		WebOrigin: opts.WebOrigin,
+
+		UsageClients: opts.UsageClients,
 	})
 	mounts := svc.Mounts(
 		api.NewLogInterceptor(opts.Logger),
