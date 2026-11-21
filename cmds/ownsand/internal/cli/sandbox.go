@@ -733,9 +733,13 @@ func resolveMissingTarget(to string) (string, error) {
 			return "", err
 		}
 		if !filepath.IsAbs(target) {
-			// path already has real directory components (see above), so
-			// ".." in the target is applied to the real directory.
-			target = filepath.Join(filepath.Dir(path), target)
+			// path already has real directory components (see above). Prefix
+			// the target with that directory without cleaning it: filepath.Join
+			// would collapse "x/.." lexically, before the next iteration
+			// resolves x (a symbolic link, or a directory that is missing) the
+			// way the kernel does.
+			dir, _ := filepath.Split(path)
+			target = dir + target
 		}
 		path = target
 	}
