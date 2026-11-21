@@ -8,7 +8,13 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import {
+  Code,
+  ConnectError,
+  createClient,
+  type Transport,
+} from "@connectrpc/connect";
+import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -86,6 +92,28 @@ describe("organizations", () => {
     expect(
       screen.getByRole("link", { name: /Northwind Labs/ }).textContent,
     ).toContain("Member");
+  });
+
+  test("requests the first 200 organizations on the page and in the switcher", async () => {
+    const mock = createMockTransport();
+    const client = createClient(OrganizationService, mock);
+    for (let i = 0; i < 50; i++) {
+      await client.createOrganization({ name: `Extra ${i}` });
+    }
+    const pageSizes: number[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary: (method, ...rest) => {
+        if (method.name === "ListOrganizations") {
+          pageSizes.push((rest[3] as { pageSize: number }).pageSize);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole("/", { transport });
+    expect(await screen.findByRole("link", { name: /Extra 49/ })).toBeTruthy();
+    expect(pageSizes.length).toBeGreaterThan(0);
+    expect(pageSizes.every((size) => size === 200)).toBe(true);
   });
 
   test("opens an organization's sandboxes and hides ended sandboxes by default", async () => {
