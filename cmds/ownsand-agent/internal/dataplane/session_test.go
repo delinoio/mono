@@ -6,6 +6,7 @@ package dataplane
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -228,4 +229,48 @@ func TestSessionIdleAndLabel(t *testing.T) {
 	if a := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: newID(t), ExpiresIn: durationpb.New(time.Hour), Sdp: sdp}); a.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
 		t.Fatalf("unknown sandbox %v", a)
 	}
+}
+
+// A revocation ends a session whose operation waits for a stalled data
+// channel to drain: the end interrupts the waiting send instead of waiting
+// for its lock.
+func TestSessionEndInterruptsBackpressuredSend(t *testing.T) {
+	w := newWorld(t)
+	dp := newPlane(w, Timing{})
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	c, id := w.session(t, dp, ch, time.Hour)
+	// The caller stops reading, so the agent's send buffer fills up.
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	t.Cleanup(release)
+	c.dc.OnMessage(func(webrtc.DataChannelMessage) { <-gate })
+	c.send(datapath.MustNewFrame(1, w.sandbox, w.execReq("/bin/sh", "-c", "head -c 100000000 /dev/zero")))
+	dp.mu.Lock()
+	s := dp.sessions[id]
+	dp.mu.Unlock()
+	waitFor(t, "a stalled send", func() bool {
+		s.mu.Lock()
+		dc := s.dc
+		s.mu.Unlock()
+		return dc != nil && dc.BufferedAmount() > maxBuffered
+	})
+	done := make(chan struct{})
+	go func() {
+		dp.Revoke(ch, &ownsandv1.SessionRevocation{RevocationId: "r", Target: &ownsandv1.SessionRevocation_SessionId{SessionId: id}})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("revocation blocked behind a backpressured send")
+	}
+	dp.mu.Lock()
+	_, kept := dp.sessions[id]
+	dp.mu.Unlock()
+	if kept {
+		t.Fatal("revoked session kept")
+	}
+	release()
 }

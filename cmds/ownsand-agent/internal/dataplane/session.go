@@ -44,9 +44,19 @@ type session struct {
 	ended    bool
 	decoder  *datapath.Decoder
 
+	// stop closes when the session starts to end. It interrupts operation
+	// sends that wait for the buffer to drain, so the bounded session-end
+	// flush can take sendMu.
+	stop chan struct{}
+
 	sendMu sync.Mutex
 	low    chan struct{}
+	// torn reports that a send stopped within a frame; the byte stream
+	// then carries a partial frame and nothing else can follow it.
+	torn bool
 }
+
+var errSessionEnding = errors.New("dataplane: session is ending")
 
 func answerError(sessionID string, code ownsandv1.ErrorCode, msg string) *ownsandv1.SignalingAnswer {
 	return &ownsandv1.SignalingAnswer{SessionId: sessionID, Error: &ownsandv1.ErrorDetail{Code: code, Message: msg}}
@@ -100,7 +110,7 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	sctx, cancel := context.WithCancel(context.Background())
 	s := &session{d: d, id: offer.GetSessionId(), sandboxID: offer.GetSandboxId(), gen: ch.Generation(), pc: pc,
 		ctx: sctx, cancel: cancel, streams: map[uint64]context.CancelFunc{}, activity: time.Now(),
-		decoder: datapath.NewDecoder(), low: make(chan struct{}, 1)}
+		decoder: datapath.NewDecoder(), low: make(chan struct{}, 1), stop: make(chan struct{})}
 	pc.OnDataChannel(s.onDataChannel)
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		if st == webrtc.PeerConnectionStateFailed || st == webrtc.PeerConnectionStateClosed {
@@ -247,9 +257,16 @@ func (k sessionSink) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	return k.s.send(ctx, f)
 }
 
-// send writes one frame as data channel messages of at most 16 KiB. It
-// waits while the channel buffers more than maxBuffered bytes.
+// send writes one frame of an operation. It fails once the session has
+// started to end.
 func (s *session) send(ctx context.Context, f *ownsandv1.DataFrame) error {
+	return s.write(ctx, f, s.stop)
+}
+
+// write writes one frame as data channel messages of at most 16 KiB. It
+// waits while the channel buffers more than maxBuffered bytes, until ctx
+// ends or stop closes; a nil stop (the session-end flush) never stops it.
+func (s *session) write(ctx context.Context, f *ownsandv1.DataFrame, stop <-chan struct{}) error {
 	msgs, err := datapath.EncodeMessages(f)
 	if err != nil {
 		return err
@@ -262,16 +279,32 @@ func (s *session) send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	for _, m := range msgs {
+	select {
+	case <-stop:
+		return errSessionEnding
+	default:
+	}
+	if s.torn {
+		return errors.New("dataplane: data channel stream carries a partial frame")
+	}
+	for i, m := range msgs {
 		for dc.BufferedAmount() > maxBuffered {
+			var err error
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				err = ctx.Err()
+			case <-stop:
+				err = errSessionEnding
 			case <-s.low:
 			case <-time.After(time.Second):
 			}
+			if err != nil {
+				s.torn = s.torn || i > 0
+				return err
+			}
 		}
 		if err := dc.Send(m); err != nil {
+			s.torn = s.torn || i > 0
 			return err
 		}
 	}
@@ -314,6 +347,7 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 		return
 	}
 	s.ended = true
+	close(s.stop)
 	var open []uint64
 	for id := range s.streams {
 		open = append(open, id)
@@ -321,9 +355,14 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 	dc := s.dc
 	s.mu.Unlock()
 	if reason != ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED && dc != nil {
+		// Closing stop above made every waiting operation send return, so
+		// write gets sendMu without waiting for a stalled channel.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		for _, id := range open {
-			_ = s.send(ctx, datapath.MustNewFrame(id, s.sandboxID, &ownsandv1.SessionEnd{Reason: reason}))
+			if err := s.write(ctx, datapath.MustNewFrame(id, s.sandboxID, &ownsandv1.SessionEnd{Reason: reason}), nil); err != nil {
+				s.d.logger.Warn("session-end frame not sent", "session_id", s.id, "stream_id", id, "error", err)
+				break
+			}
 		}
 		// Closing the data channel resets its stream and drops queued
 		// messages, so wait until the session-end frames left.
