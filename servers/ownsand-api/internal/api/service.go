@@ -57,7 +57,9 @@ type Limits struct {
 	// key validations per key prefix.
 	PerPrefix *ratelimit.Limiter
 	// PerClient limits the same RPCs per client address when a trusted
-	// client address is known.
+	// client address is known. It holds one bucket per address, keyed by the
+	// bare address, that the device RPCs, AcceptInvitation and failed API key
+	// validations share.
 	PerClient *ratelimit.Limiter
 }
 
@@ -106,11 +108,21 @@ type Service struct {
 
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID
+	// imports holds the snapshot imports that importThenCreate waits for;
+	// only a channel with an entry gets download URLs for that snapshot.
+	imports activeImports
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.
 type LeaseHolder interface {
 	Held() bool
+	// WhileHeld runs fn only while the instance holds the lease, with the
+	// ownership lock held, and reports whether it ran. The transition that
+	// clears ownership takes the same lock before it closes the agent
+	// channels, so a channel registered in fn is either closed by that
+	// transition or never registered. fn must do no I/O and must not call
+	// the lease.
+	WhileHeld(fn func()) bool
 }
 
 // DataPathHooks receives the data path parts of the agent channel.
@@ -143,6 +155,10 @@ type Timing struct {
 	// the default. The sweep that removes expired records runs every
 	// OfflineSweep.
 	CommandGrace time.Duration
+	// WriterDrainTimeout bounds the wait for the channel writer after a
+	// channel closed; a writer that is still blocked in a send after it
+	// loses its transport write (5 seconds); zero means the default.
+	WriterDrainTimeout time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -155,7 +171,18 @@ func DefaultTiming() Timing {
 		CleanupPoll:      30 * time.Second,
 		ImportWait:       2 * time.Hour,
 		CommandGrace:     DefaultCommandGrace,
+
+		WriterDrainTimeout: DefaultWriterDrainTimeout,
 	}
+}
+
+// writerDrainTimeout returns the wait for the channel writer after a channel
+// closed.
+func (s *Service) writerDrainTimeout() time.Duration {
+	if s.Timing.WriterDrainTimeout > 0 {
+		return s.Timing.WriterDrainTimeout
+	}
+	return DefaultWriterDrainTimeout
 }
 
 // commandGrace returns the retention window of unanswered commands whose

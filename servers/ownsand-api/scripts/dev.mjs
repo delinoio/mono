@@ -12,8 +12,15 @@
 // launcher prints an `ownsand_api_dev_skipped` record and exits with status 0
 // instead of failing, so the root `pnpm dev` keeps running the other
 // development servers on machines without a database. When
-// CORS_ORIGINS is unset, it allows the console's development origin
-// http://127.0.0.1:3300 in addition to the production origin.
+// CORS_ORIGINS is unset, it allows the console's development origins in
+// addition to the production origin: http://127.0.0.1:13300 (the fixed port
+// of `dev:app` and `PORTLESS=0`) and https://ownsand.delino.localhost and
+// http://ownsand.delino.localhost (the portless URL of the console with the
+// default proxy and with an unprivileged proxy). A proxy on a custom
+// PORTLESS_PORT adds that port to the URL; set CORS_ORIGINS to it there.
+// When ALLOW_DIRECT_CLIENT_ADDRESS is unset, it sets it to true: the development
+// server is reached directly, so the TCP peer is the client address for rate
+// limits. TRUST_PROXY_CLIENT_ADDRESS=true still takes precedence.
 //
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
@@ -32,7 +39,11 @@ const signalExitCode = (signal) => 128 + constants.signals[signal];
 // See the accounts-api launcher: the child runs in its own process group on
 // POSIX so a terminal signal reaches it once, through the forward.
 const ownProcessGroup = process.platform !== "win32";
-const DevelopmentConsoleOrigin = "http://127.0.0.1:3300";
+const DevelopmentConsoleOrigins = Object.freeze([
+  "http://127.0.0.1:13300",
+  "https://ownsand.delino.localhost",
+  "http://ownsand.delino.localhost",
+]);
 const ProductionConsoleOrigin = "https://ownsand.delino.io";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -85,7 +96,11 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
-  env.CORS_ORIGINS ??= `${ProductionConsoleOrigin},${DevelopmentConsoleOrigin}`;
+  env.ALLOW_DIRECT_CLIENT_ADDRESS ??= "true";
+  env.CORS_ORIGINS ??= [
+    ProductionConsoleOrigin,
+    ...DevelopmentConsoleOrigins,
+  ].join(",");
   const buildDir = await mkdtemp(join(tmpdir(), "ownsand-api-dev-"));
   try {
     if (received) return stoppedStatus();

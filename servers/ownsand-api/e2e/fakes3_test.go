@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakeBucket is the bucket of the fake S3 store.
@@ -25,6 +26,43 @@ type fakeS3 struct {
 	mu  sync.Mutex
 	// objects maps keys (without the bucket) to their content.
 	objects map[string][]byte
+	// gate, while set, holds every PUT before it stores the object, so a
+	// test can interrupt an export mid-transfer. putHeld is signaled once
+	// for each held PUT.
+	gate    chan struct{}
+	putHeld chan struct{}
+}
+
+// holdPuts makes every PUT wait until releasePuts or until the client
+// gives up (a killed agent); a held PUT stores nothing in that case.
+func (f *fakeS3) holdPuts() {
+	f.mu.Lock()
+	f.gate = make(chan struct{})
+	f.putHeld = make(chan struct{}, 64)
+	f.mu.Unlock()
+}
+
+// releasePuts lets the held PUTs and later PUTs store their objects.
+func (f *fakeS3) releasePuts() {
+	f.mu.Lock()
+	if f.gate != nil {
+		close(f.gate)
+		f.gate = nil
+	}
+	f.mu.Unlock()
+}
+
+// waitPutHeld waits until a PUT is held.
+func (f *fakeS3) waitPutHeld(t *testing.T) {
+	t.Helper()
+	f.mu.Lock()
+	held := f.putHeld
+	f.mu.Unlock()
+	select {
+	case <-held:
+	case <-time.After(60 * time.Second):
+		t.Fatal("no part upload reached the object store")
+	}
 }
 
 func newFakeS3(t *testing.T) *fakeS3 {
@@ -62,6 +100,17 @@ func (f *fakeS3) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case r.Method == http.MethodPut && key != "":
+		f.mu.Lock()
+		gate, held := f.gate, f.putHeld
+		f.mu.Unlock()
+		if gate != nil {
+			held <- struct{}{}
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+				return
+			}
+		}
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)

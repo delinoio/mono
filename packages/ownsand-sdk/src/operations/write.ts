@@ -48,26 +48,54 @@ export async function* chunkSource(
   source: WriteSource,
   size: number = MAX_FILE_CHUNK_SIZE,
 ): AsyncGenerator<{ data: Uint8Array; last: boolean }> {
-  let pending = new Uint8Array(0);
+  // Unconsumed pieces plus a read offset into the first one. Each piece and
+  // each chunk is copied once, so the total copy volume is linear in the
+  // input size. The caller's buffers are never aliased: an unacknowledged
+  // chunk can be resent after a failure while the caller mutates its own
+  // buffer.
+  const pieces: Uint8Array[] = [];
+  let offset = 0;
+  let pendingLength = 0;
   let held: Uint8Array | undefined;
+  const take = (n: number): Uint8Array => {
+    const out = new Uint8Array(n);
+    let filled = 0;
+    while (filled < n) {
+      const head = pieces[0]!;
+      const count = Math.min(n - filled, head.length - offset);
+      out.set(head.subarray(offset, offset + count), filled);
+      filled += count;
+      offset += count;
+      if (offset === head.length) {
+        pieces.shift();
+        offset = 0;
+      }
+    }
+    pendingLength -= n;
+    return out;
+  };
   for await (const piece of iterateSource(source)) {
-    const joined = new Uint8Array(pending.length + piece.length);
-    joined.set(pending, 0);
-    joined.set(piece, pending.length);
-    pending = joined;
-    while (pending.length >= size) {
+    if (piece.length === 0) continue;
+    // Own the piece before the loop asks the source for another one: a source
+    // can reuse its buffer between yields, and the caller can change a buffer
+    // while a chunk waits to be sent. Each byte is copied here once and in
+    // `take` once, so the copy volume stays linear in the input size. The
+    // constructor always copies: a Node.js `Buffer` overrides `slice` to
+    // return a view over the same memory, so `piece.slice()` would alias it.
+    pieces.push(new Uint8Array(piece));
+    pendingLength += piece.length;
+    while (pendingLength >= size) {
       if (held !== undefined) {
         yield { data: held, last: false };
       }
-      held = pending.slice(0, size);
-      pending = pending.slice(size);
+      held = take(size);
     }
   }
-  if (pending.length > 0) {
+  if (pendingLength > 0) {
     if (held !== undefined) {
       yield { data: held, last: false };
     }
-    held = pending;
+    held = take(pendingLength);
   }
   yield { data: held ?? new Uint8Array(0), last: true };
 }
@@ -216,10 +244,12 @@ async function sendChunk(
       grants.streamEnded();
     }
     throwIfAborted(signal);
-    grants.discard();
     // The control plane's 5-minute call limit is retryable for a write,
-    // which the write_id rules make safe.
-    await recoverOrThrow(ctx, window, asRetryableDeadline(failure), signal);
+    // which the write_id rules make safe. The grant decision and the
+    // recovery rules must see the same (wrapped) failure.
+    const retryable = asRetryableDeadline(failure);
+    grants.discardFor(retryable);
+    await recoverOrThrow(ctx, window, retryable, signal);
   }
 }
 

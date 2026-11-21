@@ -13,18 +13,31 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // outboundQueue is the number of envelopes that may wait for the writer of
-// one channel. A full queue means the agent does not read; Send then waits
-// until the context ends.
+// one channel. A full queue means the agent does not read.
 const outboundQueue = 256
+
+// DefaultQueueFullWait is how long Send waits for room in a full outbound
+// queue before it declares the channel saturated and closes it. A caller
+// can legitimately queue more than outboundQueue envelopes in a burst (for
+// example the delete commands after a state report), so the wait gives the
+// writer time to drain; a stalled agent does not drain and is cut off
+// after the wait instead of blocking the caller for ever.
+const DefaultQueueFullWait = 5 * time.Second
 
 // ErrNoChannel reports a device without a current agent channel on this
 // instance.
 var ErrNoChannel = errors.New("the device has no agent channel on this instance")
+
+// ErrQueueFull is the close cause of a channel whose outbound queue stayed
+// full for the queue-full wait: the agent does not read its channel.
+var ErrQueueFull = errors.New("the agent channel closed because its outbound queue stayed full")
 
 // ErrChannelClosed reports a channel that closed while a caller used it.
 var ErrChannelClosed = errors.New("the agent channel closed")
@@ -33,12 +46,20 @@ var ErrChannelClosed = errors.New("the agent channel closed")
 type Conn struct {
 	DeviceID       string
 	OrganizationID string
-	// Generation increases with every channel the hub registers.
+	// Generation increases with every channel the hub registers. It is a
+	// process-local counter that restarts with the process; use ID to
+	// identify a channel across restarts.
 	Generation uint64
+	// ID is a UUID v7 that is unique to this channel across control plane
+	// restarts. Durable records (for example the owner of a snapshot
+	// export) store it to tell later channels from the one they belong to.
+	ID string
 
 	out    chan *ownsandv1.AgentEnvelope
 	ctx    context.Context
 	cancel context.CancelCauseFunc
+	// queueFullWait is the bounded wait of Send on a full queue.
+	queueFullWait time.Duration
 	// reconciled is set when the server applied the reconnection state
 	// report; only then is the device online and eligible.
 	reconciled atomic.Bool
@@ -68,7 +89,12 @@ func (c *Conn) Reconciled() bool { return c.reconciled.Load() }
 func (c *Conn) SetReconciled() { c.reconciled.Store(true) }
 
 // Send queues env for the agent. It fails when the channel closed or ctx
-// ended first.
+// ended first. When the outbound queue is full, Send waits for the queue
+// full wait for room; if the writer frees none, the agent does not read, so
+// Send closes the channel with ErrQueueFull and returns that error. The
+// close takes the normal disconnect path of the channel handler, so the
+// caller (the channel handler or the shared control event worker) is never
+// blocked by a stalled agent beyond that wait.
 func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 	select {
 	case <-c.ctx.Done():
@@ -78,10 +104,21 @@ func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 	select {
 	case c.out <- env:
 		return nil
+	default:
+	}
+	timer := time.NewTimer(c.queueFullWait)
+	defer timer.Stop()
+	select {
+	case c.out <- env:
+		return nil
 	case <-c.ctx.Done():
 		return ErrChannelClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	case <-timer.C:
+		// Close keeps the first cause, so an earlier close reason wins.
+		c.Close(ErrQueueFull)
+		return ErrQueueFull
 	}
 }
 
@@ -110,6 +147,10 @@ type Hub struct {
 	// listeners run when a channel closes (for example to end the relay
 	// connections and grants bound to it).
 	closeListeners []func(*Conn)
+	// QueueFullWait is the bounded wait of Send on a full outbound queue
+	// for channels registered later; tests shorten it. Set it before the
+	// first Register.
+	QueueFullWait time.Duration
 	// fences holds the per-device fences that are in use (see lockDevice).
 	fences map[string]*deviceFence
 
@@ -119,7 +160,7 @@ type Hub struct {
 
 // New returns an empty hub.
 func New() *Hub {
-	return &Hub{conns: map[string]*Conn{}, fences: map[string]*deviceFence{}, Commands: NewWaiters[string, *ownsandv1.AgentCommandResult]()}
+	return &Hub{conns: map[string]*Conn{}, fences: map[string]*deviceFence{}, QueueFullWait: DefaultQueueFullWait, Commands: NewWaiters[string, *ownsandv1.AgentCommandResult]()}
 }
 
 // deviceFence serializes the registration of a new channel of one device
@@ -173,12 +214,46 @@ func (h *Hub) OnClose(fn func(*Conn)) {
 // that is running, so a new channel is never registered between the check
 // and the write of that call.
 func (h *Hub) Register(parent context.Context, deviceID, orgID string) *Conn {
-	ctx, cancel := context.WithCancelCause(parent)
 	unlock := h.lockDevice(deviceID)
 	defer unlock()
+	return h.register(parent, deviceID, orgID)
+}
+
+// RegisterAdmitted registers a new current channel like Register, but only
+// when admit runs its argument. It takes the device fence first and calls
+// admit with the fence held; admit decides whether to run the registration
+// (it returns false when it refused) and RegisterAdmitted returns nil then.
+// The registration runs inside admit, so admit can make the ownership
+// check and the registration one step under its own lock (the lease's
+// ownership lock). Because the fence is taken before admit, that lock is
+// never held while the call waits for the fence: the fence is held across
+// database I/O by IfNoChannel (the offline write of a closing channel), and
+// a wait for it under the ownership lock would stall every admission, the
+// lease renewal and the loss transition behind that I/O.
+//
+// Lock order: the device fence, then the lock of admit, then the hub lock.
+// admit and the function it runs must not take a fence.
+func (h *Hub) RegisterAdmitted(parent context.Context, deviceID, orgID string, admit func(register func()) bool) *Conn {
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+	var c *Conn
+	if !admit(func() { c = h.register(parent, deviceID, orgID) }) {
+		return nil
+	}
+	return c
+}
+
+// register adds the channel. The caller holds the device fence.
+func (h *Hub) register(parent context.Context, deviceID, orgID string) *Conn {
+	ctx, cancel := context.WithCancelCause(parent)
+	// crypto/rand does not fail on supported platforms.
+	id, err := uuidv7.NewString()
+	if err != nil {
+		panic(err)
+	}
 	h.mu.Lock()
 	h.gen++
-	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel}
+	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, ID: id, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel, queueFullWait: h.QueueFullWait}
 	old := h.conns[deviceID]
 	h.conns[deviceID] = c
 	h.mu.Unlock()

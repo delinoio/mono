@@ -82,13 +82,13 @@ func run() error {
 			JWKSFile: cfg.LogtoJWKSFile,
 			Logger:   logger,
 		}),
-		NonceKey:                cfg.NonceKey,
-		NonceKeyPrevious:        cfg.NonceKeyPrevious,
-		CORSOrigins:             cfg.CORSOrigins,
-		TrustProxyClientAddress: cfg.TrustProxyClientAddress,
-		STUNURLs:                cfg.STUNURLs,
-		Objects:                 objects,
-		SnapshotPartSizeBytes:   cfg.SnapshotPartSizeBytes,
+		NonceKey:              cfg.NonceKey,
+		NonceKeyPrevious:      cfg.NonceKeyPrevious,
+		CORSOrigins:           cfg.CORSOrigins,
+		ClientAddressMode:     cfg.ClientAddressMode,
+		STUNURLs:              cfg.STUNURLs,
+		Objects:               objects,
+		SnapshotPartSizeBytes: cfg.SnapshotPartSizeBytes,
 	})
 	if err != nil {
 		return err
@@ -127,7 +127,7 @@ func run() error {
 	}
 	defer stopAndWait()
 
-	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)))
+	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)), slog.String("client_address_mode", string(cfg.ClientAddressMode)))
 	return serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
 }
 

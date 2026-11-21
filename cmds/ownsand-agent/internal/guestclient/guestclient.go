@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guestclient connects the agent to the guest helper of one
 // sandbox: Connect GuestService over HTTP/2 without TLS on the hypervisor

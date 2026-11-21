@@ -7,6 +7,7 @@ export enum LogEvent {
   RelayRecovery = "relay_recovery",
   RelayGrant = "relay_grant",
   SessionEnded = "session_ended",
+  InvalidFrame = "invalid_frame",
 }
 
 /**

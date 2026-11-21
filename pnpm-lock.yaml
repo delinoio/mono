@@ -94,6 +94,9 @@ importers:
       e2e:
         specifier: 0.24.0
         version: 0.24.0(ai@7.0.173(zod@4.6.7))
+      portless:
+        specifier: 0.18.1
+        version: 0.18.1
       typescript:
         specifier: 6.0.3
         version: 6.0.3
@@ -128,6 +131,9 @@ importers:
       e2e:
         specifier: 0.24.0
         version: 0.24.0(ai@7.0.173(zod@4.6.7))
+      portless:
+        specifier: 0.18.1
+        version: 0.18.1
       typescript:
         specifier: 6.0.3
         version: 6.0.3
@@ -162,6 +168,9 @@ importers:
       e2e:
         specifier: 0.24.0
         version: 0.24.0(ai@7.0.173(zod@4.6.7))
+      portless:
+        specifier: 0.18.1
+        version: 0.18.1
       typescript:
         specifier: 6.0.3
         version: 6.0.3
@@ -235,6 +244,9 @@ importers:
       happy-dom:
         specifier: 21.0.4
         version: 21.0.4
+      portless:
+        specifier: 0.18.1
+        version: 0.18.1
       typescript:
         specifier: 6.0.3
         version: 6.0.3
@@ -2748,6 +2760,12 @@ packages:
   pngjs@7.0.0:
     resolution: {integrity: sha512-LKWqWJRhstyYo9pGvgor/ivk2w94eSjE3RGVuzLGlr3NmD8bf7RcYGze1mNdEHRP6TRP6rMuDHk5t44hnTRyow==}
     engines: {node: '>=14.19.0'}
+
+  portless@0.18.1:
+    resolution: {integrity: sha512-3gfeicAvS5kwFUbZrsZpt1oU1MUBvfiy2S0MT/n8mwWEp/ZjQsWI0mC353GEi/q8JUVgdx7lBGDzCcMI9O1MXg==}
+    engines: {node: '>=24'}
+    os: [darwin, linux, win32]
+    hasBin: true
 
   prettier@3.9.9:
     resolution: {integrity: sha512-Z/CJHIkdujO/OtN7nXUii0Rf3VT5SRuhjBA82Xvu2XhBUgX3nhP67T0LHceBdQLex7OOFGTox+Q5Yg8Jk2Qivg==}
@@ -5656,6 +5674,8 @@ snapshots:
   playwright-core@1.65.1: {}
 
   pngjs@7.0.0: {}
+
+  portless@0.18.1: {}
 
   prettier@3.9.9: {}
 

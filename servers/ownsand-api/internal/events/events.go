@@ -49,6 +49,11 @@ const (
 
 // Event is one control event.
 type Event struct {
+	// ID is the delivery ID of an event that After returns: the position of
+	// the event in commit order, and the cursor of the poll. The database
+	// assigns it when the transaction of the event commits, so it is not set
+	// for an event that Write receives. It is not the event_id column, which
+	// is allocated at insert time and can be out of commit order.
 	ID             int64
 	Kind           Kind
 	OrganizationID string
@@ -74,19 +79,21 @@ func Write(ctx context.Context, q db.Querier, e Event) error {
 	return err
 }
 
-// LatestID returns the ID of the newest event, or 0.
+// LatestID returns the delivery ID of the newest committed event, or 0.
 func LatestID(ctx context.Context, q db.Querier) (int64, error) {
 	var id int64
-	err := q.QueryRow(ctx, "SELECT COALESCE(max(event_id), 0) FROM control_events").Scan(&id)
+	err := q.QueryRow(ctx, "SELECT COALESCE(max(delivery_id), 0) FROM control_events").Scan(&id)
 	return id, err
 }
 
-// After returns up to limit events with an ID greater than after, oldest
-// first.
+// After returns up to limit events with a delivery ID greater than after,
+// in delivery order. A trigger assigns delivery IDs in commit order, so a
+// poll that has seen delivery ID N has also seen every event with a lower one
+// (migration 0006_control_events_delivery_id.sql).
 func After(ctx context.Context, q db.Querier, after int64, limit int) ([]Event, error) {
-	rows, err := q.Query(ctx, `SELECT event_id, kind, COALESCE(organization_id::text, ''), COALESCE(device_id::text, ''),
+	rows, err := q.Query(ctx, `SELECT delivery_id, kind, COALESCE(organization_id::text, ''), COALESCE(device_id::text, ''),
 		COALESCE(sandbox_id::text, ''), COALESCE(api_key_id::text, ''), COALESCE(user_id, ''), COALESCE(snapshot_id::text, '')
-		FROM control_events WHERE event_id > $1 ORDER BY event_id LIMIT $2`, after, limit)
+		FROM control_events WHERE delivery_id > $1 ORDER BY delivery_id LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, err
 	}

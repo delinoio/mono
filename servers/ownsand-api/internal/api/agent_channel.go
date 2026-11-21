@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"connectrpc.com/connect"
@@ -55,9 +56,48 @@ type commandInfo struct {
 // errDeviceRemoved closes a channel after the clean-up command.
 var errDeviceRemoved = errors.New("the device was removed")
 
-// writerDrainTimeout bounds the wait for the channel writer after the
-// channel closed.
-const writerDrainTimeout = 5 * time.Second
+// DefaultWriterDrainTimeout bounds the wait for the channel writer before
+// the device state changes after the channel closed. A writer that is still
+// blocked in a send after that (the agent does not read) no longer holds
+// back the device state. The handler cannot return while the send is
+// active: returning would finish the response writer under the blocked
+// send, which is a data race and a panic in net/http. The handler instead
+// aborts the blocked write (see abortStalledWrite) and then waits for the
+// writer to end.
+const DefaultWriterDrainTimeout = 5 * time.Second
+
+// streamControlKey is the context key of the response controller of the
+// agent channel request.
+type streamControlKey struct{}
+
+// WithStreamControl wraps the handler of the agent service so that the
+// channel handler can reach the response controller of its HTTP stream. The
+// server sets no WriteTimeout, because the channel is a long-lived stream, so
+// this controller is the only way to end a transport write that the agent
+// does not drain. Connect passes the request context to the RPC handler, so
+// the value is visible there.
+func WithStreamControl(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rc := http.NewResponseController(w)
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), streamControlKey{}, rc)))
+	})
+}
+
+// abortStalledWrite ends a transport write that blocks because the agent
+// does not read its channel. conn.Close only cancels the hub context, which
+// a blocked stream.Send does not observe, so without this the handler, the
+// writer, the inbound reader and the full outbound queue stay until the
+// agent disconnects. A write deadline in the past makes net/http reset the
+// HTTP/2 stream (or fail the HTTP/1.1 connection write), and the blocked
+// send returns an error. It returns an error when the abort could not be
+// requested.
+func abortStalledWrite(ctx context.Context) error {
+	rc, ok := ctx.Value(streamControlKey{}).(*http.ResponseController)
+	if !ok {
+		return errors.New("the request has no response controller")
+	}
+	return rc.SetWriteDeadline(time.Unix(1, 0))
+}
 
 // sendCommand sends cmd on conn with a new command ID and remembers it.
 func (s *Service) sendCommand(ctx context.Context, conn *hub.Conn, info commandInfo, cmd *ownsandv1.AgentCommand) (string, error) {
@@ -107,10 +147,22 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	if err != nil {
 		return err
 	}
-	if h.Hub == nil || h.Lease == nil || !h.Lease.Held() {
+	if h.Hub == nil || h.Lease == nil {
 		return errUnavailable("this instance does not accept agent channels now")
 	}
-	conn := h.Hub.Register(ctx, p.ID, p.OrganizationID)
+	// The ownership check and the hub registration are one step under the
+	// lease's ownership lock. The lease loss transition takes the same lock
+	// before it closes all channels, so this channel is either in that
+	// close or refused here, before the configuration is sent and before
+	// the hub changes. RegisterAdmitted waits for the device's fence, which
+	// the offline write of a closing channel of the same device holds across
+	// database I/O, before it takes the ownership lock. The step under the
+	// lock is in-memory only, so the lock never waits for that I/O and is
+	// released before any database or stream I/O below.
+	conn := h.Hub.RegisterAdmitted(ctx, p.ID, p.OrganizationID, h.Lease.WhileHeld)
+	if conn == nil {
+		return errUnavailable("this instance does not accept agent channels now")
+	}
 	log := h.Logger.With(slog.String("device_id", conn.DeviceID), slog.Uint64("generation", conn.Generation))
 	log.InfoContext(ctx, "agent_channel_connected")
 
@@ -118,6 +170,17 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	go func() {
 		defer close(writerDone)
 		for {
+			// A closed channel wins over a queued envelope: with both ready,
+			// the select below picks at random, and a writer that keeps
+			// sending after the handler returned uses a finished response
+			// writer (a data race, and a panic in net/http). A saturated
+			// channel closes with a full queue, so this case is the normal
+			// one there.
+			select {
+			case <-conn.Done():
+				return
+			default:
+			}
 			select {
 			case env := <-conn.Outbound():
 				if env == nil {
@@ -160,7 +223,7 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.now())
 		select {
 		case <-writerDone:
-		case <-time.After(writerDrainTimeout):
+		case <-time.After(h.writerDrainTimeout()):
 		}
 		current := h.Hub.Unregister(conn)
 		cause := context.Cause(conn.Context())
@@ -168,6 +231,20 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 			slog.Int("commands_marked_for_expiry", expiring))
 		if current {
 			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
+		}
+		select {
+		case <-writerDone:
+		default:
+			log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_stalled", slog.String("cause", fmt.Sprint(cause)))
+			// Abort the blocked transport write, then wait: the send returns
+			// an error once the stream is reset, so the wait ends. When the
+			// abort is not possible, the wait lasts until the transport ends
+			// the stream (the agent disconnects).
+			if err := abortStalledWrite(ctx); err != nil {
+				log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_abort_failed", slog.Any("error", err))
+			}
+			<-writerDone
+			log.InfoContext(context.WithoutCancel(ctx), "agent_channel_writer_ended")
 		}
 	}()
 
@@ -326,7 +403,7 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 }
 
 func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *ownsandv1.StateReport) error {
-	res, err := s.reconcileStateReport(ctx, conn.DeviceID, r)
+	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
 		return err
 	}
@@ -351,7 +428,8 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	}
 	conn.SetReconciled()
 	s.Logger.InfoContext(ctx, "agent_state_report", slog.String("device_id", conn.DeviceID), slog.Int("sandboxes", len(r.GetSandboxes())),
-		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)))
+		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)),
+		slog.Int("recovered_copies", res.recoveredCopies))
 	for _, id := range res.changed {
 		s.watch.fire(id)
 	}
@@ -389,7 +467,7 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
 	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
-	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()))
+	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
 	if !ok {
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
@@ -420,7 +498,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	case cmdCreateSnapshot:
 		err = s.applySnapshotResult(ctx, info, res)
 	case cmdExportSnapshot:
-		err = s.applyExportResult(ctx, info, res)
+		err = s.applyExportResult(ctx, info, res.GetCommandId(), res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
 			_, err = s.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)

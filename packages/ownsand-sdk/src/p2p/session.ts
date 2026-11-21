@@ -1,8 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { encodeMessages, FrameCodecError, FrameDecoder } from "../codec.ts";
-import { connectErrorFromDetail, OwnSandError } from "../errors.ts";
+import {
+  encodeMessages,
+  FrameCodecError,
+  FrameDecoder,
+  validateFrame,
+} from "../codec.ts";
+import {
+  connectErrorFromDetail,
+  InvalidFrameError,
+  OwnSandError,
+} from "../errors.ts";
 import { SessionEndReason } from "../gen/delino/ownsand/v1/common_pb.ts";
 import {
   type AttachExecRequest,
@@ -17,7 +26,11 @@ import {
   type WriteFileResponse,
 } from "../gen/delino/ownsand/v1/data_frame_pb.ts";
 import { LogEvent, safeLog } from "../logger.ts";
-import { type OperationContext, Timing } from "../relay/context.ts";
+import {
+  type OperationContext,
+  throwIfAborted,
+  Timing,
+} from "../relay/context.ts";
 import { AsyncQueue } from "./queue.ts";
 import {
   DATA_CHANNEL_LABEL,
@@ -72,6 +85,8 @@ export class PeerSession {
   readonly #streams = new Map<bigint, AsyncQueue<DataFrame>>();
   #nextStreamId = 1n;
   #ended: Error | undefined;
+  /** Tail of the send queue; a frame sends after the previous one finished. */
+  #sendTail: Promise<void> = Promise.resolve();
 
   private constructor(
     ctx: OperationContext,
@@ -242,6 +257,10 @@ export class PeerSession {
     if (this.#ended) {
       throw this.#ended;
     }
+    // A caller can abort while it waits for the shared session setup. The
+    // abort event already fired then, so the listener below would never see
+    // it. Reject before registering a stream or sending a frame.
+    throwIfAborted(signal);
     const streamId = this.#nextStreamId++;
     const queue = new AsyncQueue<DataFrame>();
     this.#streams.set(streamId, queue);
@@ -259,6 +278,7 @@ export class PeerSession {
           kind,
           payload,
         }),
+        signal,
       );
       for await (const frame of queue) {
         if (frame.payload.case === "error") {
@@ -284,24 +304,59 @@ export class PeerSession {
     }
   }
 
-  async #send(frame: DataFrame): Promise<void> {
-    for (const message of encodeMessages(frame)) {
+  /**
+   * Sends one frame. The data channel carries one length-prefixed byte
+   * stream, so the messages of two frames must never interleave. A frame
+   * spans many messages and waits for the send buffer between them; the
+   * sends of concurrent requests therefore run one after another, and each
+   * holds the turn for all messages of its frame. A caller can abort while
+   * its frame waits for the turn, so the turn re-checks the signal before it
+   * sends the first message and skips a cancelled frame; a frame that is
+   * already in progress always completes, because a partial frame would
+   * corrupt the byte stream.
+   */
+  async #send(
+    frame: DataFrame,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    // Encode before the turn so that the critical section is only I/O.
+    const messages = encodeMessages(frame);
+    const previous = this.#sendTail;
+    const turn = previous.then(() => {
+      throwIfAborted(signal);
+      return this.#writeMessages(messages);
+    });
+    // The next sender waits for this turn to finish, whether it failed or
+    // not; the failure itself reaches only the caller of this frame.
+    this.#sendTail = turn.catch(() => {});
+    await turn;
+  }
+
+  async #writeMessages(messages: Uint8Array[]): Promise<void> {
+    for (const message of messages) {
+      // The wait loops: after it wakes, another condition (a session end or a
+      // buffer that filled again) can hold, so re-check before every send.
+      while (!this.#ended && this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
+        await this.#waitForBufferLow();
+      }
       if (this.#ended) {
         throw this.#ended;
       }
-      if (this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            this.#channel.removeEventListener("bufferedamountlow", done);
-            this.#channel.removeEventListener("close", done);
-            resolve();
-          };
-          this.#channel.addEventListener("bufferedamountlow", done);
-          this.#channel.addEventListener("close", done);
-        });
-      }
       this.#channel.send(message);
     }
+  }
+
+  /** Resolves when the send buffer drains or the channel closes. */
+  #waitForBufferLow(): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        this.#channel.removeEventListener("bufferedamountlow", done);
+        this.#channel.removeEventListener("close", done);
+        resolve();
+      };
+      this.#channel.addEventListener("bufferedamountlow", done);
+      this.#channel.addEventListener("close", done);
+    });
   }
 
   #onMessage(event: unknown): void {
@@ -342,6 +397,27 @@ export class PeerSession {
         });
         this.#terminate(new SessionEndedError(reason));
         return;
+      }
+      const invalid = validateFrame(frame);
+      if (invalid !== undefined) {
+        // A frame of a newer schema or one that breaks a framing rule fails
+        // only its own stream, so the operation ends with the error instead
+        // of waiting for a frame that it can use. On stream_id 0 and on a
+        // stream that is not open there is nothing to fail, so the frame is
+        // ignored. Frames that the stream already queued are delivered first.
+        const queue = this.#streams.get(frame.streamId);
+        if (queue !== undefined) {
+          safeLog(this.#ctx.logger, {
+            event: LogEvent.InvalidFrame,
+            sandboxId: this.#ctx.sandboxId,
+            reason: invalid.message,
+          });
+          queue.fail(
+            new InvalidFrameError(invalid.message, { cause: invalid }),
+          );
+          this.#streams.delete(frame.streamId);
+        }
+        continue;
       }
       this.#streams.get(frame.streamId)?.push(frame);
     }

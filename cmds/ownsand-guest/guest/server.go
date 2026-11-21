@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guest implements the GuestService of the guest helper: the
 // readiness check, the clock setting and the DataFrame exec and file
