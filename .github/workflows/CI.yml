@@ -32,6 +32,7 @@ jobs:
       rust: ${{ steps.plan.outputs.rust }}
       e2e: ${{ steps.plan.outputs.e2e }}
       workspace: ${{ steps.plan.outputs.workspace }}
+      workflows: ${{ steps.plan.outputs.workflows }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -122,11 +123,13 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo "Planned: format=$FORMAT_PLANNED; fixtures=$FIXTURES_PLANNED" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test:tooling; scripts/ci/validate-changesets.sh (pending changeset validation)' >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Runtime, account, native platform and release acceptance: not performed; CI does not build or deploy app projects yet.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo "Planned: format=$FORMAT_PLANNED; fixtures=$FIXTURES_PLANNED"
+            echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test:tooling; scripts/ci/validate-changesets.sh (pending changeset validation)'
+            echo "Result: $RESULT"
+            echo 'Runtime, account, native platform and release acceptance: not performed. The workspace job builds the app packages; CI does not deploy them.'
+          } >> "$GITHUB_STEP_SUMMARY"
   go:
     needs: changes
     if: needs.changes.outputs.go == 'true'
@@ -153,7 +156,7 @@ jobs:
           # The protobuf breaking-change check reads the comparison base.
           fetch-depth: 0
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # Caches the Go module and build caches, keyed by the `go.sum` hash.
@@ -210,10 +213,12 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; gofmt -l on tracked .go files; go vet ./...; go test -count=1 ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime); scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; gofmt -l on tracked .go files; go vet ./...; go test -count=1 ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime); scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>'
+            echo "Result: $RESULT"
+            echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor.'
+          } >> "$GITHUB_STEP_SUMMARY"
   rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
@@ -262,10 +267,12 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Cargo workspace: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked' >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Cargo workspace: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked'
+            echo "Result: $RESULT"
+            echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
   e2e:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
@@ -326,11 +333,13 @@ jobs:
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
-          echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; e2e-web install chromium --with-deps; pnpm test:e2e -- --reporter list,junit [--exclude-tag agent]' >> "$GITHUB_STEP_SUMMARY"
-          echo "Agent-tagged tests: ${AGENT_TESTS:-not run}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Scope: development servers in headless Chromium. Production build, Cloudflare Pages, account and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; e2e-web install chromium --with-deps; pnpm test:e2e -- --reporter list,junit [--exclude-tag agent]'
+            echo "Agent-tagged tests: ${AGENT_TESTS:-not run}"
+            echo "Result: $RESULT"
+            echo 'Scope: development servers in headless Chromium. Production build, Cloudflare Pages, account and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
   workspace:
     needs: changes
     if: needs.changes.outputs.workspace == 'true'
@@ -341,7 +350,7 @@ jobs:
         with:
           persist-credentials: false
       # The server packages wrap the Go toolchain in their package scripts.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           # The go job owns the Go cache. setup-go cannot restore without
@@ -372,9 +381,46 @@ jobs:
             echo "Result: $RESULT"
             echo 'Scope: package build output, lint, typecheck and unit tests without a database. Deployment, Tauri bundles, app launch and release acceptance: not performed.'
           } >> "$GITHUB_STEP_SUMMARY"
+  workflows:
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Lint workflows with actionlint
+        # actionlint also runs the shellcheck of the Ubuntu runner image on
+        # every `run:` script.
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -color
+      - name: Audit workflows with zizmor
+        uses: zizmorcore/zizmor-action@45d7276c9ca790aabd705e31ca99c6185c3e76dd # v0.8.1
+        with:
+          version: 1.32.0
+          # Report findings as annotations and fail the step; do not upload
+          # SARIF, which would need `security-events: write`.
+          advanced-security: false
+          annotations: true
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 (with the runner shellcheck); zizmor 1.32.0 through zizmorcore/zizmor-action v0.8.1 with online audits'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
   ci-result:
     if: always()
-    needs: [changes, quality, go, rust, e2e, workspace]
+    needs: [changes, quality, go, rust, e2e, workspace, workflows]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -385,6 +431,7 @@ jobs:
           RUST_PLANNED: ${{ needs.changes.outputs.rust }}
           E2E_PLANNED: ${{ needs.changes.outputs.e2e }}
           WORKSPACE_PLANNED: ${{ needs.changes.outputs.workspace }}
+          WORKFLOWS_PLANNED: ${{ needs.changes.outputs.workflows }}
           NEEDS_RESULTS: ${{ toJSON(needs) }}
           VALIDATION_REVISION: ${{ github.sha }}
         shell: bash
@@ -392,7 +439,7 @@ jobs:
           set -euo pipefail
           echo "Validation revision: $VALIDATION_REVISION" >> "$GITHUB_STEP_SUMMARY"
           echo "$NEEDS_RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' | tee -a "$GITHUB_STEP_SUMMARY"
-          if echo "$NEEDS_RESULTS" | jq -e --arg planned "$QUALITY_PLANNED" --arg go_planned "$GO_PLANNED" --arg rust_planned "$RUST_PLANNED" --arg e2e_planned "$E2E_PLANNED" --arg workspace_planned "$WORKSPACE_PLANNED" 'all(.[]; .result == "success" or .result == "skipped") and .changes.result == "success" and (.quality.result == "success" or (.quality.result == "skipped" and $planned == "false")) and (.go.result == "success" or (.go.result == "skipped" and $go_planned == "false")) and (.rust.result == "success" or (.rust.result == "skipped" and $rust_planned == "false")) and (.e2e.result == "success" or (.e2e.result == "skipped" and $e2e_planned == "false")) and (.workspace.result == "success" or (.workspace.result == "skipped" and $workspace_planned == "false"))' > /dev/null; then
+          if echo "$NEEDS_RESULTS" | jq -e --arg planned "$QUALITY_PLANNED" --arg go_planned "$GO_PLANNED" --arg rust_planned "$RUST_PLANNED" --arg e2e_planned "$E2E_PLANNED" --arg workspace_planned "$WORKSPACE_PLANNED" --arg workflows_planned "$WORKFLOWS_PLANNED" 'all(.[]; .result == "success" or .result == "skipped") and .changes.result == "success" and (.quality.result == "success" or (.quality.result == "skipped" and $planned == "false")) and (.go.result == "success" or (.go.result == "skipped" and $go_planned == "false")) and (.rust.result == "success" or (.rust.result == "skipped" and $rust_planned == "false")) and (.e2e.result == "success" or (.e2e.result == "skipped" and $e2e_planned == "false")) and (.workspace.result == "success" or (.workspace.result == "skipped" and $workspace_planned == "false")) and (.workflows.result == "success" or (.workflows.result == "skipped" and $workflows_planned == "false"))' > /dev/null; then
             echo 'CI result: success' | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo 'CI result: failure' | tee -a "$GITHUB_STEP_SUMMARY"

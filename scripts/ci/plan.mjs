@@ -87,6 +87,14 @@ export function isWorkspaceInput(path) {
   );
 }
 
+// GitHub Actions workflows and local actions select the `workflows` job, which
+// lints them with actionlint and audits them with zizmor.
+export function isWorkflowInput(path) {
+  return (
+    path.startsWith(".github/workflows/") || path.startsWith(".github/actions/")
+  );
+}
+
 // Protobuf schema inputs: the schemas, the buf configuration, the generation
 // script and the TypeScript generation template and plugin pin of the OwnSand
 // SDK. The Go job lints them, checks breaking changes and fails when the
@@ -201,6 +209,7 @@ export function plan(cwd, base, head) {
   const rust = paths.some(isRustInput);
   const e2e = paths.some(isE2eInput);
   const workspace = paths.some(isWorkspaceInput);
+  const workflows = paths.some(isWorkflowInput);
   return {
     quality: format || fixtures,
     format,
@@ -209,6 +218,7 @@ export function plan(cwd, base, head) {
     rust,
     e2e,
     workspace,
+    workflows,
   };
 }
 
@@ -246,10 +256,10 @@ export function main(env = process.env, cwd = process.cwd()) {
   }
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
   // Branch-wide cancellation can cancel a main-push run before its Go, Rust,
-  // fixtures, e2e or workspace jobs finish, and the next push then compares
-  // only against its own parent. Every main push therefore runs the Go checks,
-  // the Rust checks, the fixtures, the e2e suites and the workspace package
-  // tasks against its own head so a later documentation-only push cannot hide a
+  // fixtures, e2e, workspace or workflows jobs finish, and the next push then
+  // compares only against its own parent. Every main push therefore runs the Go
+  // checks, the Rust checks, the fixtures, the e2e suites, the workspace package
+  // tasks and the workflow lint against its own head so a later documentation-only push cannot hide a
   // cancelled predecessor's range. The fixtures step lives in
   // the `quality` job, so forcing fixtures forces quality too. `format` stays
   // diff-derived: the formatter compares the same range and a forced run
@@ -265,6 +275,7 @@ export function main(env = process.env, cwd = process.cwd()) {
     rust: diffPlan.rust || mainPush,
     e2e: diffPlan.e2e || mainPush,
     workspace: diffPlan.workspace || mainPush,
+    workflows: diffPlan.workflows || mainPush,
   };
   const reasonOf = (selectedByDiff) =>
     mainPush && !selectedByDiff ? OutputReason.MainPush : OutputReason.Diff;
@@ -282,6 +293,7 @@ export function main(env = process.env, cwd = process.cwd()) {
     fixturesReason: reasonOf(diffPlan.fixtures),
     e2eReason: reasonOf(diffPlan.e2e),
     workspaceReason: reasonOf(diffPlan.workspace),
+    workflowsReason: reasonOf(diffPlan.workflows),
   };
   appendFileSync(
     env.GITHUB_OUTPUT,
