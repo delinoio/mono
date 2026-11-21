@@ -18,6 +18,7 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 )
 
 // credentialPolicy says which credentials an RPC accepts.
@@ -99,44 +100,51 @@ func clientAddr(ctx context.Context) string {
 
 // Interceptors returns the logging and authentication interceptors in the
 // order that handlers must apply them.
-func (s *Service) Interceptors(authn *Authenticator, trustProxy bool) []connect.Interceptor {
+func (s *Service) Interceptors(authn *Authenticator, mode config.ClientAddressMode) []connect.Interceptor {
 	return []connect.Interceptor{
-		&logInterceptor{logger: s.Logger, now: s.Now, trustProxy: trustProxy},
+		&logInterceptor{logger: s.Logger, now: s.Now, addressMode: mode},
 		&authInterceptor{authn: authn},
 	}
 }
 
-// ClientAddress returns the client address of a request: the TCP peer, or,
-// when trustProxy is set, the last X-Forwarded-For entry, which is the one
-// that the Caddy reverse proxy appends.
-func ClientAddress(peerAddr string, header http.Header, trustProxy bool) string {
-	if trustProxy {
+// ClientAddress returns the client address of a request for the mode, or ""
+// when the request has none, in which case the per-client rate limits do not
+// apply. Verified proxy mode uses only the last entry of the last
+// X-Forwarded-For header, which is the one that the Caddy reverse proxy
+// appends, and never falls back to the TCP peer (the proxy itself). Direct
+// mode uses the TCP peer and ignores forwarded headers. Any other mode,
+// including the zero value, gives no address.
+func ClientAddress(peerAddr string, header http.Header, mode config.ClientAddressMode) string {
+	switch mode {
+	case config.ClientAddressVerifiedProxy:
 		values := header.Values("X-Forwarded-For")
-		if len(values) > 0 {
-			parts := strings.Split(values[len(values)-1], ",")
-			if last := strings.TrimSpace(parts[len(parts)-1]); net.ParseIP(last) != nil {
-				return last
-			}
+		if len(values) == 0 {
+			return ""
 		}
-		// Behind the proxy, the TCP peer is the proxy itself, which is not a
-		// useful client key.
+		parts := strings.Split(values[len(values)-1], ",")
+		if last := strings.TrimSpace(parts[len(parts)-1]); net.ParseIP(last) != nil {
+			return last
+		}
+		return ""
+	case config.ClientAddressDirect:
+		host, _, err := net.SplitHostPort(peerAddr)
+		if err != nil {
+			return ""
+		}
+		return host
+	default:
 		return ""
 	}
-	host, _, err := net.SplitHostPort(peerAddr)
-	if err != nil {
-		return ""
-	}
-	return host
 }
 
 type logInterceptor struct {
-	logger     *slog.Logger
-	now        func() time.Time
-	trustProxy bool
+	logger      *slog.Logger
+	now         func() time.Time
+	addressMode config.ClientAddressMode
 }
 
 func (l *logInterceptor) start(ctx context.Context, peer connect.Peer, header http.Header) (context.Context, *rpcInfo) {
-	info := &rpcInfo{requestID: newID(), clientAddr: ClientAddress(peer.Addr, header, l.trustProxy)}
+	info := &rpcInfo{requestID: newID(), clientAddr: ClientAddress(peer.Addr, header, l.addressMode)}
 	return context.WithValue(ctx, rpcInfoKey{}, info), info
 }
 
@@ -297,14 +305,14 @@ func (a *Authenticator) apiKey(ctx context.Context, token, client string) (auth.
 		return auth.Principal{}, errRateLimited(retry)
 	}
 	if client != "" {
-		if ok, retry := s.Limits.PerClient.Peek("apikey:" + client); !ok {
+		if ok, retry := s.Limits.PerClient.Peek(client); !ok {
 			return auth.Principal{}, errRateLimited(retry)
 		}
 	}
 	fail := func() (auth.Principal, error) {
 		s.Limits.PerPrefix.Allow("apikey:"+prefix, 1)
 		if client != "" {
-			s.Limits.PerClient.Allow("apikey:"+client, 1)
+			s.Limits.PerClient.Allow(client, 1)
 		}
 		return auth.Principal{}, errUnauthenticated("invalid API key")
 	}

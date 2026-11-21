@@ -7,6 +7,8 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -879,4 +882,252 @@ func TestChallengeRateLimit(t *testing.T) {
 	}
 }
 
+// clientBucketLimits returns limits with a two-token client bucket that
+// refills one token per second on the test clock and generous per-device and
+// per-prefix limits, so only the shared per-client bucket can reject.
+func clientBucketLimits(o *app.Options) {
+	o.ClientAddressMode = config.ClientAddressVerifiedProxy
+	o.Limits = &api.Limits{
+		PerDevice: ratelimit.New(1000, 1000, o.Now),
+		PerPrefix: ratelimit.New(1000, 1000, o.Now),
+		PerClient: ratelimit.New(1, 2, o.Now),
+	}
+}
+
+// fromAddress returns clients whose requests carry the proxy-appended client
+// address addr.
+func fromAddress(env *testenv.Env, token, addr string) *testenv.Clients {
+	return env.ClientsWith(token, http.Header{"X-Forwarded-For": []string{addr}})
+}
+
+// rateLimitRetry returns the retry delay of a resource_exhausted error, or 0
+// when err is another error.
+func rateLimitRetry(t *testing.T, err error) time.Duration {
+	t.Helper()
+	var ce *connect.Error
+	if testenv.Code(err) != connect.CodeResourceExhausted || !errorsAs(err, &ce) || len(ce.Details()) == 0 {
+		return 0
+	}
+	v, derr := ce.Details()[0].Value()
+	detail, ok := v.(*ownsandv1.ErrorDetail)
+	if derr != nil || !ok {
+		t.Fatalf("retry detail = %v, %v", v, derr)
+	}
+	return detail.GetRetryAfter().AsDuration()
+}
+
+// TestClientRateLimitSharedBucket checks that device RPCs, AcceptInvitation
+// and failed API key validations draw from one per-client-address bucket.
+func TestClientRateLimitSharedBucket(t *testing.T) {
+	env := testenv.New(t, clientBucketLimits)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	newInvitation := func() string {
+		inv, err := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return inv.Msg.GetInvitationSecret()
+	}
+	users := 0
+	// Each category makes one request that passes its other limits. It returns
+	// the error of the request and whether the request is otherwise eligible.
+	type category struct {
+		name string
+		call func(addr string) error
+		// ok reports whether err is the answer of a request that the limiter let
+		// through.
+		ok func(err error) bool
+	}
+	categories := []category{
+		{"device RPC", func(addr string) error {
+			id, _ := uuidv7.NewString()
+			_, err := fromAddress(env, "", addr).Agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id}))
+			return err
+		}, func(err error) bool { return err == nil }},
+		{"AcceptInvitation", func(addr string) error {
+			users++
+			secret := newInvitation()
+			_, err := fromAddress(env, testenv.UserToken(fmt.Sprintf("joiner-%d", users)), addr).Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: secret}))
+			return err
+		}, func(err error) bool { return err == nil }},
+		{"failed API key validation", func(addr string) error {
+			_, err := fromAddress(env, "osk_BBBBAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", addr).Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+			return err
+		}, func(err error) bool { return testenv.Code(err) == connect.CodeUnauthenticated }},
+	}
+	orders := [][3]int{{0, 1, 2}, {0, 2, 1}, {1, 0, 2}, {1, 2, 0}, {2, 0, 1}, {2, 1, 0}}
+	for n, order := range orders {
+		addr := fmt.Sprintf("203.0.113.%d", n+1)
+		first, second, third := categories[order[0]], categories[order[1]], categories[order[2]]
+		t.Run(first.name+" then "+second.name+" then "+third.name, func(t *testing.T) {
+			for _, c := range []category{first, second} {
+				if err := c.call(addr); !c.ok(err) {
+					t.Fatalf("%s before exhaustion: %v", c.name, err)
+				}
+			}
+			err := third.call(addr)
+			retry := rateLimitRetry(t, err)
+			if retry <= 0 {
+				t.Fatalf("%s after two other categories: want resource_exhausted with positive retry_after, got %v", third.name, err)
+			}
+			// The rejected request took no token: one second on the fixed clock
+			// refills exactly one.
+			env.Clock.Advance(retry)
+			if err := third.call(addr); !third.ok(err) {
+				t.Fatalf("%s after waiting %s: %v", third.name, retry, err)
+			}
+		})
+	}
+
+	t.Run("other address keeps its allowance", func(t *testing.T) {
+		const exhausted, other = "198.51.100.1", "198.51.100.2"
+		for _, c := range categories[:2] {
+			if err := c.call(exhausted); !c.ok(err) {
+				t.Fatalf("%s: %v", c.name, err)
+			}
+		}
+		if rateLimitRetry(t, categories[2].call(exhausted)) <= 0 {
+			t.Fatal("the exhausted address is not limited")
+		}
+		for _, c := range categories {
+			if err := c.call(other); !c.ok(err) {
+				t.Fatalf("%s from another address: %v", c.name, err)
+			}
+			env.Clock.Advance(time.Second)
+		}
+	})
+
+	t.Run("valid API key validation takes no token", func(t *testing.T) {
+		const addr = "198.51.100.3"
+		keyClient := fromAddress(env, org.APIKey, addr)
+		for i := 0; i < 5; i++ {
+			if _, err := keyClient.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID})); err != nil {
+				t.Fatalf("valid API key call %d: %v", i, err)
+			}
+		}
+		for _, c := range categories[:2] {
+			if err := c.call(addr); !c.ok(err) {
+				t.Fatalf("%s after valid API key calls: %v", c.name, err)
+			}
+		}
+		if rateLimitRetry(t, categories[2].call(addr)) <= 0 {
+			t.Fatal("two charged calls do not exhaust the bucket")
+		}
+	})
+}
+
+// TestClientRateLimitUnresolvedAddressAndOtherLimits checks that a request
+// without a resolved client address skips only the client bucket and that
+// the per-device limit still applies next to it.
+func TestClientRateLimitUnresolvedAddressAndOtherLimits(t *testing.T) {
+	env := testenv.New(t, func(o *app.Options) {
+		clientBucketLimits(o)
+		o.Limits.PerDevice = ratelimit.New(0.001, 3, o.Now)
+	})
+	ctx := context.Background()
+	challenge := func(c *testenv.Clients, id string) error {
+		_, err := c.Agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id}))
+		return err
+	}
+	// Behind a trusted proxy, a request without a valid X-Forwarded-For entry
+	// has no client address and takes no client token.
+	noAddr := env.Clients("")
+	for i := 0; i < 3; i++ {
+		id, _ := uuidv7.NewString()
+		if err := challenge(noAddr, id); err != nil {
+			t.Fatalf("request %d without address: %v", i, err)
+		}
+	}
+	// The per-device limit (burst 3) rejects the fourth challenge for one
+	// device although each client address (burst 2) still has tokens left.
+	same, _ := uuidv7.NewString()
+	for i := 0; i < 3; i++ {
+		if err := challenge(fromAddress(env, "", fmt.Sprintf("192.0.2.%d", i+1)), same); err != nil {
+			t.Fatalf("device call %d: %v", i, err)
+		}
+	}
+	if rateLimitRetry(t, challenge(fromAddress(env, "", "192.0.2.4"), same)) <= 0 {
+		t.Fatal("the per-device limit does not reject the fourth call of one device")
+	}
+}
+
 func errorsAs(err error, target **connect.Error) bool { return errors.As(err, target) }
+
+// addressBurstLimits returns limits with a one-token client bucket and
+// generous per-device and per-prefix limits, so only the per-client bucket can
+// reject, and a per-device challenge budget of two.
+func addressBurstLimits(mode config.ClientAddressMode) func(*app.Options) {
+	return func(o *app.Options) {
+		o.ClientAddressMode = mode
+		o.Limits = &api.Limits{
+			PerDevice: ratelimit.New(0.001, 2, o.Now),
+			PerPrefix: ratelimit.New(1000, 1000, o.Now),
+			PerClient: ratelimit.New(0.001, 1, o.Now),
+		}
+	}
+}
+
+// TestClientAddressModes checks which requests the per-client bucket limits
+// in each mode, with a one-token bucket and requests that name distinct
+// devices from one TCP peer behind a proxy.
+func TestClientAddressModes(t *testing.T) {
+	ctx := context.Background()
+	challenge := func(c *testenv.Clients) error {
+		id, _ := uuidv7.NewString()
+		_, err := c.Agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id}))
+		return err
+	}
+	for _, tc := range []struct {
+		name   string
+		mode   config.ClientAddressMode
+		header http.Header
+		// limited reports whether the second request from the same peer is
+		// rejected by the client bucket.
+		limited bool
+	}{
+		{"none ignores the peer", config.ClientAddressNone, nil, false},
+		{"none ignores forwarded headers", config.ClientAddressNone, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, false},
+		{"direct uses the peer", config.ClientAddressDirect, nil, true},
+		{"direct ignores forwarded headers", config.ClientAddressDirect, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, true},
+		{"verified proxy uses the forwarded address", config.ClientAddressVerifiedProxy, http.Header{"X-Forwarded-For": []string{"203.0.113.9"}}, true},
+		{"verified proxy without the header has no address", config.ClientAddressVerifiedProxy, nil, false},
+		{"verified proxy with an invalid final value has no address", config.ClientAddressVerifiedProxy, http.Header{"X-Forwarded-For": []string{"203.0.113.9, not-an-ip"}}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := testenv.New(t, addressBurstLimits(tc.mode))
+			c := env.ClientsWith("", tc.header)
+			if err := challenge(c); err != nil {
+				t.Fatalf("first request: %v", err)
+			}
+			err := challenge(c)
+			if tc.limited {
+				if rateLimitRetry(t, err) <= 0 {
+					t.Fatalf("second request: want resource_exhausted with a retry delay, got %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("second request from a distinct device: %v", err)
+			}
+		})
+	}
+}
+
+// TestChallengeLimitWithoutClientAddress checks that the per-device budget
+// still applies when requests have no client address.
+func TestChallengeLimitWithoutClientAddress(t *testing.T) {
+	env := testenv.New(t, addressBurstLimits(config.ClientAddressNone))
+	ctx := context.Background()
+	id, _ := uuidv7.NewString()
+	agent := env.Clients("").Agent
+	for i := 0; i < 2; i++ {
+		if _, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id})); err != nil {
+			t.Fatalf("challenge %d: %v", i, err)
+		}
+	}
+	_, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: id}))
+	if rateLimitRetry(t, err) <= 0 {
+		t.Fatalf("third challenge: want resource_exhausted with a retry delay, got %v", err)
+	}
+}

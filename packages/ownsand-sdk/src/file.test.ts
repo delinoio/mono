@@ -136,7 +136,82 @@ describe("file read", () => {
   });
 });
 
+describe("file read at agent capacity", () => {
+  test("keeps the grant after a stream rejected at capacity and renews it after unavailable", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "ReadFile", function* (_req, call) {
+      if (call.index === 0) {
+        throw ownsandError(Code.ResourceExhausted, "agent stream capacity");
+      }
+      if (call.index === 1) {
+        throw ownsandError(Code.Unavailable, "agent unreachable");
+      }
+      yield file.accepted();
+      yield file.chunk(0, "hi");
+      yield file.end(2);
+    });
+    const bytes = await h.clock.run(
+      h.client.sandbox(SANDBOX).readFileBytes("/f"),
+    );
+    expect(text(bytes)).toBe("hi");
+    const reads = h.api.callsOf("ReadFile");
+    expect(reads).toHaveLength(3);
+    // The capacity rejection reuses grant-1; unavailable renews it.
+    const auths = h.api.callsOf("AuthorizeRelay").map((c) => c.request as any);
+    expect(auths).toHaveLength(2);
+    expect(auths[1].replacesGrantId).toBe("grant-1");
+    expect(reads.map((c) => c.headers.get("ownsand-relay-grant-id"))).toEqual([
+      "grant-1",
+      "grant-1",
+      "grant-2",
+    ]);
+  });
+});
+
 describe("file write", () => {
+  test("keeps the grant when a chunk is rejected at agent capacity", async () => {
+    const h = setup();
+    h.api.unary(RelayService, "WriteFile", (req, call) => {
+      if (call.index === 0) {
+        throw ownsandError(Code.ResourceExhausted, "agent capacity");
+      }
+      return {
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: true,
+        sizeBytes: req.finish?.sizeBytes ?? 0n,
+      };
+    });
+    await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", "hello"));
+    const writes = h.api.callsOf("WriteFile");
+    expect(writes).toHaveLength(2);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    for (const write of writes) {
+      expect(write.headers.get("ownsand-relay-grant-id")).toBe("grant-1");
+    }
+  });
+
+  test("renews the grant after a chunk call hits the call limit", async () => {
+    const h = setup();
+    h.api.unary(RelayService, "WriteFile", (req, call) => {
+      if (call.index === 0) {
+        throw new ConnectError("relay call limit", Code.DeadlineExceeded);
+      }
+      return {
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: true,
+        sizeBytes: req.finish?.sizeBytes ?? 0n,
+      };
+    });
+    await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", "hello"));
+    const auths = h.api.callsOf("AuthorizeRelay").map((c) => c.request as any);
+    expect(auths).toHaveLength(2);
+    expect(auths[1].replacesGrantId).toBe("grant-1");
+  });
+
   test("uploads in chunks of at most 1 MiB and finishes only with the last chunk", async () => {
     const h = setup();
     h.api.unary(RelayService, "WriteFile", (req) => ({

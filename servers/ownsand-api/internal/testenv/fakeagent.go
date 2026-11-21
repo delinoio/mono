@@ -52,6 +52,11 @@ type FakeAgent struct {
 	changed   chan struct{}
 	closed    chan struct{}
 	closeErr  error
+	// readGate, when set, holds the read loop before its next receive.
+	readGate chan struct{}
+	// stallAfter, when set, arms readGate once the read loop received an
+	// envelope that it matches (see StallReadsAfter).
+	stallAfter func(*ownsandv1.AgentEnvelope) bool
 }
 
 // DefaultLinuxCapabilities reports a Linux host that runs Linux guests.
@@ -134,6 +139,13 @@ func (a *FakeAgent) AddSnapshot(e *ownsandv1.SnapshotStateEntry) {
 	a.mu.Unlock()
 }
 
+// ForgetSnapshot removes a local snapshot, as after the agent lost the copy.
+func (a *FakeAgent) ForgetSnapshot(id string) {
+	a.mu.Lock()
+	delete(a.snapshots, id)
+	a.mu.Unlock()
+}
+
 // HasSnapshot reports whether the fake holds a local snapshot.
 func (a *FakeAgent) HasSnapshot(id string) bool {
 	a.mu.Lock()
@@ -157,9 +169,40 @@ func (a *FakeAgent) SendStateReport() {
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: report}})
 }
 
+// StallReadsAfter stops the agent from reading its channel right after it
+// received the first envelope that match accepts, until ResumeReads or
+// Close. The read loop evaluates match under the agent lock and arms the
+// stall before it publishes the envelope, so a WaitFor for that envelope
+// returns only when the stall is in effect, however far the read loop was
+// in processing earlier envelopes. match must not call agent methods.
+func (a *FakeAgent) StallReadsAfter(match func(*ownsandv1.AgentEnvelope) bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stallAfter = match
+}
+
+// ResumeReads lets a stalled agent read its channel again.
+func (a *FakeAgent) ResumeReads() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.readGate != nil {
+		close(a.readGate)
+		a.readGate = nil
+	}
+}
+
 func (a *FakeAgent) read() {
 	defer close(a.closed)
 	for {
+		a.mu.Lock()
+		gate := a.readGate
+		a.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-a.ctx.Done():
+			}
+		}
 		resp, err := a.stream.Receive()
 		if err != nil {
 			a.mu.Lock()
@@ -170,6 +213,12 @@ func (a *FakeAgent) read() {
 		env := resp.GetEnvelope()
 		a.mu.Lock()
 		a.received = append(a.received, env)
+		if a.stallAfter != nil && a.stallAfter(env) {
+			a.stallAfter = nil
+			if a.readGate == nil {
+				a.readGate = make(chan struct{})
+			}
+		}
 		ch := a.changed
 		a.changed = make(chan struct{})
 		a.mu.Unlock()
