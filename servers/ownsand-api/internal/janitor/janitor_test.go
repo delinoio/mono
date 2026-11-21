@@ -31,6 +31,14 @@ func TestRetentionJobs(t *testing.T) {
 		('01900000-0000-7000-8000-000000000003', '01900000-0000-7000-8000-000000000000', '\x00', 'h', 1, 1, '1', 3, $1, $1),
 		('01900000-0000-7000-8000-000000000004', '01900000-0000-7000-8000-000000000000', '\x00', 'h', 1, 1, '1', 3, $1, $2)`,
 		now.Add(-time.Hour), now.Add(time.Hour))
+	// Reported outbox rows go 35 days after the report; unreported rows of
+	// any age stay.
+	exec(`INSERT INTO usage_outbox (organization_id, meter, window_start, quantity, amount_usd_micros, seal_time, next_attempt_time, report_time) VALUES
+		('01900000-0000-7000-8000-000000000000', 1, $1, 1, 1, $1, $1, $1),
+		('01900000-0000-7000-8000-000000000000', 2, $1, 1, 1, $1, $1, $2),
+		('01900000-0000-7000-8000-000000000000', 3, $1, 1, 1, $1, $1, NULL)`,
+		now.Add(-36*24*time.Hour), now.Add(-34*24*time.Hour))
+	exec("INSERT INTO usage_storage_samples VALUES ($1, $1), ($2, $2)", now.Add(-25*time.Hour), now.Add(-23*time.Hour))
 	janitor.RunOnce(ctx, d, testenv.Discard(), now)
 	count := func(sql string) int {
 		var n int
@@ -47,5 +55,11 @@ func TestRetentionJobs(t *testing.T) {
 	}
 	if n := count("SELECT count(*) FROM devices"); n != 1 {
 		t.Fatalf("tombstones = %d", n)
+	}
+	if n := count("SELECT count(*) FROM usage_outbox WHERE meter IN (2, 3)"); n != 2 || count("SELECT count(*) FROM usage_outbox") != 2 {
+		t.Fatalf("usage outbox = %d", n)
+	}
+	if n := count("SELECT count(*) FROM usage_storage_samples"); n != 1 {
+		t.Fatalf("storage samples = %d", n)
 	}
 }

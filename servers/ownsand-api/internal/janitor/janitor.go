@@ -3,8 +3,9 @@
 // Package janitor runs the retention jobs of the control plane: expired
 // nonces, device sessions and idempotency keys, device tombstones whose
 // expiry passed, audit events older than 90 days, ended sandboxes older
-// than 30 days that no longer reserve a macOS machine identifier, and
-// processed control events.
+// than 30 days that no longer reserve a macOS machine identifier,
+// processed control events, usage outbox rows 35 days after accounts-api
+// accepted them and R2 storage sample records after 1 day.
 package janitor
 
 import (
@@ -17,7 +18,8 @@ import (
 
 // DefaultInterval is the interval of the retention jobs. The retention
 // periods are in the job queries: audit events 90 days, ended sandboxes 30
-// days, processed control events 1 hour.
+// days, processed control events 1 hour, reported usage outbox rows 35 days
+// and storage sample records 1 day.
 const DefaultInterval = time.Hour
 
 type job struct {
@@ -39,6 +41,11 @@ func jobs() []job {
 		{"ended_sandboxes", `DELETE FROM sandboxes WHERE end_time IS NOT NULL AND end_time < $1::timestamptz - interval '30 days'
 			AND (machine_lineage IS NULL OR max_deadline <= $1::timestamptz)`},
 		{"control_events", "DELETE FROM control_events WHERE create_time < $1::timestamptz - interval '1 hour'"},
+		// Only rows that accounts-api accepted; unreported rows stay until
+		// they are reported, also for deleted organizations.
+		{"usage_outbox", "DELETE FROM usage_outbox WHERE report_time < $1::timestamptz - interval '35 days'"},
+		// A sample record only guards the sampling of its own window.
+		{"usage_storage_samples", "DELETE FROM usage_storage_samples WHERE window_start < $1::timestamptz - interval '1 day'"},
 	}
 }
 
