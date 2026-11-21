@@ -287,6 +287,20 @@ type jsonRange struct {
 	To   int64 `json:"to"`
 }
 
+// dataPathErrorEvent builds the final JSON line of an exec whose data path
+// failed. It carries the exec ID that the SDK error holds, so a script can
+// correlate the failure with the exec, which may still run in the sandbox.
+// A failure that happened before the exec ID existed has no ID, so the line
+// omits exec_id.
+func dataPathErrorEvent(err error) execJSONEvent {
+	ev := execJSONEvent{Event: "data_path_error", Message: describeError(err)}
+	var dp *ownsand.DataPathError
+	if errors.As(err, &dp) {
+		ev.ExecID = dp.OperationID
+	}
+	return ev
+}
+
 // execJSONEvent is one line of `sandbox exec --format json`.
 type execJSONEvent struct {
 	Event         string     `json:"event"`
@@ -382,7 +396,7 @@ func (a *app) sandboxExec(ctx context.Context, name string, args []string) error
 			if werr := jw.flushAll(); werr != nil {
 				return werr
 			}
-			if werr := writeJSON(a.env.Stdout, execJSONEvent{Event: "data_path_error", Message: describeError(err)}); werr != nil {
+			if werr := writeJSON(a.env.Stdout, dataPathErrorEvent(err)); werr != nil {
 				return werr
 			}
 			return &exitError{code: ExitDataPath}

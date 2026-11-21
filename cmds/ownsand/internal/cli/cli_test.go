@@ -178,6 +178,54 @@ func TestExecJSONEvents(t *testing.T) {
 	}
 }
 
+func TestExecJSONDataPathErrorCarriesExecID(t *testing.T) {
+	r := newRunner(t)
+	res := r.run("--format", "json", "sandbox", "exec", r.f.sb, "--", "denied")
+	if res.code != 255 {
+		t.Fatalf("exit %d, want 255: %+v", res.code, res)
+	}
+	lines := strings.Split(strings.TrimSpace(res.stdout), "\n")
+	var last map[string]any
+	if err := json.Unmarshal([]byte(lines[len(lines)-1]), &last); err != nil {
+		t.Fatal(err)
+	}
+	r.f.mu.Lock()
+	ids := append([]string(nil), r.f.execIDs...)
+	r.f.mu.Unlock()
+	if len(ids) == 0 || ids[0] == "" {
+		t.Fatalf("the fake recorded no exec ID: %q", ids)
+	}
+	if last["event"] != "data_path_error" || last["exec_id"] != ids[len(ids)-1] || last["message"] == "" {
+		t.Fatalf("last line %v, want data_path_error with exec_id %q", last, ids[len(ids)-1])
+	}
+	// Text mode is unchanged: no JSON on stdout.
+	res = r.run("sandbox", "exec", r.f.sb, "--", "denied")
+	if res.code != 255 || res.stdout != "" || !strings.Contains(res.stderr, "data path") {
+		t.Fatalf("text mode: %+v", res)
+	}
+}
+
+func TestDataPathErrorEventWithoutExecID(t *testing.T) {
+	// An error before the data path is wrapped without an operation ID, so
+	// the line omits exec_id.
+	err := &ownsand.DataPathError{Operation: "exec", Err: errors.New("no credential")}
+	var out bytes.Buffer
+	if werr := writeJSON(&out, dataPathErrorEvent(err)); werr != nil {
+		t.Fatal(werr)
+	}
+	var line map[string]any
+	if jerr := json.Unmarshal(out.Bytes(), &line); jerr != nil {
+		t.Fatal(jerr)
+	}
+	if _, ok := line["exec_id"]; ok || line["event"] != "data_path_error" || line["message"] == "" {
+		t.Fatalf("line %v", line)
+	}
+	with := dataPathErrorEvent(&ownsand.DataPathError{Operation: "exec", OperationID: "e1", Err: errors.New("x")})
+	if with.ExecID != "e1" {
+		t.Fatalf("exec ID %q", with.ExecID)
+	}
+}
+
 func TestExecJSONDecodesUTF8AcrossChunks(t *testing.T) {
 	r := newRunner(t)
 	lines := func(res result) []string {

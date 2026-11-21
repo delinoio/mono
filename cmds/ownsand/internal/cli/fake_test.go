@@ -50,6 +50,8 @@ type fakeServer struct {
 	// fields keep the presence that the CLI sent.
 	limit *ownsandv1.DeviceLimitsInput
 	creat []*ownsandv1.CreateSandboxRequest
+	// execIDs are the exec IDs of the relay Exec requests, in order.
+	execIDs []string
 }
 
 func newFakeServer(t testing.TB) *fakeServer {
@@ -206,6 +208,9 @@ func (h *fakeRelay) Exec(_ context.Context, r *connect.Request[ownsandv1.ExecReq
 	if r.Header().Get("Ownsand-Relay-Grant-Id") == "" {
 		return connect.NewError(connect.CodeUnavailable, errors.New("no grant"))
 	}
+	h.f.mu.Lock()
+	h.f.execIDs = append(h.f.execIDs, r.Msg.GetExecId())
+	h.f.mu.Unlock()
 	cmd := r.Msg.GetCommand()
 	if cmd[0] == "denied" {
 		return connect.NewError(connect.CodePermissionDenied, errors.New("digest mismatch"))
