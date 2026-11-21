@@ -53,8 +53,11 @@ type Lease struct {
 	// expiring the local ownership, and the reverse.
 	DeadlineNow func() time.Time
 	// OnAcquire runs when the instance gains the lease; OnLose runs when it
-	// loses or releases it.
-	OnAcquire func()
+	// loses or releases it. The context of OnAcquire ends at the confirmed
+	// expiry of the new ownership period: OnAcquire runs while the
+	// transition lock is held, and the expiry transition (and so OnLose)
+	// waits for it, so any I/O of OnAcquire must stop with its context.
+	OnAcquire func(ctx context.Context)
 	OnLose    func()
 
 	// Test seams of this package: the renewal call, the renewal interval and
@@ -232,10 +235,16 @@ func (l *Lease) applyRenewal(epoch uint64, ok bool, reason string, expireAt time
 		l.expireAt = expireAt
 		l.epoch++
 		close(l.acquired)
+		// OnAcquire holds transitionMu, which the expiry transition needs
+		// before it can run OnLose. Bound it by the confirmed expiry, so
+		// that its I/O cannot keep the channels admitted in the remaining
+		// ownership window open past it.
+		acquireCtx, cancel := context.WithTimeout(context.Background(), expireAt.Sub(now))
+		defer cancel()
 		l.mu.Unlock()
 		l.Logger.Info("lease_acquired", slog.String("instance_id", l.InstanceID))
 		if l.OnAcquire != nil {
-			l.OnAcquire()
+			l.OnAcquire(acquireCtx)
 		}
 	default:
 		l.mu.Unlock()

@@ -183,7 +183,7 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	var acquired, lost atomic.Int32
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
-		OnAcquire: func() { acquired.Add(1) }, OnLose: func() { lost.Add(1) },
+		OnAcquire: func(context.Context) { acquired.Add(1) }, OnLose: func() { lost.Add(1) },
 		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
 	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
 
@@ -251,6 +251,58 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	}
 	if got := acquired.Load(); got != 1 {
 		t.Fatalf("OnAcquire ran %d times, want 1", got)
+	}
+}
+
+// TestLeaseAcquireCallbackBoundedByExpiry checks that the work that runs on
+// acquisition cannot delay the expiry transition: its context ends at the
+// confirmed expiry, so a callback that waits on I/O (a database read) returns
+// then, and the loss transition runs OnLose right after it instead of after
+// the full I/O timeout.
+func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
+	l, lost := newTestLease()
+	expireAt := time.Now().Add(200 * time.Millisecond)
+	var deadline time.Time
+	var hasDeadline bool
+	started := make(chan struct{})
+	returned := make(chan time.Time, 1)
+	l.OnAcquire = func(ctx context.Context) {
+		deadline, hasDeadline = ctx.Deadline()
+		close(started)
+		// Stand-in for a database read that runs until its context ends.
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
+		returned <- time.Now()
+	}
+	l.init()
+	applied := make(chan struct{})
+	go func() {
+		defer close(applied)
+		l.applyRenewal(0, true, "", expireAt)
+	}()
+	<-started
+	// The context is a timeout of the remaining time, so its deadline can
+	// differ from the expiry by the time that the call took.
+	if !hasDeadline || deadline.Sub(expireAt) > 50*time.Millisecond {
+		t.Fatalf("the acquisition context has deadline %v (set: %v), want the expiry %v", deadline, hasDeadline, expireAt)
+	}
+
+	// The watcher's expiry check waits for the callback, which ends at the
+	// expiry; OnLose runs right after, well before the 10 second I/O bound.
+	begin := time.Now()
+	time.Sleep(time.Until(expireAt) + 10*time.Millisecond)
+	l.expireIfDue()
+	<-applied
+	if took := time.Since(begin); took > 2*time.Second {
+		t.Fatalf("the loss transition took %v after the acquisition started, want about the expiry", took)
+	}
+	if end := <-returned; end.Sub(expireAt) > time.Second {
+		t.Fatalf("the callback returned %v after the expiry", end.Sub(expireAt))
+	}
+	if l.Held() || lost.Load() != 1 {
+		t.Fatalf("held %v, OnLose ran %d times, want not held and once", l.Held(), lost.Load())
 	}
 }
 
