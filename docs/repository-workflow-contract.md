@@ -42,6 +42,12 @@ Current packages:
 | `github.com/delinoio/mono/internal/procgroup` | Starting a command in a new process group and signaling that group (Linux and macOS); on Windows a new process group and `SIGKILL` of the leader only. | `ownsand-agent`, `ownsand-guest` |
 | `github.com/delinoio/mono/internal/semver`    | `MAJOR.MINOR.PATCH` parsing with an optional pre-release suffix, and version comparison.                                                               | `ownsand-agent`                  |
 
+Current `servers/internal/` packages:
+
+| Import path                                            | Content                                                                                                  | Users                         |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `github.com/delinoio/mono/servers/internal/listenaddr` | `host:port` listen address validation: a port from 0 to 65535 and an empty, IP address or RFC 1123 host. | `accounts-api`, `ownsand-api` |
+
 ## Task orchestration
 
 The pinned `turbo` dependency and root `turbo.json` orchestrate packages selected by `pnpm-workspace.yaml`: `apps/*`, `packages/*` and `servers/*`. The workspace packages are `apps/delino-site`, `apps/delino-docs`, `apps/delino-accounts`, `apps/delidev`, `packages/delino-ui`, `packages/ownsand-sdk`, `apps/ownsand`, `servers/accounts-api` and `servers/ownsand-api`; commands only run tasks that exist in package scripts. Go server packages wrap the Go toolchain in their package scripts and disable Turbo caching for their tasks because the toolchain and module cache are not declared inputs.
