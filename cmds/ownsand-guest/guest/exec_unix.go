@@ -5,6 +5,7 @@
 package guest
 
 import (
+	"errors"
 	"os"
 	"syscall"
 
@@ -23,6 +24,13 @@ func terminate(p *os.Process) {
 
 func kill(p *os.Process) {
 	_ = procgroup.Signal(p, syscall.SIGKILL)
+}
+
+// processGroupAlive reports whether the process group of p still has a
+// member. The group id equals the process id of the command, which stays
+// reserved while a member lives.
+func processGroupAlive(p *os.Process) bool {
+	return !errors.Is(syscall.Kill(-p.Pid, 0), syscall.ESRCH)
 }
 
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {
