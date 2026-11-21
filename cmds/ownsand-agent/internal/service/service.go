@@ -20,6 +20,41 @@ const LaunchdLabel = "io.delino.ownsand-agent"
 // a device removal. The service manager must not restart the agent for it.
 const ExitNotEnrolled = 3
 
+// ExitLaunchdRestart is the exit code of `run --service-manager launchd`
+// after an installed update. launchd has only a success/failure predicate
+// (KeepAlive SuccessfulExit=false restarts the job after a nonzero exit),
+// so under launchd the agent reports an installed update as a failure code
+// that makes launchd start the new executable.
+const ExitLaunchdRestart = 75
+
+// Manager identifies the service manager that starts `run`. The empty
+// value is a direct or systemd/Windows start and keeps the public exit codes.
+type Manager string
+
+// ManagerLaunchd marks a `run` started by the launchd daemon definition. The
+// definition passes it as the hidden flag `--service-manager launchd`.
+const ManagerLaunchd Manager = "launchd"
+
+// ManagerFlag is the hidden `run` flag that carries the Manager.
+const ManagerFlag = "--service-manager"
+
+// LaunchdExitCode maps the public exit code of `run` to the exit code that
+// the launchd KeepAlive predicate (SuccessfulExit=false) needs: an installed
+// update (updated) becomes ExitLaunchdRestart so that launchd starts the new
+// executable, ExitNotEnrolled becomes 0 so that launchd does not restart a
+// device that is not enrolled or was removed, and every other code (errors,
+// usage errors) stays unchanged so that launchd restarts the agent after an
+// error like the systemd unit does.
+func LaunchdExitCode(code int, updated bool) int {
+	switch {
+	case updated:
+		return ExitLaunchdRestart
+	case code == ExitNotEnrolled:
+		return 0
+	}
+	return code
+}
+
 // Paths of the service definitions.
 const (
 	SystemdUnitPath = "/etc/systemd/system/ownsand-agent.service"
@@ -59,7 +94,10 @@ WantedBy=multi-user.target
 }
 
 // LaunchdDaemon returns the launchd property list. KeepAlive restarts the
-// agent unless it exited with ExitNotEnrolled.
+// agent after a nonzero exit only (SuccessfulExit=false). The definition
+// starts `run --service-manager launchd`, under which the agent maps its exit
+// codes (see LaunchdExitCode): an installed update restarts the agent and
+// ExitNotEnrolled does not.
 func LaunchdDaemon(exe string, env []string) string {
 	var envXML strings.Builder
 	if len(env) > 0 {
@@ -80,6 +118,8 @@ func LaunchdDaemon(exe string, env []string) string {
 	<array>
 		<string>%s</string>
 		<string>run</string>
+		<string>%s</string>
+		<string>%s</string>
 	</array>
 %s	<key>RunAtLoad</key>
 	<true/>
@@ -92,7 +132,7 @@ func LaunchdDaemon(exe string, env []string) string {
 	<string>/Library/Logs/ownsand-agent.log</string>
 </dict>
 </plist>
-`, LaunchdLabel, xmlEscape(exe), envXML.String())
+`, LaunchdLabel, xmlEscape(exe), ManagerFlag, ManagerLaunchd, envXML.String())
 }
 
 func xmlEscape(s string) string {
