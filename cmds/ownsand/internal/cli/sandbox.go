@@ -4,12 +4,15 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -466,21 +469,16 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 	}
 	defer s.Close()
 	var w io.Writer = a.env.Stdout
-	var f *os.File
+	var dst *downloadTarget
 	if *to != "" {
-		if f, err = os.Create(*to); err != nil {
+		if dst, err = openDownloadTarget(*to); err != nil {
 			return err
 		}
-		w = f
+		w = dst.f
 	}
 	n, err := s.ReadFile(ctx, rest[1], w)
-	if f != nil {
-		if cerr := f.Close(); err == nil {
-			err = cerr
-		}
-		if err != nil {
-			_ = os.Remove(*to)
-		}
+	if dst != nil {
+		err = dst.finish(err)
 	}
 	if err != nil {
 		if validate.IsValidationError(err) {
@@ -490,6 +488,87 @@ func (a *app) fileRead(ctx context.Context, name string, args []string) error {
 	}
 	a.logger.Debug("ownsand file read", "sandbox_id", s.ID(), "size_bytes", n, "transport", s.Transport().String())
 	return nil
+}
+
+// downloadTarget is the local destination of file read --to. A regular file,
+// new or existing, receives the contents through a temporary file in the
+// same directory that replaces it only after the read succeeds, so a failed
+// download keeps the previous contents. An existing file that is not a
+// regular file (a device or a FIFO) cannot be replaced by a rename and is
+// written in place.
+type downloadTarget struct {
+	f *os.File
+	// path is the destination with symbolic links resolved, so that the
+	// rename replaces the target of a link and keeps the link.
+	path string
+	// tmp is the temporary file name, empty when f is the destination.
+	tmp string
+}
+
+func openDownloadTarget(to string) (*downloadTarget, error) {
+	path := to
+	info, err := os.Stat(to)
+	switch {
+	case err == nil && !info.Mode().IsRegular():
+		f, err := os.OpenFile(to, os.O_WRONLY, 0)
+		if err != nil {
+			return nil, err
+		}
+		return &downloadTarget{f: f, path: to}, nil
+	case err == nil:
+		if path, err = filepath.EvalSymlinks(to); err != nil {
+			return nil, err
+		}
+	case !errors.Is(err, os.ErrNotExist):
+		return nil, err
+	}
+	dir, base := filepath.Split(path)
+	for range 100 {
+		var b [8]byte
+		if _, err := rand.Read(b[:]); err != nil {
+			return nil, err
+		}
+		tmp := filepath.Join(dir, "."+base+"."+hex.EncodeToString(b[:])+".tmp")
+		// 0666 before the umask gives a new destination the mode that
+		// os.Create would give it.
+		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if info != nil {
+			// Keep the permissions of the file that the download replaces.
+			if err := f.Chmod(info.Mode().Perm()); err != nil {
+				_ = f.Close()
+				_ = os.Remove(tmp)
+				return nil, err
+			}
+		}
+		return &downloadTarget{f: f, path: path, tmp: tmp}, nil
+	}
+	return nil, fmt.Errorf("create a temporary file beside %s: too many name collisions", to)
+}
+
+// finish closes the target and, when readErr is nil, puts the contents in
+// place. On an error it removes the temporary file and leaves the
+// destination as it was.
+func (d *downloadTarget) finish(readErr error) error {
+	err := readErr
+	if cerr := d.f.Close(); err == nil {
+		err = cerr
+	}
+	if d.tmp == "" {
+		return err
+	}
+	if err == nil {
+		err = os.Rename(d.tmp, d.path)
+	}
+	if err != nil {
+		_ = os.Remove(d.tmp)
+	}
+	return err
 }
 
 func (a *app) fileWrite(ctx context.Context, name string, args []string) error {

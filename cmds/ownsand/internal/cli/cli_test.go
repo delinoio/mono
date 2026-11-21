@@ -393,6 +393,45 @@ func TestFileReadWrite(t *testing.T) {
 	}
 }
 
+func TestFileReadFailureKeepsDestination(t *testing.T) {
+	r := newRunner(t)
+	dir := t.TempDir()
+	to := filepath.Join(dir, "out")
+	if err := os.WriteFile(to, []byte("previous contents"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.run("file", "read", "--to", to, r.f.sb, "/missing"); res.code != ExitError || !strings.Contains(res.stderr, "not_found") {
+		t.Fatalf("missing: %+v", res)
+	}
+	if b, err := os.ReadFile(to); err != nil || string(b) != "previous contents" {
+		t.Fatalf("a failed read changed the destination: %q %v", b, err)
+	}
+	r.stdin = "new contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(to, link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if b, _ := os.ReadFile(to); string(b) != "new contents" {
+		t.Fatalf("--to content %q", b)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the download replaced the symbolic link")
+	}
+	if info, _ := os.Stat(to); runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
+		t.Fatalf("the download changed the mode to %v", info.Mode().Perm())
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 2 {
+		t.Fatalf("temporary files left: %v", entries)
+	}
+}
+
 func TestListOutputAndColor(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("api-key", "list")
