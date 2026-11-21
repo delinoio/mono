@@ -51,8 +51,13 @@ type commandInfo struct {
 // errDeviceRemoved closes a channel after the clean-up command.
 var errDeviceRemoved = errors.New("the device was removed")
 
-// writerDrainTimeout bounds the wait for the channel writer after the
-// channel closed.
+// writerDrainTimeout bounds the wait for the channel writer before the
+// device state changes after the channel closed. A writer that is still
+// blocked in a send after that (the agent does not read) no longer holds
+// back the device state, but the handler still waits for it: returning
+// would finish the response writer under the blocked send, which is a
+// data race and a panic in net/http. The send ends when the transport
+// ends the stream.
 const writerDrainTimeout = 5 * time.Second
 
 // sendCommand sends cmd on conn with a new command ID and remembers it.
@@ -113,6 +118,17 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	go func() {
 		defer close(writerDone)
 		for {
+			// A closed channel wins over a queued envelope: with both ready,
+			// the select below picks at random, and a writer that keeps
+			// sending after the handler returned uses a finished response
+			// writer (a data race, and a panic in net/http). A saturated
+			// channel closes with a full queue, so this case is the normal
+			// one there.
+			select {
+			case <-conn.Done():
+				return
+			default:
+			}
 			select {
 			case env := <-conn.Outbound():
 				if env == nil {
@@ -155,6 +171,12 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		log.InfoContext(context.WithoutCancel(ctx), "agent_channel_disconnected", slog.Bool("current", current), slog.String("cause", fmt.Sprint(cause)))
 		if current {
 			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
+		}
+		select {
+		case <-writerDone:
+		default:
+			log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_stalled", slog.String("cause", fmt.Sprint(cause)))
+			<-writerDone
 		}
 	}()
 
