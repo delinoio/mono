@@ -8,12 +8,15 @@ import (
 	"encoding/hex"
 	"errors"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -193,5 +196,75 @@ func TestSaturatedChannelDoesNotBlockOtherDevices(t *testing.T) {
 	}
 	if state := d.Msg.GetDevice().GetState(); state != ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
 		t.Fatalf("healthy device = %v", state)
+	}
+}
+
+// assertImportCreateFailed checks that the sandbox ended FAILED with
+// CREATE_FAILED and that the device allocation no longer counts it.
+func assertImportCreateFailed(t *testing.T, org *testenv.Org, sandboxID, deviceID string) {
+	t.Helper()
+	sb := waitState(t, org.OwnerClient, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	if sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("end reason = %v", sb.GetEndReason())
+	}
+	d, err := org.OwnerClient.Device.GetDevice(context.Background(), connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: deviceID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := d.Msg.GetDevice().GetAllocation().GetVcpuCount(); got != 0 {
+		t.Fatalf("reservation not released: %v", d.Msg.GetDevice().GetAllocation())
+	}
+}
+
+// TestImportSendDeadlineFailsCreate checks that an import command that a
+// saturated, still connected channel cannot take before the import deadline
+// fails the create and releases its capacity.
+func TestImportSendDeadlineFailsCreate(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: 400 * time.Millisecond}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	env.App.Service.Hub.QueueFullWait = 30 * time.Second
+	org := env.NewOrg("alice")
+	snapID, devB, agentB := importFixture(t, env, org)
+	saturate(t, env, agentB)
+	created, err := org.OwnerClient.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertImportCreateFailed(t, org, created.Msg.GetSandbox().GetSandboxId(), devB.ID)
+	if conn := env.App.Service.Hub.Get(devB.ID); conn == nil || conn.Context().Err() != nil {
+		t.Fatal("the channel must stay connected")
+	}
+}
+
+// TestImportCreateSendDeadlineFailsCreate checks the same for the create
+// command that follows a successful import: the import result arrives, the
+// channel is then saturated, and the create send outlasts the deadline.
+func TestImportCreateSendDeadlineFailsCreate(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: 6 * time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	env.App.Service.Hub.QueueFullWait = 30 * time.Second
+	org := env.NewOrg("alice")
+	snapID, devB, agentB := importFixture(t, env, org)
+	var importCmdID atomic.Value
+	agentB.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		if cmd.GetImportSnapshot() != nil {
+			importCmdID.Store(cmd.GetCommandId())
+			return nil // the test answers once the channel is saturated
+		}
+		return fa.DefaultAnswer(cmd)
+	})
+	created, err := org.OwnerClient.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	testenv.Eventually(t, "import command received", func() bool { return importCmdID.Load() != nil })
+	saturate(t, env, agentB)
+	agentB.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
+		CommandId: importCmdID.Load().(string), Result: &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{}},
+	}}})
+	assertImportCreateFailed(t, org, created.Msg.GetSandbox().GetSandboxId(), devB.ID)
+	// The create send itself reported the deadline, not the wait timer.
+	if !strings.Contains(env.Logs.String(), "agent_command_send_failed") {
+		t.Fatal("the create send did not fail on the import deadline")
 	}
 }

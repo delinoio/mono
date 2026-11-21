@@ -442,6 +442,7 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	releaseImport := s.imports.register(conn, sn.GetSnapshotId(), importCmd.CommandId)
 	defer releaseImport()
 	if _, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdImportSnapshot, orgID: info.orgID, snapshotID: sn.GetSnapshotId()}, importCmd); err != nil {
+		s.failImportSendDeadline(ctx, conn, info, err)
 		return
 	}
 	select {
@@ -463,6 +464,19 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	}
 	if _, err := s.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
 		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", info.sandboxID), slog.Any("error", err))
+		s.failImportSendDeadline(ctx, conn, info, err)
+	}
+}
+
+// failImportSendDeadline fails the create when a send of the import flow
+// returned because the import deadline expired while the channel stayed
+// connected (a full outbound queue held the send until then). Other send
+// errors keep reconnect reconciliation as the owner of the sandbox: a closed
+// channel, including one closed by a queue that stayed full, is reconciled
+// when the device reconnects.
+func (s *Service) failImportSendDeadline(ctx context.Context, conn *hub.Conn, info commandInfo, err error) {
+	if errors.Is(err, context.DeadlineExceeded) && conn.Context().Err() == nil {
+		s.failImportTimeout(ctx, conn, info)
 	}
 }
 
