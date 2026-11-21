@@ -174,30 +174,50 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	var timedOut atomic.Bool
 	var timers []*time.Timer
 	var timersMu sync.Mutex
+	// waited is set under timersMu once cmd.Wait returned; a timeout that
+	// fires later belongs to a command that already ended and does nothing.
+	waited := false
 	m.mu.Lock()
 	grace := m.killGrace
 	m.mu.Unlock()
 	if timeout := req.GetTimeout(); timeout != nil && timeout.AsDuration() > 0 {
 		timersMu.Lock()
 		timers = append(timers, time.AfterFunc(timeout.AsDuration(), func() {
+			timersMu.Lock()
+			defer timersMu.Unlock()
+			if waited {
+				return
+			}
 			timedOut.Store(true)
 			logger.Info("exec timeout reached; terminating")
 			terminate(cmd.Process)
 			if forceAfterTerminate {
-				timersMu.Lock()
 				timers = append(timers, time.AfterFunc(grace, func() {
-					logger.Info("exec did not stop after SIGTERM; killing")
+					// The direct child may have exited while a member of its
+					// process group ignores SIGTERM, so this timer outlives
+					// cmd.Wait. The group id stays reserved while any member
+					// lives; once the group is empty the check skips the kill,
+					// so a reused process id is not signaled.
+					if !processGroupAlive(cmd.Process) {
+						return
+					}
+					logger.Info("exec process group did not stop after SIGTERM; killing")
 					kill(cmd.Process)
 				}))
-				timersMu.Unlock()
 			}
 		}))
 		timersMu.Unlock()
 	}
 	waitErr := cmd.Wait()
 	timersMu.Lock()
-	for _, t := range timers {
-		t.Stop()
+	waited = true
+	// A command that ended before its timeout leaves no timer behind. After a
+	// timeout on Linux and macOS the pending SIGKILL timer keeps running
+	// without delaying the exited event, unless the group is already empty.
+	if !timedOut.Load() || !forceAfterTerminate || !processGroupAlive(cmd.Process) {
+		for _, t := range timers {
+			t.Stop()
+		}
 	}
 	timersMu.Unlock()
 	exited := &ownsandv1.ExecExited{TimedOut: timedOut.Load(), EndTime: timestamppb.New(m.now())}
