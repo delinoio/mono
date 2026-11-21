@@ -508,3 +508,34 @@ func TestWithdrawDuringDownloadKeepsSignedRevocation(t *testing.T) {
 		t.Fatalf("recovery install: %v %v", ok, err)
 	}
 }
+
+// TestFailedInstallRemovesTheArtifact checks that a failed installation does
+// not leave the downloaded file behind: every command has its own file name,
+// so repeated failures would otherwise collect one executable per retry.
+func TestFailedInstallRemovesTheArtifact(t *testing.T) {
+	r := newRelease(t, nil)
+	u, inst, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	inst.err = errors.New("read-only executable directory")
+	files := func() []string {
+		names, _ := filepath.Glob(filepath.Join(u.opts.Store.Path(store.UpdateDir), "*"))
+		return names
+	}
+	for i := 0; i < 3; i++ {
+		busy := &atomic.Bool{}
+		busy.Store(true)
+		u.opts.Busy = busy.Load
+		if err := update(u, "1.1.0", false); err != nil {
+			t.Fatal(err)
+		}
+		if len(files()) != 1 {
+			t.Fatalf("attempt %d: %d files after the download, want 1", i, len(files()))
+		}
+		busy.Store(false)
+		if ok, err := u.TryInstall(); ok || err == nil {
+			t.Fatalf("attempt %d: install should fail: %v %v", i, ok, err)
+		}
+		if names := files(); len(names) != 0 {
+			t.Fatalf("attempt %d: the failed installation left %v", i, names)
+		}
+	}
+}

@@ -434,12 +434,12 @@ func (u *Updater) TryInstall() (bool, error) {
 		a.PendingUpdate = &store.PendingUpdate{TargetVersion: target, PreviousVersion: u.opts.Running}
 		return nil
 	}); err != nil {
-		u.fail(target)
+		u.fail(target, artifact)
 		return false, err
 	}
 	if err := u.opts.Installer.Install(artifact); err != nil {
 		u.opts.Store.UpdateAgent(func(a *store.AgentState) error { a.PendingUpdate = nil; return nil })
-		u.fail(target)
+		u.fail(target, artifact)
 		return false, fmt.Errorf("update: install: %w", err)
 	}
 	os.Remove(filepath.Clean(artifact))
@@ -450,7 +450,13 @@ func (u *Updater) TryInstall() (bool, error) {
 	return true, nil
 }
 
-func (u *Updater) fail(target string) {
+// fail ends a failed installation attempt. It deletes the downloaded
+// artifact before it forgets the path: every command writes its own file, so
+// a file that no longer has a path in u.artifact would stay on disk, and a
+// device that fails to install repeatedly would collect one executable per
+// retry.
+func (u *Updater) fail(target, artifact string) {
+	os.Remove(filepath.Clean(artifact))
 	u.mu.Lock()
 	u.installing = false
 	u.artifact = ""
