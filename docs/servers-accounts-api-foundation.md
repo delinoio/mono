@@ -11,13 +11,14 @@ This contract owns the `accounts-api` component of [`delino-accounts`](project-d
 - `servers/accounts-api/package.json` and `turbo.json`: workspace task wiring and the `deploy` field.
 - `servers/accounts-api/Dockerfile`: runtime image of the Droplet deployment.
 - `servers/accounts-api/scripts/`: development launcher (`dev.mjs`) and its process-level tests.
+- `servers/accounts-api/internal/db/` (`planned`): Postgres pool, embedded goose migrations in `internal/db/migrations/` and test databases. The billing implementation adds its other packages (authentication, Connect handlers, the credit ledger, the Paddle client, email delivery and metrics) and records them here in the change that adds each.
 
-The API server is the system of record for account and billing information. It is licensed under `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md).
+The API server is the system of record for account and billing information: billing accounts, members, invitations, credit grants, the ledger, subscriptions, organization links, usage reports and billing statuses. It is licensed under `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md).
 
 ## Runtime and Language
 
 - Language: Go, in the repository root module `github.com/delinoio/mono`. The import path of the server packages is `github.com/delinoio/mono/servers/accounts-api/...`. The `go` directive in the root `go.mod` selects the toolchain version.
-- Runtime: one long-running HTTP server process. It uses only the Go standard library in the current scaffold.
+- Runtime: one long-running HTTP server process. It uses only the Go standard library in the current scaffold. The billing implementation adds the dependencies in [Dependencies and Integrations](#dependencies-and-integrations), background workers (automatic top-ups, credit expiry, status changes and email delivery) and an internal metrics listener on `METRICS_ADDR` (`planned`, see [Metrics](#metrics)).
 - Logging: `log/slog`.
 - HTTP timeouts: `newServer` in `cmd/accounts-api` sets fixed constants on the `http.Server`. They are not configuration variables, so they have no `.env.example` entry and no Turbo `passThroughEnv` entry.
   - `ReadHeaderTimeout` is 10 seconds: the time a client has to send the request headers.
@@ -32,8 +33,9 @@ The API server is the system of record for account and billing information. It i
 ## Users and Operators
 
 - The [`delino-accounts-web`](apps-delino-accounts-foundation.md) app, which calls the API on behalf of signed-in users.
-- Other Delino services. The repository rules require every service to use this API for shared account data and for billing, including billable usage or charge reports (`planned`). Record each consuming service and the RPCs that it uses here before it calls the API.
-- [`ownsand-api`](servers-ownsand-api-foundation.md) (`planned`): reads the display profile (display name) of OwnSand organization members by Logto user ID, server-to-server with its own Logto machine-to-machine credential. `ownsand-api` checks the membership before it asks; this API trusts the machine credential and its scope, not the end user. This needs an `AccountService` RPC that returns the display profiles of a list of users, and a scope for it. Record the RPC and the scope here in the change that adds them. No browser origin is needed.
+- Other Delino services. The repository rules require every service to use this API for shared account data and for billing, including billable usage or charge reports. Record each consuming service and the RPCs that it uses here before it calls the API.
+- [`ownsand-api`](servers-ownsand-api-foundation.md#billing) (`planned`), billing: reports OwnSand usage and reads billing statuses, server-to-server with its own Logto machine-to-machine credential and the scope `accounts:report-usage`. It calls every `UsageService` RPC of the [protos contract](protos-delino-accounts-api-contract.md#services-and-scopes): `ReportUsage`, `ListBillingStatusChanges`, `LinkOrganization`, `UnlinkOrganization`, `ListManageableBillingAccounts` and `GetOrganizationBilling`. `ownsand-api` checks the OwnSand organization role before it links, unlinks or reads; this API trusts the machine credential and its scope, and checks the billing account role of the user that `ownsand-api` names. No browser origin is needed.
+- [`ownsand-api`](servers-ownsand-api-foundation.md) (`planned`), display names: reads the display profile (display name) of OwnSand organization members by Logto user ID, server-to-server with its own Logto machine-to-machine credential. `ownsand-api` checks the membership before it asks; this API trusts the machine credential and its scope, not the end user. This needs an `AccountService` RPC that returns the display profiles of a list of users, and a scope for it. Record the RPC and the scope here in the change that adds them. No browser origin is needed.
 - Operators who deploy and monitor the server.
 
 ## Interfaces and Contracts
@@ -41,21 +43,116 @@ The API server is the system of record for account and billing information. It i
 - Production origin: `https://accounts.api.delino.io`.
 - Operational endpoints:
 
-| Endpoint ID | Method and path | Authentication | Response                                                                |
-| ----------- | --------------- | -------------- | ----------------------------------------------------------------------- |
-| `healthz`   | `GET /healthz`  | none           | `200` with `{"status":"ok"}` while the process can serve HTTP requests. |
+| Endpoint ID      | Method and path                              | Authentication               | Response                                                                |
+| ---------------- | -------------------------------------------- | ---------------------------- | ----------------------------------------------------------------------- |
+| `healthz`        | `GET /healthz`                               | none                         | `200` with `{"status":"ok"}` while the process can serve HTTP requests. |
+| `paddle-webhook` | `POST /webhooks/paddle` (`planned`)          | Paddle signature             | See [Paddle webhook](#paddle-webhook).                                  |
+| `metrics`        | `GET /metrics` on `METRICS_ADDR` (`planned`) | none; internal listener only | Prometheus metrics. See [Metrics](#metrics).                            |
 
-- Business APIs (`planned`): Connect RPC services generated from `protos/delino/accounts/`. Planned services:
+- Connect-only exception: `POST /webhooks/paddle` is a plain HTTP endpoint, because Paddle does not call Connect RPC. It is the only plain HTTP endpoint besides the operational endpoints.
+- Business APIs (`planned`): Connect RPC services generated from `protos/delino/accounts/v1/`. The [protos contract](protos-delino-accounts-api-contract.md) owns every RPC, message and enum.
 
-| Service ID       | Responsibility                                                                        |
-| ---------------- | ------------------------------------------------------------------------------------- |
-| `AccountService` | Read and update the profile and preferences of the signed-in Logto user.              |
-| `BillingService` | Manage payment methods, billing contacts, balances, credits and invoices of the user. |
+| Service ID              | Status  | Responsibility                                                                                                 |
+| ----------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
+| `AccountService`        | planned | Read and update the profile and preferences of the signed-in Logto user.                                       |
+| `BillingAccountService` | planned | Billing accounts, members, roles, email invitations and ownership transfer.                                    |
+| `CreditService`         | planned | Balance, credit grants, ledger, the Paddle subscription, manual and automatic top-ups, alerts and invoices.    |
+| `BillingUsageService`   | planned | Linked organizations and the monthly usage of a billing account by service, organization and meter, for users. |
+| `UsageService`          | planned | Usage reports, billing statuses, organization links and organization billing reads, for services only.         |
 
-- Authentication (`planned` with the first business API): the server is the Logto API resource `https://accounts.api.delino.io`. It validates every access token according to the [authentication contract](repository-auth-contract.md) and checks the scopes that each RPC requires. Record the scope names in this table when the RPCs are added.
-- Browser access (`planned` with the first business API): CORS allows only the `https://accounts.delino.io` origin in production and the loopback development origin locally.
+### Authentication
+
+- Status: `planned` with the first business API.
+- The server is the Logto API resource `https://accounts.api.delino.io`. It validates every access token according to the [authentication contract](repository-auth-contract.md#token-validation): signature, issuer, expiry, the audience `https://accounts.api.delino.io` and the scope of the RPC. ID tokens are rejected.
+
+| Scope                   | Token kind                      | Services                                                           |
+| ----------------------- | ------------------------------- | ------------------------------------------------------------------ |
+| `accounts:billing`      | End-user access token           | `BillingAccountService`, `CreditService` and `BillingUsageService` |
+| `accounts:report-usage` | Machine-to-machine access token | `UsageService`                                                     |
+
+- A missing, expired or otherwise invalid token, and an ID token, fail with `unauthenticated`. A valid token without the scope of the service fails with `permission_denied`.
+- Logto client credentials tokens carry the application ID as `sub`, equal to `client_id`. The server accepts `UsageService` calls only with such a machine-to-machine token, and rejects machine-to-machine tokens on the user services, with `permission_denied` in both cases. Only the machine-to-machine applications of consuming services get the role that holds `accounts:report-usage`.
+- Service mapping: the server maps each machine-to-machine client ID to the `ServiceId` values that it may use, and a `UsageService` request for another service fails with `permission_denied`. The mapping is configuration; record its variable here in the change that adds it.
+- Logto application registrations: the [web app](apps-delino-accounts-foundation.md) is a single-page application that requests `accounts:billing`. Each consuming service has its own machine-to-machine application. The server itself has a machine-to-machine application for the Logto Management API (`LOGTO_M2M_CLIENT_ID`), which it uses only to read the primary email of the caller of `AcceptInvitation`.
+- Browser access (`planned` with the first business API): CORS allows only the origins in `CORS_ORIGINS`: `https://accounts.delino.io` in production and the loopback development origin locally.
+- The Paddle webhook accepts no Logto credential. Its Paddle signature authenticates only the delivery of an event from Paddle. It gives no access to any RPC.
+
+### Billing accounts and members
+
+- A billing account is a separate entity. Any signed-in Logto user can create one and becomes its `owner`.
+
+| Action                                                                                          | `owner` | `admin` | `viewer` |
+| ----------------------------------------------------------------------------------------------- | ------- | ------- | -------- |
+| Delete the billing account, transfer ownership                                                  | yes     | no      | no       |
+| Payment method, subscription, manual top-up, automatic top-up, alerts and organization links    | yes     | yes     | no       |
+| Invitations, roles of admins and viewers, removal of admins and viewers, renaming               | yes     | yes     | no       |
+| Invoices and invoice links (they carry the payer's address)                                     | yes     | yes     | no       |
+| Read the balance, credit grants, ledger, subscription, usage, settings and linked organizations | yes     | yes     | yes      |
+
+- Access errors: a caller that is not a member of the named billing account gets `not_found`, also when the account exists, and a deleted billing account is `not_found` for every RPC. A member whose role does not allow the action gets `permission_denied`.
+- A billing account has exactly one `owner`. Nobody can change the role of the `owner` or remove the `owner` (`failed_precondition`), and nobody can grant `owner` with a role change or an invitation. Only `TransferOwnership` makes another existing member the `owner`, and the previous owner becomes `admin`. Every `admin` and `viewer` may remove itself.
+- Owners and admins invite by email address with the role `admin` or `viewer`; a second pending invitation for the same address fails with `already_exists`. The server sends the invitation email through Resend with a link to the [web app](apps-delino-accounts-foundation.md) that carries a one-time invitation token (`bai_` followed by 32 random bytes in unpadded base64url). An invitation expires 7 days after it is created. `AcceptInvitation` accepts the token only for a signed-in user whose Logto primary email equals the invited address (ASCII case folding), and creates the membership for that Logto user ID; another user gets `permission_denied`, and the invitation stays pending. An unknown token is `not_found`; an accepted, revoked or expired invitation is `failed_precondition`. The server stores only the SHA-256 hash of the token.
+- One billing account can pay for several organizations of several Delino services. A change of members has no effect on existing links.
+- `DeleteBillingAccount` succeeds only when the balance is 0 or more and no organization is linked; otherwise it fails with `failed_precondition`. It cancels the Paddle subscription at once, forfeits the remaining credit (credits are not refunded), ends every membership and pending invitation and marks the billing account deleted. Financial records and audit events stay for the retention period (see [Storage](#storage)).
+- The [protos contract](protos-delino-accounts-api-contract.md) records the exact request rules, limits and error codes of every RPC.
+
+### Payments and credits
+
+- Payment provider (recorded decision): [Paddle](https://www.paddle.com/), the merchant of record, in the `sandbox` or `production` environment that `PADDLE_ENVIRONMENT` selects. The server calls the Paddle API with a minimal hand-written HTTP client; it uses no Paddle SDK.
+- Charges are USD only and tax-exclusive. When a user buys $X of credit, Paddle adds the tax on top, and the balance receives the full $X.
+- Conversion: Paddle amounts are whole USD cents. The server converts cents to micro-USD by multiplying by 10,000, only at the payment boundary. The conversion is exact and needs no rounding. Every amount that the server sends to Paddle is a whole number of cents; a requested amount that is not a multiple of 10,000 micro-USD fails with `invalid_argument`.
+- Subscription: an active $10/month Paddle subscription (`PADDLE_SUBSCRIPTION_PRICE_ID`) is required for any billable use of a consuming service. `StartSubscription` creates the Paddle transaction with the billing account ID in its custom data, and the web app opens the Paddle.js checkout with it. Each successful subscription payment adds a $10 credit grant. A canceled subscription stays active until the end of the paid period, and `ResumeSubscription` removes a scheduled cancellation before then. The subscription becomes `ACTIVE` only after the verified payment webhook; while it is `PENDING`, `StartSubscription` returns the open checkout transaction again.
+- Manual top-up: owners and admins add credit with a one-time charge on the subscription (`POST /subscriptions/{id}/charge` with `effective_from: immediately`, on `PADDLE_TOP_UP_PRODUCT_ID`), only while the subscription is `ACTIVE`. The amount is at least $25 and at most $10,000, in whole cents. The caller's `idempotency_key` (UUID v7) makes a retry within 24 hours return the first result without a second charge.
+- Automatic top-up: off by default. An owner or admin turns it on with a threshold of at least $10, an amount of at least $25 and a required monthly cap of at least the amount. Other settings fail with `invalid_argument`.
+  - It runs when a usage deduction makes the balance fall below the threshold. At most one automatic top-up is in flight for each billing account.
+  - The monthly cap counts only automatic top-ups in a UTC calendar month; the subscription and manual top-ups do not count. A top-up that would exceed the cap does not run.
+  - The server charges the amount with `POST /subscriptions/{id}/charge` (`effective_from: immediately`). A charge that Paddle rejects, for example because the subscription is `past_due` or its next billing period starts within 30 minutes, and a failed payment count as failed automatic top-ups.
+  - After 2 failed automatic top-ups in a row, automatic top-up turns off, and owners and admins get an email. A successful automatic top-up and enabling the setting reset the count.
+- Credit is added only by verified Paddle webhooks, never by the charge call or the checkout.
+- Credit grants: each subscription payment, manual top-up and automatic top-up creates a grant that expires 12 months after the purchase. Usage consumes the grant that expires first (FIFO). A new grant first pays off any debt (a negative balance), and only the rest becomes usable credit. Owners and admins get an email 7 days before a grant expires. Expired credit leaves the balance as an `EXPIRY` ledger entry.
+- Refunds: credits are non-refundable. Support can refund only manually in the Paddle dashboard. The refund webhook removes the matching credit with a `REFUND` ledger entry, and the balance can go negative.
+- Debt: usage is always deducted, also below zero. A negative balance is debt.
+- Low-balance alert: when automatic top-up is off, owners and admins get one email each time the balance falls below the alert threshold. Owners and admins set the threshold (at least $0). The default is $10.
+- Invoices (owner and admin only): `ListInvoices` lists the completed Paddle transactions without links, and `GetInvoiceUrl` returns a short-lived link to the Paddle invoice PDF of one transaction, from Paddle `GET /transactions/{id}/invoice` on demand.
+
+### Paddle webhook
+
+- `POST /webhooks/paddle` verifies the `Paddle-Signature` header (`ts=<unix time>;h1=<hex HMAC-SHA256 of "<ts>:<raw body>" with PADDLE_WEBHOOK_SECRET>`) in constant time before it parses the payload, and rejects a timestamp more than 5 minutes from the server time. A missing or invalid signature gets `401` and changes nothing.
+- The server records each Paddle event ID and ignores a repeated event, so a replayed webhook adds no credit.
+- The server applies the event (credit grant, refund, subscription status or failed payment) in the same transaction that records the event ID, and then answers `2xx`.
+
+### Usage reports and billing status
+
+- `UsageService` implements the [usage reports](protos-delino-accounts-api-contract.md#usage-reports), the [billing status](protos-delino-accounts-api-contract.md#billing-status) and the [links](protos-delino-accounts-api-contract.md#links) of the protos contract: idempotent reports with the key (service, organization, meter, window start), attribution through the link history, unattributed usage, FIFO deductions that can make the balance negative, and the status rules `ALLOWED`, `BLOCKED` and `SUSPENDED` (3 days after the block starts).
+- `ReportUsage` validates every report of a request before it applies any, and a window may end at most 1 minute after the server time. A repeated key with other values keeps the first values and is logged as a mismatch. A status poll with cursor 0 returns every linked organization, with at most one entry per organization, and an unlink adds no entry ([protos contract](protos-delino-accounts-api-contract.md#billing-status)).
+- Concurrent reports for one billing account serialize on the billing account, so the balance, the grants and the automatic top-up trigger stay consistent.
+- A status change of a linked organization sends an email to owners and admins when it becomes `BLOCKED` (with the suspension time, 3 days later) and when it becomes `SUSPENDED`.
+
+### Emails
+
+- Delivery: Resend, with the API key `RESEND_API_KEY` and the sender `EMAIL_FROM`, in English, as plain text and simple HTML. A sender abstraction has a fake for tests that records the messages.
+- Recipients are the `owner` and `admin` members of the billing account, except the invitation, which goes to the invited address.
+
+| Email                       | Trigger                                                                   |
+| --------------------------- | ------------------------------------------------------------------------- |
+| Invitation                  | `CreateInvitation`                                                        |
+| Payment failed              | A failed automatic top-up or a failed subscription payment                |
+| Automatic top-up turned off | The second failed automatic top-up in a row                               |
+| Low balance                 | The balance falls below the alert threshold while automatic top-up is off |
+| Blocked                     | A linked organization becomes `BLOCKED`; includes the suspension time     |
+| Suspended                   | A linked organization becomes `SUSPENDED`                                 |
+| Credit expiry               | A credit grant expires in 7 days                                          |
+
+- The server records each notification with a deduplication key, so a retry never sends one notification twice.
+
+### Metrics
+
+`GET /metrics` on `METRICS_ADDR` (`planned`) serves Prometheus metrics on an internal listener. The listener is reachable only on the Droplet's `delino` Docker network: the deployment publishes no host port for it, and Caddy never routes it, so it is never reachable through a public origin. An empty `METRICS_ADDR` turns the listener off. The metrics cover at least usage reports, Paddle webhooks, top-up attempts and failures, emails and the number of linked organizations for each billing status. Metric labels never contain billing account IDs, organization IDs, user IDs, email addresses or Paddle IDs. Record the metric names and labels here in the change that adds them. A scraper, dashboards and alerts are out of scope.
+
+### Identifiers and money
+
 - Identifiers: persisted entities use UUID v7. User-owned records reference the Logto user ID (`sub`).
-- Money: all amounts are `int64` micro-USD values with a `_usd_micros` suffix, according to the [billing contract](repository-billing-contract.md). Record the payment provider conversion and its rounding direction here when the provider is selected.
+- Money: all amounts are `int64` micro-USD values with a `_usd_micros` suffix, according to the [billing contract](repository-billing-contract.md). The only provider conversion is the exact cents conversion in [Payments and credits](#payments-and-credits). `accounts-api` does no per-unit pricing: the consuming services compute and round each usage amount and document the rounding in their own contracts.
 
 ## Configuration
 
@@ -69,18 +166,49 @@ The API server is the system of record for account and billing information. It i
 - `ADDR` accepts an empty host (all interfaces), an IP address (IPv6 in brackets, with an optional zone) or an RFC 1123 hostname; configuration validation checks only the host syntax, so a hostname that does not resolve still fails when the server starts listening.
 - Root `pnpm dev` and `pnpm exec turbo run dev --filter=accounts-api` pass `ADDR` and `LOG_LEVEL` from the shell to the server through Turbo `passThroughEnv` in `servers/accounts-api/turbo.json`. Add every new configuration variable to that list in the change that makes the server read it. Values from the Infisical `/servers/accounts-api` development folder do not need that list, because the injection runs inside the task, and they override shell values.
 - Production must set `ADDR` explicitly for its deployment target. The default listens on loopback only.
-- Logto settings (`planned`): the tenant endpoint and the API resource indicator. Add them to this table and to `.env.example` in the same change that adds token validation.
+- Billing configuration (`planned`). Add each variable to the table above, to `.env.example` (name and placeholder only) and to the Turbo `passThroughEnv` list in the change that makes the server read it:
+
+| Variable                       | Required | Default                          | Meaning                                                                                            |
+| ------------------------------ | -------- | -------------------------------- | -------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                 | yes      |                                  | Postgres connection URL. Secret.                                                                   |
+| `RUN_MIGRATIONS`               | no       | `true`                           | Apply the embedded goose migrations at startup.                                                    |
+| `LOGTO_ISSUER`                 | yes      |                                  | Logto issuer, `<tenant endpoint>/oidc`.                                                            |
+| `LOGTO_AUDIENCE`               | no       | `https://accounts.api.delino.io` | Expected `aud`.                                                                                    |
+| `LOGTO_MANAGEMENT_ENDPOINT`    | yes      |                                  | Logto Management API endpoint, used to read the primary email of the caller of `AcceptInvitation`. |
+| `LOGTO_M2M_CLIENT_ID`          | yes      |                                  | Machine-to-machine application ID for the Logto Management API.                                    |
+| `LOGTO_M2M_CLIENT_SECRET`      | yes      |                                  | Its secret. Secret.                                                                                |
+| `CORS_ORIGINS`                 | no       | `https://accounts.delino.io`     | Comma-separated browser origins.                                                                   |
+| `WEB_ORIGIN`                   | no       | `https://accounts.delino.io`     | Origin of the web app in invitation email links.                                                   |
+| `RESEND_API_KEY`               | yes      |                                  | Resend API key. Secret.                                                                            |
+| `EMAIL_FROM`                   | yes      |                                  | Sender address of billing emails.                                                                  |
+| `PADDLE_ENVIRONMENT`           | yes      |                                  | `sandbox` or `production`.                                                                         |
+| `PADDLE_API_KEY`               | yes      |                                  | Paddle API key of that environment. Secret.                                                        |
+| `PADDLE_WEBHOOK_SECRET`        | yes      |                                  | Secret of the Paddle notification destination. Secret.                                             |
+| `PADDLE_SUBSCRIPTION_PRICE_ID` | yes      |                                  | Paddle price of the $10/month subscription.                                                        |
+| `PADDLE_TOP_UP_PRODUCT_ID`     | yes      |                                  | Paddle product of manual and automatic top-up charges.                                             |
+| `METRICS_ADDR`                 | no       | empty (listener off)             | `host:port` of the internal metrics listener.                                                      |
+
+- Paddle and Resend use separate sandbox and production credentials. Development uses only the Paddle `sandbox` environment and Resend test credentials, according to the [environment contract](repository-environment-contract.md#billing-integration-credentials).
 
 ## Storage
 
-The scaffold has no persistent storage. The database is PlanetScale Postgres, according to the repository defaults. Before the first persisted entity, record the migration tool and the backup policy in this contract, and add the database stage that runs before the servers to the [deployment workflow](repository-workflow-contract.md#deployment-workflow). File uploads, such as invoice documents, use Cloudflare R2 with signed URLs according to the repository defaults unless this contract documents another choice.
+The scaffold has no persistent storage. The database is PlanetScale Postgres, according to the repository defaults. File uploads, such as invoice documents, use Cloudflare R2 with signed URLs according to the repository defaults unless this contract documents another choice. Invoices stay in Paddle: the server stores no invoice documents and fetches the Paddle invoice link on demand.
+
+- Driver (`planned`): `github.com/jackc/pgx/v5`, already in the root Go module.
+- Migration tool (recorded decision, `planned`): [goose](https://github.com/pressly/goose) (`github.com/pressly/goose/v3`) with SQL migrations embedded from `internal/db/migrations/`. Migrations are forward-only and are never edited after they reach `main`; a change adds a new file. The server applies pending migrations at startup unless `RUN_MIGRATIONS=false`. The old container keeps serving while the new one starts during a deployment, so every migration must stay compatible with the code of the previous release (expand first, contract in a later release).
+- Tables (summary, `planned`): billing accounts (with a deletion time), members, invitations (token hash, email, role, expiry, acceptance and revocation times), organization links with their link history, billing audit events, credit grants, ledger entries, subscriptions, Paddle customer and transaction references, processed Paddle event IDs, automatic top-up and alert settings, notifications with their deduplication keys, usage reports (including unattributed usage) and organization billing statuses with their change sequence.
+- The server stores Paddle customer, subscription, transaction and event IDs only. It never stores card data.
+- Billing audit events record member, role, invitation, ownership, settings, subscription, top-up and link changes with the actor's Logto user ID.
+- Retention (recorded decision): usage records, the ledger, credit grants and billing audit events are kept for 7 years. Deleting a billing account (a soft delete) or unlinking or deleting an organization keeps these records. The first version has no job that deletes records after the retention period.
+- Open decision: the backup policy. Record it here before the first deployment of a revision with persisted entities.
+- Deployment: the database stage that runs before the servers is `planned` in the [deployment workflow](repository-workflow-contract.md#deployment-workflow). It must exist before the first deployment of an `accounts-api` revision with persisted entities.
 
 ## Security
 
-- Accept only Logto access tokens as API credentials. Do not accept ID tokens.
+- Accept only Logto access tokens as API credentials. Do not accept ID tokens. The Paddle webhook is the only endpoint that accepts another proof, the Paddle signature, and only for the delivery of a Paddle event (see [Authentication](#authentication)).
 - Payment card data stays with the payment provider. The server stores provider references, not raw card numbers.
-- The server never logs tokens, authorization codes, application secrets or payment details.
-- Secrets, such as Logto Management API credentials and payment provider keys, follow the [environment contract](repository-environment-contract.md). They never appear in `.env.example`.
+- The server never logs secrets, tokens, authorization codes, application secrets, API keys, card data, payment details, invitation tokens or email bodies. It does not log email addresses at the `info` level.
+- Secrets, such as the database URL, Logto Management API credentials, the Paddle API key and webhook secret and the Resend API key, follow the [environment contract](repository-environment-contract.md): Infisical for development and the Droplet env file for production. They never appear in `.env.example`.
 
 ## Graceful Shutdown
 
@@ -120,6 +248,7 @@ The scaffold has no persistent storage. The database is PlanetScale Postgres, ac
 
 - `net/http` internal errors, such as the report of a recovered handler panic with its stack trace and the report of a superfluous `WriteHeader` call, are logged as `ERROR` JSON records on standard output through `http.Server.ErrorLog`. They are never written as plain text to standard error, and they are not downgraded to `INFO` or dropped when `LOG_LEVEL` is `warn` or `error`. `http.ErrAbortHandler` panics stay unlogged, as `net/http` defines. The server is constructed in one place (`newServer` in `cmd/accounts-api`) so that this setting applies to every production server.
 - Authentication logs (`planned`) include the Logto user ID, the API resource and the rejection reason, according to the authentication contract.
+- Billing events (`planned`): structured `billing_*` records for each usage report, status change, top-up attempt and result, webhook, block, suspension, resume, email and link change. They carry the relevant fields among `billing_account_id`, `service`, `organization_id`, `meter`, `window_start`, `paddle_transaction_id` and `paddle_event_id`. An email record carries the email kind and the billing account ID, never the address or the body.
 
 ## Build and Test
 
@@ -137,6 +266,13 @@ The `build` script passes `-buildvcs=false`, so the binary carries no VCS stampi
 - Removal condition: remove the flag when the Go toolchain recognizes the linked-worktree `.git` file, or when release builds move to a normal-clone job that needs VCS stamping.
 
 Go tasks are uncached in Turbo because the Go toolchain and module cache are not declared task inputs. Remove `servers/accounts-api/dist/` after validation.
+
+Billing tests (`planned`):
+
+- Postgres-backed tests read `ACCOUNTS_TEST_DATABASE_URL`, a URL whose user may create databases, like the `OWNSAND_TEST_DATABASE_URL` fixture of `ownsand-api`; without it they are skipped.
+- Unit tests: FIFO consumption with debt payoff, credit expiry, the monthly cap, the 2-failure shutoff, the cents conversion and the status rules with a fake clock.
+- Integration tests with Postgres, a fake Paddle and the email fake: each RPC and role, invitation acceptance (valid, reused, and for another email address), idempotent and concurrent usage reports, attribution through the link history, the poll cursor, Paddle signature rejection and duplicate event IDs, a refund that makes the balance negative, and the machine-to-machine scope checks.
+- Manual acceptance on the Paddle sandbox: checkout, the $10 subscription, manual top-up, automatic top-up, failing test cards and refunds. Record it separately from fixture and build checks.
 
 CI runs the repository Go checks in the root Go module when Go sources or Go module files change: `gofmt` check, `go vet ./...` and `go test ./...`. See the [workflow contract](repository-workflow-contract.md). The `workspace-servers` job also runs the package `build`, `lint` and `test` scripts, which include the `scripts/*.test.mjs` tests of the development launcher. CI does not build container images or deploy the server.
 
@@ -156,15 +292,19 @@ CI runs the repository Go checks in the root Go module when Go sources or Go mod
 
 ## Dependencies and Integrations
 
-- Upstream: Logto shared tenant (`planned`), payment provider (not selected), PlanetScale Postgres (`planned`).
-- Downstream: [`delino-accounts-web`](apps-delino-accounts-foundation.md).
-- Protocol schemas: `protos/delino/accounts/` (`planned`).
+- Upstream: Logto shared tenant and its Management API (`planned`), Paddle (`planned`, payment provider and merchant of record), Resend (`planned`, email delivery), PlanetScale Postgres (`planned`).
+- Downstream: [`delino-accounts-web`](apps-delino-accounts-foundation.md) and the consuming services in [Users and Operators](#users-and-operators).
+- Protocol schemas: [protos contract](protos-delino-accounts-api-contract.md) for `protos/delino/accounts/v1/` (`planned`).
+- New Go dependencies (`planned`): `github.com/pressly/goose/v3` (migrations), `github.com/resend/resend-go/v2` (email delivery) and `github.com/prometheus/client_golang` (internal metrics). Each needs owner approval and a [dependency security](repository-dependency-security-contract.md) review (for example `govulncheck ./servers/accounts-api/...`) in the change that adds it; record the exact versions here. The server also uses `github.com/jackc/pgx/v5`, `github.com/go-jose/go-jose/v4`, `connectrpc.com/connect` and `google.golang.org/protobuf`, which are already in the root Go module. The Paddle client uses only the Go standard library.
+- Rollout: deploy `accounts-api` with the billing APIs before `ownsand-api` starts to report usage and enforce billing. There is no feature flag. Add a changeset for each deployed package.
 
 ## Change Triggers
 
 - Update [project-delino-accounts.md](project-delino-accounts.md) when the origin, component IDs, deployment target or open decisions change.
 - Update [apps-delino-accounts-foundation.md](apps-delino-accounts-foundation.md) when an API capability or allowed browser origin changes.
-- Add a `protos-delino-accounts-*` contract with the first Connect RPC schema.
+- Update the [protos contract](protos-delino-accounts-api-contract.md) before or with every RPC, message or enum change.
+- Update the contract of each consuming service, such as [servers-ownsand-api-foundation.md](servers-ownsand-api-foundation.md#billing), when the usage-report, link or status behavior changes.
+- Update [repository-billing-contract.md](repository-billing-contract.md) when the payment provider, the credit model or the shared billing account model changes.
 - Update [repository-workflow-contract.md](repository-workflow-contract.md) when Go validation or deployment workflows change.
 - Update `servers/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
@@ -177,4 +317,8 @@ CI runs the repository Go checks in the root Go module when Go sources or Go mod
 - [repository-environment-contract.md](repository-environment-contract.md)
 - [repository-license-contract.md](repository-license-contract.md)
 - [repository-workflow-contract.md](repository-workflow-contract.md)
+- [repository-dependency-security-contract.md](repository-dependency-security-contract.md)
+- [protos-delino-accounts-api-contract.md](protos-delino-accounts-api-contract.md)
 - [Connect for Go](https://connectrpc.com/docs/go/getting-started)
+- [Paddle: one-time charges on a subscription](https://developer.paddle.com/build/subscriptions/bill-add-one-time-charge/)
+- [Paddle pricing](https://www.paddle.com/pricing)
