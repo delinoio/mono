@@ -3,6 +3,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -172,5 +173,28 @@ func TestLoadAcceptsASCIILogLevelInAnyCase(t *testing.T) {
 		if cfg.LogLevel != want {
 			t.Errorf("%q: level = %q, want %q", value, cfg.LogLevel, want)
 		}
+	}
+}
+
+// TestSTUNAddrDefaults pins the standalone binary default and requires the
+// runtime image to override it with the wildcard address, because a
+// loopback-bound listener cannot receive datagrams from a published UDP port.
+func TestSTUNAddrDefaults(t *testing.T) {
+	cfg, err := Load(env(minimal()))
+	if err != nil || cfg.STUNAddr != "127.0.0.1:13478" {
+		t.Fatalf("default STUNAddr = %q, %v", cfg.STUNAddr, err)
+	}
+	v := minimal()
+	v[EnvSTUNAddr] = "0.0.0.0:3478"
+	cfg, err = Load(env(v))
+	if err != nil || cfg.STUNAddr != "0.0.0.0:3478" {
+		t.Fatalf("explicit STUNAddr = %q, %v", cfg.STUNAddr, err)
+	}
+	dockerfile, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(dockerfile), "\nENV "+EnvSTUNAddr+"=0.0.0.0:3478\n") {
+		t.Errorf("Dockerfile does not set %s=0.0.0.0:3478", EnvSTUNAddr)
 	}
 }
