@@ -5,6 +5,7 @@
     "dev": {
       "passThroughEnv": [
         "ADDR",
+        "ALLOW_DIRECT_CLIENT_ADDRESS",
         "LOG_LEVEL",
         "DATABASE_URL",
         "RUN_MIGRATIONS",

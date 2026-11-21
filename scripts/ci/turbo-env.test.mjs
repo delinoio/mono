@@ -34,15 +34,16 @@ const shellEnv = {
 // task declares none, so Turbo's strict mode removes every shell variable.
 const expectedPassThroughEnv = {
   "accounts-api#dev": ["ADDR", "LOG_LEVEL"],
-  "delino-accounts#dev": ["PUBLIC_API_ORIGIN"],
+  "delino-accounts#dev": ["PORTLESS", "PORTLESS_*", "PUBLIC_API_ORIGIN"],
   "delidev#dev": ["TAURI_DEV_HOST"],
-  // `delino-docs#dev` and `delino-site#dev` declare no pass-through variables on
-  // purpose. Their ports are pinned in `rspress.config.ts` (`strictPort`), and
-  // `PORT` is deliberately not supported as a per-run override.
-  "delino-docs#dev": null,
+  // The frontend `dev` scripts run portless, which reads only its own
+  // `PORTLESS` and `PORTLESS_*` settings from the shell. portless sets `PORT`
+  // for the dev server itself, so `PORT` from the shell must not pass through.
+  "delino-docs#dev": ["PORTLESS", "PORTLESS_*"],
   // Turbo reports the pass-through list sorted.
   "ownsand-api#dev": [
     "ADDR",
+    "ALLOW_DIRECT_CLIENT_ADDRESS",
     "CORS_ORIGINS",
     "DATABASE_URL",
     "LOGTO_AUDIENCE",
@@ -64,8 +65,10 @@ const expectedPassThroughEnv = {
     "STUN_URLS",
     "TRUST_PROXY_CLIENT_ADDRESS",
   ],
-  "delino-site#dev": null,
+  "delino-site#dev": ["PORTLESS", "PORTLESS_*"],
   "ownsand-console#dev": [
+    "PORTLESS",
+    "PORTLESS_*",
     "PUBLIC_API_ORIGIN",
     "PUBLIC_LOGTO_APP_ID",
     "PUBLIC_LOGTO_ENDPOINT",
@@ -227,6 +230,16 @@ test("removing a pass-through entry fails and names the dev task", async (t) => 
       path: "apps/ownsand/turbo.json",
       entry: "PUBLIC_OWNSAND_MOCK_API",
       taskId: "ownsand-console#dev",
+    },
+    {
+      path: "apps/delino-docs/turbo.json",
+      entry: "PORTLESS",
+      taskId: "delino-docs#dev",
+    },
+    {
+      path: "apps/delino-site/turbo.json",
+      entry: "PORTLESS_*",
+      taskId: "delino-site#dev",
     },
   ]) {
     await t.test(`${path} without ${entry}`, (t) => {

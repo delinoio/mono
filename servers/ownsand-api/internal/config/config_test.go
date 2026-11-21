@@ -27,7 +27,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Addr != DefaultAddr || cfg.LogtoAudience != DefaultAudience || cfg.LogtoJWKSURL != "https://tenant.logto.app/oidc/jwks" ||
-		!cfg.RunMigrations || cfg.NonceKey != nil || cfg.TrustProxyClientAddress || len(cfg.CORSOrigins) != 1 {
+		!cfg.RunMigrations || cfg.NonceKey != nil || cfg.TrustProxyClientAddress || cfg.AllowDirectClientAddress || cfg.ClientAddressMode != ClientAddressNone || len(cfg.CORSOrigins) != 1 {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }
@@ -62,6 +62,7 @@ func TestLoadRejects(t *testing.T) {
 		"previous alone":     func(v map[string]string) { v[EnvNonceKeyPrevious] = strings.Repeat("A", 43) },
 		"bad origin":         func(v map[string]string) { v[EnvCORSOrigins] = "https://x/path" },
 		"bad trust boolean":  func(v map[string]string) { v[EnvTrustProxyClientAddress] = "maybe" },
+		"bad direct boolean": func(v map[string]string) { v[EnvAllowDirectClientAddress] = "maybe" },
 		"bad migrate switch": func(v map[string]string) { v[EnvRunMigrations] = "sometimes" },
 	} {
 		v := minimal()
@@ -96,6 +97,80 @@ func TestLoadR2AndSTUN(t *testing.T) {
 		mutate(w)
 		if _, err := Load(env(w)); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestLoadClientAddressMode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		trust, allow string
+		want         ClientAddressMode
+	}{
+		{"neither", "", "", ClientAddressNone},
+		{"both false", "false", "false", ClientAddressNone},
+		{"direct", "", "true", ClientAddressDirect},
+		{"verified proxy", "true", "", ClientAddressVerifiedProxy},
+		{"verified proxy takes precedence", "true", "true", ClientAddressVerifiedProxy},
+		{"trust false allows direct", "false", "true", ClientAddressDirect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := minimal()
+			if tc.trust != "" {
+				v[EnvTrustProxyClientAddress] = tc.trust
+			}
+			if tc.allow != "" {
+				v[EnvAllowDirectClientAddress] = tc.allow
+			}
+			cfg, err := Load(env(v))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ClientAddressMode != tc.want {
+				t.Fatalf("mode = %q, want %q", cfg.ClientAddressMode, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsNonASCIILogLevelThatFoldsToLevelName(t *testing.T) {
+	for name, value := range map[string]string{
+		"U+0130 NFO":            "\u0130NFO",
+		"U+0130 nfo":            "\u0130nfo",
+		"U+0130 NFO with space": " \u0130NFO ",
+		"loud":                  "loud",
+		"KNFO":                  "KNFO",
+		"dotless i nfo":         "\u0131nfo",
+	} {
+		v := minimal()
+		v[EnvLogLevel] = value
+		_, err := Load(env(v))
+		if err == nil || err.Error() != "LOG_LEVEL must be one of debug, info, warn, error" {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+func TestLoadAcceptsASCIILogLevelInAnyCase(t *testing.T) {
+	for value, want := range map[string]LogLevel{
+		"DEBUG": LogLevelDebug,
+		"WARN":  LogLevelWarn,
+		"Error": LogLevelError,
+		"INFO":  LogLevelInfo,
+		"iNfO":  LogLevelInfo,
+		" Warn": LogLevelWarn,
+		"":      LogLevelInfo,
+		" \t ":  LogLevelInfo,
+	} {
+		v := minimal()
+		v[EnvLogLevel] = value
+		cfg, err := Load(env(v))
+		if err != nil {
+			t.Errorf("%q: %v", value, err)
+			continue
+		}
+		if cfg.LogLevel != want {
+			t.Errorf("%q: level = %q, want %q", value, cfg.LogLevel, want)
 		}
 	}
 }
