@@ -3,7 +3,8 @@
 // Fixtures for the shell steps of `.github/workflows/deploy.yml`:
 // `check-pending-changesets.sh` (against a stubbed `gh`),
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
-// `droplet-deploy.sh` (against stubbed `docker` and `curl`) and
+// `droplet-deploy.sh` (against stubbed `docker` and `curl`),
+// `start-caddy.sh` (against a stubbed `docker`) and
 // `deploy-release.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
@@ -1878,3 +1879,115 @@ test(
     }
   },
 );
+
+// --- start-caddy.sh --------------------------------------------------------
+
+const startCaddy = join(root, "scripts/droplet/start-caddy.sh");
+const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
+
+// Runs start-caddy.sh against a stubbed `docker`. Stub behavior:
+//   STUB_INSPECT  the output of `docker inspect` for the `caddy` container
+//                 (`<image> <running>`); `docker inspect` fails when unset,
+//                 as for a missing container.
+//   STUB_FAIL     the `docker` subcommand that prints a daemon error and
+//                 fails (for example `start`).
+function runCaddy(t, { inspect, fail, args } = {}) {
+  const dir = scratch(t);
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(dir, "calls.log"), "");
+  shellStub(
+    bin,
+    "docker",
+    `if [[ "\${STUB_FAIL:-}" == "$1" ]]; then
+  echo "Error response from daemon: stub $1 failed" >&2
+  exit 1
+fi
+case "$1" in
+  inspect) [[ -n "\${STUB_INSPECT:-}" ]] && echo "$STUB_INSPECT" || exit 1 ;;
+esac`,
+  );
+  const env = { ...baseEnv, PATH: `${bin}${delimiter}${baseEnv.PATH}` };
+  env.STUB_DIR = dir;
+  if (inspect !== undefined) env.STUB_INSPECT = inspect;
+  if (fail !== undefined) env.STUB_FAIL = fail;
+  const result = spawnSync(
+    "bash",
+    [startCaddy, ...(args ?? [caddyImage, "/srv/delino", "delino"])],
+    { encoding: "utf8", env },
+  );
+  return {
+    ...result,
+    calls: readFileSync(join(dir, "calls.log"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean),
+  };
+}
+
+const caddyRun = `docker run --detach --name caddy --network delino --restart unless-stopped --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
+const caddyInspect =
+  "docker inspect --format {{.Config.Image}} {{.State.Running}} caddy";
+const caddyReload =
+  "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile";
+
+test("start-caddy creates a missing container", { skip }, (t) => {
+  const result = runCaddy(t);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [
+    caddyInspect,
+    "docker rm --force caddy",
+    caddyRun,
+  ]);
+});
+
+test("start-caddy reloads a running container", { skip }, (t) => {
+  const result = runCaddy(t, { inspect: `${caddyImage} true` });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [caddyInspect, caddyReload]);
+});
+
+test("start-caddy starts a stopped container", { skip }, (t) => {
+  const result = runCaddy(t, { inspect: `${caddyImage} false` });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [caddyInspect, "docker start caddy"]);
+});
+
+test("start-caddy recreates a container with another image", { skip }, (t) => {
+  for (const running of ["true", "false"]) {
+    const result = runCaddy(t, {
+      inspect: `caddy:2.10.0@sha256:${"a".repeat(64)} ${running}`,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(
+      result.calls,
+      [caddyInspect, "docker rm --force caddy", caddyRun],
+      running,
+    );
+  }
+});
+
+test("start-caddy fails with the Docker diagnostic", { skip }, (t) => {
+  for (const [inspect, fail] of [
+    [`${caddyImage} false`, "start"],
+    [`${caddyImage} true`, "exec"],
+    [undefined, "run"],
+    ["caddy:other true", "run"],
+  ]) {
+    const result = runCaddy(t, { inspect, fail });
+    const label = `${inspect} ${fail}`;
+    assert.notEqual(result.status, 0, label);
+    assert.match(
+      result.stderr,
+      new RegExp(`Error response from daemon: stub ${fail} failed`),
+      label,
+    );
+  }
+});
+
+test("start-caddy rejects bad usage before any change", { skip }, (t) => {
+  const result = runCaddy(t, { args: [caddyImage, "/srv/delino"] });
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /usage: start-caddy\.sh/);
+  assert.deepEqual(result.calls, []);
+});

@@ -159,6 +159,7 @@ test("every shared fixture input selects tests", async (t) => {
     "rstack.config.ts",
     "lefthook.yml",
     "scripts/install-git-hooks.sh",
+    "scripts/droplet/start-caddy.sh",
     "scripts/ci/plan.mjs",
     "scripts/ci/format-changed.test.mjs",
     "turbo.json",
