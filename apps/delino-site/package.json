@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "rspress build",
-    "dev": "portless",
+    "dev": "portless run --prefix=",
     "dev:app": "rspress dev",
     "preview": "rspress preview",
     "typecheck": "tsc --noEmit",

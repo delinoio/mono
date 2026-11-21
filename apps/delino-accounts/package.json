@@ -10,7 +10,7 @@
   },
   "scripts": {
     "build": "rsbuild build",
-    "dev": "portless",
+    "dev": "portless run --prefix=",
     "dev:app": "rsbuild dev",
     "preview": "rsbuild preview",
     "test": "rstest run",

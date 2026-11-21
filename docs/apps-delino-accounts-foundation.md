@@ -63,7 +63,7 @@ The app has no server logs. Build diagnostics come from the Rsbuild CLI output i
 Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
-- `pnpm --filter delino-accounts dev`: development server through portless at `https://accounts.delino.localhost`, with a worktree label in a linked Git worktree. See [Frontend development URLs](repository-environment-contract.md#frontend-development-urls).
+- `pnpm --filter delino-accounts dev`: development server through portless at `https://accounts.delino.localhost`, in every checkout. See [Frontend development URLs](repository-environment-contract.md#frontend-development-urls).
 - `pnpm --filter delino-accounts dev:app`, or `dev` with `PORTLESS=0`: development server at `http://127.0.0.1:13100`. The server fails when the port is in use.
 - `pnpm exec turbo run build --filter=delino-accounts`: production build into `apps/delino-accounts/dist/`.
 - `pnpm exec turbo run typecheck --filter=delino-accounts`: TypeScript type check, including the e2e config and tests.

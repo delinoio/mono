@@ -70,7 +70,7 @@ The site has no runtime server logs. Build diagnostics come from the Rspress CLI
 Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
-- `pnpm --filter delino-docs dev`: development server through portless at `https://docs.delino.localhost`, with a worktree label in a linked Git worktree. See [Frontend development URLs](repository-environment-contract.md#frontend-development-urls).
+- `pnpm --filter delino-docs dev`: development server through portless at `https://docs.delino.localhost`, in every checkout. See [Frontend development URLs](repository-environment-contract.md#frontend-development-urls).
 - `pnpm --filter delino-docs dev:app`, or `dev` with `PORTLESS=0`: development server at `http://127.0.0.1:13500`. The server fails when the port is in use and does not start on another port. `PORT` changes the port only when portless also sets `PORTLESS_URL`.
 - `pnpm exec turbo run build --filter=delino-docs`: production build into `apps/delino-docs/dist/`.
 - `pnpm exec turbo run typecheck --filter=delino-docs`: TypeScript type check, including the e2e config and tests.

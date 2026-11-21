@@ -15,11 +15,9 @@
 // CORS_ORIGINS is unset, it allows the console's development origins in
 // addition to the production origin: http://127.0.0.1:13300 (the fixed port
 // of `dev:app` and `PORTLESS=0`) and https://ownsand.delino.localhost and
-// http://ownsand.delino.localhost (the portless URL of the main checkout with
-// the default proxy and with an unprivileged proxy). A linked worktree adds
-// its branch label to the portless host name, and a custom PORTLESS_PORT adds
-// a port; set CORS_ORIGINS to that URL there (`portless get ownsand.delino`
-// in apps/ownsand prints it).
+// http://ownsand.delino.localhost (the portless URL of the console with the
+// default proxy and with an unprivileged proxy). A proxy on a custom
+// PORTLESS_PORT adds that port to the URL; set CORS_ORIGINS to it there.
 //
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
