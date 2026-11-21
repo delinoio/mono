@@ -15,6 +15,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -265,6 +266,235 @@ func TestExecutableInstaller(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(exe); string(b) != "new" {
 		t.Fatalf("executable %q", b)
+	}
+}
+
+// renameCall records one rename that the installer asked the seam to run.
+type renameCall struct{ from, to string }
+
+// installFixture creates an executable with the old bytes and an artifact with
+// the new bytes.
+func installFixture(t *testing.T) (exe, art string) {
+	t.Helper()
+	dir := t.TempDir()
+	exe = filepath.Join(dir, "ownsand-agent")
+	if err := os.WriteFile(exe, []byte("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	art = filepath.Join(dir, "artifact")
+	if err := os.WriteFile(art, []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return exe, art
+}
+
+func readString(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// TestExecutableInstallerWindowsRenames drives the Windows rename sequence
+// through the rename seam. The seam performs the real rename unless a case
+// makes that call fail, so the files on disk show the outcome on any host.
+func TestExecutableInstallerWindowsRenames(t *testing.T) {
+	errSecond := errors.New("second rename denied")
+	errRestore := errors.New("restore rename denied")
+	cases := []struct {
+		name string
+		// fail returns the injected error for the n-th call (0-based), or nil to
+		// run the real rename.
+		fail          func(n int, from, to string) error
+		wantErr       error
+		wantErrText   string
+		wantNotRestor bool
+		wantCalls     int
+		wantExe       string
+	}{
+		{
+			name:      "success",
+			fail:      func(int, string, string) error { return nil },
+			wantCalls: 2,
+			wantExe:   "new",
+		},
+		{
+			name: "first rename fails",
+			fail: func(n int, _, _ string) error {
+				if n == 0 {
+					return errSecond
+				}
+				return nil
+			},
+			wantErr:   errSecond,
+			wantCalls: 1,
+			wantExe:   "old",
+		},
+		{
+			name: "second rename fails and the restore succeeds",
+			fail: func(n int, _, _ string) error {
+				if n == 1 {
+					return errSecond
+				}
+				return nil
+			},
+			wantErr:   errSecond,
+			wantCalls: 3,
+			wantExe:   "old",
+		},
+		{
+			name: "second rename and the restore fail",
+			fail: func(n int, _, _ string) error {
+				switch n {
+				case 1:
+					return errSecond
+				case 2:
+					return errRestore
+				}
+				return nil
+			},
+			wantErr:       errSecond,
+			wantErrText:   "restore",
+			wantNotRestor: true,
+			wantCalls:     3,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exe, art := installFixture(t)
+			var calls []renameCall
+			installer := ExecutableInstaller{
+				Path: exe,
+				goos: "windows",
+				rename: func(from, to string) error {
+					n := len(calls)
+					calls = append(calls, renameCall{from, to})
+					if err := tc.fail(n, from, to); err != nil {
+						return err
+					}
+					return os.Rename(from, to)
+				},
+			}
+			err := installer.Install(art)
+			if tc.wantErr == nil && tc.wantErrText == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err == nil {
+					t.Fatal("Install returned nil")
+				}
+				if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
+					t.Fatalf("error %v does not wrap %v", err, tc.wantErr)
+				}
+				if tc.wantErrText != "" && !strings.Contains(err.Error(), tc.wantErrText) {
+					t.Fatalf("error %q does not mention %q", err, tc.wantErrText)
+				}
+				if tc.wantNotRestor && !strings.Contains(err.Error(), errRestore.Error()) {
+					t.Fatalf("error %q does not include the restore failure", err)
+				}
+			}
+			if len(calls) != tc.wantCalls {
+				t.Fatalf("rename calls %v, want %d", calls, tc.wantCalls)
+			}
+			old := exe + ".old"
+			next := exe + ".new"
+			if calls[0] != (renameCall{exe, old}) {
+				t.Fatalf("first rename %v", calls[0])
+			}
+			if tc.wantCalls >= 2 && calls[1] != (renameCall{next, exe}) {
+				t.Fatalf("second rename %v", calls[1])
+			}
+			if tc.wantCalls == 3 && calls[2] != (renameCall{old, exe}) {
+				t.Fatalf("restore rename %v", calls[2])
+			}
+			if tc.wantNotRestor {
+				// The restore failed, so Path stays missing and the previous bytes
+				// remain at Path.old.
+				if _, statErr := os.Stat(exe); !os.IsNotExist(statErr) {
+					t.Fatalf("executable stat error %v, want not exist", statErr)
+				}
+				if got := readString(t, old); got != "old" {
+					t.Fatalf("previous executable %q", got)
+				}
+				return
+			}
+			if got := readString(t, exe); got != tc.wantExe {
+				t.Fatalf("executable %q, want %q", got, tc.wantExe)
+			}
+		})
+	}
+}
+
+// TestExecutableInstallerNonWindowsSingleRename checks that other hosts keep
+// one rename of Path.new onto Path and never create Path.old.
+func TestExecutableInstallerNonWindowsSingleRename(t *testing.T) {
+	exe, art := installFixture(t)
+	var calls []renameCall
+	installer := ExecutableInstaller{
+		Path: exe,
+		goos: "linux",
+		rename: func(from, to string) error {
+			calls = append(calls, renameCall{from, to})
+			return os.Rename(from, to)
+		},
+	}
+	if err := installer.Install(art); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 || calls[0] != (renameCall{exe + ".new", exe}) {
+		t.Fatalf("rename calls %v", calls)
+	}
+	if got := readString(t, exe); got != "new" {
+		t.Fatalf("executable %q", got)
+	}
+	if _, err := os.Stat(exe + ".old"); !os.IsNotExist(err) {
+		t.Fatalf("unexpected .old file: %v", err)
+	}
+}
+
+// TestFailedWindowsRenameRestoresExecutableAndSkipsRestart runs TryInstall with
+// the real ExecutableInstaller on the Windows rename sequence, where the rename
+// of the new executable onto Path fails.
+func TestFailedWindowsRenameRestoresExecutableAndSkipsRestart(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	u, _, restarts := newUpdater(t, r, "1.0.0", busy)
+	exe, _ := installFixture(t)
+	renames := 0
+	u.opts.Installer = ExecutableInstaller{
+		Path: exe,
+		goos: "windows",
+		rename: func(from, to string) error {
+			renames++
+			if from == exe+".new" {
+				return errors.New("rename denied")
+			}
+			return os.Rename(from, to)
+		},
+	}
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := u.TryInstall(); ok || err == nil {
+		t.Fatalf("install should fail: %v %v", ok, err)
+	}
+	if renames != 3 {
+		t.Fatalf("rename calls %d, want 3", renames)
+	}
+	if got := readString(t, exe); got != "old" {
+		t.Fatalf("executable %q, want the previous bytes", got)
+	}
+	if restarts.Load() != 0 {
+		t.Fatal("restarted after a failed install")
+	}
+	if st, _ := u.opts.Store.LoadAgent(); st != nil && st.PendingUpdate != nil {
+		t.Fatalf("pending update recorded: %+v", st.PendingUpdate)
+	}
+	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
+		t.Fatalf("state %v", s)
 	}
 }
 
