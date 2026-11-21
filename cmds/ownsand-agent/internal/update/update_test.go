@@ -607,3 +607,75 @@ func TestArtifactFailureWithoutRevocationReportsFailed(t *testing.T) {
 		})
 	}
 }
+
+// TestTransferReservationExcludesInstallation checks that a pending verified
+// update makes no installer or restart call while a snapshot transfer holds
+// its reservation, installs once after the last release, and refuses new
+// transfers with ErrInstalling after the installation started.
+func TestTransferReservationExcludesInstallation(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	first, err := u.BeginTransfer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := u.BeginTransfer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
+		t.Fatalf("installed during transfers: %v %v", ok, err)
+	}
+	first()
+	first() // A repeated release must not drop the reservation of the second.
+	if ok, _ := u.TryInstall(); ok || inst.installed.Load() != 0 {
+		t.Fatal("installed while one transfer still runs")
+	}
+	second()
+	select {
+	case <-u.wake:
+	default:
+		t.Fatal("the last release did not wake the installation loop")
+	}
+	if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 || restarts.Load() != 1 {
+		t.Fatalf("install after the release: %v %v", ok, err)
+	}
+	if _, err := u.BeginTransfer(); !errors.Is(err, ErrInstalling) {
+		t.Fatalf("transfer during the installation: %v", err)
+	}
+}
+
+// TestTransferReservationAfterFailedInstall checks that a failed installation
+// opens the transfer gate again, and that a transfer and a live sandbox each
+// defer the installation on their own.
+func TestTransferReservationAfterFailedInstall(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	u, inst, _ := newUpdater(t, r, "1.0.0", busy)
+	inst.err = errors.New("disk full")
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	busy.Store(true)
+	end, err := u.BeginTransfer()
+	if err != nil {
+		t.Fatal(err)
+	}
+	end()
+	if ok, _ := u.TryInstall(); ok || inst.installed.Load() != 0 {
+		t.Fatal("installed while a sandbox runs")
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); ok || err == nil || inst.installed.Load() != 1 {
+		t.Fatalf("failing install: %v %v", ok, err)
+	}
+	end, err = u.BeginTransfer()
+	if err != nil {
+		t.Fatalf("transfer after the failed installation: %v", err)
+	}
+	end()
+}

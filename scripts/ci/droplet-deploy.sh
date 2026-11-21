@@ -179,11 +179,12 @@ discard_replacement() {
   docker rm --force "$1" > /dev/null || true
 }
 
-# Waits until the container answers `GET /healthz` with a success status.
-# Fails at once when the container stops.
+# Waits until the container answers `GET /healthz` with a 2xx status. Redirects
+# are not followed, so a 3xx answer is not healthy. A transport failure (no
+# status) is retried until the deadline. Fails at once when the container stops.
 wait_healthy() {
   local container="$1" network="$2" port="$3" timeout="$4"
-  local deadline=$((SECONDS + timeout)) status address
+  local deadline=$((SECONDS + timeout)) status address code
   while (( SECONDS < deadline )); do
     status="$(docker inspect --format '{{.State.Status}}' "$container")"
     if [[ "$status" != running ]]; then
@@ -191,10 +192,14 @@ wait_healthy() {
       return 1
     fi
     address="$(docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container")"
-    if [[ -n "$address" ]] && curl --fail --silent --show-error --output /dev/null \
-      --max-time 5 "http://$address:$port/healthz" 2> /dev/null; then
-      echo "$container passed the health check."
-      return 0
+    if [[ -n "$address" ]]; then
+      code="$(curl --silent --show-error --output /dev/null \
+        --write-out '%{http_code}' --max-time 5 \
+        "http://$address:$port/healthz" 2> /dev/null)" || code=""
+      if [[ "$code" =~ ^2[0-9]{2}$ ]]; then
+        echo "$container passed the health check."
+        return 0
+      fi
     fi
     sleep 2
   done

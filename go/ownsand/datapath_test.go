@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/pion/webrtc/v4"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -399,5 +400,68 @@ func TestCallerDeadlineEndsStalledSetupWithoutRelayRecovery(t *testing.T) {
 				t.Fatal("the handle moved to the relay on a caller deadline")
 			}
 		})
+	}
+}
+
+// A control plane that applies the caller's deadline (Connect sends the time
+// left as a timeout header) can answer deadline_exceeded slightly before the
+// caller's own timer fires. The test makes that order deterministic: the held
+// request fails with deadline_exceeded at once, while the caller's context
+// still has time left and the skew is larger than that time.
+func TestControlPlaneDeadlineStatusBeforeCallerTimerIsTheCallerDeadline(t *testing.T) {
+	type tc struct {
+		stage stalledStage
+		code  connect.Code
+	}
+	var cases []tc
+	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
+		for _, code := range []connect.Code{connect.CodeDeadlineExceeded, connect.CodeUnavailable} {
+			cases = append(cases, tc{stage, code})
+		}
+	}
+	for _, tt := range cases {
+		stage := tt.stage
+		t.Run(string(stage)+"/"+tt.code.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			stallSetup(t, cp, stage)
+			cp.gateErr = connect.NewError(tt.code, errors.New("control plane ended the request"))
+			c := cp.client(t, TransportAuto)
+			c.timing.p2pOpenTimeout = 5 * time.Second
+			c.timing.callerDeadlineSkew = 10 * time.Second
+			s := cp.handle(t, c)
+
+			ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+			defer cancel()
+			r := waitExec(t, startExec(ctx, s))
+			if !errors.Is(r.err, context.DeadlineExceeded) {
+				t.Fatalf("exec error: %v", r.err)
+			}
+			if len(cp.authRequests()) != 0 {
+				t.Fatal("relay recovery started after the caller's deadline")
+			}
+			if s.Transport() == relayTransport {
+				t.Fatal("the handle moved to the relay on a caller deadline")
+			}
+		})
+	}
+}
+
+// A deadline_exceeded status without a nearby caller deadline is a control
+// plane failure: automatic routing uses the relay.
+func TestControlPlaneDeadlineStatusWithoutCallerDeadlineFallsBackToRelay(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 0)
+	stallSetup(t, cp, stageGetIceServers)
+	cp.gateErr = connect.NewError(connect.CodeDeadlineExceeded, errors.New("server deadline"))
+	c := cp.client(t, TransportAuto)
+	s := cp.handle(t, c)
+
+	r := waitExec(t, startExec(context.Background(), s))
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	if r.res.Transport != relayTransport || len(cp.authRequests()) == 0 {
+		t.Fatalf("transport %v", r.res.Transport)
 	}
 }
