@@ -58,10 +58,17 @@ const ORG_SECTIONS: Record<string, RouteId> = {
 
 /** Parses a path into a route. */
 export function parseRoute(pathname: string): Route {
-  const parts = pathname
-    .split("/")
-    .filter((p) => p !== "")
-    .map(decodeURIComponent);
+  let parts: string[];
+  try {
+    parts = pathname
+      .split("/")
+      .filter((p) => p !== "")
+      .map(decodeURIComponent);
+  } catch {
+    // decodeURIComponent throws URIError on malformed percent escapes; treat
+    // such a path as an unknown route instead of crashing the app.
+    return { id: RouteId.NotFound };
+  }
   if (parts.length === 0) return { id: RouteId.Organizations };
   if (
     parts.length === 2 &&
