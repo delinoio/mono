@@ -154,8 +154,11 @@ func AttachExecRequest(req *ownsandv1.AttachExecRequest) error {
 	if err := UUIDv7("exec_id", req.GetExecId()); err != nil {
 		return err
 	}
-	if req.GetStdoutOffset() < 0 || req.GetStderrOffset() < 0 {
-		return fail("stdout_offset", "offsets must not be negative")
+	if req.GetStdoutOffset() < 0 {
+		return fail("stdout_offset", "must not be negative")
+	}
+	if req.GetStderrOffset() < 0 {
+		return fail("stderr_offset", "must not be negative")
 	}
 	return nil
 }
