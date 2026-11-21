@@ -59,6 +59,13 @@ type fakeRuntime struct {
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
+	starts      int // Create calls, counted before any block or error
+}
+
+func (r *fakeRuntime) startCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.starts
 }
 
 func newFakeRuntime() *fakeRuntime {
@@ -70,6 +77,9 @@ func (r *fakeRuntime) Capabilities(context.Context) vmruntime.Capabilities {
 	return vmruntime.Capabilities{}
 }
 func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
+	r.mu.Lock()
+	r.starts++
+	r.mu.Unlock()
 	if r.block != nil {
 		select {
 		case <-r.block:
@@ -315,6 +325,104 @@ func TestDeleteBeforeCreateRejectsCreate(t *testing.T) {
 	}
 	if ids, _ := e.rt.Running(context.Background()); len(ids) != 0 {
 		t.Fatal("VM created after delete")
+	}
+}
+
+// blockingGate is a CreateGate whose BeginCreate waits until release is closed.
+// entered receives one value per BeginCreate call that started waiting.
+type blockingGate struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func newBlockingGate() *blockingGate {
+	return &blockingGate{entered: make(chan struct{}, 8), release: make(chan struct{})}
+}
+
+func (g *blockingGate) BeginCreate() (func(), error) {
+	g.entered <- struct{}{}
+	<-g.release
+	return func() {}, nil
+}
+
+func TestCreateGateRecheckAfterConcurrentDelete(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	type result struct {
+		entry *ownsandv1.SandboxStateEntry
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		entry, err := e.m.Create(context.Background(), cmd)
+		done <- result{entry, err}
+	}()
+	<-gate.entered
+	del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: cmd.GetSandboxId()})
+	if err != nil || del.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete %v %v", del, err)
+	}
+	close(gate.release)
+	res := <-done
+	var ce *CommandError
+	if !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("create after concurrent delete: %v", res.err)
+	}
+	if n := e.rt.startCount(); n != 0 {
+		t.Fatalf("VM starts after delete = %d, want 0", n)
+	}
+	e.m.mu.Lock()
+	got := e.m.sandboxes[cmd.GetSandboxId()].rec.State
+	e.m.mu.Unlock()
+	if got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("record state %v, want DELETED", got)
+	}
+}
+
+func TestCreateGateRecheckDuplicateCreateStartsOnce(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	type result struct {
+		entry *ownsandv1.SandboxStateEntry
+		err   error
+	}
+	done := make(chan result, 2)
+	for range 2 {
+		go func() {
+			entry, err := e.m.Create(context.Background(), cmd)
+			done <- result{entry, err}
+		}()
+	}
+	<-gate.entered
+	<-gate.entered
+	close(gate.release)
+	for range 2 {
+		res := <-done
+		if res.err != nil || res.entry.GetSandboxId() != cmd.GetSandboxId() {
+			t.Fatalf("create: %v %v", res.entry, res.err)
+		}
+	}
+	if n := e.rt.startCount(); n != 1 {
+		t.Fatalf("VM starts = %d, want 1", n)
+	}
+}
+
+func TestCreateGateControlStartsOnce(t *testing.T) {
+	e := newEnv(t)
+	gate := newBlockingGate()
+	close(gate.release)
+	e.m.SetCreateGate(gate)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err != nil || entry.GetSandboxId() != cmd.GetSandboxId() {
+		t.Fatalf("create: %v %v", entry, err)
+	}
+	if n := e.rt.startCount(); n != 1 {
+		t.Fatalf("VM starts = %d, want 1", n)
 	}
 }
 

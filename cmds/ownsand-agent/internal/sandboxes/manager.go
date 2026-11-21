@@ -455,6 +455,22 @@ func validateCreate(cmd *ownsandv1.CreateSandboxCommand) error {
 	return nil
 }
 
+// existingCreateLocked handles a create for an id that already has a record.
+// found is false when the id is unknown. A deleted or terminal record yields a
+// failed-precondition error; a live record yields its current entry, like a
+// repeated create command. The caller must hold m.mu.
+func (m *Manager) existingCreateLocked(id string) (entry *ownsandv1.SandboxStateEntry, err error, found bool) {
+	sb, ok := m.sandboxes[id]
+	if !ok {
+		return nil, nil, false
+	}
+	entry = sb.rec.Entry(m.epoch)
+	if sb.rec.DeleteMarker || sb.rec.Terminal() {
+		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox was deleted before its create"), true
+	}
+	return entry, nil, true
+}
+
 // Create runs a create command. It returns the sandbox entry and, when the
 // create was rejected or failed, an error.
 func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxCommand) (*ownsandv1.SandboxStateEntry, error) {
@@ -463,15 +479,9 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	}
 	id := cmd.GetSandboxId()
 	m.mu.Lock()
-	if sb, ok := m.sandboxes[id]; ok {
-		entry := sb.rec.Entry(m.epoch)
-		deleted := sb.rec.DeleteMarker || sb.rec.Terminal()
+	if entry, err, found := m.existingCreateLocked(id); found {
 		m.mu.Unlock()
-		if deleted {
-			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox was deleted before its create")
-		}
-		// A repeated create command returns the current state.
-		return entry, nil
+		return entry, err
 	}
 	gate := m.gate
 	m.mu.Unlock()
@@ -486,6 +496,13 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	defer release()
 
 	m.mu.Lock()
+	// The gate may block with m.mu released, so a concurrent delete (marker or
+	// terminal record) or a duplicate create may have recorded this id. Repeat
+	// the existence check before any limit check, record write or VM start.
+	if entry, err, found := m.existingCreateLocked(id); found {
+		m.mu.Unlock()
+		return entry, err
+	}
 	if err := m.checkLimitsLocked(cmd); err != nil {
 		m.mu.Unlock()
 		return nil, err

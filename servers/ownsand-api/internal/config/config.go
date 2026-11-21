@@ -256,8 +256,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvSnapshotPartSizeBytes); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
-		// Each part is one R2 object; 5 MiB to 5 GiB keeps the part count
-		// below 10,000 for disks up to 50 TiB and inside the object size limit.
+		// Each part is one R2 object. A snapshot may have at most 10,000
+		// parts, so the largest snapshot is the part size times 10,000: about
+		// 48.8 GiB at 5 MiB and 625 GiB at the 64 MiB default. The agent
+		// rejects a larger snapshot before it uploads any part.
 		if err != nil || n < 5<<20 || n > 5<<30 {
 			return Config{}, fmt.Errorf("%s must be 5 MiB to 5 GiB", EnvSnapshotPartSizeBytes)
 		}
