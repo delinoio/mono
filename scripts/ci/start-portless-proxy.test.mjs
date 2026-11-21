@@ -146,6 +146,38 @@ test("starts the proxy once with the portless of a portless app", (t) => {
   ]);
 });
 
+test("finds a portless app behind the Infisical development launcher", async (t) => {
+  for (const dev of [
+    "node ../../scripts/dev/with-infisical.mjs --path=/web -- node node_modules/portless/dist/cli.js run --prefix=",
+    "node ../../scripts/dev/with-infisical.mjs --path=/web -- portless run --prefix=",
+    "node node_modules/portless/dist/cli.js run --prefix=",
+  ]) {
+    await t.test(dev, (t) => {
+      const dir = fixture(t, [
+        { name: "a-native", dev: "rsbuild dev", installed: false },
+        { name: "b-web", dev, installed: true },
+      ]);
+      const result = run(dir);
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(result.calls, [
+        { args: ["proxy", "start"], cwd: join(dir, "apps", "b-web") },
+      ]);
+    });
+  }
+  // The launcher in front of a command other than portless is not a portless
+  // app.
+  const dir = fixture(t, [
+    {
+      name: "api",
+      dev: "node ../../scripts/dev/with-infisical.mjs --path=/api -- node scripts/dev.mjs",
+      installed: true,
+    },
+  ]);
+  const result = run(dir);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, []);
+});
+
 for (const value of ["0", "false", "skip"]) {
   test(`does not start the proxy when PORTLESS=${value}`, (t) => {
     const dir = fixture(t, [

@@ -69,6 +69,15 @@ function log(record) {
   console.error(JSON.stringify(record));
 }
 
+// A `dev` script that runs portless: `portless ...` directly, or the
+// Infisical development launcher (`scripts/dev/with-infisical.mjs`) in front
+// of the pinned portless CLI file, which the launcher starts as
+// `node node_modules/portless/dist/cli.js ...` because `shell: false` cannot
+// start the `.cmd` shim on Windows. See
+// docs/repository-environment-contract.md#local-development-injection.
+const PortlessDevScript =
+  /^(?:node \.\.\/\.\.\/scripts\/dev\/with-infisical\.mjs --path=\S+ -- )?(?:portless|node node_modules\/portless\/dist\/cli\.js)(?:\s|$)/;
+
 function readJson(path) {
   return JSON.parse(readFileSync(path, "utf8"));
 }
@@ -88,7 +97,7 @@ function findPortlessCli() {
     const manifestPath = join(appDir, "package.json");
     if (!existsSync(manifestPath)) continue;
     const devScript = readJson(manifestPath).scripts?.dev;
-    if (typeof devScript !== "string" || !/^portless(\s|$)/.test(devScript)) {
+    if (typeof devScript !== "string" || !PortlessDevScript.test(devScript)) {
       continue;
     }
     const portlessDir = join(appDir, "node_modules", "portless");
