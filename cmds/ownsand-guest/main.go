@@ -28,6 +28,7 @@ const (
 	envStateDir = "OWNSAND_GUEST_STATE_DIR"
 	envClock    = "OWNSAND_GUEST_CLOCK"
 	envLogLevel = "OWNSAND_GUEST_LOG_LEVEL"
+	envGrowDisk = "OWNSAND_GUEST_GROW_DISK"
 )
 
 func envOr(name, fallback string) string {
@@ -50,6 +51,7 @@ func run(args []string) int {
 	stateDir := fs.String("state-dir", envOr(envStateDir, defaultStateDir()), "directory for read snapshots on the guest disk (env "+envStateDir+")")
 	clock := fs.String("clock", envOr(envClock, "set"), "set: SetClock sets the system clock; ignore: SetClock changes nothing (env "+envClock+")")
 	logLevel := fs.String("log-level", envOr(envLogLevel, "info"), "debug, info, warn or error (env "+envLogLevel+")")
+	growDisk := fs.Bool("grow-disk", envOr(envGrowDisk, "") == "1", "grow the guest's system disk to the size of its disk at start; set only by guest images, never on a host (env "+envGrowDisk+"=1)")
 	showVersion := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -86,6 +88,9 @@ func run(args []string) int {
 		if err := startTunnel(logger); err != nil {
 			logger.Error("network tunnel failed", "error", err)
 		}
+	}
+	if *growDisk {
+		go growSystemDisk(logger)
 	}
 	l, err := guestlisten.Listen(*listen)
 	if err != nil {
