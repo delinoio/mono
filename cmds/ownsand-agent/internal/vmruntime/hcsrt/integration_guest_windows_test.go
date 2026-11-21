@@ -155,6 +155,14 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if !strings.Contains(strings.ToLower(out), "sandbox") || !strings.Contains(strings.ToLower(out), `nt authority\system`) {
 		t.Fatalf("guest identity %q", out)
 	}
+	// The answer file with the administrator password is gone, and the
+	// guest helper runs as the registered auto-start LocalSystem service.
+	if out, _ := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", `if exist C:\Windows\Panther\unattend.xml (echo present) else (echo absent)`); out != "absent\r\n" {
+		t.Fatalf("answer file %q", out)
+	}
+	if out, _ := e.exec(sb.GetSandboxId(), "sc.exe", "qc", "ownsand-guest"); !strings.Contains(out, "AUTO_START") || !strings.Contains(out, "LocalSystem") {
+		t.Fatalf("service configuration %q", out)
+	}
 	if out, ex := e.exec(sb.GetSandboxId(), "cmd.exe", "/c", `echo state> C:\marker.txt`); ex.GetExitCode() != 0 {
 		t.Fatalf("write marker %q %v", out, ex)
 	}
