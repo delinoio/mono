@@ -80,7 +80,7 @@ func TestWriteFileResolvesDotDotAfterSymlink(t *testing.T) {
 	if _, errd := h.write(first); errd != nil {
 		t.Fatalf("first chunk: %v", errd)
 	}
-	tmpName := "." + "file" + ".ownsand-" + id + ".tmp"
+	tmpName := ".ownsand-" + id + ".tmp"
 	if _, err := os.Stat(filepath.Join(root, "other", tmpName)); err != nil {
 		t.Fatalf("temporary file is not in the native target directory: %v", err)
 	}

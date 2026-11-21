@@ -5,6 +5,7 @@ package guest
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -71,9 +72,33 @@ func newWriteManager(now func() time.Time, logger *slog.Logger) *writeManager {
 // target so that the final rename stays on one file system.
 // The directory part is taken from the target as received, without a
 // lexical clean, so the operating system resolves it like the target.
+//
+// The temporary name does not contain the target name, so its length does
+// not depend on the length of the target name (a 255-byte target name must
+// still be writable). When the name equals the target name, a second prefix
+// is used so the staging file never is the target.
 func tempPath(target, writeID string) string {
 	dir, base := splitTarget(target)
-	return siblingPath(dir, "."+base+".ownsand-"+writeID+".tmp")
+	id := boundedWriteID(writeID)
+	name := ".ownsand-" + id + ".tmp"
+	if name == base {
+		name = ".ownsand-stage-" + id + ".tmp"
+	}
+	return siblingPath(dir, name)
+}
+
+// maxTempIDLen bounds the write_id part of a temporary name. The agent sends
+// UUIDs (36 bytes), but the guest does not validate the format, so a longer
+// id is replaced by its SHA-256 hex digest (64 bytes) to stay below the
+// 255-byte file name limit of common file systems.
+const maxTempIDLen = 128
+
+func boundedWriteID(id string) string {
+	if len(id) <= maxTempIDLen {
+		return id
+	}
+	sum := sha256.Sum256([]byte(id))
+	return hex.EncodeToString(sum[:])
 }
 
 func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, error) {
