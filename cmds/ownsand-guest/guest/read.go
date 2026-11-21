@@ -49,6 +49,12 @@ func (k SnapshotKind) String() string {
 	return "unspecified"
 }
 
+// snapshotFile is the open snapshot that a read call reads its chunks from.
+type snapshotFile interface {
+	io.ReaderAt
+	io.Closer
+}
+
 type readEntry struct {
 	path     string
 	snapshot string
@@ -75,6 +81,17 @@ type readManager struct {
 	// skips the reflink attempt; tests use them.
 	copyHook  func()
 	forceCopy bool
+	// openSnapshot opens a snapshot file for reading chunks; nil means
+	// os.Open. Tests replace it to stall a chunk read.
+	openSnapshot func(path string) (snapshotFile, error)
+}
+
+// open opens the snapshot file at path for one read call.
+func (m *readManager) open(path string) (snapshotFile, error) {
+	if m.openSnapshot != nil {
+		return m.openSnapshot(path)
+	}
+	return os.Open(path)
 }
 
 func newReadManager(dir string, now func() time.Time, logger *slog.Logger) (*readManager, error) {
