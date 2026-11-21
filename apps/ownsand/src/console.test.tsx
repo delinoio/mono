@@ -910,12 +910,12 @@ describe("billing settings", () => {
 
   async function openLinkDialog() {
     const section = await screen.findByRole("region", { name: "Billing" });
+    // Find outside act: a findBy wait inside act logs act warnings.
+    const open = await within(section).findByRole("button", {
+      name: "Link a billing account",
+    });
     await act(async () => {
-      fireEvent.click(
-        await within(section).findByRole("button", {
-          name: "Link a billing account",
-        }),
-      );
+      fireEvent.click(open);
     });
     await settle(60);
     return screen.findByRole("dialog", { name: "Link a billing account" });
@@ -997,12 +997,11 @@ describe("billing settings", () => {
   test("the owner unlinks after a confirmation and the organization is blocked at once", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/settings`);
     const section = await screen.findByRole("region", { name: "Billing" });
+    const unlink = await within(section).findByRole("button", {
+      name: "Unlink billing account",
+    });
     await act(async () => {
-      fireEvent.click(
-        await within(section).findByRole("button", {
-          name: "Unlink billing account",
-        }),
-      );
+      fireEvent.click(unlink);
     });
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain("becomes blocked at once");
@@ -1034,8 +1033,9 @@ describe("billing settings", () => {
     await act(async () => {
       fireEvent.click(screen.getByRole("combobox", { name: "New owner" }));
     });
+    const option = await screen.findByRole("option", { name: "Jun Park" });
     await act(async () => {
-      fireEvent.click(await screen.findByRole("option", { name: "Jun Park" }));
+      fireEvent.click(option);
     });
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: "Transfer" }));
