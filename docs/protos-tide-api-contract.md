@@ -26,54 +26,68 @@ This contract owns the Connect RPC schemas of [`tide`](project-tide.md) in the p
 - List RPCs use `page_size` (default 50, maximum 200) and an opaque `page_token`.
 - Every public RPC is unary or server-streaming. tide has no client-streaming or bidirectional RPC.
 - Errors use Connect error codes. Detail messages never contain credentials.
-- Credential fields exist only in request messages of set operations. Response messages carry `credential_set` (bool) and `credential_set_at` instead.
+- Credential fields exist only in request messages of set operations. Response messages carry `credential_set` (bool) and `credential_set_at` instead. The only exception is the personal API key secret in the `CreateApiKey` response.
+- `DevSessionService` RPCs accept a Logto access token or a personal API key. Every other service accepts only a Logto access token.
 
 ### Public services
 
 The control plane serves every public service at `https://tide.api.delino.io`. Every RPC except `OrganizationService.CreateOrganization`, `OrganizationService.ListOrganizations` and `MemberService.AcceptInvitation` takes an `organization_id`. The [control plane contract](servers-tide-api-foundation.md#authorization) owns the role that each RPC requires.
 
-| Service                   | RPC                        | Kind             | Purpose                                                                                                                                                              |
-| ------------------------- | -------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OrganizationService`     | `CreateOrganization`       | unary            | Create an organization. The caller becomes its `owner`.                                                                                                              |
-|                           | `GetOrganization`          | unary            | Read one organization.                                                                                                                                               |
-|                           | `ListOrganizations`        | unary            | List the organizations of the signed-in user.                                                                                                                        |
-|                           | `DeleteOrganization`       | unary            | Delete the organization and start its clean-up.                                                                                                                      |
-|                           | `TransferOwnership`        | unary            | Make another member the `owner`.                                                                                                                                     |
-| `MemberService`           | `CreateInvitation`         | unary            | Create a one-time invitation with a role. Returns the secret once.                                                                                                   |
-|                           | `ListInvitations`          | unary            | List pending invitations without secrets.                                                                                                                            |
-|                           | `RevokeInvitation`         | unary            | Revoke a pending invitation.                                                                                                                                         |
-|                           | `AcceptInvitation`         | unary            | Join the organization with an invitation secret.                                                                                                                     |
-|                           | `ListMembers`              | unary            | List members, roles and display names.                                                                                                                               |
-|                           | `UpdateMemberRole`         | unary            | Change a member role between `admin` and `member`.                                                                                                                   |
-|                           | `RemoveMember`             | unary            | Remove a member, or leave the organization.                                                                                                                          |
-| `OwnSandLinkService`      | `SetOwnSandLink`           | unary            | Link an OwnSand organization with an API key, or replace the key.                                                                                                    |
-|                           | `GetOwnSandLink`           | unary            | Read the link and its `OwnSandLinkState`, without the key.                                                                                                           |
-|                           | `RemoveOwnSandLink`        | unary            | Remove the link after tide deletes its runners.                                                                                                                      |
-| `GitHubService`           | `CreateGitHubInstallUrl`   | unary            | Return the app installation URL with a single-use `state`.                                                                                                           |
-|                           | `LinkGitHubInstallation`   | unary            | Link an installation with `installation_id`, `code` and `state`.                                                                                                     |
-|                           | `ListGitHubInstallations`  | unary            | List linked installations with their account, state and runner group.                                                                                                |
-|                           | `ListGitHubRunnerGroups`   | unary            | List the runner groups of an installation's GitHub organization.                                                                                                     |
-|                           | `UpdateGitHubInstallation` | unary            | Set the runner group of an installation.                                                                                                                             |
-|                           | `UnlinkGitHubInstallation` | unary            | Remove the link. Cancels its queued requests and deletes its waiting runners.                                                                                        |
-| `AgentIntegrationService` | `CreateAgentIntegration`   | unary            | Create an integration with a vendor, name, settings and credentials.                                                                                                 |
-|                           | `GetAgentIntegration`      | unary            | Read one integration without credentials. For `OPENAI_CODEX`, includes its webhook URL.                                                                              |
-|                           | `ListAgentIntegrations`    | unary            | List integrations without credentials.                                                                                                                               |
-|                           | `UpdateAgentIntegration`   | unary            | Change the name or settings, or replace credentials.                                                                                                                 |
-|                           | `DeleteAgentIntegration`   | unary            | Delete an integration. Fails with `failed_precondition` while a runner profile names it.                                                                             |
-| `RunnerProfileService`    | `CreateRunnerProfile`      | unary            | Create a runner profile.                                                                                                                                             |
-|                           | `GetRunnerProfile`         | unary            | Read one runner profile.                                                                                                                                             |
-|                           | `ListRunnerProfiles`       | unary            | List runner profiles.                                                                                                                                                |
-|                           | `UpdateRunnerProfile`      | unary            | Change the mutable fields of a runner profile.                                                                                                                       |
-|                           | `DeleteRunnerProfile`      | unary            | Delete a runner profile.                                                                                                                                             |
-| `WorkService`             | `ListRequests`             | unary            | List requests, with optional profile, kind and state filters; ended requests only on request.                                                                        |
-|                           | `GetRequest`               | unary            | Read one request.                                                                                                                                                    |
-|                           | `CancelRequest`            | unary            | End a `QUEUED` request with `CANCELED`.                                                                                                                              |
-|                           | `ListRunners`              | unary            | List runners, with optional profile and state filters; ended runners only on request.                                                                                |
-|                           | `GetRunner`                | unary            | Read one runner.                                                                                                                                                     |
-|                           | `DeleteRunner`             | unary            | Delete a runner and its sandbox.                                                                                                                                     |
-|                           | `GetCapacity`              | unary            | Return the device pool view of the [control plane](servers-tide-api-foundation.md#capacity-view).                                                                    |
-|                           | `WatchQueue`               | server-streaming | Stream request and runner changes of the organization for live views. Sends a keepalive at least every 30 seconds and ends before 14 minutes; the client reconnects. |
-| `AuditService`            | `ListAuditEvents`          | unary            | List audit events of the organization.                                                                                                                               |
+| Service                   | RPC                          | Kind             | Purpose                                                                                                                                                              |
+| ------------------------- | ---------------------------- | ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `OrganizationService`     | `CreateOrganization`         | unary            | Create an organization. The caller becomes its `owner`.                                                                                                              |
+|                           | `GetOrganization`            | unary            | Read one organization.                                                                                                                                               |
+|                           | `ListOrganizations`          | unary            | List the organizations of the signed-in user.                                                                                                                        |
+|                           | `DeleteOrganization`         | unary            | Delete the organization and start its clean-up.                                                                                                                      |
+|                           | `TransferOwnership`          | unary            | Make another member the `owner`.                                                                                                                                     |
+|                           | `UpdateOrganizationSettings` | unary            | Change the organization settings with a field mask. Today the only setting is `max_dev_sessions_per_user` (unset means no limit). `GetOrganization` returns it.      |
+| `MemberService`           | `CreateInvitation`           | unary            | Create a one-time invitation with a role. Returns the secret once.                                                                                                   |
+|                           | `ListInvitations`            | unary            | List pending invitations without secrets.                                                                                                                            |
+|                           | `RevokeInvitation`           | unary            | Revoke a pending invitation.                                                                                                                                         |
+|                           | `AcceptInvitation`           | unary            | Join the organization with an invitation secret.                                                                                                                     |
+|                           | `ListMembers`                | unary            | List members, roles and display names.                                                                                                                               |
+|                           | `UpdateMemberRole`           | unary            | Change a member role between `admin` and `member`.                                                                                                                   |
+|                           | `RemoveMember`               | unary            | Remove a member, or leave the organization.                                                                                                                          |
+| `OwnSandLinkService`      | `SetOwnSandLink`             | unary            | Link an OwnSand organization with an API key, or replace the key.                                                                                                    |
+|                           | `GetOwnSandLink`             | unary            | Read the link and its `OwnSandLinkState`, without the key.                                                                                                           |
+|                           | `RemoveOwnSandLink`          | unary            | Remove the link after tide deletes its runners.                                                                                                                      |
+| `GitHubService`           | `CreateGitHubInstallUrl`     | unary            | Return the app installation URL with a single-use `state`.                                                                                                           |
+|                           | `LinkGitHubInstallation`     | unary            | Link an installation with `installation_id`, `code` and `state`.                                                                                                     |
+|                           | `ListGitHubInstallations`    | unary            | List linked installations with their account, state and runner group.                                                                                                |
+|                           | `ListGitHubRunnerGroups`     | unary            | List the runner groups of an installation's GitHub organization.                                                                                                     |
+|                           | `UpdateGitHubInstallation`   | unary            | Set the runner group of an installation.                                                                                                                             |
+|                           | `UnlinkGitHubInstallation`   | unary            | Remove the link. Cancels its queued requests and deletes its waiting runners.                                                                                        |
+| `AgentIntegrationService` | `CreateAgentIntegration`     | unary            | Create an integration with a vendor, name, settings and credentials.                                                                                                 |
+|                           | `GetAgentIntegration`        | unary            | Read one integration without credentials. For `OPENAI_CODEX`, includes its webhook URL.                                                                              |
+|                           | `ListAgentIntegrations`      | unary            | List integrations without credentials.                                                                                                                               |
+|                           | `UpdateAgentIntegration`     | unary            | Change the name or settings, or replace credentials.                                                                                                                 |
+|                           | `DeleteAgentIntegration`     | unary            | Delete an integration. Fails with `failed_precondition` while a runner profile names it.                                                                             |
+| `RunnerProfileService`    | `CreateRunnerProfile`        | unary            | Create a runner profile.                                                                                                                                             |
+|                           | `GetRunnerProfile`           | unary            | Read one runner profile.                                                                                                                                             |
+|                           | `ListRunnerProfiles`         | unary            | List runner profiles.                                                                                                                                                |
+|                           | `UpdateRunnerProfile`        | unary            | Change the mutable fields of a runner profile.                                                                                                                       |
+|                           | `DeleteRunnerProfile`        | unary            | Delete a runner profile.                                                                                                                                             |
+| `WorkService`             | `ListRequests`               | unary            | List requests, with optional profile, kind and state filters; ended requests only on request.                                                                        |
+|                           | `GetRequest`                 | unary            | Read one request.                                                                                                                                                    |
+|                           | `CancelRequest`              | unary            | End a `QUEUED` request with `CANCELED`.                                                                                                                              |
+|                           | `ListRunners`                | unary            | List runners, with optional profile and state filters; ended runners only on request.                                                                                |
+|                           | `GetRunner`                  | unary            | Read one runner.                                                                                                                                                     |
+|                           | `DeleteRunner`               | unary            | Delete a runner and its sandbox.                                                                                                                                     |
+|                           | `GetCapacity`                | unary            | Return the device pool view of the [control plane](servers-tide-api-foundation.md#capacity-view).                                                                    |
+|                           | `WatchQueue`                 | server-streaming | Stream request and runner changes of the organization for live views. Sends a keepalive at least every 30 seconds and ends before 14 minutes; the client reconnects. |
+| `ApiKeyService`           | `CreateApiKey`               | unary            | Create a personal API key of the caller with a name and an optional expiry. Returns the secret once.                                                                 |
+|                           | `ListApiKeys`                | unary            | List the caller's own keys with name, display prefix, expiry, last use and state, without secrets.                                                                   |
+|                           | `RevokeApiKey`               | unary            | Revoke one of the caller's own keys.                                                                                                                                 |
+| `DevSessionService`       | `ListDevSessionProfiles`     | unary            | List the `DEV_SESSION` runner profiles with name, guest OS, resources, workspace path, TTLs and maximum queue wait.                                                  |
+|                           | `CreateDevSession`           | unary            | Create a dev session request for a profile, with an optional label. Returns at once with the dev session and its state.                                              |
+|                           | `GetDevSession`              | unary            | Read one dev session.                                                                                                                                                |
+|                           | `ListDevSessions`            | unary            | List dev sessions of the organization, with optional owner (including "the caller"), profile and state filters; ended sessions only on request.                      |
+|                           | `DeleteDevSession`           | unary            | Cancel a queued dev session or delete a starting or running one.                                                                                                     |
+|                           | `ExecDevSession`             | server-streaming | Run a command in a running dev session and stream `DevSessionExecEvent` messages.                                                                                    |
+|                           | `AttachDevSessionExec`       | server-streaming | Continue the event stream of an exec from given stdout and stderr offsets.                                                                                           |
+|                           | `ReadDevSessionFile`         | server-streaming | Stream a guest file from an offset in chunks of at most 1 MiB.                                                                                                       |
+|                           | `WriteDevSessionFile`        | unary            | Write one chunk of at most 1 MiB to a guest file at an offset.                                                                                                       |
+| `AuditService`            | `ListAuditEvents`            | unary            | List audit events of the organization.                                                                                                                               |
 
 ### Runner profile messages
 
@@ -90,6 +104,14 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 | `OPENAI_CODEX` | none           | `environment_key`, `webhook_secret` |
 | `DEVIN`        | `outpost_name` | `api_token`, `outpost_token`        |
 
+### Personal API key and dev session messages
+
+- `ApiKey`: `api_key_id`, `name`, `display_prefix`, `state`, `created_at`, `expires_at` (absent when the key does not expire), `last_used_at` and `revoked_at`. `CreateApiKeyResponse` adds the `secret` field once.
+- `DevSession`: `dev_session_id` (the request ID), `runner_profile_id`, `owner_user_id`, `label`, `guest_os`, `workspace_path`, `state` (`RequestState`), `end_reason`, `queued_at`, `started_at`, `ended_at`, `runner_id` and `ownsand_device_id` when a runner serves it.
+- `ExecDevSessionRequest`: `organization_id`, `dev_session_id`, `exec_id`, `command` (argument array), `env` (string map), optional `working_directory` and optional `timeout`. `AttachDevSessionExecRequest`: `organization_id`, `dev_session_id`, `exec_id`, `stdout_offset` and `stderr_offset`.
+- `DevSessionExecEvent` is a `oneof` of `keepalive`, `started`, `output_truncated` (first available offsets), `stdout` and `stderr` (`offset` and `data`), `exited` (`oneof` of `exit_code` or `signal`, and `timed_out`), `failed` (`ExecFailureReason` and a message) and `sandbox_ended` (the OwnSand end reason as text). It copies the meaning of the OwnSand exec events and does not import OwnSand schemas.
+- `ReadDevSessionFileRequest`: `organization_id`, `dev_session_id`, `read_id`, `path` and `offset`; the stream carries chunks with `offset` and `data`, and a final message with `size_bytes`. `WriteDevSessionFileRequest`: `organization_id`, `dev_session_id`, `write_id`, `path`, `offset`, `data`, `mode` and `final`.
+
 ### Request and runner messages
 
 - `Request`: `request_id`, `runner_profile_id`, `kind`, `source_key` (the GitHub job ID or vendor request key as text, for display), `state`, `end_reason`, `priority`, `queued_at`, `started_at`, `ended_at`, `runner_id` when a runner serves it, and for `GITHUB_JOB` the `github_installation_id`, the repository full name, the workflow run ID and the job name.
@@ -97,21 +119,23 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 
 ### Enums
 
-| Enum                      | Values                                                                                                                                                                        |
-| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `WorkloadKind`            | `GITHUB_JOB`, `AGENT_SESSION`                                                                                                                                                 |
-| `AgentVendor`             | `CLAUDE_CODE`, `CURSOR`, `OPENAI_CODEX`, `DEVIN`                                                                                                                              |
-| `GuestOs`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                                                                                   |
-| `Priority`                | `HIGH`, `NORMAL`, `LOW`                                                                                                                                                       |
-| `RequestState`            | `QUEUED`, `STARTING`, `RUNNING`, `ENDED`, `CANCELED`, `EXPIRED`, `FAILED`                                                                                                     |
-| `RequestEndReason`        | `COMPLETED`, `CANCELED_BY_SOURCE`, `CANCELED_BY_USER`, `MAX_QUEUE_WAIT`, `NO_ELIGIBLE_DEVICE`, `RUNNER_START_FAILED`, `RUNNER_LOST`, `PROFILE_DELETED`, `INTEGRATION_REMOVED` |
-| `RunnerState`             | `CREATING`, `PREPARING`, `WARM`, `WAITING_FOR_WORK`, `BUSY`, `DELETING`, `DELETED`, `FAILED`                                                                                  |
-| `RunnerEndReason`         | `WORK_DONE`, `SURPLUS`, `WARM_RECLAIMED`, `DELETED_BY_USER`, `START_FAILED`, `SANDBOX_ENDED`, `CLEAN_UP`                                                                      |
-| `OwnSandLinkState`        | `ACTIVE`, `INVALID`                                                                                                                                                           |
-| `GitHubInstallationState` | `ACTIVE`, `SUSPENDED`, `DELETED`                                                                                                                                              |
+| Enum                      | Values                                                                                                                                                                                                                                    |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WorkloadKind`            | `GITHUB_JOB`, `AGENT_SESSION`, `DEV_SESSION`                                                                                                                                                                                              |
+| `AgentVendor`             | `CLAUDE_CODE`, `CURSOR`, `OPENAI_CODEX`, `DEVIN`                                                                                                                                                                                          |
+| `GuestOs`                 | `LINUX`, `MACOS`, `WINDOWS`                                                                                                                                                                                                               |
+| `Priority`                | `HIGH`, `NORMAL`, `LOW`                                                                                                                                                                                                                   |
+| `RequestState`            | `QUEUED`, `STARTING`, `RUNNING`, `ENDED`, `CANCELED`, `EXPIRED`, `FAILED`                                                                                                                                                                 |
+| `RequestEndReason`        | `COMPLETED`, `CANCELED_BY_SOURCE`, `CANCELED_BY_USER`, `MAX_QUEUE_WAIT`, `NO_ELIGIBLE_DEVICE`, `RUNNER_START_FAILED`, `RUNNER_LOST`, `PROFILE_DELETED`, `INTEGRATION_REMOVED`, `SESSION_DELETED`, `SESSION_TTL_EXPIRED`, `MEMBER_REMOVED` |
+| `RunnerState`             | `CREATING`, `PREPARING`, `WARM`, `WAITING_FOR_WORK`, `BUSY`, `DELETING`, `DELETED`, `FAILED`                                                                                                                                              |
+| `RunnerEndReason`         | `WORK_DONE`, `SURPLUS`, `WARM_RECLAIMED`, `DELETED_BY_USER`, `START_FAILED`, `SANDBOX_ENDED`, `CLEAN_UP`                                                                                                                                  |
+| `OwnSandLinkState`        | `ACTIVE`, `INVALID`                                                                                                                                                                                                                       |
+| `GitHubInstallationState` | `ACTIVE`, `SUSPENDED`, `DELETED`                                                                                                                                                                                                          |
+| `ApiKeyState`             | `ACTIVE`, `EXPIRED`, `REVOKED`                                                                                                                                                                                                            |
+| `ExecFailureReason`       | `PROGRAM_NOT_FOUND`, `PERMISSION_DENIED`, `WORKING_DIRECTORY_INVALID`, `RESOURCE_EXHAUSTED`, `OTHER` (the values of the OwnSand enum)                                                                                                     |
 
 - `ENDED`, `CANCELED`, `EXPIRED` and `FAILED` are terminal request states. `DELETED` and `FAILED` are terminal runner states.
-- `STARTING` means that a runner was assigned to an agent session request and is not yet `BUSY`. `GITHUB_JOB` requests go from `QUEUED` to `RUNNING` directly, because GitHub assigns the job.
+- `STARTING` means that a runner was assigned to an agent session or dev session request and is not yet `BUSY`. `GITHUB_JOB` requests go from `QUEUED` to `RUNNING` directly, because GitHub assigns the job.
 
 ## Storage
 
@@ -119,8 +143,9 @@ The schemas define no storage. The [control plane contract](servers-tide-api-fou
 
 ## Security
 
-- No response message carries a credential, a JIT configuration or a work order.
+- No response message carries a credential, a JIT configuration or a work order. The only secret in a response is the personal API key secret in `CreateApiKeyResponse`.
 - Invitation secrets appear only in the `CreateInvitation` response.
+- Exec environment values are request fields that the server neither stores nor logs.
 
 ## Logging
 

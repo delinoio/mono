@@ -2,63 +2,103 @@
 
 ## Scope
 
-This contract owns the tide command-line interface, component `tide-cli`, of [`tide`](project-tide.md) at `cmds/tide/` (`planned`). The binary name is `tide`. It lets people inspect the queue, the runners and the device pool, and manage organizations, runner profiles and integrations from a terminal.
+This contract owns the tide command-line interface, component `tide-cli`, of [`tide`](project-tide.md) at `cmds/tide/` (`planned`). The binary name is `tide`. It lets people inspect the queue, the runners and the device pool, manage organizations, runner profiles, integrations and personal API keys, and use dev sessions from a terminal. `tide mcp` serves the same dev session functions to coding agents as a local MCP server.
 
 ## Runtime and Language
 
 - Language: Go in the root module `github.com/delinoio/mono`. Logging: `log/slog`.
 - The CLI uses the [Go SDK](packages-tide-sdk-foundation.md). It must not import code from `servers/`.
+- The MCP server uses the official MCP Go SDK `github.com/modelcontextprotocol/go-sdk` (owner approval recorded in the [project index](project-tide.md#open-decisions)).
 - Distribution: release artifacts for Linux, macOS and Windows on `amd64` and `arm64`. Record the release workflow with the implementation.
 
 ## Users and Operators
 
-Organization owners, admins and members who sign in with Logto.
+- Organization owners, admins and members who sign in with Logto or use a personal API key.
+- Coding agents (for example Claude Code and OpenAI Codex) that start `tide mcp` as an MCP server on the machine where they work, on Linux, macOS or Windows.
 
 ## Interfaces and Contracts
 
-| Command            | Subcommands                                                                   |
-| ------------------ | ----------------------------------------------------------------------------- |
-| `tide login`       | Sign in with the Logto device authorization flow.                             |
-| `tide logout`      | Delete the stored tokens.                                                     |
-| `tide org`         | `list`, `create`, `use`, `delete`                                             |
-| `tide member`      | `list`, `invite`, `revoke-invite`, `set-role`, `remove`, `leave`              |
-| `tide ownsand`     | `link`, `show`, `unlink`                                                      |
-| `tide github`      | `install-url`, `list`, `runner-groups`, `set-runner-group`, `unlink`          |
-| `tide integration` | `create`, `list`, `get`, `update`, `delete`                                   |
-| `tide profile`     | `create`, `list`, `get`, `update`, `delete`                                   |
-| `tide request`     | `list`, `get`, `cancel`                                                       |
-| `tide runner`      | `list`, `get`, `delete`                                                       |
-| `tide status`      | Show the queue, the runners by state and the device pool of the organization. |
+| Command             | Subcommands                                                                                 |
+| ------------------- | ------------------------------------------------------------------------------------------- |
+| `tide login`        | Sign in with the Logto device authorization flow.                                           |
+| `tide logout`       | Delete the stored tokens.                                                                   |
+| `tide org`          | `list`, `create`, `use`, `delete`                                                           |
+| `tide member`       | `list`, `invite`, `revoke-invite`, `set-role`, `remove`, `leave`                            |
+| `tide ownsand`      | `link`, `show`, `unlink`                                                                    |
+| `tide github`       | `install-url`, `list`, `runner-groups`, `set-runner-group`, `unlink`                        |
+| `tide integration`  | `create`, `list`, `get`, `update`, `delete`                                                 |
+| `tide profile`      | `create`, `list`, `get`, `update`, `delete`                                                 |
+| `tide request`      | `list`, `get`, `cancel`                                                                     |
+| `tide runner`       | `list`, `get`, `delete`                                                                     |
+| `tide status`       | Show the queue, the runners by state and the device pool of the organization.               |
+| `tide api-key`      | `create`, `list`, `revoke`                                                                  |
+| `tide session`      | `profiles`, `create`, `wait`, `list`, `get`, `exec`, `attach`, `sync`, `download`, `delete` |
+| `tide org-settings` | `get`, `set-dev-session-limit`, `clear-dev-session-limit`                                   |
+| `tide mcp`          | Serve the MCP server on standard input and output.                                          |
 
 - `tide login` uses the Logto device authorization flow, like the [OwnSand CLI](cmds-ownsand-cli-foundation.md). The CLI is a Logto native application. Record the application registration and scopes with the implementation.
 - Credential storage: a file in the user configuration directory that only the user can read, with the same rules as the OwnSand CLI.
-- `--org` selects the organization. Without `--org`, the CLI uses the organization that `tide org use` stored.
+- `--org` selects the organization. Without `--org`, the CLI uses the organization that `tide org use` stored. With a personal API key, the organization is the key's organization.
+- Personal API key: when the environment variable `TIDE_API_KEY` is set, the CLI uses it instead of the stored Logto tokens, like `OWNSAND_API_KEY` in the OwnSand CLI. Commands outside `tide session` and `tide mcp` then fail with the server's `permission_denied`.
+- `tide api-key create` prints the secret once on standard output and the other fields on standard error, so that a script can capture only the secret.
+- `tide session create <profile-name> [--label <text>] [--wait <duration>]` prints the dev session; with `--wait`, it waits until the session is `RUNNING` or ends, or the duration passes. `tide session exec`, `sync` and `download` follow the exit status rules of `ownsand sandbox exec`, `file read` and `file write` where they apply, and use the Go SDK helpers. `tide session sync <session-id> [<local-dir>] [--force]` defaults to the current directory. `tide session download <session-id> <guest-path> <local-path>`.
 - Credentials (the OwnSand API key and agent integration credentials) are read from standard input or from a file named by a `--*-file` flag. The CLI never accepts a credential as a command-line argument, because other local users can read process arguments.
 - GitHub installation needs a browser: `tide github install-url` prints the installation URL, and the console callback completes the link.
 - Output: tables by default and `--output json` for scripts. Output uses ANSI color by default; `--no-color` and the `NO_COLOR` environment variable turn color off.
 - Exit codes: `0` on success, `1` on a server or network error, `2` on invalid usage.
 
+### MCP server
+
+`tide mcp` serves the Model Context Protocol over standard input and output for one coding agent. The agent's MCP configuration starts it, for example `tide mcp --org <organization-id> --pass-env NPM_TOKEN`. It has no network listener.
+
+- Credential: `TIDE_API_KEY` when set, otherwise the stored Logto tokens of `tide login`. With Logto tokens, the server refreshes the access token as the CLI does. Without a usable credential, every tool returns an error that tells the user to run `tide login` or set `TIDE_API_KEY`.
+- `--pass-env NAME` (repeatable) names local environment variables that the server adds to every `exec` call. The server reads their values from its own environment when it runs the command, so the values never pass through the agent's model context. A tool call cannot add names to this list. When a named variable is not set, the server leaves it out and reports its name, without a value, in the tool result.
+- Standard output carries only MCP messages. Logs go to standard error.
+- Dev sessions do not depend on the server process. When it exits, its dev sessions stay until they are deleted or their TTL ends; `list_sessions` finds them again.
+- Tool waits: a tool call waits at most 50 seconds and then returns the current state. OpenAI Codex stops an MCP tool call after 60 seconds by default (`tool_timeout_sec`), so 50 seconds leaves time for the response. The `wait_seconds` arguments accept 0 to 50, with a default of 50.
+
+| Tool              | Arguments                                                                                                                    | Result                                                                                                                                                                                                              |
+| ----------------- | ---------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `list_profiles`   | none                                                                                                                         | The `DEV_SESSION` runner profiles: name, guest OS, resources, workspace path, TTLs and maximum queue wait.                                                                                                          |
+| `create_session`  | `profile` (name), optional `label`                                                                                           | The dev session ID and state. Returns at once; a session without free capacity is `QUEUED`.                                                                                                                         |
+| `wait_session`    | `session_id`, optional `wait_seconds`                                                                                        | The state after the session became `RUNNING`, ended, or the wait passed. The agent calls it again while the state is `QUEUED` or `STARTING`.                                                                        |
+| `list_sessions`   | optional `include_ended`                                                                                                     | The caller's own dev sessions with ID, profile, guest OS, state, label and times.                                                                                                                                   |
+| `get_session`     | `session_id`                                                                                                                 | One dev session.                                                                                                                                                                                                    |
+| `delete_session`  | `session_id`                                                                                                                 | The final state.                                                                                                                                                                                                    |
+| `exec`            | `session_id`, `command` (argument array), optional `cwd`, `env` (map), `timeout_seconds` (stops the command), `wait_seconds` | When the command ends within the wait: the exit code or signal, `timed_out`, and the output. Otherwise: the `exec_id`, `running: true`, the output so far and the next offsets. The command keeps running.          |
+| `exec_output`     | `session_id`, `exec_id`, `stdout_offset`, `stderr_offset`, optional `wait_seconds`                                           | The output from the given offsets, and the result when the command ended within the wait.                                                                                                                           |
+| `sync`            | `session_id`, optional `local_path` (default: the server's working directory), optional `force`, optional `wait_seconds`     | When the sync ends within the wait: the numbers of uploaded, deleted and skipped files, the bytes sent and the warnings. Otherwise: a `transfer_id` and the progress; the transfer continues in the server process. |
+| `download`        | `session_id`, `guest_path` (absolute, or relative to the workspace path), `local_path`, optional `wait_seconds`              | When the download ends within the wait: the local path, the file count and the bytes. Otherwise: a `transfer_id` and the progress.                                                                                  |
+| `transfer_status` | `transfer_id`, optional `wait_seconds`                                                                                       | The progress or the result of a sync or download that this server process runs. A transfer stops when the server process exits; a later sync sends the same files again.                                            |
+
+- Output in `exec` and `exec_output` results: for each of stdout and stderr, at most the first 8 KiB and the last 24 KiB of the new output (32 KiB), decoded as UTF-8 with invalid bytes replaced. When output is left out, the result states the omitted byte range, so that the agent can read it with `exec_output` while the OwnSand agent still keeps it (the last 8 MiB of each stream, until 10 minutes after the command ends). A `output_truncated` event is reported with the missing range.
+- Errors: tool errors carry the Connect error code and a message for the agent, for example `resource_exhausted` for the per-user dev session limit, `failed_precondition` for a session that is not `RUNNING` or a sync lock, and the paths that break a sync or download limit.
+- Interactive input (stdin and terminals) is not supported, because OwnSand `v1` exec has no stdin.
+
 ## Storage
 
-Only the stored Logto tokens and the selected organization in the user configuration directory.
+Only the stored Logto tokens and the selected organization in the user configuration directory. The MCP server keeps transfer progress only in memory. Sync state lives in the guest manifest, not on the local machine.
 
 ## Security
 
 - The CLI sends tokens only to the configured API origin and the Logto tenant.
-- The CLI never prints a stored token or a credential.
+- The CLI never prints a stored token or a credential, except the new secret of `tide api-key create` once.
+- The CLI never accepts a personal API key as a command-line argument; it reads `TIDE_API_KEY` from the environment.
+- The MCP server never returns token, API key or `--pass-env` values in tool results.
 
 ## Logging
 
-`--verbose` writes structured debug logs to standard error. Logs never contain tokens or credentials.
+`--verbose` writes structured debug logs to standard error. `tide mcp` always logs to standard error. Logs never contain tokens, credentials, command arguments, environment values, command output or file contents.
 
 ## Build and Test
 
 - Package scripts wrap the Go toolchain. Record them with the implementation.
-- Tests: argument parsing, credential input from standard input and files, output formats and error exit codes against a fake `tide-api`.
+- Tests: argument parsing, credential input from standard input and files, `TIDE_API_KEY` precedence, output formats and error exit codes against a fake `tide-api`.
+- MCP server tests against a fake `tide-api`: the tool list and schemas, the 50-second wait limit, `exec` with a command that ends within the wait and one that does not, `exec_output` from offsets with omitted ranges, `--pass-env` values that never appear in tool results, sync and download through `transfer_status`, and error mapping.
 
 ## Dependencies and Integrations
 
-- Upstream: the [Go SDK](packages-tide-sdk-foundation.md), `tide-api` and the Logto shared tenant.
+- Upstream: the [Go SDK](packages-tide-sdk-foundation.md), `tide-api`, the Logto shared tenant and the MCP Go SDK. Sync needs `git` on the local machine.
 
 ## Change Triggers
 
@@ -70,3 +110,6 @@ Only the stored Logto tokens and the selected organization in the user configura
 - [project-tide.md](project-tide.md)
 - [cmds-ownsand-cli-foundation.md](cmds-ownsand-cli-foundation.md)
 - [repository-defaults.md](repository-defaults.md)
+- [Model Context Protocol](https://modelcontextprotocol.io/)
+- [MCP Go SDK](https://github.com/modelcontextprotocol/go-sdk)
+- [OpenAI Codex MCP configuration](https://developers.openai.com/codex/mcp)
