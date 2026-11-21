@@ -6,9 +6,9 @@ import (
 	"context"
 	"errors"
 
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/backoff"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/internal/backoff"
 )
 
 // removeDevice runs the device removal: it records the authenticated

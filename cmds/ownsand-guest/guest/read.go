@@ -49,6 +49,12 @@ func (k SnapshotKind) String() string {
 	return "unspecified"
 }
 
+// snapshotFile is the open snapshot that a read call reads its chunks from.
+type snapshotFile interface {
+	io.ReaderAt
+	io.Closer
+}
+
 type readEntry struct {
 	path     string
 	snapshot string
@@ -75,6 +81,17 @@ type readManager struct {
 	// skips the reflink attempt; tests use them.
 	copyHook  func()
 	forceCopy bool
+	// openSnapshot opens a snapshot file for reading chunks; nil means
+	// os.Open. Tests replace it to stall a chunk read.
+	openSnapshot func(path string) (snapshotFile, error)
+}
+
+// open opens the snapshot file at path for one read call.
+func (m *readManager) open(path string) (snapshotFile, error) {
+	if m.openSnapshot != nil {
+		return m.openSnapshot(path)
+	}
+	return os.Open(path)
 }
 
 func newReadManager(dir string, now func() time.Time, logger *slog.Logger) (*readManager, error) {
@@ -125,7 +142,9 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 }
 
 // end ends one call. A failed snapshot is forgotten when its last call
-// ends, so a retry can try again.
+// ends, or by prepare when the failure comes after the last call ended, so a
+// retry can try again. A snapshot that succeeded after the last call ended
+// stays until the retention time passes.
 func (m *readManager) end(readID string, e *readEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -142,12 +161,26 @@ func (m *readManager) end(readID string, e *readEntry) {
 	}
 }
 
+// prepare makes the snapshot and publishes the result. It publishes under
+// m.mu so that it is ordered against end(): a failure published after the
+// last call ended removes the entry here, and a failure published before it
+// is removed by end(). Either way a retry of the read_id snapshots again.
 func (m *readManager) prepare(readID string, e *readEntry) {
-	defer close(e.ready)
 	kind, size, err := m.makeSnapshot(e.path, e.snapshot)
 	if err != nil {
 		os.Remove(e.snapshot)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	defer close(e.ready)
+	if err != nil {
 		e.err = err
+		// No call is left to receive the failure, and sweep keeps no
+		// failed entry: forget it so the next call for the read_id starts
+		// a new snapshot instead of returning this stale error.
+		if e.open == 0 && m.entries[readID] == e {
+			delete(m.entries, readID)
+		}
 		m.logger.Info("read snapshot failed", "read_id", readID, "error", err.Error())
 		return
 	}
@@ -191,7 +224,13 @@ func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error)
 	if err != nil {
 		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
-	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) || n != after.Size() {
+	if !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
+	}
+	// The copied byte count must equal the stat size, except for a procfs
+	// file: it reports st_size 0 although a read returns bytes, so its
+	// snapshot size is the byte count of the copy.
+	if n != after.Size() && !(before.Size() == 0 && isProcfs(in)) {
 		return 0, 0, errorf(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "read: file changed during the snapshot copy")
 	}
 	return SnapshotKindCopy, n, nil
