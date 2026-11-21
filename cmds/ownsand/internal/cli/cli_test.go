@@ -839,3 +839,79 @@ func TestFileReadLongDestinationName(t *testing.T) {
 		}
 	})
 }
+
+// TestOutOfRangeInt32FlagsAreUsageErrors covers values that a 64-bit int flag
+// would accept and the int32 request field would silently wrap (4294967297
+// becomes 1).
+func TestOutOfRangeInt32FlagsAreUsageErrors(t *testing.T) {
+	const wrapping = "4294967297"
+	const firstOverflow = "2147483648"
+	createBase := []string{"sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "1h", "--memory", "512", "--disk", "5"}
+	for _, c := range []struct {
+		flag string
+		args []string
+	}{
+		{"vcpu", append(slices.Clone(createBase), "--vcpu", wrapping)},
+		{"vcpu", append(slices.Clone(createBase), "--vcpu", firstOverflow)},
+		{"vcpu", []string{"device", "set-limits", "01900000-0000-7000-8000-000000000001", "--memory", "1", "--disk", "1", "--vcpu", wrapping}},
+		{"vcpu-overcommit", []string{"device", "set-limits", "01900000-0000-7000-8000-000000000001", "--memory", "1", "--disk", "1", "--vcpu", "1", "--vcpu-overcommit", wrapping}},
+		{"vcpu-overcommit", []string{"device", "set-limits", "01900000-0000-7000-8000-000000000001", "--memory", "1", "--disk", "1", "--vcpu", "1", "--vcpu-overcommit", "-2147483649"}},
+		{"page-size", []string{"org", "list", "--page-size", wrapping}},
+		{"page-size", []string{"member", "list", "--page-size", firstOverflow}},
+		{"page-size", []string{"member", "invitations", "--page-size", wrapping}},
+		{"page-size", []string{"device", "list", "--page-size", wrapping}},
+		{"page-size", []string{"enrollment-token", "list", "--page-size", wrapping}},
+		{"page-size", []string{"api-key", "list", "--page-size", wrapping}},
+		{"page-size", []string{"sandbox", "list", "--page-size", wrapping}},
+		{"page-size", []string{"snapshot", "list", "--page-size", wrapping}},
+		{"page-size", []string{"template", "list", "--page-size", wrapping}},
+	} {
+		r := newRunner(t)
+		res := r.run(c.args...)
+		if res.code != ExitUsage || !strings.Contains(res.stderr, "-"+c.flag) || !strings.Contains(res.stderr, "out of range") {
+			t.Errorf("%v: %+v", c.args, res)
+		}
+		if calls := r.f.callNames(); len(calls) != 0 {
+			t.Errorf("%v: sent %v for an out-of-range value", c.args, calls)
+		}
+	}
+}
+
+func TestInt32FlagBoundariesAreAccepted(t *testing.T) {
+	r := newRunner(t)
+	if res := r.run("org", "list", "--page-size", "2147483647"); res.code != 0 {
+		t.Fatalf("largest page size: %+v", res)
+	}
+	if res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "1h", "--vcpu", "2147483647", "--memory", "512", "--disk", "5"); res.code != ExitUsage && res.code != 0 {
+		// The server (or SDK validation) may reject the huge count, but the
+		// value must reach the request unchanged and not wrap.
+		t.Logf("create with the largest vCPU: %+v", res)
+	}
+	r.f.mu.Lock()
+	defer r.f.mu.Unlock()
+	for _, req := range r.f.creat {
+		if req.GetResources().GetVcpuCount() != 2147483647 {
+			t.Fatalf("vCPU count %d, want 2147483647", req.GetResources().GetVcpuCount())
+		}
+	}
+}
+
+func TestParseDurationDayOverflow(t *testing.T) {
+	const maxDays = 106751 // floor(MaxInt64 / 24h)
+	if d, err := parseDuration("max-ttl", "7d"); err != nil || d != 7*24*time.Hour {
+		t.Fatalf("7d: %v, %v", d, err)
+	}
+	if d, err := parseDuration("max-ttl", "106751d"); err != nil || d != maxDays*24*time.Hour || d <= 0 {
+		t.Fatalf("largest day count: %v, %v", d, err)
+	}
+	for _, s := range []string{"106752d", "213504d", "9223372036854775807d", "-106752d", "-9223372036854775808d"} {
+		if d, err := parseDuration("max-ttl", s); err == nil || !strings.Contains(err.Error(), "--max-ttl") {
+			t.Errorf("%s: %v, %v", s, d, err)
+		}
+	}
+	r := newRunner(t)
+	res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "213504d", "--vcpu", "1", "--memory", "512", "--disk", "5")
+	if res.code != ExitUsage || !strings.Contains(res.stderr, "invalid duration") || len(r.f.callNames()) != 0 {
+		t.Fatalf("%+v %v", res, r.f.callNames())
+	}
+}

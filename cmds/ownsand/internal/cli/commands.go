@@ -5,9 +5,11 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -44,14 +46,47 @@ func idArg(field, v string) error {
 	return nil
 }
 
+// int32Flag is a flag.Value for an int32 option. The standard int flag parses
+// into a 64-bit int, so a value such as 4294967297 would wrap to 1 when it is
+// narrowed to the int32 request field. This type rejects values that do not
+// fit instead, so the flag parser reports a usage error naming the flag.
+type int32Flag int32
+
+func (f *int32Flag) String() string {
+	if f == nil {
+		return "0"
+	}
+	return strconv.FormatInt(int64(*f), 10)
+}
+
+func (f *int32Flag) Set(s string) error {
+	// Base 0 matches the standard int flag (0x, 0o and 0b prefixes).
+	n, err := strconv.ParseInt(s, 0, 32)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return fmt.Errorf("value out of range: must be between %d and %d", math.MinInt32, math.MaxInt32)
+		}
+		return errors.New("parse error")
+	}
+	*f = int32Flag(n)
+	return nil
+}
+
+// int32Var registers an int32 flag that rejects out-of-range values.
+func int32Var(fs *flag.FlagSet, name string, def int32, usage string) *int32 {
+	v := def
+	fs.Var((*int32Flag)(&v), name, usage)
+	return &v
+}
+
 type pageFlags struct {
-	size  int
+	size  int32
 	token string
 }
 
 func addPageFlags(fs *flag.FlagSet) *pageFlags {
 	p := &pageFlags{}
-	fs.IntVar(&p.size, "page-size", 0, "page size (default 50, at most 200)")
+	fs.Var((*int32Flag)(&p.size), "page-size", "page size (default 50, at most 200)")
 	fs.StringVar(&p.token, "page-token", "", "page token of a previous list call")
 	return p
 }
@@ -162,9 +197,15 @@ func parseDuration(flagName, s string) (time.Duration, error) {
 		return 0, nil
 	}
 	if strings.HasSuffix(s, "d") {
-		n, err := strconv.Atoi(strings.TrimSuffix(s, "d"))
+		n, err := strconv.ParseInt(strings.TrimSuffix(s, "d"), 10, 64)
 		if err == nil {
-			return time.Duration(n) * 24 * time.Hour, nil
+			const day = 24 * time.Hour
+			// Reject counts whose product overflows time.Duration instead of
+			// letting it wrap to an unrelated, possibly negative, duration.
+			if n > int64(math.MaxInt64/day) || n < int64(math.MinInt64/day) {
+				return 0, usageErr("--%s: invalid duration %q (for example 30m, 2h or 7d)", flagName, s)
+			}
+			return time.Duration(n) * day, nil
 		}
 	}
 	d, err := time.ParseDuration(s)
@@ -186,7 +227,7 @@ func (a *app) orgList(ctx context.Context, name string, args []string) error {
 	if err != nil {
 		return err
 	}
-	res, err := c.Organizations().List(ctx, &ownsandv1.ListOrganizationsRequest{PageSize: int32(page.size), PageToken: page.token})
+	res, err := c.Organizations().List(ctx, &ownsandv1.ListOrganizationsRequest{PageSize: page.size, PageToken: page.token})
 	if err != nil {
 		return err
 	}
@@ -287,7 +328,7 @@ func (a *app) memberList(ctx context.Context, name string, args []string) error 
 	if err != nil {
 		return err
 	}
-	res, err := a.client.Members().List(ctx, &ownsandv1.ListMembersRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token})
+	res, err := a.client.Members().List(ctx, &ownsandv1.ListMembersRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token})
 	if err != nil {
 		return err
 	}
@@ -329,7 +370,7 @@ func (a *app) memberInvitations(ctx context.Context, name string, args []string)
 	if err != nil {
 		return err
 	}
-	res, err := a.client.Members().ListInvitations(ctx, &ownsandv1.ListInvitationsRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token})
+	res, err := a.client.Members().ListInvitations(ctx, &ownsandv1.ListInvitationsRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token})
 	if err != nil {
 		return err
 	}
@@ -458,7 +499,7 @@ func (a *app) deviceList(ctx context.Context, name string, args []string) error 
 	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
-	req := &ownsandv1.ListDevicesRequest{PageSize: int32(page.size), PageToken: page.token}
+	req := &ownsandv1.ListDevicesRequest{PageSize: page.size, PageToken: page.token}
 	if *state != "" {
 		st, err := parseDeviceState(*state)
 		if err != nil {
@@ -500,10 +541,10 @@ func (a *app) deviceGet(ctx context.Context, name string, args []string) error {
 
 func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) error {
 	fs := a.newFlags(name)
-	vcpu := fs.Int("vcpu", -1, "vCPU limit (required)")
+	vcpu := int32Var(fs, "vcpu", -1, "vCPU limit (required)")
 	memory := fs.Int64("memory", -1, "memory limit in MiB (required)")
 	disk := fs.Int64("disk", -1, "disk limit in GiB (required)")
-	overcommit := fs.Int("vcpu-overcommit", -1, "vCPU overcommit percentage, 100 to 400 in steps of 25 (default: the current value)")
+	overcommit := int32Var(fs, "vcpu-overcommit", -1, "vCPU overcommit percentage, 100 to 400 in steps of 25 (default: the current value)")
 	rest, err := a.positional(fs, args, "device-id")
 	if err != nil {
 		return err
@@ -521,8 +562,8 @@ func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) e
 	// ReplaceDeviceLimits needs every value to be present, so an explicit zero
 	// (for example --vcpu 0) reaches the server as zero.
 	limits := &ownsandv1.DeviceLimitsInput{
-		VcpuCount: proto.Int32(int32(*vcpu)), MemoryMib: proto.Int64(*memory), DiskGib: proto.Int64(*disk),
-		VcpuOvercommitPercent: proto.Int32(int32(*overcommit)),
+		VcpuCount: proto.Int32(*vcpu), MemoryMib: proto.Int64(*memory), DiskGib: proto.Int64(*disk),
+		VcpuOvercommitPercent: proto.Int32(*overcommit),
 	}
 	if *overcommit < 0 {
 		// Every value is required: keep the device's current overcommit.
@@ -598,7 +639,7 @@ func (a *app) enrollmentList(ctx context.Context, name string, args []string) er
 	if err != nil {
 		return err
 	}
-	res, err := a.client.Devices().ListEnrollmentTokens(ctx, &ownsandv1.ListEnrollmentTokensRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token})
+	res, err := a.client.Devices().ListEnrollmentTokens(ctx, &ownsandv1.ListEnrollmentTokensRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token})
 	if err != nil {
 		return err
 	}
@@ -661,7 +702,7 @@ func (a *app) apiKeyList(ctx context.Context, name string, args []string) error 
 	if err != nil {
 		return err
 	}
-	res, err := a.client.APIKeys().List(ctx, &ownsandv1.ListApiKeysRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token})
+	res, err := a.client.APIKeys().List(ctx, &ownsandv1.ListApiKeysRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token})
 	if err != nil {
 		return err
 	}
@@ -789,7 +830,7 @@ func (a *app) snapshotList(ctx context.Context, name string, args []string) erro
 	if err != nil {
 		return err
 	}
-	req := &ownsandv1.ListSnapshotsRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token}
+	req := &ownsandv1.ListSnapshotsRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token}
 	if *sandbox != "" {
 		req.SandboxId = sandbox
 	}
@@ -881,7 +922,7 @@ func (a *app) templateList(ctx context.Context, name string, args []string) erro
 	if err != nil {
 		return err
 	}
-	res, err := a.client.Snapshots().ListTemplates(ctx, &ownsandv1.ListTemplatesRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token})
+	res, err := a.client.Snapshots().ListTemplates(ctx, &ownsandv1.ListTemplatesRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token})
 	if err != nil {
 		return err
 	}
