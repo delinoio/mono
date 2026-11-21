@@ -5,12 +5,14 @@ import {
   encodeMessages,
   FrameCodecError,
   FrameDecoder,
+  MAX_FRAME_SIZE,
   validateFrame,
 } from "../codec.ts";
 import {
   connectErrorFromDetail,
   InvalidFrameError,
   OwnSandError,
+  PeerStreamOverrunError,
 } from "../errors.ts";
 import { SessionEndReason } from "../gen/delino/ownsand/v1/common_pb.ts";
 import {
@@ -71,6 +73,39 @@ const AUTHORIZATION_CODES: ReadonlySet<Code> = new Set([
 /** Largest data channel send buffer before the session waits. */
 const SEND_BUFFER_HIGH = 1 << 20;
 const SEND_BUFFER_LOW = 256 << 10;
+
+/**
+ * Most frames that one stream queues for a consumer that is not ready, as in
+ * the Go SDK.
+ */
+export const STREAM_QUEUE_MAX_FRAMES = 64;
+/**
+ * Most payload bytes (file chunk and exec output data) that one stream
+ * queues. It is at least one maximum frame, so a single frame never fails a
+ * stream whose consumer is caught up.
+ */
+export const STREAM_QUEUE_MAX_BYTES = 8 << 20;
+if (STREAM_QUEUE_MAX_BYTES < MAX_FRAME_SIZE) {
+  throw new Error("the stream queue byte limit is below one frame");
+}
+
+/** The bytes of file or output data that a frame adds to a stream queue. */
+function queuedBytesOf(frame: DataFrame): number {
+  switch (frame.payload.case) {
+    case "fileReadEvent": {
+      const event = frame.payload.value.event;
+      return event.case === "chunk" ? event.value.data.length : 0;
+    }
+    case "execEvent": {
+      const event = frame.payload.value.event;
+      return event.case === "stdout" || event.case === "stderr"
+        ? event.value.data.length
+        : 0;
+    }
+    default:
+      return 0;
+  }
+}
 
 /**
  * One peer-to-peer data channel session with the device agent for one
@@ -419,8 +454,46 @@ export class PeerSession {
         }
         continue;
       }
-      this.#streams.get(frame.streamId)?.push(frame);
+      this.#enqueue(frame);
     }
+  }
+
+  /**
+   * Queues a frame for its stream. The receive callback cannot wait for a
+   * slow consumer, and the data channel cannot be paused from JavaScript, so
+   * a stream that already holds the maximum frames or bytes fails at once
+   * instead of waiting as the Go SDK does for 10 seconds. The overflowing
+   * frame is dropped and the frames that follow on that stream find no
+   * stream. The consumer first takes the frames that are queued, so every
+   * delivered frame keeps its offset, and the operation continues on a new
+   * stream from the delivered offsets. Other streams and the session are not
+   * affected.
+   */
+  #enqueue(frame: DataFrame): void {
+    const queue = this.#streams.get(frame.streamId);
+    if (queue === undefined) {
+      return;
+    }
+    const size = queuedBytesOf(frame);
+    if (
+      queue.length >= STREAM_QUEUE_MAX_FRAMES ||
+      queue.bytes + size > STREAM_QUEUE_MAX_BYTES
+    ) {
+      safeLog(this.#ctx.logger, {
+        event: LogEvent.StreamOverrun,
+        sandboxId: this.#ctx.sandboxId,
+        queuedFrames: queue.length,
+        queuedBytes: queue.bytes,
+      });
+      queue.fail(
+        new PeerStreamOverrunError(
+          "the consumer did not keep up with the peer-to-peer stream",
+        ),
+      );
+      this.#streams.delete(frame.streamId);
+      return;
+    }
+    queue.push(frame, size);
   }
 
   #terminate(error: Error): void {
