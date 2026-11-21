@@ -72,6 +72,8 @@ type p2pSession struct {
 	sendMu   sync.Mutex
 	lowWater chan struct{}
 
+	queueTimeout time.Duration
+
 	mu      sync.Mutex
 	streams map[uint64]*p2pStream
 	nextID  uint64
@@ -118,6 +120,8 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 		dec:       datapath.NewDecoder(),
 		done:      make(chan struct{}),
 		lowWater:  make(chan struct{}, 1),
+
+		queueTimeout: c.timing.streamQueueTimeout,
 	}
 	opened := make(chan struct{})
 	var openOnce sync.Once
@@ -252,10 +256,30 @@ func (s *p2pSession) dispatch(f *ownsandv1.DataFrame) {
 	}
 	select {
 	case st.ch <- f:
+		return
+	default:
+	}
+	// The queue is full. The data channel is ordered and this callback
+	// serves every stream, so it waits only a bounded time for the
+	// stream's consumer: a consumer that stays blocked (for example an exec
+	// OnEvent callback that waits for another operation on the same
+	// handle) would otherwise stop the responses of every other stream. The
+	// failed stream's operation continues from its delivered offsets.
+	timer := time.NewTimer(s.queueTimeout)
+	defer timer.Stop()
+	select {
+	case st.ch <- f:
 	case <-st.closed:
 	case <-s.done:
+	case <-timer.C:
+		st.fail(errStreamOverrun)
 	}
 }
+
+// errStreamOverrun reports a stream whose consumer did not take its queued
+// frames within the stream queue timeout. It is a transport interruption:
+// the operation continues on a new stream from its delivered offsets.
+var errStreamOverrun = errors.New("ownsand: peer-to-peer stream consumer fell behind; the stream was failed")
 
 // send writes one frame as data channel messages of at most 16 KiB.
 func (s *p2pSession) send(ctx context.Context, f *ownsandv1.DataFrame) error {

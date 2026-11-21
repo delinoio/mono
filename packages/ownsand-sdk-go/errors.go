@@ -122,7 +122,7 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 	if ctx.Err() != nil {
 		return failTerminal, 0
 	}
-	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) {
+	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) || errors.Is(err, errStreamOverrun) {
 		return failInterrupted, 0
 	}
 	var fe *frameError

@@ -45,6 +45,7 @@ func mustID(t testing.TB) string {
 func testTiming() timing {
 	return timing{
 		p2pOpenTimeout:       3 * time.Second,
+		streamQueueTimeout:   200 * time.Millisecond,
 		recoveryWindow:       1500 * time.Millisecond,
 		streamStall:          400 * time.Millisecond,
 		relayStreamLimit:     time.Second,

@@ -13,6 +13,10 @@ import (
 type timing struct {
 	// p2pOpenTimeout bounds the wait for the data channel to open.
 	p2pOpenTimeout time.Duration
+	// streamQueueTimeout bounds how long the shared data channel receiver
+	// waits for room in the full queue of one stream before it fails that
+	// stream, so one blocked consumer cannot stop the other streams.
+	streamQueueTimeout time.Duration
 	// recoveryWindow is the relay recovery window and the retry window of
 	// AuthorizeRelay outside recovery.
 	recoveryWindow time.Duration
@@ -43,6 +47,7 @@ type timing struct {
 func defaultTiming() timing {
 	return timing{
 		p2pOpenTimeout:       10 * time.Second,
+		streamQueueTimeout:   10 * time.Second,
 		recoveryWindow:       60 * time.Second,
 		streamStall:          90 * time.Second,
 		relayStreamLimit:     14 * time.Minute,

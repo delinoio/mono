@@ -893,3 +893,54 @@ func TestInvalidFrameFailsItsStream(t *testing.T) {
 		})
 	}
 }
+
+// TestBlockedStreamDoesNotBlockOtherStreams checks that an exec whose
+// OnEvent callback waits for another operation on the same handle does not
+// deadlock the shared data channel receiver when the exec's stream queue
+// fills: the receiver fails the overrun stream, the other operation
+// completes, and the exec continues from its delivered offsets.
+func TestBlockedStreamDoesNotBlockOtherStreams(t *testing.T) {
+	cp := newFakeCP(t)
+	// Small output chunks, so the exec sends far more frames than its
+	// stream queue holds.
+	cp.agent.execChunk = 4
+	const lines = 100
+	cp.agent.run = lineRun(lines, 0)
+	want := []byte("file contents")
+	cp.agent.setFile("/f", want)
+	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	r := &recorder{}
+	var once sync.Once
+	var readErr error
+	res, err := s.Exec(ctx, ExecParams{Command: []string{"run"}, OnEvent: func(ev ExecEvent) error {
+		if ev.Kind == ExecEventStdout {
+			once.Do(func() {
+				// Let the agent fill the exec's queue before the read.
+				time.Sleep(100 * time.Millisecond)
+				rctx, rcancel := context.WithTimeout(ctx, 5*time.Second)
+				defer rcancel()
+				got, err := s.ReadFileBytes(rctx, "/f")
+				if err == nil && !bytes.Equal(got, want) {
+					err = fmt.Errorf("read %q", got)
+				}
+				readErr = err
+			})
+		}
+		return r.on(ev)
+	}})
+	if err != nil {
+		t.Fatalf("exec: %v", err)
+	}
+	if readErr != nil {
+		t.Fatalf("read inside OnEvent: %v", readErr)
+	}
+	checkLines(t, res, r, lines)
+	if cp.agent.totalRuns() != 1 {
+		t.Fatalf("command ran %d times", cp.agent.totalRuns())
+	}
+	if cp.openSessionCount() != 1 {
+		t.Fatalf("%d sessions, want 1", cp.openSessionCount())
+	}
+}
