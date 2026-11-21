@@ -55,7 +55,7 @@ Comprehensive performance optimization guide for React and Next.js applications,
    - 5.2 [Defer State Reads to Usage Point](#52-defer-state-reads-to-usage-point)
    - 5.3 [Do not wrap a simple expression with a primitive result type in useMemo](#53-do-not-wrap-a-simple-expression-with-a-primitive-result-type-in-usememo)
    - 5.4 [Don't Define Components Inside Components](#54-dont-define-components-inside-components)
-   - 5.5 [Extract Default Non-primitive Parameter Value from Memoized Component to Constant](#55-extract-default-non-primitive-parameter-value-from-memoized-component-to-constant)
+   - 5.5 [Extract Default Non-primitive Parameter Value to Constant When Forwarding It to Memoized Children](#55-extract-default-non-primitive-parameter-value-to-constant-when-forwarding-it-to-memoized-children)
    - 5.6 [Extract to Memoized Components](#56-extract-to-memoized-components)
    - 5.7 [Narrow Effect Dependencies](#57-narrow-effect-dependencies)
    - 5.8 [Put Interaction Logic in Event Handlers](#58-put-interaction-logic-in-event-handlers)
@@ -1814,23 +1814,34 @@ function UserProfile({ user, theme }) {
 
 - Scroll position resets inside the component
 
-### 5.5 Extract Default Non-primitive Parameter Value from Memoized Component to Constant
+### 5.5 Extract Default Non-primitive Parameter Value to Constant When Forwarding It to Memoized Children
 
-**Impact: MEDIUM (restores memoization by using a constant for default value)**
+**Impact: MEDIUM (keeps memoized children from re-rendering by using a constant for default value)**
 
-When memoized component has a default value for some non-primitive optional parameter, such as an array, function, or object, calling the component without that parameter results in broken memoization. This is because new value instances are created on every rerender, and they do not pass strict equality comparison in `memo()`.
+`memo()` compares only the props that the parent passes in (with `Object.is`), and it does this before the component function runs. A destructuring default such as `onClick = () => {}` is evaluated later, inside the render, so it cannot make `memo(UserAvatar)` re-render when the parent passes the same props. It does create a new function on every render of `UserAvatar`. That new function breaks memoization only where `UserAvatar` passes it on: as a prop to a memoized child, or in a hook dependency array.
 
-To address this issue, extract the default value into a constant.
+To address this issue, extract the default value into a constant. The child then receives the same function on every render.
 
-**Incorrect: `onClick` has different values on every rerender**
+**Incorrect: the default `onClick` is a new function on every render of `UserAvatar`, so the memoized `Icon` re-renders**
 
 ```tsx
-const UserAvatar = memo(function UserAvatar({ onClick = () => {} }: { onClick?: () => void }) {
+const Icon = memo(function Icon({ onClick }: { onClick: () => void }) {
   // ...
 })
 
-// Used without optional onClick
-<UserAvatar />
+const UserAvatar = memo(function UserAvatar({
+  onClick = () => {},
+  size,
+}: {
+  onClick?: () => void
+  size?: number
+}) {
+  return <Icon onClick={onClick} />
+})
+
+// Used without optional onClick. Rerendering the parent with unchanged props skips UserAvatar.
+// When another prop such as `size` changes, UserAvatar renders and Icon re-renders too.
+<UserAvatar size={32} />
 ```
 
 **Correct: stable default value**
@@ -1838,12 +1849,19 @@ const UserAvatar = memo(function UserAvatar({ onClick = () => {} }: { onClick?: 
 ```tsx
 const NOOP = () => {};
 
-const UserAvatar = memo(function UserAvatar({ onClick = NOOP }: { onClick?: () => void }) {
-  // ...
+const UserAvatar = memo(function UserAvatar({
+  onClick = NOOP,
+  size,
+}: {
+  onClick?: () => void
+  size?: number
+}) {
+  return <Icon onClick={onClick} />
 })
 
-// Used without optional onClick
-<UserAvatar />
+// When `size` changes, UserAvatar renders but Icon skips: it still gets NOOP.
+// A supplied onClick is forwarded unchanged: <UserAvatar onClick={handleClick} />
+<UserAvatar size={32} />
 ```
 
 ### 5.6 Extract to Memoized Components
