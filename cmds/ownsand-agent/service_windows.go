@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"golang.org/x/sys/windows/registry"
 	"golang.org/x/sys/windows/svc"
@@ -39,7 +40,7 @@ func runService(cfg config.Config) int {
 			}()
 		}
 	}
-	h := &handler{cfg: cfg}
+	h := &handler{cfg: cfg, run: runAgentOutcome}
 	if err := svc.Run(service.Name, h); err != nil {
 		return exitError
 	}
@@ -47,22 +48,36 @@ func runService(cfg config.Config) int {
 }
 
 type handler struct {
-	cfg  config.Config
+	cfg config.Config
+	// run runs the agent; tests replace it.
+	run func(context.Context, config.Config) (int, bool)
+	// code is the public exit code of `run`, unchanged by the status that
+	// the handler reports to the service control manager.
 	code int
 }
 
+// Execute runs the agent as a service. It reports the exit status that
+// service.WindowsExitStatus derives from the outcome, so that the failure
+// actions of the service restart the agent after an installed update or an
+// error and not after a stop request, a missing enrollment or a removal.
 func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status chan<- svc.Status) (bool, uint32) {
 	status <- svc.Status{State: svc.StartPending}
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan int, 1)
-	go func() { done <- runAgent(ctx, h.cfg) }()
+	type outcome struct {
+		code    int
+		updated bool
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		code, updated := h.run(ctx, h.cfg)
+		done <- outcome{code, updated}
+	}()
 	status <- svc.Status{State: svc.Running, Accepts: svc.AcceptStop | svc.AcceptShutdown}
 	for {
 		select {
-		case code := <-done:
+		case o := <-done:
 			cancel()
-			h.code = code
-			return false, uint32(code)
+			return h.finish(o.code, o.updated, false)
 		case r := <-requests:
 			switch r.Cmd {
 			case svc.Interrogate:
@@ -70,11 +85,21 @@ func (h *handler) Execute(_ []string, requests <-chan svc.ChangeRequest, status 
 			case svc.Stop, svc.Shutdown:
 				status <- svc.Status{State: svc.StopPending}
 				cancel()
-				h.code = <-done
-				return false, uint32(h.code)
+				o := <-done
+				return h.finish(o.code, o.updated, true)
 			}
 		}
 	}
+}
+
+// finish records the public exit code and returns the status for the service
+// control manager.
+func (h *handler) finish(code int, updated, stopRequested bool) (bool, uint32) {
+	h.code = code
+	serviceSpecific, exit := service.WindowsExitStatus(code, updated, stopRequested)
+	slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "ownsand-agent").Info("agent exits under the Windows service",
+		"exit_code", code, "update_installed", updated, "stop_requested", stopRequested, "reported_exit_code", exit, "service_specific", serviceSpecific)
+	return serviceSpecific, exit
 }
 
 func serviceDefinition(exe string) string {
@@ -111,6 +136,19 @@ func serviceInstall(stdout, stderr io.Writer) int {
 		return exitError
 	}
 	defer s.Close()
+	// The failure actions make the service control manager restart the agent
+	// after the service-specific exit statuses of service.WindowsExitStatus.
+	if err := service.InstallWindowsRecovery(
+		func() error {
+			return s.SetRecoveryActions([]mgr.RecoveryAction{{Type: mgr.ServiceRestart, Delay: service.WindowsRestartDelayMillis * time.Millisecond}}, service.WindowsFailureResetSecs)
+		},
+		func() error { return s.SetRecoveryActionsOnNonCrashFailures(true) },
+		s.Delete,
+	); err != nil {
+		slog.New(slog.NewJSONHandler(stderr, nil)).With("component", "ownsand-agent").Error("service failure actions failed", "service", service.Name, "error", err.Error())
+		fmt.Fprintln(stderr, "ownsand-agent:", err)
+		return exitError
+	}
 	// A Windows service does not inherit the installing shell environment,
 	// so the OWNSAND_AGENT_* variables go into the service Environment value
 	// before the service can start. Only names and the count are logged:
