@@ -62,6 +62,8 @@ func TestLoadRejects(t *testing.T) {
 		"short nonce key":    func(v map[string]string) { v[EnvNonceKey] = "c2hvcnQ" },
 		"previous alone":     func(v map[string]string) { v[EnvNonceKeyPrevious] = strings.Repeat("A", 43) },
 		"bad origin":         func(v map[string]string) { v[EnvCORSOrigins] = "https://x/path" },
+		"origin fragment":    func(v map[string]string) { v[EnvCORSOrigins] = "https://x#frag" },
+		"origin bare hash":   func(v map[string]string) { v[EnvCORSOrigins] = "https://ownsand.example#" },
 		"bad trust boolean":  func(v map[string]string) { v[EnvTrustProxyClientAddress] = "maybe" },
 		"bad direct boolean": func(v map[string]string) { v[EnvAllowDirectClientAddress] = "maybe" },
 		"bad migrate switch": func(v map[string]string) { v[EnvRunMigrations] = "sometimes" },
