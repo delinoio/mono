@@ -1123,9 +1123,11 @@ const expectedJobOutputs = {
   "go-vet": "go",
   "go-test": "go",
   protos: "go",
+  "go-platforms": "go",
   "rust-fmt": ALWAYS_RUN,
   "rust-clippy": "rust",
   "rust-test": "rust",
+  "rust-platforms": "rust",
   e2e: "e2e",
   "workspace-packages": "workspace",
   "workspace-servers": "workspace",
@@ -1390,6 +1392,39 @@ test("CI workflow runs each Go check in its own job", () => {
   for (const job of [fmtJob, vetJob]) {
     assert.doesNotMatch(job, /services:|go test|pnpm install/);
   }
+});
+
+// Read-only text check: the platform jobs run the Go and Rust checks on macOS
+// and Windows runners, check out the repository line endings on Windows and
+// keep the Go suite without the Linux-only Postgres service.
+test("CI workflow runs the Go and Rust checks on macOS and Windows", () => {
+  const jobs = workflowJobs();
+  const goJob = jobs.get("go-platforms");
+  const rustJob = jobs.get("rust-platforms");
+  for (const job of [goJob, rustJob]) {
+    assert.match(job, /^ {6}fail-fast: false$/m);
+    assert.match(job, /^\s+runner: macos-latest$/m);
+    assert.match(job, /^\s+runner: windows-latest$/m);
+    assert.match(job, /^ {4}runs-on: \$\{\{ matrix\.runner \}\}$/m);
+    assert.match(job, /^\s+run: git config --global core\.autocrlf false$/m);
+    const lineEndings = job.indexOf("core.autocrlf false");
+    assert.ok(lineEndings < job.indexOf("actions/checkout@"));
+  }
+  assert.match(goJob, /^\s+run: go vet \.\/\.\.\.$/m);
+  assert.match(
+    goJob,
+    /GOARCH="\$other_arch" CGO_ENABLED=1 go vet \.\/\.\.\.$/m,
+  );
+  assert.match(goJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
+  assert.doesNotMatch(goJob, /services:|OWNSAND_E2E: "1"/);
+  assert.match(
+    rustJob,
+    /^\s+run: cargo clippy --workspace --all-targets --locked -- -D warnings$/m,
+  );
+  assert.match(rustJob, /^\s+run: cargo test --workspace --locked$/m);
+  assert.match(rustJob, /Swatinem\/rust-cache@[0-9a-f]{40}/);
+  assert.match(rustJob, /^\s+key: \$\{\{ matrix\.runner \}\}$/m);
+  assert.match(rustJob, /cygpath -w "\$cef_path"/);
 });
 
 // Read-only text check: the fixtures step runs only when the planner selects
