@@ -173,9 +173,38 @@ func (h *Hub) OnClose(fn func(*Conn)) {
 // that is running, so a new channel is never registered between the check
 // and the write of that call.
 func (h *Hub) Register(parent context.Context, deviceID, orgID string) *Conn {
-	ctx, cancel := context.WithCancelCause(parent)
 	unlock := h.lockDevice(deviceID)
 	defer unlock()
+	return h.register(parent, deviceID, orgID)
+}
+
+// RegisterAdmitted registers a new current channel like Register, but only
+// when admit runs its argument. It takes the device fence first and calls
+// admit with the fence held; admit decides whether to run the registration
+// (it returns false when it refused) and RegisterAdmitted returns nil then.
+// The registration runs inside admit, so admit can make the ownership
+// check and the registration one step under its own lock (the lease's
+// ownership lock). Because the fence is taken before admit, that lock is
+// never held while the call waits for the fence: the fence is held across
+// database I/O by IfNoChannel (the offline write of a closing channel), and
+// a wait for it under the ownership lock would stall every admission, the
+// lease renewal and the loss transition behind that I/O.
+//
+// Lock order: the device fence, then the lock of admit, then the hub lock.
+// admit and the function it runs must not take a fence.
+func (h *Hub) RegisterAdmitted(parent context.Context, deviceID, orgID string, admit func(register func()) bool) *Conn {
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+	var c *Conn
+	if !admit(func() { c = h.register(parent, deviceID, orgID) }) {
+		return nil
+	}
+	return c
+}
+
+// register adds the channel. The caller holds the device fence.
+func (h *Hub) register(parent context.Context, deviceID, orgID string) *Conn {
+	ctx, cancel := context.WithCancelCause(parent)
 	h.mu.Lock()
 	h.gen++
 	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel}
