@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -61,6 +60,9 @@ type Runtime struct {
 	done   chan struct{}
 	mu     sync.Mutex
 	vms    map[string]*vm
+	// dialConsole replaces the dial of the COM1 pipe in tests, so they need no
+	// Hyper-V VM. It is nil in production, which dials the named pipe.
+	dialConsole consoleDialer
 }
 
 var _ vmruntime.Runtime = (*Runtime)(nil)
@@ -399,28 +401,14 @@ func (r *Runtime) copyConsole(v *vm) {
 		return
 	}
 	defer out.Close()
-	for {
-		timeout := time.Second
-		conn, err := winio.DialPipe(consolePipe(v.id), &timeout)
-		if err == nil {
-			go func() {
-				select {
-				case <-v.stopping:
-				case <-v.exited:
-				}
-				conn.Close()
-			}()
-			_, _ = io.Copy(out, conn)
-			conn.Close()
-		}
-		select {
-		case <-v.stopping:
-			return
-		case <-v.exited:
-			return
-		case <-time.After(100 * time.Millisecond):
+	dial := r.dialConsole
+	if dial == nil {
+		dial = func() (net.Conn, error) {
+			timeout := time.Second
+			return winio.DialPipe(consolePipe(v.id), &timeout)
 		}
 	}
+	copyConsoleLoop(dial, out, v.stopping, v.exited)
 }
 
 // waitGuest waits until the guest helper answers CheckReady, at most
