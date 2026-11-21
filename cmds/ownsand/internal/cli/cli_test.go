@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -267,7 +268,7 @@ func (l *fakeLogto) handler(t *testing.T) http.Handler {
 		defer l.mu.Unlock()
 		switch {
 		case r.URL.Path == "/oidc/device/auth":
-			if r.Form.Get("client_id") != "app" || !strings.Contains(r.Form.Get("scope"), "offline_access") || r.Form.Get("resource") != DefaultLogtoResource {
+			if r.Form.Get("client_id") != "app" || !strings.Contains(r.Form.Get("scope"), "offline_access") || !slices.Contains(strings.Fields(r.Form.Get("scope")), RequiredLogtoScope) || r.Form.Get("resource") != DefaultLogtoResource {
 				t.Errorf("device auth form %v", r.Form)
 			}
 			fmt.Fprint(w, `{"device_code":"dev-secret","user_code":"ABCD-EFGH","verification_uri":"https://login.example/device","expires_in":60,"interval":0}`)
@@ -575,5 +576,14 @@ func TestExecArgumentForms(t *testing.T) {
 		if res.code != 0 || res.stdout != "-n x\n" {
 			t.Errorf("%v: %+v", args, res)
 		}
+	}
+}
+
+func TestLogtoScopesAlwaysIncludeRequiredScope(t *testing.T) {
+	if got := logtoScopes(""); !slices.Equal(got, []string{RequiredLogtoScope}) {
+		t.Fatalf("logtoScopes(\"\") = %v", got)
+	}
+	if got := logtoScopes(" extra:one  extra:two "); !slices.Equal(got, []string{RequiredLogtoScope, "extra:one", "extra:two"}) {
+		t.Fatalf("logtoScopes(extra) = %v", got)
 	}
 }

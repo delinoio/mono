@@ -334,6 +334,7 @@ func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, h.internal(ctx, "delete snapshot", err)
 	}
+	h.notify()
 	return connect.NewResponse(&ownsandv1.DeleteSnapshotResponse{}), nil
 }
 

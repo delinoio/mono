@@ -156,6 +156,10 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 			return
 		}
 		s.sendDelete(ctx, conn, e.OrganizationID, pendingDelete{sandboxID: sb.ID, reason: sb.DeleteEndReason})
+	case events.KindSnapshotDeleted:
+		if conn := s.Hub.Live(e.DeviceID); conn != nil {
+			s.sendDeleteSnapshot(ctx, conn, e.OrganizationID, e.SnapshotID)
+		}
 	case events.KindDeviceRemoved:
 		conn := s.Hub.Get(e.DeviceID)
 		if conn == nil {

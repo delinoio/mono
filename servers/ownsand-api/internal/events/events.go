@@ -41,6 +41,10 @@ const (
 	// KindOrganizationDeleted: OrganizationID. Revokes every session and
 	// relay grant of the organization.
 	KindOrganizationDeleted
+	// KindSnapshotDeleted: DeviceID and SnapshotID. The snapshot record was
+	// deleted; send the delete-snapshot command to a connected device that
+	// holds a local copy.
+	KindSnapshotDeleted
 )
 
 // Event is one control event.
@@ -52,6 +56,7 @@ type Event struct {
 	SandboxID      string
 	APIKeyID       string
 	UserID         string
+	SnapshotID     string
 }
 
 func nullable(s string) any {
@@ -63,9 +68,9 @@ func nullable(s string) any {
 
 // Write inserts e. Call it inside the transaction of the change.
 func Write(ctx context.Context, q db.Querier, e Event) error {
-	_, err := q.Exec(ctx, `INSERT INTO control_events (kind, organization_id, device_id, sandbox_id, api_key_id, user_id)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		int16(e.Kind), nullable(e.OrganizationID), nullable(e.DeviceID), nullable(e.SandboxID), nullable(e.APIKeyID), nullable(e.UserID))
+	_, err := q.Exec(ctx, `INSERT INTO control_events (kind, organization_id, device_id, sandbox_id, api_key_id, user_id, snapshot_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+		int16(e.Kind), nullable(e.OrganizationID), nullable(e.DeviceID), nullable(e.SandboxID), nullable(e.APIKeyID), nullable(e.UserID), nullable(e.SnapshotID))
 	return err
 }
 
@@ -80,7 +85,7 @@ func LatestID(ctx context.Context, q db.Querier) (int64, error) {
 // first.
 func After(ctx context.Context, q db.Querier, after int64, limit int) ([]Event, error) {
 	rows, err := q.Query(ctx, `SELECT event_id, kind, COALESCE(organization_id::text, ''), COALESCE(device_id::text, ''),
-		COALESCE(sandbox_id::text, ''), COALESCE(api_key_id::text, ''), COALESCE(user_id, '')
+		COALESCE(sandbox_id::text, ''), COALESCE(api_key_id::text, ''), COALESCE(user_id, ''), COALESCE(snapshot_id::text, '')
 		FROM control_events WHERE event_id > $1 ORDER BY event_id LIMIT $2`, after, limit)
 	if err != nil {
 		return nil, err
@@ -90,7 +95,7 @@ func After(ctx context.Context, q db.Querier, after int64, limit int) ([]Event, 
 	for rows.Next() {
 		var e Event
 		var kind int16
-		if err := rows.Scan(&e.ID, &kind, &e.OrganizationID, &e.DeviceID, &e.SandboxID, &e.APIKeyID, &e.UserID); err != nil {
+		if err := rows.Scan(&e.ID, &kind, &e.OrganizationID, &e.DeviceID, &e.SandboxID, &e.APIKeyID, &e.UserID, &e.SnapshotID); err != nil {
 			return nil, err
 		}
 		e.Kind = Kind(kind)

@@ -124,6 +124,21 @@ func (a *FakeAgent) Heartbeat(seq uint64) {
 	}}})
 }
 
+// AddSnapshot records a local snapshot for the next state report.
+func (a *FakeAgent) AddSnapshot(e *ownsandv1.SnapshotStateEntry) {
+	a.mu.Lock()
+	a.snapshots[e.GetSnapshotId()] = proto.Clone(e).(*ownsandv1.SnapshotStateEntry)
+	a.mu.Unlock()
+}
+
+// HasSnapshot reports whether the fake holds a local snapshot.
+func (a *FakeAgent) HasSnapshot(id string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	_, ok := a.snapshots[id]
+	return ok
+}
+
 // SendStateReport sends the agent's records.
 func (a *FakeAgent) SendStateReport() {
 	a.mu.Lock()
@@ -275,7 +290,8 @@ func (a *FakeAgent) answer(cmd *ownsandv1.AgentCommand) {
 
 // DefaultAnswer runs a command on the fake records: creates run, pauses
 // pause, resumes run, deletes delete, snapshots become ready, exports
-// upload with signed URLs and imports succeed.
+// upload with signed URLs, imports succeed and snapshot deletes remove the
+// local record.
 func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
 	switch c := cmd.GetCommand().(type) {
 	case *ownsandv1.AgentCommand_CreateSandbox:
@@ -319,6 +335,11 @@ func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentC
 		a.snapshots[entry.SnapshotId] = entry
 		a.mu.Unlock()
 		return &ownsandv1.AgentCommandResult{Result: &ownsandv1.AgentCommandResult_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotResult{Snapshot: entry}}}
+	case *ownsandv1.AgentCommand_DeleteSnapshot:
+		a.mu.Lock()
+		delete(a.snapshots, c.DeleteSnapshot.GetSnapshotId())
+		a.mu.Unlock()
+		return &ownsandv1.AgentCommandResult{}
 	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent:
 		return &ownsandv1.AgentCommandResult{}
 	}

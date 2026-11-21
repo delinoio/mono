@@ -428,7 +428,7 @@ test("workspace roots cross-check detects extra roots in any spelling", async (t
   }
 });
 
-test("Go sources, module files and protobuf inputs select Go checks", async (t) => {
+test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs select Go checks", async (t) => {
   for (const path of [
     "servers/example/main.go",
     "servers/example/go.mod",
@@ -442,6 +442,15 @@ test("Go sources, module files and protobuf inputs select Go checks", async (t) 
     "packages/ownsand-sdk/buf.gen.yaml",
     "packages/ownsand-sdk/package.json",
     "packages/ownsand-sdk/src/gen/delino/ownsand/v1/common_pb.ts",
+    "packages/ownsand-sdk/src/client.ts",
+    "packages/ownsand-sdk/src/e2e.test.ts",
+    "packages/ownsand-sdk/rstest.config.ts",
+    "packages/ownsand-sdk/tsconfig.json",
+    ".nvmrc",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "servers/ownsand-api/internal/db/migrations/0001_initial.sql",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -454,7 +463,10 @@ test("Go sources, module files and protobuf inputs select Go checks", async (t) 
   f.write("servers/example/go.mod.example");
   f.write("protos/AGENTS.md");
   f.write("docs/buf.yaml");
-  f.write("packages/ownsand-sdk/src/client.ts");
+  f.write("packages/ownsand-sdk-example/src/client.ts");
+  f.write("packages/delino-ui/package.json");
+  f.write("rstest.config.ts");
+  f.write("servers/ownsand-api/README.md");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
 });
 
@@ -828,7 +840,8 @@ test("Go changes select go for every event and keep the diff reason", (t) => {
 
 test("fixture and e2e changes keep the diff reason on a main push", (t) => {
   const f = fixture(t);
-  f.write("package.json", "{}\n");
+  // lefthook.yml selects fixtures without selecting the Go checks.
+  f.write("lefthook.yml");
   f.write("apps/example/src/index.ts");
   const head = f.commit();
   const logged = [];
@@ -1469,7 +1482,7 @@ for (const relative of [true, false]) {
       {
         name: "shared runtime file at the root",
         change: () => f.write(".nvmrc", "22\n"),
-        expected: { go: false, fixtures: true, e2e: true, quality: true },
+        expected: { go: true, fixtures: true, e2e: true, quality: true },
       },
       {
         name: "rust and go files in sibling directories",

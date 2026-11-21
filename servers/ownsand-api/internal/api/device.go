@@ -460,8 +460,35 @@ func (s *Service) deleteSnapshotRecordTx(ctx context.Context, tx pgx.Tx, orgID, 
 			return err
 		}
 	}
-	_, err := tx.Exec(ctx, "DELETE FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2", orgID, snapshotID)
-	return err
+	// Every device that holds a copy gets a delete-snapshot command from the
+	// lease holder; the snapshot_copies rows go with the record.
+	rows, err := tx.Query(ctx, `SELECT device_id::text FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 AND device_id IS NOT NULL
+		UNION SELECT device_id::text FROM snapshot_copies WHERE snapshot_id = $2`, orgID, snapshotID)
+	if err != nil {
+		return err
+	}
+	var devices []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		devices = append(devices, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, "DELETE FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2", orgID, snapshotID); err != nil {
+		return err
+	}
+	for _, d := range devices {
+		if err := events.Write(ctx, tx, events.Event{Kind: events.KindSnapshotDeleted, OrganizationID: orgID, DeviceID: d, SnapshotID: snapshotID}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // snapshotPrefix is the R2 key prefix of a snapshot's exported objects.

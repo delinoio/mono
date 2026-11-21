@@ -30,9 +30,21 @@ func (a *app) logtoConfig() logto.Config {
 		Endpoint:   a.getenv(EnvLogtoEndpoint),
 		AppID:      a.getenv(EnvLogtoAppID),
 		Resource:   resource,
-		Scopes:     strings.Fields(a.getenv(EnvLogtoScopes)),
+		Scopes:     logtoScopes(a.getenv(EnvLogtoScopes)),
 		HTTPClient: a.env.HTTPClient,
 	}
+}
+
+// RequiredLogtoScope is the API resource scope that the control plane
+// requires in every user access token.
+const RequiredLogtoScope = "ownsand:use"
+
+// logtoScopes returns the API resource scopes that the CLI requests: always
+// RequiredLogtoScope, followed by the space-separated extra scopes of
+// OWNSAND_LOGTO_SCOPES. Without the required scope the control plane rejects
+// every token of the device flow.
+func logtoScopes(extra string) []string {
+	return append([]string{RequiredLogtoScope}, strings.Fields(extra)...)
 }
 
 // login runs the Logto device authorization flow and stores the tokens.

@@ -35,6 +35,36 @@ func setupAgent(t *testing.T, env *testenv.Env, org *testenv.Org, limits *ownsan
 	return dev, agent
 }
 
+// TestHeartbeatStoresUpdateState checks that a heartbeat stores the update
+// state and starts and clears pending_idle_since.
+func TestHeartbeatStoresUpdateState(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	dev, agent := setupAgent(t, env, org, nil)
+	pendingSince := func() (int16, bool) {
+		var state int16
+		var since *time.Time
+		if err := env.DB.Pool.QueryRow(context.Background(), "SELECT update_state, pending_idle_since FROM devices WHERE device_id = $1", dev.ID).Scan(&state, &since); err != nil {
+			t.Fatal(err)
+		}
+		return state, since != nil
+	}
+	send := func(seq uint64, st ownsandv1.AgentUpdateState) {
+		agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{Sequence: seq, UpdateState: st, UpdateTargetVersion: "1.2.3"}}})
+		agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == seq })
+	}
+	send(1, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE)
+	testenv.Eventually(t, "pending idle stored", func() bool {
+		state, since := pendingSince()
+		return state == int16(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE) && since
+	})
+	send(2, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE)
+	testenv.Eventually(t, "pending idle cleared", func() bool {
+		state, since := pendingSince()
+		return state == int16(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE) && !since
+	})
+}
+
 func createReq(orgID string) *ownsandv1.CreateSandboxRequest {
 	key, _ := uuidv7.NewString()
 	return &ownsandv1.CreateSandboxRequest{
@@ -427,6 +457,54 @@ func TestDeviceRemovalOverTheChannel(t *testing.T) {
 	if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || sb.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DEVICE_REMOVED {
 		t.Fatalf("sandbox after removal = %v", sb)
 	}
+}
+
+// TestDeleteSnapshotDeletesLocalCopy checks that DeleteSnapshot sends the
+// delete-snapshot command to the device, and that a state report that
+// lists a snapshot without a record gets the command too.
+func TestDeleteSnapshotDeletesLocalCopy(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	dev, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, _ := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	snap, err := c.Snapshot.CreateSnapshot(ctx, connect.NewRequest(&ownsandv1.CreateSnapshotRequest{OrganizationId: org.ID, SandboxId: sandboxID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapID := snap.Msg.GetSnapshot().GetSnapshotId()
+	agent.Eventually("snapshot on the device", func() bool { return agent.HasSnapshot(snapID) })
+	testenv.Eventually(t, "snapshot ready", func() bool {
+		s, err := c.Snapshot.GetSnapshot(ctx, connect.NewRequest(&ownsandv1.GetSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID}))
+		return err == nil && s.Msg.GetSnapshot().GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY
+	})
+	if _, err := c.Snapshot.DeleteSnapshot(ctx, connect.NewRequest(&ownsandv1.DeleteSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID})); err != nil {
+		t.Fatal(err)
+	}
+	agent.WaitFor("delete snapshot command", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetDeleteSnapshot().GetSnapshotId() == snapID
+	})
+	agent.Eventually("local copy deleted", func() bool { return !agent.HasSnapshot(snapID) })
+
+	// A copy that the device kept while it missed the command (offline, or
+	// an older agent) is deleted after its next state report.
+	agent.Close()
+	stale, _ := uuidv7.NewString()
+	agent2 := env.NewFakeAgent(dev)
+	agent2.OnCommand = func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		return fa.DefaultAnswer(cmd)
+	}
+	agent2.SetSandbox(sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, 0)
+	agent2.AddSnapshot(&ownsandv1.SnapshotStateEntry{SnapshotId: stale, State: ownsandv1.SnapshotState_SNAPSHOT_STATE_READY, GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX})
+	agent2.Connect()
+	agent2.WaitFor("delete stale snapshot command", func(e *ownsandv1.AgentEnvelope) bool {
+		return e.GetCommand().GetDeleteSnapshot().GetSnapshotId() == stale
+	})
+	agent2.Eventually("stale copy deleted", func() bool { return !agent2.HasSnapshot(stale) })
 }
 
 func TestSnapshotsTemplatesAndExport(t *testing.T) {

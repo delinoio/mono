@@ -208,6 +208,23 @@ func (d *Dispatcher) HasRunningExec(sandboxID string) bool {
 	return false
 }
 
+// ExecEnded reports whether the exec with execID was accepted and has
+// ended, so the data plane can release a relay grant whose stream closed
+// before the exec ended. An exec of an earlier agent process counts as
+// ended; an unknown exec_id does not.
+func (d *Dispatcher) ExecEnded(execID string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e, ok := d.execs[execID]; ok {
+		return e.log.Final() != nil
+	}
+	if _, ok := d.lost[execID]; ok {
+		return true
+	}
+	_, ok := d.ended[execID]
+	return ok
+}
+
 // SandboxEnded ends every exec of the sandbox that has not ended with a
 // sandbox_ended event and stops its guest forwarding.
 func (d *Dispatcher) SandboxEnded(sandboxID string, reason ownsandv1.SandboxEndReason) {

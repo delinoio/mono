@@ -131,6 +131,7 @@ func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.Rel
 	c.streams[id] = st
 	c.credit += r.limits.StreamReceiveWindow
 	g.streams[st] = true
+	g.opened = true
 	r.mu.Unlock()
 	r.sendFrame(c, id, g.sandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: recvWin.InitialWindow()})
 }
@@ -283,6 +284,27 @@ func (r *relay) housekeeping() {
 }
 
 func (r *relay) sweep(now time.Time) {
+	// An exec keeps running after its caller closed the stream (for example
+	// to attach again later). Its grant is released as soon as the exec
+	// ends, not only after the idle time. The dispatcher is asked outside
+	// r.mu; only grants that admitted a stream qualify, so a grant issued
+	// for an AttachExec of an already ended exec is not released before the
+	// caller opens its stream.
+	r.mu.Lock()
+	var execIDs []string
+	for _, g := range r.grants {
+		if len(g.streams) == 0 && g.opened && !g.done && g.execGrant() {
+			execIDs = append(execIDs, g.opID)
+		}
+	}
+	r.mu.Unlock()
+	endedExecs := map[string]bool{}
+	for _, id := range execIDs {
+		if r.d.opts.Dispatcher.ExecEnded(id) {
+			endedExecs[id] = true
+		}
+	}
+
 	var expired, released []*grant
 	r.mu.Lock()
 	for id, g := range r.grants {
@@ -291,7 +313,7 @@ func (r *relay) sweep(now time.Time) {
 			// The stream deadline ends the open streams without tolerance.
 			delete(r.grants, id)
 			expired = append(expired, g)
-		case len(g.streams) == 0 && (g.done ||
+		case len(g.streams) == 0 && (g.done || (g.opened && g.execGrant() && endedExecs[g.opID]) ||
 			now.Sub(g.idleSince) >= r.d.timing.GrantIdle ||
 			!now.Before(g.received.Add(g.expiresIn))):
 			delete(r.grants, id)

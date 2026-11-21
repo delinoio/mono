@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 
 	"github.com/delinoio/mono/packages/ownsand-sdk-go/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -36,6 +37,17 @@ type snapshot struct {
 	rec SnapshotRecord
 	// dir is the content directory.
 	dir string
+	// users counts the creates and exports that read the content now; a
+	// delete waits until it is zero.
+	users int
+	// deleting is set when a delete arrived while users was not zero. The
+	// snapshot takes no new users, and the last user deletes it.
+	deleting bool
+}
+
+// usable reports whether a new create or export may read the snapshot.
+func (s *snapshot) usable() bool {
+	return s.rec.State == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY && !s.deleting
 }
 
 func (s *snapshot) resources() *ownsandv1.Resources {
@@ -139,13 +151,92 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	return snap.entry(), nil
 }
 
+// AcquireSnapshot returns the content directory of a ready local snapshot
+// and keeps the snapshot from being deleted until release is called.
+func (m *Manager) AcquireSnapshot(id string) (dir string, release func(), ok bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	snap, ok := m.snapshots[id]
+	if !ok || !snap.usable() {
+		return "", nil, false
+	}
+	snap.users++
+	return snap.dir, m.snapshotReleaser(snap), true
+}
+
+// snapshotReleaser returns a function that ends one use of snap. The
+// caller holds m.mu when it increments snap.users. The last use of a
+// snapshot whose delete was deferred deletes it.
+func (m *Manager) snapshotReleaser(snap *snapshot) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			m.mu.Lock()
+			snap.users--
+			id := snap.rec.SnapshotID
+			remove := snap.deleting && snap.users == 0 && m.snapshots[id] == snap
+			if remove {
+				delete(m.snapshots, id)
+			}
+			m.mu.Unlock()
+			if remove {
+				// The command result was sent when the delete was deferred,
+				// so a failure here is only logged; the copy stays on disk
+				// until a restart reloads it and the control plane sends the
+				// delete again after the next state report.
+				_ = m.removeSnapshot(id)
+			}
+		})
+	}
+}
+
+// removeSnapshot deletes the stored record and content of a snapshot that
+// is no longer in m.snapshots.
+func (m *Manager) removeSnapshot(id string) error {
+	if err := m.st.DeleteSnapshot(id); err != nil {
+		m.logger.Error("snapshot delete failed", "snapshot_id", id, "error", err)
+		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be deleted")
+	}
+	m.logger.Info("snapshot deleted", "snapshot_id", id)
+	return nil
+}
+
+// DeleteSnapshot deletes the local copy of a snapshot whose record the
+// control plane deleted. It succeeds when the device holds no copy. While
+// a create or an export reads the copy, the snapshot takes no new users and
+// the last of the current users deletes it; the command succeeds at once,
+// because the control plane sends it only once while the agent channel
+// stays connected.
+func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
+	id := cmd.GetSnapshotId()
+	if err := validate.UUIDv7("snapshot_id", id); err != nil {
+		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
+	}
+	m.mu.Lock()
+	snap, ok := m.snapshots[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil
+	}
+	if snap.users > 0 {
+		snap.deleting = true
+		users := snap.users
+		m.mu.Unlock()
+		m.logger.Info("snapshot delete deferred until its readers end", "snapshot_id", id, "users", users)
+		return nil
+	}
+	delete(m.snapshots, id)
+	m.mu.Unlock()
+	return m.removeSnapshot(id)
+}
+
 // SnapshotContent returns the content directory and entry of a ready local
 // snapshot.
 func (m *Manager) SnapshotContent(id string) (string, *ownsandv1.SnapshotStateEntry, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	snap, ok := m.snapshots[id]
-	if !ok || snap.rec.State != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+	if !ok || !snap.usable() {
 		return "", nil, false
 	}
 	return snap.dir, snap.entry(), true

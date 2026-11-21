@@ -123,6 +123,21 @@ jobs:
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    # Postgres for the Postgres-backed ownsand-api tests and the OwnSand
+    # end-to-end suite (servers/ownsand-api/e2e). The credentials exist only
+    # inside this job.
+    services:
+      postgres:
+        image: postgres:17.11-alpine@sha256:e5d2edd28b1f8d40a0a6c0c9cdc545b19b56a0d5d88f94bc11a97d970d4700d0
+        env:
+          POSTGRES_PASSWORD: ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -140,9 +155,14 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
+      # Installed before the Go tests: the OwnSand end-to-end suite runs the
+      # TypeScript SDK test with rstest.
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Check Go module
         shell: bash
+        env:
+          OWNSAND_TEST_DATABASE_URL: postgres://postgres:ci@127.0.0.1:5432/postgres?sslmode=disable
+          OWNSAND_E2E: "1"
         run: |
           set -euo pipefail
           unformatted="$(git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l)"
@@ -176,9 +196,9 @@ jobs:
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands in the root Go module: gofmt -l on tracked .go files; go vet ./...; go test ./...; pnpm install --frozen-lockfile --ignore-scripts; scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands in the root Go module: pnpm install --frozen-lockfile --ignore-scripts; gofmt -l on tracked .go files; go vet ./...; go test ./... with a Postgres service, OWNSAND_TEST_DATABASE_URL and OWNSAND_E2E=1 (Postgres-backed ownsand-api tests and the OwnSand end-to-end suite with the process runtime); scripts/protos.sh check (Go and TypeScript bindings); scripts/protos.sh breaking <base>' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Runtime, deployment and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Runtime, deployment and release acceptance: not performed. The OwnSand end-to-end suite uses the process test runtime, not a hypervisor.' >> "$GITHUB_STEP_SUMMARY"
   rust:
     needs: changes
     if: needs.changes.outputs.rust == 'true'

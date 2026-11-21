@@ -34,6 +34,8 @@ func commandKind(cmd *ownsandv1.AgentCommand) string {
 		return "clean_up"
 	case *ownsandv1.AgentCommand_UpdateAgent:
 		return "update_agent"
+	case *ownsandv1.AgentCommand_DeleteSnapshot:
+		return "delete_snapshot"
 	}
 	return "unknown"
 }
@@ -102,6 +104,8 @@ func (a *Agent) handleCommand(ctx context.Context, cmd *ownsandv1.AgentCommand) 
 		return
 	case *ownsandv1.AgentCommand_UpdateAgent:
 		err = a.updater.Handle(ctx, c.UpdateAgent)
+	case *ownsandv1.AgentCommand_DeleteSnapshot:
+		err = a.Sandboxes.DeleteSnapshot(c.DeleteSnapshot)
 	default:
 		err = &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}
 	}
@@ -121,10 +125,11 @@ func setSandboxResult(res *ownsandv1.AgentCommandResult, e *ownsandv1.SandboxSta
 }
 
 func (a *Agent) exportSnapshot(ctx context.Context, cmd *ownsandv1.ExportSnapshotCommand) (*ownsandv1.ExportSnapshotResult, error) {
-	dir, _, ok := a.Sandboxes.SnapshotContent(cmd.GetSnapshotId())
+	dir, release, ok := a.Sandboxes.AcquireSnapshot(cmd.GetSnapshotId())
 	if !ok {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, Message: "snapshot is not ready on this device"}
 	}
+	defer release()
 	end := a.Sandboxes.BeginTransfer()
 	defer end()
 	parts, size, err := a.transfer.Export(ctx, cmd.GetSnapshotId(), dir, cmd.GetPartSizeBytes())

@@ -580,3 +580,70 @@ func TestPauseResumeAndSnapshot(t *testing.T) {
 		t.Fatal("snapshot missing from the state report")
 	}
 }
+
+func TestDeleteSnapshot(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	if _, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id}); err != nil {
+		t.Fatal(err)
+	}
+	// A delete of a snapshot in use by two readers succeeds at once and
+	// takes effect when the last reader ends; the snapshot takes no new
+	// readers meanwhile.
+	_, release, ok := e.m.AcquireSnapshot(snapID)
+	if !ok {
+		t.Fatal("AcquireSnapshot failed")
+	}
+	_, release2, ok := e.m.AcquireSnapshot(snapID)
+	if !ok {
+		t.Fatal("second AcquireSnapshot failed")
+	}
+	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
+		t.Fatalf("delete in use = %v", err)
+	}
+	if !e.m.HasSnapshot(snapID) {
+		t.Fatal("snapshot in use deleted before its readers ended")
+	}
+	if _, _, ok := e.m.AcquireSnapshot(snapID); ok {
+		t.Fatal("AcquireSnapshot of a snapshot being deleted succeeded")
+	}
+	if _, _, ok := e.m.SnapshotContent(snapID); ok {
+		t.Fatal("SnapshotContent of a snapshot being deleted succeeded")
+	}
+	var ce *CommandError
+	fromSnap := e.createCmd(1, 10*time.Minute, 2*time.Hour)
+	fromSnap.Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: snapID}
+	if _, err := e.m.Create(context.Background(), fromSnap); !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("create from a snapshot being deleted = %v", err)
+	}
+	release()
+	release() // A second call is a no-op.
+	if !e.m.HasSnapshot(snapID) {
+		t.Fatal("snapshot deleted while a reader remains")
+	}
+	release2()
+	if e.m.HasSnapshot(snapID) {
+		t.Fatal("snapshot still recorded after its last reader ended")
+	}
+	if dir, err := e.m.ImportDir(snapID); err != nil {
+		t.Fatal(err)
+	} else if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after the deferred delete: %v", err)
+	}
+	// Deleting an unknown snapshot succeeds.
+	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: snapID}); err != nil {
+		t.Fatalf("delete again = %v", err)
+	}
+	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: "nope"}); !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
+		t.Fatalf("delete invalid = %v", err)
+	}
+	// The deletion survives a restart.
+	e.restart()
+	if e.m.HasSnapshot(snapID) {
+		t.Fatal("snapshot back after restart")
+	}
+	if report := e.m.StateReport(2, nil); len(report.GetSnapshots()) != 0 {
+		t.Fatal("deleted snapshot in the state report")
+	}
+}

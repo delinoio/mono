@@ -500,11 +500,14 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 		spec.BaseImage = src.BaseImage
 	case *ownsandv1.CreateSandboxCommand_SnapshotId:
 		snap, ok := m.snapshots[src.SnapshotId]
-		if !ok || snap.rec.State != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		if !ok || !snap.usable() {
 			m.mu.Unlock()
 			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot is not ready on this device")
 		}
 		spec.Snapshot = &vmruntime.SnapshotSource{SnapshotID: src.SnapshotId, Dir: snap.dir, HasMemoryState: snap.rec.HasMemoryState, Resources: snap.resources()}
+		// The create reads the snapshot content; a snapshot delete waits.
+		snap.users++
+		defer m.snapshotReleaser(snap)()
 	}
 	now := m.now()
 	cctx, cancel := context.WithCancel(ctx)

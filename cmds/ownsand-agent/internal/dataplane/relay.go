@@ -83,6 +83,13 @@ type grant struct {
 	streams    map[*rstream]bool
 	idleSince  time.Time
 	done       bool
+	// opened is true once a stream of the grant was admitted.
+	opened bool
+}
+
+// execGrant reports whether the grant's operation is an exec.
+func (g *grant) execGrant() bool {
+	return g.kind == ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC || g.kind == ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC
 }
 
 // admittable: a new first request frame may be accepted.
