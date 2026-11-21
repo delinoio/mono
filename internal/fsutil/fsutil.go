@@ -136,8 +136,16 @@ func WriteTar(w io.Writer, dir string) error {
 }
 
 // ReadTar extracts a tar stream into dir. It rejects names that leave dir
-// and link targets that are absolute or leave dir.
+// and link targets that are absolute or leave dir. Every file system
+// operation goes through an os.Root opened on dir, so no entry can read or
+// write outside dir, including through symbolic links that the same archive
+// created earlier; such an entry fails with an error.
 func ReadTar(r io.Reader, dir string) error {
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -151,18 +159,17 @@ func ReadTar(r io.Reader, dir string) error {
 		if !filepath.IsLocal(name) {
 			return fmt.Errorf("fsutil: tar entry leaves the target directory")
 		}
-		target := filepath.Join(dir, name)
 		mode := fs.FileMode(hdr.Mode).Perm()
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, mode|0o700); err != nil {
+			if err := root.MkdirAll(name, mode|0o700); err != nil {
 				return err
 			}
 		case tar.TypeReg:
-			if err := os.MkdirAll(filepath.Dir(target), 0o700); err != nil {
+			if err := root.MkdirAll(filepath.Dir(name), 0o700); err != nil {
 				return err
 			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
+			f, err := root.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, mode)
 			if err != nil {
 				return err
 			}
@@ -177,7 +184,7 @@ func ReadTar(r io.Reader, dir string) error {
 			if filepath.IsAbs(hdr.Linkname) || !filepath.IsLocal(filepath.Join(filepath.Dir(name), hdr.Linkname)) || strings.Contains(hdr.Linkname, "\x00") {
 				return fmt.Errorf("fsutil: tar symbolic link leaves the target directory")
 			}
-			if err := os.Symlink(hdr.Linkname, target); err != nil {
+			if err := root.Symlink(hdr.Linkname, name); err != nil {
 				return err
 			}
 		default:

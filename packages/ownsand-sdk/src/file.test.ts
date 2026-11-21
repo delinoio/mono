@@ -361,4 +361,124 @@ describe("chunkSource", () => {
       [4, true],
     ]);
   });
+
+  test("keeps pending bytes when the source reuses its buffer between pieces", async () => {
+    // A source such as a file reader can refill one buffer for every piece.
+    // The bytes that wait for the next chunk must not change with the refill.
+    const reused = new Uint8Array(2);
+    async function* refill() {
+      for (const value of [1, 2, 3]) {
+        reused.fill(value);
+        yield reused;
+      }
+    }
+    const chunks: { data: number[]; last: boolean }[] = [];
+    for await (const c of chunkSource(refill(), 4)) {
+      chunks.push({ data: [...c.data], last: c.last });
+    }
+    expect(chunks).toEqual([
+      { data: [1, 1, 2, 2], last: false },
+      { data: [3, 3], last: true },
+    ]);
+  });
+
+  test("keeps pending bytes when the source reuses a Node.js Buffer between pieces", async () => {
+    // `Buffer.prototype.slice` returns a view, so a copy made with `slice`
+    // would still alias the reused Buffer.
+    const reused = Buffer.alloc(2);
+    async function* refill() {
+      for (const value of [1, 2]) {
+        reused.fill(value);
+        yield reused;
+      }
+    }
+    const chunks: { data: number[]; last: boolean }[] = [];
+    for await (const c of chunkSource(refill(), 4)) {
+      chunks.push({ data: [...c.data], last: c.last });
+    }
+    expect(chunks).toEqual([{ data: [1, 1, 2, 2], last: true }]);
+  });
+
+  test("keeps the next chunks when the caller overwrites a Buffer input after the first chunk", async () => {
+    const input = Buffer.from([1, 1, 1, 1, 2, 2, 2, 2, 3]);
+    const seen: number[][] = [];
+    for await (const c of chunkSource(input, 4)) {
+      seen.push([...c.data]);
+      input.fill(9);
+    }
+    expect(seen).toEqual([[1, 1, 1, 1], [2, 2, 2, 2], [3]]);
+  });
+
+  test("keeps a yielded chunk when the caller overwrites its buffer afterwards", async () => {
+    const input = new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2, 3]);
+    const seen: number[][] = [];
+    for await (const c of chunkSource(input, 4)) {
+      seen.push([...c.data]);
+      input.fill(9);
+    }
+    expect(seen).toEqual([[1, 1, 1, 1], [2, 2, 2, 2], [3]]);
+  });
+
+  test("copies a bounded volume for large single-piece and split inputs", async () => {
+    const size = 1024;
+    const total = 64 * 1024 * 1024;
+    const input = new Uint8Array(total);
+    for (let i = 0; i < total; i += 4099) input[i] = (i / 4099) & 0xff;
+
+    async function* split() {
+      const lengths = [size - 1, size + 1, 3 * size + 7, 17, 5 * size];
+      let at = 0;
+      for (let n = 0; at < total; n++) {
+        const len = Math.min(lengths[n % lengths.length]!, total - at);
+        yield input.subarray(at, at + len);
+        at += len;
+      }
+    }
+
+    const slice = Uint8Array.prototype.slice;
+    const set = Uint8Array.prototype.set;
+    let copied = 0;
+    Uint8Array.prototype.slice = function (
+      this: Uint8Array,
+      ...args: Parameters<Uint8Array["slice"]>
+    ) {
+      const out = slice.apply(this, args);
+      copied += out.length;
+      return out;
+    } as typeof slice;
+    Uint8Array.prototype.set = function (
+      this: Uint8Array,
+      array: ArrayLike<number>,
+      offset?: number,
+    ) {
+      copied += array.length;
+      return set.call(this, array, offset);
+    } as typeof set;
+
+    try {
+      for (const source of [input, split()]) {
+        copied = 0;
+        const chunks: Uint8Array[] = [];
+        let lasts = 0;
+        for await (const c of chunkSource(source, size)) {
+          chunks.push(c.data);
+          if (c.last) lasts++;
+        }
+        expect(copied).toBeLessThanOrEqual(2 * total);
+        expect(lasts).toBe(1);
+        expect(chunks.slice(0, -1).every((c) => c.length === size)).toBe(true);
+        expect(chunks.reduce((n, c) => n + c.length, 0)).toBe(total);
+        const joined = new Uint8Array(total);
+        let at = 0;
+        for (const c of chunks) {
+          joined.set(c, at);
+          at += c.length;
+        }
+        expect(Buffer.compare(joined, input)).toBe(0);
+      }
+    } finally {
+      Uint8Array.prototype.slice = slice;
+      Uint8Array.prototype.set = set;
+    }
+  });
 });

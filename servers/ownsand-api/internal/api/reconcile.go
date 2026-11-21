@@ -173,7 +173,13 @@ type reconcileResult struct {
 // (then it finds no organization and changes nothing), and a report that
 // started first finishes before the deletion takes its first device lock.
 // Enroll uses the same order (see EnrollDevice).
-func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, report *ownsandv1.StateReport) (reconcileResult, error) {
+//
+// channelID is the ID of the channel that sent the report. An export that a
+// retained, listed snapshot still has in EXPORTING and that another channel
+// (or no recorded channel) owns lost its owner: the command or its result
+// was lost with the earlier channel or control plane process, so the
+// report fails the export.
+func (s *Service) reconcileStateReport(ctx context.Context, deviceID, channelID string, report *ownsandv1.StateReport) (reconcileResult, error) {
 	var out reconcileResult
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		out = reconcileResult{}
@@ -255,7 +261,7 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 			}
 			out.changed = append(out.changed, r.ID)
 		}
-		recovered, err := s.reconcileSnapshotsTx(ctx, tx, deviceID, report.GetSnapshots())
+		recovered, err := s.reconcileSnapshotsTx(ctx, tx, deviceID, channelID, report.GetSnapshots())
 		if err != nil {
 			return err
 		}
@@ -279,11 +285,13 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 // list: an original copy of an exported snapshot keeps its record without a
 // device, any other snapshot record is deleted with its templates, and an
 // imported copy loses its copy row. Listed snapshots that the server still
-// has in CREATING take the reported fields. It also recovers the copy rows
-// of listed READY copies of READY, EXPORTED snapshots that the server does
-// not track (the only other writer is the in-memory import result, which a
-// lost channel or a restart loses) and returns the number of rows it
-// created.
+// has in CREATING take the reported fields, and a listed snapshot whose
+// export is EXPORTING under another channel than channelID (or under no
+// recorded channel) becomes EXPORT_FAILED with a clean-up job for the
+// attempt's objects. It also recovers the copy rows of listed READY copies
+// of READY, EXPORTED snapshots that the server does not track (the only
+// other writer is the in-memory import result, which a lost channel or a
+// restart loses) and returns the number of rows it created.
 //
 // Lock order: the organization (FOR KEY SHARE) and the device row first, as
 // reconcileStateReport takes them (the order of device removal and
@@ -295,7 +303,7 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 // records an event for the device; when the deletion commits first, the
 // report finds no record, creates no row and the report's unknown-snapshot
 // rule schedules the stale-copy clean-up.
-func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID string, entries []*ownsandv1.SnapshotStateEntry) (int, error) {
+func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID, channelID string, entries []*ownsandv1.SnapshotStateEntry) (int, error) {
 	listed := map[string]*ownsandv1.SnapshotStateEntry{}
 	var readyIDs []string
 	for _, e := range entries {
@@ -314,7 +322,8 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 		// A removed device never gets a copy row.
 		readyIDs = nil
 	}
-	rows, err := tx.Query(ctx, `SELECT snapshot_id::text, organization_id::text, state, export_state, device_id = $1 FROM snapshots
+	rows, err := tx.Query(ctx, `SELECT snapshot_id::text, organization_id::text, state, export_state,
+			COALESCE(export_command_id::text, ''), COALESCE(export_channel_id::text, ''), device_id = $1 FROM snapshots
 		WHERE device_id = $1 OR (snapshot_id = ANY($2::uuid[]) AND organization_id = $3 AND state = $4 AND export_state = $5
 			AND host_os = $6 AND arch = $7)
 		ORDER BY snapshot_id FOR UPDATE`,
@@ -324,15 +333,15 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 		return 0, err
 	}
 	type snap struct {
-		id, org       string
-		state, export int16
-		owned         bool
+		id, org, command, channel string
+		state, export             int16
+		owned                     bool
 	}
 	var snaps []snap
 	for rows.Next() {
 		var sn snap
 		var owned *bool
-		if err := rows.Scan(&sn.id, &sn.org, &sn.state, &sn.export, &owned); err != nil {
+		if err := rows.Scan(&sn.id, &sn.org, &sn.state, &sn.export, &sn.command, &sn.channel, &owned); err != nil {
 			rows.Close()
 			return 0, err
 		}
@@ -362,6 +371,15 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 					return 0, err
 				}
 			}
+			if ownsandv1.SnapshotExportState(sn.export) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING && sn.channel != channelID {
+				reason := "owner_channel_replaced"
+				if sn.channel == "" {
+					reason = "owner_unknown"
+				}
+				if err := s.failExportTx(ctx, tx, sn.org, sn.id, sn.command, reason); err != nil {
+					return 0, err
+				}
+			}
 			continue
 		}
 		if ownsandv1.SnapshotExportState(sn.export) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED {
@@ -378,7 +396,7 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 			}
 			continue
 		}
-		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id, ownsandv1.SnapshotExportState(sn.export)); err != nil {
+		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id); err != nil {
 			return 0, err
 		}
 	}

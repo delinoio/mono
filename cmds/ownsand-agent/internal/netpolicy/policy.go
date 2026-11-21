@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package netpolicy computes the OUTBOUND network policy of sandbox guests:
 // the destination prefixes that guests must never reach (the fixed private,
