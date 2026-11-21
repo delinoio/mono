@@ -391,6 +391,157 @@ describe("file write", () => {
     expect(write.path).toBe("/empty");
   });
 
+  describe("cancellation while the source is waiting", () => {
+    const REASON = new Error("caller gave up");
+
+    test("a pre-aborted signal rejects with the reason and neither pulls the source nor sends a request", async () => {
+      const h = setup();
+      // A stream starts one prefetch pull by itself, so only the pulls that
+      // follow the first one count as reads by the SDK.
+      let pulled = 0;
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {
+          pulled++;
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      const prefetched = pulled;
+      pulled = 0;
+      const iterable: AsyncIterable<Uint8Array> = {
+        [Symbol.asyncIterator]() {
+          pulled++;
+          return { next: () => new Promise(() => {}) };
+        },
+      };
+      for (const source of [stream, iterable, "text", new Uint8Array(2)]) {
+        const controller = new AbortController();
+        controller.abort(REASON);
+        await expect(
+          h.client
+            .sandbox(SANDBOX)
+            .writeFile("/f", source, { signal: controller.signal }),
+        ).rejects.toBe(REASON);
+      }
+      expect(prefetched).toBe(1);
+      expect(pulled).toBe(0);
+      expect(stream.locked).toBe(false);
+      expect(h.api.calls).toHaveLength(0);
+    });
+
+    test("an abort during a pending stream read rejects with the reason, releases the lock and sends no final chunk", async () => {
+      const h = setup();
+      let cancelled: unknown;
+      const stream = new ReadableStream<Uint8Array>({
+        pull() {
+          return new Promise(() => {});
+        },
+        cancel(reason) {
+          cancelled = reason;
+          // A source whose cancel never returns must not delay the abort.
+          return new Promise(() => {});
+        },
+      });
+      const controller = new AbortController();
+      const write = h.client
+        .sandbox(SANDBOX)
+        .writeFile("/f", stream, { signal: controller.signal });
+      const outcome = write.then(
+        () => "resolved",
+        (error) => error,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(stream.locked).toBe(true);
+      controller.abort(REASON);
+      expect(await outcome).toBe(REASON);
+      expect(stream.locked).toBe(false);
+      expect(cancelled).toBe(REASON);
+      expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+    });
+
+    test("an abort during a pending iterator next() rejects with the reason and requests return() without waiting for it", async () => {
+      const h = setup();
+      let returned = 0;
+      const iterable: AsyncIterable<Uint8Array> = {
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise(() => {}),
+            return: () => {
+              returned++;
+              return new Promise(() => {});
+            },
+          };
+        },
+      };
+      const controller = new AbortController();
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .writeFile("/f", iterable, { signal: controller.signal })
+        .then(
+          () => "resolved",
+          (error) => error,
+        );
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      controller.abort(REASON);
+      expect(await outcome).toBe(REASON);
+      expect(returned).toBe(1);
+      expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+    });
+
+    test("an abort after the first chunk was acknowledged stops at the next source wait and sends no final chunk", async () => {
+      const h = setup();
+      h.api.unary(RelayService, "WriteFile", (req) => ({
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: false,
+        sizeBytes: 0n,
+      }));
+      const controller = new AbortController();
+      async function* source() {
+        yield new Uint8Array(1 << 20);
+        yield new Uint8Array(1 << 20);
+        controller.abort(REASON);
+        await new Promise(() => {});
+      }
+      await expect(
+        h.client
+          .sandbox(SANDBOX)
+          .writeFile("/f", source(), { signal: controller.signal }),
+      ).rejects.toBe(REASON);
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      expect(writes.every((w) => w.finish === undefined)).toBe(true);
+    });
+
+    test("an unmodified stream write without an abort sends the same chunks", async () => {
+      const h = setup();
+      h.api.unary(RelayService, "WriteFile", (req) => ({
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: req.finish !== undefined,
+        sizeBytes: req.finish?.sizeBytes ?? 0n,
+      }));
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("hel"));
+          controller.enqueue(new TextEncoder().encode("lo"));
+          controller.close();
+        },
+      });
+      const controller = new AbortController();
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .writeFile("/f", stream, { signal: controller.signal }),
+      );
+      expect(result.sizeBytes).toBe(5n);
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      expect(writes).toHaveLength(1);
+      expect(text(writes[0].data)).toBe("hello");
+      expect(stream.locked).toBe(false);
+    });
+  });
+
   test("rejects a relative guest path before any request", async () => {
     const h = setup();
     await expect(
