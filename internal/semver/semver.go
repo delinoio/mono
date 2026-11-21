@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package version parses and compares OwnSand release versions. The control
-// plane and the device agent share it so both order versions the same way.
-// It logs nothing.
-package version
+// Package semver parses and compares MAJOR.MINOR.PATCH release versions
+// with an optional pre-release suffix.
+package semver
 
 import (
 	"fmt"
@@ -24,13 +23,13 @@ func Parse(s string) (Semver, error) {
 	core, pre, _ := strings.Cut(s, "-")
 	parts := strings.Split(core, ".")
 	if len(parts) != 3 {
-		return Semver{}, fmt.Errorf("version: %q is not MAJOR.MINOR.PATCH", s)
+		return Semver{}, fmt.Errorf("semver: %q is not MAJOR.MINOR.PATCH", s)
 	}
 	var nums [3]int
 	for i, p := range parts {
 		n, err := strconv.Atoi(p)
 		if err != nil || n < 0 {
-			return Semver{}, fmt.Errorf("version: %q is not MAJOR.MINOR.PATCH", s)
+			return Semver{}, fmt.Errorf("semver: %q is not MAJOR.MINOR.PATCH", s)
 		}
 		nums[i] = n
 	}

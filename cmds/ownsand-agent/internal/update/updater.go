@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
-	"github.com/delinoio/mono/go/ownsand/version"
+	"github.com/delinoio/mono/internal/semver"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -115,7 +115,7 @@ func New(opts Options) (*Updater, error) {
 	}
 	if st != nil && st.PendingUpdate != nil {
 		pending := *st.PendingUpdate
-		if c, err := version.CompareStrings(pending.TargetVersion, opts.Running); err == nil && c == 0 {
+		if c, err := semver.CompareStrings(pending.TargetVersion, opts.Running); err == nil && c == 0 {
 			opts.Logger.Info("agent update installed", "version", opts.Running, "previous_version", pending.PreviousVersion)
 		} else {
 			u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
@@ -208,7 +208,7 @@ func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, e
 // installation waits until the device is idle; Run performs it.
 func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand) error {
 	target := cmd.GetTargetVersion()
-	if _, err := version.Parse(target); err != nil {
+	if _, err := semver.Parse(target); err != nil {
 		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
 		return err
 	}
@@ -221,7 +221,7 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 	// a failed or same-version target must not install the stale artifact.
 	u.clearPendingLocked()
 	u.mu.Unlock()
-	if c, _ := version.CompareStrings(target, u.opts.Running); c == 0 {
+	if c, _ := semver.CompareStrings(target, u.opts.Running); c == 0 {
 		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 		return nil
 	}
@@ -239,7 +239,7 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 	// The control plane decides lower targets: a pinned version or a
 	// revocation recovery. The agent cannot see the organization policy,
 	// so it installs the verified target that the control plane sent.
-	if c, _ := version.CompareStrings(target, u.opts.Running); c < 0 {
+	if c, _ := semver.CompareStrings(target, u.opts.Running); c < 0 {
 		u.opts.Logger.Info("agent update installs a lower version", "target_version", target, "revocation_recovery", cmd.GetRevocationRecovery())
 	}
 	u.mu.Lock()

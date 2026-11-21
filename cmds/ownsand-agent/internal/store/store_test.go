@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -91,5 +92,45 @@ func TestSandboxAndSnapshotRecords(t *testing.T) {
 	}
 	if _, err := os.Stat(s.Path(SnapshotsDir, "partial")); !os.IsNotExist(err) {
 		t.Fatal("partial snapshot kept")
+	}
+}
+
+func TestLoadSnapshotsRemovesAbandonedTransferArchives(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := s.Path(SnapshotsDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	abandoned := []string{".export-snap1-456.tar", ".import-snap1-123.tar"}
+	kept := []string{"notes.txt", ".export-snap1-abc.tar", ".import-.tar", "export-snap1-1.tar"}
+	for _, n := range append(append([]string{}, abandoned...), kept...) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveSnapshot("ready", map[string]string{"id": "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		n := 0
+		if err := s.LoadSnapshots(func([]byte) error { n++; return nil }); err != nil {
+			t.Fatalf("load %d: %v", i, err)
+		}
+		if n != 1 {
+			t.Fatalf("load %d: snapshots %d", i, n)
+		}
+		for _, name := range abandoned {
+			if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+				t.Fatalf("load %d: %s kept", i, name)
+			}
+		}
+		for _, name := range kept {
+			if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+				t.Fatalf("load %d: %s removed: %v", i, name, err)
+			}
+		}
 	}
 }

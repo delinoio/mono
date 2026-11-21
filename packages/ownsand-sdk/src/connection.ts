@@ -159,7 +159,41 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
     }
     const secret = await currentSecret(options.credential);
     req.header.set("Authorization", `Bearer ${secret}`);
-    return next(req);
+    // Redact with the exact credential of this request. The access token
+    // differs per request, so the value lives only in this closure and never
+    // in state that concurrent requests share.
+    return redactCall(next, req, [secret]);
+  };
+}
+
+/**
+ * Calls the next handler and redacts the given secrets from errors of the
+ * call, including errors that end a response stream.
+ */
+async function redactCall(
+  next: Parameters<Interceptor>[0],
+  req: Parameters<ReturnType<Interceptor>>[0],
+  secrets: readonly string[],
+): ReturnType<ReturnType<Interceptor>> {
+  let res;
+  try {
+    res = await next(req);
+  } catch (error) {
+    throw redactError(error, secrets);
+  }
+  if (!res.stream) {
+    return res;
+  }
+  const inner = res.message;
+  return {
+    ...res,
+    message: (async function* () {
+      try {
+        yield* inner;
+      } catch (error) {
+        throw redactError(error, secrets);
+      }
+    })(),
   };
 }
 
@@ -193,31 +227,14 @@ function organizationInterceptor(defaultOrg: string | undefined): Interceptor {
   };
 }
 
+/**
+ * Redacts the static API key. The credential interceptor redacts the
+ * per-request secret, which for an access token is known only there.
+ */
 function redactingInterceptor(options: ConnectionOptions): Interceptor {
   const secrets = (): string[] =>
     "apiKey" in options.credential ? [options.credential.apiKey] : [];
-  return (next) => async (req) => {
-    let res;
-    try {
-      res = await next(req);
-    } catch (error) {
-      throw redactError(error, secrets());
-    }
-    if (!res.stream) {
-      return res;
-    }
-    const inner = res.message;
-    return {
-      ...res,
-      message: (async function* () {
-        try {
-          yield* inner;
-        } catch (error) {
-          throw redactError(error, secrets());
-        }
-      })(),
-    };
-  };
+  return (next) => (req) => redactCall(next, req, secrets());
 }
 
 function loggingInterceptor(options: ConnectionOptions): Interceptor {

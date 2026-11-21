@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package version holds the agent version. The comparison of release
-// versions lives in github.com/delinoio/mono/go/ownsand/version.
+// Package version holds the running agent version. Compare versions with
+// github.com/delinoio/mono/internal/semver.
 package version
 
 // Version is the running agent version. Release builds set it with

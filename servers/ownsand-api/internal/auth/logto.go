@@ -38,8 +38,8 @@ var signatureAlgorithms = []jose.SignatureAlgorithm{
 const clockLeeway = 30 * time.Second
 
 // jwksRefreshInterval is the cache lifetime of a fetched key set, and
-// jwksMinRefresh the shortest interval between two fetches that an unknown
-// key ID triggers.
+// jwksMinRefresh the shortest interval between two fetch attempts, whether
+// the previous attempt succeeded or failed.
 const (
 	jwksRefreshInterval = 10 * time.Minute
 	jwksMinRefresh      = time.Minute
@@ -71,6 +71,10 @@ type LogtoValidator struct {
 	mu        sync.Mutex
 	keys      jose.JSONWebKeySet
 	fetchedAt time.Time
+	// attemptedAt is the start time of the last refresh attempt, successful
+	// or not. It gates both refresh paths so that a failing key set endpoint
+	// is not fetched again within jwksMinRefresh while it holds the mutex.
+	attemptedAt time.Time
 }
 
 // NewLogtoValidator returns a validator. It does not fetch keys until the
@@ -142,7 +146,10 @@ func (v *LogtoValidator) key(ctx context.Context, kid string) (*jose.JSONWebKey,
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	now := v.cfg.Now()
-	if v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval {
+	cooling := func() bool {
+		return !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
+	}
+	if (v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval) && !cooling() {
 		if err := v.refreshLocked(ctx); err != nil && v.fetchedAt.IsZero() {
 			return nil, err
 		}
@@ -150,7 +157,9 @@ func (v *LogtoValidator) key(ctx context.Context, kid string) (*jose.JSONWebKey,
 	if k := v.findLocked(kid); k != nil {
 		return k, nil
 	}
-	if now.Sub(v.fetchedAt) < jwksMinRefresh {
+	// An unknown key ID refreshes the key set at most once per
+	// jwksMinRefresh, counted from the last attempt even when it failed.
+	if cooling() {
 		return nil, errors.New("unknown key id")
 	}
 	if err := v.refreshLocked(ctx); err != nil {
@@ -173,6 +182,7 @@ func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
 }
 
 func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
+	v.attemptedAt = v.cfg.Now()
 	var body []byte
 	var err error
 	if v.cfg.JWKSFile != "" {
