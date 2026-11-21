@@ -74,7 +74,19 @@ func (r *Record) Entry(epoch string) *ownsandv1.SandboxStateEntry {
 // ttlReason returns the end reason of the earlier passed deadline at now,
 // or UNSPECIFIED when no deadline passed. MAX_TTL_EXPIRED wins when both
 // deadlines are equal. A paused sandbox has no idle deadline.
+//
+// A sandbox in DELETING whose failed end attempt recorded a TTL reason keeps
+// that reason. The state change to DELETING hides that the sandbox was
+// paused, so recomputing the reason would apply its stale idle deadline and
+// could replace MAX_TTL_EXPIRED with IDLE_TTL_EXPIRED on a retry.
 func (r *Record) ttlReason(now time.Time) ownsandv1.SandboxEndReason {
+	if r.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		switch r.EndReason {
+		case ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED,
+			ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED:
+			return r.EndReason
+		}
+	}
 	maxPassed := !r.MaxDeadline.IsZero() && !now.Before(r.MaxDeadline)
 	idleApplies := r.State != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED && !r.IdleDeadline.IsZero()
 	idlePassed := idleApplies && !now.Before(r.IdleDeadline)

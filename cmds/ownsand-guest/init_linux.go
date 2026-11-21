@@ -24,8 +24,15 @@ func isInit() bool {
 	return os.Getpid() == 1 && os.Getenv(envInitChild) == ""
 }
 
+// isInitChild reports whether the helper is the child that the init process
+// started.
+func isInitChild() bool {
+	return os.Getenv(envInitChild) != ""
+}
+
 // runInit is the init process of the Linux base image: it mounts the
-// kernel file systems, writes /etc/resolv.conf from the kernel's IP
+// kernel file systems, grows the root file system to its disk, brings up
+// the loopback interface, writes /etc/resolv.conf from the kernel's IP
 // autoconfiguration, starts the guest helper as its child (restarting it
 // when it exits) and reaps orphaned processes. The helper runs as a child
 // so that the reaper never takes the exit status of an exec.
@@ -49,6 +56,12 @@ func runInit(args []string) int {
 		}
 	}
 	_ = unix.Sethostname([]byte("sandbox"))
+	if err := growRoot(); err != nil {
+		fmt.Fprintf(os.Stderr, "ownsand-guest init: grow the root file system: %v\n", err)
+	}
+	if err := upLoopback(); err != nil {
+		fmt.Fprintf(os.Stderr, "ownsand-guest init: bring up lo: %v\n", err)
+	}
 	if pnp, err := os.ReadFile("/proc/net/pnp"); err == nil {
 		var lines []string
 		for _, l := range strings.Split(string(pnp), "\n") {

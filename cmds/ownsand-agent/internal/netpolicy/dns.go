@@ -30,7 +30,8 @@ type DNSForwarder struct {
 }
 
 // HostResolver returns the first name server of /etc/resolv.conf as
-// host:port, or 127.0.0.53:53 (systemd-resolved) when none is listed.
+// host:port (keeping the interface zone of a scoped IPv6 address, for
+// example [fe80::53%eth0]:53), or 127.0.0.53:53 (systemd-resolved) when none is listed.
 func HostResolver(path string) string {
 	f, err := os.Open(path)
 	if err == nil {
@@ -40,7 +41,7 @@ func HostResolver(path string) string {
 			fields := strings.Fields(sc.Text())
 			if len(fields) >= 2 && fields[0] == "nameserver" {
 				if a, err := netip.ParseAddr(fields[1]); err == nil {
-					return netip.AddrPortFrom(a.WithZone(""), 53).String()
+					return netip.AddrPortFrom(a, 53).String()
 				}
 			}
 		}
