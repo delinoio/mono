@@ -7,6 +7,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -140,8 +141,25 @@ export function RouterProvider({
   onNavigate?: NavigationListener;
 }) {
   const [pathname, setPathname] = useState(() => window.location.pathname);
+  // The route the console currently shows. A `popstate` event fires after the
+  // URL already changed, so the previous route cannot be read from
+  // `window.location` there.
+  const routeRef = useRef<Route>(parseRoute(pathname));
+  // The popstate effect below runs once, so it reads the latest listener from
+  // a ref instead of capturing a stale one.
+  const onNavigateRef = useRef(onNavigate);
   useEffect(() => {
-    const onPop = () => setPathname(window.location.pathname);
+    onNavigateRef.current = onNavigate;
+  }, [onNavigate]);
+  useEffect(() => {
+    // Back and Forward do not go through `navigate()`, so they run the
+    // navigation listeners here.
+    const onPop = () => {
+      const to = parseRoute(window.location.pathname);
+      onNavigateRef.current?.(routeRef.current, to);
+      routeRef.current = to;
+      setPathname(window.location.pathname);
+    };
     window.addEventListener("popstate", onPop);
     return () => window.removeEventListener("popstate", onPop);
   }, []);
@@ -149,7 +167,9 @@ export function RouterProvider({
     (path: string, options: { replace?: boolean } = {}) => {
       const from = parseRoute(window.location.pathname);
       const url = new URL(path, window.location.origin);
-      onNavigate?.(from, parseRoute(url.pathname));
+      const to = parseRoute(url.pathname);
+      onNavigate?.(from, to);
+      routeRef.current = to;
       if (options.replace) {
         window.history.replaceState(
           null,

@@ -20,6 +20,7 @@ import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
+import { RouteId, RouterProvider, useRouter } from "./router.tsx";
 import {
   createMockTransport,
   MOCK_IDS,
@@ -566,6 +567,68 @@ describe("invitations", () => {
     ).toBeNull();
   });
 });
+
+describe("history navigation out of the invitation flow", () => {
+  /** jsdom fires no popstate for pushState, so the test dispatches it. */
+  async function historyNavigate(path: string) {
+    await act(async () => {
+      window.history.pushState(null, "", path);
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    });
+  }
+
+  test("deletes the stored secret when Back or Forward leaves the invitation flow", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept");
+    await screen.findByRole("button", { name: "Accept invitation" });
+    await historyNavigate("/");
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(
+      await screen.findByRole("link", { name: /Acme Robotics/ }),
+    ).toBeTruthy();
+  });
+
+  test("keeps the stored secret when history navigation moves to the sign-in callback", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept");
+    await screen.findByRole("button", { name: "Accept invitation" });
+    await historyNavigate("/callback");
+    await settle(60);
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+  });
+
+  test("runs the navigation listeners once per history navigation and once per link navigation", async () => {
+    const calls: string[] = [];
+    window.history.replaceState(null, "", "/");
+    render(
+      <RouterProvider
+        onNavigate={(from, to) => calls.push(`${from.id}>${to.id}`)}
+      >
+        <Probe />
+      </RouterProvider>,
+    );
+    await historyNavigate("/invitations/accept");
+    await historyNavigate("/callback");
+    expect(calls).toEqual([
+      `${RouteId.Organizations}>${RouteId.Invitation}`,
+      `${RouteId.Invitation}>${RouteId.Callback}`,
+    ]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "go" }));
+    });
+    expect(calls).toHaveLength(3);
+    expect(calls[2]).toBe(`${RouteId.Callback}>${RouteId.Organizations}`);
+  });
+});
+
+function Probe() {
+  const { navigate } = useRouter();
+  return (
+    <button type="button" onClick={() => navigate("/")}>
+      go
+    </button>
+  );
+}
 
 describe("sign-in callback", () => {
   test("shows the sign-in configuration notice when Logto is not configured", async () => {
