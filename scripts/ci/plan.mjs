@@ -74,18 +74,39 @@ const protoInputs = new Set([
   "packages/ownsand-sdk/package.json",
 ]);
 
-// Committed TypeScript bindings that the drift check compares.
-const generatedTsBindings = "packages/ownsand-sdk/src/gen/";
+// The OwnSand SDK package. The drift check compares its committed TypeScript
+// bindings, and the OwnSand end-to-end suite (servers/ownsand-api/e2e) runs
+// its `src/e2e.test.ts` with rstest against the real components, so every
+// path of the package (sources, tests, rstest and TypeScript configuration)
+// selects the Go checks.
+const ownsandSdkPackage = "packages/ownsand-sdk/";
 
-// Go sources, module files and protobuf schema inputs select the repository
-// Go checks.
+// The Go job installs the workspace dependencies with the Node.js runtime of
+// `.nvmrc` before the Go tests, so the workspace manifests and the lockfile
+// change what the TypeScript SDK end-to-end test and the protobuf generators
+// run with.
+const goWorkspaceInputs = new Set([
+  ".nvmrc",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+]);
+
+// The ownsand-api schema migrations, embedded into the service and applied by
+// the Postgres-backed tests and the end-to-end suite that the Go job runs.
+const ownsandApiMigrations = "servers/ownsand-api/internal/db/migrations/";
+
+// Go sources, module files, protobuf schema inputs and the inputs of the
+// OwnSand end-to-end suite select the repository Go checks.
 export function isGoInput(path) {
   return (
     path.endsWith(".go") ||
     /(^|\/)go\.(mod|sum)$/.test(path) ||
     path.endsWith(".proto") ||
     protoInputs.has(path) ||
-    path.startsWith(generatedTsBindings)
+    goWorkspaceInputs.has(path) ||
+    path.startsWith(ownsandSdkPackage) ||
+    path.startsWith(ownsandApiMigrations)
   );
 }
 
