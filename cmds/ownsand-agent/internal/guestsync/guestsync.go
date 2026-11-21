@@ -46,12 +46,29 @@ func Sync(ctx context.Context, sandboxID string, dial guestclient.Dialer) error 
 		case resp.GetFrame().GetError() != nil:
 			return errors.New(resp.GetFrame().GetError().GetMessage())
 		case ev.GetExited() != nil:
-			if ev.GetExited().GetExitCode() != 0 {
-				return fmt.Errorf("sync exited with %d", ev.GetExited().GetExitCode())
-			}
-			return nil
+			return exitedError(ev.GetExited())
 		case ev.GetFailed() != nil:
 			return errors.New(ev.GetFailed().GetMessage())
 		}
+	}
+}
+
+// exitedError returns nil only when sync exited normally with code 0. The
+// status is a oneof, so GetExitCode alone would read a signaled or unset
+// status as a zero exit.
+func exitedError(exited *ownsandv1.ExecExited) error {
+	if exited.GetTimedOut() {
+		return errors.New("sync timed out")
+	}
+	switch status := exited.GetStatus().(type) {
+	case *ownsandv1.ExecExited_ExitCode:
+		if status.ExitCode != 0 {
+			return fmt.Errorf("sync exited with %d", status.ExitCode)
+		}
+		return nil
+	case *ownsandv1.ExecExited_Signal:
+		return fmt.Errorf("sync killed by signal %d", status.Signal)
+	default:
+		return errors.New("sync exited without a status")
 	}
 }
