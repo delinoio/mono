@@ -247,7 +247,8 @@ func (m *readManager) sweep(now time.Time) {
 		}
 		delete(m.entries, id)
 		if err := os.Remove(e.snapshot); err != nil && !errors.Is(err, os.ErrNotExist) {
-			m.logger.Warn("remove read snapshot failed", "read_id", id, "error", err)
+			// The error is reduced to its reason: the helper never logs paths.
+			m.logger.Warn("remove read snapshot failed", "read_id", id, "error", sanitizedError(err))
 		}
 		m.expired[id] = now
 		m.logger.Info("read expired", "read_id", id)
