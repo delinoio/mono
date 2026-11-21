@@ -83,9 +83,9 @@ func (s *Service) sendDelete(ctx context.Context, conn *hub.Conn, orgID string, 
 
 // sendDeleteSnapshot tells a connected agent to delete its local copy of a
 // snapshot whose record was deleted. The agent answers success also when
-// it holds no copy; a failure (the copy is in use, or an older agent) is
-// only logged, and a later state report that lists the copy triggers the
-// command again.
+// it holds no copy and defers the deletion of a copy in use until its
+// readers end; a failure (an older agent, a storage error) is only logged,
+// and a later state report that lists the copy triggers the command again.
 func (s *Service) sendDeleteSnapshot(ctx context.Context, conn *hub.Conn, orgID, snapshotID string) {
 	_, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdDeleteSnapshot, orgID: orgID, snapshotID: snapshotID},
 		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapshotID}}})
