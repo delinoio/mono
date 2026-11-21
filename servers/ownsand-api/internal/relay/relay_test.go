@@ -293,3 +293,263 @@ func TestRunClosesConnectionOnControlFlood(t *testing.T) {
 		t.Fatalf("stream error = %v", err)
 	}
 }
+
+// fillOutbound fills the outbound queue so that an enqueue waits for room. It
+// returns the number of filler frames.
+func fillOutbound(c *Conn) int {
+	n := 0
+	for len(c.out) < cap(c.out) {
+		c.out <- datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})
+		n++
+	}
+	return n
+}
+
+// openResult is the outcome of an Open that runs in its own goroutine.
+type openResult struct {
+	s   *Stream
+	err error
+}
+
+func openAsync(ctx context.Context, c *Conn, grant string) <-chan openResult {
+	ch := make(chan openResult, 1)
+	go func() {
+		s, err := c.Open(ctx, grant, "sandbox")
+		ch <- openResult{s, err}
+	}()
+	return ch
+}
+
+func waitOpen(t *testing.T, ch <-chan openResult, within time.Duration) openResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(within):
+		t.Fatal("Open did not return in time")
+		return openResult{}
+	}
+}
+
+func waitStreams(t *testing.T, c *Conn, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.StreamCount() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("StreamCount = %d, want %d", c.StreamCount(), want)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func perGrantCount(c *Conn, grant string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.perGrant[grant]
+}
+
+// TestOpenEnqueuesInStreamIDOrderWhileQueueIsFull holds the first Open in the
+// outbound queue wait, starts a second Open, and then drains the queue: the
+// stream open frames must leave in stream_id order. Without the open gate the
+// second Open allocates stream_id 2 at once and both race for the first free
+// slot.
+func TestOpenEnqueuesInStreamIDOrderWhileQueueIsFull(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	filler := fillOutbound(c)
+	first := openAsync(context.Background(), c, "grant-a")
+	waitStreams(t, c, 1)
+	second := openAsync(context.Background(), c, "grant-b")
+	// The second Open waits for the gate and holds no stream slot or ID.
+	time.Sleep(50 * time.Millisecond)
+	if got := c.StreamCount(); got != 1 {
+		t.Fatalf("StreamCount while the first Open waits = %d, want 1", got)
+	}
+	for i := 0; i < filler; i++ {
+		<-c.out
+	}
+	a, b := waitOpen(t, first, time.Second), waitOpen(t, second, time.Second)
+	if a.err != nil || b.err != nil {
+		t.Fatalf("Open errors: %v, %v", a.err, b.err)
+	}
+	if a.s.ID != 1 || b.s.ID != 2 {
+		t.Fatalf("stream IDs = %d, %d, want 1, 2", a.s.ID, b.s.ID)
+	}
+	for _, want := range []uint64{1, 2} {
+		select {
+		case f := <-c.out:
+			if f.GetStreamId() != want || f.GetRelayStreamOpen() == nil {
+				t.Fatalf("queued frame = stream %d kind %v, want stream open %d", f.GetStreamId(), datapath.PayloadKind(f), want)
+			}
+		default:
+			t.Fatalf("stream open %d is not queued", want)
+		}
+	}
+}
+
+// TestConcurrentOpensReachTheAgentInIDOrder runs many concurrent opens
+// through the writer and applies the agent's rule: it drops a stream open
+// frame whose stream_id is not above the highest one it has seen. Every open
+// must be accepted (the agent grants initial credit for it).
+func TestConcurrentOpensReachTheAgentInIDOrder(t *testing.T) {
+	const opens = 64
+	limits := testLimits
+	limits.MaxStreamsPerConn = opens
+	limits.IdleTimeout = time.Minute
+	limits.Keepalive = time.Minute
+	c := NewConn(context.Background(), "device", 1, limits)
+	var mu sync.Mutex
+	var highest uint64
+	var accepted, dropped int
+	send := func(f *ownsandv1.DataFrame) error {
+		if f.GetRelayStreamOpen() == nil {
+			return nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if f.GetStreamId() <= highest {
+			dropped++
+			return nil
+		}
+		highest = f.GetStreamId()
+		accepted++
+		return nil
+	}
+	done := runConn(c, blockingRecv(c), send)
+	var wg sync.WaitGroup
+	errs := make(chan error, opens)
+	for i := 0; i < opens; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := c.Open(context.Background(), "grant-"+string(rune('a'+i%26))+string(rune('a'+i/26)), "sandbox")
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		mu.Lock()
+		n := accepted + dropped
+		mu.Unlock()
+		if n == opens {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("writer sent %d of %d stream open frames", n, opens)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if dropped != 0 || accepted != opens {
+		t.Fatalf("agent accepted %d and dropped %d stream open frames, want %d and 0", accepted, dropped, opens)
+	}
+	c.Close(ErrConnClosed)
+	waitRun(t, done, time.Second)
+}
+
+// TestOpenCancelWhileQueueIsFull cancels an Open that waits for room in a full
+// outbound queue and an Open that waits for the gate: both return at once and
+// release their grant and connection slots, and a later Open gets a fresh,
+// larger stream_id.
+func TestOpenCancelWhileQueueIsFull(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	filler := fillOutbound(c)
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	first := openAsync(firstCtx, c, "grant-a")
+	waitStreams(t, c, 1)
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
+	second := openAsync(secondCtx, c, "grant-b")
+	time.Sleep(20 * time.Millisecond)
+
+	cancelSecond()
+	if r := waitOpen(t, second, time.Second); !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("canceled gate waiter = %v, want context.Canceled", r.err)
+	}
+	if got := c.StreamCount(); got != 1 {
+		t.Fatalf("StreamCount after the gate waiter canceled = %d, want 1", got)
+	}
+	if got := perGrantCount(c, "grant-b"); got != 0 {
+		t.Fatalf("grant-b streams = %d, want 0", got)
+	}
+
+	cancelFirst()
+	if r := waitOpen(t, first, time.Second); !errors.Is(r.err, context.Canceled) {
+		t.Fatalf("canceled enqueue waiter = %v, want context.Canceled", r.err)
+	}
+	if got := c.StreamCount(); got != 0 {
+		t.Fatalf("StreamCount after both canceled = %d, want 0", got)
+	}
+	if got := perGrantCount(c, "grant-a"); got != 0 {
+		t.Fatalf("grant-a streams = %d, want 0", got)
+	}
+
+	for i := 0; i < filler; i++ {
+		<-c.out
+	}
+	s, err := c.Open(context.Background(), "grant-a", "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.ID <= 1 {
+		t.Fatalf("stream_id after a canceled Open = %d, want above the canceled stream_id 1", s.ID)
+	}
+	// The canceled stream's open frame never reached the queue.
+	f := <-c.out
+	if f.GetStreamId() != s.ID {
+		t.Fatalf("first queued frame has stream_id %d, want %d", f.GetStreamId(), s.ID)
+	}
+}
+
+func TestOpenReturnsWhenConnectionClosesWhileWaitingForGate(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	fillOutbound(c)
+	first := openAsync(context.Background(), c, "grant-a")
+	waitStreams(t, c, 1)
+	second := openAsync(context.Background(), c, "grant-b")
+	time.Sleep(20 * time.Millisecond)
+	c.Close(ErrConnClosed)
+	for _, ch := range []<-chan openResult{first, second} {
+		if r := waitOpen(t, ch, time.Second); !errors.Is(r.err, ErrConnClosed) {
+			t.Fatalf("Open after Close = %v, want ErrConnClosed", r.err)
+		}
+	}
+}
+
+// TestCreditWaitDoesNotDelayAnotherStream shows that a sender that waits for
+// the agent's credit does not hold the open gate or the queue.
+func TestCreditWaitDoesNotDelayAnotherStream(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	waiting := openStream(t, c)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sent := make(chan error, 1)
+	go func() {
+		sent <- waiting.Send(ctx, datapath.MustNewFrame(0, "", &ownsandv1.ExecRequest{}))
+	}()
+	time.Sleep(20 * time.Millisecond) // the agent granted no credit
+	other, err := c.Open(context.Background(), "grant-b", "sandbox")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Send(context.Background(), datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-sent:
+		t.Fatalf("Send returned %v before the agent granted credit", err)
+	default:
+	}
+	cancel()
+	if err := <-sent; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled credit wait = %v, want context.Canceled", err)
+	}
+}
