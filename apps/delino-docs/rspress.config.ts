@@ -7,6 +7,17 @@ export default defineConfig({
   // Keep build output in the repository-wide ignored `dist` directory.
   outDir: "dist",
   base: "/",
+  builderConfig: {
+    server: {
+      // Fixed loopback port for `rspress dev` and `rspress preview`; fail
+      // instead of picking another port on conflict. The Rspress CLI has no
+      // strict-port flag, so only this config can express the rule. The e2e
+      // suite overrides it with explicit `--host` and `--port` flags.
+      host: "127.0.0.1",
+      port: 3500,
+      strictPort: true,
+    },
+  },
   lang: "en",
   title: "Delino Docs",
   description: "Delino documentation",
