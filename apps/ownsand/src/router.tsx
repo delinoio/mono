@@ -46,15 +46,17 @@ export type Route =
   | { id: RouteId.Sandbox; organizationId: string; sandboxId: string }
   | { id: RouteId.Device; organizationId: string; deviceId: string };
 
-const ORG_SECTIONS: Record<string, RouteId> = {
-  sandboxes: RouteId.Sandboxes,
-  devices: RouteId.Devices,
-  members: RouteId.Members,
-  "enrollment-tokens": RouteId.EnrollmentTokens,
-  "api-keys": RouteId.ApiKeys,
-  snapshots: RouteId.Snapshots,
-  settings: RouteId.Settings,
-};
+// A Map keeps inherited Object.prototype names such as "constructor" or
+// "__proto__" from resolving as sections.
+const ORG_SECTIONS: ReadonlyMap<string, RouteId> = new Map<string, RouteId>([
+  ["sandboxes", RouteId.Sandboxes],
+  ["devices", RouteId.Devices],
+  ["members", RouteId.Members],
+  ["enrollment-tokens", RouteId.EnrollmentTokens],
+  ["api-keys", RouteId.ApiKeys],
+  ["snapshots", RouteId.Snapshots],
+  ["settings", RouteId.Settings],
+]);
 
 /** Parses a path into a route. */
 export function parseRoute(pathname: string): Route {
@@ -81,7 +83,7 @@ export function parseRoute(pathname: string): Route {
     return { id: RouteId.Callback };
   if (parts[0] === "orgs" && parts.length >= 3) {
     const organizationId = parts[1]!;
-    const section = ORG_SECTIONS[parts[2]!];
+    const section = ORG_SECTIONS.get(parts[2]!);
     if (section === undefined) return { id: RouteId.NotFound };
     if (parts.length === 3) {
       return { id: section, organizationId } as Route;

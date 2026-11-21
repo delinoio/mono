@@ -266,6 +266,17 @@ describe("router", () => {
     expect(parseRoute("/elsewhere").id).toBe(RouteId.NotFound);
   });
 
+  test("treats inherited object property names as unknown sections", () => {
+    for (const name of [
+      "constructor",
+      "toString",
+      "__proto__",
+      "hasOwnProperty",
+    ]) {
+      expect(parseRoute(`/orgs/o1/${name}`)).toEqual({ id: RouteId.NotFound });
+    }
+  });
+
   test("malformed percent escapes are not found instead of throwing", () => {
     expect(parseRoute("/orgs/%/sandboxes")).toEqual({ id: RouteId.NotFound });
     expect(parseRoute("/orgs/o1/sandboxes/%E0%A4%A")).toEqual({
