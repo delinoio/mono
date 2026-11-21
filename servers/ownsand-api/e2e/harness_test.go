@@ -17,8 +17,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -59,9 +61,10 @@ type stack struct {
 	logs     *logSink
 	objects  *fakeS3
 	// apiEnv and api are the environment and process of the control plane,
-	// so a test can kill it and start it again over the same database.
+	// so a test can kill it and start it again over the same database. The
+	// name of api prefixes its lines in logs.
 	apiEnv []string
-	api    *exec.Cmd
+	api    *proc
 	// work is the directory of the agent state directories.
 	work string
 }
@@ -148,15 +151,26 @@ func freeUDPPort(t *testing.T) string {
 }
 
 // logSink keeps the output of the child processes and prints it when the
-// test fails. Lines are prefixed with the process name.
+// test fails. Lines are prefixed with the process name and ": ".
 type logSink struct {
 	mu    sync.Mutex
 	lines []string
+	// scanners counts the scanner goroutines that still run, so a test can
+	// check that a finished process released its log resources.
+	scanners atomic.Int32
 }
 
-func (l *logSink) writer(name string) io.Writer {
+// writer returns a writer for one output stream of the process name. A
+// goroutine stores the lines written to it until the writer is closed; the
+// returned channel closes after that goroutine stored the last line and
+// exited. exec.Cmd does not close a custom writer, so the owner must.
+func (l *logSink) writer(name string) (io.WriteCloser, <-chan struct{}) {
 	r, w := io.Pipe()
+	done := make(chan struct{})
+	l.scanners.Add(1)
 	go func() {
+		defer close(done)
+		defer l.scanners.Add(-1)
 		s := bufio.NewScanner(r)
 		s.Buffer(make([]byte, 64<<10), 1<<20)
 		for s.Scan() {
@@ -164,8 +178,12 @@ func (l *logSink) writer(name string) io.Writer {
 			l.lines = append(l.lines, name+": "+s.Text())
 			l.mu.Unlock()
 		}
+		// Closing the reader fails later writes of the process instead of
+		// blocking it when the scan stopped on an error, such as a line that
+		// is too long.
+		_ = r.CloseWithError(s.Err())
 	}()
-	return w
+	return w, done
 }
 
 func (l *logSink) dump(t *testing.T) {
@@ -179,50 +197,109 @@ func (l *logSink) dump(t *testing.T) {
 	}
 }
 
-// processDone maps a started child process to the channel that closes when it
-// exited, so a test can stop one process before the test ends.
-var processDone sync.Map
+// hasLine reports whether the sink stored the exact prefixed line.
+func (l *logSink) hasLine(line string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Contains(l.lines, line)
+}
+
+// hasStateReport reports whether the process name logged an
+// agent_state_report event for the device. The control plane logs this event
+// after it marked the connection of the device as reconciled, which is when
+// placement can use the device.
+func (l *logSink) hasStateReport(name, deviceID string) bool {
+	prefix := name + ": "
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		text, ok := strings.CutPrefix(line, prefix)
+		if !ok {
+			continue
+		}
+		var event struct {
+			Msg      string `json:"msg"`
+			DeviceID string `json:"device_id"`
+		}
+		// Lines that are not JSON log records are not events.
+		if json.Unmarshal([]byte(text), &event) != nil {
+			continue
+		}
+		if event.Msg == "agent_state_report" && event.DeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
+// proc is a child process that startProcess started.
+type proc struct {
+	name string
+	cmd  *exec.Cmd
+	// done closes after the process exited and its log writers are closed
+	// and drained.
+	done chan struct{}
+}
 
 // killProcess kills a child process that startProcess started and waits for
 // it to exit, as a crash does: the process gets no chance to shut down.
-func killProcess(t *testing.T, cmd *exec.Cmd) {
+func killProcess(t *testing.T, p *proc) {
 	t.Helper()
-	done, ok := processDone.Load(cmd)
-	if !ok {
-		t.Fatal("killProcess: the process was not started by startProcess")
-	}
-	_ = cmd.Process.Kill()
+	_ = p.cmd.Process.Kill()
 	select {
-	case <-done.(chan struct{}):
+	case <-p.done:
 	case <-time.After(15 * time.Second):
-		t.Fatal("the killed process did not exit")
+		t.Fatalf("the killed process %s did not exit", p.name)
 	}
+}
+
+// launchProcess starts a child process and logs its output to logs. When the
+// process exits, it closes both log writers and waits for their scanners
+// before it closes the done channel of the process.
+func launchProcess(logs *logSink, name string, env []string, bin string, args ...string) (*proc, error) {
+	cmd := exec.Command(bin, args...)
+	cmd.Env = append(os.Environ(), env...)
+	stdout, stdoutDone := logs.writer(name)
+	stderr, stderrDone := logs.writer(name)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	release := func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		<-stdoutDone
+		<-stderrDone
+	}
+	if err := cmd.Start(); err != nil {
+		release()
+		return nil, err
+	}
+	p := &proc{name: name, cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		release()
+		close(p.done)
+	}()
+	return p, nil
 }
 
 // startProcess starts a child process that is stopped with SIGTERM when the
 // test ends.
-func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *exec.Cmd {
+func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *proc {
 	t.Helper()
-	cmd := exec.Command(bin, args...)
-	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdout = logs.writer(name)
-	cmd.Stderr = logs.writer(name)
-	if err := cmd.Start(); err != nil {
+	p, err := launchProcess(logs, name, env, bin, args...)
+	if err != nil {
 		t.Fatalf("start %s: %v", name, err)
 	}
-	done := make(chan struct{})
-	processDone.Store(cmd, done)
-	go func() { _ = cmd.Wait(); close(done) }()
 	t.Cleanup(func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = p.cmd.Process.Signal(syscall.SIGTERM)
 		select {
-		case <-done:
+		case <-p.done:
 		case <-time.After(15 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+			_ = p.cmd.Process.Kill()
+			<-p.done
 		}
 	})
-	return cmd
+	return p
 }
 
 // stackOptions configures newStack.
@@ -239,10 +316,10 @@ type stackOptions struct {
 type agentProc struct {
 	deviceID string
 	stateDir string
-	// env and cmd are the environment and process of the agent, so a test
+	// env and proc are the environment and process of the agent, so a test
 	// can kill it and start it again over the same state directory.
-	env []string
-	cmd *exec.Cmd
+	env  []string
+	proc *proc
 }
 
 // newStack starts the control plane, creates an organization with a user
@@ -355,7 +432,7 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 	if out, err := enroll.CombinedOutput(); err != nil {
 		t.Fatalf("ownsand-agent enroll: %v\n%s", err, out)
 	}
-	cmd := startProcess(t, s.logs, fmt.Sprintf("agent%d", i), agentEnv, filepath.Join(s.bins, "ownsand-agent"), "run")
+	agent := startProcess(t, s.logs, fmt.Sprintf("agent%d", i), agentEnv, filepath.Join(s.bins, "ownsand-agent"), "run")
 
 	known := map[string]bool{}
 	for _, a := range s.agents {
@@ -366,20 +443,20 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 		Limits: &ownsandv1.DeviceLimitsInput{VcpuCount: proto.Int32(8), MemoryMib: proto.Int64(16384), DiskGib: proto.Int64(100), VcpuOvercommitPercent: proto.Int32(100)}}); err != nil {
 		t.Fatalf("ReplaceDeviceLimits: %v", err)
 	}
-	return agentProc{deviceID: deviceID, stateDir: stateDir, env: agentEnv, cmd: cmd}
+	return agentProc{deviceID: deviceID, stateDir: stateDir, env: agentEnv, proc: agent}
 }
 
 // killAgent kills agent i, as a crash does.
 func (s *stack) killAgent(i int) {
 	s.t.Helper()
-	killProcess(s.t, s.agents[i].cmd)
+	killProcess(s.t, s.agents[i].proc)
 }
 
 // restartAgent starts agent i again over its state directory.
 func (s *stack) restartAgent(i int) {
 	s.t.Helper()
 	a := &s.agents[i]
-	a.cmd = startProcess(s.t, s.logs, fmt.Sprintf("agent%d-restarted", i), a.env, filepath.Join(s.bins, "ownsand-agent"), "run")
+	a.proc = startProcess(s.t, s.logs, fmt.Sprintf("agent%d-restarted", i), a.env, filepath.Join(s.bins, "ownsand-agent"), "run")
 }
 
 // killAPI kills the control plane, as a crash does.
