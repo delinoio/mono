@@ -48,7 +48,7 @@ func main() {
 func run(args []string) int {
 	fs := flag.NewFlagSet("ownsand-guest", flag.ContinueOnError)
 	listen := fs.String("listen", envOr(envListen, guestlisten.DefaultSpec), "listener spec: vsock://:<port>, unix://<path> or tcp://<host:port> (env "+envListen+")")
-	stateDir := fs.String("state-dir", envOr(envStateDir, defaultStateDir()), "directory for read snapshots on the guest disk (env "+envStateDir+")")
+	stateDir := fs.String("state-dir", envOr(envStateDir, defaultStateDir()), "directory for read snapshots and write records on the guest disk (env "+envStateDir+")")
 	clock := fs.String("clock", envOr(envClock, "set"), "set: SetClock sets the system clock; ignore: SetClock changes nothing (env "+envClock+")")
 	logLevel := fs.String("log-level", envOr(envLogLevel, "info"), "debug, info, warn or error (env "+envLogLevel+")")
 	showVersion := fs.Bool("version", false, "print the version and exit")
