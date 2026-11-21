@@ -63,6 +63,15 @@ const (
 // errProcessGone reports that a process no longer exists.
 var errProcessGone = errors.New("fcrt: process does not exist")
 
+// errVerifyIO marks a failure to inspect the system (an unreadable /proc
+// entry, an exhausted descriptor table) while verifying a launch. It is not
+// evidence about the process: the caller must not treat the process as
+// foreign or forget the VM, and retries later.
+var errVerifyIO = errors.New("fcrt: cannot inspect the process")
+
+// verifyIOError wraps err so that errors.Is reports errVerifyIO.
+func verifyIOError(err error) error { return fmt.Errorf("%w: %w", errVerifyIO, err) }
+
 // procHandle is a stable reference to one verified process. It stays bound
 // to that process even when its PID is reused after the process exits.
 type procHandle interface {
@@ -245,7 +254,7 @@ func readLaunchRecord(dir, sandboxID string) (launchRecord, launchSkipReason, er
 		if errors.Is(err, os.ErrNotExist) {
 			return launchRecord{}, skipRecordMissing, nil
 		}
-		return launchRecord{}, skipRecordUnreadable, err
+		return launchRecord{}, skipRecordUnreadable, verifyIOError(err)
 	}
 	if !dst.IsDir() || !privateToAgent(dst) {
 		return launchRecord{}, skipRecordForeign, fmt.Errorf("VM directory %s is not a private directory of this agent", dir)
@@ -256,14 +265,17 @@ func readLaunchRecord(dir, sandboxID string) (launchRecord, launchSkipReason, er
 		if errors.Is(err, os.ErrNotExist) {
 			return launchRecord{}, skipRecordMissing, nil
 		}
-		return launchRecord{}, skipRecordUnreadable, err
+		return launchRecord{}, skipRecordUnreadable, verifyIOError(err)
 	}
 	if !st.Mode().IsRegular() || !privateToAgent(st) {
 		return launchRecord{}, skipRecordForeign, fmt.Errorf("launch record %s is not a private regular file of this agent", path)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return launchRecord{}, skipRecordUnreadable, err
+		if errors.Is(err, os.ErrNotExist) {
+			return launchRecord{}, skipRecordMissing, nil
+		}
+		return launchRecord{}, skipRecordUnreadable, verifyIOError(err)
 	}
 	var rec launchRecord
 	if err := json.Unmarshal(raw, &rec); err != nil {
@@ -308,7 +320,7 @@ func verifyLaunch(host procHost, vmDir, sandboxID string) (*ownedProcess, launch
 	}
 	boot, err := host.bootID()
 	if err != nil {
-		return nil, skipRecordUnreadable, fmt.Errorf("read boot ID: %w", err)
+		return nil, skipRecordUnreadable, verifyIOError(fmt.Errorf("read boot ID: %w", err))
 	}
 	if boot != rec.BootID {
 		return nil, skipBootChanged, nil
@@ -319,7 +331,7 @@ func verifyLaunch(host procHost, vmDir, sandboxID string) (*ownedProcess, launch
 			return skipProcessGone, nil
 		}
 		if err != nil {
-			return skipProcessChanged, err
+			return skipProcessChanged, verifyIOError(err)
 		}
 		if start != rec.StartTime {
 			return skipProcessChanged, nil
@@ -329,7 +341,7 @@ func verifyLaunch(host procHost, vmDir, sandboxID string) (*ownedProcess, launch
 			return skipProcessGone, nil
 		}
 		if err != nil {
-			return skipProcessChanged, err
+			return skipProcessChanged, verifyIOError(err)
 		}
 		if !cmdlineHasID(args, sandboxID) {
 			return skipProcessChanged, nil
@@ -344,7 +356,7 @@ func verifyLaunch(host procHost, vmDir, sandboxID string) (*ownedProcess, launch
 		return nil, skipProcessGone, nil
 	}
 	if err != nil {
-		return nil, skipProcessChanged, fmt.Errorf("open process handle: %w", err)
+		return nil, skipProcessChanged, verifyIOError(fmt.Errorf("open process handle: %w", err))
 	}
 	// The PID may have been reused between the check and the open: the
 	// handle then refers to the new process. Check again, now that the

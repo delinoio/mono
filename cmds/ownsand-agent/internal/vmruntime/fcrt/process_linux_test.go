@@ -102,6 +102,10 @@ type fakeHost struct {
 	// onOpen runs inside open, before the handle is bound; it simulates a
 	// PID reuse between the check and the open.
 	onOpen func(pid int)
+	// openErr and cmdlineErr make open and cmdline fail the way an
+	// exhausted descriptor table or an unreadable /proc entry does.
+	openErr    error
+	cmdlineErr error
 }
 
 func newFakeHost() *fakeHost { return &fakeHost{boot: "boot-a", procs: map[int]*fakeProc{}} }
@@ -136,6 +140,9 @@ func (h *fakeHost) startTime(pid int) (uint64, error) {
 func (h *fakeHost) cmdline(pid int) ([]string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.cmdlineErr != nil {
+		return nil, h.cmdlineErr
+	}
 	p, err := h.live(pid)
 	if err != nil {
 		return nil, err
@@ -157,6 +164,9 @@ func (h *fakeHost) listPIDs() ([]int, error) {
 }
 
 func (h *fakeHost) open(pid int) (procHandle, error) {
+	if h.openErr != nil {
+		return nil, h.openErr
+	}
 	if h.onOpen != nil {
 		h.onOpen(pid)
 	}
@@ -414,6 +424,45 @@ func TestDeleteOrphanWaitsForExit(t *testing.T) {
 	}
 	if f.host.closed != 1 {
 		t.Fatalf("%d handles closed, want the 1 that was opened", f.host.closed)
+	}
+}
+
+// An operational failure while verifying a process (here: no descriptor for
+// the process handle, or an unreadable command line) is not proof that the
+// process is not ours: Delete fails and keeps the directory and the launch
+// record, so that a retry can still prove ownership. Running reports the
+// failure instead of hiding the VM.
+func TestVerificationErrorsKeepVMState(t *testing.T) {
+	cases := map[string]func(h *fakeHost){
+		"process handle cannot be opened": func(h *fakeHost) { h.openErr = syscall.EMFILE },
+		"command line cannot be read":     func(h *fakeHost) { h.cmdlineErr = syscall.EACCES },
+	}
+	for name, inject := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			dir, p := f.orphan("sb1", 10)
+			inject(f.host)
+			if err := f.r.Delete(context.Background(), "sb1"); err == nil {
+				t.Fatal("Delete succeeded although the process could not be verified")
+			}
+			if !f.exists(filepath.Join(dir, launchRecordFile)) {
+				t.Fatal("launch record removed after a verification error")
+			}
+			if _, err := f.r.Running(context.Background()); err == nil {
+				t.Fatal("Running hid a VM that could not be verified")
+			}
+			// The retry succeeds once the host works again.
+			f.host.openErr, f.host.cmdlineErr = nil, nil
+			if err := f.r.Delete(context.Background(), "sb1"); err != nil {
+				t.Fatalf("retry: %v", err)
+			}
+			if p.alive {
+				t.Fatal("process survived the retry")
+			}
+			if f.exists(dir) {
+				t.Fatal("VM directory kept after the retry")
+			}
+		})
 	}
 }
 

@@ -680,7 +680,16 @@ func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 			return err
 		}
 	}
-	procs := r.ownedProcesses(sandboxID)
+	procs, verr := r.ownedProcesses(sandboxID)
+	if verr != nil {
+		// A process that could not be inspected may still run: keep the
+		// registration, the directory and the launch record, which is the
+		// proof a retry needs.
+		for _, p := range procs {
+			p.handle.close()
+		}
+		return verr
+	}
 	if err := r.killOwned(procs); err != nil {
 		return err
 	}
@@ -720,8 +729,11 @@ func (r *Runtime) killOwned(procs []*ownedProcess) error {
 // empty ID, for every VM directory. The launch record is the only proof of
 // ownership: a command line is never enough. A process that carries the
 // --id argument of a sandbox but fails the proof is not returned and is
-// logged with the reason. The caller closes the handles.
-func (r *Runtime) ownedProcesses(sandboxID string) []*ownedProcess {
+// logged with the reason. A failure to inspect a process or its record is
+// not such a reason: it is returned as an error, together with the processes
+// that were verified, because the VM may still run. The caller closes the
+// handles.
+func (r *Runtime) ownedProcesses(sandboxID string) ([]*ownedProcess, error) {
 	ids := []string{sandboxID}
 	if sandboxID == "" {
 		ids = nil
@@ -740,8 +752,14 @@ func (r *Runtime) ownedProcesses(sandboxID string) []*ownedProcess {
 	var owned []*ownedProcess
 	reasons := map[string]launchSkipReason{}
 	verified := map[int]bool{}
+	var errs []error
 	for _, id := range ids {
 		p, reason, err := verifyLaunch(r.host, r.vmDir(id), id)
+		if errors.Is(err, errVerifyIO) {
+			r.logger.Error("cannot verify the launch record of a VM", "sandbox_id", id, "reason", string(reason), "error", err)
+			errs = append(errs, fmt.Errorf("fcrt: verify sandbox %s: %w", id, err))
+			continue
+		}
 		if p != nil {
 			owned = append(owned, p)
 			verified[p.pid] = true
@@ -755,7 +773,7 @@ func (r *Runtime) ownedProcesses(sandboxID string) []*ownedProcess {
 		}
 	}
 	r.logUnverified(sandboxID, reasons, verified)
-	return owned
+	return owned, errors.Join(errs...)
 }
 
 // logUnverified logs the firecracker-looking processes that carry the --id
@@ -805,7 +823,8 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 		}
 	}
 	r.mu.Unlock()
-	for _, p := range r.ownedProcesses("") {
+	procs, err := r.ownedProcesses("")
+	for _, p := range procs {
 		seen[p.sandboxID] = true
 		p.handle.close()
 	}
@@ -813,7 +832,9 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 	for id := range seen {
 		ids = append(ids, id)
 	}
-	return ids, nil
+	// An uninspectable VM directory may hold a surviving VM: report the
+	// failure instead of a list that looks complete.
+	return ids, err
 }
 
 // Close stops every microVM and the network policy refresh loop.
