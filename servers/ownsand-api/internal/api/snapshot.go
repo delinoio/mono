@@ -198,9 +198,11 @@ func partKey(orgID, snapshotID string, part int32) string {
 
 // handleSignedURLRequest issues fresh part URLs to the agent that runs an
 // export (UPLOAD, the device that holds the snapshot while it is EXPORTING)
-// or an import (DOWNLOAD, a device of the organization with the same OS and
-// architecture while the snapshot is EXPORTED). URLs expire after 15
-// minutes and are never logged.
+// or an import (DOWNLOAD, the channel to which the server assigned the
+// import command of the snapshot, on a device of the organization with the
+// same OS and architecture while the snapshot is EXPORTED, for as long as
+// importThenCreate waits for the import). URLs expire after 15 minutes and
+// are never logged; a denied request is logged as signed_url_denied.
 //
 // The eligibility check and the signing run in one transaction that holds
 // the snapshot row with FOR SHARE, so snapshot and organization deletion
@@ -258,6 +260,12 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 				ownsandv1.HostOs(host) != sn.pb.GetHostOs() || ownsandv1.Arch(arch) != sn.pb.GetArch() {
 				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not exported for this device")
 			}
+			// Compatibility is not an assignment: only the channel that
+			// runs the import the server sent gets URLs, so the signer is
+			// not called for any other request.
+			if !s.imports.assigned(conn, sn.pb.GetSnapshotId()) {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "no import of the snapshot is assigned to this channel")
+			}
 			presign = s.Objects.PresignGet
 		default:
 			return refuse(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid operation")
@@ -280,6 +288,9 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 		return err
 	}
 	if denied != nil {
+		// The reason is a fixed message; no URL or credential is logged.
+		s.Logger.WarnContext(ctx, "signed_url_denied", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", r.GetSnapshotId()),
+			slog.String("operation", r.GetOperation().String()), slog.String("reason", denied.GetMessage()))
 		return deny(denied.GetCode(), denied.GetMessage())
 	}
 	s.Logger.InfoContext(ctx, "signed_urls_issued", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", grant.GetSnapshotId()),
