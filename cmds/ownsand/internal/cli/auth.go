@@ -131,12 +131,14 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 		return nil, err
 	}
 	cfg := a.logtoConfig()
-	if cfg.Endpoint == "" {
-		cfg.Endpoint = creds.LogtoEndpoint
+	// The tokens belong to the tenant, the application and the resource
+	// that issued them. A configuration that names others must not use
+	// them: the cached access token would fail, and the refresh token would
+	// go to another tenant's token endpoint.
+	if name, ok := credentialMismatch(creds, a.getenv(EnvLogtoEndpoint), a.getenv(EnvLogtoAppID), a.getenv(EnvLogtoResource)); ok {
+		return nil, fmt.Errorf("the stored credentials were issued for a different %s value; run 'ownsand login' again", name)
 	}
-	if cfg.AppID == "" {
-		cfg.AppID = creds.AppID
-	}
+	cfg.Endpoint, cfg.AppID = creds.LogtoEndpoint, creds.AppID
 	if creds.Resource != "" {
 		cfg.Resource = creds.Resource
 	}
@@ -162,4 +164,21 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 		a.logger.Debug("ownsand refreshed the Logto access token")
 		return creds.AccessToken, nil
 	}, nil
+}
+
+// credentialMismatch reports the first explicitly configured Logto setting
+// (empty values are not configured) that differs from the identity of the
+// stored credentials.
+func credentialMismatch(creds *credstore.Credentials, endpoint, appID, resource string) (string, bool) {
+	// The endpoint is compared as the CLI uses it, without trailing slashes.
+	normalize := func(u string) string { return strings.TrimRight(u, "/") }
+	switch {
+	case endpoint != "" && normalize(endpoint) != normalize(creds.LogtoEndpoint):
+		return EnvLogtoEndpoint, true
+	case appID != "" && appID != creds.AppID:
+		return EnvLogtoAppID, true
+	case resource != "" && creds.Resource != "" && resource != creds.Resource:
+		return EnvLogtoResource, true
+	}
+	return "", false
 }

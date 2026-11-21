@@ -346,6 +346,49 @@ func TestLoginStoresUserOnlyCredentialsAndLogout(t *testing.T) {
 	}
 }
 
+func TestStoredCredentialsRejectChangedLogtoConfiguration(t *testing.T) {
+	r := newRunner(t)
+	delete(r.env, ownsand.EnvAPIKey)
+	lg := &fakeLogto{}
+	ls := httptest.NewServer(lg.handler(t))
+	defer ls.Close()
+	st := credstore.Store{Dir: r.env[EnvConfigDir]}
+	if err := st.Save(&credstore.Credentials{LogtoEndpoint: ls.URL, AppID: "app", Resource: DefaultLogtoResource, RefreshToken: "old-refresh", AccessToken: "stored-access-token", AccessTokenExpiry: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatal(err)
+	}
+	// Matching or unset configuration uses the stored tokens; a trailing
+	// slash on the endpoint does not change the tenant.
+	r.env[EnvLogtoEndpoint] = ls.URL + "/"
+	r.env[EnvLogtoAppID] = "app"
+	if res := r.run("org", "get"); res.code != 0 || r.f.lastAuth() != "Bearer stored-access-token" {
+		t.Fatalf("%+v %q", res, r.f.lastAuth())
+	}
+	for _, c := range []struct{ key, value string }{
+		{EnvLogtoEndpoint, "https://other-tenant.example"},
+		{EnvLogtoAppID, "other-app"},
+		{EnvLogtoResource, "https://other.example"},
+	} {
+		prev, had := r.env[c.key]
+		r.env[c.key] = c.value
+		before := len(r.f.callNames())
+		res := r.run("org", "get")
+		if res.code != ExitError || !strings.Contains(res.stderr, c.key) || !strings.Contains(res.stderr, "ownsand login") {
+			t.Errorf("%s: %+v", c.key, res)
+		}
+		if len(r.f.callNames()) != before {
+			t.Errorf("%s: the CLI sent a request with mismatched credentials", c.key)
+		}
+		if had {
+			r.env[c.key] = prev
+		} else {
+			delete(r.env, c.key)
+		}
+	}
+	if len(lg.refreshes) != 0 {
+		t.Fatalf("refresh token sent: %v", lg.refreshes)
+	}
+}
+
 func TestLoginWithoutConfiguration(t *testing.T) {
 	r := newRunner(t)
 	res := r.run("login")
