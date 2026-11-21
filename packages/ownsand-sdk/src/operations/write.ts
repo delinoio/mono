@@ -303,7 +303,7 @@ async function sendChunk(
       }
       throwIfAborted(signal);
       if (failure instanceof SessionEndedError) {
-        selector.sessionEnded();
+        if (session !== undefined) selector.sessionEnded(session);
         continue;
       }
       if (failure instanceof PeerUnavailableError) {
