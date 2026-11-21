@@ -63,6 +63,40 @@ export function isWorkspaceManifest(path) {
   ).test(path);
 }
 
+// Root inputs of every workspace package task: the runtime selector, the
+// workspace manifests and lockfile, the Turbo task configuration, the root Go
+// module that the server packages build, and this workflow.
+const workspaceTaskInputs = new Set([
+  ".github/workflows/CI.yml",
+  ".nvmrc",
+  "go.mod",
+  "go.sum",
+  "package.json",
+  "pnpm-lock.yaml",
+  "pnpm-workspace.yaml",
+  "turbo.json",
+]);
+
+// Any path inside a workspace package, or a root input of its tasks, selects
+// the `workspace` job. That job runs the build, lint, typecheck and test tasks
+// of every workspace package, because `turbo run --affected` selects no package
+// when only a root input such as `package.json`, `turbo.json` or `go.mod`
+// changes (checked with turbo 2.11.11).
+export function isWorkspaceInput(path) {
+  return (
+    workspaceTaskInputs.has(path) ||
+    new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/`).test(path)
+  );
+}
+
+// GitHub Actions workflows and local actions select the `workflows` job, which
+// lints them with actionlint and audits them with zizmor.
+export function isWorkflowInput(path) {
+  return (
+    path.startsWith(".github/workflows/") || path.startsWith(".github/actions/")
+  );
+}
+
 // Protobuf schema inputs: the schemas, the buf configuration, the generation
 // script and the TypeScript generation template and plugin pin of the OwnSand
 // SDK. The Go job lints them, checks breaking changes and fails when the
@@ -86,8 +120,9 @@ const ownsandSdkPackage = "packages/ownsand-sdk/";
 // The Go job installs the workspace dependencies with the Node.js runtime of
 // `.nvmrc` before the Go tests, so the workspace manifests and the lockfile
 // change what the TypeScript SDK end-to-end test and the protobuf generators
-// run with.
+// run with. The workflow defines the job's steps, services and caches.
 const goWorkspaceInputs = new Set([
+  ".github/workflows/CI.yml",
   ".nvmrc",
   "package.json",
   "pnpm-lock.yaml",
@@ -112,8 +147,13 @@ export function isGoInput(path) {
   );
 }
 
-// Root Rust toolchain and formatter configuration.
-const rustInputs = new Set(["rust-toolchain", ".rustfmt.toml"]);
+// Root Rust toolchain and formatter configuration, and the workflow that
+// defines the Rust job's packages, toolchain installation and caches.
+const rustInputs = new Set([
+  ".github/workflows/CI.yml",
+  "rust-toolchain",
+  ".rustfmt.toml",
+]);
 
 // Rust sources, Cargo manifests and lockfiles, the root toolchain files and
 // every path of a Tauri app crate select the Rust checks. A Tauri crate also
@@ -170,7 +210,18 @@ export function plan(cwd, base, head) {
   const go = paths.some(isGoInput);
   const rust = paths.some(isRustInput);
   const e2e = paths.some(isE2eInput);
-  return { quality: format || fixtures, format, fixtures, go, rust, e2e };
+  const workspace = paths.some(isWorkspaceInput);
+  const workflows = paths.some(isWorkflowInput);
+  return {
+    quality: format || fixtures,
+    format,
+    fixtures,
+    go,
+    rust,
+    e2e,
+    workspace,
+    workflows,
+  };
 }
 
 // Why a forced output has its value. Logged in the ci_plan record only.
@@ -207,10 +258,11 @@ export function main(env = process.env, cwd = process.cwd()) {
   }
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
   // Branch-wide cancellation can cancel a main-push run before its Go, Rust,
-  // fixtures or e2e jobs finish, and the next push then compares only against
-  // its own parent. Every main push therefore runs the Go checks, the Rust
-  // checks, the fixtures and the e2e suites against its own head so a later documentation-only push
-  // cannot hide a cancelled predecessor's range. The fixtures step lives in
+  // fixtures, e2e, workspace or workflows jobs finish, and the next push then
+  // compares only against its own parent. Every main push therefore runs the Go
+  // checks, the Rust checks, the fixtures, the e2e suites, the workspace package
+  // tasks and the workflow lint against its own head so a later documentation-only push cannot hide a
+  // cancelled predecessor's range. The fixtures step lives in
   // the `quality` job, so forcing fixtures forces quality too. `format` stays
   // diff-derived: the formatter compares the same range and a forced run
   // would not widen it. Pull request and manual comparisons keep affected
@@ -224,6 +276,8 @@ export function main(env = process.env, cwd = process.cwd()) {
     go: diffPlan.go || mainPush,
     rust: diffPlan.rust || mainPush,
     e2e: diffPlan.e2e || mainPush,
+    workspace: diffPlan.workspace || mainPush,
+    workflows: diffPlan.workflows || mainPush,
   };
   const reasonOf = (selectedByDiff) =>
     mainPush && !selectedByDiff ? OutputReason.MainPush : OutputReason.Diff;
@@ -240,6 +294,8 @@ export function main(env = process.env, cwd = process.cwd()) {
     rustReason: reasonOf(diffPlan.rust),
     fixturesReason: reasonOf(diffPlan.fixtures),
     e2eReason: reasonOf(diffPlan.e2e),
+    workspaceReason: reasonOf(diffPlan.workspace),
+    workflowsReason: reasonOf(diffPlan.workflows),
   };
   appendFileSync(
     env.GITHUB_OUTPUT,

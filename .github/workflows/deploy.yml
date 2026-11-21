@@ -110,7 +110,7 @@ jobs:
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
           cache: false
@@ -380,10 +380,13 @@ jobs:
       contents: write
       actions: read
     steps:
+      # The release step pushes the version commit and tags with the
+      # credentials that this checkout persists. The job uploads no artifacts,
+      # so zizmor's artipacked finding does not apply.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
-          fetch-depth: 0
+          fetch-depth: 0 # zizmor: ignore[artipacked]
       - name: Check that the plan is still current
         env:
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
