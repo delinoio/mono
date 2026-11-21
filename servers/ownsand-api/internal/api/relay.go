@@ -53,7 +53,46 @@ func (h RelayAgentHandler) Connect(ctx context.Context, stream *connect.BidiStre
 		case <-conn.Done():
 		}
 	}()
-	err = conn.Run(func() (*ownsandv1.DataFrame, error) {
+	err = serveRelayConn(ctx, conn, stream)
+	log.InfoContext(context.WithoutCancel(ctx), "relay_connection_closed", slog.String("cause", fmt.Sprint(err)), slog.Int("open_streams", conn.StreamCount()))
+	return nil
+}
+
+// relayAgentControllerKey carries the response controller of an agent relay
+// request.
+type relayAgentControllerKey struct{}
+
+// RelayAgentWriteInterrupt makes the response controller of each request
+// available to RelayAgentHandler.Connect. A Connect handler sees no response
+// writer, but only the controller can make a blocked response write fail:
+// returning from the handler does not cancel a write that waits for the
+// peer's flow control, and the HTTP/2 server would finish the response while
+// that write still uses it. Wrap the RelayAgentService handler with it.
+func RelayAgentWriteInterrupt(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := context.WithValue(r.Context(), relayAgentControllerKey{}, http.NewResponseController(w))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// relaySendInterrupt returns the function that makes a blocked response write
+// of the request fail, or nil when the handler was not wrapped with
+// RelayAgentWriteInterrupt (the relay then bounds its wait for the writer).
+func relaySendInterrupt(ctx context.Context) func() error {
+	rc, _ := ctx.Value(relayAgentControllerKey{}).(*http.ResponseController)
+	if rc == nil {
+		return nil
+	}
+	// A deadline in the past fails the pending and every later write.
+	return func() error { return rc.SetWriteDeadline(time.Now()) }
+}
+
+// serveRelayConn runs conn over the Connect stream until it closes. It
+// returns only after the last stream.Send ended, so the handler never returns
+// while a send still writes to the response.
+func serveRelayConn(ctx context.Context, conn *relay.Conn, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+	conn.SetSendInterrupt(relaySendInterrupt(ctx))
+	return conn.Run(func() (*ownsandv1.DataFrame, error) {
 		req, err := stream.Receive()
 		if err != nil {
 			return nil, err
@@ -62,8 +101,6 @@ func (h RelayAgentHandler) Connect(ctx context.Context, stream *connect.BidiStre
 	}, func(f *ownsandv1.DataFrame) error {
 		return stream.Send(&ownsandv1.ConnectResponse{Frame: f})
 	})
-	log.InfoContext(context.WithoutCancel(ctx), "relay_connection_closed", slog.String("cause", fmt.Sprint(err)), slog.Int("open_streams", conn.StreamCount()))
-	return nil
 }
 
 // RelayHandler serves RelayService.

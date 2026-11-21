@@ -51,3 +51,14 @@ func TestServeH2CAndShutdown(t *testing.T) {
 		t.Fatal("beforeDrain did not run")
 	}
 }
+
+// TestServerClosesConnectionWithBlockedWrites checks that the server bounds a
+// socket write that blocks: a relay connection whose peer stopped draining
+// its socket would otherwise keep its writer, and the Connect handler that
+// waits for it, forever.
+func TestServerClosesConnectionWithBlockedWrites(t *testing.T) {
+	srv := newServer(http.NotFoundHandler(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if srv.HTTP2 == nil || srv.HTTP2.WriteByteTimeout != writeByteTimeout || writeByteTimeout <= 0 {
+		t.Fatalf("HTTP2 config = %+v, want WriteByteTimeout %v", srv.HTTP2, writeByteTimeout)
+	}
+}

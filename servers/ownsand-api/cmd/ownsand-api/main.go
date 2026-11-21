@@ -32,10 +32,15 @@ const shutdownTimeout = 10 * time.Second
 // streams of up to 14 minutes, so it sets no ReadTimeout or WriteTimeout:
 // each RPC bounds its own lifetime (Connect deadlines, the relay limits and
 // the heartbeat timeout). readHeaderTimeout bounds the request head and
-// idleTimeout an idle keep-alive connection.
+// idleTimeout an idle keep-alive connection. writeByteTimeout closes an
+// HTTP/2 connection that accepts no byte for that long while data waits to
+// be written: a relay connection whose writer is blocked on a peer that
+// stopped draining its socket ends only through it, because a response write
+// deadline cannot interrupt a socket write that the kernel buffers block.
 const (
 	readHeaderTimeout = 10 * time.Second
 	idleTimeout       = 120 * time.Second
+	writeByteTimeout  = 30 * time.Second
 )
 
 func main() {
@@ -143,6 +148,7 @@ func newServer(handler http.Handler, logger *slog.Logger) *http.Server {
 		Protocols:         &protocols,
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
+		HTTP2:             &http.HTTP2Config{WriteByteTimeout: writeByteTimeout},
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
 	}
 }

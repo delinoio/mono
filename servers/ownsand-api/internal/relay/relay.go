@@ -80,6 +80,9 @@ type Conn struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
+	// sendInterrupt is set by SetSendInterrupt before Run starts.
+	sendInterrupt func() error
+
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
 
@@ -101,6 +104,13 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 	c.lastSend.Store(now)
 	return c
 }
+
+// SetSendInterrupt registers the function that makes a blocked send fail
+// (for an HTTP response, a write deadline in the past). Run calls it once
+// after the connection closed. It returns an error when it cannot interrupt
+// the send; Run then falls back to a bounded wait for the writer. Call it
+// before Run.
+func (c *Conn) SetSendInterrupt(interrupt func() error) { c.sendInterrupt = interrupt }
 
 // Done is closed when the connection closes.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
@@ -163,6 +173,13 @@ func (c *Conn) Supports(kind ownsandv1.DataFrameKind) bool {
 // send that makes progress to finish before the caller ends the underlying
 // stream, and returns without a send that is still blocked. Returning lets
 // the caller end the stream, which unblocks that send.
+//
+// That fallback is unsafe when the send writes to an HTTP response: the
+// handler that returns then finishes the response while the send still
+// writes to it. A caller whose send can be interrupted registers the
+// interrupt with SetSendInterrupt. Run then calls it once the connection
+// closed and waits for the writer without a limit, so Run returns only after
+// the last send ended.
 func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsandv1.DataFrame) error) error {
 	// guardedSend skips send once the connection closed, so the writer does
 	// not start a send after Run returned. A send that is already blocked
@@ -232,6 +249,13 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		}
 	}()
 	<-c.ctx.Done()
+	if c.sendInterrupt != nil && c.sendInterrupt() == nil {
+		// The interrupt makes a blocked send fail, so the writer ends soon
+		// and Run can wait for it without a limit. The caller owns the
+		// stream again only after the writer stopped using it.
+		<-writerDone
+		return c.Err()
+	}
 	grace := time.NewTimer(writerGrace)
 	defer grace.Stop()
 	select {
