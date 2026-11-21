@@ -305,14 +305,20 @@ func (x *DeviceCapabilities) GetHypervisorChecks() []*HypervisorCheck {
 
 // Resources that the sandboxes of a device use together.
 type DeviceAllocation struct {
-	state     protoimpl.MessageState `protogen:"open.v1"`
-	VcpuCount int32                  `protobuf:"varint,1,opt,name=vcpu_count,json=vcpuCount,proto3" json:"vcpu_count,omitempty"`
-	MemoryMib int64                  `protobuf:"varint,2,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
-	DiskGib   int64                  `protobuf:"varint,3,opt,name=disk_gib,json=diskGib,proto3" json:"disk_gib,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The allocated vCPUs. It is exact when the value fits in 32 bits and
+	// 2147483647 for a larger value; vcpu_total_count carries the exact value.
+	VcpuCount int32 `protobuf:"varint,1,opt,name=vcpu_count,json=vcpuCount,proto3" json:"vcpu_count,omitempty"`
+	MemoryMib int64 `protobuf:"varint,2,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	DiskGib   int64 `protobuf:"varint,3,opt,name=disk_gib,json=diskGib,proto3" json:"disk_gib,omitempty"`
 	// macOS guests in CREATING, RUNNING, PAUSED or DELETING state.
 	MacosGuestCount int32 `protobuf:"varint,4,opt,name=macos_guest_count,json=macosGuestCount,proto3" json:"macos_guest_count,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The exact allocated vCPUs, which the scheduler uses for placement. The
+	// server always sets it; it is absent when an older server sent the
+	// message, and a client then reads vcpu_count.
+	VcpuTotalCount *int64 `protobuf:"varint,5,opt,name=vcpu_total_count,json=vcpuTotalCount,proto3,oneof" json:"vcpu_total_count,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *DeviceAllocation) Reset() {
@@ -369,6 +375,13 @@ func (x *DeviceAllocation) GetDiskGib() int64 {
 func (x *DeviceAllocation) GetMacosGuestCount() int32 {
 	if x != nil {
 		return x.MacosGuestCount
+	}
+	return 0
+}
+
+func (x *DeviceAllocation) GetVcpuTotalCount() int64 {
+	if x != nil && x.VcpuTotalCount != nil {
+		return *x.VcpuTotalCount
 	}
 	return 0
 }
@@ -1689,14 +1702,16 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\x11built_base_images\x18\x05 \x03(\x0e2\x1c.delino.ownsand.v1.BaseImageR\x0fbuiltBaseImages\x124\n" +
 	"\x16macos_guests_supported\x18\x06 \x01(\bR\x14macosGuestsSupported\x122\n" +
 	"\x15macos_hardware_models\x18\a \x03(\fR\x13macosHardwareModels\x12O\n" +
-	"\x11hypervisor_checks\x18\b \x03(\v2\".delino.ownsand.v1.HypervisorCheckR\x10hypervisorChecks\"\x97\x01\n" +
+	"\x11hypervisor_checks\x18\b \x03(\v2\".delino.ownsand.v1.HypervisorCheckR\x10hypervisorChecks\"\xdb\x01\n" +
 	"\x10DeviceAllocation\x12\x1d\n" +
 	"\n" +
 	"vcpu_count\x18\x01 \x01(\x05R\tvcpuCount\x12\x1d\n" +
 	"\n" +
 	"memory_mib\x18\x02 \x01(\x03R\tmemoryMib\x12\x19\n" +
 	"\bdisk_gib\x18\x03 \x01(\x03R\adiskGib\x12*\n" +
-	"\x11macos_guest_count\x18\x04 \x01(\x05R\x0fmacosGuestCount\"\xe7\x06\n" +
+	"\x11macos_guest_count\x18\x04 \x01(\x05R\x0fmacosGuestCount\x12-\n" +
+	"\x10vcpu_total_count\x18\x05 \x01(\x03H\x00R\x0evcpuTotalCount\x88\x01\x01B\x13\n" +
+	"\x11_vcpu_total_count\"\xe7\x06\n" +
 	"\x06Device\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12'\n" +
 	"\x0forganization_id\x18\x02 \x01(\tR\x0eorganizationId\x12\x12\n" +
@@ -1923,6 +1938,7 @@ func file_delino_ownsand_v1_device_proto_init() {
 		return
 	}
 	file_delino_ownsand_v1_common_proto_init()
+	file_delino_ownsand_v1_device_proto_msgTypes[3].OneofWrappers = []any{}
 	file_delino_ownsand_v1_device_proto_msgTypes[11].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{

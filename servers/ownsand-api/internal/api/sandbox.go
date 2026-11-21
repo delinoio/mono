@@ -103,7 +103,7 @@ func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string,
 		d.vcpu_overcommit_percent, d.update_state, d.pending_idle_since, `+versionRevokedQuery()+`,
 		COALESCE(a.vcpu, 0), COALESCE(a.memory, 0), COALESCE(a.disk, 0), COALESCE(a.macos, 0), COALESCE(a.unreported, 0)
 		FROM devices d LEFT JOIN LATERAL (
-			SELECT sum(s.vcpu_count)::int AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
+			SELECT sum(s.vcpu_count)::bigint AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
 				count(*) FILTER (WHERE s.guest_os = 2)::int AS macos,
 				COALESCE(sum(s.disk_gib) FILTER (WHERE s.agent_state = 1 AND s.revision_epoch = ''), 0)::bigint AS unreported
 			FROM sandboxes s WHERE s.device_id = d.device_id AND s.agent_state IN (1, 2, 3, 4)
@@ -120,8 +120,9 @@ func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string,
 		var caps []byte
 		limits := &ownsandv1.DeviceLimits{}
 		alloc := &ownsandv1.DeviceAllocation{}
+		var vcpuTotal int64
 		if err := rows.Scan(&d.ID, &state, &host, &arch, &caps, &limits.VcpuCount, &limits.MemoryMib, &limits.DiskGib, &limits.VcpuOvercommitPercent,
-			&update, &d.PendingIdleSince, &d.VersionRevoked, &alloc.VcpuCount, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount, &d.UnreportedCreatingDiskGiB); err != nil {
+			&update, &d.PendingIdleSince, &d.VersionRevoked, &vcpuTotal, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount, &d.UnreportedCreatingDiskGiB); err != nil {
 			return nil, err
 		}
 		d.Online = ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_ONLINE
@@ -133,6 +134,7 @@ func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string,
 				return nil, err
 			}
 		}
+		setAllocationVCPU(alloc, vcpuTotal)
 		d.Limits, d.Allocation = limits, alloc
 		d.UpdateState = ownsandv1.AgentUpdateState(update)
 		d.MachineIdentifierReserved = reserved

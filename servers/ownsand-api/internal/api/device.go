@@ -193,7 +193,7 @@ const deviceSelect = `SELECT d.device_id::text, d.organization_id::text, d.name,
 	d.create_time, d.last_seen_time, d.pending_idle_since,
 	COALESCE(a.vcpu, 0), COALESCE(a.memory, 0), COALESCE(a.disk, 0), COALESCE(a.macos, 0)
 	FROM devices d LEFT JOIN LATERAL (
-		SELECT sum(s.vcpu_count)::int AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
+		SELECT sum(s.vcpu_count)::bigint AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
 			count(*) FILTER (WHERE s.guest_os = 2)::int AS macos
 		FROM sandboxes s WHERE s.device_id = d.device_id AND s.agent_state IN (1, 2, 3, 4)
 	) a ON true`
@@ -210,9 +210,10 @@ func scanDevice(row pgx.Row) (*ownsandv1.Device, error) {
 	var created time.Time
 	var lastSeen, pendingIdle *time.Time
 	var alloc ownsandv1.DeviceAllocation
+	var vcpuTotal int64
 	if err := row.Scan(&d.DeviceId, &d.OrganizationId, &d.Name, &state, &hostOS, &arch, &d.AgentVersion, &update, &caps,
 		&limits.VcpuCount, &limits.MemoryMib, &limits.DiskGib, &limits.VcpuOvercommitPercent,
-		&created, &lastSeen, &pendingIdle, &alloc.VcpuCount, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount); err != nil {
+		&created, &lastSeen, &pendingIdle, &vcpuTotal, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount); err != nil {
 		return nil, err
 	}
 	d.State = ownsandv1.DeviceState(state)
@@ -232,11 +233,20 @@ func scanDevice(row pgx.Row) (*ownsandv1.Device, error) {
 	effective := validate.EffectiveVCPULimit(&limits)
 	d.EffectiveVcpuLimitCount = effective
 	d.EffectiveVcpuLimit = int32(min(effective, math.MaxInt32))
+	setAllocationVCPU(&alloc, vcpuTotal)
 	d.Allocation = &alloc
 	d.CreateTime = ts(created)
 	d.LastSeenTime = tsPtr(lastSeen)
 	d.PendingIdleSince = tsPtr(pendingIdle)
 	return &d, nil
+}
+
+// setAllocationVCPU stores the exact allocated vCPUs in the int64 field. The
+// int32 field stays for v1 clients and is capped, because a plain conversion
+// would wrap a valid total above 2147483647 to a negative number.
+func setAllocationVCPU(alloc *ownsandv1.DeviceAllocation, total int64) {
+	alloc.VcpuTotalCount = &total
+	alloc.VcpuCount = int32(min(total, math.MaxInt32))
 }
 
 // loadDevice reads one visible device of the organization.

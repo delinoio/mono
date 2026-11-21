@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -1608,5 +1609,56 @@ func TestChannelClosesAtLeaseExpiry(t *testing.T) {
 	_ = late.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
 	if _, err := late.Receive(); testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("admission after the lease expired: %v", err)
+	}
+}
+
+// TestAggregateVCPUAllocationAboveInt32 checks that reservations whose vCPU
+// sum exceeds the int32 range are reported exactly, and that placement uses
+// the exact sum instead of failing in SQL.
+func TestAggregateVCPUAllocationAboveInt32(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	dev, agent := setupAgent(t, env, org, &ownsandv1.DeviceLimits{VcpuCount: math.MaxInt32, MemoryMib: 8192, DiskGib: 100, VcpuOvercommitPercent: 400})
+	agent.WaitFor("state report ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateAck().GetStateReport() != nil })
+	// Two RUNNING sandboxes of 2147483647 vCPUs each sum to 4294967294.
+	const total = 2 * int64(math.MaxInt32)
+	for range 2 {
+		id, _ := uuidv7.NewString()
+		if _, err := env.DB.Pool.Exec(ctx, `INSERT INTO sandboxes (sandbox_id, organization_id, device_id, agent_state, vcpu_count, memory_mib, disk_gib,
+			guest_os, host_os, arch, network_mode, idle_ttl_ms, max_ttl_ms, max_deadline, created_by_kind, created_by_id, create_time)
+			VALUES ($1, $2, $3, 2, $4, 100, 1, 1, 1, 1, 1, 60000, 60000, now(), 1, 'alice', now())`, id, org.ID, dev.ID, int32(math.MaxInt32)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := org.OwnerClient
+	got, err := c.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
+	if err != nil {
+		t.Fatalf("get device: %v", err)
+	}
+	list, err := c.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+	if err != nil || len(list.Msg.GetDevices()) != 1 {
+		t.Fatalf("list devices: %v, %v", list, err)
+	}
+	for name, d := range map[string]*ownsandv1.Device{"get": got.Msg.GetDevice(), "list": list.Msg.GetDevices()[0]} {
+		a := d.GetAllocation()
+		if a.VcpuTotalCount == nil || a.GetVcpuTotalCount() != total || a.GetVcpuCount() != math.MaxInt32 {
+			t.Errorf("%s allocation = %v, want total %d and a capped count", name, a, total)
+		}
+	}
+	// The effective limit is 8589934588, so a sandbox of 2 vCPUs fits.
+	if _, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); err != nil {
+		t.Fatalf("create with room: %v", err)
+	}
+	// A limit below the exact allocation is a capacity outcome, not an SQL
+	// integer overflow.
+	if _, err := c.Device.UpdateDeviceLimits(ctx, connect.NewRequest(&ownsandv1.UpdateDeviceLimitsRequest{
+		OrganizationId: org.ID, DeviceId: dev.ID,
+		Limits: &ownsandv1.DeviceLimits{VcpuCount: math.MaxInt32, MemoryMib: 8192, DiskGib: 100, VcpuOvercommitPercent: 100},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("create above the limit: %v", err)
 	}
 }
