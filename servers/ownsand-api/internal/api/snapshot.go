@@ -115,6 +115,12 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 	var snap *snapshotRow
 	var conn *hub.Conn
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock the organization row before the sandbox row, as
+		// DeleteOrganization does: the snapshot insert takes FOR KEY SHARE
+		// on it through its foreign key.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		sb, err := loadSandbox(ctx, tx, orgID, req.Msg.GetSandboxId(), true)
 		if err != nil {
 			return err
@@ -562,6 +568,12 @@ func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Reques
 			return err
 		}
 		if err := validateName("name", req.Msg.GetName()); err != nil {
+			return err
+		}
+		// Lock the organization row before the snapshot row, as
+		// DeleteOrganization does: the template insert takes FOR KEY SHARE
+		// on it through its foreign key.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
 			return err
 		}
 		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
