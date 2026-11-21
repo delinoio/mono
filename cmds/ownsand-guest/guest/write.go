@@ -317,11 +317,10 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if !covered {
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "written ranges do not cover exactly [0, size_bytes)")
 	}
-	mode := wireToFileMode(finish.GetMode())
 	if err := e.file.Truncate(size); err != nil {
 		return fsError("write", err)
 	}
-	if err := e.file.Chmod(mode); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+	if err := applyFileMode(e.file, finish.GetMode()); err != nil {
 		return fsError("write", err)
 	}
 	if err := e.file.Sync(); err != nil {
