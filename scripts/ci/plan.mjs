@@ -23,6 +23,8 @@ const fixtureInputs = new Set([
   "scripts/install-git-hooks.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.
   "scripts/droplet/start-caddy.sh",
+  // The portless preflight fixture runs the root `dev` preflight.
+  "scripts/dev/start-portless-proxy.mjs",
 ]);
 
 // Shared runtime and workspace inputs that change every app e2e suite.
