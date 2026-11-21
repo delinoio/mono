@@ -322,7 +322,8 @@ func (h DataPathHandler) GetIceServers(ctx context.Context, req *connect.Request
 // rule: UNREACHABLE is unavailable, a state outside allowed is
 // failed_precondition, and a device without a live channel is unavailable.
 func (p *DataPlane) liveSandbox(ctx context.Context, orgID, sandboxID string, allowed ...ownsandv1.SandboxState) (*sandboxRow, *hub.Conn, error) {
-	if err := validateID("sandbox_id", sandboxID); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", sandboxID)
+	if err != nil {
 		return nil, nil, err
 	}
 	sb, err := loadSandbox(ctx, p.S.DB.Pool, orgID, sandboxID, false)
@@ -346,14 +347,18 @@ func (p *DataPlane) liveSandbox(ctx context.Context, orgID, sandboxID string, al
 
 func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[ownsandv1.OpenSessionRequest]) (*connect.Response[ownsandv1.OpenSessionResponse], error) {
 	m := req.Msg
-	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes)
+	orgID, err := normalizeID("organization_id", m.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
 		return nil, err
 	}
 	if m.GetSdpOffer() == "" || len(m.GetSdpOffer()) > 64<<10 {
 		return nil, errInvalidf("invalid sdp_offer: must be 1 byte to 64 KiB")
 	}
-	sb, conn, err := h.liveSandbox(ctx, m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	sb, conn, err := h.liveSandbox(ctx, orgID, m.GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	if err != nil {
 		return nil, h.S.internal(ctx, "open session", err)
 	}
@@ -373,7 +378,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		return nil, err
 	}
 	// Authorize again after registering, as the contract requires.
-	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes); err != nil {
+	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return fail(err)
 	}
 	key := conn.DeviceID + "/" + sess.id
@@ -444,21 +449,31 @@ func enqueueErrorCategory(err error) string {
 
 func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Request[ownsandv1.AuthorizeRelayRequest]) (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
 	m := req.Msg
-	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes)
+	orgID, err := normalizeID("organization_id", m.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
 		return nil, err
 	}
 	if ok, retry := h.limiter.Allow(fmt.Sprintf("%d/%s", pr.Kind, pr.ID), 1); !ok {
 		return nil, errRateLimited(retry)
 	}
-	if err := validateID("authorization_id", m.GetAuthorizationId()); err != nil {
+	// The grant registry and the agent compare identifiers as text, so the
+	// grant carries the lowercase spelling of every identifier.
+	authorizationID, err := normalizeID("authorization_id", m.GetAuthorizationId())
+	if err != nil {
 		return nil, err
 	}
-	if err := validateID("operation_id", m.GetOperationId()); err != nil {
+	operationID, err := normalizeID("operation_id", m.GetOperationId())
+	if err != nil {
 		return nil, err
 	}
-	// The agent compares exec IDs as raw text, so the grant of an exec must
-	// carry the lowercase spelling that its requests are required to use.
+	// The agent compares exec IDs as raw text and the request is required to
+	// use the lowercase spelling, so an exec grant accepts only that
+	// spelling; the other operation IDs accept either hex case and are
+	// normalized above.
 	switch m.GetOperationKind() {
 	case ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC:
 		if err := validate.ExecID("operation_id", m.GetOperationId()); err != nil {
@@ -482,16 +497,20 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	default:
 		return nil, errInvalidf("invalid operation_kind")
 	}
-	if m.ReplacesGrantId != nil && !uuidv7.Valid(m.GetReplacesGrantId()) {
-		return nil, errInvalidf("invalid replaces_grant_id")
+	replacesID := ""
+	if m.ReplacesGrantId != nil {
+		if !uuidv7.Valid(m.GetReplacesGrantId()) {
+			return nil, errInvalidf("invalid replaces_grant_id")
+		}
+		replacesID = canonicalID(m.GetReplacesGrantId())
 	}
-	sb, conn, err := h.liveSandbox(ctx, m.GetOrganizationId(), m.GetSandboxId(), allowed...)
+	sb, conn, err := h.liveSandbox(ctx, orgID, m.GetSandboxId(), allowed...)
 	if err != nil {
 		return nil, h.S.internal(ctx, "authorize relay", err)
 	}
 	g, existing, err := h.Grants.Reserve(grants.Request{
-		AuthorizationID: m.GetAuthorizationId(), OrgID: sb.OrgID, SandboxID: sb.ID, DeviceID: sb.DeviceID, ChannelGen: conn.Generation,
-		Principal: pr, Kind: m.GetOperationKind(), OperationID: m.GetOperationId(), Digest: m.GetRequestDigest(), ReplacesID: m.GetReplacesGrantId(),
+		AuthorizationID: authorizationID, OrgID: sb.OrgID, SandboxID: sb.ID, DeviceID: sb.DeviceID, ChannelGen: conn.Generation,
+		Principal: pr, Kind: m.GetOperationKind(), OperationID: operationID, Digest: m.GetRequestDigest(), ReplacesID: replacesID,
 	}, newID)
 	switch {
 	case errors.Is(err, grants.ErrLimit):
@@ -505,7 +524,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	// The caller's authorization is checked again after the grant is
 	// registered, so a revocation in between reaches the pending grant.
-	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes); err != nil {
+	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		if !existing {
 			h.Grants.RemoveMatching(func(x *grants.Grant) bool { return x.ID == g.ID })
 		}

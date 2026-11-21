@@ -59,6 +59,27 @@ func requestHash(req *ownsandv1.CreateSandboxRequest) ([]byte, error) {
 	return sum[:], nil
 }
 
+// canonicalizeCreateSandbox rewrites the identifiers of a validated create
+// request to their lowercase text form in place. The API accepts either hex
+// case, but the request hash, the idempotency lock, the scheduler's device
+// filter and the stored records compare identifiers as text, so one request
+// spelled in two cases must read as one request.
+func canonicalizeCreateSandbox(m *ownsandv1.CreateSandboxRequest) {
+	m.OrganizationId = canonicalID(m.GetOrganizationId())
+	m.IdempotencyKey = canonicalID(m.GetIdempotencyKey())
+	if src := m.GetSource(); src != nil {
+		switch s := src.GetSource().(type) {
+		case *ownsandv1.SandboxSource_SnapshotId:
+			s.SnapshotId = canonicalID(s.SnapshotId)
+		case *ownsandv1.SandboxSource_TemplateId:
+			s.TemplateId = canonicalID(s.TemplateId)
+		}
+	}
+	if p := m.GetPlacement(); p != nil && p.DeviceId != nil {
+		p.DeviceId = proto.String(canonicalID(p.GetDeviceId()))
+	}
+}
+
 // lookupIdempotent returns the sandbox of a known idempotency key, or nil.
 // A known key with other parameters fails with already_exists.
 func (s *Service) lookupIdempotent(ctx context.Context, q db.Querier, orgID, key string, hash []byte) (*sandboxRow, error) {
@@ -222,6 +243,10 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	if err := validate.CreateSandboxRequest(m); err != nil {
 		return nil, errInvalid(err)
 	}
+	// Every identifier is valid now: use one spelling for the request hash,
+	// the idempotency lock, the scheduler and the records.
+	canonicalizeCreateSandbox(m)
+	orgID = m.GetOrganizationId()
 	network, _ := validate.NetworkMode(m.GetNetwork())
 	hash, err := requestHash(m)
 	if err != nil {
@@ -506,14 +531,18 @@ func (s *Service) failImportTimeout(ctx context.Context, conn *hub.Conn, info co
 }
 
 func (h SandboxHandler) GetSandbox(ctx context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
+	if err != nil {
 		return nil, err
 	}
-	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, req.Msg.GetSandboxId(), false)
+	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)
 	if err != nil {
 		return nil, h.internal(ctx, "get sandbox", err)
 	}
@@ -527,7 +556,10 @@ const shownStateSQL = `(CASE WHEN s.agent_state IN (5, 6) THEN s.agent_state WHE
 
 func (h SandboxHandler) ListSandboxes(ctx context.Context, req *connect.Request[ownsandv1.ListSandboxesRequest]) (*connect.Response[ownsandv1.ListSandboxesResponse], error) {
 	m := req.Msg
-	orgID := m.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", m.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
@@ -538,10 +570,11 @@ func (h SandboxHandler) ListSandboxes(ctx context.Context, req *connect.Request[
 	where := []string{"s.organization_id = $1", "s.sandbox_id > $2"}
 	args := []any{orgID, afterKey(after)}
 	if m.DeviceId != nil {
-		if err := validateID("device_id", m.GetDeviceId()); err != nil {
+		deviceID, err := normalizeID("device_id", m.GetDeviceId())
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, m.GetDeviceId())
+		args = append(args, deviceID)
 		where = append(where, fmt.Sprintf("s.device_id = $%d", len(args)))
 	}
 	if m.State != nil {
@@ -619,15 +652,20 @@ func (s *Service) waitSandboxOnce(ctx context.Context, orgID, sandboxID string, 
 }
 
 func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[ownsandv1.DeleteSandboxRequest]) (*connect.Response[ownsandv1.DeleteSandboxResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	sandboxID := req.Msg.GetSandboxId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawSandboxID := req.Msg.GetSandboxId()
 	var sb *sandboxRow
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	var sandboxID string
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
 		if err != nil {
 			return err
 		}
-		if err := validateID("sandbox_id", sandboxID); err != nil {
+		sandboxID, err = normalizeID("sandbox_id", rawSandboxID)
+		if err != nil {
 			return err
 		}
 		sb, err = loadSandbox(ctx, tx, orgID, sandboxID, true)
@@ -657,11 +695,16 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 }
 
 // pauseOrResume runs PauseSandbox (pause true) or ResumeSandbox.
-func (h SandboxHandler) pauseOrResume(ctx context.Context, orgID, sandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
+func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
+	orgID, err := normalizeID("organization_id", rawOrgID)
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("sandbox_id", sandboxID); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", rawSandboxID)
+	if err != nil {
 		return nil, err
 	}
 	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)

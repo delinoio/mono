@@ -109,12 +109,16 @@ func stateErr(state ownsandv1.SandboxState, rpc string) error {
 const snapshotFailTimeout = 5 * time.Second
 
 func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Request[ownsandv1.CreateSnapshotRequest]) (*connect.Response[ownsandv1.CreateSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	p, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
+	if err != nil {
 		return nil, err
 	}
 	var snap *snapshotRow
@@ -126,7 +130,7 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
 			return err
 		}
-		sb, err := loadSandbox(ctx, tx, orgID, req.Msg.GetSandboxId(), true)
+		sb, err := loadSandbox(ctx, tx, orgID, sandboxID, true)
 		if err != nil {
 			return err
 		}
@@ -388,14 +392,18 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 func validID(id string) bool { return validateID("id", id) == nil }
 
 func (h SnapshotHandler) GetSnapshot(ctx context.Context, req *connect.Request[ownsandv1.GetSnapshotRequest]) (*connect.Response[ownsandv1.GetSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+	snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+	if err != nil {
 		return nil, err
 	}
-	sn, err := loadSnapshot(ctx, h.DB.Pool, orgID, req.Msg.GetSnapshotId(), false)
+	sn, err := loadSnapshot(ctx, h.DB.Pool, orgID, snapshotID, false)
 	if err != nil {
 		return nil, h.internal(ctx, "get snapshot", err)
 	}
@@ -403,7 +411,10 @@ func (h SnapshotHandler) GetSnapshot(ctx context.Context, req *connect.Request[o
 }
 
 func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request[ownsandv1.ListSnapshotsRequest]) (*connect.Response[ownsandv1.ListSnapshotsResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
@@ -414,17 +425,19 @@ func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request
 	where := []string{"organization_id = $1", "snapshot_id > $2"}
 	args := []any{orgID, afterKey(after)}
 	if req.Msg.SandboxId != nil {
-		if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+		sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, req.Msg.GetSandboxId())
+		args = append(args, sandboxID)
 		where = append(where, fmt.Sprintf("source_sandbox_id = $%d", len(args)))
 	}
 	if req.Msg.DeviceId != nil {
-		if err := validateID("device_id", req.Msg.GetDeviceId()); err != nil {
+		deviceID, err := normalizeID("device_id", req.Msg.GetDeviceId())
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, req.Msg.GetDeviceId())
+		args = append(args, deviceID)
 		where = append(where, fmt.Sprintf("device_id = $%d", len(args)))
 	}
 	args = append(args, limit)
@@ -453,15 +466,19 @@ func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request
 }
 
 func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Request[ownsandv1.DeleteSnapshotRequest]) (*connect.Response[ownsandv1.DeleteSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if _, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes); err != nil {
 			return err
 		}
-		if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+		snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+		if err != nil {
 			return err
 		}
-		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		sn, err := loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
 		}
@@ -482,11 +499,15 @@ func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Reques
 }
 
 func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Request[ownsandv1.ExportSnapshotRequest]) (*connect.Response[ownsandv1.ExportSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+	snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+	if err != nil {
 		return nil, err
 	}
 	if h.Objects == nil {
@@ -498,9 +519,9 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 	// Every attempt has its own command ID, which the row stores with the
 	// ID of the channel that receives the command.
 	commandID := newID()
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		sn, err = loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		sn, err = loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
 		}
@@ -586,14 +607,18 @@ func scanTemplate(row pgx.Row) (*ownsandv1.Template, error) {
 }
 
 func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Request[ownsandv1.CreateTemplateRequest]) (*connect.Response[ownsandv1.CreateTemplateResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	var t *ownsandv1.Template
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
 		if err != nil {
 			return err
 		}
-		if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+		snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+		if err != nil {
 			return err
 		}
 		if err := validateName("name", req.Msg.GetName()); err != nil {
@@ -605,7 +630,7 @@ func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Reques
 		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
 			return err
 		}
-		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		sn, err := loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
 		}
@@ -626,7 +651,10 @@ func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Reques
 }
 
 func (h SnapshotHandler) ListTemplates(ctx context.Context, req *connect.Request[ownsandv1.ListTemplatesRequest]) (*connect.Response[ownsandv1.ListTemplatesResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
@@ -659,14 +687,18 @@ func (h SnapshotHandler) ListTemplates(ctx context.Context, req *connect.Request
 }
 
 func (h SnapshotHandler) DeleteTemplate(ctx context.Context, req *connect.Request[ownsandv1.DeleteTemplateRequest]) (*connect.Response[ownsandv1.DeleteTemplateResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("template_id", req.Msg.GetTemplateId()); err != nil {
+	templateID, err := normalizeID("template_id", req.Msg.GetTemplateId())
+	if err != nil {
 		return nil, err
 	}
-	tag, err := h.DB.Pool.Exec(ctx, "DELETE FROM templates WHERE organization_id = $1 AND template_id = $2", orgID, req.Msg.GetTemplateId())
+	tag, err := h.DB.Pool.Exec(ctx, "DELETE FROM templates WHERE organization_id = $1 AND template_id = $2", orgID, templateID)
 	if err != nil {
 		return nil, h.internal(ctx, "delete template", err)
 	}

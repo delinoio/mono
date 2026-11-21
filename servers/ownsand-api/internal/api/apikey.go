@@ -44,9 +44,12 @@ func scanAPIKey(row pgx.Row) (*ownsandv1.ApiKey, error) {
 }
 
 func (h APIKeyHandler) CreateApiKey(ctx context.Context, req *connect.Request[ownsandv1.CreateApiKeyRequest]) (*connect.Response[ownsandv1.CreateApiKeyResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	var resp *ownsandv1.CreateApiKeyResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageAPIKeys)
 		if err != nil {
 			return err
@@ -81,7 +84,10 @@ func (h APIKeyHandler) CreateApiKey(ctx context.Context, req *connect.Request[ow
 }
 
 func (h APIKeyHandler) ListApiKeys(ctx context.Context, req *connect.Request[ownsandv1.ListApiKeysRequest]) (*connect.Response[ownsandv1.ListApiKeysResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionManageAPIKeys); err != nil {
 		return nil, err
 	}
@@ -115,15 +121,19 @@ func (h APIKeyHandler) ListApiKeys(ctx context.Context, req *connect.Request[own
 }
 
 func (h APIKeyHandler) RevokeApiKey(ctx context.Context, req *connect.Request[ownsandv1.RevokeApiKeyRequest]) (*connect.Response[ownsandv1.RevokeApiKeyResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	keyID := req.Msg.GetApiKeyId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawKeyID := req.Msg.GetApiKeyId()
 	var resp *ownsandv1.RevokeApiKeyResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageAPIKeys)
 		if err != nil {
 			return err
 		}
-		if err := validateID("api_key_id", keyID); err != nil {
+		keyID, err := normalizeID("api_key_id", rawKeyID)
+		if err != nil {
 			return err
 		}
 		key, err := scanAPIKey(tx.QueryRow(ctx, "SELECT "+apiKeyColumns+" FROM api_keys WHERE organization_id = $1 AND api_key_id = $2 FOR UPDATE", orgID, keyID))
