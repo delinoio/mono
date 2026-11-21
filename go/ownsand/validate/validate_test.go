@@ -109,7 +109,12 @@ func TestAttachReadWrite(t *testing.T) {
 	if err := AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID}); err != nil {
 		t.Fatal(err)
 	}
-	wantInvalid(t, "negative offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StderrOffset: -1}), "")
+	if err := AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: 1 << 40, StderrOffset: 7}); err != nil {
+		t.Fatal(err)
+	}
+	wantInvalid(t, "negative stderr offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StderrOffset: -1}), "stderr_offset")
+	wantInvalid(t, "negative stdout offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: -1}), "stdout_offset")
+	wantInvalid(t, "both offsets negative", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: -1, StderrOffset: -1}), "stdout_offset")
 
 	read := &ownsandv1.ReadFileRequest{OrganizationId: orgID, SandboxId: sandboxID, ReadId: opID, Path: "/etc/hosts", BindingSalt: make([]byte, 32)}
 	if err := ReadFileRequest(read); err != nil {
