@@ -346,7 +346,7 @@ func TestCreateOutboundPreflightChecksTools(t *testing.T) {
 // the VM directory exists, but no firecracker process or tracked VM does.
 func TestDeleteRemovesFilesOfSandboxWithoutProcess(t *testing.T) {
 	vmsDir := t.TempDir()
-	r := &Runtime{opts: Options{VMsDir: vmsDir}, logger: quiet(), vms: map[string]*vm{}}
+	r := &Runtime{opts: Options{VMsDir: vmsDir}, logger: quiet(), vms: map[string]*vm{}, host: newLinuxProcs(), stopTimeout: exitTimeout}
 	dir := r.vmDir("01a1fd14-c825-72ac-926c-3bd6b87a8ba5")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
