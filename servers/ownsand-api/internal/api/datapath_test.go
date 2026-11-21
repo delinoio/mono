@@ -644,6 +644,9 @@ func TestRelayConnectionRules(t *testing.T) {
 	// Replacement: a second connection replaces the first.
 	r1 := agent.ConnectRelay(serveExec)
 	stop := keepAlive(r1)
+	// stop is idempotent; the deferred call stops the keepalive when the
+	// fixture fails before the explicit stop below.
+	defer stop()
 	r2 := agent.ConnectRelay(serveExec)
 	stop2 := keepAlive(r2)
 	defer stop2()
