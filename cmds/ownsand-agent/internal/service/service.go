@@ -29,6 +29,22 @@ const ExitNotEnrolled = 3
 // that makes launchd start the new executable.
 const ExitLaunchdRestart = 75
 
+// ExitWindowsRestart is the service-specific exit status that the Windows
+// service reports after an installed update. The service control manager
+// restarts a service whose failure actions are configured when it stops with
+// a nonzero exit status, so this status makes it start the new executable.
+// It has the same value as ExitLaunchdRestart.
+const ExitWindowsRestart = 75
+
+// Windows failure-action policy of the service. It mirrors the systemd unit
+// (Restart=always, RestartSec=5): one restart action that the service
+// control manager repeats for every failure. The reset period has no effect
+// with a single repeating action and is a recorded choice.
+const (
+	WindowsRestartDelayMillis = 5000
+	WindowsFailureResetSecs   = 86400
+)
+
 // Manager identifies the service manager that starts `run`. The empty
 // value is a direct or systemd/Windows start and keeps the public exit codes.
 type Manager string
@@ -55,6 +71,28 @@ func LaunchdExitCode(code int, updated bool) int {
 		return 0
 	}
 	return code
+}
+
+// WindowsExitStatus maps the public exit code of `run` to the exit status
+// that the Windows service reports to the service control manager. With
+// failure actions and the non-crash failure flag set, the manager restarts
+// the service after a stop with a nonzero exit status. Restart is therefore
+// reported as a service-specific error: ExitWindowsRestart after an installed
+// update (updated) and the code itself for any other nonzero code, such as 1
+// for an error. A requested stop or shutdown (stopRequested), a clean stop
+// and ExitNotEnrolled (not enrolled or a finished removal) report success, so
+// that the manager does not restart the agent. serviceSpecific tells the
+// caller to report exit as a service-specific exit code.
+func WindowsExitStatus(code int, updated, stopRequested bool) (serviceSpecific bool, exit uint32) {
+	switch {
+	case stopRequested:
+		return false, 0
+	case updated:
+		return true, ExitWindowsRestart
+	case code == ExitNotEnrolled || code == 0:
+		return false, 0
+	}
+	return true, uint32(code)
 }
 
 // Paths of the service definitions.
@@ -178,6 +216,18 @@ func WindowsCommand(exe string) string {
 	return fmt.Sprintf(`sc.exe create %s binPath= "\"%s\" run" start= auto DisplayName= "OwnSand device agent"`, Name, exe)
 }
 
+// WindowsRecoveryCommands returns the two sc.exe commands that set the
+// failure actions of the Windows service: restart after
+// WindowsRestartDelayMillis, and the flag that also applies the actions when
+// the service stops with a nonzero exit status. The commands are for
+// operators who do not use `service install` and for existing installations.
+func WindowsRecoveryCommands() []string {
+	return []string{
+		fmt.Sprintf("sc.exe failure %s reset= %d actions= restart/%d", Name, WindowsFailureResetSecs, WindowsRestartDelayMillis),
+		fmt.Sprintf("sc.exe failureflag %s 1", Name),
+	}
+}
+
 // WindowsEnvironmentCommand returns the reg.exe command that sets the
 // Environment value of the service to the NAME=value entries, or an empty
 // string when env is empty. It errors when every candidate separator occurs
@@ -228,11 +278,13 @@ func windowsQuote(s string) string {
 }
 
 // WindowsDefinition returns the printed Windows service definition: the
-// sc.exe create command and, when env is not empty, the reg.exe command that
-// sets the service environment. Without environment variables the output is
-// the sc.exe command alone.
+// sc.exe create command, the two sc.exe failure-action commands and, when env
+// is not empty, the reg.exe command that sets the service environment.
 func WindowsDefinition(exe string, env []string) string {
 	out := WindowsCommand(exe) + "\n"
+	for _, c := range WindowsRecoveryCommands() {
+		out += c + "\n"
+	}
 	if len(env) == 0 {
 		return out
 	}
@@ -259,4 +311,24 @@ func InstallWindowsEnvironment(env []string, setEnv func([]string) error, remove
 		return fmt.Errorf("write the service Environment value: %w (the new service was removed)", err)
 	}
 	return nil
+}
+
+// InstallWindowsRecovery sets the failure actions of a new service and then
+// the non-crash failure flag. When either fails it calls remove, so that a
+// failed install does not leave a service that is never restarted, and
+// returns the error.
+func InstallWindowsRecovery(setActions, setFlag, remove func() error) error {
+	err := setActions()
+	step := "set the service failure actions"
+	if err == nil {
+		err = setFlag()
+		step = "set the service failure actions flag"
+	}
+	if err == nil {
+		return nil
+	}
+	if rerr := remove(); rerr != nil {
+		return fmt.Errorf("%s: %w (removing the new service also failed: %v)", step, err, rerr)
+	}
+	return fmt.Errorf("%s: %w (the new service was removed)", step, err)
 }

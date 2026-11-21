@@ -6,6 +6,7 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -156,10 +157,44 @@ func TestLaunchdExitCode(t *testing.T) {
 	}
 }
 
-func TestWindowsDefinitionWithoutEnvironmentEqualsTheScCommand(t *testing.T) {
+func TestWindowsExitStatus(t *testing.T) {
+	// With failure actions and the non-crash failure flag, the service
+	// control manager restarts the service after a nonzero exit status only.
+	for _, tc := range []struct {
+		name          string
+		code          int
+		updated, stop bool
+		specific      bool
+		exit          uint32
+	}{
+		{"installed update", 0, true, false, true, ExitWindowsRestart},
+		{"error", 1, false, false, true, 1},
+		{"usage error", 2, false, false, true, 2},
+		{"not enrolled or removed", ExitNotEnrolled, false, false, false, 0},
+		{"clean stop", 0, false, false, false, 0},
+		{"stop request after an error", 1, false, true, false, 0},
+		{"stop request after an update", 0, true, true, false, 0},
+	} {
+		specific, exit := WindowsExitStatus(tc.code, tc.updated, tc.stop)
+		if specific != tc.specific || exit != tc.exit {
+			t.Errorf("%s: WindowsExitStatus(%d, %v, %v) = (%v, %d), want (%v, %d)", tc.name, tc.code, tc.updated, tc.stop, specific, exit, tc.specific, tc.exit)
+		}
+	}
+	if ExitWindowsRestart == 0 || ExitWindowsRestart == ExitNotEnrolled {
+		t.Errorf("ExitWindowsRestart = %d must be a nonzero code that differs from ExitNotEnrolled", ExitWindowsRestart)
+	}
+}
+
+func TestWindowsDefinitionWithoutEnvironmentPrintsTheRecoveryCommands(t *testing.T) {
 	exe := `C:\Program Files\ownsand-agent.exe`
-	if got, want := WindowsDefinition(exe, nil), WindowsCommand(exe)+"\n"; got != want {
-		t.Fatalf("WindowsDefinition() = %q, want %q", got, want)
+	lines := strings.Split(strings.TrimSuffix(WindowsDefinition(exe, nil), "\n"), "\n")
+	want := []string{
+		WindowsCommand(exe),
+		"sc.exe failure ownsand-agent reset= 86400 actions= restart/5000",
+		"sc.exe failureflag ownsand-agent 1",
+	}
+	if !reflect.DeepEqual(lines, want) {
+		t.Fatalf("WindowsDefinition() lines = %q, want %q", lines, want)
 	}
 	if strings.Contains(WindowsDefinition(exe, []string{}), "reg.exe") {
 		t.Fatal("an empty environment must not print a reg.exe command")
@@ -169,14 +204,15 @@ func TestWindowsDefinitionWithoutEnvironmentEqualsTheScCommand(t *testing.T) {
 func TestWindowsDefinitionPrintsTheEnvironmentCommand(t *testing.T) {
 	env := []string{"OWNSAND_AGENT_LOG_LEVEL=debug", `OWNSAND_AGENT_STATE_DIR=D:\ownsand test\`}
 	lines := strings.Split(strings.TrimSuffix(WindowsDefinition(`C:\a.exe`, env), "\n"), "\n")
-	if len(lines) != 2 || !strings.HasPrefix(lines[0], "sc.exe create ownsand-agent") {
+	if len(lines) != 4 || !strings.HasPrefix(lines[0], "sc.exe create ownsand-agent") ||
+		!strings.HasPrefix(lines[1], "sc.exe failure ownsand-agent") || !strings.HasPrefix(lines[2], "sc.exe failureflag ownsand-agent") {
 		t.Fatalf("definition lines = %q", lines)
 	}
 	// The trailing backslash in front of the closing quote is doubled, and
 	// `#` is the first separator that no entry contains.
 	want := `reg.exe add "HKLM\SYSTEM\CurrentControlSet\Services\ownsand-agent" /v Environment /t REG_MULTI_SZ /s "#" /d "OWNSAND_AGENT_LOG_LEVEL=debug#OWNSAND_AGENT_STATE_DIR=D:\ownsand test\\" /f`
-	if lines[1] != want {
-		t.Fatalf("reg command:\n got %s\nwant %s", lines[1], want)
+	if lines[3] != want {
+		t.Fatalf("reg command:\n got %s\nwant %s", lines[3], want)
 	}
 }
 
@@ -205,6 +241,33 @@ func TestWindowsEnvironmentCommandErrorsWithoutAFreeSeparator(t *testing.T) {
 	}
 	if out := WindowsDefinition(`C:\a.exe`, []string{all}); !strings.Contains(out, "REM no reg.exe separator") || strings.Contains(out, "reg.exe add") {
 		t.Fatalf("definition must fall back to a REM line: %q", out)
+	}
+}
+
+func TestInstallWindowsRecovery(t *testing.T) {
+	boom := errors.New("boom")
+	ok := func() error { return nil }
+	fail := func() error { return boom }
+	run := func(setActions, setFlag func() error, removeErr error) (error, int, int) {
+		flagCalls, removed := 0, 0
+		err := InstallWindowsRecovery(setActions,
+			func() error { flagCalls++; return setFlag() },
+			func() error { removed++; return removeErr })
+		return err, flagCalls, removed
+	}
+	if err, flags, removed := run(ok, ok, nil); err != nil || flags != 1 || removed != 0 {
+		t.Fatalf("success: err=%v flag calls=%d removed=%d", err, flags, removed)
+	}
+	err, flags, removed := run(fail, ok, nil)
+	if !errors.Is(err, boom) || flags != 0 || removed != 1 || !strings.Contains(err.Error(), "the new service was removed") {
+		t.Fatalf("actions failure: err=%v flag calls=%d removed=%d", err, flags, removed)
+	}
+	err, flags, removed = run(ok, fail, nil)
+	if !errors.Is(err, boom) || flags != 1 || removed != 1 {
+		t.Fatalf("flag failure: err=%v flag calls=%d removed=%d", err, flags, removed)
+	}
+	if err, _, _ := run(ok, fail, errors.New("rm")); err == nil || !strings.Contains(err.Error(), "removing the new service also failed") {
+		t.Fatalf("remove failure: err=%v", err)
 	}
 }
 
