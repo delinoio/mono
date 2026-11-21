@@ -6,8 +6,8 @@
 //   node ../../scripts/dev/with-infisical.mjs --path=/<folder> -- <command> [args...]
 //
 // When the repository root has an Infisical project configuration
-// (`.infisical.yaml`, or the legacy `.infisical.json`, which `infisical init`
-// creates and Git ignores), the launcher fetches the variables of the `dev`
+// (`.infisical.yaml`, which `infisical init` creates and Git ignores), the
+// launcher fetches the variables of the `dev`
 // environment in the package's folder with
 //
 //   infisical export --env=dev --path=<folder> --format=json ...
@@ -62,11 +62,10 @@ export const InjectionMode = Object.freeze({
   Direct: "direct",
 });
 
-// Project configuration file names, in the order in which the Infisical CLI
-// reads them from one directory.
+// Project configuration file names that the launcher reads. The launcher
+// does not read the `.infisical.json` file of older CLI versions.
 export const ProjectConfigFile = Object.freeze({
   Yaml: ".infisical.yaml",
-  LegacyJson: ".infisical.json",
 });
 
 // The only Infisical environment that development commands read.

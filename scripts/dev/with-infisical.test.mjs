@@ -269,15 +269,13 @@ test("parseArguments rejects invalid launcher arguments", async (t) => {
   }
 });
 
-test("projectConfigFile prefers .infisical.yaml like the CLI", async (t) => {
+test("projectConfigFile reads only .infisical.yaml", async (t) => {
   for (const [files, expected] of [
     [[], null],
     [[ProjectConfigFile.Yaml], ProjectConfigFile.Yaml],
-    [[ProjectConfigFile.LegacyJson], ProjectConfigFile.LegacyJson],
-    [
-      [ProjectConfigFile.LegacyJson, ProjectConfigFile.Yaml],
-      ProjectConfigFile.Yaml,
-    ],
+    // The `.infisical.json` file of older CLI versions is not read.
+    [[".infisical.json"], null],
+    [[".infisical.json", ProjectConfigFile.Yaml], ProjectConfigFile.Yaml],
     // The CLI does not read `.infisical.yml`.
     [[".infisical.yml"], null],
   ]) {

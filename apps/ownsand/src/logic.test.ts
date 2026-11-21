@@ -10,7 +10,6 @@ import { sandboxSettling, snapshotSettling } from "./api.ts";
 import { clearInvitationOnLeave } from "./App.tsx";
 import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
 import {
-  deviceEffectiveVcpuLimit,
   effectiveVcpuLimit,
   formatDuration,
   formatMib,
@@ -189,53 +188,6 @@ describe("roles", () => {
 });
 
 describe("formatting and form rules", () => {
-  test("reads the exact int64 effective vCPU limit of a device", () => {
-    const limits = (vcpuCount: number, vcpuOvercommitPercent: number) => ({
-      vcpuCount,
-      vcpuOvercommitPercent,
-    });
-    // An updated server: the exact count wins over the limits.
-    expect(
-      deviceEffectiveVcpuLimit({
-        effectiveVcpuLimitCount: 2147483648n,
-        limits: limits(536870912, 400),
-      }),
-    ).toBe(2147483648n);
-    expect(
-      deviceEffectiveVcpuLimit({
-        effectiveVcpuLimitCount: 7n,
-        limits: limits(5, 150),
-      }),
-    ).toBe(7n);
-    // An older server never sets the count: derive it from the limits.
-    expect(
-      deviceEffectiveVcpuLimit({
-        effectiveVcpuLimitCount: 0n,
-        limits: limits(536870912, 400),
-      }),
-    ).toBe(2147483648n);
-    expect(
-      deviceEffectiveVcpuLimit({
-        effectiveVcpuLimitCount: 0n,
-        limits: limits(2147483647, 400),
-      }),
-    ).toBe(8589934588n);
-    expect(
-      deviceEffectiveVcpuLimit({
-        effectiveVcpuLimitCount: 0n,
-        limits: limits(5, 150),
-      }),
-    ).toBe(7n);
-    // Zero limits, and a device without limits, report 0.
-    expect(
-      deviceEffectiveVcpuLimit({
-        effectiveVcpuLimitCount: 0n,
-        limits: limits(0, 100),
-      }),
-    ).toBe(0n);
-    expect(deviceEffectiveVcpuLimit({ effectiveVcpuLimitCount: 0n })).toBe(0n);
-  });
-
   test("computes the effective vCPU limit with integer arithmetic", () => {
     expect(effectiveVcpuLimit(16, 150)).toBe(24);
     expect(effectiveVcpuLimit(3, 125)).toBe(3);

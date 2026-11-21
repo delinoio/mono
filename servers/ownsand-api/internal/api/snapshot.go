@@ -38,8 +38,7 @@ type snapshotRow struct {
 	lineage string
 	// exportCommandID is the command ID of the latest export attempt; it is
 	// also the attempt ID in the object keys of the attempt's parts. It is
-	// empty for a snapshot that was never exported and for an export that
-	// started before attempt IDs existed (legacy object keys).
+	// empty for a snapshot that was never exported.
 	exportCommandID string
 	// exportChannelID is the ID of the agent channel that received the
 	// command of the latest export attempt.
@@ -225,7 +224,7 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 
 // failExportTx sets the EXPORTING snapshot snapshotID to EXPORT_FAILED and
 // records a clean-up job for the objects that the attempt attemptID may have
-// uploaded (the legacy part prefix when attemptID is empty). The caller holds
+// uploaded. The caller holds
 // the snapshot row with FOR UPDATE, so the job's final_sweep_after is
 // computed after the last upload URL of the attempt was signed: the attempt
 // can sign no more URL once the row is not EXPORTING. The failed attempt's
@@ -243,18 +242,12 @@ func (s *Service) failExportTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID
 }
 
 // attemptPrefix is the R2 key prefix of the objects of one export attempt.
-// An empty attemptID selects the prefix of the legacy keys that exports
-// wrote before attempt IDs existed.
 func attemptPrefix(orgID, snapshotID, attemptID string) string {
-	if attemptID == "" {
-		return snapshotPrefix(orgID, snapshotID) + "parts/"
-	}
 	return snapshotPrefix(orgID, snapshotID) + "attempts/" + attemptID + "/"
 }
 
 // partKey is the R2 object key of one exported part of the attempt
-// attemptID. An empty attemptID selects the legacy key of an export that
-// started before attempt IDs existed, which stays downloadable.
+// attemptID.
 func partKey(orgID, snapshotID, attemptID string, part int32) string {
 	return fmt.Sprintf("%s%d", attemptPrefix(orgID, snapshotID, attemptID), part)
 }
@@ -316,10 +309,9 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 		switch r.GetOperation() {
 		case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_UPLOAD:
 			// The owner is the channel that received the command of the
-			// attempt: a channel that replaced it, or an export without an
-			// owner (started before owners were recorded), gets no URL.
+			// attempt: a channel that replaced it gets no URL.
 			if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || sn.pb.GetDeviceId() != conn.DeviceID ||
-				sn.exportChannelID == "" || sn.exportChannelID != conn.ID {
+				sn.exportChannelID != conn.ID {
 				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not being exported by this channel")
 			}
 			presign = s.Objects.PresignPut
@@ -344,7 +336,7 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 				return refuse(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid part number")
 			}
 			// Uploads use the current attempt; downloads use the successful
-			// attempt, which the row keeps (empty for a legacy export).
+			// attempt, which the row keeps.
 			u, exp, err := presign(partKey(conn.OrganizationID, sn.pb.GetSnapshotId(), sn.exportCommandID, n), signedURLLifetime)
 			if err != nil {
 				return refuse(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "signing failed")
@@ -499,14 +491,10 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			// (the channel was replaced while the claim committed): fail the
 			// attempt and start a new one.
 			live := h.Hub.Live(sn.pb.GetDeviceId())
-			if live == nil || (sn.exportChannelID != "" && live.ID == sn.exportChannelID) {
+			if live == nil || live.ID == sn.exportChannelID {
 				return nil
 			}
-			reason := "owner_channel_replaced"
-			if sn.exportChannelID == "" {
-				reason = "owner_unknown"
-			}
-			if err := h.failExportTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.exportCommandID, reason); err != nil {
+			if err := h.failExportTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.exportCommandID, "owner_channel_replaced"); err != nil {
 				return err
 			}
 		}
