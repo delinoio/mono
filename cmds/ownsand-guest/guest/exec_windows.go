@@ -6,15 +6,17 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
 // forceAfterTerminate: Windows guests terminate the process tree at once.
 const forceAfterTerminate = false
 
-func setProcessGroup(cmd *exec.Cmd) {
-	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
-}
+// envKeyFold: Windows environment variable names are case-insensitive. Go's
+// os/exec folds with strings.ToLower when it removes duplicates, so the merge
+// must fold the same way.
+func envKeyFold(key string) string { return strings.ToLower(key) }
 
 // terminate ends the process tree with taskkill, which every supported
 // Windows edition includes. A job object would also catch children that
@@ -28,6 +30,10 @@ func terminate(p *os.Process) {
 func kill(p *os.Process) {
 	_ = p.Kill()
 }
+
+// processGroupAlive is never consulted on Windows because forceAfterTerminate
+// is false; taskkill ends the tree at once.
+func processGroupAlive(*os.Process) bool { return false }
 
 // exitStatus keeps the full 32-bit exit code; Windows has no signals.
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {

@@ -15,7 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
@@ -164,6 +164,129 @@ func TestInvitations(t *testing.T) {
 	}
 }
 
+// countJoined returns the number of MEMBER_JOINED audit events of an organization.
+func countJoined(t *testing.T, env *testenv.Env, orgID string) int {
+	t.Helper()
+	var n int
+	if err := env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2",
+		orgID, int16(ownsandv1.AuditAction_AUDIT_ACTION_MEMBER_JOINED)).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// pendingInvitation reports whether the invitation still has no accept time.
+func pendingInvitation(t *testing.T, env *testenv.Env, invitationID string) bool {
+	t.Helper()
+	var pending bool
+	if err := env.DB.Pool.QueryRow(context.Background(), "SELECT accept_time IS NULL FROM invitations WHERE invitation_id = $1", invitationID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	return pending
+}
+
+// A concurrent acceptance by the same user, which loses the race on the
+// membership unique index, gets already_exists and leaves its invitation
+// unused and unaudited.
+func TestInvitationsConcurrentAcceptByMember(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	invB, err := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedBefore := countJoined(t, env, org.ID)
+	// This transaction plays the first acceptance: its membership insert is
+	// not committed yet, so the second acceptance passes its existence check
+	// and then waits on the unique index.
+	membershipID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, 'erin', $3, now())",
+		membershipID, org.ID, int16(ownsandv1.Role_ROLE_MEMBER)); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := env.User("erin").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: invB.Msg.GetInvitationSecret()}))
+		result <- err
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked bool
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO memberships%')").Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second acceptance never blocked on the membership insert")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; testenv.Code(err) != connect.CodeAlreadyExists {
+		t.Fatalf("losing concurrent accept: %v", err)
+	}
+	var memberships int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM memberships WHERE organization_id = $1 AND user_id = 'erin'", org.ID).Scan(&memberships); err != nil || memberships != 1 {
+		t.Fatalf("memberships of erin = %d, %v", memberships, err)
+	}
+	if got := countJoined(t, env, org.ID); got != joinedBefore {
+		t.Fatalf("MEMBER_JOINED events = %d, want %d", got, joinedBefore)
+	}
+	if !pendingInvitation(t, env, invB.Msg.GetInvitation().GetInvitationId()) {
+		t.Fatal("the losing acceptance used the invitation")
+	}
+	if _, err := env.User("frank").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: invB.Msg.GetInvitationSecret()})); err != nil {
+		t.Fatalf("another user accepts the unused invitation: %v", err)
+	}
+}
+
+// A unique violation other than the (organization, user) membership key
+// still fails as internal and leaves the invitation pending.
+func TestInvitationsUnrelatedUniqueViolation(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	other := env.NewOrg("bob")
+	// gina already belongs to another organization. The test-only index
+	// then makes a second membership of gina violate a unique key that is
+	// not the (organization, user) key.
+	env.Join(other.ID, other.OwnerClient, "gina", ownsandv1.Role_ROLE_MEMBER)
+	if _, err := env.DB.Pool.Exec(ctx, "CREATE UNIQUE INDEX test_memberships_gina_only ON memberships (user_id) WHERE user_id = 'gina'"); err != nil {
+		t.Fatal(err)
+	}
+	inv, err := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedBefore := countJoined(t, env, org.ID)
+	if _, err := env.User("gina").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: inv.Msg.GetInvitationSecret()})); testenv.Code(err) != connect.CodeInternal {
+		t.Fatalf("unrelated unique violation: %v", err)
+	}
+	var memberships int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM memberships WHERE organization_id = $1 AND user_id = 'gina'", org.ID).Scan(&memberships); err != nil || memberships != 0 {
+		t.Fatalf("memberships of gina = %d, %v", memberships, err)
+	}
+	if got := countJoined(t, env, org.ID); got != joinedBefore {
+		t.Fatalf("MEMBER_JOINED events = %d, want %d", got, joinedBefore)
+	}
+	if !pendingInvitation(t, env, inv.Msg.GetInvitation().GetInvitationId()) {
+		t.Fatal("the failed acceptance used the invitation")
+	}
+}
+
 func TestAPIKeyLifecycle(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()
@@ -189,6 +312,76 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	var revoked int
 	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM control_events WHERE kind = 1 AND api_key_id = $1", org.APIKeyID).Scan(&revoked); err != nil || revoked != 1 {
 		t.Fatalf("api key revocation events = %d, %v", revoked, err)
+	}
+}
+
+func TestAPIKeyOrganizationIDCase(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	var org, other *testenv.Org
+	// Organization IDs contain hex letters in most cases; retry until the
+	// ID has a letter so that the uppercase spelling differs.
+	for i := 0; i < 50; i++ {
+		org = env.NewOrg("alice")
+		if strings.ToUpper(org.ID) != org.ID {
+			break
+		}
+	}
+	if strings.ToUpper(org.ID) == org.ID {
+		t.Skip("no organization ID with a hex letter")
+	}
+	other = env.NewOrg("bob")
+	key := env.Clients(org.APIKey)
+	list := func(id string) (*connect.Response[ownsandv1.ListDevicesResponse], error) {
+		return key.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: id}))
+	}
+	lower, err := list(org.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper, err := list(strings.ToUpper(org.ID))
+	if err != nil {
+		t.Fatalf("uppercase own organization id: %v", err)
+	}
+	if len(lower.Msg.GetDevices()) != len(upper.Msg.GetDevices()) {
+		t.Fatal("results differ between spellings")
+	}
+	if _, err := list(strings.ToUpper(other.ID)); testenv.Code(err) != connect.CodeNotFound {
+		t.Fatalf("other organization: %v", err)
+	}
+	if _, err := list("not-a-uuid"); testenv.Code(err) != connect.CodeInvalidArgument {
+		t.Fatalf("invalid id: %v", err)
+	}
+}
+
+func TestChallengeRateLimitSharesBucketAcrossCase(t *testing.T) {
+	limits := api.Limits{
+		PerDevice: ratelimit.New(0.001, 2, nil),
+		PerPrefix: ratelimit.New(1000, 1000, nil),
+		PerClient: ratelimit.New(1000, 1000, nil),
+	}
+	env := testenv.New(t, func(o *app.Options) { o.Limits = &limits })
+	ctx := context.Background()
+	var id string
+	for {
+		id, _ = uuidv7.NewString()
+		if strings.ToUpper(id) != id {
+			break
+		}
+	}
+	agent := env.Clients("").Agent
+	call := func(d string) error {
+		_, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: d}))
+		return err
+	}
+	if err := call(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(strings.ToUpper(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(id); testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("third spelling-mixed challenge: %v", err)
 	}
 }
 
@@ -434,6 +627,112 @@ func TestRemovedDeviceAfterOrganizationDeletion(t *testing.T) {
 	}
 	if _, err := org.OwnerClient.Organization.GetOrganization(ctx, connect.NewRequest(&ownsandv1.GetOrganizationRequest{OrganizationId: org.ID})); testenv.Code(err) != connect.CodeNotFound {
 		t.Fatalf("get after deletion: %v", err)
+	}
+}
+
+// TestRemovedDeviceRowsHoldNoInventory removes one device with RemoveDevice
+// and another with DeleteOrganization, and checks that both tombstones hold
+// no inventory (also after a late capability and update-field write), keep
+// their identity and expiry, and still answer the signed removal paths.
+func TestRemovedDeviceRowsHoldNoInventory(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	viaRPC := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_MACOS, ownsandv1.Arch_ARCH_ARM64)
+	viaOrg := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	keep := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	for _, d := range []*testenv.Device{viaRPC, viaOrg, keep} {
+		if _, err := org.OwnerClient.Device.UpdateDeviceLimits(ctx, connect.NewRequest(&ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: org.ID, DeviceId: d.ID,
+			Limits: &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 4096, DiskGib: 100, VcpuOvercommitPercent: 150}})); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := env.DB.Pool.Exec(ctx, `UPDATE devices SET name = 'secret-name', agent_version = '2.3.4', update_state = 2, update_target_version = '2.4.0',
+			pending_idle_since = now(), capabilities = '\x0a00', last_seen_time = now(), state_epoch = $2 WHERE device_id = $1`, d.ID, d.Epoch); err != nil {
+			t.Fatal(err)
+		}
+	}
+	inventoryRows := func(id string) (name, version, epoch string, limit, overcommit int32, caps, idle, seen bool) {
+		t.Helper()
+		if err := env.DB.Pool.QueryRow(ctx, `SELECT name, agent_version, state_epoch, limit_vcpu_count, vcpu_overcommit_percent,
+			capabilities IS NOT NULL, pending_idle_since IS NOT NULL, last_seen_time IS NOT NULL FROM devices WHERE device_id = $1`, id).
+			Scan(&name, &version, &epoch, &limit, &overcommit, &caps, &idle, &seen); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if name, version, _, limit, _, caps, _, _ := inventoryRows(viaRPC.ID); name != "secret-name" || version != "2.3.4" || limit != 8 || !caps {
+		t.Fatalf("active device before removal holds no inventory: %q %q %d %v", name, version, limit, caps)
+	}
+
+	removed, err := org.OwnerClient.Device.RemoveDevice(ctx, connect.NewRequest(&ownsandv1.RemoveDeviceRequest{OrganizationId: org.ID, DeviceId: viaRPC.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The RemoveDevice response reads the tombstone: state and IDs stay, the
+	// inventory fields are blank.
+	rd := removed.Msg.GetDevice()
+	if rd.GetState() != ownsandv1.DeviceState_DEVICE_STATE_REMOVED || rd.GetDeviceId() != viaRPC.ID || rd.GetOrganizationId() != org.ID ||
+		rd.GetName() != "" || rd.GetAgentVersion() != "" || rd.GetCapabilities() != nil || rd.GetLimits().GetVcpuCount() != 0 || rd.GetEffectiveVcpuLimit() != 0 {
+		t.Fatalf("RemoveDevice response = %v", rd)
+	}
+	// ListDevices(state=REMOVED) shows the same blank tombstone.
+	removedState := ownsandv1.DeviceState_DEVICE_STATE_REMOVED
+	list, err := org.OwnerClient.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID, State: &removedState}))
+	if err != nil || len(list.Msg.GetDevices()) != 1 || list.Msg.GetDevices()[0].GetName() != "" || list.Msg.GetDevices()[0].GetDeviceId() != viaRPC.ID {
+		t.Fatalf("ListDevices(removed) = %v, %v", list, err)
+	}
+
+	// A late capability report, update fields and built images on the
+	// tombstone cannot restore inventory.
+	if _, err := env.DB.Pool.Exec(ctx, `UPDATE devices SET capabilities = '\x0a00', update_state = 2, update_target_version = '9.9.9', name = 'late',
+		limit_vcpu_count = 16, last_seen_time = now() WHERE device_id = $1`, viaRPC.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{viaRPC.ID, viaOrg.ID, keep.ID} {
+		name, version, epoch, limit, overcommit, caps, idle, seen := inventoryRows(id)
+		if name != "" || version != "" || epoch != "" || limit != 0 || overcommit != 100 || caps || idle || seen {
+			t.Fatalf("tombstone %s holds inventory: %q %q %q %d %d %v %v %v", id, name, version, epoch, limit, overcommit, caps, idle, seen)
+		}
+		var state int16
+		var key []byte
+		var orgID string
+		var removeTime, expire *time.Time
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT state, public_key, organization_id::text, remove_time, tombstone_expire_time FROM devices WHERE device_id = $1", id).
+			Scan(&state, &key, &orgID, &removeTime, &expire); err != nil {
+			t.Fatal(err)
+		}
+		if ownsandv1.DeviceState(state) != ownsandv1.DeviceState_DEVICE_STATE_REMOVED || len(key) != 32 || orgID != org.ID || removeTime == nil || expire == nil {
+			t.Fatalf("tombstone %s identity: state %d, key %d bytes, org %s, remove %v, expire %v", id, state, len(key), orgID, removeTime, expire)
+		}
+	}
+
+	// The removal notice and the signed confirmation work on a scrubbed row.
+	for _, d := range []*testenv.Device{viaRPC, viaOrg} {
+		resp, err := env.Authenticate(d)
+		if err != nil || resp.GetRemovalNotice() == nil || resp.GetSession() != nil {
+			t.Fatalf("authenticate removed device %s: %v, %v", d.ID, resp, err)
+		}
+	}
+	agent := env.Clients("").Agent
+	ch, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: viaRPC.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := agent.ConfirmRemoval(ctx, connect.NewRequest(&ownsandv1.ConfirmRemovalRequest{DeviceId: viaRPC.ID, Nonce: ch.Msg.GetNonce(),
+		Signature: viaRPC.Sign(auth.PurposeConfirmRemoval, ch.Msg.GetNonce())})); err != nil {
+		t.Fatalf("confirm removal: %v", err)
+	}
+	var left int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM devices WHERE device_id = $1", viaRPC.ID).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("tombstone rows after confirmation = %d, %v", left, err)
+	}
+	// An unconfirmed tombstone still expires.
+	env.Clock.Advance(366 * 24 * time.Hour)
+	if _, err := env.Authenticate(viaOrg); testenv.Code(err) != connect.CodeNotFound {
+		t.Fatalf("expired tombstone: %v", err)
 	}
 }
 

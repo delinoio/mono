@@ -6,7 +6,9 @@ import {
   fireEvent,
   render,
   screen,
+  within,
 } from "@testing-library/react";
+import { Code, ConnectError, type Transport } from "@connectrpc/connect";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
@@ -19,13 +21,19 @@ import {
   MOCK_USER,
 } from "./mock/mock-api.ts";
 
+/** The seeded Acme invitation, which the mock user cannot accept: already a member. */
+const MOCK_ACME_INVITATION_SECRET = "osi_7f3a_unused";
+
 const config = {
   apiOrigin: "https://api.test",
   authMode: AuthMode.Mock,
   logto: undefined,
 };
 
-function renderConsole(path: string, options: { signedIn?: boolean } = {}) {
+function renderConsole(
+  path: string,
+  options: { signedIn?: boolean; transport?: Transport } = {},
+) {
   window.history.replaceState(null, "", path);
   const signIns: number[] = [];
   const signedIn = options.signedIn ?? true;
@@ -46,7 +54,7 @@ function renderConsole(path: string, options: { signedIn?: boolean } = {}) {
     <AuthContextProvider value={auth}>
       <Console
         config={config}
-        transport={createMockTransport()}
+        transport={options.transport ?? createMockTransport()}
         queryClient={queryClient}
       />
     </AuthContextProvider>,
@@ -198,6 +206,24 @@ describe("devices", () => {
       await screen.findByText("10 of 3000000000 (2000000000 × 1.5)"),
     ).toBeTruthy();
   });
+
+  test("a removed device disappears from the device list", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Remove device" }),
+      );
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Remove device" }),
+      );
+    });
+    await settle(100);
+    expect(await screen.findByText("studio-mac")).toBeTruthy();
+    expect(screen.queryByText("build-box-1")).toBeNull();
+  });
 });
 
 describe("invitations", () => {
@@ -232,8 +258,9 @@ describe("invitations", () => {
     );
   });
 
-  test("deletes the stored secret also when AcceptInvitation fails", async () => {
-    pendingInvitation.save("osi_wrong");
+  test("deletes the stored secret and shows the error with the accept button when AcceptInvitation fails", async () => {
+    // The mock user already belongs to Acme, so the control plane refuses it.
+    pendingInvitation.save(MOCK_ACME_INVITATION_SECRET);
     renderConsole("/invitations/accept");
     await act(async () => {
       fireEvent.click(
@@ -242,5 +269,76 @@ describe("invitations", () => {
     });
     await settle(60);
     expect(pendingInvitation.read()).toBeUndefined();
+    expect(await screen.findByText("you are already a member")).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(screen.queryByText(/needs an invitation link/)).toBeNull();
+  });
+
+  test("accepts again with the same secret after a transient failure", async () => {
+    const mock = createMockTransport();
+    let acceptCalls = 0;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "AcceptInvitation") {
+          acceptCalls += 1;
+          if (acceptCalls === 1) {
+            throw new ConnectError("down", Code.Unavailable);
+          }
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { transport });
+    const click = async () => {
+      await act(async () => {
+        fireEvent.click(
+          await screen.findByRole("button", { name: "Accept invitation" }),
+        );
+      });
+      await settle(60);
+    };
+    await click();
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(await screen.findByText(/not available right now/)).toBeTruthy();
+    expect(window.location.pathname).toBe("/invitations/accept");
+    await click();
+    expect(acceptCalls).toBe(2);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+    );
+  });
+
+  test("clears the previous error when a new invitation link opens", async () => {
+    pendingInvitation.save(MOCK_ACME_INVITATION_SECRET);
+    renderConsole("/invitations/accept");
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await settle(60);
+    expect(await screen.findByText("you are already a member")).toBeTruthy();
+    await act(async () => {
+      window.location.hash = `secret=${MOCK_INVITATION_SECRET}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await settle(30);
+    expect(screen.queryByText("you are already a member")).toBeNull();
+    expect(
+      screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+  });
+
+  test("shows the missing-secret screen when the page opens without a secret", async () => {
+    renderConsole("/invitations/accept");
+    expect(await screen.findByText(/needs an invitation link/)).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Accept invitation" }),
+    ).toBeNull();
   });
 });
