@@ -31,7 +31,7 @@ Random UUID PKs (v4) can cause index fragmentation; UUIDs are also larger (16 vs
 Prefer CHECK constraints over ENUM types — they're easier to modify:
 
 ```sql
-CREATE TABLE order (
+CREATE TABLE customer_order (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   status TEXT NOT NULL CHECK (status IN ('pending', 'shipped', 'delivered'))
 );
@@ -44,11 +44,11 @@ CREATE TABLE order (
 - Suggestion: use `ON DELETE CASCADE` or `ON DELETE SET NULL` explicitly
 
 ```sql
-CREATE TABLE order (
+CREATE TABLE customer_order (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   customer_id BIGINT NOT NULL REFERENCES customer(id) ON DELETE CASCADE
 );
-CREATE INDEX order_customer_id_idx ON order (customer_id);
+CREATE INDEX customer_order_customer_id_idx ON customer_order (customer_id);
 ```
 
 ## Naming Conventions
