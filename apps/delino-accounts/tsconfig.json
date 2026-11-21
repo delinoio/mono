@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "lib": ["DOM", "ES2023"],
+    "lib": ["DOM", "DOM.Iterable", "ES2023"],
     "jsx": "react-jsx",
     "target": "ES2023",
     "noEmit": true,
@@ -18,5 +18,11 @@
     "noUnusedLocals": true,
     "noUnusedParameters": true
   },
-  "include": ["src", "e2e", "rsbuild.config.ts", "e2e.config.ts"]
+  "include": [
+    "src",
+    "e2e",
+    "rsbuild.config.ts",
+    "e2e.config.ts",
+    "rstest.config.ts"
+  ]
 }

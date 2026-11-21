@@ -3,10 +3,24 @@
   "extends": ["//"],
   "tasks": {
     "dev": {
-      "passThroughEnv": ["PUBLIC_API_ORIGIN", "PORTLESS", "PORTLESS_*"]
+      "passThroughEnv": [
+        "PUBLIC_API_ORIGIN",
+        "PUBLIC_LOGTO_ENDPOINT",
+        "PUBLIC_LOGTO_APP_ID",
+        "PUBLIC_PADDLE_CLIENT_TOKEN",
+        "PUBLIC_PADDLE_ENVIRONMENT",
+        "PORTLESS",
+        "PORTLESS_*"
+      ]
     },
     "build": {
-      "env": ["PUBLIC_API_ORIGIN"],
+      "env": [
+        "PUBLIC_API_ORIGIN",
+        "PUBLIC_LOGTO_ENDPOINT",
+        "PUBLIC_LOGTO_APP_ID",
+        "PUBLIC_PADDLE_CLIENT_TOKEN",
+        "PUBLIC_PADDLE_ENVIRONMENT"
+      ],
       "inputs": ["$TURBO_DEFAULT$", ".env", ".env.*"]
     }
   }

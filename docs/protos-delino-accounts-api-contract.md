@@ -6,11 +6,11 @@ This contract owns the Connect RPC schemas of [`delino-accounts`](project-delino
 
 - `protos/delino/accounts/v1/`: `.proto` files of the protobuf package `delino.accounts.v1`.
 - The generated Go bindings, committed next to the schemas: message code in the Go package `github.com/delinoio/mono/protos/delino/accounts/v1` (package name `accountsv1`) and Connect handlers and clients in its `accountsv1connect` subpackage.
-- The generated TypeScript bindings (`planned`) for the [web app](apps-delino-accounts-foundation.md) in `apps/delino-accounts/src/gen/`, with their template `apps/delino-accounts/buf.gen.yaml`. `scripts/protos.sh` generates and checks them together with the Go bindings, as it does for the OwnSand schemas.
+- The generated TypeScript bindings for the [web app](apps-delino-accounts-foundation.md) in `apps/delino-accounts/src/gen/`, with their template `apps/delino-accounts/buf.gen.yaml`. `scripts/protos.sh` generates and checks them together with the Go bindings, as it does for the OwnSand schemas.
 
 The schemas share `protos/buf.yaml`, `protos/buf.gen.yaml` and `scripts/protos.sh` with the OwnSand schemas. The [OwnSand protos contract](protos-ownsand-api-contract.md#build-and-test) owns these tools and their versions.
 
-`scripts/protos.sh` generates and checks the Go bindings of every schema under `protos/`, so the accounts schemas need no separate Go target. The TypeScript bindings stay `planned` until the web app consumes the schemas; that change adds the `delino/accounts` TypeScript target to the generation and drift check of `scripts/protos.sh`.
+`scripts/protos.sh` generates and checks the Go bindings of every schema under `protos/`, so the accounts schemas need no separate Go target. It also generates and checks the TypeScript bindings of `delino/accounts` with the web app template.
 
 Schema files:
 
@@ -185,7 +185,7 @@ The schemas define no logging. Components log RPC names, identifiers, enum value
 
 ## Build and Test
 
-- Generation, lint, formatting, breaking-change and drift checks: `scripts/protos.sh generate`, `check` and `breaking`, as the [OwnSand protos contract](protos-ownsand-api-contract.md#build-and-test) describes; they cover the `delino/accounts` schemas with the Go bindings. The change that adds the TypeScript bindings of the web app extends the script and its fixtures to the web app template.
+- Generation, lint, formatting, breaking-change and drift checks: `scripts/protos.sh generate`, `check` and `breaking`, as the [OwnSand protos contract](protos-ownsand-api-contract.md#build-and-test) describes; they cover the `delino/accounts` schemas with the Go bindings and with the TypeScript bindings of the web app: the script runs `buf generate` with the template `apps/delino-accounts/buf.gen.yaml` and `--path delino/accounts`, replaces `apps/delino-accounts/src/gen/` only after every generator succeeded, and its drift check fails when the committed web app bindings differ from the generated output. `scripts/ci/protos-generate.test.mjs` covers the web app target together with the OwnSand SDK target. A change of `apps/delino-accounts/buf.gen.yaml`, `apps/delino-accounts/package.json` or a file under `apps/delino-accounts/src/gen/` selects the CI `protos` job, according to the [workflow contract](repository-workflow-contract.md#validation). The shared formatter excludes `apps/delino-accounts/src/gen/`.
 - `protos/delino/accounts/v1/schema_test.go` checks that every enum of the package has an `_UNSPECIFIED` zero value, that every field whose name mentions `usd` is a singular `int64` that ends with `_usd_micros`, and that each `Meter` value maps to its stable `<service>.<meter>` identifier, so a renamed or removed meter fails.
 - The OwnSand `schema_test.go` checks that each OwnSand `BillingMeter` value has exactly one `Meter` value of OwnSand with the same name, and the reverse (see the [OwnSand protos contract](protos-ownsand-api-contract.md#build-and-test)).
 

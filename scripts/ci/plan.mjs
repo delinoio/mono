@@ -100,10 +100,10 @@ export function isWorkflowInput(path) {
 }
 
 // Protobuf schema inputs: the schemas, the buf configuration, the generation
-// script and the TypeScript generation template and plugin pin of the OwnSand
-// SDK. The protos job, which the `go` output selects, lints them, checks
-// breaking changes and fails when the committed Go or TypeScript bindings
-// differ from the generated output.
+// script and the TypeScript generation templates and plugin pins of the
+// OwnSand SDK and the delino-accounts web app. The protos job, which the `go`
+// output selects, lints them, checks breaking changes and fails when the
+// committed Go or TypeScript bindings differ from the generated output.
 const protoInputs = new Set([
   "protos/buf.yaml",
   "protos/buf.gen.yaml",
@@ -111,7 +111,13 @@ const protoInputs = new Set([
   "scripts/protos.sh",
   "packages/ownsand-sdk/buf.gen.yaml",
   "packages/ownsand-sdk/package.json",
+  "apps/delino-accounts/buf.gen.yaml",
+  "apps/delino-accounts/package.json",
 ]);
+
+// The committed TypeScript bindings of the delino-accounts web app, which the
+// drift check of the protos job compares.
+const accountsWebBindings = "apps/delino-accounts/src/gen/";
 
 // The OwnSand SDK package. The drift check compares its committed TypeScript
 // bindings, and the OwnSand end-to-end suite (servers/ownsand-api/e2e) runs
@@ -161,6 +167,7 @@ export function isGoInput(path) {
     protoInputs.has(path) ||
     goWorkspaceInputs.has(path) ||
     path.startsWith(ownsandSdkPackage) ||
+    path.startsWith(accountsWebBindings) ||
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
     goTestdata.test(path)

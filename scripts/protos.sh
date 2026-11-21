@@ -16,35 +16,41 @@
 set -euo pipefail
 
 # Exact tool versions. protoc-gen-go and protoc-gen-connect-go are pinned in
-# protos/buf.gen.yaml; protoc-gen-es is pinned in
-# packages/ownsand-sdk/package.json.
+# protos/buf.gen.yaml; protoc-gen-es is pinned in the package.json of each
+# TypeScript target below (packages/ownsand-sdk and apps/delino-accounts).
 readonly BUF_MODULE="github.com/bufbuild/buf/cmd/buf"
 readonly BUF_VERSION="v1.72.0"
 
 root="$(git rev-parse --show-toplevel)"
 readonly root
 readonly protos_dir="$root/protos"
-# TypeScript bindings of the OwnSand schemas, owned by the TypeScript SDK
-# (docs/packages-ownsand-sdk-foundation.md).
-readonly ts_package_dir="$root/packages/ownsand-sdk"
-readonly ts_template="$ts_package_dir/buf.gen.yaml"
-readonly ts_gen_dir="$ts_package_dir/src/gen"
+# TypeScript targets: "<package directory relative to the root>:<schema
+# path under protos/>". Each package owns its template `buf.gen.yaml`, its
+# pinned protoc-gen-es and the generated bindings in `src/gen/`.
+# - packages/ownsand-sdk: the OwnSand schemas, owned by the TypeScript SDK
+#   (docs/packages-ownsand-sdk-foundation.md).
+# - apps/delino-accounts: the delino-accounts schemas, owned by the web app
+#   (docs/protos-delino-accounts-api-contract.md).
+readonly ts_targets=(
+  "packages/ownsand-sdk:delino/ownsand"
+  "apps/delino-accounts:delino/accounts"
+)
 
 buf() {
   (cd "$protos_dir" && go run "${BUF_MODULE}@${BUF_VERSION}" "$@")
 }
 
-# Runs `buf generate` with the TypeScript template into the package
-# directory $1. The plugin comes from the package's node_modules, which
-# `pnpm install` creates.
+# Runs `buf generate` for the TypeScript target $1 (package directory
+# relative to the root) and schema path $2 into the directory $3. The plugin
+# comes from the package's node_modules, which `pnpm install` creates.
 buf_generate_ts() {
-  local out="$1"
-  local plugin_bin="$ts_package_dir/node_modules/.bin"
+  local package="$1" schemas="$2" out="$3"
+  local plugin_bin="$root/$package/node_modules/.bin"
   if [[ ! -x "$plugin_bin/protoc-gen-es" ]]; then
     echo "protos: $plugin_bin/protoc-gen-es is missing; run pnpm install at the repository root" >&2
     exit 1
   fi
-  PATH="$plugin_bin:$PATH" buf generate --template "$ts_template" --path delino/ownsand --output "$out"
+  PATH="$plugin_bin:$PATH" buf generate --template "$root/$package/buf.gen.yaml" --path "$schemas" --output "$out"
 }
 
 # Generated Go files, relative to protos/, sorted.
@@ -64,23 +70,34 @@ generated_ts_files() {
 
 generate() {
   buf format --write
-  # Generate both languages into a temporary directory first. The committed
-  # bindings are replaced only after both generators succeeded, so a failing
-  # generator or a missing TypeScript plugin leaves every committed binding
-  # untouched. buf_generate_ts exits the script on a missing plugin; the EXIT
-  # trap still removes the temporary directory then.
+  # Generate every language and target into a temporary directory first. The
+  # committed bindings are replaced only after every generator succeeded, so
+  # a failing generator or a missing TypeScript plugin leaves every committed
+  # binding untouched. buf_generate_ts exits the script on a missing plugin;
+  # the EXIT trap still removes the temporary directory then.
   local tmp
   tmp="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" EXIT
-  local go_out="$tmp/go" ts_out="$tmp/ts"
-  mkdir -p "$go_out" "$ts_out"
+  local go_out="$tmp/go"
+  mkdir -p "$go_out"
   buf generate --output "$go_out"
-  buf_generate_ts "$ts_out"
-  if [[ -z "$(generated_files "$go_out")" || -z "$(generated_ts_files "$ts_out/src/gen")" ]]; then
+  if [[ -z "$(generated_files "$go_out")" ]]; then
     echo "protos: a generator produced no files; the committed bindings are unchanged" >&2
     exit 1
   fi
+  local target package schemas i=0
+  for target in "${ts_targets[@]}"; do
+    package="${target%%:*}"
+    schemas="${target#*:}"
+    mkdir -p "$tmp/ts$i"
+    buf_generate_ts "$package" "$schemas" "$tmp/ts$i"
+    if [[ -z "$(generated_ts_files "$tmp/ts$i/src/gen")" ]]; then
+      echo "protos: a generator produced no files; the committed bindings are unchanged" >&2
+      exit 1
+    fi
+    i=$((i + 1))
+  done
 
   # Replace the committed bindings. Removing the old generated files first
   # leaves no stale binding behind for a removed schema file.
@@ -90,25 +107,32 @@ generate() {
     mkdir -p "$protos_dir/$(dirname "$file")"
     cp "$go_out/$file" "$protos_dir/$file"
   done < <(generated_files "$go_out")
-  rm -rf "$ts_gen_dir"
-  mkdir -p "$ts_gen_dir"
-  cp -R "$ts_out/src/gen/." "$ts_gen_dir/"
+  i=0
+  for target in "${ts_targets[@]}"; do
+    package="${target%%:*}"
+    rm -rf "$root/$package/src/gen"
+    mkdir -p "$root/$package/src/gen"
+    cp -R "$tmp/ts$i/src/gen/." "$root/$package/src/gen/"
+    i=$((i + 1))
+  done
   echo "protos: regenerated Go and TypeScript bindings with buf ${BUF_VERSION}"
 }
 
-# Compares the committed TypeScript bindings with a fresh generation in a
-# temporary directory.
+# Compares the committed TypeScript bindings of the target $1 (package
+# directory) and $2 (schema path) with a fresh generation in the temporary
+# directory $3.
 check_ts() {
-  local tmp="$1"
-  buf_generate_ts "$tmp"
-  if ! diff -u <(generated_ts_files "$ts_gen_dir") <(generated_ts_files "$tmp/src/gen"); then
-    echo "protos: the set of committed TypeScript bindings differs from the generated output; run scripts/protos.sh generate" >&2
+  local package="$1" schemas="$2" tmp="$3"
+  local gen_dir="$root/$package/src/gen"
+  buf_generate_ts "$package" "$schemas" "$tmp"
+  if ! diff -u <(generated_ts_files "$gen_dir") <(generated_ts_files "$tmp/src/gen"); then
+    echo "protos: the set of committed TypeScript bindings in $package/src/gen differs from the generated output; run scripts/protos.sh generate" >&2
     exit 1
   fi
   local file drift=0
   while IFS= read -r file; do
-    if ! cmp -s "$ts_gen_dir/$file" "$tmp/src/gen/$file"; then
-      echo "protos: committed binding differs from the generated output: packages/ownsand-sdk/src/gen/${file#./}" >&2
+    if ! cmp -s "$gen_dir/$file" "$tmp/src/gen/$file"; then
+      echo "protos: committed binding differs from the generated output: $package/src/gen/${file#./}" >&2
       drift=1
     fi
   done < <(generated_ts_files "$tmp/src/gen")
@@ -128,8 +152,8 @@ check() {
   tmp="$(mktemp -d)"
   # shellcheck disable=SC2064
   trap "rm -rf '$tmp'" EXIT
-  local go_out="$tmp/go" ts_out="$tmp/ts"
-  mkdir -p "$go_out" "$ts_out"
+  local go_out="$tmp/go"
+  mkdir -p "$go_out"
   buf generate --output "$go_out"
   if ! diff -u <(generated_files "$protos_dir") <(generated_files "$go_out"); then
     echo "protos: the set of committed Go bindings differs from the generated output; run scripts/protos.sh generate" >&2
@@ -146,7 +170,12 @@ check() {
     echo "protos: run scripts/protos.sh generate and commit the result" >&2
     exit 1
   fi
-  check_ts "$ts_out"
+  local target i=0
+  for target in "${ts_targets[@]}"; do
+    mkdir -p "$tmp/ts$i"
+    check_ts "${target%%:*}" "${target#*:}" "$tmp/ts$i"
+    i=$((i + 1))
+  done
   echo "protos: lint, format and generated Go and TypeScript bindings are up to date"
 }
 
