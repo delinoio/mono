@@ -526,20 +526,36 @@ jobs:
     steps:
       - name: Check validation results
         env:
-          QUALITY_PLANNED: ${{ needs.changes.outputs.quality }}
-          GO_PLANNED: ${{ needs.changes.outputs.go }}
-          RUST_PLANNED: ${{ needs.changes.outputs.rust }}
-          E2E_PLANNED: ${{ needs.changes.outputs.e2e }}
-          WORKSPACE_PLANNED: ${{ needs.changes.outputs.workspace }}
-          WORKFLOWS_PLANNED: ${{ needs.changes.outputs.workflows }}
           NEEDS_RESULTS: ${{ toJSON(needs) }}
           VALIDATION_REVISION: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
+          # The planner output that selects each validation job. Keep exactly
+          # one entry for each job in `needs` other than `changes`: the check
+          # fails when the two job lists differ, so a new job cannot pass
+          # without an entry. A skipped job passes only when the planner did
+          # not select its output.
+          job_outputs='{
+            "quality": "quality",
+            "go": "go",
+            "protos": "go",
+            "rust": "rust",
+            "e2e": "e2e",
+            "workspace": "workspace",
+            "workflows": "workflows"
+          }'
           echo "Validation revision: $VALIDATION_REVISION" >> "$GITHUB_STEP_SUMMARY"
           echo "$NEEDS_RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' | tee -a "$GITHUB_STEP_SUMMARY"
-          if echo "$NEEDS_RESULTS" | jq -e --arg planned "$QUALITY_PLANNED" --arg go_planned "$GO_PLANNED" --arg rust_planned "$RUST_PLANNED" --arg e2e_planned "$E2E_PLANNED" --arg workspace_planned "$WORKSPACE_PLANNED" --arg workflows_planned "$WORKFLOWS_PLANNED" 'all(.[]; .result == "success" or .result == "skipped") and .changes.result == "success" and (.quality.result == "success" or (.quality.result == "skipped" and $planned == "false")) and (.go.result == "success" or (.go.result == "skipped" and $go_planned == "false")) and (.protos.result == "success" or (.protos.result == "skipped" and $go_planned == "false")) and (.rust.result == "success" or (.rust.result == "skipped" and $rust_planned == "false")) and (.e2e.result == "success" or (.e2e.result == "skipped" and $e2e_planned == "false")) and (.workspace.result == "success" or (.workspace.result == "skipped" and $workspace_planned == "false")) and (.workflows.result == "success" or (.workflows.result == "skipped" and $workflows_planned == "false"))' > /dev/null; then
+          if echo "$NEEDS_RESULTS" | jq -e --argjson outputs "$job_outputs" '
+            .changes.result == "success"
+            and ((keys - ["changes"]) == ($outputs | keys))
+            and (.changes.outputs as $planned
+              | del(.changes)
+              | to_entries
+              | all(.value.result == "success"
+                or (.value.result == "skipped" and $planned[$outputs[.key]] == "false")))
+          ' > /dev/null; then
             echo 'CI result: success' | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo 'CI result: failure' | tee -a "$GITHUB_STEP_SUMMARY"

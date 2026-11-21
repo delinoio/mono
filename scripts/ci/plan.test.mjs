@@ -1068,49 +1068,186 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
   );
 });
 
-// Read-only text check: the single `go` planner output must keep driving both
-// the Go job and the aggregate, so the planner's main-push selection is
-// enforced by ci-result without a workflow edit.
-test("CI workflow reads the planner go output for the Go job and the aggregate", () => {
+// Splits CI.yml into its jobs, keyed by job ID, in file order. A job body is
+// every following line that is empty or indented by at least four spaces.
+function workflowJobs() {
   const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  assert.match(workflow, /^\s+go: \$\{\{ steps\.plan\.outputs\.go \}\}$/m);
-  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.go == 'true'$/m);
-  assert.match(
-    workflow,
-    /^\s+GO_PLANNED: \$\{\{ needs\.changes\.outputs\.go \}\}$/m,
+  const jobsStart = workflow.indexOf("\njobs:\n");
+  assert.notEqual(jobsStart, -1, "CI.yml has no jobs section");
+  const jobs = new Map();
+  for (const match of workflow
+    .slice(jobsStart)
+    .matchAll(/^ {2}([a-z][a-z0-9-]*):\n((?:(?: {4}.*)?\n)*)/gm)) {
+    jobs.set(match[1], match[2]);
+  }
+  return jobs;
+}
+
+// The planner output that selects each validation job, as the `job_outputs`
+// table of `ci-result` records it.
+const expectedJobOutputs = {
+  quality: "quality",
+  go: "go",
+  protos: "go",
+  rust: "rust",
+  e2e: "e2e",
+  workspace: "workspace",
+  workflows: "workflows",
+};
+
+function ciResultTable(jobs) {
+  const match = /job_outputs='(\{[^']*\})'/.exec(jobs.get("ci-result"));
+  assert.ok(match, "ci-result has no job_outputs table");
+  return JSON.parse(match[1]);
+}
+
+// Read-only text check: each validation job runs only when the planner output
+// in the ci-result table selects it, and ci-result needs every validation
+// job. The planner's main-push selection is therefore enforced by ci-result
+// without a workflow edit.
+test("CI workflow aggregates every validation job by the planner output that selects it", () => {
+  const jobs = workflowJobs();
+  const changes = jobs.get("changes");
+  const ciResult = jobs.get("ci-result");
+  const validationJobs = [...jobs.keys()].filter(
+    (id) => id !== "changes" && id !== "ci-result",
   );
-  assert.match(
-    workflow,
-    /\.go\.result == "skipped" and \$go_planned == "false"/,
+  const table = ciResultTable(jobs);
+  assert.deepEqual(table, expectedJobOutputs);
+  assert.deepEqual(Object.keys(table).sort(), [...validationJobs].sort());
+  const needs = /^ {4}needs: \[([a-z0-9, -]+)\]$/m.exec(ciResult);
+  assert.ok(needs, "ci-result has no needs list");
+  assert.deepEqual(needs[1].split(", "), ["changes", ...validationJobs]);
+  assert.match(ciResult, /^ {4}if: always\(\)$/m);
+  for (const [id, job] of jobs) {
+    assert.match(job, /^ {4}timeout-minutes: \d+$/m, id);
+  }
+  for (const id of validationJobs) {
+    const output = table[id];
+    const job = jobs.get(id);
+    assert.match(job, /^ {4}needs: changes$/m, id);
+    assert.match(
+      job,
+      new RegExp(
+        `^ {4}if: needs\\.changes\\.outputs\\.${output} == 'true'$`,
+        "m",
+      ),
+      id,
+    );
+    assert.match(
+      changes,
+      new RegExp(
+        `^ {6}${output}: \\$\\{\\{ steps\\.plan\\.outputs\\.${output} \\}\\}$`,
+        "m",
+      ),
+      id,
+    );
+  }
+});
+
+// Runs the ci-result jq check of CI.yml against a `needs` object.
+function ciResultPasses(jobs, needs) {
+  const ciResult = jobs.get("ci-result");
+  const table = /job_outputs='(\{[^']*\})'/.exec(ciResult)[1];
+  const program =
+    /--argjson outputs "\$job_outputs" '([^']*)' > \/dev\/null/.exec(ciResult);
+  assert.ok(program, "ci-result has no jq check");
+  const result = spawnSync(
+    "jq",
+    ["-e", "--argjson", "outputs", table, program[1]],
+    { input: JSON.stringify(needs), encoding: "utf8" },
+  );
+  if (result.error) {
+    throw result.error;
+  }
+  return result.status === 0;
+}
+
+// Runs the aggregate check itself. Every GitHub-hosted Ubuntu runner has jq;
+// a local run without jq skips this test.
+test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
+  if (spawnSync("jq", ["--version"]).error) {
+    t.skip("jq is not installed");
+    return;
+  }
+  const jobs = workflowJobs();
+  const table = ciResultTable(jobs);
+  const outputs = [...new Set(Object.values(table))];
+  const needsOf = (results, planned, changes = "success") => ({
+    changes: { result: changes, outputs: planned },
+    ...Object.fromEntries(
+      Object.entries(results).map(([id, result]) => [
+        id,
+        { result, outputs: {} },
+      ]),
+    ),
+  });
+  const allSelected = Object.fromEntries(outputs.map((o) => [o, "true"]));
+  const noneSelected = Object.fromEntries(outputs.map((o) => [o, "false"]));
+  const allSucceeded = Object.fromEntries(
+    Object.keys(table).map((id) => [id, "success"]),
+  );
+  const allSkipped = Object.fromEntries(
+    Object.keys(table).map((id) => [id, "skipped"]),
+  );
+  assert.equal(ciResultPasses(jobs, needsOf(allSucceeded, allSelected)), true);
+  for (const [id, output] of Object.entries(table)) {
+    assert.equal(
+      ciResultPasses(
+        jobs,
+        needsOf(
+          { ...allSucceeded, [id]: "skipped" },
+          { ...allSelected, [output]: "false" },
+        ),
+      ),
+      true,
+      `${id} skipped without selection`,
+    );
+    for (const result of ["skipped", "failure", "cancelled"]) {
+      assert.equal(
+        ciResultPasses(
+          jobs,
+          needsOf({ ...allSucceeded, [id]: result }, allSelected),
+        ),
+        false,
+        `${id} ${result} with selection`,
+      );
+    }
+  }
+  assert.equal(
+    ciResultPasses(
+      jobs,
+      needsOf({ ...allSucceeded, extra: "success" }, allSelected),
+    ),
+    false,
+    "a needed job without a table entry",
+  );
+  const [firstJob] = Object.keys(table);
+  const { [firstJob]: _omitted, ...missingOne } = allSucceeded;
+  assert.equal(
+    ciResultPasses(jobs, needsOf(missingOne, allSelected)),
+    false,
+    "a table entry without a needed job",
+  );
+  assert.equal(
+    ciResultPasses(jobs, needsOf(allSkipped, {}, "failure")),
+    false,
+    "a failed planner",
   );
 });
 
 // The protos job runs the protobuf drift and breaking-change checks with the
-// planner's comparison base, so it needs the full history. Every protobuf
-// input is a Go input, so the `go` output selects it, and the aggregate
-// passes a skipped protos job only when the planner did not select `go`.
+// planner's comparison base, so it needs the full history.
 test("CI workflow checks protobuf schemas in the protos job", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  const goJob = workflow.slice(
-    workflow.indexOf("\n  go:\n"),
-    workflow.indexOf("\n  protos:\n"),
-  );
-  assert.doesNotMatch(goJob, /scripts\/protos\.sh/);
-  const protosJob = workflow.slice(
-    workflow.indexOf("\n  protos:\n"),
-    workflow.indexOf("\n  rust:\n"),
-  );
-  assert.match(protosJob, /^\s+if: needs\.changes\.outputs\.go == 'true'$/m);
+  const jobs = workflowJobs();
+  assert.doesNotMatch(jobs.get("go"), /scripts\/protos\.sh/);
+  const protosJob = jobs.get("protos");
   assert.match(protosJob, /fetch-depth: 0/);
   assert.match(protosJob, /scripts\/protos\.sh check/);
   assert.match(protosJob, /scripts\/protos\.sh breaking "\$COMPARISON_BASE"/);
   assert.match(
     protosJob,
     /COMPARISON_BASE: \$\{\{ needs\.changes\.outputs\.base \}\}/,
-  );
-  assert.match(
-    workflow,
-    /\.protos\.result == "skipped" and \$go_planned == "false"/,
   );
 });
 
@@ -1149,32 +1286,11 @@ test("Rust changes select rust for every event and keep the diff reason", (t) =>
   }
 });
 
-// Read-only text check: the single `rust` planner output must keep driving
-// both the Rust job and the aggregate, so the planner's main-push selection is
-// enforced by ci-result without a workflow edit.
-test("CI workflow reads the planner rust output for the Rust job and the aggregate", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  assert.match(workflow, /^\s+rust: \$\{\{ steps\.plan\.outputs\.rust \}\}$/m);
-  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.rust == 'true'$/m);
-  assert.match(
-    workflow,
-    /^\s+RUST_PLANNED: \$\{\{ needs\.changes\.outputs\.rust \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /\.rust\.result == "skipped" and \$rust_planned == "false"/,
-  );
-});
-
 // Read-only text check: the Rust job runs the lint and test checks as
 // parallel matrix entries with separate caches, and together they still run
 // every Rust command.
 test("CI workflow runs the Rust lint and test checks in parallel", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  const rustJob = workflow.slice(
-    workflow.indexOf("\n  rust:\n"),
-    workflow.indexOf("\n  e2e:\n"),
-  );
+  const rustJob = workflowJobs().get("rust");
   assert.match(rustJob, /^\s+fail-fast: false$/m);
   assert.match(rustJob, /^\s+check: \[lint, test\]$/m);
   assert.match(rustJob, /^\s+key: \$\{\{ matrix\.check \}\}$/m);
@@ -1186,120 +1302,42 @@ test("CI workflow runs the Rust lint and test checks in parallel", () => {
   assert.match(rustJob, /^\s+cargo test --workspace --locked$/m);
 });
 
-// Read-only text check: the `quality`, `fixtures` and `e2e` planner outputs
-// must keep driving their jobs and the aggregate, so the planner's main-push
-// selection is enforced by ci-result without a workflow edit.
-test("CI workflow reads the planner quality, fixtures and e2e outputs for their jobs and the aggregate", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  for (const output of ["quality", "fixtures", "e2e"]) {
-    assert.match(
-      workflow,
-      new RegExp(
-        `^\\s+${output}: \\$\\{\\{ steps\\.plan\\.outputs\\.${output} \\}\\}$`,
-        "m",
-      ),
-      output,
-    );
-  }
+// Read-only text check: the fixtures step runs only when the planner selects
+// fixtures, and it does not repeat the workspace package tests that the
+// workspace job runs.
+test("CI workflow runs the fixtures in the quality job", () => {
+  const jobs = workflowJobs();
   assert.match(
-    workflow,
-    /^\s+if: needs\.changes\.outputs\.quality == 'true'$/m,
+    jobs.get("changes"),
+    /^ {6}fixtures: \$\{\{ steps\.plan\.outputs\.fixtures \}\}$/m,
   );
+  const qualityJob = jobs.get("quality");
   assert.match(
-    workflow,
+    qualityJob,
     /^\s+if: needs\.changes\.outputs\.fixtures == 'true'$/m,
-  );
-  assert.match(workflow, /^\s+if: needs\.changes\.outputs\.e2e == 'true'$/m);
-  assert.match(
-    workflow,
-    /^\s+QUALITY_PLANNED: \$\{\{ needs\.changes\.outputs\.quality \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /^\s+E2E_PLANNED: \$\{\{ needs\.changes\.outputs\.e2e \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /\.quality\.result == "skipped" and \$planned == "false"/,
-  );
-  assert.match(
-    workflow,
-    /\.e2e\.result == "skipped" and \$e2e_planned == "false"/,
-  );
-});
-
-// Read-only text check: the `workspace` planner output must keep driving the
-// workspace job and the aggregate, and the fixtures step must not repeat the
-// workspace package tests that the workspace job runs.
-test("CI workflow reads the planner workspace output for the workspace job and the aggregate", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
-  assert.match(
-    workflow,
-    /^\s+workspace: \$\{\{ steps\.plan\.outputs\.workspace \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /^\s+if: needs\.changes\.outputs\.workspace == 'true'$/m,
-  );
-  assert.match(
-    workflow,
-    /^\s+WORKSPACE_PLANNED: \$\{\{ needs\.changes\.outputs\.workspace \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /\.workspace\.result == "skipped" and \$workspace_planned == "false"/,
-  );
-  assert.match(
-    workflow,
-    /^\s+needs: \[changes, quality, go, protos, rust, e2e, workspace(, [a-z]+)*\]$/m,
-  );
-  const workspaceJob = workflow.slice(workflow.indexOf("\n  workspace:\n"));
-  assert.match(
-    workspaceJob,
-    /pnpm exec turbo run build lint typecheck test --continue "--filter=\$filter"/,
-  );
-  // The shards must stay complements so that together they select every
-  // workspace package.
-  assert.match(workspaceJob, /^\s+fail-fast: false$/m);
-  assert.match(workspaceJob, /^\s+shard: \[packages, servers\]$/m);
-  assert.match(workspaceJob, /^\s+packages\) filter='!\.\/servers\/\*' ;;$/m);
-  assert.match(workspaceJob, /^\s+servers\) filter='\.\/servers\/\*' ;;$/m);
-  const qualityJob = workflow.slice(
-    workflow.indexOf("\n  quality:\n"),
-    workflow.indexOf("\n  go:\n"),
   );
   assert.match(qualityJob, /run: pnpm test:tooling$/m);
   assert.doesNotMatch(qualityJob, /run: pnpm test$/m);
 });
 
-// Read-only text check: the `workflows` planner output must keep driving the
-// workflow lint job and the aggregate.
-test("CI workflow reads the planner workflows output for the workflow lint job and the aggregate", () => {
-  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+// Read-only text check: the workspace shards are complements, so together they
+// select every workspace package.
+test("CI workflow runs every workspace package in the workspace shards", () => {
+  const workspaceJob = workflowJobs().get("workspace");
   assert.match(
-    workflow,
-    /^\s+workflows: \$\{\{ steps\.plan\.outputs\.workflows \}\}$/m,
+    workspaceJob,
+    /pnpm exec turbo run build lint typecheck test --continue "--filter=\$filter"/,
   );
-  assert.match(
-    workflow,
-    /^\s+if: needs\.changes\.outputs\.workflows == 'true'$/m,
-  );
-  assert.match(
-    workflow,
-    /^\s+WORKFLOWS_PLANNED: \$\{\{ needs\.changes\.outputs\.workflows \}\}$/m,
-  );
-  assert.match(
-    workflow,
-    /\.workflows\.result == "skipped" and \$workflows_planned == "false"/,
-  );
-  assert.match(
-    workflow,
-    /^\s+needs: \[changes, quality, go, protos, rust, e2e, workspace, workflows\]$/m,
-  );
-  const workflowsJob = workflow.slice(
-    workflow.indexOf("\n  workflows:\n"),
-    workflow.indexOf("\n  ci-result:\n"),
-  );
+  assert.match(workspaceJob, /^\s+fail-fast: false$/m);
+  assert.match(workspaceJob, /^\s+shard: \[packages, servers\]$/m);
+  assert.match(workspaceJob, /^\s+packages\) filter='!\.\/servers\/\*' ;;$/m);
+  assert.match(workspaceJob, /^\s+servers\) filter='\.\/servers\/\*' ;;$/m);
+});
+
+// Read-only text check: the workflows job lints and audits the workflows with
+// pinned tools.
+test("CI workflow lints and audits the workflows", () => {
+  const workflowsJob = workflowJobs().get("workflows");
   assert.match(workflowsJob, /actionlint@v\d+\.\d+\.\d+/);
   assert.match(workflowsJob, /zizmorcore\/zizmor-action@[0-9a-f]{40}/);
 });
