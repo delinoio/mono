@@ -264,6 +264,20 @@ func validateID(field, value string) error {
 	return nil
 }
 
+// normalizeID validates a required UUID v7 field like validateID and returns
+// its lowercase canonical text. The API accepts either hex case, but identity
+// comparisons and rate-limit keys must use the value, not its spelling.
+func normalizeID(field, value string) (string, error) {
+	if err := validateID(field, value); err != nil {
+		return "", err
+	}
+	id, err := uuidv7.Parse(value)
+	if err != nil {
+		return "", errInvalid(err)
+	}
+	return id.String(), nil
+}
+
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without
 // control characters.
 func validateName(field, name string) error {
@@ -299,7 +313,8 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 	if err != nil {
 		return p, 0, err
 	}
-	if err := validateID("organization_id", orgID); err != nil {
+	orgID, err = normalizeID("organization_id", orgID)
+	if err != nil {
 		return p, 0, err
 	}
 	setRPCOrganization(ctx, orgID)
