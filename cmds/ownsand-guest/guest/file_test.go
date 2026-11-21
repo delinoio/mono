@@ -11,6 +11,8 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -153,6 +155,148 @@ func TestReadKeepaliveWhilePreparing(t *testing.T) {
 	if ev := s.recv().GetFileReadEvent(); ev.GetKeepalive() == nil {
 		t.Fatalf("first event %v", ev)
 	}
+}
+
+// gatedSnapshot wraps a snapshot file and blocks its second ReadAt call
+// until release is closed, like a disk that stalls on the second chunk.
+type gatedSnapshot struct {
+	snapshotFile
+	reads     atomic.Int32
+	started   chan struct{}
+	release   chan struct{}
+	closed    chan struct{}
+	closeOnce sync.Once
+}
+
+func (g *gatedSnapshot) ReadAt(p []byte, off int64) (int, error) {
+	if g.reads.Add(1) == 2 {
+		close(g.started)
+		<-g.release
+	}
+	return g.snapshotFile.ReadAt(p, off)
+}
+
+func (g *gatedSnapshot) Close() error {
+	g.closeOnce.Do(func() { close(g.closed) })
+	return g.snapshotFile.Close()
+}
+
+// gateSnapshots makes the read manager of h open gated snapshot files and
+// returns the gate of the first one.
+func gateSnapshots(h *harness) *gatedSnapshot {
+	g := &gatedSnapshot{started: make(chan struct{}), release: make(chan struct{}), closed: make(chan struct{})}
+	h.srv.reads.openSnapshot = func(path string) (snapshotFile, error) {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		g.snapshotFile = f
+		return g, nil
+	}
+	return g
+}
+
+// readEntryOpen returns the number of open calls of a read_id.
+func (m *readManager) readEntryOpen(readID string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if e, ok := m.entries[readID]; ok {
+		return e.open
+	}
+	return 0
+}
+
+// A stalled chunk read must not stop the keepalives, and the stream
+// continues with the right offset after the read returns.
+func TestReadKeepaliveWhileChunkPending(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
+	g := gateSnapshots(h)
+	path := filepath.Join(t.TempDir(), "f")
+	content := randomBytes(t, 2<<20+100)
+	if err := os.WriteFile(path, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	s := h.open(ctx)
+	defer s.s.CloseRequest()
+	s.send(1, readReq(t, path))
+	var chunk *ownsandv1.FileChunk
+	for chunk == nil {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetEnd() != nil {
+			t.Fatal("end before the first chunk")
+		}
+		chunk = ev.GetChunk()
+	}
+	if chunk.GetOffset() != 0 || !bytes.Equal(chunk.GetData(), content[:len(chunk.GetData())]) {
+		t.Fatalf("first chunk offset %d size %d", chunk.GetOffset(), len(chunk.GetData()))
+	}
+	got := append([]byte(nil), chunk.GetData()...)
+	waitStarted(t, g.started)
+	// The second read is stalled: keepalives arrive meanwhile, and no
+	// chunk can.
+	for i := 0; i < 3; i++ {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetKeepalive() == nil {
+			t.Fatalf("event while the read is stalled: %v", ev)
+		}
+	}
+	close(g.release)
+	for {
+		ev := s.recv().GetFileReadEvent()
+		if ev.GetKeepalive() != nil {
+			continue
+		}
+		if ev.GetEnd() != nil {
+			if ev.GetEnd().GetSizeBytes() != int64(len(content)) {
+				t.Fatalf("end size %d", ev.GetEnd().GetSizeBytes())
+			}
+			break
+		}
+		c := ev.GetChunk()
+		if c.GetOffset() != int64(len(got)) {
+			t.Fatalf("chunk offset %d, want %d", c.GetOffset(), len(got))
+		}
+		got = append(got, c.GetData()...)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("read %d bytes, content differs", len(got))
+	}
+	waitClosed(t, g.closed)
+}
+
+// A cancellation ends the call while a chunk read is stalled; the late
+// worker closes its handle when the read returns.
+func TestReadCancelWhileChunkPending(t *testing.T) {
+	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 20 * time.Millisecond })
+	g := gateSnapshots(h)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, randomBytes(t, 2<<20+100), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := h.open(ctx)
+	req := readReq(t, path)
+	s.send(1, req)
+	waitStarted(t, g.started)
+	cancel()
+	// The call ends while the gate is closed.
+	deadline := time.Now().Add(10 * time.Second)
+	for h.srv.reads.readEntryOpen(req.GetReadId()) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the call did not end while the chunk read was stalled")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	select {
+	case <-g.closed:
+		t.Fatal("snapshot closed while its read is still stalled")
+	default:
+	}
+	close(g.release)
+	waitClosed(t, g.closed)
 }
 
 func TestReadRetention(t *testing.T) {
