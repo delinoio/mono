@@ -45,6 +45,15 @@ type snapshot struct {
 	deleting bool
 }
 
+// pendingSnapshot marks a snapshot whose content the runtime is capturing.
+// It is kept in Manager.pending, not in Manager.snapshots, so that the
+// snapshot is not usable and not reported before it is complete.
+type pendingSnapshot struct {
+	// deleted is set, under Manager.mu, when a delete arrived during the
+	// capture. The create then publishes nothing and removes its content.
+	deleted bool
+}
+
 // usable reports whether a new create or export may read the snapshot.
 func (s *snapshot) usable() bool {
 	return s.rec.State == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY && !s.deleting
@@ -93,8 +102,9 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	if err := validate.UUIDv7("snapshot_id", cmd.GetSnapshotId()); err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
 	}
+	id := cmd.GetSnapshotId()
 	m.mu.Lock()
-	if snap, ok := m.snapshots[cmd.GetSnapshotId()]; ok {
+	if snap, ok := m.snapshots[id]; ok {
 		m.mu.Unlock()
 		return snap.entry(), nil
 	}
@@ -107,26 +117,60 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	defer sb.cmdMu.Unlock()
 	m.mu.Lock()
 	state, vm, rec := sb.rec.State, sb.vm, sb.rec
+	// A duplicate create that waited for the sandbox lock finds the
+	// snapshot that the first create published.
+	if snap, ok := m.snapshots[id]; ok {
+		m.mu.Unlock()
+		return snap.entry(), nil
+	}
 	m.mu.Unlock()
 	if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is %s", state)
 	}
-	dir, err := m.st.SnapshotDir(cmd.GetSnapshotId())
+	dir, err := m.st.SnapshotDir(id)
 	if err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
 	}
+	// Register the capture before it starts, so that a delete that arrives
+	// meanwhile can record its intent.
+	pending := &pendingSnapshot{}
+	m.mu.Lock()
+	if _, busy := m.pending[id]; busy {
+		m.mu.Unlock()
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot is being created")
+	}
+	m.pending[id] = pending
+	m.mu.Unlock()
+	finish := func() {
+		m.mu.Lock()
+		if m.pending[id] == pending {
+			delete(m.pending, id)
+		}
+		m.mu.Unlock()
+	}
+	// published is true once the snapshot is in m.snapshots; until then
+	// the pending entry stays, so a delete cannot miss the create.
+	published := false
+	defer func() {
+		if !published {
+			finish()
+		}
+	}()
 	if err := removeDirIfExists(dir); err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot directory could not be prepared")
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot directory could not be created")
 	}
-	m.logger.Info("snapshot creating", "snapshot_id", cmd.GetSnapshotId(), "sandbox_id", cmd.GetSandboxId())
+	m.logger.Info("snapshot creating", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId())
 	info, err := m.rt.Snapshot(ctx, vm, filepath.Join(dir, contentDir))
 	if err != nil {
 		os.RemoveAll(dir)
-		m.logger.Error("snapshot failed", "snapshot_id", cmd.GetSnapshotId(), "error", err)
+		m.logger.Error("snapshot failed", "snapshot_id", id, "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
+	}
+	if m.snapshotDeletedDuringCreate(pending) {
+		return nil, m.abortSnapshotCreate(id, dir)
 	}
 	snap := &snapshot{dir: filepath.Join(dir, contentDir), rec: SnapshotRecord{
 		SnapshotID:      cmd.GetSnapshotId(),
@@ -144,11 +188,47 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 		os.RemoveAll(dir)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot record could not be saved")
 	}
+	// A delete can also arrive while the record is saved. Check again under
+	// the lock that publishes the snapshot, so that exactly one of the two
+	// wins: either the delete is recorded here, or the delete finds the
+	// published snapshot and deletes it.
 	m.mu.Lock()
+	if pending.deleted {
+		delete(m.pending, id)
+		m.mu.Unlock()
+		published = true // The pending entry is already removed.
+		_ = m.st.DeleteSnapshot(id)
+		return nil, m.abortedSnapshotError(id)
+	}
 	m.snapshots[snap.rec.SnapshotID] = snap
+	delete(m.pending, id)
 	m.mu.Unlock()
+	published = true
 	m.logger.Info("snapshot ready", "snapshot_id", snap.rec.SnapshotID, "size_bytes", snap.rec.SizeBytes, "has_memory_state", snap.rec.HasMemoryState)
 	return snap.entry(), nil
+}
+
+// snapshotDeletedDuringCreate reports whether a delete arrived while the
+// capture of pending ran.
+func (m *Manager) snapshotDeletedDuringCreate(pending *pendingSnapshot) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return pending.deleted
+}
+
+// abortSnapshotCreate removes the content of a capture that a delete
+// overtook and returns the error of the create. The pending entry is
+// removed by the caller's deferred cleanup.
+func (m *Manager) abortSnapshotCreate(id, dir string) error {
+	if err := removeDirIfExists(dir); err != nil {
+		m.logger.Error("aborted snapshot content could not be removed", "snapshot_id", id, "error", err)
+	}
+	return m.abortedSnapshotError(id)
+}
+
+func (m *Manager) abortedSnapshotError(id string) error {
+	m.logger.Info("snapshot create aborted by a delete", "snapshot_id", id)
+	return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot was deleted during its create")
 }
 
 // AcquireSnapshot returns the content directory of a ready local snapshot
@@ -206,7 +286,9 @@ func (m *Manager) removeSnapshot(id string) error {
 // a create or an export reads the copy, the snapshot takes no new users and
 // the last of the current users deletes it; the command succeeds at once,
 // because the control plane sends it only once while the agent channel
-// stays connected.
+// stays connected. A delete that arrives while the snapshot is being
+// created also succeeds at once; the create then aborts with ABORTED and
+// publishes nothing.
 func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 	id := cmd.GetSnapshotId()
 	if err := validate.UUIDv7("snapshot_id", id); err != nil {
@@ -215,6 +297,14 @@ func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 	m.mu.Lock()
 	snap, ok := m.snapshots[id]
 	if !ok {
+		if pending, capturing := m.pending[id]; capturing {
+			// The snapshot is being captured: record the delete, and the
+			// create discards the content instead of publishing it.
+			pending.deleted = true
+			m.mu.Unlock()
+			m.logger.Info("snapshot delete recorded during its create", "snapshot_id", id)
+			return nil
+		}
 		m.mu.Unlock()
 		return nil
 	}
