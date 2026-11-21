@@ -207,3 +207,61 @@ func TestRevocationMatchingAndLateAck(t *testing.T) {
 		t.Fatal("a late acknowledgement revived a revoked grant")
 	}
 }
+
+// TestRemoveUndelivered covers the removal after a failed enqueue: the exact
+// reservation is released, the outcome is recorded before the waiters wake and
+// a replacement leaves its predecessor installed and free of a successor.
+func TestRemoveUndelivered(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	g, _, _ := r.Reserve(req("a", "u", "op"), newID)
+	woken := make(chan Outcome, 1)
+	go func() { <-g.Done(); woken <- g.Outcome() }()
+	if !r.RemoveUndelivered(g.ID) {
+		t.Fatal("pending grant not removed")
+	}
+	if got := <-woken; got != OutcomeDeliveryFailed {
+		t.Fatalf("waiter outcome = %v", got)
+	}
+	if r.Len() != 0 || r.Get(g.ID) != nil {
+		t.Fatal("removed grant is still registered")
+	}
+	// The authorization_id slot is free: the same ID reserves a new grant.
+	again, existing, err := r.Reserve(req("a", "u", "op"), newID)
+	if err != nil || existing || again.ID == g.ID {
+		t.Fatalf("reserve after removal: %v existing=%v same=%v", err, existing, again.ID == g.ID)
+	}
+	// A second removal of the removed grant changes nothing.
+	if r.RemoveUndelivered(g.ID) || r.Len() != 1 {
+		t.Fatal("removal of a removed grant touched the registry")
+	}
+	// An installed grant is never removed.
+	r.Ack(again.ID, accepted, "")
+	if r.RemoveUndelivered(again.ID) || r.Admittable(again.ID) == nil {
+		t.Fatal("installed grant removed")
+	}
+	// A failed replacement keeps the predecessor and frees its successor link.
+	repl := req("b", "u", "op")
+	repl.ReplacesID = again.ID
+	succ, _, err := r.Reserve(repl, newID)
+	if err != nil || succ.Replaces != again.ID {
+		t.Fatalf("replacement: %v", err)
+	}
+	second := req("c", "u", "op")
+	second.ReplacesID = again.ID
+	if _, _, err := r.Reserve(second, newID); !errors.Is(err, ErrReplaceActive) {
+		t.Fatalf("second replacement: %v", err)
+	}
+	if !r.RemoveUndelivered(succ.ID) {
+		t.Fatal("pending replacement not removed")
+	}
+	if succ.Outcome() != OutcomeDeliveryFailed {
+		t.Fatalf("replacement outcome = %v", succ.Outcome())
+	}
+	if r.Admittable(again.ID) == nil || again.Successor != "" || r.Len() != 1 {
+		t.Fatalf("predecessor not kept clean: successor=%q len=%d", again.Successor, r.Len())
+	}
+	if _, _, err := r.Reserve(repl, newID); err != nil {
+		t.Fatalf("replacement retry after the failed one: %v", err)
+	}
+}
