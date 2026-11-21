@@ -1089,3 +1089,39 @@ func TestRelayDialsWhenAnotherGrantLiveAfterCredentialRequest(t *testing.T) {
 	e.openOK(rc, 1, g2.GetGrantId())
 	e.noConn(300 * time.Millisecond)
 }
+
+// TestRelayProbeWithFullQueueSkipsEchoAndKeepsTimeout checks that the echo
+// probe, which grant runs on the agent channel receive loop, never waits on
+// a full outbound queue: it queues nothing, logs the skip, and the timeout
+// still ends a connection that receives no byte, while a received byte keeps
+// the connection.
+func TestRelayProbeWithFullQueueSkipsEchoAndKeepsTimeout(t *testing.T) {
+	timing := Timing{ProbeIdle: 50 * time.Millisecond, ProbeTimeout: 200 * time.Millisecond}
+	for _, answered := range []bool{false, true} {
+		f := newRevokeFixture(t, 2)
+		f.r.d.timing = timing.withDefaults()
+		f.r.d.logger = slog.New(slog.NewJSONHandler(f.logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		f.c.lastRecv.Store(time.Now().Add(-time.Hour).UnixNano())
+		f.fillQueue()
+
+		within(t, "probe", func() { f.r.probe(f.c) })
+
+		if len(f.c.out) != cap(f.c.out) {
+			t.Fatalf("the full queue changed: %d queued", len(f.c.out))
+		}
+		if n := strings.Count(f.logs.String(), "echo probe skipped"); n != 1 {
+			t.Fatalf("skipped echo logged %d times, want once:\n%s", n, f.logs.String())
+		}
+		if answered {
+			f.c.lastRecv.Store(time.Now().UnixNano())
+		}
+		time.Sleep(500 * time.Millisecond)
+		if answered {
+			if f.c.ctx.Err() != nil || f.c.probeFailed.Load() {
+				t.Fatal("a byte within the probe timeout did not keep the connection")
+			}
+		} else if f.c.ctx.Err() == nil || !f.c.probeFailed.Load() {
+			t.Fatal("the probe timeout did not cancel the idle connection")
+		}
+	}
+}
