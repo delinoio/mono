@@ -15,6 +15,7 @@ package datapath
 import (
 	"errors"
 	"fmt"
+	"reflect"
 
 	"google.golang.org/protobuf/proto"
 
@@ -119,9 +120,20 @@ func IsConnectionKind(kind ownsandv1.DataFrameKind) bool {
 }
 
 // PayloadKind returns the kind that the payload of f names, or UNSPECIFIED
-// when no payload is set or the payload is unknown to this schema version.
+// when no payload is set, the payload is a typed nil wrapper (a nil
+// pointer held in the oneof interface, which decoding never produces but a
+// hand-built frame can), or the payload is unknown to this schema version.
 func PayloadKind(f *ownsandv1.DataFrame) ownsandv1.DataFrameKind {
-	switch f.GetPayload().(type) {
+	payload := f.GetPayload()
+	if payload == nil {
+		return ownsandv1.DataFrameKind_DATA_FRAME_KIND_UNSPECIFIED
+	}
+	// Every oneof wrapper is a pointer to a struct, so a typed nil is a nil
+	// pointer value; the type switch below would otherwise match it.
+	if v := reflect.ValueOf(payload); v.Kind() == reflect.Pointer && v.IsNil() {
+		return ownsandv1.DataFrameKind_DATA_FRAME_KIND_UNSPECIFIED
+	}
+	switch payload.(type) {
 	case *ownsandv1.DataFrame_RelayStreamOpen:
 		return ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_STREAM_OPEN
 	case *ownsandv1.DataFrame_RelayStreamClose:
