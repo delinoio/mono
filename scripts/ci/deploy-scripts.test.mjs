@@ -2016,6 +2016,12 @@ test(
       [["api", image, "8080", "localhost"], {}, /host name/],
       [["api", image, "8080", "a.example.com;x"], {}, /host name/],
       [
+        ["api", image, "8080", `${"a".repeat(64)}.example.com`],
+        {},
+        /host name/,
+      ],
+      [["api", image, "8080", `api.${"a".repeat(64)}.com`], {}, /host name/],
+      [
         ["api", image, "8080", "api.example.com"],
         { envFile: null },
         /api\.env does not exist/,
@@ -2032,6 +2038,13 @@ test(
       assert.match(result.stderr, message, label);
       assert.deepEqual(result.calls, [""], label);
     }
+    // A 63-character label is the longest valid one and passes validation.
+    const valid = runDroplet(
+      t,
+      ["api", image, "8080", `${"a".repeat(63)}.example.com`],
+      {},
+    );
+    assert.doesNotMatch(valid.stderr, /host name/);
   },
 );
 

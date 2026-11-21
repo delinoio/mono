@@ -57,7 +57,8 @@ main() {
   local service="$1" image="$2" port="$3" hostname="$4"
   # The planner already checks these values; check them again, because they
   # become file names, container names and proxy configuration here.
-  local label='[a-z0-9](-*[a-z0-9])*'
+  # A DNS label has at most 63 characters, as in the planner's host check.
+  local label='[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?'
   if [[ ! "$service" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; then
     fail "the service name ${service@Q} is not valid."
   fi
