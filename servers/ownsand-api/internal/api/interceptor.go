@@ -101,11 +101,12 @@ func clientAddr(ctx context.Context) string {
 	return ""
 }
 
-// Interceptors returns the logging and authentication interceptors in the
-// order that handlers must apply them.
+// Interceptors returns the logging, metering and authentication
+// interceptors in the order that handlers must apply them.
 func (s *Service) Interceptors(authn *Authenticator, mode config.ClientAddressMode) []connect.Interceptor {
 	return []connect.Interceptor{
 		&logInterceptor{logger: s.Logger, now: s.Now, addressMode: mode},
+		&meterInterceptor{s: s},
 		&authInterceptor{authn: authn},
 	}
 }

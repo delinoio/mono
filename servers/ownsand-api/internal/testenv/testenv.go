@@ -251,7 +251,12 @@ type Clients struct {
 // ClientsWith returns clients that send token as the bearer credential (no
 // header when token is empty) and the extra headers.
 func (e *Env) ClientsWith(token string, extra http.Header) *Clients {
-	httpClient := e.Server.Client()
+	return e.ClientsWithHTTP(e.Server.Client(), token, extra)
+}
+
+// ClientsWithHTTP is ClientsWith over httpClient, for example a client whose
+// transport observes the responses.
+func (e *Env) ClientsWithHTTP(httpClient *http.Client, token string, extra http.Header) *Clients {
 	opts := []connect.ClientOption{connect.WithInterceptors(bearer{token: token, extra: extra})}
 	url := e.Server.URL
 	return &Clients{

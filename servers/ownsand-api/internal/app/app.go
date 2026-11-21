@@ -15,11 +15,14 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/delinoio/mono/go/uuidv7"
+	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
@@ -73,6 +76,18 @@ type Options struct {
 	// (tests).
 	RelayLimits *relay.Limits
 	RelayTiming *api.RelayTiming
+
+	// UsageClient reports metered usage to delino-accounts. When it is nil,
+	// usage is still metered and sealed into the outbox, and the reporter
+	// stays idle.
+	UsageClient accountsv1connect.UsageServiceClient
+	// BillingStatuses receives the billing statuses of accepted usage
+	// reports; nil drops them.
+	BillingStatuses billing.StatusSink
+	// BillingTiming overrides the metering intervals (tests).
+	BillingTiming *billing.Timing
+	// Metrics registers the control plane metrics; nil registers none.
+	Metrics prometheus.Registerer
 }
 
 // App is a wired control plane.
@@ -82,7 +97,9 @@ type App struct {
 	Lease   *lease.Lease
 	Control *api.Control
 	Plane   *api.DataPlane
-	handler http.Handler
+	// Metering meters billable usage and reports it.
+	Metering *billing.Metering
+	handler  http.Handler
 }
 
 // New wires the control plane.
@@ -136,6 +153,11 @@ func New(opts Options) (*App, error) {
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
 		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
 	svc.Lease = l
+	metering := billing.New(billing.Options{
+		DB: opts.DB, Logger: opts.Logger, Now: opts.Now, Held: l.Held, Client: opts.UsageClient,
+		Statuses: opts.BillingStatuses, Metrics: opts.Metrics, Timing: opts.BillingTiming,
+	})
+	svc.Usage = metering
 	relayLimits := relay.DefaultLimits()
 	if opts.RelayLimits != nil {
 		relayLimits = *opts.RelayLimits
@@ -164,27 +186,29 @@ func New(opts Options) (*App, error) {
 	// means to interrupt a body read that blocks.
 	relayOpts := append(slices.Clone(handlerOpts), connect.WithRequestGate(plane.RelayGate(authn, opts.ClientAddressMode)))
 	relayPath, relayHandler := ownsandv1connect.NewRelayServiceHandler(api.RelayHandler{DataPlane: plane}, relayOpts...)
-	add(relayPath, api.RelayReadDeadlines(relayHandler))
+	add(relayPath, api.RelayReadDeadlines(plane.MeterRelayEgress(relayHandler)))
 	relayAgentPath, relayAgentHandler := ownsandv1connect.NewRelayAgentServiceHandler(api.RelayAgentHandler{DataPlane: plane}, handlerOpts...)
 	add(relayAgentPath, api.RelayAgentWriteInterrupt(relayAgentHandler))
 
 	return &App{
-		opts:    opts,
-		Service: svc,
-		Lease:   l,
-		Control: control,
-		Plane:   plane,
-		handler: server.NewHandler(server.Options{Logger: opts.Logger, CORSOrigins: opts.CORSOrigins, Mounts: mounts}),
+		opts:     opts,
+		Service:  svc,
+		Lease:    l,
+		Control:  control,
+		Plane:    plane,
+		Metering: metering,
+		handler:  server.NewHandler(server.Options{Logger: opts.Logger, CORSOrigins: opts.CORSOrigins, Mounts: mounts}),
 	}, nil
 }
 
 // Handler returns the root HTTP handler.
 func (a *App) Handler() http.Handler { return a.handler }
 
-// Run runs the background workers until ctx ends and waits for them.
+// Run runs the background workers until ctx ends and waits for them. The
+// metering worker writes the remaining usage counts before Run returns.
 func (a *App) Run(ctx context.Context) {
 	var wg sync.WaitGroup
-	wg.Add(3)
+	wg.Add(4)
 	go func() {
 		defer wg.Done()
 		janitor.Run(ctx, a.opts.DB, a.opts.Logger, a.opts.Now, a.opts.JanitorInterval)
@@ -199,5 +223,13 @@ func (a *App) Run(ctx context.Context) {
 		defer wg.Done()
 		a.Control.Run(ctx)
 	}()
+	go func() {
+		defer wg.Done()
+		a.Metering.Run(ctx)
+	}()
 	wg.Wait()
 }
+
+// FlushUsage writes the usage counts that are still in memory, for example
+// the counts of RPCs that ended during the HTTP drain after Run returned.
+func (a *App) FlushUsage(ctx context.Context) error { return a.Metering.Flush(ctx) }

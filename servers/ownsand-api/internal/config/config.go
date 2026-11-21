@@ -42,6 +42,11 @@ const (
 	EnvSTUNAddr                 = "STUN_ADDR"
 	EnvSTUNRateBytesPerSecond   = "STUN_RATE_LIMIT_BYTES_PER_SECOND"
 	EnvSTUNRateBurstBytes       = "STUN_RATE_LIMIT_BURST_BYTES"
+	EnvAccountsAPIOrigin        = "ACCOUNTS_API_ORIGIN"
+	EnvLogtoTokenEndpoint       = "LOGTO_TOKEN_ENDPOINT"
+	EnvAccountsM2MClientID      = "ACCOUNTS_M2M_CLIENT_ID"
+	EnvAccountsM2MClientSecret  = "ACCOUNTS_M2M_CLIENT_SECRET"
+	EnvMetricsAddr              = "METRICS_ADDR"
 )
 
 // Defaults.
@@ -61,6 +66,9 @@ const (
 	// per second sustained with a burst of about 100.
 	DefaultSTUNRateBytesPerSecond = 1024
 	DefaultSTUNRateBurstBytes     = 4096
+	// DefaultAccountsAPIOrigin is the production origin of the delino-accounts
+	// API.
+	DefaultAccountsAPIOrigin = "https://accounts.api.delino.io"
 	// DefaultSnapshotPartSizeBytes is the snapshot export part size (64 MiB).
 	DefaultSnapshotPartSizeBytes = 64 << 20
 	// minNonceKeySize is the smallest accepted nonce key.
@@ -153,6 +161,18 @@ type R2 struct {
 	SecretAccessKey string
 }
 
+// Accounts is the delino-accounts client configuration of usage reporting.
+// Enabled is false when the machine-to-machine credential is not configured
+// (development and tests); usage is then still metered into the outbox,
+// and the reporter stays idle.
+type Accounts struct {
+	Enabled       bool
+	APIOrigin     string
+	TokenEndpoint string
+	ClientID      string
+	ClientSecret  string
+}
+
 // Config is the validated server configuration. It holds secrets; never log
 // it as a whole.
 type Config struct {
@@ -195,6 +215,12 @@ type Config struct {
 	STUNAddr               string
 	STUNRateBytesPerSecond int
 	STUNRateBurstBytes     int
+
+	// Accounts configures usage reporting to delino-accounts.
+	Accounts Accounts
+	// MetricsAddr is the listen address of the internal Prometheus
+	// listener; empty turns it off.
+	MetricsAddr string
 }
 
 // Load reads the configuration through lookup, which has the signature of
@@ -348,6 +374,35 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.STUNRateBurstBytes, err2 = positiveInt(EnvSTUNRateBurstBytes, get(EnvSTUNRateBurstBytes), DefaultSTUNRateBurstBytes); err2 != nil {
 		return Config{}, err2
+	}
+
+	cfg.Accounts = Accounts{
+		APIOrigin:     DefaultAccountsAPIOrigin,
+		TokenEndpoint: get(EnvLogtoTokenEndpoint),
+		ClientID:      get(EnvAccountsM2MClientID),
+		ClientSecret:  get(EnvAccountsM2MClientSecret),
+	}
+	if v := get(EnvAccountsAPIOrigin); v != "" {
+		u, err := url.Parse(v)
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || strings.Contains(v, "#") {
+			return Config{}, fmt.Errorf("%s must be an origin such as https://accounts.api.delino.io", EnvAccountsAPIOrigin)
+		}
+		cfg.Accounts.APIOrigin = strings.TrimSuffix(v, "/")
+	}
+	if a := cfg.Accounts; a.TokenEndpoint != "" || a.ClientID != "" || a.ClientSecret != "" {
+		if a.TokenEndpoint == "" || a.ClientID == "" || a.ClientSecret == "" {
+			return Config{}, fmt.Errorf("%s, %s and %s must be set together", EnvLogtoTokenEndpoint, EnvAccountsM2MClientID, EnvAccountsM2MClientSecret)
+		}
+		if err := validateURL(EnvLogtoTokenEndpoint, a.TokenEndpoint); err != nil {
+			return Config{}, err
+		}
+		cfg.Accounts.Enabled = true
+	}
+	if v := get(EnvMetricsAddr); v != "" {
+		if err := listenaddr.Validate(EnvMetricsAddr, v); err != nil {
+			return Config{}, err
+		}
+		cfg.MetricsAddr = v
 	}
 	return cfg, nil
 }

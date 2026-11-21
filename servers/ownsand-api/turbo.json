@@ -25,7 +25,12 @@
         "SNAPSHOT_PART_SIZE_BYTES",
         "STUN_ADDR",
         "STUN_RATE_LIMIT_BYTES_PER_SECOND",
-        "STUN_RATE_LIMIT_BURST_BYTES"
+        "STUN_RATE_LIMIT_BURST_BYTES",
+        "ACCOUNTS_API_ORIGIN",
+        "LOGTO_TOKEN_ENDPOINT",
+        "ACCOUNTS_M2M_CLIENT_ID",
+        "ACCOUNTS_M2M_CLIENT_SECRET",
+        "METRICS_ADDR"
       ]
     },
     "build": {

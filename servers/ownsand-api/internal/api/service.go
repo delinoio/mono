@@ -106,6 +106,10 @@ type Service struct {
 	// releases) and the revocation events. Nil until the data path exists.
 	DataPath DataPathHooks
 
+	// Usage records billable usage (RPC calls and relay egress); nil turns
+	// metering off.
+	Usage UsageRecorder
+
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID
 	// imports holds the snapshot imports that importThenCreate waits for;

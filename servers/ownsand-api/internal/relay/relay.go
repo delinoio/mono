@@ -19,6 +19,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -115,6 +117,8 @@ type Conn struct {
 
 	// sendInterrupt is set by SetSendInterrupt before Run starts.
 	sendInterrupt func() error
+	// wireBytes is set by SetWireBytes before Run starts.
+	wireBytes func() int64
 
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
@@ -149,6 +153,9 @@ type outFrame struct {
 	frame   *ownsandv1.DataFrame
 	final   bool
 	grantID string
+	// onWritten, when set, receives the bytes that the send of the frame
+	// wrote (see Stream.SendMetered).
+	onWritten func(n int64)
 }
 
 // NewConn returns a connection for the device bound to an agent channel
@@ -176,6 +183,39 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 // the send; Run then falls back to a bounded wait for the writer. Call it
 // before Run.
 func (c *Conn) SetSendInterrupt(interrupt func() error) { c.sendInterrupt = interrupt }
+
+// SetWireBytes registers a function that returns the total bytes written to
+// the underlying connection so far. The writer uses it to measure the bytes
+// of a metered frame on the wire (see Stream.SendMetered); without it, a
+// metered frame counts its encoded ConnectResponse message plus the 5-byte
+// envelope prefix. Call it before Run.
+func (c *Conn) SetWireBytes(written func() int64) { c.wireBytes = written }
+
+// envelopePrefix is the size of the Connect and gRPC message envelope
+// prefix (one flag byte and a 4-byte length).
+const envelopePrefix = 5
+
+// sendMeasured sends of.frame with send and reports its bytes to
+// of.onWritten: the bytes that the send wrote, also when it failed after a
+// partial write.
+func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) error {
+	if of.onWritten == nil {
+		return send(of.frame)
+	}
+	if c.wireBytes == nil {
+		err := send(of.frame)
+		if err == nil {
+			of.onWritten(int64(proto.Size(&ownsandv1.ConnectResponse{Frame: of.frame})) + envelopePrefix)
+		}
+		return err
+	}
+	before := c.wireBytes()
+	err := send(of.frame)
+	if n := c.wireBytes() - before; n > 0 {
+		of.onWritten(n)
+	}
+	return err
+}
 
 // Done is closed when the connection closes.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
@@ -227,6 +267,11 @@ func (c *Conn) LastLargeReceive() time.Time {
 // enqueue queues an ordinary frame. It waits for one of the outboundQueue
 // tokens, and returns when ctx ends or the connection closes.
 func (c *Conn) enqueue(ctx context.Context, f *ownsandv1.DataFrame) error {
+	return c.enqueueFrame(ctx, outFrame{frame: f})
+}
+
+// enqueueFrame queues an ordinary outFrame; see enqueue.
+func (c *Conn) enqueueFrame(ctx context.Context, of outFrame) error {
 	select {
 	case c.slots <- struct{}{}:
 	case <-c.ctx.Done():
@@ -236,7 +281,7 @@ func (c *Conn) enqueue(ctx context.Context, f *ownsandv1.DataFrame) error {
 	}
 	// The token guarantees room: ordinary frames never exceed outboundQueue,
 	// and the queue also holds the reserved places of the finals.
-	c.out <- outFrame{frame: f}
+	c.out <- of
 	return nil
 }
 
@@ -331,7 +376,7 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 			select {
 			case of := <-c.out:
 				c.dequeued(of)
-				err := guardedSend(of.frame)
+				err := c.sendMeasured(of, guardedSend)
 				c.sent(of)
 				if err != nil {
 					c.Close(err)
@@ -531,6 +576,13 @@ func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, er
 // Send sends f on the stream. Credit-consuming frames wait for the agent's
 // credit; other frames go out at once.
 func (s *Stream) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
+	return s.SendMetered(ctx, f, nil)
+}
+
+// SendMetered is Send with a callback that receives the bytes of f on the
+// agent connection after the writer wrote it (relay egress metering). It is
+// not called when the frame is never written.
+func (s *Stream) SendMetered(ctx context.Context, f *ownsandv1.DataFrame, onWritten func(n int64)) error {
 	f.StreamId, f.SandboxId = s.ID, s.SandboxID
 	if datapath.ConsumesCredit(f.GetKind()) {
 		ctx, cancel := context.WithCancel(ctx)
@@ -549,7 +601,7 @@ func (s *Stream) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
 			return err
 		}
 	}
-	return s.conn.enqueue(ctx, f)
+	return s.conn.enqueueFrame(ctx, outFrame{frame: f, onWritten: onWritten})
 }
 
 // push queues a frame from the agent. Frames that consume credit are bounded
