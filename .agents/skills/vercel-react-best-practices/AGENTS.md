@@ -3157,7 +3157,10 @@ function getCookie(name: string) {
 
 ```typescript
 window.addEventListener('storage', (e) => {
-  if (e.key) storageCache.delete(e.key)
+  if (e.storageArea !== localStorage) return
+  // key is null when clear() ran in another tab; '' is a valid key
+  if (e.key === null) storageCache.clear()
+  else storageCache.delete(e.key)
 })
 
 document.addEventListener('visibilitychange', () => {
