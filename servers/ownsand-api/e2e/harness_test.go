@@ -410,20 +410,47 @@ func (s *stack) ctx(d time.Duration) context.Context {
 	return ctx
 }
 
+// healthStartupBudget bounds the whole wait for the control plane: every
+// request and every retry delay stops when it expires.
+const healthStartupBudget = 60 * time.Second
+
+// healthPollInterval is the delay between health probes.
+const healthPollInterval = 200 * time.Millisecond
+
 func (s *stack) waitHealthy() {
 	s.t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(s.apiURL + "/healthz")
+	if err := pollHealthy(s.apiURL+"/healthz", healthStartupBudget); err != nil {
+		s.t.Fatalf("the control plane did not become healthy: %v", err)
+	}
+}
+
+// pollHealthy probes url until it answers 200. The budget covers the HTTP
+// requests too, so a connection that is accepted but never answered cannot
+// outlive it.
+func pollHealthy(url string, budget time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	var lastErr error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return
+				return nil
 			}
+			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
-		time.Sleep(200 * time.Millisecond)
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("not healthy within %s: %w", budget, lastErr)
+		case <-time.After(healthPollInterval):
+		}
 	}
-	s.t.Fatal("the control plane did not become healthy")
 }
 
 // userToken signs an RFC 9068 access token for the test issuer.
