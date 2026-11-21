@@ -19,7 +19,34 @@ import (
 // request, matching net/http's built-in handler.
 const maxOptionsBodyBytes = 4 << 10
 
-// NewHandler returns the root HTTP handler with request logging applied.
+// Mount is one handler and its path prefix, such as a Connect service.
+type Mount struct {
+	Path    string
+	Handler http.Handler
+}
+
+// Option configures NewHandler.
+type Option func(*handlerOptions)
+
+type handlerOptions struct {
+	mounts      []Mount
+	corsOrigins []string
+}
+
+// WithMounts adds handlers under their path prefixes.
+func WithMounts(mounts ...Mount) Option {
+	return func(o *handlerOptions) { o.mounts = append(o.mounts, mounts...) }
+}
+
+// WithCORSOrigins sets the browser origins that may call the API. Without it
+// no origin gets CORS headers.
+func WithCORSOrigins(origins []string) Option {
+	return func(o *handlerOptions) { o.corsOrigins = append([]string(nil), origins...) }
+}
+
+// NewHandler returns the root HTTP handler with request logging applied. It
+// serves `GET /healthz` and the mounted handlers, behind the CORS handling
+// for the configured origins.
 //
 // The handler answers a server-wide "OPTIONS *" request itself, inside the
 // request logger. net/http answers that request before it consults the
@@ -29,10 +56,17 @@ const maxOptionsBodyBytes = 4 << 10
 // same connection is not logged by the request head observer, and the
 // duration_ms of later http_request_rejected records on that connection is
 // measured from the "OPTIONS *" request.
-func NewHandler(logger *slog.Logger) http.Handler {
+func NewHandler(logger *slog.Logger, opts ...Option) http.Handler {
+	var o handlerOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", handleHealthz(logger))
-	return logRequests(logger, withGeneralOptions(mux))
+	for _, m := range o.mounts {
+		mux.Handle(m.Path, m.Handler)
+	}
+	return logRequests(logger, withGeneralOptions(cors(o.corsOrigins, mux)))
 }
 
 // withGeneralOptions answers "OPTIONS *" and passes every other request to

@@ -14,7 +14,12 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/delinoio/mono/servers/accounts-api/internal/app"
+	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/config"
+	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
+	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/server"
 )
 
@@ -61,15 +66,60 @@ func run() error {
 	ctx, stop := shutdownContext()
 	defer stop()
 
+	database, err := db.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer database.Close()
+	if cfg.RunMigrations {
+		if err := database.Migrate(ctx, logger); err != nil {
+			return err
+		}
+	} else {
+		logger.Info("db_migrations_skipped", slog.String("reason", config.EnvRunMigrations+" is false"))
+	}
+
+	handler, err := newHandler(cfg, database, logger)
+	if err != nil {
+		return err
+	}
+
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
 		return err
 	}
 
-	srv := newServer(server.NewHandler(logger), logger)
+	srv := newServer(handler, logger)
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)))
 	return serve(ctx, stop, srv, listener, logger, shutdownTimeout)
+}
+
+// newHandler builds the production handler from the configuration.
+func newHandler(cfg config.Config, database *db.DB, logger *slog.Logger) (http.Handler, error) {
+	sender, err := email.NewResend(email.ResendConfig{APIKey: cfg.ResendAPIKey, From: cfg.EmailFrom, Logger: logger})
+	if err != nil {
+		return nil, err
+	}
+	return app.Handler(app.Options{
+		DB: database,
+		Validator: auth.NewLogtoValidator(auth.LogtoConfig{
+			Issuer:   cfg.LogtoIssuer,
+			Audience: cfg.LogtoAudience,
+			Logger:   logger,
+		}),
+		Directory: directory.NewLogto(directory.LogtoConfig{
+			Endpoint:     cfg.LogtoManagementEndpoint,
+			ClientID:     cfg.LogtoM2MClientID,
+			ClientSecret: cfg.LogtoM2MClientSecret,
+			Logger:       logger,
+		}),
+		Email:       sender,
+		Logger:      logger,
+		Audience:    cfg.LogtoAudience,
+		CORSOrigins: cfg.CORSOrigins,
+		WebOrigin:   cfg.WebOrigin,
+	}), nil
 }
 
 // shutdownContext returns a context that is cancelled by the first SIGINT or
