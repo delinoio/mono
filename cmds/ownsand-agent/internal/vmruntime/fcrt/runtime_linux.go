@@ -347,7 +347,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 // startProcess starts firecracker for v, bound to the agent process.
 func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
-	logf, err := os.OpenFile(filepath.Join(v.dir, logFile), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logf, err := openCappedLog(filepath.Join(v.dir, logFile), consoleLogLimit, r.logger, v.id)
 	if err != nil {
 		return err
 	}
@@ -355,7 +355,13 @@ func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
 	os.Remove(filepath.Join(v.dir, vsockSocket))
 	cmd := exec.Command(r.opts.Binary, "--api-sock", apiSocket, "--id", idPrefix+v.id)
 	cmd.Dir = v.dir
+	// One writer value for both streams: os/exec then uses a single pipe and
+	// one copying goroutine, and Wait returns after the copy ended, so the
+	// close below never races a write.
 	cmd.Stdout, cmd.Stderr = logf, logf
+	// Output goes through a pipe now, so a stray descendant that keeps the
+	// pipe open must not keep Wait (and v.exited) from returning.
+	cmd.WaitDelay = 5 * time.Second
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := launcher.Start(cmd); err != nil {
 		logf.Close()
