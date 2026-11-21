@@ -191,7 +191,9 @@ export function projectConfigFile(root) {
 // CLI log debug records, and `LOG_DESTINATION=stdout` would mix its logs into
 // the JSON output. The CLI reads `LOG_LEVEL` before it parses its flags, so the
 // launcher removes these variables from the CLI's environment and also passes
-// the logging flags.
+// `--log-level`. It does not pass `--log-destination`: the CLI logs to
+// standard error by default, and CLI versions before the flag was added (for
+// example 0.43.110) reject it as an unknown flag.
 const CliLoggingVariables = ["LOG_LEVEL", "LOG_DESTINATION", "LOG_FORMAT"];
 
 // Environment of the fetch: the inherited environment without the CLI
@@ -211,7 +213,6 @@ export function exportArguments(folder) {
     "--format=json",
     "--silent",
     "--log-level=warn",
-    "--log-destination=stderr",
   ];
 }
 

@@ -299,7 +299,6 @@ test("exportArguments pins the dev environment, the folder and logging", () => {
     "--format=json",
     "--silent",
     "--log-level=warn",
-    "--log-destination=stderr",
   ]);
 });
 
