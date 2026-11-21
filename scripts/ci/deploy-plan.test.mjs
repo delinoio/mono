@@ -768,6 +768,39 @@ test("a static site output must be a directory inside the package", () => {
   );
 });
 
+test("a static site output with characters the deploy loops cannot carry fails", () => {
+  const site = (output) => [
+    pkg("apps/web", {
+      name: "web",
+      deploy: { target: DeployTarget.CloudflarePages, project: "web", output },
+    }),
+  ];
+  for (const output of [
+    "a\tb",
+    "a\nb",
+    "a\rb",
+    "a\u0007b",
+    "a\u007fb",
+    "a\\b",
+  ]) {
+    assert.throws(
+      () => plan(status(["web", "1.0.0"]), site(output)),
+      /web: deploy\.output must not contain/,
+      JSON.stringify(output),
+    );
+  }
+  for (const [output, expected] of [
+    ["dist", "apps/web/dist"],
+    ["./build/", "apps/web/build"],
+    ["build/site", "apps/web/build/site"],
+  ]) {
+    assert.equal(
+      plan(status(["web", "1.0.0"]), site(output)).staticSites[0].output,
+      expected,
+    );
+  }
+});
+
 test("a static site output outside the package fails", () => {
   const site = [
     pkg("apps/web", {
