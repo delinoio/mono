@@ -1033,3 +1033,43 @@ func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
 		t.Fatalf("%d grants left", n)
 	}
 }
+
+// TestRelayRotationWithQueuedFrames checks that the rotation deadline holds
+// on every receive, not only on an empty wake. The long keepalive keeps the
+// handler's ticker from waking it near the deadline, so the only receives
+// after the deadline carry frames: the call must end with an OK status at the
+// first of them, and neither that frame nor the exit event behind it is
+// forwarded.
+func TestRelayRotationWithQueuedFrames(t *testing.T) {
+	env := testenv.New(t, func(o *app.Options) {
+		o.RelayTiming = &api.RelayTiming{Rotation: 2 * time.Second, Keepalive: 30 * time.Second, Acceptance: 30 * time.Second,
+			RequestDeadline: 10 * time.Second, GrantAck: time.Second, Signaling: 2 * time.Second}
+	})
+	org, agent, sandboxID := runningSandbox(t, env)
+	r := agent.ConnectRelay(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		s.Send(&ownsandv1.RequestAccepted{})
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 0, Data: []byte("before")}}})
+		time.Sleep(2500 * time.Millisecond) // past the rotation deadline
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 6, Data: []byte("after")}}})
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}})
+	})
+	stop := keepAlive(r)
+	defer stop()
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, org.OwnerClient, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := collectExec(t, es)
+	if err != nil {
+		t.Fatalf("rotation with queued frames: %v", err)
+	}
+	// The events are the accepted notice and the output before the deadline.
+	if len(events) != 2 || events[0].GetAccepted() == nil || string(events[1].GetStdout().GetData()) != "before" {
+		t.Fatalf("events = %v, want only the events before the deadline", events)
+	}
+}
