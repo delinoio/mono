@@ -84,7 +84,10 @@ type sandbox struct {
 	guest        *guestclient.Client
 	createCancel context.CancelFunc
 	// ending is true while the agent itself stops the VM.
-	ending         bool
+	ending bool
+	// stopped is true once an end attempt stopped the VM and told the exec
+	// tracker, so a retry after a later failure does not repeat them.
+	stopped        bool
 	idleDirty      bool
 	lastIdleReport time.Time
 }
@@ -619,7 +622,11 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 }
 
 // endLocked stops the VM and records the end. The caller holds sb.cmdMu.
-func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.SandboxState, reason ownsandv1.SandboxEndReason) (*ownsandv1.SandboxStateEntry, error) {
+// When the attempt fails, it clears sb.ending so that a later Tick (TTL) or
+// Delete retries the end; the record may stay in DELETING until then. The
+// retry runs under sb.cmdMu, so ends still cannot overlap. A retry does not
+// repeat the exec tracker notification.
+func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.SandboxState, reason ownsandv1.SandboxEndReason) (entry *ownsandv1.SandboxStateEntry, err error) {
 	m.mu.Lock()
 	sb.ending = true
 	guest := sb.guest
@@ -630,25 +637,40 @@ func (m *Manager) endLocked(ctx context.Context, sb *sandbox, state ownsandv1.Sa
 		return entry, nil
 	}
 	m.mu.Unlock()
+	defer func() {
+		if err == nil {
+			return
+		}
+		m.mu.Lock()
+		if !m.closed && !sb.rec.Terminal() {
+			sb.ending = false
+		}
+		m.mu.Unlock()
+	}()
 	if _, err := m.update(sb, func(r *Record) {
 		r.State = ownsandv1.SandboxState_SANDBOX_STATE_DELETING
 		r.EndReason = reason
 	}); err != nil {
 		return nil, err
 	}
-	if err := m.rt.Delete(ctx, sb.rec.SandboxID); err != nil {
-		m.logger.Error("runtime delete failed", "sandbox_id", sb.rec.SandboxID, "error", err)
-		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox VM could not be stopped")
-	}
-	if execs != nil {
-		execs.SandboxEnded(sb.rec.SandboxID, reason)
-	}
-	if guest != nil {
-		guest.Close()
-	}
 	m.mu.Lock()
-	sb.vm, sb.guest = nil, nil
+	stopped := sb.stopped
 	m.mu.Unlock()
+	if !stopped {
+		if err := m.rt.Delete(ctx, sb.rec.SandboxID); err != nil {
+			m.logger.Error("runtime delete failed", "sandbox_id", sb.rec.SandboxID, "error", err)
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox VM could not be stopped")
+		}
+		if execs != nil {
+			execs.SandboxEnded(sb.rec.SandboxID, reason)
+		}
+		if guest != nil {
+			guest.Close()
+		}
+		m.mu.Lock()
+		sb.vm, sb.guest, sb.stopped = nil, nil, true
+		m.mu.Unlock()
+	}
 	return m.update(sb, func(r *Record) {
 		r.State = state
 		r.EndReason = reason
