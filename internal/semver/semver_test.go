@@ -14,6 +14,10 @@ func TestCompare(t *testing.T) {
 		{"1.10.0", "1.9.9", 1},
 		{"1.0.0-rc.1", "1.0.0", -1},
 		{"0.0.0-dev", "0.1.0", -1},
+		{"1.10.0", "1.9.0", 1},
+		{"1.9.0", "1.10.0", -1},
+		{"v1.9.0", "1.9.0", 0},
+		{"1.9.0-rc.1", "1.9.0", -1},
 	}
 	for _, c := range cases {
 		got, err := CompareStrings(c.a, c.b)
@@ -23,5 +27,16 @@ func TestCompare(t *testing.T) {
 	}
 	if _, err := Parse("1.2"); err == nil {
 		t.Fatal("short version accepted")
+	}
+}
+
+func TestParseRejectsInvalidVersions(t *testing.T) {
+	for _, s := range []string{"", "dev", "1.2", "1.2.3.4", "1.x.3", "1.-2.3", "latest"} {
+		if _, err := Parse(s); err == nil {
+			t.Errorf("Parse(%q) accepted", s)
+		}
+		if _, err := CompareStrings(s, "1.0.0"); err == nil {
+			t.Errorf("CompareStrings(%q, 1.0.0) accepted", s)
+		}
 	}
 }

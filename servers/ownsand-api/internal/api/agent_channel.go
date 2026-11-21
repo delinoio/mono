@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/internal/semver"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
 )
@@ -530,7 +531,10 @@ type releaseKey struct{}
 // updateTarget computes the target version of a device from the
 // organization policy and the agent releases table. A revoked running or
 // pinned version selects the platform default as a revocation recovery,
-// regardless of HOLD or PIN.
+// regardless of HOLD or PIN. A PIN sends the pinned version even when it is
+// lower than the running version. Under FOLLOW_DEFAULT the platform default
+// is a target only when it is strictly newer than the running version, so a
+// default that was rolled back never downgrades a healthy device.
 func (s *Service) updateTarget(ctx context.Context, deviceID string) (string, bool, error) {
 	var orgID, running string
 	var hostOS, arch int16
@@ -570,6 +574,21 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (string, bo
 		}
 		return policy.GetPinnedVersion(), false, nil
 	case ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD:
+		return "", false, nil
+	}
+	if def == "" {
+		return "", false, nil
+	}
+	cmp, err := semver.CompareStrings(def, running)
+	if err != nil {
+		// Without an order the server cannot tell an upgrade from a
+		// downgrade, so it sends no ordinary default target.
+		s.Logger.WarnContext(ctx, "agent_update_skipped", slog.String("device_id", deviceID),
+			slog.String("reason", "version_not_comparable"), slog.String("default_version", def),
+			slog.String("running_version", running), slog.Any("error", err))
+		return "", false, nil
+	}
+	if cmp <= 0 {
 		return "", false, nil
 	}
 	return def, false, nil

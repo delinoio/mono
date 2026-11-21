@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -683,6 +684,97 @@ func TestConfigurationPushAndAgentUpdates(t *testing.T) {
 	// The revoked version makes the device ineligible (transient).
 	if _, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("create on a revoked agent: %v", err)
+	}
+}
+
+// TestAgentUpdateTargetOrdering checks which update target the control
+// plane sends for a running version, the releases of the platform and the
+// organization policy: an ordinary default is a target only when it is
+// strictly newer, a pin is sent as it is, and a revocation recovery selects
+// the default even when it is lower.
+func TestAgentUpdateTargetOrdering(t *testing.T) {
+	type release struct {
+		version            string
+		isDefault, revoked bool
+	}
+	const (
+		follow = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT
+		pin    = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_PIN
+		hold   = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD
+	)
+	cases := []struct {
+		name         string
+		running      string
+		releases     []release
+		mode         ownsandv1.AgentVersionPolicyMode
+		pinned       string
+		wantTarget   string // empty: no update command
+		wantRecovery bool
+		wantWarning  bool
+	}{
+		{name: "lower default is not a downgrade", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, false}}, mode: follow},
+		{name: "numeric minor ordering sends a newer default", running: "1.9.0", releases: []release{{"1.10.0", true, false}, {"1.9.0", false, false}}, mode: follow, wantTarget: "1.10.0"},
+		{name: "numeric patch ordering sends a newer default", running: "1.2.9", releases: []release{{"1.2.10", true, false}}, mode: follow, wantTarget: "1.2.10"},
+		{name: "equal default with a v prefix", running: "1.9.0", releases: []release{{"v1.9.0", true, false}}, mode: follow},
+		{name: "a release is newer than its pre-release", running: "1.9.0-rc.1", releases: []release{{"1.9.0", true, false}}, mode: follow, wantTarget: "1.9.0"},
+		{name: "a pre-release default is older than the release", running: "1.9.0", releases: []release{{"1.9.0-rc.1", true, false}}, mode: follow},
+		{name: "unrecognized running version", running: "dev-build", releases: []release{{"1.9.0", true, false}}, mode: follow, wantWarning: true},
+		{name: "unrecognized default version", running: "1.9.0", releases: []release{{"latest", true, false}}, mode: follow, wantWarning: true},
+		{name: "no default release", running: "1.9.0", releases: []release{{"1.8.0", false, false}}, mode: follow},
+		{name: "lower pin is sent without recovery", running: "1.10.0", releases: []release{{"1.10.0", true, false}, {"1.9.0", false, false}}, mode: pin, pinned: "1.9.0", wantTarget: "1.9.0"},
+		{name: "healthy hold sends nothing", running: "1.0.0", releases: []release{{"1.1.0", true, false}}, mode: hold},
+		{name: "revoked running version recovers to a lower default", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, true}}, mode: follow, wantTarget: "1.9.0", wantRecovery: true},
+		{name: "revoked running version recovers under hold", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, true}}, mode: hold, wantTarget: "1.9.0", wantRecovery: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := testenv.New(t)
+			ctx := context.Background()
+			org := env.NewOrg("alice")
+			for _, r := range c.releases {
+				if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ($1, 1, 1, $2, $3)", r.version, r.isDefault, r.revoked); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.mode != follow {
+				if _, err := org.OwnerClient.Device.UpdateAgentVersionPolicy(ctx, connect.NewRequest(&ownsandv1.UpdateAgentVersionPolicyRequest{OrganizationId: org.ID, Mode: c.mode, PinnedVersion: c.pinned})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+			agent := env.NewFakeAgent(dev)
+			agent.AgentVersion = c.running
+			agent.Connect()
+			if c.wantTarget != "" {
+				up := agent.WaitFor("update command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil }).GetCommand().GetUpdateAgent()
+				if up.GetTargetVersion() != c.wantTarget || up.GetRevocationRecovery() != c.wantRecovery {
+					t.Fatalf("update = %v, want target %q recovery %t", up, c.wantTarget, c.wantRecovery)
+				}
+			}
+			// The channel handles envelopes in order, so the acknowledgement
+			// of a heartbeat that follows the capability and state reports
+			// shows that their update evaluation finished.
+			agent.Heartbeat(1)
+			agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 1 })
+			var updates []*ownsandv1.UpdateAgentCommand
+			for _, e := range agent.Received() {
+				if u := e.GetCommand().GetUpdateAgent(); u != nil {
+					updates = append(updates, u)
+				}
+			}
+			wantCount := 0
+			if c.wantTarget != "" {
+				wantCount = 1
+			}
+			if len(updates) != wantCount {
+				t.Fatalf("update commands = %v, want %d", updates, wantCount)
+			}
+			logs := env.Logs.String()
+			warned := strings.Contains(logs, "agent_update_skipped") && strings.Contains(logs, fmt.Sprintf(`"device_id":%q`, dev.ID)) && strings.Contains(logs, "version_not_comparable")
+			if warned != c.wantWarning || (!c.wantWarning && strings.Contains(logs, "agent_update_skipped")) {
+				t.Fatalf("warning logged = %t, want %t", warned, c.wantWarning)
+			}
+		})
 	}
 }
 
