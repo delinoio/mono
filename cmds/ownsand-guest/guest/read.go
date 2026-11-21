@@ -107,14 +107,14 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "read expired")
 	}
 	if e, ok := m.entries[readID]; ok {
-		if e.path != filepath.Clean(path) {
+		if e.path != nativePath(path) {
 			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS, "read_id is bound to another path")
 		}
 		e.open++
 		return e, nil
 	}
 	e := &readEntry{
-		path:     filepath.Clean(path),
+		path:     nativePath(path),
 		snapshot: filepath.Join(m.dir, readID),
 		ready:    make(chan struct{}),
 		open:     1,

@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sort"
 	"sync"
 	"time"
@@ -34,7 +33,8 @@ type finishFields struct {
 
 type writeEntry struct {
 	mu         sync.Mutex
-	path       string
+	path       string // exact path string of the binding
+	target     string // path that the finish renames to
 	tmp        string
 	file       *os.File
 	ranges     []span
@@ -69,8 +69,11 @@ func newWriteManager(now func() time.Time, logger *slog.Logger) *writeManager {
 
 // tempPath returns the temporary file of a write. It lives next to the
 // target so that the final rename stays on one file system.
+// The directory part is taken from the target as received, without a
+// lexical clean, so the operating system resolves it like the target.
 func tempPath(target, writeID string) string {
-	return filepath.Join(filepath.Dir(target), "."+filepath.Base(target)+".ownsand-"+writeID+".tmp")
+	dir, base := splitTarget(target)
+	return siblingPath(dir, "."+base+".ownsand-"+writeID+".tmp")
 }
 
 func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, error) {
@@ -81,7 +84,7 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
 	}
 	if e, ok := m.entries[id]; ok {
-		if req.GetPath() != "" && filepath.Clean(req.GetPath()) != e.path {
+		if req.GetPath() != "" && nativePath(req.GetPath()) != e.path {
 			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write_id is bound to another path")
 		}
 		return e, nil
@@ -92,10 +95,18 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 	if err := checkGuestPath(req.GetPath()); err != nil {
 		return nil, err
 	}
-	target := filepath.Clean(req.GetPath())
-	if st, err := os.Stat(filepath.Dir(target)); err != nil || !st.IsDir() {
+	// bound is the exact path string of the binding; target is the same
+	// path without trailing separators. Neither is cleaned: the operating
+	// system resolves "..", which follows symlinks first.
+	bound := nativePath(req.GetPath())
+	dir, base := splitTarget(bound)
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: parent directory does not exist")
 	}
+	if isDirectoryName(base) {
+		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: target is a directory")
+	}
+	target := siblingPath(dir, base)
 	if st, err := os.Lstat(target); err == nil && st.IsDir() {
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: target is a directory")
 	}
@@ -104,7 +115,7 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 	if err != nil {
 		return nil, fsError("write", err)
 	}
-	e := &writeEntry{path: target, tmp: tmp, file: f, lastChunk: m.now()}
+	e := &writeEntry{path: bound, target: target, tmp: tmp, file: f, lastChunk: m.now()}
 	m.entries[id] = e
 	m.logger.Info("write started", "write_id", id)
 	return e, nil
@@ -235,7 +246,7 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if err := e.file.Close(); err != nil {
 		return fsError("write", err)
 	}
-	if err := os.Rename(e.tmp, e.path); err != nil {
+	if err := os.Rename(e.tmp, e.target); err != nil {
 		// Reopen so a retry of the finish can try again.
 		if f, openErr := os.OpenFile(e.tmp, os.O_RDWR, 0); openErr == nil {
 			e.file = f
