@@ -109,10 +109,13 @@ type rconn struct {
 	cancel   context.CancelFunc
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
-	streams  map[uint64]*rstream
-	highest  uint64
-	credit   int64
-	kinds    map[ownsandv1.DataFrameKind]bool
+	// probeFailed is set before an unanswered echo probe cancels the
+	// connection; only then does the loop dial again without back-off.
+	probeFailed atomic.Bool
+	streams     map[uint64]*rstream
+	highest     uint64
+	credit      int64
+	kinds       map[ownsandv1.DataFrameKind]bool
 }
 
 // closeAfterFlush closes the connection after every queued frame was
@@ -298,6 +301,7 @@ func (r *relay) probe(c *rconn) {
 		case <-time.After(r.d.timing.ProbeTimeout):
 			if time.Unix(0, c.lastRecv.Load()).Before(sent) {
 				r.d.logger.Warn("relay connection did not answer the echo probe; reconnecting")
+				c.probeFailed.Store(true)
 				c.cancel()
 			}
 		}
@@ -444,20 +448,18 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	}()
 	tick := time.NewTicker(time.Second)
 	defer tick.Stop()
-	probeLost := false
 	for {
 		select {
 		case err := <-recvErr:
+			// This cancel only cleans up, so it does not count as a probe
+			// loss: an ordinary connection error keeps the back-off.
 			cancel()
 			<-writerDone
-			if ctx.Err() != nil && r.ctx.Err() == nil {
-				probeLost = true
-			}
-			return probeLost, err
+			return c.probeFailed.Load() && r.ctx.Err() == nil, err
 		case <-ctx.Done():
 			<-writerDone
 			<-recvErr
-			return r.ctx.Err() == nil, errors.New("dataplane: relay connection canceled")
+			return c.probeFailed.Load() && r.ctx.Err() == nil, errors.New("dataplane: relay connection canceled")
 		case <-tick.C:
 			now := time.Now()
 			if now.Sub(time.Unix(0, c.lastSend.Load())) >= r.d.timing.KeepaliveInterval {

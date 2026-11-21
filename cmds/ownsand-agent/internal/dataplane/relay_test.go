@@ -485,3 +485,20 @@ func TestRelayLoopFollowsNewChannel(t *testing.T) {
 		})
 	}
 }
+
+// A relay endpoint that fails every connection at once gets attempts with
+// back-off, not an unthrottled reconnect loop.
+func TestRelayErrorKeepsBackoff(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second}, RelayLimits{})
+	var attempts atomic.Int32
+	e.cp.SetRelayHandler(func(context.Context, string, *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		attempts.Add(1)
+		return connect.NewError(connect.CodeUnavailable, errors.New("relay unavailable"))
+	})
+	e.execGrant(e.execReq("/bin/true"))
+	time.Sleep(1500 * time.Millisecond)
+	// Back-off of 200, 400, 800 milliseconds allows about four attempts.
+	if n := attempts.Load(); n < 1 || n > 6 {
+		t.Fatalf("%d relay connection attempts in 1.5 seconds", n)
+	}
+}
