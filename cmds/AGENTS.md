@@ -28,10 +28,18 @@
 
 - When Go code in this domain changes, run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` from the repository root and confirm that it prints no path, then run `go vet ./...` and `go test ./...` from the repository root before finishing.
 
+## Licensing
+
+- `cmds/ownsand-agent/` and `cmds/ownsand-guest/` are licensed under FSL-1.1-ALv2 (their `LICENSE` files), not the repository-wide Apache-2.0 license. Use `SPDX-License-Identifier: FSL-1.1-ALv2` in their source headers.
+- The rest of `cmds/`, including `cmds/ownsand/`, `cmds/internal/` and new command tools, uses Apache-2.0. Use `SPDX-License-Identifier: Apache-2.0` in its source headers.
+- Apache-2.0 code must not import code from `cmds/ownsand-agent/` or `cmds/ownsand-guest/`. Put code that both licenses use in an Apache-2.0 directory.
+- A new FSL-1.1-ALv2 directory, or a move of code between license boundaries, needs an explicit relicensing decision. Follow `docs/repository-license-contract.md`.
+
 ## Owning contracts
 
 - [Repository defaults](../docs/repository-defaults.md)
 - [Repository workflow](../docs/repository-workflow-contract.md)
+- [Repository licensing](../docs/repository-license-contract.md)
 - `cmds/ownsand-guest/` and `cmds/ownsand-agent/`: [project index](../docs/project-ownsand.md) and [device agent foundation contract](../docs/cmds-ownsand-agent-foundation.md)
 - `cmds/ownsand/`: [project index](../docs/project-ownsand.md) and [CLI foundation contract](../docs/cmds-ownsand-cli-foundation.md)
 - `cmds/tide/` (`planned`): [project index](../docs/project-tide.md) and [CLI foundation contract](../docs/cmds-tide-cli-foundation.md)

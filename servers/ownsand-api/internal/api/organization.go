@@ -174,11 +174,11 @@ func lockOrganization(ctx context.Context, tx pgx.Tx, orgID string) error {
 // records, except the device removal tombstones, the audit events and the
 // R2 clean-up job state. It removes every device of the organization as
 // RemoveDevice does, with ORGANIZATION_DELETED as the sandbox end reason,
-// and starts the R2 clean-up job of the organization prefix, which deletes
-// its exported snapshots, retries until it succeeds and sweeps the prefix
-// once more after every signed upload URL expired. Deleting the records in
-// the same transaction stops every signed URL issuance for the
-// organization. It returns the removed device IDs.
+// and, after the records are deleted, starts the R2 clean-up job of the
+// organization prefix, which deletes its exported snapshots, retries until
+// it succeeds and sweeps the prefix once more after every signed upload URL
+// expired. Deleting the records in the same transaction stops every signed
+// URL issuance for the organization. It returns the removed device IDs.
 func (s *Service) deleteOrganizationTx(ctx context.Context, tx pgx.Tx, orgID string, actor auth.Principal) ([]string, error) {
 	rows, err := tx.Query(ctx, "SELECT device_id::text FROM devices WHERE organization_id = $1 AND state <> $2",
 		orgID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED))
@@ -208,9 +208,6 @@ func (s *Service) deleteOrganizationTx(ctx context.Context, tx pgx.Tx, orgID str
 	if err := s.endSandboxesTx(ctx, tx, "organization_id = $1", []any{orgID}, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_ORGANIZATION_DELETED, actor); err != nil {
 		return nil, err
 	}
-	if err := s.startCleanupJobTx(ctx, tx, orgID, organizationKeyPrefix+orgID+"/"); err != nil {
-		return nil, err
-	}
 	if err := s.writeAudit(ctx, tx, auditEvent{
 		OrganizationID: orgID, Action: ownsandv1.AuditAction_AUDIT_ACTION_ORGANIZATION_DELETED, Actor: actor,
 		TargetKind: ownsandv1.AuditTargetKind_AUDIT_TARGET_KIND_ORGANIZATION, TargetID: orgID,
@@ -223,8 +220,18 @@ func (s *Service) deleteOrganizationTx(ctx context.Context, tx pgx.Tx, orgID str
 	// The foreign keys delete memberships, invitations, API keys, enrollment
 	// tokens, sandboxes, snapshots, templates, idempotency keys and the
 	// agent version policy with the organization.
-	_, err = tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", orgID)
-	return devices, err
+	if _, err := tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", orgID); err != nil {
+		return nil, err
+	}
+	// The job is recorded after the cascade: the DELETE waits for every
+	// signing transaction that holds a snapshot row of the organization
+	// (handleSignedURLRequest takes FOR SHARE), so final_sweep_after is
+	// computed after the last URL that can exist for the prefix was signed
+	// and is never earlier than its expiry.
+	if err := s.startCleanupJobTx(ctx, tx, orgID, organizationKeyPrefix+orgID+"/"); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 // startCleanupJobTx records an R2 clean-up job for prefix.

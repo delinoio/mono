@@ -10,7 +10,7 @@ This contract owns the tide web console, component `tide-console`, of [`tide`](p
 - Deployment: static output on Cloudflare Pages through the [deployment workflow](repository-workflow-contract.md#deployment-workflow).
 - Server state: React Query with `@connectrpc/connect-query` and the TypeScript code from the [protos contract](protos-tide-api-contract.md).
 - UI components: [`delino-ui`](packages-delino-ui-foundation.md).
-- Development port (`planned`): `127.0.0.1:3400`. Add it to the [environment contract](repository-environment-contract.md) with the implementation.
+- Development port (`planned`): `127.0.0.1:13400`. Add it to the [environment contract](repository-environment-contract.md) with the implementation.
 
 ## Users and Operators
 

@@ -93,7 +93,7 @@ func ParseTransport(s string) (Transport, error) {
 // Options configures a Client.
 type Options struct {
 	// BaseURL is the API origin, for example https://ownsand.api.delino.io
-	// or http://127.0.0.1:8300 for a local control plane. An http:// origin
+	// or http://127.0.0.1:18300 for a local control plane. An http:// origin
 	// uses HTTP/2 without TLS (h2c with prior knowledge). Empty means
 	// DefaultBaseURL.
 	BaseURL string

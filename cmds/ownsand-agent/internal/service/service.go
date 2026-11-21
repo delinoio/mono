@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package service produces the service definitions that run
 // `ownsand-agent run` under the service manager of each host OS: a

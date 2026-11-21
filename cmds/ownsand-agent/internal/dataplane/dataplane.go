@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package dataplane serves the data path of the agent: peer-to-peer
 // WebRTC sessions that the control plane signals (pion, answerer,
