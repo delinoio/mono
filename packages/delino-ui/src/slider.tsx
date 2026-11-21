@@ -8,7 +8,7 @@ import {
   SliderTrack,
   SliderValue,
 } from "@ui-sdk/react/slider";
-import type * as React from "react";
+import * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 
 export type SliderProps = Omit<
@@ -44,6 +44,9 @@ function isEmptyArray(value: unknown): boolean {
  * `onValueChange` then reports a number, not an array, because the UI SDK state
  * is a number when no value is given. A later re-render with `value={[20]}`
  * shows one thumb with the value 20.
+ *
+ * When `value={[]}` replaces a number or a non-empty array, the slider resets
+ * to that default, as if it mounted again with no value.
  */
 export function Slider({
   label,
@@ -56,7 +59,31 @@ export function Slider({
   defaultValue: defaultValueProp,
   ...props
 }: SliderProps) {
-  const value = isEmptyArray(valueProp) ? undefined : valueProp;
+  const valueIsEmpty = isEmptyArray(valueProp);
+  const value = valueIsEmpty ? undefined : valueProp;
+  const hasValue = value !== undefined;
+  // Workaround: the UI SDK keeps its last state when `value` becomes
+  // undefined, and this wrapper maps an empty array to undefined. After a
+  // non-empty value is replaced by `[]`, the SDK state (for example the range
+  // 20 and 80) would then differ from the one default thumb rendered here.
+  // Remounting the SDK root through a new key makes it start again from `min`
+  // or `defaultValue`. The key changes only when a value is replaced by an
+  // empty array, so a fresh mount, `[]` to a value and an uncontrolled slider
+  // keep their state. The remount drops the focus of the thumb. The state is
+  // adjusted during render, which React supports for state derived from props.
+  // Remove when the UI SDK resets its state when a controlled value becomes
+  // undefined.
+  const [resetState, setResetState] = React.useState({
+    hadValue: hasValue,
+    epoch: 0,
+  });
+  let resetEpoch = resetState.epoch;
+  if (resetState.hadValue !== hasValue) {
+    if (resetState.hadValue && valueIsEmpty) {
+      resetEpoch += 1;
+    }
+    setResetState({ hadValue: hasValue, epoch: resetEpoch });
+  }
   const defaultValue = isEmptyArray(defaultValueProp)
     ? undefined
     : defaultValueProp;
@@ -74,6 +101,7 @@ export function Slider({
   return (
     <Field className="dui-text-field" disabled={disabled}>
       <SliderRoot
+        key={resetEpoch}
         className={mergeClassName("dui-slider", className)}
         disabled={disabled}
         value={value}
