@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -167,7 +168,16 @@ func New(sb Sandboxes, st *store.Store, opts Options) (*Dispatcher, error) {
 	now := d.now()
 	for _, p := range saved {
 		if now.Sub(p.IDTime) < persistedExecRetention {
-			d.lost[p.ExecID] = p
+			// Requests are required to spell exec_id in lowercase, but an
+			// earlier agent version accepted any case and may have persisted
+			// a mixed-case record. Reserve its lowercase spelling, so that
+			// the lowercase request cannot start the command a second time.
+			// The persisted record keeps the spelling it was written with.
+			key := strings.ToLower(p.ExecID)
+			if _, taken := d.lost[key]; taken && p.ExecID != key {
+				continue
+			}
+			d.lost[key] = p
 		}
 	}
 	if len(saved) > 0 {
