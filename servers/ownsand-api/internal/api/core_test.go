@@ -163,6 +163,129 @@ func TestInvitations(t *testing.T) {
 	}
 }
 
+// countJoined returns the number of MEMBER_JOINED audit events of an organization.
+func countJoined(t *testing.T, env *testenv.Env, orgID string) int {
+	t.Helper()
+	var n int
+	if err := env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM audit_events WHERE organization_id = $1 AND action = $2",
+		orgID, int16(ownsandv1.AuditAction_AUDIT_ACTION_MEMBER_JOINED)).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// pendingInvitation reports whether the invitation still has no accept time.
+func pendingInvitation(t *testing.T, env *testenv.Env, invitationID string) bool {
+	t.Helper()
+	var pending bool
+	if err := env.DB.Pool.QueryRow(context.Background(), "SELECT accept_time IS NULL FROM invitations WHERE invitation_id = $1", invitationID).Scan(&pending); err != nil {
+		t.Fatal(err)
+	}
+	return pending
+}
+
+// A concurrent acceptance by the same user, which loses the race on the
+// membership unique index, gets already_exists and leaves its invitation
+// unused and unaudited.
+func TestInvitationsConcurrentAcceptByMember(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	invB, err := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedBefore := countJoined(t, env, org.ID)
+	// This transaction plays the first acceptance: its membership insert is
+	// not committed yet, so the second acceptance passes its existence check
+	// and then waits on the unique index.
+	membershipID, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, 'erin', $3, now())",
+		membershipID, org.ID, int16(ownsandv1.Role_ROLE_MEMBER)); err != nil {
+		t.Fatal(err)
+	}
+	result := make(chan error, 1)
+	go func() {
+		_, err := env.User("erin").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: invB.Msg.GetInvitationSecret()}))
+		result <- err
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked bool
+		if err := env.DB.Pool.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE 'INSERT INTO memberships%')").Scan(&blocked); err != nil {
+			t.Fatal(err)
+		}
+		if blocked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the second acceptance never blocked on the membership insert")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-result; testenv.Code(err) != connect.CodeAlreadyExists {
+		t.Fatalf("losing concurrent accept: %v", err)
+	}
+	var memberships int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM memberships WHERE organization_id = $1 AND user_id = 'erin'", org.ID).Scan(&memberships); err != nil || memberships != 1 {
+		t.Fatalf("memberships of erin = %d, %v", memberships, err)
+	}
+	if got := countJoined(t, env, org.ID); got != joinedBefore {
+		t.Fatalf("MEMBER_JOINED events = %d, want %d", got, joinedBefore)
+	}
+	if !pendingInvitation(t, env, invB.Msg.GetInvitation().GetInvitationId()) {
+		t.Fatal("the losing acceptance used the invitation")
+	}
+	if _, err := env.User("frank").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: invB.Msg.GetInvitationSecret()})); err != nil {
+		t.Fatalf("another user accepts the unused invitation: %v", err)
+	}
+}
+
+// A unique violation other than the (organization, user) membership key
+// still fails as internal and leaves the invitation pending.
+func TestInvitationsUnrelatedUniqueViolation(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	other := env.NewOrg("bob")
+	// gina already belongs to another organization. The test-only index
+	// then makes a second membership of gina violate a unique key that is
+	// not the (organization, user) key.
+	env.Join(other.ID, other.OwnerClient, "gina", ownsandv1.Role_ROLE_MEMBER)
+	if _, err := env.DB.Pool.Exec(ctx, "CREATE UNIQUE INDEX test_memberships_gina_only ON memberships (user_id) WHERE user_id = 'gina'"); err != nil {
+		t.Fatal(err)
+	}
+	inv, err := org.OwnerClient.Member.CreateInvitation(ctx, connect.NewRequest(&ownsandv1.CreateInvitationRequest{OrganizationId: org.ID, Role: ownsandv1.Role_ROLE_MEMBER}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	joinedBefore := countJoined(t, env, org.ID)
+	if _, err := env.User("gina").Member.AcceptInvitation(ctx, connect.NewRequest(&ownsandv1.AcceptInvitationRequest{InvitationSecret: inv.Msg.GetInvitationSecret()})); testenv.Code(err) != connect.CodeInternal {
+		t.Fatalf("unrelated unique violation: %v", err)
+	}
+	var memberships int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM memberships WHERE organization_id = $1 AND user_id = 'gina'", org.ID).Scan(&memberships); err != nil || memberships != 0 {
+		t.Fatalf("memberships of gina = %d, %v", memberships, err)
+	}
+	if got := countJoined(t, env, org.ID); got != joinedBefore {
+		t.Fatalf("MEMBER_JOINED events = %d, want %d", got, joinedBefore)
+	}
+	if !pendingInvitation(t, env, inv.Msg.GetInvitation().GetInvitationId()) {
+		t.Fatal("the failed acceptance used the invitation")
+	}
+}
+
 func TestAPIKeyLifecycle(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()
