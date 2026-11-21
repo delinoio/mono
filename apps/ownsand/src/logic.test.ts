@@ -17,6 +17,7 @@ import {
   readConsoleConfig,
 } from "./config.ts";
 import {
+  deviceAllocatedVcpu,
   effectiveVcpuLimit,
   formatDuration,
   formatMib,
@@ -33,6 +34,39 @@ import {
 } from "./invitation.ts";
 import { can, canManageMember, Permission } from "./roles.ts";
 import { parseRoute, RouteId, routePath } from "./router.tsx";
+
+describe("deviceAllocatedVcpu", () => {
+  test("prefers the exact 64-bit total above the int32 range", () => {
+    expect(
+      deviceAllocatedVcpu({
+        allocation: { vcpuCount: 2147483647, vcpuTotalCount: 4294967294n },
+      }),
+    ).toBe(4294967294n);
+    expect(
+      deviceAllocatedVcpu({
+        allocation: { vcpuCount: 3, vcpuTotalCount: 3n },
+      }),
+    ).toBe(3n);
+  });
+
+  test("a present zero total is exact", () => {
+    expect(
+      deviceAllocatedVcpu({ allocation: { vcpuCount: 0, vcpuTotalCount: 0n } }),
+    ).toBe(0n);
+  });
+
+  test("falls back to the int32 count for a server without the total", () => {
+    expect(
+      deviceAllocatedVcpu({
+        allocation: { vcpuCount: 7, vcpuTotalCount: undefined },
+      }),
+    ).toBe(7n);
+  });
+
+  test("is 0 without an allocation", () => {
+    expect(deviceAllocatedVcpu({})).toBe(0n);
+  });
+});
 
 describe("console configuration", () => {
   test("defaults to the production API origin and Logto mode", () => {

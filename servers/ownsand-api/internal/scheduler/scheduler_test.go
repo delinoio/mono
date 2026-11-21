@@ -4,8 +4,11 @@ package scheduler
 
 import (
 	"errors"
+	"math"
 	"testing"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -235,5 +238,39 @@ func TestFreeDisk(t *testing.T) {
 	d.UnreportedCreatingDiskGiB = 6
 	if _, err := Place(linuxRequest(), []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
 		t.Fatalf("free disk minus unreported creates: %v", err)
+	}
+}
+
+func TestAllocatedVCPUBeyondInt32(t *testing.T) {
+	const total = 2 * int64(math.MaxInt32)
+	// The exact total decides capacity: the capped int32 field alone would
+	// look like 2147483647 and leave room under a 4294967294 limit.
+	d := linuxDevice("d1")
+	d.Limits.VcpuCount = math.MaxInt32
+	d.Limits.VcpuOvercommitPercent = 200 // effective 4294967294
+	d.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32, VcpuTotalCount: proto.Int64(total)}
+	if _, err := Place(linuxRequest(), []Device{d}, now); code(err) != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("exact allocation at the limit: %v", err)
+	}
+	d.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32, VcpuTotalCount: proto.Int64(total - 2)}
+	if _, err := Place(linuxRequest(), []Device{d}, now); err != nil {
+		t.Fatalf("exact allocation with room: %v", err)
+	}
+	// A record without the total falls back to the 32-bit count.
+	d.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32}
+	if _, err := Place(linuxRequest(), []Device{d}, now); err != nil {
+		t.Fatalf("allocation without a total: %v", err)
+	}
+	// Ranking uses the exact value: the fuller device ranks last.
+	a, b := linuxDevice("a"), linuxDevice("b")
+	for _, x := range []*Device{&a, &b} {
+		x.Limits.VcpuCount = math.MaxInt32
+		x.Limits.VcpuOvercommitPercent = 400
+	}
+	a.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32, VcpuTotalCount: proto.Int64(total)}
+	b.Allocation = &ownsandv1.DeviceAllocation{VcpuCount: math.MaxInt32, VcpuTotalCount: proto.Int64(math.MaxInt32)}
+	dec, err := Place(linuxRequest(), []Device{a, b}, now)
+	if err != nil || dec.DeviceID != "b" {
+		t.Fatalf("ranking = %v, %v", dec, err)
 	}
 }
