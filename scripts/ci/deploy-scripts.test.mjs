@@ -1648,10 +1648,20 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
+// `stubs` adds stub commands (name -> shell body) that shadow system tools, and
+// `prepare(deployRoot)` changes the scratch state before the run.
 function runDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
-  { env = {}, old = [], envFile = "LOG_LEVEL=info\n", route, state } = {},
+  {
+    env = {},
+    old = [],
+    envFile = "LOG_LEVEL=info\n",
+    route,
+    state,
+    stubs = {},
+    prepare,
+  } = {},
 ) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
@@ -1686,6 +1696,10 @@ function runDroplet(
 esac`,
   );
   shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
+  for (const [name, body] of Object.entries(stubs)) {
+    shellStub(bin, name, body);
+  }
+  prepare?.(deployRoot);
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
     input: readFileSync(dropletDeploy, "utf8"),
@@ -1830,8 +1844,10 @@ test(
       env: { STUB_RELOAD: "1" },
     });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /did not accept the route/);
+    assert.match(result.stderr, /proxy rejected the route/);
+    assert.match(result.stderr, /route of api was not switched/);
     assert.equal(result.read("caddy/sites/api.caddy"), previous);
+    assert.equal(result.read("caddy/sites/api.caddy.new"), undefined);
     assert.ok(
       result.calls.some((call) => call.startsWith("docker rm --force api-")),
     );
@@ -1840,6 +1856,71 @@ test(
     const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
     assert.equal(first.status, 1);
     assert.equal(first.read("caddy/sites/api.caddy"), undefined);
+  },
+);
+
+test(
+  "droplet deploy fails and keeps the route when a route step fails",
+  { skip },
+  (t) => {
+    const previous = "# old route\nold.example.com {\n}\n";
+    const current = `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`;
+    const cases = [
+      {
+        name: "directory",
+        message: /could not create the directory of the route file/,
+        stubs: {
+          mkdir: `case "\${@: -1}" in */caddy/sites) exit 1 ;; esac\nexec /bin/mkdir "$@"`,
+        },
+      },
+      {
+        name: "backup",
+        message: /could not back up the route file/,
+        stubs: { cp: "exit 1" },
+      },
+      {
+        name: "write",
+        message: /could not write the new route/,
+        // A directory in the place of the temporary file makes the write fail
+        // also when the tests run as root.
+        prepare: (root) => mkdirSync(join(root, "caddy/sites/api.caddy.new")),
+      },
+      {
+        name: "install",
+        message: /could not install the new route/,
+        stubs: { mv: "exit 1" },
+      },
+    ];
+    for (const { name, message, stubs, prepare } of cases) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        route: previous,
+        state: current,
+        stubs,
+        prepare,
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, message, name);
+      assert.match(result.stderr, /route of api was not switched/, name);
+      // The proxy still has the original route and nothing reloaded it.
+      assert.equal(result.read("caddy/sites/api.caddy"), previous, name);
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker exec")),
+        name,
+      );
+      // The old container keeps serving and the replacement is removed.
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker stop")),
+        name,
+      );
+      assert.ok(
+        result.calls.some((call) => call.startsWith("docker rm --force api-")),
+        name,
+      );
+      assert.match(result.stdout, /Last log lines of api-/, name);
+      assert.equal(result.read("state/api.current"), current, name);
+      assert.equal(result.read("state/api.previous"), undefined, name);
+    }
   },
 );
 
