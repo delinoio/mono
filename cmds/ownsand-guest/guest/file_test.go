@@ -489,3 +489,44 @@ func TestReadSuccessAfterLastCallEndedIsKept(t *testing.T) {
 		t.Fatal("snapshot was kept after the retention time")
 	}
 }
+
+func TestReadCopyZeroSizeProcfs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("procfs exists only on Linux")
+	}
+	const path = "/proc/cpuinfo"
+	st, err := os.Stat(path)
+	if err != nil || st.Size() != 0 {
+		t.Skipf("%s is missing or reports a size: %v", path, err)
+	}
+	h := newHarness(t, nil)
+	h.srv.reads.forceCopy = true
+	req := readReq(t, path)
+	data, size, errd := h.readAll(req)
+	if errd != nil || len(data) == 0 || size != int64(len(data)) {
+		t.Fatalf("procfs read: %d bytes size %d err %v", len(data), size, errd)
+	}
+	// A resumed read returns the suffix of the snapshot.
+	req.Offset = 1
+	suffix, size2, errd := h.readAll(req)
+	if errd != nil || size2 != size || !bytes.Equal(suffix, data[1:]) {
+		t.Fatalf("resumed procfs read: %d bytes size %d err %v", len(suffix), size2, errd)
+	}
+}
+
+func TestReadCopyEmptyFileAndSizeChange(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.reads.forceCopy = true
+	empty := filepath.Join(t.TempDir(), "empty")
+	if err := os.WriteFile(empty, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if data, size, errd := h.readAll(readReq(t, empty)); errd != nil || len(data) != 0 || size != 0 {
+		t.Fatalf("empty file: %d bytes size %d err %v", len(data), size, errd)
+	}
+	// An ordinary empty file that grows during the copy is still aborted.
+	h.srv.reads.copyHook = func() { os.WriteFile(empty, []byte("grown"), 0o644) }
+	if _, _, errd := h.readAll(readReq(t, empty)); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("empty file that grew: %v", errd)
+	}
+}
