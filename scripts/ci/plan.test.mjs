@@ -1166,6 +1166,26 @@ test("CI workflow reads the planner rust output for the Rust job and the aggrega
   );
 });
 
+// Read-only text check: the Rust job runs the lint and test checks as
+// parallel matrix entries with separate caches, and together they still run
+// every Rust command.
+test("CI workflow runs the Rust lint and test checks in parallel", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+  const rustJob = workflow.slice(
+    workflow.indexOf("\n  rust:\n"),
+    workflow.indexOf("\n  e2e:\n"),
+  );
+  assert.match(rustJob, /^\s+fail-fast: false$/m);
+  assert.match(rustJob, /^\s+check: \[lint, test\]$/m);
+  assert.match(rustJob, /^\s+key: \$\{\{ matrix\.check \}\}$/m);
+  assert.match(rustJob, /^\s+cargo fmt --all --check$/m);
+  assert.match(
+    rustJob,
+    /^\s+cargo clippy --workspace --all-targets --locked -- -D warnings$/m,
+  );
+  assert.match(rustJob, /^\s+cargo test --workspace --locked$/m);
+});
+
 // Read-only text check: the `quality`, `fixtures` and `e2e` planner outputs
 // must keep driving their jobs and the aggregate, so the planner's main-push
 // selection is enforced by ci-result without a workflow edit.

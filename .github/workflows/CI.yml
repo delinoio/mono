@@ -266,6 +266,13 @@ jobs:
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      # The lint and test checks build the workspace separately on their own
+      # runners, so they run in parallel instead of one after the other.
+      # A failed check does not cancel the other, so one run reports both.
+      fail-fast: false
+      matrix:
+        check: [lint, test]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -292,26 +299,49 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-directories: ~/.cache/cef
+          # Clippy and the test build write different `target/` content, so
+          # each check keeps its own cache entry.
+          key: ${{ matrix.check }}
           # Only main pushes save the cache. Pull requests restore the main
           # cache and do not use the repository cache quota for their builds.
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check Rust workspace
+        id: check
         shell: bash
+        env:
+          CHECK: ${{ matrix.check }}
         run: |
           set -euo pipefail
-          cargo fmt --all --check
-          cargo clippy --workspace --all-targets --locked -- -D warnings
-          cargo test --workspace --locked
+          case "$CHECK" in
+            lint)
+              commands='cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings'
+              echo "commands=$commands" >> "$GITHUB_OUTPUT"
+              cargo fmt --all --check
+              cargo clippy --workspace --all-targets --locked -- -D warnings
+              ;;
+            test)
+              commands='cargo test --workspace --locked'
+              echo "commands=$commands" >> "$GITHUB_OUTPUT"
+              cargo test --workspace --locked
+              ;;
+            *)
+              echo "::error::Unknown Rust check: $CHECK"
+              exit 1
+              ;;
+          esac
       - name: Record validation result
         if: always()
         env:
           RESULT: ${{ job.status }}
+          CHECK: ${{ matrix.check }}
+          COMMANDS: ${{ steps.check.outputs.commands }}
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           {
             echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
-            echo 'Commands in the root Cargo workspace: cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked'
+            echo "Rust check: $CHECK"
+            echo "Commands in the root Cargo workspace: ${COMMANDS:-not started}"
             echo "Result: $RESULT"
             echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
           } >> "$GITHUB_STEP_SUMMARY"
