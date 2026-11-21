@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	connectrpc.com/connect v1.21.1
 	github.com/Code-Hex/vz/v3 v3.8.0
+	github.com/Microsoft/go-winio v0.6.4
 	github.com/containers/gvisor-tap-vsock v0.9.0
 	github.com/go-jose/go-jose/v4 v4.1.9
 	github.com/jackc/pgx/v5 v5.12.0

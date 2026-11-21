@@ -27,7 +27,8 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Run
 		kernel, rootfs := linuxImage(cfg, st)
 		return vzrt.New(vzrt.Options{Kernel: kernel, Rootfs: rootfs, VMsDir: st.Path(store.VMsDir), Logger: logger})
 	case config.RuntimeKindHyperV:
-		return hcsrt.New()
+		kernel, rootfs := linuxImage(cfg, st)
+		return hcsrt.New(hcsrt.Options{Kernel: kernel, Rootfs: rootfs, VMsDir: st.Path(store.VMsDir), Logger: logger})
 	}
 	return nil, fmt.Errorf("%w: no sandbox runtime for this host; set %s", vmruntime.ErrUnsupported, config.EnvRuntime)
 }
