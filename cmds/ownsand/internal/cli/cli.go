@@ -152,6 +152,9 @@ func Run(ctx context.Context, env Env) int {
 
 // describeError formats an error for standard error.
 func describeError(err error) string {
+	if text, ok := billingErrorText(err); ok {
+		return text
+	}
 	var ce *connect.Error
 	if errors.As(err, &ce) {
 		return fmt.Sprintf("%s: %s", ce.Code(), ce.Message())
@@ -368,6 +371,9 @@ func init() {
 		},
 		"template": {
 			"create": (*app).templateCreate, "list": (*app).templateList, "delete": (*app).templateDelete,
+		},
+		"billing": {
+			"status": (*app).billingStatus,
 		},
 	}
 }
