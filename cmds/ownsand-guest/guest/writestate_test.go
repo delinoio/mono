@@ -32,6 +32,16 @@ func releaseWriteFiles(h *harness) {
 	}
 }
 
+// releaseOnCleanup closes the staging files that h holds when the test ends.
+// Windows cannot delete a directory that holds an open file, and t.Cleanup
+// functions run last-in first-out: call it after the t.TempDir() of the
+// target directory (the harness registers its own cleanup before the test
+// creates that directory), so the files close before the directory is removed.
+func releaseOnCleanup(t *testing.T, h *harness) {
+	t.Helper()
+	t.Cleanup(func() { releaseWriteFiles(h) })
+}
+
 // restart simulates a helper restart on the same state directory and clock:
 // it closes the files that the old server holds open (the process exit does
 // that) and starts a new server.
@@ -47,6 +57,7 @@ func restart(t *testing.T, h *harness, mutate func(*Config)) *harness {
 		}
 	})
 	h2.clock = h.clock
+	releaseOnCleanup(t, h2)
 	return h2
 }
 
@@ -73,6 +84,7 @@ func exists(path string) bool {
 func startPartialWrite(t *testing.T, h *harness) (target string, req *ownsandv1.WriteFileRequest) {
 	t.Helper()
 	target = filepath.Join(t.TempDir(), "f")
+	releaseOnCleanup(t, h)
 	if err := os.WriteFile(target, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -251,6 +263,7 @@ func TestWriteRecoveryDropsRecordsWithoutStagingFile(t *testing.T) {
 func TestWriteFinishedUploadSurvivesRestartAndExpiry(t *testing.T) {
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "f")
+	releaseOnCleanup(t, h)
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("final"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 5}}
 	first := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: req.GetWriteId(), Path: target, BindingSalt: make([]byte, 32), Data: []byte("fi")}
 	if _, errd := h.write(first); errd != nil {
@@ -274,6 +287,7 @@ func TestWriteFinishedUploadSurvivesRestartAndExpiry(t *testing.T) {
 func TestWriteFinishedRecordFailureIsRetriedBySweep(t *testing.T) {
 	h := newHarness(t, nil)
 	target := filepath.Join(t.TempDir(), "f")
+	releaseOnCleanup(t, h)
 	// A record that cannot be removed (a directory with a file) does not fail
 	// the finish; the sweep keeps trying.
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("x"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1}}
@@ -376,6 +390,7 @@ func TestWriteRecordFailuresLogWriteIDWithoutPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
+	releaseOnCleanup(t, h)
 	target := filepath.Join(dir, "secret-name")
 	req := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32), Data: []byte("x"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1}}
 	if resp, errd := h.write(req); errd != nil || !resp.GetFinished() {
