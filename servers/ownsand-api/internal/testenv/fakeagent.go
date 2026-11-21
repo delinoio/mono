@@ -52,6 +52,9 @@ type FakeAgent struct {
 	closeErr  error
 	// readGate, when set, holds the read loop before its next receive.
 	readGate chan struct{}
+	// stallAfter, when set, arms readGate once the read loop received an
+	// envelope that it matches (see StallReadsAfter).
+	stallAfter func(*ownsandv1.AgentEnvelope) bool
 }
 
 // DefaultLinuxCapabilities reports a Linux host that runs Linux guests.
@@ -156,15 +159,16 @@ func (a *FakeAgent) SendStateReport() {
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: report}})
 }
 
-// StallReads stops the agent from reading its channel after the envelope
-// it receives next, so the server's writes back up in the transport until
-// ResumeReads or Close.
-func (a *FakeAgent) StallReads() {
+// StallReadsAfter stops the agent from reading its channel right after it
+// received the first envelope that match accepts, until ResumeReads or
+// Close. The read loop evaluates match under the agent lock and arms the
+// stall before it publishes the envelope, so a WaitFor for that envelope
+// returns only when the stall is in effect, however far the read loop was
+// in processing earlier envelopes. match must not call agent methods.
+func (a *FakeAgent) StallReadsAfter(match func(*ownsandv1.AgentEnvelope) bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	if a.readGate == nil {
-		a.readGate = make(chan struct{})
-	}
+	a.stallAfter = match
 }
 
 // ResumeReads lets a stalled agent read its channel again.
@@ -199,6 +203,12 @@ func (a *FakeAgent) read() {
 		env := resp.GetEnvelope()
 		a.mu.Lock()
 		a.received = append(a.received, env)
+		if a.stallAfter != nil && a.stallAfter(env) {
+			a.stallAfter = nil
+			if a.readGate == nil {
+				a.readGate = make(chan struct{})
+			}
+		}
 		ch := a.changed
 		a.changed = make(chan struct{})
 		a.mu.Unlock()

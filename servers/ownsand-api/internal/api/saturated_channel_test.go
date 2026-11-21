@@ -27,8 +27,12 @@ const saturationQueueFullWait = 300 * time.Millisecond
 // than the queue-full wait, so it does not close the channel itself.
 func saturate(t *testing.T, env *testenv.Env, agent *testenv.FakeAgent) {
 	t.Helper()
-	agent.StallReads()
-	// The acknowledgement is the last envelope that the agent reads.
+	// The acknowledgement is the last envelope that the agent reads. The
+	// stall is armed by the read loop itself when it receives that
+	// acknowledgement, so it does not depend on whether the loop is already
+	// blocked in a receive when the stall is requested (it can still be
+	// processing an earlier configuration or state acknowledgement).
+	agent.StallReadsAfter(func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 900 })
 	agent.Heartbeat(900)
 	agent.WaitFor("last heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 900 })
 	conn := env.App.Service.Hub.Get(agent.Device.ID)
