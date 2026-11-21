@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/url"
@@ -62,12 +63,11 @@ func NewURL(t testing.TB) string {
 		defer func() { _ = conn.Close(ctx) }()
 		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
 	})
-	u, err := url.Parse(admin)
+	child, err := childURL(admin, name)
 	if err != nil {
-		t.Fatalf("parse %s: %v", EnvTestDatabaseURL, err)
+		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
 	}
-	u.Path = "/" + name
-	d, err := db.Open(ctx, u.String())
+	d, err := db.Open(ctx, child)
 	if err != nil {
 		t.Fatalf("open test database: %v", err)
 	}
@@ -75,7 +75,31 @@ func NewURL(t testing.TB) string {
 	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil))); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
-	return u.String()
+	return child
+}
+
+// childURL returns the admin URL retargeted to the database name. It rewrites
+// the path for path-only URLs and appends dbname=name as the last query
+// setting, because pgx lets the dbname and database query settings override
+// the path and the last duplicate wins. The rest of the query keeps its raw
+// bytes and order. The error never contains the URL.
+func childURL(admin, name string) (string, error) {
+	u, err := url.Parse(admin)
+	if err != nil {
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			return "", uerr.Err
+		}
+		return "", errors.New("invalid URL")
+	}
+	u.Path = "/" + name
+	u.RawPath = ""
+	if u.RawQuery == "" {
+		u.RawQuery = "dbname=" + name
+	} else {
+		u.RawQuery += "&dbname=" + name
+	}
+	return u.String(), nil
 }
 
 // New returns an open pool on a fresh, migrated database.
