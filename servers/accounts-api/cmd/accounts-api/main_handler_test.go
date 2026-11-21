@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"connectrpc.com/connect"
@@ -16,12 +17,14 @@ import (
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/accounts-api/internal/config"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 )
 
-// TestNewHandlerServesBillingAccountService checks the production wiring
-// without a database: the service is mounted behind authentication and CORS,
-// and /healthz still answers.
-func TestNewHandlerServesBillingAccountService(t *testing.T) {
+// TestNewHandlerServesTheBillingServices checks the production wiring
+// without a database: the services are mounted behind authentication and
+// CORS, the Paddle webhook checks signatures, /metrics is not public and
+// /healthz still answers.
+func TestNewHandlerServesTheBillingServices(t *testing.T) {
 	cfg, err := config.Load(func(name string) (string, bool) {
 		value, ok := map[string]string{
 			config.EnvDatabaseURL:             "postgres://user@127.0.0.1:1/none",
@@ -31,6 +34,11 @@ func TestNewHandlerServesBillingAccountService(t *testing.T) {
 			config.EnvLogtoM2MClientSecret:    "secret",
 			config.EnvResendAPIKey:            "re_test",
 			config.EnvEmailFrom:               "billing@delino.io",
+			config.EnvPaddleEnvironment:       "sandbox",
+			config.EnvPaddleAPIKey:            "pdl_test",
+			config.EnvPaddleWebhookSecret:     "pdl_ntfset_test",
+			config.EnvPaddlePriceID:           "pri_01aaaaaaaaaaaaaaaaaaaaaaaa",
+			config.EnvPaddleTopUpProductID:    "pro_01bbbbbbbbbbbbbbbbbbbbbbbb",
 		}[name]
 		return value, ok
 	})
@@ -42,7 +50,7 @@ func TestNewHandlerServesBillingAccountService(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	handler, err := newHandler(cfg, database, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	handler, _, err := newHandler(cfg, database, slog.New(slog.NewJSONHandler(io.Discard, nil)), metrics.New())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,11 +62,35 @@ func TestNewHandlerServesBillingAccountService(t *testing.T) {
 	if connect.CodeOf(err) != connect.CodeUnauthenticated {
 		t.Fatalf("ListBillingAccounts without a token: %v, want unauthenticated", err)
 	}
+	credit := accountsv1connect.NewCreditServiceClient(http.DefaultClient, srv.URL)
+	_, err = credit.GetBalance(context.Background(), connect.NewRequest(&accountsv1.GetBalanceRequest{}))
+	if connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("GetBalance without a token: %v, want unauthenticated", err)
+	}
+
+	// The Paddle webhook rejects an unsigned delivery before it reads the
+	// database, and the public handler never serves the metrics.
+	resp, err := http.Post(srv.URL+"/webhooks/paddle", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("unsigned webhook status %d, want 401", resp.StatusCode)
+	}
+	resp, err = http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("public /metrics status %d, want 404", resp.StatusCode)
+	}
 
 	req, _ := http.NewRequest(http.MethodOptions, srv.URL+accountsv1connect.BillingAccountServiceGetBillingAccountProcedure, nil)
 	req.Header.Set("Origin", config.DefaultWebOrigin)
 	req.Header.Set("Access-Control-Request-Method", http.MethodPost)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err = http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

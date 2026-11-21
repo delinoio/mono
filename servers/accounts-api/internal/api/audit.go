@@ -25,6 +25,13 @@ const (
 	AuditMemberRoleChanged     AuditKind = "member_role_changed"
 	AuditMemberRemoved         AuditKind = "member_removed"
 	AuditOwnershipTransferred  AuditKind = "ownership_transferred"
+
+	AuditSubscriptionStarted      AuditKind = "subscription_started"
+	AuditSubscriptionCanceled     AuditKind = "subscription_canceled"
+	AuditSubscriptionResumed      AuditKind = "subscription_resumed"
+	AuditTopUpRequested           AuditKind = "top_up_requested"
+	AuditAutoTopUpSettingsUpdated AuditKind = "auto_top_up_settings_updated"
+	AuditAlertSettingsUpdated     AuditKind = "alert_settings_updated"
 )
 
 // auditEvent is one billing audit event. Details never hold secrets or email

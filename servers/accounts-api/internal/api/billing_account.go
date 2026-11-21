@@ -268,11 +268,14 @@ func (h *BillingAccountHandler) DeleteBillingAccount(ctx context.Context, req *c
 		if linked {
 			return failedPrecondition("a billing account with linked organizations cannot be deleted")
 		}
-		// The deletion is a soft delete: the row, the organization link
-		// history and the audit events stay for the retention period. The
-		// Paddle subscription and the credit ledger do not exist yet; the
-		// change that adds them must cancel the subscription and record the
-		// forfeited credit in this transaction.
+		// Cancel the Paddle subscription at once and forfeit the remaining
+		// credit with EXPIRY entries. A Paddle failure fails the deletion,
+		// so nothing changes. The deletion is a soft delete: the row, the
+		// ledger, the grants, the organization link history and the audit
+		// events stay for the retention period.
+		if err := h.billing.CloseAccount(ctx, tx, accountID); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `UPDATE billing_accounts SET delete_time = $2, update_time = $2 WHERE billing_account_id = $1`,
 			accountID, now); err != nil {
 			return err
