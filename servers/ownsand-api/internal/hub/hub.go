@@ -110,6 +110,8 @@ type Hub struct {
 	// listeners run when a channel closes (for example to end the relay
 	// connections and grants bound to it).
 	closeListeners []func(*Conn)
+	// fences holds the per-device fences that are in use (see lockDevice).
+	fences map[string]*deviceFence
 
 	// Commands holds the waiters for command results by command ID.
 	Commands *Waiters[string, *ownsandv1.AgentCommandResult]
@@ -117,7 +119,45 @@ type Hub struct {
 
 // New returns an empty hub.
 func New() *Hub {
-	return &Hub{conns: map[string]*Conn{}, Commands: NewWaiters[string, *ownsandv1.AgentCommandResult]()}
+	return &Hub{conns: map[string]*Conn{}, fences: map[string]*deviceFence{}, Commands: NewWaiters[string, *ownsandv1.AgentCommandResult]()}
+}
+
+// deviceFence serializes the registration of a new channel of one device
+// with the offline write of a closing channel of the same device. refs
+// counts the goroutines that hold or wait for mu, so that the hub drops the
+// fence of an idle device.
+type deviceFence struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockDevice takes the fence of the device and returns its release
+// function. The fence is an in-process lock: it never spans an instance, and
+// the lease holder is the only instance that has channels.
+//
+// Lock order: a caller that also locks the device row in Postgres locks the
+// row first and the fence second. Register holds no row lock while it waits
+// for the fence, so a holder of the row lock that waits for the fence waits
+// only for a Register call that needs no further lock.
+func (h *Hub) lockDevice(deviceID string) (unlock func()) {
+	h.mu.Lock()
+	f := h.fences[deviceID]
+	if f == nil {
+		f = &deviceFence{}
+		h.fences[deviceID] = f
+	}
+	f.refs++
+	h.mu.Unlock()
+	f.mu.Lock()
+	return func() {
+		f.mu.Unlock()
+		h.mu.Lock()
+		f.refs--
+		if f.refs == 0 {
+			delete(h.fences, deviceID)
+		}
+		h.mu.Unlock()
+	}
 }
 
 // OnClose adds a listener that runs after a channel closed and was removed.
@@ -129,9 +169,13 @@ func (h *Hub) OnClose(fn func(*Conn)) {
 
 // Register adds a new current channel for the device. It closes the
 // previous channel of the device, whose later events no longer change the
-// device state.
+// device state. Register waits for an IfNoChannel call of the same device
+// that is running, so a new channel is never registered between the check
+// and the write of that call.
 func (h *Hub) Register(parent context.Context, deviceID, orgID string) *Conn {
 	ctx, cancel := context.WithCancelCause(parent)
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
 	h.mu.Lock()
 	h.gen++
 	c := &Conn{DeviceID: deviceID, OrganizationID: orgID, Generation: h.gen, out: make(chan *ownsandv1.AgentEnvelope, outboundQueue), ctx: ctx, cancel: cancel}
@@ -159,6 +203,28 @@ func (h *Hub) Unregister(c *Conn) bool {
 		fn(c)
 	}
 	return current
+}
+
+// IfNoChannel runs fn when the device has no registered channel, and
+// reports whether it ran. fn runs under the device fence: Register of the
+// same device waits until fn returns, and no channel of the device is
+// registered while fn runs. A channel that closed and was unregistered uses
+// it for the offline write, so that the write cannot take a device offline
+// that a replacement channel registered after the unregistration (the
+// replacement's state report then sets it online after the write, not
+// before). It runs outside the close listeners, which run in Unregister
+// without a lock. fn must not call Register of the same device.
+func (h *Hub) IfNoChannel(deviceID string, fn func()) bool {
+	unlock := h.lockDevice(deviceID)
+	defer unlock()
+	h.mu.Lock()
+	registered := h.conns[deviceID] != nil
+	h.mu.Unlock()
+	if registered {
+		return false
+	}
+	fn()
+	return true
 }
 
 // Get returns the current channel of the device, or nil.

@@ -191,6 +191,76 @@ func TestExecContinuesOnNewSessionAfterSessionEnd(t *testing.T) {
 	}
 }
 
+// quietRotations is more session ends than the failure cap of 5 allows.
+const quietRotations = 8
+
+// TestExecQuietSessionExpiriesDoNotHitFailureCap simulates a silent exec that
+// outlives more session expiries than the failure cap: every session ends
+// after the agent served the continuation and before any output arrives.
+func TestExecQuietSessionExpiriesDoNotHitFailureCap(t *testing.T) {
+	cp := newFakeCP(t)
+	gate := make(chan struct{})
+	cp.agent.run = func(_ []string, e *fakeExec) {
+		<-gate
+		e.write(0, []byte("line 0\n"))
+		e.write(1, []byte("done\n"))
+		e.finish(exitedEvent(3))
+	}
+	cp.p2pScript = func(n int) p2pAction {
+		if n <= quietRotations {
+			return p2pAction{endAfterStarted: true, reason: ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED}
+		}
+		if n == quietRotations+1 {
+			close(gate)
+		}
+		return p2pAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportAuto))
+	res, r := runExec(t, s)
+	checkLines(t, res, r, 1)
+	if cp.openSessionCount() != quietRotations+1 {
+		t.Fatalf("%d sessions, want %d", cp.openSessionCount(), quietRotations+1)
+	}
+	if res.Transport != ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER {
+		t.Fatalf("transport %v", res.Transport)
+	}
+	if cp.agent.totalRuns() != 1 {
+		t.Fatalf("command ran %d times", cp.agent.totalRuns())
+	}
+}
+
+// TestExecRepeatedSessionFailuresHitFailureCap checks that real failures
+// still end the exec: session ends before the agent served the request, and
+// a data channel that closes without a session-end frame on a forced
+// peer-to-peer handle.
+func TestExecRepeatedSessionFailuresHitFailureCap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tr   Transport
+		act  p2pAction
+	}{
+		{"UnacceptedSessionEnd", TransportAuto, p2pAction{endNow: true, reason: ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED}},
+		{"ChannelFailure", TransportPeerToPeer, p2pAction{failNow: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(1, 0)
+			cp.p2pScript = func(int) p2pAction { return tc.act }
+			s := cp.handle(t, cp.client(t, tc.tr))
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+			var dp *DataPathError
+			if !errors.As(err, &dp) {
+				t.Fatalf("want a DataPathError, got %v", err)
+			}
+			if got := cp.openSessionCount(); got != 6 {
+				t.Fatalf("%d sessions, want 6 (the sixth failure ends the exec)", got)
+			}
+		})
+	}
+}
+
 func TestExecMovesToRelayAfterChannelFailure(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.agent.run = lineRun(6, 20*time.Millisecond)

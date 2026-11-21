@@ -56,7 +56,10 @@ type fakeRuntime struct {
 	paused    map[string]bool
 	createErr error
 	block     chan struct{}
-	starts    int // Create calls, counted before any block or error
+	// deleteFails is the number of Delete calls that fail before one works.
+	deleteFails int
+	deleteCalls int
+	starts      int // Create calls, counted before any block or error
 }
 
 func (r *fakeRuntime) startCount() int {
@@ -112,6 +115,12 @@ func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (v
 }
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	r.mu.Lock()
+	r.deleteCalls++
+	if r.deleteFails > 0 {
+		r.deleteFails--
+		r.mu.Unlock()
+		return errors.New("injected stop failure")
+	}
 	v := r.vms[id]
 	delete(r.vms, id)
 	r.mu.Unlock()
@@ -513,6 +522,110 @@ func TestTTLExpiry(t *testing.T) {
 	}
 }
 
+// TestTTLEndRetriesAfterStopFailure checks that a failed stop during TTL
+// termination leaves the sandbox in DELETING and that a later Tick completes
+// the end exactly once.
+func TestTTLEndRetriesAfterStopFailure(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	e.clk.Advance(11 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.rt.mu.Lock()
+		defer e.rt.mu.Unlock()
+		return e.rt.deleteCalls == 1
+	})
+	// The failed attempt must clear the ending flag so Tick can select the
+	// sandbox again. It stays DELETING until the retry.
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state after failed stop %v, want DELETING", s)
+	}
+	e.ex.mu.Lock()
+	_, ended := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if ended {
+		t.Fatal("exec tracker notified before the VM stopped")
+	}
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("end reason %v", r)
+	}
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("runtime Delete calls %d, want 2", calls)
+	}
+	e.ex.mu.Lock()
+	r := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("exec tracker end reason %v", r)
+	}
+	// A further Tick does nothing for the terminal record.
+	e.m.Tick(context.Background(), false)
+	time.Sleep(50 * time.Millisecond)
+	e.rt.mu.Lock()
+	calls = e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("runtime Delete calls after terminal %d, want 2", calls)
+	}
+}
+
+// TestMaxTTLReasonSurvivesRetryOfPausedSandbox checks that a retry after a
+// failed stop keeps MAX_TTL_EXPIRED for a paused sandbox. The record in
+// DELETING no longer says paused, so recomputing the reason would apply the
+// idle deadline that the pause suspended.
+func TestMaxTTLReasonSurvivesRetryOfPausedSandbox(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	if en, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v %v", en, err)
+	}
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	// Only the maximum deadline passed; the idle deadline is stale.
+	e.clk.Advance(2 * time.Hour)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.rt.mu.Lock()
+		defer e.rt.mu.Unlock()
+		return e.rt.deleteCalls == 1
+	})
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state after failed stop %v, want DELETING", s)
+	}
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("end reason after retry %v, want MAX_TTL_EXPIRED", r)
+	}
+	e.ex.mu.Lock()
+	r := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("exec tracker end reason %v, want MAX_TTL_EXPIRED", r)
+	}
+}
+
 // TestCloseWaitsForTTLEnds checks that Close returns only after the TTL
 // ends that Tick started have written their records, and that a Tick after
 // Close starts no end.
@@ -754,4 +867,16 @@ func TestDeleteSnapshot(t *testing.T) {
 	if report := e.m.StateReport(2, nil); len(report.GetSnapshots()) != 0 {
 		t.Fatal("deleted snapshot in the state report")
 	}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("condition not met in time")
 }
