@@ -54,10 +54,13 @@ func (s *Service) scanInvitation(row pgx.Row) (*ownsandv1.Invitation, error) {
 }
 
 func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Request[ownsandv1.CreateInvitationRequest]) (*connect.Response[ownsandv1.CreateInvitationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	role := req.Msg.GetRole()
 	var resp *ownsandv1.CreateInvitationResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
 			return err
@@ -94,7 +97,10 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 }
 
 func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request[ownsandv1.ListInvitationsRequest]) (*connect.Response[ownsandv1.ListInvitationsResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionManageMembers); err != nil {
 		return nil, err
 	}
@@ -129,15 +135,19 @@ func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request
 }
 
 func (h MemberHandler) RevokeInvitation(ctx context.Context, req *connect.Request[ownsandv1.RevokeInvitationRequest]) (*connect.Response[ownsandv1.RevokeInvitationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	invID := req.Msg.GetInvitationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawInvID := req.Msg.GetInvitationId()
 	var resp *ownsandv1.RevokeInvitationResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
 			return err
 		}
-		if err := validateID("invitation_id", invID); err != nil {
+		invID, err := normalizeID("invitation_id", rawInvID)
+		if err != nil {
 			return err
 		}
 		inv, err := h.scanInvitation(tx.QueryRow(ctx, "SELECT "+invitationColumns+" FROM invitations WHERE organization_id = $1 AND invitation_id = $2 FOR UPDATE", orgID, invID))
@@ -280,7 +290,10 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 }
 
 func (h MemberHandler) ListMembers(ctx context.Context, req *connect.Request[ownsandv1.ListMembersRequest]) (*connect.Response[ownsandv1.ListMembersResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadOrganization); err != nil {
 		return nil, err
 	}
@@ -341,11 +354,14 @@ func loadMembership(ctx context.Context, q db.Querier, orgID, userID string) (st
 }
 
 func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Request[ownsandv1.UpdateMemberRoleRequest]) (*connect.Response[ownsandv1.UpdateMemberRoleResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	target := req.Msg.GetUserId()
 	role := req.Msg.GetRole()
 	var resp *ownsandv1.UpdateMemberRoleResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
 			return err
@@ -383,9 +399,12 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 }
 
 func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ownsandv1.RemoveMemberRequest]) (*connect.Response[ownsandv1.RemoveMemberResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	target := req.Msg.GetUserId()
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, err := principal(ctx)
 		if err != nil {
 			return err

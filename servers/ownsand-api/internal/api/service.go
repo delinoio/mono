@@ -307,6 +307,13 @@ func normalizeID(field, value string) (string, error) {
 	return id.String(), nil
 }
 
+// canonicalID returns the lowercase text form of a UUID that validateID or
+// validate.UUIDv7 already accepted. Use normalizeID when the value is not
+// validated yet.
+func canonicalID(value string) string {
+	return strings.ToLower(value)
+}
+
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without
 // control characters.
 func validateName(field, name string) error {

@@ -60,7 +60,10 @@ func (h OrganizationHandler) CreateOrganization(ctx context.Context, req *connec
 }
 
 func (h OrganizationHandler) GetOrganization(ctx context.Context, req *connect.Request[ownsandv1.GetOrganizationRequest]) (*connect.Response[ownsandv1.GetOrganizationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	_, role, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadOrganization)
 	if err != nil {
 		return nil, err
@@ -114,9 +117,12 @@ func (h OrganizationHandler) ListOrganizations(ctx context.Context, req *connect
 }
 
 func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connect.Request[ownsandv1.DeleteOrganizationRequest]) (*connect.Response[ownsandv1.DeleteOrganizationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	var removedDevices []string
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		// The organization lock also serializes the deletion with concurrent
 		// creates in the organization and with an ownership transfer.
 		p, _, err := h.authorizeOwnerLocked(ctx, tx, orgID)
@@ -264,12 +270,15 @@ func (s *Service) startCleanupJobTx(ctx context.Context, q pgx.Tx, orgID, prefix
 }
 
 func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect.Request[ownsandv1.TransferOwnershipRequest]) (*connect.Response[ownsandv1.TransferOwnershipResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	target := req.Msg.GetUserId()
 	if target == "" {
 		return nil, errInvalidf("invalid user_id: is required")
 	}
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorizeOwnerLocked(ctx, tx, orgID)
 		if err != nil {
 			return err

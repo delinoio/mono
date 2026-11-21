@@ -546,9 +546,25 @@ func execEvents(send func(*ownsandv1.ExecEvent) error) streamEvents {
 	}
 }
 
+// canonicalizeIDs rewrites validated UUID fields of a relay request to their
+// lowercase text form in place. The grant check and the agent compare the
+// organization, sandbox and operation identifiers as text, and the request
+// frame that is forwarded to the agent must spell them like the grant does.
+// exec_id is not listed: it is lowercase-only and validation rejects any other
+// spelling before this runs.
+func canonicalizeIDs(ids ...*string) {
+	for _, id := range ids {
+		*id = canonicalID(*id)
+	}
+}
+
 func (h RelayHandler) Exec(ctx context.Context, req *connect.Request[ownsandv1.ExecRequest], stream *connect.ServerStream[ownsandv1.ExecResponse]) error {
 	m := req.Msg
-	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceExecProcedure, req.Header(), validate.ExecRequest(m), m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, m.GetExecId())
+	verr := validate.ExecRequest(m)
+	if verr == nil {
+		canonicalizeIDs(&m.OrganizationId, &m.SandboxId)
+	}
+	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceExecProcedure, req.Header(), verr, m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, m.GetExecId())
 	if err != nil {
 		return err
 	}
@@ -559,7 +575,11 @@ func (h RelayHandler) Exec(ctx context.Context, req *connect.Request[ownsandv1.E
 
 func (h RelayHandler) AttachExec(ctx context.Context, req *connect.Request[ownsandv1.AttachExecRequest], stream *connect.ServerStream[ownsandv1.AttachExecResponse]) error {
 	m := req.Msg
-	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceAttachExecProcedure, req.Header(), validate.AttachExecRequest(m), m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, m.GetExecId())
+	verr := validate.AttachExecRequest(m)
+	if verr == nil {
+		canonicalizeIDs(&m.OrganizationId, &m.SandboxId)
+	}
+	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceAttachExecProcedure, req.Header(), verr, m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, m.GetExecId())
 	if err != nil {
 		return err
 	}
@@ -570,7 +590,11 @@ func (h RelayHandler) AttachExec(ctx context.Context, req *connect.Request[ownsa
 
 func (h RelayHandler) ReadFile(ctx context.Context, req *connect.Request[ownsandv1.ReadFileRequest], stream *connect.ServerStream[ownsandv1.ReadFileResponse]) error {
 	m := req.Msg
-	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceReadFileProcedure, req.Header(), validate.ReadFileRequest(m), m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE, m.GetReadId())
+	verr := validate.ReadFileRequest(m)
+	if verr == nil {
+		canonicalizeIDs(&m.OrganizationId, &m.SandboxId, &m.ReadId)
+	}
+	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceReadFileProcedure, req.Header(), verr, m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE, m.GetReadId())
 	if err != nil {
 		return err
 	}
@@ -595,7 +619,11 @@ func (h RelayHandler) ReadFile(ctx context.Context, req *connect.Request[ownsand
 
 func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsandv1.WriteFileRequest]) (resp *connect.Response[ownsandv1.WriteFileResponse], err error) {
 	m := req.Msg
-	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceWriteFileProcedure, req.Header(), validate.WriteFileRequest(m, false), m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, m.GetWriteId())
+	verr := validate.WriteFileRequest(m, false)
+	if verr == nil {
+		canonicalizeIDs(&m.OrganizationId, &m.SandboxId, &m.WriteId)
+	}
+	c, deadline, err := h.begin(ctx, ownsandv1connect.RelayServiceWriteFileProcedure, req.Header(), verr, m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, m.GetWriteId())
 	if err != nil {
 		return nil, err
 	}
