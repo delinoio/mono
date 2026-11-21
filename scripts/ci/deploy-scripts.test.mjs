@@ -1672,7 +1672,7 @@ function runDroplet(
   writeFileSync(join(dir, "calls.log"), "");
   // `null` leaves the env file out.
   if (envFile !== null) {
-    writeFileSync(join(deployRoot, "env", "api.env"), envFile);
+    writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
   }
   if (state !== undefined) {
     mkdirSync(join(deployRoot, "state"));
@@ -1748,8 +1748,13 @@ test(
       "docker image",
     ]);
     const run = result.calls.find((call) => call.startsWith("docker run"));
+    // The replacement joins a unique alias, never the alias of the running
+    // container, so the live route cannot reach it before the health check.
+    const alias = run.match(/--network-alias (\S+)/)[1];
+    assert.match(alias, /^api-\d{14}-e{12}$/);
+    assert.ok(!/--network-alias api /.test(run), run);
     for (const part of [
-      "--network delino --network-alias api",
+      `--network delino --network-alias ${alias}`,
       "--label io.delino.service=api",
       "--restart unless-stopped",
       "/srv/env/api.env",
@@ -1772,26 +1777,61 @@ test(
     );
     const route = result.read("caddy/sites/api.caddy");
     assert.match(route, /^api\.example\.com \{$/m);
-    assert.match(route, /reverse_proxy api:8080 \{/);
+    assert.equal(route.includes(`reverse_proxy ${alias}:8080 {`), true, route);
+    assert.ok(!/reverse_proxy api:/.test(route), route);
     assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
   },
 );
 
-test("droplet deploy does not reload an unchanged route", { skip }, (t) => {
-  const first = runDroplet(t);
-  assert.equal(first.status, 0, first.stderr);
-  const route = first.read("caddy/sites/api.caddy");
-  const next = `registry.digitalocean.com/delino/api@sha256:${"f".repeat(64)}`;
-  // A second run in a fresh root with the state of the first run.
-  const second = runDroplet(t, ["api", next, "8080", "api.example.com"], {
-    old: ["old1"],
-    route,
-  });
-  assert.equal(second.status, 0, second.stderr);
-  // The route did not change, so the proxy is not reloaded.
-  assert.ok(!second.calls.some((call) => call.startsWith("docker exec")));
-  assert.equal(second.read("state/api.current"), `${next}\n`);
-});
+test(
+  "droplet deploy switches the route to the new alias on every deployment",
+  { skip },
+  (t) => {
+    const first = runDroplet(t);
+    assert.equal(first.status, 0, first.stderr);
+    const route = first.read("caddy/sites/api.caddy");
+    // A second run of the same image, in a fresh root with the route of the
+    // first run, still reloads the proxy: every deployment has its own alias.
+    const second = runDroplet(t, undefined, { old: ["old1"], route });
+    assert.equal(second.status, 0, second.stderr);
+    assert.ok(second.calls.some((call) => call.startsWith("docker exec")));
+    assert.equal(second.read("state/api.current"), `${dropletImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy keeps the alias of a long service name a valid DNS label",
+  { skip },
+  (t) => {
+    // The service name may have 63 characters, and cutting the name can leave a
+    // trailing hyphen.
+    const services = [
+      "a".repeat(63),
+      `${"b".repeat(34)}-${"c".repeat(28)}`,
+      "d".repeat(36),
+      "api",
+    ];
+    for (const service of services) {
+      const result = runDroplet(
+        t,
+        [service, dropletImage, "8080", "api.example.com"],
+        { old: ["old1"] },
+      );
+      assert.equal(result.status, 0, `${service}: ${result.stderr}`);
+      const run = result.calls.find((call) => call.startsWith("docker run"));
+      const alias = run.match(/--network-alias (\S+)/)[1];
+      assert.match(alias, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, service);
+      assert.match(alias, /-\d{14}-e{12}$/, service);
+      assert.ok(!alias.includes("--"), alias);
+      assert.ok(alias.startsWith(service.slice(0, 35).replace(/-+$/, "")));
+      assert.ok(
+        result
+          .read(`caddy/sites/${service}.caddy`)
+          .includes(`reverse_proxy ${alias}:8080 {`),
+      );
+    }
+  },
+);
 
 test(
   "droplet deploy keeps the previous image for a rollback",
@@ -1829,6 +1869,12 @@ test(
       );
       assert.equal(result.read("caddy/sites/api.caddy"), undefined, label);
       assert.equal(result.read("state/api.current"), undefined, label);
+      // The route is not written, so the live route still targets only the
+      // current container.
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker exec")),
+        label,
+      );
     }
   },
 );
