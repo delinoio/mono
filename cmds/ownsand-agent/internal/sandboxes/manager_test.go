@@ -583,6 +583,49 @@ func TestTTLEndRetriesAfterStopFailure(t *testing.T) {
 	}
 }
 
+// TestMaxTTLReasonSurvivesRetryOfPausedSandbox checks that a retry after a
+// failed stop keeps MAX_TTL_EXPIRED for a paused sandbox. The record in
+// DELETING no longer says paused, so recomputing the reason would apply the
+// idle deadline that the pause suspended.
+func TestMaxTTLReasonSurvivesRetryOfPausedSandbox(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	if en, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("pause: %v %v", en, err)
+	}
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	// Only the maximum deadline passed; the idle deadline is stale.
+	e.clk.Advance(2 * time.Hour)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.rt.mu.Lock()
+		defer e.rt.mu.Unlock()
+		return e.rt.deleteCalls == 1
+	})
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state after failed stop %v, want DELETING", s)
+	}
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("end reason after retry %v, want MAX_TTL_EXPIRED", r)
+	}
+	e.ex.mu.Lock()
+	r := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("exec tracker end reason %v, want MAX_TTL_EXPIRED", r)
+	}
+}
+
 // TestCloseWaitsForTTLEnds checks that Close returns only after the TTL
 // ends that Tick started have written their records, and that a Tick after
 // Close starts no end.
