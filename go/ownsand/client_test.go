@@ -351,3 +351,37 @@ func TestRedactKeepsWireProvenance(t *testing.T) {
 		t.Fatalf("redacted terminal wire error classified %v", kind)
 	}
 }
+
+func TestOrganizationDefaultKeepsCallerRequestUnchanged(t *testing.T) {
+	cp := newFakeCP(t)
+	newClient := func(org string) *Client {
+		c, err := New(Options{BaseURL: cp.srv.URL, APIKey: testAPIKey, OrganizationID: org, LookupEnv: func(string) (string, bool) { return "", false }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	first, second := newClient("org-first"), newClient("org-second")
+	req := &ownsandv1.GetOrganizationRequest{}
+	for _, tc := range []struct {
+		c    *Client
+		want string
+	}{{first, "org-first"}, {second, "org-second"}} {
+		res, err := tc.c.Organizations().Get(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.GetOrganization().GetOrganizationId(); got != tc.want {
+			t.Fatalf("RPC saw organization %q, want %q", got, tc.want)
+		}
+		if req.GetOrganizationId() != "" {
+			t.Fatalf("caller request was modified: organization_id=%q", req.GetOrganizationId())
+		}
+	}
+	// An explicit organization wins and stays as the caller set it.
+	explicit := &ownsandv1.GetOrganizationRequest{OrganizationId: "org-explicit"}
+	res, err := first.Organizations().Get(context.Background(), explicit)
+	if err != nil || res.GetOrganization().GetOrganizationId() != "org-explicit" {
+		t.Fatalf("explicit organization: %v %v", res, err)
+	}
+}
