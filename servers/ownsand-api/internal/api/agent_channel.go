@@ -300,7 +300,8 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	}
 	conn.SetReconciled()
 	s.Logger.InfoContext(ctx, "agent_state_report", slog.String("device_id", conn.DeviceID), slog.Int("sandboxes", len(r.GetSandboxes())),
-		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)))
+		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)),
+		slog.Int("recovered_copies", res.recoveredCopies))
 	for _, id := range res.changed {
 		s.watch.fire(id)
 	}

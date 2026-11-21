@@ -140,6 +140,9 @@ type reconcileResult struct {
 	// was deleted while the device was offline or before it learned the
 	// delete-snapshot command.
 	snapshotDeletes []string
+	// recoveredCopies counts the snapshot_copies rows that the report
+	// created for listed copies that the server did not track.
+	recoveredCopies int
 }
 
 // reconcileStateReport applies a full state report of the device: each
@@ -197,9 +200,11 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 			}
 			out.changed = append(out.changed, r.ID)
 		}
-		if err := s.reconcileSnapshotsTx(ctx, tx, deviceID, report.GetSnapshots()); err != nil {
+		recovered, err := s.reconcileSnapshotsTx(ctx, tx, deviceID, report.GetSnapshots())
+		if err != nil {
 			return err
 		}
+		out.recoveredCopies = recovered
 		unknown, err := unknownSnapshotsTx(ctx, tx, report.GetSnapshots())
 		if err != nil {
 			return err
@@ -219,46 +224,92 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 // list: an original copy of an exported snapshot keeps its record without a
 // device, any other snapshot record is deleted with its templates, and an
 // imported copy loses its copy row. Listed snapshots that the server still
-// has in CREATING take the reported fields.
-func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID string, entries []*ownsandv1.SnapshotStateEntry) error {
+// has in CREATING take the reported fields. It also recovers the copy rows
+// of listed READY copies of READY, EXPORTED snapshots that the server does
+// not track (the only other writer is the in-memory import result, which a
+// lost channel or a restart loses) and returns the number of rows it
+// created.
+//
+// Lock order: the device row first (the order of device removal), then the
+// snapshot rows in snapshot_id order in one statement, so that reports of
+// different devices that share an exported snapshot never wait on each
+// other in opposite orders. The snapshot row lock conflicts with the one
+// that DeleteSnapshot takes: when the report commits first, the deletion
+// reads the recovered row and records an event for the device; when the
+// deletion commits first, the report finds no record, creates no row and
+// the report's unknown-snapshot rule schedules the stale-copy clean-up.
+func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID string, entries []*ownsandv1.SnapshotStateEntry) (int, error) {
 	listed := map[string]*ownsandv1.SnapshotStateEntry{}
+	var readyIDs []string
 	for _, e := range entries {
 		listed[e.GetSnapshotId()] = e
+		if (e.GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY || e.GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_UNSPECIFIED) &&
+			validateID("snapshot_id", e.GetSnapshotId()) == nil {
+			readyIDs = append(readyIDs, e.GetSnapshotId())
+		}
 	}
-	rows, err := tx.Query(ctx, "SELECT snapshot_id::text, organization_id::text, state, export_state FROM snapshots WHERE device_id = $1 FOR UPDATE", deviceID)
+	var devOrg string
+	var devHost, devArch, devState int16
+	if err := tx.QueryRow(ctx, "SELECT organization_id::text, host_os, arch, state FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&devOrg, &devHost, &devArch, &devState); err != nil {
+		return 0, err
+	}
+	if ownsandv1.DeviceState(devState) == ownsandv1.DeviceState_DEVICE_STATE_REMOVED {
+		// A removed device never gets a copy row.
+		readyIDs = nil
+	}
+	rows, err := tx.Query(ctx, `SELECT snapshot_id::text, organization_id::text, state, export_state, device_id = $1 FROM snapshots
+		WHERE device_id = $1 OR (snapshot_id = ANY($2::uuid[]) AND organization_id = $3 AND state = $4 AND export_state = $5
+			AND host_os = $6 AND arch = $7)
+		ORDER BY snapshot_id FOR UPDATE`,
+		deviceID, readyIDs, devOrg, int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_READY),
+		int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED), devHost, devArch)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	type snap struct {
 		id, org       string
 		state, export int16
+		owned         bool
 	}
 	var snaps []snap
 	for rows.Next() {
 		var sn snap
-		if err := rows.Scan(&sn.id, &sn.org, &sn.state, &sn.export); err != nil {
+		var owned *bool
+		if err := rows.Scan(&sn.id, &sn.org, &sn.state, &sn.export, &owned); err != nil {
 			rows.Close()
-			return err
+			return 0, err
 		}
+		sn.owned = owned != nil && *owned
 		snaps = append(snaps, sn)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return err
+		return 0, err
 	}
+	recovered := 0
 	for _, sn := range snaps {
+		if !sn.owned {
+			// A candidate for copy recovery: another device holds the original
+			// copy or none does.
+			tag, err := tx.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", sn.id, deviceID)
+			if err != nil {
+				return 0, err
+			}
+			recovered += int(tag.RowsAffected())
+			continue
+		}
 		e, ok := listed[sn.id]
 		if ok {
 			if ownsandv1.SnapshotState(sn.state) == ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING && e.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING {
 				if err := applySnapshotEntryTx(ctx, tx, sn.id, e); err != nil {
-					return err
+					return 0, err
 				}
 			}
 			continue
 		}
 		if ownsandv1.SnapshotExportState(sn.export) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED {
 			if _, err := tx.Exec(ctx, "UPDATE snapshots SET device_id = NULL WHERE snapshot_id = $1", sn.id); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
@@ -266,39 +317,39 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID 
 			// A snapshot that the agent never reported has failed; its record
 			// stays in FAILED so callers see the outcome.
 			if _, err := tx.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1", sn.id, int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED)); err != nil {
-				return err
+				return 0, err
 			}
 			continue
 		}
 		if err := s.deleteSnapshotRecordTx(ctx, tx, sn.org, sn.id, ownsandv1.SnapshotExportState(sn.export)); err != nil {
-			return err
+			return 0, err
 		}
 	}
 	copyRows, err := tx.Query(ctx, "SELECT snapshot_id::text FROM snapshot_copies WHERE device_id = $1", deviceID)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	var copies []string
 	for copyRows.Next() {
 		var id string
 		if err := copyRows.Scan(&id); err != nil {
 			copyRows.Close()
-			return err
+			return 0, err
 		}
 		copies = append(copies, id)
 	}
 	copyRows.Close()
 	if err := copyRows.Err(); err != nil {
-		return err
+		return 0, err
 	}
 	for _, id := range copies {
 		if _, ok := listed[id]; !ok {
 			if _, err := tx.Exec(ctx, "DELETE FROM snapshot_copies WHERE snapshot_id = $1 AND device_id = $2", id, deviceID); err != nil {
-				return err
+				return 0, err
 			}
 		}
 	}
-	return nil
+	return recovered, nil
 }
 
 // unknownSnapshotsTx returns the listed snapshot IDs that have no record.
