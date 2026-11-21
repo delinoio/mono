@@ -21,7 +21,7 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

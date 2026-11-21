@@ -11,8 +11,8 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

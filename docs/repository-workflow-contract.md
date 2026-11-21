@@ -17,10 +17,36 @@ Use Node.js 24 from `.nvmrc` and pnpm 10.26.2 from `package.json`. The Go toolch
 Go packages that users outside this repository import live under the root `go/` directory, in the root Go module `github.com/delinoio/mono`. Each top-level directory `go/<name>/` is one public package tree with the import path `github.com/delinoio/mono/go/<name>`. Its name is the Go package name of its root package, for example `go/ownsand/` with the package `ownsand`. The `go/` directory contains no other code.
 
 - Put a Go package under `go/` when external users import it, or when the exported API of such a package uses it. A project contract names each of its packages under `go/` and owns their behavior.
-- Keep Go code that only this repository uses in the directory of its owning project, preferably in an `internal/` directory, for example `cmds/ownsand-agent/internal/` or `servers/ownsand-api/internal/`. Do not put Go packages for external users under `apps/`, `cmds/`, `crates/`, `packages/` or `servers/`.
+- Keep Go code that only this repository uses in the directory of its owning project, preferably in an `internal/` directory, for example `cmds/ownsand-agent/internal/` or `servers/ownsand-api/internal/`. Generic code that several projects or components share goes to a [shared internal directory](#shared-internal-go-packages) instead. Do not put Go packages for external users under `apps/`, `cmds/`, `crates/`, `packages/` or `servers/`.
 - Exception: the generated protobuf Go bindings stay next to their schemas under `protos/` (for example `protos/delino/ownsand/v1/`), also when packages under `go/` use their types in an exported API. The protos contracts own them.
 - Packages under `go/` use Apache-2.0. They import only other packages under `go/`, the generated bindings under `protos/`, the standard library and external modules. They never import code from `servers/`.
+- A package that is not specific to one project is a repository-wide public package. This contract owns it:
+  - `go/uuidv7/` (`github.com/delinoio/mono/go/uuidv7`): UUID v7 generation (strictly increasing within a process: a 12-bit counter in `rand_a` that starts from a random value each millisecond), canonical parsing that rejects other versions and variants, and timestamp extraction. The OwnSand components and the OwnSand Go SDK use it. Its import path was `github.com/delinoio/mono/go/ownsand/uuidv7` before; that path no longer exists.
 - The import path and the exported API of a package under `go/` are a public interface. Moving or renaming a package, or removing or changing an exported identifier, breaks external users; mark such a change as breaking in the pull request title (`!`) and record it in the owning contract.
+
+## Shared internal Go packages
+
+Go packages that several projects or components of this repository use, and that external users do not import, live in shared internal directories of the root Go module. The Go `internal` rule lets every package of the module import them and keeps them out of the reach of other modules.
+
+- Root `internal/<name>/` (import path `github.com/delinoio/mono/internal/<name>`) holds generic Apache-2.0 packages that do not depend on one project, for example a backoff schedule, a directory tree copy or a version comparison. Code under `apps/`, `cmds/`, `crates/`, `packages/` and `servers/` may import them. Packages under `go/` do not import them, because the public packages import only other packages under `go/` (see [Public Go packages](#public-go-packages)). Root `internal/` packages import only other root `internal/` packages, the standard library and external modules; they never import code from `servers/` or from a project directory.
+- `servers/internal/<name>/` (import path `github.com/delinoio/mono/servers/internal/<name>`) holds `FSL-1.1-ALv2` packages that only servers share, for example the validation of a listen address. Only code under `servers/` can import them. Code that apps, packages, crates or command tools also use belongs in root `internal/` instead; moving code between the two directories changes its license (see the [license contract](repository-license-contract.md)).
+- Put a package in a shared internal directory only when it has no project-specific behavior. Keep project-specific code in the owning project directory, also when several components of the project use it. Each package documents its behavior in its package comment and keeps its tests next to it.
+- Root `internal/` packages are not a public interface: a change to them must update every importer in the same change, and it needs no breaking-change marker.
+
+Current packages:
+
+| Import path                                   | Content                                                                                                                                                | Users                            |
+| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------- |
+| `github.com/delinoio/mono/internal/backoff`   | Jittered exponential reconnect delays and a context-aware sleep.                                                                                       | `ownsand-agent`                  |
+| `github.com/delinoio/mono/internal/fsutil`    | Directory tree copy and size, and tar packing and unpacking that rejects entries outside the target.                                                   | `ownsand-agent`                  |
+| `github.com/delinoio/mono/internal/procgroup` | Starting a command in a new process group and signaling that group (Linux and macOS); on Windows a new process group and `SIGKILL` of the leader only. | `ownsand-agent`, `ownsand-guest` |
+| `github.com/delinoio/mono/internal/semver`    | `MAJOR.MINOR.PATCH` parsing with an optional pre-release suffix, and version comparison.                                                               | `ownsand-agent`                  |
+
+Current `servers/internal/` packages:
+
+| Import path                                            | Content                                                                                                  | Users                         |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `github.com/delinoio/mono/servers/internal/listenaddr` | `host:port` listen address validation: a port from 0 to 65535 and an empty, IP address or RFC 1123 host. | `accounts-api`, `ownsand-api` |
 
 ## Task orchestration
 

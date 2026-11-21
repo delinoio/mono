@@ -10,7 +10,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/go/ownsand/datapath"
-	"github.com/delinoio/mono/go/ownsand/uuidv7"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

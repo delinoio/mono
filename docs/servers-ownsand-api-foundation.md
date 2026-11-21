@@ -278,6 +278,8 @@ The server reads its configuration from environment variables. `servers/ownsand-
 | `STUN_RATE_LIMIT_BURST_BYTES`      | no       | `4096`                            | STUN response burst in bytes per source IP.                                                                                                                   |
 | `TRUST_PROXY_CLIENT_ADDRESS`       | no       | `false`                           | Use the last `X-Forwarded-For` entry as the client address for rate limits (see [Security](#security)).                                                       |
 
+`ADDR` and `STUN_ADDR` must be `host:port` addresses with a port from 0 to 65535. The host must be empty (all interfaces), an IP address (IPv6 in brackets, with an optional zone) or an RFC 1123 hostname. Configuration validation checks only the syntax and does not resolve the host, so a hostname that does not resolve still fails when the server listens. `accounts-api` applies the same rule to its `ADDR` through the shared `servers/internal/listenaddr` package.
+
 Running the server locally for end-to-end tests: start Postgres, then run `pnpm --filter ownsand-api dev` (or the built binary) with `DATABASE_URL`, `LOGTO_ISSUER` set to the test issuer and `LOGTO_JWKS_FILE` set to the test key set, as described in [Authentication](#authentication). The server applies its migrations at startup and serves `GET /healthz` when it is ready.
 
 ## Security
