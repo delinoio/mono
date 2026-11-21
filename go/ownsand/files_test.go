@@ -94,6 +94,57 @@ func TestReadFileResumesWithSameReadID(t *testing.T) {
 	}
 }
 
+func TestReadFileStreamClosedWithoutAcceptedResumesAtNextOffset(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.readChunk = 10
+	want := randomBytes(t, 95)
+	cp.agent.setFile("/f", want)
+	cp.relayScript = func(_ string, n int) relayAction {
+		switch n {
+		case 1:
+			return relayAction{abortAfter: 2}
+		case 2:
+			return relayAction{noAccept: true}
+		}
+		return relayAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	var out bytes.Buffer
+	size, err := s.ReadFile(context.Background(), "/f", &out)
+	if err != nil || size != int64(len(want)) || !bytes.Equal(out.Bytes(), want) {
+		t.Fatalf("read %d bytes: %v", size, err)
+	}
+	if n := cp.relayCount("ReadFile"); n != 3 {
+		t.Fatalf("%d ReadFile calls, want 3", n)
+	}
+	cp.agent.mu.Lock()
+	reads := len(cp.agent.reads)
+	cp.agent.mu.Unlock()
+	if reads != 1 {
+		t.Fatalf("%d read snapshots, want 1 (one read_id)", reads)
+	}
+}
+
+func TestReadFileStreamClosedWithoutAcceptedEndsWithLastErrorAtWindow(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.setFile("/f", randomBytes(t, 20))
+	cp.relayScript = func(string, int) relayAction { return relayAction{noAccept: true} }
+	c := cp.client(t, TransportRelay)
+	s := cp.handle(t, c)
+	start := time.Now()
+	_, err := s.ReadFileBytes(context.Background(), "/f")
+	var dp *DataPathError
+	if !errors.As(err, &dp) || !errors.Is(err, errNotAccepted) {
+		t.Fatalf("want a DataPathError with errNotAccepted, got %v", err)
+	}
+	if time.Since(start) > c.timing.recoveryWindow+time.Second {
+		t.Fatal("unaccepted streams must end within the recovery window")
+	}
+	if n := cp.relayCount("ReadFile"); n < 3 {
+		t.Fatalf("%d ReadFile calls, want repeated attempts", n)
+	}
+}
+
 func TestReadFileResumesOnNewSession(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10

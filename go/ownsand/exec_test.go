@@ -523,18 +523,79 @@ func TestRelayStreamRejectedAtCapacityIsRetried(t *testing.T) {
 	}
 }
 
-func TestStreamWithoutAcceptedIsNotARotation(t *testing.T) {
+func TestStreamWithoutAcceptedIsRetriedWithinRecoveryWindow(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.relayScript = func(string, int) relayAction { return relayAction{noAccept: true} }
 	c := cp.client(t, TransportRelay)
 	s := cp.handle(t, c)
 	start := time.Now()
 	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"echo"}})
-	if !errors.Is(err, errNotAccepted) {
-		t.Fatalf("want errNotAccepted, got %v", err)
+	var dp *DataPathError
+	if !errors.As(err, &dp) || !errors.Is(err, errNotAccepted) {
+		t.Fatalf("want a DataPathError with errNotAccepted, got %v", err)
 	}
 	if time.Since(start) > c.timing.recoveryWindow+time.Second {
 		t.Fatal("unaccepted streams must end within the recovery window")
+	}
+	// The early close is a recoverable failure: the SDK retried inside the
+	// window and did not give up after the first stream.
+	if n := cp.relayCount("Exec") + cp.relayCount("AttachExec"); n < 3 {
+		t.Fatalf("%d relay streams, want repeated attempts", n)
+	}
+	if n := len(cp.authRequests()); n < 3 {
+		t.Fatalf("%d authorizations, want a renewal for each retry", n)
+	}
+}
+
+func TestExecFirstStreamClosedWithoutAcceptedAttachesThenResends(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(2, 0)
+	cp.relayScript = func(method string, n int) relayAction {
+		if method == "Exec" && n == 1 {
+			return relayAction{noAccept: true}
+		}
+		return relayAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	res, r := runExec(t, s)
+	checkLines(t, res, r, 2)
+	cp.mu.Lock()
+	log := strings.Join(cp.relayLog, ",")
+	cp.mu.Unlock()
+	// AttachExec first (not_found: the agent never got the request), then
+	// the identical ExecRequest with the same exec_id.
+	if log != "Exec,AttachExec,Exec" {
+		t.Fatalf("relay calls %s, want Exec,AttachExec,Exec", log)
+	}
+	if cp.agent.totalRuns() != 1 {
+		t.Fatalf("ran %d times", cp.agent.totalRuns())
+	}
+	auths := cp.authRequests()
+	if len(auths) != 2 || auths[1].ReplacesGrantId == nil || auths[0].GetOperationId() != auths[1].GetOperationId() {
+		t.Fatalf("authorizations %v, want one renewal for the same exec_id", auths)
+	}
+}
+
+func TestExecAttachClosedWithoutAcceptedIsRetried(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 10*time.Millisecond)
+	cp.relayScript = func(method string, n int) relayAction {
+		switch {
+		case method == "Exec":
+			return relayAction{abortAfter: 1}
+		case method == "AttachExec" && n == 1:
+			return relayAction{noAccept: true}
+		}
+		return relayAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	res, r := runExec(t, s)
+	checkLines(t, res, r, 3)
+	if n := cp.relayCount("AttachExec"); n != 2 {
+		t.Fatalf("%d AttachExec calls, want 2", n)
+	}
+	if cp.agent.totalRuns() != 1 {
+		t.Fatalf("ran %d times", cp.agent.totalRuns())
 	}
 }
 
