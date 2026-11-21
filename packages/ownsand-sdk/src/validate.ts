@@ -142,6 +142,28 @@ export function validateExec(input: {
   }
 }
 
+/**
+ * Reports whether a non-empty path is absolute for either guest OS: a POSIX
+ * path, a Windows drive path (`C:\` or `C:/`), a UNC path that starts with two
+ * separators (mixed separators allowed) or a root local device path (`\??\`).
+ * A single leading backslash (`\file.txt`) is root-relative on Windows, so it
+ * is not absolute. Mirrors the Go validator.
+ */
+function isAbsoluteGuestPath(path: string): boolean {
+  if (path[0] === "/") {
+    return true;
+  }
+  if (path[0] === "\\") {
+    return path[1] === "\\" || path[1] === "/" || path.startsWith("\\??\\");
+  }
+  return (
+    path.length >= 3 &&
+    /^[A-Za-z]$/.test(path[0]!) &&
+    path[1] === ":" &&
+    (path[2] === "\\" || path[2] === "/")
+  );
+}
+
 /** Checks that a path is absolute for some guest OS. */
 export function validateGuestPath(field: string, path: string): void {
   if (path === "") {
@@ -150,13 +172,7 @@ export function validateGuestPath(field: string, path: string): void {
   if (!path.isWellFormed()) {
     throw new OwnSandValidationError(field, "must be valid UTF-8");
   }
-  const absolute =
-    path[0] === "/" ||
-    path[0] === "\\" ||
-    (path.length >= 3 &&
-      /^[A-Za-z]$/.test(path[0]!) &&
-      path[1] === ":" &&
-      (path[2] === "\\" || path[2] === "/"));
+  const absolute = isAbsoluteGuestPath(path);
   if (!absolute) {
     throw new OwnSandValidationError(field, "must be an absolute guest path");
   }
