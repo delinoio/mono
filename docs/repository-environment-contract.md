@@ -2,13 +2,54 @@
 
 ## Configuration ownership
 
-The public repository has no environment selectors, secret provider integration or production credentials. Each service defines its configuration schema, validation, local defaults and credential boundaries in its domain contract. The [`accounts-api` contract](servers-accounts-api-foundation.md) owns the API server configuration, and the [`delino-accounts` web app contract](apps-delino-accounts-foundation.md) owns the web app build configuration.
+The public repository contains no secret values, Infisical project identifiers or production credentials. Infisical is the secret provider for local development only, as [Local development injection](#local-development-injection) describes; deployed servers keep reading the env files that the [deployment workflow](repository-workflow-contract.md#deployment-workflow) describes. Each service defines its configuration schema, validation, local defaults and credential boundaries in its domain contract. The [`accounts-api` contract](servers-accounts-api-foundation.md) owns the API server configuration, and the [`delino-accounts` web app contract](apps-delino-accounts-foundation.md) owns the web app build configuration.
 
 Servers under `servers/` read their runtime configuration from environment variables without a project or service prefix, for example `DATABASE_URL`, `LOGTO_ISSUER` and `CORS_ORIGINS`, not `OWNSAND_DATABASE_URL`. Each server runs as its own process with its own environment, so a prefix adds no isolation. This rule applies to the configuration that a deployed server reads. It does not apply to command-line tools, device-side programs, SDKs or web app builds, which share an environment with other programs, or to the variables that opt in to tests.
 
 ## Local state
 
-Never commit `.infisical.json`, `.dev-environment/`, real `.env` files or user, production, release and signing credentials. Service-local `.env.example` files may contain names, validation guidance, placeholders and safe loopback defaults only. Do not add a root environment example.
+Never commit `.infisical.yaml`, `.infisical.json`, `.dev-environment/`, real `.env` files or user, production, release and signing credentials. Service-local `.env.example` files may contain names, validation guidance, placeholders and safe loopback defaults only. Do not add a root environment example.
+
+## Local development injection
+
+Package `dev` scripts that read configuration run their development command through the shared launcher `scripts/dev/with-infisical.mjs`:
+
+```sh
+node ../../scripts/dev/with-infisical.mjs --path=/<folder> -- <command> [args...]
+```
+
+| Package           | `dev` command after `--`                               | Infisical folder   |
+| ----------------- | ------------------------------------------------------ | ------------------ |
+| `accounts-api`    | `node scripts/dev.mjs`                                 | `/accounts-api`    |
+| `ownsand-api`     | `node scripts/dev.mjs`                                 | `/ownsand-api`     |
+| `delino-accounts` | `node node_modules/portless/dist/cli.js run --prefix=` | `/delino-accounts` |
+| `ownsand-console` | `node node_modules/portless/dist/cli.js run --prefix=` | `/ownsand-console` |
+
+For the frontends behind portless (see [Frontend development URLs](#frontend-development-urls)), the launcher wraps portless in `dev`, not the `dev:app` script: portless reads the `dev:app` script text to add `--port` and `--host` to `rsbuild dev`, and a launcher command in front of `rsbuild` would stop that detection. The injected variables reach `dev:app` through the environment of portless, also with `PORTLESS=0`. Running `dev:app` alone does not inject them.
+
+`delino-site`, `delino-docs` and the `delidev` frontend read no configuration that Infisical supplies, so their `dev` scripts do not use the launcher. A package that starts to read configuration adds the launcher with its own folder, named after the package, in the same change, and adds a row to this table.
+
+Injection mode:
+
+- `infisical`: the repository root contains `.infisical.yaml` or the legacy `.infisical.json`, the Infisical CLI project configuration. The launcher runs `infisical run --env=dev --project-config-dir=<repository root> --path=<folder> -- <command> [args...]`. Injection is then required: when the CLI is not on `PATH`, the user is not logged in or the fetch fails, the launcher exits with a non-zero status and the development command does not start.
+- `direct`: no project configuration exists. The launcher runs the command directly with the inherited environment and logs a `dev_env_direct` record. A checkout without Infisical access, for example an external contributor's, uses this mode with shell variables and the service-local files that the owning contract documents.
+
+Setup for maintainers with access to the development project:
+
+1. Install the [Infisical CLI](https://infisical.com/docs/cli/overview) and run `infisical login` against the team's Infisical instance.
+2. Run `infisical init` in the repository root and select the development project. Current CLI versions write `.infisical.yaml`, older versions `.infisical.json`; Git ignores both. Each checkout and each linked worktree needs its own copy, because the launcher reads only the repository root of the checkout. Do not set `general.domain` (or `domain`) to an instance that the team does not operate: the CLI sends its credentials to that host.
+3. Keep each package's development variables in the `dev` environment, in the package's folder from the table above. A folder holds only the variables of its own package: server credentials never enter a frontend folder, and a frontend folder holds only public `PUBLIC_` build values, because they are inlined into the browser bundle.
+
+Rules:
+
+- The environment is always `dev`. The launcher passes `--env=dev` explicitly, so a default environment or a Git-branch mapping in the local project configuration cannot select a staging or production environment. Production values stay in the deployment env files and are not stored in the `dev` environment.
+- Infisical values override variables that are already set in the shell, because `infisical run` applies them over the inherited environment. For a value that differs for one developer, use an Infisical personal override instead of a shell variable. Rsbuild keeps a non-empty process value over the value of the same name in a `.env` file, so a non-empty injected value also overrides the service-local `.env` files of the frontends.
+- Do not define a variable that fixes a development listen address or port (for example `ADDR` or `STUN_ADDR`) in a development folder; development servers keep the fixed loopback ports of [Process boundaries](#process-boundaries).
+- Injection happens inside each package task, after Turborepo filters the task environment. The `passThroughEnv` lists in package `turbo.json` files therefore apply to shell values only, and root `pnpm dev`, package-filtered Turbo runs and `pnpm --filter <package> dev` inject the same values. Turbo strict mode removes `INFISICAL_*` variables (for example `INFISICAL_TOKEN`) from the task environment, so root `pnpm dev` uses the CLI login of the user. The CLI login reaches the task through `HOME` and, for the system keyring on Linux, `DBUS_SESSION_BUS_ADDRESS` and `XDG_RUNTIME_DIR`, which Turbo passes.
+- Builds, tests, end-to-end suites, CI and deployments do not use this injection. End-to-end suites start `rsbuild` or `rspress` directly with the variables that their configuration passes, according to the [e2e contract](repository-e2e-contract.md#app-under-test).
+- The launcher logs structured records on standard error (`dev_env_infisical`, `dev_env_direct`, `dev_env_signal`, `dev_env_usage_error` and `dev_env_failed`) with the mode, environment, folder and configuration file name. It never logs variable names or values; never print injected values in development command logs either.
+
+Process handling: the launcher starts its child (the CLI or the command) in its own process group on POSIX, forwards `SIGINT`, `SIGTERM`, `SIGQUIT` and `SIGHUP` to it once, waits for it to exit and exits with its status, or with `128 + <signal number>` after a forwarded signal. The CLI forwards every signal that it receives to the development command, which stays in the CLI's process group. A terminal Ctrl-C therefore reaches the development command exactly once, through the launcher and the CLI, and does not abort the graceful shutdown of a server launcher. On Windows the launcher does not create a process group, as the server development launchers do not. A command must be an executable on `PATH`; on Windows `shell: false` cannot start the `.cmd` shims in `node_modules/.bin`, so package scripts start JavaScript tools as `node <package bin file>`. `scripts/dev/with-infisical.test.mjs` tests both modes with a fake CLI, including the single signal delivery; the root `test:tooling` task runs it.
 
 ## Process boundaries
 

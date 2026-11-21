@@ -29,6 +29,8 @@ pnpm test
 pnpm format:check --all
 ```
 
+`pnpm dev` works without any secret provider. Maintainers with access to the team's Infisical development project can run `infisical login` and then `infisical init` in the repository root; the development servers then receive their development variables from Infisical. See [the environment contract](docs/repository-environment-contract.md#local-development-injection).
+
 ## Add a project
 
 Start with [the documentation catalog](docs/README.md) and [repository instructions](AGENTS.md). Create a project index and at least one domain contract before runtime implementation. Add language workspaces and build, test and release workflows when their first owning project is introduced.
