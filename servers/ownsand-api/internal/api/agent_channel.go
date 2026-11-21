@@ -102,10 +102,19 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	if err != nil {
 		return err
 	}
-	if h.Hub == nil || h.Lease == nil || !h.Lease.Held() {
+	if h.Hub == nil || h.Lease == nil {
 		return errUnavailable("this instance does not accept agent channels now")
 	}
-	conn := h.Hub.Register(ctx, p.ID, p.OrganizationID)
+	// The ownership check and the hub registration are one step under the
+	// lease's ownership lock. The lease loss transition takes the same lock
+	// before it closes all channels, so this channel is either in that
+	// close or refused here, before the configuration is sent and before
+	// the hub changes. Register is in-memory only; the lock is released
+	// before any database or stream I/O below.
+	var conn *hub.Conn
+	if !h.Lease.WhileHeld(func() { conn = h.Hub.Register(ctx, p.ID, p.OrganizationID) }) {
+		return errUnavailable("this instance does not accept agent channels now")
+	}
 	log := h.Logger.With(slog.String("device_id", conn.DeviceID), slog.Uint64("generation", conn.Generation))
 	log.InfoContext(ctx, "agent_channel_connected")
 

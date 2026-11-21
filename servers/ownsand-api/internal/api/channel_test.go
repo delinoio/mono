@@ -4,6 +4,8 @@ package api_test
 
 import (
 	"context"
+	"errors"
+	"net/http/httptest"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
@@ -662,4 +665,218 @@ func TestChannelNeedsLease(t *testing.T) {
 		t.Fatalf("api key on the channel: %v", err)
 	}
 	_ = dev
+}
+
+// gateLease is a LeaseHolder test double with the ownership semantics of
+// the real lease: WhileHeld holds the ownership lock while fn runs and the
+// loss transition takes the same lock before it closes the channels. The
+// gate pauses an admission before it reaches the lock.
+type gateLease struct {
+	mu   sync.Mutex
+	held bool
+	hub  interface{ CloseAll(error) }
+
+	// entered receives once when an admission reaches the gate; the
+	// admission continues after proceed is closed.
+	entered chan struct{}
+	proceed chan struct{}
+}
+
+func (g *gateLease) Held() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.held
+}
+
+func (g *gateLease) WhileHeld(fn func()) bool {
+	if g.entered != nil {
+		g.entered <- struct{}{}
+		<-g.proceed
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if !g.held {
+		return false
+	}
+	fn()
+	return true
+}
+
+// lose clears ownership under the lock and then closes every channel, like
+// Lease.set(false) followed by OnLose.
+func (g *gateLease) lose() {
+	g.mu.Lock()
+	g.held = false
+	g.mu.Unlock()
+	g.hub.CloseAll(errors.New("lease lost"))
+}
+
+// alwaysHeld is the lease of a successor instance that holds the lease.
+type alwaysHeld struct{}
+
+func (alwaysHeld) Held() bool { return true }
+
+func (alwaysHeld) WhileHeld(fn func()) bool {
+	fn()
+	return true
+}
+
+// instance is a second control plane instance on the database of env. It is
+// not run (no lease loop, no workers); lease replaces its lease.
+type instance struct {
+	app    *app.App
+	server *httptest.Server
+}
+
+func newInstance(t *testing.T, env *testenv.Env, lease api.LeaseHolder) *instance {
+	t.Helper()
+	a, err := app.New(app.Options{DB: env.DB, Logger: env.Logger, Now: env.Clock.Now, STUNURLs: []string{"stun:127.0.0.1:3478"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g, ok := lease.(*gateLease); ok {
+		g.hub = a.Service.Hub
+	}
+	a.Service.Lease = lease
+	srv := httptest.NewUnstartedServer(a.Handler())
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	return &instance{app: a, server: srv}
+}
+
+// channel opens the agent channel of the device on the instance.
+func (i *instance) channel(ctx context.Context, cred string) *connect.BidiStreamForClient[ownsandv1.ChannelRequest, ownsandv1.ChannelResponse] {
+	client := ownsandv1connect.NewAgentServiceClient(i.server.Client(), i.server.URL)
+	stream := client.Channel(ctx)
+	stream.RequestHeader().Set("Authorization", "Bearer "+cred)
+	return stream
+}
+
+type receiveResult struct {
+	msg *ownsandv1.ChannelResponse
+	err error
+}
+
+// receive reads the next message in the background so a test can time out.
+func receive(stream *connect.BidiStreamForClient[ownsandv1.ChannelRequest, ownsandv1.ChannelResponse]) <-chan receiveResult {
+	out := make(chan receiveResult, 1)
+	go func() {
+		msg, err := stream.Receive()
+		out <- receiveResult{msg, err}
+	}()
+	return out
+}
+
+func awaitReceive(t *testing.T, what string, ch <-chan receiveResult) receiveResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+		return receiveResult{}
+	}
+}
+
+// TestChannelAdmissionAfterLeaseLoss checks that an admission that passed
+// the pre-lock stage after ownership was cleared and the channels were
+// closed is answered unavailable, sends no configuration and leaves the hub
+// unchanged.
+func TestChannelAdmissionAfterLeaseLoss(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	cred := env.SessionCredential(dev)
+
+	gate := &gateLease{held: true, entered: make(chan struct{}, 1), proceed: make(chan struct{})}
+	former := newInstance(t, env, gate)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := former.channel(ctx, cred)
+	_ = stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	first := receive(stream)
+
+	// The admission is paused at the ownership step; the instance loses the
+	// lease and finishes its loss transition meanwhile.
+	select {
+	case <-gate.entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the admission did not reach the ownership step")
+	}
+	gate.lose()
+	close(gate.proceed)
+
+	r := awaitReceive(t, "the admission result", first)
+	if r.err == nil {
+		t.Fatalf("the former holder admitted the channel and sent %v", r.msg)
+	}
+	if testenv.Code(r.err) != connect.CodeUnavailable {
+		t.Fatalf("admission after lease loss: %v", r.err)
+	}
+	if former.app.Service.Hub.Get(dev.ID) != nil || len(former.app.Service.Hub.All()) != 0 {
+		t.Fatal("the hub holds a channel that was admitted after lease loss")
+	}
+}
+
+// TestChannelRegisteredBeforeLeaseLossCloses checks that a channel that is
+// registered when the real lease is lost closes during the loss transition,
+// and that the device then connects to the successor and gets its
+// configuration and heartbeat acknowledgements.
+func TestChannelRegisteredBeforeLeaseLossCloses(t *testing.T) {
+	env := testenv.New(t)
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	if err := env.App.Lease.Wait(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	agent := env.NewFakeAgent(dev)
+	agent.Connect()
+	conn := env.App.Service.Hub.Get(dev.ID)
+	if conn == nil {
+		t.Fatal("the holder has no channel for the device")
+	}
+
+	// The holder releases the lease, for example when it starts to drain.
+	env.App.Lease.Release()
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the channel stayed open after the lease was lost")
+	}
+	select {
+	case <-agent.Closed():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent did not see the channel close")
+	}
+	// A new admission to the former holder is refused.
+	late := env.Clients(env.SessionCredential(dev)).Agent.Channel(context.Background())
+	_ = late.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	if _, err := late.Receive(); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("admission to the former holder: %v", err)
+	}
+
+	// The successor holds the lease: the device reconnects there.
+	successor := newInstance(t, env, alwaysHeld{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stream := successor.channel(ctx, env.SessionCredential(dev))
+	// The client request starts with its first message.
+	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := awaitReceive(t, "the configuration", receive(stream))
+	if cfg.err != nil || cfg.msg.GetEnvelope().GetConfiguration() == nil {
+		t.Fatalf("first message from the successor: %v %v", cfg.msg, cfg.err)
+	}
+	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{
+		Sequence: 7, UpdateState: ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE,
+	}}}}); err != nil {
+		t.Fatal(err)
+	}
+	ack := awaitReceive(t, "the heartbeat acknowledgement", receive(stream))
+	if ack.err != nil || ack.msg.GetEnvelope().GetHeartbeatAck().GetSequence() != 7 {
+		t.Fatalf("heartbeat acknowledgement from the successor: %v %v", ack.msg, ack.err)
+	}
 }
