@@ -62,6 +62,13 @@ const expectedPassThroughEnv = {
     "OWNSAND_TRUST_PROXY_CLIENT_ADDRESS",
   ],
   "delino-site#dev": null,
+  "ownsand-console#dev": [
+    "PUBLIC_API_ORIGIN",
+    "PUBLIC_LOGTO_APP_ID",
+    "PUBLIC_LOGTO_ENDPOINT",
+    "PUBLIC_LOGTO_SCOPES",
+    "PUBLIC_OWNSAND_MOCK_API",
+  ],
 };
 
 // Workspace directories named by the patterns of `pnpm-workspace.yaml`.
@@ -212,6 +219,11 @@ test("removing a pass-through entry fails and names the dev task", async (t) => 
       path: "apps/delino-accounts/turbo.json",
       entry: "PUBLIC_API_ORIGIN",
       taskId: "delino-accounts#dev",
+    },
+    {
+      path: "apps/ownsand/turbo.json",
+      entry: "PUBLIC_OWNSAND_MOCK_API",
+      taskId: "ownsand-console#dev",
     },
   ]) {
     await t.test(`${path} without ${entry}`, (t) => {
