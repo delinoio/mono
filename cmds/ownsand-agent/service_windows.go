@@ -26,10 +26,17 @@ func runService(cfg config.Config) int {
 		return runInteractive(cfg)
 	}
 	// A Windows service has no standard error; the agent writes its JSON
-	// log to agent.log in the state directory.
+	// log to agent.log in the state directory. The file is opened with
+	// delete sharing (see openServiceLog) so that a device removal can delete
+	// it while the service runs, and it is closed when the service ends.
 	if err := os.MkdirAll(cfg.StateDir, 0o700); err == nil {
-		if f, err := os.OpenFile(filepath.Join(cfg.StateDir, "agent.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600); err == nil {
+		if f, err := openServiceLog(filepath.Join(cfg.StateDir, "agent.log")); err == nil {
+			prev := os.Stderr
 			os.Stderr = f
+			defer func() {
+				os.Stderr = prev
+				_ = f.Close()
+			}()
 		}
 	}
 	h := &handler{cfg: cfg}

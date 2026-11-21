@@ -385,16 +385,20 @@ func (s *Store) WipeLocalData() error {
 }
 
 // Reset deletes the whole content of the state directory, including the
-// identity.
+// identity. A failure to delete one entry does not stop the deletion of the
+// others: an entry that stays (for example, a log file that another process
+// holds open) must not keep the identity on disk. Reset returns every
+// failure joined into one error.
 func (s *Store) Reset() error {
 	entries, err := os.ReadDir(s.dir)
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, e := range entries {
 		if err := os.RemoveAll(filepath.Join(s.dir, e.Name())); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
