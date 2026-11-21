@@ -27,13 +27,15 @@ type AgentHandler struct{ *Service }
 const maxDeviceNameLength = 253
 
 // limitAgentRPC applies the per-device (or per-prefix) and per-client
-// limits of the unauthenticated device RPCs.
+// limits of the unauthenticated device RPCs. The per-client key is the bare
+// client address, so these RPCs, AcceptInvitation and failed API key
+// validations share one bucket per address.
 func (s *Service) limitAgentRPC(ctx context.Context, key string) error {
 	if ok, retry := s.Limits.PerDevice.Allow(key, 1); !ok {
 		return errRateLimited(retry)
 	}
 	if addr := clientAddr(ctx); addr != "" {
-		if ok, retry := s.Limits.PerClient.Allow("agent:"+addr, 1); !ok {
+		if ok, retry := s.Limits.PerClient.Allow(addr, 1); !ok {
 			return errRateLimited(retry)
 		}
 	}

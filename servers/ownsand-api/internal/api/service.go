@@ -58,7 +58,9 @@ type Limits struct {
 	// key validations per key prefix.
 	PerPrefix *ratelimit.Limiter
 	// PerClient limits the same RPCs per client address when a trusted
-	// client address is known.
+	// client address is known. It holds one bucket per address, keyed by the
+	// bare address, that the device RPCs, AcceptInvitation and failed API key
+	// validations share.
 	PerClient *ratelimit.Limiter
 }
 
