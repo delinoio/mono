@@ -13,6 +13,7 @@ package validate
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -234,9 +235,17 @@ func guestPath(field, path string) error {
 	return nil
 }
 
+// isAbsoluteGuestPath reports whether path is absolute for either guest OS:
+// a POSIX path, a Windows drive path (`C:\` or `C:/`), a UNC path that starts
+// with two separators (mixed separators allowed) or a root local device path
+// (`\??\C:\`). A single leading backslash (`\file.txt`) is root-relative on
+// Windows, not absolute, so it is rejected.
 func isAbsoluteGuestPath(path string) bool {
-	if path[0] == '/' || path[0] == '\\' {
+	if path[0] == '/' {
 		return true
+	}
+	if path[0] == '\\' {
+		return len(path) >= 2 && (path[1] == '\\' || path[1] == '/') || strings.HasPrefix(path, `\??\`)
 	}
 	// A Windows drive path such as `C:\` or `C:/`.
 	return len(path) >= 3 && isLetter(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/')
