@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"io"
 	"log/slog"
 	"net/url"
@@ -37,6 +38,19 @@ func URL(t testing.TB) string {
 // URL. The database is dropped when the test ends.
 func NewURL(t testing.TB) string {
 	t.Helper()
+	return newURL(t, 0)
+}
+
+// NewURLAtVersion is like NewURL but applies only the migrations up to and
+// including maxVersion, so an upgrade test can insert legacy data and then
+// apply the later migrations with db.MigrateUpTo or db.Migrate.
+func NewURLAtVersion(t testing.TB, maxVersion int) string {
+	t.Helper()
+	return newURL(t, maxVersion)
+}
+
+func newURL(t testing.TB, maxVersion int) string {
+	t.Helper()
 	admin := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -62,20 +76,43 @@ func NewURL(t testing.TB) string {
 		defer func() { _ = conn.Close(ctx) }()
 		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
 	})
-	u, err := url.Parse(admin)
+	child, err := childURL(admin, name)
 	if err != nil {
-		t.Fatalf("parse %s: %v", EnvTestDatabaseURL, err)
+		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
 	}
-	u.Path = "/" + name
-	d, err := db.Open(ctx, u.String())
+	d, err := db.Open(ctx, child)
 	if err != nil {
 		t.Fatalf("open test database: %v", err)
 	}
 	defer d.Close()
-	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil))); err != nil {
+	if err := d.MigrateUpTo(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil)), maxVersion); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
-	return u.String()
+	return child
+}
+
+// childURL returns the admin URL retargeted to the database name. It rewrites
+// the path for path-only URLs and appends dbname=name as the last query
+// setting, because pgx lets the dbname and database query settings override
+// the path and the last duplicate wins. The rest of the query keeps its raw
+// bytes and order. The error never contains the URL.
+func childURL(admin, name string) (string, error) {
+	u, err := url.Parse(admin)
+	if err != nil {
+		var uerr *url.Error
+		if errors.As(err, &uerr) {
+			return "", uerr.Err
+		}
+		return "", errors.New("invalid URL")
+	}
+	u.Path = "/" + name
+	u.RawPath = ""
+	if u.RawQuery == "" {
+		u.RawQuery = "dbname=" + name
+	} else {
+		u.RawQuery += "&dbname=" + name
+	}
+	return u.String(), nil
 }
 
 // New returns an open pool on a fresh, migrated database.
