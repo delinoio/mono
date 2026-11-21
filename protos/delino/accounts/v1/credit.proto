@@ -1,0 +1,367 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.accounts.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/accounts/v1;accountsv1";
+
+// Prepaid credits, the Paddle subscription, top-ups, alerts and invoices of
+// a billing account. The owning contract is
+// docs/protos-delino-accounts-api-contract.md; the package-wide rules are
+// in billing_account.proto.
+//
+// Credit rules that the RPCs below expose:
+//
+// - Paddle charges in whole USD cents, tax exclusive. accounts-api converts
+//   cents to micro-USD by multiplying by 10,000, at the payment boundary only.
+// - Only verified, deduplicated Paddle webhooks add credit, never an RPC
+//   response. A purchase of X USD adds a credit grant of X USD.
+// - A credit grant expires 12 months after its purchase. Usage consumes the
+//   grant that expires first. A new grant first pays off a negative balance
+//   (debt); only the rest stays in the grant.
+// - Usage is always deducted, also below zero.
+
+// Status of the Paddle subscription of a billing account. Only ACTIVE counts
+// as an active subscription for the billing status of linked organizations.
+enum SubscriptionStatus {
+  SUBSCRIPTION_STATUS_UNSPECIFIED = 0;
+  // The billing account never had a subscription.
+  SUBSCRIPTION_STATUS_NONE = 1;
+  // StartSubscription created a checkout transaction, and no verified
+  // webhook confirmed the first payment yet.
+  SUBSCRIPTION_STATUS_PENDING = 2;
+  // The subscription is paid for the current period. It stays ACTIVE until
+  // current_period_end also when cancel_at_period_end is true.
+  SUBSCRIPTION_STATUS_ACTIVE = 3;
+  // A renewal payment failed, and Paddle retries it.
+  SUBSCRIPTION_STATUS_PAST_DUE = 4;
+  // The subscription ended. StartSubscription starts a new one.
+  SUBSCRIPTION_STATUS_CANCELED = 5;
+}
+
+// Kind of a ledger entry. Credit grants and invoices use the three purchase
+// kinds (SUBSCRIPTION_CREDIT, MANUAL_TOP_UP and AUTO_TOP_UP).
+enum LedgerEntryKind {
+  LEDGER_ENTRY_KIND_UNSPECIFIED = 0;
+  // Credit of 10 USD from a paid subscription period. Positive amount.
+  LEDGER_ENTRY_KIND_SUBSCRIPTION_CREDIT = 1;
+  // Credit from a manual top-up (CreditService.CreateTopUp). Positive amount.
+  LEDGER_ENTRY_KIND_MANUAL_TOP_UP = 2;
+  // Credit from an automatic top-up. Positive amount.
+  LEDGER_ENTRY_KIND_AUTO_TOP_UP = 3;
+  // Deduction for one usage report of a service. Negative or zero amount.
+  LEDGER_ENTRY_KIND_USAGE = 4;
+  // Removal of the unused rest of an expired credit grant. Negative amount.
+  LEDGER_ENTRY_KIND_EXPIRY = 5;
+  // Removal of refunded credit after a refund in the Paddle dashboard.
+  // Negative amount; the balance can become negative.
+  LEDGER_ENTRY_KIND_REFUND = 6;
+}
+
+// CreditService reads and manages the balance, the subscription, top-ups,
+// alerts and invoices of a billing account. Every RPC needs a user token
+// with the scope `accounts:billing` and a membership in the named billing
+// account. Reads of the balance, the ledger, the subscription and the
+// settings are open to every member; every change and the invoices are
+// owner and admin only.
+service CreditService {
+  // Read the balance and the usable credit grants. Every member may call it.
+  rpc GetBalance(GetBalanceRequest) returns (GetBalanceResponse);
+  // List ledger entries, newest first. Every member may call it.
+  rpc ListLedgerEntries(ListLedgerEntriesRequest) returns (ListLedgerEntriesResponse);
+  // Read the subscription. Every member may call it.
+  rpc GetSubscription(GetSubscriptionRequest) returns (GetSubscriptionResponse);
+  // Start the 10 USD per month subscription. Owner and admin only.
+  // accounts-api creates a Paddle checkout transaction for the subscription
+  // price with the billing account ID in its custom data and returns its ID
+  // for Paddle.js checkout. The subscription becomes ACTIVE only after the
+  // verified payment webhook. While the status is PENDING, the call returns
+  // the open checkout transaction again, so that a user can retry a closed
+  // checkout. Fails with `already_exists` while the status is ACTIVE or
+  // PAST_DUE.
+  rpc StartSubscription(StartSubscriptionRequest) returns (StartSubscriptionResponse);
+  // Cancel the subscription at the end of the paid period. Owner and admin
+  // only. The subscription stays ACTIVE until current_period_end. Calling it
+  // again while a cancellation is scheduled changes nothing. Fails with
+  // `failed_precondition` unless the status is ACTIVE or PAST_DUE.
+  rpc CancelSubscription(CancelSubscriptionRequest) returns (CancelSubscriptionResponse);
+  // Remove a scheduled cancellation before the period ends. Owner and admin
+  // only. Calling it without a scheduled cancellation changes nothing. Fails
+  // with `failed_precondition` unless the status is ACTIVE or PAST_DUE.
+  rpc ResumeSubscription(ResumeSubscriptionRequest) returns (ResumeSubscriptionResponse);
+  // Buy credit with a one-time charge on the subscription's payment method
+  // (Paddle `POST /subscriptions/{id}/charge`, `effective_from: immediately`).
+  // Owner and admin only. Fails with `failed_precondition` unless the
+  // subscription is ACTIVE. The credit arrives with the verified payment
+  // webhook as a MANUAL_TOP_UP ledger entry and credit grant, not with the
+  // response. A Paddle rejection fails with `failed_precondition` and a
+  // message without payment data; Paddle unavailability fails with
+  // `unavailable`.
+  rpc CreateTopUp(CreateTopUpRequest) returns (CreateTopUpResponse);
+  // Read the automatic top-up settings. Every member may call it.
+  rpc GetAutoTopUpSettings(GetAutoTopUpSettingsRequest) returns (GetAutoTopUpSettingsResponse);
+  // Replace the automatic top-up settings. Owner and admin only.
+  rpc UpdateAutoTopUpSettings(UpdateAutoTopUpSettingsRequest) returns (UpdateAutoTopUpSettingsResponse);
+  // Read the low-balance alert settings. Every member may call it.
+  rpc GetAlertSettings(GetAlertSettingsRequest) returns (GetAlertSettingsResponse);
+  // Replace the low-balance alert settings. Owner and admin only.
+  rpc UpdateAlertSettings(UpdateAlertSettingsRequest) returns (UpdateAlertSettingsResponse);
+  // List the completed Paddle transactions of the billing account, newest
+  // first. Owner and admin only, because invoices carry the payer's address.
+  rpc ListInvoices(ListInvoicesRequest) returns (ListInvoicesResponse);
+  // Return a short-lived link to the Paddle invoice PDF of one transaction,
+  // from Paddle `GET /transactions/{id}/invoice`. Owner and admin only. A
+  // transaction of another billing account fails with `not_found`; a
+  // transaction without an invoice yet fails with `failed_precondition`;
+  // Paddle unavailability fails with `unavailable`.
+  rpc GetInvoiceUrl(GetInvoiceUrlRequest) returns (GetInvoiceUrlResponse);
+}
+
+// One change of the balance. The ledger is append-only; entries are kept for
+// 7 years, also after the billing account is deleted.
+message LedgerEntry {
+  // UUID v7.
+  string ledger_entry_id = 1;
+  string billing_account_id = 2;
+  LedgerEntryKind kind = 3;
+  // Signed change of the balance: positive for credits, negative or zero for
+  // USAGE, EXPIRY and REFUND.
+  int64 amount_usd_micros = 4;
+  // Balance after this entry. Negative while the billing account has debt.
+  int64 balance_after_usd_micros = 5;
+  google.protobuf.Timestamp create_time = 6;
+  // Paddle transaction of a purchase or a refund. Empty for USAGE and
+  // EXPIRY.
+  string paddle_transaction_id = 7;
+  // Credit grant that a purchase entry created, or that an EXPIRY or REFUND
+  // entry reduced. Empty for USAGE.
+  string credit_grant_id = 8;
+  // USAGE only: stable lowercase identifier of the reporting service, for
+  // example `ownsand`. Empty for other kinds.
+  string service = 9;
+  // USAGE only: organization ID of the reporting service, unchanged. Empty
+  // for other kinds.
+  string organization_id = 10;
+  // USAGE only: stable meter identifier `<service>.<meter>`. The values are
+  // `ownsand.relay_egress`, `ownsand.r2_storage`, `ownsand.class_a_rpc` and
+  // `ownsand.class_b_rpc`, in the unit of the meter. Empty for other kinds.
+  string meter = 11;
+  // USAGE only: start of the aligned 5-minute UTC usage window.
+  google.protobuf.Timestamp window_start = 12;
+  // USAGE only: measured quantity of the window in the unit of the meter
+  // (bytes for relay egress, byte-seconds for R2 storage, calls for the RPC
+  // meters). Zero for other kinds.
+  int64 quantity = 13;
+}
+
+// Credit from one purchase. Usage consumes grants in expire_time order.
+message CreditGrant {
+  // UUID v7.
+  string credit_grant_id = 1;
+  // SUBSCRIPTION_CREDIT, MANUAL_TOP_UP or AUTO_TOP_UP.
+  LedgerEntryKind source = 2;
+  // Purchased credit, before debt payoff and usage. Positive.
+  int64 original_usd_micros = 3;
+  // Unused credit of the grant. Between 0 and original_usd_micros.
+  int64 remaining_usd_micros = 4;
+  // Paddle transaction of the purchase.
+  string paddle_transaction_id = 5;
+  google.protobuf.Timestamp create_time = 6;
+  // 12 months after create_time. The unused rest leaves the balance as an
+  // EXPIRY ledger entry at this time.
+  google.protobuf.Timestamp expire_time = 7;
+}
+
+// The Paddle subscription of a billing account.
+message Subscription {
+  SubscriptionStatus status = 1;
+  // True when the subscription ends at current_period_end.
+  bool cancel_at_period_end = 2;
+  // End of the paid period. Unset for NONE and PENDING.
+  google.protobuf.Timestamp current_period_end = 3;
+  // Price of one period. 10 USD (10,000,000).
+  int64 price_usd_micros = 4;
+}
+
+// Automatic top-up settings of a billing account. A top-up runs when a usage
+// deduction makes the balance fall below threshold_usd_micros, with at most
+// one automatic top-up in flight per billing account and the monthly cap
+// counting only automatic top-ups of the current UTC calendar month. A
+// rejected Paddle charge, also for a PAST_DUE subscription, counts as a
+// failure.
+message AutoTopUpSettings {
+  // Off by default.
+  bool enabled = 1;
+  // Required when enabled: at least 10 USD (10,000,000), whole cents.
+  int64 threshold_usd_micros = 2;
+  // Required when enabled: at least 25 USD (25,000,000), whole cents.
+  int64 amount_usd_micros = 3;
+  // Required when enabled: at least amount_usd_micros, whole cents. Upper
+  // limit of the automatic top-ups in one UTC calendar month.
+  int64 monthly_cap_usd_micros = 4;
+  // Output only; ignored in updates. Failed automatic top-ups in a row.
+  // After 2, accounts-api sets enabled to false and emails owners and
+  // admins. A successful top-up and enabling the setting reset it to 0.
+  int32 consecutive_failures = 5;
+  // Output only; ignored in updates. Sum of the automatic top-ups charged in
+  // the current UTC calendar month.
+  int64 month_to_date_usd_micros = 6;
+}
+
+// Low-balance alert settings of a billing account. While automatic top-up is
+// off, owners and admins get one email each time the balance falls below the
+// threshold.
+message AlertSettings {
+  // At least 0, whole cents. Default 10 USD (10,000,000).
+  int64 low_balance_threshold_usd_micros = 1;
+}
+
+// A completed Paddle transaction of a billing account.
+message Invoice {
+  string paddle_transaction_id = 1;
+  // SUBSCRIPTION_CREDIT, MANUAL_TOP_UP or AUTO_TOP_UP.
+  LedgerEntryKind kind = 2;
+  // Credit amount of the transaction, tax excluded.
+  int64 amount_usd_micros = 3;
+  google.protobuf.Timestamp create_time = 4;
+}
+
+message GetBalanceRequest {
+  string billing_account_id = 1;
+}
+
+message GetBalanceResponse {
+  // Sum of the remaining credit, or the debt as a negative value.
+  int64 balance_usd_micros = 1;
+  // Unexpired grants with remaining credit, in consumption order (expire_time
+  // ascending).
+  repeated CreditGrant credit_grants = 2;
+}
+
+message ListLedgerEntriesRequest {
+  string billing_account_id = 1;
+  // Default 50, maximum 200.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListLedgerEntriesResponse {
+  repeated LedgerEntry ledger_entries = 1;
+  string next_page_token = 2;
+}
+
+message GetSubscriptionRequest {
+  string billing_account_id = 1;
+}
+
+message GetSubscriptionResponse {
+  Subscription subscription = 1;
+}
+
+message StartSubscriptionRequest {
+  string billing_account_id = 1;
+}
+
+message StartSubscriptionResponse {
+  // Paddle transaction ID (`txn_...`) to open with Paddle.js checkout.
+  string paddle_transaction_id = 1;
+  Subscription subscription = 2;
+}
+
+message CancelSubscriptionRequest {
+  string billing_account_id = 1;
+}
+
+message CancelSubscriptionResponse {
+  Subscription subscription = 1;
+}
+
+message ResumeSubscriptionRequest {
+  string billing_account_id = 1;
+}
+
+message ResumeSubscriptionResponse {
+  Subscription subscription = 1;
+}
+
+message CreateTopUpRequest {
+  string billing_account_id = 1;
+  // UUID v7 that the caller generates for each logical top-up and reuses for
+  // every retry. A repeated key of the same billing account within 24 hours
+  // returns the first result and charges nothing again; a repeated key with
+  // another amount fails with `invalid_argument`.
+  string idempotency_key = 2;
+  // At least 25 USD (25,000,000) and at most 10,000 USD (10,000,000,000),
+  // whole cents. Other values fail with `invalid_argument`.
+  int64 amount_usd_micros = 3;
+}
+
+// Paddle accepted the charge. The credit arrives later with the verified
+// payment webhook; the ledger and ListInvoices then show the transaction.
+message CreateTopUpResponse {}
+
+message GetAutoTopUpSettingsRequest {
+  string billing_account_id = 1;
+}
+
+message GetAutoTopUpSettingsResponse {
+  AutoTopUpSettings settings = 1;
+}
+
+message UpdateAutoTopUpSettingsRequest {
+  string billing_account_id = 1;
+  // Required. Replaces every input field. With enabled true, a threshold
+  // below 10 USD, an amount below 25 USD, a monthly cap below the amount
+  // (including a missing cap) or an amount that is not whole cents fails
+  // with `invalid_argument`. With enabled false, the values must be zero or
+  // non-negative whole cents; they are kept for a later enable.
+  AutoTopUpSettings settings = 2;
+}
+
+message UpdateAutoTopUpSettingsResponse {
+  AutoTopUpSettings settings = 1;
+}
+
+message GetAlertSettingsRequest {
+  string billing_account_id = 1;
+}
+
+message GetAlertSettingsResponse {
+  AlertSettings settings = 1;
+}
+
+message UpdateAlertSettingsRequest {
+  string billing_account_id = 1;
+  // Required. A negative threshold or one that is not whole cents fails with
+  // `invalid_argument`.
+  AlertSettings settings = 2;
+}
+
+message UpdateAlertSettingsResponse {
+  AlertSettings settings = 1;
+}
+
+message ListInvoicesRequest {
+  string billing_account_id = 1;
+  // Default 50, maximum 200.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListInvoicesResponse {
+  repeated Invoice invoices = 1;
+  string next_page_token = 2;
+}
+
+message GetInvoiceUrlRequest {
+  string billing_account_id = 1;
+  string paddle_transaction_id = 2;
+}
+
+message GetInvoiceUrlResponse {
+  // Short-lived Paddle link to the invoice PDF. Never log.
+  string invoice_url = 1;
+}
