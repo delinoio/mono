@@ -553,3 +553,36 @@ func TestCreditWaitDoesNotDelayAnotherStream(t *testing.T) {
 		t.Fatalf("canceled credit wait = %v, want context.Canceled", err)
 	}
 }
+
+// TestLastLargeReceiveCountsOnlyLargeStreamFrames checks which frames extend
+// the wait for a request accepted notice: only a large frame of an open
+// stream does.
+func TestLastLargeReceiveCountsOnlyLargeStreamFrames(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	s := openStream(t, c)
+	if !c.LastLargeReceive().IsZero() {
+		t.Fatal("a new connection has a large receive time")
+	}
+	stdout := func(streamID uint64, size int) *ownsandv1.DataFrame {
+		return datapath.MustNewFrame(streamID, "sandbox", &ownsandv1.ExecEvent{
+			Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: make([]byte, size)}}})
+	}
+	for name, f := range map[string]*ownsandv1.DataFrame{
+		"keepalive":          datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{}),
+		"small stream frame": stdout(s.ID, 1024),
+		"closed stream":      stdout(s.ID+100, 2*LargeFrameBytes),
+	} {
+		if err := c.dispatch(f); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if !c.LastLargeReceive().IsZero() {
+			t.Fatalf("%s counted as a large frame", name)
+		}
+	}
+	if err := c.dispatch(stdout(s.ID, 2*LargeFrameBytes)); err != nil {
+		t.Fatal(err)
+	}
+	if c.LastLargeReceive().IsZero() {
+		t.Fatal("a large stream frame was not counted")
+	}
+}
