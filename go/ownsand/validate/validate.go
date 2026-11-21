@@ -92,6 +92,23 @@ func UUIDv7(field, value string) error {
 	return nil
 }
 
+// ExecID checks that value is a canonical UUID v7 in the lowercase text form
+// that uuidv7.UUID.String returns. uuidv7.Parse accepts either hex case, but
+// the agent and the relay grant compare exec IDs as raw text, so two
+// spellings of one UUID would be two different execs. The rule applies to
+// exec_id of ExecRequest and AttachExecRequest and to operation_id of the
+// EXEC and ATTACH_EXEC relay grants; other UUID fields keep the case
+// tolerant UUIDv7 check.
+func ExecID(field, value string) error {
+	if err := UUIDv7(field, value); err != nil {
+		return err
+	}
+	if value != strings.ToLower(value) {
+		return fail(field, "must be a canonical lowercase UUID v7")
+	}
+	return nil
+}
+
 // ExecFieldsSize returns the encoded size of the command, env and
 // working_directory fields of req.
 func ExecFieldsSize(req *ownsandv1.ExecRequest) int {
@@ -106,8 +123,9 @@ func ExecFieldsSize(req *ownsandv1.ExecRequest) int {
 // plane) and again after it is decoded (agent): the IDs, a non-empty command
 // whose first element is not empty, the 256 KiB limit of the encoded
 // command, env and working_directory, a non-negative valid timeout and a
-// 32-byte binding salt. It does not check the admission window of exec_id;
-// the agent does that with datapath.CheckOperationID.
+// 32-byte binding salt. exec_id must be lowercase (see ExecID). It does not
+// check the admission window of exec_id; the agent does that with
+// datapath.CheckOperationID.
 func ExecRequest(req *ownsandv1.ExecRequest) error {
 	if err := UUIDv7("organization_id", req.GetOrganizationId()); err != nil {
 		return err
@@ -115,7 +133,7 @@ func ExecRequest(req *ownsandv1.ExecRequest) error {
 	if err := UUIDv7("sandbox_id", req.GetSandboxId()); err != nil {
 		return err
 	}
-	if err := UUIDv7("exec_id", req.GetExecId()); err != nil {
+	if err := ExecID("exec_id", req.GetExecId()); err != nil {
 		return err
 	}
 	if len(req.GetCommand()) == 0 || req.GetCommand()[0] == "" {
@@ -151,7 +169,7 @@ func AttachExecRequest(req *ownsandv1.AttachExecRequest) error {
 	if err := UUIDv7("sandbox_id", req.GetSandboxId()); err != nil {
 		return err
 	}
-	if err := UUIDv7("exec_id", req.GetExecId()); err != nil {
+	if err := ExecID("exec_id", req.GetExecId()); err != nil {
 		return err
 	}
 	if req.GetStdoutOffset() < 0 {
