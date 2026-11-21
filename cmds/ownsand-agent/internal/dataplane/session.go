@@ -42,7 +42,9 @@ type session struct {
 	streams  map[uint64]context.CancelFunc
 	activity time.Time
 	ended    bool
-	decoder  *datapath.Decoder
+	// endReason is the reason that the first end call carried.
+	endReason ownsandv1.SessionEndReason
+	decoder   *datapath.Decoder
 
 	// stop closes when the session starts to end. It interrupts operation
 	// sends that wait for the buffer to drain, so the bounded session-end
@@ -111,39 +113,94 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	s := &session{d: d, id: offer.GetSessionId(), sandboxID: offer.GetSandboxId(), gen: ch.Generation(), pc: pc,
 		ctx: sctx, cancel: cancel, streams: map[uint64]context.CancelFunc{}, activity: time.Now(),
 		decoder: datapath.NewDecoder(), low: make(chan struct{}, 1), stop: make(chan struct{})}
+	// The session is visible to Revoke, ChannelLost and Close from here on,
+	// so each of them can end it while its candidates are gathered. The
+	// closed check and the insertion share one critical section: Close
+	// either finds the session in the map or the offer sees closed.
+	d.mu.Lock()
+	_, dup = d.sessions[s.id]
+	closed = d.closed
+	if !closed && !dup {
+		d.sessions[s.id] = s
+	}
+	d.mu.Unlock()
+	if closed || dup {
+		cancel()
+		pc.Close()
+		if closed {
+			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
+		}
+		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer needs a new session ID and an SDP body")
+	}
 	pc.OnDataChannel(s.onDataChannel)
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		if st == webrtc.PeerConnectionStateFailed || st == webrtc.PeerConnectionStateClosed {
 			s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED)
 		}
 	})
+	// fail ends the session, which removes it from the session map and
+	// closes its peer connection.
 	fail := func(msg string, err error) *ownsandv1.SignalingAnswer {
 		logger.Warn("answer failed", "step", msg, "error", err)
-		cancel()
-		pc.Close()
+		s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_UNSPECIFIED)
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer could not be answered: "+msg)
 	}
+	// ended answers an offer whose session ended before the answer was
+	// ready (revoked, closed data plane or lost channel).
+	ended := func() *ownsandv1.SignalingAnswer {
+		s.mu.Lock()
+		reason := s.endReason
+		s.mu.Unlock()
+		logger.Warn("session ended before it was answered", "cancellation_reason", reason.String())
+		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
+	}
+	// A channel that closed before or during the answer ends the session.
+	// ChannelLost covers the sessions in the map by channel generation;
+	// this also covers a channel whose loss was reported before the
+	// insertion above.
+	select {
+	case <-ch.Done():
+		s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
+		return ended()
+	default:
+	}
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: offer.GetSdp()}); err != nil {
+		if s.isEnded() {
+			return ended()
+		}
 		return fail("remote description", err)
 	}
 	answer, err := pc.CreateAnswer(nil)
 	if err != nil {
+		if s.isEnded() {
+			return ended()
+		}
 		return fail("create answer", err)
 	}
 	gathered := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(answer); err != nil {
+		if s.isEnded() {
+			return ended()
+		}
 		return fail("local description", err)
 	}
+	timeout := time.NewTimer(gatherTimeout)
+	defer timeout.Stop()
 	select {
 	case <-gathered:
-	case <-time.After(gatherTimeout):
+	case <-timeout.C:
 		return fail("candidate gathering", errors.New("timed out"))
 	case <-ctx.Done():
 		return fail("candidate gathering", ctx.Err())
+	case <-ch.Done():
+		s.end(ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST)
+		return ended()
+	case <-s.ctx.Done():
+		return ended()
 	}
-	d.mu.Lock()
-	d.sessions[s.id] = s
-	d.mu.Unlock()
+	if s.isEnded() {
+		return ended()
+	}
 	go s.watch(expiresIn)
 	// A channel that closed while the offer was answered ends the session.
 	go func() {
@@ -155,6 +212,12 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 	}()
 	logger.Info("session answered", "transport", ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER.String(), "expires_in_s", int64(expiresIn.Seconds()))
 	return &ownsandv1.SignalingAnswer{SessionId: s.id, Sdp: pc.LocalDescription().SDP}
+}
+
+func (s *session) isEnded() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ended
 }
 
 func (s *session) onDataChannel(dc *webrtc.DataChannel) {
@@ -347,6 +410,7 @@ func (s *session) end(reason ownsandv1.SessionEndReason) {
 		return
 	}
 	s.ended = true
+	s.endReason = reason
 	close(s.stop)
 	var open []uint64
 	for id := range s.streams {
