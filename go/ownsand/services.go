@@ -176,7 +176,16 @@ func (s *DeviceService) Get(ctx context.Context, req *ownsandv1.GetDeviceRequest
 	return unary(ctx, s.c, s.c.devices.GetDevice, req)
 }
 
-// UpdateLimits sets all four device limits.
+// ReplaceLimits replaces all four device limits. Every value must be present;
+// the server rejects a missing value with invalid_argument, and an explicit
+// zero is stored. New code uses this method.
+func (s *DeviceService) ReplaceLimits(ctx context.Context, req *ownsandv1.ReplaceDeviceLimitsRequest) (*ownsandv1.ReplaceDeviceLimitsResponse, error) {
+	return unary(ctx, s.c, s.c.devices.ReplaceDeviceLimits, req)
+}
+
+// UpdateLimits sets all four device limits with implicit field presence: a
+// missing value reads as zero. Legacy, kept for v1 clients; use
+// ReplaceLimits.
 func (s *DeviceService) UpdateLimits(ctx context.Context, req *ownsandv1.UpdateDeviceLimitsRequest) (*ownsandv1.UpdateDeviceLimitsResponse, error) {
 	return unary(ctx, s.c, s.c.devices.UpdateDeviceLimits, req)
 }

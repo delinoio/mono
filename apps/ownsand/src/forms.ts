@@ -6,6 +6,12 @@
  * the control plane checks them again.
  */
 
+import { create } from "@bufbuild/protobuf";
+import {
+  type DeviceLimitsInput,
+  DeviceLimitsInputSchema,
+} from "ownsand-sdk/gen/common_pb";
+
 export const MAX_TTL_SECONDS = 7 * 24 * 3600;
 export const MAX_LABELS = 32;
 
@@ -63,4 +69,39 @@ export function parseLabels(
     return { error: `Use at most ${MAX_LABELS} labels.` };
   }
   return { labels };
+}
+
+/** The limit fields of the device form; `null` is a blank input. */
+export interface DeviceLimitsForm {
+  vcpu: number | null;
+  memoryMib: number | null;
+  diskGib: number | null;
+  overcommitPercent: number;
+}
+
+/**
+ * Builds the ReplaceDeviceLimits input of the device form. The RPC needs
+ * every value, and a blank input is not zero: it returns the message to show
+ * for the first blank field, so the form never sends a silent zero. An
+ * explicit zero is a value.
+ */
+export function deviceLimitsInput(
+  form: DeviceLimitsForm,
+): { limits: DeviceLimitsInput } | { error: string } {
+  const blank = [
+    [form.vcpu, "vCPU limit"],
+    [form.memoryMib, "Memory limit"],
+    [form.diskGib, "Disk limit"],
+  ].find(([value]) => value === null);
+  if (blank !== undefined) {
+    return { error: `${blank[1]} is required. Enter 0 to allow none.` };
+  }
+  return {
+    limits: create(DeviceLimitsInputSchema, {
+      vcpuCount: form.vcpu!,
+      memoryMib: BigInt(form.memoryMib!),
+      diskGib: BigInt(form.diskGib!),
+      vcpuOvercommitPercent: form.overcommitPercent,
+    }),
+  };
 }

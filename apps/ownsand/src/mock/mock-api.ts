@@ -22,6 +22,8 @@ import {
   ApiKeyState,
   Arch,
   BaseImage,
+  type DeviceLimits,
+  DeviceLimitsSchema,
   DeviceState,
   EnrollmentTokenState,
   GuestOs,
@@ -396,6 +398,39 @@ export function createMockTransport(
       throw new ConnectError("device not found", Code.NotFound);
     return d;
   };
+  // Shared by the legacy and the strict limits RPC: the numeric rules and the
+  // derived effective vCPU limit of the server.
+  const applyDeviceLimits = (
+    org: OrgState,
+    deviceId: string,
+    l: DeviceLimits | undefined,
+  ) => {
+    if (
+      l === undefined ||
+      l.vcpuCount < 0 ||
+      l.memoryMib < 0n ||
+      l.diskGib < 0n
+    ) {
+      throw new ConnectError(
+        "limits must not be negative",
+        Code.InvalidArgument,
+      );
+    }
+    const p = l.vcpuOvercommitPercent;
+    if (p < 100 || p > 400 || p % 25 !== 0) {
+      throw new ConnectError(
+        "limits.vcpu_overcommit_percent must be 100 to 400 in steps of 25",
+        Code.InvalidArgument,
+      );
+    }
+    const device = findDevice(org, deviceId);
+    device.limits = l;
+    // Like the server: the exact int64 value, and the int32 field capped.
+    const effective = effectiveVcpuLimit(l.vcpuCount, p);
+    device.effectiveVcpuLimitCount = BigInt(effective);
+    device.effectiveVcpuLimit = Math.min(effective, MAX_INT32);
+    return device;
+  };
   const findSnapshot = (org: OrgState, id: string) => {
     const s = org.snapshots.find((x) => x.snapshotId === id);
     if (s === undefined)
@@ -634,34 +669,47 @@ export function createMockTransport(
         return { device: findDevice(org, req.deviceId) };
       },
       updateDeviceLimits(req) {
+        // Legacy RPC: a missing value reads as zero.
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        const device = findDevice(org, req.deviceId);
+        return { device: applyDeviceLimits(org, req.deviceId, req.limits) };
+      },
+      replaceDeviceLimits(req) {
+        const { org, role } = membership(req.organizationId);
+        requireAdmin(role);
         const l = req.limits;
-        if (
-          l === undefined ||
-          l.vcpuCount < 0 ||
-          l.memoryMib < 0n ||
-          l.diskGib < 0n
-        ) {
+        // Like the server: every value must be present, and an explicit zero
+        // is a value. The first missing field in schema order is named.
+        const missing =
+          l === undefined
+            ? "limits"
+            : l.vcpuCount === undefined
+              ? "limits.vcpu_count"
+              : l.memoryMib === undefined
+                ? "limits.memory_mib"
+                : l.diskGib === undefined
+                  ? "limits.disk_gib"
+                  : l.vcpuOvercommitPercent === undefined
+                    ? "limits.vcpu_overcommit_percent"
+                    : undefined;
+        if (l === undefined || missing !== undefined) {
           throw new ConnectError(
-            "limits must not be negative",
+            `${missing} is required`,
             Code.InvalidArgument,
           );
         }
-        const p = l.vcpuOvercommitPercent;
-        if (p < 100 || p > 400 || p % 25 !== 0) {
-          throw new ConnectError(
-            "limits.vcpu_overcommit_percent must be 100 to 400 in steps of 25",
-            Code.InvalidArgument,
-          );
-        }
-        device.limits = l;
-        // Like the server: the exact int64 value, and the int32 field capped.
-        const effective = effectiveVcpuLimit(l.vcpuCount, p);
-        device.effectiveVcpuLimitCount = BigInt(effective);
-        device.effectiveVcpuLimit = Math.min(effective, MAX_INT32);
-        return { device };
+        return {
+          device: applyDeviceLimits(
+            org,
+            req.deviceId,
+            create(DeviceLimitsSchema, {
+              vcpuCount: l.vcpuCount,
+              memoryMib: l.memoryMib,
+              diskGib: l.diskGib,
+              vcpuOvercommitPercent: l.vcpuOvercommitPercent,
+            }),
+          ),
+        };
       },
       removeDevice(req) {
         const { org, role } = membership(req.organizationId);

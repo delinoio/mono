@@ -46,7 +46,9 @@ type fakeServer struct {
 	auths []string
 	calls []string
 	files map[string][]byte
-	limit *ownsandv1.DeviceLimits
+	// limit is the last limits input of ReplaceDeviceLimits; its optional
+	// fields keep the presence that the CLI sent.
+	limit *ownsandv1.DeviceLimitsInput
 	creat []*ownsandv1.CreateSandboxRequest
 }
 
@@ -148,11 +150,15 @@ func (h *fakeDevices) GetDevice(context.Context, *connect.Request[ownsandv1.GetD
 	return connect.NewResponse(&ownsandv1.GetDeviceResponse{Device: &ownsandv1.Device{DeviceId: h.f.dev, Limits: &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: 150}}}), nil
 }
 
-func (h *fakeDevices) UpdateDeviceLimits(_ context.Context, r *connect.Request[ownsandv1.UpdateDeviceLimitsRequest]) (*connect.Response[ownsandv1.UpdateDeviceLimitsResponse], error) {
+// ReplaceDeviceLimits is the only limits RPC that the fake implements, so a
+// CLI that called the legacy UpdateDeviceLimits would fail with unimplemented.
+func (h *fakeDevices) ReplaceDeviceLimits(_ context.Context, r *connect.Request[ownsandv1.ReplaceDeviceLimitsRequest]) (*connect.Response[ownsandv1.ReplaceDeviceLimitsResponse], error) {
 	h.f.mu.Lock()
 	h.f.limit = r.Msg.GetLimits()
 	h.f.mu.Unlock()
-	return connect.NewResponse(&ownsandv1.UpdateDeviceLimitsResponse{Device: &ownsandv1.Device{DeviceId: h.f.dev, Limits: r.Msg.GetLimits()}}), nil
+	in := r.Msg.GetLimits()
+	limits := &ownsandv1.DeviceLimits{VcpuCount: in.GetVcpuCount(), MemoryMib: in.GetMemoryMib(), DiskGib: in.GetDiskGib(), VcpuOvercommitPercent: in.GetVcpuOvercommitPercent()}
+	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: &ownsandv1.Device{DeviceId: h.f.dev, Limits: limits}}), nil
 }
 
 type fakeSandbox struct {

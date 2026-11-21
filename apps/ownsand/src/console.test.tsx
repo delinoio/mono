@@ -226,6 +226,29 @@ describe("devices", () => {
   });
 });
 
+describe("device limits", () => {
+  test("saves an explicit zero with the strict RPC", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    const disk = await screen.findByLabelText("Disk limit (GiB)");
+    await settle();
+    await act(async () => {
+      fireEvent.input(disk, { target: { value: "0" } });
+      fireEvent.blur(disk);
+    });
+    await settle();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    });
+    await settle(60);
+    expect(
+      (await screen.findAllByText("The device limits are saved.")).length,
+    ).toBeGreaterThan(0);
+    expect(
+      (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
+    ).toBe("0");
+  });
+});
+
 describe("invitations", () => {
   test("keeps the secret only for the sign-in redirect and removes it from the address", async () => {
     const { signIns } = renderConsole(

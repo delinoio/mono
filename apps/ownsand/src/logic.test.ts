@@ -15,7 +15,7 @@ import {
   formatMib,
   OVERCOMMIT_PERCENTAGES,
 } from "./format.ts";
-import { parseLabels, ttlErrors } from "./forms.ts";
+import { deviceLimitsInput, parseLabels, ttlErrors } from "./forms.ts";
 import {
   invitationLink,
   PENDING_INVITATION_KEY,
@@ -301,5 +301,40 @@ describe("polling", () => {
         exportState: SnapshotExportState.EXPORTING,
       }),
     ).toBe(true);
+  });
+});
+
+describe("deviceLimitsInput", () => {
+  test("sends an explicit zero as a present value", () => {
+    const result = deviceLimitsInput({
+      vcpu: 0,
+      memoryMib: 0,
+      diskGib: 0,
+      overcommitPercent: 100,
+    });
+    expect("limits" in result).toBe(true);
+    if (!("limits" in result)) return;
+    expect(result.limits.vcpuCount).toBe(0);
+    expect(result.limits.memoryMib).toBe(0n);
+    expect(result.limits.diskGib).toBe(0n);
+    expect(result.limits.vcpuOvercommitPercent).toBe(100);
+  });
+
+  test("asks for a blank field instead of sending zero", () => {
+    const base = {
+      vcpu: 4,
+      memoryMib: 8192,
+      diskGib: 100,
+      overcommitPercent: 150,
+    };
+    expect(deviceLimitsInput({ ...base, vcpu: null })).toEqual({
+      error: "vCPU limit is required. Enter 0 to allow none.",
+    });
+    expect(deviceLimitsInput({ ...base, memoryMib: null })).toEqual({
+      error: "Memory limit is required. Enter 0 to allow none.",
+    });
+    expect(deviceLimitsInput({ ...base, diskGib: null })).toEqual({
+      error: "Disk limit is required. Enter 0 to allow none.",
+    });
   });
 });
