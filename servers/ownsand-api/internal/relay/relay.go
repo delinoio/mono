@@ -48,6 +48,11 @@ func DefaultLimits() Limits {
 	}
 }
 
+// writerGrace is how long Conn.Run waits for the writer after the connection
+// closed. A send that makes progress finishes within it; a send blocked on
+// the peer's flow control does not, and Run returns without it.
+const writerGrace = 100 * time.Millisecond
+
 // outboundQueue bounds the frames waiting for the connection writer.
 const outboundQueue = 1024
 
@@ -150,28 +155,57 @@ func (c *Conn) Supports(kind ownsandv1.DataFrameKind) bool {
 // Run serves the connection: it sends the supported frame kinds, writes
 // queued frames with send, reads frames with recv, sends keepalives and
 // closes an idle connection. It returns when the connection closes.
+//
+// The idle check runs in its own goroutine because send can block on the
+// peer's flow control: a peer that stops reading and sends nothing would
+// otherwise stall the writer, and with it the idle check, forever. For the
+// same reason Run waits for the writer only for writerGrace, enough for a
+// send that makes progress to finish before the caller ends the underlying
+// stream, and returns without a send that is still blocked. Returning lets
+// the caller end the stream, which unblocks that send.
 func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsandv1.DataFrame) error) error {
+	// guardedSend skips send once the connection closed, so the writer does
+	// not start a send after Run returned. A send that is already blocked
+	// ends when the caller ends the underlying stream.
+	guardedSend := func(f *ownsandv1.DataFrame) error {
+		if c.ctx.Err() != nil {
+			return context.Cause(c.ctx)
+		}
+		return send(f)
+	}
+	tick := c.limits.Keepalive / 3
+	go func() {
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
+					c.Close(ErrIdle)
+					return
+				}
+			case <-c.ctx.Done():
+				return
+			}
+		}
+	}()
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		ticker := time.NewTicker(c.limits.Keepalive / 3)
+		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
 		for {
 			select {
 			case f := <-c.out:
-				if err := send(f); err != nil {
+				if err := guardedSend(f); err != nil {
 					c.Close(err)
 					return
 				}
 				c.lastSend.Store(time.Now().UnixNano())
 			case <-ticker.C:
 				now := time.Now()
-				if now.Sub(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
-					c.Close(ErrIdle)
-					return
-				}
 				if now.Sub(time.Unix(0, c.lastSend.Load())) >= c.limits.Keepalive {
-					if err := send(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
+					if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
 						c.Close(err)
 						return
 					}
@@ -198,7 +232,12 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		}
 	}()
 	<-c.ctx.Done()
-	<-writerDone
+	grace := time.NewTimer(writerGrace)
+	defer grace.Stop()
+	select {
+	case <-writerDone:
+	case <-grace.C:
+	}
 	return c.Err()
 }
 
