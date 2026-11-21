@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	"github.com/delinoio/mono/cmds/internal/loglevel"
 	"github.com/delinoio/mono/cmds/ownsand-guest/guest"
 	"github.com/delinoio/mono/cmds/ownsand-guest/guestlisten"
 )
@@ -58,8 +59,8 @@ func run(args []string) int {
 		fmt.Println(version)
 		return 0
 	}
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
+	level, err := loglevel.Parse(*logLevel)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "ownsand-guest: invalid log level %q\n", *logLevel)
 		return 2
 	}

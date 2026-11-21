@@ -6,11 +6,44 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"fmt"
 	"testing"
 )
 
 func env(m map[string]string) Lookup {
 	return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+}
+
+func TestFromEnvLogLevel(t *testing.T) {
+	valid := map[string]string{
+		"debug": "DEBUG",
+		"DEBUG": "DEBUG",
+		"Warn":  "WARN",
+		"Error": "ERROR",
+		"iNfO":  "INFO",
+		" info": "INFO", // FromEnv trims white space first
+	}
+	for value, want := range valid {
+		cfg, err := FromEnv(env(map[string]string{EnvLogLevel: value}))
+		if err != nil {
+			t.Errorf("log level %q rejected: %v", value, err)
+			continue
+		}
+		if cfg.LogLevel.String() != want {
+			t.Errorf("log level %q = %s, want %s", value, cfg.LogLevel, want)
+		}
+	}
+	for _, value := range []string{"ınfo", "ınfo+1", "info+1", "warn-2", "İNFO", "verbose"} {
+		_, err := FromEnv(env(map[string]string{EnvLogLevel: value}))
+		if err == nil {
+			t.Errorf("log level %q accepted", value)
+			continue
+		}
+		want := fmt.Sprintf("config: invalid %s %q", EnvLogLevel, value)
+		if err.Error() != want {
+			t.Errorf("log level %q error = %q, want %q", value, err, want)
+		}
+	}
 }
 
 func TestFromEnv(t *testing.T) {
