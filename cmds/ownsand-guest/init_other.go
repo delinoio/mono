@@ -12,4 +12,4 @@ func isInitChild() bool { return false }
 
 func runInit([]string) int { return 1 }
 
-func startTunnel(*slog.Logger) error { return nil }
+func startTunnel(*slog.Logger) (<-chan error, error) { return nil, nil }
