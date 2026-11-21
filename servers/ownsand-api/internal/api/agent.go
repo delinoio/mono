@@ -26,6 +26,11 @@ type AgentHandler struct{ *Service }
 // maxDeviceNameLength bounds the reported host name.
 const maxDeviceNameLength = 253
 
+// agentLimiterKey builds the per-device limiter key of an unary agent RPC.
+// deviceID must be normalized so that every spelling of one device shares a
+// bucket per operation.
+func agentLimiterKey(op, deviceID string) string { return op + ":" + deviceID }
+
 // limitAgentRPC applies the per-device (or per-prefix) and per-client
 // limits of the unauthenticated device RPCs.
 func (s *Service) limitAgentRPC(ctx context.Context, key string) error {
@@ -72,14 +77,41 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 	hash := auth.HashSecret(token)
 	var resp *ownsandv1.EnrollResponse
 	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock order: organization, then token, the order that
+		// DeleteOrganization follows (organization row lock, then the cascade
+		// to its tokens). Step 1 resolves the organization without a lock, so
+		// the transaction never holds the token lock while it waits for the
+		// organization. Step 2 takes FOR KEY SHARE on the organization: it
+		// lets enrollments of one organization run together, and it conflicts
+		// with the FOR UPDATE of a deletion, so a deletion that already
+		// listed the devices cannot miss this device, and an enrollment that
+		// started after the deletion committed finds no organization. Step 3
+		// locks the token and reads it again; everything is validated there.
+		var preOrgID string
+		err := tx.QueryRow(ctx, "SELECT organization_id::text FROM enrollment_tokens WHERE secret_sha256 = $1", hash).Scan(&preOrgID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errEnrollmentInvalid()
+		}
+		if err != nil {
+			return err
+		}
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", preOrgID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The organization was deleted while this call waited for the lock.
+			return errEnrollmentInvalid()
+		}
+		if err != nil {
+			return err
+		}
 		var tokenID, orgID, deviceID string
 		var stored, usedKey []byte
 		var expires time.Time
 		var used, revoked *time.Time
-		err := tx.QueryRow(ctx, `SELECT enrollment_token_id::text, organization_id::text, secret_sha256, expire_time, use_time, revoke_time,
+		err = tx.QueryRow(ctx, `SELECT enrollment_token_id::text, organization_id::text, secret_sha256, expire_time, use_time, revoke_time,
 			COALESCE(device_id::text, ''), device_public_key FROM enrollment_tokens WHERE secret_sha256 = $1 FOR UPDATE`, hash).
 			Scan(&tokenID, &orgID, &stored, &expires, &used, &revoked, &deviceID, &usedKey)
-		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !auth.HashEqual(stored, hash)) {
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && (!auth.HashEqual(stored, hash) || orgID != preOrgID)) {
 			return errEnrollmentInvalid()
 		}
 		if err != nil {
@@ -129,11 +161,12 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 }
 
 func (h AgentHandler) CreateChallenge(ctx context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
-	deviceID := req.Msg.GetDeviceId()
-	if err := validateID("device_id", deviceID); err != nil {
+	rawID := req.Msg.GetDeviceId()
+	deviceID, err := normalizeID("device_id", rawID)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.limitAgentRPC(ctx, "challenge:"+deviceID); err != nil {
+	if err := h.limitAgentRPC(ctx, agentLimiterKey("challenge", deviceID)); err != nil {
 		return nil, err
 	}
 	nonce, expiry, err := h.Nonces.Issue(deviceID)
@@ -187,18 +220,19 @@ func (s *Service) verifySignedNonce(ctx context.Context, tx pgx.Tx, deviceID str
 
 func (h AgentHandler) Authenticate(ctx context.Context, req *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
 	m := req.Msg
-	deviceID := m.GetDeviceId()
-	if err := validateID("device_id", deviceID); err != nil {
+	rawID := m.GetDeviceId()
+	deviceID, err := normalizeID("device_id", rawID)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.limitAgentRPC(ctx, "authenticate:"+deviceID); err != nil {
+	if err := h.limitAgentRPC(ctx, agentLimiterKey("authenticate", deviceID)); err != nil {
 		return nil, err
 	}
 	if !uuidv7.Valid(m.GetStateEpoch()) {
 		return nil, errInvalidf("invalid state_epoch: must be a canonical UUID v7")
 	}
 	var resp *ownsandv1.AuthenticateResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		rec, err := h.verifySignedNonce(ctx, tx, deviceID, m.GetNonce(), m.GetSignature(), auth.PurposeAuthenticate)
 		if err != nil {
 			return err
@@ -244,14 +278,15 @@ func (h AgentHandler) Authenticate(ctx context.Context, req *connect.Request[own
 
 func (h AgentHandler) ConfirmRemoval(ctx context.Context, req *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
 	m := req.Msg
-	deviceID := m.GetDeviceId()
-	if err := validateID("device_id", deviceID); err != nil {
+	rawID := m.GetDeviceId()
+	deviceID, err := normalizeID("device_id", rawID)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.limitAgentRPC(ctx, "confirm-removal:"+deviceID); err != nil {
+	if err := h.limitAgentRPC(ctx, agentLimiterKey("confirm-removal", deviceID)); err != nil {
 		return nil, err
 	}
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		rec, err := h.verifySignedNonce(ctx, tx, deviceID, m.GetNonce(), m.GetSignature(), auth.PurposeConfirmRemoval)
 		if err != nil {
 			return err

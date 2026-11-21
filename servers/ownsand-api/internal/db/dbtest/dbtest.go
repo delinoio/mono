@@ -38,24 +38,18 @@ func URL(t testing.TB) string {
 // URL. The database is dropped when the test ends.
 func NewURL(t testing.TB) string {
 	t.Helper()
-	child := NewUnmigratedURL(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	d, err := db.Open(ctx, child)
-	if err != nil {
-		t.Fatalf("open test database: %v", err)
-	}
-	defer d.Close()
-	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil))); err != nil {
-		t.Fatalf("migrate test database: %v", err)
-	}
-	return child
+	return newURL(t, 0)
 }
 
-// NewUnmigratedURL creates a fresh, empty database and returns its URL, for
-// tests that apply the migrations themselves. The database is dropped when
-// the test ends.
-func NewUnmigratedURL(t testing.TB) string {
+// NewURLAtVersion is like NewURL but applies only the migrations up to and
+// including maxVersion, so an upgrade test can insert legacy data and then
+// apply the later migrations with db.MigrateUpTo or db.Migrate.
+func NewURLAtVersion(t testing.TB, maxVersion int) string {
+	t.Helper()
+	return newURL(t, maxVersion)
+}
+
+func newURL(t testing.TB, maxVersion int) string {
 	t.Helper()
 	admin := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -85,6 +79,14 @@ func NewUnmigratedURL(t testing.TB) string {
 	child, err := childURL(admin, name)
 	if err != nil {
 		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
+	}
+	d, err := db.Open(ctx, child)
+	if err != nil {
+		t.Fatalf("open test database: %v", err)
+	}
+	defer d.Close()
+	if err := d.MigrateUpTo(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil)), maxVersion); err != nil {
+		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
 }

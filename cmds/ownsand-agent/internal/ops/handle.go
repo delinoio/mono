@@ -213,6 +213,7 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 		digest:    digest,
 		idTime:    idTime(req.GetExecId()),
 		log:       execlog.New(req.GetExecId(), execlog.KeptOutputBytes),
+		ctx:       execCtx,
 		cancel:    cancel,
 	}
 	d.execs[req.GetExecId()] = op
@@ -231,6 +232,10 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 	d.wg.Add(1)
 	go func() {
 		defer d.wg.Done()
+		// Release the child context from d.ctx once forwarding is over (final
+		// event, guest error final or d.ctx end). The kept result in op.log
+		// stays available until Sweep.
+		defer cancel()
 		d.forwardExec(execCtx, op, req)
 	}()
 	h.accepted()
