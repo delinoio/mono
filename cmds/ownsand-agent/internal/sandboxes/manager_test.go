@@ -66,9 +66,13 @@ type fakeRuntime struct {
 	// pauseErr and resumeErr, when set, make Pause and Resume fail.
 	pauseErr  error
 	resumeErr error
-	starts    int // Create calls, counted before any block or error
 	// onCreate, when set, runs in Create after the VM started.
 	onCreate func(spec vmruntime.Spec)
+	// files holds the sandbox IDs whose runtime files exist. Create adds an
+	// ID, a successful Delete removes it, and a test adds an ID to model the
+	// files that a lost VM leaves behind.
+	files  map[string]bool
+	starts int // Create calls, counted before any block or error
 }
 
 func (r *fakeRuntime) startCount() int {
@@ -78,7 +82,7 @@ func (r *fakeRuntime) startCount() int {
 }
 
 func newFakeRuntime() *fakeRuntime {
-	return &fakeRuntime{vms: map[string]*fakeVM{}, paused: map[string]bool{}}
+	return &fakeRuntime{vms: map[string]*fakeVM{}, paused: map[string]bool{}, files: map[string]bool{}}
 }
 
 func (r *fakeRuntime) Kind() config.RuntimeKind { return config.RuntimeKindProcess }
@@ -106,6 +110,7 @@ func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntim
 	if r.onCreate != nil {
 		r.onCreate(spec)
 	}
+	r.files[spec.SandboxID] = true
 	return v, nil
 }
 func (r *fakeRuntime) Pause(_ context.Context, vm vmruntime.VM) error {
@@ -145,11 +150,18 @@ func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	}
 	v := r.vms[id]
 	delete(r.vms, id)
+	delete(r.files, id)
 	r.mu.Unlock()
 	if v != nil {
 		v.stop()
 	}
 	return nil
+}
+
+func (r *fakeRuntime) hasFiles(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.files[id]
 }
 func (r *fakeRuntime) Running(context.Context) ([]string, error) {
 	r.mu.Lock()
@@ -710,6 +722,68 @@ func TestRestartReconcile(t *testing.T) {
 	e.restart()
 	if e.m.Epoch() == epoch {
 		t.Fatal("epoch kept after the state was lost")
+	}
+}
+
+// TestRestartRemovesRuntimeFilesOfLostSandboxes checks that a restart removes
+// the runtime files of every live record whose VM is gone, before the record
+// ends, for a lost VM and for a passed TTL.
+func TestRestartRemovesRuntimeFilesOfLostSandboxes(t *testing.T) {
+	e := newEnv(t)
+	lost := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	expired := e.create(5*time.Minute, 2*time.Hour).GetSandboxId()
+	// The agent restarts: the VMs ended with the agent process, and their
+	// files stay on the device.
+	e.rt = newFakeRuntime()
+	e.rt.files[lost] = true
+	e.rt.files[expired] = true
+	e.clk.Advance(10 * time.Minute)
+	e.restart()
+	if e.rt.hasFiles(lost) || e.rt.hasFiles(expired) {
+		t.Fatal("runtime files of a lost sandbox kept")
+	}
+	if s, _ := e.m.State(lost); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, lost) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("lost sandbox %v %v", s, endReason(e.m, lost))
+	}
+	if s, _ := e.m.State(expired); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || endReason(e.m, expired) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("expired sandbox %v %v", s, endReason(e.m, expired))
+	}
+	// The terminal records are dropped after the acknowledgement.
+	var acks []*ownsandv1.SandboxUpdateAck
+	for _, entry := range e.m.Entries() {
+		acks = append(acks, &ownsandv1.SandboxUpdateAck{SandboxId: entry.GetSandboxId(), Revision: entry.GetRevision()})
+	}
+	e.m.AckStateReport(&ownsandv1.StateReportAck{ReportSequence: 1, Sandboxes: acks})
+	for _, id := range []string{lost, expired} {
+		if _, ok := e.m.State(id); ok {
+			t.Fatalf("terminal record of %s kept after the acknowledgement", id)
+		}
+	}
+}
+
+// TestRestartKeepsRecordLiveWhenFileRemovalFails checks that a failed Delete
+// at start leaves the record live and persisted, so the next start retries,
+// and that the terminal state is reported only after the files are gone.
+func TestRestartKeepsRecordLiveWhenFileRemovalFails(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.rt = newFakeRuntime()
+	e.rt.files[id] = true
+	e.rt.deleteFails = 1
+	e.restart()
+	if !e.rt.hasFiles(id) {
+		t.Fatal("files removed although Delete failed")
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("state after failed Delete %v, want RUNNING", s)
+	}
+	// The record file still holds the live state.
+	e.restart()
+	if e.rt.hasFiles(id) {
+		t.Fatal("files kept after the retry")
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("state after retry %v %v", s, endReason(e.m, id))
 	}
 }
 
