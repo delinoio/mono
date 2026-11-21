@@ -309,15 +309,18 @@ func (r *relay) grant(ch agent.Channel, pg *ownsandv1.RelayGrant) *ownsandv1.Rel
 
 // probe checks a connection that received nothing for ProbeIdle with an
 // echo request; without any byte within ProbeTimeout it is treated as lost
-// and dialed again at once.
+// and dialed again at once. The echo is optional and grant calls probe on the
+// agent channel receive loop, so the echo never waits on the outbound queue:
+// a full queue (a blocked writer) skips the echo and the timeout still runs,
+// because a connection that moves no byte in that time is lost anyway.
 func (r *relay) probe(c *rconn) {
 	last := time.Unix(0, c.lastRecv.Load())
 	if time.Since(last) < r.d.timing.ProbeIdle {
 		return
 	}
 	sent := time.Now()
-	if c.enqueue(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}}) != nil {
-		return
+	if !c.tryEnqueue(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}}) {
+		r.d.logger.Debug("relay echo probe skipped because the outbound queue is full", "generation", c.gen)
 	}
 	go func() {
 		select {
