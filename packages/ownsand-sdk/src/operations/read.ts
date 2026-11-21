@@ -156,7 +156,7 @@ export async function* runReadFile(
         cause: failure,
       });
     }
-    if (onRelay) grants.discard();
+    if (onRelay) grants.discardFor(failure);
     await recoverOrThrow(ctx, window, failure, signal);
   }
 }

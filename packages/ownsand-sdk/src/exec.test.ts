@@ -749,6 +749,39 @@ describe("exec over the relay", () => {
         .wait(),
     );
     expect(result.kind).toBe(ExecResultKind.Exited);
+    // A rejection at capacity says nothing about the grant: one
+    // authorization, and the same grant ID in the header of every call.
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    const calls = [...h.api.callsOf("Exec"), ...h.api.callsOf("AttachExec")];
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    for (const call of calls) {
+      expect(call.headers.get("ownsand-relay-grant-id")).toBe("grant-1");
+    }
+  });
+
+  test("renews the grant with replaces_grant_id after an unavailable stream", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", async function* (_req, call) {
+      if (call.index === 0) {
+        throw ownsandError(Code.Unavailable, "agent unreachable");
+      }
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    h.api.stream(RelayService, "AttachExec", async function* () {
+      throw new ConnectError("no exec", Code.NotFound);
+    });
+    const result = await h.clock.run(
+      h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"] })
+        .wait(),
+    );
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    const auths = h.api.callsOf("AuthorizeRelay").map((c) => c.request as any);
+    expect(auths).toHaveLength(2);
+    expect(auths[1].replacesGrantId).toBe("grant-1");
   });
 
   test("waits at least the retry delay after AuthorizeRelay fails with resource_exhausted", async () => {
