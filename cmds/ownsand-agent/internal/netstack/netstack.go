@@ -285,22 +285,38 @@ func (n *Network) Serve(ctx context.Context, conn net.Conn, framing Framing) err
 	return err
 }
 
-// track registers c so that Close closes it; it reports false when the
-// network is closed already.
-func (n *Network) track(c io.Closer) bool {
+// startProxy registers the connections of one forwarded flow, so that
+// Close closes them, and runs relay in a goroutine that Close waits for.
+// The registration and the WaitGroup increment happen under the lock that
+// Close takes to mark the network closed, so Close either sees every
+// connection and the goroutine or none of them. When the network is closed
+// already, startProxy closes the connections and reports false.
+func (n *Network) startProxy(relay func(), conns ...io.Closer) bool {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	if n.closed {
+		n.mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
 		return false
 	}
-	n.conns[c] = true
-	return true
-}
-
-func (n *Network) untrack(c io.Closer) {
-	n.mu.Lock()
-	delete(n.conns, c)
+	for _, c := range conns {
+		n.conns[c] = true
+	}
+	n.wg.Add(1)
 	n.mu.Unlock()
+	go func() {
+		defer n.wg.Done()
+		defer func() {
+			n.mu.Lock()
+			for _, c := range conns {
+				delete(n.conns, c)
+			}
+			n.mu.Unlock()
+		}()
+		relay()
+	}()
+	return true
 }
 
 func destination(addr tcpip.Address) netip.Addr {
@@ -334,19 +350,7 @@ func (n *Network) forwardTCP(r *tcp.ForwarderRequest) {
 		return
 	}
 	in := gonet.NewTCPConn(&wq, ep)
-	if !n.track(in) {
-		in.Close()
-		out.Close()
-		return
-	}
-	n.track(out)
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
-		defer n.untrack(in)
-		defer n.untrack(out)
-		proxy(in, out)
-	}()
+	n.startProxy(func() { proxy(in, out) }, in, out)
 }
 
 // proxy copies both directions until both ended; a side's end closes the
@@ -390,19 +394,7 @@ func (n *Network) forwardUDP(r *udp.ForwarderRequest) bool {
 		in.Close()
 		return true
 	}
-	if !n.track(in) {
-		in.Close()
-		out.Close()
-		return true
-	}
-	n.track(out)
-	n.wg.Add(1)
-	go func() {
-		defer n.wg.Done()
-		defer n.untrack(in)
-		defer n.untrack(out)
-		proxyUDP(in, out)
-	}()
+	n.startProxy(func() { proxyUDP(in, out) }, in, out)
 	return true
 }
 
