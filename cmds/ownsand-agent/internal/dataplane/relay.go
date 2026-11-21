@@ -83,7 +83,10 @@ type grant struct {
 	streams    map[*rstream]bool
 	idleSince  time.Time
 	done       bool
-	// opened is true once a stream of the grant was admitted.
+	// opened is true once the dispatcher accepted an exec or attach request
+	// (or a file read) under the grant. A stream that was admitted but
+	// closed before it carried a request does not set it, so a grant that
+	// no request used keeps its idle time.
 	opened bool
 }
 
@@ -157,6 +160,25 @@ func (c *rconn) enqueue(f *ownsandv1.DataFrame) error {
 	select {
 	case c.out <- f:
 		return nil
+	case <-c.ctx.Done():
+		return errors.New("dataplane: relay connection closed")
+	}
+}
+
+// enqueueCtx queues a frame like enqueue and also stops waiting when ctx ends
+// (a stream context that a close frame canceled). It returns ctx.Err() then,
+// and queues no frame when ctx has already ended, so a frame of a closed
+// stream never follows the close. Connection-level and terminal frames keep
+// the connection-lifetime enqueue.
+func (c *rconn) enqueueCtx(ctx context.Context, f *ownsandv1.DataFrame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.out <- f:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-c.ctx.Done():
 		return errors.New("dataplane: relay connection closed")
 	}
