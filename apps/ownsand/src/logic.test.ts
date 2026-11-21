@@ -26,6 +26,7 @@ import {
 import { deviceLimitsInput, parseLabels, ttlErrors } from "./forms.ts";
 import {
   invitationLink,
+  openInvitationFromAddress,
   PENDING_INVITATION_KEY,
   pendingInvitation,
   secretFromFragment,
@@ -198,6 +199,26 @@ describe("invitation secrets", () => {
     );
     expect(secret).toBe("osi_x");
     expect(calls).toEqual(["/invitations/accept"]);
+  });
+
+  test("drops the stored secret only when the address carries a new one", () => {
+    const history = { replaceState: () => {} };
+    const at = (hash: string) => ({
+      hash,
+      pathname: "/invitations/accept",
+      search: "",
+    });
+    window.sessionStorage.clear();
+    pendingInvitation.save("osi_old");
+    expect(openInvitationFromAddress(at(""), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("osi_old");
+    expect(openInvitationFromAddress(at("#other=1"), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("osi_old");
+    expect(openInvitationFromAddress(at("#secret=osi_new"), history)).toBe(
+      "osi_new",
+    );
+    expect(pendingInvitation.read()).toBeUndefined();
+    window.sessionStorage.clear();
   });
 
   test("keeps the pending secret in sessionStorage only", () => {

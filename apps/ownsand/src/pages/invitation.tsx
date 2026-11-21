@@ -5,7 +5,7 @@ import { MemberService } from "ownsand-sdk/gen/member_pb";
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";
-import { pendingInvitation, takeSecretFromAddress } from "../invitation.ts";
+import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /**
@@ -17,7 +17,10 @@ export function InvitationPage() {
   const auth = useAuth();
   const { navigate } = useRouter();
   const [secret, setSecret] = useState<string | undefined>(() => {
-    const fromAddress = takeSecretFromAddress(window.location, window.history);
+    const fromAddress = openInvitationFromAddress(
+      window.location,
+      window.history,
+    );
     return fromAddress ?? pendingInvitation.read();
   });
   const accept = useMutation(MemberService.method.acceptInvitation);
@@ -37,7 +40,7 @@ export function InvitationPage() {
     // A new link opened while the page is shown. The error of the previous
     // link does not apply to it.
     const onHash = () => {
-      const next = takeSecretFromAddress(window.location, window.history);
+      const next = openInvitationFromAddress(window.location, window.history);
       if (next !== undefined) {
         currentAttempt.current += 1;
         resetAccept();
