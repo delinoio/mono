@@ -48,6 +48,11 @@ func DefaultLimits() Limits {
 	}
 }
 
+// writerGrace is how long Conn.Run waits for the writer after the connection
+// closed. A send that makes progress finishes within it; a send blocked on
+// the peer's flow control does not, and Run returns without it.
+const writerGrace = 100 * time.Millisecond
+
 // outboundQueue bounds the frames waiting for the connection writer.
 const outboundQueue = 1024
 
@@ -75,6 +80,9 @@ type Conn struct {
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
+	// sendInterrupt is set by SetSendInterrupt before Run starts.
+	sendInterrupt func() error
+
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
 
@@ -96,6 +104,13 @@ func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits)
 	c.lastSend.Store(now)
 	return c
 }
+
+// SetSendInterrupt registers the function that makes a blocked send fail
+// (for an HTTP response, a write deadline in the past). Run calls it once
+// after the connection closed. It returns an error when it cannot interrupt
+// the send; Run then falls back to a bounded wait for the writer. Call it
+// before Run.
+func (c *Conn) SetSendInterrupt(interrupt func() error) { c.sendInterrupt = interrupt }
 
 // Done is closed when the connection closes.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
@@ -150,28 +165,64 @@ func (c *Conn) Supports(kind ownsandv1.DataFrameKind) bool {
 // Run serves the connection: it sends the supported frame kinds, writes
 // queued frames with send, reads frames with recv, sends keepalives and
 // closes an idle connection. It returns when the connection closes.
+//
+// The idle check runs in its own goroutine because send can block on the
+// peer's flow control: a peer that stops reading and sends nothing would
+// otherwise stall the writer, and with it the idle check, forever. For the
+// same reason Run waits for the writer only for writerGrace, enough for a
+// send that makes progress to finish before the caller ends the underlying
+// stream, and returns without a send that is still blocked. Returning lets
+// the caller end the stream, which unblocks that send.
+//
+// That fallback is unsafe when the send writes to an HTTP response: the
+// handler that returns then finishes the response while the send still
+// writes to it. A caller whose send can be interrupted registers the
+// interrupt with SetSendInterrupt. Run then calls it once the connection
+// closed and waits for the writer without a limit, so Run returns only after
+// the last send ended.
 func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsandv1.DataFrame) error) error {
+	// guardedSend skips send once the connection closed, so the writer does
+	// not start a send after Run returned. A send that is already blocked
+	// ends when the caller ends the underlying stream.
+	guardedSend := func(f *ownsandv1.DataFrame) error {
+		if c.ctx.Err() != nil {
+			return context.Cause(c.ctx)
+		}
+		return send(f)
+	}
+	tick := c.limits.Keepalive / 3
+	go func() {
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				if time.Since(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
+					c.Close(ErrIdle)
+					return
+				}
+			case <-c.ctx.Done():
+				return
+			}
+		}
+	}()
 	writerDone := make(chan struct{})
 	go func() {
 		defer close(writerDone)
-		ticker := time.NewTicker(c.limits.Keepalive / 3)
+		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
 		for {
 			select {
 			case f := <-c.out:
-				if err := send(f); err != nil {
+				if err := guardedSend(f); err != nil {
 					c.Close(err)
 					return
 				}
 				c.lastSend.Store(time.Now().UnixNano())
 			case <-ticker.C:
 				now := time.Now()
-				if now.Sub(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
-					c.Close(ErrIdle)
-					return
-				}
 				if now.Sub(time.Unix(0, c.lastSend.Load())) >= c.limits.Keepalive {
-					if err := send(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
+					if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
 						c.Close(err)
 						return
 					}
@@ -198,7 +249,19 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		}
 	}()
 	<-c.ctx.Done()
-	<-writerDone
+	if c.sendInterrupt != nil && c.sendInterrupt() == nil {
+		// The interrupt makes a blocked send fail, so the writer ends soon
+		// and Run can wait for it without a limit. The caller owns the
+		// stream again only after the writer stopped using it.
+		<-writerDone
+		return c.Err()
+	}
+	grace := time.NewTimer(writerGrace)
+	defer grace.Stop()
+	select {
+	case <-writerDone:
+	case <-grace.C:
+	}
 	return c.Err()
 }
 
