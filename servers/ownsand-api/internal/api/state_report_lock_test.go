@@ -133,7 +133,8 @@ func (f *stateReportLockFixture) waitRemoval(t *testing.T, done <-chan error) {
 }
 
 // requireRemoved checks the removed device and its ended sandbox, and
-// returns the stored state epoch of the device.
+// returns the stored state epoch of the device, which is empty because the
+// scrub trigger clears the inventory of a removed row.
 func (f *stateReportLockFixture) requireRemoved(t *testing.T) (stateEpoch string) {
 	t.Helper()
 	var state int16
@@ -207,8 +208,11 @@ func TestRemovalAfterStateReportWins(t *testing.T) {
 		t.Fatal("the report found a removed device although it took the device lock first")
 	}
 	f.requireNoDeadlockLog(t)
-	if got := f.requireRemoved(t); got != report.GetStateEpoch() {
-		t.Fatalf("state_epoch = %s, want %s: the report that took the device lock first was not applied", got, report.GetStateEpoch())
+	// The report was applied before the removal (the reconcile above did not
+	// see a removed device); the removal then scrubbed the row, state_epoch
+	// included, so the epoch no longer shows the report.
+	if got := f.requireRemoved(t); got != "" {
+		t.Fatalf("state_epoch = %q, want it scrubbed by the removal", got)
 	}
 }
 
