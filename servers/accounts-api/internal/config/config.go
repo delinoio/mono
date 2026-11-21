@@ -131,7 +131,8 @@ type Config struct {
 
 	// CORSOrigins are the browser origins that may call the API.
 	CORSOrigins []string
-	// WebOrigin is the origin of the web app in invitation email links.
+	// WebOrigin is the origin of the web app in invitation and billing email
+	// links.
 	WebOrigin string
 
 	// ResendAPIKey is the Resend API key. Secret.
