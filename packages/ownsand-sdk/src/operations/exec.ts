@@ -442,10 +442,17 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
 
   /** Drains the remaining events and returns the result. */
   async wait(): Promise<ExecResult> {
-    if (!this.#iterated) {
-      for await (const _ of this) {
-        // Discard events.
+    // Decide on whether the underlying generator finished, not on whether
+    // iteration started: a consumer can break out of a for-await early, which
+    // leaves the generator suspended with its stream open and no result yet.
+    this.#iterated = true;
+    while (this.#result === undefined) {
+      const next = await this.#generator.next();
+      if (next.done) {
+        this.#result = next.value;
+        break;
       }
+      // Discard events.
     }
     if (this.#result === undefined) {
       throw new OwnSandError("the exec ended without a result");

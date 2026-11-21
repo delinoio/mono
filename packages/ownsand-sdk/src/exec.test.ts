@@ -101,6 +101,48 @@ describe("exec over the relay", () => {
     expect(execReq.organizationId).toBe(ORG);
   });
 
+  test("wait() drains the remaining events after a partial iteration and returns the same result each time", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.stdout(1, "b"));
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const handle = sandbox.exec({ command: ["sh", "-c", "echo a; echo b"] });
+    const first = await h.clock.run(
+      (async () => {
+        for await (const e of handle) return e;
+        return undefined;
+      })(),
+    );
+    expect(first?.type).toBe(ExecEventType.Started);
+    const result = await h.clock.run(handle.wait());
+    expect(result).toMatchObject({
+      kind: ExecResultKind.Exited,
+      exitCode: 0n,
+      complete: true,
+    });
+    expect(await handle.wait()).toBe(result);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+  });
+
+  test("wait() without iterating returns the result and is repeatable", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["true"] });
+    const result = await h.clock.run(handle.wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(await handle.wait()).toBe(result);
+  });
+
   test("reports a command that could not start, a timeout and a sandbox end as distinct results", async () => {
     const h = setup();
     let n = 0;
