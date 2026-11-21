@@ -422,8 +422,41 @@ func CreateSandboxRequest(req *ownsandv1.CreateSandboxRequest) error {
 	return Labels(req.GetLabels())
 }
 
-// DeviceLimits checks the four device limits of UpdateDeviceLimits:
-// vcpu_count, memory_mib and disk_gib are present and not negative (zero
+// DeviceLimitsInput checks the limits of a ReplaceDeviceLimits request. All
+// four fields must be present (an explicit zero is present), in the order
+// vcpu_count, memory_mib, disk_gib, vcpu_overcommit_percent; the first
+// missing one fails with its field path, before any numeric rule. It then
+// applies the numeric rules of DeviceLimits and returns the resolved limits.
+func DeviceLimitsInput(l *ownsandv1.DeviceLimitsInput) (*ownsandv1.DeviceLimits, error) {
+	if l == nil {
+		return nil, fail("limits", "is required")
+	}
+	if l.VcpuCount == nil {
+		return nil, fail("limits.vcpu_count", "is required")
+	}
+	if l.MemoryMib == nil {
+		return nil, fail("limits.memory_mib", "is required")
+	}
+	if l.DiskGib == nil {
+		return nil, fail("limits.disk_gib", "is required")
+	}
+	if l.VcpuOvercommitPercent == nil {
+		return nil, fail("limits.vcpu_overcommit_percent", "is required")
+	}
+	limits := &ownsandv1.DeviceLimits{
+		VcpuCount:             l.GetVcpuCount(),
+		MemoryMib:             l.GetMemoryMib(),
+		DiskGib:               l.GetDiskGib(),
+		VcpuOvercommitPercent: l.GetVcpuOvercommitPercent(),
+	}
+	if err := DeviceLimits(limits); err != nil {
+		return nil, err
+	}
+	return limits, nil
+}
+
+// DeviceLimits checks the four device limits of the legacy
+// UpdateDeviceLimits: vcpu_count, memory_mib and disk_gib are present and not negative (zero
 // makes the device ineligible for new sandboxes, like a new device), and
 // vcpu_overcommit_percent is 100 to 400 in steps of 25.
 func DeviceLimits(l *ownsandv1.DeviceLimits) error {
