@@ -293,11 +293,14 @@ export function FormDialog({
   onOpenChange,
   children,
   wide = false,
+  submitDisabled = false,
 }: {
   open: boolean;
   title: string;
   description?: ReactNode;
   submitLabel: string;
+  /** Disables the submit button, for example while there is nothing to submit. */
+  submitDisabled?: boolean;
   /** A wider panel for forms with several fields per row. */
   wide?: boolean;
   onSubmit: () => Promise<unknown>;
@@ -308,7 +311,7 @@ export function FormDialog({
   const [pending, setPending] = useState(false);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (pending) return;
+    if (pending || submitDisabled) return;
     setPending(true);
     setError(undefined);
     try {
@@ -337,7 +340,7 @@ export function FormDialog({
           {error !== undefined ? <ErrorNotice error={error} /> : null}
           <DialogActions>
             <DialogClose>Cancel</DialogClose>
-            <Button type="submit" disabled={pending}>
+            <Button type="submit" disabled={pending || submitDisabled}>
               {submitLabel}
             </Button>
           </DialogActions>

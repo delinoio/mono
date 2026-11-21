@@ -2,6 +2,7 @@
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { billingReasonOf } from "./api.ts";
+import { BillingAccountRole, BillingMeter } from "ownsand-sdk/gen/billing_pb";
 import {
   AgentUpdateState,
   AgentVersionPolicyMode,
@@ -125,6 +126,19 @@ export const labels = {
     [SnapshotExportState.EXPORTING]: "Exporting",
     [SnapshotExportState.EXPORTED]: "Exported",
     [SnapshotExportState.EXPORT_FAILED]: "Export failed",
+  },
+  billingMeter: {
+    [BillingMeter.UNSPECIFIED]: "Unknown meter",
+    [BillingMeter.RELAY_EGRESS]: "Relay egress",
+    [BillingMeter.R2_STORAGE]: "R2 snapshot storage",
+    [BillingMeter.CLASS_A_RPC]: "Class A RPCs",
+    [BillingMeter.CLASS_B_RPC]: "Class B RPCs",
+  },
+  billingAccountRole: {
+    [BillingAccountRole.UNSPECIFIED]: "Unknown role",
+    [BillingAccountRole.OWNER]: "Owner",
+    [BillingAccountRole.ADMIN]: "Admin",
+    [BillingAccountRole.VIEWER]: "Viewer",
   },
   policyMode: {
     [AgentVersionPolicyMode.UNSPECIFIED]: "Unknown",

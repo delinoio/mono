@@ -269,6 +269,12 @@ describe("roles", () => {
     expect(can(Role.MEMBER, Permission.LeaveOrganization)).toBe(true);
     expect(can(Role.MEMBER, Permission.UseSandboxes)).toBe(true);
     expect(can(undefined, Permission.ReadOrganization)).toBe(false);
+    expect(can(Role.OWNER, Permission.ViewBilling)).toBe(true);
+    expect(can(Role.ADMIN, Permission.ViewBilling)).toBe(true);
+    expect(can(Role.MEMBER, Permission.ViewBilling)).toBe(false);
+    expect(can(Role.OWNER, Permission.ManageBillingLink)).toBe(true);
+    expect(can(Role.ADMIN, Permission.ManageBillingLink)).toBe(false);
+    expect(can(Role.MEMBER, Permission.ManageBillingLink)).toBe(false);
   });
 
   test("an admin cannot manage the owner or itself", () => {

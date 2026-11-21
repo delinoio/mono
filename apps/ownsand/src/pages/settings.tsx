@@ -9,6 +9,7 @@ import {
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
+import { BillingService } from "ownsand-sdk/gen/billing_pb";
 import { AgentVersionPolicyMode, Role } from "ownsand-sdk/gen/common_pb";
 import { DeviceService } from "ownsand-sdk/gen/device_pb";
 import { MemberService } from "ownsand-sdk/gen/member_pb";
@@ -27,6 +28,7 @@ import {
 import { formatTime, labels } from "../format.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
+import { BillingSection } from "./billing-settings.tsx";
 
 const MODES = [
   AgentVersionPolicyMode.FOLLOW_DEFAULT,
@@ -36,7 +38,8 @@ const MODES = [
 
 /**
  * Route `settings`: the agent version policy (read for members, changed by
- * admins), ownership transfer and organization deletion (owner).
+ * admins), billing (owner and admins; linking by the owner), ownership
+ * transfer and organization deletion (owner).
  */
 export function SettingsPage() {
   const { organizationId, name, role } = useOrg();
@@ -51,6 +54,7 @@ export function SettingsPage() {
         <Detail term="Your role">{labels.role[role]}</Detail>
       </dl>
       <AgentPolicy />
+      {can(role, Permission.ViewBilling) ? <BillingSection /> : null}
       {can(role, Permission.TransferOwnership) ? <OwnerActions /> : null}
     </>
   );
@@ -165,7 +169,12 @@ function OwnerActions() {
   });
   const transfer = useMutation(OrganizationService.method.transferOwnership, {
     onSuccess: () =>
-      invalidateServices(queryClient, OrganizationService, MemberService),
+      invalidateServices(
+        queryClient,
+        OrganizationService,
+        MemberService,
+        BillingService,
+      ),
   });
   const remove = useMutation(OrganizationService.method.deleteOrganization, {
     onSuccess: () => invalidateServices(queryClient, OrganizationService),
@@ -225,7 +234,7 @@ function OwnerActions() {
         open={confirmTransfer}
         onOpenChange={setConfirmTransfer}
         title={`Make ${targetName} the owner?`}
-        description="You become an admin. Only the new owner can give ownership back."
+        description="You become an admin. Only the new owner can give ownership back. The transfer removes the billing link, so the organization is blocked until the new owner links a billing account."
         confirmLabel="Transfer ownership"
         onConfirm={() =>
           transfer.mutateAsync({ organizationId, userId: target! })

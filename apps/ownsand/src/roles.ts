@@ -14,6 +14,8 @@ export enum Permission {
   TransferOwnership = "transfer_ownership",
   DeleteOrganization = "delete_organization",
   UseSandboxes = "use_sandboxes",
+  ViewBilling = "view_billing",
+  ManageBillingLink = "manage_billing_link",
 }
 
 const ADMIN: ReadonlySet<Role> = new Set([Role.OWNER, Role.ADMIN]);
@@ -33,6 +35,7 @@ export function can(role: Role | undefined, permission: Permission): boolean {
       return role === Role.ADMIN || role === Role.MEMBER;
     case Permission.TransferOwnership:
     case Permission.DeleteOrganization:
+    case Permission.ManageBillingLink:
       return role === Role.OWNER;
     case Permission.ManageInvitations:
     case Permission.ManageMembers:
@@ -40,6 +43,7 @@ export function can(role: Role | undefined, permission: Permission): boolean {
     case Permission.ManageEnrollmentTokens:
     case Permission.ManageApiKeys:
     case Permission.ChangeAgentVersionPolicy:
+    case Permission.ViewBilling:
       return ADMIN.has(role);
   }
 }
