@@ -82,11 +82,15 @@ func run(args []string) int {
 	}
 	// The network tunnel of the Hyper-V runtime lives in the helper that
 	// the init process of a Linux guest restarts, so a failed relay comes
-	// back with the helper.
+	// back with the helper: a terminal tunnel error ends the helper with
+	// a failure status (see serve). A tunnel setup failure only logs.
+	var tunnelFatal <-chan error
 	if isInitChild() {
-		if err := startTunnel(logger); err != nil {
+		fatal, err := startTunnel(logger)
+		if err != nil {
 			logger.Error("network tunnel failed", "error", err)
 		}
+		tunnelFatal = fatal
 	}
 	l, err := guestlisten.Listen(*listen)
 	if err != nil {
@@ -95,11 +99,31 @@ func run(args []string) int {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	if err := srv.Run(ctx, l); err != nil {
-		logger.Error("serve failed", "error", err)
+	return serve(ctx, logger, tunnelFatal, func(ctx context.Context) error { return srv.Run(ctx, l) })
+}
+
+// serve runs the guest service until it ends and returns the exit code of
+// the helper. A terminal tunnel error (a receive from tunnelFatal; a nil
+// channel never fires) makes it stop the service and return 1 at once, so
+// the init process restarts the helper and the host reconnects its tunnel.
+func serve(ctx context.Context, logger *slog.Logger, tunnelFatal <-chan error, run func(context.Context) error) int {
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- run(runCtx) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			logger.Error("serve failed", "error", err)
+			return 1
+		}
+		return 0
+	case err := <-tunnelFatal:
+		// Do not wait for the service to drain: the helper is about to
+		// be replaced, and in-flight requests end with the process.
+		logger.Error("network tunnel failed; exiting so that init restarts the helper", "error", err)
 		return 1
 	}
-	return 0
 }
 
 func defaultStateDir() string {
