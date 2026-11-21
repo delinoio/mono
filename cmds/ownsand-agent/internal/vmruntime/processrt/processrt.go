@@ -202,22 +202,64 @@ func (r *Runtime) lookup(id string) (*vm, error) {
 	return v, nil
 }
 
-// Pause stops the helper's process group.
-func (r *Runtime) Pause(_ context.Context, m vmruntime.VM) error {
+// Pause stops the helper's process group and the process groups of the
+// exec workers below the helper.
+//
+// The guest helper starts every exec in a process group of its own, so a
+// signal to the helper's group does not reach the exec workers. Pause stops
+// the helper's group first, so that the helper cannot start another worker
+// while Pause enumerates the process tree, and then stops each worker group.
+func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return err
 	}
-	return signalGroup(v.cmd, sigStop)
+	if err := signalGroup(v.cmd, sigStop); err != nil {
+		return err
+	}
+	return r.signalDescendants(ctx, v, sigStop)
 }
 
-// Resume continues the helper's process group.
-func (r *Runtime) Resume(_ context.Context, m vmruntime.VM) error {
+// Resume continues the process groups of the exec workers and then the
+// helper's process group.
+func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return err
 	}
-	return signalGroup(v.cmd, sigCont)
+	// Continue the helper even when the enumeration of the workers fails, so
+	// that a failed Resume never leaves the helper stopped.
+	workersErr := r.signalDescendants(ctx, v, sigCont)
+	return errors.Join(workersErr, signalGroup(v.cmd, sigCont))
+}
+
+// signalDescendants sends sig to the process group of every process below
+// the helper, except the helper's own group. It finds the processes through
+// their parent links, so a worker that detached from the helper's process
+// tree (a double fork that the init process adopted) is not found; see the
+// process runtime entry in docs/cmds-ownsand-agent-foundation.md.
+func (r *Runtime) signalDescendants(ctx context.Context, v *vm, sig syscall.Signal) error {
+	if v.cmd == nil || v.cmd.Process == nil {
+		return nil
+	}
+	select {
+	case <-v.exited:
+		// The helper was reaped, so its process ID may belong to another
+		// process now.
+		return nil
+	default:
+	}
+	groups, err := descendantGroups(ctx, v.cmd.Process.Pid)
+	if err != nil {
+		return fmt.Errorf("processrt: list exec process groups of sandbox %s: %w", v.id, err)
+	}
+	var errs []error
+	for _, pgid := range groups {
+		if err := signalGroupID(pgid, sig); err != nil {
+			errs = append(errs, fmt.Errorf("processrt: signal exec process group of sandbox %s: %w", v.id, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // Snapshot copies the sandbox root directory as its disk. The process
@@ -237,13 +279,21 @@ func (r *Runtime) Snapshot(_ context.Context, m vmruntime.VM, dir string) (vmrun
 	return vmruntime.SnapshotInfo{SizeBytes: size}, nil
 }
 
-// Delete kills the helper's process group and removes the sandbox files.
-func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
+// Delete kills the helper's process group and the process groups of the
+// exec workers below the helper, and removes the sandbox files.
+func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 	r.mu.Lock()
 	v, ok := r.vms[sandboxID]
 	delete(r.vms, sandboxID)
 	r.mu.Unlock()
 	if ok {
+		// Stop the helper first so that it cannot start another worker while
+		// the process tree is enumerated, then kill the workers and the helper.
+		// A stop or an enumeration error must not keep the helper alive.
+		_ = signalGroup(v.cmd, sigStop)
+		if err := r.signalDescendants(ctx, v, sigKill); err != nil {
+			r.logger.Warn("process sandbox exec workers may keep running", "sandbox_id", sandboxID, "error", err)
+		}
 		_ = signalGroup(v.cmd, sigCont)
 		_ = signalGroup(v.cmd, sigKill)
 		select {
