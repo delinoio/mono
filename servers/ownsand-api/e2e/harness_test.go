@@ -25,6 +25,7 @@ import (
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsand "github.com/delinoio/mono/go/ownsand"
@@ -361,9 +362,9 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 		known[a.deviceID] = true
 	}
 	deviceID := s.waitDeviceOnline(user, known)
-	if _, err := user.Devices().UpdateLimits(ctx, &ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: s.orgID, DeviceId: deviceID,
-		Limits: &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 16384, DiskGib: 100, VcpuOvercommitPercent: 100}}); err != nil {
-		t.Fatalf("UpdateDeviceLimits: %v", err)
+	if _, err := user.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: s.orgID, DeviceId: deviceID,
+		Limits: &ownsandv1.DeviceLimitsInput{VcpuCount: proto.Int32(8), MemoryMib: proto.Int64(16384), DiskGib: proto.Int64(100), VcpuOvercommitPercent: proto.Int32(100)}}); err != nil {
+		t.Fatalf("ReplaceDeviceLimits: %v", err)
 	}
 	return agentProc{deviceID: deviceID, stateDir: stateDir, env: agentEnv, cmd: cmd}
 }

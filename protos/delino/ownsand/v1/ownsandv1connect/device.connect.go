@@ -52,6 +52,9 @@ const (
 	// DeviceServiceUpdateDeviceLimitsProcedure is the fully-qualified name of the DeviceService's
 	// UpdateDeviceLimits RPC.
 	DeviceServiceUpdateDeviceLimitsProcedure = "/delino.ownsand.v1.DeviceService/UpdateDeviceLimits"
+	// DeviceServiceReplaceDeviceLimitsProcedure is the fully-qualified name of the DeviceService's
+	// ReplaceDeviceLimits RPC.
+	DeviceServiceReplaceDeviceLimitsProcedure = "/delino.ownsand.v1.DeviceService/ReplaceDeviceLimits"
 	// DeviceServiceRemoveDeviceProcedure is the fully-qualified name of the DeviceService's
 	// RemoveDevice RPC.
 	DeviceServiceRemoveDeviceProcedure = "/delino.ownsand.v1.DeviceService/RemoveDevice"
@@ -75,8 +78,14 @@ type DeviceServiceClient interface {
 	ListDevices(context.Context, *connect.Request[v1.ListDevicesRequest]) (*connect.Response[v1.ListDevicesResponse], error)
 	// Read one device.
 	GetDevice(context.Context, *connect.Request[v1.GetDeviceRequest]) (*connect.Response[v1.GetDeviceResponse], error)
-	// Set all four device limits.
+	// Legacy: set all four device limits with implicit field presence. A
+	// missing value reads as zero, so an omitted `disk_gib` is stored as zero.
+	// Kept for v1 clients; new clients call ReplaceDeviceLimits.
 	UpdateDeviceLimits(context.Context, *connect.Request[v1.UpdateDeviceLimitsRequest]) (*connect.Response[v1.UpdateDeviceLimitsResponse], error)
+	// Replace all four device limits. Every value must be present: a missing
+	// value is rejected with `invalid_argument`, and an explicit zero for
+	// `vcpu_count`, `memory_mib` or `disk_gib` is stored as zero.
+	ReplaceDeviceLimits(context.Context, *connect.Request[v1.ReplaceDeviceLimitsRequest]) (*connect.Response[v1.ReplaceDeviceLimitsResponse], error)
 	// Revoke the device credentials and request local clean-up.
 	RemoveDevice(context.Context, *connect.Request[v1.RemoveDeviceRequest]) (*connect.Response[v1.RemoveDeviceResponse], error)
 	// Read the agent version policy of the organization.
@@ -132,6 +141,12 @@ func NewDeviceServiceClient(httpClient connect.HTTPClient, baseURL string, opts 
 			connect.WithSchema(deviceServiceMethods.ByName("UpdateDeviceLimits")),
 			connect.WithClientOptions(opts...),
 		),
+		replaceDeviceLimits: connect.NewClient[v1.ReplaceDeviceLimitsRequest, v1.ReplaceDeviceLimitsResponse](
+			httpClient,
+			baseURL+DeviceServiceReplaceDeviceLimitsProcedure,
+			connect.WithSchema(deviceServiceMethods.ByName("ReplaceDeviceLimits")),
+			connect.WithClientOptions(opts...),
+		),
 		removeDevice: connect.NewClient[v1.RemoveDeviceRequest, v1.RemoveDeviceResponse](
 			httpClient,
 			baseURL+DeviceServiceRemoveDeviceProcedure,
@@ -161,6 +176,7 @@ type deviceServiceClient struct {
 	listDevices              *connect.Client[v1.ListDevicesRequest, v1.ListDevicesResponse]
 	getDevice                *connect.Client[v1.GetDeviceRequest, v1.GetDeviceResponse]
 	updateDeviceLimits       *connect.Client[v1.UpdateDeviceLimitsRequest, v1.UpdateDeviceLimitsResponse]
+	replaceDeviceLimits      *connect.Client[v1.ReplaceDeviceLimitsRequest, v1.ReplaceDeviceLimitsResponse]
 	removeDevice             *connect.Client[v1.RemoveDeviceRequest, v1.RemoveDeviceResponse]
 	getAgentVersionPolicy    *connect.Client[v1.GetAgentVersionPolicyRequest, v1.GetAgentVersionPolicyResponse]
 	updateAgentVersionPolicy *connect.Client[v1.UpdateAgentVersionPolicyRequest, v1.UpdateAgentVersionPolicyResponse]
@@ -196,6 +212,11 @@ func (c *deviceServiceClient) UpdateDeviceLimits(ctx context.Context, req *conne
 	return c.updateDeviceLimits.CallUnary(ctx, req)
 }
 
+// ReplaceDeviceLimits calls delino.ownsand.v1.DeviceService.ReplaceDeviceLimits.
+func (c *deviceServiceClient) ReplaceDeviceLimits(ctx context.Context, req *connect.Request[v1.ReplaceDeviceLimitsRequest]) (*connect.Response[v1.ReplaceDeviceLimitsResponse], error) {
+	return c.replaceDeviceLimits.CallUnary(ctx, req)
+}
+
 // RemoveDevice calls delino.ownsand.v1.DeviceService.RemoveDevice.
 func (c *deviceServiceClient) RemoveDevice(ctx context.Context, req *connect.Request[v1.RemoveDeviceRequest]) (*connect.Response[v1.RemoveDeviceResponse], error) {
 	return c.removeDevice.CallUnary(ctx, req)
@@ -223,8 +244,14 @@ type DeviceServiceHandler interface {
 	ListDevices(context.Context, *connect.Request[v1.ListDevicesRequest]) (*connect.Response[v1.ListDevicesResponse], error)
 	// Read one device.
 	GetDevice(context.Context, *connect.Request[v1.GetDeviceRequest]) (*connect.Response[v1.GetDeviceResponse], error)
-	// Set all four device limits.
+	// Legacy: set all four device limits with implicit field presence. A
+	// missing value reads as zero, so an omitted `disk_gib` is stored as zero.
+	// Kept for v1 clients; new clients call ReplaceDeviceLimits.
 	UpdateDeviceLimits(context.Context, *connect.Request[v1.UpdateDeviceLimitsRequest]) (*connect.Response[v1.UpdateDeviceLimitsResponse], error)
+	// Replace all four device limits. Every value must be present: a missing
+	// value is rejected with `invalid_argument`, and an explicit zero for
+	// `vcpu_count`, `memory_mib` or `disk_gib` is stored as zero.
+	ReplaceDeviceLimits(context.Context, *connect.Request[v1.ReplaceDeviceLimitsRequest]) (*connect.Response[v1.ReplaceDeviceLimitsResponse], error)
 	// Revoke the device credentials and request local clean-up.
 	RemoveDevice(context.Context, *connect.Request[v1.RemoveDeviceRequest]) (*connect.Response[v1.RemoveDeviceResponse], error)
 	// Read the agent version policy of the organization.
@@ -276,6 +303,12 @@ func NewDeviceServiceHandler(svc DeviceServiceHandler, opts ...connect.HandlerOp
 		connect.WithSchema(deviceServiceMethods.ByName("UpdateDeviceLimits")),
 		connect.WithHandlerOptions(opts...),
 	)
+	deviceServiceReplaceDeviceLimitsHandler := connect.NewUnaryHandler(
+		DeviceServiceReplaceDeviceLimitsProcedure,
+		svc.ReplaceDeviceLimits,
+		connect.WithSchema(deviceServiceMethods.ByName("ReplaceDeviceLimits")),
+		connect.WithHandlerOptions(opts...),
+	)
 	deviceServiceRemoveDeviceHandler := connect.NewUnaryHandler(
 		DeviceServiceRemoveDeviceProcedure,
 		svc.RemoveDevice,
@@ -308,6 +341,8 @@ func NewDeviceServiceHandler(svc DeviceServiceHandler, opts ...connect.HandlerOp
 			deviceServiceGetDeviceHandler.ServeHTTP(w, r)
 		case DeviceServiceUpdateDeviceLimitsProcedure:
 			deviceServiceUpdateDeviceLimitsHandler.ServeHTTP(w, r)
+		case DeviceServiceReplaceDeviceLimitsProcedure:
+			deviceServiceReplaceDeviceLimitsHandler.ServeHTTP(w, r)
 		case DeviceServiceRemoveDeviceProcedure:
 			deviceServiceRemoveDeviceHandler.ServeHTTP(w, r)
 		case DeviceServiceGetAgentVersionPolicyProcedure:
@@ -345,6 +380,10 @@ func (UnimplementedDeviceServiceHandler) GetDevice(context.Context, *connect.Req
 
 func (UnimplementedDeviceServiceHandler) UpdateDeviceLimits(context.Context, *connect.Request[v1.UpdateDeviceLimitsRequest]) (*connect.Response[v1.UpdateDeviceLimitsResponse], error) {
 	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("delino.ownsand.v1.DeviceService.UpdateDeviceLimits is not implemented"))
+}
+
+func (UnimplementedDeviceServiceHandler) ReplaceDeviceLimits(context.Context, *connect.Request[v1.ReplaceDeviceLimitsRequest]) (*connect.Response[v1.ReplaceDeviceLimitsResponse], error) {
+	return nil, connect.NewError(connect.CodeUnimplemented, errors.New("delino.ownsand.v1.DeviceService.ReplaceDeviceLimits is not implemented"))
 }
 
 func (UnimplementedDeviceServiceHandler) RemoveDevice(context.Context, *connect.Request[v1.RemoveDeviceRequest]) (*connect.Response[v1.RemoveDeviceResponse], error) {

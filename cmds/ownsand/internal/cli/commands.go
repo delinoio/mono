@@ -530,19 +530,24 @@ func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) e
 	if err != nil {
 		return err
 	}
-	limits := &ownsandv1.DeviceLimits{VcpuCount: int32(*vcpu), MemoryMib: *memory, DiskGib: *disk, VcpuOvercommitPercent: int32(*overcommit)}
+	// ReplaceDeviceLimits needs every value to be present, so an explicit zero
+	// (for example --vcpu 0) reaches the server as zero.
+	limits := &ownsandv1.DeviceLimitsInput{
+		VcpuCount: proto.Int32(int32(*vcpu)), MemoryMib: proto.Int64(*memory), DiskGib: proto.Int64(*disk),
+		VcpuOvercommitPercent: proto.Int32(int32(*overcommit)),
+	}
 	if *overcommit < 0 {
 		// Every value is required: keep the device's current overcommit.
 		dev, err := a.client.Devices().Get(ctx, &ownsandv1.GetDeviceRequest{OrganizationId: org, DeviceId: rest[0]})
 		if err != nil {
 			return err
 		}
-		limits.VcpuOvercommitPercent = dev.GetDevice().GetLimits().GetVcpuOvercommitPercent()
+		limits.VcpuOvercommitPercent = proto.Int32(dev.GetDevice().GetLimits().GetVcpuOvercommitPercent())
 	}
-	if err := validate.DeviceLimits(limits); err != nil {
+	if _, err := validate.DeviceLimitsInput(limits); err != nil {
 		return usageErr("%v", err)
 	}
-	res, err := a.client.Devices().UpdateLimits(ctx, &ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: org, DeviceId: rest[0], Limits: limits})
+	res, err := a.client.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: org, DeviceId: rest[0], Limits: limits})
 	if err != nil {
 		return err
 	}

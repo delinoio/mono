@@ -129,6 +129,11 @@ func matrixCases(env *testenv.Env, org *testenv.Org) []rpcCase {
 				Limits: &ownsandv1.DeviceLimits{VcpuCount: 1, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: 100}}))
 			return err
 		}, connect.CodeNotFound, connect.CodeNotFound, deny, deny},
+		{"ReplaceDeviceLimits", func(ctx context.Context, c *testenv.Clients, o string) error {
+			_, err := c.Device.ReplaceDeviceLimits(ctx, connect.NewRequest(&ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: o, DeviceId: nonexistent,
+				Limits: &ownsandv1.DeviceLimitsInput{VcpuCount: i32(1), MemoryMib: i64(1), DiskGib: i64(1), VcpuOvercommitPercent: i32(100)}}))
+			return err
+		}, connect.CodeNotFound, connect.CodeNotFound, deny, deny},
 		{"RemoveDevice", func(ctx context.Context, c *testenv.Clients, o string) error {
 			_, err := c.Device.RemoveDevice(ctx, connect.NewRequest(&ownsandv1.RemoveDeviceRequest{OrganizationId: o, DeviceId: nonexistent}))
 			return err

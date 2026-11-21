@@ -268,6 +268,13 @@ func (e *Env) ClientsWith(token string, extra http.Header) *Clients {
 	}
 }
 
+// JSONDeviceClient returns a DeviceService client that speaks Connect with
+// the protobuf JSON codec and sends token as the bearer credential.
+func (e *Env) JSONDeviceClient(token string) ownsandv1connect.DeviceServiceClient {
+	return ownsandv1connect.NewDeviceServiceClient(e.Server.Client(), e.Server.URL,
+		connect.WithProtoJSON(), connect.WithInterceptors(bearer{token: token}))
+}
+
 // Clients returns clients with token as the bearer credential.
 func (e *Env) Clients(token string) *Clients { return e.ClientsWith(token, nil) }
 

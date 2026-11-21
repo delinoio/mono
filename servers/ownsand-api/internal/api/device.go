@@ -310,10 +310,38 @@ func (h DeviceHandler) GetDevice(ctx context.Context, req *connect.Request[ownsa
 	return connect.NewResponse(&ownsandv1.GetDeviceResponse{Device: d}), nil
 }
 
+// UpdateDeviceLimits is the legacy RPC with implicit field presence: a
+// missing value reads as zero. It shares the write path with
+// ReplaceDeviceLimits.
 func (h DeviceHandler) UpdateDeviceLimits(ctx context.Context, req *connect.Request[ownsandv1.UpdateDeviceLimitsRequest]) (*connect.Response[ownsandv1.UpdateDeviceLimitsResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	deviceID := req.Msg.GetDeviceId()
 	limits := req.Msg.GetLimits()
+	device, err := h.setDeviceLimits(ctx, req.Msg.GetOrganizationId(), req.Msg.GetDeviceId(), func() (*ownsandv1.DeviceLimits, error) {
+		return limits, validate.DeviceLimits(limits)
+	})
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&ownsandv1.UpdateDeviceLimitsResponse{Device: device}), nil
+}
+
+// ReplaceDeviceLimits replaces all four limits. A missing field fails with
+// invalid_argument before any write.
+func (h DeviceHandler) ReplaceDeviceLimits(ctx context.Context, req *connect.Request[ownsandv1.ReplaceDeviceLimitsRequest]) (*connect.Response[ownsandv1.ReplaceDeviceLimitsResponse], error) {
+	device, err := h.setDeviceLimits(ctx, req.Msg.GetOrganizationId(), req.Msg.GetDeviceId(), func() (*ownsandv1.DeviceLimits, error) {
+		return validate.DeviceLimitsInput(req.Msg.GetLimits())
+	})
+	if err != nil {
+		return nil, err
+	}
+	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: device}), nil
+}
+
+// setDeviceLimits is the shared write path of UpdateDeviceLimits and
+// ReplaceDeviceLimits: authorization, device ID and limit validation, the
+// update, the configuration event and the audit record in one transaction.
+// The resolve callback runs after the authorization and ID checks and before
+// any write, and returns the validated limits.
+func (h DeviceHandler) setDeviceLimits(ctx context.Context, orgID, deviceID string, resolve func() (*ownsandv1.DeviceLimits, error)) (*ownsandv1.Device, error) {
 	var device *ownsandv1.Device
 	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageDevices)
@@ -323,7 +351,8 @@ func (h DeviceHandler) UpdateDeviceLimits(ctx context.Context, req *connect.Requ
 		if err := validateID("device_id", deviceID); err != nil {
 			return err
 		}
-		if err := validate.DeviceLimits(limits); err != nil {
+		limits, err := resolve()
+		if err != nil {
 			return errInvalid(err)
 		}
 		tag, err := tx.Exec(ctx, `UPDATE devices SET limit_vcpu_count = $3, limit_memory_mib = $4, limit_disk_gib = $5, vcpu_overcommit_percent = $6
@@ -349,10 +378,10 @@ func (h DeviceHandler) UpdateDeviceLimits(ctx context.Context, req *connect.Requ
 		return err
 	})
 	if err != nil {
-		return nil, h.internal(ctx, "update device limits", err)
+		return nil, h.internal(ctx, "set device limits", err)
 	}
 	h.notify()
-	return connect.NewResponse(&ownsandv1.UpdateDeviceLimitsResponse{Device: device}), nil
+	return device, nil
 }
 
 func (h DeviceHandler) RemoveDevice(ctx context.Context, req *connect.Request[ownsandv1.RemoveDeviceRequest]) (*connect.Response[ownsandv1.RemoveDeviceResponse], error) {

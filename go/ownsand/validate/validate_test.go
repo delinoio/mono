@@ -301,6 +301,48 @@ func TestCreateSandboxRequest(t *testing.T) {
 	wantInvalid(t, "typed nil source", CreateSandboxRequest(r), "source")
 }
 
+func TestDeviceLimitsInput(t *testing.T) {
+	i32 := func(v int32) *int32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	full := func() *ownsandv1.DeviceLimitsInput {
+		return &ownsandv1.DeviceLimitsInput{VcpuCount: i32(4), MemoryMib: i64(8), DiskGib: i64(2), VcpuOvercommitPercent: i32(150)}
+	}
+	got, err := DeviceLimitsInput(full())
+	if err != nil || got.GetVcpuCount() != 4 || got.GetMemoryMib() != 8 || got.GetDiskGib() != 2 || got.GetVcpuOvercommitPercent() != 150 {
+		t.Fatalf("complete input: %v, %v", got, err)
+	}
+	// Explicit zeros are present and valid.
+	zero := &ownsandv1.DeviceLimitsInput{VcpuCount: i32(0), MemoryMib: i64(0), DiskGib: i64(0), VcpuOvercommitPercent: i32(100)}
+	if _, err := DeviceLimitsInput(zero); err != nil {
+		t.Fatalf("explicit zeros rejected: %v", err)
+	}
+	_, err = DeviceLimitsInput(nil)
+	wantInvalid(t, "nil", err, "limits")
+	for field, clear := range map[string]func(*ownsandv1.DeviceLimitsInput){
+		"limits.vcpu_count":              func(l *ownsandv1.DeviceLimitsInput) { l.VcpuCount = nil },
+		"limits.memory_mib":              func(l *ownsandv1.DeviceLimitsInput) { l.MemoryMib = nil },
+		"limits.disk_gib":                func(l *ownsandv1.DeviceLimitsInput) { l.DiskGib = nil },
+		"limits.vcpu_overcommit_percent": func(l *ownsandv1.DeviceLimitsInput) { l.VcpuOvercommitPercent = nil },
+	} {
+		l := full()
+		clear(l)
+		_, err := DeviceLimitsInput(l)
+		wantInvalid(t, "missing "+field, err, field)
+	}
+	// Presence comes before the numeric rules.
+	l := &ownsandv1.DeviceLimitsInput{VcpuCount: i32(-1)}
+	_, err = DeviceLimitsInput(l)
+	wantInvalid(t, "presence first", err, "limits.memory_mib")
+	l = full()
+	l.DiskGib = i64(-1)
+	_, err = DeviceLimitsInput(l)
+	wantInvalid(t, "negative disk", err, "limits.disk_gib")
+	l = full()
+	l.VcpuOvercommitPercent = i32(110)
+	_, err = DeviceLimitsInput(l)
+	wantInvalid(t, "overcommit", err, "limits.vcpu_overcommit_percent")
+}
+
 func TestDeviceLimits(t *testing.T) {
 	for p := int32(100); p <= 400; p += 25 {
 		if err := DeviceLimits(&ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 1, DiskGib: 1, VcpuOvercommitPercent: p}); err != nil {
