@@ -245,10 +245,6 @@ func (s *p2pSession) onMessage(msg webrtc.DataChannelMessage) {
 }
 
 func (s *p2pSession) dispatch(f *ownsandv1.DataFrame) {
-	if f.GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END {
-		s.end(&errSessionEnded{reason: f.GetSessionEnd().GetReason()})
-		return
-	}
 	s.mu.Lock()
 	st := s.streams[f.GetStreamId()]
 	s.mu.Unlock()
@@ -261,6 +257,12 @@ func (s *p2pSession) dispatch(f *ownsandv1.DataFrame) {
 		if st != nil {
 			st.fail(&errInvalidFrame{cause: err})
 		}
+		return
+	}
+	// A valid session-end frame retires the session only after validation,
+	// so a malformed one is handled like any other invalid frame.
+	if f.GetKind() == ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END {
+		s.end(&errSessionEnded{reason: f.GetSessionEnd().GetReason()})
 		return
 	}
 	if st == nil {
