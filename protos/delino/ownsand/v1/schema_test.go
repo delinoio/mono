@@ -9,6 +9,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoreflect"
 	"google.golang.org/protobuf/reflect/protoregistry"
 
+	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -103,4 +104,74 @@ func TestAuditActionsMatchContract(t *testing.T) {
 			t.Errorf("AuditAction has no value %s", name)
 		}
 	}
+}
+
+// The billing reasons are the three reasons of the protos contract. Clients
+// treat every value as terminal, so a new value needs a contract change.
+func TestBillingReasonsMatchContract(t *testing.T) {
+	want := []string{"ACCOUNT_REQUIRED", "BLOCKED", "SUSPENDED"}
+	values := ownsandv1.BillingReason(0).Descriptor().Values()
+	if values.Len() != len(want)+1 {
+		t.Fatalf("BillingReason has %d values, want %d", values.Len(), len(want)+1)
+	}
+	for _, name := range want {
+		if values.ByName(protoreflect.Name("BILLING_REASON_"+name)) == nil {
+			t.Errorf("BillingReason has no value %s", name)
+		}
+	}
+}
+
+// Every BillingMeter value has exactly one delino-accounts Meter value of
+// OwnSand with the same name, and the reverse, so that the control plane
+// maps meters by name when it reports usage.
+func TestBillingMetersMatchAccountsMeters(t *testing.T) {
+	accounts := map[string]bool{}
+	accountsValues := accountsv1.Meter(0).Descriptor().Values()
+	for i := 0; i < accountsValues.Len(); i++ {
+		name := string(accountsValues.Get(i).Name())
+		if meter, ok := strings.CutPrefix(name, "METER_OWNSAND_"); ok {
+			accounts[meter] = true
+		}
+	}
+	values := ownsandv1.BillingMeter(0).Descriptor().Values()
+	for i := 0; i < values.Len(); i++ {
+		value := values.Get(i)
+		if value.Number() == 0 {
+			continue
+		}
+		meter := strings.TrimPrefix(string(value.Name()), "BILLING_METER_")
+		if !accounts[meter] {
+			t.Errorf("BillingMeter %s has no accounts Meter METER_OWNSAND_%s", value.Name(), meter)
+		}
+		delete(accounts, meter)
+	}
+	for meter := range accounts {
+		t.Errorf("accounts Meter METER_OWNSAND_%s has no BillingMeter", meter)
+	}
+}
+
+// Money fields follow the billing contract: a signed 64-bit micro-USD value
+// whose name ends with `_usd_micros`.
+func TestMoneyFieldsAreInt64UsdMicros(t *testing.T) {
+	protoregistry.GlobalTypes.RangeMessages(func(message protoreflect.MessageType) bool {
+		descriptor := message.Descriptor()
+		if descriptor.ParentFile().Package() != packageName {
+			return true
+		}
+		fields := descriptor.Fields()
+		for i := 0; i < fields.Len(); i++ {
+			field := fields.Get(i)
+			name := string(field.Name())
+			if !strings.Contains(name, "usd") {
+				continue
+			}
+			if !strings.HasSuffix(name, "_usd_micros") {
+				t.Errorf("field %s mentions usd but does not end with _usd_micros", field.FullName())
+			}
+			if field.Kind() != protoreflect.Int64Kind || field.IsList() || field.IsMap() {
+				t.Errorf("money field %s is not a singular int64", field.FullName())
+			}
+		}
+		return true
+	})
 }
