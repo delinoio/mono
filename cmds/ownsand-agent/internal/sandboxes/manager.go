@@ -120,14 +120,21 @@ type Manager struct {
 	execs     ExecTracker
 	gate      CreateGate
 	closed    bool
+	// bg tracks the background sandbox ends (TTL expiries and unexpected
+	// VM exits). Add is called only under mu while closed is false, so
+	// that Close can wait for them.
+	bg sync.WaitGroup
 }
 
-// Close stops recording VM ends. The agent calls it when it shuts down:
-// its VMs end with the process, and the next start reconciles the records.
+// Close stops recording VM ends and starting TTL ends, and waits for the
+// ends that already run, so that no record is written after Close
+// returns. The agent calls it when it shuts down: its VMs end with the
+// process, and the next start reconciles the records.
 func (m *Manager) Close() {
 	m.mu.Lock()
 	m.closed = true
 	m.mu.Unlock()
+	m.bg.Wait()
 }
 
 // New loads the records, creates a state epoch when the state directory
@@ -581,10 +588,14 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 	<-vm.Exited()
 	m.mu.Lock()
 	expected := m.closed || sb.ending || sb.vm != vm
+	if !expected {
+		m.bg.Add(1)
+	}
 	m.mu.Unlock()
 	if expected {
 		return
 	}
+	defer m.bg.Done()
 	sb.cmdMu.Lock()
 	defer sb.cmdMu.Unlock()
 	m.mu.Lock()
@@ -743,6 +754,10 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	var reports []*sandbox
 	var unacked []*ownsandv1.SandboxStateEntry
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
 	execs := m.execs
 	for _, sb := range m.sandboxes {
 		if sb.ending {
@@ -773,10 +788,12 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 		}
 	}
 	outbox := m.outbox
+	m.bg.Add(len(expired))
 	m.mu.Unlock()
 	for _, e := range expired {
 		m.logger.Info("sandbox TTL expired", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
 		go func(e expiry) {
+			defer m.bg.Done()
 			e.sb.cmdMu.Lock()
 			defer e.sb.cmdMu.Unlock()
 			if _, err := m.endLocked(ctx, e.sb, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, e.reason); err != nil {

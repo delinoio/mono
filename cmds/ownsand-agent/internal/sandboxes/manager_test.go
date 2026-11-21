@@ -179,6 +179,9 @@ func newEnv(t *testing.T) *env {
 	}
 	e := &env{t: t, st: st, rt: newFakeRuntime(), clk: &clock{now: time.Now()}, out: &outbox{}, ex: &execs{running: map[string]bool{}, ended: map[string]ownsandv1.SandboxEndReason{}}}
 	e.restart()
+	// Registered after t.TempDir, so it runs before the state directory is
+	// removed: Close waits for the background ends that still write records.
+	t.Cleanup(func() { e.m.Close() })
 	return e
 }
 
@@ -395,6 +398,34 @@ func TestTTLExpiry(t *testing.T) {
 	e.clk.Advance(time.Hour)
 	e.m.Tick(context.Background(), false)
 	waitState(t, e.m, paused, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	// A running exec does not hold the sandbox past its max TTL.
+	waitState(t, e.m, busy, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, busy); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("busy reason %v", r)
+	}
+}
+
+// TestCloseWaitsForTTLEnds checks that Close returns only after the TTL
+// ends that Tick started have written their records, and that a Tick after
+// Close starts no end.
+func TestCloseWaitsForTTLEnds(t *testing.T) {
+	e := newEnv(t)
+	first := e.create(time.Minute, time.Hour).GetSandboxId()
+	second := e.create(time.Minute, time.Hour).GetSandboxId()
+	e.clk.Advance(2 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	e.m.Close()
+	for _, id := range []string{first, second} {
+		if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("sandbox %s state %v after Close", id, s)
+		}
+	}
+	third := e.create(time.Minute, time.Hour).GetSandboxId()
+	e.clk.Advance(2 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	if s, _ := e.m.State(third); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("Tick after Close ended sandbox: %v", s)
+	}
 }
 
 func TestEqualDeadlinesGiveMaxTTL(t *testing.T) {
