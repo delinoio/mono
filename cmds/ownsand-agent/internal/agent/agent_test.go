@@ -36,6 +36,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/processrt"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -946,5 +947,272 @@ func TestUpdateDefersToSandboxDuringTransfers(t *testing.T) {
 	}
 	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil || env.installs.Load() != 0 {
 		t.Fatalf("installed with a running sandbox: %v %v", ok, err)
+	}
+}
+
+// gateRuntime holds Create until the test releases it, and reports whether
+// the context of Create ended first.
+type gateRuntime struct {
+	vmruntime.Runtime
+	started  chan struct{}
+	release  chan struct{}
+	canceled chan struct{}
+	once     sync.Once
+}
+
+func newGateRuntime(r vmruntime.Runtime) *gateRuntime {
+	return &gateRuntime{Runtime: r, started: make(chan struct{}), release: make(chan struct{}), canceled: make(chan struct{})}
+}
+
+func (g *gateRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
+	g.once.Do(func() { close(g.started) })
+	select {
+	case <-g.release:
+		return g.Runtime.Create(ctx, spec)
+	case <-ctx.Done():
+		close(g.canceled)
+		return nil, ctx.Err()
+	}
+}
+
+func (g *gateRuntime) isCanceled() bool {
+	select {
+	case <-g.canceled:
+		return true
+	default:
+		return false
+	}
+}
+
+// startGated starts an agent with a gated runtime, waits for its first state
+// report and sends a create command that blocks in the runtime.
+func startGated(t *testing.T) (*harness, *gateRuntime, string, *testcp.Server) {
+	t.Helper()
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	var gate *gateRuntime
+	h := startWith(t, cp, st, id, func(o *Options) {
+		gate = newGateRuntime(o.Runtime)
+		o.Runtime = gate
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+
+	sandboxID, _ := uuidv7.NewString()
+	cmd := createCommand(sandboxID)
+	cmd.CommandId, _ = uuidv7.NewString()
+	if !cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+		t.Fatal("no channel")
+	}
+	select {
+	case <-gate.started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the create did not reach the runtime")
+	}
+	return h, gate, sandboxID, cp
+}
+
+// startBlockedCreate extends startGated: it closes the agent channel and
+// waits until the agent reconnected and reported the sandbox as creating.
+func startBlockedCreate(t *testing.T) (*harness, *gateRuntime, string, *testcp.Server) {
+	t.Helper()
+	h, gate, sandboxID, cp := startGated(t)
+	channels := cp.Channels()
+	from := cp.Received()
+	cp.Current().Close()
+	deadline := time.Now().Add(10 * time.Second)
+	for cp.Channels() == channels {
+		if time.Now().After(deadline) {
+			t.Fatal("agent did not reconnect")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	h.wait(from, "state report listing the create", func(e *ownsandv1.AgentEnvelope) bool {
+		for _, s := range e.GetStateReport().GetSandboxes() {
+			if s.GetSandboxId() == sandboxID && s.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_CREATING {
+				return true
+			}
+		}
+		return false
+	})
+	return h, gate, sandboxID, cp
+}
+
+func reportsSandboxState(e *ownsandv1.AgentEnvelope, sandboxID string, match func(*ownsandv1.SandboxStateEntry) bool) bool {
+	if u := e.GetSandboxUpdate().GetSandbox(); u != nil && u.GetSandboxId() == sandboxID && match(u) {
+		return true
+	}
+	for _, s := range e.GetStateReport().GetSandboxes() {
+		if s.GetSandboxId() == sandboxID && match(s) {
+			return true
+		}
+	}
+	return false
+}
+
+func TestCreateSurvivesAgentChannelLoss(t *testing.T) {
+	h, gate, sandboxID, cp := startBlockedCreate(t)
+	close(gate.release)
+
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if state, _ := h.agent.Sandboxes.State(sandboxID); state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the sandbox did not reach RUNNING")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if gate.isCanceled() {
+		t.Fatal("the channel loss canceled the create")
+	}
+	h.wait(0, "running report", func(e *ownsandv1.AgentEnvelope) bool {
+		return reportsSandboxState(e, sandboxID, func(s *ownsandv1.SandboxStateEntry) bool {
+			return s.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+		})
+	})
+	if env, _ := cp.WaitFor(300*time.Millisecond, 0, func(e *ownsandv1.AgentEnvelope) bool {
+		return reportsSandboxState(e, sandboxID, func(s *ownsandv1.SandboxStateEntry) bool {
+			return s.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_FAILED || s.GetEndReason() == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED
+		})
+	}); env != nil {
+		t.Fatalf("the agent reported a failed create: %v", env)
+	}
+}
+
+func TestDeleteAfterChannelLossStillCancelsCreate(t *testing.T) {
+	h, gate, sandboxID, cp := startBlockedCreate(t)
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: sandboxID}}})
+	if res.GetSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("delete result %v", res)
+	}
+	select {
+	case <-gate.canceled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the delete did not cancel the create")
+	}
+	if env, _ := cp.WaitFor(300*time.Millisecond, 0, func(e *ownsandv1.AgentEnvelope) bool {
+		return reportsSandboxState(e, sandboxID, func(s *ownsandv1.SandboxStateEntry) bool {
+			return s.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+		})
+	}); env != nil {
+		t.Fatalf("the agent reported the canceled sandbox as running: %v", env)
+	}
+}
+
+func TestShutdownCancelsRunningCreate(t *testing.T) {
+	h, gate, _, _ := startGated(t)
+	h.stop()
+	select {
+	case <-gate.canceled:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent shutdown did not cancel the create")
+	}
+}
+
+// recordingHandler keeps every log record, with the attributes of
+// Logger.With, for assertions.
+type recordingHandler struct {
+	mu      *sync.Mutex
+	records *[]slog.Record
+	attrs   []slog.Attr
+}
+
+func newRecordingHandler() *recordingHandler {
+	return &recordingHandler{mu: &sync.Mutex{}, records: &[]slog.Record{}}
+}
+
+func (h *recordingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordingHandler) Handle(_ context.Context, r slog.Record) error {
+	r = r.Clone()
+	r.AddAttrs(h.attrs...)
+	h.mu.Lock()
+	*h.records = append(*h.records, r)
+	h.mu.Unlock()
+	return nil
+}
+func (h *recordingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &recordingHandler{mu: h.mu, records: h.records, attrs: append(append([]slog.Attr{}, h.attrs...), attrs...)}
+}
+func (h *recordingHandler) WithGroup(string) slog.Handler { return h }
+
+func TestCommandResultWithoutChannelIsLogged(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	rec := newRecordingHandler()
+	rt, err := processrt.New(guestBinary, quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, _ := cpclient.New(cp.URL, nil)
+	a, err := New(context.Background(), Options{
+		Store: st, Identity: id, Control: client, Runtime: rt, Logger: slog.New(rec),
+		Update: update.Options{Platform: "linux-amd64", Running: "1.0.0", Installer: update.ExecutableInstaller{Path: filepath.Join(t.TempDir(), "exe")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(a.shutdown)
+
+	commandID, _ := uuidv7.NewString()
+	snapshotID, _ := uuidv7.NewString()
+	ctx := context.Background()
+	a.handleCommand(ctx, ctx, &ownsandv1.AgentCommand{CommandId: commandID, Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: snapshotID}}}, 0)
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	var found int
+	for _, r := range *rec.records {
+		if r.Message != "command result not sent" {
+			continue
+		}
+		found++
+		attrs := map[string]string{}
+		r.Attrs(func(a slog.Attr) bool { attrs[a.Key] = a.Value.String(); return true })
+		if r.Level != slog.LevelWarn || attrs["command_id"] != commandID || attrs["command"] != "delete_snapshot" {
+			t.Fatalf("record %v attrs %v", r, attrs)
+		}
+	}
+	if found != 1 {
+		t.Fatalf("got %d records, want 1", found)
+	}
+}
+
+// snapshotCtxRuntime records the context error that Snapshot sees.
+type snapshotCtxRuntime struct {
+	vmruntime.Runtime
+	ctxErr chan error
+}
+
+func (r *snapshotCtxRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+	r.ctxErr <- ctx.Err()
+	return r.Runtime.Snapshot(ctx, vm, dir)
+}
+
+// TestSnapshotCaptureEndsWithItsChannel checks that a snapshot capture stays
+// bound to the channel context: a pending capture is not in the state report,
+// so the control plane fails it after a reconnect, and nothing reports a late
+// completion. Remove this test together with that limit.
+func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	rt := &snapshotCtxRuntime{ctxErr: make(chan error, 1)}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt.Runtime = o.Runtime
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatalf("create %v", res)
+	}
+	snapID, _ := uuidv7.NewString()
+	chanCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
+	if err := <-rt.ctxErr; err == nil {
+		t.Fatal("snapshot capture ran on a context that outlives its channel")
 	}
 }
