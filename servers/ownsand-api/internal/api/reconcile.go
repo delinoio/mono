@@ -15,10 +15,25 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
 )
 
+// canonicalUUID returns the lowercase canonical text of a valid UUID v7 and
+// any other value unchanged. Agents may spell an identifier in either hex
+// case, but the stored identifiers are lowercase uuid::text, so report maps
+// and revision epochs must compare by value, not by spelling. A value that
+// is not a UUID v7 stays as it is and never equals a stored identifier.
+func canonicalUUID(s string) string {
+	id, err := uuidv7.Parse(s)
+	if err != nil {
+		return s
+	}
+	return id.String()
+}
+
 // compareRevision orders sandbox revisions: a newer epoch (a later UUID v7,
-// which sorts lexicographically by time in canonical form) always wins, and
-// within one epoch the higher counter wins. The empty epoch of a
-// server-made state is older than every agent revision.
+// which sorts lexicographically by time in lowercase canonical form) always
+// wins, and within one epoch the higher counter wins. The empty epoch of a
+// server-made state is older than every agent revision. Callers pass epochs
+// in lowercase canonical form (see canonicalUUID); the comparison is
+// byte-wise, so an uppercase spelling would sort before every lowercase one.
 func compareRevision(epochA string, counterA uint64, epochB string, counterB uint64) int {
 	switch {
 	case epochA < epochB:
@@ -68,12 +83,14 @@ func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID str
 	if !uuidv7.Valid(e.GetSandboxId()) || !validAgentState(e.GetState()) || e.GetRevision() == nil || !uuidv7.Valid(e.GetRevision().GetEpoch()) {
 		return res, nil
 	}
-	r, err := scanSandbox(tx.QueryRow(ctx, sandboxSelect+" WHERE s.sandbox_id = $1 AND s.device_id = $2 FOR UPDATE OF s", e.GetSandboxId(), deviceID))
+	sandboxID := canonicalUUID(e.GetSandboxId())
+	epoch := canonicalUUID(e.GetRevision().GetEpoch())
+	r, err := scanSandbox(tx.QueryRow(ctx, sandboxSelect+" WHERE s.sandbox_id = $1 AND s.device_id = $2 FOR UPDATE OF s", sandboxID, deviceID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		// The agent runs a VM that the server does not know (for example of a
 		// deleted record): delete it.
 		if !isTerminal(e.GetState()) {
-			res.delete = &pendingDelete{sandboxID: e.GetSandboxId(), reason: ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER}
+			res.delete = &pendingDelete{sandboxID: sandboxID, reason: ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER}
 		}
 		return res, nil
 	}
@@ -88,7 +105,9 @@ func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID str
 		return res, nil
 	}
 	rev := e.GetRevision()
-	if compareRevision(rev.GetEpoch(), rev.GetCounter(), r.Epoch, r.Counter) > 0 {
+	// A stored epoch may still be in the spelling an earlier version wrote, so
+	// canonicalize it before the byte-wise comparison.
+	if compareRevision(epoch, rev.GetCounter(), canonicalUUID(r.Epoch), r.Counter) > 0 {
 		res.applied = true
 		var idle any
 		if e.GetIdleDeadline() != nil {
@@ -112,14 +131,14 @@ func (s *Service) applySandboxEntry(ctx context.Context, tx pgx.Tx, deviceID str
 			}
 			if _, err := tx.Exec(ctx, `UPDATE sandboxes SET revision_epoch = $2, revision_counter = $3,
 				idle_deadline = COALESCE($4, idle_deadline), restore_path = COALESCE($5, restore_path) WHERE sandbox_id = $1`,
-				r.ID, rev.GetEpoch(), int64(rev.GetCounter()), idle, restore); err != nil {
+				r.ID, epoch, int64(rev.GetCounter()), idle, restore); err != nil {
 				return res, err
 			}
 			return res, s.endSandboxTx(ctx, tx, r, e.GetState(), reason, r.deleteActor())
 		}
 		if _, err := tx.Exec(ctx, `UPDATE sandboxes SET agent_state = $2, revision_epoch = $3, revision_counter = $4,
 			idle_deadline = COALESCE($5, idle_deadline), restore_path = COALESCE($6, restore_path) WHERE sandbox_id = $1`,
-			r.ID, int16(e.GetState()), rev.GetEpoch(), int64(rev.GetCounter()), idle, restore); err != nil {
+			r.ID, int16(e.GetState()), epoch, int64(rev.GetCounter()), idle, restore); err != nil {
 			return res, err
 		}
 	}
@@ -217,13 +236,14 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID, channelID 
 		}
 		listed := map[string]bool{}
 		for _, e := range report.GetSandboxes() {
-			listed[e.GetSandboxId()] = true
+			listed[canonicalUUID(e.GetSandboxId())] = true
 			res, err := s.applySandboxEntry(ctx, tx, deviceID, e)
 			if err != nil {
 				return err
 			}
 			if res.applied {
-				out.changed = append(out.changed, e.GetSandboxId())
+				// The stored ID, so that the change watchers fire by value.
+				out.changed = append(out.changed, canonicalUUID(e.GetSandboxId()))
 			}
 			if res.delete != nil {
 				out.deletes = append(out.deletes, *res.delete)
@@ -307,10 +327,11 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID,
 	listed := map[string]*ownsandv1.SnapshotStateEntry{}
 	var readyIDs []string
 	for _, e := range entries {
-		listed[e.GetSnapshotId()] = e
+		snapshotID := canonicalUUID(e.GetSnapshotId())
+		listed[snapshotID] = e
 		if (e.GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_READY || e.GetState() == ownsandv1.SnapshotState_SNAPSHOT_STATE_UNSPECIFIED) &&
 			validateID("snapshot_id", e.GetSnapshotId()) == nil {
-			readyIDs = append(readyIDs, e.GetSnapshotId())
+			readyIDs = append(readyIDs, snapshotID)
 		}
 	}
 	var devOrg string
