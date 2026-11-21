@@ -44,9 +44,12 @@ func (c *Control) Kick() {
 
 // LeaseAcquired starts the event processor at the newest event: events
 // older than the lease belong to channels of the previous holder, and the
-// state reports of reconnecting agents trigger pending deletes again.
-func (c *Control) LeaseAcquired() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// state reports of reconnecting agents trigger pending deletes again. The
+// lease cancels ctx at the confirmed expiry of the ownership period, so the
+// database read cannot delay the loss transition; a failed read leaves the
+// cursor unset and the event processor repeats it while the lease is held.
+func (c *Control) LeaseAcquired(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	id, err := events.LatestID(ctx, c.S.DB.Pool)
 	if err != nil {
@@ -105,7 +108,7 @@ func (c *Control) processEvents(ctx context.Context) {
 	cursor := c.cursor
 	c.mu.Unlock()
 	if cursor < 0 {
-		c.LeaseAcquired()
+		c.LeaseAcquired(ctx)
 		return
 	}
 	for {

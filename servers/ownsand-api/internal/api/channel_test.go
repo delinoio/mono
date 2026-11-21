@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/lease"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
@@ -1163,4 +1165,49 @@ func TestImportBeforeWaitExpiryCreates(t *testing.T) {
 	agentB.WaitFor("create after import", func(e *ownsandv1.AgentEnvelope) bool {
 		return e.GetCommand().GetCreateSandbox().GetSandboxId() == created.Msg.GetSandbox().GetSandboxId()
 	})
+}
+
+// offsetClock is the real clock plus an offset that a test moves forward.
+type offsetClock struct{ offset atomic.Int64 }
+
+func (c *offsetClock) Now() time.Time { return time.Now().Add(time.Duration(c.offset.Load())) }
+
+func (c *offsetClock) Advance(d time.Duration) { c.offset.Add(int64(d)) }
+
+// TestChannelClosesAtLeaseExpiry checks that a holder that cannot confirm a
+// renewal stops serving at the confirmed expiry: the connected agent channel
+// closes, the instance no longer holds the lease and a new admission is
+// refused. The test moves the local lease deadline clock past the TTL; the
+// next scheduled renewal is 10 seconds away, so nothing renews in between.
+func TestChannelClosesAtLeaseExpiry(t *testing.T) {
+	clock := &offsetClock{}
+	env := testenv.New(t, func(o *app.Options) { o.LeaseDeadlineNow = clock.Now })
+	org := env.NewOrg("alice")
+	dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	agent := env.NewFakeAgent(dev)
+	agent.Connect()
+	conn := env.App.Service.Hub.Get(dev.ID)
+	if conn == nil {
+		t.Fatal("the holder has no channel for the device")
+	}
+
+	clock.Advance(lease.TTL)
+	if env.App.Lease.Held() {
+		t.Fatal("the instance holds the lease at the confirmed expiry")
+	}
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the channel stayed open after the lease expired")
+	}
+	select {
+	case <-agent.Closed():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the agent did not see the channel close")
+	}
+	late := env.Clients(env.SessionCredential(dev)).Agent.Channel(context.Background())
+	_ = late.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	if _, err := late.Receive(); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("admission after the lease expired: %v", err)
+	}
 }
