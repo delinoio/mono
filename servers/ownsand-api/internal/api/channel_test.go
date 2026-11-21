@@ -683,6 +683,41 @@ func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
 			t.Fatalf("%d withdrawals, want 1", w)
 		}
 	})
+
+	// The channel handler and the control event processor both evaluate the
+	// update of one channel. While another decision for the channel runs, a
+	// policy change must wait: a decision that read an older policy could
+	// otherwise queue its command after the command of a newer decision.
+	t.Run("an update decision waits for the decision that runs on the channel", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev, agent := setupAgent(t, env, org, nil)
+		agent.WaitFor("update command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil })
+		conn := env.App.Service.Hub.Live(dev.ID)
+		if conn == nil {
+			t.Fatal("the device has no live channel")
+		}
+
+		unlock := conn.LockUpdates()
+		unlocked := false
+		defer func() {
+			if !unlocked {
+				unlock()
+			}
+		}()
+		setPolicy(t, org, hold)
+		time.Sleep(500 * time.Millisecond)
+		if _, w := count(agent); w != 0 {
+			t.Fatalf("%d withdrawals while another decision held the channel", w)
+		}
+		unlock()
+		unlocked = true
+		agent.WaitFor("withdrawal after the decision ended", isWithdraw)
+	})
 }
 
 // TestAgentUpdateTargetOrdering checks which update target the control

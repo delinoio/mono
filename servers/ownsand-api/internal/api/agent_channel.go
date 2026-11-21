@@ -545,7 +545,14 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 // Mixed versions: an agent that predates the withdrawal command answers it
 // with UNIMPLEMENTED. The server only logs that result (agent_command_result)
 // and does not retry or negotiate; such an agent keeps its queued update.
+//
+// The channel handler (capability and state reports) and the control event
+// processor (policy changes) both call it for the same channel, so the whole
+// decision, from reading the policy to queueing the command, runs under the
+// per-channel update lock. A decision that read an older policy then cannot
+// send its command after the command of a newer decision.
 func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
+	defer conn.LockUpdates()()
 	d, err := s.updateTarget(ctx, conn.DeviceID)
 	if err != nil {
 		return err
