@@ -1,0 +1,369 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.accounts.v1;
+
+import "delino/accounts/v1/billing_account.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/accounts/v1;accountsv1";
+
+// Usage reports, organization links and the billing status of linked
+// organizations. The owning contract is
+// docs/protos-delino-accounts-api-contract.md; the package-wide rules are
+// in billing_account.proto.
+//
+// A Delino service that charges for usage (the calling service) links each
+// of its organizations to at most one billing account, reports usage per
+// organization, meter and 5-minute window, and enforces the billing status
+// that accounts-api computes for each linked organization:
+//
+// - ALLOWED: the subscription of the billing account is ACTIVE and its
+//   balance is greater than zero.
+// - BLOCKED: otherwise (non-payment). blocked_since is the start of the
+//   uninterrupted non-payment of the billing account, or the link time when
+//   that is later. suspend_time is blocked_since plus 3 days.
+// - SUSPENDED: the non-payment continued until suspend_time. accounts-api
+//   records this change when suspend_time passes, without a usage report.
+//
+// When the balance becomes greater than zero and the subscription is ACTIVE
+// again, the status returns to ALLOWED.
+
+// Billing status of a linked organization.
+enum BillingStatus {
+  BILLING_STATUS_UNSPECIFIED = 0;
+  BILLING_STATUS_ALLOWED = 1;
+  BILLING_STATUS_BLOCKED = 2;
+  BILLING_STATUS_SUSPENDED = 3;
+}
+
+// Why a linked organization is BLOCKED or SUSPENDED.
+enum BillingStatusReason {
+  BILLING_STATUS_REASON_UNSPECIFIED = 0;
+  // The status is ALLOWED.
+  BILLING_STATUS_REASON_NONE = 1;
+  // The subscription of the billing account is not ACTIVE. When the balance
+  // is also not greater than zero, this reason wins.
+  BILLING_STATUS_REASON_NO_ACTIVE_SUBSCRIPTION = 2;
+  // The subscription is ACTIVE, and the balance is zero or negative.
+  BILLING_STATUS_REASON_NON_POSITIVE_BALANCE = 3;
+}
+
+// A Delino service that reports usage. The stable lowercase identifier of a
+// value is its name without the `SERVICE_ID_` prefix, in lowercase (for
+// example `ownsand`). LedgerEntry.service and the database store it.
+enum ServiceId {
+  SERVICE_ID_UNSPECIFIED = 0;
+  SERVICE_ID_OWNSAND = 1;
+}
+
+// A usage meter. Each value starts with the name of its ServiceId value. The
+// stable identifier of a meter is `<service>.<meter>` in lowercase, for
+// example `ownsand.relay_egress` for METER_OWNSAND_RELAY_EGRESS.
+// LedgerEntry.meter and the database store it. The service owns the prices
+// and computes amount_usd_micros; accounts-api does not price usage.
+enum Meter {
+  METER_UNSPECIFIED = 0;
+  // Relay egress. Quantity unit: bytes.
+  METER_OWNSAND_RELAY_EGRESS = 1;
+  // Exported-snapshot R2 storage. Quantity unit: byte-seconds.
+  METER_OWNSAND_R2_STORAGE = 2;
+  // Class A RPC calls. Quantity unit: calls.
+  METER_OWNSAND_CLASS_A_RPC = 3;
+  // Class B RPC calls. Quantity unit: calls.
+  METER_OWNSAND_CLASS_B_RPC = 4;
+}
+
+// UsageService is the service API for Delino services. Every RPC needs a
+// Logto machine-to-machine access token with the scope
+// `accounts:report-usage`; a user token fails with `permission_denied`.
+// accounts-api maps each machine-to-machine client to the ServiceId values
+// that it may use; a request for another service fails with
+// `permission_denied`. The calling service authorizes its own users; this API
+// trusts the machine credential and checks only billing account roles.
+service UsageService {
+  // Report usage and deduct it from the balance. Each report is idempotent by
+  // its key (service, organization_id, meter, window_start): a repeated key,
+  // also within one request, returns the first result with duplicate set to
+  // true and deducts nothing again. A repeated key with another quantity or
+  // amount keeps the first values; accounts-api logs the mismatch. The
+  // server validates every report before it applies any; one invalid report
+  // fails the request with `invalid_argument` that names its index. A
+  // failure after validation can leave some reports applied; the retry of the
+  // whole request is safe.
+  //
+  // Attribution: a report is charged to the billing account whose link to
+  // the organization overlapped the window [window_start, window_start + 5
+  // minutes); when several links overlapped, the link active at the end of
+  // the window. This keeps the usage of an unlinked or deleted organization
+  // on its former billing account. A report without an overlapping link is
+  // stored as unattributed usage (kept 7 years, nothing deducted) and
+  // returns unattributed set to true. Usage is never dropped.
+  rpc ReportUsage(ReportUsageRequest) returns (ReportUsageResponse);
+  // List the current billing status of organizations whose status changed
+  // after a cursor, for polling. Statuses are ordered by sequence, with at
+  // most one entry per organization (its latest status). after_sequence 0
+  // returns every linked organization of the service. Only linked
+  // organizations appear; an unlink adds no entry.
+  rpc ListBillingStatusChanges(ListBillingStatusChangesRequest) returns (ListBillingStatusChangesResponse);
+  // Link an organization of the service to a billing account on behalf of a
+  // user. The user must be the owner or an admin of the billing account
+  // (`permission_denied` otherwise); the calling service checks its own
+  // organization role first. An unknown or deleted billing account, or one
+  // in which the user has no membership, fails with `not_found`. An
+  // organization that is linked to another billing account fails with
+  // `already_exists`; linking it to the same billing account again changes
+  // only organization_name.
+  rpc LinkOrganization(LinkOrganizationRequest) returns (LinkOrganizationResponse);
+  // Remove the link of an organization. Idempotent: an organization without
+  // a link succeeds and changes nothing. Usage of earlier windows stays
+  // attributed to the former billing account.
+  rpc UnlinkOrganization(UnlinkOrganizationRequest) returns (UnlinkOrganizationResponse);
+  // List the billing accounts in which a user is owner or admin, ordered by
+  // billing_account_id, for the link flow of the calling service.
+  rpc ListManageableBillingAccounts(ListManageableBillingAccountsRequest) returns (ListManageableBillingAccountsResponse);
+  // Read the billing of one linked organization: the billing account, its
+  // balance, the status and the usage of the current UTC calendar month. An
+  // organization without a link fails with `not_found`.
+  rpc GetOrganizationBilling(GetOrganizationBillingRequest) returns (GetOrganizationBillingResponse);
+}
+
+// BillingUsageService shows linked organizations and usage to the members of
+// a billing account. Every RPC needs a user token with the scope
+// `accounts:billing` and a membership in the named billing account; every
+// member may call it.
+service BillingUsageService {
+  // List the organizations that are linked to the billing account now,
+  // ordered by link time.
+  rpc ListLinkedOrganizations(ListLinkedOrganizationsRequest) returns (ListLinkedOrganizationsResponse);
+  // Summarize the usage that was charged to the billing account in one UTC
+  // calendar month, by service, organization and meter.
+  rpc ListUsageSummary(ListUsageSummaryRequest) returns (ListUsageSummaryResponse);
+}
+
+// Billing status of one linked organization.
+message OrganizationBillingStatus {
+  ServiceId service = 1;
+  // Organization ID of the service, unchanged.
+  string organization_id = 2;
+  // Billing account that the organization is linked to.
+  string billing_account_id = 3;
+  BillingStatus status = 4;
+  // NONE for ALLOWED; NO_ACTIVE_SUBSCRIPTION or NON_POSITIVE_BALANCE
+  // otherwise.
+  BillingStatusReason reason = 5;
+  // Start of the non-payment. Set for BLOCKED and SUSPENDED; unset for
+  // ALLOWED.
+  google.protobuf.Timestamp blocked_since = 6;
+  // blocked_since plus 3 days: the time when a BLOCKED organization becomes
+  // SUSPENDED, or became SUSPENDED. Unset for ALLOWED.
+  google.protobuf.Timestamp suspend_time = 7;
+  // Position of this status in the change sequence of the service. Greater
+  // than zero; it increases with every change of any field above for any
+  // organization of the service. Use it as the cursor of
+  // ListBillingStatusChanges. A caller keeps the status with the highest
+  // sequence and ignores a status whose billing_account_id differs from the
+  // link that it knows, which can arrive after an unlink.
+  int64 sequence = 8;
+}
+
+// Usage of one organization, meter and 5-minute window.
+message UsageReport {
+  ServiceId service = 1;
+  // Organization ID of the service, unchanged: 1 to 128 bytes of printable
+  // ASCII. OwnSand sends lowercase UUID text.
+  string organization_id = 2;
+  // A meter of the same service. A meter of another service fails with
+  // `invalid_argument`.
+  Meter meter = 3;
+  // Start of the window, aligned to 5 minutes in UTC (whole seconds that are
+  // a multiple of 300, zero nanoseconds). The end of the window must not be
+  // later than the server time plus 1 minute. There is no lower limit, so a
+  // service can report old windows after an outage.
+  google.protobuf.Timestamp window_start = 4;
+  // Measured quantity of the window in the unit of the meter. At least 0.
+  int64 quantity = 5;
+  // Price of the window that the service computed, rounded as the service's
+  // domain contract records. At least 0.
+  int64 amount_usd_micros = 6;
+}
+
+// Result of one usage report.
+message UsageReportResult {
+  // Key of the report, echoed.
+  ServiceId service = 1;
+  string organization_id = 2;
+  Meter meter = 3;
+  google.protobuf.Timestamp window_start = 4;
+  // True when an earlier report with the same key exists; the other fields
+  // then describe that first result.
+  bool duplicate = 5;
+  // True when no link overlapped the window, so nothing was deducted.
+  bool unattributed = 6;
+  // Billing account that the report was charged to. Empty when
+  // unattributed.
+  string billing_account_id = 7;
+  // USAGE ledger entry of the deduction. Empty when unattributed.
+  string ledger_entry_id = 8;
+}
+
+// Usage of one meter in a period.
+message MeterUsage {
+  Meter meter = 1;
+  // Sum of the reported quantities, in the unit of the meter.
+  int64 quantity = 2;
+  // Sum of the reported amounts.
+  int64 amount_usd_micros = 3;
+}
+
+// An organization that is linked to a billing account now.
+message LinkedOrganization {
+  ServiceId service = 1;
+  string organization_id = 2;
+  // Display name that the service sent with the last LinkOrganization call.
+  // Empty when the service sent none.
+  string organization_name = 3;
+  google.protobuf.Timestamp link_time = 4;
+  OrganizationBillingStatus status = 5;
+}
+
+// Usage of one organization and meter that was charged to a billing account
+// in a month.
+message UsageSummaryRow {
+  ServiceId service = 1;
+  string organization_id = 2;
+  Meter meter = 3;
+  // Sum of the quantities, in the unit of the meter.
+  int64 quantity = 4;
+  // Sum of the amounts.
+  int64 amount_usd_micros = 5;
+}
+
+message ReportUsageRequest {
+  // 1 to 500 reports. Other counts fail with `invalid_argument`.
+  repeated UsageReport reports = 1;
+}
+
+message ReportUsageResponse {
+  // One result per report, in request order.
+  repeated UsageReportResult results = 1;
+  // Current status of each linked organization that the request names, one
+  // entry per organization, after the deductions.
+  repeated OrganizationBillingStatus statuses = 2;
+}
+
+message ListBillingStatusChangesRequest {
+  ServiceId service = 1;
+  // Return statuses with a sequence greater than this value. 0 returns
+  // every linked organization. Negative values fail with
+  // `invalid_argument`.
+  int64 after_sequence = 2;
+  // Default 50, maximum 200.
+  int32 page_size = 3;
+}
+
+message ListBillingStatusChangesResponse {
+  repeated OrganizationBillingStatus statuses = 1;
+  // Cursor for the next call: the highest sequence in statuses, or
+  // after_sequence when statuses is empty. Fewer than page_size statuses
+  // mean that the caller is up to date.
+  int64 next_sequence = 2;
+}
+
+message LinkOrganizationRequest {
+  ServiceId service = 1;
+  // Same rules as UsageReport.organization_id.
+  string organization_id = 2;
+  string billing_account_id = 3;
+  // Logto `sub` of the user that links the organization in the calling
+  // service.
+  string user_id = 4;
+  // Display name of the organization for the billing account members. At
+  // most 200 bytes of UTF-8 without control characters; may be empty.
+  string organization_name = 5;
+}
+
+message LinkOrganizationResponse {
+  // Billing status of the organization after the link.
+  OrganizationBillingStatus status = 1;
+  // Name of the billing account, for display in the calling service.
+  string billing_account_name = 2;
+}
+
+message UnlinkOrganizationRequest {
+  ServiceId service = 1;
+  string organization_id = 2;
+}
+
+message UnlinkOrganizationResponse {}
+
+message ListManageableBillingAccountsRequest {
+  // Logto `sub` of the user of the calling service.
+  string user_id = 1;
+  // Default 50, maximum 200.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListManageableBillingAccountsResponse {
+  // Billing accounts in which the user is owner or admin. caller_role holds
+  // the role of the user.
+  repeated BillingAccount billing_accounts = 1;
+  string next_page_token = 2;
+}
+
+message GetOrganizationBillingRequest {
+  ServiceId service = 1;
+  string organization_id = 2;
+}
+
+message GetOrganizationBillingResponse {
+  // Linked billing account.
+  string billing_account_id = 1;
+  string billing_account_name = 2;
+  // Balance of the billing account. Negative when it has debt.
+  int64 balance_usd_micros = 3;
+  OrganizationBillingStatus status = 4;
+  // Start of the current UTC calendar month.
+  google.protobuf.Timestamp month_start = 5;
+  // Usage of the organization in windows that start in the current UTC
+  // calendar month, one entry for every meter of the service in Meter
+  // order, zero when it had no usage. It counts every report of the
+  // organization, also reports that were charged to a former billing
+  // account or were unattributed.
+  repeated MeterUsage meter_usages = 6;
+}
+
+message ListLinkedOrganizationsRequest {
+  string billing_account_id = 1;
+  // Default 50, maximum 200.
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListLinkedOrganizationsResponse {
+  repeated LinkedOrganization linked_organizations = 1;
+  string next_page_token = 2;
+}
+
+message ListUsageSummaryRequest {
+  string billing_account_id = 1;
+  // UTC calendar year, 2000 to 9999.
+  int32 year = 2;
+  // UTC calendar month, 1 to 12. A month in the future returns no rows.
+  int32 month = 3;
+  // Default 50, maximum 200.
+  int32 page_size = 4;
+  string page_token = 5;
+}
+
+message ListUsageSummaryResponse {
+  // Rows with usage, ordered by service, organization_id and meter. Only
+  // usage that was charged to this billing account.
+  repeated UsageSummaryRow rows = 1;
+  string next_page_token = 2;
+  // Sum of amount_usd_micros of every row of the month, also of rows on
+  // other pages.
+  int64 total_amount_usd_micros = 3;
+}
