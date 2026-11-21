@@ -270,6 +270,94 @@ func TestOfflineDeleteAndReconciliation(t *testing.T) {
 	if audits != 1 {
 		t.Fatalf("system audit events for B = %d", audits)
 	}
+	if n := env.App.Service.WatcherCount(); n != 0 {
+		t.Fatalf("watchers after the offline delete = %d", n)
+	}
+}
+
+// TestOfflineDeleteLeavesNoWatchers checks that DeleteSandbox on an offline
+// device, which waits through at least one poll, leaves no sandbox watch
+// registration behind and keeps the pending delete.
+func TestOfflineDeleteLeavesNoWatchers(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 1500 * time.Millisecond, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	_, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, _ := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	id := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	agent.Close()
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE)
+	for i := 0; i < 3; i++ {
+		start := time.Now()
+		del, err := c.Sandbox.DeleteSandbox(ctx, connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: id}))
+		if err != nil || del.Msg.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE {
+			t.Fatalf("delete %d: %v %v", i, del, err)
+		}
+		if time.Since(start) < time.Second {
+			t.Fatalf("delete %d returned before a poll: %v", i, time.Since(start))
+		}
+		if n := env.App.Service.WatcherCount(); n != 0 {
+			t.Fatalf("watchers after delete %d = %d", i, n)
+		}
+	}
+	var pending bool
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT delete_pending FROM sandboxes WHERE sandbox_id = $1", id).Scan(&pending); err != nil || !pending {
+		t.Fatalf("delete_pending = %v, %v", pending, err)
+	}
+}
+
+// TestWaitSandboxCancelledWaiterLeavesOtherWaiter checks that cancelling one
+// waiter unregisters it and that a terminal update still wakes the other.
+func TestWaitSandboxCancelledWaiterLeavesOtherWaiter(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 45 * time.Second, CommandWait: 20 * time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: time.Hour, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	_, agent := setupAgent(t, env, org, nil)
+	c := org.OwnerClient
+	created, _ := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	id := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	// The agent never answers the delete, so both calls wait.
+	agent.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+		if cmd.GetDeleteSandbox() != nil {
+			return nil
+		}
+		return fa.DefaultAnswer(cmd)
+	})
+	req := func() *connect.Request[ownsandv1.DeleteSandboxRequest] {
+		return connect.NewRequest(&ownsandv1.DeleteSandboxRequest{OrganizationId: org.ID, SandboxId: id})
+	}
+	cancelCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	firstDone := make(chan error, 1)
+	go func() { _, err := c.Sandbox.DeleteSandbox(cancelCtx, req()); firstDone <- err }()
+	type result struct {
+		resp *connect.Response[ownsandv1.DeleteSandboxResponse]
+		err  error
+	}
+	secondDone := make(chan result, 1)
+	go func() { r, err := c.Sandbox.DeleteSandbox(ctx, req()); secondDone <- result{r, err} }()
+	testenv.Eventually(t, "two watchers", func() bool { return env.App.Service.WatcherCount() == 2 })
+	cancel()
+	if err := <-firstDone; err == nil {
+		t.Fatal("cancelled delete succeeded")
+	}
+	testenv.Eventually(t, "one watcher", func() bool { return env.App.Service.WatcherCount() == 1 })
+	deleted := agent.SetSandbox(id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
+	agent.SendUpdate(deleted)
+	select {
+	case r := <-secondDone:
+		if r.err != nil || r.resp.Msg.GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+			t.Fatalf("second delete: %v %v", r.resp, r.err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("second waiter was not woken")
+	}
+	testenv.Eventually(t, "no watchers", func() bool { return env.App.Service.WatcherCount() == 0 })
 }
 
 func TestRevisionRuleAndAbsorbingStates(t *testing.T) {
