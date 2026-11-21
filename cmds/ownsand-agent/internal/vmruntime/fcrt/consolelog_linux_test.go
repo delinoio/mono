@@ -253,7 +253,7 @@ head -c 2000000 /dev/zero | tr '\0' b >&2
 echo UNREACHABLE-TAIL
 exit 0`)
 	vmsDir := t.TempDir()
-	r := &Runtime{opts: Options{Binary: bin, VMsDir: vmsDir}, logger: quiet(), vms: map[string]*vm{}}
+	r := bareRuntime(Options{Binary: bin, VMsDir: vmsDir})
 	dir := r.vmDir("sbx")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
@@ -298,7 +298,7 @@ exit 0`)
 
 func TestStartProcessTrimsOversizedExistingLog(t *testing.T) {
 	bin := writeFakeFirecracker(t, "echo late; exit 0")
-	r := &Runtime{opts: Options{Binary: bin}, logger: quiet(), vms: map[string]*vm{}}
+	r := bareRuntime(Options{Binary: bin})
 	dir := t.TempDir()
 	path := filepath.Join(dir, logFile)
 	if err := os.WriteFile(path, bytes.Repeat([]byte("o"), int(consoleLogLimit)+4096), 0o600); err != nil {
@@ -312,7 +312,7 @@ func TestStartProcessTrimsOversizedExistingLog(t *testing.T) {
 
 func TestStartProcessKeepsShortOutput(t *testing.T) {
 	bin := writeFakeFirecracker(t, "echo out; echo err >&2; exit 0")
-	r := &Runtime{opts: Options{Binary: bin}, logger: quiet(), vms: map[string]*vm{}}
+	r := bareRuntime(Options{Binary: bin})
 	dir := t.TempDir()
 	runFake(t, r, &vm{id: "sbx", dir: dir})
 	got, err := os.ReadFile(filepath.Join(dir, logFile))

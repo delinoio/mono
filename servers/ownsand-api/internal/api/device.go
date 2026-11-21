@@ -68,9 +68,12 @@ func (s *Service) scanEnrollmentToken(row pgx.Row) (*ownsandv1.EnrollmentToken, 
 }
 
 func (h DeviceHandler) CreateEnrollmentToken(ctx context.Context, req *connect.Request[ownsandv1.CreateEnrollmentTokenRequest]) (*connect.Response[ownsandv1.CreateEnrollmentTokenResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	var resp *ownsandv1.CreateEnrollmentTokenResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageDevices)
 		if err != nil {
 			return err
@@ -106,7 +109,10 @@ func (h DeviceHandler) CreateEnrollmentToken(ctx context.Context, req *connect.R
 }
 
 func (h DeviceHandler) ListEnrollmentTokens(ctx context.Context, req *connect.Request[ownsandv1.ListEnrollmentTokensRequest]) (*connect.Response[ownsandv1.ListEnrollmentTokensResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionManageDevices); err != nil {
 		return nil, err
 	}
@@ -140,15 +146,19 @@ func (h DeviceHandler) ListEnrollmentTokens(ctx context.Context, req *connect.Re
 }
 
 func (h DeviceHandler) RevokeEnrollmentToken(ctx context.Context, req *connect.Request[ownsandv1.RevokeEnrollmentTokenRequest]) (*connect.Response[ownsandv1.RevokeEnrollmentTokenResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	tokenID := req.Msg.GetEnrollmentTokenId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawTokenID := req.Msg.GetEnrollmentTokenId()
 	var resp *ownsandv1.RevokeEnrollmentTokenResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageDevices)
 		if err != nil {
 			return err
 		}
-		if err := validateID("enrollment_token_id", tokenID); err != nil {
+		tokenID, err := normalizeID("enrollment_token_id", rawTokenID)
+		if err != nil {
 			return err
 		}
 		token, err := h.scanEnrollmentToken(tx.QueryRow(ctx, "SELECT "+enrollmentTokenColumns+" FROM enrollment_tokens WHERE organization_id = $1 AND enrollment_token_id = $2 FOR UPDATE", orgID, tokenID))
@@ -259,7 +269,10 @@ func (s *Service) loadDevice(ctx context.Context, q db.Querier, orgID, deviceID 
 }
 
 func (h DeviceHandler) ListDevices(ctx context.Context, req *connect.Request[ownsandv1.ListDevicesRequest]) (*connect.Response[ownsandv1.ListDevicesResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadDevices); err != nil {
 		return nil, err
 	}
@@ -306,14 +319,18 @@ func (h DeviceHandler) ListDevices(ctx context.Context, req *connect.Request[own
 }
 
 func (h DeviceHandler) GetDevice(ctx context.Context, req *connect.Request[ownsandv1.GetDeviceRequest]) (*connect.Response[ownsandv1.GetDeviceResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadDevices); err != nil {
 		return nil, err
 	}
-	if err := validateID("device_id", req.Msg.GetDeviceId()); err != nil {
+	deviceID, err := normalizeID("device_id", req.Msg.GetDeviceId())
+	if err != nil {
 		return nil, err
 	}
-	d, err := h.loadDevice(ctx, h.DB.Pool, orgID, req.Msg.GetDeviceId())
+	d, err := h.loadDevice(ctx, h.DB.Pool, orgID, deviceID)
 	if err != nil {
 		return nil, h.internal(ctx, "get device", err)
 	}
@@ -351,14 +368,19 @@ func (h DeviceHandler) ReplaceDeviceLimits(ctx context.Context, req *connect.Req
 // update, the configuration event and the audit record in one transaction.
 // The resolve callback runs after the authorization and ID checks and before
 // any write, and returns the validated limits.
-func (h DeviceHandler) setDeviceLimits(ctx context.Context, orgID, deviceID string, resolve func() (*ownsandv1.DeviceLimits, error)) (*ownsandv1.Device, error) {
+func (h DeviceHandler) setDeviceLimits(ctx context.Context, rawOrgID, rawDeviceID string, resolve func() (*ownsandv1.DeviceLimits, error)) (*ownsandv1.Device, error) {
 	var device *ownsandv1.Device
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	orgID, err := normalizeID("organization_id", rawOrgID)
+	if err != nil {
+		return nil, err
+	}
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageDevices)
 		if err != nil {
 			return err
 		}
-		if err := validateID("device_id", deviceID); err != nil {
+		deviceID, err := normalizeID("device_id", rawDeviceID)
+		if err != nil {
 			return err
 		}
 		limits, err := resolve()
@@ -395,19 +417,20 @@ func (h DeviceHandler) setDeviceLimits(ctx context.Context, orgID, deviceID stri
 }
 
 func (h DeviceHandler) RemoveDevice(ctx context.Context, req *connect.Request[ownsandv1.RemoveDeviceRequest]) (*connect.Response[ownsandv1.RemoveDeviceResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	deviceID := req.Msg.GetDeviceId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawDeviceID := req.Msg.GetDeviceId()
 	var device *ownsandv1.Device
 	removed := false
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	var deviceID string
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageDevices)
 		if err != nil {
 			return err
 		}
-		if err := validateID("device_id", deviceID); err != nil {
-			return err
-		}
-		orgID, err = normalizeID("organization_id", orgID)
+		deviceID, err = normalizeID("device_id", rawDeviceID)
 		if err != nil {
 			return err
 		}
@@ -638,7 +661,10 @@ func (s *Service) loadPolicy(ctx context.Context, q db.Querier, orgID string) (*
 }
 
 func (h DeviceHandler) GetAgentVersionPolicy(ctx context.Context, req *connect.Request[ownsandv1.GetAgentVersionPolicyRequest]) (*connect.Response[ownsandv1.GetAgentVersionPolicyResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadDevices); err != nil {
 		return nil, err
 	}
@@ -653,11 +679,14 @@ func (h DeviceHandler) GetAgentVersionPolicy(ctx context.Context, req *connect.R
 const maxVersionLength = 64
 
 func (h DeviceHandler) UpdateAgentVersionPolicy(ctx context.Context, req *connect.Request[ownsandv1.UpdateAgentVersionPolicyRequest]) (*connect.Response[ownsandv1.UpdateAgentVersionPolicyResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	mode := req.Msg.GetMode()
 	pinned := req.Msg.GetPinnedVersion()
 	var policy *ownsandv1.AgentVersionPolicy
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageDevices)
 		if err != nil {
 			return err

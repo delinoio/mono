@@ -161,6 +161,15 @@ type Timing struct {
 	// channel closed; a writer that is still blocked in a send after it
 	// loses its transport write (5 seconds); zero means the default.
 	WriterDrainTimeout time.Duration
+	// ExportApplyRetryWindow bounds how long the channel read loop retries
+	// to apply an export result after a transient database error (15
+	// seconds, below the heartbeat timeout because the loop reads no
+	// heartbeat meanwhile); zero means the default.
+	ExportApplyRetryWindow time.Duration
+	// ExportApplyRetryBackoff is the first wait between two attempts to
+	// apply an export result (250 milliseconds); it doubles up to 2 seconds;
+	// zero means the default.
+	ExportApplyRetryBackoff time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -175,6 +184,9 @@ func DefaultTiming() Timing {
 		CommandGrace:     DefaultCommandGrace,
 
 		WriterDrainTimeout: DefaultWriterDrainTimeout,
+
+		ExportApplyRetryWindow:  DefaultExportApplyRetryWindow,
+		ExportApplyRetryBackoff: DefaultExportApplyRetryBackoff,
 	}
 }
 
@@ -305,6 +317,13 @@ func normalizeID(field, value string) (string, error) {
 		return "", errInvalid(err)
 	}
 	return id.String(), nil
+}
+
+// canonicalID returns the lowercase text form of a UUID that validateID or
+// validate.UUIDv7 already accepted. Use normalizeID when the value is not
+// validated yet.
+func canonicalID(value string) string {
+	return strings.ToLower(value)
 }
 
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without

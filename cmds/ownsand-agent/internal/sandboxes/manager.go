@@ -123,7 +123,6 @@ type Manager struct {
 	// LockSnapshotImport.
 	importLocks map[string]*importLock
 	limits      *ownsandv1.DeviceLimits
-	transfers   int
 	reports     map[uint64]map[string]uint64
 	outbox      Outbox
 	execs       ExecTracker
@@ -396,14 +395,12 @@ func (m *Manager) SetLimits(l *ownsandv1.DeviceLimits) {
 	}
 }
 
-// Busy reports whether a sandbox is creating, running or paused, or a
-// snapshot export or import runs; an update installs only when not busy.
+// Busy reports whether a sandbox is creating, running or paused; an update
+// installs only when not busy. Snapshot transfers reserve the device with the
+// updater and are not counted here.
 func (m *Manager) Busy() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.transfers > 0 {
-		return true
-	}
 	for _, sb := range m.sandboxes {
 		switch sb.rec.State {
 		case ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED:

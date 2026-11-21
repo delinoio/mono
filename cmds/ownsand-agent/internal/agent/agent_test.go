@@ -7,6 +7,12 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -18,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -429,19 +436,26 @@ func (h *harness) result(commandID string) *ownsandv1.AgentCommandResult {
 // importFixture holds a snapshot that was exported from the agent and whose
 // parts the fake bucket serves under other snapshot IDs.
 type importFixture struct {
-	h     *harness
-	b     *httptest.Server
-	snap  *ownsandv1.SnapshotStateEntry
-	parts []*ownsandv1.SnapshotPart
+	h         *harness
+	b         *httptest.Server
+	sandboxID string
+	snap      *ownsandv1.SnapshotStateEntry
+	parts     []*ownsandv1.SnapshotPart
 }
 
 func newImportFixture(t *testing.T, hook func(r *http.Request) int) *importFixture {
+	t.Helper()
+	return newImportFixtureWith(t, hook, nil)
+}
+
+// newImportFixtureWith is newImportFixture with options that tweak the agent.
+func newImportFixtureWith(t *testing.T, hook func(r *http.Request) int, tweak func(*Options)) *importFixture {
 	t.Helper()
 	cp := testcp.New(t)
 	b := bucketWithHook(t, hook)
 	cp.SetSignedURLBase(b.URL)
 	st, id := enrollDevice(t, cp)
-	h := start(t, cp, st, id)
+	h := startWith(t, cp, st, id, tweak)
 	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
 	sandboxID, _ := uuidv7.NewString()
 	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
@@ -454,7 +468,7 @@ func newImportFixture(t *testing.T, hook func(r *http.Request) int) *importFixtu
 	if res.GetError() != nil || len(res.GetExportSnapshot().GetParts()) == 0 {
 		t.Fatalf("export %v", res)
 	}
-	return &importFixture{h: h, b: b, snap: snap, parts: res.GetExportSnapshot().GetParts()}
+	return &importFixture{h: h, b: b, sandboxID: sandboxID, snap: snap, parts: res.GetExportSnapshot().GetParts()}
 }
 
 // stage copies the exported parts to the bucket under a new snapshot ID and
@@ -618,6 +632,48 @@ func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	f.requireRestorable(t, id)
 }
 
+// TestImportStopsWithItsChannelContext checks that an import whose channel
+// context ends during a download publishes nothing: no ready snapshot, no
+// content directory and no leftover files, and that an import of the same
+// snapshot afterwards still succeeds.
+func TestImportStopsWithItsChannelContext(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var downloads atomic.Int32
+	f := newImportFixture(t, func(r *http.Request) int {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
+			// The channel closes while the import still downloads.
+			cancel()
+		}
+		return 0
+	})
+	cmd := f.stage(t, id, false).GetImportSnapshot()
+	if len(cmd.GetParts()) < 3 {
+		t.Fatalf("the fixture needs at least 3 parts, has %d", len(cmd.GetParts()))
+	}
+	if _, err := f.h.agent.importSnapshot(ctx, cmd); err == nil {
+		t.Fatal("import succeeded with a closed channel context")
+	}
+	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+		t.Fatal("a cancelled import left a ready snapshot")
+	}
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after a cancelled import: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); len(left) != 0 {
+		t.Fatalf("temporary archives left: %v", left)
+	}
+	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
+		t.Fatalf("import after the cancelled one = %v", res)
+	}
+	f.requireRestorable(t, id)
+}
+
 // TestImportsOfDifferentSnapshotsStayConcurrent checks that an import that
 // waits on its download does not block the import of another snapshot.
 func TestImportsOfDifferentSnapshotsStayConcurrent(t *testing.T) {
@@ -705,5 +761,190 @@ func TestWithdrawAgentUpdateCommand(t *testing.T) {
 	}
 	if state, target := h.agent.updater.State(); state != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE || target != "" {
 		t.Fatalf("update state %v %q", state, target)
+	}
+}
+
+// updateEnv serves a signed release and counts installer calls, so that a test
+// can stage a verified update on the agent. The installer blocks in Install
+// until unblock is closed when block is set.
+type updateEnv struct {
+	installs atomic.Int32
+	entered  chan struct{}
+	unblock  chan struct{}
+	block    bool
+	keys     []ed25519.PublicKey
+	manifest string
+}
+
+func (e *updateEnv) Install(string) error {
+	if e.installs.Add(1) == 1 {
+		close(e.entered)
+	}
+	if e.block {
+		<-e.unblock
+	}
+	return nil
+}
+
+func newUpdateEnv(t *testing.T, block bool) *updateEnv {
+	t.Helper()
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	e := &updateEnv{entered: make(chan struct{}), unblock: make(chan struct{}), block: block, keys: []ed25519.PublicKey{pub}}
+	artifact := []byte("new agent binary")
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	sum := sha256.Sum256(artifact)
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
+	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
+	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
+	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) { w.Write(artifact) })
+	e.manifest = srv.URL + "/manifest.json"
+	return e
+}
+
+func (e *updateEnv) tweak(o *Options) {
+	o.Update.Keys = e.keys
+	o.Update.ManifestURL = e.manifest
+	o.Update.Installer = e
+}
+
+// stageUpdate sends an update command, so the agent holds a verified
+// artifact, and deletes the fixture sandbox, so that only transfers and the
+// installer decide whether the device is idle.
+func (f *importFixture) stageUpdate(t *testing.T) {
+	t.Helper()
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}}}); res.GetError() != nil {
+		t.Fatalf("update command: %v", res.GetError())
+	}
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: f.sandboxID}}}); res.GetError() != nil {
+		t.Fatalf("delete sandbox: %v", res.GetError())
+	}
+}
+
+func waitInstalls(t *testing.T, e *updateEnv, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for e.installs.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("installer calls = %d, want %d", e.installs.Load(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestUpdateWaitsForRunningImport checks that a pending verified update does
+// not call the installer while an import holds its reservation and installs
+// once after the import ended.
+func TestUpdateWaitsForRunningImport(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	gate := newGetGate(id)
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, gate.hook, env.tweak)
+	f.stageUpdate(t)
+	cmdID := f.h.sendCommand(f.stage(t, id, false))
+	waitClosed(t, gate.started, "the import download")
+	// A failed assertion must not leave the import blocked: the agent cleanup
+	// waits for its commands.
+	t.Cleanup(func() {
+		select {
+		case <-gate.release:
+		default:
+			close(gate.release)
+		}
+	})
+	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil {
+		t.Fatalf("install during an import: %v %v", ok, err)
+	}
+	settle()
+	if n := env.installs.Load(); n != 0 {
+		t.Fatalf("installer calls during an import = %d", n)
+	}
+	close(gate.release)
+	if res := f.h.result(cmdID); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	// The release wakes the installation loop.
+	waitInstalls(t, env, 1)
+}
+
+// TestFailedImportReleasesTransferReservation checks that an import that
+// fails its hash check does not keep the update from installing.
+func TestFailedImportReleasesTransferReservation(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, nil, env.tweak)
+	f.stageUpdate(t)
+	// The command runs the transfer before it fails, and the update waits for
+	// it only until it released the reservation.
+	if res := f.h.command(f.stage(t, id, true)); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
+		t.Fatalf("bad import = %v", res)
+	}
+	waitInstalls(t, env, 1)
+}
+
+// TestTransfersRefusedWhileUpdateInstalls checks that export and uncached
+// import commands fail with UNAVAILABLE before any transfer I/O once the
+// installation reserved the device, and that an import of a ready copy still
+// returns it.
+func TestTransfersRefusedWhileUpdateInstalls(t *testing.T) {
+	ready, _ := uuidv7.NewString()
+	fresh, _ := uuidv7.NewString()
+	gate := newGetGate(fresh)
+	env := newUpdateEnv(t, true)
+	f := newImportFixtureWith(t, gate.hook, env.tweak)
+	// Cleanups run last in, first out: release the installer before the agent
+	// cleanup waits for Run to end.
+	t.Cleanup(func() { close(env.unblock) })
+	// A copy that exists before the installation starts.
+	if res := f.h.command(f.stage(t, ready, false)); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	staged := f.stage(t, fresh, false)
+	f.stageUpdate(t)
+	// The installation loop only ticks every 10 seconds; start it now. The
+	// blocked installer keeps the installing flag set.
+	go f.h.agent.updater.TryInstall()
+	waitClosed(t, env.entered, "the installer")
+	export := &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{SnapshotId: f.snap.GetSnapshotId(), PartSizeBytes: 512}}}
+	if res := f.h.command(export); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("export during the installation = %v", res)
+	}
+	if res := f.h.command(staged); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("import during the installation = %v", res)
+	}
+	if n := gate.count(); n != 0 {
+		t.Fatalf("part downloads of the refused import = %d", n)
+	}
+	dir, err := f.h.st.SnapshotDir(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused import changed the snapshot directory: %v", err)
+	}
+	if res := f.h.command(f.command(ready, false)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("cached import during the installation = %v", res)
+	}
+	if n := env.installs.Load(); n != 1 {
+		t.Fatalf("installer calls = %d, want 1", n)
+	}
+}
+
+// TestUpdateDefersToSandboxDuringTransfers checks that a live sandbox still
+// defers the installation after the transfers ended.
+func TestUpdateDefersToSandboxDuringTransfers(t *testing.T) {
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, nil, env.tweak)
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}}}); res.GetError() != nil {
+		t.Fatalf("update command: %v", res.GetError())
+	}
+	id, _ := uuidv7.NewString()
+	if res := f.h.command(f.stage(t, id, false)); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil || env.installs.Load() != 0 {
+		t.Fatalf("installed with a running sandbox: %v %v", ok, err)
 	}
 }

@@ -328,7 +328,7 @@ export async function* runExec(
 
     throwIfAborted(signal);
     if (failure instanceof SessionEndedError) {
-      selector.sessionEnded();
+      if (session !== undefined) selector.sessionEnded(session);
       mode = Mode.Attach;
       continue;
     }

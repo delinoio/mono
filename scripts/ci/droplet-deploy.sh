@@ -93,8 +93,19 @@ main() {
   echo "Pull $image"
   docker pull --quiet "$image"
 
-  local -a old
-  mapfile -t old < <(docker ps --all --quiet --filter "label=io.delino.service=$service")
+  # Read the list into a variable first: a failure inside a process
+  # substitution would not stop the script, and the deployment would then
+  # leave the previous containers running next to the new one.
+  local old_ids
+  old_ids="$(docker ps --all --quiet --filter "label=io.delino.service=$service")" ||
+    fail "could not list the existing containers of $service; no replacement was started."
+  local -a old=()
+  local old_id
+  while IFS= read -r old_id; do
+    if [[ -n "$old_id" ]]; then
+      old+=("$old_id")
+    fi
+  done <<< "$old_ids"
   local stamp new upstream
   stamp="$(date -u +%Y%m%d%H%M%S)-${image: -12}"
   new="$service-$stamp"
@@ -168,11 +179,12 @@ discard_replacement() {
   docker rm --force "$1" > /dev/null || true
 }
 
-# Waits until the container answers `GET /healthz` with a success status.
-# Fails at once when the container stops.
+# Waits until the container answers `GET /healthz` with a 2xx status. Redirects
+# are not followed, so a 3xx answer is not healthy. A transport failure (no
+# status) is retried until the deadline. Fails at once when the container stops.
 wait_healthy() {
   local container="$1" network="$2" port="$3" timeout="$4"
-  local deadline=$((SECONDS + timeout)) status address
+  local deadline=$((SECONDS + timeout)) status address code
   while (( SECONDS < deadline )); do
     status="$(docker inspect --format '{{.State.Status}}' "$container")"
     if [[ "$status" != running ]]; then
@@ -180,10 +192,14 @@ wait_healthy() {
       return 1
     fi
     address="$(docker inspect --format "{{with index .NetworkSettings.Networks \"$network\"}}{{.IPAddress}}{{end}}" "$container")"
-    if [[ -n "$address" ]] && curl --fail --silent --show-error --output /dev/null \
-      --max-time 5 "http://$address:$port/healthz" 2> /dev/null; then
-      echo "$container passed the health check."
-      return 0
+    if [[ -n "$address" ]]; then
+      code="$(curl --silent --show-error --output /dev/null \
+        --write-out '%{http_code}' --max-time 5 \
+        "http://$address:$port/healthz" 2> /dev/null)" || code=""
+      if [[ "$code" =~ ^2[0-9]{2}$ ]]; then
+        echo "$container passed the health check."
+        return 0
+      fi
     fi
     sleep 2
   done

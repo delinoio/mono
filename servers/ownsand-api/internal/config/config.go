@@ -276,7 +276,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.CORSOrigins = nil
 		for _, origin := range splitList(v) {
 			u, err := url.Parse(origin)
-			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
+				// A bare "#" leaves u.Fragment empty, so check the raw value too. Browsers never send a fragment in Origin.
+				u.Fragment != "" || strings.Contains(origin, "#") {
 				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
 			}
 			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)

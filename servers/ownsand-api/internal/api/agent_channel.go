@@ -500,7 +500,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	case cmdCreateSnapshot:
 		err = s.applySnapshotResult(ctx, info, res)
 	case cmdExportSnapshot:
-		err = s.applyExportResult(ctx, info, res.GetCommandId(), res)
+		err = s.applyExportResultWithRetry(ctx, conn, info, res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
 			_, err = s.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)

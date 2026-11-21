@@ -344,19 +344,6 @@ func (m *Manager) HasSnapshot(id string) bool {
 	return ok
 }
 
-// BeginTransfer marks a running export or import; the returned function
-// ends it.
-func (m *Manager) BeginTransfer() func() {
-	m.mu.Lock()
-	m.transfers++
-	m.mu.Unlock()
-	return func() {
-		m.mu.Lock()
-		m.transfers--
-		m.mu.Unlock()
-	}
-}
-
 // importLock is the lock of one snapshot ID. held is a one-slot semaphore, so
 // that a waiting import can give up when its context ends. refs counts the
 // imports that hold or wait for the lock and is guarded by Manager.mu; the

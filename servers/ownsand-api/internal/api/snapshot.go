@@ -109,12 +109,16 @@ func stateErr(state ownsandv1.SandboxState, rpc string) error {
 const snapshotFailTimeout = 5 * time.Second
 
 func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Request[ownsandv1.CreateSnapshotRequest]) (*connect.Response[ownsandv1.CreateSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	p, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
+	if err != nil {
 		return nil, err
 	}
 	var snap *snapshotRow
@@ -126,7 +130,7 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
 			return err
 		}
-		sb, err := loadSandbox(ctx, tx, orgID, req.Msg.GetSandboxId(), true)
+		sb, err := loadSandbox(ctx, tx, orgID, sandboxID, true)
 		if err != nil {
 			return err
 		}
@@ -220,11 +224,20 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 		case result == nil || len(result.GetParts()) == 0:
 			reason = "no_parts"
 		default:
+			// A part number that repeats is invalid: the manifest keys its
+			// parts by number, so the database would reject the second
+			// insert and abort the transaction instead of failing the attempt.
+			seen := make(map[int32]struct{}, len(result.GetParts()))
 			for _, part := range result.GetParts() {
 				if part.GetPartNumber() < 1 || part.GetPartNumber() > maxSnapshotParts || len(part.GetSha256()) != 32 || part.GetSizeBytes() < 0 {
 					reason = "invalid_part"
 					break
 				}
+				if _, dup := seen[part.GetPartNumber()]; dup {
+					reason = "invalid_part"
+					break
+				}
+				seen[part.GetPartNumber()] = struct{}{}
 			}
 		}
 		if reason != "" {
@@ -245,6 +258,93 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 		s.Logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("parts", len(result.GetParts())))
 		return nil
 	})
+}
+
+// Retry of the application of an export result after a transient database
+// error.
+const (
+	// DefaultExportApplyRetryWindow bounds the retry of an export result.
+	DefaultExportApplyRetryWindow = 15 * time.Second
+	// DefaultExportApplyRetryBackoff is the first wait between two attempts.
+	DefaultExportApplyRetryBackoff = 250 * time.Millisecond
+	// exportApplyRetryBackoffMax caps the doubling wait between attempts.
+	exportApplyRetryBackoffMax = 2 * time.Second
+)
+
+// errExportResultNotApplied is the cause that closes a channel whose export
+// result could not be applied before the retry window ended.
+var errExportResultNotApplied = errors.New("the export result could not be applied")
+
+func (s *Service) exportApplyRetryWindow() time.Duration {
+	if s.Timing.ExportApplyRetryWindow > 0 {
+		return s.Timing.ExportApplyRetryWindow
+	}
+	return DefaultExportApplyRetryWindow
+}
+
+func (s *Service) exportApplyRetryBackoff() time.Duration {
+	if s.Timing.ExportApplyRetryBackoff > 0 {
+		return s.Timing.ExportApplyRetryBackoff
+	}
+	return DefaultExportApplyRetryBackoff
+}
+
+// applyExportResultWithRetry applies an export result and retries after a
+// transient database error (see isTransientDBError) with a doubling backoff
+// until the retry window ends or the channel closes. The server removed the
+// command record before it applied the result, and the row stays EXPORTING
+// with a live owner channel, which neither a repeat ExportSnapshot nor the
+// owner's state report would release, so a result that is lost here would
+// strand the export. A permanent error is returned at once. Every attempt
+// reruns the snapshot row lock and the command ID check of applyExportResult,
+// so a retry after a commit whose outcome is unknown, after a newer attempt
+// or after the deletion of the snapshot changes nothing more. When the
+// window ends while conn is still the current channel of its device, the
+// channel is closed: the state report of the replacement channel then fails
+// the abandoned attempt with a clean-up job, and an explicit retry of the
+// export sends a new command.
+func (s *Service) applyExportResultWithRetry(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+	commandID := res.GetCommandId()
+	retryCtx, cancel := context.WithTimeout(ctx, s.exportApplyRetryWindow())
+	defer cancel()
+	backoff := s.exportApplyRetryBackoff()
+	for attempt := 1; ; attempt++ {
+		err := s.applyExportResult(retryCtx, info, commandID, res)
+		if err == nil {
+			if attempt > 1 {
+				s.Logger.InfoContext(ctx, "export_result_apply_recovered", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("attempts", attempt))
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err // the channel closed; the replacement channel's state report settles the attempt
+		}
+		if retryCtx.Err() == nil {
+			if !isTransientDBError(err) {
+				return err
+			}
+			s.Logger.WarnContext(ctx, "export_result_apply_retry", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
+				slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-retryCtx.Done():
+				timer.Stop()
+			}
+			if backoff *= 2; backoff > exportApplyRetryBackoffMax {
+				backoff = exportApplyRetryBackoffMax
+			}
+			continue
+		}
+		// The retry window ended.
+		current := s.Hub.Get(info.deviceID) == conn
+		s.Logger.ErrorContext(ctx, "export_result_apply_abandoned", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
+			slog.Int("attempts", attempt), slog.Bool("channel_current", current), slog.Any("error", err))
+		if current {
+			conn.Close(errExportResultNotApplied)
+		}
+		return err
+	}
 }
 
 // failExportTx sets the EXPORTING snapshot snapshotID to EXPORT_FAILED and
@@ -388,14 +488,18 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 func validID(id string) bool { return validateID("id", id) == nil }
 
 func (h SnapshotHandler) GetSnapshot(ctx context.Context, req *connect.Request[ownsandv1.GetSnapshotRequest]) (*connect.Response[ownsandv1.GetSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+	snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+	if err != nil {
 		return nil, err
 	}
-	sn, err := loadSnapshot(ctx, h.DB.Pool, orgID, req.Msg.GetSnapshotId(), false)
+	sn, err := loadSnapshot(ctx, h.DB.Pool, orgID, snapshotID, false)
 	if err != nil {
 		return nil, h.internal(ctx, "get snapshot", err)
 	}
@@ -403,7 +507,10 @@ func (h SnapshotHandler) GetSnapshot(ctx context.Context, req *connect.Request[o
 }
 
 func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request[ownsandv1.ListSnapshotsRequest]) (*connect.Response[ownsandv1.ListSnapshotsResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
@@ -414,17 +521,19 @@ func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request
 	where := []string{"organization_id = $1", "snapshot_id > $2"}
 	args := []any{orgID, afterKey(after)}
 	if req.Msg.SandboxId != nil {
-		if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+		sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, req.Msg.GetSandboxId())
+		args = append(args, sandboxID)
 		where = append(where, fmt.Sprintf("source_sandbox_id = $%d", len(args)))
 	}
 	if req.Msg.DeviceId != nil {
-		if err := validateID("device_id", req.Msg.GetDeviceId()); err != nil {
+		deviceID, err := normalizeID("device_id", req.Msg.GetDeviceId())
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, req.Msg.GetDeviceId())
+		args = append(args, deviceID)
 		where = append(where, fmt.Sprintf("device_id = $%d", len(args)))
 	}
 	args = append(args, limit)
@@ -453,15 +562,19 @@ func (h SnapshotHandler) ListSnapshots(ctx context.Context, req *connect.Request
 }
 
 func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Request[ownsandv1.DeleteSnapshotRequest]) (*connect.Response[ownsandv1.DeleteSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if _, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes); err != nil {
 			return err
 		}
-		if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+		snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+		if err != nil {
 			return err
 		}
-		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		sn, err := loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
 		}
@@ -482,11 +595,15 @@ func (h SnapshotHandler) DeleteSnapshot(ctx context.Context, req *connect.Reques
 }
 
 func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Request[ownsandv1.ExportSnapshotRequest]) (*connect.Response[ownsandv1.ExportSnapshotResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+	snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+	if err != nil {
 		return nil, err
 	}
 	if h.Objects == nil {
@@ -498,9 +615,9 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 	// Every attempt has its own command ID, which the row stores with the
 	// ID of the channel that receives the command.
 	commandID := newID()
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
-		sn, err = loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		sn, err = loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
 		}
@@ -586,14 +703,18 @@ func scanTemplate(row pgx.Row) (*ownsandv1.Template, error) {
 }
 
 func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Request[ownsandv1.CreateTemplateRequest]) (*connect.Response[ownsandv1.CreateTemplateResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	var t *ownsandv1.Template
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
 		if err != nil {
 			return err
 		}
-		if err := validateID("snapshot_id", req.Msg.GetSnapshotId()); err != nil {
+		snapshotID, err := normalizeID("snapshot_id", req.Msg.GetSnapshotId())
+		if err != nil {
 			return err
 		}
 		if err := validateName("name", req.Msg.GetName()); err != nil {
@@ -605,7 +726,7 @@ func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Reques
 		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
 			return err
 		}
-		sn, err := loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
+		sn, err := loadSnapshot(ctx, tx, orgID, snapshotID, true)
 		if err != nil {
 			return err
 		}
@@ -626,7 +747,10 @@ func (h SnapshotHandler) CreateTemplate(ctx context.Context, req *connect.Reques
 }
 
 func (h SnapshotHandler) ListTemplates(ctx context.Context, req *connect.Request[ownsandv1.ListTemplatesRequest]) (*connect.Response[ownsandv1.ListTemplatesResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
@@ -659,14 +783,18 @@ func (h SnapshotHandler) ListTemplates(ctx context.Context, req *connect.Request
 }
 
 func (h SnapshotHandler) DeleteTemplate(ctx context.Context, req *connect.Request[ownsandv1.DeleteTemplateRequest]) (*connect.Response[ownsandv1.DeleteTemplateResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("template_id", req.Msg.GetTemplateId()); err != nil {
+	templateID, err := normalizeID("template_id", req.Msg.GetTemplateId())
+	if err != nil {
 		return nil, err
 	}
-	tag, err := h.DB.Pool.Exec(ctx, "DELETE FROM templates WHERE organization_id = $1 AND template_id = $2", orgID, req.Msg.GetTemplateId())
+	tag, err := h.DB.Pool.Exec(ctx, "DELETE FROM templates WHERE organization_id = $1 AND template_id = $2", orgID, templateID)
 	if err != nil {
 		return nil, h.internal(ctx, "delete template", err)
 	}
