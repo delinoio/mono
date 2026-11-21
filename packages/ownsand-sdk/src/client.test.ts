@@ -278,6 +278,12 @@ describe("createSandbox", () => {
     ["a missing idle TTL", { idleTtl: undefined }, "idle_ttl"],
     ["a missing max TTL", { maxTtl: undefined }, "max_ttl"],
     ["a zero idle TTL", { idleTtl: 0 }, "idle_ttl"],
+    ["an idle TTL below one nanosecond", { idleTtl: 1e-7 }, "idle_ttl"],
+    [
+      "a max TTL below one nanosecond",
+      { maxTtl: 1e-7, idleTtl: 1e-6 },
+      "max_ttl",
+    ],
     ["an idle TTL above the max TTL", { idleTtl: 3 * HOUR }, "idle_ttl"],
     ["a max TTL above 7 days", { maxTtl: 7 * 24 * HOUR + 1 }, "max_ttl"],
     [
@@ -307,6 +313,39 @@ describe("createSandbox", () => {
     expect(sandbox.sandboxId).toBe(SANDBOX);
     const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
     expect(req.maxTtl.seconds).toBe(604800n);
+  });
+
+  test.each([
+    [0.5, 0n, 500_000],
+    [1.5, 0n, 1_500_000],
+    [1000.25, 1n, 250_000],
+    [1.0000004, 0n, 1_000_000 + 0],
+  ])(
+    "keeps the fractional part of a %s ms TTL on the wire",
+    async (ms, seconds, nanos) => {
+      const h = setup();
+      h.api.unary(SandboxService, "CreateSandbox", () => ({
+        sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+      }));
+      await h.client.createSandbox({
+        ...validCreate,
+        idleTtl: ms,
+        maxTtl: HOUR,
+      });
+      const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
+      expect(req.idleTtl.seconds).toBe(seconds);
+      expect(req.idleTtl.nanos).toBe(nanos);
+    },
+  );
+
+  test("compares the TTL ordering on the precise values", async () => {
+    const h = setup();
+    const error = await h.client
+      .createSandbox({ ...validCreate, idleTtl: 1.5, maxTtl: 1.4 })
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandValidationError);
+    expect(error.field).toBe("idle_ttl");
+    expect(h.api.calls).toHaveLength(0);
   });
 
   test("reuses one idempotency key for every retry of a create", async () => {

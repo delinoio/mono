@@ -1232,7 +1232,25 @@ describe("exec over the relay", () => {
     expect(() => sandbox.exec({ command: ["x"], timeoutMs: -1 })).toThrow(
       "timeout",
     );
+    expect(() => sandbox.exec({ command: ["x"], timeoutMs: 1e-7 })).toThrow(
+      "timeout",
+    );
     expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("sends a fractional millisecond timeout at nanosecond precision", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(
+      sandbox.exec({ command: ["x"], timeoutMs: 1500.5 }).wait(),
+    );
+    const timeout = (h.api.callsOf("Exec")[0]!.request as any).timeout;
+    expect(timeout.seconds).toBe(1n);
+    expect(timeout.nanos).toBe(500_000_000 + 500_000);
   });
 });
 
