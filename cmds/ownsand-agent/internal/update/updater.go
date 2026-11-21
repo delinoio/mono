@@ -48,28 +48,57 @@ type Installer interface {
 // ExecutableInstaller replaces the executable at Path.
 type ExecutableInstaller struct {
 	Path string
+
+	// rename and goos are test seams. A nil rename uses os.Rename and an empty
+	// goos uses runtime.GOOS. They let tests drive the Windows rename sequence
+	// and its failures on any host. Production code leaves both unset.
+	rename func(oldPath, newPath string) error
+	goos   string
 }
 
 // Install copies the artifact next to the executable and renames it into
 // place. On Windows the running executable is renamed away first, because
-// Windows cannot replace a running executable.
+// Windows cannot replace a running executable. When the rename of the new
+// executable onto Path then fails, Install renames the previous executable
+// back to Path, so the next start still finds it.
 func (i ExecutableInstaller) Install(artifactPath string) error {
 	data, err := os.ReadFile(artifactPath)
 	if err != nil {
 		return err
 	}
+	rename := i.rename
+	if rename == nil {
+		rename = os.Rename
+	}
+	goos := i.goos
+	if goos == "" {
+		goos = runtime.GOOS
+	}
 	next := i.Path + ".new"
 	if err := store.WriteFileAtomic(next, data, 0o755); err != nil {
 		return err
 	}
-	if runtime.GOOS == "windows" {
-		old := i.Path + ".old"
-		os.Remove(old)
-		if err := os.Rename(i.Path, old); err != nil {
-			return err
-		}
+	if goos != "windows" {
+		return rename(next, i.Path)
 	}
-	return os.Rename(next, i.Path)
+	old := i.Path + ".old"
+	os.Remove(old)
+	if err := rename(i.Path, old); err != nil {
+		return err
+	}
+	if err := rename(next, i.Path); err != nil {
+		// Path is missing now and the previous bytes are at old. Put them back.
+		if restoreErr := rename(old, i.Path); restoreErr != nil {
+			slog.Error("agent update install failed and the previous executable was not restored",
+				"path", i.Path, "previous_path", old, "install_error", err, "restore_error", restoreErr)
+			return fmt.Errorf("update: install %q failed: %w; restoring the previous executable from %q failed, so %q is not restored: %v",
+				i.Path, err, old, i.Path, restoreErr)
+		}
+		slog.Warn("agent update install failed and the previous executable was restored",
+			"path", i.Path, "previous_path", old, "install_error", err)
+		return err
+	}
+	return nil
 }
 
 // Options configure an Updater.
