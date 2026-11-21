@@ -558,6 +558,61 @@ describe("invitations", () => {
     expect(window.location.pathname).toBe(leftPath);
   });
 
+  test("a new link drops the stored secret of an earlier link", async () => {
+    pendingInvitation.save(MOCK_ACME_INVITATION_SECRET);
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`);
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    expect(window.location.hash).toBe("");
+    expect(pendingInvitation.read()).toBeUndefined();
+    cleanup();
+    renderConsole("/invitations/accept");
+    expect(await screen.findByText(/needs an invitation link/)).toBeTruthy();
+  });
+
+  test("accepts the new link and not the stored secret of an earlier link", async () => {
+    // The stored secret would fail with "you are already a member".
+    pendingInvitation.save(MOCK_ACME_INVITATION_SECRET);
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`);
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await settle(60);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+    );
+  });
+
+  test("a link opened while the page is shown drops the stored secret of an earlier link", async () => {
+    pendingInvitation.save(MOCK_ACME_INVITATION_SECRET);
+    renderConsole("/invitations/accept");
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    await act(async () => {
+      window.location.hash = `secret=${MOCK_INVITATION_SECRET}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await settle(30);
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.location.hash).toBe("");
+    cleanup();
+    renderConsole("/invitations/accept");
+    expect(await screen.findByText(/needs an invitation link/)).toBeTruthy();
+  });
+
+  test("keeps the stored secret for the sign-in return when the fragment is empty", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { signedIn: false });
+    expect(
+      await screen.findByRole("button", { name: "Sign in to accept" }),
+    ).toBeTruthy();
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+  });
+
   test("shows the missing-secret screen when the page opens without a secret", async () => {
     renderConsole("/invitations/accept");
     expect(await screen.findByText(/needs an invitation link/)).toBeTruthy();
