@@ -56,8 +56,8 @@ func TestFullTunnelVPNPairIsDefault(t *testing.T) {
 
 func TestRulesetAndLinks(t *testing.T) {
 	v4, v6 := Blocked(nil, nil)
-	rs := Ruleset(v4, v6)
-	for _, want := range []string{"delete table inet ownsand", `iifname "osb-*" ip daddr @blocked4 drop`, `oifname "osb-*" drop`, "masquerade", "udp dport 53 accept", "10.0.0.0/8"} {
+	rs := Ruleset(v4, v6, nil)
+	for _, want := range []string{"delete table inet ownsand", `iifname "osb-*" ip daddr @blocked4 drop`, `oifname "osb-*" drop`, "masquerade", "10.0.0.0/8"} {
 		if !strings.Contains(rs, want) {
 			t.Errorf("ruleset lacks %q", want)
 		}
@@ -74,6 +74,90 @@ func TestRulesetAndLinks(t *testing.T) {
 	}
 	if _, err := LinkFor(16384); err == nil {
 		t.Fatal("index beyond the subnet accepted")
+	}
+}
+
+// inputChain returns the lines of the input chain of a ruleset.
+func inputChain(t *testing.T, rs string) []string {
+	t.Helper()
+	_, rest, ok := strings.Cut(rs, "chain input {")
+	if !ok {
+		t.Fatal("ruleset has no input chain")
+	}
+	body, _, _ := strings.Cut(rest, "\n\t}")
+	var lines []string
+	for _, l := range strings.Split(body, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// DNS accept rules match each tap and the gateway of that tap only; the
+// DHCP and neighbor discovery exceptions stay, and the wildcard drop is the
+// last input rule, so DNS to any other host address falls through to it.
+func TestRulesetDNSMatchesTapAndGateway(t *testing.T) {
+	v4, v6 := Blocked(nil, nil)
+	a := TapGateway{Tap: TapName(2), Gateway: netip.MustParseAddr("172.30.0.9")}
+	b := TapGateway{Tap: TapName(1), Gateway: netip.MustParseAddr("172.30.0.5")}
+	rs := Ruleset(v4, v6, []TapGateway{a, b})
+	in := inputChain(t, rs)
+	wantDNS := []string{
+		`iifname "osb-00000000001" ip daddr 172.30.0.5 udp dport 53 accept`,
+		`iifname "osb-00000000001" ip daddr 172.30.0.5 tcp dport 53 accept`,
+		`iifname "osb-00000000002" ip daddr 172.30.0.9 udp dport 53 accept`,
+		`iifname "osb-00000000002" ip daddr 172.30.0.9 tcp dport 53 accept`,
+	}
+	// Preamble line (type filter hook ...) first, then sorted DNS rules.
+	if len(in) < 1+len(wantDNS) || !slices.Equal(in[1:1+len(wantDNS)], wantDNS) {
+		t.Fatalf("input chain DNS rules = %q, want %q", in, wantDNS)
+	}
+	// No DNS rule without a destination match, for any tap.
+	for _, l := range in {
+		if strings.Contains(l, "dport 53") && !strings.Contains(l, "ip daddr 172.30.0.") {
+			t.Errorf("DNS rule without gateway match: %q", l)
+		}
+	}
+	// Controls: the other exceptions and the final drop stay.
+	for _, want := range []string{
+		`iifname "osb-*" udp sport 68 udp dport 67 accept`,
+		`iifname "osb-*" udp sport 546 udp dport 547 accept`,
+		`iifname "osb-*" icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept`,
+	} {
+		if !slices.Contains(in, want) {
+			t.Errorf("input chain lacks %q", want)
+		}
+	}
+	if last := in[len(in)-1]; last != `iifname "osb-*" drop` {
+		t.Fatalf("last input rule = %q, want the wildcard drop", last)
+	}
+	// The cross-tap and wildcard DNS forms never appear.
+	for _, bad := range []string{`iifname "osb-*" udp dport 53`, `iifname "osb-*" tcp dport 53`, `osb-00000000001" ip daddr 172.30.0.9`, `osb-00000000002" ip daddr 172.30.0.5`} {
+		if strings.Contains(rs, bad) {
+			t.Errorf("ruleset contains %q", bad)
+		}
+	}
+	// The output does not depend on the assignment order.
+	if rs != Ruleset(v4, v6, []TapGateway{b, a}) {
+		t.Error("ruleset depends on the assignment order")
+	}
+	// Removing one assignment removes only its two DNS rules.
+	without := inputChain(t, Ruleset(v4, v6, []TapGateway{b}))
+	if want := slices.DeleteFunc(slices.Clone(in), func(l string) bool { return strings.Contains(l, "osb-00000000002") }); !slices.Equal(without, want) {
+		t.Fatalf("after removing one assignment: %q, want %q", without, want)
+	}
+	// No assignment: no DNS exception at all.
+	for _, l := range inputChain(t, Ruleset(v4, v6, nil)) {
+		if strings.Contains(l, "dport 53") {
+			t.Errorf("DNS rule without an assignment: %q", l)
+		}
+	}
+	// An invalid assignment renders no rule.
+	for _, l := range inputChain(t, Ruleset(v4, v6, []TapGateway{{Tap: "", Gateway: a.Gateway}, {Tap: a.Tap}, {Tap: a.Tap, Gateway: netip.MustParseAddr("fe80::1")}})) {
+		if strings.Contains(l, "dport 53") {
+			t.Errorf("DNS rule from an invalid assignment: %q", l)
+		}
 	}
 }
 

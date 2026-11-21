@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -436,4 +437,133 @@ func TestAttachDuringPendingDetachKeepsDistinctTap(t *testing.T) {
 	}
 	close(release)
 	waitFor(t, done, "Detach")
+}
+
+// useRealRefresh makes the manager render the real ruleset from its DNS
+// assignments with a fixed host routing table; every applied script is
+// recorded and applyErr (when set) fails the application.
+func useRealRefresh(m *Manager) (applied func() []string, setApplyErr func(error)) {
+	var mu sync.Mutex
+	var scripts []string
+	var applyErr error
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) { return nil, nil, nil }
+	m.applyRules = func(rules string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if applyErr != nil {
+			return applyErr
+		}
+		scripts = append(scripts, rules)
+		return nil
+	}
+	m.refresh = m.Refresh
+	return func() []string {
+			mu.Lock()
+			defer mu.Unlock()
+			return append([]string(nil), scripts...)
+		}, func(err error) {
+			mu.Lock()
+			defer mu.Unlock()
+			applyErr = err
+		}
+}
+
+func dnsRuleLines(rules string) []string {
+	var out []string
+	for _, l := range strings.Split(rules, "\n") {
+		if l = strings.TrimSpace(l); strings.Contains(l, "dport 53 accept") {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func dnsRulesFor(l Link) []string {
+	tap := TapName(l.Index)
+	return []string{
+		`iifname "` + tap + `" ip daddr ` + l.Gateway.String() + ` udp dport 53 accept`,
+		`iifname "` + tap + `" ip daddr ` + l.Gateway.String() + ` tcp dport 53 accept`,
+	}
+}
+
+// Attach and Detach change only the DNS rules of their own tap, and a
+// detached tap leaves no exception behind.
+func TestAttachDetachChangeOnlyOwnDNSRules(t *testing.T) {
+	m, _ := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	a := mustAttach(t, m, "sandbox-a")
+	last := func() string {
+		s := applied()
+		if len(s) == 0 {
+			t.Fatal("no ruleset applied")
+		}
+		return s[len(s)-1]
+	}
+	if got, want := dnsRuleLines(last()), dnsRulesFor(a); !slices.Equal(got, want) {
+		t.Fatalf("after attach a: %q, want %q", got, want)
+	}
+	b := mustAttach(t, m, "sandbox-b")
+	if got, want := dnsRuleLines(last()), append(dnsRulesFor(a), dnsRulesFor(b)...); !slices.Equal(got, want) {
+		t.Fatalf("after attach b: %q, want %q", got, want)
+	}
+	m.Detach("sandbox-a")
+	if got, want := dnsRuleLines(last()), dnsRulesFor(b); !slices.Equal(got, want) {
+		t.Fatalf("after detach a: %q, want only the rules of b %q", got, want)
+	}
+	m.Detach("sandbox-b")
+	if got := dnsRuleLines(last()); len(got) != 0 {
+		t.Fatalf("after detach b: DNS rules remain: %q", got)
+	}
+	// A reused tap name gets exactly its own gateway.
+	c := mustAttach(t, m, "sandbox-c")
+	if c.Index != a.Index {
+		t.Fatalf("index = %d, want the reused %d", c.Index, a.Index)
+	}
+	if got, want := dnsRuleLines(last()), dnsRulesFor(c); !slices.Equal(got, want) {
+		t.Fatalf("after reuse: %q, want %q", got, want)
+	}
+}
+
+// A failed attach leaves no DNS exception: not when the policy refresh
+// fails, and not when the DNS forwarder fails after the refresh applied it.
+func TestFailedAttachLeavesNoDNSException(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, setApplyErr := useRealRefresh(m)
+	staged := func() int {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		return len(m.gateways)
+	}
+
+	setApplyErr(errors.New("nft failed"))
+	if _, _, err := m.Attach("sandbox-a"); err == nil {
+		t.Fatal("Attach succeeded with a failing ruleset application")
+	}
+	if n := staged(); n != 0 {
+		t.Fatalf("%d staged assignments after a failed refresh", n)
+	}
+	setApplyErr(nil)
+
+	h.mu.Lock()
+	h.startDNSErr = errors.New("address already in use")
+	h.mu.Unlock()
+	if _, _, err := m.Attach("sandbox-b"); err == nil {
+		t.Fatal("Attach succeeded with a failing DNS start")
+	}
+	h.mu.Lock()
+	h.startDNSErr = nil
+	h.mu.Unlock()
+	scripts := applied()
+	if len(scripts) < 2 {
+		t.Fatalf("want a ruleset with the exception and one without, got %d scripts", len(scripts))
+	}
+	if got := dnsRuleLines(scripts[0]); len(got) != 2 {
+		t.Fatalf("first applied ruleset DNS rules = %q, want the two rules of the attaching tap", got)
+	}
+	if got := dnsRuleLines(scripts[len(scripts)-1]); len(got) != 0 {
+		t.Fatalf("the ruleset after the failed attach keeps DNS rules: %q", got)
+	}
+	if n := staged(); n != 0 {
+		t.Fatalf("%d staged assignments after a failed attach", n)
+	}
 }
