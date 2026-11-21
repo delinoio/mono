@@ -236,8 +236,8 @@ func endFromAgent(f *ownsandv1.DataFrame) (error, bool) {
 // serveStream runs a server-streaming relay RPC after begin: it forwards the
 // request, sends keepalives at least every keepalive interval (also before
 // the accepted event), ends a stream without the agent's accepted notice
-// after the acceptance timeout (restarted whenever the connection receives
-// a frame, because a notice cannot overtake a large frame in transit), and
+// after the acceptance timeout (restarted when the connection receives a
+// large frame, because a notice cannot overtake a large frame in transit), and
 // rotates an accepted stream with an OK status before 14 minutes.
 func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, request *ownsandv1.DataFrame, ev streamEvents) (err error) {
 	sendClose := true
@@ -289,8 +289,13 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, request *owns
 		}
 		if f == nil {
 			if forwarded && !accepted {
-				if last := c.conn.LastReceive().Add(p.Timing.Acceptance); last.After(acceptBy) {
-					acceptBy = last
+				// Only a large frame extends the wait: the notice cannot overtake
+				// it. Keepalives and small frames never do, so they cannot keep
+				// a stalled admission alive.
+				if last := c.conn.LastLargeReceive(); !last.IsZero() {
+					if until := last.Add(p.Timing.Acceptance); until.After(acceptBy) {
+						acceptBy = until
+					}
 				}
 				if !now.Before(acceptBy) {
 					return errUnavailable("the agent did not accept the request")

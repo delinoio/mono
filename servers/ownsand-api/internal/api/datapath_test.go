@@ -781,6 +781,15 @@ func TestRelayBoundsFramesWithoutCredit(t *testing.T) {
 	}
 }
 
+func hasAccepted(events []*ownsandv1.ExecEvent) bool {
+	for _, e := range events {
+		if e.GetAccepted() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // keepAlive sends relay keepalives until stopped.
 func keepAlive(r *testenv.FakeRelay) func() {
 	done := make(chan struct{})
@@ -813,6 +822,19 @@ func TestRelayStreamTimers(t *testing.T) {
 			s.Send(&ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED})
 		case "long":
 			s.Send(&ownsandv1.RequestAccepted{})
+		case "large-then-accepted", "small-then-accepted":
+			// The acceptance timeout is 1 s in tests. A frame at 0.6 s moves the
+			// deadline to 1.6 s only when it is large; the notice at 1.3 s
+			// comes after the original deadline.
+			size := 1
+			if modeV.Load().(string) == "large-then-accepted" {
+				size = 2 * relay.LargeFrameBytes
+			}
+			time.Sleep(600 * time.Millisecond)
+			s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 0, Data: make([]byte, size)}}})
+			time.Sleep(700 * time.Millisecond)
+			s.Send(&ownsandv1.RequestAccepted{})
+			s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}})
 		}
 	})
 	stop := keepAlive(r)
@@ -826,7 +848,7 @@ func TestRelayStreamTimers(t *testing.T) {
 		start := time.Now()
 		es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(ctx, connect.NewRequest(req))
 		if err != nil {
-			return nil, err, 0
+			return nil, err, time.Since(start)
 		}
 		events, err := collectExec(t, es)
 		return events, err, time.Since(start)
@@ -837,20 +859,38 @@ func TestRelayStreamTimers(t *testing.T) {
 	if testenv.Code(err) != connect.CodeUnavailable || errDetail(err).GetSessionEndReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED {
 		t.Fatalf("session end: %v", err)
 	}
-	// No accepted notice (keepalives from the connection keep restarting the
-	// acceptance timer, so stop them): unavailable, with keepalive events
-	// before it and a stream close sent.
-	stop()
+	// No accepted notice while the agent keeps sending keepalives every 50 ms:
+	// the keepalives do not extend the wait, so the call ends with
+	// unavailable after the acceptance timeout (1 s in tests), with keepalive
+	// events before it and a stream close sent.
 	modeV.Store("silent")
-	events, err, _ := run()
+	events, err, took := run()
 	if testenv.Code(err) != connect.CodeUnavailable || len(events) == 0 || events[0].GetKeepalive() == nil {
 		t.Fatalf("acceptance timeout: %v, %d events", err, len(events))
 	}
+	if took > 2*time.Second {
+		t.Fatalf("acceptance timeout after %v, want about 1 s although keepalives kept arriving", took)
+	}
+	// A small frame of the stream does not extend the wait either: the notice
+	// after the original deadline finds the call already ended.
+	modeV.Store("small-then-accepted")
+	if _, err, took = run(); testenv.Code(err) != connect.CodeUnavailable || took > 1500*time.Millisecond {
+		t.Fatalf("small frame: %v after %v, want unavailable at about 1 s", err, took)
+	}
+	// A large frame extends the wait by one acceptance timeout from its
+	// arrival, so the notice behind it is accepted.
+	modeV.Store("large-then-accepted")
+	events, err, took = run()
+	if err != nil || took < 1300*time.Millisecond {
+		t.Fatalf("large frame: %v after %v, want the notice accepted after the original deadline", err, took)
+	}
+	if !hasAccepted(events) {
+		t.Fatalf("large frame: events = %v, want an accepted event", events)
+	}
 	// Accepted and silent: keepalives, then the rotation with an OK status
 	// and no final event before the rotation limit (3 s in tests).
-	stop = keepAlive(r)
 	modeV.Store("long")
-	events, err, took := run()
+	events, err, took = run()
 	if err != nil || took < 2900*time.Millisecond || events[len(events)-1].GetKeepalive() == nil {
 		t.Fatalf("rotation: %v after %v", err, took)
 	}

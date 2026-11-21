@@ -102,6 +102,9 @@ type Conn struct {
 
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
+	// lastLarge is when the connection last received a large frame of an
+	// open stream (zero before the first one); see LargeFrameBytes.
+	lastLarge atomic.Int64
 
 	// openGate serializes Open: a holder allocates a stream_id and enqueues
 	// the stream open frame before the next Open starts, so the stream open
@@ -169,6 +172,25 @@ func (c *Conn) StreamCount() int {
 
 // LastReceive returns when the connection last received a frame.
 func (c *Conn) LastReceive() time.Time { return time.Unix(0, c.lastRecv.Load()) }
+
+// LargeFrameBytes is the encoded size from which a received stream frame
+// counts as large. The control plane cannot see a frame in transit, because
+// Connect delivers whole frames, so only a large frame, which can still have
+// been arriving when the agent's request accepted notice was ready, extends
+// the wait for that notice.
+const LargeFrameBytes = 64 << 10
+
+// LastLargeReceive returns when the connection last received a frame of an
+// open stream that is at least LargeFrameBytes large, or the zero time when
+// it received none. Keepalives, other connection-level frames, frames of a
+// closed stream and small frames do not count.
+func (c *Conn) LastLargeReceive() time.Time {
+	n := c.lastLarge.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
 
 func (c *Conn) enqueue(ctx context.Context, f *ownsandv1.DataFrame) error {
 	select {
@@ -296,7 +318,8 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 }
 
 func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
-	if datapath.CheckFrameSize(f) != nil {
+	size := datapath.EncodedSize(f)
+	if size > datapath.MaxFrameSize {
 		return errMalformedFrame
 	}
 	if f.GetStreamId() == 0 {
@@ -328,6 +351,9 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 	if s == nil {
 		// A late frame of a closed stream is dropped.
 		return nil
+	}
+	if size >= LargeFrameBytes {
+		c.lastLarge.Store(time.Now().UnixNano())
 	}
 	if err := datapath.ValidateFrame(f); err != nil {
 		var unknown *datapath.UnknownKindError
