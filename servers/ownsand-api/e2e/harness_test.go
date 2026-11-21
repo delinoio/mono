@@ -10,6 +10,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -559,24 +560,77 @@ func (s *stack) apiKeyClient(transport ownsand.Transport) *ownsand.Client {
 	return c
 }
 
-// waitDeviceOnline returns the ID of an online device that is not in skip.
+// deviceWaitTimeout bounds how long a started agent may take to come online
+// and to be reconciled by the control plane.
+const deviceWaitTimeout = time.Minute
+
+// waitDeviceOnline returns the ID of a device that is not in skip, is ONLINE
+// and has been reconciled by the current control plane process. ONLINE is
+// stored when the control plane handles the first state report, but placement
+// only uses the device after the connection is marked as reconciled, which
+// the control plane logs as agent_state_report afterwards. A sandbox created
+// right after this returns must not race with that.
 func (s *stack) waitDeviceOnline(c *ownsand.Client, skip map[string]bool) string {
 	s.t.Helper()
-	ctx := s.ctx(time.Minute)
-	for {
-		res, err := c.Devices().List(ctx, &ownsandv1.ListDevicesRequest{OrganizationId: s.orgID})
-		if err != nil {
-			s.t.Fatalf("ListDevices: %v", err)
-		}
-		for _, d := range res.GetDevices() {
-			if d.GetState() == ownsandv1.DeviceState_DEVICE_STATE_ONLINE && !skip[d.GetDeviceId()] {
-				return d.GetDeviceId()
+	ctx, cancel := context.WithTimeout(context.Background(), deviceWaitTimeout)
+	defer cancel()
+	apiName := s.api.name
+	id, err := awaitDeviceReconciled(ctx, 200*time.Millisecond, skip,
+		func(ctx context.Context) ([]string, error) {
+			res, err := c.Devices().List(ctx, &ownsandv1.ListDevicesRequest{OrganizationId: s.orgID})
+			if err != nil {
+				return nil, err
 			}
+			var online []string
+			for _, d := range res.GetDevices() {
+				if d.GetState() == ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
+					online = append(online, d.GetDeviceId())
+				}
+			}
+			return online, nil
+		},
+		func(id string) bool { return s.logs.hasStateReport(apiName, id) },
+		apiName)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	return id
+}
+
+// awaitDeviceReconciled polls until a device that is not in skip is listed as
+// online and reconciled(id) reports true, and returns its ID. When ctx ends
+// first, the error names the condition that was missing. process names the
+// control plane process for that message.
+func awaitDeviceReconciled(ctx context.Context, interval time.Duration, skip map[string]bool,
+	listOnline func(context.Context) ([]string, error), reconciled func(id string) bool, process string) (string, error) {
+	// pending is the last online device that was not reconciled.
+	pending := ""
+	for {
+		online, err := listOnline(ctx)
+		switch {
+		case err == nil:
+			pending = ""
+			for _, id := range online {
+				if skip[id] {
+					continue
+				}
+				if reconciled(id) {
+					return id, nil
+				}
+				if pending == "" {
+					pending = id
+				}
+			}
+		case ctx.Err() == nil:
+			return "", fmt.Errorf("ListDevices: %w", err)
 		}
 		select {
 		case <-ctx.Done():
-			s.t.Fatal("the device did not come online")
-		case <-time.After(200 * time.Millisecond):
+			if pending == "" {
+				return "", errors.New("the device did not come online: no new device is ONLINE")
+			}
+			return "", fmt.Errorf("device %s is ONLINE but agent_state_report was not observed for it in the logs of process %s", pending, process)
+		case <-time.After(interval):
 		}
 	}
 }
