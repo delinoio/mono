@@ -220,7 +220,19 @@ func TestListenUnixBindErrorOmitsPath(t *testing.T) {
 	if !errors.Is(err, ErrBindFailed) {
 		t.Fatalf("err = %v, want ErrBindFailed", err)
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	if runtime.GOOS == "windows" {
+		// Winsock reports a bind in a missing directory with an error number
+		// (for example "dead network") that does not map to os.ErrNotExist,
+		// so only require that the original OS error number and its text
+		// are kept.
+		var errno syscall.Errno
+		if !errors.As(err, &errno) {
+			t.Fatalf("err = %v does not keep the OS cause", err)
+		}
+		if !strings.HasSuffix(err.Error(), ": "+errno.Error()) {
+			t.Fatalf("err = %v does not carry the text of the OS cause %v", err, errno)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("err = %v does not keep the OS cause", err)
 	}
 	for _, leak := range []string{"no-such-dir-secret", "guest-secret", ".sock"} {
