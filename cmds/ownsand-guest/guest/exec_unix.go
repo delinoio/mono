@@ -15,6 +15,9 @@ import (
 // after KillGrace.
 const forceAfterTerminate = true
 
+// envKeyFold: environment variable names are case-sensitive on Unix.
+func envKeyFold(key string) string { return key }
+
 // setProcessGroup starts the command in its own process group, so a timeout
 // stops the command together with its children.
 func setProcessGroup(cmd *exec.Cmd) {

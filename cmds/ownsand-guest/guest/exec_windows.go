@@ -6,11 +6,17 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 )
 
 // forceAfterTerminate: Windows guests terminate the process tree at once.
 const forceAfterTerminate = false
+
+// envKeyFold: Windows environment variable names are case-insensitive. Go's
+// os/exec folds with strings.ToLower when it removes duplicates, so the merge
+// must fold the same way.
+func envKeyFold(key string) string { return strings.ToLower(key) }
 
 func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: syscall.CREATE_NEW_PROCESS_GROUP}
