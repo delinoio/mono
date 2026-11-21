@@ -392,7 +392,7 @@ func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentC
 		delete(a.snapshots, c.DeleteSnapshot.GetSnapshotId())
 		a.mu.Unlock()
 		return &ownsandv1.AgentCommandResult{}
-	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent:
+	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent, *ownsandv1.AgentCommand_WithdrawAgentUpdate:
 		return &ownsandv1.AgentCommandResult{}
 	}
 	return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}}

@@ -34,11 +34,12 @@ const (
 	cmdCleanUp
 	cmdUpdateAgent
 	cmdDeleteSnapshot
+	cmdWithdrawUpdate
 )
 
 func (k commandKind) String() string {
 	return [...]string{"", "create_sandbox", "delete_sandbox", "pause_sandbox", "resume_sandbox", "create_snapshot",
-		"export_snapshot", "import_snapshot", "clean_up", "update_agent", "delete_snapshot"}[k]
+		"export_snapshot", "import_snapshot", "clean_up", "update_agent", "delete_snapshot", "withdraw_agent_update"}[k]
 }
 
 // commandInfo is what the server remembers about a sent command, so that it
@@ -525,31 +526,48 @@ func (s *Service) applyResultEntry(ctx context.Context, conn *hub.Conn, e *ownsa
 	return nil
 }
 
-// releaseKey is the per-channel value of the last update target sent.
+// releaseKey is the per-channel value of the last update decision sent.
 type releaseKey struct{}
 
-// updateTarget computes the target version of a device from the
+// withdrawKey is the releaseKey value after a withdrawal. It cannot equal a
+// target key, which has the form "<version>/<recovery>".
+const withdrawKey = "withdraw"
+
+// updateDecision is what the control plane sends a device for an update.
+type updateDecision struct {
+	// target is the version to install; empty when none is sent.
+	target string
+	// recovery marks the target as a revocation recovery.
+	recovery bool
+	// withdraw tells the agent to drop a queued update. It is set only under
+	// HOLD when no revocation recovery applies.
+	withdraw bool
+}
+
+// updateTarget computes the update decision of a device from the
 // organization policy and the agent releases table. A revoked running or
 // pinned version selects the platform default as a revocation recovery,
 // regardless of HOLD or PIN. A PIN sends the pinned version even when it is
 // lower than the running version. Under FOLLOW_DEFAULT the platform default
 // is a target only when it is strictly newer than the running version, so a
-// default that was rolled back never downgrades a healthy device.
-func (s *Service) updateTarget(ctx context.Context, deviceID string) (string, bool, error) {
+// default that was rolled back never downgrades a healthy device. HOLD
+// sends no target and asks the agent to withdraw an update that it queued
+// earlier.
+func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDecision, error) {
 	var orgID, running string
 	var hostOS, arch int16
 	if err := s.DB.Pool.QueryRow(ctx, "SELECT organization_id::text, agent_version, host_os, arch FROM devices WHERE device_id = $1", deviceID).
 		Scan(&orgID, &running, &hostOS, &arch); err != nil {
-		return "", false, err
+		return updateDecision{}, err
 	}
 	policy, err := s.loadPolicy(ctx, s.DB.Pool, orgID)
 	if err != nil {
-		return "", false, err
+		return updateDecision{}, err
 	}
 	var def string
 	err = s.DB.Pool.QueryRow(ctx, "SELECT version FROM agent_releases WHERE host_os = $1 AND arch = $2 AND is_default", hostOS, arch).Scan(&def)
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return "", false, err
+		return updateDecision{}, err
 	}
 	revoked := func(v string) (bool, error) {
 		var r bool
@@ -558,26 +576,26 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (string, bo
 	}
 	runningRevoked, err := revoked(running)
 	if err != nil {
-		return "", false, err
+		return updateDecision{}, err
 	}
 	if runningRevoked {
-		return def, true, nil
+		return updateDecision{target: def, recovery: true}, nil
 	}
 	switch policy.GetMode() {
 	case ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_PIN:
 		pinnedRevoked, err := revoked(policy.GetPinnedVersion())
 		if err != nil {
-			return "", false, err
+			return updateDecision{}, err
 		}
 		if pinnedRevoked {
-			return def, true, nil
+			return updateDecision{target: def, recovery: true}, nil
 		}
-		return policy.GetPinnedVersion(), false, nil
+		return updateDecision{target: policy.GetPinnedVersion()}, nil
 	case ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD:
-		return "", false, nil
+		return updateDecision{withdraw: true}, nil
 	}
 	if def == "" {
-		return "", false, nil
+		return updateDecision{}, nil
 	}
 	cmp, err := semver.CompareStrings(def, running)
 	if err != nil {
@@ -586,19 +604,44 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (string, bo
 		s.Logger.WarnContext(ctx, "agent_update_skipped", slog.String("device_id", deviceID),
 			slog.String("reason", "version_not_comparable"), slog.String("default_version", def),
 			slog.String("running_version", running), slog.Any("error", err))
-		return "", false, nil
+		return updateDecision{}, nil
 	}
 	if cmp <= 0 {
-		return "", false, nil
+		return updateDecision{}, nil
 	}
-	return def, false, nil
+	return updateDecision{target: def}, nil
 }
 
 // evaluateUpdate sends an update command when the target version differs
-// from the running version and from the last target sent on the channel.
+// from the running version and from the last target sent on the channel. It
+// sends the withdrawal of a queued update when the policy is HOLD and no
+// revocation recovery applies, once per channel and policy state: also after
+// reconciliation on a new channel, because the agent may still hold an
+// update that an earlier channel queued, and again after a target was sent in
+// between, so a change back to FOLLOW_DEFAULT resends the target.
+//
+// Mixed versions: an agent that predates the withdrawal command answers it
+// with UNIMPLEMENTED. The server only logs that result (agent_command_result)
+// and does not retry or negotiate; such an agent keeps its queued update.
+//
+// The channel handler (capability and state reports) and the control event
+// processor (policy changes) both call it for the same channel, so the whole
+// decision, from reading the policy to queueing the command, runs under the
+// per-channel update lock. A decision that read an older policy then cannot
+// send its command after the command of a newer decision.
 func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
-	target, recovery, err := s.updateTarget(ctx, conn.DeviceID)
+	defer conn.LockUpdates()()
+	d, err := s.updateTarget(ctx, conn.DeviceID)
 	if err != nil {
+		return err
+	}
+	if d.withdraw {
+		if conn.Value(releaseKey{}) == withdrawKey {
+			return nil
+		}
+		conn.SetValue(releaseKey{}, withdrawKey)
+		_, err = s.sendCommand(ctx, conn, commandInfo{kind: cmdWithdrawUpdate, orgID: conn.OrganizationID},
+			&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_WithdrawAgentUpdate{WithdrawAgentUpdate: &ownsandv1.WithdrawAgentUpdateCommand{}}})
 		return err
 	}
 	var running string
@@ -607,13 +650,13 @@ func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
 	}
 	// A revocation recovery is sent even when the same target was sent
 	// before without it, because only a recovery allows a downgrade.
-	sent := fmt.Sprintf("%s/%t", target, recovery)
-	if target == "" || target == running || conn.Value(releaseKey{}) == sent {
+	sent := fmt.Sprintf("%s/%t", d.target, d.recovery)
+	if d.target == "" || d.target == running || conn.Value(releaseKey{}) == sent {
 		return nil
 	}
 	conn.SetValue(releaseKey{}, sent)
 	_, err = s.sendCommand(ctx, conn, commandInfo{kind: cmdUpdateAgent, orgID: conn.OrganizationID},
-		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: target, RevocationRecovery: recovery}}})
+		&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: d.target, RevocationRecovery: d.recovery}}})
 	return err
 }
 

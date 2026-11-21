@@ -237,7 +237,13 @@ func (a *Agent) dispatch(ctx context.Context, c *conn, env *ownsandv1.AgentEnvel
 			a.Sandboxes.AckSandboxUpdate(ack.SandboxUpdate)
 		}
 	case *ownsandv1.AgentEnvelope_Command:
-		go a.handleCommand(ctx, m.Command)
+		// An update or withdrawal command takes its order here, in receive
+		// order, because the commands run in separate goroutines.
+		var order uint64
+		if isUpdateCommand(m.Command) {
+			order = a.updater.NextOrder()
+		}
+		go a.handleCommand(ctx, m.Command, order)
 	case *ownsandv1.AgentEnvelope_Configuration:
 		cfg := m.Configuration
 		a.Sandboxes.SetLimits(cfg.GetLimits())
