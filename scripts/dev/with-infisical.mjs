@@ -49,7 +49,7 @@
 // names or values, and the fetched values never leave the launcher's memory
 // except as the command's environment.
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { constants } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -416,9 +416,14 @@ async function main() {
 }
 
 // The module also exports its pure helpers for tests; run only as a script.
+// Node.js loads the main module from its real path, so `import.meta.url` has
+// no symbolic links while `process.argv[1]` keeps the path as given. Compare
+// real paths: a checkout under a symbolic link (on macOS the temporary
+// directory under `/var` is one) would otherwise exit 0 without starting the
+// command.
 if (
   process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
+  realpathSync(process.argv[1]) === fileURLToPath(import.meta.url)
 ) {
   const removeSignalRecording = installSignalRecording();
   try {

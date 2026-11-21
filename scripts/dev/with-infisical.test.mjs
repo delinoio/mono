@@ -9,7 +9,9 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -90,7 +92,10 @@ if (process.argv[3] === "wait") {
 // `scripts/dev/with-infisical.mjs`, so that the launcher resolves the
 // fixture as its repository root.
 function fixture(t, { config = null, cli = true, env = {} } = {}) {
-  const root = mkdtempSync(join(tmpdir(), "with-infisical-"));
+  // The real path, so that working directories that a child process reports
+  // match the fixture paths also where the temporary directory is under a
+  // symbolic link (macOS `/var`).
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "with-infisical-")));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, "scripts", "dev"), { recursive: true });
   const launcher = join(root, "scripts", "dev", "with-infisical.mjs");
@@ -381,6 +386,31 @@ test(
         folder: "/api",
       },
     ]);
+  },
+);
+
+test(
+  "a launcher path under a symbolic link still runs the command",
+  posixOnly,
+  async (t) => {
+    const f = fixture(t);
+    const link = `${f.root}-link`;
+    symlinkSync(f.root, link);
+    t.after(() => rmSync(link, { force: true }));
+    const child = spawn(
+      process.execPath,
+      [
+        join(link, "scripts", "dev", "with-infisical.mjs"),
+        "--path=/api",
+        ...commandArgs(7),
+      ],
+      { cwd: f.packageDir, env: f.env, stdio: ["ignore", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr.on("data", (chunk) => (stderr += chunk));
+    const code = await new Promise((resolve) => child.once("close", resolve));
+    assert.equal(code, 7, stderr);
+    assert.deepEqual(started(f).args, ["7"]);
   },
 );
 
