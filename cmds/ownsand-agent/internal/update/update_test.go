@@ -53,9 +53,12 @@ func newRelease(t *testing.T, mutate func(*Manifest, *[]byte)) *release {
 	return r
 }
 
-type fakeInstaller struct{ installed atomic.Int32 }
+type fakeInstaller struct {
+	installed atomic.Int32
+	err       error
+}
 
-func (f *fakeInstaller) Install(string) error { f.installed.Add(1); return nil }
+func (f *fakeInstaller) Install(string) error { f.installed.Add(1); return f.err }
 
 func newUpdater(t *testing.T, r *release, running string, busy *atomic.Bool, keys ...ed25519.PublicKey) (*Updater, *fakeInstaller, *atomic.Int32) {
 	st, _ := store.Open(t.TempDir())
@@ -175,6 +178,60 @@ func TestRevokedRunningVersion(t *testing.T) {
 	busy.Store(false)
 	if ok, _ := u.TryInstall(); !ok || inst.installed.Load() != 1 {
 		t.Fatal("revoked version not replaced when idle")
+	}
+}
+
+func TestFailedInstallKeepsRunningRevocation(t *testing.T) {
+	for _, tc := range []struct {
+		name, running string
+		recovery      bool
+		wantRevoked   bool
+	}{
+		{"revoked running version stays blocked", "0.9.0", true, true},
+		{"non-revoked running version stays admitted", "1.0.0", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRelease(t, nil)
+			busy := &atomic.Bool{}
+			u, inst, restarts := newUpdater(t, r, tc.running, busy)
+			inst.err = errors.New("read-only executable directory")
+			if err := update(u, "1.1.0", tc.recovery); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := u.TryInstall(); ok || err == nil {
+				t.Fatalf("install should fail: %v %v", ok, err)
+			}
+			if restarts.Load() != 0 {
+				t.Fatal("restarted after a failed install")
+			}
+			if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
+				t.Fatalf("state %v", s)
+			}
+			release, err := u.BeginCreate()
+			if tc.wantRevoked {
+				if !errors.Is(err, ErrRunningRevoked) {
+					t.Fatalf("create after failed install on revoked version: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("create after failed install: %v", err)
+			}
+			release()
+		})
+	}
+}
+
+func TestFailedInstallReleasesInstallingFlag(t *testing.T) {
+	r := newRelease(t, nil)
+	u, inst, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	inst.err = errors.New("boom")
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	u.TryInstall()
+	if _, err := u.BeginCreate(); errors.Is(err, ErrInstalling) {
+		t.Fatal("installing flag not released")
 	}
 }
 
