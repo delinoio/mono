@@ -341,15 +341,21 @@ func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
+	// A failed host clean-up does not stop the deletion of the local data, so
+	// that one reset removes everything that it can; it still makes the reset
+	// fail, and running reset again deletes the remaining host resources.
+	code := exitOK
 	if err := resetHost(cfg, st); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: reset host resources:", err)
+		fmt.Fprintln(stderr, "ownsand-agent: run reset again, as an operator with CAP_NET_ADMIN, to delete the remaining host resources")
+		code = exitError
 	}
 	if err := st.Reset(); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
 	fmt.Fprintln(stdout, "Local agent data deleted from", filepath.Clean(cfg.StateDir))
-	return exitOK
+	return code
 }
 
 func servicePrint(stdout, stderr io.Writer) int {

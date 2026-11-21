@@ -61,7 +61,9 @@ func New(opts Options) (*Runtime, error) {
 	logger := opts.Logger
 	return newRuntime(opts, func() {
 		if hasNetAdmin() {
-			netpolicy.CleanupHost(logger)
+			// Best effort: CleanupHost logs each failed resource, and the
+			// agent start does not depend on the result.
+			_ = netpolicy.CleanupHost(logger)
 		}
 	})
 }

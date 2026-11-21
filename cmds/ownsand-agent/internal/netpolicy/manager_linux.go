@@ -123,7 +123,7 @@ func run(name string, args ...string) error {
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("netpolicy: %s %s: %v: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("netpolicy: %s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
 }
@@ -344,17 +344,82 @@ func (m *Manager) Run(ctx context.Context) {
 	}
 }
 
-// CleanupHost deletes every sandbox tap device and the agent's nftables
-// table, for an agent start (the VMs ended with the previous process) and
-// for `ownsand-agent reset`.
-func CleanupHost(logger *slog.Logger) {
-	ifaces, _ := net.Interfaces()
+// hostCleanupOps are the host operations of CleanupHost; tests replace them
+// so that the clean-up runs without root and without touching the host.
+type hostCleanupOps struct {
+	// listTaps returns the names of the sandbox tap devices of the host.
+	listTaps func() ([]string, error)
+	// run executes `ip` and `nft`.
+	run func(name string, args ...string) error
+	// tapExists reports whether a tap device may still exist.
+	tapExists func(tap string) bool
+}
+
+// listTapDevices returns the names of the interfaces that start with
+// TapPrefix.
+func listTapDevices() ([]string, error) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil, err
+	}
+	var taps []string
 	for _, iface := range ifaces {
 		if strings.HasPrefix(iface.Name, TapPrefix) {
-			if err := run("ip", "link", "del", iface.Name); err != nil {
-				logger.Warn("delete stale tap device failed", "tap", iface.Name, "error", err)
-			}
+			taps = append(taps, iface.Name)
 		}
 	}
-	_ = run("nft", "delete", "table", "inet", TableName)
+	return taps, nil
+}
+
+// isNftTableAbsent reports whether an `nft delete table` failure means that
+// the table does not exist (nft prints "No such file or directory" for a
+// missing table), or that nft is not installed, so that the host cannot hold
+// a table of the agent that the agent could delete.
+func isNftTableAbsent(err error) bool {
+	if errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such file or directory") || strings.Contains(msg, "does not exist")
+}
+
+// CleanupHost deletes every sandbox tap device and the agent's nftables
+// table, for an agent start (the VMs ended with the previous process) and
+// for `ownsand-agent reset`. It attempts every resource even when an earlier
+// one fails, logs each failure with its operation and resource, and returns
+// the failures joined (nil when every resource is deleted or was already
+// absent, so a retry after a partial failure succeeds once the remaining
+// resources are removable). The agent start treats the error as best effort;
+// reset reports it.
+func CleanupHost(logger *slog.Logger) error {
+	return cleanupHost(logger, hostCleanupOps{listTaps: listTapDevices, run: run, tapExists: tapDeviceExists})
+}
+
+func cleanupHost(logger *slog.Logger, ops hostCleanupOps) error {
+	var errs []error
+	taps, err := ops.listTaps()
+	if err != nil {
+		logger.Warn("list tap devices failed", "operation", "list_taps", "error", err)
+		errs = append(errs, fmt.Errorf("list tap devices: %w", err))
+	}
+	for _, tap := range taps {
+		err := ops.run("ip", "link", "del", tap)
+		switch {
+		case err == nil:
+		case !ops.tapExists(tap):
+			logger.Debug("tap device already absent", "operation", "delete_tap", "tap", tap, "error", err)
+		default:
+			logger.Warn("delete stale tap device failed", "operation", "delete_tap", "tap", tap, "error", err)
+			errs = append(errs, fmt.Errorf("delete tap device %s: %w", tap, err))
+		}
+	}
+	if err := ops.run("nft", "delete", "table", "inet", TableName); err != nil {
+		if isNftTableAbsent(err) {
+			logger.Debug("nftables table already absent", "operation", "delete_nft_table", "table", TableName, "error", err)
+		} else {
+			logger.Warn("delete nftables table failed", "operation", "delete_nft_table", "table", TableName, "error", err)
+			errs = append(errs, fmt.Errorf("delete nftables table inet %s: %w", TableName, err))
+		}
+	}
+	return errors.Join(errs...)
 }
