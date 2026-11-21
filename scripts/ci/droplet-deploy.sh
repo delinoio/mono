@@ -93,8 +93,19 @@ main() {
   echo "Pull $image"
   docker pull --quiet "$image"
 
-  local -a old
-  mapfile -t old < <(docker ps --all --quiet --filter "label=io.delino.service=$service")
+  # Read the list into a variable first: a failure inside a process
+  # substitution would not stop the script, and the deployment would then
+  # leave the previous containers running next to the new one.
+  local old_ids
+  old_ids="$(docker ps --all --quiet --filter "label=io.delino.service=$service")" ||
+    fail "could not list the existing containers of $service; no replacement was started."
+  local -a old=()
+  local old_id
+  while IFS= read -r old_id; do
+    if [[ -n "$old_id" ]]; then
+      old+=("$old_id")
+    fi
+  done <<< "$old_ids"
   local stamp new upstream
   stamp="$(date -u +%Y%m%d%H%M%S)-${image: -12}"
   new="$service-$stamp"
