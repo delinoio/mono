@@ -69,7 +69,7 @@ import {
   type Template,
   TemplateSchema,
 } from "ownsand-sdk/gen/snapshot_pb";
-import { effectiveVcpuLimit } from "../format.ts";
+import { effectiveVcpuLimit, MAX_INT32 } from "../format.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -198,6 +198,7 @@ function seed(): Map<string, OrgState> {
         vcpuOvercommitPercent: 150,
       },
       effectiveVcpuLimit: 24,
+      effectiveVcpuLimitCount: 24n,
       allocation: { vcpuCount: 10, memoryMib: 20480n, diskGib: 80n },
       createTime: ts(-50 * 24 * HOUR),
       lastSeenTime: ts(-5),
@@ -225,6 +226,7 @@ function seed(): Map<string, OrgState> {
         vcpuOvercommitPercent: 100,
       },
       effectiveVcpuLimit: 0,
+      effectiveVcpuLimitCount: 0n,
       allocation: { vcpuCount: 2, memoryMib: 4096n, diskGib: 20n },
       createTime: ts(-3 * 24 * HOUR),
       lastSeenTime: ts(-2 * HOUR),
@@ -645,7 +647,10 @@ export function createMockTransport(
           );
         }
         device.limits = l;
-        device.effectiveVcpuLimit = effectiveVcpuLimit(l.vcpuCount, p);
+        // Like the server: the exact int64 value, and the int32 field capped.
+        const effective = effectiveVcpuLimit(l.vcpuCount, p);
+        device.effectiveVcpuLimitCount = BigInt(effective);
+        device.effectiveVcpuLimit = Math.min(effective, MAX_INT32);
         return { device };
       },
       removeDevice(req) {
