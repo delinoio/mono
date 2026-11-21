@@ -109,6 +109,37 @@ func TestSaturatedChannelHeartbeatClosesChannel(t *testing.T) {
 	}
 }
 
+// TestSaturatedChannelEndsStalledWrite checks that a channel whose agent
+// keeps its HTTP/2 stream open but stops reading does not keep the handler,
+// the writer and the full outbound queue until the agent disconnects: after
+// the writer drain timeout the handler aborts the blocked transport write
+// and returns. The server sets no write timeout, so only that abort ends
+// the write; the agent stays stalled and connected throughout.
+func TestSaturatedChannelEndsStalledWrite(t *testing.T) {
+	env := testenv.New(t)
+	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
+	env.App.Service.Timing.WriterDrainTimeout = saturationQueueFullWait
+	org := env.NewOrg("alice")
+	dev, agent := setupAgent(t, env, org, nil)
+	conn := env.App.Service.Hub.Get(dev.ID)
+
+	saturate(t, env, agent)
+	agent.Heartbeat(901)
+
+	select {
+	case <-conn.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the saturated channel stayed open")
+	}
+	testenv.Eventually(t, "the blocked writer ended", func() bool {
+		logs := env.Logs.String()
+		return strings.Contains(logs, "agent_channel_writer_stalled") && strings.Contains(logs, "agent_channel_writer_ended")
+	})
+	if logs := env.Logs.String(); strings.Contains(logs, "agent_channel_writer_abort_failed") {
+		t.Fatalf("the abort of the blocked write failed:\n%s", logs)
+	}
+}
+
 // TestSaturatedChannelDoesNotBlockOtherDevices checks that a control event
 // for a device whose agent stopped reading does not hold back the event of
 // a healthy device, and that the saturated channel closes.

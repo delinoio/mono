@@ -143,6 +143,10 @@ type Timing struct {
 	// the default. The sweep that removes expired records runs every
 	// OfflineSweep.
 	CommandGrace time.Duration
+	// WriterDrainTimeout bounds the wait for the channel writer after a
+	// channel closed; a writer that is still blocked in a send after it
+	// loses its transport write (5 seconds); zero means the default.
+	WriterDrainTimeout time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -155,7 +159,18 @@ func DefaultTiming() Timing {
 		CleanupPoll:      30 * time.Second,
 		ImportWait:       2 * time.Hour,
 		CommandGrace:     DefaultCommandGrace,
+
+		WriterDrainTimeout: DefaultWriterDrainTimeout,
 	}
+}
+
+// writerDrainTimeout returns the wait for the channel writer after a channel
+// closed.
+func (s *Service) writerDrainTimeout() time.Duration {
+	if s.Timing.WriterDrainTimeout > 0 {
+		return s.Timing.WriterDrainTimeout
+	}
+	return DefaultWriterDrainTimeout
 }
 
 // commandGrace returns the retention window of unanswered commands whose
