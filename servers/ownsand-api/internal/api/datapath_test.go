@@ -412,6 +412,25 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(attach)); testenv.Code(err) != connect.CodeInvalidArgument {
 		t.Fatalf("attach with a digest: %v", err)
 	}
+	// EXEC and ATTACH_EXEC grants need the canonical lowercase operation_id
+	// and nothing is reserved for a rejected request, so the same
+	// authorization_id still works with the lowercase spelling.
+	upperReq := newExec(org.ID, sandboxID)
+	upperAuthID, _ := uuidv7.NewString()
+	upperExec := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: strings.ToUpper(upperReq.GetExecId()), RequestDigest: relaybinding.ExecDigest(upperReq), AuthorizationId: upperAuthID}
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(upperExec)); testenv.Code(err) != connect.CodeInvalidArgument || !strings.Contains(err.Error(), "operation_id") {
+		t.Fatalf("EXEC with an uppercase operation_id: %v", err)
+	}
+	upperAttach := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC,
+		OperationId: strings.ToUpper(upperReq.GetExecId()), AuthorizationId: upperAuthID}
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(upperAttach)); testenv.Code(err) != connect.CodeInvalidArgument || !strings.Contains(err.Error(), "operation_id") {
+		t.Fatalf("ATTACH_EXEC with an uppercase operation_id: %v", err)
+	}
+	upperExec.OperationId = upperReq.GetExecId()
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(upperExec)); err != nil {
+		t.Fatalf("EXEC with the lowercase operation_id after a rejected uppercase one: %v", err)
+	}
 	// The per-principal rate limit of 10 calls per second.
 	limited := false
 	for i := 0; i < 15 && !limited; i++ {
