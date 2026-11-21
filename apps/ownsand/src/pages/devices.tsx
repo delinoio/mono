@@ -20,6 +20,7 @@ import {
   PageHeader,
 } from "../components/ui.tsx";
 import {
+  deviceAllocatedVcpu,
   effectiveVcpuLimit,
   errorMessage,
   formatBytes,
@@ -36,7 +37,7 @@ function vcpuSummary(d: Device): string {
   const l = d.limits;
   if (l === undefined) return "—";
   const ratio = l.vcpuOvercommitPercent / 100;
-  return `${d.allocation?.vcpuCount ?? 0} of ${d.effectiveVcpuLimitCount} (${l.vcpuCount} × ${ratio})`;
+  return `${deviceAllocatedVcpu(d)} of ${d.effectiveVcpuLimitCount} (${l.vcpuCount} × ${ratio})`;
 }
 
 /** Route `devices`: devices with state, limits, allocation and agent version. */
@@ -220,7 +221,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             "—"}
         </Detail>
         <Detail term="Allocated">
-          {`${d.allocation?.vcpuCount ?? 0} vCPU · ${formatMib(d.allocation?.memoryMib ?? 0n)} · ${d.allocation?.diskGib ?? 0n} GiB disk`}
+          {`${deviceAllocatedVcpu(d)} vCPU · ${formatMib(d.allocation?.memoryMib ?? 0n)} · ${d.allocation?.diskGib ?? 0n} GiB disk`}
         </Detail>
       </dl>
       <section className="section" aria-labelledby="limits-title">
