@@ -923,3 +923,48 @@ func TestWriteExpiryOfLongTargetRemovesTemporaryFile(t *testing.T) {
 		t.Fatal("target exists after expiry")
 	}
 }
+
+// A path swapped to another same-size file between the first stat and the
+// open must abort the snapshot and leave no snapshot file behind.
+func TestReadSnapshotAbortsWhenPathSwappedBeforeOpen(t *testing.T) {
+	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(path, []byte("aaaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("bbbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, forceCopy := range []bool{true, false} {
+		m.forceCopy = forceCopy
+		swapped := false
+		m.openHook = func() {
+			if swapped {
+				return
+			}
+			swapped = true
+			if err := os.Rename(other, path); err != nil {
+				t.Fatal(err)
+			}
+		}
+		dst := filepath.Join(m.dir, "snap")
+		_, _, err := m.makeSnapshot(path, dst)
+		if err == nil || !strings.Contains(err.Error(), "file changed during the snapshot copy") {
+			t.Fatalf("forceCopy=%v: expected abort, got %v", forceCopy, err)
+		}
+		os.Remove(dst)
+		// Restore the fixture for the next round.
+		os.WriteFile(path, []byte("aaaa"), 0o644)
+		os.WriteFile(other, []byte("bbbb"), 0o644)
+	}
+	// A stable file still reads.
+	m.openHook = nil
+	if kind, n, err := m.makeSnapshot(path, filepath.Join(m.dir, "ok")); err != nil || n != 4 {
+		t.Fatalf("stable read: kind %v n %d err %v", kind, n, err)
+	}
+}
