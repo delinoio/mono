@@ -119,6 +119,30 @@ describe("devices", () => {
     ).toContainText("24");
     await expect(screen.getByRole("button", "Remove device")).toBeVisible();
   });
+
+  test("removes a device and drops it from the device list", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/devices`);
+    await expect(screen.getByText("build-box-1").first()).toBeVisible();
+    await expect(screen.getByText("studio-mac").first()).toBeVisible();
+
+    await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+    await screen.getByRole("button", "Remove device").tap();
+    const dialog = screen.getByRole("alertdialog", "Remove build-box-1?");
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", "Remove device").tap();
+
+    // The console returns to the device list. The mock API omits a removed
+    // device from a list request that sets no state, like the real API.
+    await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
+    await expect(screen.getByText("studio-mac").first()).toBeVisible();
+    await expect(screen.getByText("build-box-1")).toBeHidden();
+  });
 });
 
 describe("roles", () => {
