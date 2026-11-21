@@ -446,7 +446,13 @@ jobs:
               exit 1
               ;;
           esac
-          mapfile -t all_packages < <(go list ./...)
+          # macOS runners run bash 3.2, which has no `mapfile`. The command
+          # substitution keeps a `go list` failure fatal under `set -e`.
+          package_list="$(go list ./...)"
+          all_packages=()
+          while IFS= read -r package; do
+            all_packages+=("$package")
+          done <<< "$package_list"
           skipped=()
           for package in "${known_failures[@]}"; do
             if [[ ! " ${all_packages[*]} " == *" $module/$package "* ]]; then
