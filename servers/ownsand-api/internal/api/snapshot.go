@@ -30,22 +30,31 @@ const maxSnapshotParts = 10000
 
 const snapshotColumns = `snapshot_id::text, organization_id::text, source_sandbox_id::text, COALESCE(device_id::text, ''), state, export_state,
 	guest_os, host_os, arch, vcpu_count, memory_mib, disk_gib, network_mode, has_memory_state, size_bytes, COALESCE(macos_hardware_model, ''::bytea),
-	COALESCE(machine_lineage::text, ''), created_by_kind, created_by_id, create_time`
+	COALESCE(machine_lineage::text, ''), created_by_kind, created_by_id, create_time,
+	COALESCE(export_command_id::text, ''), COALESCE(export_channel_id::text, '')`
 
 type snapshotRow struct {
 	pb      *ownsandv1.Snapshot
 	lineage string
+	// exportCommandID is the command ID of the latest export attempt; it is
+	// also the attempt ID in the object keys of the attempt's parts. It is
+	// empty for a snapshot that was never exported and for an export that
+	// started before attempt IDs existed (legacy object keys).
+	exportCommandID string
+	// exportChannelID is the ID of the agent channel that received the
+	// command of the latest export attempt.
+	exportChannelID string
 }
 
 func scanSnapshot(row pgx.Row) (*snapshotRow, error) {
 	var sn ownsandv1.Snapshot
 	var state, export, guest, host, arch, network, kind int16
-	var createdBy, lineage string
+	var createdBy, lineage, exportCommand, exportChannel string
 	var created time.Time
 	var res ownsandv1.Resources
 	if err := row.Scan(&sn.SnapshotId, &sn.OrganizationId, &sn.SourceSandboxId, &sn.DeviceId, &state, &export, &guest, &host, &arch,
 		&res.VcpuCount, &res.MemoryMib, &res.DiskGib, &network, &sn.HasMemoryState, &sn.SizeBytes, &sn.MacosHardwareModel, &lineage,
-		&kind, &createdBy, &created); err != nil {
+		&kind, &createdBy, &created, &exportCommand, &exportChannel); err != nil {
 		return nil, err
 	}
 	sn.State = ownsandv1.SnapshotState(state)
@@ -60,7 +69,7 @@ func scanSnapshot(row pgx.Row) (*snapshotRow, error) {
 	if len(sn.MacosHardwareModel) == 0 {
 		sn.MacosHardwareModel = nil
 	}
-	return &snapshotRow{pb: &sn, lineage: lineage}, nil
+	return &snapshotRow{pb: &sn, lineage: lineage, exportCommandID: exportCommand, exportChannelID: exportChannel}, nil
 }
 
 func loadSnapshot(ctx context.Context, q db.Querier, orgID, snapshotID string, lock bool) (*snapshotRow, error) {
@@ -158,46 +167,101 @@ func (s *Service) applySnapshotResult(ctx context.Context, info commandInfo, res
 	})
 }
 
-func (s *Service) applyExportResult(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+// applyExportResult applies the result of an export command. Only the result
+// of the attempt that the snapshot row names (its export command ID) in the
+// EXPORTING state changes the row: a result of an earlier attempt that
+// arrives late is ignored and leaves the state and the part manifest of the
+// current attempt as they are.
+func (s *Service) applyExportResult(ctx context.Context, info commandInfo, commandID string, res *ownsandv1.AgentCommandResult) error {
 	return s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var export int16
-		err := tx.QueryRow(ctx, "SELECT export_state FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", info.snapshotID).Scan(&export)
+		var owner string
+		err := tx.QueryRow(ctx, "SELECT export_state, COALESCE(export_command_id::text, '') FROM snapshots WHERE snapshot_id = $1 FOR UPDATE", info.snapshotID).Scan(&export, &owner)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil // deleted meanwhile; its clean-up job removes the parts
 		}
-		if err != nil || ownsandv1.SnapshotExportState(export) != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING {
+		if err != nil {
 			return err
 		}
+		if ownsandv1.SnapshotExportState(export) != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || owner != commandID {
+			s.Logger.InfoContext(ctx, "export_result_stale", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
+				slog.String("current_command_id", owner), slog.String("export_state", ownsandv1.SnapshotExportState(export).String()))
+			return nil
+		}
 		result := res.GetExportSnapshot()
-		if res.GetError() != nil || result == nil || len(result.GetParts()) == 0 {
-			_, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED))
-			return err
+		reason := ""
+		switch {
+		case res.GetError() != nil:
+			reason = "agent_error_" + res.GetError().GetCode().String()
+		case result == nil || len(result.GetParts()) == 0:
+			reason = "no_parts"
+		default:
+			for _, part := range result.GetParts() {
+				if part.GetPartNumber() < 1 || part.GetPartNumber() > maxSnapshotParts || len(part.GetSha256()) != 32 || part.GetSizeBytes() < 0 {
+					reason = "invalid_part"
+					break
+				}
+			}
+		}
+		if reason != "" {
+			return s.failExportTx(ctx, tx, info.orgID, info.snapshotID, commandID, reason)
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM snapshot_parts WHERE snapshot_id = $1", info.snapshotID); err != nil {
 			return err
 		}
 		for _, part := range result.GetParts() {
-			if part.GetPartNumber() < 1 || part.GetPartNumber() > maxSnapshotParts || len(part.GetSha256()) != 32 || part.GetSizeBytes() < 0 {
-				_, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED))
-				return err
-			}
 			if _, err := tx.Exec(ctx, "INSERT INTO snapshot_parts (snapshot_id, part_number, size_bytes, sha256) VALUES ($1, $2, $3, $4)",
 				info.snapshotID, part.GetPartNumber(), part.GetSizeBytes(), part.GetSha256()); err != nil {
 				return err
 			}
 		}
-		_, err = tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED))
-		return err
+		if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", info.snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)); err != nil {
+			return err
+		}
+		s.Logger.InfoContext(ctx, "export_completed", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("parts", len(result.GetParts())))
+		return nil
 	})
 }
 
-// partKey is the R2 object key of one exported part.
-func partKey(orgID, snapshotID string, part int32) string {
-	return fmt.Sprintf("%sparts/%d", snapshotPrefix(orgID, snapshotID), part)
+// failExportTx sets the EXPORTING snapshot snapshotID to EXPORT_FAILED and
+// records a clean-up job for the objects that the attempt attemptID may have
+// uploaded (the legacy part prefix when attemptID is empty). The caller holds
+// the snapshot row with FOR UPDATE, so the job's final_sweep_after is
+// computed after the last upload URL of the attempt was signed: the attempt
+// can sign no more URL once the row is not EXPORTING. The failed attempt's
+// objects never outlive the sweep, and a retry writes to the prefix of its
+// own attempt.
+func (s *Service) failExportTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID, attemptID, reason string) error {
+	if _, err := tx.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", snapshotID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)); err != nil {
+		return err
+	}
+	if err := s.startCleanupJobTx(ctx, tx, orgID, attemptPrefix(orgID, snapshotID, attemptID)); err != nil {
+		return err
+	}
+	s.Logger.WarnContext(ctx, "export_failed", slog.String("snapshot_id", snapshotID), slog.String("command_id", attemptID), slog.String("reason", reason))
+	return nil
+}
+
+// attemptPrefix is the R2 key prefix of the objects of one export attempt.
+// An empty attemptID selects the prefix of the legacy keys that exports
+// wrote before attempt IDs existed.
+func attemptPrefix(orgID, snapshotID, attemptID string) string {
+	if attemptID == "" {
+		return snapshotPrefix(orgID, snapshotID) + "parts/"
+	}
+	return snapshotPrefix(orgID, snapshotID) + "attempts/" + attemptID + "/"
+}
+
+// partKey is the R2 object key of one exported part of the attempt
+// attemptID. An empty attemptID selects the legacy key of an export that
+// started before attempt IDs existed, which stays downloadable.
+func partKey(orgID, snapshotID, attemptID string, part int32) string {
+	return fmt.Sprintf("%s%d", attemptPrefix(orgID, snapshotID, attemptID), part)
 }
 
 // handleSignedURLRequest issues fresh part URLs to the agent that runs an
-// export (UPLOAD, the device that holds the snapshot while it is EXPORTING)
+// export (UPLOAD, the channel that owns the export attempt of the snapshot
+// while it is EXPORTING; the URLs address the objects of that attempt only)
 // or an import (DOWNLOAD, the channel to which the server assigned the
 // import command of the snapshot, on a device of the organization with the
 // same OS and architecture while the snapshot is EXPORTED, for as long as
@@ -251,8 +315,12 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 		var presign func(string, time.Duration) (string, time.Time, error)
 		switch r.GetOperation() {
 		case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_UPLOAD:
-			if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || sn.pb.GetDeviceId() != conn.DeviceID {
-				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not being exported by this device")
+			// The owner is the channel that received the command of the
+			// attempt: a channel that replaced it, or an export without an
+			// owner (started before owners were recorded), gets no URL.
+			if sn.pb.GetExportState() != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING || sn.pb.GetDeviceId() != conn.DeviceID ||
+				sn.exportChannelID == "" || sn.exportChannelID != conn.ID {
+				return refuse(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "the snapshot is not being exported by this channel")
 			}
 			presign = s.Objects.PresignPut
 		case ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD:
@@ -275,7 +343,9 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 			if n < 1 || n > maxSnapshotParts {
 				return refuse(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "invalid part number")
 			}
-			u, exp, err := presign(partKey(conn.OrganizationID, sn.pb.GetSnapshotId(), n), signedURLLifetime)
+			// Uploads use the current attempt; downloads use the successful
+			// attempt, which the row keeps (empty for a legacy export).
+			u, exp, err := presign(partKey(conn.OrganizationID, sn.pb.GetSnapshotId(), sn.exportCommandID, n), signedURLLifetime)
 			if err != nil {
 				return refuse(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "signing failed")
 			}
@@ -290,7 +360,7 @@ func (s *Service) handleSignedURLRequest(ctx context.Context, conn *hub.Conn, r 
 	if denied != nil {
 		// The reason is a fixed message; no URL or credential is logged.
 		s.Logger.WarnContext(ctx, "signed_url_denied", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", r.GetSnapshotId()),
-			slog.String("operation", r.GetOperation().String()), slog.String("reason", denied.GetMessage()))
+			slog.String("channel_id", conn.ID), slog.String("operation", r.GetOperation().String()), slog.String("reason", denied.GetMessage()))
 		return deny(denied.GetCode(), denied.GetMessage())
 	}
 	s.Logger.InfoContext(ctx, "signed_urls_issued", slog.String("device_id", conn.DeviceID), slog.String("snapshot_id", grant.GetSnapshotId()),
@@ -408,6 +478,9 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 	var sn *snapshotRow
 	var conn *hub.Conn
 	start := false
+	// Every attempt has its own command ID, which the row stores with the
+	// ID of the channel that receives the command.
+	commandID := newID()
 	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		var err error
 		sn, err = loadSnapshot(ctx, tx, orgID, req.Msg.GetSnapshotId(), true)
@@ -415,8 +488,27 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			return err
 		}
 		switch sn.pb.GetExportState() {
-		case ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED:
+		case ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED:
 			return nil
+		case ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING:
+			// A healthy export runs on the live channel that owns it, and a
+			// repeat call dispatches nothing. Without a live channel the
+			// owner cannot be judged and the export stays as it is. A live
+			// channel that is not the owner means the export lost its owner
+			// without the state report of the new channel having failed it
+			// (the channel was replaced while the claim committed): fail the
+			// attempt and start a new one.
+			live := h.Hub.Live(sn.pb.GetDeviceId())
+			if live == nil || (sn.exportChannelID != "" && live.ID == sn.exportChannelID) {
+				return nil
+			}
+			reason := "owner_channel_replaced"
+			if sn.exportChannelID == "" {
+				reason = "owner_unknown"
+			}
+			if err := h.failExportTx(ctx, tx, orgID, sn.pb.GetSnapshotId(), sn.exportCommandID, reason); err != nil {
+				return err
+			}
 		}
 		if sn.pb.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 			return errPrecondition("only a ready snapshot can be exported")
@@ -428,8 +520,9 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 		if conn == nil {
 			return errUnavailable("the snapshot's device has no live agent channel")
 		}
-		sn, err = scanSnapshot(tx.QueryRow(ctx, "UPDATE snapshots SET export_state = $2, export_part_size_bytes = $3 WHERE snapshot_id = $1 RETURNING "+snapshotColumns,
-			sn.pb.GetSnapshotId(), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING), h.SnapshotPartSizeBytes))
+		sn, err = scanSnapshot(tx.QueryRow(ctx, `UPDATE snapshots SET export_state = $2, export_part_size_bytes = $3, export_command_id = $4, export_channel_id = $5
+			WHERE snapshot_id = $1 RETURNING `+snapshotColumns,
+			sn.pb.GetSnapshotId(), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING), h.SnapshotPartSizeBytes, commandID, conn.ID))
 		start = err == nil
 		return err
 	})
@@ -437,11 +530,17 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 		return nil, h.internal(ctx, "export snapshot", err)
 	}
 	if start {
+		h.Logger.InfoContext(ctx, "export_started", slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID), slog.String("channel_id", conn.ID))
 		if _, err := h.sendCommand(ctx, conn, commandInfo{kind: cmdExportSnapshot, orgID: orgID, snapshotID: sn.pb.GetSnapshotId()},
-			&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{
+			&ownsandv1.AgentCommand{CommandId: commandID, Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{
 				SnapshotId: sn.pb.GetSnapshotId(), PartSizeBytes: h.SnapshotPartSizeBytes,
 			}}}); err != nil {
-			_, _ = h.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_state = $2 WHERE snapshot_id = $1", sn.pb.GetSnapshotId(), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED))
+			// The attempt fails only while the row still names it: a
+			// concurrent retry owns the row by now and keeps its state.
+			tag, execErr := h.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
+				sn.pb.GetSnapshotId(), commandID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING))
+			h.Logger.WarnContext(ctx, "export_failed", slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID),
+				slog.String("channel_id", conn.ID), slog.String("reason", "send_failed"), slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0))
 			return nil, errUnavailable("the agent channel closed")
 		}
 	}
