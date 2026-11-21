@@ -53,6 +53,7 @@ const expectedPassThroughEnv = {
     "PADDLE_WEBHOOK_SECRET",
     "RESEND_API_KEY",
     "RUN_MIGRATIONS",
+    "USAGE_SERVICE_CLIENTS",
     "WEB_ORIGIN",
   ],
   "delino-accounts#dev": ["PORTLESS", "PORTLESS_*", "PUBLIC_API_ORIGIN"],
