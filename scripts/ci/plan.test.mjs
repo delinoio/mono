@@ -1083,13 +1083,18 @@ function workflowJobs() {
   return jobs;
 }
 
+// The table value of a job that runs for every event without the planner.
+const ALWAYS_RUN = "always";
+
 // The planner output that selects each validation job, as the `job_outputs`
 // table of `ci-result` records it.
 const expectedJobOutputs = {
   quality: "quality",
   go: "go",
   protos: "go",
-  rust: "rust",
+  "rust-fmt": ALWAYS_RUN,
+  "rust-clippy": "rust",
+  "rust-test": "rust",
   e2e: "e2e",
   workspace: "workspace",
   workflows: "workflows",
@@ -1115,16 +1120,25 @@ test("CI workflow aggregates every validation job by the planner output that sel
   const table = ciResultTable(jobs);
   assert.deepEqual(table, expectedJobOutputs);
   assert.deepEqual(Object.keys(table).sort(), [...validationJobs].sort());
-  const needs = /^ {4}needs: \[([a-z0-9, -]+)\]$/m.exec(ciResult);
+  const needs = /^ {4}needs:\s*\[([a-z0-9,\s-]+)\]/m.exec(ciResult);
   assert.ok(needs, "ci-result has no needs list");
-  assert.deepEqual(needs[1].split(", "), ["changes", ...validationJobs]);
+  assert.deepEqual(needs[1].split(/[\s,]+/).filter(Boolean), [
+    "changes",
+    ...validationJobs,
+  ]);
   assert.match(ciResult, /^ {4}if: always\(\)$/m);
   for (const [id, job] of jobs) {
     assert.match(job, /^ {4}timeout-minutes: \d+$/m, id);
   }
+  // The planner must never publish the marker as an output name.
+  assert.doesNotMatch(changes, new RegExp(`^ {6}${ALWAYS_RUN}:`, "m"));
   for (const id of validationJobs) {
     const output = table[id];
     const job = jobs.get(id);
+    if (output === ALWAYS_RUN) {
+      assert.doesNotMatch(job, /^ {4}(needs|if):/m, id);
+      continue;
+    }
     assert.match(job, /^ {4}needs: changes$/m, id);
     assert.match(
       job,
@@ -1172,6 +1186,8 @@ test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
   }
   const jobs = workflowJobs();
   const table = ciResultTable(jobs);
+  // Planner outputs, plus the marker as an output: a skipped job that runs
+  // without the planner must fail even if the planner published the marker.
   const outputs = [...new Set(Object.values(table))];
   const needsOf = (results, planned, changes = "success") => ({
     changes: { result: changes, outputs: planned },
@@ -1192,17 +1208,30 @@ test("CI aggregate passes only successful or unselected skipped jobs", (t) => {
   );
   assert.equal(ciResultPasses(jobs, needsOf(allSucceeded, allSelected)), true);
   for (const [id, output] of Object.entries(table)) {
-    assert.equal(
-      ciResultPasses(
-        jobs,
-        needsOf(
-          { ...allSucceeded, [id]: "skipped" },
-          { ...allSelected, [output]: "false" },
+    if (output === ALWAYS_RUN) {
+      // A job that runs without the planner must succeed even when the
+      // planner selects nothing.
+      assert.equal(
+        ciResultPasses(
+          jobs,
+          needsOf({ ...allSucceeded, [id]: "skipped" }, noneSelected),
         ),
-      ),
-      true,
-      `${id} skipped without selection`,
-    );
+        false,
+        `${id} skipped`,
+      );
+    } else {
+      assert.equal(
+        ciResultPasses(
+          jobs,
+          needsOf(
+            { ...allSucceeded, [id]: "skipped" },
+            { ...allSelected, [output]: "false" },
+          ),
+        ),
+        true,
+        `${id} skipped without selection`,
+      );
+    }
     for (const result of ["skipped", "failure", "cancelled"]) {
       assert.equal(
         ciResultPasses(
@@ -1286,20 +1315,27 @@ test("Rust changes select rust for every event and keep the diff reason", (t) =>
   }
 });
 
-// Read-only text check: the Rust job runs the lint and test checks as
-// parallel matrix entries with separate caches, and together they still run
-// every Rust command.
-test("CI workflow runs the Rust lint and test checks in parallel", () => {
-  const rustJob = workflowJobs().get("rust");
-  assert.match(rustJob, /^\s+fail-fast: false$/m);
-  assert.match(rustJob, /^\s+check: \[lint, test\]$/m);
-  assert.match(rustJob, /^\s+key: \$\{\{ matrix\.check \}\}$/m);
-  assert.match(rustJob, /^\s+cargo fmt --all --check$/m);
+// Read-only text check: each Rust check runs in its own job. The formatting
+// job installs only rustfmt and no build packages; the clippy and test jobs
+// build the workspace with the Rust cache.
+test("CI workflow runs each Rust check in its own job", () => {
+  const jobs = workflowJobs();
+  const fmtJob = jobs.get("rust-fmt");
+  assert.match(fmtJob, /^\s+run: cargo fmt --all --check$/m);
+  assert.match(fmtJob, /--profile minimal --component rustfmt$/m);
+  assert.doesNotMatch(fmtJob, /libgtk-4-dev|rust-cache|cargo (clippy|test)/);
+  const clippyJob = jobs.get("rust-clippy");
   assert.match(
-    rustJob,
-    /^\s+cargo clippy --workspace --all-targets --locked -- -D warnings$/m,
+    clippyJob,
+    /^\s+run: cargo clippy --workspace --all-targets --locked -- -D warnings$/m,
   );
-  assert.match(rustJob, /^\s+cargo test --workspace --locked$/m);
+  const testJob = jobs.get("rust-test");
+  assert.match(testJob, /^\s+run: cargo test --workspace --locked$/m);
+  for (const job of [clippyJob, testJob]) {
+    assert.match(job, /libgtk-4-dev/);
+    assert.match(job, /Swatinem\/rust-cache@[0-9a-f]{40}/);
+    assert.match(job, /CEF_PATH=\$HOME\/\.cache\/cef/);
+  }
 });
 
 // Read-only text check: the fixtures step runs only when the planner selects

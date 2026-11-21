@@ -261,18 +261,44 @@ jobs:
             echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; scripts/protos.sh check (buf lint, buf format and the Go and TypeScript binding drift check); scripts/protos.sh breaking <base>'
             echo "Result: $RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
-  rust:
+  rust-fmt:
+    name: Rust formatting
+    # Formatting checks every tracked Rust file, builds nothing and takes
+    # seconds, so this job does not wait for the planner. It runs for every
+    # event, and ci-result requires it to succeed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+          rustc --version
+          cargo --version
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          VALIDATION_REVISION: ${{ github.sha }}
+        run: |
+          {
+            echo "Validation revision: $VALIDATION_REVISION"
+            echo 'Commands in the root Cargo workspace: cargo fmt --all --check'
+            echo "Result: $RESULT"
+          } >> "$GITHUB_STEP_SUMMARY"
+  rust-clippy:
+    name: Rust clippy
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    strategy:
-      # The lint and test checks build the workspace separately on their own
-      # runners, so they run in parallel instead of one after the other.
-      # A failed check does not cancel the other, so one run reports both.
-      fail-fast: false
-      matrix:
-        check: [lint, test]
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -288,7 +314,7 @@ jobs:
         run: |
           set -euo pipefail
           toolchain="$(tr -d '[:space:]' < rust-toolchain)"
-          rustup toolchain install "$toolchain" --profile minimal --component rustfmt,clippy
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
           rustc --version
           cargo --version
           # The `cef-dll-sys` build script downloads the CEF distribution into
@@ -299,49 +325,75 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-directories: ~/.cache/cef
-          # Clippy and the test build write different `target/` content, so
-          # each check keeps its own cache entry.
-          key: ${{ matrix.check }}
+          # The cache key includes the job ID, so the clippy and test jobs,
+          # which write different `target/` content, keep separate entries.
           # Only main pushes save the cache. Pull requests restore the main
           # cache and do not use the repository cache quota for their builds.
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check Rust workspace
-        id: check
-        shell: bash
-        env:
-          CHECK: ${{ matrix.check }}
-        run: |
-          set -euo pipefail
-          case "$CHECK" in
-            lint)
-              commands='cargo fmt --all --check; cargo clippy --workspace --all-targets --locked -- -D warnings'
-              echo "commands=$commands" >> "$GITHUB_OUTPUT"
-              cargo fmt --all --check
-              cargo clippy --workspace --all-targets --locked -- -D warnings
-              ;;
-            test)
-              commands='cargo test --workspace --locked'
-              echo "commands=$commands" >> "$GITHUB_OUTPUT"
-              cargo test --workspace --locked
-              ;;
-            *)
-              echo "::error::Unknown Rust check: $CHECK"
-              exit 1
-              ;;
-          esac
+      - name: Lint Rust workspace with clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Record validation result
         if: always()
         env:
           RESULT: ${{ job.status }}
-          CHECK: ${{ matrix.check }}
-          COMMANDS: ${{ steps.check.outputs.commands }}
           COMPARISON_BASE: ${{ needs.changes.outputs.base }}
           COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
         run: |
           {
             echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
-            echo "Rust check: $CHECK"
-            echo "Commands in the root Cargo workspace: ${COMMANDS:-not started}"
+            echo 'Commands in the root Cargo workspace: cargo clippy --workspace --all-targets --locked -- -D warnings'
+            echo "Result: $RESULT"
+            echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  rust-test:
+    name: Rust tests
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Linux build packages
+        # Tauri and `tauri-runtime-cef` link GTK 4 on Linux. The `cef` crate
+        # build script downloads the CEF distribution itself.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libgtk-4-dev
+      - name: Install Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal
+          rustc --version
+          cargo --version
+          # The `cef-dll-sys` build script downloads the CEF distribution into
+          # `$CEF_PATH/<version>` when that directory is missing, and reuses it
+          # otherwise. Keep it outside `target/` so the Rust cache stores it.
+          echo "CEF_PATH=$HOME/.cache/cef" >> "$GITHUB_ENV"
+      - name: Restore Rust and CEF cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-directories: ~/.cache/cef
+          # The cache key includes the job ID, so the clippy and test jobs,
+          # which write different `target/` content, keep separate entries.
+          # Only main pushes save the cache. Pull requests restore the main
+          # cache and do not use the repository cache quota for their builds.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands in the root Cargo workspace: cargo test --workspace --locked'
             echo "Result: $RESULT"
             echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -520,7 +572,19 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
   ci-result:
     if: always()
-    needs: [changes, quality, go, protos, rust, e2e, workspace, workflows]
+    needs:
+      [
+        changes,
+        quality,
+        go,
+        protos,
+        rust-fmt,
+        rust-clippy,
+        rust-test,
+        e2e,
+        workspace,
+        workflows,
+      ]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -535,12 +599,15 @@ jobs:
           # one entry for each job in `needs` other than `changes`: the check
           # fails when the two job lists differ, so a new job cannot pass
           # without an entry. A skipped job passes only when the planner did
-          # not select its output.
+          # not select its output. `always` marks a job that runs without the
+          # planner; that job must succeed.
           job_outputs='{
             "quality": "quality",
             "go": "go",
             "protos": "go",
-            "rust": "rust",
+            "rust-fmt": "always",
+            "rust-clippy": "rust",
+            "rust-test": "rust",
             "e2e": "e2e",
             "workspace": "workspace",
             "workflows": "workflows"
@@ -554,7 +621,9 @@ jobs:
               | del(.changes)
               | to_entries
               | all(.value.result == "success"
-                or (.value.result == "skipped" and $planned[$outputs[.key]] == "false")))
+                or (.value.result == "skipped"
+                  and $outputs[.key] != "always"
+                  and $planned[$outputs[.key]] == "false")))
           ' > /dev/null; then
             echo 'CI result: success' | tee -a "$GITHUB_STEP_SUMMARY"
           else
