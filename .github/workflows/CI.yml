@@ -323,6 +323,181 @@ jobs:
             echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; scripts/protos.sh check (buf lint, buf format and the Go and TypeScript binding drift check); scripts/protos.sh breaking <base>'
             echo "Result: $RESULT"
           } >> "$GITHUB_STEP_SUMMARY"
+  go-platforms:
+    name: Go on ${{ matrix.platform }}
+    # The device agent, the guest helper and the CLI have macOS and Windows
+    # code (build tags and `_darwin`/`_windows` files), and the macOS
+    # Virtualization.framework runtime builds only with cgo on a macOS host.
+    # The Linux go-vet and go-test jobs do not compile or run that code.
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    strategy:
+      # Report the failures of every platform in one run.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            runner: macos-latest
+          - platform: Windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Keep the repository line endings in the Windows checkout
+        # Git for Windows on the runner image sets `core.autocrlf=true`, which
+        # would check out CRLF files that the repository and the Linux jobs
+        # never contain. The repository has no `.gitattributes`.
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          # Caches the Go module and build caches. The setup-go key includes
+          # the runner OS and architecture, so these entries never share a key
+          # with the Linux go-test job.
+          cache: true
+      - name: Vet Go module
+        run: go vet ./...
+      - name: Vet the other build configurations of the host OS
+        shell: bash
+        run: |
+          set -euo pipefail
+          other_arch=amd64
+          if [[ "$(go env GOARCH)" == amd64 ]]; then
+            other_arch=arm64
+          fi
+          case "$RUNNER_OS" in
+            macOS)
+              # The Virtualization.framework runtime has a cgo file for each
+              # architecture and a fallback for builds without cgo.
+              GOARCH="$other_arch" CGO_ENABLED=1 go vet ./...
+              CGO_ENABLED=0 go vet ./...
+              ;;
+            Windows)
+              GOARCH="$other_arch" go vet ./...
+              ;;
+            *)
+              echo "::error::Unexpected runner OS $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          echo "Other architecture vetted: $other_arch" >> "$GITHUB_STEP_SUMMARY"
+      - name: Test Go module
+        # No Postgres service: Docker service containers run only on Linux
+        # runners. The Postgres-backed ownsand-api tests and the OwnSand
+        # end-to-end suite skip without OWNSAND_TEST_DATABASE_URL and
+        # OWNSAND_E2E; the go-test job runs them on Linux. The hypervisor
+        # integration tests skip without their image variables.
+        #
+        # Workaround: the packages in `known_failures` have tests that fail on
+        # this platform today because of the causes in the comments below.
+        # The blocking run leaves them out so that every other package blocks
+        # CI. A second, non-blocking run still tests them and reports each one
+        # that passes. Remove a package from the list in the change that fixes
+        # its failures on this platform; remove the list when it is empty. The
+        # run fails when a listed package no longer exists.
+        shell: bash
+        run: |
+          set -euo pipefail
+          module=github.com/delinoio/mono
+          case "$RUNNER_OS" in
+            macOS)
+              known_failures=(
+                # The process test runtime runs only guests of the host OS,
+                # but the tests create Linux guests, and the guest helper
+                # socket paths under the macOS TMPDIR exceed the 104-byte unix
+                # socket path limit, so every sandbox create fails.
+                cmds/ownsand-agent
+                cmds/ownsand-agent/internal/agent
+                cmds/ownsand-agent/internal/dataplane
+                cmds/ownsand-agent/internal/ops
+                # The exec test compares the working directory with the
+                # TMPDIR path, which macOS reports as `/private/var/...`.
+                cmds/ownsand-guest/guest
+              )
+              ;;
+            Windows)
+              known_failures=(
+                # The dangling-symlink and long-destination-name file read
+                # tests expect Linux errors.
+                cmds/ownsand/internal/cli
+                # The read snapshot does not abort when the path is swapped
+                # before open.
+                cmds/ownsand-guest/guest
+                # The peer-to-peer data channel never opens, so the
+                # peer-to-peer tests time out.
+                go/ownsand
+                # The tar escape checks accept links such as `/etc/passwd`,
+                # which are not absolute paths on Windows.
+                internal/fsutil
+                # The HTTP observer receives no response for a request that
+                # starts with CRLF after a POST.
+                servers/accounts-api/internal/server
+                # The relay test that blocks socket writes ends with
+                # `context canceled` before the idle timeout.
+                servers/ownsand-api/internal/api
+              )
+              ;;
+            *)
+              echo "::error::Unexpected runner OS $RUNNER_OS"
+              exit 1
+              ;;
+          esac
+          # macOS runners run bash 3.2, which has no `mapfile`. The command
+          # substitution keeps a `go list` failure fatal under `set -e`.
+          package_list="$(go list ./...)"
+          all_packages=()
+          while IFS= read -r package; do
+            all_packages+=("$package")
+          done <<< "$package_list"
+          skipped=()
+          for package in "${known_failures[@]}"; do
+            if [[ ! " ${all_packages[*]} " == *" $module/$package "* ]]; then
+              echo "::error::Known failing package $module/$package does not exist; remove it from the list"
+              exit 1
+            fi
+            skipped+=("$module/$package")
+          done
+          tested=()
+          for package in "${all_packages[@]}"; do
+            if [[ ! " ${skipped[*]} " == *" $package "* ]]; then
+              tested+=("$package")
+            fi
+          done
+          {
+            echo "Packages left out of the blocking run: ${#skipped[@]}"
+            printf -- '- %s\n' "${skipped[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          status=0
+          go test -count=1 "${tested[@]}" || status=$?
+          echo "::group::Known failing packages (non-blocking)"
+          for package in "${skipped[@]}"; do
+            if go test -count=1 "$package"; then
+              echo "::notice::$package passes on $RUNNER_OS; remove it from the known failures"
+              echo "Known failing package passed: $package" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done
+          echo "::endgroup::"
+          exit "$status"
+      - name: Record validation result
+        if: always()
+        shell: bash
+        env:
+          RESULT: ${{ job.status }}
+          PLATFORM: ${{ matrix.platform }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo "Platform: $PLATFORM ($(go env GOOS)/$(go env GOARCH))"
+            echo 'Commands in the root Go module: go vet ./...; go vet ./... for the other architecture (macOS: with and without cgo); go test -count=1 for every package except the known failing packages listed above, without Postgres, then a non-blocking go test of each known failing package'
+            echo "Result: $RESULT"
+            echo 'Scope: compile, vet and unit tests on the hosted runner. Postgres-backed tests, the OwnSand end-to-end suite, Virtualization.framework and Hyper-V VM boots, code signing and device acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
   rust-fmt:
     name: Rust formatting
     # Formatting checks every tracked Rust file, builds nothing and takes
@@ -458,6 +633,84 @@ jobs:
             echo 'Commands in the root Cargo workspace: cargo test --workspace --locked'
             echo "Result: $RESULT"
             echo 'Scope: Linux desktop target only. Tauri bundles, macOS, Windows, Android, iOS, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
+  rust-platforms:
+    name: Rust on ${{ matrix.platform }}
+    # The delidev desktop app links CEF on macOS and Windows differently from
+    # Linux (a framework on macOS, import libraries and runtime DLLs on
+    # Windows), so the Linux rust-clippy and rust-test jobs do not cover them.
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    strategy:
+      # Report the failures of every platform in one run.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macOS
+            runner: macos-latest
+          - platform: Windows
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    steps:
+      - name: Keep the repository line endings in the Windows checkout
+        # Git for Windows on the runner image sets `core.autocrlf=true`; Tauri
+        # compiles the checked-out configuration and capabilities into the
+        # binary, so keep the bytes that the Linux jobs build.
+        if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install Rust toolchain
+        # The macOS and Windows runner images include CMake and Ninja, which
+        # the `cef-dll-sys` build script uses for the CEF C++ wrapper.
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(tr -d '[:space:]' < rust-toolchain)"
+          rustup toolchain install "$toolchain" --profile minimal --component clippy
+          rustc --version
+          cargo --version
+          cmake --version
+          ninja --version
+          # The `cef-dll-sys` build script downloads the CEF distribution into
+          # `$CEF_PATH/<version>` when that directory is missing, and reuses it
+          # otherwise. Keep it outside `target/` so the Rust cache stores it.
+          # The build script is a native Windows program, so pass it a Windows
+          # path instead of the MSYS path of Git Bash.
+          cef_path="$HOME/.cache/cef"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            cef_path="$(cygpath -w "$cef_path")"
+          fi
+          echo "CEF_PATH=$cef_path" >> "$GITHUB_ENV"
+      - name: Restore Rust and CEF cache
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # The job ID is the same for every matrix entry, so add the runner
+          # to the key. Only main pushes save the cache.
+          key: ${{ matrix.runner }}
+          cache-directories: ~/.cache/cef
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Lint Rust workspace with clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Test Rust workspace
+        run: cargo test --workspace --locked
+      - name: Record validation result
+        if: always()
+        shell: bash
+        env:
+          RESULT: ${{ job.status }}
+          PLATFORM: ${{ matrix.platform }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo "Platform: $PLATFORM desktop target"
+            echo 'Commands in the root Cargo workspace: cargo clippy --workspace --all-targets --locked -- -D warnings; cargo test --workspace --locked'
+            echo "Result: $RESULT"
+            echo 'Scope: host desktop target only. Tauri bundles, code signing, notarization, Android, iOS, app launch and release acceptance: not performed.'
           } >> "$GITHUB_STEP_SUMMARY"
   e2e:
     needs: changes
@@ -665,9 +918,11 @@ jobs:
         go-vet,
         go-test,
         protos,
+        go-platforms,
         rust-fmt,
         rust-clippy,
         rust-test,
+        rust-platforms,
         e2e,
         workspace-packages,
         workspace-servers,
@@ -695,9 +950,11 @@ jobs:
             "go-vet": "go",
             "go-test": "go",
             "protos": "go",
+            "go-platforms": "go",
             "rust-fmt": "always",
             "rust-clippy": "rust",
             "rust-test": "rust",
+            "rust-platforms": "rust",
             "e2e": "e2e",
             "workspace-packages": "workspace",
             "workspace-servers": "workspace",

@@ -9,7 +9,7 @@ The device agent has its own commands; the [agent contract](cmds-ownsand-agent-f
 ## Runtime and Language
 
 - Language: Go in the root module. The CLI is built on the [Go SDK](packages-ownsand-sdk-foundation.md).
-- Targets: Linux, macOS and Windows on `amd64` and `arm64`. The CLI is pure Go and builds with `go build ./cmds/ownsand` for every target; CI checks only Linux, and `GOOS=darwin` and `GOOS=windows` `go vet ./cmds/ownsand/...` check that the other targets compile. A release and distribution workflow for the binary does not exist yet; it needs a [workflow contract](repository-workflow-contract.md) change before the first release.
+- Targets: Linux, macOS and Windows on `amd64` and `arm64`. The CLI is pure Go and builds with `go build ./cmds/ownsand` for every target; CI runs `go vet` and `go test` on Linux, macOS and Windows runners, and vets the other architecture of macOS and Windows (see the [workflow contract](repository-workflow-contract.md#validation)). Locally, `GOOS=darwin` and `GOOS=windows` `go vet ./cmds/ownsand/...` check that the other targets compile. A release and distribution workflow for the binary does not exist yet; it needs a [workflow contract](repository-workflow-contract.md) change before the first release.
 
 ## Users and Operators
 
