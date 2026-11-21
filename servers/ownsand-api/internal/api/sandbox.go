@@ -429,11 +429,18 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	}}}
 	wait := s.Hub.Commands.Register(importCmd.CommandId)
 	defer s.Hub.Commands.Cancel(importCmd.CommandId)
+	// The assignment is recorded before the command is sent, so the agent's
+	// first download URL request finds it. It is cleared when the import
+	// ends: on a result, a send failure, the wait timeout or a closed channel
+	// (every return below) and as soon as the result arrives.
+	releaseImport := s.imports.register(conn, sn.GetSnapshotId(), importCmd.CommandId)
+	defer releaseImport()
 	if _, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdImportSnapshot, orgID: info.orgID, snapshotID: sn.GetSnapshotId()}, importCmd); err != nil {
 		return
 	}
 	select {
 	case res := <-wait:
+		releaseImport()
 		if res.GetError() != nil {
 			_ = s.failCreateRejected(context.WithoutCancel(ctx), info.sandboxID)
 			s.watch.fire(info.sandboxID)
