@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -76,12 +77,15 @@ func newWriteManager(now func() time.Time, logger *slog.Logger) *writeManager {
 // The temporary name does not contain the target name, so its length does
 // not depend on the length of the target name (a 255-byte target name must
 // still be writable). When the name equals the target name, a second prefix
-// is used so the staging file never is the target.
+// is used so the staging file never is the target. The comparison folds
+// letter case, because the staging file also is the target on a
+// case-insensitive file system (macOS APFS, Windows NTFS) when the target
+// differs from the name only in letter case.
 func tempPath(target, writeID string) string {
 	dir, base := splitTarget(target)
 	id := boundedWriteID(writeID)
 	name := ".ownsand-" + id + ".tmp"
-	if name == base {
+	if strings.EqualFold(name, base) {
 		name = ".ownsand-stage-" + id + ".tmp"
 	}
 	return siblingPath(dir, name)

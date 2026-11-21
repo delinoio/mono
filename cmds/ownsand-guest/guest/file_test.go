@@ -744,6 +744,24 @@ func TestWriteTempNameNeverEqualsTarget(t *testing.T) {
 	}
 }
 
+// On a case-insensitive file system, a target that differs from the
+// temporary name only in letter case names the same file, so the temporary
+// name must differ from the target name under case folding too.
+func TestWriteTempNameDiffersFromTargetUnderCaseFolding(t *testing.T) {
+	dir := t.TempDir()
+	id := newID(t)
+	for _, base := range []string{
+		".ownsand-" + id + ".tmp",
+		strings.ToUpper(".ownsand-" + id + ".tmp"),
+		".OwnSand-" + id + ".Tmp",
+	} {
+		target := filepath.Join(dir, base)
+		if got := filepath.Base(tempPath(target, id)); strings.EqualFold(got, base) {
+			t.Fatalf("temporary name %q equals target name %q under case folding", got, base)
+		}
+	}
+}
+
 func TestWriteLongWriteIDIsBounded(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "f")
 	long := strings.Repeat("x", 1000)
