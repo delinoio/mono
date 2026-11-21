@@ -17,10 +17,16 @@ import {
   readConsoleConfig,
 } from "./config.ts";
 import {
+  BYTE_SECONDS_PER_GIB_MONTH,
   deviceAllocatedVcpu,
   effectiveVcpuLimit,
+  formatByteCount,
+  formatCount,
   formatDuration,
+  formatGibMonths,
   formatMib,
+  formatUsageCostUsdMicros,
+  formatUsdMicros,
   OVERCOMMIT_PERCENTAGES,
 } from "./format.ts";
 import { deviceLimitsInput, parseLabels, ttlErrors } from "./forms.ts";
@@ -477,5 +483,96 @@ describe("deviceLimitsInput", () => {
     expect(deviceLimitsInput({ ...base, diskGib: null })).toEqual({
       error: "Disk limit is required. Enter 0 to allow none.",
     });
+  });
+});
+
+describe("billing amounts", () => {
+  test("formats balances in USD with 2 decimals, half away from zero", () => {
+    expect(formatUsdMicros(0n)).toBe("$0.00");
+    expect(formatUsdMicros(1n)).toBe("$0.00");
+    expect(formatUsdMicros(4_999n)).toBe("$0.00");
+    expect(formatUsdMicros(5_000n)).toBe("$0.01");
+    expect(formatUsdMicros(9_999n)).toBe("$0.01");
+    expect(formatUsdMicros(10_000n)).toBe("$0.01");
+    expect(formatUsdMicros(14_999n)).toBe("$0.01");
+    expect(formatUsdMicros(15_000n)).toBe("$0.02");
+    expect(formatUsdMicros(1_234_567_890n)).toBe("$1,234.57");
+  });
+
+  test("formats debt with a minus sign and never shows a negative zero", () => {
+    expect(formatUsdMicros(-1_234_567n)).toBe("-$1.23");
+    expect(formatUsdMicros(-5_000n)).toBe("-$0.01");
+    expect(formatUsdMicros(-4_999n)).toBe("$0.00");
+    expect(formatUsdMicros(-1n)).toBe("$0.00");
+  });
+
+  test("keeps amounts beyond 2^53 exact", () => {
+    // 2^53 + 1 micro-USD is not representable as a number.
+    expect(formatUsdMicros(9_007_199_254_740_993n)).toBe("$9,007,199,254.74");
+    expect(formatUsdMicros(9_223_372_036_854_775_807n)).toBe(
+      "$9,223,372,036,854.78",
+    );
+    expect(formatUsdMicros(-9_223_372_036_854_775_808n)).toBe(
+      "-$9,223,372,036,854.78",
+    );
+    expect(formatUsdMicros(9_007_199_254_745_000n)).toBe("$9,007,199,254.75");
+  });
+
+  test("shows usage costs below $0.01 with up to 6 decimals", () => {
+    expect(formatUsageCostUsdMicros(0n)).toBe("$0.00");
+    expect(formatUsageCostUsdMicros(1n)).toBe("$0.000001");
+    expect(formatUsageCostUsdMicros(120n)).toBe("$0.00012");
+    expect(formatUsageCostUsdMicros(5_000n)).toBe("$0.005");
+    expect(formatUsageCostUsdMicros(9_999n)).toBe("$0.009999");
+    expect(formatUsageCostUsdMicros(-5_000n)).toBe("-$0.005");
+  });
+
+  test("shows usage costs of $0.01 and more with 2 decimals", () => {
+    expect(formatUsageCostUsdMicros(10_000n)).toBe("$0.01");
+    expect(formatUsageCostUsdMicros(15_000n)).toBe("$0.02");
+    expect(formatUsageCostUsdMicros(9_007_199_254_740_993n)).toBe(
+      "$9,007,199,254.74",
+    );
+  });
+
+  test("shows R2 storage in GiB-months of 730 hours", () => {
+    expect(BYTE_SECONDS_PER_GIB_MONTH).toBe(2n ** 30n * 2_628_000n);
+    expect(formatGibMonths(0n)).toBe("0.000 GiB-months");
+    expect(formatGibMonths(BYTE_SECONDS_PER_GIB_MONTH)).toBe(
+      "1.000 GiB-months",
+    );
+    // One GiB for 30 days is 720 of 730 hours.
+    expect(formatGibMonths(2n ** 30n * 2_592_000n)).toBe("0.986 GiB-months");
+    // 0.0005 GiB-months rounds half away from zero.
+    expect(formatGibMonths(BYTE_SECONDS_PER_GIB_MONTH / 2_000n)).toBe(
+      "0.001 GiB-months",
+    );
+    expect(formatGibMonths(BYTE_SECONDS_PER_GIB_MONTH / 2_000n - 1n)).toBe(
+      "less than 0.001 GiB-months",
+    );
+    expect(formatGibMonths(1n)).toBe("less than 0.001 GiB-months");
+    expect(formatGibMonths(2n ** 62n)).toBe("1,634.310 GiB-months");
+  });
+
+  test("shows byte counts in binary units", () => {
+    expect(formatByteCount(0n)).toBe("0 B");
+    expect(formatByteCount(1_000n)).toBe("1,000 B");
+    // 1,023 bytes are 0.999 KiB, which shows as 1.00 KiB.
+    expect(formatByteCount(1_023n)).toBe("1.00 KiB");
+    expect(formatByteCount(1_024n)).toBe("1.00 KiB");
+    expect(formatByteCount(1_536n)).toBe("1.50 KiB");
+    // Rounds up into the next unit instead of showing 1024.00 KiB.
+    expect(formatByteCount(1_048_575n)).toBe("1.00 MiB");
+    expect(formatByteCount(13_421_772_800n)).toBe("12.50 GiB");
+    expect(formatByteCount(2n ** 60n)).toBe("1.00 EiB");
+    expect(formatByteCount(9_223_372_036_854_775_807n)).toBe("8.00 EiB");
+  });
+
+  test("shows counts with thousands separators", () => {
+    expect(formatCount(0n)).toBe("0");
+    expect(formatCount(1_234_567n)).toBe("1,234,567");
+    expect(formatCount(9_223_372_036_854_775_807n)).toBe(
+      "9,223,372,036,854,775,807",
+    );
   });
 });
