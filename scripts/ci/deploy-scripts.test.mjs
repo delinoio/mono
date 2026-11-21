@@ -1648,10 +1648,20 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_PS       `docker ps` fails when 1 (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
+// `prepare(deployRoot)` changes the prepared state directory before the run,
+// and `stubs` maps extra command names to stub bodies.
 function runDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
-  { env = {}, old = [], envFile = "LOG_LEVEL=info\n", route, state } = {},
+  {
+    env = {},
+    old = [],
+    envFile = "LOG_LEVEL=info\n",
+    route,
+    state,
+    prepare,
+    stubs = {},
+  } = {},
 ) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
@@ -1687,6 +1697,25 @@ function runDroplet(
 esac`,
   );
   shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
+  for (const [name, body] of Object.entries(stubs)) {
+    shellStub(bin, name, body);
+  }
+  if (prepare !== undefined) {
+    prepare(deployRoot);
+  }
+  try {
+    return runDropletScript(dir, bin, deployRoot, args, env);
+  } finally {
+    // A test can make a directory read-only; make it removable again.
+    try {
+      chmodSync(join(deployRoot, "caddy", "sites"), 0o755);
+    } catch {
+      // The test replaced the directory.
+    }
+  }
+}
+
+function runDropletScript(dir, bin, deployRoot, args, env) {
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
     input: readFileSync(dropletDeploy, "utf8"),
@@ -1832,6 +1861,12 @@ test(
     assert.match(route, /^api\.example\.com \{$/m);
     assert.match(route, /reverse_proxy api:8080 \{/);
     assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+    // The proxy reloads before the old container stops.
+    const index = (prefix) =>
+      result.calls.findIndex((call) => call.startsWith(prefix));
+    assert.ok(index("docker exec") < index("docker stop"));
+    // No pending or backup file is left in the proxy configuration.
+    assert.equal(result.read("caddy/sites/api.caddy.new"), undefined);
   },
 );
 
@@ -1911,6 +1946,7 @@ test(
       call.startsWith("docker rm --force api-"),
     );
     assert.ok(logs >= 0 && logs < removal, "logs are read before removal");
+    assert.match(result.stderr, /route of api was not switched/);
     assert.equal(result.read("caddy/sites/api.caddy"), previous);
     assert.ok(
       result.calls.some((call) => call.startsWith("docker rm --force api-")),
@@ -1931,6 +1967,136 @@ test(
     const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
     assert.equal(first.status, 1);
     assert.equal(first.read("caddy/sites/api.caddy"), undefined);
+  },
+);
+
+// A permission failure needs a non-root user: root ignores directory modes.
+const skipUnlessUnprivileged =
+  skip || (process.getuid?.() === 0 ? "root ignores file permissions" : false);
+
+// The failure asserts of a route write: the deployment fails with a
+// diagnostic of the failing operation, the replacement is removed, the old
+// container keeps serving and the recorded image does not change.
+function assertRouteFailure(result, diagnostic, label = "") {
+  assert.equal(result.status, 1, label + result.stdout + result.stderr);
+  assert.match(result.stderr, diagnostic, label);
+  assert.match(result.stderr, /route of api was not switched/, label);
+  assert.ok(
+    result.calls.some((call) => call.startsWith("docker rm --force api-")),
+    label,
+  );
+  assert.ok(
+    !result.calls.some((call) => call.startsWith("docker stop")),
+    label,
+  );
+  assert.ok(
+    !result.calls.some((call) => call.startsWith("docker exec")),
+    label,
+  );
+  assert.equal(result.read("state/api.current"), previousImage, label);
+}
+
+const previousImage = `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`;
+const previousRoute = "# old route\nold.example.com {\n}\n";
+
+test(
+  "droplet deploy fails and keeps the old route when the route directory cannot be created",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      state: previousImage,
+      // A file in place of the directory makes `mkdir -p` fail.
+      prepare: (deployRoot) => {
+        const sites = join(deployRoot, "caddy", "sites");
+        rmSync(sites, { recursive: true });
+        writeFileSync(sites, "not a directory");
+      },
+    });
+    assertRouteFailure(result, /could not create the route directory/);
+  },
+);
+
+test(
+  "droplet deploy fails and keeps the old route when the route backup fails",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      state: previousImage,
+      route: previousRoute,
+      // A dangling link at the backup path makes `cp` fail.
+      prepare: (deployRoot) =>
+        symlinkSync(
+          join(deployRoot, "missing", "route"),
+          join(deployRoot, "caddy", "sites", "api.caddy.previous"),
+        ),
+    });
+    assertRouteFailure(result, /could not back up the route/);
+    assert.equal(result.read("caddy/sites/api.caddy"), previousRoute);
+  },
+);
+
+test(
+  "droplet deploy fails and keeps the old route when the route file cannot be written",
+  { skip: skipUnlessUnprivileged },
+  (t) => {
+    for (const route of [undefined, previousRoute]) {
+      const label = `route ${JSON.stringify(route)}: `;
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        state: previousImage,
+        route,
+        prepare: (deployRoot) => {
+          const sites = join(deployRoot, "caddy", "sites");
+          if (route !== undefined) {
+            // The backup overwrites this file, which needs no directory
+            // write access, so only the new route file fails.
+            writeFileSync(join(sites, "api.caddy.previous"), "");
+          }
+          chmodSync(sites, 0o555);
+        },
+      });
+      assertRouteFailure(result, /could not write the route file/, label);
+      assert.equal(result.read("caddy/sites/api.caddy"), route, label);
+      assert.equal(result.read("caddy/sites/api.caddy.new"), undefined, label);
+    }
+  },
+);
+
+test(
+  "droplet deploy fails and keeps the old route when the route file cannot be installed",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      state: previousImage,
+      route: previousRoute,
+      // `command -p mv` runs the real `mv` for every other file.
+      stubs: { mv: '[[ "$3" == *.caddy ]] && exit 1; command -p mv "$@"' },
+    });
+    assertRouteFailure(result, /could not install the route file/);
+    assert.equal(result.read("caddy/sites/api.caddy"), previousRoute);
+    assert.equal(result.read("caddy/sites/api.caddy.new"), undefined);
+  },
+);
+
+test(
+  "droplet deploy reports a previous route that cannot be restored",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      state: previousImage,
+      route: previousRoute,
+      env: { STUB_RELOAD: "1" },
+      stubs: { mv: '[[ "$2" == *.previous ]] && exit 1; command -p mv "$@"' },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /did not accept the route/);
+    assert.match(result.stderr, /could not restore the previous route/);
+    assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+    assert.equal(result.read("state/api.current"), previousImage);
   },
 );
 

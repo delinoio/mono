@@ -114,7 +114,7 @@ main() {
 
   if ! write_route "$site" "$service" "$port" "$hostname" "$proxy"; then
     discard_replacement "$new"
-    fail "the reverse proxy did not accept the route of $service; the previous container keeps serving."
+    fail "the route of $service was not switched; the previous container keeps serving."
   fi
 
   local id
@@ -172,7 +172,12 @@ wait_healthy() {
 }
 
 # Writes the reverse proxy route of the service and reloads the proxy when the
-# route changed. Restores the previous route when the proxy rejects it.
+# route changed. Every step reports its own failure and returns 1: the caller
+# runs this function as an `if` condition, where Bash disables `set -e`, so a
+# failed file operation would not stop the function otherwise. The route file
+# changes only by one `mv`, which replaces it atomically, so a failure before
+# the reload leaves the previous route in place. Restores the previous route
+# when the proxy rejects the new one.
 write_route() {
   local site="$1" service="$2" port="$3" hostname="$4" proxy="$5"
   local route
@@ -188,21 +193,42 @@ write_route() {
   if [[ -f "$site" ]] && [[ "$(< "$site")" == "$route" ]]; then
     return 0
   fi
-  local backup=""
+  local dir pending="$site.new" backup=""
+  dir="$(dirname "$site")"
+  if ! mkdir -p "$dir"; then
+    echo "::error::could not create the route directory $dir." >&2
+    return 1
+  fi
   if [[ -f "$site" ]]; then
     backup="$site.previous"
-    cp "$site" "$backup"
+    if ! cp "$site" "$backup"; then
+      echo "::error::could not back up the route $site to $backup." >&2
+      return 1
+    fi
   fi
-  mkdir -p "$(dirname "$site")"
-  printf '%s\n' "$route" > "$site"
+  # The proxy imports only `sites/*.caddy`, so neither the pending file nor
+  # the backup is part of its configuration.
+  if ! printf '%s\n' "$route" > "$pending"; then
+    rm -f "$pending" || true
+    echo "::error::could not write the route file $pending." >&2
+    return 1
+  fi
+  if ! mv -f "$pending" "$site"; then
+    rm -f "$pending" || true
+    echo "::error::could not install the route file $site." >&2
+    return 1
+  fi
   if docker exec "$proxy" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
     echo "Reloaded the reverse proxy with the route https://$hostname -> $service:$port"
     return 0
   fi
+  echo "::error::the reverse proxy did not accept the route of $service." >&2
   if [[ -n "$backup" ]]; then
-    mv "$backup" "$site"
-  else
-    rm -f "$site"
+    if ! mv -f "$backup" "$site"; then
+      echo "::error::could not restore the previous route $site from $backup; restore it by hand." >&2
+    fi
+  elif ! rm -f "$site"; then
+    echo "::error::could not remove the rejected route $site; remove it by hand." >&2
   fi
   return 1
 }
