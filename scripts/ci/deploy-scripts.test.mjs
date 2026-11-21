@@ -1646,6 +1646,7 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_STATUS   `docker inspect` container status (default running).
 //   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
+//   STUB_PS       `docker ps` fails when 1 (default 0).
 function runDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
@@ -1673,7 +1674,8 @@ function runDroplet(
     bin,
     "docker",
     `case "$1" in
-  ps) printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
+  ps) [[ "\${STUB_PS:-0}" == 0 ]] || exit 1
+    printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
   inspect)
     case "$3" in
       *State.Status*) echo "\${STUB_STATUS:-running}" ;;
@@ -1712,6 +1714,77 @@ esac`,
 
 const commands = (calls) =>
   calls.map((call) => call.split(" ").slice(0, 2).join(" "));
+
+test(
+  "droplet deploy fails before docker run when the container list cannot be read",
+  { skip },
+  (t) => {
+    const route = "api.example.com { # existing\n}\n";
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_PS: "1" },
+      route,
+      state: "previous-image\n",
+    });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stderr,
+      /::error::.*could not list the containers of api/,
+    );
+    assert.deepEqual(commands(result.calls), ["docker pull", "docker ps"]);
+    assert.equal(result.read("caddy/sites/api.caddy"), route);
+    assert.equal(result.read("state/api.current"), "previous-image\n");
+    assert.equal(result.read("state/api.previous"), undefined);
+  },
+);
+
+test(
+  "droplet deploy without a route or state writes none when the list fails",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_PS: "1" },
+    });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.equal(result.read("caddy/sites/api.caddy"), undefined);
+    assert.equal(result.read("state/api.current"), undefined);
+    assert.equal(result.read("state/api.previous"), undefined);
+  },
+);
+
+test(
+  "droplet deploy with an empty container list deploys and stops nothing",
+  { skip },
+  (t) => {
+    const result = runDroplet(t);
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const names = commands(result.calls);
+    assert.ok(names.includes("docker run"));
+    assert.ok(!names.includes("docker stop"));
+    assert.ok(!names.includes("docker rm"));
+    assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+    assert.match(
+      result.read("caddy/sites/api.caddy"),
+      /reverse_proxy api:8080/,
+    );
+  },
+);
+
+test(
+  "droplet deploy stops and removes every listed container in order",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, { old: ["old1", "old2"] });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const tail = result.calls.filter((call) => /^docker (stop|rm) /.test(call));
+    assert.equal(tail.length, 4);
+    assert.match(tail[0], /^docker stop .* old1$/);
+    assert.match(tail[1], /^docker rm old1$/);
+    assert.match(tail[2], /^docker stop .* old2$/);
+    assert.match(tail[3], /^docker rm old2$/);
+  },
+);
 
 test(
   "droplet deploy starts, checks, routes and then stops the old container",

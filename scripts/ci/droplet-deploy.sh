@@ -86,8 +86,17 @@ main() {
   echo "Pull $image"
   docker pull --quiet "$image"
 
-  local -a old
-  mapfile -t old < <(docker ps --all --quiet --filter "label=io.delino.service=$service")
+  # Read the old containers into a variable first: a process substitution
+  # would discard the exit status of docker ps, and a failed listing would
+  # look like a first deployment and leave the old containers running.
+  local -a old=()
+  local listing
+  if ! listing="$(docker ps --all --quiet --filter "label=io.delino.service=$service")"; then
+    fail "could not list the containers of $service; no container was started."
+  fi
+  if [[ -n "$listing" ]]; then
+    mapfile -t old <<< "$listing"
+  fi
   local new
   new="$service-$(date -u +%Y%m%d%H%M%S)-${image: -12}"
   echo "Start $new"
