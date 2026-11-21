@@ -624,6 +624,100 @@ func TestRelayLoopFollowsNewChannel(t *testing.T) {
 	}
 }
 
+// A credential request that never returns is canceled when its agent
+// channel closes, so a grant of the next channel gets a fresh credential
+// request and a connection without waiting for the old response.
+func TestRelayCancelsPendingCredentialOnChannelLoss(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	canceled := make(chan struct{})
+	hook := func(ctx context.Context) error {
+		if calls.Add(1) > 1 {
+			return nil
+		}
+		entered <- struct{}{}
+		// The first request returns only when it is canceled.
+		<-ctx.Done()
+		close(canceled)
+		return ctx.Err()
+	}
+	e.beforeAuth.Store(&hook)
+	e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay loop did not request a credential")
+	}
+	// The channel closes first, as in the agent, then the data plane learns
+	// about the loss.
+	e.ch.Close()
+	e.dp.ChannelLost(e.ch)
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pending credential request was not canceled with its channel")
+	}
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	g := e.execGrant(e.execReq("/bin/true"))
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("credential requests = %d, want 2", n)
+	}
+}
+
+// A credential that arrives after its channel closed cannot start a
+// connection, and a new channel without a live grant makes no dial.
+func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	hook := func(context.Context) error {
+		// The old response completes during the teardown and ignores the
+		// cancellation of its request.
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-gate
+		}
+		return nil
+	}
+	e.beforeAuth.Store(&hook)
+	e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay loop did not request a credential")
+	}
+	e.ch.Close()
+	e.dp.ChannelLost(e.ch)
+	close(gate)
+	e.noConn(500 * time.Millisecond)
+	// A new channel without a grant gets no relay dial either.
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	e.noConn(500 * time.Millisecond)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("credential requests = %d, want 1 without a live grant", n)
+	}
+	// A grant of the new channel starts a connection again.
+	g := e.execGrant(e.execReq("/bin/true"))
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+}
+
+// noConn fails when a relay connection opens within d.
+func (e *relayEnv) noConn(d time.Duration) {
+	e.t.Helper()
+	select {
+	case <-e.conns:
+		e.t.Fatal("a relay connection opened without a live grant of the current channel")
+	case <-time.After(d):
+	}
+}
+
 // A relay endpoint that fails every connection at once gets attempts with
 // back-off, not an unthrottled reconnect loop.
 func TestRelayErrorKeepsBackoff(t *testing.T) {
