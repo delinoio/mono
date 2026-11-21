@@ -45,7 +45,7 @@ const (
 // Defaults.
 const (
 	// DefaultAddr is the development port of the control plane (h2c).
-	DefaultAddr = "127.0.0.1:8300"
+	DefaultAddr = "127.0.0.1:18300"
 	// DefaultAudience is the Logto API resource indicator of OwnSand.
 	DefaultAudience = "https://ownsand.api.delino.io"
 	// DefaultCORSOrigin is the production console origin.
@@ -53,7 +53,7 @@ const (
 	// DefaultSTUNURL is the production STUN URL that callers and agents get.
 	DefaultSTUNURL = "stun:ownsand.api.delino.io:3478"
 	// DefaultSTUNAddr is the UDP listen address of the STUN service.
-	DefaultSTUNAddr = "127.0.0.1:3478"
+	DefaultSTUNAddr = "127.0.0.1:13478"
 	// DefaultSTUNRateBytesPerSecond and DefaultSTUNRateBurstBytes are the
 	// response byte budget per source address: about 25 binding responses
 	// per second sustained with a burst of about 100.

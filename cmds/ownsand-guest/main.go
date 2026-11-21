@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Command ownsand-guest is the OwnSand guest helper. It runs inside every
 // sandbox guest, listens on the hypervisor socket and serves the

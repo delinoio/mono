@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: FSL-1.1-ALv2
 #
 # Builds the OwnSand Linux guest kernel in a Docker container: the pinned
 # Linux long-term release with the architecture's defconfig and the

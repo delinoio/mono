@@ -13,7 +13,7 @@
 // instead of failing, so the root `pnpm dev` keeps running the other
 // development servers on machines without a database. When
 // CORS_ORIGINS is unset, it allows the console's development origin
-// http://127.0.0.1:3300 in addition to the production origin. When
+// http://127.0.0.1:13300 in addition to the production origin. When
 // ALLOW_DIRECT_CLIENT_ADDRESS is unset, it sets it to true: the development
 // server is reached directly, so the TCP peer is the client address for rate
 // limits. TRUST_PROXY_CLIENT_ADDRESS=true still takes precedence.
@@ -35,7 +35,7 @@ const signalExitCode = (signal) => 128 + constants.signals[signal];
 // See the accounts-api launcher: the child runs in its own process group on
 // POSIX so a terminal signal reaches it once, through the forward.
 const ownProcessGroup = process.platform !== "win32";
-const DevelopmentConsoleOrigin = "http://127.0.0.1:3300";
+const DevelopmentConsoleOrigin = "http://127.0.0.1:13300";
 const ProductionConsoleOrigin = "https://ownsand.delino.io";
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");

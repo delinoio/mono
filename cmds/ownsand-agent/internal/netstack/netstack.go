@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package netstack is the userspace network stack of the OUTBOUND network
 // mode on macOS and Windows hosts. Each sandbox gets its own stack (the
