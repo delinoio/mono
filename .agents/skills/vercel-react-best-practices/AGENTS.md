@@ -1554,11 +1554,13 @@ const data = localStorage.getItem('userConfig')
 ```typescript
 const VERSION = 'v2'
 
-function saveConfig(config: { theme: string; language: string }) {
+function saveConfig(config: { theme: string; language: string }): boolean {
   try {
     localStorage.setItem(`userConfig:${VERSION}`, JSON.stringify(config))
+    return true
   } catch {
     // Throws in incognito/private browsing, quota exceeded, or disabled
+    return false
   }
 }
 
@@ -1577,8 +1579,10 @@ function migrate() {
     const v1 = localStorage.getItem('userConfig:v1')
     if (v1) {
       const old = JSON.parse(v1)
-      saveConfig({ theme: old.darkMode ? 'dark' : 'light', language: old.lang })
-      localStorage.removeItem('userConfig:v1')
+      // Keep v1 when the v2 write fails so the legacy config is not lost
+      if (saveConfig({ theme: old.darkMode ? 'dark' : 'light', language: old.lang })) {
+        localStorage.removeItem('userConfig:v1')
+      }
     }
   } catch {}
 }
