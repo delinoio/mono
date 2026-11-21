@@ -22,6 +22,7 @@ import (
 	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
+	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
@@ -30,7 +31,9 @@ import (
 
 // Deps are the dependencies of the services.
 type Deps struct {
-	DB        *db.DB
+	DB *db.DB
+	// Billing is the credit, subscription and top-up logic.
+	Billing   *billing.Service
 	Directory directory.Directory
 	Email     email.Sender
 	Logger    *slog.Logger
@@ -44,6 +47,7 @@ type Deps struct {
 // Service is the shared state of the Connect services.
 type Service struct {
 	db        *db.DB
+	billing   *billing.Service
 	directory directory.Directory
 	email     email.Sender
 	logger    *slog.Logger
@@ -58,6 +62,7 @@ func New(deps Deps) *Service {
 	}
 	return &Service{
 		db:        deps.DB,
+		billing:   deps.Billing,
 		directory: deps.Directory,
 		email:     deps.Email,
 		logger:    deps.Logger,
@@ -75,6 +80,7 @@ func (s *Service) Mounts(interceptors ...connect.Interceptor) []server.Mount {
 		mounts = append(mounts, server.Mount{Path: path, Handler: handler})
 	}
 	add(accountsv1connect.NewBillingAccountServiceHandler(&BillingAccountHandler{s}, opts...))
+	add(accountsv1connect.NewCreditServiceHandler(&CreditHandler{s}, opts...))
 	return mounts
 }
 

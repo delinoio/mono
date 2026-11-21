@@ -129,8 +129,9 @@ function stopLauncher(run) {
 // RUN_MIGRATIONS=false, so the unreachable database (port 1 refuses
 // connections) is never contacted: these tests cover the launcher and the
 // process lifecycle, not the billing APIs, which the Go integration tests
-// cover with a real Postgres. Logto, the Logto Management API and Resend are
-// contacted only by RPCs, which these tests do not call.
+// cover with a real Postgres. Logto, the Logto Management API, Resend and
+// Paddle are contacted only by RPCs and by billing work found in the
+// database, which these tests do not reach.
 const serverEnv = Object.freeze({
   DATABASE_URL: "postgres://accounts@127.0.0.1:1/accounts?connect_timeout=1",
   RUN_MIGRATIONS: "false",
@@ -140,6 +141,11 @@ const serverEnv = Object.freeze({
   LOGTO_M2M_CLIENT_SECRET: "launcher-test-secret",
   RESEND_API_KEY: "re_launcher_test",
   EMAIL_FROM: "billing@example.com",
+  PADDLE_ENVIRONMENT: "sandbox",
+  PADDLE_API_KEY: "pdl_launcher_test",
+  PADDLE_WEBHOOK_SECRET: "pdl_ntfset_launcher_test",
+  PADDLE_SUBSCRIPTION_PRICE_ID: "pri_01aaaaaaaaaaaaaaaaaaaaaaaa",
+  PADDLE_TOP_UP_PRODUCT_ID: "pro_01bbbbbbbbbbbbbbbbbbbbbbbb",
 });
 
 function startLauncher(t, { port, env = {}, pathPrefix } = {}) {

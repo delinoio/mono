@@ -18,6 +18,11 @@ var requiredValues = map[string]string{
 	EnvLogtoM2MClientSecret:    "m2m-secret",
 	EnvResendAPIKey:            "re_test",
 	EnvEmailFrom:               "Delino <billing@delino.io>",
+	EnvPaddleEnvironment:       "sandbox",
+	EnvPaddleAPIKey:            "pdl_sdbx_apikey_test",
+	EnvPaddleWebhookSecret:     "pdl_ntfset_test",
+	EnvPaddlePriceID:           "pri_01aaaaaaaaaaaaaaaaaaaaaaaa",
+	EnvPaddleTopUpProductID:    "pro_01bbbbbbbbbbbbbbbbbbbbbbbb",
 }
 
 // lookupFrom returns a lookup over values on top of requiredValues. A value
@@ -432,5 +437,34 @@ func TestMetricsAddr(t *testing.T) {
 		if _, err := Load(lookupFrom(map[string]string{EnvMetricsAddr: value})); err == nil || !strings.Contains(err.Error(), EnvMetricsAddr) {
 			t.Errorf("METRICS_ADDR=%q: err = %v, want an error that names %s", value, err, EnvMetricsAddr)
 		}
+	}
+}
+
+func TestPaddleConfig(t *testing.T) {
+	cfg, err := Load(lookupFrom(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PaddleEnvironment != "sandbox" || cfg.PaddleAPIKey != "pdl_sdbx_apikey_test" || cfg.PaddleWebhookSecret != "pdl_ntfset_test" ||
+		cfg.PaddleSubscriptionPriceID != "pri_01aaaaaaaaaaaaaaaaaaaaaaaa" || cfg.PaddleTopUpProductID != "pro_01bbbbbbbbbbbbbbbbbbbbbbbb" {
+		t.Fatalf("Paddle configuration = %+v", cfg)
+	}
+	if cfg, err := Load(lookupFrom(map[string]string{EnvPaddleEnvironment: "production"})); err != nil || cfg.PaddleEnvironment != "production" {
+		t.Fatalf("production: %v", err)
+	}
+	for name, value := range map[string]string{
+		EnvPaddleEnvironment:    "live",
+		EnvPaddlePriceID:        "pro_01aaaaaaaaaaaaaaaaaaaaaaaa",
+		EnvPaddleTopUpProductID: "pri_01bbbbbbbbbbbbbbbbbbbbbbbb",
+	} {
+		_, err := Load(lookupFrom(map[string]string{name: value}))
+		if err == nil || !strings.Contains(err.Error(), name) || strings.Contains(err.Error(), value) {
+			t.Errorf("%s=%q: err = %v, want an error that names the variable and not the value", name, value, err)
+		}
+	}
+	// The secrets never appear in an error.
+	_, err = Load(lookupFrom(map[string]string{EnvPaddleAPIKey: " "}))
+	if err == nil || err.Error() != EnvPaddleAPIKey+" is required" {
+		t.Fatalf("missing key: %v", err)
 	}
 }

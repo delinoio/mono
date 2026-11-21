@@ -121,10 +121,11 @@ func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountSt
 
 // CreateTopUp runs a manual top-up. authorize runs first in the transaction
 // that records the top-up; it checks the caller's role and locks the billing
-// account. The Paddle charge runs after that transaction commits, so a
-// concurrent retry with the same key finds the recorded top-up and charges
-// nothing again.
-func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key string, amount int64, authorize func(pgx.Tx) error) error {
+// account. created runs in the same transaction when a new top-up is
+// recorded (not for a repeated key). The Paddle charge runs after that
+// transaction commits, so a concurrent retry with the same key finds the
+// recorded top-up and charges nothing again.
+func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key string, amount int64, authorize func(pgx.Tx) error, created func(pgx.Tx, string) error) error {
 	if err := ValidateTopUpAmount(amount); err != nil {
 		return err
 	}
@@ -166,11 +167,16 @@ func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key s
 		}
 		t = topUp{ID: id, BillingAccountID: accountID, Kind: TopUpManual, Amount: amount, Status: TopUpCharging,
 			PaddleSubscriptionID: sub.PaddleSubscriptionID, CreateTime: now}
-		_, err = tx.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, idempotency_key, actor_user_id,
+		if _, err := tx.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, idempotency_key, actor_user_id,
 				amount_usd_micros, status, paddle_subscription_id, create_time, update_time)
 			VALUES ($1, $2, 'manual', $3, $4, $5, 'charging', $6, $7, $7)`,
-			id, accountID, key, actorUserID, amount, sub.PaddleSubscriptionID, now)
-		return err
+			id, accountID, key, actorUserID, amount, sub.PaddleSubscriptionID, now); err != nil {
+			return err
+		}
+		if created != nil {
+			return created(tx, id)
+		}
+		return nil
 	})
 	if err != nil {
 		return err

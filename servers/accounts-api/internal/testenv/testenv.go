@@ -3,11 +3,13 @@
 // Package testenv runs accounts-api in process for integration tests: a
 // fresh Postgres database (skipped without ACCOUNTS_TEST_DATABASE_URL), the
 // production handler from internal/app, a test Logto issuer, the fake Logto
-// directory, the email fake and a controllable clock.
+// directory, the email fake, a fake Paddle API and a controllable clock.
 package testenv
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -23,10 +25,20 @@ import (
 	"github.com/delinoio/mono/servers/accounts-api/internal/app"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth/authtest"
+	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
+	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
+	"github.com/delinoio/mono/servers/accounts-api/internal/paddle/paddletest"
+)
+
+// Paddle configuration of the test server.
+const (
+	PaddleWebhookSecret = "pdl_ntfset_testenv"
+	PaddlePriceID       = "pri_01aaaaaaaaaaaaaaaaaaaaaaaa"
+	PaddleProductID     = "pro_01bbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
 // WebOrigin is the web app origin of invitation links in tests.
@@ -82,6 +94,8 @@ type Env struct {
 	Issuer    *authtest.Issuer
 	Directory *directory.Fake
 	Email     *email.Fake
+	Paddle    *paddletest.Server
+	Billing   *billing.Service
 	Clock     *Clock
 	Logs      *SafeBuffer
 }
@@ -98,11 +112,25 @@ func New(t testing.TB) *Env {
 		Issuer:    authtest.NewIssuer(t),
 		Directory: directory.NewFake(),
 		Email:     email.NewFake(),
+		Paddle:    paddletest.New(t),
 		Clock:     &Clock{now: time.Now().UTC().Truncate(time.Microsecond)},
 		Logs:      logs,
 	}
+	env.Billing = billing.New(billing.Config{
+		DB:                  database,
+		Paddle:              paddle.New(paddle.Config{BaseURL: env.Paddle.URL, APIKey: paddletest.APIKey}),
+		Directory:           env.Directory,
+		Email:               env.Email,
+		Logger:              logger,
+		Now:                 env.Clock.Now,
+		WebhookSecret:       PaddleWebhookSecret,
+		SubscriptionPriceID: PaddlePriceID,
+		TopUpProductID:      PaddleProductID,
+		WebOrigin:           WebOrigin,
+	})
 	handler := app.Handler(app.Options{
-		DB: database,
+		DB:      database,
+		Billing: env.Billing,
 		Validator: auth.NewLogtoValidator(auth.LogtoConfig{
 			Issuer: env.Issuer.URL, Audience: authtest.Audience, Logger: logger,
 		}),
@@ -145,6 +173,51 @@ func (b bearer) WrapStreamingHandler(next connect.StreamingHandlerFunc) connect.
 func (e *Env) Client(token string) accountsv1connect.BillingAccountServiceClient {
 	return accountsv1connect.NewBillingAccountServiceClient(http.DefaultClient, e.URL,
 		connect.WithInterceptors(bearer(token)))
+}
+
+// Credit returns a CreditService client that sends a valid user access
+// token of userID.
+func (e *Env) Credit(userID string) accountsv1connect.CreditServiceClient {
+	e.t.Helper()
+	return accountsv1connect.NewCreditServiceClient(http.DefaultClient, e.URL,
+		connect.WithInterceptors(bearer(e.Issuer.UserToken(e.t, userID))))
+}
+
+var eventSeq struct {
+	sync.Mutex
+	n int
+}
+
+// Webhook posts a signed Paddle event and returns the HTTP status.
+func (e *Env) Webhook(eventType string, data any) int {
+	e.t.Helper()
+	eventSeq.Lock()
+	eventSeq.n++
+	id := fmt.Sprintf("evt_testenv_%d", eventSeq.n)
+	eventSeq.Unlock()
+	now := e.Clock.Now()
+	body := paddletest.Event(id, eventType, now, data)
+	return e.PostWebhook(body, paddle.SignatureHeaderValue(PaddleWebhookSecret, now, body))
+}
+
+// PostWebhook posts body with the signature header (none when empty) and
+// returns the HTTP status.
+func (e *Env) PostWebhook(body []byte, signature string) int {
+	e.t.Helper()
+	req, err := http.NewRequest(http.MethodPost, e.URL+"/webhooks/paddle", bytes.NewReader(body))
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if signature != "" {
+		req.Header.Set(paddle.SignatureHeader, signature)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	return resp.StatusCode
 }
 
 // User registers a Logto user with a primary email and a display name and

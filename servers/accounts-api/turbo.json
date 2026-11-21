@@ -17,7 +17,12 @@
         "WEB_ORIGIN",
         "RESEND_API_KEY",
         "EMAIL_FROM",
-        "METRICS_ADDR"
+        "METRICS_ADDR",
+        "PADDLE_ENVIRONMENT",
+        "PADDLE_API_KEY",
+        "PADDLE_WEBHOOK_SECRET",
+        "PADDLE_SUBSCRIPTION_PRICE_ID",
+        "PADDLE_TOP_UP_PRODUCT_ID"
       ]
     },
     "build": {

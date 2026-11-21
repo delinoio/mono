@@ -9,9 +9,11 @@ import (
 	"log/slog"
 	"net/mail"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 
+	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
 
@@ -31,6 +33,11 @@ const (
 	EnvResendAPIKey            = "RESEND_API_KEY"
 	EnvEmailFrom               = "EMAIL_FROM"
 	EnvMetricsAddr             = "METRICS_ADDR"
+	EnvPaddleEnvironment       = "PADDLE_ENVIRONMENT"
+	EnvPaddleAPIKey            = "PADDLE_API_KEY"
+	EnvPaddleWebhookSecret     = "PADDLE_WEBHOOK_SECRET"
+	EnvPaddlePriceID           = "PADDLE_SUBSCRIPTION_PRICE_ID"
+	EnvPaddleTopUpProductID    = "PADDLE_TOP_UP_PRODUCT_ID"
 )
 
 // DefaultAudience is the Logto API resource indicator of accounts-api.
@@ -96,8 +103,8 @@ func parseLogLevel(value string) (LogLevel, error) {
 }
 
 // Config is the validated server configuration. The fields that hold
-// secrets (DatabaseURL, LogtoM2MClientSecret and ResendAPIKey) must never be
-// logged.
+// secrets (DatabaseURL, LogtoM2MClientSecret, ResendAPIKey, PaddleAPIKey and
+// PaddleWebhookSecret) must never be logged.
 type Config struct {
 	Addr     string
 	LogLevel LogLevel
@@ -135,7 +142,25 @@ type Config struct {
 	// MetricsAddr is the `host:port` of the internal Prometheus listener;
 	// empty turns the listener off.
 	MetricsAddr string
+
+	// PaddleEnvironment selects the Paddle API: sandbox or production.
+	PaddleEnvironment paddle.Environment
+	// PaddleAPIKey is the Paddle API key of that environment. Secret.
+	PaddleAPIKey string
+	// PaddleWebhookSecret is the secret of the Paddle notification
+	// destination. Secret.
+	PaddleWebhookSecret string
+	// PaddleSubscriptionPriceID is the price of the $10/month subscription.
+	PaddleSubscriptionPriceID string
+	// PaddleTopUpProductID is the product of top-up charges.
+	PaddleTopUpProductID string
 }
+
+// Paddle catalog ID formats (https://developer.paddle.com/api-reference/about/paddle-ids).
+var (
+	paddlePriceID   = regexp.MustCompile(`^pri_[a-z0-9]{26}$`)
+	paddleProductID = regexp.MustCompile(`^pro_[a-z0-9]{26}$`)
+)
 
 // Load reads the configuration through lookup, which has the signature of
 // os.LookupEnv. Unset or empty values select the documented defaults, and a
@@ -246,6 +271,33 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			return Config{}, err
 		}
 		cfg.MetricsAddr = value
+	}
+
+	environment, err := required(EnvPaddleEnvironment)
+	if err != nil {
+		return Config{}, err
+	}
+	var ok bool
+	if cfg.PaddleEnvironment, ok = paddle.ParseEnvironment(environment); !ok {
+		return Config{}, fmt.Errorf("%s must be sandbox or production", EnvPaddleEnvironment)
+	}
+	if cfg.PaddleAPIKey, err = required(EnvPaddleAPIKey); err != nil {
+		return Config{}, err
+	}
+	if cfg.PaddleWebhookSecret, err = required(EnvPaddleWebhookSecret); err != nil {
+		return Config{}, err
+	}
+	if cfg.PaddleSubscriptionPriceID, err = required(EnvPaddlePriceID); err != nil {
+		return Config{}, err
+	}
+	if !paddlePriceID.MatchString(cfg.PaddleSubscriptionPriceID) {
+		return Config{}, fmt.Errorf("%s must be a Paddle price ID (pri_...)", EnvPaddlePriceID)
+	}
+	if cfg.PaddleTopUpProductID, err = required(EnvPaddleTopUpProductID); err != nil {
+		return Config{}, err
+	}
+	if !paddleProductID.MatchString(cfg.PaddleTopUpProductID) {
+		return Config{}, fmt.Errorf("%s must be a Paddle product ID (pro_...)", EnvPaddleTopUpProductID)
 	}
 
 	return cfg, nil

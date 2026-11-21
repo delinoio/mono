@@ -16,11 +16,13 @@ import (
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/app"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
+	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
 	"github.com/delinoio/mono/servers/accounts-api/internal/config"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/directory"
 	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
+	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/server"
 )
 
@@ -83,7 +85,7 @@ func run() error {
 	// The metrics exist also without METRICS_ADDR, so the code that records
 	// them never checks whether the listener runs.
 	appMetrics := metrics.New()
-	handler, err := newHandler(cfg, database, logger)
+	handler, billingService, err := newHandler(cfg, database, logger, appMetrics)
 	if err != nil {
 		return err
 	}
@@ -93,11 +95,16 @@ func run() error {
 		return err
 	}
 
-	// The background tasks (the internal metrics listener) run until the
-	// HTTP server has drained, and run waits for them before it returns.
+	// The background tasks (the billing worker and the internal metrics
+	// listener) run until the HTTP server has drained, and run waits for
+	// them before it returns. The worker finishes the run in progress, so a
+	// Paddle call that has started records its result.
 	background, stopBackground := context.WithCancel(context.Background())
 	defer stopBackground()
-	var backgroundErrs []<-chan error
+	backgroundErrs := []<-chan error{runAsync(func() error {
+		billingService.RunWorker(background, billing.DefaultWorkerInterval)
+		return nil
+	})}
 	if cfg.MetricsAddr != "" {
 		metricsListener, err := net.Listen("tcp", cfg.MetricsAddr)
 		if err != nil {
@@ -128,31 +135,46 @@ func runAsync(fn func() error) <-chan error {
 	return errc
 }
 
-// newHandler builds the production handler from the configuration.
-func newHandler(cfg config.Config, database *db.DB, logger *slog.Logger) (http.Handler, error) {
+// newHandler builds the production handler and the billing service, whose
+// worker run starts, from the configuration.
+func newHandler(cfg config.Config, database *db.DB, logger *slog.Logger, appMetrics *metrics.Metrics) (http.Handler, *billing.Service, error) {
 	sender, err := email.NewResend(email.ResendConfig{APIKey: cfg.ResendAPIKey, From: cfg.EmailFrom, Logger: logger})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	dir := directory.NewLogto(directory.LogtoConfig{
+		Endpoint:     cfg.LogtoManagementEndpoint,
+		ClientID:     cfg.LogtoM2MClientID,
+		ClientSecret: cfg.LogtoM2MClientSecret,
+		Logger:       logger,
+	})
+	billingService := billing.New(billing.Config{
+		DB:                  database,
+		Paddle:              paddle.New(paddle.Config{BaseURL: cfg.PaddleEnvironment.BaseURL(), APIKey: cfg.PaddleAPIKey}),
+		Directory:           dir,
+		Email:               sender,
+		Metrics:             appMetrics,
+		Logger:              logger,
+		WebhookSecret:       cfg.PaddleWebhookSecret,
+		SubscriptionPriceID: cfg.PaddleSubscriptionPriceID,
+		TopUpProductID:      cfg.PaddleTopUpProductID,
+		WebOrigin:           cfg.WebOrigin,
+	})
 	return app.Handler(app.Options{
-		DB: database,
+		DB:      database,
+		Billing: billingService,
 		Validator: auth.NewLogtoValidator(auth.LogtoConfig{
 			Issuer:   cfg.LogtoIssuer,
 			Audience: cfg.LogtoAudience,
 			Logger:   logger,
 		}),
-		Directory: directory.NewLogto(directory.LogtoConfig{
-			Endpoint:     cfg.LogtoManagementEndpoint,
-			ClientID:     cfg.LogtoM2MClientID,
-			ClientSecret: cfg.LogtoM2MClientSecret,
-			Logger:       logger,
-		}),
+		Directory:   dir,
 		Email:       sender,
 		Logger:      logger,
 		Audience:    cfg.LogtoAudience,
 		CORSOrigins: cfg.CORSOrigins,
 		WebOrigin:   cfg.WebOrigin,
-	}), nil
+	}), billingService, nil
 }
 
 // shutdownContext returns a context that is cancelled by the first SIGINT or
