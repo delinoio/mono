@@ -50,6 +50,8 @@ type FakeAgent struct {
 	changed   chan struct{}
 	closed    chan struct{}
 	closeErr  error
+	// readGate, when set, holds the read loop before its next receive.
+	readGate chan struct{}
 }
 
 // DefaultLinuxCapabilities reports a Linux host that runs Linux guests.
@@ -154,9 +156,39 @@ func (a *FakeAgent) SendStateReport() {
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: report}})
 }
 
+// StallReads stops the agent from reading its channel after the envelope
+// it receives next, so the server's writes back up in the transport until
+// ResumeReads or Close.
+func (a *FakeAgent) StallReads() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.readGate == nil {
+		a.readGate = make(chan struct{})
+	}
+}
+
+// ResumeReads lets a stalled agent read its channel again.
+func (a *FakeAgent) ResumeReads() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.readGate != nil {
+		close(a.readGate)
+		a.readGate = nil
+	}
+}
+
 func (a *FakeAgent) read() {
 	defer close(a.closed)
 	for {
+		a.mu.Lock()
+		gate := a.readGate
+		a.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-a.ctx.Done():
+			}
+		}
 		resp, err := a.stream.Receive()
 		if err != nil {
 			a.mu.Lock()
