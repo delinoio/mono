@@ -347,11 +347,15 @@ func (l *Lease) Run(ctx context.Context) {
 }
 
 // Release gives the lease up at once, for example when the instance starts
-// to drain.
+// to drain. It ends a local ownership period when there is one (and runs
+// OnLose then), and it always deletes the row of this instance. The row can
+// exist without a confirmed ownership period: an acquisition whose call was
+// canceled or failed after the database committed it never set the local
+// ownership, and its row would otherwise block the replacement until the
+// TTL ends. The delete is scoped to this holder, so the row of another
+// instance stays.
 func (l *Lease) Release() {
-	if !l.lose(reasonReleased) {
-		return
-	}
+	l.lose(reasonReleased)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, err := l.DB.Pool.Exec(ctx, "DELETE FROM instance_leases WHERE lease_name = $1 AND holder = $2", Name, l.InstanceID); err != nil {

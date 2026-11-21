@@ -376,6 +376,68 @@ func TestLeaseReleaseDrain(t *testing.T) {
 	}
 }
 
+// TestLeaseReleaseAfterUncertainAcquisition checks that a drain deletes the
+// row of an acquisition that the database committed but the instance never
+// confirmed (the call failed or was canceled), without OnLose, and that
+// another holder takes the lease at once.
+func TestLeaseReleaseAfterUncertainAcquisition(t *testing.T) {
+	database := dbtest.New(t)
+	clock := newTestClock()
+	var lost atomic.Int32
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
+		OnLose: func() { lost.Add(1) }}
+	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
+	// The renewal commits the row and then reports an error, as a call does
+	// when the connection breaks after the commit.
+	a.renew = func(ctx context.Context) (bool, error) {
+		if _, err := a.TryAcquire(context.Background()); err != nil {
+			return false, err
+		}
+		return false, errors.New("connection reset after commit")
+	}
+	a.renewOnce(context.Background())
+	if a.Held() {
+		t.Fatal("an unconfirmed acquisition set the ownership")
+	}
+	if held, err := b.TryAcquire(context.Background()); err != nil || held {
+		t.Fatalf("the other instance took a valid lease: %v %v", held, err)
+	}
+	a.Release()
+	if lost.Load() != 0 {
+		t.Fatalf("OnLose ran %d times for an unconfirmed acquisition", lost.Load())
+	}
+	if held, err := b.TryAcquire(context.Background()); err != nil || !held {
+		t.Fatalf("the other instance could not take the released lease: %v %v", held, err)
+	}
+}
+
+// TestLeaseReleaseKeepsOtherHolderRow checks that a drain of an instance that
+// does not own the lease leaves the row of the current holder.
+func TestLeaseReleaseKeepsOtherHolderRow(t *testing.T) {
+	database := dbtest.New(t)
+	clock := newTestClock()
+	var lost atomic.Int32
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	a := &Lease{DB: database, InstanceID: "a", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger,
+		OnLose: func() { lost.Add(1) }}
+	b := &Lease{DB: database, InstanceID: "b", Now: clock.Now, DeadlineNow: clock.Now, Logger: logger}
+	if held, err := b.TryAcquire(context.Background()); err != nil || !held {
+		t.Fatalf("b could not acquire: %v %v", held, err)
+	}
+	a.Release()
+	if lost.Load() != 0 {
+		t.Fatalf("OnLose ran %d times for an instance that never held the lease", lost.Load())
+	}
+	if held, err := b.TryAcquire(context.Background()); err != nil || !held {
+		t.Fatalf("the row of the other holder was deleted: %v %v", held, err)
+	}
+	var holder string
+	if err := database.Pool.QueryRow(context.Background(), "SELECT holder FROM instance_leases WHERE lease_name = $1", Name).Scan(&holder); err != nil || holder != "b" {
+		t.Fatalf("row holder %q, error %v", holder, err)
+	}
+}
+
 // newRenewTestLease returns a lease with a test clock, a text log buffer and
 // a renewal stub that returns the result of next.
 func newRenewTestLease(next func() (bool, error)) (*Lease, *testClock, *atomic.Int32, *bytes.Buffer) {
