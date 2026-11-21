@@ -37,6 +37,10 @@ type Generator struct {
 	random  io.Reader
 	lastMs  uint64
 	counter uint16
+	// started records that the generator has issued a value, so that a first
+	// clock reading of 0 ms (the Unix epoch) is not mistaken for "no previous
+	// value" through lastMs alone.
+	started bool
 }
 
 // NewGenerator returns a generator that reads the clock from now and
@@ -80,7 +84,8 @@ func (g *Generator) New() (UUID, error) {
 	}
 	current := uint64(ms)
 	switch {
-	case current > g.lastMs:
+	case !g.started || current > g.lastMs:
+		g.started = true
 		g.lastMs = current
 		// Start the counter in the lower half of its range, so that many
 		// values fit in one millisecond before it overflows.
