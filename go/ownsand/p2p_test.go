@@ -12,6 +12,7 @@ import (
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/pion/webrtc/v4"
 )
 
 // holdSendAt makes the session report a full send buffer from the n-th check
@@ -225,5 +226,77 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 				t.Fatalf("%d sessions opened, want 1", n)
 			}
 		})
+	}
+}
+
+// newDispatchSession returns a session with open streams 1 and 2 for tests
+// that call dispatch directly.
+func newDispatchSession(t *testing.T) (*p2pSession, *p2pStream, *p2pStream) {
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pc.Close() })
+	s := &p2pSession{
+		pc:           pc,
+		streams:      map[uint64]*p2pStream{},
+		done:         make(chan struct{}),
+		queueTimeout: time.Second,
+	}
+	mk := func(id uint64) *p2pStream {
+		st := &p2pStream{s: s, id: id, ch: make(chan *ownsandv1.DataFrame, 4), closed: make(chan struct{}), failed: make(chan struct{})}
+		s.streams[id] = st
+		return st
+	}
+	return s, mk(1), mk(2)
+}
+
+func TestDispatchInvalidSessionEndDoesNotEndSession(t *testing.T) {
+	s, st1, st2 := newDispatchSession(t)
+
+	// A session-end kind without its payload fails only its open stream.
+	s.dispatch(&ownsandv1.DataFrame{StreamId: 1, Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END})
+	select {
+	case <-st1.failed:
+		var inv *errInvalidFrame
+		if !errors.As(st1.failErr, &inv) {
+			t.Fatalf("stream 1 error = %v, want errInvalidFrame", st1.failErr)
+		}
+	default:
+		t.Fatal("stream 1 was not failed")
+	}
+	if s.isDone() {
+		t.Fatal("an invalid session-end frame ended the session")
+	}
+
+	// A session-end kind on stream 0 and on an unopened stream is ignored.
+	s.dispatch(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END})
+	s.dispatch(&ownsandv1.DataFrame{StreamId: 9, Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SESSION_END})
+	if s.isDone() {
+		t.Fatal("an ignored invalid session-end frame ended the session")
+	}
+
+	// Another stream keeps receiving frames.
+	f := datapath.MustNewFrame(2, "", &ownsandv1.ErrorDetail{Message: "x"})
+	s.dispatch(f)
+	select {
+	case got := <-st2.ch:
+		if got != f {
+			t.Fatal("stream 2 received another frame")
+		}
+	default:
+		t.Fatal("stream 2 did not receive its frame")
+	}
+}
+
+func TestDispatchValidSessionEndEndsSession(t *testing.T) {
+	s, _, _ := newDispatchSession(t)
+	s.dispatch(datapath.MustNewFrame(1, "", &ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED}))
+	if !s.isDone() {
+		t.Fatal("a valid session-end frame did not end the session")
+	}
+	var ended *errSessionEnded
+	if !errors.As(s.endErr, &ended) || ended.reason != ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED {
+		t.Fatalf("end error = %v, want errSessionEnded with the reason", s.endErr)
 	}
 }
