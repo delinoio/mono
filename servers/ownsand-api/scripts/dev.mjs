@@ -18,6 +18,9 @@
 // http://ownsand.delino.localhost (the portless URL of the console with the
 // default proxy and with an unprivileged proxy). A proxy on a custom
 // PORTLESS_PORT adds that port to the URL; set CORS_ORIGINS to it there.
+// When ALLOW_DIRECT_CLIENT_ADDRESS is unset, it sets it to true: the development
+// server is reached directly, so the TCP peer is the client address for rate
+// limits. TRUST_PROXY_CLIENT_ADDRESS=true still takes precedence.
 //
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
@@ -93,6 +96,7 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
+  env.ALLOW_DIRECT_CLIENT_ADDRESS ??= "true";
   env.CORS_ORIGINS ??= [
     ProductionConsoleOrigin,
     ...DevelopmentConsoleOrigins,
