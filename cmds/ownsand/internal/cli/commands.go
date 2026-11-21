@@ -438,13 +438,23 @@ func (a *app) memberRemove(ctx context.Context, name string, args []string) erro
 
 // ---- device ----
 
+// allocatedVCPU returns the exact allocated vCPUs. A server that predates
+// vcpu_total_count leaves it unset, and the int32 vcpu_count, which is capped
+// at 2147483647 for a larger total, is then the best value.
+func allocatedVCPU(a *ownsandv1.DeviceAllocation) int64 {
+	if a != nil && a.VcpuTotalCount != nil {
+		return a.GetVcpuTotalCount()
+	}
+	return int64(a.GetVcpuCount())
+}
+
 func deviceRows(ds []*ownsandv1.Device) [][]string {
 	var rows [][]string
 	for _, d := range ds {
 		l := d.GetLimits()
 		rows = append(rows, []string{
 			d.GetDeviceId(), d.GetName(), enumName(d.GetState()), enumName(d.GetHostOs()) + "/" + enumName(d.GetArch()),
-			fmt.Sprintf("%d/%d vCPU %d/%d MiB %d/%d GiB", d.GetAllocation().GetVcpuCount(), d.GetEffectiveVcpuLimitCount(), d.GetAllocation().GetMemoryMib(), l.GetMemoryMib(), d.GetAllocation().GetDiskGib(), l.GetDiskGib()),
+			fmt.Sprintf("%d/%d vCPU %d/%d MiB %d/%d GiB", allocatedVCPU(d.GetAllocation()), d.GetEffectiveVcpuLimitCount(), d.GetAllocation().GetMemoryMib(), l.GetMemoryMib(), d.GetAllocation().GetDiskGib(), l.GetDiskGib()),
 			d.GetAgentVersion(),
 		})
 	}

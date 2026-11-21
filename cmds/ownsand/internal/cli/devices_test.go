@@ -45,3 +45,43 @@ func TestDeviceRowsEffectiveVCPULimit(t *testing.T) {
 		}
 	}
 }
+
+func TestDeviceRowsAllocatedVCPU(t *testing.T) {
+	total := func(n int64) *int64 { return &n }
+	for _, tc := range []struct {
+		name  string
+		alloc *ownsandv1.DeviceAllocation
+		want  string
+	}{
+		{
+			name:  "exact total above the int32 range",
+			alloc: &ownsandv1.DeviceAllocation{VcpuCount: 2147483647, VcpuTotalCount: total(4294967294)},
+			want:  "4294967294/0 vCPU",
+		},
+		{
+			name:  "in-range total",
+			alloc: &ownsandv1.DeviceAllocation{VcpuCount: 3, VcpuTotalCount: total(3)},
+			want:  "3/0 vCPU",
+		},
+		{
+			name:  "present zero total",
+			alloc: &ownsandv1.DeviceAllocation{VcpuTotalCount: total(0)},
+			want:  "0/0 vCPU",
+		},
+		{
+			name:  "older server without the total",
+			alloc: &ownsandv1.DeviceAllocation{VcpuCount: 7},
+			want:  "7/0 vCPU",
+		},
+		{
+			name:  "older server with a capped count",
+			alloc: &ownsandv1.DeviceAllocation{VcpuCount: 2147483647},
+			want:  "2147483647/0 vCPU",
+		},
+	} {
+		rows := deviceRows([]*ownsandv1.Device{{Allocation: tc.alloc}})
+		if len(rows) != 1 || !strings.HasPrefix(rows[0][4], tc.want) {
+			t.Errorf("%s: allocation column = %v, want prefix %q", tc.name, rows, tc.want)
+		}
+	}
+}
