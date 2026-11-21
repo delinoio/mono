@@ -787,6 +787,44 @@ func TestRestartKeepsRecordLiveWhenFileRemovalFails(t *testing.T) {
 	}
 }
 
+// TestRestartPendingCleanupRejectsVMOperations checks that a live record kept
+// for a cleanup retry has no VM, so pause, resume and snapshot are rejected
+// instead of passing a nil VM to the runtime.
+func TestRestartPendingCleanupRejectsVMOperations(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	running := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	paused := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: paused}); err != nil {
+		t.Fatal(err)
+	}
+	e.rt = newFakeRuntime()
+	e.rt.files[running], e.rt.files[paused] = true, true
+	e.rt.deleteFails = 2
+	e.restart()
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: running}); err == nil {
+		t.Fatal("pause accepted while the restart cleanup is pending")
+	}
+	if _, err := e.m.Resume(ctx, &ownsandv1.ResumeSandboxCommand{SandboxId: paused}); err == nil {
+		t.Fatal("resume accepted while the restart cleanup is pending")
+	}
+	for _, id := range []string{running, paused} {
+		snapshotID, err := uuidv7.NewString()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapshotID, SandboxId: id}); err == nil {
+			t.Fatalf("snapshot of %s accepted while the restart cleanup is pending", id)
+		}
+	}
+	if s, _ := e.m.State(running); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("state %v, want RUNNING", s)
+	}
+	if s, _ := e.m.State(paused); s != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("state %v, want PAUSED", s)
+	}
+}
+
 func TestSurvivingVMIsStoppedAtStart(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()

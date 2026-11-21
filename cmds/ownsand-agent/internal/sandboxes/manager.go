@@ -794,6 +794,10 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 	default:
 		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is %s", state)
 	}
+	if vm == nil {
+		// A record kept live for a pending restart cleanup has no VM.
+		return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox VM is not available")
+	}
 	if pause {
 		if err := m.rt.Pause(ctx, vm); err != nil {
 			m.logger.Error("pause failed", "sandbox_id", id, "error", err)

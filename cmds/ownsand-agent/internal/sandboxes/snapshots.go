@@ -127,6 +127,10 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox is %s", state)
 	}
+	if vm == nil {
+		// A record kept live for a pending restart cleanup has no VM.
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "sandbox VM is not available")
+	}
 	dir, err := m.st.SnapshotDir(id)
 	if err != nil {
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "%v", err)
