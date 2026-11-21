@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -314,5 +316,176 @@ func TestMergeSpan(t *testing.T) {
 	}
 	if len(r) != 2 || r[0] != (span{0, 20}) || r[1] != (span{30, 50}) {
 		t.Fatalf("ranges %v", r)
+	}
+}
+
+// blockedReadManager returns a read manager whose copy blocks in the copy
+// hook until release is closed. started receives one value per copy that
+// reaches the hook.
+func blockedReadManager(t *testing.T) (m *readManager, started chan struct{}, release chan struct{}) {
+	t.Helper()
+	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), time.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started = make(chan struct{}, 4)
+	release = make(chan struct{})
+	m.forceCopy = true
+	m.copyHook = func() {
+		started <- struct{}{}
+		<-release
+	}
+	return m, started, release
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for the snapshot")
+	}
+}
+
+func waitStarted(t *testing.T, ch <-chan struct{}) {
+	t.Helper()
+	waitClosed(t, ch)
+}
+
+func (m *readManager) hasEntry(readID string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	_, ok := m.entries[readID]
+	return ok
+}
+
+// A failure published after the last call ended removes the entry, so the
+// next call for the read_id makes a new snapshot.
+func TestReadFailureAfterLastCallEndedIsForgotten(t *testing.T) {
+	m, started, release := blockedReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-failure-after-end"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	m.end(readID, e)
+	// The source changes during the copy, so the copy check fails.
+	if err := os.WriteFile(path, []byte("after, longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err == nil {
+		t.Fatal("expected the snapshot to fail")
+	}
+	if m.hasEntry(readID) {
+		t.Fatal("failed entry stayed after the last call ended")
+	}
+	m.copyHook = nil
+	e2, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.end(readID, e2)
+	if e2 == e {
+		t.Fatal("retry reused the failed entry")
+	}
+	waitClosed(t, e2.ready)
+	if e2.err != nil || e2.size != int64(len("after, longer")) {
+		t.Fatalf("retry: size %d err %v", e2.size, e2.err)
+	}
+}
+
+// A call that still waits receives the failure, and the entry goes away when
+// that call ends.
+func TestReadFailureReachesWaitingCall(t *testing.T) {
+	m, started, release := blockedReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("before"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-failure-waiting"
+	first, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	second, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatal("second call did not share the entry")
+	}
+	m.end(readID, first)
+	if err := os.WriteFile(path, []byte("after, longer"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitClosed(t, second.ready)
+	if second.err == nil {
+		t.Fatal("waiting call did not receive the failure")
+	}
+	if !m.hasEntry(readID) {
+		t.Fatal("entry was removed while a call was still waiting")
+	}
+	m.end(readID, second)
+	if m.hasEntry(readID) {
+		t.Fatal("failed entry stayed after its last call ended")
+	}
+}
+
+// A snapshot that succeeds after the last call ended stays for the
+// retention time, so a later call reads the original snapshot.
+func TestReadSuccessAfterLastCallEndedIsKept(t *testing.T) {
+	m, started, release := blockedReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-success-after-end"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	m.end(readID, e)
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err != nil {
+		t.Fatalf("snapshot failed: %v", e.err)
+	}
+	if !m.hasEntry(readID) {
+		t.Fatal("successful entry was removed after the last call ended")
+	}
+	// The source changes; a later call still sees the original snapshot.
+	if err := os.WriteFile(path, []byte("changed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e2, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e2 != e {
+		t.Fatal("retry did not reuse the snapshot")
+	}
+	got, err := os.ReadFile(e2.snapshot)
+	if err != nil || string(got) != "0123456789" || e2.size != 10 {
+		t.Fatalf("snapshot %q size %d err %v", got, e2.size, err)
+	}
+	// The snapshot stays until the retention time after the last call.
+	m.end(readID, e2)
+	m.sweep(e2.lastEnd.Add(m.retention - time.Minute))
+	if !m.hasEntry(readID) {
+		t.Fatal("snapshot was swept before the retention time")
+	}
+	m.sweep(e2.lastEnd.Add(m.retention))
+	if m.hasEntry(readID) {
+		t.Fatal("snapshot was kept after the retention time")
 	}
 }
