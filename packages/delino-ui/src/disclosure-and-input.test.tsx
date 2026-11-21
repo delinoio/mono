@@ -404,6 +404,88 @@ describe("Slider", () => {
     expect((maximum as HTMLInputElement).value).toBe("80");
   });
 
+  test("names each range thumb by the label and its position without thumbLabels", () => {
+    render(<Slider label="Price" defaultValue={[20, 80]} />);
+
+    const first = screen.getByRole("slider", { name: "Price 1 of 2" });
+    const second = screen.getByRole("slider", { name: "Price 2 of 2" });
+    expect((first as HTMLInputElement).value).toBe("20");
+    expect((second as HTMLInputElement).value).toBe("80");
+    expect(first.hasAttribute("aria-label")).toBe(false);
+    expect(screen.getAllByRole("slider").length).toBe(2);
+  });
+
+  test("numbers the fallback names of a range of three thumbs", () => {
+    render(<Slider label="Price" defaultValue={[10, 50, 90]} />);
+
+    for (const position of [1, 2, 3]) {
+      expect(
+        screen.getByRole("slider", { name: `Price ${position} of 3` }),
+      ).toBeTruthy();
+    }
+  });
+
+  test("keeps an explicit thumb name and names the other thumb by position", () => {
+    render(
+      <Slider label="Price" defaultValue={[20, 80]} thumbLabels={["Min"]} />,
+    );
+
+    const first = screen.getByRole("slider", { name: "Min" });
+    const second = screen.getByRole("slider", { name: "Price 2 of 2" });
+    expect((first as HTMLInputElement).value).toBe("20");
+    expect((second as HTMLInputElement).value).toBe("80");
+    expect(first.getAttribute("aria-label")).toBe("Min");
+    expect(first.hasAttribute("aria-labelledby")).toBe(false);
+  });
+
+  test("treats an empty thumb name as missing", () => {
+    render(
+      <Slider
+        label="Price"
+        defaultValue={[20, 80]}
+        thumbLabels={["", "Max"]}
+      />,
+    );
+
+    expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Max" })).toBeTruthy();
+  });
+
+  test("names fallback thumbs by a React node label", () => {
+    render(
+      <Slider
+        label={
+          <>
+            Nightly <em>price</em>
+          </>
+        }
+        defaultValue={[20, 80]}
+      />,
+    );
+
+    expect(
+      screen.getByRole("slider", { name: "Nightly price 1 of 2" }),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("slider", { name: "Nightly price 2 of 2" }),
+    ).toBeTruthy();
+  });
+
+  test("names a controlled range thumb by position", () => {
+    render(<Slider label="Price" value={[20, 80]} onValueChange={() => {}} />);
+
+    expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
+    expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
+  });
+
+  test("names a scalar thumb with the label alone", () => {
+    render(<Slider label="Volume" defaultValue={40} />);
+
+    const thumb = screen.getByRole("slider", { name: "Volume" });
+    expect(thumb.hasAttribute("aria-label")).toBe(false);
+    expect(screen.queryByRole("slider", { name: /of/ })).toBeNull();
+  });
+
   test("moves with the arrow keys", async () => {
     const values: (number | number[])[] = [];
     render(
