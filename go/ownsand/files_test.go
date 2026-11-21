@@ -180,6 +180,52 @@ func TestWriteFileChunkedBothTransports(t *testing.T) {
 	}
 }
 
+// truncatedReader yields data and then err, in one Read call per piece.
+type truncatedReader struct {
+	data []byte
+	err  error
+}
+
+func (r *truncatedReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestWriteFileSourceEnd(t *testing.T) {
+	chunk := datapath.MaxFileChunkSize
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		for _, size := range []int{10, chunk + 10} {
+			t.Run(tr.String(), func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				data := randomBytes(t, size)
+				_, err := s.WriteFile(context.Background(), "/trunc", &truncatedReader{data: data, err: io.ErrUnexpectedEOF}, WriteOptions{})
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("size %d: want io.ErrUnexpectedEOF, got %v", size, err)
+				}
+				for _, r := range cp.agent.writeRequests() {
+					if r.GetFinish() != nil {
+						t.Fatalf("size %d: finish sent for a truncated source", size)
+					}
+				}
+				if _, ok := cp.agent.file("/trunc"); ok {
+					t.Fatalf("size %d: file written", size)
+				}
+
+				// A clean end of a short stream finishes with exactly those bytes.
+				n, err := s.WriteFile(context.Background(), "/clean", &truncatedReader{data: data, err: io.EOF}, WriteOptions{})
+				if err != nil || n != int64(size) || !bytes.Equal(must(cp.agent.file("/clean")), data) {
+					t.Fatalf("size %d: clean EOF wrote %d bytes, err %v", size, n, err)
+				}
+			})
+		}
+	}
+}
+
 func TestWriteEmptyFile(t *testing.T) {
 	cp := newFakeCP(t)
 	s := cp.handle(t, cp.client(t, TransportRelay))
