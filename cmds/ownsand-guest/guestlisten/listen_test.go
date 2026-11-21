@@ -119,6 +119,9 @@ func TestListenUnixAbstractAddress(t *testing.T) {
 }
 
 func TestHvsockNotImplemented(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows guests implement Hyper-V sockets; see hvsock_windows_test.go")
+	}
 	if _, err := Listen("hvsock://00000000-0000-0000-0000-000000000000"); !errors.Is(err, ErrUnsupported) {
 		t.Fatalf("hvsock: %v", err)
 	}

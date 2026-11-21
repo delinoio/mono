@@ -10,7 +10,7 @@
 // A listener spec is a URL-like string:
 //
 //	vsock://:1024       vsock port 1024, any CID
-//	hvsock://<service>  Hyper-V socket service GUID (not implemented yet)
+//	hvsock://<service>  Hyper-V socket service GUID (Windows guests)
 //	unix:///path/sock   unix domain socket
 //	tcp://127.0.0.1:0   TCP, for tests only
 package guestlisten
@@ -130,13 +130,9 @@ func prepareUnixAddress(address string) error {
 	return nil
 }
 
-// listenHvsock is the plug-in point of the Hyper-V socket transport of
-// Windows hosts.
-//
-// Not implemented yet: it needs an AF_HYPERV binding (for example
-// github.com/Microsoft/go-winio) inside Windows guests and on Linux guests of
-// Hyper-V hosts (where Hyper-V sockets appear as vsock). Remove this stub
-// with the Windows runtime implementation.
-func listenHvsock(string) (net.Listener, error) {
-	return nil, fmt.Errorf("%w: Hyper-V sockets are not implemented yet", ErrUnsupported)
+// listenHvsock opens a Hyper-V socket listener on a service GUID. Windows
+// guests of the Hyper-V runtime set it (hvsock_windows.go); a Linux guest of
+// a Hyper-V host sees Hyper-V sockets as vsock and uses vsock:// instead.
+var listenHvsock = func(string) (net.Listener, error) {
+	return nil, fmt.Errorf("%w: Hyper-V sockets need a Windows guest", ErrUnsupported)
 }
