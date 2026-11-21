@@ -1647,6 +1647,7 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_STATUS   `docker inspect` container status (default running).
 //   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
+//   STUB_LOGS     exit code of `docker logs` (default 0).
 function runDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
@@ -1681,7 +1682,7 @@ function runDroplet(
       *) echo 172.18.0.5 ;;
     esac ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
-  logs) echo "server log line" ;;
+  logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
 esac`,
   );
   shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
@@ -1839,6 +1840,33 @@ test(
     const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
     assert.equal(first.status, 1);
     assert.equal(first.read("caddy/sites/api.caddy"), undefined);
+  },
+);
+
+test(
+  "droplet deploy prints the replacement logs before it removes it when the route fails",
+  { skip },
+  (t) => {
+    // A failing `docker logs` must neither stop the cleanup nor change the
+    // verdict.
+    for (const logs of ["0", "1"]) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        env: { STUB_RELOAD: "1", STUB_LOGS: logs },
+      });
+      assert.equal(result.status, 1, logs);
+      assert.match(result.stdout, /Last log lines of api-/, logs);
+      assert.match(result.stdout, /server log line/, logs);
+      const logsAt = result.calls.findIndex((call) =>
+        /^docker logs --tail 200 api-/.test(call),
+      );
+      const removeAt = result.calls.findIndex((call) =>
+        call.startsWith("docker rm --force api-"),
+      );
+      assert.ok(logsAt >= 0, logs);
+      assert.ok(removeAt > logsAt, `${logs}: logs before rm`);
+      assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+    }
   },
 );
 
