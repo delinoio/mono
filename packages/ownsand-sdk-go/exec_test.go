@@ -944,3 +944,52 @@ func TestBlockedStreamDoesNotBlockOtherStreams(t *testing.T) {
 		t.Fatalf("%d sessions, want 1", cp.openSessionCount())
 	}
 }
+
+// TestStalledAuthorizeRelayEndsWithTheWindow checks that an AuthorizeRelay
+// call whose response never arrives on an open connection ends when its
+// retry window ends, both for the first authorization of an operation and
+// inside relay recovery, also for a caller without its own deadline.
+func TestStalledAuthorizeRelayEndsWithTheWindow(t *testing.T) {
+	cases := map[string]struct {
+		stallFrom int
+		relay     func(method string, n int) relayAction
+	}{
+		"first authorization": {stallFrom: 1},
+		"inside recovery": {stallFrom: 2, relay: func(method string, n int) relayAction {
+			if method == "Exec" && n == 1 {
+				return relayAction{abortAfter: 1}
+			}
+			return relayAction{}
+		}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(20, 50*time.Millisecond)
+			cp.relayScript = tc.relay
+			cp.authScript = func(n int, _ *ownsandv1.AuthorizeRelayRequest) authAction {
+				return authAction{stall: n >= tc.stallFrom}
+			}
+			c := cp.client(t, TransportRelay)
+			s := cp.handle(t, c)
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				var dp *DataPathError
+				if !errors.As(err, &dp) || !errors.Is(err, errAuthorizeDeadline) {
+					t.Fatalf("want a DataPathError after the stalled AuthorizeRelay, got %v", err)
+				}
+				if d := time.Since(start); d > c.timing.recoveryWindow+time.Second {
+					t.Fatalf("exec ended after %v, longer than the window", d)
+				}
+			case <-time.After(10 * time.Second):
+				t.Fatal("exec did not end after the recovery window")
+			}
+		})
+	}
+}

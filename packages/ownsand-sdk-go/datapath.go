@@ -238,13 +238,37 @@ func (g *relayGrant) authorize(ctx context.Context, rec *recovery) error {
 	}
 	// Inside relay recovery the retries share the operation's window;
 	// otherwise (startup or a renewal before the next stream) they get their
-	// own 60-second window.
-	window := newRecovery(c.timing.recoveryWindow)
+	// own 60-second window, which starts with the first attempt.
+	var window *recovery
 	if rec != nil && rec.inRecovery() {
 		window = rec
+	} else {
+		window = newRecovery(c.timing.recoveryWindow)
+		window.begin()
 	}
 	for {
-		res, err := c.dataPath.AuthorizeRelay(ctx, connect.NewRequest(proto.Clone(req).(*ownsandv1.AuthorizeRelayRequest)))
+		// Bound each attempt by the time left in the window: a response
+		// that stalls on an open connection must not outlive the window,
+		// because the default HTTP client has no overall timeout and the
+		// stall detector covers only relay server streams. A timer cancels
+		// the attempt instead of a context deadline, so Connect does not
+		// send the bound as a request timeout and the server cannot answer
+		// it first with a deadline_exceeded status, which is terminal.
+		left := window.remaining()
+		if left <= 0 {
+			if err := window.err(); err != nil {
+				return err
+			}
+			return errAuthorizeDeadline
+		}
+		actx, cancel := context.WithCancelCause(ctx)
+		timer := time.AfterFunc(left, func() { cancel(errAuthorizeDeadline) })
+		res, err := c.dataPath.AuthorizeRelay(actx, connect.NewRequest(proto.Clone(req).(*ownsandv1.AuthorizeRelayRequest)))
+		timer.Stop()
+		if err != nil && ctx.Err() == nil && errors.Is(context.Cause(actx), errAuthorizeDeadline) {
+			err = errAuthorizeDeadline
+		}
+		cancel(context.Canceled)
 		if err == nil {
 			now := time.Now()
 			g.grantID = res.Msg.GetGrantId()

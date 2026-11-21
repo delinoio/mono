@@ -101,6 +101,19 @@ func (r *recovery) fail(err error) {
 	}
 }
 
+// begin starts the window without recording a failure, when it is not
+// active. A retry window that bounds a call from its first attempt uses it.
+func (r *recovery) begin() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !r.active {
+		r.active = true
+		r.paused = false
+		r.used = 0
+		r.running = time.Now()
+	}
+}
+
 // pauseClock stops the clock while an accepted continuation stays open.
 func (r *recovery) pauseClock() {
 	r.mu.Lock()

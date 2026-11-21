@@ -98,6 +98,7 @@ type p2pAction struct {
 type authAction struct {
 	err             error
 	abortAfterGrant bool
+	stall           bool // keep the connection open and never respond
 }
 
 type fakeGrant struct {
@@ -460,7 +461,7 @@ func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[own
 	}), nil
 }
 
-func (f *fakeDataPath) AuthorizeRelay(_ context.Context, req *connect.Request[ownsandv1.AuthorizeRelayRequest]) (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
+func (f *fakeDataPath) AuthorizeRelay(ctx context.Context, req *connect.Request[ownsandv1.AuthorizeRelayRequest]) (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
 	cp := f.cp
 	cp.mu.Lock()
 	cp.authReqs = append(cp.authReqs, proto.Clone(req.Msg).(*ownsandv1.AuthorizeRelayRequest))
@@ -474,6 +475,10 @@ func (f *fakeDataPath) AuthorizeRelay(_ context.Context, req *connect.Request[ow
 	}
 	if act.err != nil {
 		return nil, act.err
+	}
+	if act.stall {
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	switch state {
 	case ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE:

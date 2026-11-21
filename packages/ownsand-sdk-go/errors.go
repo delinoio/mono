@@ -115,6 +115,11 @@ var errStall = errors.New("ownsand: relay stream received nothing for 90 seconds
 // deadline; it is a transport interruption.
 var errAttemptDeadline = errors.New("ownsand: WriteFile attempt passed its deadline")
 
+// errAuthorizeDeadline reports an AuthorizeRelay attempt that got no
+// response before its retry window ended; it is a transport interruption,
+// so the window then ends the operation with it.
+var errAuthorizeDeadline = errors.New("ownsand: AuthorizeRelay got no response within the recovery window")
+
 // classify returns the failure kind of err and the retry delay of a
 // resource_exhausted error, if the error detail carries one. ctx is the
 // caller context: a cancelled caller is always terminal.
@@ -122,7 +127,7 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 	if ctx.Err() != nil {
 		return failTerminal, 0
 	}
-	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) || errors.Is(err, errStreamOverrun) {
+	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) || errors.Is(err, errStreamOverrun) || errors.Is(err, errAuthorizeDeadline) {
 		return failInterrupted, 0
 	}
 	var fe *frameError
