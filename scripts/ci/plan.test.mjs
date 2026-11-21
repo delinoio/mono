@@ -1085,20 +1085,32 @@ test("CI workflow reads the planner go output for the Go job and the aggregate",
   );
 });
 
-// The Go job runs the protobuf drift and breaking-change checks with the
-// planner's comparison base, so it needs the full history.
-test("CI workflow checks protobuf schemas in the Go job", () => {
+// The protos job runs the protobuf drift and breaking-change checks with the
+// planner's comparison base, so it needs the full history. Every protobuf
+// input is a Go input, so the `go` output selects it, and the aggregate
+// passes a skipped protos job only when the planner did not select `go`.
+test("CI workflow checks protobuf schemas in the protos job", () => {
   const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
   const goJob = workflow.slice(
     workflow.indexOf("\n  go:\n"),
+    workflow.indexOf("\n  protos:\n"),
+  );
+  assert.doesNotMatch(goJob, /scripts\/protos\.sh/);
+  const protosJob = workflow.slice(
+    workflow.indexOf("\n  protos:\n"),
     workflow.indexOf("\n  rust:\n"),
   );
-  assert.match(goJob, /fetch-depth: 0/);
-  assert.match(goJob, /scripts\/protos\.sh check/);
-  assert.match(goJob, /scripts\/protos\.sh breaking "\$COMPARISON_BASE"/);
+  assert.match(protosJob, /^\s+if: needs\.changes\.outputs\.go == 'true'$/m);
+  assert.match(protosJob, /fetch-depth: 0/);
+  assert.match(protosJob, /scripts\/protos\.sh check/);
+  assert.match(protosJob, /scripts\/protos\.sh breaking "\$COMPARISON_BASE"/);
   assert.match(
-    goJob,
+    protosJob,
     /COMPARISON_BASE: \$\{\{ needs\.changes\.outputs\.base \}\}/,
+  );
+  assert.match(
+    workflow,
+    /\.protos\.result == "skipped" and \$go_planned == "false"/,
   );
 });
 
@@ -1219,7 +1231,7 @@ test("CI workflow reads the planner workspace output for the workspace job and t
   );
   assert.match(
     workflow,
-    /^\s+needs: \[changes, quality, go, rust, e2e, workspace(, [a-z]+)*\]$/m,
+    /^\s+needs: \[changes, quality, go, protos, rust, e2e, workspace(, [a-z]+)*\]$/m,
   );
   const workspaceJob = workflow.slice(workflow.indexOf("\n  workspace:\n"));
   assert.match(
@@ -1256,7 +1268,7 @@ test("CI workflow reads the planner workflows output for the workflow lint job a
   );
   assert.match(
     workflow,
-    /^\s+needs: \[changes, quality, go, rust, e2e, workspace, workflows\]$/m,
+    /^\s+needs: \[changes, quality, go, protos, rust, e2e, workspace, workflows\]$/m,
   );
   const workflowsJob = workflow.slice(
     workflow.indexOf("\n  workflows:\n"),
