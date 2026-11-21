@@ -16,14 +16,21 @@ import (
 // directory.
 const LinuxImageDir = "linux"
 
-func newFirecracker(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Runtime, error) {
-	kernel, rootfs := cfg.LinuxKernel, cfg.LinuxRootfs
+// linuxImage returns the kernel and the root file system of the Linux base
+// image: the configured paths, or images/linux in the state directory.
+func linuxImage(cfg config.Config, st *store.Store) (kernel, rootfs string) {
+	kernel, rootfs = cfg.LinuxKernel, cfg.LinuxRootfs
 	if kernel == "" {
 		kernel = st.Path(store.ImagesDir, LinuxImageDir, "vmlinux")
 	}
 	if rootfs == "" {
 		rootfs = st.Path(store.ImagesDir, LinuxImageDir, "rootfs.ext4")
 	}
+	return kernel, rootfs
+}
+
+func newFirecracker(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Runtime, error) {
+	kernel, rootfs := linuxImage(cfg, st)
 	return fcrt.NewRuntime(fcrt.Options{
 		Binary:  cfg.FirecrackerBinary,
 		Kernel:  kernel,

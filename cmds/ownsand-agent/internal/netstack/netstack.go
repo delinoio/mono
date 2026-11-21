@@ -1,0 +1,463 @@
+// SPDX-License-Identifier: Apache-2.0
+
+// Package netstack is the userspace network stack of the OUTBOUND network
+// mode on macOS and Windows hosts. Each sandbox gets its own stack (the
+// gVisor network stack, through the building blocks of gvisor-tap-vsock)
+// that terminates the guest's Ethernet link inside the agent: it answers ARP
+// and DHCPv4 for the guest link, serves DNS at the gateway address through
+// the host resolver, and opens every TCP connection and UDP flow of the
+// guest from the agent with a host socket, after the netpolicy Filter
+// allowed the destination. Packets to blocked destinations never leave the
+// agent, inbound connections to the guest do not exist, and the guest has
+// no IPv6 address, as on Linux hosts. ICMP is not forwarded.
+//
+// The macOS runtime connects the stack to a Virtualization.framework
+// file-handle network attachment (one Ethernet frame per datagram); the
+// Windows runtime connects it to the guest helper's network tunnel over a
+// Hyper-V socket (frames with a 32-bit big-endian length). See
+// docs/cmds-ownsand-agent-foundation.md#network-policy.
+package netstack
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net"
+	"net/netip"
+	"strconv"
+	"sync"
+	"time"
+
+	"github.com/containers/gvisor-tap-vsock/pkg/services/dhcp"
+	"github.com/containers/gvisor-tap-vsock/pkg/services/dns"
+	"github.com/containers/gvisor-tap-vsock/pkg/tap"
+	"github.com/containers/gvisor-tap-vsock/pkg/types"
+	"github.com/sirupsen/logrus"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
+)
+
+// Framing names how Ethernet frames travel on the connection to the guest.
+type Framing int
+
+const (
+	// FramingDatagram carries one frame per datagram (a unix datagram
+	// socket pair of a Virtualization.framework file-handle attachment).
+	FramingDatagram Framing = iota + 1
+	// FramingLengthPrefixed carries frames on a stream, each after its
+	// length as a 32-bit big-endian integer (the guest helper's network
+	// tunnel).
+	FramingLengthPrefixed
+)
+
+func (f Framing) protocol() (types.Protocol, error) {
+	switch f {
+	case FramingDatagram:
+		return types.VfkitProtocol, nil
+	case FramingLengthPrefixed:
+		return types.QemuProtocol, nil
+	}
+	return "", fmt.Errorf("netstack: unknown framing %d", f)
+}
+
+// MTU of the guest link.
+const MTU = 1500
+
+// nicID is the only NIC of each stack.
+const nicID tcpip.NICID = 1
+
+// Timeouts of the forwarders.
+const (
+	tcpConnectTimeout = 30 * time.Second
+	// udpIdleTimeout ends a UDP flow without traffic in either direction.
+	udpIdleTimeout = 90 * time.Second
+	maxInFlightTCP = 256
+)
+
+func init() {
+	// gvisor-tap-vsock logs through logrus; the agent logs through slog
+	// and the stack reports its own errors. Keep only logrus errors, on
+	// standard error like the agent's JSON logs.
+	logrus.SetLevel(logrus.ErrorLevel)
+	logrus.SetFormatter(&logrus.JSONFormatter{})
+}
+
+// Options configure one sandbox network.
+type Options struct {
+	SandboxID string
+	// Link is the guest link: the gateway address of the stack and the
+	// guest address.
+	Link netpolicy.Link
+	// GuestMAC is the MAC address of the guest interface, for the static
+	// DHCP lease.
+	GuestMAC net.HardwareAddr
+	// Filter decides which destinations the guest may reach.
+	Filter *netpolicy.Filter
+	Logger *slog.Logger
+	// dial opens host connections; tests replace it.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
+}
+
+// Network is the stack of one sandbox.
+type Network struct {
+	opts   Options
+	logger *slog.Logger
+	stack  *stack.Stack
+	sw     *tap.Switch
+	dns    *dns.Server
+	dhcp   *dhcp.Server
+	udpLn  *gonet.UDPConn
+	tcpLn  *gonet.TCPListener
+	ctx    context.Context
+	cancel context.CancelFunc
+	wg     sync.WaitGroup
+	mu     sync.Mutex
+	closed bool
+	conns  map[io.Closer]bool
+}
+
+// RandomMAC returns a random locally administered unicast MAC address.
+func RandomMAC() (net.HardwareAddr, error) {
+	mac := make(net.HardwareAddr, 6)
+	if _, err := rand.Read(mac); err != nil {
+		return nil, err
+	}
+	mac[0] = mac[0]&^0x01 | 0x02
+	return mac, nil
+}
+
+// New starts the stack of one sandbox.
+func New(opts Options) (*Network, error) {
+	if opts.Filter == nil {
+		return nil, errors.New("netstack: a filter is required")
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
+	if opts.dial == nil {
+		var d net.Dialer
+		opts.dial = d.DialContext
+	}
+	gatewayMAC, err := RandomMAC()
+	if err != nil {
+		return nil, err
+	}
+	subnet := netip.PrefixFrom(opts.Link.Gateway, opts.Link.Bits).Masked()
+	pool, err := tap.NewIPPool(subnet.String())
+	if err != nil {
+		return nil, err
+	}
+	if err := pool.Reserve(opts.Link.Gateway.String(), gatewayMAC.String()); err != nil {
+		return nil, err
+	}
+	if err := pool.Reserve(opts.Link.Guest.String(), opts.GuestMAC.String()); err != nil {
+		return nil, err
+	}
+	link, err := tap.NewLinkEndpoint(false, MTU, gatewayMAC.String(), opts.Link.Gateway.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	sw := tap.NewSwitch(false)
+	link.Connect(sw)
+	sw.Connect(link)
+
+	s := stack.New(stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol, arp.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, udp.NewProtocol},
+	})
+	if terr := s.CreateNIC(nicID, link); terr != nil {
+		return nil, fmt.Errorf("netstack: create NIC: %s", terr)
+	}
+	gw := tcpip.AddrFrom4(opts.Link.Gateway.As4())
+	if terr := s.AddProtocolAddress(nicID, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: gw.WithPrefix(),
+	}, stack.AddressProperties{}); terr != nil {
+		s.Destroy()
+		return nil, fmt.Errorf("netstack: add gateway address: %s", terr)
+	}
+	// Spoofing and promiscuous mode let the stack accept the guest's
+	// packets to any destination and answer from that destination, which
+	// is how the forwarders terminate guest connections.
+	s.SetSpoofing(nicID, true)
+	s.SetPromiscuousMode(nicID, true)
+	tsub, _ := tcpip.NewSubnet(tcpip.AddrFrom4(subnet.Addr().As4()), tcpip.MaskFromBytes(net.CIDRMask(subnet.Bits(), 32)))
+	s.SetRouteTable([]tcpip.Route{{Destination: tsub, NIC: nicID}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	n := &Network{opts: opts, logger: opts.Logger.With("sandbox_id", opts.SandboxID), stack: s, sw: sw,
+		ctx: ctx, cancel: cancel, conns: map[io.Closer]bool{}}
+
+	tcpFwd := tcp.NewForwarder(s, 0, maxInFlightTCP, n.forwardTCP)
+	s.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		// The gateway's own TCP port 53 is the DNS listener.
+		if id.LocalAddress == gw && id.LocalPort == 53 {
+			return false
+		}
+		return tcpFwd.HandlePacket(id, pkt)
+	})
+	udpFwd := udp.NewForwarder(s, n.forwardUDP)
+	s.SetTransportProtocolHandler(udp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
+		// DHCP and DNS of the gateway have their own endpoints.
+		if id.LocalAddress == gw || id.LocalAddress == header.IPv4Broadcast {
+			return false
+		}
+		return udpFwd.HandlePacket(id, pkt)
+	})
+
+	if err := n.startServices(gw, pool); err != nil {
+		n.Close()
+		return nil, err
+	}
+	n.logger.Info("sandbox network stack started", "gateway", opts.Link.Gateway.String(), "guest", opts.Link.Guest.String())
+	return n, nil
+}
+
+func (n *Network) startServices(gw tcpip.Address, pool *tap.IPPool) error {
+	udpLn, err := gonet.DialUDP(n.stack, &tcpip.FullAddress{NIC: nicID, Addr: gw, Port: 53}, nil, ipv4.ProtocolNumber)
+	if err != nil {
+		return fmt.Errorf("netstack: DNS UDP listener: %w", err)
+	}
+	tcpLn, err := gonet.ListenTCP(n.stack, tcpip.FullAddress{NIC: nicID, Addr: gw, Port: 53}, ipv4.ProtocolNumber)
+	if err != nil {
+		udpLn.Close()
+		return fmt.Errorf("netstack: DNS TCP listener: %w", err)
+	}
+	n.udpLn, n.tcpLn = udpLn, tcpLn
+	server, err := dns.New(udpLn, tcpLn, nil)
+	if err != nil {
+		return fmt.Errorf("netstack: DNS server: %w", err)
+	}
+	n.dns = server
+	n.wg.Add(2)
+	go func() { defer n.wg.Done(); _ = server.Serve() }()
+	go func() { defer n.wg.Done(); _ = server.ServeTCP() }()
+
+	cfg := &types.Configuration{
+		MTU:              MTU,
+		Subnet:           netip.PrefixFrom(n.opts.Link.Gateway, n.opts.Link.Bits).Masked().String(),
+		GatewayIP:        n.opts.Link.Gateway.String(),
+		DHCPStaticLeases: map[string]string{n.opts.Link.Guest.String(): n.opts.GuestMAC.String()},
+	}
+	d, err := dhcp.New(cfg, n.stack, pool)
+	if err != nil {
+		return fmt.Errorf("netstack: DHCP server: %w", err)
+	}
+	n.dhcp = d
+	n.wg.Add(1)
+	go func() { defer n.wg.Done(); _ = d.Serve() }()
+	return nil
+}
+
+// Serve carries the guest's Ethernet frames between conn and the stack
+// until conn fails, ctx ends or the network closes. A later Serve may
+// attach a new connection (for example after the tunnel reconnected).
+func (n *Network) Serve(ctx context.Context, conn net.Conn, framing Framing) error {
+	proto, err := framing.protocol()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-n.ctx.Done():
+		}
+		conn.Close()
+	}()
+	err = n.sw.Accept(ctx, conn, proto)
+	if n.ctx.Err() != nil || ctx.Err() != nil {
+		return nil
+	}
+	return err
+}
+
+// track registers c so that Close closes it; it reports false when the
+// network is closed already.
+func (n *Network) track(c io.Closer) bool {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.closed {
+		return false
+	}
+	n.conns[c] = true
+	return true
+}
+
+func (n *Network) untrack(c io.Closer) {
+	n.mu.Lock()
+	delete(n.conns, c)
+	n.mu.Unlock()
+}
+
+func destination(addr tcpip.Address) netip.Addr {
+	a, _ := netip.AddrFromSlice(addr.AsSlice())
+	return a
+}
+
+// forwardTCP opens the host connection of one guest TCP connection after
+// the filter allowed its destination, and then completes the guest's
+// handshake. A blocked or unreachable destination gets a reset.
+func (n *Network) forwardTCP(r *tcp.ForwarderRequest) {
+	id := r.ID()
+	dst := destination(id.LocalAddress)
+	if !n.opts.Filter.Allows(dst) {
+		n.logger.Debug("guest TCP connection blocked by the network policy", "destination", dst.String(), "port", id.LocalPort)
+		r.Complete(true)
+		return
+	}
+	ctx, cancel := context.WithTimeout(n.ctx, tcpConnectTimeout)
+	out, err := n.opts.dial(ctx, "tcp", net.JoinHostPort(dst.String(), strconv.Itoa(int(id.LocalPort))))
+	cancel()
+	if err != nil {
+		r.Complete(true)
+		return
+	}
+	var wq waiter.Queue
+	ep, terr := r.CreateEndpoint(&wq)
+	r.Complete(false)
+	if terr != nil {
+		out.Close()
+		return
+	}
+	in := gonet.NewTCPConn(&wq, ep)
+	if !n.track(in) {
+		in.Close()
+		out.Close()
+		return
+	}
+	n.track(out)
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer n.untrack(in)
+		defer n.untrack(out)
+		proxy(in, out)
+	}()
+}
+
+// proxy copies both directions until both ended; a side's end closes the
+// other side's write direction.
+func proxy(a, b net.Conn) {
+	done := make(chan struct{}, 2)
+	cp := func(dst, src net.Conn) {
+		_, _ = io.Copy(dst, src)
+		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+			_ = cw.CloseWrite()
+		} else {
+			_ = dst.Close()
+		}
+		done <- struct{}{}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	<-done
+	<-done
+	a.Close()
+	b.Close()
+}
+
+// forwardUDP opens the host flow of one guest UDP flow (by its source and
+// destination) after the filter allowed its destination.
+func (n *Network) forwardUDP(r *udp.ForwarderRequest) bool {
+	id := r.ID()
+	dst := destination(id.LocalAddress)
+	if !n.opts.Filter.Allows(dst) {
+		n.logger.Debug("guest UDP flow blocked by the network policy", "destination", dst.String(), "port", id.LocalPort)
+		return true
+	}
+	var wq waiter.Queue
+	ep, terr := r.CreateEndpoint(&wq)
+	if terr != nil {
+		return true
+	}
+	in := gonet.NewUDPConn(&wq, ep)
+	out, err := n.opts.dial(n.ctx, "udp", net.JoinHostPort(dst.String(), strconv.Itoa(int(id.LocalPort))))
+	if err != nil {
+		in.Close()
+		return true
+	}
+	if !n.track(in) {
+		in.Close()
+		out.Close()
+		return true
+	}
+	n.track(out)
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer n.untrack(in)
+		defer n.untrack(out)
+		proxyUDP(in, out)
+	}()
+	return true
+}
+
+// proxyUDP relays the datagrams of one flow until it is idle for
+// udpIdleTimeout or a side fails.
+func proxyUDP(in *gonet.UDPConn, out net.Conn) {
+	done := make(chan struct{}, 2)
+	relay := func(dst, src net.Conn) {
+		buf := make([]byte, 65535)
+		for {
+			_ = src.SetReadDeadline(time.Now().Add(udpIdleTimeout))
+			k, err := src.Read(buf)
+			if err != nil {
+				break
+			}
+			if _, err := dst.Write(buf[:k]); err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}
+	go relay(out, in)
+	go relay(in, out)
+	<-done
+	in.Close()
+	out.Close()
+	<-done
+}
+
+// Close stops the stack and closes every forwarded connection.
+func (n *Network) Close() {
+	n.mu.Lock()
+	if n.closed {
+		n.mu.Unlock()
+		return
+	}
+	n.closed = true
+	conns := n.conns
+	n.conns = map[io.Closer]bool{}
+	n.mu.Unlock()
+	n.cancel()
+	for c := range conns {
+		c.Close()
+	}
+	if n.udpLn != nil {
+		n.udpLn.Close()
+	}
+	if n.tcpLn != nil {
+		n.tcpLn.Close()
+	}
+	if n.dhcp != nil {
+		_ = n.dhcp.Underlying.Close()
+	}
+	n.stack.Close()
+	n.wg.Wait()
+	n.stack.Destroy()
+	n.logger.Info("sandbox network stack stopped")
+}
