@@ -91,6 +91,7 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
   f.write("assets/image.svg");
   assert.deepEqual(plan(f.cwd, f.base, f.commit()), {
@@ -100,6 +101,7 @@ test("planner skips empty comparisons and non-validation paths", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
 });
 
@@ -119,6 +121,7 @@ test("documentation changes select formatting without fixtures", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
 });
 
@@ -138,6 +141,7 @@ test("documentation and source paths select formatting in any extension case", (
       go: false,
       rust: false,
       e2e: false,
+      workspace: false,
     });
   }
   // An unsupported extension stays unformatted whatever its case.
@@ -531,6 +535,50 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
   assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
 });
 
+test("workspace package paths and root task inputs select workspace tasks", async (t) => {
+  for (const path of [
+    "apps/delino-accounts/src/App.tsx",
+    "packages/delino-ui/src/slider.tsx",
+    "packages/ownsand-sdk/rstest.config.ts",
+    "servers/accounts-api/scripts/dev.test.mjs",
+    "servers/ownsand-api/internal/api/server.go",
+    ".github/workflows/CI.yml",
+    ".nvmrc",
+    "go.mod",
+    "go.sum",
+    "package.json",
+    "pnpm-lock.yaml",
+    "pnpm-workspace.yaml",
+    "turbo.json",
+  ]) {
+    await t.test(path, (t) => {
+      const f = fixture(t);
+      f.write(path);
+      assert.equal(plan(f.cwd, f.base, f.commit()).workspace, true);
+    });
+  }
+  // Files directly inside a workspace root are not inside a package, and
+  // paths outside the workspace roots are not workspace task inputs.
+  const f = fixture(t);
+  f.write("apps/AGENTS.md");
+  f.write("packages/README.md");
+  f.write("servers/LICENSE");
+  f.write("docs/packages-delino-ui-foundation.md");
+  f.write("crates/example/src/lib.rs");
+  f.write("cmds/tool/main.go");
+  f.write("scripts/ci/example.mjs");
+  f.write(".github/workflows/deploy.yml");
+  assert.equal(plan(f.cwd, f.base, f.commit()).workspace, false);
+});
+
+test("deleted workspace package files still select workspace tasks", (t) => {
+  const f = fixture(t);
+  f.write("packages/delino-ui/src/old.tsx");
+  const base = f.commit();
+  f.git("rm", "--quiet", "packages/delino-ui/src/old.tsx");
+  assert.equal(plan(f.cwd, base, f.commit()).workspace, true);
+});
+
 test("deleted Go files still select Go checks", (t) => {
   const f = fixture(t);
   f.write("servers/example/old.go");
@@ -553,6 +601,7 @@ test("deleted inputs and renamed paths still select affected fixtures", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
 });
 
@@ -568,6 +617,7 @@ test("deleted documentation has no remaining formatting input", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
 });
 
@@ -595,7 +645,7 @@ test("planner publishes booleans and records exact comparison and checkout", (t)
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\n",
   );
   const record = JSON.parse(
     readFileSync(summary, "utf8").slice("CI plan: ".length),
@@ -640,6 +690,7 @@ test("planner accepts more than 1 MiB of changed paths", (t) => {
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
 });
 
@@ -675,7 +726,7 @@ test("planner CLI runs through physical and symlinked script paths", (t) => {
     assert.match(result.stdout, /"event":"ci_plan"/, script);
     assert.equal(
       readFileSync(output, "utf8"),
-      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\n",
       script,
     );
   }
@@ -732,18 +783,20 @@ for (const row of eventMatrix) {
     const mainPush = row.main === true;
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\n`,
+      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\nworkspace=${mainPush}\n`,
     );
     const record = JSON.parse(logged.join(""));
     assert.equal(record.go, mainPush);
     assert.equal(record.rust, mainPush);
     assert.equal(record.fixtures, mainPush);
     assert.equal(record.e2e, mainPush);
+    assert.equal(record.workspace, mainPush);
     const reason = mainPush ? OutputReason.MainPush : OutputReason.Diff;
     assert.equal(record.goReason, reason);
     assert.equal(record.rustReason, reason);
     assert.equal(record.fixturesReason, reason);
     assert.equal(record.e2eReason, reason);
+    assert.equal(record.workspaceReason, reason);
     assert.deepEqual(
       JSON.parse(readFileSync(summary, "utf8").slice("CI plan: ".length)),
       record,
@@ -768,6 +821,7 @@ test("a later documentation-only main push still selects the fixtures and e2e of
     go: false,
     rust: false,
     e2e: false,
+    workspace: false,
   });
   const run = (event, ref) => {
     const output = join(f.cwd, `output-${event}`.replaceAll("/", "_"));
@@ -789,11 +843,11 @@ test("a later documentation-only main push still selects the fixtures and e2e of
   };
   assert.equal(
     run(MAIN_PUSH_EVENT, MAIN_REF),
-    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\n",
+    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\n",
   );
   assert.equal(
     run("pull_request", "refs/pull/1/merge"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\n",
   );
 });
 
@@ -858,9 +912,12 @@ test("fixture and e2e changes keep the diff reason on a main push", (t) => {
     f.cwd,
   );
   const record = JSON.parse(logged.at(-1));
-  // The diff selects fixtures and e2e on its own; only go and rust are forced.
+  // The diff selects fixtures, e2e and the workspace tasks on its own; only go
+  // and rust are forced.
   assert.equal(record.fixturesReason, OutputReason.Diff);
   assert.equal(record.e2eReason, OutputReason.Diff);
+  assert.equal(record.workspace, true);
+  assert.equal(record.workspaceReason, OutputReason.Diff);
   assert.equal(record.goReason, OutputReason.MainPush);
   assert.equal(record.rustReason, OutputReason.MainPush);
 });
@@ -882,7 +939,7 @@ test("main push selects every whole-suite check for an empty comparison", (t) =>
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\n",
+    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\n",
   );
 });
 
@@ -915,7 +972,7 @@ test("planner CLI forces whole-suite checks for a main push and keeps pull reque
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\n`,
+      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\nworkspace=${forced}\n`,
       event,
     );
   }
@@ -964,7 +1021,7 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\n",
   );
 });
 
@@ -1096,6 +1153,44 @@ test("CI workflow reads the planner quality, fixtures and e2e outputs for their 
   );
 });
 
+// Read-only text check: the `workspace` planner output must keep driving the
+// workspace job and the aggregate, and the fixtures step must not repeat the
+// workspace package tests that the workspace job runs.
+test("CI workflow reads the planner workspace output for the workspace job and the aggregate", () => {
+  const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
+  assert.match(
+    workflow,
+    /^\s+workspace: \$\{\{ steps\.plan\.outputs\.workspace \}\}$/m,
+  );
+  assert.match(
+    workflow,
+    /^\s+if: needs\.changes\.outputs\.workspace == 'true'$/m,
+  );
+  assert.match(
+    workflow,
+    /^\s+WORKSPACE_PLANNED: \$\{\{ needs\.changes\.outputs\.workspace \}\}$/m,
+  );
+  assert.match(
+    workflow,
+    /\.workspace\.result == "skipped" and \$workspace_planned == "false"/,
+  );
+  assert.match(
+    workflow,
+    /^\s+needs: \[changes, quality, go, rust, e2e, workspace(, [a-z]+)*\]$/m,
+  );
+  const workspaceJob = workflow.slice(workflow.indexOf("\n  workspace:\n"));
+  assert.match(
+    workspaceJob,
+    /pnpm exec turbo run build lint typecheck test --continue/,
+  );
+  const qualityJob = workflow.slice(
+    workflow.indexOf("\n  quality:\n"),
+    workflow.indexOf("\n  go:\n"),
+  );
+  assert.match(qualityJob, /run: pnpm test:tooling$/m);
+  assert.doesNotMatch(qualityJob, /run: pnpm test$/m);
+});
+
 test("planner skips a non-UTF-8 gitlink instead of failing", (t) => {
   const raw = Buffer.concat([
     Buffer.from([0x63, 0x61, 0x66, 0xe9]),
@@ -1207,6 +1302,7 @@ test("planner selects formatting for non-UTF-8 names whether or not Rstack exclu
       go: false,
       rust: false,
       e2e: false,
+      workspace: false,
     });
   }
 });
@@ -1399,7 +1495,7 @@ test("planner CLI still exits 0 with one ci_plan record and no error record on s
   assert.match(result.stdout, /"event":"ci_plan"/u);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\n",
   );
 });
 
@@ -1542,7 +1638,7 @@ for (const relative of [true, false]) {
     const fromRoot = run(f.cwd, "root");
     assert.equal(
       fromRoot.output,
-      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\n",
+      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\nworkspace=true\n",
     );
     for (const directory of startDirectories) {
       assert.deepEqual(

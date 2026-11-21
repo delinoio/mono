@@ -72,7 +72,7 @@ Run from the repository root:
 - `pnpm exec turbo run test:e2e --filter=delino-site`: browser end-to-end tests against the development server on a free loopback port. See the [e2e contract](repository-e2e-contract.md).
 - `pnpm --filter delino-site preview`: serve the production build locally.
 
-Remove `apps/delino-site/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI does not build this site. The [deployment workflow](repository-workflow-contract.md#deployment-workflow) builds and deploys it when a pending changeset releases it.
+Remove `apps/delino-site/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI builds and type-checks this site in the `workspace` job of the [workflow contract](repository-workflow-contract.md#validation) but does not deploy it. The [deployment workflow](repository-workflow-contract.md#deployment-workflow) builds and deploys it when a pending changeset releases it.
 
 ## Dependencies and Integrations
 

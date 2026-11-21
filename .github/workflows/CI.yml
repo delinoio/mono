@@ -27,6 +27,7 @@ jobs:
       go: ${{ steps.plan.outputs.go }}
       rust: ${{ steps.plan.outputs.rust }}
       e2e: ${{ steps.plan.outputs.e2e }}
+      workspace: ${{ steps.plan.outputs.workspace }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -97,9 +98,10 @@ jobs:
           TURBO_SCM_BASE: ${{ needs.changes.outputs.base }}
           TURBO_SCM_HEAD: ${{ needs.changes.outputs.head }}
         run: pnpm format:check
-      - name: Test formatting and hooks
+      # The workspace package tests run in the `workspace` job.
+      - name: Test formatting, hooks and CI scripts
         if: needs.changes.outputs.fixtures == 'true'
-        run: pnpm test
+        run: pnpm test:tooling
       - name: Validate pending changesets
         # Runs `changeset version` when a changeset is pending; it rewrites
         # files of this throwaway checkout, so it runs last.
@@ -116,7 +118,7 @@ jobs:
         run: |
           echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD" >> "$GITHUB_STEP_SUMMARY"
           echo "Planned: format=$FORMAT_PLANNED; fixtures=$FIXTURES_PLANNED" >> "$GITHUB_STEP_SUMMARY"
-          echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test; scripts/ci/validate-changesets.sh (pending changeset validation)' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Commands (when planned): pnpm install --frozen-lockfile --ignore-scripts; pnpm format:check; pnpm test:tooling; scripts/ci/validate-changesets.sh (pending changeset validation)' >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Runtime, account, native platform and release acceptance: not performed; CI does not build or deploy app projects yet.' >> "$GITHUB_STEP_SUMMARY"
   go:
@@ -302,9 +304,46 @@ jobs:
           echo "Agent-tagged tests: ${AGENT_TESTS:-not run}" >> "$GITHUB_STEP_SUMMARY"
           echo "Result: $RESULT" >> "$GITHUB_STEP_SUMMARY"
           echo 'Scope: development servers in headless Chromium. Production build, Cloudflare Pages, account and release acceptance: not performed.' >> "$GITHUB_STEP_SUMMARY"
+  workspace:
+    needs: changes
+    if: needs.changes.outputs.workspace == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      # The server packages wrap the Go toolchain in their package scripts.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .nvmrc
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build, lint, typecheck and test workspace packages
+        # Every package runs: `--affected` selects no package when only a root
+        # input such as `package.json`, `turbo.json` or `go.mod` changes.
+        # `--continue` reports the failures of every package in one run.
+        run: pnpm exec turbo run build lint typecheck test --continue
+      - name: Record validation result
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          COMPARISON_BASE: ${{ needs.changes.outputs.base }}
+          COMPARISON_HEAD: ${{ needs.changes.outputs.head }}
+        run: |
+          {
+            echo "Comparison: $COMPARISON_BASE..$COMPARISON_HEAD"
+            echo 'Commands: pnpm install --frozen-lockfile --ignore-scripts; pnpm exec turbo run build lint typecheck test --continue (every workspace package)'
+            echo "Result: $RESULT"
+            echo 'Scope: package build output, lint, typecheck and unit tests without a database. Deployment, Tauri bundles, app launch and release acceptance: not performed.'
+          } >> "$GITHUB_STEP_SUMMARY"
   ci-result:
     if: always()
-    needs: [changes, quality, go, rust, e2e]
+    needs: [changes, quality, go, rust, e2e, workspace]
     runs-on: ubuntu-latest
     steps:
       - name: Check validation results
@@ -313,6 +352,7 @@ jobs:
           GO_PLANNED: ${{ needs.changes.outputs.go }}
           RUST_PLANNED: ${{ needs.changes.outputs.rust }}
           E2E_PLANNED: ${{ needs.changes.outputs.e2e }}
+          WORKSPACE_PLANNED: ${{ needs.changes.outputs.workspace }}
           NEEDS_RESULTS: ${{ toJSON(needs) }}
           VALIDATION_REVISION: ${{ github.sha }}
         shell: bash
@@ -320,7 +360,7 @@ jobs:
           set -euo pipefail
           echo "Validation revision: $VALIDATION_REVISION" >> "$GITHUB_STEP_SUMMARY"
           echo "$NEEDS_RESULTS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"' | tee -a "$GITHUB_STEP_SUMMARY"
-          if echo "$NEEDS_RESULTS" | jq -e --arg planned "$QUALITY_PLANNED" --arg go_planned "$GO_PLANNED" --arg rust_planned "$RUST_PLANNED" --arg e2e_planned "$E2E_PLANNED" 'all(.[]; .result == "success" or .result == "skipped") and .changes.result == "success" and (.quality.result == "success" or (.quality.result == "skipped" and $planned == "false")) and (.go.result == "success" or (.go.result == "skipped" and $go_planned == "false")) and (.rust.result == "success" or (.rust.result == "skipped" and $rust_planned == "false")) and (.e2e.result == "success" or (.e2e.result == "skipped" and $e2e_planned == "false"))' > /dev/null; then
+          if echo "$NEEDS_RESULTS" | jq -e --arg planned "$QUALITY_PLANNED" --arg go_planned "$GO_PLANNED" --arg rust_planned "$RUST_PLANNED" --arg e2e_planned "$E2E_PLANNED" --arg workspace_planned "$WORKSPACE_PLANNED" 'all(.[]; .result == "success" or .result == "skipped") and .changes.result == "success" and (.quality.result == "success" or (.quality.result == "skipped" and $planned == "false")) and (.go.result == "success" or (.go.result == "skipped" and $go_planned == "false")) and (.rust.result == "success" or (.rust.result == "skipped" and $rust_planned == "false")) and (.e2e.result == "success" or (.e2e.result == "skipped" and $e2e_planned == "false")) and (.workspace.result == "success" or (.workspace.result == "skipped" and $workspace_planned == "false"))' > /dev/null; then
             echo 'CI result: success' | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo 'CI result: failure' | tee -a "$GITHUB_STEP_SUMMARY"
