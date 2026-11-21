@@ -278,6 +278,13 @@ func (r *Registry) Ack(grantID string, result ownsandv1.RelayGrantResult, replac
 	g.AckAt = r.Now()
 	if replacedID != "" && replacedID == g.Replaces {
 		r.removeLocked(replacedID, OutcomeRemoved)
+	} else if g.Replaces != "" {
+		// The agent did not name the predecessor, so it stays installed. Clear
+		// its forward link too, or it could never be replaced again: Reserve
+		// rejects a replacement while Successor is set.
+		if p := r.byID[g.Replaces]; p != nil && p.Successor == grantID {
+			p.Successor = ""
+		}
 	}
 	g.Replaces = ""
 	close(g.done)
@@ -324,6 +331,16 @@ func (r *Registry) Admittable(grantID string) *Grant {
 		return nil
 	}
 	return g
+}
+
+// ReplacesOf returns the predecessor ID that g currently replaces, or "" when
+// g replaces no grant or the predecessor is already gone. The registry changes
+// the field under its mutex (Ack, Release and every removal), so callers must
+// use this snapshot instead of reading Grant.Replaces of a registry-owned grant.
+func (r *Registry) ReplacesOf(g *Grant) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return g.Replaces
 }
 
 // Get returns a grant in any state, or nil.

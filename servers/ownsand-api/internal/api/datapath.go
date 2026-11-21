@@ -461,13 +461,17 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	if !existing {
 		now := h.S.now()
+		// Snapshot the predecessor once under the registry mutex: the registry
+		// clears the field on release or ack while the writer still serializes
+		// the queued message.
+		replaces := h.Grants.ReplacesOf(g)
 		msg := &ownsandv1.RelayGrant{
 			GrantId: g.ID, SandboxId: g.SandboxID, OperationKind: g.Kind, OperationId: g.OperationID, RequestDigest: g.Digest,
 			Principal: pr.Proto(), ExpireTime: ts(g.ExpireAt), StreamDeadline: ts(g.StreamDeadline),
 			ExpiresIn: durationpb.New(g.ExpireAt.Sub(now)), StreamDeadlineIn: durationpb.New(g.StreamDeadlineIn),
 		}
-		if g.Replaces != "" {
-			msg.ReplacesGrantId = &g.Replaces
+		if replaces != "" {
+			msg.ReplacesGrantId = &replaces
 		}
 		if err := h.sendGrant(ctx, conn, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrant{RelayGrant: msg}}); err != nil {
 			// The grant never entered the outbound queue, so the agent cannot
@@ -476,7 +480,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 			// failure; a grant that was queued is never removed here.
 			removed := h.Grants.RemoveUndelivered(g.ID)
 			h.S.Logger.WarnContext(ctx, "relay_grant_enqueue_failed", slog.String("grant_id", g.ID), slog.String("sandbox_id", g.SandboxID),
-				slog.String("operation_kind", g.Kind.String()), slog.Bool("replacement", g.Replaces != ""),
+				slog.String("operation_kind", g.Kind.String()), slog.Bool("replacement", replaces != ""),
 				slog.String("error_category", enqueueErrorCategory(err)), slog.Bool("reservation_removed", removed))
 			return nil, errUnavailable("the agent channel closed")
 		}

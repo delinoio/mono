@@ -265,3 +265,102 @@ func TestRemoveUndelivered(t *testing.T) {
 		t.Fatalf("replacement retry after the failed one: %v", err)
 	}
 }
+
+// installedWithReplacement installs a grant and reserves a pending
+// replacement of it.
+func installedWithReplacement(t *testing.T, r *Registry) (pred, succ *Grant) {
+	t.Helper()
+	pred, _, err := r.Reserve(req("pred", "u", "op"), newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Ack(pred.ID, accepted, "")
+	repl := req("succ", "u", "op")
+	repl.ReplacesID = pred.ID
+	succ, _, err = r.Reserve(repl, newID)
+	if err != nil || succ.Replaces != pred.ID {
+		t.Fatalf("replacement: %v", err)
+	}
+	return pred, succ
+}
+
+// TestAckWithoutReplacedGrantFreesPredecessor covers an accepting
+// acknowledgement that does not name the predecessor: the predecessor stays
+// installed and can be replaced again.
+func TestAckWithoutReplacedGrantFreesPredecessor(t *testing.T) {
+	for _, replacedID := range []string{"", "another-grant"} {
+		t.Run("replaced="+replacedID, func(t *testing.T) {
+			c := &clock{t: time.Unix(1000, 0)}
+			r := New(c.now)
+			pred, succ := installedWithReplacement(t, r)
+			// While the successor is pending, a second replacement is refused.
+			again := req("again", "u", "op")
+			again.ReplacesID = pred.ID
+			if _, _, err := r.Reserve(again, newID); !errors.Is(err, ErrReplaceActive) {
+				t.Fatalf("replacement while pending: %v", err)
+			}
+			r.Ack(succ.ID, accepted, replacedID)
+			if r.Get(pred.ID) == nil {
+				t.Fatal("predecessor removed by an acknowledgement that did not name it")
+			}
+			if pred.Successor != "" || succ.Replaces != "" {
+				t.Fatalf("links not cleared: successor=%q replaces=%q", pred.Successor, succ.Replaces)
+			}
+			// The predecessor can be replaced again.
+			next, _, err := r.Reserve(again, newID)
+			if err != nil || next.Replaces != pred.ID {
+				t.Fatalf("replacement after the ack: %v", err)
+			}
+		})
+	}
+}
+
+// TestAckNamingPredecessorRemovesIt keeps the contract path: the named
+// predecessor is removed and the successor stays installed.
+func TestAckNamingPredecessorRemovesIt(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	r.Ack(succ.ID, accepted, pred.ID)
+	<-succ.Done()
+	if r.Get(pred.ID) != nil || r.Admittable(succ.ID) == nil || succ.Replaces != "" {
+		t.Fatal("swap not applied")
+	}
+}
+
+// TestReplacesOf covers the locked snapshot of the predecessor link.
+func TestReplacesOf(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	if got := r.ReplacesOf(succ); got != pred.ID {
+		t.Fatalf("ReplacesOf = %q", got)
+	}
+	r.Release(pred.ID, pred.DeviceID)
+	if got := r.ReplacesOf(succ); got != "" {
+		t.Fatalf("ReplacesOf after the release = %q", got)
+	}
+	if r.ReplacesOf(pred) != "" {
+		t.Fatal("grant without predecessor reports one")
+	}
+}
+
+// TestReplacesOfConcurrentRelease runs the snapshot against releases and acks
+// of the link; the race detector reports an unlocked read.
+func TestReplacesOfConcurrentRelease(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Release(pred.ID, pred.DeviceID)
+		r.Ack(succ.ID, accepted, pred.ID)
+	}()
+	for i := 0; i < 1000; i++ {
+		if got := r.ReplacesOf(succ); got != "" && got != pred.ID {
+			t.Fatalf("ReplacesOf = %q", got)
+		}
+	}
+	<-done
+}
