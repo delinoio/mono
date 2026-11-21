@@ -539,3 +539,71 @@ func TestFailedInstallRemovesTheArtifact(t *testing.T) {
 		}
 	}
 }
+
+// TestArtifactFailureKeepsSignedRevocation checks that a failed artifact
+// download keeps the state REVOKED_PENDING_IDLE while the verified manifest
+// revokes the running version, and that a later verified artifact installs.
+func TestArtifactFailureKeepsSignedRevocation(t *testing.T) {
+	r := newRelease(t, func(_ *Manifest, a *[]byte) { *a = []byte("tampered") })
+	busy := &atomic.Bool{}
+	busy.Store(true)
+	u, inst, restarts := newUpdater(t, r, "0.9.0", busy)
+	if err := update(u, "1.1.0", true); !errors.Is(err, ErrHashMismatch) {
+		t.Fatalf("hash mismatch: %v", err)
+	}
+	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE {
+		t.Fatalf("state after the artifact failure: %v", s)
+	}
+	if _, err := u.BeginCreate(); !errors.Is(err, ErrRunningRevoked) {
+		t.Fatalf("create after the artifact failure: %v", err)
+	}
+	if inst.installed.Load() != 0 || restarts.Load() != 0 {
+		t.Fatal("installer or restart ran after a failed artifact")
+	}
+	// A later command stages a verified artifact and installs once idle.
+	good := newRelease(t, nil)
+	u.opts.HTTP, u.opts.ManifestURL, u.opts.Keys = good.srv.Client(), good.srv.URL+"/manifest.json", []ed25519.PublicKey{good.pub}
+	if err := update(u, "1.1.0", true); err != nil {
+		t.Fatal(err)
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 {
+		t.Fatalf("recovery install: %v %v", ok, err)
+	}
+}
+
+// TestArtifactFailureWithoutRevocationReportsFailed covers the controls: an
+// unrevoked running version and an untrusted manifest signature both report
+// FAILED and never gate creates.
+func TestArtifactFailureWithoutRevocationReportsFailed(t *testing.T) {
+	tamper := func(_ *Manifest, a *[]byte) { *a = []byte("tampered") }
+	other, _, _ := ed25519.GenerateKey(rand.Reader)
+	for _, tc := range []struct {
+		name    string
+		running string
+		keys    func(*release) []ed25519.PublicKey
+	}{
+		{"running version not revoked", "1.0.0", func(r *release) []ed25519.PublicKey { return []ed25519.PublicKey{r.pub} }},
+		{"invalid manifest signature", "0.9.0", func(*release) []ed25519.PublicKey { return []ed25519.PublicKey{other} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRelease(t, tamper)
+			busy := &atomic.Bool{}
+			u, inst, _ := newUpdater(t, r, tc.running, busy, tc.keys(r)...)
+			if err := update(u, "1.1.0", true); err == nil {
+				t.Fatal("update should fail")
+			}
+			if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
+				t.Fatalf("state %v", s)
+			}
+			release, err := u.BeginCreate()
+			if err != nil {
+				t.Fatalf("create gated: %v", err)
+			}
+			release()
+			if inst.installed.Load() != 0 {
+				t.Fatal("installer ran")
+			}
+		})
+	}
+}

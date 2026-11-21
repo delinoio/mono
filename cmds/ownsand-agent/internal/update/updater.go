@@ -292,8 +292,17 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	}
 	m, artifactPath, err := u.download(ctx, target, order)
 	if err != nil {
-		if u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target) {
-			u.opts.Logger.Error("agent update verification failed", "target_version", target, "error", err)
+		// A verified manifest that revokes the running version keeps the
+		// device in the revoked state after an artifact failure, so the
+		// heartbeat tells the control plane to stop placing sandboxes.
+		failedState := ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
+		u.mu.Lock()
+		if u.revokedRunning {
+			failedState = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE
+		}
+		u.mu.Unlock()
+		if u.setStateFor(order, failedState, target) {
+			u.opts.Logger.Error("agent update verification failed", "target_version", target, "update_state", failedState.String(), "error", err)
 			return err
 		}
 		return ErrSuperseded
