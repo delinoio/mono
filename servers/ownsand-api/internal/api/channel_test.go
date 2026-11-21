@@ -816,14 +816,43 @@ func TestChannelNeedsLease(t *testing.T) {
 	if err != nil || held {
 		t.Fatalf("second instance lease: %v %v", held, err)
 	}
-	// The API key of the device's own organization and a device credential
-	// for another RPC are rejected on the channel.
-	stream := env.Clients(org.APIKey).Agent.Channel(context.Background())
-	_ = stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
-	if _, err := stream.Receive(); testenv.Code(err) != connect.CodePermissionDenied {
+	secondServer := httptest.NewUnstartedServer(second.Handler())
+	secondServer.EnableHTTP2 = true
+	secondServer.StartTLS()
+	t.Cleanup(secondServer.Close)
+	secondInstance := &instance{app: second, server: secondServer}
+	cred := env.SessionCredential(dev)
+
+	// A valid device stream to the instance without the lease ends
+	// unavailable before any configuration arrives.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	stream := secondInstance.channel(ctx, cred)
+	if err := stream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
+		t.Fatal(err)
+	}
+	if r := awaitReceive(t, "the refusal", receive(stream)); testenv.Code(r.err) != connect.CodeUnavailable || r.msg != nil {
+		t.Fatalf("device stream on the instance without the lease: %v %v", r.msg, r.err)
+	}
+
+	// Control: the same credential on the lease holder receives the
+	// configuration.
+	holder := (&instance{app: env.App, server: env.Server}).channel(ctx, cred)
+	if err := holder.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}}); err != nil {
+		t.Fatal(err)
+	}
+	cfg := awaitReceive(t, "the configuration from the holder", receive(holder))
+	if cfg.err != nil || cfg.msg.GetEnvelope().GetConfiguration() == nil {
+		t.Fatalf("first message from the lease holder: %v %v", cfg.msg, cfg.err)
+	}
+
+	// The API key of the device's own organization is rejected on the
+	// channel of the lease holder.
+	keyStream := env.Clients(org.APIKey).Agent.Channel(context.Background())
+	_ = keyStream.Send(&ownsandv1.ChannelRequest{Envelope: &ownsandv1.AgentEnvelope{}})
+	if _, err := keyStream.Receive(); testenv.Code(err) != connect.CodePermissionDenied {
 		t.Fatalf("api key on the channel: %v", err)
 	}
-	_ = dev
 }
 
 // gateLease is a LeaseHolder test double with the ownership semantics of
