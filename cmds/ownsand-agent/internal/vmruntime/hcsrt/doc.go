@@ -29,7 +29,8 @@ type computeSystemDoc struct {
 }
 
 type virtualMachineDoc struct {
-	// StopOnReset turns a guest reboot (panic=1) into a stop.
+	// StopOnReset turns a guest reboot (panic=1) into a stop. Windows
+	// guests keep it off: Windows Setup and installers reboot the guest.
 	StopOnReset     bool
 	Chipset         chipsetDoc
 	ComputeTopology topologyDoc
@@ -37,7 +38,25 @@ type virtualMachineDoc struct {
 }
 
 type chipsetDoc struct {
-	LinuxKernelDirect linuxKernelDirectDoc
+	LinuxKernelDirect *linuxKernelDirectDoc `json:",omitempty"`
+	Uefi              *uefiDoc              `json:",omitempty"`
+}
+
+// uefiDoc boots a Windows guest with the Hyper-V UEFI firmware. Without
+// BootThis the firmware boots the default removable-media path
+// (\EFI\Boot\bootx64.efi) of the EFI system partition of the SCSI disk,
+// which `bcdboot /s` writes. The guest state (NVRAM) is transient, so no
+// firmware boot entry outlives a boot.
+type uefiDoc struct {
+	BootThis *uefiBootEntryDoc `json:",omitempty"`
+	// Console sends the firmware console to a COM port ("ComPort1").
+	Console string `json:",omitempty"`
+}
+
+type uefiBootEntryDoc struct {
+	DeviceType string
+	DevicePath string `json:",omitempty"`
+	DiskNumber uint16
 }
 
 type linuxKernelDirectDoc struct {
@@ -97,6 +116,12 @@ const hvSocketSDDL = "D:P(A;;FA;;;SY)(A;;FA;;;BA)"
 
 // vmSpec is the input of the compute system document.
 type vmSpec struct {
+	// Owner is the HCS owner; empty selects Owner.
+	Owner string
+	// Windows boots Disk with UEFI instead of the Linux kernel.
+	Windows bool
+	// AllowReset keeps a Windows guest running across guest reboots.
+	AllowReset  bool
 	Kernel      string
 	Disk        string
 	ConsolePipe string
@@ -127,16 +152,23 @@ func kernelCmdLine(tunnel *netpolicy.Link) string {
 func newComputeSystemDoc(s vmSpec) computeSystemDoc {
 	// Hyper-V needs the memory size in whole 2 MiB pages.
 	mem := uint64(s.MemoryMiB+1) &^ 1
+	owner := s.Owner
+	if owner == "" {
+		owner = Owner
+	}
+	chipset := chipsetDoc{}
+	if s.Windows {
+		chipset.Uefi = &uefiDoc{Console: "ComPort1"}
+	} else {
+		chipset.LinuxKernelDirect = &linuxKernelDirectDoc{KernelFilePath: s.Kernel, KernelCmdLine: kernelCmdLine(s.Tunnel)}
+	}
 	doc := computeSystemDoc{
-		Owner:                             Owner,
+		Owner:                             owner,
 		SchemaVersion:                     schemaVersion{Major: 2, Minor: 1},
 		ShouldTerminateOnLastHandleClosed: true,
 		VirtualMachine: virtualMachineDoc{
-			StopOnReset: true,
-			Chipset: chipsetDoc{LinuxKernelDirect: linuxKernelDirectDoc{
-				KernelFilePath: s.Kernel,
-				KernelCmdLine:  kernelCmdLine(s.Tunnel),
-			}},
+			StopOnReset: !(s.Windows && s.AllowReset),
+			Chipset:     chipset,
 			ComputeTopology: topologyDoc{
 				Memory:    memoryDoc{SizeInMB: mem, AllowOvercommit: true, EnableDeferredCommit: true},
 				Processor: processorDoc{Count: uint32(s.VCPUs)},

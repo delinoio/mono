@@ -64,3 +64,47 @@ func TestComputeSystemDoc(t *testing.T) {
 		t.Errorf("NONE command line %q", cmd)
 	}
 }
+
+func TestWindowsComputeSystemDoc(t *testing.T) {
+	doc := newComputeSystemDoc(vmSpec{Windows: true, AllowReset: true, Disk: `C:\vms\w\disk.vhdx`,
+		ConsolePipe: `\.\pipe\ownsand-w-com1`, VCPUs: 2, MemoryMiB: 4096})
+	b, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Owner          string
+		VirtualMachine struct {
+			StopOnReset bool
+			Chipset     map[string]map[string]any
+			Devices     struct {
+				Scsi     map[string]map[string]map[string]map[string]string
+				ComPorts map[string]map[string]string
+			}
+			ComputeTopology struct{ Memory struct{ SizeInMB int } }
+		}
+	}
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	vm := got.VirtualMachine
+	if got.Owner != Owner || vm.StopOnReset {
+		t.Errorf("owner %q, StopOnReset %v in %s", got.Owner, vm.StopOnReset, b)
+	}
+	if _, ok := vm.Chipset["LinuxKernelDirect"]; ok {
+		t.Errorf("Windows guest boots a Linux kernel: %s", b)
+	}
+	if uefi, ok := vm.Chipset["Uefi"]; !ok || uefi["Console"] != "ComPort1" {
+		t.Errorf("Uefi chipset %v in %s", uefi, b)
+	}
+	if p := vm.Devices.Scsi["0"]["Attachments"]["0"]["Path"]; p != `C:\vms\w\disk.vhdx` {
+		t.Errorf("disk %q", p)
+	}
+	if vm.Devices.ComPorts["0"]["NamedPipe"] != `\.\pipe\ownsand-w-com1` || vm.ComputeTopology.Memory.SizeInMB != 4096 {
+		t.Errorf("devices %s", b)
+	}
+	build := newComputeSystemDoc(vmSpec{Owner: "ownsand-agent-image-build", Windows: true, Disk: "d"})
+	if build.Owner != "ownsand-agent-image-build" || !build.VirtualMachine.StopOnReset {
+		t.Errorf("owner %q StopOnReset %v", build.Owner, build.VirtualMachine.StopOnReset)
+	}
+}

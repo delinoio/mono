@@ -22,7 +22,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netstack"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -31,11 +31,14 @@ import (
 
 // Timeouts of the runtime.
 const (
-	readyTimeout  = 60 * time.Second
-	stopTimeout   = 30 * time.Second
-	dialTimeout   = 10 * time.Second
-	tunnelTimeout = 20 * time.Second
-	removeTimeout = 10 * time.Second
+	readyTimeout = 60 * time.Second
+	// windowsReadyTimeout bounds the cold boot of a Windows guest until its
+	// guest helper service answers.
+	windowsReadyTimeout = 5 * time.Minute
+	stopTimeout         = 30 * time.Second
+	dialTimeout         = 10 * time.Second
+	tunnelTimeout       = 20 * time.Second
+	removeTimeout       = 10 * time.Second
 )
 
 // guestLink is the link of every OUTBOUND sandbox: each sandbox has its own
@@ -114,11 +117,16 @@ func (r *Runtime) Capabilities(context.Context) vmruntime.Capabilities {
 	} else {
 		check(checkImage, false, "kernel or root file system is missing")
 	}
-	check(checkNetwork, true, "OUTBOUND sandboxes use the agent's userspace network stack through a Hyper-V socket tunnel")
+	winImage, winDetail := r.windowsImageCheck()
+	check(checkWindowsImage, winImage, winDetail)
+	check(checkNetwork, true, "OUTBOUND Linux sandboxes use the agent's userspace network stack through a Hyper-V socket tunnel; Windows sandboxes run with network mode NONE only")
 	if hv {
-		caps.GuestOSes = []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_LINUX}
+		caps.GuestOSes = []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_LINUX, ownsandv1.GuestOs_GUEST_OS_WINDOWS}
 		if image {
-			caps.BaseImages = []ownsandv1.BaseImage{ownsandv1.BaseImage_BASE_IMAGE_LINUX}
+			caps.BaseImages = append(caps.BaseImages, ownsandv1.BaseImage_BASE_IMAGE_LINUX)
+		}
+		if winImage {
+			caps.BaseImages = append(caps.BaseImages, ownsandv1.BaseImage_BASE_IMAGE_WINDOWS)
 		}
 	}
 	return caps
@@ -127,6 +135,7 @@ func (r *Runtime) Capabilities(context.Context) vmruntime.Capabilities {
 type vm struct {
 	id        string
 	dir       string
+	guestOS   ownsandv1.GuestOs
 	restore   ownsandv1.SandboxRestorePath
 	network   ownsandv1.NetworkMode
 	runtimeID guid.GUID
@@ -220,14 +229,21 @@ func consolePipe(sandboxID string) string { return `\\.\pipe\ownsand-` + sandbox
 
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
-	if spec.GuestOS != ownsandv1.GuestOs_GUEST_OS_LINUX {
-		return nil, fmt.Errorf("%w: this agent version runs only Linux guests on Windows hosts", vmruntime.ErrUnsupported)
-	}
-	if !fileExists(r.opts.Kernel) {
-		return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
-	}
-	if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
-		return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+	windowsGuest := spec.GuestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS
+	switch spec.GuestOS {
+	case ownsandv1.GuestOs_GUEST_OS_LINUX:
+		if !fileExists(r.opts.Kernel) {
+			return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
+		}
+		if spec.Snapshot == nil && !fileExists(r.opts.Rootfs) {
+			return nil, fmt.Errorf("%w: the Linux base image is missing", vmruntime.ErrUnsupported)
+		}
+	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
+		if err := r.checkWindowsSpec(spec); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("%w: Hyper-V runs Linux and Windows guests, not %v", vmruntime.ErrUnsupported, spec.GuestOS)
 	}
 	if err := hcsLoad(); err != nil {
 		return nil, fmt.Errorf("%w: the Host Compute Service is not available: %v", vmruntime.ErrUnsupported, err)
@@ -239,7 +255,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if err := os.MkdirAll(spec.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	v := &vm{id: spec.SandboxID, dir: spec.Dir, network: spec.NetworkMode,
+	v := &vm{id: spec.SandboxID, dir: spec.Dir, guestOS: spec.GuestOS, network: spec.NetworkMode,
 		exited: make(chan struct{}), stopping: make(chan struct{})}
 	// cleanup releases everything of a failed create: the sandbox manager
 	// records the sandbox as FAILED and never calls Delete for it.
@@ -261,38 +277,27 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		cleanup()
 		return nil, err
 	}
-	if err := grantVMGroup(r.opts.Kernel, accessRead, false); err != nil {
-		cleanup()
-		return nil, err
+	var (
+		vs   vmSpec
+		size int64
+		err  error
+	)
+	if windowsGuest {
+		vs, size, err = r.prepareWindowsDisk(spec)
+	} else {
+		vs, size, err = r.prepareLinuxDisk(spec)
 	}
-	src, hasFooter := r.opts.Rootfs, false
-	if spec.Snapshot != nil {
-		src, hasFooter = filepath.Join(spec.Snapshot.Dir, snapDisk), true
-	}
-	disk := filepath.Join(spec.Dir, diskFile)
-	if err := copyFile(src, disk); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("hcsrt: prepare disk: %w", err)
-	}
-	size, err := makeFixedVHD(disk, spec.Resources.GetDiskGib()<<30, hasFooter)
 	if err != nil {
 		cleanup()
-		return nil, fmt.Errorf("hcsrt: prepare disk: %w", err)
-	}
-	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
-		cleanup()
 		return nil, err
 	}
+	vs.ConsolePipe = consolePipe(v.id)
+	vs.VCPUs, vs.MemoryMiB = spec.Resources.GetVcpuCount(), spec.Resources.GetMemoryMib()
 	diskReady := time.Now()
 	r.mu.Lock()
 	r.vms[spec.SandboxID] = v
 	r.mu.Unlock()
 
-	vs := vmSpec{Kernel: r.opts.Kernel, Disk: disk, ConsolePipe: consolePipe(v.id),
-		VCPUs: spec.Resources.GetVcpuCount(), MemoryMiB: spec.Resources.GetMemoryMib()}
-	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
-		vs.Tunnel = &guestLink
-	}
 	sys, err := createSystem(systemID(v.id), newComputeSystemDoc(vs))
 	if err != nil {
 		cleanup()
@@ -320,11 +325,20 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	v.consoleDone = make(chan struct{})
 	go r.copyConsole(v)
 	booted := time.Now()
-	if err := r.waitGuest(ctx, v); err != nil {
+	timeout := readyTimeout
+	if windowsGuest {
+		timeout = windowsReadyTimeout
+	}
+	if err := waitGuest(ctx, v.Dial, v.exited, timeout); err != nil {
 		cleanup()
 		return nil, err
 	}
 	ready := time.Now()
+	if windowsGuest {
+		// The guest has no time synchronization with the host and its RTC
+		// need not hold UTC, so the clock is set at every boot.
+		r.setGuestClock(ctx, v)
+	}
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		if err := r.attachNetwork(ctx, v); err != nil {
 			cleanup()
@@ -336,11 +350,39 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	} else {
 		v.restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE
 	}
-	r.logger.Info("VM started", "sandbox_id", v.id, "restore_path", v.restore.String(),
+	r.logger.Info("VM started", "sandbox_id", v.id, "guest_os", v.guestOS.String(), "restore_path", v.restore.String(),
 		"runtime_id", v.runtimeID.String(), "disk_bytes", size,
 		"disk_ms", diskReady.Sub(start).Milliseconds(), "create_ms", booted.Sub(diskReady).Milliseconds(),
 		"guest_ready_ms", ready.Sub(booted).Milliseconds(), "total_ms", time.Since(start).Milliseconds())
 	return v, nil
+}
+
+// prepareLinuxDisk makes the fixed VHD of a Linux guest from the root file
+// system or a snapshot disk.
+func (r *Runtime) prepareLinuxDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
+	if err := grantVMGroup(r.opts.Kernel, accessRead, false); err != nil {
+		return vmSpec{}, 0, err
+	}
+	src, hasFooter := r.opts.Rootfs, false
+	if spec.Snapshot != nil {
+		src, hasFooter = filepath.Join(spec.Snapshot.Dir, snapDisk), true
+	}
+	disk := filepath.Join(spec.Dir, diskFile)
+	if err := copyFile(src, disk); err != nil {
+		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
+	}
+	size, err := makeFixedVHD(disk, spec.Resources.GetDiskGib()<<30, hasFooter)
+	if err != nil {
+		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
+	}
+	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {
+		return vmSpec{}, 0, err
+	}
+	vs := vmSpec{Kernel: r.opts.Kernel, Disk: disk}
+	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
+		vs.Tunnel = &guestLink
+	}
+	return vs, size, nil
 }
 
 // copyConsole copies the COM1 output of v to console.log for boot
@@ -378,11 +420,12 @@ func (r *Runtime) copyConsole(v *vm) {
 	}
 }
 
-// waitGuest waits until the guest helper answers CheckReady.
-func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
-	rctx, cancel := context.WithTimeout(ctx, readyTimeout)
+// waitGuest waits until the guest helper answers CheckReady, at most
+// timeout, and fails when exited closes first.
+func waitGuest(ctx context.Context, dial guestclient.Dialer, exited <-chan struct{}, timeout time.Duration) error {
+	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	client := guestclient.New(v.Dial)
+	client := guestclient.New(dial)
 	defer client.Close()
 	done := make(chan error, 1)
 	go func() {
@@ -395,7 +438,7 @@ func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
 			return fmt.Errorf("hcsrt: guest helper not ready: %w", err)
 		}
 		return nil
-	case <-v.exited:
+	case <-exited:
 		return errors.New("hcsrt: the VM stopped during boot")
 	}
 }
@@ -506,7 +549,7 @@ func (r *Runtime) Pause(ctx context.Context, m vmruntime.VM) error {
 	if err != nil {
 		return err
 	}
-	if err := guestsync.Sync(ctx, v.id, v.Dial); err != nil {
+	if err := r.flushGuest(ctx, v); err != nil {
 		r.logger.Warn("guest sync before pause failed", "sandbox_id", v.id, "error", err)
 	}
 	if err := sys.pause(); err != nil {
@@ -565,8 +608,14 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 		}()
 	}
 	start := time.Now()
-	dst := filepath.Join(dir, snapDisk)
-	if err := copyFile(filepath.Join(v.dir, diskFile), dst); err != nil {
+	src, dst := filepath.Join(v.dir, diskFile), filepath.Join(dir, snapDisk)
+	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS {
+		src, dst = filepath.Join(v.dir, windowsDiskFile), filepath.Join(dir, snapWindowsDisk)
+		if err := copyFile(filepath.Join(v.dir, images.MetadataFile), filepath.Join(dir, images.MetadataFile)); err != nil {
+			return vmruntime.SnapshotInfo{}, err
+		}
+	}
+	if err := copyFile(src, dst); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
 	st, err := os.Stat(dst)
