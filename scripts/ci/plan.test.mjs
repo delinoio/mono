@@ -464,6 +464,11 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "servers/ownsand-api/internal/db/migrations/0001_initial.sql",
+    "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
+    "go/example/testdata/case.golden",
+    "cmds/example/internal/testdata/input.json",
+    "internal/example/testdata/input.txt",
+    "servers/example/testdata/fixture.json",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -481,7 +486,28 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("rstest.config.ts");
   f.write("servers/ownsand-api/README.md");
   f.write(".github/workflows/deploy.yml");
+  f.write("docs/testdata/example.json");
+  f.write("go/example/mytestdata/example.json");
+  f.write("go/example/testdata.json");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
+});
+
+test("The relay request digest vectors select Go checks and workspace jobs", (t) => {
+  const f = fixture(t);
+  f.write("go/ownsand/relaybinding/testdata/request-digest-vectors.json");
+  const result = plan(f.cwd, f.base, f.commit());
+  assert.equal(result.go, true);
+  assert.equal(result.workspace, true);
+  assert.equal(result.rust, false);
+  assert.equal(result.workflows, false);
+});
+
+test("Other Go testdata selects Go checks but not workspace jobs", (t) => {
+  const f = fixture(t);
+  f.write("go/example/testdata/case.golden");
+  const result = plan(f.cwd, f.base, f.commit());
+  assert.equal(result.go, true);
+  assert.equal(result.workspace, false);
 });
 
 test("Rust sources, Cargo files, toolchain files and Tauri crates select Rust checks", async (t) => {
