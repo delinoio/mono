@@ -304,19 +304,33 @@ func relayRequest[T any](g *relayGrant, msg *T) *connect.Request[T] {
 
 // stallContext returns a context for one relay server stream that is
 // cancelled with errStall when the response body receives no byte for the
-// stall timeout.
-func (c *Client) stallContext(ctx context.Context) (context.Context, func()) {
+// stall timeout. A positive budget also cancels it with errRecoveryDeadline
+// when the budget passes before the caller calls disarm, which the operation
+// does when the agent accepts the stream or its progress ends the recovery
+// window. A zero budget arms no such timer. The timer, not a context
+// deadline, cancels the stream, so a blocked Receive and keepalive-only
+// traffic obey the budget and Connect sends no request timeout.
+func (c *Client) stallContext(ctx context.Context, budget time.Duration) (actx context.Context, disarm func(), stop func()) {
 	actx, cancel := context.WithCancelCause(ctx)
 	a := newActivity()
 	actx = withActivity(actx, a)
-	stop := make(chan struct{})
+	var timer *time.Timer
+	if budget > 0 {
+		timer = time.AfterFunc(budget, func() { cancel(errRecoveryDeadline) })
+	}
+	disarm = func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}
+	quit := make(chan struct{})
 	go func() {
 		tick := max(c.timing.streamStall/20, time.Millisecond)
 		t := time.NewTicker(tick)
 		defer t.Stop()
 		for {
 			select {
-			case <-stop:
+			case <-quit:
 				return
 			case <-actx.Done():
 				return
@@ -328,16 +342,25 @@ func (c *Client) stallContext(ctx context.Context) (context.Context, func()) {
 			}
 		}
 	}()
-	return actx, func() {
-		close(stop)
+	return actx, disarm, func() {
+		disarm()
+		close(quit)
 		cancel(context.Canceled)
 	}
 }
 
-// streamErr turns the error of a stalled stream into errStall.
-func streamErr(actx context.Context, err error) error {
-	if err != nil && errors.Is(context.Cause(actx), errStall) {
+// streamErr turns the error of a stream that the SDK cancelled into the
+// cause: errStall for a stalled stream, and for a continuation that passed
+// its recovery budget before acceptance the deadline error of rec.
+func streamErr(actx context.Context, err error, rec *recovery) error {
+	if err == nil {
+		return nil
+	}
+	switch cause := context.Cause(actx); {
+	case errors.Is(cause, errStall):
 		return errStall
+	case errors.Is(cause, errRecoveryDeadline):
+		return rec.deadlineErr()
 	}
 	return err
 }

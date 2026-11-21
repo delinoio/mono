@@ -4,6 +4,8 @@ package ownsand
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -154,6 +156,36 @@ func (r *recovery) remaining() time.Duration {
 		used += time.Since(r.running)
 	}
 	return r.window - used
+}
+
+// deadlineErr returns the error of a continuation that cannot start or stay
+// unaccepted any longer because the window ended. It wraps the last failure
+// of the window, so the caller sees the failure that started the recovery.
+func (r *recovery) deadlineErr() error {
+	last := r.err()
+	if last == nil {
+		return errRecoveryDeadline
+	}
+	if errors.Is(last, errRecoveryDeadline) {
+		return last
+	}
+	return fmt.Errorf("%w: last failure: %w", errRecoveryDeadline, last)
+}
+
+// streamBudget returns the time that a relay stream attempt may wait for the
+// agent to accept it. It returns zero when the attempt is not part of a
+// recovery, so only the byte-idle limit applies. When the window has ended,
+// it returns a negative duration.
+func (r *recovery) streamBudget() time.Duration {
+	if !r.inRecovery() {
+		return 0
+	}
+	left := r.remaining()
+	if left == 0 {
+		// An exhausted budget must not read as "no budget".
+		return -1
+	}
+	return left
 }
 
 // backoff waits before the next attempt: at least minDelay, with an

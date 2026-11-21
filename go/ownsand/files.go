@@ -226,22 +226,35 @@ func (op *readOp) relayAttempt(ctx context.Context) readAttempt {
 		at.err, at.authErr = err, true
 		return at
 	}
-	actx, stop := c.stallContext(ctx)
+	budget := op.rec.streamBudget()
+	if budget < 0 {
+		// The recovery window ended while the grant was renewed: start no
+		// continuation.
+		at.err = op.rec.deadlineErr()
+		return at
+	}
+	actx, disarm, stop := c.stallContext(ctx, budget)
 	defer stop()
 	defer op.grant.streamEnded()
 	stream, err := c.relay.ReadFile(actx, relayRequest(op.grant, op.request()))
 	if err != nil {
-		at.err = streamErr(actx, err)
+		at.err = streamErr(actx, err, op.rec)
 		return at
 	}
 	defer stream.Close()
 	for stream.Receive() {
-		if op.handleEvent(stream.Msg().GetEvent(), &at) {
+		done := op.handleEvent(stream.Msg().GetEvent(), &at)
+		if at.accepted || !op.rec.inRecovery() {
+			// The agent accepted the continuation, or progress ended the
+			// window: the recovery budget no longer bounds the stream.
+			disarm()
+		}
+		if done {
 			return at
 		}
 	}
 	if err := stream.Err(); err != nil {
-		at.err = streamErr(actx, err)
+		at.err = streamErr(actx, err, op.rec)
 		return at
 	}
 	at.err = io.EOF

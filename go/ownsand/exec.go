@@ -454,7 +454,14 @@ func (op *execOp) relayAttempt(ctx context.Context) attempt {
 		return at
 	}
 	at.sentExec = isExec
-	actx, stop := c.stallContext(ctx)
+	budget := op.rec.streamBudget()
+	if budget < 0 {
+		// The recovery window ended while the grant was renewed: start no
+		// continuation.
+		at.err = op.rec.deadlineErr()
+		return at
+	}
+	actx, disarm, stop := c.stallContext(ctx, budget)
 	defer stop()
 	defer op.grant.streamEnded()
 	var stream serverStream
@@ -462,26 +469,32 @@ func (op *execOp) relayAttempt(ctx context.Context) attempt {
 	if isExec {
 		s, err := c.relay.Exec(actx, relayRequest(op.grant, payload.(*ownsandv1.ExecRequest)))
 		if err != nil {
-			at.err = streamErr(actx, err)
+			at.err = streamErr(actx, err, op.rec)
 			return at
 		}
 		stream, next = s, func() *ownsandv1.ExecEvent { return s.Msg().GetEvent() }
 	} else {
 		s, err := c.relay.AttachExec(actx, relayRequest(op.grant, payload.(*ownsandv1.AttachExecRequest)))
 		if err != nil {
-			at.err = streamErr(actx, err)
+			at.err = streamErr(actx, err, op.rec)
 			return at
 		}
 		stream, next = s, func() *ownsandv1.ExecEvent { return s.Msg().GetEvent() }
 	}
 	defer stream.Close()
 	for stream.Receive() {
-		if done := op.handleEvent(next(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY); done {
+		done := op.handleEvent(next(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY)
+		if at.accepted || !op.rec.inRecovery() {
+			// The agent accepted the continuation, or progress ended the
+			// window: the recovery budget no longer bounds the stream.
+			disarm()
+		}
+		if done {
 			return at
 		}
 	}
 	if err := stream.Err(); err != nil {
-		at.err = streamErr(actx, err)
+		at.err = streamErr(actx, err, op.rec)
 		return at
 	}
 	at.err = io.EOF

@@ -1164,3 +1164,153 @@ func TestRelayUnavailableWithCredentialStillRecovers(t *testing.T) {
 	res, r := runExec(t, s)
 	checkLines(t, res, r, 3)
 }
+
+// recoveryDeadlineClient returns a relay client whose recovery window is
+// much shorter than the byte-idle limit, so only the recovery deadline can
+// end a continuation that the agent does not accept.
+func recoveryDeadlineClient(t *testing.T, cp *fakeCP, window time.Duration) *Client {
+	t.Helper()
+	c := cp.client(t, TransportRelay)
+	c.timing.recoveryWindow = window
+	c.timing.streamStall = 30 * time.Second
+	return c
+}
+
+// heldDurations returns how long each held relay stream stayed open. It
+// waits briefly for the fake to see the cancellation of every held stream
+// that began, because the server handler ends after the client call returns.
+func (cp *fakeCP) heldDurations() []time.Duration {
+	for range 100 {
+		cp.mu.Lock()
+		done := len(cp.heldEnds) >= len(cp.heldStarts)
+		cp.mu.Unlock()
+		if done {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	var d []time.Duration
+	for i := range min(len(cp.heldStarts), len(cp.heldEnds)) {
+		d = append(d, cp.heldEnds[i].Sub(cp.heldStarts[i]))
+	}
+	return d
+}
+
+func TestExecContinuationNotAcceptedEndsAtRecoveryDeadline(t *testing.T) {
+	for name, act := range map[string]relayAction{
+		"blocked receive": {holdOpen: true},
+		"keepalives only": {keepalivesOnly: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(5, 20*time.Millisecond)
+			cp.relayScript = func(method string, n int) relayAction {
+				if method == "Exec" {
+					return relayAction{abortAfter: 1}
+				}
+				return act
+			}
+			c := recoveryDeadlineClient(t, cp, 300*time.Millisecond)
+			s := cp.handle(t, c)
+			start := time.Now()
+			_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+			elapsed := time.Since(start)
+			var dp *DataPathError
+			if !errors.As(err, &dp) || !errors.Is(err, errRecoveryDeadline) {
+				t.Fatalf("want a DataPathError with errRecoveryDeadline, got %v", err)
+			}
+			// The error carries the failure that started the recovery: the
+			// lost first stream, which has no valid terminal status.
+			if !strings.Contains(err.Error(), "last failure") {
+				t.Fatalf("error %v does not carry the last recovery failure", err)
+			}
+			if elapsed > c.timing.recoveryWindow+time.Second {
+				t.Fatalf("operation took %v, want about the recovery window %v", elapsed, c.timing.recoveryWindow)
+			}
+			held := cp.heldDurations()
+			if len(held) != 1 || held[0] > c.timing.recoveryWindow+500*time.Millisecond {
+				t.Fatalf("held streams %v, want one that the SDK cancelled within the recovery window", held)
+			}
+			if n := cp.relayCount("AttachExec"); n != 1 {
+				t.Fatalf("%d AttachExec calls, want 1: no continuation starts after expiry", n)
+			}
+		})
+	}
+}
+
+func TestExecContinuationAcceptedBeforeDeadlineStaysOpenPastIt(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 0)
+	cp.relayScript = func(method string, n int) relayAction {
+		if method == "Exec" {
+			return relayAction{abortAfter: 1}
+		}
+		// Accepted at once, then keepalives for longer than the window.
+		return relayAction{acceptedKeepalives: 700 * time.Millisecond}
+	}
+	c := recoveryDeadlineClient(t, cp, 300*time.Millisecond)
+	s := cp.handle(t, c)
+	start := time.Now()
+	res, r := runExec(t, s)
+	checkLines(t, res, r, 3)
+	if time.Since(start) < 2*c.timing.recoveryWindow {
+		t.Fatalf("operation took %v; the accepted continuation did not outlive the window", time.Since(start))
+	}
+	if n := cp.relayCount("AttachExec"); n != 1 {
+		t.Fatalf("%d AttachExec calls, want 1", n)
+	}
+}
+
+func TestExecInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 0)
+	cp.relayScript = func(method string, n int) relayAction {
+		switch {
+		case method == "Exec":
+			return relayAction{abortAfter: 1}
+		case n == 1:
+			// 300 ms before acceptance use half of the budget; the accepted
+			// stream then stays open for longer than the whole window and
+			// is lost without data.
+			return relayAction{delay: 300 * time.Millisecond, acceptedKeepalives: 800 * time.Millisecond, abortAfterKeepalives: true}
+		}
+		return relayAction{holdOpen: true}
+	}
+	c := recoveryDeadlineClient(t, cp, 600*time.Millisecond)
+	s := cp.handle(t, c)
+	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+	if !errors.Is(err, errRecoveryDeadline) {
+		t.Fatalf("want errRecoveryDeadline, got %v", err)
+	}
+	held := cp.heldDurations()
+	// A fresh window would hold the second continuation for about 600 ms;
+	// the saved budget is what the first continuation left over.
+	if len(held) != 1 || held[0] > 480*time.Millisecond {
+		t.Fatalf("held streams %v, want one bounded by the saved budget", held)
+	}
+}
+
+func TestExecCallerCancellationEndsHeldContinuationEarlier(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(5, 20*time.Millisecond)
+	cp.relayScript = func(method string, n int) relayAction {
+		if method == "Exec" {
+			return relayAction{abortAfter: 1}
+		}
+		return relayAction{holdOpen: true}
+	}
+	c := recoveryDeadlineClient(t, cp, 5*time.Second)
+	s := cp.handle(t, c)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+	if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, errRecoveryDeadline) {
+		t.Fatalf("want the caller's deadline, got %v", err)
+	}
+	if time.Since(start) > time.Second {
+		t.Fatalf("cancellation took %v", time.Since(start))
+	}
+}
