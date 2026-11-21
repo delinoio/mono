@@ -61,6 +61,9 @@ type fakeRuntime struct {
 	// capture started and wait until snapBlock is closed.
 	snapStarted chan struct{}
 	snapBlock   chan struct{}
+	// snapshotErr, when set, makes Snapshot fail after it wrote its content,
+	// like a runtime whose resume failed after a completed capture.
+	snapshotErr error
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
@@ -149,6 +152,12 @@ func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (v
 	}
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, "disk"), []byte("disk"), 0o600)
+	r.mu.Lock()
+	snapshotErr := r.snapshotErr
+	r.mu.Unlock()
+	if snapshotErr != nil {
+		return vmruntime.SnapshotInfo{}, snapshotErr
+	}
 	return vmruntime.SnapshotInfo{SizeBytes: 4}, nil
 }
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
@@ -1054,6 +1063,44 @@ func TestPauseResumeAndSnapshot(t *testing.T) {
 	}
 	if report := e.m.StateReport(2, nil); len(report.GetSnapshots()) != 1 {
 		t.Fatal("snapshot missing from the state report")
+	}
+}
+
+// TestSnapshotErrorNeverYieldsReady checks that an error from the runtime
+// snapshot, for example a resume that failed after a completed capture, fails
+// the command with INTERNAL and leaves no snapshot record, no snapshot
+// content and no READY entry in the state report, and that a retry works.
+func TestSnapshotErrorNeverYieldsReady(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	e.rt.mu.Lock()
+	e.rt.snapshotErr = errors.New("resume after snapshot: hcs: resume rejected")
+	e.rt.mu.Unlock()
+	entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+	var ce *CommandError
+	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL || entry != nil {
+		t.Fatalf("snapshot %v %v, want an INTERNAL error and no entry", entry, err)
+	}
+	if e.m.HasSnapshot(snapID) {
+		t.Fatal("failed snapshot is known to the manager")
+	}
+	for _, s := range e.m.StateReport(2, nil).GetSnapshots() {
+		t.Fatalf("state report holds the snapshot %v after a failed capture", s)
+	}
+	if dir, err := e.st.SnapshotDir(snapID); err != nil {
+		t.Fatal(err)
+	} else {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Fatalf("snapshot directory %s remains: %v", dir, err)
+		}
+	}
+	// The error leaves the capture unregistered, so a retry can succeed.
+	e.rt.mu.Lock()
+	e.rt.snapshotErr = nil
+	e.rt.mu.Unlock()
+	if en, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id}); err != nil || en.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("retry %v %v", en, err)
 	}
 }
 

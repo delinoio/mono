@@ -651,17 +651,17 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	v.mu.Lock()
 	wasPaused := v.paused
 	v.mu.Unlock()
-	// A paused VM was flushed by its Pause; Pause flushes a running one.
-	if !wasPaused {
-		if err := r.Pause(ctx, m); err != nil {
-			return vmruntime.SnapshotInfo{}, err
-		}
-		defer func() {
-			if err := r.Resume(context.Background(), m); err != nil {
-				r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", err)
-			}
-		}()
-	}
+	// A paused VM was flushed by its Pause; Pause flushes a running one. A
+	// failed resume after a completed capture fails the snapshot, so no READY
+	// record is saved for a VM that stays paused.
+	return vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
+		func() error { return r.Pause(ctx, m) },
+		func() error { return r.Resume(context.Background(), m) },
+		func() (vmruntime.SnapshotInfo, error) { return r.capture(v, dir) })
+}
+
+// capture writes the snapshot content of the paused VM v into dir.
+func (r *Runtime) capture(v *vm, dir string) (vmruntime.SnapshotInfo, error) {
 	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
 		return r.snapshotMacOS(v, dir)
 	}
