@@ -67,6 +67,8 @@ type fakeRuntime struct {
 	pauseErr  error
 	resumeErr error
 	starts    int // Create calls, counted before any block or error
+	// onCreate, when set, runs in Create after the VM started.
+	onCreate func(spec vmruntime.Spec)
 }
 
 func (r *fakeRuntime) startCount() int {
@@ -101,6 +103,9 @@ func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntim
 	defer r.mu.Unlock()
 	v := &fakeVM{id: spec.SandboxID, exited: make(chan struct{})}
 	r.vms[spec.SandboxID] = v
+	if r.onCreate != nil {
+		r.onCreate(spec)
+	}
 	return v, nil
 }
 func (r *fakeRuntime) Pause(_ context.Context, vm vmruntime.VM) error {
@@ -723,6 +728,97 @@ func TestSurvivingVMIsStoppedAtStart(t *testing.T) {
 func TestLostVM(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.vms[id].stop()
+	e.rt.mu.Unlock()
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	if endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatal("lost VM reason")
+	}
+}
+
+// blockRecord makes every later save of the sandbox record fail: it replaces
+// the record file with a non-empty directory, which the atomic rename cannot
+// overwrite.
+func blockRecord(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	path := st.Path(store.SandboxesDir, id+".json")
+	if err := os.RemoveAll(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "keep"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func unblockRecord(t *testing.T, st *store.Store, id string) {
+	t.Helper()
+	if err := os.RemoveAll(st.Path(store.SandboxesDir, id+".json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func requireInternal(t *testing.T, err error) {
+	t.Helper()
+	var ce *CommandError
+	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL {
+		t.Fatalf("want an internal error, got %v", err)
+	}
+}
+
+func TestCreateFirstRecordFailureRollsBack(t *testing.T) {
+	e := newEnv(t)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	blockRecord(t, e.st, id)
+	_, err := e.m.Create(context.Background(), cmd)
+	requireInternal(t, err)
+	if e.rt.startCount() != 0 {
+		t.Fatal("a VM started although the record was not saved")
+	}
+	if _, ok := e.m.State(id); ok {
+		t.Fatal("unrecorded sandbox is still known")
+	}
+	if len(e.m.Entries()) != 0 || len(e.m.StateReport(1, nil).GetSandboxes()) != 0 || e.m.Busy() {
+		t.Fatal("unrecorded sandbox is still reported or busy")
+	}
+	// The rolled-back sandbox does not count against the limits: three more
+	// one-vCPU sandboxes and the retry below fill the four-vCPU device.
+	for range 3 {
+		if _, err := e.m.Create(context.Background(), e.createCmd(1, time.Hour, time.Hour)); err != nil {
+			t.Fatalf("create after rollback: %v", err)
+		}
+	}
+	// A retry of the same command after the store recovers creates one VM.
+	unblockRecord(t, e.st, id)
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("retry %v %v", entry, err)
+	}
+	if e.rt.startCount() != 4 {
+		t.Fatalf("starts %d, want 4", e.rt.startCount())
+	}
+}
+
+func TestCreateRunningRecordFailureStillWatchesVM(t *testing.T) {
+	e := newEnv(t)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	// The first save works; the running save fails.
+	e.rt.onCreate = func(vmruntime.Spec) { blockRecord(t, e.st, id) }
+	_, err := e.m.Create(context.Background(), cmd)
+	requireInternal(t, err)
+	if e.rt.startCount() != 1 {
+		t.Fatalf("starts %d, want 1", e.rt.startCount())
+	}
+	if _, ok := e.m.State(id); !ok {
+		t.Fatal("sandbox with a running VM is not tracked")
+	}
+	// Once the store works again, the VM exit ends the record.
+	unblockRecord(t, e.st, id)
 	e.rt.mu.Lock()
 	e.rt.vms[id].stop()
 	e.rt.mu.Unlock()
