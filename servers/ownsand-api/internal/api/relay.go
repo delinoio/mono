@@ -274,7 +274,9 @@ func (p *DataPlane) serveStream(ctx context.Context, c *relayCall, request *owns
 				return ctx.Err()
 			}
 			if errors.Is(nerr, relay.ErrUnknownKind) {
-				return connect.NewError(connect.CodeInternal, nerr)
+				// The relay already ended the stream with an error frame.
+				sendClose = false
+				return connect.NewError(connect.CodeUnimplemented, nerr)
 			}
 			return errUnavailable("the relay connection closed")
 		}
@@ -452,6 +454,11 @@ func (h RelayHandler) WriteFile(ctx context.Context, req *connect.Request[ownsan
 			}
 			if cctx.Err() != nil {
 				return nil, connect.NewError(connect.CodeDeadlineExceeded, errors.New("the write did not finish within the call deadline"))
+			}
+			if errors.Is(nerr, relay.ErrUnknownKind) {
+				// The relay already ended the stream with an error frame.
+				sendClose = false
+				return nil, connect.NewError(connect.CodeUnimplemented, nerr)
 			}
 			return nil, errUnavailable("the relay connection closed")
 		}
