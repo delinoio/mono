@@ -1,9 +1,12 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package snapxfer
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"io"
 	"log/slog"
@@ -84,6 +87,58 @@ func TestExportImportRoundTrip(t *testing.T) {
 	parts[2].Sha256[0] ^= 1
 	if err := tr.Import(context.Background(), "snap", parts, filepath.Join(t.TempDir(), "c2")); err == nil {
 		t.Fatal("tampered hash accepted")
+	}
+}
+
+// TestImportRejectsSymlinkEscape imports an archive whose chained symbolic
+// links resolve outside the snapshot directory and checks that nothing is
+// written there and that the import fails.
+func TestImportRejectsSymlinkEscape(t *testing.T) {
+	probe := t.TempDir()
+	if err := os.Symlink("target", filepath.Join(probe, "probe")); err != nil {
+		t.Skipf("symbolic links are not available: %v", err)
+	}
+	var archive bytes.Buffer
+	tw := tar.NewWriter(&archive)
+	for _, e := range []struct {
+		hdr  tar.Header
+		data string
+	}{
+		{hdr: tar.Header{Name: "a", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "a/b", Typeflag: tar.TypeSymlink, Linkname: ".."}},
+		{hdr: tar.Header{Name: "l2", Typeflag: tar.TypeSymlink, Linkname: "a/b/.."}},
+		{hdr: tar.Header{Name: "l2/evil", Typeflag: tar.TypeReg, Mode: 0o644}, data: "pwned"},
+	} {
+		hdr := e.hdr
+		hdr.Size = int64(len(e.data))
+		if err := tw.WriteHeader(&hdr); err != nil {
+			t.Fatal(err)
+		}
+		tw.Write([]byte(e.data))
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	b := newBucket(t)
+	b.objects["/snap/1"] = archive.Bytes()
+	sum := sha256.Sum256(archive.Bytes())
+	parts := []*ownsandv1.SnapshotPart{{PartNumber: 1, SizeBytes: int64(archive.Len()), Sha256: sum[:]}}
+	tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), TempDir: t.TempDir()}
+	base := t.TempDir()
+	dst := filepath.Join(base, "content")
+	if err := tr.Import(context.Background(), "snap", parts, dst); err == nil {
+		t.Fatal("import accepted an archive that escapes through symbolic links")
+	}
+	// The staging directory is the parent of the restore root ("content.importing");
+	// the escape target is its parent, which is base.
+	if _, err := os.Lstat(filepath.Join(base, "evil")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("file written outside the restore root: %v", err)
+	}
+	if _, err := os.Lstat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot content installed after a failed import: %v", err)
+	}
+	if _, err := os.Lstat(dst + ".importing"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging directory left behind: %v", err)
 	}
 }
 

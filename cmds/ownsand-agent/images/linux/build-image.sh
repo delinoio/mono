@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: FSL-1.1-ALv2
 #
 # Builds the development Linux base image of one guest architecture with
 # Docker: the guest kernel (build-kernel.sh) and the root file system

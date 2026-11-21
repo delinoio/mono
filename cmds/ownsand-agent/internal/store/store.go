@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package store owns the agent state directory. The identity file (device
 // ID and Ed25519 private key) is kept apart from every other record, so the

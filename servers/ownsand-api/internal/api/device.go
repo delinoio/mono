@@ -410,31 +410,25 @@ func (s *Service) removeDeviceTx(ctx context.Context, tx pgx.Tx, orgID, deviceID
 		deviceID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)); err != nil {
 		return err
 	}
-	rows, err := tx.Query(ctx, "SELECT snapshot_id::text, export_state FROM snapshots WHERE device_id = $1", deviceID)
+	rows, err := tx.Query(ctx, "SELECT snapshot_id::text FROM snapshots WHERE device_id = $1", deviceID)
 	if err != nil {
 		return err
 	}
-	type snap struct {
-		id    string
-		state ownsandv1.SnapshotExportState
-	}
-	var snaps []snap
+	var snaps []string
 	for rows.Next() {
-		var sn snap
-		var st int16
-		if err := rows.Scan(&sn.id, &st); err != nil {
+		var id string
+		if err := rows.Scan(&id); err != nil {
 			rows.Close()
 			return err
 		}
-		sn.state = ownsandv1.SnapshotExportState(st)
-		snaps = append(snaps, sn)
+		snaps = append(snaps, id)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, sn := range snaps {
-		if err := s.deleteSnapshotRecordTx(ctx, tx, orgID, sn.id, sn.state); err != nil {
+	for _, id := range snaps {
+		if err := s.deleteSnapshotRecordTx(ctx, tx, orgID, id); err != nil {
 			return err
 		}
 	}
@@ -451,15 +445,17 @@ func (s *Service) removeDeviceTx(ctx context.Context, tx pgx.Tx, orgID, deviceID
 }
 
 // deleteSnapshotRecordTx deletes a snapshot record and the templates that
-// reference it. When its export started, it also starts the R2 clean-up
-// job of the snapshot prefix, which cancels the export: no signed URL is
-// issued for a deleted snapshot.
-func (s *Service) deleteSnapshotRecordTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID string, exportState ownsandv1.SnapshotExportState) error {
-	if exportState != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_NOT_EXPORTED {
-		if err := s.startCleanupJobTx(ctx, tx, orgID, snapshotPrefix(orgID, snapshotID)); err != nil {
-			return err
-		}
-	}
+// reference it. When its export had started, it also starts the R2
+// clean-up job of the snapshot prefix, which cancels the export: no signed
+// URL is issued for a deleted snapshot.
+//
+// The job is recorded after the row DELETE: the DELETE waits for every
+// signing transaction that holds the row (handleSignedURLRequest takes
+// FOR SHARE), so the job's final_sweep_after (now + signedURLLifetime) is
+// computed after the last URL that can exist for the prefix was signed and
+// is never earlier than its expiry. The export state comes from the
+// deleted row (RETURNING), which is current even when the DELETE waited.
+func (s *Service) deleteSnapshotRecordTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID string) error {
 	// Every device that holds a copy gets a delete-snapshot command from the
 	// lease holder; the snapshot_copies rows go with the record.
 	rows, err := tx.Query(ctx, `SELECT device_id::text FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 AND device_id IS NOT NULL
@@ -480,8 +476,18 @@ func (s *Service) deleteSnapshotRecordTx(ctx context.Context, tx pgx.Tx, orgID, 
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(ctx, "DELETE FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2", orgID, snapshotID); err != nil {
+	var export int16
+	err = tx.QueryRow(ctx, "DELETE FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 RETURNING export_state", orgID, snapshotID).Scan(&export)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // deleted meanwhile by a transaction that recorded its own job
+	}
+	if err != nil {
 		return err
+	}
+	if ownsandv1.SnapshotExportState(export) != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_NOT_EXPORTED {
+		if err := s.startCleanupJobTx(ctx, tx, orgID, snapshotPrefix(orgID, snapshotID)); err != nil {
+			return err
+		}
 	}
 	for _, d := range devices {
 		if err := events.Write(ctx, tx, events.Event{Kind: events.KindSnapshotDeleted, OrganizationID: orgID, DeviceID: d, SnapshotID: snapshotID}); err != nil {

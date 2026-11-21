@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: FSL-1.1-ALv2
 #
 # Builds the minimal Linux base image root file system: an ext4 image with a
 # static BusyBox userland and the guest helper as /sbin/init. It needs Go, a
