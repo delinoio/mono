@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"math/rand/v2"
 	"strings"
 	"testing"
@@ -368,6 +369,32 @@ func TestSplitMessages(t *testing.T) {
 	if string(got[1]) != "efgh" {
 		t.Fatalf("messages share capacity: %q", got[1])
 	}
+}
+
+func TestSplitMessagesHugeMaxSize(t *testing.T) {
+	// len+maxSize-1 would overflow int for this limit.
+	stream := []byte("ab")
+	got := SplitMessages(stream, math.MaxInt)
+	if len(got) != 1 || string(got[0]) != "ab" || cap(got[0]) != 2 {
+		t.Fatalf("got %q cap %d", got, cap(got[0]))
+	}
+	if &got[0][0] != &stream[0] {
+		t.Fatal("message does not share the input memory")
+	}
+}
+
+func TestSplitMessagesBoundaries(t *testing.T) {
+	// Exact division leaves no empty trailing message.
+	got := SplitMessages([]byte("abcd"), 2)
+	if len(got) != 2 || string(got[0]) != "ab" || string(got[1]) != "cd" {
+		t.Fatalf("got %q", got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("zero maxSize did not panic")
+		}
+	}()
+	SplitMessages([]byte("ab"), 0)
 }
 
 func TestSendWindow(t *testing.T) {
