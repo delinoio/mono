@@ -81,3 +81,65 @@ func TestCopyConsoleCapsLogAcrossRedials(t *testing.T) {
 		t.Fatal("console.log does not keep the first bytes of the guest output")
 	}
 }
+
+// A pipe that ends while the VM still runs leaves no closer goroutine behind,
+// on the real named pipe that the Hyper-V worker process serves: the runtime
+// re-dials after each end, and once the pipe is gone no closer from an earlier
+// connection is alive. Stopping the VM then ends copyConsole.
+func TestCopyConsoleEndsCloserWhenPipeEnds(t *testing.T) {
+	const sandboxID = "console-closer-test"
+	pipe := consolePipe(sandboxID)
+	l, err := winio.ListenPipe(pipe, nil)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", pipe, err)
+	}
+	defer l.Close()
+
+	dir := t.TempDir()
+	v := &vm{
+		id:          sandboxID,
+		dir:         dir,
+		stopping:    make(chan struct{}),
+		exited:      make(chan struct{}),
+		consoleDone: make(chan struct{}),
+	}
+	r := &Runtime{logger: slog.New(slog.NewJSONHandler(io.Discard, nil))}
+	go r.copyConsole(v)
+
+	// Three connections end from the guest side while the VM runs.
+	var want []byte
+	for _, msg := range []string{"one;", "two;", "three;"} {
+		conn, err := l.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("guest write: %v", err)
+		}
+		conn.Close()
+		want = append(want, msg...)
+	}
+	// Remove the pipe, so the runtime cannot dial again; its live connection,
+	// if any, ends with the listener. The VM has not stopped.
+	l.Close()
+	waitConsoleClosers(t, 0)
+	select {
+	case <-v.consoleDone:
+		t.Fatal("copyConsole returned while the VM still runs")
+	default:
+	}
+
+	close(v.stopping)
+	select {
+	case <-v.consoleDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("copyConsole did not end after stopping")
+	}
+	got, err := os.ReadFile(filepath.Join(dir, consoleFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("console.log = %q, want every connection appended: %q", got, want)
+	}
+}
