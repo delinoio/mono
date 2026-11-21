@@ -26,6 +26,11 @@ type AgentHandler struct{ *Service }
 // maxDeviceNameLength bounds the reported host name.
 const maxDeviceNameLength = 253
 
+// agentLimiterKey builds the per-device limiter key of an unary agent RPC.
+// deviceID must be normalized so that every spelling of one device shares a
+// bucket per operation.
+func agentLimiterKey(op, deviceID string) string { return op + ":" + deviceID }
+
 // limitAgentRPC applies the per-device (or per-prefix) and per-client
 // limits of the unauthenticated device RPCs.
 func (s *Service) limitAgentRPC(ctx context.Context, key string) error {
@@ -129,11 +134,12 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 }
 
 func (h AgentHandler) CreateChallenge(ctx context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
-	deviceID := req.Msg.GetDeviceId()
-	if err := validateID("device_id", deviceID); err != nil {
+	rawID := req.Msg.GetDeviceId()
+	deviceID, err := normalizeID("device_id", rawID)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.limitAgentRPC(ctx, "challenge:"+deviceID); err != nil {
+	if err := h.limitAgentRPC(ctx, agentLimiterKey("challenge", deviceID)); err != nil {
 		return nil, err
 	}
 	nonce, expiry, err := h.Nonces.Issue(deviceID)
@@ -187,18 +193,19 @@ func (s *Service) verifySignedNonce(ctx context.Context, tx pgx.Tx, deviceID str
 
 func (h AgentHandler) Authenticate(ctx context.Context, req *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
 	m := req.Msg
-	deviceID := m.GetDeviceId()
-	if err := validateID("device_id", deviceID); err != nil {
+	rawID := m.GetDeviceId()
+	deviceID, err := normalizeID("device_id", rawID)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.limitAgentRPC(ctx, "authenticate:"+deviceID); err != nil {
+	if err := h.limitAgentRPC(ctx, agentLimiterKey("authenticate", deviceID)); err != nil {
 		return nil, err
 	}
 	if !uuidv7.Valid(m.GetStateEpoch()) {
 		return nil, errInvalidf("invalid state_epoch: must be a canonical UUID v7")
 	}
 	var resp *ownsandv1.AuthenticateResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		rec, err := h.verifySignedNonce(ctx, tx, deviceID, m.GetNonce(), m.GetSignature(), auth.PurposeAuthenticate)
 		if err != nil {
 			return err
@@ -244,14 +251,15 @@ func (h AgentHandler) Authenticate(ctx context.Context, req *connect.Request[own
 
 func (h AgentHandler) ConfirmRemoval(ctx context.Context, req *connect.Request[ownsandv1.ConfirmRemovalRequest]) (*connect.Response[ownsandv1.ConfirmRemovalResponse], error) {
 	m := req.Msg
-	deviceID := m.GetDeviceId()
-	if err := validateID("device_id", deviceID); err != nil {
+	rawID := m.GetDeviceId()
+	deviceID, err := normalizeID("device_id", rawID)
+	if err != nil {
 		return nil, err
 	}
-	if err := h.limitAgentRPC(ctx, "confirm-removal:"+deviceID); err != nil {
+	if err := h.limitAgentRPC(ctx, agentLimiterKey("confirm-removal", deviceID)); err != nil {
 		return nil, err
 	}
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		rec, err := h.verifySignedNonce(ctx, tx, deviceID, m.GetNonce(), m.GetSignature(), auth.PurposeConfirmRemoval)
 		if err != nil {
 			return err

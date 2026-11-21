@@ -191,6 +191,76 @@ func TestAPIKeyLifecycle(t *testing.T) {
 	}
 }
 
+func TestAPIKeyOrganizationIDCase(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	var org, other *testenv.Org
+	// Organization IDs contain hex letters in most cases; retry until the
+	// ID has a letter so that the uppercase spelling differs.
+	for i := 0; i < 50; i++ {
+		org = env.NewOrg("alice")
+		if strings.ToUpper(org.ID) != org.ID {
+			break
+		}
+	}
+	if strings.ToUpper(org.ID) == org.ID {
+		t.Skip("no organization ID with a hex letter")
+	}
+	other = env.NewOrg("bob")
+	key := env.Clients(org.APIKey)
+	list := func(id string) (*connect.Response[ownsandv1.ListDevicesResponse], error) {
+		return key.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: id}))
+	}
+	lower, err := list(org.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	upper, err := list(strings.ToUpper(org.ID))
+	if err != nil {
+		t.Fatalf("uppercase own organization id: %v", err)
+	}
+	if len(lower.Msg.GetDevices()) != len(upper.Msg.GetDevices()) {
+		t.Fatal("results differ between spellings")
+	}
+	if _, err := list(strings.ToUpper(other.ID)); testenv.Code(err) != connect.CodeNotFound {
+		t.Fatalf("other organization: %v", err)
+	}
+	if _, err := list("not-a-uuid"); testenv.Code(err) != connect.CodeInvalidArgument {
+		t.Fatalf("invalid id: %v", err)
+	}
+}
+
+func TestChallengeRateLimitSharesBucketAcrossCase(t *testing.T) {
+	limits := api.Limits{
+		PerDevice: ratelimit.New(0.001, 2, nil),
+		PerPrefix: ratelimit.New(1000, 1000, nil),
+		PerClient: ratelimit.New(1000, 1000, nil),
+	}
+	env := testenv.New(t, func(o *app.Options) { o.Limits = &limits })
+	ctx := context.Background()
+	var id string
+	for {
+		id, _ = uuidv7.NewString()
+		if strings.ToUpper(id) != id {
+			break
+		}
+	}
+	agent := env.Clients("").Agent
+	call := func(d string) error {
+		_, err := agent.CreateChallenge(ctx, connect.NewRequest(&ownsandv1.CreateChallengeRequest{DeviceId: d}))
+		return err
+	}
+	if err := call(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(strings.ToUpper(id)); err != nil {
+		t.Fatal(err)
+	}
+	if err := call(id); testenv.Code(err) != connect.CodeResourceExhausted {
+		t.Fatalf("third spelling-mixed challenge: %v", err)
+	}
+}
+
 func TestAPIKeyFailureRateLimit(t *testing.T) {
 	limits := api.Limits{
 		PerDevice: ratelimit.New(1000, 1000, nil),
