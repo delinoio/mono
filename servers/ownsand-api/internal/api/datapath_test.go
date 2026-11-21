@@ -1119,6 +1119,44 @@ func TestAuthorizeRelayReplacementEnqueueFailure(t *testing.T) {
 	})
 }
 
+// TestAuthorizeRelayAckWithoutReplacedGrant covers an acknowledgement of a
+// replacement that does not name the predecessor: the predecessor stays
+// installed and a later replacement of it succeeds instead of aborting.
+func TestAuthorizeRelayAckWithoutReplacedGrant(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	c := org.OwnerClient
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	first, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := first.Msg.GetGrantId()
+	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck {
+		return &ownsandv1.RelayGrantAck{GrantId: g.GetGrantId(), Result: ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED}
+	})
+	replace := func() (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
+		id, _ := uuidv7.NewString()
+		rep := proto.Clone(areq).(*ownsandv1.AuthorizeRelayRequest)
+		rep.AuthorizationId = id
+		rep.ReplacesGrantId = &prev
+		return c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep))
+	}
+	if _, err := replace(); err != nil {
+		t.Fatalf("first replacement: %v", err)
+	}
+	if env.App.Plane.Grants.Admittable(prev) == nil {
+		t.Fatal("the predecessor was removed by an acknowledgement that did not name it")
+	}
+	if _, err := replace(); err != nil {
+		t.Fatalf("second replacement of the same predecessor: %v", err)
+	}
+}
+
 // TestAuthorizeRelayEnqueueFailureWakesWaiters covers a concurrent call of
 // the same authorization_id that waits on the reservation: when the enqueue
 // fails it returns unavailable (retryable, no grant-limit delay), not

@@ -278,6 +278,13 @@ func (r *Registry) Ack(grantID string, result ownsandv1.RelayGrantResult, replac
 	g.AckAt = r.Now()
 	if replacedID != "" && replacedID == g.Replaces {
 		r.removeLocked(replacedID, OutcomeRemoved)
+	} else if g.Replaces != "" {
+		// The agent did not name the predecessor, so it stays installed. Clear
+		// its forward link too, or it could never be replaced again: Reserve
+		// rejects a replacement while Successor is set.
+		if p := r.byID[g.Replaces]; p != nil && p.Successor == grantID {
+			p.Successor = ""
+		}
 	}
 	g.Replaces = ""
 	close(g.done)
