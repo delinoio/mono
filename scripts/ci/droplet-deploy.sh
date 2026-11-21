@@ -11,15 +11,21 @@
 # the previous deployment (`/srv/delino/state/<service>.previous`).
 #
 # Steps: pull the image by digest, start a new container next to the running
-# one under the same network alias, wait until `GET /healthz` returns a
-# success status, write the reverse proxy route and reload the proxy, and only
-# then stop the old container. A failure before the old container stops
-# removes the new container, so the old one keeps serving. The exit code is
-# the deployment verdict.
+# one under its own unique network alias (it does not join the alias of the
+# running one), wait until `GET /healthz` returns a success status, write the
+# reverse proxy route to the new alias and reload the proxy, and only then
+# stop the old container. The proxy route selects the old container until the
+# reload succeeds, so a container that is starting or unhealthy never receives
+# a request. A failure before the old container stops removes the new
+# container, so the old one keeps serving. The exit code is the deployment
+# verdict.
 #
 # Arguments:
-#   service   Droplet service name: container name prefix, network alias of
-#             the reverse proxy upstream and env file name.
+#   service   Droplet service name: container name prefix, label value and
+#             env file name. A deployment by an earlier version of this
+#             script also used it as the network alias of the reverse proxy
+#             upstream; the first deployment with this version switches the
+#             route away from that alias.
 #   image     image reference pinned by digest (`<repository>@sha256:<hex>`).
 #   port      port that the server listens on inside the container. The
 #             script sets `ADDR=:<port>`.
@@ -88,26 +94,31 @@ main() {
 
   local -a old
   mapfile -t old < <(docker ps --all --quiet --filter "label=io.delino.service=$service")
-  local new
-  new="$service-$(date -u +%Y%m%d%H%M%S)-${image: -12}"
-  echo "Start $new"
+  local stamp new upstream
+  stamp="$(date -u +%Y%m%d%H%M%S)-${image: -12}"
+  new="$service-$stamp"
+  upstream="$(upstream_alias "$service" "$stamp")"
+  echo "Start $new as $upstream"
+  # The replacement takes no `--network-alias "$service"`. The running
+  # container keeps that alias (and the route still names it), and Docker DNS
+  # would hand out the replacement address with the shared alias while the
+  # replacement still starts or fails its health check. The route switches to
+  # the unique alias only after the health check passed.
   docker run --detach --name "$new" \
-    --network "$network" --network-alias "$service" \
+    --network "$network" --network-alias "$upstream" \
     --label "io.delino.service=$service" --label "io.delino.image=$image" \
     --restart unless-stopped \
     --env-file "$env_file" --env "ADDR=:$port" \
     "$image" > /dev/null
 
   if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
-    echo "Last log lines of $new:"
-    docker logs --tail 200 "$new" 2>&1 || true
-    docker rm --force "$new" > /dev/null || true
+    discard_replacement "$new"
     fail "$new did not pass the health check; the previous container keeps serving."
   fi
 
-  if ! write_route "$site" "$service" "$port" "$hostname" "$proxy"; then
-    docker rm --force "$new" > /dev/null || true
-    fail "the reverse proxy did not accept the route of $service; the previous container keeps serving."
+  if ! write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy"; then
+    discard_replacement "$new"
+    fail "the route of $service was not switched; the previous container keeps serving."
   fi
 
   local id
@@ -133,6 +144,29 @@ fail() {
   exit 1
 }
 
+# Prints the unique network alias of a replacement container. The alias is a
+# DNS label, which has at most 63 characters, but a service name can use all of
+# them. The alias keeps the first 35 characters of the service name (without a
+# trailing hyphen) and appends a hyphen and the 27-character stamp (a 14-digit
+# timestamp, a hyphen and 12 digest characters), so it is at most 63
+# characters long and differs in every deployment.
+upstream_alias() {
+  local prefix="${1:0:35}" stamp="$2"
+  while [[ "$prefix" == *- ]]; do
+    prefix="${prefix%-}"
+  done
+  echo "$prefix-$stamp"
+}
+
+# Prints the log tail of a replacement that failed, then removes it. A failed
+# log read or removal must not hide the deployment failure that the caller
+# reports.
+discard_replacement() {
+  echo "Last log lines of $1:"
+  docker logs --tail 200 "$1" 2>&1 || true
+  docker rm --force "$1" > /dev/null || true
+}
+
 # Waits until the container answers `GET /healthz` with a success status.
 # Fails at once when the container stops.
 wait_healthy() {
@@ -156,38 +190,60 @@ wait_healthy() {
   return 1
 }
 
-# Writes the reverse proxy route of the service and reloads the proxy when the
-# route changed. Restores the previous route when the proxy rejects it.
+# Writes the reverse proxy route of the service to the unique alias of its
+# replacement container and reloads the proxy. The caller evaluates this function as an `if` condition, which
+# disables `set -e` inside it, so every step checks its own status and names
+# the failed operation. The previous route stays in place until the new route
+# is complete (the new route goes to a temporary file that `mv` renames over
+# the route file), and the proxy reloads only after that. Restores the
+# previous route when the proxy rejects the new one.
 write_route() {
-  local site="$1" service="$2" port="$3" hostname="$4" proxy="$5"
+  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6"
   local route
   # `lb_try_duration` retries a failed connection for 10 seconds, so a request
   # that reaches the old container while it stops is sent to the new one.
   route="$(printf '%s\n' \
     "# Written by scripts/ci/droplet-deploy.sh for $service. Do not edit." \
     "$hostname {" \
-    "	reverse_proxy $service:$port {" \
+    "	reverse_proxy $upstream:$port {" \
     "		lb_try_duration 10s" \
     "	}" \
     "}")"
-  if [[ -f "$site" ]] && [[ "$(< "$site")" == "$route" ]]; then
-    return 0
+  # The proxy imports `sites/*.caddy`; the suffixes below keep the backup and
+  # the temporary file out of that glob.
+  local backup="" pending="$site.new"
+  if ! mkdir -p "$(dirname "$site")"; then
+    echo "::error::could not create the directory of the route file $site." >&2
+    return 1
   fi
-  local backup=""
   if [[ -f "$site" ]]; then
     backup="$site.previous"
-    cp "$site" "$backup"
+    if ! cp "$site" "$backup"; then
+      echo "::error::could not back up the route file $site to $backup." >&2
+      return 1
+    fi
   fi
-  mkdir -p "$(dirname "$site")"
-  printf '%s\n' "$route" > "$site"
+  if ! printf '%s\n' "$route" > "$pending"; then
+    echo "::error::could not write the new route to $pending." >&2
+    rm -f "$pending"
+    return 1
+  fi
+  if ! mv -f "$pending" "$site"; then
+    echo "::error::could not install the new route as $site." >&2
+    rm -f "$pending"
+    return 1
+  fi
   if docker exec "$proxy" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    echo "Reloaded the reverse proxy with the route https://$hostname -> $service:$port"
+    echo "Reloaded the reverse proxy with the route https://$hostname -> $upstream:$port"
     return 0
   fi
+  echo "::error::the reverse proxy rejected the route of $service; restoring the previous route." >&2
   if [[ -n "$backup" ]]; then
-    mv "$backup" "$site"
-  else
-    rm -f "$site"
+    if ! mv -f "$backup" "$site"; then
+      echo "::error::could not restore the previous route from $backup to $site." >&2
+    fi
+  elif ! rm -f "$site"; then
+    echo "::error::could not remove the rejected route $site." >&2
   fi
   return 1
 }
