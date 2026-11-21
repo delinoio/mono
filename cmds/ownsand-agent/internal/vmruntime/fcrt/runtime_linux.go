@@ -399,7 +399,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 
 // startProcess starts firecracker for v, bound to the agent process.
 func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
-	logf, err := openCappedLog(filepath.Join(v.dir, logFile), consoleLogLimit, r.logger, v.id)
+	logf, err := vmruntime.OpenCappedLog(filepath.Join(v.dir, logFile), vmruntime.ConsoleLogLimit, r.logger, v.id, vmruntime.ConsoleLogKindFirecracker)
 	if err != nil {
 		return err
 	}
