@@ -1228,3 +1228,80 @@ test("check accepts the repository and rejects bad changeset file names", () => 
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("unnamed non-deployable packages do not break dependency ordering", () => {
+  const packages = [
+    pkg("tools/unnamed", {
+      private: true,
+      dependencies: { self: "workspace:../unnamed" },
+    }),
+    pkg("servers/api", {
+      name: "api",
+      dependencies: {
+        lodash: "^4.0.0",
+        helper: "workspace:../../tools/unnamed",
+      },
+      deploy: droplet("api-svc"),
+    }),
+    pkg("servers/billing", {
+      name: "billing",
+      dependencies: { api: "workspace:*" },
+      deploy: droplet("billing"),
+    }),
+  ];
+  const result = plan(status(["api", "1.0.1"], ["billing", "1.0.1"]), packages);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["api", "billing"],
+  );
+});
+
+test("an unnamed package with a relative workspace link is ignored", () => {
+  const packages = [
+    pkg("tools/unnamed", {
+      private: true,
+      dependencies: { self: "workspace:../unnamed" },
+    }),
+    pkg("servers/api", {
+      name: "api",
+      dependencies: { helper: "workspace:../../tools/unnamed" },
+      deploy: droplet("api-svc"),
+    }),
+  ];
+  const result = plan(status(["api", "1.0.1"]), packages);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["api"],
+  );
+});
+
+test("real workspace cycles still fail next to unnamed packages", () => {
+  const packages = [
+    pkg("tools/unnamed", { private: true }),
+    pkg("servers/a", {
+      name: "a",
+      dependencies: { b: "workspace:*" },
+      deploy: droplet("a-svc"),
+    }),
+    pkg("servers/b", {
+      name: "b",
+      dependencies: { a: "workspace:*" },
+      deploy: droplet("b-svc"),
+    }),
+  ];
+  assert.throws(
+    () => plan(status(["a", "1.0.1"], ["b", "1.0.1"]), packages),
+    /workspace dependency cycle: a -> b -> a/,
+  );
+});
+
+test("an unnamed deployable still fails beside named packages", () => {
+  const packages = [
+    pkg("servers/api", { name: "api", deploy: droplet("api-svc") }),
+    pkg("servers/nameless", { deploy: droplet("other") }),
+  ];
+  assert.throws(
+    () => plan(status(["api", "1.0.1"]), packages),
+    /servers\/nameless: a deployable package name must be a string/,
+  );
+});
