@@ -145,3 +145,85 @@ func TestSendCancelledAfterFirstFragmentRetiresSession(t *testing.T) {
 		t.Fatalf("transport %v, want peer-to-peer", got)
 	}
 }
+
+// TestSendContextDoneWhileWaitingForSendTurnWritesNothing checks that a
+// request that is canceled or past its deadline while it waits for the send
+// turn writes no message when the send buffer has room, removes its stream and
+// keeps the session usable.
+func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
+	cases := []struct {
+		name string
+		mk   func(parent context.Context) (context.Context, func(), error)
+		want error
+	}{
+		{"canceled", func(p context.Context) (context.Context, func(), error) {
+			c, cancel := context.WithCancel(p)
+			return c, cancel, nil
+		}, context.Canceled},
+		{"deadline", func(p context.Context) (context.Context, func(), error) {
+			c, cancel := context.WithTimeout(p, 50*time.Millisecond)
+			return c, cancel, nil
+		}, context.DeadlineExceeded},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			sess, err := s.dp.route(ctx)
+			if err != nil || sess == nil {
+				t.Fatalf("route: %v, %v", sess, err)
+			}
+			sess.sendMu.Lock()
+			reqCtx, stop, _ := tc.mk(ctx)
+			defer stop()
+			errc := make(chan error, 1)
+			go func() {
+				_, err := sess.openStream(reqCtx, &ownsandv1.WriteFileRequest{WriteId: mustID(t), Path: "/never", Data: []byte("x")})
+				errc <- err
+			}()
+			// Wait until the stream is registered, then make the context done
+			// while the request still waits for the send turn.
+			for {
+				sess.mu.Lock()
+				n := len(sess.streams)
+				sess.mu.Unlock()
+				if n == 1 {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if tc.want == context.Canceled {
+				stop()
+			}
+			<-reqCtx.Done()
+			sess.sendMu.Unlock()
+			if err := <-errc; !errors.Is(err, tc.want) {
+				t.Fatalf("openStream: want %v, got %v", tc.want, err)
+			}
+			if sess.isDone() {
+				t.Fatal("the session ended")
+			}
+			sess.mu.Lock()
+			n := len(sess.streams)
+			sess.mu.Unlock()
+			if n != 0 {
+				t.Fatalf("%d streams left", n)
+			}
+			want := []byte("after")
+			if err := s.WriteFileBytes(ctx, "/after", want, WriteOptions{}); err != nil {
+				t.Fatalf("write on the same session: %v", err)
+			}
+			if _, ok := cp.agent.file("/never"); ok {
+				t.Fatal("the agent received the canceled request")
+			}
+			if got, _ := cp.agent.file("/after"); !bytes.Equal(got, want) {
+				t.Fatalf("file %q", got)
+			}
+			if n := cp.openSessionCount(); n != 1 {
+				t.Fatalf("%d sessions opened, want 1", n)
+			}
+		})
+	}
+}

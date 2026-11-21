@@ -330,6 +330,14 @@ func (s *p2pSession) send(ctx context.Context, f *ownsandv1.DataFrame) error {
 		if s.isDone() {
 			return s.endErr
 		}
+		// A request whose context is already done must not start a frame: once
+		// the first message is written, only retirement can undo it. After the
+		// first message, a frame that is not blocked by the buffer completes.
+		if i == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
 		if err := s.dc.Send(m); err != nil {
 			s.end(&errP2PFailed{cause: err})
 			return s.endErr
