@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -778,6 +779,99 @@ func TestRelayBoundsFramesWithoutCredit(t *testing.T) {
 	case <-r2.Closed():
 		t.Fatal("an unknown frame kind closed the connection")
 	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestRelayUnknownFrameKind checks that an unknown frame kind from the agent
+// on a stream ends only that stream: the control plane sends one UNIMPLEMENTED
+// error frame on it, no stream close frame, and the RPC returns unimplemented,
+// while another stream of the same connection continues.
+func TestRelayUnknownFrameKind(t *testing.T) {
+	env := testenv.New(t)
+	org, agent, sandboxID := runningSandbox(t, env)
+	r := agent.ConnectRelay(serveExec)
+	stop := keepAlive(r)
+	defer stop()
+
+	reqOK, reqBad := newExec(org.ID, sandboxID), newExec(org.ID, sandboxID)
+	release := make(chan struct{})
+	r.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		if f.GetExecRequest().GetExecId() == reqOK.GetExecId() {
+			// The healthy stream answers only after the other stream failed.
+			s.Send(&ownsandv1.RequestAccepted{})
+			<-release
+			serveExec(s, f)
+			return
+		}
+		s.Send(&ownsandv1.RequestAccepted{})
+		r.SendFrame(&ownsandv1.DataFrame{StreamId: s.ID, SandboxId: s.SandboxID, Kind: ownsandv1.DataFrameKind(9999)})
+	})
+	call := func(req *ownsandv1.ExecRequest) *connect.ServerStreamForClient[ownsandv1.ExecResponse] {
+		t.Helper()
+		grant, err := authorizeExec(t, org.OwnerClient, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return es
+	}
+	ok := call(reqOK)
+	// The healthy stream is open (its stream open frame reached the agent)
+	// before the failing one starts.
+	r.WaitFrame("healthy request", func(f *ownsandv1.DataFrame) bool { return f.GetExecRequest().GetExecId() == reqOK.GetExecId() })
+	bad := call(reqBad)
+
+	_, err := collectExec(t, bad)
+	if testenv.Code(err) != connect.CodeUnimplemented {
+		t.Fatalf("stream with an unknown frame kind: %v, want unimplemented", err)
+	}
+	var badID uint64
+	for _, f := range r.Frames() {
+		if f.GetExecRequest().GetExecId() == reqBad.GetExecId() {
+			badID = f.GetStreamId()
+		}
+	}
+	ef := r.WaitFrame("error frame", func(f *ownsandv1.DataFrame) bool { return f.GetStreamId() == badID && f.GetError() != nil })
+	if ef.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED || ef.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_ERROR {
+		t.Fatalf("error frame = %v, want ERROR_CODE_UNIMPLEMENTED", ef)
+	}
+	if msg := ef.GetError().GetMessage(); !strings.Contains(msg, "9999") || !strings.Contains(msg, fmt.Sprintf("stream %d", badID)) {
+		t.Fatalf("message %q does not name the kind and the stream", msg)
+	}
+	// Neither a second error frame nor a stream close frame follows.
+	time.Sleep(300 * time.Millisecond)
+	errorFrames := 0
+	for _, f := range r.Frames() {
+		if f.GetStreamId() != badID {
+			continue
+		}
+		if f.GetError() != nil {
+			errorFrames++
+		}
+		if f.GetRelayStreamClose() != nil {
+			t.Fatalf("a stream close frame followed the error frame: %v", f)
+		}
+	}
+	if errorFrames != 1 {
+		t.Fatalf("error frames on the stream = %d, want 1", errorFrames)
+	}
+
+	// The other stream and the connection continue.
+	close(release)
+	events, err := collectExec(t, ok)
+	if err != nil {
+		t.Fatalf("healthy stream: %v", err)
+	}
+	if last := events[len(events)-1]; last.GetExited() == nil {
+		t.Fatalf("last event of the healthy stream = %v, want the exit", last)
+	}
+	select {
+	case <-r.Closed():
+		t.Fatal("an unknown frame kind closed the connection")
+	default:
 	}
 }
 

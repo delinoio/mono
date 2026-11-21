@@ -5,6 +5,8 @@ package relay
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -584,5 +586,95 @@ func TestLastLargeReceiveCountsOnlyLargeStreamFrames(t *testing.T) {
 	}
 	if c.LastLargeReceive().IsZero() {
 		t.Fatal("a large stream frame was not counted")
+	}
+}
+
+// drainOut returns the frames waiting in the outbound queue.
+func drainOut(c *Conn) []*ownsandv1.DataFrame {
+	var frames []*ownsandv1.DataFrame
+	for {
+		select {
+		case f := <-c.out:
+			frames = append(frames, f)
+		default:
+			return frames
+		}
+	}
+}
+
+func TestUnknownKindOnAStreamSendsOneErrorFrameAndClosesOnlyThatStream(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	a, b := openStream(t, c), openStream(t, c)
+	if got := len(drainOut(c)); got != 2 {
+		t.Fatalf("queued stream open frames = %d, want 2", got)
+	}
+
+	if err := c.dispatch(&ownsandv1.DataFrame{StreamId: a.ID, SandboxId: "sandbox", Kind: ownsandv1.DataFrameKind(99)}); err != nil {
+		t.Fatalf("dispatch of an unknown kind closed the connection: %v", err)
+	}
+	if _, err := a.Next(context.Background(), nil); !errors.Is(err, ErrUnknownKind) {
+		t.Fatalf("stream error = %v, want ErrUnknownKind", err)
+	}
+	// The RPC ends and closes the stream; that adds no stream close frame
+	// behind the error frame.
+	a.Close(true)
+	frames := drainOut(c)
+	if len(frames) != 1 {
+		t.Fatalf("frames after the unknown kind = %d, want one error frame", len(frames))
+	}
+	e := frames[0]
+	if e.GetStreamId() != a.ID || e.GetSandboxId() != "sandbox" || e.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_ERROR ||
+		e.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED {
+		t.Fatalf("frame = %v, want an UNIMPLEMENTED error frame on stream %d", e, a.ID)
+	}
+	if msg := e.GetError().GetMessage(); !strings.Contains(msg, "kind 99") || !strings.Contains(msg, "stream "+strconv.FormatUint(a.ID, 10)) {
+		t.Fatalf("message %q does not name the kind and the stream", msg)
+	}
+	if got := c.StreamCount(); got != 1 {
+		t.Fatalf("StreamCount = %d, want 1", got)
+	}
+
+	// The other stream keeps working.
+	out := datapath.MustNewFrame(b.ID, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("x")}}})
+	if err := c.dispatch(out); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if f, err := b.Next(ctx, nil); err != nil || f.GetExecEvent().GetStdout() == nil {
+		t.Fatalf("other stream: %v, %v", f, err)
+	}
+	// A late frame of the closed stream is dropped without a reply.
+	if err := c.dispatch(&ownsandv1.DataFrame{StreamId: a.ID, Kind: ownsandv1.DataFrameKind(99)}); err != nil {
+		t.Fatal(err)
+	}
+	if frames := drainOut(c); len(frames) != 0 {
+		t.Fatalf("a frame of a closed stream got %d replies", len(frames))
+	}
+}
+
+func TestUnknownKindOnStreamZeroIsIgnored(t *testing.T) {
+	c := NewConn(context.Background(), "device", 1, testLimits)
+	s := openStream(t, c)
+	drainOut(c)
+	if err := c.dispatch(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind(99)}); err != nil {
+		t.Fatalf("unknown kind on stream 0: %v", err)
+	}
+	if frames := drainOut(c); len(frames) != 0 {
+		t.Fatalf("unknown kind on stream 0 queued %d frames", len(frames))
+	}
+	if err := c.dispatch(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{EchoRequested: true})); err != nil {
+		t.Fatal(err)
+	}
+	if frames := drainOut(c); len(frames) != 1 || frames[0].GetRelayKeepalive() == nil {
+		t.Fatalf("keepalive echo after the unknown kind = %v", frames)
+	}
+	if c.StreamCount() != 1 {
+		t.Fatalf("StreamCount = %d, want 1", c.StreamCount())
+	}
+	// Ordinary stream close is unchanged: it sends a stream close frame.
+	s.Close(true)
+	if frames := drainOut(c); len(frames) != 1 || frames[0].GetRelayStreamClose() == nil || frames[0].GetStreamId() != s.ID {
+		t.Fatalf("ordinary close frames = %v, want one stream close frame", frames)
 	}
 }

@@ -13,6 +13,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -358,8 +359,16 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 	if err := datapath.ValidateFrame(f); err != nil {
 		var unknown *datapath.UnknownKindError
 		if errors.As(err, &unknown) {
+			// End the stream with an error frame, not a stream close frame:
+			// the agent ends the stream on it without a reply. The stream
+			// closes before it fails, so the RPC, which wakes on the failure,
+			// finds it closed and sends no stream close frame behind the
+			// error frame.
+			s.closeWith(datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ErrorDetail{
+				Code:    ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED,
+				Message: fmt.Sprintf("unknown frame kind %d on stream %d", int32(unknown.Kind), unknown.StreamID),
+			}))
 			s.fail(ErrUnknownKind)
-			s.Close(true)
 			return nil
 		}
 		return errMalformedFrame
@@ -568,6 +577,19 @@ func (s *Stream) Consumed(ctx context.Context, f *ownsandv1.DataFrame) {
 // stream close frame, which the control plane does whenever an RPC ends
 // for a reason other than an agent session-end or error frame.
 func (s *Stream) Close(sendClose bool) {
+	var final *ownsandv1.DataFrame
+	if sendClose {
+		final = datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayStreamClose{})
+	}
+	s.closeWith(final)
+}
+
+// closeWith removes the stream from its connection like Close and enqueues
+// final, when not nil, as the last frame of the stream. The enqueue is best
+// effort and never blocks, because the callers include the receive loop: a
+// closed connection ends the stream on the agent too. A stream that already
+// closed sends nothing.
+func (s *Stream) closeWith(final *ownsandv1.DataFrame) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -586,10 +608,9 @@ func (s *Stream) Close(sendClose bool) {
 		delete(c.perGrant, s.GrantID)
 	}
 	c.mu.Unlock()
-	if sendClose {
-		// Best effort: a closed connection ends the stream on the agent too.
+	if final != nil {
 		select {
-		case c.out <- datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayStreamClose{}):
+		case c.out <- final:
 		default:
 		}
 	}
