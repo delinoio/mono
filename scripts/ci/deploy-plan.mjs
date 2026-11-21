@@ -186,6 +186,14 @@ function deployable(pkg) {
       `${name}: deploy.output must be a directory inside the package`,
     );
   }
+  // The deploy workflow carries the output through tab-separated and
+  // line-separated transports (`jq @tsv` and `mapfile`), which corrupt tabs,
+  // line breaks, other control characters and backslashes.
+  if (/[\u0000-\u001f\u007f\\]/.test(output)) {
+    throw new DeployPlanError(
+      `${name}: deploy.output must not contain control characters or a backslash`,
+    );
+  }
   return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
 }
 
