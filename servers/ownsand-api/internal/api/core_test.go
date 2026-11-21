@@ -7,6 +7,7 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -448,6 +449,14 @@ func TestDeviceLimitsAndAllocation(t *testing.T) {
 		}
 		return resp.Msg.GetDevice(), nil
 	}
+	// A newly enrolled device has zero limits and reports a zero effective limit.
+	fresh, err := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Msg.GetDevice().GetEffectiveVcpuLimit() != 0 || fresh.Msg.GetDevice().GetEffectiveVcpuLimitCount() != 0 {
+		t.Fatalf("new device effective = %d / %d", fresh.Msg.GetDevice().GetEffectiveVcpuLimit(), fresh.Msg.GetDevice().GetEffectiveVcpuLimitCount())
+	}
 	for _, bad := range []int32{0, 99, 110, 425, 50} {
 		if _, err := update(&ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 1024, DiskGib: 10, VcpuOvercommitPercent: bad}); testenv.Code(err) != connect.CodeInvalidArgument {
 			t.Fatalf("overcommit %d: %v", bad, err)
@@ -457,8 +466,40 @@ func TestDeviceLimitsAndAllocation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if d.GetEffectiveVcpuLimit() != 7 { // floor(5 * 150 / 100)
-		t.Fatalf("effective vcpu = %d", d.GetEffectiveVcpuLimit())
+	if d.GetEffectiveVcpuLimit() != 7 || d.GetEffectiveVcpuLimitCount() != 7 { // floor(5 * 150 / 100)
+		t.Fatalf("effective vcpu = %d / %d", d.GetEffectiveVcpuLimit(), d.GetEffectiveVcpuLimitCount())
+	}
+	// A limit that exceeds the int32 range is exact in the int64 field and
+	// capped in the legacy field, on the update, get and list responses.
+	// The last case restores the limits of the allocation checks below.
+	wide := []struct {
+		vcpu, percent int32
+		count         int64
+		legacy        int32
+	}{
+		{536870912, 400, 2147483648, math.MaxInt32},
+		{math.MaxInt32, 400, 8589934588, math.MaxInt32},
+		{math.MaxInt32, 100, math.MaxInt32, math.MaxInt32},
+		{5, 150, 7, 7},
+	}
+	for _, tc := range wide {
+		big, err := update(&ownsandv1.DeviceLimits{VcpuCount: tc.vcpu, MemoryMib: 1024, DiskGib: 10, VcpuOvercommitPercent: tc.percent})
+		if err != nil {
+			t.Fatalf("update %d at %d: %v", tc.vcpu, tc.percent, err)
+		}
+		got, err := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: dev.ID}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		list, err := org.OwnerClient.Device.ListDevices(ctx, connect.NewRequest(&ownsandv1.ListDevicesRequest{OrganizationId: org.ID}))
+		if err != nil || len(list.Msg.GetDevices()) != 1 {
+			t.Fatalf("list: %v, %v", list, err)
+		}
+		for name, d := range map[string]*ownsandv1.Device{"update": big, "get": got.Msg.GetDevice(), "list": list.Msg.GetDevices()[0]} {
+			if d.GetEffectiveVcpuLimitCount() != tc.count || d.GetEffectiveVcpuLimit() != tc.legacy {
+				t.Errorf("%s %d vCPU at %d percent: count = %d, legacy = %d, want %d, %d", name, tc.vcpu, tc.percent, d.GetEffectiveVcpuLimitCount(), d.GetEffectiveVcpuLimit(), tc.count, tc.legacy)
+			}
+		}
 	}
 	// Allocation counts CREATING, RUNNING, PAUSED and DELETING sandboxes, and
 	// macOS guests separately; ended sandboxes do not count.
@@ -480,8 +521,8 @@ func TestDeviceLimitsAndAllocation(t *testing.T) {
 	}
 	var events int
 	_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM control_events WHERE kind = 4 AND device_id = $1", dev.ID).Scan(&events)
-	if events != 1 {
-		t.Fatalf("config events = %d", events)
+	if want := 1 + len(wide); events != want { // every accepted update writes one
+		t.Fatalf("config events = %d, want %d", events, want)
 	}
 }
 
