@@ -178,3 +178,80 @@ func TestServeCountsReservedHeaderBitsInvalid(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func TestUnknownRequiredAttributesGet420(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5}
+	build := func(types ...pionstun.AttrType) *pionstun.Message {
+		setters := []pionstun.Setter{pionstun.TransactionID, pionstun.BindingRequest}
+		for _, at := range types {
+			at := at
+			setters = append(setters, pionstun.RawAttribute{Type: at, Value: []byte{1, 2, 3, 4}})
+		}
+		setters = append(setters, pionstun.Fingerprint)
+		return pionstun.MustBuild(setters...)
+	}
+
+	req := build(0x0030, 0x8030, 0x0031)
+	raw, err := Respond(req.Raw, src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &pionstun.Message{Raw: raw}
+	if err := m.Decode(); err != nil {
+		t.Fatal(err)
+	}
+	var code pionstun.ErrorCodeAttribute
+	var unknown pionstun.UnknownAttributes
+	if m.Type != pionstun.BindingError || m.TransactionID != req.TransactionID ||
+		code.GetFrom(m) != nil || code.Code != pionstun.CodeUnknownAttribute ||
+		unknown.GetFrom(m) != nil || len(unknown) != 2 || unknown[0] != 0x0030 || unknown[1] != 0x0031 ||
+		!m.Contains(pionstun.AttrFingerprint) || pionstun.Fingerprint.Check(m) != nil {
+		t.Fatalf("bad error response %v code %v unknown %v", m, code, unknown)
+	}
+
+	for name, r := range map[string]*pionstun.Message{
+		"plain":          build(),
+		"optional only":  build(0x8030),
+		"known required": build(pionstun.AttrUsername),
+	} {
+		raw, err := Respond(r.Raw, src)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		m := &pionstun.Message{Raw: raw}
+		var xor pionstun.XORMappedAddress
+		if err := m.Decode(); err != nil || m.Type != pionstun.BindingSuccess || xor.GetFrom(m) != nil {
+			t.Fatalf("%s: bad response %v %v", name, m, err)
+		}
+	}
+}
+
+func TestUnknownRequiredErrorUsesByteBudget(t *testing.T) {
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A budget below one error response and almost no refill.
+	s := New(slog.New(slog.NewJSONHandler(io.Discard, nil)), 1, 10)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx, pc) }()
+	defer func() { cancel(); <-done }()
+	client, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+	req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest,
+		pionstun.RawAttribute{Type: 0x0030, Value: []byte{1, 2, 3, 4}}, pionstun.Fingerprint)
+	if _, err := client.WriteTo(req.Raw, pc.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	_ = client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if n, _, err := client.ReadFrom(make([]byte, 1500)); err == nil {
+		t.Fatalf("error reply of %d bytes sent over the budget", n)
+	}
+	if reqs, resps, limited := s.Stats(); reqs != 1 || resps != 0 || limited != 1 {
+		t.Fatalf("requests %d, responses %d, limited %d", reqs, resps, limited)
+	}
+}
