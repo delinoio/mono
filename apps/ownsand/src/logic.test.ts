@@ -6,6 +6,8 @@ import {
   SnapshotExportState,
   SnapshotState,
 } from "ownsand-sdk/gen/common_pb";
+import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
+import { CreateSandboxRequestSchema } from "ownsand-sdk/gen/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
 import { clearInvitationOnLeave } from "./App.tsx";
 import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
@@ -231,6 +233,42 @@ describe("formatting and form rules", () => {
     expect(
       parseLabels(Array.from({ length: 33 }, (_, i) => `k${i}=v`).join("\n")),
     ).toHaveProperty("error");
+  });
+
+  test("keeps labels whose keys match object prototype properties", () => {
+    const parsed = parseLabels(
+      "__proto__=x\nconstructor=y\ntoString=z\n__proto__=w",
+    );
+    if ("error" in parsed) throw new Error(parsed.error);
+    expect(Object.keys(parsed.labels).sort()).toEqual([
+      "__proto__",
+      "constructor",
+      "toString",
+    ]);
+    expect(Object.hasOwn(parsed.labels, "__proto__")).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(parsed.labels, "__proto__")?.value,
+    ).toBe("w");
+    // The request that the console sends keeps the label through protobuf.
+    const request = create(CreateSandboxRequestSchema, {
+      labels: parsed.labels,
+    });
+    const decoded = fromBinary(
+      CreateSandboxRequestSchema,
+      toBinary(CreateSandboxRequestSchema, request),
+    );
+    expect(Object.hasOwn(request.labels, "__proto__")).toBe(true);
+    expect(Object.hasOwn(decoded.labels, "__proto__")).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(decoded.labels, "__proto__")?.value,
+    ).toBe("w");
+  });
+
+  test("counts a prototype-named key toward the label limit", () => {
+    const lines = Array.from({ length: 32 }, (_, i) => `k${i}=v`);
+    expect(parseLabels([...lines, "__proto__=v"].join("\n"))).toHaveProperty(
+      "error",
+    );
   });
 });
 
