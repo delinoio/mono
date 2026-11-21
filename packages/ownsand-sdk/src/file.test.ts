@@ -3,11 +3,18 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
 import { DataPathError, OwnSandValidationError } from "./errors.ts";
+import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import { RelayOperationKind } from "./gen/delino/ownsand/v1/common_pb.ts";
 import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
 import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
 import { chunkSource } from "./operations/write.ts";
-import { Disconnect, ownsandError, Trickle } from "./testing/fake-api.ts";
+import {
+  Disconnect,
+  Hang,
+  ownsandError,
+  Sleep,
+  Trickle,
+} from "./testing/fake-api.ts";
 import { file, SANDBOX, setup, text } from "./testing/harness.ts";
 import { validateGuestPath } from "./validate.ts";
 
@@ -112,6 +119,76 @@ describe("file read", () => {
       .slice(1)
       .map((c) => (c.request as any).offset);
     expect(new Set(offsets)).toEqual(new Set([1n]));
+  });
+
+  describe("a recovery read that the agent does not accept", () => {
+    test("ends at the remaining window while only keepalives arrive", async () => {
+      const h = setup();
+      let continuation: AbortSignal | undefined;
+      h.api.stream(RelayService, "ReadFile", async function* (_req, call) {
+        if (call.index === 0) {
+          yield file.accepted();
+          yield file.chunk(0, "a");
+          yield new Disconnect();
+          return;
+        }
+        continuation = call.signal;
+        for (;;) {
+          yield file.keepalive();
+          yield new Sleep(10_000);
+        }
+      });
+      const error = await h.clock
+        .run(h.client.sandbox(SANDBOX).readFileBytes("/data"))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+      expect(h.clock.now()).toBeLessThan(MIN + 1_000);
+      expect(h.api.callsOf("ReadFile")).toHaveLength(2);
+      expect(continuation?.aborted).toBe(true);
+    });
+
+    test("ends at the remaining window while no frame arrives", async () => {
+      const h = setup();
+      h.api.stream(RelayService, "ReadFile", async function* (_req, call) {
+        if (call.index === 0) {
+          yield new Disconnect();
+          return;
+        }
+        yield new Hang();
+      });
+      const error = await h.clock
+        .run(h.client.sandbox(SANDBOX).readFileBytes("/data"))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+      expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+      expect(h.clock.now()).toBeLessThan(MIN + 1_000);
+      expect(h.api.callsOf("ReadFile")).toHaveLength(2);
+    });
+
+    test("keeps running past the window when accepted arrives in time", async () => {
+      const h = setup();
+      h.api.stream(RelayService, "ReadFile", async function* (_req, call) {
+        if (call.index === 0) {
+          yield new Disconnect();
+          return;
+        }
+        yield new Sleep(30_000);
+        yield file.accepted();
+        for (let i = 0; i < 12; i++) {
+          yield new Sleep(10_000);
+          yield file.keepalive();
+        }
+        yield file.chunk(0, "ok");
+        yield file.end(2);
+      });
+      const bytes = await h.clock.run(
+        h.client.sandbox(SANDBOX).readFileBytes("/data"),
+      );
+      expect(text(bytes)).toBe("ok");
+      expect(h.clock.now()).toBeGreaterThan(MIN + 30_000);
+    });
   });
 
   test("a recovery read whose first chunk takes longer than 90 seconds while bytes keep arriving", async () => {
