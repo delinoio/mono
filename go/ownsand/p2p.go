@@ -36,6 +36,19 @@ func (e *errSessionEnded) Error() string {
 	return fmt.Sprintf("ownsand: data path session ended (%s)", e.reason)
 }
 
+// errSessionRetired reports a session that the SDK itself ended because a
+// send was interrupted (for example by a cancelled context) after some
+// fragments of a frame were already written. The peer would read the next
+// frame's bytes as the missing tail of the torn frame, so the session cannot
+// carry another frame. Like errSessionEnded it is not a transport failure:
+// the handle stays on peer-to-peer and opens a new session, and concurrent
+// streams of the retired session continue on it.
+type errSessionRetired struct{}
+
+func (e *errSessionRetired) Error() string {
+	return "ownsand: data path session retired after an interrupted frame"
+}
+
 // errP2PFailed reports a data channel that closed without a session-end
 // frame, an ICE failure or an invalid byte stream. The handle moves to the
 // relay.
@@ -71,6 +84,10 @@ type p2pSession struct {
 
 	sendMu   sync.Mutex
 	lowWater chan struct{}
+	// bufferedAmount reports the bytes queued on the data channel. It is a
+	// field only so that tests can hold a send at a chosen fragment, which
+	// a real data channel on loopback cannot do deterministically.
+	bufferedAmount func() uint64
 
 	queueTimeout time.Duration
 
@@ -121,7 +138,8 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 		done:      make(chan struct{}),
 		lowWater:  make(chan struct{}, 1),
 
-		queueTimeout: c.timing.streamQueueTimeout,
+		bufferedAmount: dc.BufferedAmount,
+		queueTimeout:   c.timing.streamQueueTimeout,
 	}
 	opened := make(chan struct{})
 	var openOnce sync.Once
@@ -282,6 +300,12 @@ func (s *p2pSession) dispatch(f *ownsandv1.DataFrame) {
 var errStreamOverrun = errors.New("ownsand: peer-to-peer stream consumer fell behind; the stream was failed")
 
 // send writes one frame as data channel messages of at most 16 KiB.
+//
+// The frame is a varint length prefix and a body split over the messages, so
+// an interruption after the first message leaves a torn frame on the ordered
+// channel and the peer would take the next frame's bytes as its tail. Such an
+// interruption retires the session (errSessionRetired); an interruption before
+// the first message leaves the session reusable.
 func (s *p2pSession) send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	msgs, err := datapath.EncodeMessages(f)
 	if err != nil {
@@ -289,14 +313,17 @@ func (s *p2pSession) send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()
-	for _, m := range msgs {
-		for s.dc.BufferedAmount() > maxBufferedAmount {
+	for i, m := range msgs {
+		for s.bufferedAmount() > maxBufferedAmount {
 			select {
 			case <-s.lowWater:
 			case <-time.After(50 * time.Millisecond):
 			case <-s.done:
 				return s.endErr
 			case <-ctx.Done():
+				if i > 0 {
+					s.end(&errSessionRetired{})
+				}
 				return ctx.Err()
 			}
 		}

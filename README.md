@@ -1,6 +1,6 @@
 # Delino
 
-Monorepo for Delino services. It currently contains the `delino-site`, `delino-docs` and `delino-accounts` web apps, the `delidev` desktop and mobile app, the `accounts-api` Go server, the shared React UI component package `delino-ui` in `packages/`, and shared instructions, skills, documentation and formatting tooling. The root Cargo workspace has one member, `apps/delidev/src-tauri`. The `crates/`, `cmds/` and `protos/` directories are reserved: they hold only scoped `AGENTS.md` instructions today, and no Go command tools or protocol schemas exist yet.
+Monorepo for Delino services. It currently contains the `delino-site`, `delino-docs`, `delino-accounts` and `ownsand` web apps, the `delidev` desktop and mobile app, the `accounts-api` and `ownsand-api` Go servers in `servers/`, the shared React UI component package `delino-ui` and the TypeScript SDK `ownsand-sdk` in `packages/`, the Go SDK `ownsand-sdk-go` in the public Go package tree `go/ownsand`, the Go command tools `cmds/ownsand`, `cmds/ownsand-agent` and `cmds/ownsand-guest`, the OwnSand Connect RPC schemas in `protos/delino/ownsand/v1` with committed Go bindings (the TypeScript bindings are in `packages/ownsand-sdk`), and shared instructions, skills, documentation and formatting tooling. The root Cargo workspace has one member, `apps/delidev/src-tauri`. Only the `crates/` directory is still reserved: it holds only its scoped `AGENTS.md` instructions today.
 
 ## License
 
@@ -19,7 +19,7 @@ Imported skills retain their original licenses and notices. See [NOTICE](NOTICE)
 
 ## Setup
 
-Use Node.js 24, pnpm 10.26.2 and the Go toolchain selected by the root `go.mod` (Go 1.26.1 or later). The root `pnpm build`, `pnpm dev`, `pnpm lint` and `pnpm test` tasks run `servers/accounts-api`, whose scripts call `go`.
+Use Node.js 24, pnpm 10.26.2 and the Go toolchain selected by the root `go.mod` (Go 1.26.1 or later). The root `pnpm build`, `pnpm dev`, `pnpm lint` and `pnpm test` tasks run the Go servers `servers/accounts-api` and `servers/ownsand-api`, whose scripts call `go`.
 
 ```sh
 pnpm install --frozen-lockfile

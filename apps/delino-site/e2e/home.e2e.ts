@@ -43,6 +43,16 @@ describe("brand colors", () => {
       const probe = document.createElement("span");
       document.body.append(probe);
       const resolve = (name: string): [number, number, number] => {
+        // An undefined custom property makes `var()` invalid at computed-value
+        // time, so the probe would silently inherit the body color and could
+        // pass the contrast check. Fail on an undefined variable instead.
+        if (
+          !getComputedStyle(document.documentElement)
+            .getPropertyValue(name)
+            .trim()
+        ) {
+          throw new Error(`${name} is not defined`);
+        }
         probe.style.color = "";
         probe.style.color = `var(${name})`;
         const channels = getComputedStyle(probe).color.match(/[\d.]+/g) ?? [];
@@ -74,6 +84,8 @@ describe("brand colors", () => {
         Math.min(...surfaces.map((surface) => ratio(foreground, surface)));
       const result = {
         brand: resolve("--rp-c-brand").join(","),
+        brandLight: resolve("--rp-c-brand-light").join(","),
+        brandLighter: resolve("--rp-c-brand-lighter").join(","),
         brandDark: resolve("--rp-c-brand-dark").join(","),
         brandDarker: resolve("--rp-c-brand-darker").join(","),
         brandLowest: lowest("--rp-c-brand"),
@@ -97,6 +109,8 @@ describe("brand colors", () => {
     const dark = await browser.evaluate(readBrandContrast());
 
     expect(dark.brand).toBe("138,160,255");
+    expect(dark.brandLight).toBe("163,180,255");
+    expect(dark.brandLighter).toBe("192,204,255");
     expect(dark.brandLowest).toBeGreaterThanOrEqual(4.5);
     expect(dark.brandLightLowest).toBeGreaterThanOrEqual(4.5);
     expect(dark.brandLighterLowest).toBeGreaterThanOrEqual(4.5);

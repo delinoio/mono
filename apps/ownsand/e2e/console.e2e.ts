@@ -10,6 +10,9 @@ const NORTHWIND = "0193a000-0000-7000-8000-000000000002";
 const CONTOSO = "0193a000-0000-7000-8000-000000000003";
 const BUILD_BOX = "0193a000-0000-7000-8000-0000000000d1";
 const INVITATION_SECRET = "osi_mock_contoso_invitation";
+// A seeded Acme invitation. The mock user already belongs to Acme, so
+// accepting it fails and leaves the invitation unused.
+const ACME_INVITATION_SECRET = "osi_7f3a_unused";
 
 describe("sign-in", () => {
   test("signs in and lists the organizations", async ({ app, screen }) => {
@@ -119,6 +122,30 @@ describe("devices", () => {
     ).toContainText("24");
     await expect(screen.getByRole("button", "Remove device")).toBeVisible();
   });
+
+  test("removes a device and drops it from the device list", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await app.open(`/orgs/${ACME}/devices`);
+    await expect(screen.getByText("build-box-1").first()).toBeVisible();
+    await expect(screen.getByText("studio-mac").first()).toBeVisible();
+
+    await app.open(`/orgs/${ACME}/devices/${BUILD_BOX}`);
+    await screen.getByRole("button", "Remove device").tap();
+    const dialog = screen.getByRole("alertdialog", "Remove build-box-1?");
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", "Remove device").tap();
+
+    // The console returns to the device list. The mock API omits a removed
+    // device from a list request that sets no state, like the real API.
+    await expect(browser).toHaveURL(`/orgs/${ACME}/devices`);
+    await expect(screen.getByText("studio-mac").first()).toBeVisible();
+    await expect(screen.getByText("build-box-1")).toBeHidden();
+  });
 });
 
 describe("roles", () => {
@@ -149,6 +176,20 @@ describe("invitations", () => {
     await expect(screen.getByRole("navigation", "Organization")).toContainText(
       "Contoso Research",
     );
+  });
+
+  test("shows the error of a failed acceptance and keeps the accept button", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open(`/invitations/accept#secret=${ACME_INVITATION_SECRET}`);
+    await screen.getByRole("button", "Sign in to accept").tap();
+    await screen.getByRole("button", "Accept invitation").tap();
+
+    await expect(screen.getByText("you are already a member")).toBeVisible();
+    await expect(screen.getByRole("button", "Accept invitation")).toBeVisible();
+    await expect(browser).toHaveURL("/invitations/accept");
   });
 });
 

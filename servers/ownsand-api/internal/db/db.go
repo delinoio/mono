@@ -119,6 +119,14 @@ func loadMigrations() ([]migration, error) {
 // Migrate applies every embedded migration that the database has not
 // applied yet.
 func (d *DB) Migrate(ctx context.Context, logger *slog.Logger) error {
+	return d.MigrateUpTo(ctx, logger, 0)
+}
+
+// MigrateUpTo applies the embedded migrations that the database has not
+// applied yet, up to and including maxVersion; 0 means all of them. Upgrade
+// tests use it to build a database at an older schema version and then
+// apply the later migrations through the normal runner.
+func (d *DB) MigrateUpTo(ctx context.Context, logger *slog.Logger, maxVersion int) error {
 	migrations, err := loadMigrations()
 	if err != nil {
 		return err
@@ -161,6 +169,9 @@ func (d *DB) Migrate(ctx context.Context, logger *slog.Logger) error {
 		return err
 	}
 	for _, m := range migrations {
+		if maxVersion > 0 && m.version > maxVersion {
+			break
+		}
 		if sum, ok := applied[m.version]; ok {
 			if string(sum) != string(m.sum[:]) {
 				return fmt.Errorf("migration %s changed after it was applied", m.name)
