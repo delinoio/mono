@@ -18,9 +18,11 @@ import { fileURLToPath } from "node:url";
 
 import {
   DevelopmentEnvironment,
-  InjectionMode,
-  launchPlan,
+  exportArguments,
+  exportEnvironment,
+  FailureReason,
   parseArguments,
+  parseExport,
   ProjectConfigFile,
   projectConfigFile,
 } from "./with-infisical.mjs";
@@ -34,54 +36,59 @@ const posixOnly = {
     "process groups and the fake CLI shebang are POSIX-only",
 };
 
-// A fake `infisical` CLI. Like the real CLI (`infisical run`), it adds the
-// fetched variables over the inherited environment, starts the command after
-// `--` in its own process group and forwards every stop signal to it. It
-// records its arguments so that tests can check the exact invocation. The
-// file has no extension, so Node.js runs it as CommonJS.
+// A value that must never appear in launcher output.
+const secretValue = "s3cr3t-value-that-must-not-be-logged";
+
+// A fake `infisical` CLI. For `export` it records its arguments and working
+// directory, optionally waits, and then prints FAKE_INFISICAL_OUTPUT on
+// standard output and exits with FAKE_INFISICAL_EXIT. The file has no
+// extension, so Node.js runs it as CommonJS.
 const fakeInfisical = `#!/usr/bin/env node
-const { spawn } = require("node:child_process");
 const { writeFileSync } = require("node:fs");
-const args = process.argv.slice(2);
-writeFileSync(process.env.FAKE_INFISICAL_ARGS, JSON.stringify(args));
-const command = args.slice(args.indexOf("--") + 1);
-const child = spawn(command[0], command.slice(1), {
-  stdio: "inherit",
-  shell: false,
-  env: { ...process.env, INJECTED_BY_FAKE_INFISICAL: "yes" },
-});
-for (const signal of ["SIGINT", "SIGTERM", "SIGQUIT", "SIGHUP"]) {
-  process.on(signal, () => child.kill(signal));
-}
-child.on("close", (code, signal) => process.exit(code ?? 255));
+writeFileSync(
+  process.env.FAKE_INFISICAL_ARGS,
+  JSON.stringify({
+    args: process.argv.slice(2),
+    cwd: process.cwd(),
+    LOG_LEVEL: process.env.LOG_LEVEL ?? null,
+  }),
+);
+const finish = () => {
+  process.stdout.write(process.env.FAKE_INFISICAL_OUTPUT ?? "[]");
+  process.exitCode = Number(process.env.FAKE_INFISICAL_EXIT ?? "0");
+};
+setTimeout(finish, Number(process.env.FAKE_INFISICAL_DELAY_MS ?? "0"));
 `;
 
-// The development command. It records its arguments and the injected marker,
-// prints a ready line, and on SIGINT records the signal and exits shortly
-// afterwards, so that a duplicate delivery is also recorded.
+// The development command. It records its process ID, arguments and selected
+// variables, prints a ready line, and on SIGINT records the signal and exits
+// shortly afterwards, so that a duplicate delivery is also recorded.
 const devCommand = `import { appendFileSync, writeFileSync } from "node:fs";
 const out = process.env.DEV_COMMAND_OUT;
 writeFileSync(out + ".start", JSON.stringify({
+  pid: process.pid,
   args: process.argv.slice(2),
-  injected: process.env.INJECTED_BY_FAKE_INFISICAL ?? null,
+  DEV_VALUE: process.env.DEV_VALUE ?? null,
+  SHELL_ONLY: process.env.SHELL_ONLY ?? null,
+  HOME: process.env.HOME ?? null,
+  LOG_LEVEL: process.env.LOG_LEVEL ?? null,
 }));
 process.on("SIGINT", () => {
   appendFileSync(out + ".signals", "SIGINT\\n");
   setTimeout(() => process.exit(0), 300);
 });
-const exitCode = Number(process.argv[2] ?? "0");
 if (process.argv[3] === "wait") {
   console.log("ready");
   setInterval(() => {}, 1000);
 } else {
-  process.exit(exitCode);
+  process.exit(Number(process.argv[2] ?? "0"));
 }
 `;
 
 // Builds a repository-like directory with the launcher at
 // `scripts/dev/with-infisical.mjs`, so that the launcher resolves the
 // fixture as its repository root.
-function fixture(t, { config = null, cli = true } = {}) {
+function fixture(t, { config = null, cli = true, env = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), "with-infisical-"));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   mkdirSync(join(root, "scripts", "dev"), { recursive: true });
@@ -94,10 +101,14 @@ function fixture(t, { config = null, cli = true } = {}) {
     writeFileSync(join(bin, "infisical"), fakeInfisical);
     chmodSync(join(bin, "infisical"), 0o755);
   }
-  writeFileSync(join(root, "dev-command.mjs"), devCommand);
+  // The command runs from a package directory, as a package script does.
+  const packageDir = join(root, "apps", "example");
+  mkdirSync(packageDir, { recursive: true });
+  writeFileSync(join(packageDir, "dev-command.mjs"), devCommand);
   const out = join(root, "out");
   return {
     root,
+    packageDir,
     launcher,
     out,
     infisicalArgs: join(root, "infisical-args.json"),
@@ -108,15 +119,16 @@ function fixture(t, { config = null, cli = true } = {}) {
       HOME: root,
       FAKE_INFISICAL_ARGS: join(root, "infisical-args.json"),
       DEV_COMMAND_OUT: out,
+      ...env,
     },
   };
 }
 
-// Starts the launcher in its own process group, as a terminal starts a
-// foreground job, and collects its output.
+// Starts the launcher in its own process group, as a terminal or Turborepo
+// starts a job, and collects its output.
 function startLauncher(f, args) {
   const child = spawn(process.execPath, [f.launcher, ...args], {
-    cwd: f.root,
+    cwd: f.packageDir,
     env: f.env,
     stdio: ["ignore", "pipe", "pipe"],
     shell: false,
@@ -149,6 +161,17 @@ const commandArgs = (exitCode, ...rest) => [
   ...rest,
 ];
 
+const started = (f) => JSON.parse(readFileSync(`${f.out}.start`, "utf8"));
+
+function alive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function waitFor(predicate, what) {
   const deadline = Date.now() + 10_000;
   while (!predicate()) {
@@ -156,6 +179,8 @@ async function waitFor(predicate, what) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
 }
+
+const exported = (entries) => JSON.stringify(entries);
 
 test("parseArguments accepts one folder and a command", () => {
   assert.deepEqual(
@@ -173,10 +198,7 @@ test("parseArguments accepts one folder and a command", () => {
   // Arguments after `--`, including a second `--`, belong to the command.
   assert.deepEqual(
     parseArguments(["--path=/a", "--", "x", "--", "--path=/b"]),
-    {
-      folder: "/a",
-      command: ["x", "--", "--path=/b"],
-    },
+    { folder: "/a", command: ["x", "--", "--path=/b"] },
   );
 });
 
@@ -224,39 +246,79 @@ test("projectConfigFile prefers .infisical.yaml like the CLI", async (t) => {
   }
 });
 
-test("launchPlan pins the dev environment and the package folder", () => {
-  const command = ["node", "dev.mjs", "--flag"];
-  assert.deepEqual(
-    launchPlan({ root: "/repo", folder: "/api", command, configFile: null }),
-    {
-      mode: InjectionMode.Direct,
-      executable: "node",
-      args: ["dev.mjs", "--flag"],
-    },
-  );
+test("exportArguments pins the dev environment, the folder and logging", () => {
   assert.equal(DevelopmentEnvironment, "dev");
+  assert.deepEqual(exportArguments("/api"), [
+    "export",
+    "--env=dev",
+    "--path=/api",
+    "--format=json",
+    "--silent",
+    "--log-level=warn",
+    "--log-destination=stderr",
+  ]);
+});
+
+test("exportEnvironment removes only the CLI logging variables", () => {
   assert.deepEqual(
-    launchPlan({
-      root: "/repo",
-      folder: "/api",
-      command,
-      configFile: ProjectConfigFile.Yaml,
+    exportEnvironment({
+      LOG_LEVEL: "debug",
+      LOG_DESTINATION: "stdout",
+      LOG_FORMAT: "json",
+      HOME: "/home/user",
+      DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/bus",
     }),
+    { HOME: "/home/user", DBUS_SESSION_BUS_ADDRESS: "unix:path=/run/bus" },
+  );
+});
+
+test("parseExport keeps valid names and skips reserved and invalid ones", () => {
+  assert.deepEqual(
+    parseExport(
+      exported([
+        { key: "DATABASE_URL", value: "postgres://x", type: "shared" },
+        { key: "EMPTY", value: "" },
+        { key: "PATH", value: "/evil" },
+        { key: "HOME", value: "/evil" },
+        { key: "XDG_CONFIG_HOME", value: "/evil" },
+        { key: "LC_ALL", value: "C" },
+        { key: "1BAD", value: "x" },
+        { key: "BAD-NAME", value: "x" },
+        { key: "BAD=NAME", value: "x" },
+        { key: "NUL_VALUE", value: "a\0b" },
+      ]),
+    ),
     {
-      mode: InjectionMode.Infisical,
-      executable: "infisical",
-      args: [
-        "run",
-        "--env=dev",
-        "--project-config-dir=/repo",
-        "--path=/api",
-        "--",
-        "node",
-        "dev.mjs",
-        "--flag",
-      ],
+      variables: { DATABASE_URL: "postgres://x", EMPTY: "" },
+      reserved: 4,
+      invalid: 4,
     },
   );
+  assert.deepEqual(parseExport("[]"), {
+    variables: {},
+    reserved: 0,
+    invalid: 0,
+  });
+});
+
+test("parseExport rejects output that is not the export array", async (t) => {
+  for (const output of [
+    "",
+    "KEY=value",
+    "{}",
+    "null",
+    exported([{ key: "A" }]),
+    exported([{ key: 1, value: "x" }]),
+    exported(["A=b"]),
+    exported([null]),
+  ]) {
+    await t.test(JSON.stringify(output), () => {
+      assert.throws(
+        () => parseExport(output),
+        (error) => error.reason === FailureReason.OutputInvalid,
+      );
+    });
+  }
 });
 
 test(
@@ -268,8 +330,7 @@ test(
       .exited;
     assert.equal(result.code, 7, result.stderr);
     assert.equal(existsSync(f.infisicalArgs), false, "the CLI must not run");
-    const start = JSON.parse(readFileSync(`${f.out}.start`, "utf8"));
-    assert.deepEqual(start, { args: ["7"], injected: null });
+    assert.deepEqual(started(f).args, ["7"]);
     assert.deepEqual(records(result.stderr), [
       {
         event: "dev_env_direct",
@@ -281,55 +342,94 @@ test(
 );
 
 test(
-  "with a project configuration the command runs through infisical run",
+  "with a project configuration the command receives the exported variables",
   posixOnly,
   async (t) => {
     for (const config of Object.values(ProjectConfigFile)) {
       await t.test(config, async (t) => {
-        const f = fixture(t, { config });
+        const f = fixture(t, {
+          config,
+          env: {
+            DEV_VALUE: "from-shell",
+            SHELL_ONLY: "kept",
+            LOG_LEVEL: "debug",
+            FAKE_INFISICAL_OUTPUT: exported([
+              { key: "DEV_VALUE", value: secretValue },
+              { key: "HOME", value: "/from-infisical" },
+              { key: "not-a-name", value: "x" },
+            ]),
+          },
+        });
         const result = await startLauncher(f, [
           "--path=/accounts-api",
           ...commandArgs(3),
         ]).exited;
         assert.equal(result.code, 3, result.stderr);
-        assert.deepEqual(JSON.parse(readFileSync(f.infisicalArgs, "utf8")), [
-          "run",
-          "--env=dev",
-          `--project-config-dir=${f.root}`,
-          "--path=/accounts-api",
-          "--",
-          process.execPath,
-          "dev-command.mjs",
-          "3",
-        ]);
-        const start = JSON.parse(readFileSync(`${f.out}.start`, "utf8"));
-        assert.deepEqual(start, { args: ["3"], injected: "yes" });
+        // The CLI runs in the repository root, where it finds the project
+        // configuration, with the pinned arguments.
+        // The CLI does not see the servers' LOG_LEVEL; the command does.
+        assert.deepEqual(JSON.parse(readFileSync(f.infisicalArgs, "utf8")), {
+          args: exportArguments("/accounts-api"),
+          cwd: f.root,
+          LOG_LEVEL: null,
+        });
+        const start = started(f);
+        assert.deepEqual(start.args, ["3"]);
+        // Infisical values replace shell values; other shell values stay, and
+        // reserved names keep their inherited values.
+        assert.equal(start.DEV_VALUE, secretValue);
+        assert.equal(start.SHELL_ONLY, "kept");
+        assert.equal(start.HOME, f.root);
+        assert.equal(start.LOG_LEVEL, "debug");
         assert.deepEqual(records(result.stderr), [
           {
             event: "dev_env_infisical",
             environment: "dev",
             folder: "/accounts-api",
             config,
+            variables: 1,
+            reservedSkipped: 1,
+            invalidSkipped: 1,
           },
         ]);
+        assert.equal(result.stderr.includes(secretValue), false);
+        assert.equal(result.stdout.includes(secretValue), false);
       });
     }
   },
 );
 
 test(
-  "a configured checkout without the CLI fails before the command runs",
+  "a configured checkout stops before the command when the fetch fails",
   posixOnly,
   async (t) => {
-    const f = fixture(t, { config: ProjectConfigFile.Yaml, cli: false });
-    const result = await startLauncher(f, ["--path=/api", ...commandArgs(0)])
-      .exited;
-    assert.equal(result.code, 1, result.stderr);
-    assert.equal(existsSync(`${f.out}.start`), false);
-    const failure = records(result.stderr).find(
-      (record) => record.event === "dev_env_failed",
-    );
-    assert.equal(failure?.reason, "infisical_cli_missing", result.stderr);
+    for (const [name, options, reason] of [
+      ["missing CLI", { cli: false }, FailureReason.CliMissing],
+      [
+        "failed export",
+        { env: { FAKE_INFISICAL_EXIT: "1" } },
+        FailureReason.FetchFailed,
+      ],
+      [
+        "invalid output",
+        { env: { FAKE_INFISICAL_OUTPUT: "KEY=value" } },
+        FailureReason.OutputInvalid,
+      ],
+    ]) {
+      await t.test(name, async (t) => {
+        const f = fixture(t, { config: ProjectConfigFile.Yaml, ...options });
+        const result = await startLauncher(f, [
+          "--path=/api",
+          ...commandArgs(0),
+        ]).exited;
+        assert.equal(result.code, 1, result.stderr);
+        assert.equal(existsSync(`${f.out}.start`), false);
+        const failure = records(result.stderr).find(
+          (record) => record.event === "dev_env_failed",
+        );
+        assert.equal(failure?.reason, reason, result.stderr);
+      });
+    }
   },
 );
 
@@ -357,9 +457,55 @@ test(
         // A terminal Ctrl-C signals the whole foreground process group.
         process.kill(-launcher.child.pid, "SIGINT");
         const result = await launcher.exited;
-        assert.equal(result.code, 130, result.stderr);
+        // The launcher waits for the command and exits with its status.
+        assert.equal(result.code, 0, result.stderr);
         assert.equal(readFileSync(`${f.out}.signals`, "utf8"), "SIGINT\n");
       });
     }
+  },
+);
+
+test(
+  "a forced stop of the process group also stops the command",
+  posixOnly,
+  async (t) => {
+    // Turborepo force-stops a task with SIGKILL to the task's process group.
+    for (const config of [null, ProjectConfigFile.Yaml]) {
+      await t.test(config ?? "direct", async (t) => {
+        const f = fixture(t, { config });
+        const launcher = startLauncher(f, [
+          "--path=/api",
+          ...commandArgs(0, "wait"),
+        ]);
+        await waitFor(() => launcher.output().includes("ready"), "the command");
+        const { pid } = started(f);
+        process.kill(-launcher.child.pid, "SIGKILL");
+        try {
+          // Check the command first: a command that survives keeps the
+          // launcher's output pipes open, so `exited` would never resolve.
+          await waitFor(() => !alive(pid), "the command to stop");
+        } finally {
+          if (alive(pid)) process.kill(pid, "SIGKILL");
+        }
+        await launcher.exited;
+      });
+    }
+  },
+);
+
+test(
+  "a signal during the fetch prevents the command from starting",
+  posixOnly,
+  async (t) => {
+    const f = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: { FAKE_INFISICAL_DELAY_MS: "5000" },
+    });
+    const launcher = startLauncher(f, ["--path=/api", ...commandArgs(0)]);
+    await waitFor(() => existsSync(f.infisicalArgs), "the fetch");
+    process.kill(-launcher.child.pid, "SIGINT");
+    const result = await launcher.exited;
+    assert.equal(result.code, 130, result.stderr);
+    assert.equal(existsSync(`${f.out}.start`), false);
   },
 );
