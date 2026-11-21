@@ -205,6 +205,13 @@ func TestResourcesSourceNetwork(t *testing.T) {
 	wantInvalid(t, "unspecified image", SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_BaseImage{}}), "source.base_image")
 	wantInvalid(t, "unknown image", SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_BaseImage{BaseImage: 42}}), "source.base_image")
 	wantInvalid(t, "bad template", SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_TemplateId{TemplateId: "t"}}), "source.template_id")
+	// A typed nil wrapper inside the oneof must be reported, not dereferenced.
+	wantInvalid(t, "typed nil base image", SandboxSource(&ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_BaseImage)(nil)}), "source")
+	wantInvalid(t, "typed nil snapshot id", SandboxSource(&ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_SnapshotId)(nil)}), "source")
+	wantInvalid(t, "typed nil template id", SandboxSource(&ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_TemplateId)(nil)}), "source")
+	if err := SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_TemplateId{TemplateId: opID}}); err != nil {
+		t.Fatal(err)
+	}
 
 	if mode, err := NetworkMode(nil); err != nil || mode != ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		t.Fatalf("absent network: %v %v", mode, err)
@@ -248,6 +255,9 @@ func TestCreateSandboxRequest(t *testing.T) {
 	r = valid()
 	r.Network = &ownsandv1.Network{}
 	wantInvalid(t, "network", CreateSandboxRequest(r), "network.mode")
+	r = valid()
+	r.Source = &ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_SnapshotId)(nil)}
+	wantInvalid(t, "typed nil source", CreateSandboxRequest(r), "source")
 }
 
 func TestDeviceLimits(t *testing.T) {
