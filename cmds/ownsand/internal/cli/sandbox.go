@@ -66,7 +66,7 @@ func (a *app) sandboxCreate(ctx context.Context, name string, args []string) err
 	template := fs.String("template", "", "source template ID")
 	idle := fs.String("idle-ttl", "", "idle TTL, for example 30m (required)")
 	maxTTL := fs.String("max-ttl", "", "maximum TTL, at most 7d (required)")
-	vcpu := fs.Int("vcpu", 0, "vCPU count (required)")
+	vcpu := int32Var(fs, "vcpu", 0, "vCPU count (required)")
 	memory := fs.Int64("memory", 0, "memory in MiB (required)")
 	disk := fs.Int64("disk", 0, "disk in GiB (required)")
 	device := fs.String("device", "", "device ID")
@@ -109,7 +109,7 @@ func (a *app) sandboxCreate(ctx context.Context, name string, args []string) err
 	if p.MaxTTL, err = parseDuration("max-ttl", *maxTTL); err != nil {
 		return err
 	}
-	p.Resources = ownsand.Resources{VCPUCount: int32(*vcpu), MemoryMiB: *memory, DiskGiB: *disk}
+	p.Resources = ownsand.Resources{VCPUCount: *vcpu, MemoryMiB: *memory, DiskGiB: *disk}
 	if *hostOS != "" {
 		v, err := parseHostOS(*hostOS)
 		if err != nil {
@@ -233,7 +233,7 @@ func (a *app) sandboxList(ctx context.Context, name string, args []string) error
 	if err != nil {
 		return err
 	}
-	req := &ownsandv1.ListSandboxesRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token, IncludeEnded: *ended}
+	req := &ownsandv1.ListSandboxesRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token, IncludeEnded: *ended}
 	if *device != "" {
 		req.DeviceId = device
 	}
