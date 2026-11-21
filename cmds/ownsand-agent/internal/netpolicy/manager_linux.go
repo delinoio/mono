@@ -20,7 +20,13 @@ import (
 type attachment struct {
 	link Link
 	tap  string
-	dns  *DNSForwarder
+	dns  dnsCloser
+}
+
+// dnsCloser is the part of a DNS forwarder that the manager needs after the
+// start; tests replace the forwarder.
+type dnsCloser interface {
+	Close()
 }
 
 // Manager attaches OUTBOUND sandboxes to tap devices and keeps the
@@ -36,13 +42,58 @@ type Manager struct {
 	// them.
 	interval time.Duration
 	refresh  func() error
+	// run, startDNS, setForwarding and tapExists are the host operations of
+	// the manager: the `ip` command, the DNS forwarder, the IPv4 forwarding
+	// switch and the tap device probe. Tests replace them so that the
+	// manager runs without root.
+	run           func(name string, args ...string) error
+	startDNS      func(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error)
+	setForwarding func() error
+	tapExists     func(tap string) bool
 }
 
 // NewManager returns a manager.
 func NewManager(logger *slog.Logger) *Manager {
-	m := &Manager{logger: logger, attached: map[string]*attachment{}, used: map[int]bool{}, interval: RefreshInterval}
+	m := &Manager{
+		logger:        logger,
+		attached:      map[string]*attachment{},
+		used:          map[int]bool{},
+		interval:      RefreshInterval,
+		run:           run,
+		startDNS:      startDNSForwarder,
+		setForwarding: enableIPv4Forwarding,
+		tapExists:     tapDeviceExists,
+	}
 	m.refresh = m.Refresh
 	return m
+}
+
+// startDNSForwarder is StartDNS behind the dnsCloser interface. It returns a
+// nil interface, not a nil pointer, when the start fails.
+func startDNSForwarder(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error) {
+	f, err := StartDNS(listen, upstream, logger)
+	if err != nil {
+		return nil, err
+	}
+	return f, nil
+}
+
+func enableIPv4Forwarding() error {
+	return os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644)
+}
+
+// errNoSuchInterface is the text of the error that net.InterfaceByName
+// returns for a missing device; the standard library does not export the
+// error value.
+const errNoSuchInterface = "no such network interface"
+
+// tapDeviceExists reports whether the tap device may still exist. It is
+// false only when net.InterfaceByName confirms that the device is absent; an
+// unknown lookup failure counts as "may exist", so that the caller keeps the
+// reservation.
+func tapDeviceExists(tap string) bool {
+	_, err := net.InterfaceByName(tap)
+	return err == nil || !strings.Contains(err.Error(), errNoSuchInterface)
 }
 
 func run(name string, args ...string) error {
@@ -132,30 +183,29 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	link, _ := LinkFor(idx)
 	tap := TapName(sandboxID)
 	fail := func(err error) (Link, string, error) {
-		_ = run("ip", "link", "del", tap)
-		m.mu.Lock()
-		delete(m.used, idx)
-		m.mu.Unlock()
+		// The link stays reserved while a tap device with the link address
+		// may still exist.
+		m.removeTap(sandboxID, tap, idx)
 		m.logger.Error("network setup failed", "sandbox_id", sandboxID, "error", err)
 		return Link{}, "", err
 	}
-	if err := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644); err != nil {
+	if err := m.setForwarding(); err != nil {
 		return fail(fmt.Errorf("netpolicy: enable IPv4 forwarding: %w", err))
 	}
-	_ = run("ip", "link", "del", tap)
+	_ = m.run("ip", "link", "del", tap)
 	for _, args := range [][]string{
 		{"tuntap", "add", "dev", tap, "mode", "tap"},
 		{"addr", "add", fmt.Sprintf("%s/%d", link.Gateway, link.Bits), "dev", tap},
 		{"link", "set", tap, "up"},
 	} {
-		if err := run("ip", args...); err != nil {
+		if err := m.run("ip", args...); err != nil {
 			return fail(err)
 		}
 	}
-	if err := m.Refresh(); err != nil {
+	if err := m.refresh(); err != nil {
 		return fail(err)
 	}
-	dns, err := StartDNS(netip.AddrPortFrom(link.Gateway, 53), HostResolver("/etc/resolv.conf"), m.logger)
+	dns, err := m.startDNS(netip.AddrPortFrom(link.Gateway, 53), HostResolver("/etc/resolv.conf"), m.logger)
 	if err != nil {
 		return fail(fmt.Errorf("netpolicy: start DNS forwarder: %w", err))
 	}
@@ -166,22 +216,40 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	return link, tap, nil
 }
 
-// Detach removes the tap device and DNS forwarder of a sandbox.
+// Detach removes the tap device and DNS forwarder of a sandbox. The link of
+// the sandbox stays reserved until the DNS forwarder is closed and the tap
+// device is deleted or confirmed absent, so that a concurrent Attach cannot
+// receive the same /30 link and gateway address while they exist. The
+// teardown runs outside the manager mutex, so other free links serve new
+// sandboxes meanwhile.
 func (m *Manager) Detach(sandboxID string) {
 	m.mu.Lock()
 	a, ok := m.attached[sandboxID]
 	delete(m.attached, sandboxID)
-	if ok {
-		delete(m.used, a.link.Index)
-	}
 	m.mu.Unlock()
 	if !ok {
 		return
 	}
 	a.dns.Close()
-	if err := run("ip", "link", "del", a.tap); err != nil {
-		m.logger.Warn("delete tap device failed", "sandbox_id", sandboxID, "error", err)
+	m.removeTap(sandboxID, a.tap, a.link.Index)
+}
+
+// removeTap deletes a tap device and releases its link index. When the
+// deletion fails and the device may still exist, the index stays reserved
+// (the agent has no retry for it; CleanupHost removes the device at the next
+// agent start) and the manager logs a warning.
+func (m *Manager) removeTap(sandboxID, tap string, idx int) {
+	err := m.run("ip", "link", "del", tap)
+	if err != nil && m.tapExists(tap) {
+		m.logger.Warn("delete tap device failed", "sandbox_id", sandboxID, "tap", tap, "error", err)
+		return
 	}
+	if err != nil {
+		m.logger.Debug("tap device already absent", "sandbox_id", sandboxID, "tap", tap, "error", err)
+	}
+	m.mu.Lock()
+	delete(m.used, idx)
+	m.mu.Unlock()
 }
 
 // Run refreshes the policy every RefreshInterval while sandboxes are
