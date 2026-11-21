@@ -35,7 +35,20 @@ type Limits struct {
 	Keepalive time.Duration
 	// IdleTimeout closes a connection that received nothing.
 	IdleTimeout time.Duration
+	// MaxQueuedControlFrames bounds the frames that carry no credit (request
+	// accepted, session end, error, stream close and stream open frames) that
+	// wait in one stream queue for the handler. Zero selects the default.
+	MaxQueuedControlFrames int
+	// MaxQueuedControlBytes bounds the encoded bytes of those frames in one
+	// stream queue. A frame without credit can be as large as a maximum frame,
+	// so the count alone does not bound the memory. Zero selects the default.
+	MaxQueuedControlBytes int64
 }
+
+const (
+	defaultMaxQueuedControlFrames       = 4
+	defaultMaxQueuedControlBytes  int64 = 64 << 10
+)
 
 // DefaultLimits returns the recorded limits.
 func DefaultLimits() Limits {
@@ -45,6 +58,9 @@ func DefaultLimits() Limits {
 		MaxStreamsPerGrant: 4,
 		Keepalive:          30 * time.Second,
 		IdleTimeout:        90 * time.Second,
+
+		MaxQueuedControlFrames: defaultMaxQueuedControlFrames,
+		MaxQueuedControlBytes:  defaultMaxQueuedControlBytes,
 	}
 }
 
@@ -62,6 +78,7 @@ var (
 	ErrReplaced       = errors.New("a newer agent relay connection replaced this one")
 	ErrTooManyStreams = errors.New("too many relay streams")
 	ErrWindowExceeded = errors.New("the agent sent beyond its credit window")
+	ErrControlFlood   = errors.New("the agent queued too many frames without credit on one stream")
 	ErrStreamClosed   = errors.New("the relay stream closed")
 	ErrIdle           = errors.New("no byte received for the idle timeout")
 	ErrUnknownKind    = errors.New("unknown frame kind on a stream")
@@ -96,6 +113,12 @@ type Conn struct {
 // NewConn returns a connection for the device bound to an agent channel
 // generation.
 func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits) *Conn {
+	if limits.MaxQueuedControlFrames <= 0 {
+		limits.MaxQueuedControlFrames = defaultMaxQueuedControlFrames
+	}
+	if limits.MaxQueuedControlBytes <= 0 {
+		limits.MaxQueuedControlBytes = defaultMaxQueuedControlBytes
+	}
 	ctx, cancel := context.WithCancelCause(parent)
 	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan *ownsandv1.DataFrame, outboundQueue),
 		ctx: ctx, cancel: cancel, streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
@@ -319,8 +342,7 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 			return ErrWindowExceeded
 		}
 	}
-	s.push(f)
-	return nil
+	return s.push(f)
 }
 
 // Stream is one relay stream.
@@ -332,11 +354,15 @@ type Stream struct {
 	recv      *datapath.ReceiveWindow
 	send      *datapath.SendWindow
 
-	mu     sync.Mutex
-	queue  []*ownsandv1.DataFrame
-	notify chan struct{}
-	err    error
-	closed bool
+	mu    sync.Mutex
+	queue []*ownsandv1.DataFrame
+	// controlFrames and controlBytes count the queued frames that carry no
+	// credit. The receive credit window bounds every other queued frame.
+	controlFrames int
+	controlBytes  int64
+	notify        chan struct{}
+	err           error
+	closed        bool
 	// Started is when the stream_id was allocated.
 	Started time.Time
 }
@@ -396,17 +422,33 @@ func (s *Stream) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	return s.conn.enqueue(ctx, f)
 }
 
-func (s *Stream) push(f *ownsandv1.DataFrame) {
+// push queues a frame from the agent. Frames that consume credit are bounded
+// by the receive window. Frames that carry no credit bypass it, so push
+// bounds them by count and by bytes and returns ErrControlFlood beyond a
+// limit; dispatch then closes the connection, like a window violation. A
+// compliant agent sends one request accepted frame and one terminal frame
+// per stream, which never reaches the limits even when the handler is slow.
+func (s *Stream) push(f *ownsandv1.DataFrame) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return
+		return nil
+	}
+	if !datapath.ConsumesCredit(f.GetKind()) {
+		size := int64(datapath.EncodedSize(f))
+		if s.controlFrames+1 > s.conn.limits.MaxQueuedControlFrames || s.controlBytes+size > s.conn.limits.MaxQueuedControlBytes {
+			s.mu.Unlock()
+			return ErrControlFlood
+		}
+		s.controlFrames++
+		s.controlBytes += size
 	}
 	s.queue = append(s.queue, f)
 	ch := s.notify
 	s.notify = make(chan struct{})
 	s.mu.Unlock()
 	close(ch)
+	return nil
 }
 
 func (s *Stream) fail(err error) {
@@ -430,6 +472,10 @@ func (s *Stream) Next(ctx context.Context, wake <-chan time.Time) (*ownsandv1.Da
 			f := s.queue[0]
 			s.queue[0] = nil
 			s.queue = s.queue[1:]
+			if !datapath.ConsumesCredit(f.GetKind()) {
+				s.controlFrames--
+				s.controlBytes -= int64(datapath.EncodedSize(f))
+			}
 			s.mu.Unlock()
 			return f, nil
 		}
@@ -474,6 +520,7 @@ func (s *Stream) Close(sendClose bool) {
 	}
 	s.closed = true
 	s.queue = nil
+	s.controlFrames, s.controlBytes = 0, 0
 	s.mu.Unlock()
 	c := s.conn
 	c.mu.Lock()

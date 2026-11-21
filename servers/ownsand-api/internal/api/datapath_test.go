@@ -685,6 +685,102 @@ func TestRelayConnectionRules(t *testing.T) {
 	}
 }
 
+// stalledExecCaller sets up an Exec whose caller reads nothing while the
+// agent fills the buffers between the handler and the caller with stdout, so
+// that the handler blocks in its send and stops dequeuing frames. The relay
+// stream buffer exceeds the HTTP/2 and socket buffers on the path, so the
+// agent stays within its credit window while the handler blocks.
+func stalledExecCaller(t *testing.T, env *testenv.Env, org *testenv.Org, sandboxID string, r *testenv.FakeRelay, afterFill func(s *testenv.RelayStream)) *connect.ServerStreamForClient[ownsandv1.ExecResponse] {
+	t.Helper()
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, org.OwnerClient, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		s.Send(&ownsandv1.RequestAccepted{})
+		chunk := make([]byte, 1<<20)
+		for i := 0; i < 40; i++ {
+			s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: int64(i) << 20, Data: chunk}}})
+		}
+		afterFill(s)
+	})
+	es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return es
+}
+
+func TestRelayBoundsFramesWithoutCredit(t *testing.T) {
+	limits := relay.Limits{StreamBuffer: 48 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: time.Second, IdleTimeout: time.Minute,
+		MaxQueuedControlFrames: 4, MaxQueuedControlBytes: 64 << 10}
+	env := testenv.New(t, func(o *app.Options) { o.RelayLimits = &limits })
+	org, agent, sandboxID := runningSandbox(t, env)
+
+	// An agent that queues frames without credit beyond the limit while the
+	// caller reads nothing loses its connection, and the call ends with
+	// unavailable.
+	r := agent.ConnectRelay(serveExec)
+	es := stalledExecCaller(t, env, org, sandboxID, r, func(s *testenv.RelayStream) {
+		for i := 0; i < 20; i++ {
+			s.Send(&ownsandv1.RequestAccepted{})
+		}
+	})
+	select {
+	case <-r.Closed():
+	case <-time.After(10 * time.Second):
+		t.Fatal("a connection that queued frames without credit stayed open")
+	}
+	if _, err := collectExec(t, es); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("call on the closed connection: %v, want unavailable", err)
+	}
+
+	// A compliant exchange with a slow caller (one accepted frame, credit
+	// frames, one terminal frame) never reaches the limit.
+	r2 := agent.ConnectRelay(serveExec)
+	stop := keepAlive(r2)
+	defer stop()
+	es = stalledExecCaller(t, env, org, sandboxID, r2, func(s *testenv.RelayStream) {
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}})
+	})
+	time.Sleep(500 * time.Millisecond) // the handler is blocked while the caller reads nothing
+	events, err := collectExec(t, es)
+	if err != nil {
+		t.Fatalf("compliant exchange: %v", err)
+	}
+	if last := events[len(events)-1]; last.GetExited() == nil {
+		t.Fatalf("last event = %v, want the exit", last)
+	}
+	select {
+	case <-r2.Closed():
+		t.Fatal("a compliant exchange closed the connection")
+	default:
+	}
+
+	// An unknown frame kind fails only its stream; the connection stays open.
+	r2.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		r2.SendFrame(&ownsandv1.DataFrame{StreamId: s.ID, SandboxId: s.SandboxID, Kind: ownsandv1.DataFrameKind(9999)})
+	})
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, org.OwnerClient, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err = env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collectExec(t, es); err == nil {
+		t.Fatal("a stream with an unknown frame kind completed")
+	}
+	select {
+	case <-r2.Closed():
+		t.Fatal("an unknown frame kind closed the connection")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
 // keepAlive sends relay keepalives until stopped.
 func keepAlive(r *testenv.FakeRelay) func() {
 	done := make(chan struct{})
