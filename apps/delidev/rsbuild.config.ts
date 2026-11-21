@@ -20,7 +20,7 @@ export default defineConfig({
     // Fixed port that `build.devUrl` in `src-tauri/tauri.conf.json` names;
     // fail instead of picking another port on conflict.
     host: devHost,
-    port: 3200,
+    port: 13200,
     strictPort: true,
   },
 });

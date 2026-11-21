@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package agent wires the device agent together: the agent channel with
 // authentication, reconnect back-off, heartbeats, capability and state

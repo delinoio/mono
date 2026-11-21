@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package processrt is the process test runtime. It runs the real guest
 // helper binary as a host process for each sandbox, so end-to-end tests can

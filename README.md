@@ -6,14 +6,16 @@ Monorepo for Delino services. It currently contains the `delino-site`, `delino-d
 
 This repository uses two licenses. The license depends on the directory.
 
-| Path                         | License                                                                                |
-| ---------------------------- | -------------------------------------------------------------------------------------- |
-| `servers/`                   | [Functional Source License 1.1, ALv2 Future License](servers/LICENSE) (`FSL-1.1-ALv2`) |
-| All other repository content | [Apache License 2.0](LICENSE) (`Apache-2.0`)                                           |
+| Path                         | License                                                                                           |
+| ---------------------------- | ------------------------------------------------------------------------------------------------- |
+| `servers/`                   | [Functional Source License 1.1, ALv2 Future License](servers/LICENSE) (`FSL-1.1-ALv2`)            |
+| `cmds/ownsand-agent/`        | [Functional Source License 1.1, ALv2 Future License](cmds/ownsand-agent/LICENSE) (`FSL-1.1-ALv2`) |
+| `cmds/ownsand-guest/`        | [Functional Source License 1.1, ALv2 Future License](cmds/ownsand-guest/LICENSE) (`FSL-1.1-ALv2`) |
+| All other repository content | [Apache License 2.0](LICENSE) (`Apache-2.0`)                                                      |
 
-The backend services in `servers/` are source-available, not Apache-2.0. You can use, change and redistribute them for any purpose other than a Competing Use, as defined in [servers/LICENSE](servers/LICENSE). Each version becomes available under Apache-2.0 two years after its release.
+The backend services in `servers/`, the OwnSand device agent in `cmds/ownsand-agent/` and the OwnSand guest helper in `cmds/ownsand-guest/` are source-available, not Apache-2.0. You can use, change and redistribute them for any purpose other than a Competing Use, as defined in [servers/LICENSE](servers/LICENSE). Each version becomes available under Apache-2.0 two years after its release. The OwnSand CLI in `cmds/ownsand/`, the SDKs and the Connect RPC schemas use Apache-2.0.
 
-[LICENSE-FSL](LICENSE-FSL) is a root copy of `servers/LICENSE`. It is there so that the GitHub license summary shows both licenses. Its terms apply only to `servers/`.
+[LICENSE-FSL](LICENSE-FSL) is a root copy of the FSL-1.1-ALv2 license files. It is there so that the GitHub license summary shows both licenses. Its terms apply only to `servers/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/`.
 
 Imported skills retain their original licenses and notices. See [NOTICE](NOTICE).
 

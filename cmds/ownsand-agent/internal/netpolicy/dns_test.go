@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package netpolicy
 
@@ -85,6 +85,15 @@ func TestHostResolver(t *testing.T) {
 	os.WriteFile(p, []byte("# x\nsearch lan\nnameserver 192.0.2.53\nnameserver 192.0.2.54\n"), 0o644)
 	if got := HostResolver(p); got != "192.0.2.53:53" {
 		t.Fatalf("resolver %s", got)
+	}
+	for _, c := range []struct{ conf, want string }{
+		{"nameserver fe80::53%eth-test\nnameserver 192.0.2.54\n", "[fe80::53%eth-test]:53"},
+		{"nameserver 2001:db8::53\nnameserver 192.0.2.54\n", "[2001:db8::53]:53"},
+	} {
+		os.WriteFile(p, []byte(c.conf), 0o644)
+		if got := HostResolver(p); got != c.want {
+			t.Fatalf("resolver %q: got %s want %s", c.conf, got, c.want)
+		}
 	}
 	if got := HostResolver(filepath.Join(t.TempDir(), "missing")); got != "127.0.0.53:53" {
 		t.Fatalf("fallback %s", got)

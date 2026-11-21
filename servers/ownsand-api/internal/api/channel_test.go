@@ -463,6 +463,70 @@ func TestOfflineWriteOfClosedChannelSkipsReplacement(t *testing.T) {
 	}
 }
 
+// TestOfflineSweepWithEmptyRegistry checks that the sweep marks a stale
+// ONLINE device OFFLINE when the lease holder has no channel at all, and
+// leaves a recent device and terminal sandboxes unchanged.
+func TestOfflineSweepWithEmptyRegistry(t *testing.T) {
+	timing := api.Timing{HeartbeatTimeout: 400 * time.Millisecond, CommandWait: time.Second, EventPoll: 50 * time.Millisecond, OfflineSweep: 100 * time.Millisecond, CleanupPoll: time.Hour, ImportWait: time.Second}
+	env := testenv.New(t, func(o *app.Options) { o.Timing = &timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	stale := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	recent := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+	now := env.Clock.Now()
+	// No agent connects, so the channel registry stays empty. Seed the
+	// devices ONLINE directly: one not heard from for longer than the
+	// heartbeat timeout, one heard from just now.
+	for id, seen := range map[string]time.Time{stale.ID: now.Add(-time.Hour), recent.ID: now.Add(time.Hour)} {
+		if _, err := env.DB.Pool.Exec(ctx, "UPDATE devices SET state = $2, last_seen_time = $3 WHERE device_id = $1",
+			id, int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE), seen); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed := func(deviceID string, state ownsandv1.SandboxState, endReason int16) string {
+		id, _ := uuidv7.NewString()
+		var reason *int16
+		if endReason != 0 {
+			reason = &endReason
+		}
+		if _, err := env.DB.Pool.Exec(ctx, `INSERT INTO sandboxes (sandbox_id, organization_id, device_id, agent_state, end_reason, vcpu_count, memory_mib, disk_gib,
+			guest_os, host_os, arch, network_mode, idle_ttl_ms, max_ttl_ms, max_deadline, created_by_kind, created_by_id, create_time)
+			VALUES ($1, $2, $3, $4, $5, 1, 512, 1, 1, 1, 1, 1, 60000, 60000, now() + interval '1 hour', 1, 'alice', now())`,
+			id, org.ID, deviceID, int16(state), reason); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	running := seed(stale.ID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, 0)
+	deleted := seed(stale.ID, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, 1)
+	recentRunning := seed(recent.ID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, 0)
+	deviceState := func(id string) ownsandv1.DeviceState {
+		d, err := org.OwnerClient.Device.GetDevice(ctx, connect.NewRequest(&ownsandv1.GetDeviceRequest{OrganizationId: org.ID, DeviceId: id}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return d.Msg.GetDevice().GetState()
+	}
+	testenv.Eventually(t, "stale device offline", func() bool {
+		return deviceState(stale.ID) == ownsandv1.DeviceState_DEVICE_STATE_OFFLINE
+	})
+	// Several more sweeps pass before the other devices are checked.
+	time.Sleep(400 * time.Millisecond)
+	if got := deviceState(recent.ID); got != ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
+		t.Fatalf("recent device = %v", got)
+	}
+	sb := getSandbox(t, org.OwnerClient, org.ID, running)
+	if sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE || sb.GetLastKnownState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("sandbox on stale device = %v, last known %v", sb.GetState(), sb.GetLastKnownState())
+	}
+	if sb := getSandbox(t, org.OwnerClient, org.ID, recentRunning); sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("sandbox on recent device = %v", sb.GetState())
+	}
+	if sb := getSandbox(t, org.OwnerClient, org.ID, deleted); sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || sb.GetEndReason() != ownsandv1.SandboxEndReason(1) {
+		t.Fatalf("terminal sandbox = %v, end reason %v", sb.GetState(), sb.GetEndReason())
+	}
+}
+
 func TestConcurrentReservation(t *testing.T) {
 	env := testenv.New(t)
 	ctx := context.Background()

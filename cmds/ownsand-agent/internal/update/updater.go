@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package update
 
@@ -170,6 +170,17 @@ func (u *Updater) setState(s ownsandv1.AgentUpdateState, target string) {
 	u.opts.Logger.Info("agent update state", "update_state", s.String(), "target_version", target)
 }
 
+// clearPendingLocked drops the queued artifact and removes its downloaded
+// file. The caller holds u.mu. revokedRunning is kept: it describes the
+// running version, not the queued artifact.
+func (u *Updater) clearPendingLocked() {
+	if u.artifact == "" {
+		return
+	}
+	os.Remove(filepath.Clean(u.artifact))
+	u.artifact = ""
+}
+
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
@@ -206,6 +217,9 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 		u.mu.Unlock()
 		return ErrInstalling
 	}
+	// A new command supersedes the queued artifact, whatever its outcome:
+	// a failed or same-version target must not install the stale artifact.
+	u.clearPendingLocked()
 	u.mu.Unlock()
 	if c, _ := semver.CompareStrings(target, u.opts.Running); c == 0 {
 		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
@@ -321,7 +335,9 @@ func (u *Updater) fail(target string) {
 	u.mu.Lock()
 	u.installing = false
 	u.artifact = ""
-	u.revokedRunning = false
+	// revokedRunning is deliberately kept: it describes the running version
+	// from a verified manifest, not the failed install attempt, so creates stay
+	// blocked until a later install replaces the revoked version.
 	u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
 	u.target = target
 	u.mu.Unlock()
