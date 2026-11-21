@@ -18,7 +18,7 @@ import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
-import { AuthMode } from "./config.ts";
+import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
 import {
   createMockTransport,
@@ -38,7 +38,11 @@ const config = {
 
 function renderConsole(
   path: string,
-  options: { signedIn?: boolean; transport?: Transport } = {},
+  options: {
+    signedIn?: boolean;
+    transport?: Transport;
+    config?: ConsoleConfig;
+  } = {},
 ) {
   window.history.replaceState(null, "", path);
   const signIns: number[] = [];
@@ -59,7 +63,7 @@ function renderConsole(
   render(
     <AuthContextProvider value={auth}>
       <Console
-        config={config}
+        config={options.config ?? config}
         transport={options.transport ?? createMockTransport()}
         queryClient={queryClient}
       />
@@ -560,5 +564,30 @@ describe("invitations", () => {
     expect(
       screen.queryByRole("button", { name: "Accept invitation" }),
     ).toBeNull();
+  });
+});
+
+describe("sign-in callback", () => {
+  test("shows the sign-in configuration notice when Logto is not configured", async () => {
+    // The default build: Logto mode without a registration, so no Logto
+    // provider exists and the Logto callback hook has nothing to complete.
+    renderConsole("/callback", {
+      signedIn: false,
+      config: {
+        apiOrigin: "https://api.test",
+        authMode: AuthMode.Logto,
+        logto: undefined,
+      },
+    });
+    // The toast region has its own alert announcer, so match the text.
+    expect(
+      await screen.findByText("Sign-in is not configured for this build."),
+    ).toBeTruthy();
+  });
+
+  test("the mock callback still returns to the organizations", async () => {
+    renderConsole("/callback", { signedIn: false });
+    await settle(60);
+    expect(window.location.pathname).toBe("/");
   });
 });
