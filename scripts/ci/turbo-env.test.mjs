@@ -36,6 +36,9 @@ const expectedPassThroughEnv = {
   "accounts-api#dev": ["ADDR", "LOG_LEVEL"],
   "delino-accounts#dev": ["PUBLIC_API_ORIGIN"],
   "delidev#dev": ["TAURI_DEV_HOST"],
+  // `delino-docs#dev` and `delino-site#dev` declare no pass-through variables on
+  // purpose. Their ports are pinned in `rspress.config.ts` (`strictPort`), and
+  // `PORT` is deliberately not supported as a per-run override.
   "delino-docs#dev": null,
   // Turbo reports the pass-through list sorted.
   "ownsand-api#dev": [
