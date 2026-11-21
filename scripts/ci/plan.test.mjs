@@ -1415,7 +1415,14 @@ test("CI workflow runs the Go and Rust checks on macOS and Windows", () => {
     goJob,
     /GOARCH="\$other_arch" CGO_ENABLED=1 go vet \.\/\.\.\.$/m,
   );
-  assert.match(goJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
+  // Known failing packages leave only the blocking run; the job still tests
+  // them without blocking, and it fails when a listed package is gone.
+  assert.match(
+    goJob,
+    /^\s+go test -count=1 "\$\{tested\[@\]\}" \|\| status=\$\?$/m,
+  );
+  assert.match(goJob, /^\s+if go test -count=1 "\$package"; then$/m);
+  assert.match(goJob, /does not exist; remove it from the list/);
   assert.doesNotMatch(goJob, /services:|OWNSAND_E2E: "1"/);
   assert.match(
     rustJob,
