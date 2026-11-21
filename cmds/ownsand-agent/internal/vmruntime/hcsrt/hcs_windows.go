@@ -43,11 +43,15 @@ const (
 	hcsEventServiceDisconnect = 0x02000000
 )
 
-// HRESULTs of the HCS (hcsshim internal/hcs/errors.go names them).
+// HRESULTs of the HCS. computecore.dll returns the HCS_E_* values of
+// winerror.h (0x8037....); the 0xc037.... forms are the vmcompute.dll
+// values that hcsshim internal/hcs/errors.go names, kept in case a Windows
+// build returns them.
 const (
-	hrSystemNotFound       = 0xc037010e
-	hrSystemAlreadyStopped = 0x80370110
-	hrAlreadyStopped       = 0xc0370110
+	hrSystemNotFound          = 0x8037010e // HCS_E_SYSTEM_NOT_FOUND
+	hrSystemAlreadyStopped    = 0x80370110 // HCS_E_SYSTEM_ALREADY_STOPPED
+	hrVmcomputeNotFound       = 0xc037010e
+	hrVmcomputeAlreadyStopped = 0xc0370110
 )
 
 // hcsOperationTimeout bounds one HCS operation.
@@ -84,7 +88,7 @@ func isNotFoundOrStopped(err error) bool {
 		return false
 	}
 	switch he.hr {
-	case hrSystemNotFound, hrSystemAlreadyStopped, hrAlreadyStopped:
+	case hrSystemNotFound, hrSystemAlreadyStopped, hrVmcomputeNotFound, hrVmcomputeAlreadyStopped:
 		return true
 	}
 	return false
