@@ -187,6 +187,38 @@ while :; do sleep 0.05; done`
 	}
 }
 
+// A pending SIGKILL must not outlive its process group: once every member is
+// gone the group id can be reused by an unrelated process group, so the
+// escalation ends at that point and not at the end of the grace period.
+func TestExecTimeoutDropsKillWhenGroupEmpties(t *testing.T) {
+	h := newHarness(t, nil)
+	h.srv.execs.mu.Lock()
+	h.srv.execs.killGrace = 30 * time.Second
+	h.srv.execs.groupPoll = 20 * time.Millisecond
+	h.srv.execs.mu.Unlock()
+	// The leader exits on SIGTERM. Its background child ignores SIGTERM, as
+	// does the sleep it runs, and ends by itself 0.4 seconds later.
+	script := `trap 'exit 0' TERM
+sh -c 'trap "" TERM; sleep 0.4' >/dev/null 2>&1 &
+while :; do sleep 0.05; done`
+	req := execReq(t, "/bin/sh", "-c", script)
+	req.Timeout = durationpb.New(200 * time.Millisecond)
+	evs := h.runExec(req)
+	if ex := evs[len(evs)-1].GetExited(); !ex.GetTimedOut() {
+		t.Fatalf("exited %v", ex)
+	}
+	done := make(chan struct{})
+	go func() {
+		h.srv.execs.escalations.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the pending SIGKILL outlived its empty process group")
+	}
+}
+
 func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
 	h := newHarness(t, nil)
 	h.srv.execs.mu.Lock()

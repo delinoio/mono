@@ -25,6 +25,10 @@ import (
 // ends on Linux and macOS guests.
 const KillGrace = 10 * time.Second
 
+// groupPollInterval is how often the pending SIGKILL of a timed-out exec
+// checks that the process group still has a member.
+const groupPollInterval = 50 * time.Millisecond
+
 // pipeWaitDelay bounds how long the helper waits for the output pipes after
 // the command exits, because a background child may keep them open.
 const pipeWaitDelay = 2 * time.Second
@@ -42,8 +46,13 @@ type execManager struct {
 	retention time.Duration
 	capacity  int
 	killGrace time.Duration
+	// groupPoll is how often a pending SIGKILL checks that its process group
+	// still has a member.
+	groupPoll time.Duration
 	logger    *slog.Logger
 	wg        sync.WaitGroup
+	// escalations tracks the pending SIGKILL goroutines, which outlive run.
+	escalations sync.WaitGroup
 }
 
 func newExecManager(now func() time.Time, logger *slog.Logger) *execManager {
@@ -53,6 +62,7 @@ func newExecManager(now func() time.Time, logger *slog.Logger) *execManager {
 		retention: execlog.Retention,
 		capacity:  execlog.KeptOutputBytes,
 		killGrace: KillGrace,
+		groupPoll: groupPollInterval,
 		logger:    logger,
 	}
 }
@@ -173,17 +183,18 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	logger.Info("exec started", "pid", cmd.Process.Pid)
 
 	var timedOut atomic.Bool
-	var timers []*time.Timer
+	var timeoutTimer *time.Timer
 	var timersMu sync.Mutex
 	// waited is set under timersMu once cmd.Wait returned; a timeout that
 	// fires later belongs to a command that already ended and does nothing.
 	waited := false
 	m.mu.Lock()
 	grace := m.killGrace
+	poll := m.groupPoll
 	m.mu.Unlock()
 	if timeout := req.GetTimeout(); timeout != nil && timeout.AsDuration() > 0 {
 		timersMu.Lock()
-		timers = append(timers, time.AfterFunc(timeout.AsDuration(), func() {
+		timeoutTimer = time.AfterFunc(timeout.AsDuration(), func() {
 			timersMu.Lock()
 			defer timersMu.Unlock()
 			if waited {
@@ -193,32 +204,19 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 			logger.Info("exec timeout reached; terminating")
 			terminate(cmd.Process)
 			if forceAfterTerminate {
-				timers = append(timers, time.AfterFunc(grace, func() {
-					// The direct child may have exited while a member of its
-					// process group ignores SIGTERM, so this timer outlives
-					// cmd.Wait. The group id stays reserved while any member
-					// lives; once the group is empty the check skips the kill,
-					// so a reused process id is not signaled.
-					if !processGroupAlive(cmd.Process) {
-						return
-					}
-					logger.Info("exec process group did not stop after SIGTERM; killing")
-					kill(cmd.Process)
-				}))
+				m.escalate(cmd.Process, grace, poll, logger)
 			}
-		}))
+		})
 		timersMu.Unlock()
 	}
 	waitErr := cmd.Wait()
 	timersMu.Lock()
 	waited = true
 	// A command that ended before its timeout leaves no timer behind. After a
-	// timeout on Linux and macOS the pending SIGKILL timer keeps running
-	// without delaying the exited event, unless the group is already empty.
-	if !timedOut.Load() || !forceAfterTerminate || !processGroupAlive(cmd.Process) {
-		for _, t := range timers {
-			t.Stop()
-		}
+	// timeout on Linux and macOS the escalation started by the timeout keeps
+	// running on its own, without delaying the exited event.
+	if timeoutTimer != nil {
+		timeoutTimer.Stop()
 	}
 	timersMu.Unlock()
 	exited := &ownsandv1.ExecExited{TimedOut: timedOut.Load(), EndTime: timestamppb.New(m.now())}
@@ -235,4 +233,44 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	}
 	l.Finish(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: exited}}, m.now())
 	logger.Info("exec exited", "exit_code", code, "signal", signal, "timed_out", exited.GetTimedOut())
+}
+
+// escalate sends SIGKILL to the process group of p after grace, unless the
+// group has no member left by then. The direct child may exit on SIGTERM while
+// another member of its group ignores it, so the escalation outlives
+// cmd.Wait. The group id stays reserved only while a member lives: once the
+// group is empty the id can name an unrelated process group. The escalation
+// therefore polls the group and ends as soon as it is empty, so that the
+// SIGKILL is never sent to a reused id after the original group is gone. A
+// pid reuse inside one poll interval remains theoretically possible, but a
+// reuse needs a full pid wrap-around.
+func (m *execManager) escalate(p *os.Process, grace, poll time.Duration, logger *slog.Logger) {
+	if poll <= 0 || poll > grace {
+		poll = grace
+	}
+	if poll <= 0 {
+		poll = time.Millisecond
+	}
+	m.escalations.Add(1)
+	go func() {
+		defer m.escalations.Done()
+		deadline := time.NewTimer(grace)
+		defer deadline.Stop()
+		tick := time.NewTicker(poll)
+		defer tick.Stop()
+		for {
+			select {
+			case <-tick.C:
+				if !processGroupAlive(p) {
+					return
+				}
+			case <-deadline.C:
+				if processGroupAlive(p) {
+					logger.Info("exec process group did not stop after SIGTERM; killing")
+					kill(p)
+				}
+				return
+			}
+		}
+	}()
 }
