@@ -107,10 +107,22 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 	if err != nil {
 		return err
 	}
-	if h.Hub == nil || h.Lease == nil || !h.Lease.Held() {
+	if h.Hub == nil || h.Lease == nil {
 		return errUnavailable("this instance does not accept agent channels now")
 	}
-	conn := h.Hub.Register(ctx, p.ID, p.OrganizationID)
+	// The ownership check and the hub registration are one step under the
+	// lease's ownership lock. The lease loss transition takes the same lock
+	// before it closes all channels, so this channel is either in that
+	// close or refused here, before the configuration is sent and before
+	// the hub changes. RegisterAdmitted waits for the device's fence, which
+	// the offline write of a closing channel of the same device holds across
+	// database I/O, before it takes the ownership lock. The step under the
+	// lock is in-memory only, so the lock never waits for that I/O and is
+	// released before any database or stream I/O below.
+	conn := h.Hub.RegisterAdmitted(ctx, p.ID, p.OrganizationID, h.Lease.WhileHeld)
+	if conn == nil {
+		return errUnavailable("this instance does not accept agent channels now")
+	}
 	log := h.Logger.With(slog.String("device_id", conn.DeviceID), slog.Uint64("generation", conn.Generation))
 	log.InfoContext(ctx, "agent_channel_connected")
 
@@ -326,7 +338,7 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 }
 
 func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *ownsandv1.StateReport) error {
-	res, err := s.reconcileStateReport(ctx, conn.DeviceID, r)
+	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
 		return err
 	}
@@ -351,7 +363,8 @@ func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *owns
 	}
 	conn.SetReconciled()
 	s.Logger.InfoContext(ctx, "agent_state_report", slog.String("device_id", conn.DeviceID), slog.Int("sandboxes", len(r.GetSandboxes())),
-		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)))
+		slog.Int("snapshots", len(r.GetSnapshots())), slog.Int("changed", len(res.changed)), slog.Int("deletes", len(res.deletes)),
+		slog.Int("recovered_copies", res.recoveredCopies))
 	for _, id := range res.changed {
 		s.watch.fire(id)
 	}
@@ -389,7 +402,7 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
 	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
-	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()))
+	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
 	if !ok {
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
@@ -420,7 +433,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	case cmdCreateSnapshot:
 		err = s.applySnapshotResult(ctx, info, res)
 	case cmdExportSnapshot:
-		err = s.applyExportResult(ctx, info, res)
+		err = s.applyExportResult(ctx, info, res.GetCommandId(), res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
 			_, err = s.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)

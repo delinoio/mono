@@ -64,6 +64,9 @@ type Options struct {
 	// InstanceID names this instance in the lease; empty selects a new
 	// UUID v7.
 	InstanceID string
+	// LeaseDeadlineNow is the clock of the local lease ownership deadline;
+	// nil selects the real clock (tests).
+	LeaseDeadlineNow func() time.Time
 
 	// RelayLimits and RelayTiming override the relay limits and durations
 	// (tests).
@@ -130,7 +133,7 @@ func New(opts Options) (*App, error) {
 	}
 	control := api.NewControl(svc)
 	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
-		OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
+		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
 	svc.Lease = l
 	relayLimits := relay.DefaultLimits()
 	if opts.RelayLimits != nil {

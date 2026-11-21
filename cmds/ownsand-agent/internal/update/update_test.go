@@ -53,9 +53,12 @@ func newRelease(t *testing.T, mutate func(*Manifest, *[]byte)) *release {
 	return r
 }
 
-type fakeInstaller struct{ installed atomic.Int32 }
+type fakeInstaller struct {
+	installed atomic.Int32
+	err       error
+}
 
-func (f *fakeInstaller) Install(string) error { f.installed.Add(1); return nil }
+func (f *fakeInstaller) Install(string) error { f.installed.Add(1); return f.err }
 
 func newUpdater(t *testing.T, r *release, running string, busy *atomic.Bool, keys ...ed25519.PublicKey) (*Updater, *fakeInstaller, *atomic.Int32) {
 	st, _ := store.Open(t.TempDir())
@@ -178,6 +181,60 @@ func TestRevokedRunningVersion(t *testing.T) {
 	}
 }
 
+func TestFailedInstallKeepsRunningRevocation(t *testing.T) {
+	for _, tc := range []struct {
+		name, running string
+		recovery      bool
+		wantRevoked   bool
+	}{
+		{"revoked running version stays blocked", "0.9.0", true, true},
+		{"non-revoked running version stays admitted", "1.0.0", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRelease(t, nil)
+			busy := &atomic.Bool{}
+			u, inst, restarts := newUpdater(t, r, tc.running, busy)
+			inst.err = errors.New("read-only executable directory")
+			if err := update(u, "1.1.0", tc.recovery); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := u.TryInstall(); ok || err == nil {
+				t.Fatalf("install should fail: %v %v", ok, err)
+			}
+			if restarts.Load() != 0 {
+				t.Fatal("restarted after a failed install")
+			}
+			if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED {
+				t.Fatalf("state %v", s)
+			}
+			release, err := u.BeginCreate()
+			if tc.wantRevoked {
+				if !errors.Is(err, ErrRunningRevoked) {
+					t.Fatalf("create after failed install on revoked version: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("create after failed install: %v", err)
+			}
+			release()
+		})
+	}
+}
+
+func TestFailedInstallReleasesInstallingFlag(t *testing.T) {
+	r := newRelease(t, nil)
+	u, inst, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	inst.err = errors.New("boom")
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	u.TryInstall()
+	if _, err := u.BeginCreate(); errors.Is(err, ErrInstalling) {
+		t.Fatal("installing flag not released")
+	}
+}
+
 func TestPinnedLowerVersionAndSameVersion(t *testing.T) {
 	r := newRelease(t, nil)
 	busy := &atomic.Bool{}
@@ -208,5 +265,48 @@ func TestExecutableInstaller(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(exe); string(b) != "new" {
 		t.Fatalf("executable %q", b)
+	}
+}
+
+func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
+	cases := []struct {
+		name      string
+		target    string
+		wantErr   bool
+		wantState ownsandv1.AgentUpdateState
+	}{
+		{"same version", "1.0.0", false, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE},
+		{"failed target", "9.9.9", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRelease(t, nil)
+			busy := &atomic.Bool{}
+			busy.Store(true)
+			u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+			if err := update(u, "1.1.0", false); err != nil {
+				t.Fatal(err)
+			}
+			if err := update(u, tc.target, false); (err != nil) != tc.wantErr {
+				t.Fatalf("superseding command: %v", err)
+			}
+			if s, _ := u.State(); s != tc.wantState {
+				t.Fatalf("state %v", s)
+			}
+			busy.Store(false)
+			if ok, err := u.TryInstall(); ok || err != nil || inst.installed.Load() != 0 || restarts.Load() != 0 {
+				t.Fatalf("installed a superseded artifact: %v %v", ok, err)
+			}
+			if st, _ := u.opts.Store.LoadAgent(); st != nil && st.PendingUpdate != nil {
+				t.Fatalf("pending update recorded: %+v", st.PendingUpdate)
+			}
+			// Control: a valid later target still installs.
+			if err := update(u, "1.1.0", false); err != nil {
+				t.Fatal(err)
+			}
+			if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 {
+				t.Fatalf("control install: %v %v", ok, err)
+			}
+		})
 	}
 }

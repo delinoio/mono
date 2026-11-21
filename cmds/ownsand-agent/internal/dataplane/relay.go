@@ -119,10 +119,13 @@ type rconn struct {
 	// probeFailed is set before an unanswered echo probe cancels the
 	// connection; only then does the loop dial again without back-off.
 	probeFailed atomic.Bool
-	streams     map[uint64]*rstream
-	highest     uint64
-	credit      int64
-	kinds       map[ownsandv1.DataFrameKind]bool
+	// queueFullLogged limits the log of the queue-full fallback of a
+	// terminal frame to one entry per connection.
+	queueFullLogged atomic.Bool
+	streams         map[uint64]*rstream
+	highest         uint64
+	credit          int64
+	kinds           map[ownsandv1.DataFrameKind]bool
 }
 
 // closeAfterFlush closes the connection after every queued frame was
@@ -136,6 +139,20 @@ func (c *rconn) closeAfterFlush() {
 	}
 }
 
+// tryEnqueue offers a frame without waiting and reports whether the
+// queue took it. A caller whose frame is optional (a periodic keepalive)
+// uses it so it never waits on a writer that only its own cancel can end.
+func (c *rconn) tryEnqueue(f *ownsandv1.DataFrame) bool {
+	select {
+	case c.out <- f:
+		return true
+	default:
+		return false
+	}
+}
+
+// enqueue queues a frame and waits for a free slot or the end of the
+// connection; payload and startup frames use it to keep their order.
 func (c *rconn) enqueue(f *ownsandv1.DataFrame) error {
 	select {
 	case c.out <- f:
@@ -371,13 +388,57 @@ var (
 	errChannelChanged = errors.New("dataplane: agent channel changed before the relay connection opened")
 )
 
+// channelDone reports whether the agent channel closed.
+func channelDone(ch agent.Channel) bool {
+	select {
+	case <-ch.Done():
+		return true
+	default:
+		return false
+	}
+}
+
+// acquireCredential gets a device session credential for a relay
+// connection of channel ch. The request is bound to the channel: when the
+// channel closes while the request is pending, the request context is
+// canceled and errChannelChanged is returned, so the loop does not wait for
+// a response that no connection may use and can dial for the next channel
+// at once. Any other failure is returned as is and keeps the back-off. The
+// cancellation covers only the credential request; an established
+// connection ends through channelLost, which flushes its session-end
+// frames first.
+func (r *relay) acquireCredential(ch agent.Channel) (string, error) {
+	authCtx, cancel := context.WithCancel(r.ctx)
+	watchDone := make(chan struct{})
+	defer func() {
+		// Stop the watcher before returning so it never outlives the call.
+		cancel()
+		<-watchDone
+	}()
+	go func() {
+		defer close(watchDone)
+		select {
+		case <-ch.Done():
+			cancel()
+		case <-authCtx.Done():
+		}
+	}()
+	cred, err := r.d.opts.Auth.NewDeviceSession(authCtx)
+	if err != nil && channelDone(ch) && r.ctx.Err() == nil {
+		r.d.logger.Info("relay credential request canceled by agent channel loss",
+			"generation", ch.Generation(), "outcome", "canceled_by_channel_loss")
+		return "", errChannelChanged
+	}
+	return cred, err
+}
+
 // connectOnce runs one relay connection until it ends. It reports whether
 // the echo probe ended it.
 func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	if r.client == nil {
 		return false, errors.New("dataplane: no relay client")
 	}
-	cred, err := r.d.opts.Auth.NewDeviceSession(r.ctx)
+	cred, err := r.acquireCredential(ch)
 	if err != nil {
 		return false, err
 	}
@@ -392,12 +453,15 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	c.lastRecv.Store(now)
 	c.lastSend.Store(now)
 	// The channel can change while the credential is fetched. A
-	// connection of a replaced channel would serve no grant, and
+	// connection of a replaced or closed channel would serve no grant, and
 	// channelLost closes only the installed connection, so the loop
-	// dials again for the current channel instead.
+	// dials again for the current channel instead. A credential that
+	// arrived after the channel closed is dropped without a dial.
 	r.mu.Lock()
-	if r.ch != ch {
+	if r.ch != ch || channelDone(ch) {
 		r.mu.Unlock()
+		r.d.logger.Info("relay credential dropped: its agent channel is no longer current",
+			"generation", ch.Generation(), "outcome", "stale_credential_dropped")
 		return false, errChannelChanged
 	}
 	r.conn = c
@@ -464,18 +528,13 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 			<-writerDone
 			return c.probeFailed.Load() && r.ctx.Err() == nil, err
 		case <-ctx.Done():
-			<-writerDone
-			<-recvErr
+			awaitTeardown(writerDone, recvErr)
 			return c.probeFailed.Load() && r.ctx.Err() == nil, errors.New("dataplane: relay connection canceled")
 		case <-tick.C:
 			now := time.Now()
-			if now.Sub(time.Unix(0, c.lastSend.Load())) >= r.d.timing.KeepaliveInterval {
-				c.enqueue(keepaliveFrame(false))
-			}
-			if now.Sub(time.Unix(0, c.lastRecv.Load())) >= r.d.timing.ReceiveTimeout {
+			if r.watchdogTick(c, now) {
 				cancel()
-				<-writerDone
-				<-recvErr
+				awaitTeardown(writerDone, recvErr)
 				return true, errors.New("dataplane: relay connection received nothing within the receive timeout")
 			}
 			r.mu.Lock()
@@ -486,13 +545,62 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 			r.mu.Unlock()
 			if idle {
 				cancel()
-				<-writerDone
-				<-recvErr
+				awaitTeardown(writerDone, recvErr)
 				r.d.logger.Info("relay connection closed after its idle time")
 				return false, errIdle
 			}
 		}
 	}
+}
+
+// teardownGrace bounds how long a canceled relay connection waits for its
+// writer and receive goroutines to end.
+//
+// Workaround: when the writer is blocked by HTTP/2 flow control, net/http
+// does not abort the stream on context cancellation while the request body
+// is still open, so the receive goroutine stays in its read until the
+// transport itself fails. Without a bound, the loop would wait on that
+// goroutine and never dial again, which defeats the receive timeout. The
+// receive goroutine reports into a buffered channel, so it ends alone
+// when the transport fails. Remove the bound when net/http aborts such a
+// stream on context cancellation.
+const teardownGrace = 2 * time.Second
+
+// awaitTeardown waits for the writer and receive goroutines of a canceled
+// relay connection, for at most teardownGrace.
+func awaitTeardown(writerDone <-chan struct{}, recvErr <-chan error) {
+	timer := time.NewTimer(teardownGrace)
+	defer timer.Stop()
+	for writerDone != nil || recvErr != nil {
+		select {
+		case <-writerDone:
+			writerDone = nil
+		case <-recvErr:
+			recvErr = nil
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+// watchdogTick runs the periodic checks of one relay connection and
+// reports whether the receive timeout expired. It checks the receive
+// timeout first and never waits on the outbound queue: when a blocked
+// writer keeps the queue full, only this watchdog can cancel the
+// connection, so a blocking keepalive enqueue would deadlock it. A
+// periodic keepalive that finds no free slot is skipped, because the
+// queued frames already show the connection is in use and the next tick
+// offers it again.
+func (r *relay) watchdogTick(c *rconn, now time.Time) bool {
+	if now.Sub(time.Unix(0, c.lastRecv.Load())) >= r.d.timing.ReceiveTimeout {
+		return true
+	}
+	if now.Sub(time.Unix(0, c.lastSend.Load())) >= r.d.timing.KeepaliveInterval {
+		if !c.tryEnqueue(keepaliveFrame(false)) {
+			r.d.logger.Debug("relay keepalive skipped because the outbound queue is full")
+		}
+	}
+	return false
 }
 
 func keepaliveFrame(echo bool) *ownsandv1.DataFrame {
