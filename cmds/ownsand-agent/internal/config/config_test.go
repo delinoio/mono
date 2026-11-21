@@ -6,11 +6,30 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
+	"slices"
 	"testing"
 )
 
 func env(m map[string]string) Lookup {
 	return func(k string) (string, bool) { v, ok := m[k]; return v, ok }
+}
+
+func TestEnvNamesPinTheDocumentedVariables(t *testing.T) {
+	want := []string{
+		"OWNSAND_AGENT_STATE_DIR",
+		"OWNSAND_AGENT_API_URL",
+		"OWNSAND_AGENT_RUNTIME",
+		"OWNSAND_AGENT_GUEST_BINARY",
+		"OWNSAND_AGENT_RELEASE_MANIFEST_URL",
+		"OWNSAND_AGENT_RELEASE_PUBLIC_KEYS",
+		"OWNSAND_AGENT_LOG_LEVEL",
+		"OWNSAND_AGENT_FIRECRACKER_BINARY",
+		"OWNSAND_AGENT_LINUX_KERNEL",
+		"OWNSAND_AGENT_LINUX_ROOTFS",
+	}
+	if !slices.Equal(EnvNames, want) {
+		t.Fatalf("EnvNames = %v, want %v", EnvNames, want)
+	}
 }
 
 func TestFromEnv(t *testing.T) {
