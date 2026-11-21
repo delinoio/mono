@@ -37,19 +37,26 @@ type Manager struct {
 	mu       sync.Mutex
 	attached map[string]*attachment
 	used     map[int]bool
+	// gateways holds the DNS exception of each tap (the key) that the
+	// ruleset renders: Attach stages it before the first policy refresh of
+	// the sandbox and removes it when the attachment fails or ends.
+	gateways map[string]TapGateway
 	rules    string
 	// interval and refresh are RefreshInterval and Refresh; tests replace
 	// them.
 	interval time.Duration
 	refresh  func() error
-	// run, startDNS, setForwarding and tapExists are the host operations of
-	// the manager: the `ip` command, the DNS forwarder, the IPv4 forwarding
-	// switch and the tap device probe. Tests replace them so that the
-	// manager runs without root.
+	// run, startDNS, setForwarding, tapExists, hostRoutes and applyRules are
+	// the host operations of the manager: the `ip` command, the DNS
+	// forwarder, the IPv4 forwarding switch, the tap device probe, the
+	// routing table read and the `nft` script replacement. Tests replace
+	// them so that the manager runs without root.
 	run           func(name string, args ...string) error
 	startDNS      func(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error)
 	setForwarding func() error
 	tapExists     func(tap string) bool
+	hostRoutes    func() ([]Route, []netip.Prefix, error)
+	applyRules    func(rules string) error
 }
 
 // NewManager returns a manager.
@@ -58,11 +65,14 @@ func NewManager(logger *slog.Logger) *Manager {
 		logger:        logger,
 		attached:      map[string]*attachment{},
 		used:          map[int]bool{},
+		gateways:      map[string]TapGateway{},
 		interval:      RefreshInterval,
 		run:           run,
 		startDNS:      startDNSForwarder,
 		setForwarding: enableIPv4Forwarding,
 		tapExists:     tapDeviceExists,
+		hostRoutes:    HostRoutes,
+		applyRules:    applyNftRules,
 	}
 	m.refresh = m.Refresh
 	return m
@@ -94,6 +104,18 @@ const errNoSuchInterface = "no such network interface"
 func tapDeviceExists(tap string) bool {
 	_, err := net.InterfaceByName(tap)
 	return err == nil || !strings.Contains(err.Error(), errNoSuchInterface)
+}
+
+// applyNftRules replaces the agent's nftables table with `nft -f`.
+func applyNftRules(rules string) error {
+	cmd := exec.Command("nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(rules)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("netpolicy: apply nftables rules: %v: %s", err, strings.TrimSpace(stderr.String()))
+	}
+	return nil
 }
 
 func run(name string, args ...string) error {
@@ -138,28 +160,29 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 	return routes, onLink, nil
 }
 
-// Refresh recomputes the ruleset and applies it when it changed.
+// Refresh recomputes the ruleset from the host routes and the current DNS
+// assignments of the attached sandboxes and applies it when it changed.
 func (m *Manager) Refresh() error {
-	routes, onLink, err := HostRoutes()
+	routes, onLink, err := m.hostRoutes()
 	if err != nil {
 		return err
 	}
 	v4, v6 := Blocked(routes, onLink)
-	rules := Ruleset(v4, v6)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	assignments := make([]TapGateway, 0, len(m.gateways))
+	for _, g := range m.gateways {
+		assignments = append(assignments, g)
+	}
+	rules := Ruleset(v4, v6, assignments)
 	if rules == m.rules {
 		return nil
 	}
-	cmd := exec.Command("nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(rules)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("netpolicy: apply nftables rules: %v: %s", err, strings.TrimSpace(stderr.String()))
+	if err := m.applyRules(rules); err != nil {
+		return err
 	}
 	m.rules = rules
-	m.logger.Info("network policy applied", "blocked_ipv4_prefixes", len(v4), "blocked_ipv6_prefixes", len(v6))
+	m.logger.Info("network policy applied", "blocked_ipv4_prefixes", len(v4), "blocked_ipv6_prefixes", len(v6), "dns_assignments", len(assignments))
 	return nil
 }
 
@@ -182,7 +205,19 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 	m.mu.Unlock()
 	link, _ := LinkFor(idx)
 	tap := TapName(idx)
+	// applied is true once a refresh succeeded with this sandbox's DNS
+	// assignment staged, so that the ruleset may hold its exception.
+	applied := false
 	fail := func(err error) (Link, string, error) {
+		// A failed attach leaves no DNS exception: unstage the assignment
+		// and, when a refresh already applied it, apply the ruleset
+		// without it.
+		m.unstage(tap)
+		if applied {
+			if rerr := m.refresh(); rerr != nil {
+				m.logger.Error("network policy refresh after failed setup failed", "sandbox_id", sandboxID, "tap", tap, "error", rerr)
+			}
+		}
 		// The link stays reserved while a tap device with the link address
 		// may still exist.
 		m.removeTap(sandboxID, tap, idx)
@@ -202,9 +237,13 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 			return fail(err)
 		}
 	}
+	m.mu.Lock()
+	m.gateways[tap] = TapGateway{Tap: tap, Gateway: link.Gateway}
+	m.mu.Unlock()
 	if err := m.refresh(); err != nil {
 		return fail(err)
 	}
+	applied = true
 	dns, err := m.startDNS(netip.AddrPortFrom(link.Gateway, 53), HostResolver("/etc/resolv.conf"), m.logger)
 	if err != nil {
 		return fail(fmt.Errorf("netpolicy: start DNS forwarder: %w", err))
@@ -226,12 +265,27 @@ func (m *Manager) Detach(sandboxID string) {
 	m.mu.Lock()
 	a, ok := m.attached[sandboxID]
 	delete(m.attached, sandboxID)
+	if ok {
+		delete(m.gateways, a.tap)
+	}
 	m.mu.Unlock()
 	if !ok {
 		return
 	}
+	// Remove the DNS exception of the tap first, so that a reused tap name
+	// never inherits a stale gateway rule. Other taps keep their rules.
+	if err := m.refresh(); err != nil {
+		m.logger.Error("network policy refresh after detach failed", "sandbox_id", sandboxID, "tap", a.tap, "error", err)
+	}
 	a.dns.Close()
 	m.removeTap(sandboxID, a.tap, a.link.Index)
+}
+
+// unstage removes the DNS assignment of a tap from the next ruleset.
+func (m *Manager) unstage(tap string) {
+	m.mu.Lock()
+	delete(m.gateways, tap)
+	m.mu.Unlock()
 }
 
 // removeTap deletes a tap device and releases its link index. When the
