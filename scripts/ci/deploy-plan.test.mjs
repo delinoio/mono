@@ -356,6 +356,108 @@ test("string deployable names that fail the pattern still fail", () => {
   }
 });
 
+// A deployable of each kind with the package name, for the name rule tests.
+const namedDeployables = (name) => ({
+  [DeployTarget.Droplet]: pkg("servers/api", {
+    name,
+    deploy: droplet("api"),
+  }),
+  [DeployTarget.CloudflarePages]: pkg("apps/web", {
+    name,
+    deploy: { target: DeployTarget.CloudflarePages, project: "web" },
+  }),
+});
+
+test("a deployable name with consecutive dots fails for every target", () => {
+  const targets = namedDeployables("a..b");
+  for (const target of Object.keys(targets)) {
+    assert.throws(
+      () => plan(status(), [targets[target]]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, target);
+        assert.match(
+          error.message,
+          /^a\.\.b: a deployable package name must match/,
+          target,
+        );
+        return true;
+      },
+      target,
+    );
+  }
+});
+
+test("a droplet deployable name must be a container image repository name", () => {
+  for (const name of ["a.", "a-", "a._b", "a_.b", "a___b"]) {
+    assert.throws(
+      () => plan(status(), [namedDeployables(name)[DeployTarget.Droplet]]),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, name);
+        assert.ok(error.message.startsWith(`${name}: `), name);
+        assert.match(error.message, /container image repository name/, name);
+        return true;
+      },
+      name,
+    );
+  }
+});
+
+test("deployable names with single separators are accepted", () => {
+  for (const name of ["a.b", "a_b", "a__b", "a-b", "a--b"]) {
+    const targets = namedDeployables(name);
+    for (const target of Object.keys(targets)) {
+      assert.doesNotThrow(
+        () => plan(status(), [targets[target]]),
+        `${target} ${name}`,
+      );
+    }
+  }
+});
+
+test("a static-site deployable name keeps the looser separator rule", () => {
+  for (const name of ["a.", "a._b"]) {
+    assert.doesNotThrow(
+      () =>
+        plan(status(), [namedDeployables(name)[DeployTarget.CloudflarePages]]),
+      name,
+    );
+  }
+});
+
+test("check and the --check CLI reject a deployable name with consecutive dots", () => {
+  const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
+  const cases = [
+    ["servers/a..b", droplet("api")],
+    ["apps/a..b", { target: DeployTarget.CloudflarePages, project: "web" }],
+  ];
+  for (const [dir, deploy] of cases) {
+    const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-dots-"));
+    try {
+      mkdirSync(join(workDir, ".changeset"));
+      writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+      mkdirSync(join(workDir, dir), { recursive: true });
+      writeFileSync(
+        join(workDir, dir, "package.json"),
+        JSON.stringify({ name: "a..b", deploy }),
+      );
+      assert.throws(() => check(workDir), /a\.\.b: a deployable package name/);
+      const run = spawnSync(process.execPath, [cli, "--check", workDir], {
+        encoding: "utf8",
+      });
+      assert.equal(run.status, 2, dir);
+      const event = JSON.parse(run.stderr.trim());
+      assert.equal(event.event, "deploy_plan_error", dir);
+      assert.match(
+        event.message,
+        /^a\.\.b: a deployable package name must match/,
+        dir,
+      );
+    } finally {
+      rmSync(workDir, { recursive: true, force: true });
+    }
+  }
+});
+
 test("check and the --check CLI reject a nameless deployable", () => {
   const cli = fileURLToPath(new URL("./deploy-plan.mjs", import.meta.url));
   const cases = [

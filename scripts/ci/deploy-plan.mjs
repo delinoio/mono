@@ -53,7 +53,18 @@ export const ReleaseType = Object.freeze({
   None: "none",
 });
 
-const deployableName = /^[a-z0-9][a-z0-9._-]*$/;
+// The release script tags each release `<name>@<version>`, and Git rejects a
+// reference name that contains `..`, so a deployable name must not contain two
+// consecutive dots. A trailing dot stays valid, because the version follows it.
+const deployableName = /^(?!.*\.\.)[a-z0-9][a-z0-9._-]*$/;
+
+// The deploy workflow builds the image of a Droplet deployable with
+// `docker build --tag <name>:<sha>`, so the package name is a container image
+// repository name: lowercase alphanumeric runs joined by one separator, where
+// a separator is `.`, `_`, `__` or one or more `-`. This is the repository
+// path component grammar of the OCI distribution specification. A static-site
+// deployable has no image and keeps the looser `deployableName` rule.
+const dropletImageName = /^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$/;
 
 // A Droplet service name is a container name, a Docker network alias that
 // the reverse proxy resolves, and a file name on the Droplet, so it allows no
@@ -116,7 +127,8 @@ function deployable(pkg) {
     );
   }
   // The workflow uses the package name in file paths, artifact names and
-  // tags, so a deployable name must not contain a scope or a slash.
+  // tags, so a deployable name must not contain a scope or a slash, and the
+  // release tag excludes consecutive dots (see `deployableName`).
   if (!deployableName.test(name)) {
     throw new DeployPlanError(
       `${name}: a deployable package name must match ${deployableName}`,
@@ -129,6 +141,11 @@ function deployable(pkg) {
   }
   const base = { name, dir: pkg.dir, kind: rule.kind, target: deploy.target };
   if (deploy.target === DeployTarget.Droplet) {
+    if (!dropletImageName.test(name)) {
+      throw new DeployPlanError(
+        `${name}: a droplet deployable package name must be a container image repository name matching ${dropletImageName}`,
+      );
+    }
     if (typeof deploy.service !== "string" || deploy.service === "") {
       throw new DeployPlanError(`${name}: deploy.service is required`);
     }
