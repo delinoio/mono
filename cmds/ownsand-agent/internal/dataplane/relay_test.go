@@ -1023,3 +1023,69 @@ func TestRelayRevokeKeepsUnrelatedGrantRunning(t *testing.T) {
 		t.Fatal("the revocation closed the relay connection")
 	}
 }
+
+func (e *relayEnv) relayRunning() bool {
+	e.dp.relay.mu.Lock()
+	defer e.dp.relay.mu.Unlock()
+	return e.dp.relay.running
+}
+
+// gatedGrant installs one exec grant and returns once the loop waits in
+// the credential request. The returned function releases the request.
+func (e *relayEnv) gatedGrant(t *testing.T) (*ownsandv1.RelayGrant, func()) {
+	t.Helper()
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	hook := func(context.Context) error {
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-gate
+		}
+		return nil
+	}
+	e.beforeAuth.Store(&hook)
+	g := e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay loop did not request a credential")
+	}
+	return g, func() { close(gate) }
+}
+
+func (e *relayEnv) revokeGrant(g *ownsandv1.RelayGrant) {
+	e.dp.Revoke(e.ch, &ownsandv1.SessionRevocation{RevocationId: newID(e.t), Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.GetGrantId()}})
+}
+
+// A grant that is revoked while the credential is requested leaves no live
+// grant, so the loop makes no dial and stops; a later grant starts again.
+func TestRelayNoDialWhenOnlyGrantRevokedDuringCredentialRequest(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+	g, release := e.gatedGrant(t)
+	e.revokeGrant(g)
+	release()
+	e.noConn(500 * time.Millisecond)
+	deadline := time.Now().Add(5 * time.Second)
+	for e.relayRunning() {
+		if time.Now().After(deadline) {
+			t.Fatal("relay loop did not stop without a live grant")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	g2 := e.execGrant(e.execReq("/bin/true"))
+	rc := e.conn()
+	e.openOK(rc, 1, g2.GetGrantId())
+}
+
+// Another live grant of the same channel keeps the one relay connection.
+func TestRelayDialsWhenAnotherGrantLiveAfterCredentialRequest(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+	g, release := e.gatedGrant(t)
+	g2 := e.execGrant(e.execReq("/bin/true"))
+	e.revokeGrant(g)
+	release()
+	rc := e.conn()
+	e.openOK(rc, 1, g2.GetGrantId())
+	e.noConn(300 * time.Millisecond)
+}

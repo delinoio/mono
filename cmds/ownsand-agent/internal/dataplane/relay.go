@@ -366,7 +366,7 @@ func (r *relay) loop(ch agent.Channel) {
 		}
 		probeLost, err := r.connectOnce(ch)
 		switch {
-		case errors.Is(err, errIdle), errors.Is(err, errChannelChanged):
+		case errors.Is(err, errIdle), errors.Is(err, errChannelChanged), errors.Is(err, errNoLiveGrant):
 			continue
 		case err != nil && !probeLost:
 			r.d.logger.Warn("relay connection ended", "error", err)
@@ -386,6 +386,7 @@ func (r *relay) loop(ch agent.Channel) {
 var (
 	errIdle           = errors.New("dataplane: relay connection idle")
 	errChannelChanged = errors.New("dataplane: agent channel changed before the relay connection opened")
+	errNoLiveGrant    = errors.New("dataplane: no live grant remains after the relay credential was issued")
 )
 
 // channelDone reports whether the agent channel closed.
@@ -463,6 +464,16 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 		r.d.logger.Info("relay credential dropped: its agent channel is no longer current",
 			"generation", ch.Generation(), "outcome", "stale_credential_dropped")
 		return false, errChannelChanged
+	}
+	// A grant that was live before the credential request can be revoked or
+	// expire meanwhile. Dialing without one would open a connection that
+	// serves nothing, so the loop decides again: it stops when no grant
+	// remains or dials when a new one arrived.
+	if !r.hasLiveGrantLocked(time.Now()) {
+		r.mu.Unlock()
+		r.d.logger.Info("relay credential dropped: no live grant remains",
+			"generation", ch.Generation(), "outcome", "no_live_grant_dropped")
+		return false, errNoLiveGrant
 	}
 	r.conn = c
 	r.idleFrom = time.Now()
