@@ -24,7 +24,9 @@ export type SliderProps = Omit<
   /**
    * The accessible names of the thumbs of a range, such as
    * `["Minimum price", "Maximum price"]`. A range has more than one value.
-   * A single thumb is named by `label`, including a one-value array.
+   * A range thumb with no entry, or an empty entry, is named by `label` and
+   * its one-based position, such as "Price 1 of 2". A single thumb is named by
+   * `label`, including a one-value array.
    */
   thumbLabels?: readonly string[];
 };
@@ -92,6 +94,15 @@ export function Slider({
   // The UI SDK treats only an array of more than one value as a range. A
   // one-value array is a single thumb that the field label names.
   const isRange = Array.isArray(initial) && initial.length > 1;
+  // A range thumb without an explicit name is named by the visible label and
+  // its position. The names reference the rendered label by id, so a React node
+  // label works and the names stay correct on the server and the client.
+  const labelId = React.useId();
+  const positionIdPrefix = React.useId();
+  const hasThumbLabel = (index: number) => {
+    const thumbLabel = thumbLabels?.[index];
+    return typeof thumbLabel === "string" && thumbLabel !== "";
+  };
   const hasDescription =
     description !== undefined &&
     description !== null &&
@@ -109,7 +120,12 @@ export function Slider({
         {...props}
       >
         <div className="dui-slider-header">
-          <FieldLabel className="dui-text-field-label">{label}</FieldLabel>
+          <FieldLabel
+            className="dui-text-field-label"
+            id={isRange ? labelId : undefined}
+          >
+            {label}
+          </FieldLabel>
           {showValue ? <SliderValue className="dui-slider-value" /> : null}
         </div>
         <SliderControl className="dui-slider-control">
@@ -122,12 +138,37 @@ export function Slider({
                 key={index}
                 index={index}
                 className="dui-slider-thumb"
-                aria-label={isRange ? thumbLabels?.[index] : undefined}
+                // An explicit name keeps `aria-label`. Without one, the thumb is
+                // named by the label and the hidden position text below;
+                // `aria-labelledby` would override `aria-label`, so the two are
+                // never set together.
+                aria-label={
+                  isRange && hasThumbLabel(index)
+                    ? thumbLabels?.[index]
+                    : undefined
+                }
+                aria-labelledby={
+                  isRange && !hasThumbLabel(index)
+                    ? `${labelId} ${positionIdPrefix}-${index}`
+                    : undefined
+                }
               />
             ))}
           </SliderTrack>
         </SliderControl>
       </SliderRoot>
+      {isRange
+        ? Array.from({ length: thumbCount }, (_, index) =>
+            hasThumbLabel(index) ? null : (
+              // Hidden text that only `aria-labelledby` of a thumb reads.
+              <span
+                key={index}
+                id={`${positionIdPrefix}-${index}`}
+                hidden
+              >{`${index + 1} of ${thumbCount}`}</span>
+            ),
+          )
+        : null}
       {/* Workaround: the UI SDK Field predicts the description id in
           aria-describedby before the field binds on the client, so static
           markup would point at a missing element. Always render the
