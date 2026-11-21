@@ -75,8 +75,27 @@ func TestRulesetAndLinks(t *testing.T) {
 	if _, err := LinkFor(16384); err == nil {
 		t.Fatal("index beyond the subnet accepted")
 	}
-	if n := TapName("0192f4b6-7c3a-7def-8abc-0123456789ab"); len(n) != 15 || !strings.HasPrefix(n, "osb-") {
-		t.Fatalf("tap name %s", n)
+}
+
+// The tap name derives from the link index: it keeps the prefix and the
+// 15-byte Linux limit for every valid index, and differs for every index.
+func TestTapName(t *testing.T) {
+	if got := TapName(1); got != "osb-00000000001" {
+		t.Fatalf("TapName(1) = %q, want osb-00000000001", got)
+	}
+	if got := TapName(16383); got != "osb-00000003fff" {
+		t.Fatalf("TapName(16383) = %q, want osb-00000003fff", got)
+	}
+	seen := map[string]int{}
+	for i := 1; i < 1<<14; i++ {
+		n := TapName(i)
+		if len(n) != 15 || !strings.HasPrefix(n, TapPrefix) {
+			t.Fatalf("TapName(%d) = %q: want prefix %q and 15 bytes", i, n, TapPrefix)
+		}
+		if j, dup := seen[n]; dup {
+			t.Fatalf("TapName(%d) and TapName(%d) are both %q", j, i, n)
+		}
+		seen[n] = i
 	}
 }
 

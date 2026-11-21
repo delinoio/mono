@@ -217,14 +217,13 @@ func (l Link) KernelIPArg() string {
 	return fmt.Sprintf("ip=%s::%s:%d.%d.%d.%d::eth0:off:%s", l.Guest, l.Gateway, byte(m>>24), byte(m>>16), byte(m>>8), byte(m), l.Gateway)
 }
 
-// TapName returns the tap device name of a sandbox: TapPrefix and 11 hex
-// characters of the sandbox ID, 15 bytes in total (the Linux limit).
-func TapName(sandboxID string) string {
-	hex := strings.ReplaceAll(sandboxID, "-", "")
-	if len(hex) > 11 {
-		hex = hex[len(hex)-11:]
-	}
-	return TapPrefix + hex
+// TapName returns the tap device name of the link with the given index:
+// TapPrefix and the index as 11 zero-padded lower-case hex digits, 15 bytes
+// in total (the Linux interface-name limit). The manager reserves a link
+// index for one attachment until its teardown ends, so two live or pending
+// attachments never share a tap name.
+func TapName(linkIndex int) string {
+	return fmt.Sprintf("%s%011x", TapPrefix, linkIndex)
 }
 
 var errNoLinks = errors.New("netpolicy: no free sandbox link")

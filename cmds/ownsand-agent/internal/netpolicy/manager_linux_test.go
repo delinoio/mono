@@ -171,8 +171,8 @@ func mustAttach(t *testing.T, m *Manager, id string) Link {
 	if err != nil {
 		t.Fatalf("Attach(%s): %v", id, err)
 	}
-	if tap != TapName(id) {
-		t.Fatalf("Attach(%s) tap = %q, want %q", id, tap, TapName(id))
+	if tap != TapName(link.Index) {
+		t.Fatalf("Attach(%s) tap = %q, want %q", id, tap, TapName(link.Index))
 	}
 	return link
 }
@@ -200,7 +200,7 @@ func TestAttachConfiguresTapAndDNS(t *testing.T) {
 	if link.Index != 1 {
 		t.Fatalf("index = %d, want 1", link.Index)
 	}
-	tap := TapName("sandbox-a")
+	tap := TapName(link.Index)
 	want := []string{
 		"ip tuntap add dev " + tap + " mode tap",
 		"ip addr add " + link.Gateway.String() + "/30 dev " + tap,
@@ -304,7 +304,7 @@ func TestDetachFailedTapDeletion(t *testing.T) {
 	h.mu.Unlock()
 	m.Detach("sandbox-a")
 	log := h.log()
-	for _, want := range []string{`"msg":"delete tap device failed"`, `"sandbox_id":"sandbox-a"`, `"tap":"` + TapName("sandbox-a") + `"`, `"error":`} {
+	for _, want := range []string{`"msg":"delete tap device failed"`, `"sandbox_id":"sandbox-a"`, `"tap":"` + TapName(1) + `"`, `"error":`} {
 		if !strings.Contains(log, want) {
 			t.Errorf("log lacks %s:\n%s", want, log)
 		}
@@ -315,7 +315,7 @@ func TestDetachFailedTapDeletion(t *testing.T) {
 
 	// The tap vanished: the failed deletion no longer keeps the link.
 	h.mu.Lock()
-	delete(h.taps, TapName("sandbox-b"))
+	delete(h.taps, TapName(2))
 	h.mu.Unlock()
 	m.Detach("sandbox-b")
 	if link := mustAttach(t, m, "sandbox-c"); link.Index != 2 {
@@ -357,10 +357,83 @@ func TestAttachFailureReservation(t *testing.T) {
 
 // tapDeviceExists confirms an absent device without root.
 func TestTapDeviceExistsAbsent(t *testing.T) {
-	if tapDeviceExists(TapName("0123456789abcdef")) {
+	if tapDeviceExists(TapName(1<<14 - 1)) {
 		t.Fatal("a device that does not exist is reported as present")
 	}
 	if !tapDeviceExists("lo") {
 		t.Skip("no loopback interface in this environment")
 	}
+}
+
+// Two sandboxes whose IDs share the last 11 hex digits (the 44-bit suffix
+// that the former name used) get distinct taps, links and gateways, and the
+// second attach does not delete the tap of the first.
+func TestAttachDistinctTapsForSameIDSuffix(t *testing.T) {
+	m, h := newFakeManager(t)
+	idA := "0192f4b6-7c3a-7def-8abc-0123456789ab"
+	idB := "0192f4b6-7c3b-7000-8abc-1123456789ab"
+	linkA, tapA, err := m.Attach(idA)
+	if err != nil {
+		t.Fatalf("Attach(%s): %v", idA, err)
+	}
+	linkB, tapB, err := m.Attach(idB)
+	if err != nil {
+		t.Fatalf("Attach(%s): %v", idB, err)
+	}
+	if tapA == tapB {
+		t.Fatalf("both sandboxes share the tap %q", tapA)
+	}
+	if linkA.Index == linkB.Index || linkA.Gateway == linkB.Gateway || linkA.Guest == linkB.Guest {
+		t.Fatalf("links overlap: %+v %+v", linkA, linkB)
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.taps[tapA] || !h.taps[tapB] {
+		t.Fatalf("taps = %v, want both %q and %q present", h.taps, tapA, tapB)
+	}
+	// Only the first attach's own pre-create cleanup may delete its tap.
+	dels := 0
+	for _, c := range h.cmds {
+		if c == "ip link del "+tapA {
+			dels++
+		}
+	}
+	if dels != 1 {
+		t.Fatalf("`ip link del %s` ran %d times, want 1 (the second attach must not delete it): %v", tapA, dels, h.cmds)
+	}
+}
+
+// While the teardown of a sandbox is pending, a new attach for an ID with
+// the same suffix gets another tap name and leaves the pending tap alone.
+func TestAttachDuringPendingDetachKeepsDistinctTap(t *testing.T) {
+	m, h := newFakeManager(t)
+	idA := "0192f4b6-7c3a-7def-8abc-0123456789ab"
+	idB := "0192f4b6-7c3b-7000-8abc-1123456789ab"
+	_, tapA, err := m.Attach(idA)
+	if err != nil {
+		t.Fatalf("Attach(%s): %v", idA, err)
+	}
+	release := make(chan struct{})
+	closing := make(chan struct{}, 1)
+	h.mu.Lock()
+	h.dnsRelease = release
+	h.dnsClosing = closing
+	h.mu.Unlock()
+	done := detachAsync(m, idA)
+	waitFor(t, closing, "DNS close start")
+	_, tapB, err := m.Attach(idB)
+	if err != nil {
+		t.Fatalf("Attach(%s): %v", idB, err)
+	}
+	if tapB == tapA {
+		t.Fatalf("pending and new attachment share the tap %q", tapA)
+	}
+	h.mu.Lock()
+	present := h.taps[tapA]
+	h.mu.Unlock()
+	if !present {
+		t.Fatalf("the pending tap %q was deleted by the new attach", tapA)
+	}
+	close(release)
+	waitFor(t, done, "Detach")
 }
