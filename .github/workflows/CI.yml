@@ -15,9 +15,13 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  # Each job timeout is at least three times the longest observed run without
+  # caches, so a hung service, download or test fails the job instead of
+  # running until the six-hour default.
   changes:
     name: Plan affected CI jobs
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       base: ${{ steps.comparison.outputs.base }}
       head: ${{ steps.comparison.outputs.head }}
@@ -81,6 +85,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.quality == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -126,6 +131,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.go == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     # Postgres for the Postgres-backed ownsand-api tests and the OwnSand
     # end-to-end suite (servers/ownsand-api/e2e). The credentials exist only
     # inside this job.
@@ -212,6 +218,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -263,6 +270,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.e2e == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       E2E_TELEMETRY_DISABLED: "1"
     steps:
@@ -327,6 +335,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.workspace == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -367,6 +376,7 @@ jobs:
     if: always()
     needs: [changes, quality, go, rust, e2e, workspace]
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Check validation results
         env:
