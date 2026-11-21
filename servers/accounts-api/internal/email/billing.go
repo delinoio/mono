@@ -17,6 +17,11 @@ const (
 	KindAutoTopUpDisabled Kind = "auto_top_up_disabled"
 	KindLowBalance        Kind = "low_balance"
 	KindCreditExpiry      Kind = "credit_expiry"
+	// KindOrganizationBlocked and KindOrganizationSuspended report that an
+	// organization that is linked to the billing account became BLOCKED or
+	// SUSPENDED.
+	KindOrganizationBlocked   Kind = "organization_blocked"
+	KindOrganizationSuspended Kind = "organization_suspended"
 )
 
 // BillingAccountPath returns the web app page of a billing account.
@@ -68,10 +73,12 @@ var noticeHTML = template.Must(template.New("html").Parse(`<!doctype html>
 
 // subjects of the notification kinds.
 var subjects = map[Kind]string{
-	KindPaymentFailed:     "A Delino payment failed",
-	KindAutoTopUpDisabled: "Delino automatic top-up is turned off",
-	KindLowBalance:        "Your Delino credit balance is low",
-	KindCreditExpiry:      "Delino credit expires in 7 days",
+	KindPaymentFailed:         "A Delino payment failed",
+	KindAutoTopUpDisabled:     "Delino automatic top-up is turned off",
+	KindLowBalance:            "Your Delino credit balance is low",
+	KindCreditExpiry:          "Delino credit expires in 7 days",
+	KindOrganizationBlocked:   "A linked organization is blocked for non-payment",
+	KindOrganizationSuspended: "A linked organization is suspended for non-payment",
 }
 
 // NoticeMessage renders a billing notification email. html/template escapes

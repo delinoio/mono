@@ -22,6 +22,9 @@ func TestServeAndShutdown(t *testing.T) {
 	m.Email("low_balance", "sent")
 	m.CreditGrant("subscription_credit")
 	m.AutoTopUpDisabled()
+	m.UsageReport("ownsand", "charged")
+	m.StatusChange("blocked")
+	m.LinkedOrganizations("suspended", 3)
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -44,6 +47,9 @@ func TestServeAndShutdown(t *testing.T) {
 		`accounts_billing_emails_total{kind="low_balance",result="sent"} 1`,
 		`accounts_credit_grants_total{source="subscription_credit"} 1`,
 		`accounts_auto_top_up_disabled_total 1`,
+		`accounts_usage_reports_total{result="charged",service="ownsand"} 1`,
+		`accounts_billing_status_changes_total{status="blocked"} 1`,
+		`accounts_linked_organizations{status="suspended"} 3`,
 		`go_goroutines`,
 	} {
 		if !strings.Contains(string(body), want) {

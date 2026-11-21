@@ -28,8 +28,10 @@ func (s *Service) tasks() []workerTask {
 		{"process_auto_top_ups", s.ProcessAutoTopUps},
 		{"time_out_top_ups", s.TimeOutTopUps},
 		{"expire_grants", s.ExpireGrants},
+		{"suspend_due_organizations", func(ctx context.Context) error { return s.SuspendDue(ctx, SuspendFilter{}) }},
 		{"queue_expiry_notices", s.QueueExpiryNotices},
 		{"deliver_notifications", s.DeliverNotifications},
+		{"refresh_status_metrics", s.RefreshStatusMetrics},
 	}
 }
 

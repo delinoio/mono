@@ -307,8 +307,9 @@ type DeductionResult struct {
 // Deduct deducts a usage amount from the billing account in tx: it consumes
 // grants in FIFO order, lets the balance go negative (debt), writes a USAGE
 // entry, queues an automatic top-up when the balance falls below its
-// threshold and queues the low-balance email when automatic top-up is off.
-// The caller owns tx; Deduct locks the billing account row in it.
+// threshold, queues the low-balance email when automatic top-up is off and
+// recomputes the billing statuses of the linked organizations. The caller
+// owns tx; Deduct locks the billing account row in it.
 func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, d Deduction) (DeductionResult, error) {
 	if d.AmountUSDMicros < 0 {
 		return DeductionResult{}, fmt.Errorf("usage amount %d is negative", d.AmountUSDMicros)
@@ -334,6 +335,9 @@ func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, d Deduction) (Deduction
 	}
 	queued, err := s.afterDecrease(ctx, tx, acct, before, now, d.AmountUSDMicros > 0)
 	if err != nil {
+		return DeductionResult{}, err
+	}
+	if err := s.syncStatuses(ctx, tx, acct.ID, now); err != nil {
 		return DeductionResult{}, err
 	}
 	return DeductionResult{LedgerEntryID: id, BalanceAfterUSDMicros: acct.Balance, AutoTopUpQueued: queued}, nil

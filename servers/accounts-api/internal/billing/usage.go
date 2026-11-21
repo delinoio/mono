@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
+package billing
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+
+	"github.com/delinoio/mono/servers/accounts-api/internal/db"
+)
+
+// WindowLength is the length of a usage window.
+const WindowLength = 5 * time.Minute
+
+// Usage report results, which are also metric label values.
+const (
+	UsageCharged      = "charged"
+	UsageDuplicate    = "duplicate"
+	UsageUnattributed = "unattributed"
+)
+
+// UsageReport is one validated usage report with stable identifiers.
+type UsageReport struct {
+	Service        string
+	OrganizationID string
+	Meter          string
+	WindowStart    time.Time
+	Quantity       int64
+	Amount         int64
+}
+
+// UsageResult is the first result of a usage report key.
+type UsageResult struct {
+	Duplicate        bool
+	Unattributed     bool
+	BillingAccountID string
+	LedgerEntryID    string
+}
+
+// storedReport is a usage_reports row.
+type storedReport struct {
+	Quantity         int64
+	Amount           int64
+	BillingAccountID *string
+	LedgerEntryID    *string
+}
+
+func (r storedReport) result() UsageResult {
+	res := UsageResult{Duplicate: true, Unattributed: r.BillingAccountID == nil}
+	if r.BillingAccountID != nil {
+		res.BillingAccountID = *r.BillingAccountID
+	}
+	if r.LedgerEntryID != nil {
+		res.LedgerEntryID = *r.LedgerEntryID
+	}
+	return res
+}
+
+func loadReport(ctx context.Context, q db.Querier, r UsageReport) (storedReport, bool, error) {
+	var st storedReport
+	err := q.QueryRow(ctx, `SELECT quantity, amount_usd_micros, billing_account_id::text, ledger_entry_id::text
+		FROM usage_reports WHERE service = $1 AND organization_id = $2 AND meter = $3 AND window_start = $4`,
+		r.Service, r.OrganizationID, r.Meter, r.WindowStart).Scan(&st.Quantity, &st.Amount, &st.BillingAccountID, &st.LedgerEntryID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return storedReport{}, false, nil
+	}
+	return st, err == nil, err
+}
+
+// attribution is the link that a report is charged to.
+type attribution struct {
+	LinkID    string
+	AccountID string
+}
+
+// attribute returns the link of the organization that overlapped the window
+// [start, start + 5 minutes): a link from link_time until unlink_time (open
+// while current). When several links overlapped, the latest one, which was
+// active at the end of the window, wins. ok is false without such a link.
+func attribute(ctx context.Context, q db.Querier, r UsageReport) (attribution, bool, error) {
+	var a attribution
+	err := q.QueryRow(ctx, `SELECT organization_link_id::text, billing_account_id::text FROM organization_links
+		WHERE service = $1 AND organization_id = $2 AND link_time < $4 AND (unlink_time IS NULL OR unlink_time > $3)
+		ORDER BY link_time DESC, organization_link_id DESC LIMIT 1`,
+		r.Service, r.OrganizationID, r.WindowStart, r.WindowStart.Add(WindowLength)).Scan(&a.LinkID, &a.AccountID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return attribution{}, false, nil
+	}
+	return a, err == nil, err
+}
+
+// errAttributionChanged makes ReportUsage retry when a link changed between
+// the attribution and the billing account lock.
+var errAttributionChanged = errors.New("the attribution of the usage report changed")
+
+// ReportUsage applies one usage report. A repeated key returns the first
+// result with Duplicate set and deducts nothing again; other values than
+// the first ones are logged as a mismatch. A report is charged to the
+// billing account of the link that overlapped its window, through Deduct,
+// which can make the balance negative; without such a link it is stored
+// as unattributed usage.
+//
+// Concurrency: the attributed path locks the billing account before it
+// claims the key, so concurrent reports of one billing account serialize,
+// and a concurrent report with the same key waits for the first one and
+// then reads its result.
+func (s *Service) ReportUsage(ctx context.Context, r UsageReport) (UsageResult, error) {
+	r.WindowStart = r.WindowStart.UTC()
+	if st, ok, err := loadReport(ctx, s.db.Pool, r); err != nil || ok {
+		if ok {
+			s.duplicate(ctx, r, st)
+			return st.result(), nil
+		}
+		return UsageResult{}, err
+	}
+	for attempt := 0; ; attempt++ {
+		res, queued, err := s.applyReport(ctx, r)
+		if errors.Is(err, errAttributionChanged) && attempt < 3 {
+			continue
+		}
+		if err != nil {
+			return UsageResult{}, err
+		}
+		if queued {
+			s.Wake()
+		}
+		return res, nil
+	}
+}
+
+func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, bool, error) {
+	link, attributed, err := attribute(ctx, s.db.Pool, r)
+	if err != nil {
+		return UsageResult{}, false, err
+	}
+	var res UsageResult
+	var queued bool
+	var dup *storedReport
+	err = s.db.InTx(ctx, func(tx pgx.Tx) error {
+		res, queued, dup = UsageResult{}, false, nil
+		now := s.timestamp()
+		if attributed {
+			if _, err := lockAccount(ctx, tx, link.AccountID); err != nil {
+				return err
+			}
+			// A link or unlink of the organization locks the billing account
+			// too; read the attribution again under the lock.
+			again, ok, err := attribute(ctx, tx, r)
+			if err != nil {
+				return err
+			}
+			if !ok || again != link {
+				return errAttributionChanged
+			}
+		} else if _, ok, err := attribute(ctx, tx, r); err != nil || ok {
+			if ok {
+				return errAttributionChanged
+			}
+			return err
+		}
+		id, err := newID()
+		if err != nil {
+			return err
+		}
+		var accountID, linkID *string
+		if attributed {
+			accountID, linkID = &link.AccountID, &link.LinkID
+		}
+		tag, err := tx.Exec(ctx, `INSERT INTO usage_reports (usage_report_id, service, organization_id, meter, window_start,
+				quantity, amount_usd_micros, billing_account_id, organization_link_id, create_time)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (service, organization_id, meter, window_start) DO NOTHING`,
+			id, r.Service, r.OrganizationID, r.Meter, r.WindowStart, r.Quantity, r.Amount, accountID, linkID, now)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			// A concurrent report with the same key committed first.
+			st, ok, err := loadReport(ctx, tx, r)
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("usage report key conflict without a row")
+			}
+			dup = &st
+			return nil
+		}
+		if !attributed {
+			res = UsageResult{Unattributed: true}
+			return nil
+		}
+		d, err := s.Deduct(ctx, tx, Deduction{
+			BillingAccountID: link.AccountID, AmountUSDMicros: r.Amount, Service: r.Service,
+			OrganizationID: r.OrganizationID, Meter: r.Meter, WindowStart: r.WindowStart, Quantity: r.Quantity,
+		})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `UPDATE usage_reports SET ledger_entry_id = $2 WHERE usage_report_id = $1`,
+			id, d.LedgerEntryID); err != nil {
+			return err
+		}
+		res = UsageResult{BillingAccountID: link.AccountID, LedgerEntryID: d.LedgerEntryID}
+		queued = d.AutoTopUpQueued
+		return nil
+	})
+	if err != nil {
+		return UsageResult{}, false, err
+	}
+	if dup != nil {
+		s.duplicate(ctx, r, *dup)
+		return dup.result(), false, nil
+	}
+	result := UsageCharged
+	if res.Unattributed {
+		result = UsageUnattributed
+	}
+	s.metrics.UsageReport(r.Service, result)
+	s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_usage_reported",
+		slog.String("service", r.Service),
+		slog.String("organization_id", r.OrganizationID),
+		slog.String("meter", r.Meter),
+		slog.Time("window_start", r.WindowStart),
+		slog.Int64("quantity", r.Quantity),
+		slog.Int64("amount_usd_micros", r.Amount),
+		slog.String("result", result),
+		slog.String("billing_account_id", res.BillingAccountID),
+		slog.String("ledger_entry_id", res.LedgerEntryID))
+	return res, queued, nil
+}
+
+// duplicate counts and logs a repeated key, and logs a mismatch when the
+// values differ from the first report, whose values are kept.
+func (s *Service) duplicate(ctx context.Context, r UsageReport, first storedReport) {
+	s.metrics.UsageReport(r.Service, UsageDuplicate)
+	attrs := []slog.Attr{
+		slog.String("service", r.Service),
+		slog.String("organization_id", r.OrganizationID),
+		slog.String("meter", r.Meter),
+		slog.Time("window_start", r.WindowStart),
+	}
+	if first.Quantity != r.Quantity || first.Amount != r.Amount {
+		s.logger.LogAttrs(ctx, slog.LevelWarn, "billing_usage_report_mismatch", append(attrs,
+			slog.Int64("first_quantity", first.Quantity),
+			slog.Int64("quantity", r.Quantity),
+			slog.Int64("first_amount_usd_micros", first.Amount),
+			slog.Int64("amount_usd_micros", r.Amount))...)
+		return
+	}
+	s.logger.LogAttrs(ctx, slog.LevelDebug, "billing_usage_report_duplicate", attrs...)
+}
+
+// MeterUsage is the usage of one meter in a period.
+type MeterUsage struct {
+	Meter    string
+	Quantity int64
+	Amount   int64
+}
+
+// OrganizationMonthUsage returns the usage of every report of the
+// organization (charged to any billing account or unattributed) in windows
+// that start in [from, to), by meter.
+func OrganizationMonthUsage(ctx context.Context, q db.Querier, service, organizationID string, from, to time.Time) (map[string]MeterUsage, error) {
+	rows, err := q.Query(ctx, `SELECT meter, COALESCE(SUM(quantity), 0)::bigint, COALESCE(SUM(amount_usd_micros), 0)::bigint
+		FROM usage_reports WHERE service = $1 AND organization_id = $2 AND window_start >= $3 AND window_start < $4
+		GROUP BY meter`, service, organizationID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	usages, err := pgx.CollectRows(rows, pgx.RowToStructByPos[MeterUsage])
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]MeterUsage, len(usages))
+	for _, u := range usages {
+		out[u.Meter] = u
+	}
+	return out, nil
+}
+
+// SummaryRow is the usage of one organization and meter that was charged
+// to a billing account in a period.
+type SummaryRow struct {
+	Service        string
+	OrganizationID string
+	Meter          string
+	Quantity       int64
+	Amount         int64
+}
+
+// SummaryKey is the position of a summary row: rows are ordered by service,
+// organization ID and meter identifier in byte order.
+type SummaryKey struct {
+	Service        string
+	OrganizationID string
+	Meter          string
+}
+
+// UsageSummary returns up to limit rows of the usage charged to the billing
+// account in windows that start in [from, to), after the key (from the
+// start when nil), and the total amount of every row of the period.
+func UsageSummary(ctx context.Context, q db.Querier, accountID string, from, to time.Time, after *SummaryKey, limit int) ([]SummaryRow, int64, error) {
+	var total int64
+	if err := q.QueryRow(ctx, `SELECT COALESCE(SUM(amount_usd_micros), 0)::bigint FROM usage_reports
+		WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3`, accountID, from, to).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	var k SummaryKey
+	if after != nil {
+		k = *after
+	}
+	rows, err := q.Query(ctx, `SELECT service, organization_id, meter, SUM(quantity)::bigint, SUM(amount_usd_micros)::bigint
+		FROM usage_reports
+		WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3
+			AND ($4 = false OR (service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C") > ($5, $6, $7))
+		GROUP BY service, organization_id, meter
+		ORDER BY service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C"
+		LIMIT $8`, accountID, from, to, after != nil, k.Service, k.OrganizationID, k.Meter, limit)
+	if err != nil {
+		return nil, 0, err
+	}
+	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[SummaryRow])
+	return out, total, err
+}

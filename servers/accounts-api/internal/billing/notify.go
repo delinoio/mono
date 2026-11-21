@@ -240,8 +240,39 @@ func noticeLines(n notification) []string {
 			fmt.Sprintf("%s of credit expires on %s.", amount(notifyDetailAmount), expires),
 			"Unused credit leaves the balance when it expires.",
 		}
+	case NotifyOrganizationBlocked, NotifyOrganizationSuspended:
+		return organizationLines(n)
 	default:
 		return nil
+	}
+}
+
+// organizationLines renders the blocked and suspended emails. The
+// organization name comes from the calling service; html/template escapes
+// it in the HTML body.
+func organizationLines(n notification) []string {
+	org := fmt.Sprintf("The %s organization", ServiceDisplayName(n.Details[notifyDetailService]))
+	if name := n.Details[notifyDetailOrganizationName]; name != "" {
+		org += fmt.Sprintf(" %q", name)
+	}
+	org += fmt.Sprintf(" (%s)", n.Details[notifyDetailOrganizationID])
+	cause := "the billing account has no active subscription"
+	if n.Details[notifyDetailReason] == string(ReasonNonPositiveBalance) {
+		cause = "the credit balance of the billing account is $0.00 or less"
+	}
+	suspend := n.Details[notifyDetailSuspendTime]
+	if t, err := time.Parse(time.RFC3339Nano, suspend); err == nil {
+		suspend = t.UTC().Format("January 2, 2006 15:04 UTC")
+	}
+	if n.Kind == NotifyOrganizationSuspended {
+		return []string{
+			fmt.Sprintf("%s is suspended because the billing account was not paid for 3 days: %s.", org, cause),
+			"Start the subscription and add credit so that the organization can be used again.",
+		}
+	}
+	return []string{
+		fmt.Sprintf("%s is blocked because %s.", org, cause),
+		fmt.Sprintf("It will be suspended on %s unless the subscription is active and the balance is above $0.00 before then.", suspend),
 	}
 }
 
@@ -318,8 +349,10 @@ func (s *Service) ExpireGrants(ctx context.Context) error {
 			if err := s.expireDue(ctx, tx, acct, now); err != nil {
 				return err
 			}
-			_, err = s.afterDecrease(ctx, tx, acct, before, now, false)
-			return err
+			if _, err := s.afterDecrease(ctx, tx, acct, before, now, false); err != nil {
+				return err
+			}
+			return s.syncStatuses(ctx, tx, acct.ID, now)
 		})
 		if err != nil {
 			return err
