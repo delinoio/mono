@@ -364,3 +364,31 @@ func TestReplacesOfConcurrentRelease(t *testing.T) {
 	}
 	<-done
 }
+
+// TestRevocableUntil pins the end of the revocable time of a grant: the stream
+// deadline plus the delivery margin, or the acknowledgement plus the sent
+// stream deadline duration when that is later.
+func TestRevocableUntil(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	g, _, err := r.Reserve(req("a1", "u", "op"), newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := c.t
+	if got, want := g.RevocableUntil(), start.Add(StreamDeadline+DeliveryMargin); !got.Equal(want) {
+		t.Fatalf("pending grant revocable until %v, want %v", got, want)
+	}
+	// A late acknowledgement extends the end past the margin.
+	c.t = start.Add(2 * time.Minute)
+	r.Ack(g.ID, accepted, "")
+	if got, want := r.Get(g.ID).RevocableUntil(), start.Add(2*time.Minute+StreamDeadline); !got.Equal(want) {
+		t.Fatalf("acknowledged grant revocable until %v, want %v", got, want)
+	}
+	// The registry stops matching the grant exactly at that end.
+	c.t = start.Add(2*time.Minute + StreamDeadline - time.Second)
+	cp := r.RemoveMatching(func(*Grant) bool { return true })
+	if len(cp) != 1 || !cp[0].RevocableUntil().Equal(start.Add(2*time.Minute+StreamDeadline)) {
+		t.Fatalf("RemoveMatching before the end returned %v", cp)
+	}
+}

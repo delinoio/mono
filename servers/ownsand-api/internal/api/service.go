@@ -132,6 +132,8 @@ type DataPathHooks interface {
 	HandleEnvelope(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) bool
 	// HandleEvent applies a revocation event.
 	HandleEvent(ctx context.Context, e events.Event)
+	// SweepExpired deletes the pending revocations that ended.
+	SweepExpired(ctx context.Context)
 }
 
 // Timing holds the durations of the agent channel rules.

@@ -129,17 +129,23 @@ func New(now func() time.Time) *Registry {
 	return &Registry{Now: now, byID: map[string]*Grant{}, byAuth: map[string]*Grant{}}
 }
 
-// revocableLocked reports whether g still counts: until the later of its
-// stream deadline plus the delivery margin and its acknowledgement time
-// plus the stream deadline duration that was sent.
-func (r *Registry) revocableLocked(g *Grant, now time.Time) bool {
+// RevocableUntil returns the end of the time in which g still counts as
+// revocable: the later of its stream deadline plus the delivery margin and its
+// acknowledgement time plus the stream deadline duration that was sent. Read
+// it on a copy that RemoveMatching returned, or under the registry mutex.
+func (g *Grant) RevocableUntil() time.Time {
 	end := g.StreamDeadline.Add(DeliveryMargin)
 	if !g.AckAt.IsZero() {
 		if alt := g.AckAt.Add(g.StreamDeadlineIn); alt.After(end) {
 			end = alt
 		}
 	}
-	return now.Before(end)
+	return end
+}
+
+// revocableLocked reports whether g still counts: until RevocableUntil.
+func (r *Registry) revocableLocked(g *Grant, now time.Time) bool {
+	return now.Before(g.RevocableUntil())
 }
 
 // admittableLocked reports whether a new relay stream may start under g.

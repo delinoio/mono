@@ -52,6 +52,9 @@ type FakeAgent struct {
 	changed   chan struct{}
 	closed    chan struct{}
 	closeErr  error
+	// noRevocationAck, when set, makes the read loop skip the revocation
+	// acknowledgement (see SetAckRevocations).
+	noRevocationAck bool
 	// readGate, when set, holds the read loop before its next receive.
 	readGate chan struct{}
 	// stallAfter, when set, arms readGate once the read loop received an
@@ -232,10 +235,24 @@ func (a *FakeAgent) read() {
 		if o := env.GetSignaling().GetOffer(); o != nil {
 			go a.answerOffer(o)
 		}
-		if r := env.GetSessionRevocation(); r != nil {
+		if r := env.GetSessionRevocation(); r != nil && !a.skipsRevocationAck() {
 			go a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RevocationAck{RevocationAck: &ownsandv1.RevocationAck{RevocationId: r.GetRevocationId()}}})
 		}
 	}
+}
+
+// SetAckRevocations sets whether the agent acknowledges a session revocation
+// (the default) or stays silent, like an agent that never answers.
+func (a *FakeAgent) SetAckRevocations(ack bool) {
+	a.mu.Lock()
+	a.noRevocationAck = !ack
+	a.mu.Unlock()
+}
+
+func (a *FakeAgent) skipsRevocationAck() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.noRevocationAck
 }
 
 // SetOnGrant replaces the relay grant hook while the agent runs.
