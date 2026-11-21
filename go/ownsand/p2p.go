@@ -23,6 +23,10 @@ const DataChannelLabel = "ownsand-data"
 // p2pConfig holds peer-to-peer settings. Tests restrict ICE to loopback.
 type p2pConfig struct {
 	settingEngine func() *webrtc.SettingEngine
+	// setupDone, when set, runs after a session setup ends and before the
+	// handle installs the session. Tests use it to close the handle at that
+	// exact point, which a real setup cannot reach deterministically.
+	setupDone func()
 }
 
 // errSessionEnded reports a session end frame: the agent ended the session
@@ -105,10 +109,33 @@ type p2pSession struct {
 // sender waits, so a large write applies back-pressure to the caller.
 const maxBufferedAmount = 4 << 20
 
+// errSetupTimeout is the cancel cause of a session setup that used the whole
+// setup window.
+var errSetupTimeout = errors.New("peer-to-peer session setup did not finish within the setup window")
+
+// openP2PSession sets up one session. The setup window (timing.p2pOpenTimeout)
+// starts with the call and covers GetIceServers, ICE gathering, OpenSession and
+// the wait for the data channel to open. A setup that uses the whole window
+// ends with *errP2POpen, so automatic routing uses the relay; when ctx ends
+// first, the error of ctx (or of the request that it cancelled) comes back and
+// the caller returns ctx.Err() without recovery.
 func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2pSession, error) {
-	iceRes, err := c.dataPath.GetIceServers(ctx, connect.NewRequest(&ownsandv1.GetIceServersRequest{OrganizationId: org}))
+	sctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	timer := time.AfterFunc(c.timing.p2pOpenTimeout, func() { cancel(errSetupTimeout) })
+	defer timer.Stop()
+	// expired reports an error of a step that the setup window cut short, as
+	// a setup failure that is not a caller cancellation.
+	expired := func(err error) error {
+		if ctx.Err() == nil && errors.Is(context.Cause(sctx), errSetupTimeout) {
+			return &errP2POpen{cause: errSetupTimeout}
+		}
+		return err
+	}
+
+	iceRes, err := c.dataPath.GetIceServers(sctx, connect.NewRequest(&ownsandv1.GetIceServersRequest{OrganizationId: org}))
 	if err != nil {
-		return nil, err
+		return nil, expired(err)
 	}
 	var servers []webrtc.ICEServer
 	for _, s := range iceRes.Msg.GetIceServers() {
@@ -123,10 +150,14 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 	if err != nil {
 		return nil, &errP2POpen{cause: err}
 	}
+	// PeerConnection.Close waits for the gathering goroutines of pion, which
+	// can run until their STUN or TURN requests time out, so a setup that
+	// ends early closes the connection in the background.
+	closePC := func() { go func() { _ = pc.Close() }() }
 	ordered := true
 	dc, err := pc.CreateDataChannel(DataChannelLabel, &webrtc.DataChannelInit{Ordered: &ordered})
 	if err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, &errP2POpen{cause: err}
 	}
 	s := &p2pSession{
@@ -161,51 +192,52 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 
 	offer, err := pc.CreateOffer(nil)
 	if err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, &errP2POpen{cause: err}
 	}
 	// Non-trickle signaling: gather every candidate before the offer leaves.
 	gathered := webrtc.GatheringCompletePromise(pc)
 	if err := pc.SetLocalDescription(offer); err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, &errP2POpen{cause: err}
 	}
 	select {
 	case <-gathered:
-	case <-ctx.Done():
-		_ = pc.Close()
-		return nil, ctx.Err()
+	case <-sctx.Done():
+		closePC()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, expired(context.Cause(sctx))
 	}
-	res, err := c.dataPath.OpenSession(ctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{
+	res, err := c.dataPath.OpenSession(sctx, connect.NewRequest(&ownsandv1.OpenSessionRequest{
 		OrganizationId: org,
 		SandboxId:      sandboxID,
 		SdpOffer:       pc.LocalDescription().SDP,
 	}))
 	if err != nil {
-		_ = pc.Close()
-		return nil, err
+		closePC()
+		return nil, expired(err)
 	}
 	s.sessionID = res.Msg.GetSessionId()
 	// pion verifies the DTLS fingerprint of the answer, which arrived over
 	// the authenticated control plane connection.
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeAnswer, SDP: res.Msg.GetSdpAnswer()}); err != nil {
-		_ = pc.Close()
+		closePC()
 		return nil, &errP2POpen{cause: err}
 	}
-	timer := time.NewTimer(c.timing.p2pOpenTimeout)
-	defer timer.Stop()
 	select {
 	case <-opened:
 		return s, nil
 	case <-s.done:
-		_ = pc.Close()
+		closePC()
 		return nil, &errP2POpen{cause: s.endErr}
-	case <-timer.C:
-		_ = pc.Close()
-		return nil, &errP2POpen{cause: errors.New("data channel did not open within the open timeout")}
-	case <-ctx.Done():
-		_ = pc.Close()
-		return nil, ctx.Err()
+	case <-sctx.Done():
+		closePC()
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		return nil, expired(context.Cause(sctx))
 	}
 }
 

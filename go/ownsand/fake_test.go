@@ -151,6 +151,20 @@ type fakeCP struct {
 
 	openSessions int
 	iceFail      bool
+	// iceGate and openGate hold every GetIceServers or OpenSession request
+	// until the gate closes or the request context ends. The channel is
+	// created by the test before the first request and never replaced.
+	iceGate  chan struct{}
+	openGate chan struct{}
+	// iceServers are the ICE server URLs that GetIceServers returns.
+	iceServers []string
+	iceCalls   int // GetIceServers requests
+	// gateHits receives one value for each request that reached a closed
+	// gate (kind "ice" or "open"), so a test can wait for the stall.
+	gateHits chan string
+	// gateCanceled counts held requests whose context ended before the gate
+	// opened (the SDK gave up on them).
+	gateCanceled int
 	p2pRequests  int
 	p2pScript    func(n int) p2pAction
 	answerers    []*webrtc.PeerConnection
@@ -253,6 +267,18 @@ func (cp *fakeCP) authRequests() []*ownsandv1.AuthorizeRelayRequest {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	return append([]*ownsandv1.AuthorizeRelayRequest(nil), cp.authReqs...)
+}
+
+func (cp *fakeCP) iceCallCount() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.iceCalls
+}
+
+func (cp *fakeCP) gateCanceledCount() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.gateCanceled
 }
 
 func (cp *fakeCP) openSessionCount() int {
@@ -425,8 +451,49 @@ type fakeDataPath struct {
 	cp *fakeCP
 }
 
-func (f *fakeDataPath) GetIceServers(context.Context, *connect.Request[ownsandv1.GetIceServersRequest]) (*connect.Response[ownsandv1.GetIceServersResponse], error) {
-	return connect.NewResponse(&ownsandv1.GetIceServersResponse{}), nil
+// hold blocks a request at a gate until the gate closes or the request ends.
+// A nil gate never blocks.
+func (f *fakeDataPath) hold(ctx context.Context, gate chan struct{}, kind string) error {
+	if gate == nil {
+		return nil
+	}
+	select {
+	case <-gate:
+		return nil
+	default:
+	}
+	if f.cp.gateHits != nil {
+		select {
+		case f.cp.gateHits <- kind:
+		default:
+		}
+	}
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		f.cp.mu.Lock()
+		f.cp.gateCanceled++
+		f.cp.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (f *fakeDataPath) GetIceServers(ctx context.Context, _ *connect.Request[ownsandv1.GetIceServersRequest]) (*connect.Response[ownsandv1.GetIceServersResponse], error) {
+	cp := f.cp
+	cp.mu.Lock()
+	cp.iceCalls++
+	gate := cp.iceGate
+	urls := cp.iceServers
+	cp.mu.Unlock()
+	if err := f.hold(ctx, gate, "ice"); err != nil {
+		return nil, err
+	}
+	res := &ownsandv1.GetIceServersResponse{}
+	if len(urls) > 0 {
+		res.IceServers = []*ownsandv1.IceServer{{Urls: urls}}
+	}
+	return connect.NewResponse(res), nil
 }
 
 func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[ownsandv1.OpenSessionRequest]) (*connect.Response[ownsandv1.OpenSessionResponse], error) {
@@ -435,7 +502,11 @@ func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[own
 	cp.openSessions++
 	iceFail := cp.iceFail
 	state := cp.state
+	gate := cp.openGate
 	cp.mu.Unlock()
+	if err := f.hold(ctx, gate, "open"); err != nil {
+		return nil, err
+	}
 	switch state {
 	case ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:
 	case ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE:

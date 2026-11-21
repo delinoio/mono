@@ -164,7 +164,7 @@ func (c *Client) Sandbox(org, sandboxID string) (*Sandbox, error) {
 
 func (c *Client) handle(org string, sb *ownsandv1.Sandbox) *Sandbox {
 	s := &Sandbox{c: c, org: org, id: sb.GetSandboxId(), info: sb}
-	s.dp = &dataPath{s: s}
+	s.dp = newDataPath(s)
 	return s
 }
 
@@ -251,8 +251,13 @@ func (s *Sandbox) Snapshot(ctx context.Context) (*ownsandv1.Snapshot, error) {
 	return res.Msg.GetSnapshot(), nil
 }
 
-// Close closes the handle's peer-to-peer session. Running execs continue on
-// the agent and can be attached again.
+// Close closes the handle's peer-to-peer session and cancels a session setup
+// that is in flight: that operation returns a "sandbox handle closed" error,
+// and a session that the setup still opens is closed and never installed.
+// A closed handle rejects later operations that use the peer-to-peer path
+// (every transport except TransportRelay) with the same error. Running execs
+// continue on the agent and can be attached again with a new handle. Close is
+// idempotent.
 func (s *Sandbox) Close() error {
 	s.dp.close()
 	return nil
