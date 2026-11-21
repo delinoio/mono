@@ -1201,9 +1201,13 @@ func TestAuthorizeRelayAckWithoutReplacedGrant(t *testing.T) {
 
 // TestAuthorizeRelayEnqueueFailureWakesWaiters covers a concurrent call of
 // the same authorization_id that waits on the reservation: when the enqueue
-// fails it returns unavailable (retryable, no grant-limit delay), not
-// resource_exhausted.
+// fails, the waiter is woken by the delivery failure and returns unavailable
+// (retryable, no grant-limit delay), not resource_exhausted. The test orders
+// the two calls with the sender and wait observer instead of sleeping, and
+// tells a woken waiter from an acknowledgement timeout or a second enqueue
+// attempt by the exact message and the count of sender calls.
 func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
+	const barrierTimeout = 10 * time.Second
 	env := testenv.New(t)
 	ctx := context.Background()
 	org, _, sandboxID := runningSandbox(t, env)
@@ -1213,35 +1217,68 @@ func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
 	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
 		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
 	release := make(chan struct{})
-	entered := make(chan struct{}, 1)
+	var releaseOnce sync.Once
+	releaseSender := func() { releaseOnce.Do(func() { close(release) }) }
+	// Release a sender that is still blocked when the test ends early.
+	t.Cleanup(releaseSender)
+	var senderCalls atomic.Int32
+	entered := make(chan struct{}, 2)
 	env.App.Plane.SetGrantSender(func(ctx context.Context, conn *hub.Conn, e *ownsandv1.AgentEnvelope) error {
+		senderCalls.Add(1)
 		entered <- struct{}{}
-		<-release
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
 		return context.DeadlineExceeded
 	})
-	errs := make(chan error, 2)
+	waiting := make(chan struct{}, 2)
+	env.App.Plane.SetGrantWaitObserver(func(string) { waiting <- struct{}{} })
+	first := make(chan error, 1)
+	second := make(chan error, 1)
 	go func() {
 		_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
-		errs <- err
+		first <- err
 	}()
-	<-entered
+	select {
+	case <-entered:
+	case <-time.After(barrierTimeout):
+		t.Fatal("the first call did not reach the grant sender")
+	}
 	go func() {
 		_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
-		errs <- err
+		second <- err
 	}()
-	// Let the second call find the pending reservation and wait on it. If it
-	// is slower, it reserves after the removal and fails in the sender too.
-	time.Sleep(200 * time.Millisecond)
-	close(release)
-	for i := 0; i < 2; i++ {
+	// The second call must find the pending reservation and wait on it before
+	// the sender fails; it must not enqueue the grant itself.
+	select {
+	case <-waiting:
+	case <-entered:
+		t.Fatal("the second call entered the grant sender instead of waiting on the reservation")
+	case <-time.After(barrierTimeout):
+		t.Fatal("the second call did not wait on the pending reservation")
+	}
+	releaseSender()
+	check := func(name string, ch <-chan error, wantMessage string) {
+		t.Helper()
 		select {
-		case err := <-errs:
-			if testenv.Code(err) != connect.CodeUnavailable || errDetail(err).GetRetryAfter() != nil {
-				t.Fatalf("call %d: %v", i, err)
+		case err := <-ch:
+			var ce *connect.Error
+			if !errors.As(err, &ce) {
+				t.Fatalf("%s call: %v, want a connect error", name, err)
 			}
-		case <-time.After(10 * time.Second):
-			t.Fatal("a call did not return after the enqueue failure")
+			if ce.Code() != connect.CodeUnavailable || errDetail(err).GetRetryAfter() != nil || ce.Message() != wantMessage {
+				t.Fatalf("%s call: code %v message %q retry_after %v, want unavailable %q without retry_after",
+					name, ce.Code(), ce.Message(), errDetail(err).GetRetryAfter(), wantMessage)
+			}
+		case <-time.After(barrierTimeout):
+			t.Fatalf("the %s call did not return after the enqueue failure", name)
 		}
+	}
+	check("first", first, "the agent channel closed")
+	check("second", second, "the relay grant could not be delivered to the agent")
+	if n := senderCalls.Load(); n != 1 {
+		t.Fatalf("grant sender called %d times, want 1", n)
 	}
 	if n := env.App.Plane.Grants.Len(); n != 0 {
 		t.Fatalf("%d grants left", n)

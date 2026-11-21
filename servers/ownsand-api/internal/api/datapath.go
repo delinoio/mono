@@ -70,6 +70,28 @@ type DataPlane struct {
 	// channel, which a running channel produces only when the outbound queue
 	// is full and the caller's context ends.
 	grantSender func(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error
+	// grantWaitObserver is called with the grant ID when a retried call finds
+	// an existing reservation and is about to wait for its outcome; nil does
+	// nothing. Tests use it to know that a concurrent call is waiting.
+	grantWaitObserver func(grantID string)
+}
+
+// SetGrantWaitObserver sets a callback that AuthorizeRelay calls just before
+// a call for an already reserved grant waits for the outcome (tests only); nil
+// removes it. It never changes how the call behaves.
+func (p *DataPlane) SetGrantWaitObserver(fn func(grantID string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.grantWaitObserver = fn
+}
+
+func (p *DataPlane) observeGrantWait(grantID string) {
+	p.mu.Lock()
+	fn := p.grantWaitObserver
+	p.mu.Unlock()
+	if fn != nil {
+		fn(grantID)
+	}
 }
 
 // SetGrantSender replaces how AuthorizeRelay enqueues a relay grant for the
@@ -484,6 +506,9 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 				slog.String("error_category", enqueueErrorCategory(err)), slog.Bool("reservation_removed", removed))
 			return nil, errUnavailable("the agent channel closed")
 		}
+	}
+	if existing {
+		h.observeGrantWait(g.ID)
 	}
 	timer := time.NewTimer(h.Timing.GrantAck)
 	defer timer.Stop()
