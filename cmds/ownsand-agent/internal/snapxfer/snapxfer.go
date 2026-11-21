@@ -26,8 +26,35 @@ import (
 // urlBatch is how many part URLs the agent asks for at a time.
 const urlBatch = 8
 
-// maxParts bounds the part count of an import.
+// maxParts bounds the part count of an export and of an import. It matches
+// the control plane's per-snapshot part limit.
 const maxParts = 10000
+
+// ErrTooManyParts reports that a snapshot needs more parts than maxParts.
+var ErrTooManyParts = errors.New("snapxfer: snapshot needs more parts than the limit")
+
+// TooManyPartsError carries the part count and limit of a rejected export.
+type TooManyPartsError struct {
+	PartCount int64
+	Limit     int64
+}
+
+func (e *TooManyPartsError) Error() string {
+	return fmt.Sprintf("snapxfer: snapshot needs %d parts; the limit is %d", e.PartCount, e.Limit)
+}
+
+func (e *TooManyPartsError) Is(target error) bool { return target == ErrTooManyParts }
+
+// partCount returns how many parts of partSize bytes hold size bytes, at
+// least 1. It computes in int64, so callers narrow only after checking the
+// limit.
+func partCount(size, partSize int64) int64 {
+	n := size / partSize
+	if size%partSize != 0 {
+		n++
+	}
+	return max(n, 1)
+}
 
 // URLSource asks the control plane for signed part URLs.
 type URLSource interface {
@@ -79,10 +106,12 @@ func (t *Transfer) Export(ctx context.Context, snapshotID, contentDir string, pa
 	if err != nil {
 		return nil, 0, err
 	}
-	count := int32((size + partSize - 1) / partSize)
-	if count == 0 {
-		count = 1
+	count64 := partCount(size, partSize)
+	if count64 > maxParts {
+		// Reject before the first URL request so that no part is uploaded.
+		return nil, 0, &TooManyPartsError{PartCount: count64, Limit: maxParts}
 	}
+	count := int32(count64)
 	var parts []*ownsandv1.SnapshotPart
 	for first := int32(1); first <= count; first += urlBatch {
 		var batch []int32

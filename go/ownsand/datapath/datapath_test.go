@@ -440,6 +440,67 @@ func TestSendWindow(t *testing.T) {
 	}
 }
 
+func TestSendWindowAddRejectsOverflowingIncrement(t *testing.T) {
+	w, err := NewSendWindow(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Add(math.MaxInt64); !errors.Is(err, ErrInvalidWindowUpdate) {
+		t.Fatalf("Add(MaxInt64): %v", err)
+	}
+	if w.Available() != 1 {
+		t.Fatalf("available %d after rejected update", w.Available())
+	}
+	if err := w.Add(MaxWindowSize - 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Add(1); !errors.Is(err, ErrInvalidWindowUpdate) {
+		t.Fatalf("Add past cap: %v", err)
+	}
+	if w.Available() != MaxWindowSize {
+		t.Fatalf("available %d, want cap", w.Available())
+	}
+}
+
+func TestSendWindowConsumeEndedContext(t *testing.T) {
+	w, err := NewSendWindow(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := w.Consume(ctx, 40); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Consume with canceled context: %v", err)
+	}
+	if w.Available() != 100 {
+		t.Fatalf("available %d, credit deducted for canceled context", w.Available())
+	}
+	if err := w.Consume(context.Background(), 40); err != nil || w.Available() != 60 {
+		t.Fatalf("active consume: %v, available %d", err, w.Available())
+	}
+
+	// A waiter that is canceled and woken by a window update at the same
+	// time must not deduct the new credit.
+	waiter, err := NewSendWindow(10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, wcancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- waiter.Consume(wctx, 50) }()
+	time.Sleep(10 * time.Millisecond)
+	wcancel()
+	if err := waiter.Add(100); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled waiter: %v", err)
+	}
+	if waiter.Available() != 110 {
+		t.Fatalf("available %d, want 110", waiter.Available())
+	}
+}
+
 func TestReceiveWindow(t *testing.T) {
 	if _, err := NewReceiveWindow(MinWindowSize - 1); err == nil {
 		t.Fatal("window below one maximum frame accepted")

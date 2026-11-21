@@ -58,14 +58,31 @@ func New(opts Options) (*Runtime, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
+	logger := opts.Logger
+	return newRuntime(opts, func() {
+		if hasNetAdmin() {
+			netpolicy.CleanupHost(logger)
+		}
+	})
+}
+
+// newRuntime builds the runtime with an injectable startup cleanup. With a
+// network manager it calls startupCleanup once, before the refresh loop
+// starts; without a manager it calls neither. New passes the privileged
+// host clean-up, so that tests can pass a fake and never reach the live
+// host network, whatever the capabilities of the test process are.
+func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
+	}
 	if opts.Binary == "" {
 		opts.Binary = "firecracker"
 	}
 	if p, err := exec.LookPath(opts.Binary); err == nil {
 		opts.Binary = p
 	}
-	if opts.Network != nil && hasNetAdmin() {
-		netpolicy.CleanupHost(opts.Logger)
+	if opts.Network != nil {
+		startupCleanup()
 	}
 	r := &Runtime{opts: opts, logger: opts.Logger, vms: map[string]*vm{}}
 	if opts.Network != nil {
