@@ -21,6 +21,8 @@ import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
 import { DeviceState, SandboxState } from "ownsand-sdk/gen/common_pb";
 import { type FormEvent, type ReactNode, useState } from "react";
+import { billingReasonOf } from "../api.ts";
+import { ACCOUNTS_URL } from "../config.ts";
 import { errorMessage, labels } from "../format.ts";
 
 export function PageHeader({
@@ -43,6 +45,20 @@ export function PageHeader({
   );
 }
 
+/**
+ * Shows a failed action in a toast. A billing error also gets a link
+ * action to the billing site, because toast text cannot hold a link.
+ */
+export function toastError(error: unknown): void {
+  if (billingReasonOf(error) !== undefined) {
+    toast.error(errorMessage(error), {
+      action: { label: "Open billing", href: ACCOUNTS_URL },
+    });
+    return;
+  }
+  toast.error(errorMessage(error));
+}
+
 /** A loading placeholder for a list. */
 export function Loading({ label = "Loading" }: { label?: string }) {
   return (
@@ -54,7 +70,32 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-/** A failed request, with a retry button. */
+/**
+ * Text in which every occurrence of the billing site address is a link,
+ * for server messages such as billing errors.
+ */
+export function TextWithAccountsLink({ text }: { text: string }) {
+  const parts = text.split(ACCOUNTS_URL);
+  return (
+    <>
+      {parts.map((part, i) => (
+        <span key={i}>
+          {i > 0 ? (
+            <a href={ACCOUNTS_URL} target="_blank" rel="noreferrer">
+              {ACCOUNTS_URL}
+            </a>
+          ) : null}
+          {part}
+        </span>
+      ))}
+    </>
+  );
+}
+
+/**
+ * A failed request, with a retry button. A billing error shows the server
+ * message with its link and never offers a retry, because it is terminal.
+ */
 export function ErrorNotice({
   error,
   onRetry,
@@ -62,10 +103,13 @@ export function ErrorNotice({
   error: unknown;
   onRetry?: () => void;
 }) {
+  const billing = billingReasonOf(error) !== undefined;
   return (
     <div className="notice notice-error" role="alert">
-      <p>{errorMessage(error)}</p>
-      {onRetry ? (
+      <p>
+        <TextWithAccountsLink text={errorMessage(error)} />
+      </p>
+      {onRetry && !billing ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>

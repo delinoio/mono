@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { billingReasonOf } from "./api.ts";
 import {
   AgentUpdateState,
   AgentVersionPolicyMode,
@@ -19,6 +20,7 @@ import {
   SnapshotExportState,
   SnapshotState,
 } from "ownsand-sdk/gen/common_pb";
+import { ACCOUNTS_URL } from "./config.ts";
 
 /** Display labels of the enums the console shows. */
 export const labels = {
@@ -239,6 +241,14 @@ export function errorMessage(error: unknown): string {
     case Code.Unavailable:
       return "OwnSand is not available right now. Try again in a moment.";
     case Code.ResourceExhausted:
+      // A billing rejection is terminal: show the server's message, which
+      // names the reason and links to the billing site.
+      if (billingReasonOf(error) !== undefined) {
+        return (
+          error.rawMessage ||
+          `Billing does not allow this action. Check the billing at ${ACCOUNTS_URL}.`
+        );
+      }
       return "Too many requests. Wait a moment and try again.";
     case Code.InvalidArgument:
     case Code.FailedPrecondition:

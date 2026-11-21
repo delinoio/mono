@@ -11,6 +11,7 @@ import { ACCOUNTS_URL } from "../config.ts";
 import { labels } from "../format.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
+import { BillingBanner } from "./billing.tsx";
 import { ErrorNotice, Loading } from "./ui.tsx";
 
 interface OrgContextValue {
@@ -197,6 +198,7 @@ export function OrgShell({
             </ul>
           </nav>
           <main className="content">
+            <BillingBanner organizationId={organizationId} role={role} />
             {canOpenSection(role, current) ? (
               children
             ) : (

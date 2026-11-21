@@ -26,6 +26,7 @@ import {
   MOCK_IDS,
   MOCK_INVITATION_SECRET,
   MOCK_USER,
+  MockBillingState,
 } from "./mock/mock-api.ts";
 
 /** The seeded Acme invitation, which the mock user cannot accept: already a member. */
@@ -707,5 +708,137 @@ describe("sign-in callback", () => {
     renderConsole("/callback", { signedIn: false });
     await settle(60);
     expect(window.location.pathname).toBe("/");
+  });
+});
+
+/** The seeded Acme members of each role. */
+const ACME_ROLES = [
+  ["owner", MOCK_USER],
+  ["admin", "user-admin-jun"],
+  ["member", "user-member-ada"],
+] as const;
+
+const BILLING_STATES = [
+  MockBillingState.AllowedLinked,
+  MockBillingState.BlockedUnlinked,
+  MockBillingState.BlockedLinked,
+  MockBillingState.Suspended,
+] as const;
+
+/** A mock transport that counts the calls of each method. */
+function countingTransport(mock: Transport) {
+  const calls: Record<string, number> = {};
+  const transport: Transport = {
+    ...mock,
+    unary(method, ...rest) {
+      calls[method.name] = (calls[method.name] ?? 0) + 1;
+      return mock.unary(method, ...rest);
+    },
+  };
+  return { transport, calls };
+}
+
+describe("billing banner", () => {
+  for (const [roleName, userId] of ACME_ROLES) {
+    for (const state of BILLING_STATES) {
+      test(`the ${roleName} in ${state}`, async () => {
+        renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+          transport: createMockTransport({
+            userId,
+            billing: { [MOCK_IDS.acme]: state },
+          }),
+        });
+        await screen.findByRole("heading", { name: "Sandboxes", level: 1 });
+        await settle(60);
+        const banner = screen.queryByRole("region", {
+          name: /This organization is/,
+        });
+        if (state === MockBillingState.AllowedLinked) {
+          expect(banner).toBeNull();
+          return;
+        }
+        expect(banner).not.toBeNull();
+        const text = banner!.textContent!;
+        const link = within(banner!).getByRole("link", {
+          name: "Manage billing at accounts.delino.io",
+        });
+        expect(link.getAttribute("href")).toBe("https://accounts.delino.io");
+        if (state === MockBillingState.Suspended) {
+          expect(text).toContain("This organization is suspended");
+          expect(text).toContain("Running sandboxes are paused");
+          expect(text).toContain("Suspended since");
+        } else {
+          expect(text).toContain("This organization is blocked");
+          expect(text).toContain("OwnSand rejects creating sandboxes");
+          expect(text).toContain("is suspended on");
+        }
+        if (state === MockBillingState.BlockedUnlinked) {
+          expect(text).toContain("No billing account is linked");
+          expect(
+            within(banner!).queryByRole("link", {
+              name: "Link a billing account",
+            }) !== null,
+          ).toBe(roleName === "owner");
+          expect(text.includes("The organization owner must link")).toBe(
+            roleName !== "owner",
+          );
+        }
+        if (state === MockBillingState.BlockedLinked) {
+          expect(text).toContain("Payment is missing");
+        }
+      });
+    }
+  }
+
+  test("shows on every organization page", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedLinked },
+      }),
+    });
+    expect(
+      await screen.findByRole("region", {
+        name: "This organization is blocked",
+      }),
+    ).toBeTruthy();
+  });
+});
+
+describe("billing errors", () => {
+  test("a mutation rejected by billing shows the message and link once and refreshes the status", async () => {
+    const { transport, calls } = countingTransport(
+      createMockTransport({
+        billing: { [MOCK_IDS.acme]: MockBillingState.BlockedLinked },
+      }),
+    );
+    renderConsole(`/orgs/${MOCK_IDS.acme}/enrollment-tokens`, { transport });
+    await screen.findByRole("region", { name: "This organization is blocked" });
+    await screen.findByText(/ose_91c2/);
+    const statusReads = calls.GetBillingStatus ?? 0;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+    });
+    const dialog = await screen.findByRole("dialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create token" }),
+      );
+    });
+    await settle(100);
+    const notice = dialog.querySelector(".notice-error") as HTMLElement;
+    expect(notice.textContent).toContain(
+      "has no active subscription or no balance",
+    );
+    expect(
+      within(notice)
+        .getByRole("link", { name: "https://accounts.delino.io" })
+        .getAttribute("href"),
+    ).toBe("https://accounts.delino.io");
+    expect(within(notice).queryByRole("button", { name: "Try again" })).toBe(
+      null,
+    );
+    // Never retried, and the banner's status is read again.
+    expect(calls.CreateEnrollmentToken).toBe(1);
+    expect(calls.GetBillingStatus ?? 0).toBeGreaterThan(statusReads);
   });
 });

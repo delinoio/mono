@@ -9,7 +9,10 @@ import {
 } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { QueryClient } from "@tanstack/react-query";
+import { BillingService } from "ownsand-sdk/gen/billing_pb";
 import {
+  BillingReason,
+  ErrorDetailSchema,
   SandboxState,
   SnapshotExportState,
   SnapshotState,
@@ -107,4 +110,53 @@ export function invalidateServices(
       }),
     ),
   ).then(() => undefined);
+}
+
+/**
+ * The billing reason of an RPC error that billing enforcement rejected: a
+ * `resource_exhausted` error with an `ErrorDetail` whose `billing_reason`
+ * is set. A `resource_exhausted` error without one is a rate limit or a
+ * capacity error and returns undefined. Callers never retry a billing
+ * error.
+ */
+export function billingReasonOf(error: unknown): BillingReason | undefined {
+  if (!(error instanceof ConnectError)) return undefined;
+  if (error.code !== Code.ResourceExhausted) return undefined;
+  for (const detail of error.findDetails(ErrorDetailSchema)) {
+    if (detail.billingReason !== BillingReason.UNSPECIFIED) {
+      return detail.billingReason;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Reads the billing status again after any query or mutation of the client
+ * fails with a billing reason, so the billing banner shows the phase that
+ * rejected the call. Returns the function that stops watching.
+ */
+export function watchBillingErrors(queryClient: QueryClient): () => void {
+  const refresh = (error: unknown) => {
+    if (billingReasonOf(error) === undefined) return;
+    void queryClient.invalidateQueries({
+      queryKey: createConnectQueryKey({
+        schema: BillingService.method.getBillingStatus,
+        cardinality: undefined,
+      }),
+    });
+  };
+  const stopQueries = queryClient.getQueryCache().subscribe((event) => {
+    if (event.type === "updated" && event.action.type === "error") {
+      refresh(event.action.error);
+    }
+  });
+  const stopMutations = queryClient.getMutationCache().subscribe((event) => {
+    if (event.type === "updated" && event.action.type === "error") {
+      refresh(event.action.error);
+    }
+  });
+  return () => {
+    stopQueries();
+    stopMutations();
+  };
 }

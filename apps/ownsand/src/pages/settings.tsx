@@ -22,8 +22,9 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  toastError,
 } from "../components/ui.tsx";
-import { errorMessage, formatTime, labels } from "../format.ts";
+import { formatTime, labels } from "../format.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
 
@@ -93,7 +94,7 @@ function AgentPolicy() {
       });
       toast.success("The agent version policy is saved.");
     } catch (error) {
-      toast.error(errorMessage(error));
+      toastError(error);
     }
   };
 
