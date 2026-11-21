@@ -108,14 +108,12 @@ main() {
     "$image" > /dev/null
 
   if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
-    echo "Last log lines of $new:"
-    docker logs --tail 200 "$new" 2>&1 || true
-    docker rm --force "$new" > /dev/null || true
+    discard_replacement "$new"
     fail "$new did not pass the health check; the previous container keeps serving."
   fi
 
   if ! write_route "$site" "$service" "$port" "$hostname" "$proxy"; then
-    docker rm --force "$new" > /dev/null || true
+    discard_replacement "$new"
     fail "the reverse proxy did not accept the route of $service; the previous container keeps serving."
   fi
 
@@ -140,6 +138,14 @@ main() {
 fail() {
   echo "::error::$1" >&2
   exit 1
+}
+
+# Prints the log tail of a replacement that failed, then removes it. A failed
+# log read or removal must not hide the deployment failure the caller reports.
+discard_replacement() {
+  echo "Last log lines of $1:"
+  docker logs --tail 200 "$1" 2>&1 || true
+  docker rm --force "$1" > /dev/null || true
 }
 
 # Waits until the container answers `GET /healthz` with a success status.

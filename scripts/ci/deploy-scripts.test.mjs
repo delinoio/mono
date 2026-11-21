@@ -1647,6 +1647,7 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_PS       `docker ps` fails when 1 (default 0).
+//   STUB_LOGS     exit code of `docker logs` (default 0).
 function runDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
@@ -1682,7 +1683,7 @@ function runDroplet(
       *) echo 172.18.0.5 ;;
     esac ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
-  logs) echo "server log line" ;;
+  logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
 esac`,
   );
   shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
@@ -1902,11 +1903,30 @@ test(
     });
     assert.equal(result.status, 1);
     assert.match(result.stderr, /did not accept the route/);
+    assert.match(result.stdout, /server log line/);
+    const logs = result.calls.findIndex((call) =>
+      call.startsWith("docker logs --tail 200 api-"),
+    );
+    const removal = result.calls.findIndex((call) =>
+      call.startsWith("docker rm --force api-"),
+    );
+    assert.ok(logs >= 0 && logs < removal, "logs are read before removal");
     assert.equal(result.read("caddy/sites/api.caddy"), previous);
     assert.ok(
       result.calls.some((call) => call.startsWith("docker rm --force api-")),
     );
     assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+    // A failed log read does not stop the cleanup or change the result.
+    const unreadable = runDroplet(t, undefined, {
+      env: { STUB_RELOAD: "1", STUB_LOGS: "1" },
+    });
+    assert.equal(unreadable.status, 1);
+    assert.match(unreadable.stderr, /did not accept the route/);
+    assert.ok(
+      unreadable.calls.some((call) =>
+        call.startsWith("docker rm --force api-"),
+      ),
+    );
     // Without a previous route, the new route file is removed.
     const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
     assert.equal(first.status, 1);
