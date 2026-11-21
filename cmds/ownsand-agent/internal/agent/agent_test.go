@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -313,9 +314,23 @@ func TestUnknownDeviceKeepsData(t *testing.T) {
 
 // bucket is a fake R2 bucket: PUT stores, GET returns.
 func bucket(t *testing.T) *httptest.Server {
+	return bucketWithHook(t, nil)
+}
+
+// bucketWithHook is bucket with a hook that sees every request before the
+// bucket serves it, without holding the bucket lock, so that it can block.
+// When the hook returns a non-zero status, the bucket answers with it and
+// does not serve the request.
+func bucketWithHook(t *testing.T, hook func(r *http.Request) int) *httptest.Server {
 	var mu sync.Mutex
 	objects := map[string][]byte{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hook != nil {
+			if status := hook(r); status != 0 {
+				http.Error(w, "injected failure", status)
+				return
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		switch r.Method {
@@ -390,6 +405,239 @@ func TestSnapshotExportImport(t *testing.T) {
 	if res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{Snapshot: b3, Parts: parts}}}); res.GetError() == nil {
 		t.Fatal("tampered import accepted")
 	}
+}
+
+// sendCommand sends a command without waiting for its result.
+func (h *harness) sendCommand(cmd *ownsandv1.AgentCommand) string {
+	h.t.Helper()
+	cmd.CommandId, _ = uuidv7.NewString()
+	if !h.cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+		h.t.Fatal("no channel")
+	}
+	return cmd.GetCommandId()
+}
+
+func (h *harness) result(commandID string) *ownsandv1.AgentCommandResult {
+	h.t.Helper()
+	res := h.cp.CommandResult(30*time.Second, commandID)
+	if res == nil {
+		h.t.Fatal("no command result")
+	}
+	return res
+}
+
+// importFixture holds a snapshot that was exported from the agent and whose
+// parts the fake bucket serves under other snapshot IDs.
+type importFixture struct {
+	h     *harness
+	b     *httptest.Server
+	snap  *ownsandv1.SnapshotStateEntry
+	parts []*ownsandv1.SnapshotPart
+}
+
+func newImportFixture(t *testing.T, hook func(r *http.Request) int) *importFixture {
+	t.Helper()
+	cp := testcp.New(t)
+	b := bucketWithHook(t, hook)
+	cp.SetSignedURLBase(b.URL)
+	st, id := enrollDevice(t, cp)
+	h := start(t, cp, st, id)
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatal(res.GetError())
+	}
+	snapID, _ := uuidv7.NewString()
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}})
+	snap := res.GetCreateSnapshot().GetSnapshot()
+	res = h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{SnapshotId: snapID, PartSizeBytes: 512}}})
+	if res.GetError() != nil || len(res.GetExportSnapshot().GetParts()) == 0 {
+		t.Fatalf("export %v", res)
+	}
+	return &importFixture{h: h, b: b, snap: snap, parts: res.GetExportSnapshot().GetParts()}
+}
+
+// stage copies the exported parts to the bucket under a new snapshot ID and
+// returns an import command for it. With badHash the command carries a
+// wrong hash for the first part, so the import fails its hash check.
+func (f *importFixture) stage(t *testing.T, id string, badHash bool) *ownsandv1.AgentCommand {
+	t.Helper()
+	src := f.snap.GetSnapshotId()
+	for _, p := range f.parts {
+		resp, err := http.Get(fmt.Sprintf("%s/%s/%d", f.b.URL, src, p.GetPartNumber()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/%s/%d", f.b.URL, id, p.GetPartNumber()), bytes.NewReader(data))
+		resp2, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp2.Body.Close()
+	}
+	return f.command(id, badHash)
+}
+
+func (f *importFixture) command(id string, badHash bool) *ownsandv1.AgentCommand {
+	entry := proto.Clone(f.snap).(*ownsandv1.SnapshotStateEntry)
+	entry.SnapshotId = id
+	parts := make([]*ownsandv1.SnapshotPart, len(f.parts))
+	for i, p := range f.parts {
+		parts[i] = proto.Clone(p).(*ownsandv1.SnapshotPart)
+	}
+	if badHash {
+		parts[0].Sha256[0] ^= 1
+	}
+	return &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{Snapshot: entry, Parts: parts}}}
+}
+
+// requireRestorable checks that the snapshot content is on disk and that a
+// sandbox restores from it.
+func (f *importFixture) requireRestorable(t *testing.T, id string) {
+	t.Helper()
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "content")); err != nil {
+		t.Fatalf("snapshot content after the import: %v", err)
+	}
+	fromSnap, _ := uuidv7.NewString()
+	cmd := createCommand(fromSnap)
+	cmd.GetCreateSandbox().Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: id}
+	if res := f.h.command(cmd); res.GetError() != nil || res.GetCreateSandbox().GetSandbox().GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+		t.Fatalf("create from the imported snapshot %v", res)
+	}
+}
+
+// getGate counts the part downloads of one snapshot ID and blocks the first
+// of them until release is closed.
+type getGate struct {
+	id      string
+	mu      sync.Mutex
+	gets    int
+	started chan struct{}
+	release chan struct{}
+}
+
+func newGetGate(id string) *getGate {
+	return &getGate{id: id, started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *getGate) hook(r *http.Request) int {
+	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/"+g.id+"/") {
+		return 0
+	}
+	g.mu.Lock()
+	g.gets++
+	first := g.gets == 1
+	g.mu.Unlock()
+	if first {
+		close(g.started)
+		<-g.release
+	}
+	return 0
+}
+
+func (g *getGate) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.gets
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// settle gives a command that waits for a lock time to reach it. The
+// assertions below hold whether or not it arrived, so the delay only makes
+// the contended path likely and never makes the test flaky.
+func settle() { time.Sleep(300 * time.Millisecond) }
+
+// TestConcurrentImportsOfOneSnapshotDownloadOnce checks that two imports of
+// the same absent snapshot return the same ready entry after one download.
+func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	gate := newGetGate(id)
+	f := newImportFixture(t, gate.hook)
+	first := f.h.sendCommand(f.stage(t, id, false))
+	waitClosed(t, gate.started, "the first download")
+	second := f.h.sendCommand(f.command(id, false))
+	settle()
+	close(gate.release)
+	r1, r2 := f.h.result(first), f.h.result(second)
+	for _, r := range []*ownsandv1.AgentCommandResult{r1, r2} {
+		if r.GetError() != nil || r.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+			t.Fatalf("import %v", r)
+		}
+	}
+	if !proto.Equal(r1.GetImportSnapshot().GetSnapshot(), r2.GetImportSnapshot().GetSnapshot()) {
+		t.Fatalf("entries differ: %v and %v", r1.GetImportSnapshot().GetSnapshot(), r2.GetImportSnapshot().GetSnapshot())
+	}
+	if got := gate.count(); got != len(f.parts) {
+		t.Fatalf("part downloads = %d, want one download of %d parts", got, len(f.parts))
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestFailedImportDoesNotDeleteAPublishedCopy checks that a failing import
+// of a snapshot neither blocks the waiting import of the same snapshot from
+// downloading and publishing it nor deletes the copy it publishes, and that
+// a later import reuses the copy.
+func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	gate := newGetGate(id)
+	f := newImportFixture(t, gate.hook)
+	bad := f.h.sendCommand(f.stage(t, id, true))
+	waitClosed(t, gate.started, "the first download")
+	good := f.h.sendCommand(f.command(id, false))
+	// Without the per-snapshot lock the good import publishes the copy while
+	// the bad one still waits at its gate, and the bad one then deletes it.
+	settle()
+	close(gate.release)
+	badRes, goodRes := f.h.result(bad), f.h.result(good)
+	if badRes.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
+		t.Fatalf("bad import = %v", badRes)
+	}
+	if goodRes.GetError() != nil || goodRes.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("good import = %v", goodRes)
+	}
+	f.requireRestorable(t, id)
+	// A later import reuses the copy: even one that would fail its hash check
+	// returns the ready entry and leaves the content alone.
+	if res := f.h.command(f.command(id, true)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("later import = %v", res)
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestImportsOfDifferentSnapshotsStayConcurrent checks that an import that
+// waits on its download does not block the import of another snapshot.
+func TestImportsOfDifferentSnapshotsStayConcurrent(t *testing.T) {
+	slow, _ := uuidv7.NewString()
+	fast, _ := uuidv7.NewString()
+	gate := newGetGate(slow)
+	f := newImportFixture(t, gate.hook)
+	slowID := f.h.sendCommand(f.stage(t, slow, false))
+	waitClosed(t, gate.started, "the first download")
+	fastCmd := f.stage(t, fast, false)
+	// The fast import finishes while the slow one still waits.
+	if res := f.h.command(fastCmd); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("fast import = %v", res)
+	}
+	close(gate.release)
+	if res := f.h.result(slowID); res.GetError() != nil {
+		t.Fatalf("slow import = %v", res)
+	}
+	f.requireRestorable(t, fast)
+	f.requireRestorable(t, slow)
 }
 
 // TestEnrollRetriesAfterOriginWriteFailure checks that a failed agent.json
