@@ -83,6 +83,18 @@ type relayAction struct {
 	stallAccepted    bool          // send accepted, then nothing
 	endAfterTime     time.Duration // end OK at the first event after this time
 	delay            time.Duration
+	// holdOpen keeps the stream open without any event (no accepted) until
+	// the caller cancels it.
+	holdOpen bool
+	// keepalivesOnly sends relay keepalives every 10 ms without accepted
+	// until the caller cancels the stream.
+	keepalivesOnly bool
+	// acceptedKeepalives sends accepted, then keepalives every 10 ms for
+	// this long, and then serves the request as usual.
+	acceptedKeepalives time.Duration
+	// abortAfterKeepalives aborts the connection after the accepted
+	// keepalives, without any data.
+	abortAfterKeepalives bool
 }
 
 // p2pAction scripts one data channel request.
@@ -147,6 +159,10 @@ type fakeCP struct {
 	authScript  func(n int, req *ownsandv1.AuthorizeRelayRequest) authAction
 	relayCalls  map[string]int
 	relayLog    []string
+	// heldEnded records when a held (holdOpen or keepalivesOnly) relay
+	// stream ended because the caller cancelled it, and when it began.
+	heldStarts  []time.Time
+	heldEnds    []time.Time
 	relayScript func(method string, n int) relayAction
 
 	openSessions int
@@ -617,10 +633,66 @@ func (r *relaySender) sendEvent(ev *ownsandv1.ExecEvent) error {
 	return nil
 }
 
+// hold serves the pre-acceptance hold actions. It reports whether it held
+// the stream; the caller then returns the result.
+func (f *fakeRelay) hold(ctx context.Context, act relayAction, keepalive func() error) (bool, error) {
+	if !act.holdOpen && !act.keepalivesOnly {
+		return false, nil
+	}
+	cp := f.cp
+	cp.mu.Lock()
+	cp.heldStarts = append(cp.heldStarts, time.Now())
+	cp.mu.Unlock()
+	defer func() {
+		cp.mu.Lock()
+		cp.heldEnds = append(cp.heldEnds, time.Now())
+		cp.mu.Unlock()
+	}()
+	if act.holdOpen {
+		<-ctx.Done()
+		return true, ctx.Err()
+	}
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-t.C:
+			if err := keepalive(); err != nil {
+				<-ctx.Done()
+				return true, ctx.Err()
+			}
+		}
+	}
+}
+
+// sendKeepalives sends keepalives for d, as an accepted stream that waits
+// for its operation.
+func sendKeepalives(ctx context.Context, d time.Duration, keepalive func() error) error {
+	end := time.Now().Add(d)
+	for time.Now().Before(end) {
+		if err := keepalive(); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
 func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, attach *ownsandv1.AttachExecRequest, execReq *ownsandv1.ExecRequest, send func(*ownsandv1.ExecEvent) error) error {
 	g, act, err := f.begin(method, h, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC)
 	if err != nil {
 		return err
+	}
+	if held, herr := f.hold(ctx, act, func() error {
+		return send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}})
+	}); held {
+		return herr
 	}
 	if act.noAccept {
 		return nil
@@ -662,6 +734,16 @@ func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, 
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	if act.acceptedKeepalives > 0 {
+		if err := sendKeepalives(ctx, act.acceptedKeepalives, func() error {
+			return send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}})
+		}); err != nil {
+			return err
+		}
+		if act.abortAfterKeepalives {
+			panic(http.ErrAbortHandler)
+		}
+	}
 	rs := &relaySender{act: act, send: send, ctx: ctx, start: time.Now()}
 	err = cp.agent.serveExec(ctx, cp, e, outOff, errOff, rs.sendEvent)
 	if errors.Is(err, errRotate) {
@@ -690,6 +772,12 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 	if g.opID != req.Msg.GetReadId() || !relaybinding.Equal(g.digest, relaybinding.ReadFileDigest(req.Msg)) {
 		return connect.NewError(connect.CodePermissionDenied, errors.New("digest mismatch"))
 	}
+	readKeepalive := func() error {
+		return stream.Send(&ownsandv1.ReadFileResponse{Event: &ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}}})
+	}
+	if held, herr := f.hold(ctx, act, readKeepalive); held {
+		return herr
+	}
 	if act.noAccept {
 		return nil
 	}
@@ -699,6 +787,14 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 	if act.stallAccepted {
 		<-ctx.Done()
 		return ctx.Err()
+	}
+	if act.acceptedKeepalives > 0 {
+		if err := sendKeepalives(ctx, act.acceptedKeepalives, readKeepalive); err != nil {
+			return err
+		}
+		if act.abortAfterKeepalives {
+			panic(http.ErrAbortHandler)
+		}
 	}
 	chunks := 0
 	err = f.cp.agent.serveRead(req.Msg, func(ev *ownsandv1.FileReadEvent) error {
