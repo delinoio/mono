@@ -150,7 +150,7 @@ Run from the repository root:
 - `pnpm exec turbo run typecheck --filter=delino-ui`: TypeScript type check.
 - `pnpm exec turbo run test --filter=delino-ui`: Rstest unit tests for rendering, props, naming, selection, keyboard and dismissal behavior, and for static (server-rendered) markup: description and error id references, empty descriptions, disabled-field errors, caller ARIA routing and gauge names. `src/components.test.tsx`, `src/disclosure-and-input.test.tsx`, `src/ssr-field-error.test.tsx` and `src/ssr-gauge-name.test.tsx` hold them.
 
-Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI runs its `typecheck` and unit `test` scripts in the `workspace` job whenever a path inside the package changes and for every push to `main`, as the [workflow contract](repository-workflow-contract.md#validation) describes.
+Root `pnpm test` and `pnpm typecheck` include the package. The package has no `build` or `dev` script. CI runs its `typecheck` and unit `test` scripts in the `workspace-packages` job whenever a path inside the package changes and for every push to `main`, as the [workflow contract](repository-workflow-contract.md#validation) describes.
 
 ## Dependencies and Integrations
 

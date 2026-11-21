@@ -117,7 +117,7 @@ The cross-component suite in `servers/ownsand-api/e2e/` (package `e2e`, licensed
 
 - Run it with `OWNSAND_E2E=1 OWNSAND_TEST_DATABASE_URL=<postgres URL whose user may create databases> go test ./servers/ownsand-api/e2e/` from the repository root after `pnpm install` (the TypeScript part needs `pnpm` on `PATH` and is skipped without it). `OWNSAND_E2E_LOGS=1` prints the logs of the child processes also when the tests pass. Without `OWNSAND_E2E=1` or the database URL, or with `-short`, the suite is skipped.
 - `TestLifecycleFirecracker` runs the Go SDK lifecycle with the Firecracker runtime and network `NONE` (including a memory-state restore) when `OWNSAND_FC_TEST_BINARY`, `OWNSAND_FC_TEST_KERNEL` and `OWNSAND_FC_TEST_ROOTFS` name the Firecracker binary, the guest kernel and a root file system from `cmds/ownsand-agent/images/linux/build-rootfs.sh`, like the agent's [Firecracker integration test](cmds-ownsand-agent-foundation.md#build-and-test); it needs `/dev/kvm` access but no root, and CI does not run it.
-- CI runs it in the `go` job with a Postgres service container, according to the [workflow contract](repository-workflow-contract.md#validation).
+- CI runs it in the `go-test` job with a Postgres service container, according to the [workflow contract](repository-workflow-contract.md#validation).
 - It does not cover the `OUTBOUND` network policy (which needs root), the macOS and Windows hypervisor runtimes, signed updates, the WebSocket fallback, real R2, TLS or real Logto, macOS or Windows hosts; those stay part of device acceptance.
 
 ## Change Policy

@@ -91,7 +91,7 @@ Run from the repository root:
 
 `tauri dev` and `tauri build` for desktop compile the Rust crate with CEF. Physical Android and iOS devices load the development server through the LAN address in `TAURI_DEV_HOST`, which the Tauri CLI sets; `rsbuild.config.ts` binds to that address instead of the loopback address, and `turbo.json` passes `TAURI_DEV_HOST` to the `dev` task. Remove `apps/delidev/dist/` after validation.
 
-CI runs the Rust checks in the `rust` job of the [workflow contract](repository-workflow-contract.md#validation) on Ubuntu. CI type-checks and builds the frontend in the `workspace` job of the [workflow contract](repository-workflow-contract.md#validation). CI does not run `tauri build`, mobile builds or the app. The project has no e2e suite yet. The Android and iOS host projects are not generated in the repository yet.
+CI runs the Rust checks in the `rust-fmt`, `rust-clippy` and `rust-test` jobs of the [workflow contract](repository-workflow-contract.md#validation) on Ubuntu. CI type-checks and builds the frontend in the `workspace-packages` job of the [workflow contract](repository-workflow-contract.md#validation). CI does not run `tauri build`, mobile builds or the app. The project has no e2e suite yet. The Android and iOS host projects are not generated in the repository yet.
 
 ## Dependencies and Integrations
 

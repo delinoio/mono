@@ -78,8 +78,9 @@ const workspaceTaskInputs = new Set([
 ]);
 
 // Any path inside a workspace package, or a root input of its tasks, selects
-// the `workspace` job. That job runs the build, lint, typecheck and test tasks
-// of every workspace package, because `turbo run --affected` selects no package
+// the `workspace-packages` and `workspace-servers` jobs. Together they run the
+// build, lint, typecheck and test tasks of every workspace package, because
+// `turbo run --affected` selects no package
 // when only a root input such as `package.json`, `turbo.json` or `go.mod`
 // changes (checked with turbo 2.11.11).
 export function isWorkspaceInput(path) {
@@ -99,8 +100,9 @@ export function isWorkflowInput(path) {
 
 // Protobuf schema inputs: the schemas, the buf configuration, the generation
 // script and the TypeScript generation template and plugin pin of the OwnSand
-// SDK. The Go job lints them, checks breaking changes and fails when the
-// committed Go or TypeScript bindings differ from the generated output.
+// SDK. The protos job, which the `go` output selects, lints them, checks
+// breaking changes and fails when the committed Go or TypeScript bindings
+// differ from the generated output.
 const protoInputs = new Set([
   "protos/buf.yaml",
   "protos/buf.gen.yaml",
@@ -117,10 +119,10 @@ const protoInputs = new Set([
 // selects the Go checks.
 const ownsandSdkPackage = "packages/ownsand-sdk/";
 
-// The Go job installs the workspace dependencies with the Node.js runtime of
-// `.nvmrc` before the Go tests, so the workspace manifests and the lockfile
+// The go-test and protos jobs install the workspace dependencies with the
+// Node.js runtime of `.nvmrc`, so the workspace manifests and the lockfile
 // change what the TypeScript SDK end-to-end test and the protobuf generators
-// run with. The workflow defines the job's steps, services and caches.
+// run with. The workflow defines the jobs' steps, services and caches.
 const goWorkspaceInputs = new Set([
   ".github/workflows/CI.yml",
   ".nvmrc",
@@ -130,7 +132,7 @@ const goWorkspaceInputs = new Set([
 ]);
 
 // The ownsand-api schema migrations, embedded into the service and applied by
-// the Postgres-backed tests and the end-to-end suite that the Go job runs.
+// the Postgres-backed tests and the end-to-end suite that the go-test job runs.
 const ownsandApiMigrations = "servers/ownsand-api/internal/db/migrations/";
 
 // Go sources, module files, protobuf schema inputs and the inputs of the
