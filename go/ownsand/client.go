@@ -141,6 +141,7 @@ type Client struct {
 	snapshots     ownsandv1connect.SnapshotServiceClient
 	dataPath      ownsandv1connect.DataPathServiceClient
 	relay         ownsandv1connect.RelayServiceClient
+	billing       ownsandv1connect.BillingServiceClient
 }
 
 // ErrNoCredential reports a client without an API key or token source.
@@ -219,6 +220,7 @@ func New(opts Options) (*Client, error) {
 	c.snapshots = ownsandv1connect.NewSnapshotServiceClient(c.httpClient, base, interceptors)
 	c.dataPath = ownsandv1connect.NewDataPathServiceClient(c.httpClient, base, interceptors)
 	c.relay = ownsandv1connect.NewRelayServiceClient(c.httpClient, base, interceptors)
+	c.billing = ownsandv1connect.NewBillingServiceClient(c.httpClient, base, interceptors)
 	return c, nil
 }
 

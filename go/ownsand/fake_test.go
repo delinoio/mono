@@ -151,6 +151,9 @@ type fakeCP struct {
 	// response, after the dropped ones, until the caller gives up.
 	stallCreates int
 	createKeys   []string // idempotency_key of each CreateSandbox request
+	// createErr, when set, returns the error of the n-th CreateSandbox
+	// request (from 1), or nil to serve it.
+	createErr func(n int) error
 
 	expiresIn   time.Duration
 	clockOffset time.Duration // added to expire_time: a server clock that differs from the caller's
@@ -176,6 +179,8 @@ type fakeCP struct {
 	// gateErr, when set, is the error that a held request returns right
 	// after it reaches its gate, in place of waiting for the gate.
 	gateErr error
+	// openErr, when set, is the error of every OpenSession request.
+	openErr error
 	// iceServers are the ICE server URLs that GetIceServers returns.
 	iceServers []string
 	iceCalls   int // GetIceServers requests
@@ -213,6 +218,7 @@ func newFakeCP(t testing.TB) *fakeCP {
 	mux.Handle(ownsandv1connect.NewDataPathServiceHandler(&fakeDataPath{cp: cp}, opts))
 	mux.Handle(ownsandv1connect.NewRelayServiceHandler(&fakeRelay{cp: cp}, opts))
 	mux.Handle(ownsandv1connect.NewOrganizationServiceHandler(&fakeOrgs{cp: cp}, opts))
+	mux.Handle(ownsandv1connect.NewBillingServiceHandler(&fakeBilling{cp: cp}, opts))
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cp.mu.Lock()
 		target := cp.redirectTo
@@ -396,6 +402,12 @@ func (f *fakeSandboxes) CreateSandbox(ctx context.Context, req *connect.Request[
 	cp.createCalls++
 	key := req.Msg.GetIdempotencyKey()
 	cp.createKeys = append(cp.createKeys, key)
+	if cp.createErr != nil {
+		if err := cp.createErr(cp.createCalls); err != nil {
+			cp.mu.Unlock()
+			return nil, err
+		}
+	}
 	sb, ok := cp.created[key]
 	if !ok {
 		sb = &ownsandv1.Sandbox{SandboxId: mustID(cp.t), OrganizationId: req.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
@@ -526,9 +538,13 @@ func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[own
 	iceFail := cp.iceFail
 	state := cp.state
 	gate := cp.openGate
+	openErr := cp.openErr
 	cp.mu.Unlock()
 	if err := f.hold(ctx, gate, "open"); err != nil {
 		return nil, err
+	}
+	if openErr != nil {
+		return nil, openErr
 	}
 	switch state {
 	case ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:

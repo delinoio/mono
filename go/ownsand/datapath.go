@@ -136,6 +136,13 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		// starts no relay recovery.
 		return nil, cerr
 	}
+	if IsBillingError(err) {
+		// Billing enforcement rejected GetIceServers or OpenSession. The
+		// relay is rejected for the same reason, so the error ends the
+		// operation instead of a fall back to the relay.
+		c.logger.DebugContext(ctx, "ownsand data path rejected by billing", "sandbox_id", d.s.id, "billing_reason", BillingReasonOf(err).String())
+		return nil, err
+	}
 	var openErr *errP2POpen
 	if !errors.As(err, &openErr) {
 		// OpenSession or GetIceServers failed. An authorization error ends

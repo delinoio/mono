@@ -86,6 +86,34 @@ func errorDetail(err error) *ownsandv1.ErrorDetail {
 	return nil
 }
 
+// BillingReasonOf returns the billing reason of err: the billing_reason of
+// the ErrorDetail of a resource_exhausted *connect.Error in the chain of err,
+// also when a *DataPathError wraps it. It returns
+// BILLING_REASON_UNSPECIFIED when err is not a billing error.
+//
+// Billing enforcement of the control plane rejects a call with such an error
+// when the organization has no linked billing account (ACCOUNT_REQUIRED), is
+// blocked for non-payment (BLOCKED) or is suspended (SUSPENDED). The error is
+// terminal: the SDK never retries it, and the caller must not retry the call
+// until the billing of the organization changes. The message of the
+// *connect.Error names the reason and contains the billing link
+// https://accounts.delino.io.
+func BillingReasonOf(err error) ownsandv1.BillingReason {
+	if err == nil || connect.CodeOf(err) != connect.CodeResourceExhausted {
+		return ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED
+	}
+	if d := errorDetail(err); d != nil {
+		return d.GetBillingReason()
+	}
+	return ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED
+}
+
+// IsBillingError reports whether err is a billing error, a
+// resource_exhausted error with a billing reason (see BillingReasonOf).
+func IsBillingError(err error) bool {
+	return BillingReasonOf(err) != ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED
+}
+
 // failureKind classifies a failed data path attempt.
 type failureKind int
 
@@ -155,6 +183,12 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 	case connect.CodeUnavailable:
 		return failUnavailable, 0
 	case connect.CodeResourceExhausted:
+		if IsBillingError(err) {
+			// A billing error is terminal everywhere, also under relay
+			// recovery and in the CreateSandbox retry: only a change of
+			// the organization's billing can lift it.
+			return failTerminal, 0
+		}
 		var delay time.Duration
 		if d := errorDetail(err); d != nil && d.GetRetryAfter() != nil {
 			delay = d.GetRetryAfter().AsDuration()
