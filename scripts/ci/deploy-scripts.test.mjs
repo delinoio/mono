@@ -1876,6 +1876,21 @@ test(
   },
 );
 
+test(
+  "droplet deploy accepts host name labels of up to 63 characters",
+  { skip },
+  (t) => {
+    for (const hostname of [
+      `${"a".repeat(63)}.example.com`,
+      `api.${"b".repeat(61)}c.com`,
+      "a.b.co",
+    ]) {
+      const result = runDroplet(t, ["api", dropletImage, "8080", hostname]);
+      assert.equal(result.status, 0, `${hostname}: ${result.stderr}`);
+    }
+  },
+);
+
 test("droplet deploy does not reload an unchanged route", { skip }, (t) => {
   const first = runDroplet(t);
   assert.equal(first.status, 0, first.stderr);
@@ -2161,6 +2176,14 @@ test(
       [["api", image, "70000", "api.example.com"], {}, /port/],
       [["api", image, "8080", "localhost"], {}, /host name/],
       [["api", image, "8080", "a.example.com;x"], {}, /host name/],
+      [
+        ["api", image, "8080", `${"a".repeat(64)}.example.com`],
+        {},
+        /host name/,
+      ],
+      [["api", image, "8080", `api.${"a".repeat(64)}.com`], {}, /host name/],
+      [["api", image, "8080", "-a.example.com"], {}, /host name/],
+      [["api", image, "8080", "a-.example.com"], {}, /host name/],
       [
         ["api", image, "8080", "api.example.com"],
         { envFile: null },
