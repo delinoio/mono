@@ -803,6 +803,124 @@ describe("exec over the relay", () => {
     expect(issued[0]).toBe(issued[1]);
   });
 
+  describe("a stalled AuthorizeRelay call", () => {
+    /** A response that never arrives; the fake aborts it with its signal. */
+    const stall = () => new Promise<never>(() => {});
+
+    test("ends the operation with a DataPathError at the end of its own 60-second window, also without a signal", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", stall);
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"] })
+        .wait()
+        .catch((e) => e);
+      let settled = false;
+      outcome.then(() => (settled = true));
+      await h.clock.advance(60_000 - 1);
+      expect(settled).toBe(false);
+      await h.clock.advance(1);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(error.outcomeUnknown).toBe(false);
+      expect(h.clock.now()).toBe(60_000);
+      // The deadline is not retried and sends no Connect timeout.
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      expect(h.api.calls[0]!.headers.get("connect-timeout-ms")).toBeNull();
+      expect(h.api.callsOf("Exec")).toHaveLength(0);
+    });
+
+    test("ends a recovering operation with a DataPathError when the recovery window ends", async () => {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        yield new Sleep(10_000);
+        yield new Disconnect();
+      });
+      h.api.unary(DataPathService, "AuthorizeRelay", (_req, call) =>
+        call.index === 0
+          ? { grantId: "g", expiresIn: { seconds: 900n } }
+          : stall(),
+      );
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.Unavailable);
+      // The window starts at the interruption (10 s) and lasts 60 s.
+      expect(h.clock.now()).toBe(70_000);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+    });
+
+    test("ends with the caller's abort error when the caller cancels first", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", stall);
+      const abort = new AbortController();
+      const reason = new Error("caller gave up");
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: abort.signal })
+        .wait()
+        .catch((e) => e);
+      await h.clock.advance(10_000);
+      abort.abort(reason);
+      const error = await outcome;
+      expect(error).toBe(reason);
+      expect(h.clock.now()).toBe(10_000);
+    });
+
+    test("uses a grant that arrives within the window", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", async () => {
+        await h.clock.sleep(5_000);
+        return { grantId: "late", expiresIn: { seconds: 900n } };
+      });
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      );
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(h.clock.now()).toBe(5_000);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      expect(
+        h.api.callsOf("Exec")[0]!.headers.get("ownsand-relay-grant-id"),
+      ).toBe("late");
+    });
+
+    test("ends with the last error when an attempt fails as the window ends", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", async () => {
+        // The response arrives with an error just before the window ends.
+        await h.clock.sleep(59_900);
+        throw ownsandError(Code.Unavailable, "sandbox unreachable");
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(h.clock.now()).toBe(59_900);
+    });
+  });
+
   test("retries a lost renewal response with the same authorization_id and replaces_grant_id", async () => {
     const h = setup();
     const requests: any[] = [];

@@ -1,10 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-import { ConnectError } from "@connectrpc/connect";
-import { classifyFailure, FailureClass, retryAfterMs } from "../errors.ts";
+import { Code, ConnectError } from "@connectrpc/connect";
+import {
+  classifyFailure,
+  DataPathError,
+  FailureClass,
+  OwnSandError,
+  retryAfterMs,
+} from "../errors.ts";
 import { RelayOperationKind } from "../gen/delino/ownsand/v1/common_pb.ts";
 import { LogEvent, safeLog } from "../logger.ts";
 import { type OperationContext, Timing, throwIfAborted } from "./context.ts";
 import { backoffMs, FixedBudget, type RetryBudget } from "./recovery.ts";
+import { linkedController } from "./stream.ts";
+
+/**
+ * The reason that cancels an `AuthorizeRelay` attempt whose response has not
+ * arrived when its retry window ends. It never reaches the caller: the grant
+ * keeper ends the operation with a `DataPathError` instead.
+ */
+class AuthorizeDeadlineError extends OwnSandError {
+  override name = "AuthorizeDeadlineError";
+}
 
 /** The kind of the relay call that a grant must cover. */
 export enum RelayCallKind {
@@ -115,8 +131,30 @@ export class GrantKeeper {
   ): Promise<string> {
     const authorizationId = this.#ctx.ids.next();
     const replacesGrantId = this.#lastGrantId;
+    let lastError: unknown;
     for (let attempt = 0; ; attempt++) {
       throwIfAborted(signal);
+      // The attempt runs only for the time left in its window. A finite
+      // bound is enforced with a timer and an abort controller, not with a
+      // Connect timeout, so a response that never arrives ends the operation.
+      const left = budget.remainingMs();
+      if (Number.isFinite(left) && left <= 0) {
+        throw lastError === undefined
+          ? this.#deadlineError(undefined)
+          : toConnectError(lastError);
+      }
+      const { controller, dispose } = linkedController(signal);
+      const stop = new AbortController();
+      let deadlineReached = false;
+      if (Number.isFinite(left)) {
+        this.#ctx.clock.sleep(left, stop.signal).then(
+          () => {
+            deadlineReached = true;
+            controller.abort(new AuthorizeDeadlineError("no response"));
+          },
+          () => {},
+        );
+      }
       try {
         const res = await this.#ctx.dataPath.authorizeRelay(
           {
@@ -128,7 +166,7 @@ export class GrantKeeper {
             authorizationId,
             replacesGrantId,
           },
-          { signal },
+          { signal: controller.signal },
         );
         const receivedAt = this.#ctx.clock.now();
         const expiresInMs =
@@ -149,22 +187,47 @@ export class GrantKeeper {
         });
         return res.grantId;
       } catch (error) {
+        // Stop the attempt's timer and listener before any back-off sleep.
+        stop.abort();
+        dispose();
+        // The caller's cancellation wins over the window's deadline.
         throwIfAborted(signal);
+        if (deadlineReached) {
+          // Raised before classification: the abort must not be retried as
+          // an interruption or converted to a Connect error.
+          throw this.#deadlineError(error);
+        }
         const failure = classifyFailure(error);
         if (failure === FailureClass.Terminal) {
           throw error;
         }
+        lastError = error;
         const delay = Math.max(
           backoffMs(attempt),
           failure === FailureClass.ResourceExhausted ? retryAfterMs(error) : 0,
         );
         if (budget.remainingMs() <= delay) {
-          throw error instanceof ConnectError
-            ? error
-            : ConnectError.from(error);
+          throw toConnectError(error);
         }
         await this.#ctx.clock.sleep(delay, signal);
+      } finally {
+        stop.abort();
+        dispose();
       }
     }
   }
+
+  #deadlineError(cause: unknown): DataPathError {
+    return new DataPathError(
+      "AuthorizeRelay got no response within the window",
+      {
+        code: Code.Unavailable,
+        cause,
+      },
+    );
+  }
+}
+
+function toConnectError(error: unknown): ConnectError {
+  return error instanceof ConnectError ? error : ConnectError.from(error);
 }
