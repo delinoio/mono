@@ -23,25 +23,29 @@ Organization owners, admins and members who sign in with Logto.
 - Account settings: the console links to `https://accounts.delino.io`. It has no profile or account pages.
 - The console never calls `ownsand-api`. Device management (enrollment, device limits including the vCPU overcommit, device removal) stays in the [OwnSand console](apps-ownsand-console-foundation.md), and the tide console links to it.
 
-| Route ID        | Path                                 | Content                                                                                                                   | Minimum role |
-| --------------- | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- | ------------ |
-| `organizations` | `/`                                  | Organization list and creation; invitation acceptance entry.                                                              | signed in    |
-| `invitation`    | `/invitations/accept`                | Accept an invitation secret as the signed-in user.                                                                        | signed in    |
-| `github-setup`  | `/github/setup`                      | Callback of the GitHub App installation. Calls `LinkGitHubInstallation` and continues to `integrations`.                  | `admin`      |
-| `overview`      | `/orgs/:organizationId`              | Live queue (waiting requests in queue order), runners by state and the device pool from `GetCapacity`.                    | `member`     |
-| `requests`      | `/orgs/:organizationId/requests`     | Request list with filters, states, end reasons and queue wait; cancel for `admin`.                                        | `member`     |
-| `runners`       | `/orgs/:organizationId/runners`      | Runner list with profile, device, state and end reason; delete for `admin`.                                               | `member`     |
-| `profiles`      | `/orgs/:organizationId/profiles`     | Runner profiles; create, change and delete for `admin`. For `GITHUB_JOB` profiles, shows the `runs-on` label to copy.     | `member`     |
-| `integrations`  | `/orgs/:organizationId/integrations` | OwnSand link, GitHub installations with runner groups, and agent integrations with credential state; changes for `admin`. | `member`     |
-| `members`       | `/orgs/:organizationId/members`      | Members and roles; invitations for `admin` and above.                                                                     | `member`     |
-| `audit`         | `/orgs/:organizationId/audit`        | Audit events.                                                                                                             | `member`     |
-| `settings`      | `/orgs/:organizationId/settings`     | Ownership transfer and organization deletion.                                                                             | `owner`      |
+| Route ID        | Path                                 | Content                                                                                                                                               | Minimum role |
+| --------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------- | ------------ |
+| `organizations` | `/`                                  | Organization list and creation; invitation acceptance entry.                                                                                          | signed in    |
+| `invitation`    | `/invitations/accept`                | Accept an invitation secret as the signed-in user.                                                                                                    | signed in    |
+| `github-setup`  | `/github/setup`                      | Callback of the GitHub App installation. Calls `LinkGitHubInstallation` and continues to `integrations`.                                              | `admin`      |
+| `overview`      | `/orgs/:organizationId`              | Live queue (waiting requests in queue order), runners by state and the device pool from `GetCapacity`.                                                | `member`     |
+| `requests`      | `/orgs/:organizationId/requests`     | Request list with filters, states, end reasons and queue wait; cancel for `admin`.                                                                    | `member`     |
+| `runners`       | `/orgs/:organizationId/runners`      | Runner list with profile, device, state and end reason; delete for `admin`.                                                                           | `member`     |
+| `profiles`      | `/orgs/:organizationId/profiles`     | Runner profiles; create, change and delete for `admin`. For `GITHUB_JOB` profiles, shows the `runs-on` label to copy.                                 | `member`     |
+| `integrations`  | `/orgs/:organizationId/integrations` | OwnSand link, GitHub installations with runner groups, and agent integrations with credential state; changes for `admin`.                             | `member`     |
+| `members`       | `/orgs/:organizationId/members`      | Members and roles; invitations for `admin` and above.                                                                                                 | `member`     |
+| `dev-sessions`  | `/orgs/:organizationId/dev-sessions` | Dev sessions of the organization with owner, profile, guest OS, state and end reason. Delete for the session owner, and for `admin` on every session. | `member`     |
+| `api-keys`      | `/orgs/:organizationId/api-keys`     | The signed-in user's personal API keys: create (shows the secret once), list and revoke.                                                              | `member`     |
+| `audit`         | `/orgs/:organizationId/audit`        | Audit events.                                                                                                                                         | `member`     |
+| `settings`      | `/orgs/:organizationId/settings`     | The per-user dev session limit (`admin`), ownership transfer and organization deletion (`owner`).                                                     | `admin`      |
 
 - The `overview` route uses `WatchQueue` and reconnects when the stream ends.
 - Empty states guide the first setup in this order: link OwnSand, connect GitHub or create an agent integration, create a runner profile. Each empty state names the next step.
 - When the OwnSand link is `INVALID`, every organization route shows a banner that explains that dispatch has stopped and links to `integrations`.
 - Credential forms accept a value once and never show it again. After a save, the form shows only that the credential is set and when.
 - For an `OPENAI_CODEX` integration, the console shows the webhook URL to register in OpenAI.
+- The `profiles` route requires `workspace_path` for `DEV_SESSION` profiles. The `dev-sessions` route shows no command, output or file content, and it does not run commands; commands and file transfers are available only through the CLI, the MCP server and the SDKs.
+- The `api-keys` route shows a new secret once with a copy action and a notice that tide cannot show it again, and explains that the key works only for dev sessions.
 - Organization deletion tells the owner to uninstall the GitHub App in GitHub, because tide cannot uninstall it.
 - The console hides actions that the user's role does not allow; the control plane still enforces every permission.
 - UX follows the Toss Design Guidelines. Dialogs close with `Esc`. A form with a single critical input focuses it when it opens.
@@ -53,8 +57,8 @@ The console stores nothing except the Logto SDK session state in the browser. It
 ## Security
 
 - Credential inputs use password-type fields and are cleared after submission.
-- Destructive actions (OwnSand link removal, GitHub installation unlink, integration deletion, profile deletion, runner deletion, organization deletion, ownership transfer) need an explicit confirmation step.
-- The console shows no runner output.
+- Destructive actions (OwnSand link removal, GitHub installation unlink, integration deletion, profile deletion, runner deletion, dev session deletion, API key revocation, organization deletion, ownership transfer) need an explicit confirmation step.
+- The console shows no runner output and no dev session output. It never stores an API key secret.
 
 ## Logging
 

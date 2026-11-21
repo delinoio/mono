@@ -17,16 +17,18 @@ The SDKs give programs and the [CLI](cmds-tide-cli-foundation.md) typed access t
 
 ## Users and Operators
 
-- The tide CLI (Go SDK).
-- Programs of tide users that read the queue or manage runner profiles with a Logto access token.
+- The tide CLI and the `tide mcp` MCP server (Go SDK).
+- Programs of tide users that read the queue or manage runner profiles with a Logto access token, or that use dev sessions with a Logto access token or a personal API key.
 
 ## Interfaces and Contracts
 
-- A client takes the API origin (default `https://tide.api.delino.io`) and a token source that returns a Logto access token for the API resource `https://tide.api.delino.io`.
+- A client takes the API origin (default `https://tide.api.delino.io`) and a token source that returns a Logto access token for the API resource `https://tide.api.delino.io`, or a personal API key.
 - The SDKs expose every public service of the protos contract with the generated request and response types. They add no behavior that the server does not define.
 - Helpers:
   - Pagination iterators for every list RPC.
   - A `WatchQueue` helper that reconnects after each stream end with exponential backoff (1 second to 30 seconds) and reports a gap when it reconnects, so the caller can reload the state.
+  - Both SDKs: an exec helper that generates the `exec_id`, continues with `AttachDevSessionExec` after each stream end and reports lost output.
+  - Go SDK only: a dev session wait helper (repeated `GetDevSession` until the session is `RUNNING`, ends, or the caller's deadline passes), and the [sync](servers-tide-api-foundation.md#dev-session-sync) and [download](servers-tide-api-foundation.md#dev-session-download) helpers that the CLI and the MCP server share. The Go SDK owns their file selection, manifest, lock, archive, limit and path-safety rules, and the exact guest commands per guest OS, which it records with the implementation.
 - Errors keep the Connect error code.
 
 ## Storage
@@ -45,7 +47,7 @@ The Go SDK logs retries and reconnects at debug level through the caller's logge
 ## Build and Test
 
 - Package scripts `build`, `lint`, `typecheck` and `test` for the TypeScript SDK, and Go tests for the Go SDK. Record them with the implementation.
-- Tests: pagination, `WatchQueue` reconnects and error mapping against a fake server.
+- Tests: pagination, `WatchQueue` reconnects, exec attach after stream rotation and error mapping against a fake server. Go SDK sync and download tests: file selection with tracked, untracked and ignored files, incremental upload and deletion with the manifest, the size limits, case collisions and invalid Windows names, the lock, symbolic links, path traversal on extraction, and a restart after a stopped sync.
 
 ## Dependencies and Integrations
 
