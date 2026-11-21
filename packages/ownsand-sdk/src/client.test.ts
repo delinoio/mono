@@ -16,10 +16,18 @@ import { MemberService } from "./gen/delino/ownsand/v1/member_pb.ts";
 import { OrganizationService } from "./gen/delino/ownsand/v1/organization_pb.ts";
 import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
 import { SandboxService } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
+import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { isUuidV7 } from "./uuidv7.ts";
 import { LostResponse } from "./testing/fake-api.ts";
-import { API_KEY, ORG, SANDBOX, setup } from "./testing/harness.ts";
+import {
+  API_KEY,
+  ev,
+  execMsg,
+  ORG,
+  SANDBOX,
+  setup,
+} from "./testing/harness.ts";
 
 const HOUR = 3_600_000;
 
@@ -144,11 +152,30 @@ describe("credentials", () => {
 
   test("sends relay RPCs with the credential only to the configured origin", async () => {
     const h = setup();
-    h.api.unary(SandboxService, "GetSandbox", () => ({ sandbox: {} }));
-    await h.client.sandbox(SANDBOX).get();
-    expect(h.api.fetchedUrls.every((u) => u.startsWith(h.api.origin))).toBe(
-      true,
+    h.api.stream(RelayService, "Exec", function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["/bin/true"] });
+    const result = await h.clock.run(handle.wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+
+    const execCalls = h.api.callsOf("Exec");
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0]!.headers.get("authorization")).toBe(
+      `Bearer ${API_KEY}`,
     );
+    const execUrls = h.api.fetchedUrls.filter((u) =>
+      new URL(u).pathname.endsWith("/Exec"),
+    );
+    expect(execUrls).toHaveLength(1);
+    expect(new URL(execUrls[0]!).origin).toBe(new URL(h.api.origin).origin);
+    expect(
+      h.api.fetchedUrls.every(
+        (u) => new URL(u).origin === new URL(h.api.origin).origin,
+      ),
+    ).toBe(true);
   });
 
   test("redacts the credential from errors", async () => {
