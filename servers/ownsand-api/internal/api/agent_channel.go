@@ -11,6 +11,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -187,15 +188,43 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 
 // markOffline sets the device offline after its current channel closed.
 // Its non-terminal sandboxes then show as UNREACHABLE.
+//
+// The closing channel was current when Unregister removed it, but a
+// replacement channel may have registered, and its state report may have
+// committed ONLINE, before this write. The write therefore runs under the
+// hub's device fence and only while the device has no registered channel:
+// either the replacement registered first and the write is skipped, or the
+// replacement registers after the check, and its state report cannot
+// commit ONLINE before this transaction commits, because the transaction
+// holds the device row lock until then. The replacement's state report
+// then sets the device ONLINE after the write.
+//
+// Lock order: the device row lock is taken first (as the state report
+// transaction does), and the fence second.
 func (s *Service) markOffline(ctx context.Context, deviceID string) {
-	tag, err := s.DB.Pool.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1 AND state = $3",
-		deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE))
-	if err != nil {
-		s.Logger.WarnContext(ctx, "device_offline_update_failed", slog.String("device_id", deviceID), slog.Any("error", err))
-		return
-	}
-	if tag.RowsAffected() > 0 {
-		s.Logger.InfoContext(ctx, "device_offline", slog.String("device_id", deviceID))
+	log := s.Logger.With(slog.String("device_id", deviceID))
+	var offline, ran bool
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		offline, ran = false, false
+		if _, err := tx.Exec(ctx, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE", deviceID); err != nil {
+			return err
+		}
+		var execErr error
+		ran = s.Hub.IfNoChannel(deviceID, func() {
+			var tag pgconn.CommandTag
+			tag, execErr = tx.Exec(ctx, "UPDATE devices SET state = $2 WHERE device_id = $1 AND state = $3",
+				deviceID, int16(ownsandv1.DeviceState_DEVICE_STATE_OFFLINE), int16(ownsandv1.DeviceState_DEVICE_STATE_ONLINE))
+			offline = execErr == nil && tag.RowsAffected() > 0
+		})
+		return execErr
+	})
+	switch {
+	case err != nil:
+		log.WarnContext(ctx, "device_offline_update_failed", slog.Any("error", err))
+	case !ran:
+		log.InfoContext(ctx, "device_offline_skipped", slog.String("reason", "a newer agent channel is registered"))
+	case offline:
+		log.InfoContext(ctx, "device_offline")
 	}
 }
 
