@@ -23,7 +23,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	"github.com/delinoio/mono/go/ownsand/version"
 )
 
 // BuiltinKeys are the release public keys built into the agent. A release

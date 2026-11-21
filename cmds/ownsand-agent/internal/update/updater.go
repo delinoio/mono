@@ -19,7 +19,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	"github.com/delinoio/mono/go/ownsand/version"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
