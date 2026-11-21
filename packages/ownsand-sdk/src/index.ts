@@ -18,8 +18,10 @@ export {
   requestDigest,
 } from "./digest.ts";
 export {
+  billingReasonOf,
   DataPathError,
   InvalidFrameError,
+  isBillingError,
   OwnSandConfigError,
   OwnSandError,
   OwnSandValidationError,
@@ -44,3 +46,8 @@ export { type ExecOptions, type RunResult, Sandbox } from "./sandbox.ts";
 export { isUuidV7, UuidV7Generator } from "./uuidv7.ts";
 export * from "./gen/delino/ownsand/v1/common_pb.ts";
 export { ExecFailureReason } from "./gen/delino/ownsand/v1/data_frame_pb.ts";
+export {
+  BillingAccountRole,
+  BillingMeter,
+  BillingPhase,
+} from "./gen/delino/ownsand/v1/billing_pb.ts";

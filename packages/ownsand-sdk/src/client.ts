@@ -24,6 +24,7 @@ import {
   OwnSandError,
 } from "./errors.ts";
 import { ApiKeyService } from "./gen/delino/ownsand/v1/api_key_pb.ts";
+import { BillingService } from "./gen/delino/ownsand/v1/billing_pb.ts";
 import type {
   Arch,
   BaseImage,
@@ -123,6 +124,11 @@ export class OwnSandClient {
   readonly snapshots: Client<typeof SnapshotService>;
   readonly dataPath: Client<typeof DataPathService>;
   readonly relay: Client<typeof RelayService>;
+  /**
+   * Billing status, usage and the billing account link. Payments, top-ups
+   * and billing account management stay on https://accounts.delino.io.
+   */
+  readonly billing: Client<typeof BillingService>;
   readonly #clock: Clock;
   readonly #ids: UuidV7Generator;
   readonly #activity = new ActivityRegistry();
@@ -170,6 +176,7 @@ export class OwnSandClient {
     this.snapshots = createClient(SnapshotService, transport);
     this.dataPath = createClient(DataPathService, transport);
     this.relay = createClient(RelayService, transport);
+    this.billing = createClient(BillingService, transport);
   }
 
   #org(override: string | undefined): string {

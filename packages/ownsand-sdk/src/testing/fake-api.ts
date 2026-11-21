@@ -10,6 +10,7 @@ import {
 import { Code, ConnectError } from "@connectrpc/connect";
 import { ErrorDetailSchema } from "../gen/delino/ownsand/v1/common_pb.ts";
 import { ApiKeyService } from "../gen/delino/ownsand/v1/api_key_pb.ts";
+import { BillingService } from "../gen/delino/ownsand/v1/billing_pb.ts";
 import { DataPathService } from "../gen/delino/ownsand/v1/data_path_pb.ts";
 import { DeviceService } from "../gen/delino/ownsand/v1/device_pb.ts";
 import { MemberService } from "../gen/delino/ownsand/v1/member_pb.ts";
@@ -75,6 +76,7 @@ const SERVICES = [
   SnapshotService,
   DataPathService,
   RelayService,
+  BillingService,
 ];
 
 const METHODS = new Map<string, DescMethod>();
@@ -358,7 +360,11 @@ function toMessage(
 export function ownsandError(
   code: Code,
   message: string,
-  detail: { retryAfterMs?: number; sessionEndReason?: number } = {},
+  detail: {
+    retryAfterMs?: number;
+    sessionEndReason?: number;
+    billingReason?: number;
+  } = {},
 ): ConnectError {
   return new ConnectError(message, code, undefined, [
     {
@@ -374,6 +380,7 @@ export function ownsandError(
                 nanos: (detail.retryAfterMs % 1000) * 1e6,
               },
         sessionEndReason: detail.sessionEndReason ?? 0,
+        billingReason: detail.billingReason ?? 0,
       },
     },
   ]);
