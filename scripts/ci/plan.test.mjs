@@ -464,6 +464,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
     "servers/ownsand-api/internal/db/migrations/0001_initial.sql",
+    "servers/accounts-api/internal/db/migrations/00001_billing_accounts.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
     "go/example/testdata/case.golden",
     "cmds/example/internal/testdata/input.json",
