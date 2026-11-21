@@ -6,6 +6,7 @@ package dataplane
 
 import (
 	"context"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -273,4 +274,198 @@ func TestSessionEndInterruptsBackpressuredSend(t *testing.T) {
 		t.Fatal("revoked session kept")
 	}
 	release()
+}
+
+// silentSTUN is a loopback UDP socket that never answers, so the ICE
+// gathering of an offer that uses it as STUN server waits for the STUN
+// timeout of pion (5 seconds) instead of finishing at once. That keeps an
+// offer in its gathering step for a test.
+func silentSTUN(t *testing.T) string {
+	t.Helper()
+	conn, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	return "stun:" + conn.LocalAddr().String()
+}
+
+// newGatheringPlane returns a data plane whose offers gather candidates
+// until the STUN timeout.
+func newGatheringPlane(w *world, stunURL string) *DataPlane {
+	dp := New(Options{Dispatcher: w.d, Sandboxes: w.m, Logger: logger(), IncludeLoopback: true, InterfaceFilter: loopbackOnly})
+	dp.Configure([]string{stunURL})
+	w.t.Cleanup(dp.Close)
+	return dp
+}
+
+// startOffer starts an offer on ch in a goroutine and returns its session ID
+// and the channel of its answer.
+func (w *world) startOffer(t *testing.T, dp *DataPlane, ch *fakeChannel) (*caller, string, <-chan *ownsandv1.SignalingAnswer) {
+	t.Helper()
+	c, sdp := newCaller(t, DataChannelLabel)
+	id := newID(t)
+	answers := make(chan *ownsandv1.SignalingAnswer, 1)
+	go func() {
+		answers <- dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: id, SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: sdp})
+	}()
+	return c, id, answers
+}
+
+// waitGathering waits until the offer of the session ID gathers candidates
+// and returns its session.
+func waitGathering(t *testing.T, dp *DataPlane, id string) *session {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for time.Now().Before(deadline) {
+		dp.mu.Lock()
+		s := dp.sessions[id]
+		dp.mu.Unlock()
+		if s != nil && s.pc.ICEGatheringState() == webrtc.ICEGatheringStateGathering {
+			return s
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("offer did not start to gather candidates")
+	return nil
+}
+
+func (d *DataPlane) sessionCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.sessions)
+}
+
+func requireNoSession(t *testing.T, dp *DataPlane) {
+	t.Helper()
+	if n := dp.sessionCount(); n != 0 {
+		t.Fatalf("%d sessions in the session map, want 0", n)
+	}
+}
+
+// requireEndedAnswer fails unless the offer returns an error answer without
+// an SDP body before the silent STUN server times out its gathering.
+func requireEndedAnswer(t *testing.T, answers <-chan *ownsandv1.SignalingAnswer) {
+	t.Helper()
+	select {
+	case a := <-answers:
+		if a.GetError() == nil || a.GetSdp() != "" {
+			t.Fatalf("answer %v, want an error answer without an SDP body", a)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("offer did not end before the gathering timeout")
+	}
+}
+
+// A revocation that arrives while the offer gathers candidates ends the
+// session with REVOKED and the offer returns an error answer.
+func TestRevokeDuringOfferGathering(t *testing.T) {
+	w := newWorld(t)
+	dp := newGatheringPlane(w, silentSTUN(t))
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	_, id, answers := w.startOffer(t, dp, ch)
+	s := waitGathering(t, dp, id)
+	dp.Revoke(ch, &ownsandv1.SessionRevocation{RevocationId: "r", Target: &ownsandv1.SessionRevocation_SessionId{SessionId: id}})
+	requireEndedAnswer(t, answers)
+	requireNoSession(t, dp)
+	s.mu.Lock()
+	reason := s.endReason
+	s.mu.Unlock()
+	if reason != ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED {
+		t.Fatalf("end reason %v", reason)
+	}
+	if st := s.pc.ConnectionState(); st != webrtc.PeerConnectionStateClosed {
+		t.Fatalf("peer connection state %v", st)
+	}
+}
+
+// Close ends a session whose offer gathers candidates: none exists after
+// Close returns.
+func TestCloseDuringOfferGathering(t *testing.T) {
+	w := newWorld(t)
+	dp := newGatheringPlane(w, silentSTUN(t))
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	_, id, answers := w.startOffer(t, dp, ch)
+	waitGathering(t, dp, id)
+	dp.Close()
+	requireNoSession(t, dp)
+	requireEndedAnswer(t, answers)
+	requireNoSession(t, dp)
+}
+
+// A lost channel cancels its pending offer and closes its peer connection;
+// an offer on a live channel continues and gets its answer.
+func TestChannelLostDuringOfferGathering(t *testing.T) {
+	w := newWorld(t)
+	dp := newGatheringPlane(w, silentSTUN(t))
+	lost, live := newChannel(1), newChannel(2)
+	dp.ChannelOpened(lost)
+	dp.ChannelOpened(live)
+	_, lostID, lostAnswers := w.startOffer(t, dp, lost)
+	liveCaller, liveID, liveAnswers := w.startOffer(t, dp, live)
+	lostSession := waitGathering(t, dp, lostID)
+	waitGathering(t, dp, liveID)
+	lost.Close()
+	dp.ChannelLost(lost)
+	requireEndedAnswer(t, lostAnswers)
+	dp.mu.Lock()
+	_, lostKept := dp.sessions[lostID]
+	_, liveKept := dp.sessions[liveID]
+	dp.mu.Unlock()
+	if lostKept || !liveKept {
+		t.Fatalf("lost session in map: %v, live session in map: %v", lostKept, liveKept)
+	}
+	if st := lostSession.pc.ConnectionState(); st != webrtc.PeerConnectionStateClosed {
+		t.Fatalf("peer connection state %v", st)
+	}
+	select {
+	case a := <-liveAnswers:
+		liveCaller.accept(a)
+	case <-time.After(15 * time.Second):
+		t.Fatal("offer on the live channel did not return")
+	}
+}
+
+// An offer whose channel closes without a ChannelLost call ends too.
+func TestChannelDoneDuringOfferGathering(t *testing.T) {
+	w := newWorld(t)
+	dp := newGatheringPlane(w, silentSTUN(t))
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	_, id, answers := w.startOffer(t, dp, ch)
+	waitGathering(t, dp, id)
+	ch.Close()
+	requireEndedAnswer(t, answers)
+	requireNoSession(t, dp)
+}
+
+// A channel that closed before the offer started cancels it before it
+// gathers.
+func TestOfferOnClosedChannel(t *testing.T) {
+	w := newWorld(t)
+	dp := newPlane(w, Timing{})
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	ch.Close()
+	_, sdp := newCaller(t, DataChannelLabel)
+	a := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: sdp})
+	if a.GetError() == nil || a.GetSdp() != "" {
+		t.Fatalf("answer %v", a)
+	}
+	requireNoSession(t, dp)
+}
+
+// A failed answer leaves no session in the map.
+func TestFailedOfferLeavesNoSession(t *testing.T) {
+	w := newWorld(t)
+	dp := newPlane(w, Timing{})
+	ch := newChannel(1)
+	dp.ChannelOpened(ch)
+	a := dp.Offer(context.Background(), ch, &ownsandv1.SignalingOffer{SessionId: newID(t), SandboxId: w.sandbox, ExpiresIn: durationpb.New(time.Hour), Sdp: "not an sdp"})
+	if a.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
+		t.Fatalf("answer %v", a)
+	}
+	requireNoSession(t, dp)
 }
