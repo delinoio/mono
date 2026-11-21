@@ -48,26 +48,47 @@ export async function* chunkSource(
   source: WriteSource,
   size: number = MAX_FILE_CHUNK_SIZE,
 ): AsyncGenerator<{ data: Uint8Array; last: boolean }> {
-  let pending = new Uint8Array(0);
+  // Unconsumed pieces plus a read offset into the first one. Each chunk is
+  // copied once, so the total copy volume is linear in the input size. The
+  // caller's buffers are never aliased: an unacknowledged chunk can be resent
+  // after a failure while the caller mutates its own buffer.
+  const pieces: Uint8Array[] = [];
+  let offset = 0;
+  let pendingLength = 0;
   let held: Uint8Array | undefined;
+  const take = (n: number): Uint8Array => {
+    const out = new Uint8Array(n);
+    let filled = 0;
+    while (filled < n) {
+      const head = pieces[0]!;
+      const count = Math.min(n - filled, head.length - offset);
+      out.set(head.subarray(offset, offset + count), filled);
+      filled += count;
+      offset += count;
+      if (offset === head.length) {
+        pieces.shift();
+        offset = 0;
+      }
+    }
+    pendingLength -= n;
+    return out;
+  };
   for await (const piece of iterateSource(source)) {
-    const joined = new Uint8Array(pending.length + piece.length);
-    joined.set(pending, 0);
-    joined.set(piece, pending.length);
-    pending = joined;
-    while (pending.length >= size) {
+    if (piece.length === 0) continue;
+    pieces.push(piece);
+    pendingLength += piece.length;
+    while (pendingLength >= size) {
       if (held !== undefined) {
         yield { data: held, last: false };
       }
-      held = pending.slice(0, size);
-      pending = pending.slice(size);
+      held = take(size);
     }
   }
-  if (pending.length > 0) {
+  if (pendingLength > 0) {
     if (held !== undefined) {
       yield { data: held, last: false };
     }
-    held = pending;
+    held = take(pendingLength);
   }
   yield { data: held ?? new Uint8Array(0), last: true };
 }

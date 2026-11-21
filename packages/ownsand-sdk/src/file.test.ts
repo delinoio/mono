@@ -361,4 +361,67 @@ describe("chunkSource", () => {
       [4, true],
     ]);
   });
+
+  test("copies a bounded volume for large single-piece and split inputs", async () => {
+    const size = 1024;
+    const total = 64 * 1024 * 1024;
+    const input = new Uint8Array(total);
+    for (let i = 0; i < total; i += 4099) input[i] = (i / 4099) & 0xff;
+
+    async function* split() {
+      const lengths = [size - 1, size + 1, 3 * size + 7, 17, 5 * size];
+      let at = 0;
+      for (let n = 0; at < total; n++) {
+        const len = Math.min(lengths[n % lengths.length]!, total - at);
+        yield input.subarray(at, at + len);
+        at += len;
+      }
+    }
+
+    const slice = Uint8Array.prototype.slice;
+    const set = Uint8Array.prototype.set;
+    let copied = 0;
+    Uint8Array.prototype.slice = function (
+      this: Uint8Array,
+      ...args: Parameters<Uint8Array["slice"]>
+    ) {
+      const out = slice.apply(this, args);
+      copied += out.length;
+      return out;
+    } as typeof slice;
+    Uint8Array.prototype.set = function (
+      this: Uint8Array,
+      array: ArrayLike<number>,
+      offset?: number,
+    ) {
+      copied += array.length;
+      return set.call(this, array, offset);
+    } as typeof set;
+
+    try {
+      for (const source of [input, split()]) {
+        copied = 0;
+        const chunks: Uint8Array[] = [];
+        let lasts = 0;
+        for await (const c of chunkSource(source, size)) {
+          chunks.push(c.data);
+          if (c.last) lasts++;
+        }
+        expect(copied).toBeLessThanOrEqual(2 * total);
+        expect(lasts).toBe(1);
+        expect(chunks.slice(0, -1).every((c) => c.length === size)).toBe(true);
+        expect(chunks.reduce((n, c) => n + c.length, 0)).toBe(total);
+        const joined = new Uint8Array(total);
+        let at = 0;
+        for (const c of chunks) {
+          joined.set(c, at);
+          at += c.length;
+        }
+        expect(Buffer.compare(joined, input)).toBe(0);
+      }
+    } finally {
+      Uint8Array.prototype.slice = slice;
+      Uint8Array.prototype.set = set;
+    }
+  });
 });
