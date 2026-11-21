@@ -61,13 +61,30 @@ export class PeerUnavailableError extends OwnSandError {
   override name = "PeerUnavailableError";
 }
 
+/**
+ * `OpenSession` reported `failed_precondition`: the sandbox is not `RUNNING`
+ * (for example `PAUSED`, where an `AttachExec` still works on the relay). The
+ * operation uses the relay for this attempt and the handle stays on
+ * peer-to-peer, so the next operation calls `OpenSession` again. This is
+ * neither a `PeerUnavailableError` (that moves the handle to the relay for
+ * good) nor an authorization error (that ends the operation). `cause` is the
+ * `ConnectError` that a forced peer-to-peer transport returns to the caller.
+ */
+export class SessionNotOpenError extends OwnSandError {
+  override name = "SessionNotOpenError";
+  declare readonly cause: ConnectError;
+
+  constructor(cause: ConnectError) {
+    super("OpenSession reported a sandbox that is not running", { cause });
+  }
+}
+
 /** Connect codes of an `OpenSession` failure that end the operation. */
 const AUTHORIZATION_CODES: ReadonlySet<Code> = new Set([
   Code.Unauthenticated,
   Code.PermissionDenied,
   Code.NotFound,
   Code.InvalidArgument,
-  Code.FailedPrecondition,
 ]);
 
 /** Largest data channel send buffer before the session waits. */
@@ -195,6 +212,12 @@ export class PeerSession {
         ) {
           throw error;
         }
+        if (
+          error instanceof ConnectError &&
+          error.code === Code.FailedPrecondition
+        ) {
+          throw new SessionNotOpenError(error);
+        }
         throw new PeerUnavailableError("OpenSession failed", { cause: error });
       }
       // The answer carries the agent's DTLS fingerprint; the WebRTC stack
@@ -211,6 +234,7 @@ export class PeerSession {
       if (
         error instanceof ConnectError ||
         error instanceof PeerUnavailableError ||
+        error instanceof SessionNotOpenError ||
         signal?.aborted
       ) {
         throw error;
