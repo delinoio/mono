@@ -544,6 +544,66 @@ test("missing service or project names fail", () => {
   assert.throws(() => plan(status(["web", "1.0.0"]), site), /deploy.project/);
 });
 
+test("a Pages project name must be one the provider accepts", () => {
+  const site = (project) => [
+    pkg("apps/web", {
+      name: "web",
+      deploy: { target: DeployTarget.CloudflarePages, project },
+    }),
+  ];
+  for (const project of [
+    "bad name",
+    "Bad-Name",
+    "bad_name",
+    "bad.name",
+    "bad/name",
+    " bad",
+    "bad ",
+    "-bad",
+    "bad-",
+  ]) {
+    assert.throws(
+      () => plan(status(["web", "1.0.0"]), site(project)),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError, project);
+        assert.match(error.message, /^web: deploy\.project/, project);
+        return true;
+      },
+      project,
+    );
+  }
+  for (const project of ["web", "a", "a-site", "site2", "a-b-c"]) {
+    const result = plan(status(["web", "1.0.0"]), site(project));
+    assert.equal(result.staticSites[0].project, project);
+  }
+});
+
+test("check rejects an invalid Pages project name before any build", () => {
+  const workDir = mkdtempSync(join(tmpdir(), "deploy-plan-project-"));
+  try {
+    mkdirSync(join(workDir, ".changeset"));
+    writeFileSync(join(workDir, ".changeset", "brave-cats.md"), "---\n---\n");
+    mkdirSync(join(workDir, "apps/web"), { recursive: true });
+    writeFileSync(
+      join(workDir, "apps/web", "package.json"),
+      JSON.stringify({
+        name: "web",
+        deploy: { target: "cloudflare-pages", project: "Bad_Name" },
+      }),
+    );
+    assert.throws(
+      () => check(workDir),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError);
+        assert.match(error.message, /^web: deploy\.project/);
+        return true;
+      },
+    );
+  } finally {
+    rmSync(workDir, { recursive: true, force: true });
+  }
+});
+
 test("ties break alphabetically among packages that are ready", () => {
   const sites = [
     pkg("apps/a", {

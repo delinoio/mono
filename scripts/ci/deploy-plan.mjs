@@ -65,6 +65,12 @@ const dropletServiceName = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const dropletHostname =
   /^(?=.{1,253}$)[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+$/;
 
+// A Cloudflare Pages project name is passed to `wrangler pages deploy
+// --project-name`. The provider accepts only lowercase letters, digits and
+// hyphens, beginning and ending with a letter or digit, so the planner rejects
+// other names before any build or upload. It sets no length limit here.
+const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
 // The container listens on this port inside its own network namespace. Ports
 // below 1024 need privileges that the non-root server images do not have.
 const minimumDropletPort = 1024;
@@ -158,6 +164,11 @@ function deployable(pkg) {
   }
   if (typeof deploy.project !== "string" || deploy.project === "") {
     throw new DeployPlanError(`${name}: deploy.project is required`);
+  }
+  if (!pagesProjectName.test(deploy.project)) {
+    throw new DeployPlanError(
+      `${name}: deploy.project must contain only lowercase letters, digits and hyphens, and must begin and end with a letter or digit`,
+    );
   }
   const raw = deploy.output ?? "dist";
   // The output must be a directory inside the package, never the package
