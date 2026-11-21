@@ -7,11 +7,14 @@ import (
 	"context"
 	"encoding/json"
 	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
@@ -389,4 +392,138 @@ func TestStateReportCopyRecoveryCommitOrder(t *testing.T) {
 			t.Fatalf("copy rows = %v", got)
 		}
 	})
+}
+
+// snapshotReportOutcome is the result of a state report transaction.
+type snapshotReportOutcome struct {
+	removed bool
+	err     error
+}
+
+// reconcileAsync applies a state report of deviceID that lists snapID as a
+// READY copy, without an agent channel, so the test controls when the
+// transaction runs.
+func reconcileAsync(t *testing.T, env *testenv.Env, deviceID, snapID string) <-chan snapshotReportOutcome {
+	t.Helper()
+	epoch, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	report := &ownsandv1.StateReport{StateEpoch: epoch, Snapshots: []*ownsandv1.SnapshotStateEntry{readySnapshotEntry(snapID)}}
+	done := make(chan snapshotReportOutcome, 1)
+	go func() {
+		removed, err := env.App.Service.ReconcileStateReportForTest(context.Background(), deviceID, report)
+		done <- snapshotReportOutcome{removed: removed, err: err}
+	}()
+	return done
+}
+
+func waitSnapshotReport(t *testing.T, done <-chan snapshotReportOutcome) snapshotReportOutcome {
+	t.Helper()
+	select {
+	case out := <-done:
+		requireNoDeadlock(t, "state report", out.err)
+		if out.err != nil {
+			t.Fatalf("state report transaction failed: %v", out.err)
+		}
+		return out
+	case <-time.After(15 * time.Second):
+		t.Fatal("the state report transaction did not finish")
+		return snapshotReportOutcome{}
+	}
+}
+
+// TestStateReportCopyRecoveryWithOrganizationDeletion starts a state report
+// of device B that lists a copy of a snapshot exported from device A and
+// an organization deletion together. The report locks the snapshot of
+// device A, and the deletion removes device A (and so locks its exported
+// snapshots) before it removes device B. If the report held the device row
+// of B while it waited for that snapshot, the deletion would wait for B and
+// the two transactions would deadlock. The test holds the device row of B
+// so that the report and the deletion queue behind it, releases it, and
+// expects both to finish without a deadlock.
+func TestStateReportCopyRecoveryWithOrganizationDeletion(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	_, _ = setupAgent(t, env, org, nil)
+	snapID := exportedSnapshot(t, org)
+	devB, _ := setupAgent(t, env, org, nil)
+
+	holder, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, "SELECT 1 FROM devices WHERE device_id = $1 FOR UPDATE", devB.ID); err != nil {
+		t.Fatal(err)
+	}
+	reported := reconcileAsync(t, env, devB.ID, snapID)
+	waitLockWaiters(t, env, 1)
+
+	deleteDone := make(chan error, 1)
+	go func() {
+		_, err := org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: org.ID}))
+		deleteDone <- err
+	}()
+	// The deletion waits for the device row of B, or for the organization
+	// lock that the report holds.
+	waitLockWaiters(t, env, 2)
+	if err := holder.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	waitSnapshotReport(t, reported)
+	select {
+	case err := <-deleteDone:
+		requireNoDeadlock(t, "organization deletion", err)
+		if err != nil {
+			t.Fatalf("organization deletion: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the organization deletion did not finish")
+	}
+	logs := env.Logs.String()
+	if strings.Contains(logs, "40P01") || strings.Contains(strings.ToLower(logs), "deadlock detected") {
+		t.Fatalf("the server logged a deadlock:\n%s", logs)
+	}
+}
+
+// TestStateReportAfterOrganizationDeletionCommits holds the organization lock
+// like a deletion, so that a state report that lists a copy waits for it
+// before it takes any device or snapshot lock. After the deletion commits,
+// the report finds no organization and changes nothing, like a report of a
+// removed device.
+func TestStateReportAfterOrganizationDeletionCommits(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	_, _ = setupAgent(t, env, org, nil)
+	snapID := exportedSnapshot(t, org)
+	devB, _ := setupAgent(t, env, org, nil)
+
+	holder, err := env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", org.ID); err != nil {
+		t.Fatal(err)
+	}
+	reported := reconcileAsync(t, env, devB.ID, snapID)
+	// The report waits for the organization lock, before any device lock.
+	waitForLockWaiter(t, env, "FROM organizations WHERE organization_id", "FOR KEY SHARE")
+
+	if _, err := holder.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", org.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if out := waitSnapshotReport(t, reported); !out.removed {
+		t.Fatal("the report that waited for the organization deletion was applied")
+	}
+	if got := copyDevices(t, env, snapID); len(got) != 0 {
+		t.Fatalf("copy rows after the deletion = %v", got)
+	}
 }

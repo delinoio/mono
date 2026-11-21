@@ -155,18 +155,53 @@ type reconcileResult struct {
 // online in the same transaction, so the device is eligible only after its
 // report was applied.
 //
-// Lock order: the transaction locks the device row first and keeps the lock
-// to commit, then the sandbox rows, like removeDeviceTx, which updates the
-// device row before it ends the device's sandboxes. A removal that commits
-// first makes the report a no-op (reconcileResult.removed); a report that
-// commits first is followed by the removal, which ends the sandboxes.
+// Lock order: the transaction takes FOR KEY SHARE on the organization row
+// first, then locks the device row and keeps the lock to commit, then the
+// snapshot and sandbox rows, like removeDeviceTx, which updates the device
+// row before it ends the device's sandboxes. A removal that commits first
+// makes the report a no-op (reconcileResult.removed); a report that commits
+// first is followed by the removal, which ends the sandboxes.
+//
+// The organization lock serializes the report with an organization
+// deletion, which removes the devices of the organization one at a time and
+// locks the exported snapshots of each removed device. A report of device B
+// that locks a snapshot exported from device A while it holds the row of B
+// would otherwise wait for a deletion that already removed A and waits for
+// B. FOR KEY SHARE lets reports of one organization run together, and it
+// conflicts with the FOR UPDATE of the deletion: a deletion that started
+// first makes the report wait before it takes any device or snapshot lock
+// (then it finds no organization and changes nothing), and a report that
+// started first finishes before the deletion takes its first device lock.
+// Enroll uses the same order (see EnrollDevice).
 func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, report *ownsandv1.StateReport) (reconcileResult, error) {
 	var out reconcileResult
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		out = reconcileResult{}
+		// Step 1 resolves the organization without a lock, so the
+		// transaction never holds the device lock while it waits for the
+		// organization lock. The organization of a device never changes.
+		var orgID string
+		err := tx.QueryRow(ctx, "SELECT organization_id::text FROM devices WHERE device_id = $1", deviceID).Scan(&orgID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			out.removed = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", orgID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// The organization was deleted: its devices are removed.
+			out.removed = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
 		var state int16
 		var capabilities []byte
-		err := tx.QueryRow(ctx, "SELECT state, capabilities FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&state, &capabilities)
+		err = tx.QueryRow(ctx, "SELECT state, capabilities FROM devices WHERE device_id = $1 FOR UPDATE", deviceID).Scan(&state, &capabilities)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_REMOVED) {
 			out.removed = true
 			return nil
@@ -250,14 +285,16 @@ func (s *Service) reconcileStateReport(ctx context.Context, deviceID string, rep
 // lost channel or a restart loses) and returns the number of rows it
 // created.
 //
-// Lock order: the device row first (the order of device removal), then the
-// snapshot rows in snapshot_id order in one statement, so that reports of
-// different devices that share an exported snapshot never wait on each
-// other in opposite orders. The snapshot row lock conflicts with the one
-// that DeleteSnapshot takes: when the report commits first, the deletion
-// reads the recovered row and records an event for the device; when the
-// deletion commits first, the report finds no record, creates no row and
-// the report's unknown-snapshot rule schedules the stale-copy clean-up.
+// Lock order: the organization (FOR KEY SHARE) and the device row first, as
+// reconcileStateReport takes them (the order of device removal and
+// organization deletion), then the snapshot rows in snapshot_id order in
+// one statement, so that reports of different devices that share an
+// exported snapshot never wait on each other in opposite orders. The
+// snapshot row lock conflicts with the one that DeleteSnapshot takes: when
+// the report commits first, the deletion reads the recovered row and
+// records an event for the device; when the deletion commits first, the
+// report finds no record, creates no row and the report's unknown-snapshot
+// rule schedules the stale-copy clean-up.
 func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID string, entries []*ownsandv1.SnapshotStateEntry) (int, error) {
 	listed := map[string]*ownsandv1.SnapshotStateEntry{}
 	var readyIDs []string
