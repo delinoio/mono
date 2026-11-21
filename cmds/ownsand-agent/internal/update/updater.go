@@ -321,7 +321,9 @@ func (u *Updater) fail(target string) {
 	u.mu.Lock()
 	u.installing = false
 	u.artifact = ""
-	u.revokedRunning = false
+	// revokedRunning is deliberately kept: it describes the running version
+	// from a verified manifest, not the failed install attempt, so creates stay
+	// blocked until a later install replaces the revoked version.
 	u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED
 	u.target = target
 	u.mu.Unlock()
