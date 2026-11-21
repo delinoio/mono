@@ -70,7 +70,9 @@ The API server is the system of record for account and billing information: bill
 | `accounts:billing`      | End-user access token           | `BillingAccountService`, `CreditService` and `BillingUsageService` |
 | `accounts:report-usage` | Machine-to-machine access token | `UsageService`                                                     |
 
+- A missing, expired or otherwise invalid token, and an ID token, fail with `unauthenticated`. A valid token without the scope of the service fails with `permission_denied`.
 - Logto client credentials tokens carry the application ID as `sub`, equal to `client_id`. The server accepts `UsageService` calls only with such a machine-to-machine token, and rejects machine-to-machine tokens on the user services, with `permission_denied` in both cases. Only the machine-to-machine applications of consuming services get the role that holds `accounts:report-usage`.
+- Service mapping: the server maps each machine-to-machine client ID to the `ServiceId` values that it may use, and a `UsageService` request for another service fails with `permission_denied`. The mapping is configuration; record its variable here in the change that adds it.
 - Logto application registrations: the [web app](apps-delino-accounts-foundation.md) is a single-page application that requests `accounts:billing`. Each consuming service has its own machine-to-machine application. The server itself has a machine-to-machine application for the Logto Management API (`LOGTO_M2M_CLIENT_ID`), which it uses only to read the primary email of the caller of `AcceptInvitation`.
 - Browser access (`planned` with the first business API): CORS allows only the origins in `CORS_ORIGINS`: `https://accounts.delino.io` in production and the loopback development origin locally.
 - The Paddle webhook accepts no Logto credential. Its Paddle signature authenticates only the delivery of an event from Paddle. It gives no access to any RPC.
@@ -79,36 +81,39 @@ The API server is the system of record for account and billing information: bill
 
 - A billing account is a separate entity. Any signed-in Logto user can create one and becomes its `owner`.
 
-| Action                                                                                       | `owner` | `admin` | `viewer` |
-| -------------------------------------------------------------------------------------------- | ------- | ------- | -------- |
-| Delete the billing account, transfer ownership                                               | yes     | no      | no       |
-| Payment method, subscription, manual top-up, automatic top-up, alerts and organization links | yes     | yes     | no       |
-| Invitations, member roles, removal of another member, renaming                               | yes     | yes     | no       |
-| Read the balance, credit grants, ledger, usage, settings, invoices and linked organizations  | yes     | yes     | yes      |
+| Action                                                                                          | `owner` | `admin` | `viewer` |
+| ----------------------------------------------------------------------------------------------- | ------- | ------- | -------- |
+| Delete the billing account, transfer ownership                                                  | yes     | no      | no       |
+| Payment method, subscription, manual top-up, automatic top-up, alerts and organization links    | yes     | yes     | no       |
+| Invitations, roles of admins and viewers, removal of admins and viewers, renaming               | yes     | yes     | no       |
+| Invoices and invoice links (they carry the payer's address)                                     | yes     | yes     | no       |
+| Read the balance, credit grants, ledger, subscription, usage, settings and linked organizations | yes     | yes     | yes      |
 
-- A billing account has exactly one `owner`. An `admin` cannot change the role of the `owner`, remove the `owner` or grant `owner`. Only `TransferOwnership` makes another existing member the `owner`, and the previous owner becomes `admin`. A member may remove itself, except the `owner`.
-- Owners and admins invite by email address with the role `admin` or `viewer`. The server sends the invitation email through Resend with a link to the [web app](apps-delino-accounts-foundation.md) that carries a one-time invitation token. An invitation expires after 7 days. `AcceptInvitation` accepts the token only for a signed-in user whose Logto primary email equals the invited address, and creates the membership for that Logto user ID. A used, revoked or expired invitation fails with `not_found`. The server stores only a hash of the token.
+- Access errors: a caller that is not a member of the named billing account gets `not_found`, also when the account exists, and a deleted billing account is `not_found` for every RPC. A member whose role does not allow the action gets `permission_denied`.
+- A billing account has exactly one `owner`. Nobody can change the role of the `owner` or remove the `owner` (`failed_precondition`), and nobody can grant `owner` with a role change or an invitation. Only `TransferOwnership` makes another existing member the `owner`, and the previous owner becomes `admin`. Every `admin` and `viewer` may remove itself.
+- Owners and admins invite by email address with the role `admin` or `viewer`; a second pending invitation for the same address fails with `already_exists`. The server sends the invitation email through Resend with a link to the [web app](apps-delino-accounts-foundation.md) that carries a one-time invitation token (`bai_` followed by 32 random bytes in unpadded base64url). An invitation expires 7 days after it is created. `AcceptInvitation` accepts the token only for a signed-in user whose Logto primary email equals the invited address (ASCII case folding), and creates the membership for that Logto user ID; another user gets `permission_denied`, and the invitation stays pending. An unknown token is `not_found`; an accepted, revoked or expired invitation is `failed_precondition`. The server stores only the SHA-256 hash of the token.
 - One billing account can pay for several organizations of several Delino services. A change of members has no effect on existing links.
-- `DeleteBillingAccount` succeeds only when the balance is 0 or more and no organization is linked; otherwise it fails with `failed_precondition`. It cancels the Paddle subscription and marks the billing account deleted. Remaining credit is not refunded. Financial records and audit events stay for the retention period (see [Storage](#storage)).
+- `DeleteBillingAccount` succeeds only when the balance is 0 or more and no organization is linked; otherwise it fails with `failed_precondition`. It cancels the Paddle subscription at once, forfeits the remaining credit (credits are not refunded), ends every membership and pending invitation and marks the billing account deleted. Financial records and audit events stay for the retention period (see [Storage](#storage)).
+- The [protos contract](protos-delino-accounts-api-contract.md) records the exact request rules, limits and error codes of every RPC.
 
 ### Payments and credits
 
 - Payment provider (recorded decision): [Paddle](https://www.paddle.com/), the merchant of record, in the `sandbox` or `production` environment that `PADDLE_ENVIRONMENT` selects. The server calls the Paddle API with a minimal hand-written HTTP client; it uses no Paddle SDK.
 - Charges are USD only and tax-exclusive. When a user buys $X of credit, Paddle adds the tax on top, and the balance receives the full $X.
 - Conversion: Paddle amounts are whole USD cents. The server converts cents to micro-USD by multiplying by 10,000, only at the payment boundary. The conversion is exact and needs no rounding. Every amount that the server sends to Paddle is a whole number of cents; a requested amount that is not a multiple of 10,000 micro-USD fails with `invalid_argument`.
-- Subscription: an active $10/month Paddle subscription (`PADDLE_SUBSCRIPTION_PRICE_ID`) is required for any billable use of a consuming service. `StartSubscription` creates the Paddle transaction with the billing account ID in its custom data, and the web app opens the Paddle.js checkout with it. Each successful subscription payment adds a $10 credit grant. A canceled subscription stays active until the end of the paid period.
-- Manual top-up: owners and admins add credit with a one-time charge on the subscription (`POST /subscriptions/{id}/charge` with `effective_from: immediately`, on `PADDLE_TOP_UP_PRODUCT_ID`). The minimum is $25.
+- Subscription: an active $10/month Paddle subscription (`PADDLE_SUBSCRIPTION_PRICE_ID`) is required for any billable use of a consuming service. `StartSubscription` creates the Paddle transaction with the billing account ID in its custom data, and the web app opens the Paddle.js checkout with it. Each successful subscription payment adds a $10 credit grant. A canceled subscription stays active until the end of the paid period, and `ResumeSubscription` removes a scheduled cancellation before then. The subscription becomes `ACTIVE` only after the verified payment webhook; while it is `PENDING`, `StartSubscription` returns the open checkout transaction again.
+- Manual top-up: owners and admins add credit with a one-time charge on the subscription (`POST /subscriptions/{id}/charge` with `effective_from: immediately`, on `PADDLE_TOP_UP_PRODUCT_ID`), only while the subscription is `ACTIVE`. The amount is at least $25 and at most $10,000, in whole cents. The caller's `idempotency_key` (UUID v7) makes a retry within 24 hours return the first result without a second charge.
 - Automatic top-up: off by default. An owner or admin turns it on with a threshold of at least $10, an amount of at least $25 and a required monthly cap of at least the amount. Other settings fail with `invalid_argument`.
   - It runs when a usage deduction makes the balance fall below the threshold. At most one automatic top-up is in flight for each billing account.
   - The monthly cap counts only automatic top-ups in a UTC calendar month; the subscription and manual top-ups do not count. A top-up that would exceed the cap does not run.
   - The server charges the amount with `POST /subscriptions/{id}/charge` (`effective_from: immediately`). A charge that Paddle rejects, for example because the subscription is `past_due` or its next billing period starts within 30 minutes, and a failed payment count as failed automatic top-ups.
-  - After 2 failed automatic top-ups in a row, automatic top-up turns off, and owners and admins get an email. A successful automatic top-up resets the count.
+  - After 2 failed automatic top-ups in a row, automatic top-up turns off, and owners and admins get an email. A successful automatic top-up and enabling the setting reset the count.
 - Credit is added only by verified Paddle webhooks, never by the charge call or the checkout.
 - Credit grants: each subscription payment, manual top-up and automatic top-up creates a grant that expires 12 months after the purchase. Usage consumes the grant that expires first (FIFO). A new grant first pays off any debt (a negative balance), and only the rest becomes usable credit. Owners and admins get an email 7 days before a grant expires. Expired credit leaves the balance as an `EXPIRY` ledger entry.
 - Refunds: credits are non-refundable. Support can refund only manually in the Paddle dashboard. The refund webhook removes the matching credit with a `REFUND` ledger entry, and the balance can go negative.
 - Debt: usage is always deducted, also below zero. A negative balance is debt.
 - Low-balance alert: when automatic top-up is off, owners and admins get one email each time the balance falls below the alert threshold. Owners and admins set the threshold (at least $0). The default is $10.
-- Invoices: `ListInvoices` lists the Paddle transactions, and `GetInvoiceUrl` returns the Paddle invoice link of one transaction, fetched from Paddle on demand.
+- Invoices (owner and admin only): `ListInvoices` lists the completed Paddle transactions without links, and `GetInvoiceUrl` returns a short-lived link to the Paddle invoice PDF of one transaction, from Paddle `GET /transactions/{id}/invoice` on demand.
 
 ### Paddle webhook
 
@@ -119,6 +124,7 @@ The API server is the system of record for account and billing information: bill
 ### Usage reports and billing status
 
 - `UsageService` implements the [usage reports](protos-delino-accounts-api-contract.md#usage-reports), the [billing status](protos-delino-accounts-api-contract.md#billing-status) and the [links](protos-delino-accounts-api-contract.md#links) of the protos contract: idempotent reports with the key (service, organization, meter, window start), attribution through the link history, unattributed usage, FIFO deductions that can make the balance negative, and the status rules `ALLOWED`, `BLOCKED` and `SUSPENDED` (3 days after the block starts).
+- `ReportUsage` validates every report of a request before it applies any, and a window may end at most 1 minute after the server time. A repeated key with other values keeps the first values and is logged as a mismatch. A status poll with cursor 0 returns every linked organization, with at most one entry per organization, and an unlink adds no entry ([protos contract](protos-delino-accounts-api-contract.md#billing-status)).
 - Concurrent reports for one billing account serialize on the billing account, so the balance, the grants and the automatic top-up trigger stay consistent.
 - A status change of a linked organization sends an email to owners and admins when it becomes `BLOCKED` (with the suspension time, 3 days later) and when it becomes `SUSPENDED`.
 
