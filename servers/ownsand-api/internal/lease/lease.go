@@ -58,6 +58,26 @@ func (l *Lease) Held() bool {
 	return l.held
 }
 
+// WhileHeld runs fn while this instance holds the lease and reports whether
+// it ran. It holds the ownership lock for the whole call, and the transition
+// that clears ownership takes the same lock before it runs OnLose. So fn
+// either completes before the transition (and OnLose sees its effects) or
+// is not run at all. Agent channel admission uses it to register a channel
+// in the hub as one step with the ownership check.
+//
+// fn must be short, in-memory work: it must not do database or stream I/O,
+// block, or call a method of the lease (Held, WhileHeld, Wait), because the
+// lock is not reentrant and the lock stalls the renewal loop.
+func (l *Lease) WhileHeld(fn func()) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if !l.held {
+		return false
+	}
+	fn()
+	return true
+}
+
 // Wait blocks until the instance holds the lease or ctx ends.
 func (l *Lease) Wait(ctx context.Context) error {
 	l.init()
