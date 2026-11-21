@@ -1814,6 +1814,7 @@ type AgentCommand struct {
 	//	*AgentCommand_CleanUp
 	//	*AgentCommand_UpdateAgent
 	//	*AgentCommand_DeleteSnapshot
+	//	*AgentCommand_WithdrawAgentUpdate
 	Command       isAgentCommand_Command `protobuf_oneof:"command"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1953,6 +1954,15 @@ func (x *AgentCommand) GetDeleteSnapshot() *DeleteSnapshotCommand {
 	return nil
 }
 
+func (x *AgentCommand) GetWithdrawAgentUpdate() *WithdrawAgentUpdateCommand {
+	if x != nil {
+		if x, ok := x.Command.(*AgentCommand_WithdrawAgentUpdate); ok {
+			return x.WithdrawAgentUpdate
+		}
+	}
+	return nil
+}
+
 type isAgentCommand_Command interface {
 	isAgentCommand_Command()
 }
@@ -1997,6 +2007,10 @@ type AgentCommand_DeleteSnapshot struct {
 	DeleteSnapshot *DeleteSnapshotCommand `protobuf:"bytes,11,opt,name=delete_snapshot,json=deleteSnapshot,proto3,oneof"`
 }
 
+type AgentCommand_WithdrawAgentUpdate struct {
+	WithdrawAgentUpdate *WithdrawAgentUpdateCommand `protobuf:"bytes,12,opt,name=withdraw_agent_update,json=withdrawAgentUpdate,proto3,oneof"`
+}
+
 func (*AgentCommand_CreateSandbox) isAgentCommand_Command() {}
 
 func (*AgentCommand_DeleteSandbox) isAgentCommand_Command() {}
@@ -2016,6 +2030,8 @@ func (*AgentCommand_CleanUp) isAgentCommand_Command() {}
 func (*AgentCommand_UpdateAgent) isAgentCommand_Command() {}
 
 func (*AgentCommand_DeleteSnapshot) isAgentCommand_Command() {}
+
+func (*AgentCommand_WithdrawAgentUpdate) isAgentCommand_Command() {}
 
 type CreateSandboxCommand struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
@@ -2688,6 +2704,50 @@ func (x *UpdateAgentCommand) GetRevocationRecovery() bool {
 	return false
 }
 
+// Withdraw the update that an earlier UpdateAgentCommand queued: the agent
+// drops the queued artifact, ignores a download that is still running and
+// reports AGENT_UPDATE_STATE_UP_TO_DATE, so it does not install the target
+// after it becomes idle. The control plane sends it when the organization
+// policy changes to HOLD and no revocation recovery applies. It fails with
+// FAILED_PRECONDITION once the installation started or while the running
+// version is revoked. An agent from before this command answers UNIMPLEMENTED
+// and keeps its queued update.
+type WithdrawAgentUpdateCommand struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *WithdrawAgentUpdateCommand) Reset() {
+	*x = WithdrawAgentUpdateCommand{}
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[35]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *WithdrawAgentUpdateCommand) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*WithdrawAgentUpdateCommand) ProtoMessage() {}
+
+func (x *WithdrawAgentUpdateCommand) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[35]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use WithdrawAgentUpdateCommand.ProtoReflect.Descriptor instead.
+func (*WithdrawAgentUpdateCommand) Descriptor() ([]byte, []int) {
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{35}
+}
+
 type CreateSandboxResult struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Sandbox       *SandboxStateEntry     `protobuf:"bytes,1,opt,name=sandbox,proto3" json:"sandbox,omitempty"`
@@ -2697,7 +2757,7 @@ type CreateSandboxResult struct {
 
 func (x *CreateSandboxResult) Reset() {
 	*x = CreateSandboxResult{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[35]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[36]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2709,7 +2769,7 @@ func (x *CreateSandboxResult) String() string {
 func (*CreateSandboxResult) ProtoMessage() {}
 
 func (x *CreateSandboxResult) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[35]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[36]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2722,7 +2782,7 @@ func (x *CreateSandboxResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSandboxResult.ProtoReflect.Descriptor instead.
 func (*CreateSandboxResult) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{35}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{36}
 }
 
 func (x *CreateSandboxResult) GetSandbox() *SandboxStateEntry {
@@ -2741,7 +2801,7 @@ type SandboxCommandResult struct {
 
 func (x *SandboxCommandResult) Reset() {
 	*x = SandboxCommandResult{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[36]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[37]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2753,7 +2813,7 @@ func (x *SandboxCommandResult) String() string {
 func (*SandboxCommandResult) ProtoMessage() {}
 
 func (x *SandboxCommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[36]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[37]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2766,7 +2826,7 @@ func (x *SandboxCommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxCommandResult.ProtoReflect.Descriptor instead.
 func (*SandboxCommandResult) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{36}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{37}
 }
 
 func (x *SandboxCommandResult) GetSandbox() *SandboxStateEntry {
@@ -2785,7 +2845,7 @@ type CreateSnapshotResult struct {
 
 func (x *CreateSnapshotResult) Reset() {
 	*x = CreateSnapshotResult{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[37]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[38]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2797,7 +2857,7 @@ func (x *CreateSnapshotResult) String() string {
 func (*CreateSnapshotResult) ProtoMessage() {}
 
 func (x *CreateSnapshotResult) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[37]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[38]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2810,7 +2870,7 @@ func (x *CreateSnapshotResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CreateSnapshotResult.ProtoReflect.Descriptor instead.
 func (*CreateSnapshotResult) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{37}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{38}
 }
 
 func (x *CreateSnapshotResult) GetSnapshot() *SnapshotStateEntry {
@@ -2830,7 +2890,7 @@ type ExportSnapshotResult struct {
 
 func (x *ExportSnapshotResult) Reset() {
 	*x = ExportSnapshotResult{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[38]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[39]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2842,7 +2902,7 @@ func (x *ExportSnapshotResult) String() string {
 func (*ExportSnapshotResult) ProtoMessage() {}
 
 func (x *ExportSnapshotResult) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[38]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[39]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2855,7 +2915,7 @@ func (x *ExportSnapshotResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportSnapshotResult.ProtoReflect.Descriptor instead.
 func (*ExportSnapshotResult) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{38}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{39}
 }
 
 func (x *ExportSnapshotResult) GetParts() []*SnapshotPart {
@@ -2881,7 +2941,7 @@ type ImportSnapshotResult struct {
 
 func (x *ImportSnapshotResult) Reset() {
 	*x = ImportSnapshotResult{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[39]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[40]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2893,7 +2953,7 @@ func (x *ImportSnapshotResult) String() string {
 func (*ImportSnapshotResult) ProtoMessage() {}
 
 func (x *ImportSnapshotResult) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[39]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[40]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2906,7 +2966,7 @@ func (x *ImportSnapshotResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportSnapshotResult.ProtoReflect.Descriptor instead.
 func (*ImportSnapshotResult) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{39}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{40}
 }
 
 func (x *ImportSnapshotResult) GetSnapshot() *SnapshotStateEntry {
@@ -2935,7 +2995,7 @@ type AgentCommandResult struct {
 
 func (x *AgentCommandResult) Reset() {
 	*x = AgentCommandResult{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[40]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[41]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2947,7 +3007,7 @@ func (x *AgentCommandResult) String() string {
 func (*AgentCommandResult) ProtoMessage() {}
 
 func (x *AgentCommandResult) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[40]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[41]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2960,7 +3020,7 @@ func (x *AgentCommandResult) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentCommandResult.ProtoReflect.Descriptor instead.
 func (*AgentCommandResult) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{40}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{41}
 }
 
 func (x *AgentCommandResult) GetCommandId() string {
@@ -3076,7 +3136,7 @@ type AgentConfiguration struct {
 
 func (x *AgentConfiguration) Reset() {
 	*x = AgentConfiguration{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[41]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[42]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3088,7 +3148,7 @@ func (x *AgentConfiguration) String() string {
 func (*AgentConfiguration) ProtoMessage() {}
 
 func (x *AgentConfiguration) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[41]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[42]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3101,7 +3161,7 @@ func (x *AgentConfiguration) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentConfiguration.ProtoReflect.Descriptor instead.
 func (*AgentConfiguration) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{41}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{42}
 }
 
 func (x *AgentConfiguration) GetStunUrls() []string {
@@ -3134,7 +3194,7 @@ type SignalingOffer struct {
 
 func (x *SignalingOffer) Reset() {
 	*x = SignalingOffer{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[42]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3146,7 +3206,7 @@ func (x *SignalingOffer) String() string {
 func (*SignalingOffer) ProtoMessage() {}
 
 func (x *SignalingOffer) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[42]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3159,7 +3219,7 @@ func (x *SignalingOffer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignalingOffer.ProtoReflect.Descriptor instead.
 func (*SignalingOffer) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{42}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{43}
 }
 
 func (x *SignalingOffer) GetSessionId() string {
@@ -3216,7 +3276,7 @@ type SignalingAnswer struct {
 
 func (x *SignalingAnswer) Reset() {
 	*x = SignalingAnswer{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[43]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[44]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3228,7 +3288,7 @@ func (x *SignalingAnswer) String() string {
 func (*SignalingAnswer) ProtoMessage() {}
 
 func (x *SignalingAnswer) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[43]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[44]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3241,7 +3301,7 @@ func (x *SignalingAnswer) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignalingAnswer.ProtoReflect.Descriptor instead.
 func (*SignalingAnswer) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{43}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{44}
 }
 
 func (x *SignalingAnswer) GetSessionId() string {
@@ -3278,7 +3338,7 @@ type SignalingMessage struct {
 
 func (x *SignalingMessage) Reset() {
 	*x = SignalingMessage{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[44]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[45]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3290,7 +3350,7 @@ func (x *SignalingMessage) String() string {
 func (*SignalingMessage) ProtoMessage() {}
 
 func (x *SignalingMessage) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[44]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[45]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3303,7 +3363,7 @@ func (x *SignalingMessage) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignalingMessage.ProtoReflect.Descriptor instead.
 func (*SignalingMessage) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{44}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{45}
 }
 
 func (x *SignalingMessage) GetMessage() isSignalingMessage_Message {
@@ -3361,7 +3421,7 @@ type SessionRevocation struct {
 
 func (x *SessionRevocation) Reset() {
 	*x = SessionRevocation{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[45]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[46]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3373,7 +3433,7 @@ func (x *SessionRevocation) String() string {
 func (*SessionRevocation) ProtoMessage() {}
 
 func (x *SessionRevocation) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[45]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[46]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3386,7 +3446,7 @@ func (x *SessionRevocation) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SessionRevocation.ProtoReflect.Descriptor instead.
 func (*SessionRevocation) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{45}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{46}
 }
 
 func (x *SessionRevocation) GetRevocationId() string {
@@ -3446,7 +3506,7 @@ type RevocationAck struct {
 
 func (x *RevocationAck) Reset() {
 	*x = RevocationAck{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[46]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[47]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3458,7 +3518,7 @@ func (x *RevocationAck) String() string {
 func (*RevocationAck) ProtoMessage() {}
 
 func (x *RevocationAck) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[46]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[47]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3471,7 +3531,7 @@ func (x *RevocationAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RevocationAck.ProtoReflect.Descriptor instead.
 func (*RevocationAck) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{46}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{47}
 }
 
 func (x *RevocationAck) GetRevocationId() string {
@@ -3493,7 +3553,7 @@ type SignedUrlRequest struct {
 
 func (x *SignedUrlRequest) Reset() {
 	*x = SignedUrlRequest{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[47]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[48]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3505,7 +3565,7 @@ func (x *SignedUrlRequest) String() string {
 func (*SignedUrlRequest) ProtoMessage() {}
 
 func (x *SignedUrlRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[47]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[48]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3518,7 +3578,7 @@ func (x *SignedUrlRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignedUrlRequest.ProtoReflect.Descriptor instead.
 func (*SignedUrlRequest) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{47}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{48}
 }
 
 func (x *SignedUrlRequest) GetRequestId() string {
@@ -3561,7 +3621,7 @@ type SignedPartUrl struct {
 
 func (x *SignedPartUrl) Reset() {
 	*x = SignedPartUrl{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[48]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[49]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3573,7 +3633,7 @@ func (x *SignedPartUrl) String() string {
 func (*SignedPartUrl) ProtoMessage() {}
 
 func (x *SignedPartUrl) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[48]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[49]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3586,7 +3646,7 @@ func (x *SignedPartUrl) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignedPartUrl.ProtoReflect.Descriptor instead.
 func (*SignedPartUrl) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{48}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{49}
 }
 
 func (x *SignedPartUrl) GetPartNumber() int32 {
@@ -3625,7 +3685,7 @@ type SignedUrlGrant struct {
 
 func (x *SignedUrlGrant) Reset() {
 	*x = SignedUrlGrant{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[49]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[50]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3637,7 +3697,7 @@ func (x *SignedUrlGrant) String() string {
 func (*SignedUrlGrant) ProtoMessage() {}
 
 func (x *SignedUrlGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[49]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[50]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3650,7 +3710,7 @@ func (x *SignedUrlGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SignedUrlGrant.ProtoReflect.Descriptor instead.
 func (*SignedUrlGrant) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{49}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{50}
 }
 
 func (x *SignedUrlGrant) GetRequestId() string {
@@ -3710,7 +3770,7 @@ type RelayGrant struct {
 
 func (x *RelayGrant) Reset() {
 	*x = RelayGrant{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[50]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[51]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3722,7 +3782,7 @@ func (x *RelayGrant) String() string {
 func (*RelayGrant) ProtoMessage() {}
 
 func (x *RelayGrant) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[50]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[51]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3735,7 +3795,7 @@ func (x *RelayGrant) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayGrant.ProtoReflect.Descriptor instead.
 func (*RelayGrant) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{50}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{51}
 }
 
 func (x *RelayGrant) GetGrantId() string {
@@ -3827,7 +3887,7 @@ type RelayGrantAck struct {
 
 func (x *RelayGrantAck) Reset() {
 	*x = RelayGrantAck{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[51]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[52]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3839,7 +3899,7 @@ func (x *RelayGrantAck) String() string {
 func (*RelayGrantAck) ProtoMessage() {}
 
 func (x *RelayGrantAck) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[51]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[52]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3852,7 +3912,7 @@ func (x *RelayGrantAck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayGrantAck.ProtoReflect.Descriptor instead.
 func (*RelayGrantAck) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{51}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{52}
 }
 
 func (x *RelayGrantAck) GetGrantId() string {
@@ -3885,7 +3945,7 @@ type RelayGrantRelease struct {
 
 func (x *RelayGrantRelease) Reset() {
 	*x = RelayGrantRelease{}
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[52]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[53]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -3897,7 +3957,7 @@ func (x *RelayGrantRelease) String() string {
 func (*RelayGrantRelease) ProtoMessage() {}
 
 func (x *RelayGrantRelease) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[52]
+	mi := &file_delino_ownsand_v1_agent_proto_msgTypes[53]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -3910,7 +3970,7 @@ func (x *RelayGrantRelease) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayGrantRelease.ProtoReflect.Descriptor instead.
 func (*RelayGrantRelease) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{52}
+	return file_delino_ownsand_v1_agent_proto_rawDescGZIP(), []int{53}
 }
 
 func (x *RelayGrantRelease) GetGrantId() string {
@@ -4044,7 +4104,7 @@ const file_delino_ownsand_v1_agent_proto_rawDesc = "" +
 	"\bStateAck\x12F\n" +
 	"\fstate_report\x18\x01 \x01(\v2!.delino.ownsand.v1.StateReportAckH\x00R\vstateReport\x12L\n" +
 	"\x0esandbox_update\x18\x02 \x01(\v2#.delino.ownsand.v1.SandboxUpdateAckH\x00R\rsandboxUpdateB\x05\n" +
-	"\x03ack\"\xdd\x06\n" +
+	"\x03ack\"\xc2\a\n" +
 	"\fAgentCommand\x12\x1d\n" +
 	"\n" +
 	"command_id\x18\x01 \x01(\tR\tcommandId\x12P\n" +
@@ -4058,7 +4118,8 @@ const file_delino_ownsand_v1_agent_proto_rawDesc = "" +
 	"\bclean_up\x18\t \x01(\v2!.delino.ownsand.v1.CleanUpCommandH\x00R\acleanUp\x12J\n" +
 	"\fupdate_agent\x18\n" +
 	" \x01(\v2%.delino.ownsand.v1.UpdateAgentCommandH\x00R\vupdateAgent\x12S\n" +
-	"\x0fdelete_snapshot\x18\v \x01(\v2(.delino.ownsand.v1.DeleteSnapshotCommandH\x00R\x0edeleteSnapshotB\t\n" +
+	"\x0fdelete_snapshot\x18\v \x01(\v2(.delino.ownsand.v1.DeleteSnapshotCommandH\x00R\x0edeleteSnapshot\x12c\n" +
+	"\x15withdraw_agent_update\x18\f \x01(\v2-.delino.ownsand.v1.WithdrawAgentUpdateCommandH\x00R\x13withdrawAgentUpdateB\t\n" +
 	"\acommand\"\xac\x05\n" +
 	"\x14CreateSandboxCommand\x12\x1d\n" +
 	"\n" +
@@ -4114,7 +4175,8 @@ const file_delino_ownsand_v1_agent_proto_rawDesc = "" +
 	"\x0eCleanUpCommand\"l\n" +
 	"\x12UpdateAgentCommand\x12%\n" +
 	"\x0etarget_version\x18\x01 \x01(\tR\rtargetVersion\x12/\n" +
-	"\x13revocation_recovery\x18\x02 \x01(\bR\x12revocationRecovery\"U\n" +
+	"\x13revocation_recovery\x18\x02 \x01(\bR\x12revocationRecovery\"\x1c\n" +
+	"\x1aWithdrawAgentUpdateCommand\"U\n" +
 	"\x13CreateSandboxResult\x12>\n" +
 	"\asandbox\x18\x01 \x01(\v2$.delino.ownsand.v1.SandboxStateEntryR\asandbox\"V\n" +
 	"\x14SandboxCommandResult\x12>\n" +
@@ -4237,90 +4299,91 @@ func file_delino_ownsand_v1_agent_proto_rawDescGZIP() []byte {
 }
 
 var file_delino_ownsand_v1_agent_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_delino_ownsand_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 53)
+var file_delino_ownsand_v1_agent_proto_msgTypes = make([]protoimpl.MessageInfo, 54)
 var file_delino_ownsand_v1_agent_proto_goTypes = []any{
-	(SignedUrlOperation)(0),         // 0: delino.ownsand.v1.SignedUrlOperation
-	(*EnrollRequest)(nil),           // 1: delino.ownsand.v1.EnrollRequest
-	(*EnrollResponse)(nil),          // 2: delino.ownsand.v1.EnrollResponse
-	(*CreateChallengeRequest)(nil),  // 3: delino.ownsand.v1.CreateChallengeRequest
-	(*CreateChallengeResponse)(nil), // 4: delino.ownsand.v1.CreateChallengeResponse
-	(*AuthenticateRequest)(nil),     // 5: delino.ownsand.v1.AuthenticateRequest
-	(*DeviceSession)(nil),           // 6: delino.ownsand.v1.DeviceSession
-	(*RemovalNotice)(nil),           // 7: delino.ownsand.v1.RemovalNotice
-	(*AuthenticateResponse)(nil),    // 8: delino.ownsand.v1.AuthenticateResponse
-	(*ConfirmRemovalRequest)(nil),   // 9: delino.ownsand.v1.ConfirmRemovalRequest
-	(*ConfirmRemovalResponse)(nil),  // 10: delino.ownsand.v1.ConfirmRemovalResponse
-	(*ChannelRequest)(nil),          // 11: delino.ownsand.v1.ChannelRequest
-	(*ChannelResponse)(nil),         // 12: delino.ownsand.v1.ChannelResponse
-	(*AgentEnvelope)(nil),           // 13: delino.ownsand.v1.AgentEnvelope
-	(*Heartbeat)(nil),               // 14: delino.ownsand.v1.Heartbeat
-	(*HeartbeatAck)(nil),            // 15: delino.ownsand.v1.HeartbeatAck
-	(*CapabilityReport)(nil),        // 16: delino.ownsand.v1.CapabilityReport
-	(*SandboxStateEntry)(nil),       // 17: delino.ownsand.v1.SandboxStateEntry
-	(*SnapshotStateEntry)(nil),      // 18: delino.ownsand.v1.SnapshotStateEntry
-	(*StateReport)(nil),             // 19: delino.ownsand.v1.StateReport
-	(*SandboxUpdate)(nil),           // 20: delino.ownsand.v1.SandboxUpdate
-	(*StateReportAck)(nil),          // 21: delino.ownsand.v1.StateReportAck
-	(*SandboxUpdateAck)(nil),        // 22: delino.ownsand.v1.SandboxUpdateAck
-	(*StateAck)(nil),                // 23: delino.ownsand.v1.StateAck
-	(*AgentCommand)(nil),            // 24: delino.ownsand.v1.AgentCommand
-	(*CreateSandboxCommand)(nil),    // 25: delino.ownsand.v1.CreateSandboxCommand
-	(*DeleteSandboxCommand)(nil),    // 26: delino.ownsand.v1.DeleteSandboxCommand
-	(*PauseSandboxCommand)(nil),     // 27: delino.ownsand.v1.PauseSandboxCommand
-	(*ResumeSandboxCommand)(nil),    // 28: delino.ownsand.v1.ResumeSandboxCommand
-	(*CreateSnapshotCommand)(nil),   // 29: delino.ownsand.v1.CreateSnapshotCommand
-	(*SnapshotPart)(nil),            // 30: delino.ownsand.v1.SnapshotPart
-	(*ExportSnapshotCommand)(nil),   // 31: delino.ownsand.v1.ExportSnapshotCommand
-	(*ImportSnapshotCommand)(nil),   // 32: delino.ownsand.v1.ImportSnapshotCommand
-	(*DeleteSnapshotCommand)(nil),   // 33: delino.ownsand.v1.DeleteSnapshotCommand
-	(*CleanUpCommand)(nil),          // 34: delino.ownsand.v1.CleanUpCommand
-	(*UpdateAgentCommand)(nil),      // 35: delino.ownsand.v1.UpdateAgentCommand
-	(*CreateSandboxResult)(nil),     // 36: delino.ownsand.v1.CreateSandboxResult
-	(*SandboxCommandResult)(nil),    // 37: delino.ownsand.v1.SandboxCommandResult
-	(*CreateSnapshotResult)(nil),    // 38: delino.ownsand.v1.CreateSnapshotResult
-	(*ExportSnapshotResult)(nil),    // 39: delino.ownsand.v1.ExportSnapshotResult
-	(*ImportSnapshotResult)(nil),    // 40: delino.ownsand.v1.ImportSnapshotResult
-	(*AgentCommandResult)(nil),      // 41: delino.ownsand.v1.AgentCommandResult
-	(*AgentConfiguration)(nil),      // 42: delino.ownsand.v1.AgentConfiguration
-	(*SignalingOffer)(nil),          // 43: delino.ownsand.v1.SignalingOffer
-	(*SignalingAnswer)(nil),         // 44: delino.ownsand.v1.SignalingAnswer
-	(*SignalingMessage)(nil),        // 45: delino.ownsand.v1.SignalingMessage
-	(*SessionRevocation)(nil),       // 46: delino.ownsand.v1.SessionRevocation
-	(*RevocationAck)(nil),           // 47: delino.ownsand.v1.RevocationAck
-	(*SignedUrlRequest)(nil),        // 48: delino.ownsand.v1.SignedUrlRequest
-	(*SignedPartUrl)(nil),           // 49: delino.ownsand.v1.SignedPartUrl
-	(*SignedUrlGrant)(nil),          // 50: delino.ownsand.v1.SignedUrlGrant
-	(*RelayGrant)(nil),              // 51: delino.ownsand.v1.RelayGrant
-	(*RelayGrantAck)(nil),           // 52: delino.ownsand.v1.RelayGrantAck
-	(*RelayGrantRelease)(nil),       // 53: delino.ownsand.v1.RelayGrantRelease
-	(HostOs)(0),                     // 54: delino.ownsand.v1.HostOs
-	(Arch)(0),                       // 55: delino.ownsand.v1.Arch
-	(*timestamppb.Timestamp)(nil),   // 56: google.protobuf.Timestamp
-	(*durationpb.Duration)(nil),     // 57: google.protobuf.Duration
-	(AgentUpdateState)(0),           // 58: delino.ownsand.v1.AgentUpdateState
-	(*DeviceCapabilities)(nil),      // 59: delino.ownsand.v1.DeviceCapabilities
-	(SandboxState)(0),               // 60: delino.ownsand.v1.SandboxState
-	(SandboxEndReason)(0),           // 61: delino.ownsand.v1.SandboxEndReason
-	(*SandboxRevision)(nil),         // 62: delino.ownsand.v1.SandboxRevision
-	(SandboxRestorePath)(0),         // 63: delino.ownsand.v1.SandboxRestorePath
-	(SnapshotState)(0),              // 64: delino.ownsand.v1.SnapshotState
-	(GuestOs)(0),                    // 65: delino.ownsand.v1.GuestOs
-	(*Resources)(nil),               // 66: delino.ownsand.v1.Resources
-	(NetworkMode)(0),                // 67: delino.ownsand.v1.NetworkMode
-	(BaseImage)(0),                  // 68: delino.ownsand.v1.BaseImage
-	(*DeviceLimits)(nil),            // 69: delino.ownsand.v1.DeviceLimits
-	(*ErrorDetail)(nil),             // 70: delino.ownsand.v1.ErrorDetail
-	(*Principal)(nil),               // 71: delino.ownsand.v1.Principal
-	(RelayOperationKind)(0),         // 72: delino.ownsand.v1.RelayOperationKind
-	(RelayGrantResult)(0),           // 73: delino.ownsand.v1.RelayGrantResult
+	(SignedUrlOperation)(0),            // 0: delino.ownsand.v1.SignedUrlOperation
+	(*EnrollRequest)(nil),              // 1: delino.ownsand.v1.EnrollRequest
+	(*EnrollResponse)(nil),             // 2: delino.ownsand.v1.EnrollResponse
+	(*CreateChallengeRequest)(nil),     // 3: delino.ownsand.v1.CreateChallengeRequest
+	(*CreateChallengeResponse)(nil),    // 4: delino.ownsand.v1.CreateChallengeResponse
+	(*AuthenticateRequest)(nil),        // 5: delino.ownsand.v1.AuthenticateRequest
+	(*DeviceSession)(nil),              // 6: delino.ownsand.v1.DeviceSession
+	(*RemovalNotice)(nil),              // 7: delino.ownsand.v1.RemovalNotice
+	(*AuthenticateResponse)(nil),       // 8: delino.ownsand.v1.AuthenticateResponse
+	(*ConfirmRemovalRequest)(nil),      // 9: delino.ownsand.v1.ConfirmRemovalRequest
+	(*ConfirmRemovalResponse)(nil),     // 10: delino.ownsand.v1.ConfirmRemovalResponse
+	(*ChannelRequest)(nil),             // 11: delino.ownsand.v1.ChannelRequest
+	(*ChannelResponse)(nil),            // 12: delino.ownsand.v1.ChannelResponse
+	(*AgentEnvelope)(nil),              // 13: delino.ownsand.v1.AgentEnvelope
+	(*Heartbeat)(nil),                  // 14: delino.ownsand.v1.Heartbeat
+	(*HeartbeatAck)(nil),               // 15: delino.ownsand.v1.HeartbeatAck
+	(*CapabilityReport)(nil),           // 16: delino.ownsand.v1.CapabilityReport
+	(*SandboxStateEntry)(nil),          // 17: delino.ownsand.v1.SandboxStateEntry
+	(*SnapshotStateEntry)(nil),         // 18: delino.ownsand.v1.SnapshotStateEntry
+	(*StateReport)(nil),                // 19: delino.ownsand.v1.StateReport
+	(*SandboxUpdate)(nil),              // 20: delino.ownsand.v1.SandboxUpdate
+	(*StateReportAck)(nil),             // 21: delino.ownsand.v1.StateReportAck
+	(*SandboxUpdateAck)(nil),           // 22: delino.ownsand.v1.SandboxUpdateAck
+	(*StateAck)(nil),                   // 23: delino.ownsand.v1.StateAck
+	(*AgentCommand)(nil),               // 24: delino.ownsand.v1.AgentCommand
+	(*CreateSandboxCommand)(nil),       // 25: delino.ownsand.v1.CreateSandboxCommand
+	(*DeleteSandboxCommand)(nil),       // 26: delino.ownsand.v1.DeleteSandboxCommand
+	(*PauseSandboxCommand)(nil),        // 27: delino.ownsand.v1.PauseSandboxCommand
+	(*ResumeSandboxCommand)(nil),       // 28: delino.ownsand.v1.ResumeSandboxCommand
+	(*CreateSnapshotCommand)(nil),      // 29: delino.ownsand.v1.CreateSnapshotCommand
+	(*SnapshotPart)(nil),               // 30: delino.ownsand.v1.SnapshotPart
+	(*ExportSnapshotCommand)(nil),      // 31: delino.ownsand.v1.ExportSnapshotCommand
+	(*ImportSnapshotCommand)(nil),      // 32: delino.ownsand.v1.ImportSnapshotCommand
+	(*DeleteSnapshotCommand)(nil),      // 33: delino.ownsand.v1.DeleteSnapshotCommand
+	(*CleanUpCommand)(nil),             // 34: delino.ownsand.v1.CleanUpCommand
+	(*UpdateAgentCommand)(nil),         // 35: delino.ownsand.v1.UpdateAgentCommand
+	(*WithdrawAgentUpdateCommand)(nil), // 36: delino.ownsand.v1.WithdrawAgentUpdateCommand
+	(*CreateSandboxResult)(nil),        // 37: delino.ownsand.v1.CreateSandboxResult
+	(*SandboxCommandResult)(nil),       // 38: delino.ownsand.v1.SandboxCommandResult
+	(*CreateSnapshotResult)(nil),       // 39: delino.ownsand.v1.CreateSnapshotResult
+	(*ExportSnapshotResult)(nil),       // 40: delino.ownsand.v1.ExportSnapshotResult
+	(*ImportSnapshotResult)(nil),       // 41: delino.ownsand.v1.ImportSnapshotResult
+	(*AgentCommandResult)(nil),         // 42: delino.ownsand.v1.AgentCommandResult
+	(*AgentConfiguration)(nil),         // 43: delino.ownsand.v1.AgentConfiguration
+	(*SignalingOffer)(nil),             // 44: delino.ownsand.v1.SignalingOffer
+	(*SignalingAnswer)(nil),            // 45: delino.ownsand.v1.SignalingAnswer
+	(*SignalingMessage)(nil),           // 46: delino.ownsand.v1.SignalingMessage
+	(*SessionRevocation)(nil),          // 47: delino.ownsand.v1.SessionRevocation
+	(*RevocationAck)(nil),              // 48: delino.ownsand.v1.RevocationAck
+	(*SignedUrlRequest)(nil),           // 49: delino.ownsand.v1.SignedUrlRequest
+	(*SignedPartUrl)(nil),              // 50: delino.ownsand.v1.SignedPartUrl
+	(*SignedUrlGrant)(nil),             // 51: delino.ownsand.v1.SignedUrlGrant
+	(*RelayGrant)(nil),                 // 52: delino.ownsand.v1.RelayGrant
+	(*RelayGrantAck)(nil),              // 53: delino.ownsand.v1.RelayGrantAck
+	(*RelayGrantRelease)(nil),          // 54: delino.ownsand.v1.RelayGrantRelease
+	(HostOs)(0),                        // 55: delino.ownsand.v1.HostOs
+	(Arch)(0),                          // 56: delino.ownsand.v1.Arch
+	(*timestamppb.Timestamp)(nil),      // 57: google.protobuf.Timestamp
+	(*durationpb.Duration)(nil),        // 58: google.protobuf.Duration
+	(AgentUpdateState)(0),              // 59: delino.ownsand.v1.AgentUpdateState
+	(*DeviceCapabilities)(nil),         // 60: delino.ownsand.v1.DeviceCapabilities
+	(SandboxState)(0),                  // 61: delino.ownsand.v1.SandboxState
+	(SandboxEndReason)(0),              // 62: delino.ownsand.v1.SandboxEndReason
+	(*SandboxRevision)(nil),            // 63: delino.ownsand.v1.SandboxRevision
+	(SandboxRestorePath)(0),            // 64: delino.ownsand.v1.SandboxRestorePath
+	(SnapshotState)(0),                 // 65: delino.ownsand.v1.SnapshotState
+	(GuestOs)(0),                       // 66: delino.ownsand.v1.GuestOs
+	(*Resources)(nil),                  // 67: delino.ownsand.v1.Resources
+	(NetworkMode)(0),                   // 68: delino.ownsand.v1.NetworkMode
+	(BaseImage)(0),                     // 69: delino.ownsand.v1.BaseImage
+	(*DeviceLimits)(nil),               // 70: delino.ownsand.v1.DeviceLimits
+	(*ErrorDetail)(nil),                // 71: delino.ownsand.v1.ErrorDetail
+	(*Principal)(nil),                  // 72: delino.ownsand.v1.Principal
+	(RelayOperationKind)(0),            // 73: delino.ownsand.v1.RelayOperationKind
+	(RelayGrantResult)(0),              // 74: delino.ownsand.v1.RelayGrantResult
 }
 var file_delino_ownsand_v1_agent_proto_depIdxs = []int32{
-	54,  // 0: delino.ownsand.v1.EnrollRequest.host_os:type_name -> delino.ownsand.v1.HostOs
-	55,  // 1: delino.ownsand.v1.EnrollRequest.arch:type_name -> delino.ownsand.v1.Arch
-	56,  // 2: delino.ownsand.v1.CreateChallengeResponse.expire_time:type_name -> google.protobuf.Timestamp
-	56,  // 3: delino.ownsand.v1.DeviceSession.expire_time:type_name -> google.protobuf.Timestamp
-	57,  // 4: delino.ownsand.v1.DeviceSession.expires_in:type_name -> google.protobuf.Duration
-	56,  // 5: delino.ownsand.v1.RemovalNotice.remove_time:type_name -> google.protobuf.Timestamp
+	55,  // 0: delino.ownsand.v1.EnrollRequest.host_os:type_name -> delino.ownsand.v1.HostOs
+	56,  // 1: delino.ownsand.v1.EnrollRequest.arch:type_name -> delino.ownsand.v1.Arch
+	57,  // 2: delino.ownsand.v1.CreateChallengeResponse.expire_time:type_name -> google.protobuf.Timestamp
+	57,  // 3: delino.ownsand.v1.DeviceSession.expire_time:type_name -> google.protobuf.Timestamp
+	58,  // 4: delino.ownsand.v1.DeviceSession.expires_in:type_name -> google.protobuf.Duration
+	57,  // 5: delino.ownsand.v1.RemovalNotice.remove_time:type_name -> google.protobuf.Timestamp
 	6,   // 6: delino.ownsand.v1.AuthenticateResponse.session:type_name -> delino.ownsand.v1.DeviceSession
 	7,   // 7: delino.ownsand.v1.AuthenticateResponse.removal_notice:type_name -> delino.ownsand.v1.RemovalNotice
 	13,  // 8: delino.ownsand.v1.ChannelRequest.envelope:type_name -> delino.ownsand.v1.AgentEnvelope
@@ -4332,35 +4395,35 @@ var file_delino_ownsand_v1_agent_proto_depIdxs = []int32{
 	20,  // 14: delino.ownsand.v1.AgentEnvelope.sandbox_update:type_name -> delino.ownsand.v1.SandboxUpdate
 	23,  // 15: delino.ownsand.v1.AgentEnvelope.state_ack:type_name -> delino.ownsand.v1.StateAck
 	24,  // 16: delino.ownsand.v1.AgentEnvelope.command:type_name -> delino.ownsand.v1.AgentCommand
-	41,  // 17: delino.ownsand.v1.AgentEnvelope.command_result:type_name -> delino.ownsand.v1.AgentCommandResult
-	42,  // 18: delino.ownsand.v1.AgentEnvelope.configuration:type_name -> delino.ownsand.v1.AgentConfiguration
-	45,  // 19: delino.ownsand.v1.AgentEnvelope.signaling:type_name -> delino.ownsand.v1.SignalingMessage
-	46,  // 20: delino.ownsand.v1.AgentEnvelope.session_revocation:type_name -> delino.ownsand.v1.SessionRevocation
-	47,  // 21: delino.ownsand.v1.AgentEnvelope.revocation_ack:type_name -> delino.ownsand.v1.RevocationAck
-	48,  // 22: delino.ownsand.v1.AgentEnvelope.signed_url_request:type_name -> delino.ownsand.v1.SignedUrlRequest
-	50,  // 23: delino.ownsand.v1.AgentEnvelope.signed_url_grant:type_name -> delino.ownsand.v1.SignedUrlGrant
-	51,  // 24: delino.ownsand.v1.AgentEnvelope.relay_grant:type_name -> delino.ownsand.v1.RelayGrant
-	52,  // 25: delino.ownsand.v1.AgentEnvelope.relay_grant_ack:type_name -> delino.ownsand.v1.RelayGrantAck
-	53,  // 26: delino.ownsand.v1.AgentEnvelope.relay_grant_release:type_name -> delino.ownsand.v1.RelayGrantRelease
-	58,  // 27: delino.ownsand.v1.Heartbeat.update_state:type_name -> delino.ownsand.v1.AgentUpdateState
-	54,  // 28: delino.ownsand.v1.CapabilityReport.host_os:type_name -> delino.ownsand.v1.HostOs
-	55,  // 29: delino.ownsand.v1.CapabilityReport.arch:type_name -> delino.ownsand.v1.Arch
-	59,  // 30: delino.ownsand.v1.CapabilityReport.capabilities:type_name -> delino.ownsand.v1.DeviceCapabilities
-	60,  // 31: delino.ownsand.v1.SandboxStateEntry.state:type_name -> delino.ownsand.v1.SandboxState
-	61,  // 32: delino.ownsand.v1.SandboxStateEntry.end_reason:type_name -> delino.ownsand.v1.SandboxEndReason
-	56,  // 33: delino.ownsand.v1.SandboxStateEntry.idle_deadline:type_name -> google.protobuf.Timestamp
-	62,  // 34: delino.ownsand.v1.SandboxStateEntry.revision:type_name -> delino.ownsand.v1.SandboxRevision
-	63,  // 35: delino.ownsand.v1.SandboxStateEntry.restore_path:type_name -> delino.ownsand.v1.SandboxRestorePath
-	64,  // 36: delino.ownsand.v1.SnapshotStateEntry.state:type_name -> delino.ownsand.v1.SnapshotState
-	65,  // 37: delino.ownsand.v1.SnapshotStateEntry.guest_os:type_name -> delino.ownsand.v1.GuestOs
-	66,  // 38: delino.ownsand.v1.SnapshotStateEntry.resources:type_name -> delino.ownsand.v1.Resources
-	67,  // 39: delino.ownsand.v1.SnapshotStateEntry.network_mode:type_name -> delino.ownsand.v1.NetworkMode
+	42,  // 17: delino.ownsand.v1.AgentEnvelope.command_result:type_name -> delino.ownsand.v1.AgentCommandResult
+	43,  // 18: delino.ownsand.v1.AgentEnvelope.configuration:type_name -> delino.ownsand.v1.AgentConfiguration
+	46,  // 19: delino.ownsand.v1.AgentEnvelope.signaling:type_name -> delino.ownsand.v1.SignalingMessage
+	47,  // 20: delino.ownsand.v1.AgentEnvelope.session_revocation:type_name -> delino.ownsand.v1.SessionRevocation
+	48,  // 21: delino.ownsand.v1.AgentEnvelope.revocation_ack:type_name -> delino.ownsand.v1.RevocationAck
+	49,  // 22: delino.ownsand.v1.AgentEnvelope.signed_url_request:type_name -> delino.ownsand.v1.SignedUrlRequest
+	51,  // 23: delino.ownsand.v1.AgentEnvelope.signed_url_grant:type_name -> delino.ownsand.v1.SignedUrlGrant
+	52,  // 24: delino.ownsand.v1.AgentEnvelope.relay_grant:type_name -> delino.ownsand.v1.RelayGrant
+	53,  // 25: delino.ownsand.v1.AgentEnvelope.relay_grant_ack:type_name -> delino.ownsand.v1.RelayGrantAck
+	54,  // 26: delino.ownsand.v1.AgentEnvelope.relay_grant_release:type_name -> delino.ownsand.v1.RelayGrantRelease
+	59,  // 27: delino.ownsand.v1.Heartbeat.update_state:type_name -> delino.ownsand.v1.AgentUpdateState
+	55,  // 28: delino.ownsand.v1.CapabilityReport.host_os:type_name -> delino.ownsand.v1.HostOs
+	56,  // 29: delino.ownsand.v1.CapabilityReport.arch:type_name -> delino.ownsand.v1.Arch
+	60,  // 30: delino.ownsand.v1.CapabilityReport.capabilities:type_name -> delino.ownsand.v1.DeviceCapabilities
+	61,  // 31: delino.ownsand.v1.SandboxStateEntry.state:type_name -> delino.ownsand.v1.SandboxState
+	62,  // 32: delino.ownsand.v1.SandboxStateEntry.end_reason:type_name -> delino.ownsand.v1.SandboxEndReason
+	57,  // 33: delino.ownsand.v1.SandboxStateEntry.idle_deadline:type_name -> google.protobuf.Timestamp
+	63,  // 34: delino.ownsand.v1.SandboxStateEntry.revision:type_name -> delino.ownsand.v1.SandboxRevision
+	64,  // 35: delino.ownsand.v1.SandboxStateEntry.restore_path:type_name -> delino.ownsand.v1.SandboxRestorePath
+	65,  // 36: delino.ownsand.v1.SnapshotStateEntry.state:type_name -> delino.ownsand.v1.SnapshotState
+	66,  // 37: delino.ownsand.v1.SnapshotStateEntry.guest_os:type_name -> delino.ownsand.v1.GuestOs
+	67,  // 38: delino.ownsand.v1.SnapshotStateEntry.resources:type_name -> delino.ownsand.v1.Resources
+	68,  // 39: delino.ownsand.v1.SnapshotStateEntry.network_mode:type_name -> delino.ownsand.v1.NetworkMode
 	17,  // 40: delino.ownsand.v1.StateReport.sandboxes:type_name -> delino.ownsand.v1.SandboxStateEntry
 	18,  // 41: delino.ownsand.v1.StateReport.snapshots:type_name -> delino.ownsand.v1.SnapshotStateEntry
-	68,  // 42: delino.ownsand.v1.StateReport.built_base_images:type_name -> delino.ownsand.v1.BaseImage
+	69,  // 42: delino.ownsand.v1.StateReport.built_base_images:type_name -> delino.ownsand.v1.BaseImage
 	17,  // 43: delino.ownsand.v1.SandboxUpdate.sandbox:type_name -> delino.ownsand.v1.SandboxStateEntry
 	22,  // 44: delino.ownsand.v1.StateReportAck.sandboxes:type_name -> delino.ownsand.v1.SandboxUpdateAck
-	62,  // 45: delino.ownsand.v1.SandboxUpdateAck.revision:type_name -> delino.ownsand.v1.SandboxRevision
+	63,  // 45: delino.ownsand.v1.SandboxUpdateAck.revision:type_name -> delino.ownsand.v1.SandboxRevision
 	21,  // 46: delino.ownsand.v1.StateAck.state_report:type_name -> delino.ownsand.v1.StateReportAck
 	22,  // 47: delino.ownsand.v1.StateAck.sandbox_update:type_name -> delino.ownsand.v1.SandboxUpdateAck
 	25,  // 48: delino.ownsand.v1.AgentCommand.create_sandbox:type_name -> delino.ownsand.v1.CreateSandboxCommand
@@ -4373,63 +4436,64 @@ var file_delino_ownsand_v1_agent_proto_depIdxs = []int32{
 	34,  // 55: delino.ownsand.v1.AgentCommand.clean_up:type_name -> delino.ownsand.v1.CleanUpCommand
 	35,  // 56: delino.ownsand.v1.AgentCommand.update_agent:type_name -> delino.ownsand.v1.UpdateAgentCommand
 	33,  // 57: delino.ownsand.v1.AgentCommand.delete_snapshot:type_name -> delino.ownsand.v1.DeleteSnapshotCommand
-	68,  // 58: delino.ownsand.v1.CreateSandboxCommand.base_image:type_name -> delino.ownsand.v1.BaseImage
-	66,  // 59: delino.ownsand.v1.CreateSandboxCommand.resources:type_name -> delino.ownsand.v1.Resources
-	67,  // 60: delino.ownsand.v1.CreateSandboxCommand.network_mode:type_name -> delino.ownsand.v1.NetworkMode
-	65,  // 61: delino.ownsand.v1.CreateSandboxCommand.guest_os:type_name -> delino.ownsand.v1.GuestOs
-	57,  // 62: delino.ownsand.v1.CreateSandboxCommand.idle_ttl:type_name -> google.protobuf.Duration
-	57,  // 63: delino.ownsand.v1.CreateSandboxCommand.max_ttl:type_name -> google.protobuf.Duration
-	56,  // 64: delino.ownsand.v1.CreateSandboxCommand.create_time:type_name -> google.protobuf.Timestamp
-	56,  // 65: delino.ownsand.v1.CreateSandboxCommand.max_deadline:type_name -> google.protobuf.Timestamp
-	69,  // 66: delino.ownsand.v1.CreateSandboxCommand.limits:type_name -> delino.ownsand.v1.DeviceLimits
-	61,  // 67: delino.ownsand.v1.DeleteSandboxCommand.end_reason:type_name -> delino.ownsand.v1.SandboxEndReason
-	18,  // 68: delino.ownsand.v1.ImportSnapshotCommand.snapshot:type_name -> delino.ownsand.v1.SnapshotStateEntry
-	30,  // 69: delino.ownsand.v1.ImportSnapshotCommand.parts:type_name -> delino.ownsand.v1.SnapshotPart
-	17,  // 70: delino.ownsand.v1.CreateSandboxResult.sandbox:type_name -> delino.ownsand.v1.SandboxStateEntry
-	17,  // 71: delino.ownsand.v1.SandboxCommandResult.sandbox:type_name -> delino.ownsand.v1.SandboxStateEntry
-	18,  // 72: delino.ownsand.v1.CreateSnapshotResult.snapshot:type_name -> delino.ownsand.v1.SnapshotStateEntry
-	30,  // 73: delino.ownsand.v1.ExportSnapshotResult.parts:type_name -> delino.ownsand.v1.SnapshotPart
-	18,  // 74: delino.ownsand.v1.ImportSnapshotResult.snapshot:type_name -> delino.ownsand.v1.SnapshotStateEntry
-	70,  // 75: delino.ownsand.v1.AgentCommandResult.error:type_name -> delino.ownsand.v1.ErrorDetail
-	36,  // 76: delino.ownsand.v1.AgentCommandResult.create_sandbox:type_name -> delino.ownsand.v1.CreateSandboxResult
-	37,  // 77: delino.ownsand.v1.AgentCommandResult.sandbox:type_name -> delino.ownsand.v1.SandboxCommandResult
-	38,  // 78: delino.ownsand.v1.AgentCommandResult.create_snapshot:type_name -> delino.ownsand.v1.CreateSnapshotResult
-	39,  // 79: delino.ownsand.v1.AgentCommandResult.export_snapshot:type_name -> delino.ownsand.v1.ExportSnapshotResult
-	40,  // 80: delino.ownsand.v1.AgentCommandResult.import_snapshot:type_name -> delino.ownsand.v1.ImportSnapshotResult
-	69,  // 81: delino.ownsand.v1.AgentConfiguration.limits:type_name -> delino.ownsand.v1.DeviceLimits
-	71,  // 82: delino.ownsand.v1.SignalingOffer.principal:type_name -> delino.ownsand.v1.Principal
-	56,  // 83: delino.ownsand.v1.SignalingOffer.expire_time:type_name -> google.protobuf.Timestamp
-	57,  // 84: delino.ownsand.v1.SignalingOffer.expires_in:type_name -> google.protobuf.Duration
-	70,  // 85: delino.ownsand.v1.SignalingAnswer.error:type_name -> delino.ownsand.v1.ErrorDetail
-	43,  // 86: delino.ownsand.v1.SignalingMessage.offer:type_name -> delino.ownsand.v1.SignalingOffer
-	44,  // 87: delino.ownsand.v1.SignalingMessage.answer:type_name -> delino.ownsand.v1.SignalingAnswer
-	0,   // 88: delino.ownsand.v1.SignedUrlRequest.operation:type_name -> delino.ownsand.v1.SignedUrlOperation
-	56,  // 89: delino.ownsand.v1.SignedPartUrl.expire_time:type_name -> google.protobuf.Timestamp
-	0,   // 90: delino.ownsand.v1.SignedUrlGrant.operation:type_name -> delino.ownsand.v1.SignedUrlOperation
-	49,  // 91: delino.ownsand.v1.SignedUrlGrant.part_urls:type_name -> delino.ownsand.v1.SignedPartUrl
-	70,  // 92: delino.ownsand.v1.SignedUrlGrant.error:type_name -> delino.ownsand.v1.ErrorDetail
-	72,  // 93: delino.ownsand.v1.RelayGrant.operation_kind:type_name -> delino.ownsand.v1.RelayOperationKind
-	71,  // 94: delino.ownsand.v1.RelayGrant.principal:type_name -> delino.ownsand.v1.Principal
-	56,  // 95: delino.ownsand.v1.RelayGrant.expire_time:type_name -> google.protobuf.Timestamp
-	56,  // 96: delino.ownsand.v1.RelayGrant.stream_deadline:type_name -> google.protobuf.Timestamp
-	57,  // 97: delino.ownsand.v1.RelayGrant.expires_in:type_name -> google.protobuf.Duration
-	57,  // 98: delino.ownsand.v1.RelayGrant.stream_deadline_in:type_name -> google.protobuf.Duration
-	73,  // 99: delino.ownsand.v1.RelayGrantAck.result:type_name -> delino.ownsand.v1.RelayGrantResult
-	1,   // 100: delino.ownsand.v1.AgentService.Enroll:input_type -> delino.ownsand.v1.EnrollRequest
-	3,   // 101: delino.ownsand.v1.AgentService.CreateChallenge:input_type -> delino.ownsand.v1.CreateChallengeRequest
-	5,   // 102: delino.ownsand.v1.AgentService.Authenticate:input_type -> delino.ownsand.v1.AuthenticateRequest
-	9,   // 103: delino.ownsand.v1.AgentService.ConfirmRemoval:input_type -> delino.ownsand.v1.ConfirmRemovalRequest
-	11,  // 104: delino.ownsand.v1.AgentService.Channel:input_type -> delino.ownsand.v1.ChannelRequest
-	2,   // 105: delino.ownsand.v1.AgentService.Enroll:output_type -> delino.ownsand.v1.EnrollResponse
-	4,   // 106: delino.ownsand.v1.AgentService.CreateChallenge:output_type -> delino.ownsand.v1.CreateChallengeResponse
-	8,   // 107: delino.ownsand.v1.AgentService.Authenticate:output_type -> delino.ownsand.v1.AuthenticateResponse
-	10,  // 108: delino.ownsand.v1.AgentService.ConfirmRemoval:output_type -> delino.ownsand.v1.ConfirmRemovalResponse
-	12,  // 109: delino.ownsand.v1.AgentService.Channel:output_type -> delino.ownsand.v1.ChannelResponse
-	105, // [105:110] is the sub-list for method output_type
-	100, // [100:105] is the sub-list for method input_type
-	100, // [100:100] is the sub-list for extension type_name
-	100, // [100:100] is the sub-list for extension extendee
-	0,   // [0:100] is the sub-list for field type_name
+	36,  // 58: delino.ownsand.v1.AgentCommand.withdraw_agent_update:type_name -> delino.ownsand.v1.WithdrawAgentUpdateCommand
+	69,  // 59: delino.ownsand.v1.CreateSandboxCommand.base_image:type_name -> delino.ownsand.v1.BaseImage
+	67,  // 60: delino.ownsand.v1.CreateSandboxCommand.resources:type_name -> delino.ownsand.v1.Resources
+	68,  // 61: delino.ownsand.v1.CreateSandboxCommand.network_mode:type_name -> delino.ownsand.v1.NetworkMode
+	66,  // 62: delino.ownsand.v1.CreateSandboxCommand.guest_os:type_name -> delino.ownsand.v1.GuestOs
+	58,  // 63: delino.ownsand.v1.CreateSandboxCommand.idle_ttl:type_name -> google.protobuf.Duration
+	58,  // 64: delino.ownsand.v1.CreateSandboxCommand.max_ttl:type_name -> google.protobuf.Duration
+	57,  // 65: delino.ownsand.v1.CreateSandboxCommand.create_time:type_name -> google.protobuf.Timestamp
+	57,  // 66: delino.ownsand.v1.CreateSandboxCommand.max_deadline:type_name -> google.protobuf.Timestamp
+	70,  // 67: delino.ownsand.v1.CreateSandboxCommand.limits:type_name -> delino.ownsand.v1.DeviceLimits
+	62,  // 68: delino.ownsand.v1.DeleteSandboxCommand.end_reason:type_name -> delino.ownsand.v1.SandboxEndReason
+	18,  // 69: delino.ownsand.v1.ImportSnapshotCommand.snapshot:type_name -> delino.ownsand.v1.SnapshotStateEntry
+	30,  // 70: delino.ownsand.v1.ImportSnapshotCommand.parts:type_name -> delino.ownsand.v1.SnapshotPart
+	17,  // 71: delino.ownsand.v1.CreateSandboxResult.sandbox:type_name -> delino.ownsand.v1.SandboxStateEntry
+	17,  // 72: delino.ownsand.v1.SandboxCommandResult.sandbox:type_name -> delino.ownsand.v1.SandboxStateEntry
+	18,  // 73: delino.ownsand.v1.CreateSnapshotResult.snapshot:type_name -> delino.ownsand.v1.SnapshotStateEntry
+	30,  // 74: delino.ownsand.v1.ExportSnapshotResult.parts:type_name -> delino.ownsand.v1.SnapshotPart
+	18,  // 75: delino.ownsand.v1.ImportSnapshotResult.snapshot:type_name -> delino.ownsand.v1.SnapshotStateEntry
+	71,  // 76: delino.ownsand.v1.AgentCommandResult.error:type_name -> delino.ownsand.v1.ErrorDetail
+	37,  // 77: delino.ownsand.v1.AgentCommandResult.create_sandbox:type_name -> delino.ownsand.v1.CreateSandboxResult
+	38,  // 78: delino.ownsand.v1.AgentCommandResult.sandbox:type_name -> delino.ownsand.v1.SandboxCommandResult
+	39,  // 79: delino.ownsand.v1.AgentCommandResult.create_snapshot:type_name -> delino.ownsand.v1.CreateSnapshotResult
+	40,  // 80: delino.ownsand.v1.AgentCommandResult.export_snapshot:type_name -> delino.ownsand.v1.ExportSnapshotResult
+	41,  // 81: delino.ownsand.v1.AgentCommandResult.import_snapshot:type_name -> delino.ownsand.v1.ImportSnapshotResult
+	70,  // 82: delino.ownsand.v1.AgentConfiguration.limits:type_name -> delino.ownsand.v1.DeviceLimits
+	72,  // 83: delino.ownsand.v1.SignalingOffer.principal:type_name -> delino.ownsand.v1.Principal
+	57,  // 84: delino.ownsand.v1.SignalingOffer.expire_time:type_name -> google.protobuf.Timestamp
+	58,  // 85: delino.ownsand.v1.SignalingOffer.expires_in:type_name -> google.protobuf.Duration
+	71,  // 86: delino.ownsand.v1.SignalingAnswer.error:type_name -> delino.ownsand.v1.ErrorDetail
+	44,  // 87: delino.ownsand.v1.SignalingMessage.offer:type_name -> delino.ownsand.v1.SignalingOffer
+	45,  // 88: delino.ownsand.v1.SignalingMessage.answer:type_name -> delino.ownsand.v1.SignalingAnswer
+	0,   // 89: delino.ownsand.v1.SignedUrlRequest.operation:type_name -> delino.ownsand.v1.SignedUrlOperation
+	57,  // 90: delino.ownsand.v1.SignedPartUrl.expire_time:type_name -> google.protobuf.Timestamp
+	0,   // 91: delino.ownsand.v1.SignedUrlGrant.operation:type_name -> delino.ownsand.v1.SignedUrlOperation
+	50,  // 92: delino.ownsand.v1.SignedUrlGrant.part_urls:type_name -> delino.ownsand.v1.SignedPartUrl
+	71,  // 93: delino.ownsand.v1.SignedUrlGrant.error:type_name -> delino.ownsand.v1.ErrorDetail
+	73,  // 94: delino.ownsand.v1.RelayGrant.operation_kind:type_name -> delino.ownsand.v1.RelayOperationKind
+	72,  // 95: delino.ownsand.v1.RelayGrant.principal:type_name -> delino.ownsand.v1.Principal
+	57,  // 96: delino.ownsand.v1.RelayGrant.expire_time:type_name -> google.protobuf.Timestamp
+	57,  // 97: delino.ownsand.v1.RelayGrant.stream_deadline:type_name -> google.protobuf.Timestamp
+	58,  // 98: delino.ownsand.v1.RelayGrant.expires_in:type_name -> google.protobuf.Duration
+	58,  // 99: delino.ownsand.v1.RelayGrant.stream_deadline_in:type_name -> google.protobuf.Duration
+	74,  // 100: delino.ownsand.v1.RelayGrantAck.result:type_name -> delino.ownsand.v1.RelayGrantResult
+	1,   // 101: delino.ownsand.v1.AgentService.Enroll:input_type -> delino.ownsand.v1.EnrollRequest
+	3,   // 102: delino.ownsand.v1.AgentService.CreateChallenge:input_type -> delino.ownsand.v1.CreateChallengeRequest
+	5,   // 103: delino.ownsand.v1.AgentService.Authenticate:input_type -> delino.ownsand.v1.AuthenticateRequest
+	9,   // 104: delino.ownsand.v1.AgentService.ConfirmRemoval:input_type -> delino.ownsand.v1.ConfirmRemovalRequest
+	11,  // 105: delino.ownsand.v1.AgentService.Channel:input_type -> delino.ownsand.v1.ChannelRequest
+	2,   // 106: delino.ownsand.v1.AgentService.Enroll:output_type -> delino.ownsand.v1.EnrollResponse
+	4,   // 107: delino.ownsand.v1.AgentService.CreateChallenge:output_type -> delino.ownsand.v1.CreateChallengeResponse
+	8,   // 108: delino.ownsand.v1.AgentService.Authenticate:output_type -> delino.ownsand.v1.AuthenticateResponse
+	10,  // 109: delino.ownsand.v1.AgentService.ConfirmRemoval:output_type -> delino.ownsand.v1.ConfirmRemovalResponse
+	12,  // 110: delino.ownsand.v1.AgentService.Channel:output_type -> delino.ownsand.v1.ChannelResponse
+	106, // [106:111] is the sub-list for method output_type
+	101, // [101:106] is the sub-list for method input_type
+	101, // [101:101] is the sub-list for extension type_name
+	101, // [101:101] is the sub-list for extension extendee
+	0,   // [0:101] is the sub-list for field type_name
 }
 
 func init() { file_delino_ownsand_v1_agent_proto_init() }
@@ -4477,34 +4541,35 @@ func file_delino_ownsand_v1_agent_proto_init() {
 		(*AgentCommand_CleanUp)(nil),
 		(*AgentCommand_UpdateAgent)(nil),
 		(*AgentCommand_DeleteSnapshot)(nil),
+		(*AgentCommand_WithdrawAgentUpdate)(nil),
 	}
 	file_delino_ownsand_v1_agent_proto_msgTypes[24].OneofWrappers = []any{
 		(*CreateSandboxCommand_BaseImage)(nil),
 		(*CreateSandboxCommand_SnapshotId)(nil),
 	}
-	file_delino_ownsand_v1_agent_proto_msgTypes[40].OneofWrappers = []any{
+	file_delino_ownsand_v1_agent_proto_msgTypes[41].OneofWrappers = []any{
 		(*AgentCommandResult_CreateSandbox)(nil),
 		(*AgentCommandResult_Sandbox)(nil),
 		(*AgentCommandResult_CreateSnapshot)(nil),
 		(*AgentCommandResult_ExportSnapshot)(nil),
 		(*AgentCommandResult_ImportSnapshot)(nil),
 	}
-	file_delino_ownsand_v1_agent_proto_msgTypes[44].OneofWrappers = []any{
+	file_delino_ownsand_v1_agent_proto_msgTypes[45].OneofWrappers = []any{
 		(*SignalingMessage_Offer)(nil),
 		(*SignalingMessage_Answer)(nil),
 	}
-	file_delino_ownsand_v1_agent_proto_msgTypes[45].OneofWrappers = []any{
+	file_delino_ownsand_v1_agent_proto_msgTypes[46].OneofWrappers = []any{
 		(*SessionRevocation_SessionId)(nil),
 		(*SessionRevocation_RelayGrantId)(nil),
 	}
-	file_delino_ownsand_v1_agent_proto_msgTypes[50].OneofWrappers = []any{}
+	file_delino_ownsand_v1_agent_proto_msgTypes[51].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_ownsand_v1_agent_proto_rawDesc), len(file_delino_ownsand_v1_agent_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   53,
+			NumMessages:   54,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
