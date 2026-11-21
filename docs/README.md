@@ -36,6 +36,7 @@
 - [Project index](project-delino-accounts.md)
 - [Web app foundation](apps-delino-accounts-foundation.md)
 - [API server foundation](servers-accounts-api-foundation.md)
+- [Connect RPC API contract](protos-delino-accounts-api-contract.md)
 
 ### delino-ui
 
