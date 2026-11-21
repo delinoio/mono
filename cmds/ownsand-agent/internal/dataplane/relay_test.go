@@ -198,6 +198,76 @@ func TestRelayGrantReleasedWhenDetachedExecEnds(t *testing.T) {
 	waitFor(t, "grant release after the exec ended", func() bool { return e.ch.released(g.GetGrantId()) })
 }
 
+// TestRelayEmptyStreamKeepsAttachGrantOfEndedExec checks that a stream that
+// closes before it carries a request does not mark an ATTACH_EXEC grant as
+// used: the grant of an exec that already ended stays until its idle time, a
+// second stream attaches under it and gets the retained exit event, and the
+// grant is released only after that attach ended.
+func TestRelayEmptyStreamKeepsAttachGrantOfEndedExec(t *testing.T) {
+	e := newRelayEnv(t, Timing{}, RelayLimits{})
+	req := e.execReq("/bin/sh", "-c", "echo done")
+	g := e.execGrant(req)
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamClose{}))
+	waitFor(t, "exec end", func() bool { return e.d.ExecEnded(req.GetExecId()) })
+	waitFor(t, "release of the exec grant", func() bool { return e.ch.released(g.GetGrantId()) })
+
+	attach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: req.GetExecId()}
+	g2, ack := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, req.GetExecId(), nil, 15*time.Minute, 30*time.Minute, "")
+	if ack.GetResult() != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
+		t.Fatalf("grant ack %v", ack)
+	}
+	e.openOK(rc, 2, g2.GetGrantId())
+	rc.send(datapath.MustNewFrame(2, e.sandbox, &ownsandv1.RelayStreamClose{}))
+	waitFor(t, "empty stream end", func() bool {
+		e.dp.relay.mu.Lock()
+		defer e.dp.relay.mu.Unlock()
+		// A released grant is gone from the map; the checks below report it.
+		held := e.dp.relay.grants[g2.GetGrantId()]
+		return held == nil || len(held.streams) == 0
+	})
+	// The sweep runs here at several instants before the idle time.
+	for _, d := range []time.Duration{0, time.Second, 30 * time.Second} {
+		e.dp.relay.sweep(time.Now().Add(d))
+		if e.ch.released(g2.GetGrantId()) {
+			t.Fatalf("the grant of an unused attach was released %v after an empty stream", d)
+		}
+	}
+
+	e.openOK(rc, 3, g2.GetGrantId())
+	rc.send(datapath.MustNewFrame(3, e.sandbox, attach))
+	if f := rc.nextOn(3); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+		t.Fatalf("expected the accepted notice, got %v", f)
+	}
+	var sawExit bool
+	for !sawExit {
+		f := rc.nextOn(3)
+		sawExit = f.GetExecEvent().GetExited() != nil
+	}
+	rc.send(datapath.MustNewFrame(3, e.sandbox, &ownsandv1.RelayStreamClose{}))
+	waitFor(t, "release after the attach ended", func() bool {
+		e.dp.relay.sweep(time.Now())
+		return e.ch.released(g2.GetGrantId())
+	})
+}
+
+// TestRelayUnusedAttachGrantReleasedAtIdle checks that a grant that no
+// request used still releases at its idle time.
+func TestRelayUnusedAttachGrantReleasedAtIdle(t *testing.T) {
+	e := newRelayEnv(t, Timing{}, RelayLimits{})
+	g, _ := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC, newID(t), nil, 15*time.Minute, 30*time.Minute, "")
+	e.dp.relay.sweep(time.Now())
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the unused grant was released before its idle time")
+	}
+	e.dp.relay.sweep(time.Now().Add(e.dp.timing.GrantIdle + time.Second))
+	if !e.ch.released(g.GrantId) {
+		t.Fatal("the unused grant was not released at its idle time")
+	}
+}
+
 // TestRelayErrorFrameFromControlPlaneEndsTheStreamQuietly checks that an
 // error frame of the control plane ends the stream like a stream close frame:
 // the agent sends no frame back and does not mark the grant done, so the exec

@@ -144,7 +144,6 @@ func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.Rel
 	c.streams[id] = st
 	c.credit += r.limits.StreamReceiveWindow
 	g.streams[st] = true
-	g.opened = true
 	r.mu.Unlock()
 	r.sendFrame(c, id, g.sandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: recvWin.InitialWindow()})
 }
@@ -184,6 +183,11 @@ func (r *relay) request(c *rconn, f *ownsandv1.DataFrame) {
 			SandboxID: g.sandboxID,
 			Grant:     &ops.GrantCheck{Kind: g.kind, OperationID: g.opID, Digest: g.digest},
 			OnAccepted: func() {
+				// The dispatcher accepted a request under the grant: only now
+				// does the grant count as used (see grant.opened).
+				r.mu.Lock()
+				g.opened = true
+				r.mu.Unlock()
 				r.sendFrame(c, st.id, g.sandboxID, &ownsandv1.RequestAccepted{})
 			},
 		}, relaySink{st})

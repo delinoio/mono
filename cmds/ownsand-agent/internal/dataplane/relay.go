@@ -83,7 +83,10 @@ type grant struct {
 	streams    map[*rstream]bool
 	idleSince  time.Time
 	done       bool
-	// opened is true once a stream of the grant was admitted.
+	// opened is true once the dispatcher accepted an exec or attach request
+	// (or a file read) under the grant. A stream that was admitted but
+	// closed before it carried a request does not set it, so a grant that
+	// no request used keeps its idle time.
 	opened bool
 }
 
