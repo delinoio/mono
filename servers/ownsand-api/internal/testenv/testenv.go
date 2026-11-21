@@ -29,6 +29,7 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/objectstore"
@@ -127,14 +128,16 @@ func New(t testing.TB, opts ...Option) *Env {
 	}
 	objects := objectstore.NewMemory(clock.Now)
 	o := app.Options{
-		DB:       database,
-		Logger:   logger,
-		Now:      clock.Now,
-		Logto:    fakeLogto{},
-		Limits:   &limits,
-		Timing:   &timing,
-		Objects:  objects,
-		STUNURLs: []string{"stun:127.0.0.1:3478"},
+		DB:     database,
+		Logger: logger,
+		Now:    clock.Now,
+		Logto:  fakeLogto{},
+		Limits: &limits,
+		Timing: &timing,
+		// Tests connect to the server directly, so the TCP peer is the client.
+		ClientAddressMode: config.ClientAddressDirect,
+		Objects:           objects,
+		STUNURLs:          []string{"stun:127.0.0.1:3478"},
 		RelayTiming: &api.RelayTiming{Rotation: 3 * time.Second, Keepalive: 200 * time.Millisecond, Acceptance: time.Second,
 			RequestDeadline: 2 * time.Second, GrantAck: time.Second, Signaling: 2 * time.Second},
 	}

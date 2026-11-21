@@ -13,7 +13,10 @@
 // instead of failing, so the root `pnpm dev` keeps running the other
 // development servers on machines without a database. When
 // CORS_ORIGINS is unset, it allows the console's development origin
-// http://127.0.0.1:3300 in addition to the production origin.
+// http://127.0.0.1:3300 in addition to the production origin. When
+// ALLOW_DIRECT_CLIENT_ADDRESS is unset, it sets it to true: the development
+// server is reached directly, so the TCP peer is the client address for rate
+// limits. TRUST_PROXY_CLIENT_ADDRESS=true still takes precedence.
 //
 // Child processes use explicit argument arrays and `shell: false` according
 // to the repository environment contract.
@@ -85,6 +88,7 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
+  env.ALLOW_DIRECT_CLIENT_ADDRESS ??= "true";
   env.CORS_ORIGINS ??= `${ProductionConsoleOrigin},${DevelopmentConsoleOrigin}`;
   const buildDir = await mkdtemp(join(tmpdir(), "ownsand-api-dev-"));
   try {

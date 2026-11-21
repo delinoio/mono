@@ -27,7 +27,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Addr != DefaultAddr || cfg.LogtoAudience != DefaultAudience || cfg.LogtoJWKSURL != "https://tenant.logto.app/oidc/jwks" ||
-		!cfg.RunMigrations || cfg.NonceKey != nil || cfg.TrustProxyClientAddress || len(cfg.CORSOrigins) != 1 {
+		!cfg.RunMigrations || cfg.NonceKey != nil || cfg.TrustProxyClientAddress || cfg.AllowDirectClientAddress || cfg.ClientAddressMode != ClientAddressNone || len(cfg.CORSOrigins) != 1 {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }
@@ -62,6 +62,7 @@ func TestLoadRejects(t *testing.T) {
 		"previous alone":     func(v map[string]string) { v[EnvNonceKeyPrevious] = strings.Repeat("A", 43) },
 		"bad origin":         func(v map[string]string) { v[EnvCORSOrigins] = "https://x/path" },
 		"bad trust boolean":  func(v map[string]string) { v[EnvTrustProxyClientAddress] = "maybe" },
+		"bad direct boolean": func(v map[string]string) { v[EnvAllowDirectClientAddress] = "maybe" },
 		"bad migrate switch": func(v map[string]string) { v[EnvRunMigrations] = "sometimes" },
 	} {
 		v := minimal()
@@ -97,5 +98,37 @@ func TestLoadR2AndSTUN(t *testing.T) {
 		if _, err := Load(env(w)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestLoadClientAddressMode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		trust, allow string
+		want         ClientAddressMode
+	}{
+		{"neither", "", "", ClientAddressNone},
+		{"both false", "false", "false", ClientAddressNone},
+		{"direct", "", "true", ClientAddressDirect},
+		{"verified proxy", "true", "", ClientAddressVerifiedProxy},
+		{"verified proxy takes precedence", "true", "true", ClientAddressVerifiedProxy},
+		{"trust false allows direct", "false", "true", ClientAddressDirect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := minimal()
+			if tc.trust != "" {
+				v[EnvTrustProxyClientAddress] = tc.trust
+			}
+			if tc.allow != "" {
+				v[EnvAllowDirectClientAddress] = tc.allow
+			}
+			cfg, err := Load(env(v))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ClientAddressMode != tc.want {
+				t.Fatalf("mode = %q, want %q", cfg.ClientAddressMode, tc.want)
+			}
+		})
 	}
 }

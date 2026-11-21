@@ -250,6 +250,9 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	s := &stack{t: t, bins: bins, apiURL: "http://" + addr, stunAddr: stunAddr, key: key, userSub: "e2e-user-" + randomSuffix(t), logs: logs}
 	apiEnv := []string{
 		"ADDR=" + addr,
+		// The e2e clients connect to the server directly, so the TCP peer is
+		// the client address for rate limits.
+		"ALLOW_DIRECT_CLIENT_ADDRESS=true",
 		"LOG_LEVEL=debug",
 		"DATABASE_URL=" + dbtest.NewURL(t),
 		"LOGTO_ISSUER=" + testIssuer,

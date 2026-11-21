@@ -43,6 +43,7 @@ const expectedPassThroughEnv = {
   // Turbo reports the pass-through list sorted.
   "ownsand-api#dev": [
     "ADDR",
+    "ALLOW_DIRECT_CLIENT_ADDRESS",
     "CORS_ORIGINS",
     "DATABASE_URL",
     "LOGTO_AUDIENCE",
