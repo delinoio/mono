@@ -115,19 +115,27 @@ func TestAttachReadWrite(t *testing.T) {
 	if err := ReadFileRequest(read); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{`C:\Users\x`, "C:/x", `\\server\share`} {
+	for _, path := range []string{`C:\Users\x`, "C:/x", `\\server\share`, `\/server/share`, `\??\C:\file.txt`} {
 		r := proto.Clone(read).(*ownsandv1.ReadFileRequest)
 		r.Path = path
 		if err := ReadFileRequest(r); err != nil {
 			t.Errorf("path %q: %v", path, err)
 		}
 	}
-	for _, path := range []string{"", "relative/file", "C:", "\xff"} {
+	for _, path := range []string{"", "relative/file", "C:", "\xff", `\file.txt`, `\`, `\?x`} {
 		r := proto.Clone(read).(*ownsandv1.ReadFileRequest)
 		r.Path = path
 		wantInvalid(t, "path "+path, ReadFileRequest(r), "path")
 	}
+	if err := ReadFileRequest(proto.Clone(read).(*ownsandv1.ReadFileRequest)); err != nil {
+		t.Fatal(err)
+	}
 	r := proto.Clone(read).(*ownsandv1.ReadFileRequest)
+	r.Path = `\file.txt`
+	if err := ReadFileRequest(r); err == nil || strings.Contains(err.Error(), "file.txt") {
+		t.Errorf("root-relative path error must exist and omit the value: %v", err)
+	}
+	r = proto.Clone(read).(*ownsandv1.ReadFileRequest)
 	r.BindingSalt = nil
 	wantInvalid(t, "read without salt", ReadFileRequest(r), "binding_salt")
 
@@ -135,6 +143,10 @@ func TestAttachReadWrite(t *testing.T) {
 	if err := WriteFileRequest(first, true); err != nil {
 		t.Fatal(err)
 	}
+	rootRel := proto.Clone(first).(*ownsandv1.WriteFileRequest)
+	rootRel.Path = `\file.txt`
+	wantInvalid(t, "write first root-relative", WriteFileRequest(rootRel, true), "path")
+	wantInvalid(t, "write later root-relative", WriteFileRequest(rootRel, false), "path")
 	later := &ownsandv1.WriteFileRequest{OrganizationId: orgID, SandboxId: sandboxID, WriteId: opID, Offset: 1, Data: []byte("y"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 2, Mode: 0o644}}
 	if err := WriteFileRequest(later, false); err != nil {
 		t.Fatal(err)
