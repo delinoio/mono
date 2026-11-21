@@ -45,7 +45,10 @@ export const Timing = {
   pausedPollMaxMs: 10_000,
   /** An operation ID older than this is expired at the agent. */
   operationIdLifetimeMs: 15 * 60_000,
-  /** The data channel must open within this time. */
+  /**
+   * The data channel must open within this time after the answer is applied;
+   * ICE gathering has the same limit, counted from the start of gathering.
+   */
   dataChannelOpenMs: 10_000,
 } as const;
 

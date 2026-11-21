@@ -22,6 +22,7 @@ import {
   type FakeAgent,
   type FakeAgentPeer,
   type FakeWebRtc,
+  type FakeWebRtcOptions,
   fakeWebRtc,
 } from "./testing/fake-webrtc.ts";
 import {
@@ -35,10 +36,11 @@ import {
 
 function p2pSetup(
   agent: FakeAgent,
-  options: {
-    neverOpen?: boolean;
+  options: FakeWebRtcOptions & {
     transport?: DataPathTransport;
     logger?: Logger;
+    /** Virtual time that the OpenSession call takes. */
+    openSessionMs?: number;
   } = {},
 ) {
   let rtc: FakeWebRtc | undefined;
@@ -53,11 +55,16 @@ function p2pSetup(
   h.api.unary(DataPathService, "GetIceServers", () => ({
     iceServers: [{ urls: ["stun:stun.ownsand.api.test:3478"] }],
   }));
-  h.api.unary(DataPathService, "OpenSession", (_req, call) => ({
-    sessionId: `session-${call.index + 1}`,
-    sdpAnswer: "v=0 fake-answer",
-    expiresIn: { seconds: 3600n },
-  }));
+  h.api.unary(DataPathService, "OpenSession", async (_req, call) => {
+    if (options.openSessionMs !== undefined) {
+      await h.clock.sleep(options.openSessionMs);
+    }
+    return {
+      sessionId: `session-${call.index + 1}`,
+      sdpAnswer: "v=0 fake-answer",
+      expiresIn: { seconds: 3600n },
+    };
+  });
   return { h, rtc: rtc! };
 }
 
@@ -166,9 +173,105 @@ describe("peer-to-peer data path", () => {
     const result = await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
     expect(result.kind).toBe(ExecResultKind.Exited);
     expect(sandbox.transport).toBe(DataPathTransport.RELAY);
-    expect(h.clock.now()).toBeGreaterThanOrEqual(10_000);
+    // 100 ms of ICE gathering, then 10 seconds for the channel to open.
+    expect(h.clock.now()).toBe(10_100);
     await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
     expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+  });
+
+  const exitingAgent: FakeAgent = (frame, peer) => {
+    if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+      execEvent(peer, frame.streamId, ev.started());
+      execEvent(peer, frame.streamId, ev.exited(0));
+    }
+  };
+
+  test("starts the 10 second open limit after the answer, so a slow OpenSession keeps peer-to-peer", async () => {
+    const { h, rtc } = p2pSetup(exitingAgent, { openSessionMs: 11_000 });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const result = await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    // 100 ms gathering, 11 s OpenSession, 50 ms until the channel opens.
+    expect(h.clock.now()).toBe(11_150);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    expect(rtc.frames).toHaveLength(1);
+    expect(rtc.channels[0]!.readyState).toBe("open");
+  });
+
+  test("counts gathering and OpenSession separately from the open limit", async () => {
+    const { h } = p2pSetup(exitingAgent, {
+      gatherMs: 6_000,
+      openSessionMs: 6_000,
+      openDelayMs: 9_000,
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.clock.now()).toBe(21_000);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
+  test("falls back to the relay exactly 10 seconds after the answer when the channel never opens", async () => {
+    const { h, rtc } = p2pSetup(() => {}, {
+      neverOpen: true,
+      openSessionMs: 6_000,
+    });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+    // 100 ms gathering and 6 s OpenSession, then the 10 second limit.
+    expect(h.clock.now()).toBe(16_100);
+    expect(rtc.channels[0]!.readyState).toBe("closed");
+  });
+
+  test("counts an open event that fires before the answer", async () => {
+    const { h } = p2pSetup(exitingAgent, {
+      openBeforeAnswer: true,
+      openSessionMs: 11_000,
+      openDelayMs: 60_000,
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    expect(h.clock.now()).toBe(11_100);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
+  test("ends with the abort reason and closes the connection when the caller aborts while the channel opens", async () => {
+    const { h, rtc } = p2pSetup(() => {}, { neverOpen: true });
+    const controller = new AbortController();
+    const reason = new Error("caller cancelled");
+    const sandbox = h.client.sandbox(SANDBOX);
+    const pending = sandbox
+      .exec({ command: ["x"], signal: controller.signal })
+      .wait()
+      .catch((e) => e);
+    // The answer is applied at 100 ms; abort 3 seconds into the open wait.
+    await h.clock.advance(3_100);
+    controller.abort(reason);
+    const error = await h.clock.run(pending);
+    expect(error).toBe(reason);
+    expect(h.clock.now()).toBe(3_100);
+    expect(rtc.channels[0]!.readyState).toBe("closed");
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+  });
+
+  test("keeps the 10 second ICE gathering limit", async () => {
+    const { h } = p2pSetup(() => {}, { gatherMs: 10_500 });
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+    expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+    expect(h.clock.now()).toBe(10_000);
+    expect(h.api.callsOf("OpenSession")).toHaveLength(0);
   });
 
   test("continues an exec on the relay with AttachExec after the channel fails, never running it again", async () => {

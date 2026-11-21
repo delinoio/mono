@@ -166,7 +166,10 @@ export class PeerSession {
 
   /**
    * Opens a session: `GetIceServers`, a non-trickle offer with all
-   * candidates, `OpenSession`, and the data channel open within 10 seconds.
+   * candidates (10 seconds at most), `OpenSession`, and the data channel
+   * open within 10 seconds after the answer is applied. `OpenSession` has no
+   * limit of its own here, so a slow signaling call does not use up the time
+   * that the channel needs to open.
    */
   static async open(
     ctx: OperationContext,
@@ -185,9 +188,10 @@ export class PeerSession {
         ordered: true,
       });
       channel.binaryType = "arraybuffer";
-      const opened = waitForEvent(channel, "open", ctx, signal);
-      // Awaited below; this keeps an early timeout from being unhandled.
-      opened.catch(() => {});
+      // Listens from now on, so an `open` event that fires before the answer
+      // is applied still counts. It never rejects; the 10 second limit
+      // starts only after the answer is applied (below).
+      const opened = channelOpened(channel);
       await pc.setLocalDescription(await pc.createOffer());
       await waitForGathering(pc, ctx, signal);
       const offer = pc.localDescription?.sdp;
@@ -223,7 +227,7 @@ export class PeerSession {
       // The answer carries the agent's DTLS fingerprint; the WebRTC stack
       // accepts only that fingerprint for the data channel.
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
-      await opened;
+      await waitForOpen(opened, ctx, signal);
       if (channel.readyState !== "open") {
         throw new PeerUnavailableError("data channel did not open");
       }
@@ -545,35 +549,45 @@ const KIND_OF_REQUEST: Readonly<Record<string, DataFrameKind>> = {
   fileWriteChunk: DataFrameKind.FILE_WRITE_CHUNK,
 };
 
-function waitForEvent(
-  target: DataChannelLike,
-  type: string,
+/**
+ * A promise that resolves when the channel opens. It listens from the call on
+ * and never rejects, so it needs no timer and no handler before it is awaited.
+ */
+function channelOpened(channel: DataChannelLike): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const onOpen = () => {
+      channel.removeEventListener("open", onOpen);
+      resolve();
+    };
+    channel.addEventListener("open", onOpen);
+  });
+}
+
+/**
+ * Waits for `opened` for at most `Timing.dataChannelOpenMs`, counted from the
+ * call. The caller calls it right after it applied the answer, so the time
+ * that gathering and `OpenSession` took does not count. An abort ends the wait
+ * with the abort reason.
+ */
+async function waitForOpen(
+  opened: Promise<void>,
   ctx: OperationContext,
   signal: AbortSignal | undefined,
 ): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const stop = new AbortController();
-    const onEvent = () => {
-      stop.abort();
-      target.removeEventListener(type, onEvent);
-      resolve();
-    };
-    target.addEventListener(type, onEvent);
-    ctx.clock
-      .sleep(Timing.dataChannelOpenMs, anySignal(stop.signal, signal))
-      .then(
-        () => {
-          target.removeEventListener(type, onEvent);
-          reject(new PeerUnavailableError("data channel did not open in time"));
-        },
-        (error: unknown) => {
-          if (!stop.signal.aborted) {
-            target.removeEventListener(type, onEvent);
-            reject(error);
-          }
-        },
-      );
-  });
+  const stop = new AbortController();
+  try {
+    await Promise.race([
+      opened,
+      ctx.clock
+        .sleep(Timing.dataChannelOpenMs, anySignal(stop.signal, signal))
+        .then(() => {
+          throw new PeerUnavailableError("data channel did not open in time");
+        }),
+    ]);
+  } finally {
+    // Cancels the timer when the channel opened first.
+    stop.abort();
+  }
 }
 
 async function waitForGathering(
