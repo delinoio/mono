@@ -264,6 +264,20 @@ describe("router", () => {
     expect(parseRoute("/orgs/o1/unknown").id).toBe(RouteId.NotFound);
     expect(parseRoute("/elsewhere").id).toBe(RouteId.NotFound);
   });
+
+  test("malformed percent escapes are not found instead of throwing", () => {
+    expect(parseRoute("/orgs/%/sandboxes")).toEqual({ id: RouteId.NotFound });
+    expect(parseRoute("/orgs/o1/sandboxes/%E0%A4%A")).toEqual({
+      id: RouteId.NotFound,
+    });
+  });
+
+  test("valid encoded segments are decoded", () => {
+    expect(parseRoute("/orgs/o%201/sandboxes")).toEqual({
+      id: RouteId.Sandboxes,
+      organizationId: "o 1",
+    });
+  });
 });
 
 describe("polling", () => {

@@ -1,13 +1,17 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
 package dataplane
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -460,6 +464,119 @@ func TestRelayReceiveTimeoutProbeAndIdle(t *testing.T) {
 	}
 }
 
+// newManualConn returns a relay and a connection that no loop drives, so a
+// test sets the queue and the byte clocks by hand.
+func newManualConn(t *testing.T, timing Timing, queue int) (*relay, *rconn) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r := &relay{d: &DataPlane{timing: timing.withDefaults(), logger: logger()}}
+	c := &rconn{out: make(chan *ownsandv1.DataFrame, queue), ctx: ctx, cancel: cancel}
+	return r, c
+}
+
+// TestRelayWatchdogSkipsKeepaliveOnFullQueue checks that the watchdog never
+// waits on the outbound queue: a full queue skips the periodic keepalive
+// while recent inbound bytes keep the connection, and a free slot gets the
+// keepalive once it is due.
+func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
+	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Second, ReceiveTimeout: time.Minute}, 2)
+	now := time.Now()
+	c.lastRecv.Store(now.UnixNano())
+	c.lastSend.Store(now.Add(-time.Hour).UnixNano())
+	payload := &ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS}
+	for i := 0; i < cap(c.out); i++ {
+		if err := c.enqueue(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan bool, 1)
+	go func() { done <- r.watchdogTick(c, now) }()
+	select {
+	case timedOut := <-done:
+		if timedOut {
+			t.Fatal("watchdog timed out a connection with recent inbound bytes")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchdog waited on the full outbound queue")
+	}
+	if c.ctx.Err() != nil || len(c.out) != cap(c.out) {
+		t.Fatalf("skipped keepalive changed the connection: ctx %v, queued %d", c.ctx.Err(), len(c.out))
+	}
+	// A free slot and a due keepalive: the keepalive is sent, after the
+	// queued payload frames.
+	<-c.out
+	if r.watchdogTick(c, now) {
+		t.Fatal("watchdog timed out a connection with recent inbound bytes")
+	}
+	<-c.out
+	if f := <-c.out; f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE || f.GetRelayKeepalive().GetEchoRequested() {
+		t.Fatalf("queued frame %v, want a plain keepalive", f)
+	}
+	// A keepalive that is not due is not sent.
+	c.lastSend.Store(now.UnixNano())
+	r.watchdogTick(c, now)
+	if len(c.out) != 0 {
+		t.Fatalf("keepalive sent before it was due: %d queued", len(c.out))
+	}
+	// The receive timeout wins over a full queue.
+	for i := 0; i < cap(c.out); i++ {
+		c.enqueue(payload)
+	}
+	c.lastSend.Store(now.Add(-time.Hour).UnixNano())
+	c.lastRecv.Store(now.Add(-2 * time.Minute).UnixNano())
+	if !r.watchdogTick(c, now) {
+		t.Fatal("watchdog did not report the receive timeout with a full queue")
+	}
+}
+
+// TestRelayWatchdogRedialsWhenWriterIsBlocked checks the whole loop: with a
+// live grant, a full outbound queue, a writer that cannot send (the control
+// plane does not read the stream, so HTTP/2 flow control stops it) and no
+// inbound bytes, the agent cancels the connection at the receive timeout
+// and dials again.
+func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
+	e := newRelayEnv(t, Timing{KeepaliveInterval: 100 * time.Millisecond, ReceiveTimeout: 1500 * time.Millisecond, ProbeIdle: time.Hour}, RelayLimits{})
+	var stalled atomic.Bool
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var count atomic.Int32
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		rc := &relayConn{t: t, ctx: ctx, frames: make(chan *ownsandv1.DataFrame, 4096), stream: stream}
+		e.conns <- rc
+		if count.Add(1) > 1 {
+			return nil
+		}
+		// First connection: read the startup frames, then stop reading and
+		// stay silent.
+		for i := 0; i < 2; i++ {
+			if _, err := stream.Receive(); err != nil {
+				return nil
+			}
+		}
+		stalled.Store(true)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	req := e.execReq("/bin/sh", "-c", "head -c 64000000 /dev/zero")
+	g := e.execGrant(req)
+	// The connection loss ends the stream of g and releases it; this second
+	// grant stays live, so the agent has a reason to dial again.
+	e.execGrant(e.execReq("/bin/true"))
+	rc := <-e.conns
+	waitFor(t, "stalled relay handler", stalled.Load)
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamOpen{GrantId: g.GetGrantId(), InitialWindowBytes: 64 << 20}))
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	select {
+	case <-e.conns:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the agent did not dial again after the receive timeout")
+	}
+}
+
 // A grant of a new channel that arrives while the relay loop of the
 // previous channel still authenticates gets a relay connection: the
 // running loop dials for the new channel, whether the old attempt fails
@@ -507,6 +624,100 @@ func TestRelayLoopFollowsNewChannel(t *testing.T) {
 	}
 }
 
+// A credential request that never returns is canceled when its agent
+// channel closes, so a grant of the next channel gets a fresh credential
+// request and a connection without waiting for the old response.
+func TestRelayCancelsPendingCredentialOnChannelLoss(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	canceled := make(chan struct{})
+	hook := func(ctx context.Context) error {
+		if calls.Add(1) > 1 {
+			return nil
+		}
+		entered <- struct{}{}
+		// The first request returns only when it is canceled.
+		<-ctx.Done()
+		close(canceled)
+		return ctx.Err()
+	}
+	e.beforeAuth.Store(&hook)
+	e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay loop did not request a credential")
+	}
+	// The channel closes first, as in the agent, then the data plane learns
+	// about the loss.
+	e.ch.Close()
+	e.dp.ChannelLost(e.ch)
+	select {
+	case <-canceled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pending credential request was not canceled with its channel")
+	}
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	g := e.execGrant(e.execReq("/bin/true"))
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+	if n := calls.Load(); n != 2 {
+		t.Fatalf("credential requests = %d, want 2", n)
+	}
+}
+
+// A credential that arrives after its channel closed cannot start a
+// connection, and a new channel without a live grant makes no dial.
+func TestRelayDropsCredentialOfClosedChannel(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: 300 * time.Millisecond}, RelayLimits{})
+	var calls atomic.Int32
+	entered := make(chan struct{}, 1)
+	gate := make(chan struct{})
+	hook := func(context.Context) error {
+		// The old response completes during the teardown and ignores the
+		// cancellation of its request.
+		if calls.Add(1) == 1 {
+			entered <- struct{}{}
+			<-gate
+		}
+		return nil
+	}
+	e.beforeAuth.Store(&hook)
+	e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("relay loop did not request a credential")
+	}
+	e.ch.Close()
+	e.dp.ChannelLost(e.ch)
+	close(gate)
+	e.noConn(500 * time.Millisecond)
+	// A new channel without a grant gets no relay dial either.
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	e.noConn(500 * time.Millisecond)
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("credential requests = %d, want 1 without a live grant", n)
+	}
+	// A grant of the new channel starts a connection again.
+	g := e.execGrant(e.execReq("/bin/true"))
+	rc := e.conn()
+	e.openOK(rc, 1, g.GetGrantId())
+}
+
+// noConn fails when a relay connection opens within d.
+func (e *relayEnv) noConn(d time.Duration) {
+	e.t.Helper()
+	select {
+	case <-e.conns:
+		e.t.Fatal("a relay connection opened without a live grant of the current channel")
+	case <-time.After(d):
+	}
+}
+
 // A relay endpoint that fails every connection at once gets attempts with
 // back-off, not an unthrottled reconnect loop.
 func TestRelayErrorKeepsBackoff(t *testing.T) {
@@ -521,5 +732,255 @@ func TestRelayErrorKeepsBackoff(t *testing.T) {
 	// Back-off of 200, 400, 800 milliseconds allows about four attempts.
 	if n := attempts.Load(); n < 1 || n > 6 {
 		t.Fatalf("%d relay connection attempts in 1.5 seconds", n)
+	}
+}
+
+// logBuffer is a log sink that a test reads while the relay writes to it.
+type logBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *logBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *logBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// revokeFixture is a relay with one hand-built connection whose outbound
+// queue nobody drains, which models a writer that the transport blocks.
+type revokeFixture struct {
+	t    *testing.T
+	r    *relay
+	c    *rconn
+	logs *logBuffer
+}
+
+func newRevokeFixture(t *testing.T, queue int) *revokeFixture {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	logs := &logBuffer{}
+	d := &DataPlane{timing: Timing{}.withDefaults(), logger: slog.New(slog.NewJSONHandler(logs, nil))}
+	r := &relay{d: d, limits: DefaultRelayLimits(), grants: map[string]*grant{}}
+	c := &rconn{gen: 7, out: make(chan *ownsandv1.DataFrame, queue), ctx: ctx, cancel: cancel, streams: map[uint64]*rstream{}}
+	r.conn = c
+	return &revokeFixture{t: t, r: r, c: c, logs: logs}
+}
+
+// grant installs a grant with one stream per given ID on the connection.
+func (f *revokeFixture) grant(deadlineIn time.Duration, received time.Time, ids ...uint64) (*grant, []*rstream) {
+	g := &grant{id: newID(f.t), sandboxID: "sandbox", kind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		ch: newChannel(7), received: received, expiresIn: time.Hour, deadlineIn: deadlineIn, streams: map[*rstream]bool{}, opened: true}
+	var streams []*rstream
+	f.r.mu.Lock()
+	defer f.r.mu.Unlock()
+	f.r.grants[g.id] = g
+	for _, id := range ids {
+		ctx, cancel := context.WithCancel(f.c.ctx)
+		st := &rstream{id: id, g: g, conn: f.c, ctx: ctx, cancel: cancel}
+		g.streams[st] = true
+		f.c.streams[id] = st
+		streams = append(streams, st)
+	}
+	return g, streams
+}
+
+func (f *revokeFixture) fillQueue() {
+	f.t.Helper()
+	for i := 0; i < cap(f.c.out); i++ {
+		if !f.c.tryEnqueue(keepaliveFrame(false)) {
+			f.t.Fatal("queue full too early")
+		}
+	}
+}
+
+// within runs fn and fails the test when it does not return in time.
+func within(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s waited on the full outbound queue", what)
+	}
+}
+
+func (f *revokeFixture) streamCount() int {
+	f.r.mu.Lock()
+	defer f.r.mu.Unlock()
+	return len(f.c.streams)
+}
+
+// TestRelayRevokeWithFullQueueClosesConnection checks that a revocation
+// never waits on a full outbound queue behind a blocked writer: it cancels
+// the affected streams and the connection, leaves the queue untouched and
+// logs the fallback once for the connection. The agent channel receive
+// loop calls revoke before it acknowledges the revocation, so the return
+// of revoke is what keeps the channel available.
+func TestRelayRevokeWithFullQueueClosesConnection(t *testing.T) {
+	f := newRevokeFixture(t, 2)
+	g, streams := f.grant(time.Hour, time.Now(), 1, 2)
+	_, other := f.grant(time.Hour, time.Now(), 3)
+	f.fillQueue()
+
+	within(t, "revoke", func() { f.r.revoke(g.id) })
+
+	if f.c.ctx.Err() == nil {
+		t.Fatal("the connection that could not take the terminal frame was not canceled")
+	}
+	for _, st := range streams {
+		if st.ctx.Err() == nil || !st.ended {
+			t.Fatalf("stream %d of the revoked grant was not ended", st.id)
+		}
+	}
+	if len(f.c.out) != cap(f.c.out) {
+		t.Fatalf("the full queue changed: %d queued", len(f.c.out))
+	}
+	f.r.mu.Lock()
+	_, kept := f.r.grants[g.id]
+	f.r.mu.Unlock()
+	if kept {
+		t.Fatal("the revoked grant stays installed")
+	}
+	// The unrelated grant stays installed; the closed connection ends its
+	// stream like any connection loss.
+	f.r.mu.Lock()
+	_, otherKept := f.r.grants[other[0].g.id]
+	f.r.mu.Unlock()
+	if !otherKept {
+		t.Fatal("an unrelated grant was removed")
+	}
+	f.r.connClosed(f.c)
+	if f.streamCount() != 0 || other[0].ctx.Err() == nil {
+		t.Fatal("the connection close did not end the remaining stream")
+	}
+	logs := f.logs.String()
+	if n := strings.Count(logs, "outbound queue is full"); n != 1 {
+		t.Fatalf("queue-full fallback logged %d times, want once per connection:\n%s", n, logs)
+	}
+	for _, want := range []string{`"generation":7`, `"termination_reason":"SESSION_END_REASON_REVOKED"`} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("log lacks %s:\n%s", want, logs)
+		}
+	}
+}
+
+// TestRelayRevokeWithQueueSpaceSendsRevoked checks that the fallback does
+// not change the normal path: the revoked stream gets its REVOKED frame
+// and the connection and an unrelated grant stay in use.
+func TestRelayRevokeWithQueueSpaceSendsRevoked(t *testing.T) {
+	f := newRevokeFixture(t, 4)
+	g, streams := f.grant(time.Hour, time.Now(), 1)
+	_, other := f.grant(time.Hour, time.Now(), 3)
+
+	within(t, "revoke", func() { f.r.revoke(g.id) })
+
+	select {
+	case fr := <-f.c.out:
+		if fr.GetStreamId() != 1 || fr.GetSessionEnd().GetReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED {
+			t.Fatalf("queued frame %v, want REVOKED on stream 1", fr)
+		}
+	default:
+		t.Fatal("no session-end frame was queued")
+	}
+	if f.c.ctx.Err() != nil || other[0].ctx.Err() != nil || other[0].ended {
+		t.Fatal("a revocation with queue space affected the connection or an unrelated stream")
+	}
+	if streams[0].ctx.Err() == nil || !streams[0].ended {
+		t.Fatal("the revoked stream was not ended")
+	}
+	if logs := f.logs.String(); strings.Contains(logs, "outbound queue is full") {
+		t.Fatalf("unexpected fallback log:\n%s", logs)
+	}
+}
+
+// TestRelayDeadlineSweepWithQueueSpaceAndFullQueue checks the stream
+// deadline sweep, which runs on the housekeeping goroutine: with a free
+// slot the stream ends with EXPIRED, with a full queue the sweep returns
+// and closes the connection.
+func TestRelayDeadlineSweepWithQueueSpaceAndFullQueue(t *testing.T) {
+	past := time.Now().Add(-time.Hour)
+	t.Run("queue space", func(t *testing.T) {
+		f := newRevokeFixture(t, 4)
+		_, streams := f.grant(time.Minute, past, 1)
+		within(t, "sweep", func() { f.r.sweep(time.Now()) })
+		select {
+		case fr := <-f.c.out:
+			if fr.GetSessionEnd().GetReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_EXPIRED {
+				t.Fatalf("queued frame %v, want EXPIRED", fr)
+			}
+		default:
+			t.Fatal("no session-end frame was queued")
+		}
+		if f.c.ctx.Err() != nil || !streams[0].ended {
+			t.Fatal("the deadline ended the connection or kept the stream")
+		}
+	})
+	t.Run("full queue", func(t *testing.T) {
+		f := newRevokeFixture(t, 2)
+		_, streams := f.grant(time.Minute, past, 1)
+		f.fillQueue()
+		within(t, "sweep", func() { f.r.sweep(time.Now()) })
+		if f.c.ctx.Err() == nil || !streams[0].ended {
+			t.Fatal("the full queue did not close the connection and end the stream")
+		}
+		if n := strings.Count(f.logs.String(), `"termination_reason":"SESSION_END_REASON_EXPIRED"`); n != 1 {
+			t.Fatalf("fallback logged %d times\n%s", n, f.logs.String())
+		}
+	})
+}
+
+// TestRelayRevokeKeepsUnrelatedGrantRunning runs the whole path on a real
+// relay connection: the named grant's stream gets REVOKED and an exec of an
+// unrelated grant on the same connection continues to its result.
+func TestRelayRevokeKeepsUnrelatedGrantRunning(t *testing.T) {
+	e := newRelayEnv(t, Timing{}, RelayLimits{})
+	long := e.execReq("/bin/sh", "-c", "sleep 30")
+	g1 := e.execGrant(long)
+	rc := e.conn()
+	e.openOK(rc, 1, g1.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, long))
+	rc.nextOn(1) // accepted
+
+	other := e.execReq("/bin/sh", "-c", "sleep 1; echo alive")
+	g2 := e.execGrant(other)
+	e.openOK(rc, 2, g2.GetGrantId())
+	rc.send(datapath.MustNewFrame(2, e.sandbox, other))
+	rc.nextOn(2) // accepted
+
+	e.dp.Revoke(e.ch, &ownsandv1.SessionRevocation{RevocationId: "r", Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g1.GetGrantId()}})
+	for {
+		f := rc.nextOn(1)
+		if f.GetSessionEnd() != nil {
+			if f.GetSessionEnd().GetReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED {
+				t.Fatalf("revocation %v", f)
+			}
+			break
+		}
+	}
+	var out string
+	for {
+		ev := rc.nextOn(2).GetExecEvent()
+		out += string(ev.GetStdout().GetData())
+		if ev.GetExited() != nil {
+			break
+		}
+	}
+	if out != "alive\n" {
+		t.Fatalf("unrelated exec output %q", out)
+	}
+	if rc.ctx.Err() != nil {
+		t.Fatal("the revocation closed the relay connection")
 	}
 }

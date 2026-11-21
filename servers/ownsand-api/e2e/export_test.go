@@ -68,7 +68,8 @@ func TestSnapshotExportImport(t *testing.T) {
 		t.Fatalf("ExportSnapshot: %v", err)
 	}
 	waitExported(ctx, t, c, snapID)
-	keys := s.objects.keys("organizations/" + s.orgID + "/snapshots/" + snapID + "/parts/")
+	// Each export attempt writes its parts under its own prefix.
+	keys := s.objects.keys("organizations/" + s.orgID + "/snapshots/" + snapID + "/attempts/")
 	if len(keys) != 3 {
 		t.Fatalf("exported objects %v, want 3 parts", keys)
 	}

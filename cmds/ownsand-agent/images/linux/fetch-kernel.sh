@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: FSL-1.1-ALv2
 #
 # Downloads the Linux guest kernel of the Firecracker runtime and checks its
 # pinned SHA-256: the 6.1 guest kernel that the Firecracker project

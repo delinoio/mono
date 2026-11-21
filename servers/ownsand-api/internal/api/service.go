@@ -106,6 +106,9 @@ type Service struct {
 
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID
+	// imports holds the snapshot imports that importThenCreate waits for;
+	// only a channel with an entry gets download URLs for that snapshot.
+	imports activeImports
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.

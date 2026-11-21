@@ -14,7 +14,7 @@ export default defineConfig({
       // strict-port flag, so only this config can express the rule. The e2e
       // suite overrides it with explicit `--host` and `--port` flags.
       host: "127.0.0.1",
-      port: 3500,
+      port: 13500,
       strictPort: true,
     },
   },
