@@ -136,6 +136,20 @@ func (c *rconn) closeAfterFlush() {
 	}
 }
 
+// tryEnqueue offers a frame without waiting and reports whether the
+// queue took it. A caller whose frame is optional (a periodic keepalive)
+// uses it so it never waits on a writer that only its own cancel can end.
+func (c *rconn) tryEnqueue(f *ownsandv1.DataFrame) bool {
+	select {
+	case c.out <- f:
+		return true
+	default:
+		return false
+	}
+}
+
+// enqueue queues a frame and waits for a free slot or the end of the
+// connection; payload and startup frames use it to keep their order.
 func (c *rconn) enqueue(f *ownsandv1.DataFrame) error {
 	select {
 	case c.out <- f:
@@ -464,18 +478,13 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 			<-writerDone
 			return c.probeFailed.Load() && r.ctx.Err() == nil, err
 		case <-ctx.Done():
-			<-writerDone
-			<-recvErr
+			awaitTeardown(writerDone, recvErr)
 			return c.probeFailed.Load() && r.ctx.Err() == nil, errors.New("dataplane: relay connection canceled")
 		case <-tick.C:
 			now := time.Now()
-			if now.Sub(time.Unix(0, c.lastSend.Load())) >= r.d.timing.KeepaliveInterval {
-				c.enqueue(keepaliveFrame(false))
-			}
-			if now.Sub(time.Unix(0, c.lastRecv.Load())) >= r.d.timing.ReceiveTimeout {
+			if r.watchdogTick(c, now) {
 				cancel()
-				<-writerDone
-				<-recvErr
+				awaitTeardown(writerDone, recvErr)
 				return true, errors.New("dataplane: relay connection received nothing within the receive timeout")
 			}
 			r.mu.Lock()
@@ -486,13 +495,62 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 			r.mu.Unlock()
 			if idle {
 				cancel()
-				<-writerDone
-				<-recvErr
+				awaitTeardown(writerDone, recvErr)
 				r.d.logger.Info("relay connection closed after its idle time")
 				return false, errIdle
 			}
 		}
 	}
+}
+
+// teardownGrace bounds how long a canceled relay connection waits for its
+// writer and receive goroutines to end.
+//
+// Workaround: when the writer is blocked by HTTP/2 flow control, net/http
+// does not abort the stream on context cancellation while the request body
+// is still open, so the receive goroutine stays in its read until the
+// transport itself fails. Without a bound, the loop would wait on that
+// goroutine and never dial again, which defeats the receive timeout. The
+// receive goroutine reports into a buffered channel, so it ends alone
+// when the transport fails. Remove the bound when net/http aborts such a
+// stream on context cancellation.
+const teardownGrace = 2 * time.Second
+
+// awaitTeardown waits for the writer and receive goroutines of a canceled
+// relay connection, for at most teardownGrace.
+func awaitTeardown(writerDone <-chan struct{}, recvErr <-chan error) {
+	timer := time.NewTimer(teardownGrace)
+	defer timer.Stop()
+	for writerDone != nil || recvErr != nil {
+		select {
+		case <-writerDone:
+			writerDone = nil
+		case <-recvErr:
+			recvErr = nil
+		case <-timer.C:
+			return
+		}
+	}
+}
+
+// watchdogTick runs the periodic checks of one relay connection and
+// reports whether the receive timeout expired. It checks the receive
+// timeout first and never waits on the outbound queue: when a blocked
+// writer keeps the queue full, only this watchdog can cancel the
+// connection, so a blocking keepalive enqueue would deadlock it. A
+// periodic keepalive that finds no free slot is skipped, because the
+// queued frames already show the connection is in use and the next tick
+// offers it again.
+func (r *relay) watchdogTick(c *rconn, now time.Time) bool {
+	if now.Sub(time.Unix(0, c.lastRecv.Load())) >= r.d.timing.ReceiveTimeout {
+		return true
+	}
+	if now.Sub(time.Unix(0, c.lastSend.Load())) >= r.d.timing.KeepaliveInterval {
+		if !c.tryEnqueue(keepaliveFrame(false)) {
+			r.d.logger.Debug("relay keepalive skipped because the outbound queue is full")
+		}
+	}
+	return false
 }
 
 func keepaliveFrame(echo bool) *ownsandv1.DataFrame {

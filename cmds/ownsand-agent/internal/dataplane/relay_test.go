@@ -460,6 +460,119 @@ func TestRelayReceiveTimeoutProbeAndIdle(t *testing.T) {
 	}
 }
 
+// newManualConn returns a relay and a connection that no loop drives, so a
+// test sets the queue and the byte clocks by hand.
+func newManualConn(t *testing.T, timing Timing, queue int) (*relay, *rconn) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	r := &relay{d: &DataPlane{timing: timing.withDefaults(), logger: logger()}}
+	c := &rconn{out: make(chan *ownsandv1.DataFrame, queue), ctx: ctx, cancel: cancel}
+	return r, c
+}
+
+// TestRelayWatchdogSkipsKeepaliveOnFullQueue checks that the watchdog never
+// waits on the outbound queue: a full queue skips the periodic keepalive
+// while recent inbound bytes keep the connection, and a free slot gets the
+// keepalive once it is due.
+func TestRelayWatchdogSkipsKeepaliveOnFullQueue(t *testing.T) {
+	r, c := newManualConn(t, Timing{KeepaliveInterval: time.Second, ReceiveTimeout: time.Minute}, 2)
+	now := time.Now()
+	c.lastRecv.Store(now.UnixNano())
+	c.lastSend.Store(now.Add(-time.Hour).UnixNano())
+	payload := &ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_SUPPORTED_FRAME_KINDS}
+	for i := 0; i < cap(c.out); i++ {
+		if err := c.enqueue(payload); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan bool, 1)
+	go func() { done <- r.watchdogTick(c, now) }()
+	select {
+	case timedOut := <-done:
+		if timedOut {
+			t.Fatal("watchdog timed out a connection with recent inbound bytes")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("watchdog waited on the full outbound queue")
+	}
+	if c.ctx.Err() != nil || len(c.out) != cap(c.out) {
+		t.Fatalf("skipped keepalive changed the connection: ctx %v, queued %d", c.ctx.Err(), len(c.out))
+	}
+	// A free slot and a due keepalive: the keepalive is sent, after the
+	// queued payload frames.
+	<-c.out
+	if r.watchdogTick(c, now) {
+		t.Fatal("watchdog timed out a connection with recent inbound bytes")
+	}
+	<-c.out
+	if f := <-c.out; f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE || f.GetRelayKeepalive().GetEchoRequested() {
+		t.Fatalf("queued frame %v, want a plain keepalive", f)
+	}
+	// A keepalive that is not due is not sent.
+	c.lastSend.Store(now.UnixNano())
+	r.watchdogTick(c, now)
+	if len(c.out) != 0 {
+		t.Fatalf("keepalive sent before it was due: %d queued", len(c.out))
+	}
+	// The receive timeout wins over a full queue.
+	for i := 0; i < cap(c.out); i++ {
+		c.enqueue(payload)
+	}
+	c.lastSend.Store(now.Add(-time.Hour).UnixNano())
+	c.lastRecv.Store(now.Add(-2 * time.Minute).UnixNano())
+	if !r.watchdogTick(c, now) {
+		t.Fatal("watchdog did not report the receive timeout with a full queue")
+	}
+}
+
+// TestRelayWatchdogRedialsWhenWriterIsBlocked checks the whole loop: with a
+// live grant, a full outbound queue, a writer that cannot send (the control
+// plane does not read the stream, so HTTP/2 flow control stops it) and no
+// inbound bytes, the agent cancels the connection at the receive timeout
+// and dials again.
+func TestRelayWatchdogRedialsWhenWriterIsBlocked(t *testing.T) {
+	e := newRelayEnv(t, Timing{KeepaliveInterval: 100 * time.Millisecond, ReceiveTimeout: 1500 * time.Millisecond, ProbeIdle: time.Hour}, RelayLimits{})
+	var stalled atomic.Bool
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var count atomic.Int32
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		rc := &relayConn{t: t, ctx: ctx, frames: make(chan *ownsandv1.DataFrame, 4096), stream: stream}
+		e.conns <- rc
+		if count.Add(1) > 1 {
+			return nil
+		}
+		// First connection: read the startup frames, then stop reading and
+		// stay silent.
+		for i := 0; i < 2; i++ {
+			if _, err := stream.Receive(); err != nil {
+				return nil
+			}
+		}
+		stalled.Store(true)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return nil
+	})
+	req := e.execReq("/bin/sh", "-c", "head -c 64000000 /dev/zero")
+	g := e.execGrant(req)
+	// The connection loss ends the stream of g and releases it; this second
+	// grant stays live, so the agent has a reason to dial again.
+	e.execGrant(e.execReq("/bin/true"))
+	rc := <-e.conns
+	waitFor(t, "stalled relay handler", stalled.Load)
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamOpen{GrantId: g.GetGrantId(), InitialWindowBytes: 64 << 20}))
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	select {
+	case <-e.conns:
+	case <-time.After(15 * time.Second):
+		t.Fatal("the agent did not dial again after the receive timeout")
+	}
+}
+
 // A grant of a new channel that arrives while the relay loop of the
 // previous channel still authenticates gets a relay connection: the
 // running loop dials for the new channel, whether the old attempt fails
