@@ -203,6 +203,9 @@ export function plan(cwd, base, head) {
     (path) =>
       fixtureInputs.has(path) ||
       path.startsWith("scripts/ci/") ||
+      // The development scripts (the root `dev` portless preflight and the
+      // Infisical launcher) have fixtures in `test:tooling`.
+      path.startsWith("scripts/dev/") ||
       // A pending changeset is validated in the quality job, so that an
       // invalid one cannot reach main and stop every deployment.
       path.startsWith(".changeset/") ||

@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -685,6 +686,204 @@ func TestRelayConnectionRules(t *testing.T) {
 	}
 }
 
+// stalledExecCaller sets up an Exec whose caller reads nothing while the
+// agent fills the buffers between the handler and the caller with stdout, so
+// that the handler blocks in its send and stops dequeuing frames. The relay
+// stream buffer exceeds the HTTP/2 and socket buffers on the path, so the
+// agent stays within its credit window while the handler blocks.
+func stalledExecCaller(t *testing.T, env *testenv.Env, org *testenv.Org, sandboxID string, r *testenv.FakeRelay, afterFill func(s *testenv.RelayStream)) *connect.ServerStreamForClient[ownsandv1.ExecResponse] {
+	t.Helper()
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, org.OwnerClient, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		s.Send(&ownsandv1.RequestAccepted{})
+		chunk := make([]byte, 1<<20)
+		for i := 0; i < 40; i++ {
+			s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: int64(i) << 20, Data: chunk}}})
+		}
+		afterFill(s)
+	})
+	es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return es
+}
+
+func TestRelayBoundsFramesWithoutCredit(t *testing.T) {
+	limits := relay.Limits{StreamBuffer: 48 << 20, MaxStreamsPerConn: 64, MaxStreamsPerGrant: 4, Keepalive: time.Second, IdleTimeout: time.Minute,
+		MaxQueuedControlFrames: 4, MaxQueuedControlBytes: 64 << 10}
+	env := testenv.New(t, func(o *app.Options) { o.RelayLimits = &limits })
+	org, agent, sandboxID := runningSandbox(t, env)
+
+	// An agent that queues frames without credit beyond the limit while the
+	// caller reads nothing loses its connection, and the call ends with
+	// unavailable.
+	r := agent.ConnectRelay(serveExec)
+	es := stalledExecCaller(t, env, org, sandboxID, r, func(s *testenv.RelayStream) {
+		for i := 0; i < 20; i++ {
+			s.Send(&ownsandv1.RequestAccepted{})
+		}
+	})
+	select {
+	case <-r.Closed():
+	case <-time.After(10 * time.Second):
+		t.Fatal("a connection that queued frames without credit stayed open")
+	}
+	if _, err := collectExec(t, es); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("call on the closed connection: %v, want unavailable", err)
+	}
+
+	// A compliant exchange with a slow caller (one accepted frame, credit
+	// frames, one terminal frame) never reaches the limit.
+	r2 := agent.ConnectRelay(serveExec)
+	stop := keepAlive(r2)
+	defer stop()
+	es = stalledExecCaller(t, env, org, sandboxID, r2, func(s *testenv.RelayStream) {
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}})
+	})
+	time.Sleep(500 * time.Millisecond) // the handler is blocked while the caller reads nothing
+	events, err := collectExec(t, es)
+	if err != nil {
+		t.Fatalf("compliant exchange: %v", err)
+	}
+	if last := events[len(events)-1]; last.GetExited() == nil {
+		t.Fatalf("last event = %v, want the exit", last)
+	}
+	select {
+	case <-r2.Closed():
+		t.Fatal("a compliant exchange closed the connection")
+	default:
+	}
+
+	// An unknown frame kind fails only its stream; the connection stays open.
+	r2.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		r2.SendFrame(&ownsandv1.DataFrame{StreamId: s.ID, SandboxId: s.SandboxID, Kind: ownsandv1.DataFrameKind(9999)})
+	})
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, org.OwnerClient, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err = env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := collectExec(t, es); err == nil {
+		t.Fatal("a stream with an unknown frame kind completed")
+	}
+	select {
+	case <-r2.Closed():
+		t.Fatal("an unknown frame kind closed the connection")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// TestRelayUnknownFrameKind checks that an unknown frame kind from the agent
+// on a stream ends only that stream: the control plane sends one UNIMPLEMENTED
+// error frame on it, no stream close frame, and the RPC returns unimplemented,
+// while another stream of the same connection continues.
+func TestRelayUnknownFrameKind(t *testing.T) {
+	env := testenv.New(t)
+	org, agent, sandboxID := runningSandbox(t, env)
+	r := agent.ConnectRelay(serveExec)
+	stop := keepAlive(r)
+	defer stop()
+
+	reqOK, reqBad := newExec(org.ID, sandboxID), newExec(org.ID, sandboxID)
+	release := make(chan struct{})
+	r.SetOnRequest(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		if f.GetExecRequest().GetExecId() == reqOK.GetExecId() {
+			// The healthy stream answers only after the other stream failed.
+			s.Send(&ownsandv1.RequestAccepted{})
+			<-release
+			serveExec(s, f)
+			return
+		}
+		s.Send(&ownsandv1.RequestAccepted{})
+		r.SendFrame(&ownsandv1.DataFrame{StreamId: s.ID, SandboxId: s.SandboxID, Kind: ownsandv1.DataFrameKind(9999)})
+	})
+	call := func(req *ownsandv1.ExecRequest) *connect.ServerStreamForClient[ownsandv1.ExecResponse] {
+		t.Helper()
+		grant, err := authorizeExec(t, org.OwnerClient, req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return es
+	}
+	ok := call(reqOK)
+	// The healthy stream is open (its stream open frame reached the agent)
+	// before the failing one starts.
+	r.WaitFrame("healthy request", func(f *ownsandv1.DataFrame) bool { return f.GetExecRequest().GetExecId() == reqOK.GetExecId() })
+	bad := call(reqBad)
+
+	_, err := collectExec(t, bad)
+	if testenv.Code(err) != connect.CodeUnimplemented {
+		t.Fatalf("stream with an unknown frame kind: %v, want unimplemented", err)
+	}
+	var badID uint64
+	for _, f := range r.Frames() {
+		if f.GetExecRequest().GetExecId() == reqBad.GetExecId() {
+			badID = f.GetStreamId()
+		}
+	}
+	ef := r.WaitFrame("error frame", func(f *ownsandv1.DataFrame) bool { return f.GetStreamId() == badID && f.GetError() != nil })
+	if ef.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED || ef.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_ERROR {
+		t.Fatalf("error frame = %v, want ERROR_CODE_UNIMPLEMENTED", ef)
+	}
+	if msg := ef.GetError().GetMessage(); !strings.Contains(msg, "9999") || !strings.Contains(msg, fmt.Sprintf("stream %d", badID)) {
+		t.Fatalf("message %q does not name the kind and the stream", msg)
+	}
+	// Neither a second error frame nor a stream close frame follows.
+	time.Sleep(300 * time.Millisecond)
+	errorFrames := 0
+	for _, f := range r.Frames() {
+		if f.GetStreamId() != badID {
+			continue
+		}
+		if f.GetError() != nil {
+			errorFrames++
+		}
+		if f.GetRelayStreamClose() != nil {
+			t.Fatalf("a stream close frame followed the error frame: %v", f)
+		}
+	}
+	if errorFrames != 1 {
+		t.Fatalf("error frames on the stream = %d, want 1", errorFrames)
+	}
+
+	// The other stream and the connection continue.
+	close(release)
+	events, err := collectExec(t, ok)
+	if err != nil {
+		t.Fatalf("healthy stream: %v", err)
+	}
+	if last := events[len(events)-1]; last.GetExited() == nil {
+		t.Fatalf("last event of the healthy stream = %v, want the exit", last)
+	}
+	select {
+	case <-r.Closed():
+		t.Fatal("an unknown frame kind closed the connection")
+	default:
+	}
+}
+
+func hasAccepted(events []*ownsandv1.ExecEvent) bool {
+	for _, e := range events {
+		if e.GetAccepted() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 // keepAlive sends relay keepalives until stopped.
 func keepAlive(r *testenv.FakeRelay) func() {
 	done := make(chan struct{})
@@ -717,6 +916,19 @@ func TestRelayStreamTimers(t *testing.T) {
 			s.Send(&ownsandv1.SessionEnd{Reason: ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED})
 		case "long":
 			s.Send(&ownsandv1.RequestAccepted{})
+		case "large-then-accepted", "small-then-accepted":
+			// The acceptance timeout is 1 s in tests. A frame at 0.6 s moves the
+			// deadline to 1.6 s only when it is large; the notice at 1.3 s
+			// comes after the original deadline.
+			size := 1
+			if modeV.Load().(string) == "large-then-accepted" {
+				size = 2 * relay.LargeFrameBytes
+			}
+			time.Sleep(600 * time.Millisecond)
+			s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 0, Data: make([]byte, size)}}})
+			time.Sleep(700 * time.Millisecond)
+			s.Send(&ownsandv1.RequestAccepted{})
+			s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}})
 		}
 	})
 	stop := keepAlive(r)
@@ -730,7 +942,7 @@ func TestRelayStreamTimers(t *testing.T) {
 		start := time.Now()
 		es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(ctx, connect.NewRequest(req))
 		if err != nil {
-			return nil, err, 0
+			return nil, err, time.Since(start)
 		}
 		events, err := collectExec(t, es)
 		return events, err, time.Since(start)
@@ -741,20 +953,38 @@ func TestRelayStreamTimers(t *testing.T) {
 	if testenv.Code(err) != connect.CodeUnavailable || errDetail(err).GetSessionEndReason() != ownsandv1.SessionEndReason_SESSION_END_REASON_REVOKED {
 		t.Fatalf("session end: %v", err)
 	}
-	// No accepted notice (keepalives from the connection keep restarting the
-	// acceptance timer, so stop them): unavailable, with keepalive events
-	// before it and a stream close sent.
-	stop()
+	// No accepted notice while the agent keeps sending keepalives every 50 ms:
+	// the keepalives do not extend the wait, so the call ends with
+	// unavailable after the acceptance timeout (1 s in tests), with keepalive
+	// events before it and a stream close sent.
 	modeV.Store("silent")
-	events, err, _ := run()
+	events, err, took := run()
 	if testenv.Code(err) != connect.CodeUnavailable || len(events) == 0 || events[0].GetKeepalive() == nil {
 		t.Fatalf("acceptance timeout: %v, %d events", err, len(events))
 	}
+	if took > 2*time.Second {
+		t.Fatalf("acceptance timeout after %v, want about 1 s although keepalives kept arriving", took)
+	}
+	// A small frame of the stream does not extend the wait either: the notice
+	// after the original deadline finds the call already ended.
+	modeV.Store("small-then-accepted")
+	if _, err, took = run(); testenv.Code(err) != connect.CodeUnavailable || took > 1500*time.Millisecond {
+		t.Fatalf("small frame: %v after %v, want unavailable at about 1 s", err, took)
+	}
+	// A large frame extends the wait by one acceptance timeout from its
+	// arrival, so the notice behind it is accepted.
+	modeV.Store("large-then-accepted")
+	events, err, took = run()
+	if err != nil || took < 1300*time.Millisecond {
+		t.Fatalf("large frame: %v after %v, want the notice accepted after the original deadline", err, took)
+	}
+	if !hasAccepted(events) {
+		t.Fatalf("large frame: events = %v, want an accepted event", events)
+	}
 	// Accepted and silent: keepalives, then the rotation with an OK status
 	// and no final event before the rotation limit (3 s in tests).
-	stop = keepAlive(r)
 	modeV.Store("long")
-	events, err, took := run()
+	events, err, took = run()
 	if err != nil || took < 2900*time.Millisecond || events[len(events)-1].GetKeepalive() == nil {
 		t.Fatalf("rotation: %v after %v", err, took)
 	}
@@ -935,5 +1165,45 @@ func TestAuthorizeRelayEnqueueFailureWakesWaiters(t *testing.T) {
 	}
 	if n := env.App.Plane.Grants.Len(); n != 0 {
 		t.Fatalf("%d grants left", n)
+	}
+}
+
+// TestRelayRotationWithQueuedFrames checks that the rotation deadline holds
+// on every receive, not only on an empty wake. The long keepalive keeps the
+// handler's ticker from waking it near the deadline, so the only receives
+// after the deadline carry frames: the call must end with an OK status at the
+// first of them, and neither that frame nor the exit event behind it is
+// forwarded.
+func TestRelayRotationWithQueuedFrames(t *testing.T) {
+	env := testenv.New(t, func(o *app.Options) {
+		o.RelayTiming = &api.RelayTiming{Rotation: 2 * time.Second, Keepalive: 30 * time.Second, Acceptance: 30 * time.Second,
+			RequestDeadline: 10 * time.Second, GrantAck: time.Second, Signaling: 2 * time.Second}
+	})
+	org, agent, sandboxID := runningSandbox(t, env)
+	r := agent.ConnectRelay(func(s *testenv.RelayStream, f *ownsandv1.DataFrame) {
+		s.Send(&ownsandv1.RequestAccepted{})
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 0, Data: []byte("before")}}})
+		time.Sleep(2500 * time.Millisecond) // past the rotation deadline
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Offset: 6, Data: []byte("after")}}})
+		s.Send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: 0}}}})
+	})
+	stop := keepAlive(r)
+	defer stop()
+	req := newExec(org.ID, sandboxID)
+	grant, err := authorizeExec(t, org.OwnerClient, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	es, err := env.ClientsWith(testenv.UserToken(org.Owner), grantHeader(grant.GetGrantId())).Relay.Exec(context.Background(), connect.NewRequest(req))
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := collectExec(t, es)
+	if err != nil {
+		t.Fatalf("rotation with queued frames: %v", err)
+	}
+	// The events are the accepted notice and the output before the deadline.
+	if len(events) != 2 || events[0].GetAccepted() == nil || string(events[1].GetStdout().GetData()) != "before" {
+		t.Fatalf("events = %v, want only the events before the deadline", events)
 	}
 }

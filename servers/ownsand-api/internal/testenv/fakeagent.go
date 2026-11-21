@@ -28,6 +28,8 @@ type FakeAgent struct {
 	HostOS       ownsandv1.HostOs
 	Arch         ownsandv1.Arch
 	Capabilities *ownsandv1.DeviceCapabilities
+	// AgentVersion is the running agent version reported at connect.
+	AgentVersion string
 	// OnCommand, when set, answers a command instead of the default
 	// behavior; returning nil sends no result.
 	OnCommand func(a *FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult
@@ -71,7 +73,8 @@ func (e *Env) NewFakeAgent(d *Device) *FakeAgent {
 	return &FakeAgent{
 		T: e.T, Env: e, Device: d,
 		HostOS: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, Capabilities: DefaultLinuxCapabilities(),
-		sandboxes: map[string]*ownsandv1.SandboxStateEntry{}, snapshots: map[string]*ownsandv1.SnapshotStateEntry{},
+		AgentVersion: "1.0.0",
+		sandboxes:    map[string]*ownsandv1.SandboxStateEntry{}, snapshots: map[string]*ownsandv1.SnapshotStateEntry{},
 		changed: make(chan struct{}),
 	}
 }
@@ -90,7 +93,7 @@ func (a *FakeAgent) Connect() {
 	a.closed = make(chan struct{})
 	go a.read()
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: &ownsandv1.CapabilityReport{
-		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: "1.0.0", Capabilities: a.Capabilities,
+		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: a.AgentVersion, Capabilities: a.Capabilities,
 	}}})
 	a.SendStateReport()
 	a.Eventually("device online", func() bool { return a.Env.App.Service.Hub.Live(a.Device.ID) != nil })
@@ -389,7 +392,7 @@ func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentC
 		delete(a.snapshots, c.DeleteSnapshot.GetSnapshotId())
 		a.mu.Unlock()
 		return &ownsandv1.AgentCommandResult{}
-	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent:
+	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent, *ownsandv1.AgentCommand_WithdrawAgentUpdate:
 		return &ownsandv1.AgentCommandResult{}
 	}
 	return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}}

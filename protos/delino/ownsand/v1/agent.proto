@@ -258,6 +258,7 @@ message AgentCommand {
     CleanUpCommand clean_up = 9;
     UpdateAgentCommand update_agent = 10;
     DeleteSnapshotCommand delete_snapshot = 11;
+    WithdrawAgentUpdateCommand withdraw_agent_update = 12;
   }
 }
 
@@ -342,6 +343,16 @@ message UpdateAgentCommand {
   // Install also when the target is lower than the running version.
   bool revocation_recovery = 2;
 }
+
+// Withdraw the update that an earlier UpdateAgentCommand queued: the agent
+// drops the queued artifact, ignores a download that is still running and
+// reports AGENT_UPDATE_STATE_UP_TO_DATE, so it does not install the target
+// after it becomes idle. The control plane sends it when the organization
+// policy changes to HOLD and no revocation recovery applies. It fails with
+// FAILED_PRECONDITION once the installation started or while the running
+// version is revoked. An agent from before this command answers UNIMPLEMENTED
+// and keeps its queued update.
+message WithdrawAgentUpdateCommand {}
 
 message CreateSandboxResult {
   SandboxStateEntry sandbox = 1;

@@ -7,12 +7,12 @@
   "scripts": {
     "prepare": "./scripts/install-git-hooks.sh",
     "build": "turbo run build",
-    "dev": "turbo run dev",
+    "dev": "node scripts/dev/start-portless-proxy.mjs && turbo run dev",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "test": "turbo run test test:tooling",
     "test:e2e": "turbo run test:e2e",
-    "test:tooling": "node --test scripts/ci/*.test.mjs",
+    "test:tooling": "node --test scripts/ci/*.test.mjs scripts/dev/*.test.mjs",
     "format": "node scripts/ci/format-changed.mjs --write",
     "format:check": "node scripts/ci/format-changed.mjs"
   },

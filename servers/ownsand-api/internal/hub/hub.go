@@ -68,6 +68,10 @@ type Conn struct {
 	// values holds per-channel state of higher layers (for example the
 	// last update target sent).
 	values map[any]any
+
+	// updateMu serializes the update decisions of the channel, from reading
+	// the policy to queueing the command; see LockUpdates.
+	updateMu sync.Mutex
 }
 
 // Context ends when the channel closes.
@@ -137,6 +141,17 @@ func (c *Conn) SetValue(key, value any) {
 		c.values = map[any]any{}
 	}
 	c.values[key] = value
+}
+
+// LockUpdates takes the per-channel update lock and returns its release
+// function. The channel handler and the control event processor both decide
+// on updates for the same channel. Without one lock, a decision that read an
+// older policy can queue its command after the command of a newer decision,
+// and the agent then applies the older decision last. Hold the lock from
+// reading the policy until the command is queued.
+func (c *Conn) LockUpdates() (unlock func()) {
+	c.updateMu.Lock()
+	return c.updateMu.Unlock
 }
 
 // Hub is the registry of agent channels.

@@ -495,6 +495,56 @@ func TestWriteSpecialModeBits(t *testing.T) {
 	}
 }
 
+// TestWriteReadOnlyFinishMode covers the finish mode 0444. Linux and macOS
+// guests apply it. Windows guests ignore it: Go's Chmod would set the
+// read-only file attribute there, so the target must stay writable.
+func TestWriteReadOnlyFinishMode(t *testing.T) {
+	h := newHarness(t, nil)
+	target := filepath.Join(t.TempDir(), "out.bin")
+	req := &ownsandv1.WriteFileRequest{
+		SandboxId: testSandbox, WriteId: newID(t), Path: target, BindingSalt: make([]byte, 32),
+		Data:   []byte("x"),
+		Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1, Mode: 0o444},
+	}
+	resp, errd := h.write(req)
+	if errd != nil || !resp.GetFinished() || resp.GetSizeBytes() != 1 {
+		t.Fatalf("finish %v %v", resp, errd)
+	}
+	st, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "windows" {
+		// Go reports the read-only file attribute as a mode without the owner
+		// write bit.
+		if st.Mode().Perm()&0o200 == 0 {
+			t.Fatalf("read-only attribute set, mode %v", st.Mode())
+		}
+		f, err := os.OpenFile(target, os.O_WRONLY, 0)
+		if err != nil {
+			t.Fatalf("target is not writable: %v", err)
+		}
+		f.Close()
+	} else if st.Mode().Perm() != 0o444 {
+		t.Fatalf("mode %v, want 0444", st.Mode().Perm())
+	}
+	// A repeated identical finish returns the same result.
+	resp2, errd := h.write(req)
+	if errd != nil || !resp2.GetFinished() || resp2.GetSizeBytes() != 1 {
+		t.Fatalf("repeated finish %v %v", resp2, errd)
+	}
+	// The mode is part of the recorded finish fields on every OS, so a repeat
+	// with another mode fails, also where the mode is ignored.
+	other := &ownsandv1.WriteFileRequest{
+		SandboxId: req.GetSandboxId(), WriteId: req.GetWriteId(), Path: target, BindingSalt: make([]byte, 32),
+		Data:   []byte("x"),
+		Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1, Mode: 0o644},
+	}
+	if _, errd := h.write(other); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+		t.Fatalf("repeated finish with another mode: %v", errd)
+	}
+}
+
 func TestWriteEmptyFileAndErrors(t *testing.T) {
 	h := newHarness(t, nil)
 	dir := t.TempDir()
