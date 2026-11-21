@@ -327,3 +327,40 @@ func TestAckNamingPredecessorRemovesIt(t *testing.T) {
 		t.Fatal("swap not applied")
 	}
 }
+
+// TestReplacesOf covers the locked snapshot of the predecessor link.
+func TestReplacesOf(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	if got := r.ReplacesOf(succ); got != pred.ID {
+		t.Fatalf("ReplacesOf = %q", got)
+	}
+	r.Release(pred.ID, pred.DeviceID)
+	if got := r.ReplacesOf(succ); got != "" {
+		t.Fatalf("ReplacesOf after the release = %q", got)
+	}
+	if r.ReplacesOf(pred) != "" {
+		t.Fatal("grant without predecessor reports one")
+	}
+}
+
+// TestReplacesOfConcurrentRelease runs the snapshot against releases and acks
+// of the link; the race detector reports an unlocked read.
+func TestReplacesOfConcurrentRelease(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Release(pred.ID, pred.DeviceID)
+		r.Ack(succ.ID, accepted, pred.ID)
+	}()
+	for i := 0; i < 1000; i++ {
+		if got := r.ReplacesOf(succ); got != "" && got != pred.ID {
+			t.Fatalf("ReplacesOf = %q", got)
+		}
+	}
+	<-done
+}

@@ -1119,6 +1119,48 @@ func TestAuthorizeRelayReplacementEnqueueFailure(t *testing.T) {
 	})
 }
 
+// TestAuthorizeRelayKeepsPredecessorAfterRelease covers a predecessor that the
+// agent releases after the replacement message was built and before it is
+// queued: the queued grant keeps its original replaces_grant_id, and the
+// registry has already freed the predecessor.
+func TestAuthorizeRelayKeepsPredecessorAfterRelease(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org, agent, sandboxID := runningSandbox(t, env)
+	c := org.OwnerClient
+	req := newExec(org.ID, sandboxID)
+	authID, _ := uuidv7.NewString()
+	areq := &ownsandv1.AuthorizeRelayRequest{OrganizationId: org.ID, SandboxId: sandboxID, OperationKind: ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC,
+		OperationId: req.GetExecId(), RequestDigest: relaybinding.ExecDigest(req), AuthorizationId: authID}
+	first, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := first.Msg.GetGrantId()
+	repID, _ := uuidv7.NewString()
+	rep := proto.Clone(areq).(*ownsandv1.AuthorizeRelayRequest)
+	rep.AuthorizationId = repID
+	rep.ReplacesGrantId = &prev
+	// The sender hook runs after the message is built and before it is
+	// queued: release the predecessor through the agent channel there.
+	env.App.Plane.SetGrantSender(func(ctx context.Context, conn *hub.Conn, e *ownsandv1.AgentEnvelope) error {
+		agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrantRelease{RelayGrantRelease: &ownsandv1.RelayGrantRelease{GrantId: prev}}})
+		testenv.Eventually(t, "predecessor released", func() bool { return env.App.Plane.Grants.Get(prev) == nil })
+		return conn.Send(ctx, e)
+	})
+	repl, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep))
+	if err != nil {
+		t.Fatalf("replacement: %v", err)
+	}
+	g := agent.WaitFor("replacement grant", func(e *ownsandv1.AgentEnvelope) bool { return e.GetRelayGrant().GetGrantId() == repl.Msg.GetGrantId() }).GetRelayGrant()
+	if g.ReplacesGrantId == nil || g.GetReplacesGrantId() != prev {
+		t.Fatalf("queued grant lost its predecessor: replaces_grant_id = %v", g.ReplacesGrantId)
+	}
+	if env.App.Plane.Grants.Get(prev) != nil || env.App.Plane.Grants.Admittable(repl.Msg.GetGrantId()) == nil {
+		t.Fatal("the registry did not free the predecessor and install the successor")
+	}
+}
+
 // TestAuthorizeRelayAckWithoutReplacedGrant covers an acknowledgement of a
 // replacement that does not name the predecessor: the predecessor stays
 // installed and a later replacement of it succeeds instead of aborting.
