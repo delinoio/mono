@@ -89,7 +89,7 @@ func TestUsageErrors(t *testing.T) {
 		}
 	}
 	for _, c := range r.f.callNames() {
-		if c == "CreateSandbox" || c == "AcceptInvitation" || c == "UpdateDeviceLimits" {
+		if c == "CreateSandbox" || c == "AcceptInvitation" || c == "ReplaceDeviceLimits" {
 			t.Fatalf("%s sent for an invalid command", c)
 		}
 	}
@@ -425,8 +425,32 @@ func TestDeviceSetLimitsKeepsCurrentOvercommit(t *testing.T) {
 	if l.GetVcpuCount() != 8 || l.GetMemoryMib() != 16384 || l.GetDiskGib() != 200 || l.GetVcpuOvercommitPercent() != 150 {
 		t.Fatalf("limits %v", l)
 	}
+	for _, c := range r.f.callNames() {
+		if c == "UpdateDeviceLimits" {
+			t.Fatal("device set-limits called the legacy UpdateDeviceLimits")
+		}
+	}
 	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "8", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "110"); res.code != ExitUsage {
 		t.Fatalf("overcommit not in steps of 25 accepted: %+v", res)
+	}
+}
+
+// TestDeviceSetLimitsSendsExplicitZero checks that a zero flag value is sent
+// as a present zero, which the strict RPC accepts, and that every field of
+// the request is present.
+func TestDeviceSetLimitsSendsExplicitZero(t *testing.T) {
+	r := newRunner(t)
+	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "0", "--memory", "0", "--disk", "0", "--vcpu-overcommit", "100"); res.code != 0 {
+		t.Fatalf("%+v", res)
+	}
+	r.f.mu.Lock()
+	l := r.f.limit
+	r.f.mu.Unlock()
+	if l.VcpuCount == nil || l.MemoryMib == nil || l.DiskGib == nil || l.VcpuOvercommitPercent == nil {
+		t.Fatalf("a field is missing in %v", l)
+	}
+	if l.GetVcpuCount() != 0 || l.GetMemoryMib() != 0 || l.GetDiskGib() != 0 || l.GetVcpuOvercommitPercent() != 100 {
+		t.Fatalf("limits %v", l)
 	}
 }
 
