@@ -255,3 +255,44 @@ func TestUnknownRequiredErrorUsesByteBudget(t *testing.T) {
 		t.Fatalf("requests %d, responses %d, limited %d", reqs, resps, limited)
 	}
 }
+
+// RFC 8489 section 9: attributes after MESSAGE-INTEGRITY (or after
+// MESSAGE-INTEGRITY-SHA256 when MESSAGE-INTEGRITY is absent) are ignored,
+// so an unknown required attribute there must not trigger a 420.
+func TestUnknownRequiredAfterIntegrityBoundaryIgnored(t *testing.T) {
+	src := &net.UDPAddr{IP: net.IPv4(1, 2, 3, 4), Port: 5}
+	unknownAttr := pionstun.RawAttribute{Type: 0x0030, Value: []byte{1, 2, 3, 4}}
+	integrity := pionstun.RawAttribute{Type: pionstun.AttrMessageIntegrity, Value: make([]byte, 20)}
+	integritySHA256 := pionstun.RawAttribute{Type: pionstun.AttrMessageIntegritySHA256, Value: make([]byte, 32)}
+
+	for name, tc := range map[string]struct {
+		attrs   []pionstun.Setter
+		wantErr bool
+	}{
+		"after message-integrity":                 {[]pionstun.Setter{integrity, unknownAttr}, false},
+		"after integrity and sha256":              {[]pionstun.Setter{integrity, integritySHA256, unknownAttr}, false},
+		"after sha256 without message-integrity":  {[]pionstun.Setter{integritySHA256, unknownAttr}, false},
+		"before message-integrity":                {[]pionstun.Setter{unknownAttr, integrity}, true},
+		"between message-integrity and sha256":    {[]pionstun.Setter{integrity, unknownAttr, integritySHA256}, false},
+		"before sha256 without message-integrity": {[]pionstun.Setter{unknownAttr, integritySHA256}, true},
+	} {
+		setters := append([]pionstun.Setter{pionstun.TransactionID, pionstun.BindingRequest}, tc.attrs...)
+		setters = append(setters, pionstun.Fingerprint)
+		req := pionstun.MustBuild(setters...)
+		raw, err := Respond(req.Raw, src)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		m := &pionstun.Message{Raw: raw}
+		if err := m.Decode(); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		want := pionstun.BindingSuccess
+		if tc.wantErr {
+			want = pionstun.BindingError
+		}
+		if m.Type != want {
+			t.Fatalf("%s: response type %v, want %v", name, m.Type, want)
+		}
+	}
+}

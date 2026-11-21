@@ -111,10 +111,19 @@ var knownRequired = map[pionstun.AttrType]struct{}{
 
 // unknownRequired returns the distinct comprehension-required attribute
 // types of req that the server does not understand, in request order.
+// RFC 8489 section 9: attributes after MESSAGE-INTEGRITY are ignored, as are
+// those after MESSAGE-INTEGRITY-SHA256 when MESSAGE-INTEGRITY is absent. The
+// only exempt attributes (MESSAGE-INTEGRITY-SHA256 and FINGERPRINT) are
+// understood types, so scanning stops at the boundary.
 func unknownRequired(req *pionstun.Message) pionstun.UnknownAttributes {
 	var unknown pionstun.UnknownAttributes
 	seen := map[pionstun.AttrType]struct{}{}
+	hasIntegrity := req.Contains(pionstun.AttrMessageIntegrity)
 	for _, a := range req.Attributes {
+		if a.Type == pionstun.AttrMessageIntegrity ||
+			(a.Type == pionstun.AttrMessageIntegritySHA256 && !hasIntegrity) {
+			break
+		}
 		if !a.Type.Required() {
 			continue
 		}
