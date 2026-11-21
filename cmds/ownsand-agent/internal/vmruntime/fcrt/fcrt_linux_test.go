@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -256,5 +257,86 @@ func TestRuntimeWithoutNetworkSkipsCleanupAndRefresh(t *testing.T) {
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// stubOutbound builds a runtime with a network manager (never started) and
+// stubbed capability and executable lookups.
+func stubOutbound(t *testing.T, netAdmin bool, present ...string) *Runtime {
+	t.Helper()
+	r := &Runtime{
+		opts:        Options{Binary: filepath.Join(t.TempDir(), "missing"), Kernel: "/nonexistent", Rootfs: "/nonexistent", Network: netpolicy.NewManager(quiet()), Logger: quiet()},
+		logger:      quiet(),
+		vms:         map[string]*vm{},
+		hasNetAdmin: func() bool { return netAdmin },
+		lookPath: func(name string) (string, error) {
+			for _, p := range present {
+				if p == name {
+					return "/bin/" + name, nil
+				}
+			}
+			return "", exec.ErrNotFound
+		},
+	}
+	return r
+}
+
+func outboundCheck(t *testing.T, r *Runtime) (bool, string) {
+	t.Helper()
+	for _, c := range r.Capabilities(context.Background()).Checks {
+		if c.GetCheckId() == "outbound-network" {
+			return c.GetPassed(), c.GetDetail()
+		}
+	}
+	t.Fatal("no outbound-network check")
+	return false, ""
+}
+
+func TestOutboundNetworkReportsMissingTools(t *testing.T) {
+	cases := []struct {
+		name    string
+		admin   bool
+		present []string
+		ok      bool
+		detail  string
+	}{
+		{"all present", true, []string{"ip", "nft"}, true, ""},
+		{"missing nft", true, []string{"ip"}, false, "nft"},
+		{"missing ip", true, []string{"nft"}, false, "ip"},
+		{"missing both", true, nil, false, "ip, nft"},
+		{"missing capability", false, []string{"ip", "nft"}, false, "CAP_NET_ADMIN is missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, detail := outboundCheck(t, stubOutbound(t, tc.admin, tc.present...))
+			if ok != tc.ok || !strings.Contains(detail, tc.detail) {
+				t.Fatalf("passed=%v detail=%q, want passed=%v containing %q", ok, detail, tc.ok, tc.detail)
+			}
+		})
+	}
+}
+
+// A missing tool fails an OUTBOUND create at the preflight, before the VM
+// directory exists; with the tools present, OUTBOUND proceeds to the later
+// checks, and NONE ignores the tools.
+func TestCreateOutboundPreflightChecksTools(t *testing.T) {
+	spec := func(mode ownsandv1.NetworkMode) vmruntime.Spec {
+		return vmruntime.Spec{GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX, NetworkMode: mode, Dir: filepath.Join(t.TempDir(), "vm")}
+	}
+	s := spec(ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND)
+	_, err := stubOutbound(t, true, "ip").Create(context.Background(), s)
+	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "nft") {
+		t.Fatalf("outbound create with missing nft: %v", err)
+	}
+	if _, statErr := os.Stat(s.Dir); statErr == nil {
+		t.Fatal("VM directory created before the preflight failed")
+	}
+	_, err = stubOutbound(t, true, "ip", "nft").Create(context.Background(), spec(ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND))
+	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "base image") {
+		t.Fatalf("outbound create with tools: %v", err)
+	}
+	_, err = stubOutbound(t, true).Create(context.Background(), spec(ownsandv1.NetworkMode_NETWORK_MODE_NONE))
+	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "base image") {
+		t.Fatalf("NONE create without tools: %v", err)
 	}
 }
