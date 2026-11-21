@@ -23,52 +23,65 @@ import (
 func Sync(ctx context.Context, sandboxID string, dial guestclient.Dialer) error {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	id, err := uuidv7.NewString()
+	code, err := Run(ctx, sandboxID, dial, []string{"sync"})
 	if err != nil {
 		return err
+	}
+	if code != 0 {
+		return fmt.Errorf("sync exited with %d", code)
+	}
+	return nil
+}
+
+// Run runs an agent-owned command in the guest through its guest helper and
+// returns its exit code. The output is discarded, and the exec never
+// reaches a caller. The image builds use it to provision a guest.
+func Run(ctx context.Context, sandboxID string, dial guestclient.Dialer, command []string) (int64, error) {
+	id, err := uuidv7.NewString()
+	if err != nil {
+		return 0, err
 	}
 	client := guestclient.New(dial)
 	defer client.Close()
 	s := client.Serve(ctx)
 	defer s.CloseResponse()
 	if err := s.Send(&ownsandv1.ServeRequest{Frame: datapath.MustNewFrame(1, sandboxID, &ownsandv1.ExecRequest{
-		SandboxId: sandboxID, ExecId: id, Command: []string{"sync"},
+		SandboxId: sandboxID, ExecId: id, Command: command,
 	})}); err != nil {
-		return err
+		return 0, err
 	}
 	for {
 		resp, err := s.Receive()
 		if err != nil {
-			return err
+			return 0, err
 		}
 		ev := resp.GetFrame().GetExecEvent()
 		switch {
 		case resp.GetFrame().GetError() != nil:
-			return errors.New(resp.GetFrame().GetError().GetMessage())
+			return 0, errors.New(resp.GetFrame().GetError().GetMessage())
 		case ev.GetExited() != nil:
-			return exitedError(ev.GetExited())
+			return exitCode(ev.GetExited())
 		case ev.GetFailed() != nil:
-			return errors.New(ev.GetFailed().GetMessage())
+			return 0, errors.New(ev.GetFailed().GetMessage())
+		case ev.GetSandboxEnded() != nil:
+			return 0, errors.New("the guest ended during the command")
 		}
 	}
 }
 
-// exitedError returns nil only when sync exited normally with code 0. The
+// exitCode returns the exit code of a command that exited normally. The
 // status is a oneof, so GetExitCode alone would read a signaled or unset
-// status as a zero exit.
-func exitedError(exited *ownsandv1.ExecExited) error {
+// status as a zero exit; those and a timeout are errors.
+func exitCode(exited *ownsandv1.ExecExited) (int64, error) {
 	if exited.GetTimedOut() {
-		return errors.New("sync timed out")
+		return 0, errors.New("the command timed out")
 	}
 	switch status := exited.GetStatus().(type) {
 	case *ownsandv1.ExecExited_ExitCode:
-		if status.ExitCode != 0 {
-			return fmt.Errorf("sync exited with %d", status.ExitCode)
-		}
-		return nil
+		return status.ExitCode, nil
 	case *ownsandv1.ExecExited_Signal:
-		return fmt.Errorf("sync killed by signal %d", status.Signal)
+		return 0, fmt.Errorf("the command was killed by signal %d", status.Signal)
 	default:
-		return errors.New("sync exited without a status")
+		return 0, errors.New("the command exited without a status")
 	}
 }

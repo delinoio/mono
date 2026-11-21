@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"os"
 	"strings"
@@ -19,7 +20,7 @@ func runCapturingStderr(t *testing.T, args []string) (int, string) {
 	}
 	orig := os.Stderr
 	os.Stderr = w
-	code := run(args)
+	code := run(context.Background(), args, nil)
 	os.Stderr = orig
 	w.Close()
 	out, err := io.ReadAll(r)

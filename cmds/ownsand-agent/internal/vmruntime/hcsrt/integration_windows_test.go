@@ -189,7 +189,7 @@ func TestHyperVIntegration(t *testing.T) {
 	for _, c := range caps.Checks {
 		t.Logf("check %s passed=%v: %s", c.GetCheckId(), c.GetPassed(), c.GetDetail())
 	}
-	if len(caps.BaseImages) != 1 || len(caps.GuestOSes) != 1 {
+	if len(caps.BaseImages) != 1 || caps.BaseImages[0] != ownsandv1.BaseImage_BASE_IMAGE_LINUX || len(caps.GuestOSes) != 2 {
 		t.Fatalf("capabilities %+v", caps.Checks)
 	}
 	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: rt, Logger: logger})

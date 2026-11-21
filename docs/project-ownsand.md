@@ -96,12 +96,13 @@ The project has one hosted server deployable (the control plane on the shared Di
 
 - Linux hosts need KVM access for the microVM runtime.
 - macOS guests need an Apple silicon host. Virtualization.framework runs at most two macOS guests at the same time on one Mac. Linux guests do not count toward this limit.
+- macOS and Windows guests use base images that the device builds with `ownsand-agent image build` ([agent contract](cmds-ownsand-agent-foundation.md#images)). Windows guests run only with network mode `NONE` in this version.
 - Windows hosts need Hyper-V, which Windows 11 Pro, Enterprise and Education and Windows Server include. Windows 11 Home does not include Hyper-V.
 - Delino does not distribute macOS or Windows images. Each device builds them locally from an Apple IPSW or from a Windows ISO that an admin supplies. The organization is responsible for the operating system license terms of its guests.
 
 ### Open decisions
 
-Record each decision in the owning domain contract before the implementation that depends on it. The domain contracts also own narrower open decisions (for example, the production Linux base image, the macOS and Windows guest images, the CLI keychain storage, the verification of the client address header and the stalled relay reader timeout (the header rule and the relay buffer and concurrency limits are recorded), and the WebSocket transport for devices behind HTTP/1.1-only proxies); each is recorded where it applies. The cross-domain ones are:
+Record each decision in the owning domain contract before the implementation that depends on it. The domain contracts also own narrower open decisions (for example, the production Linux base image, the network access of Windows guests (a TUN driver for `OUTBOUND`), the CLI keychain storage, the verification of the client address header and the stalled relay reader timeout (the header rule and the relay buffer and concurrency limits are recorded), and the WebSocket transport for devices behind HTTP/1.1-only proxies); each is recorded where it applies. The cross-domain ones are:
 
 - The release signing tool and the key custody process ([agent contract](cmds-ownsand-agent-foundation.md#agent-updates)).
 - The microVM implementation for Linux hosts (Firecracker class) ([agent contract](cmds-ownsand-agent-foundation.md#isolation)): recorded as Firecracker `v1.17.0` without the jailer; the jailer, the production Linux base image and its signed publication remain open.

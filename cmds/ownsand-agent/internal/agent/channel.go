@@ -14,6 +14,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sysinfo"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -218,6 +219,7 @@ func abs(v int64) int64 {
 
 func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityReport {
 	caps := a.rt.Capabilities(ctx)
+	caps.MacOSHardwareModels = a.macOSHardwareModels(caps.MacOSHardwareModels)
 	free, _ := sysinfo.FreeDiskBytes(a.st.Dir())
 	return &ownsandv1.CapabilityReport{
 		HostOs:       sysinfo.HostOS(),
@@ -234,6 +236,27 @@ func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityRepor
 			HypervisorChecks:     caps.Checks,
 		},
 	}
+}
+
+// macOSHardwareModels adds the hardware models of the local macOS
+// snapshots that the runtime supports to the models of its built image, so
+// that the scheduler can place sandboxes from those snapshots here.
+func (a *Agent) macOSHardwareModels(models [][]byte) [][]byte {
+	checker, ok := a.rt.(vmruntime.MacOSHardwareModelChecker)
+	if !ok {
+		return models
+	}
+	seen := map[string]bool{}
+	for _, m := range models {
+		seen[string(m)] = true
+	}
+	for _, m := range a.Sandboxes.MacOSHardwareModels() {
+		if !seen[string(m)] && checker.MacOSHardwareModelSupported(m) {
+			seen[string(m)] = true
+			models = append(models, m)
+		}
+	}
+	return models
 }
 
 // dispatch handles one envelope of the control plane. chanCtx ends with the

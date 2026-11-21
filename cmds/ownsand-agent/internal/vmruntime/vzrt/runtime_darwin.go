@@ -33,8 +33,11 @@ import (
 // Timeouts of the runtime.
 const (
 	readyTimeout = 60 * time.Second
-	stopTimeout  = 10 * time.Second
-	dialTimeout  = 10 * time.Second
+	// macOSReadyTimeout covers a macOS cold boot, which takes far longer
+	// than a Linux boot.
+	macOSReadyTimeout = 5 * time.Minute
+	stopTimeout       = 10 * time.Second
+	dialTimeout       = 10 * time.Second
 )
 
 // guestLink is the link of every OUTBOUND sandbox: each sandbox has its own
@@ -125,10 +128,20 @@ func (r *Runtime) Capabilities(ctx context.Context) vmruntime.Capabilities {
 		check(checkImage, false, "kernel or root file system is missing")
 	}
 	check(checkNetwork, true, "OUTBOUND sandboxes use the agent's userspace network stack")
+	macModel, macDetail := r.macOSImage()
+	check(checkMacOSImage, macModel != nil, macDetail)
 	if framework && entitled {
 		caps.GuestOSes = []ownsandv1.GuestOs{ownsandv1.GuestOs_GUEST_OS_LINUX}
 		if image {
 			caps.BaseImages = []ownsandv1.BaseImage{ownsandv1.BaseImage_BASE_IMAGE_LINUX}
+		}
+		if macOSGuestsSupported {
+			caps.MacOSGuestsSupported = true
+			caps.GuestOSes = append(caps.GuestOSes, ownsandv1.GuestOs_GUEST_OS_MACOS)
+			if macModel != nil {
+				caps.BaseImages = append(caps.BaseImages, ownsandv1.BaseImage_BASE_IMAGE_MACOS)
+				caps.MacOSHardwareModels = [][]byte{macModel}
+			}
 		}
 	}
 	return caps
@@ -137,17 +150,20 @@ func (r *Runtime) Capabilities(ctx context.Context) vmruntime.Capabilities {
 type vm struct {
 	id        string
 	dir       string
+	guestOS   ownsandv1.GuestOs
 	machine   *vz.VirtualMachine
 	machineID []byte
-	exited    chan struct{}
-	restore   ownsandv1.SandboxRestorePath
-	network   ownsandv1.NetworkMode
-	net       *netstack.Network
-	netConn   net.Conn
-	vcpu      int32
-	memMiB    int64
-	mu        sync.Mutex
-	paused    bool
+	// hardwareModel is the hardware model of a macOS guest.
+	hardwareModel []byte
+	exited        <-chan struct{}
+	restore       ownsandv1.SandboxRestorePath
+	network       ownsandv1.NetworkMode
+	net           *netstack.Network
+	netConn       net.Conn
+	vcpu          int32
+	memMiB        int64
+	mu            sync.Mutex
+	paused        bool
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -170,42 +186,7 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	devices := machine.SocketDevices()
-	if len(devices) == 0 {
-		return nil, errors.New("vzrt: the VM has no socket device")
-	}
-	type result struct {
-		conn net.Conn
-		err  error
-	}
-	ch := make(chan result, 1)
-	go func() {
-		c, err := devices[0].Connect(GuestPort)
-		if err != nil {
-			ch <- result{nil, err}
-			return
-		}
-		ch <- result{c, nil}
-	}()
-	timer := time.NewTimer(dialTimeout)
-	defer timer.Stop()
-	select {
-	case res := <-ch:
-		return res.conn, res.err
-	case <-ctx.Done():
-	case <-timer.C:
-	case <-exited:
-	}
-	// Close a connection that completes after the caller gave up.
-	go func() {
-		if res := <-ch; res.conn != nil {
-			res.conn.Close()
-		}
-	}()
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
-	}
-	return nil, errors.New("vzrt: connect to the guest helper timed out")
+	return DialGuest(ctx, machine, GuestPort, exited)
 }
 
 func (r *Runtime) vmDir(id string) string { return filepath.Join(r.opts.VMsDir, id) }
@@ -247,8 +228,12 @@ func growFile(path string, size int64) error {
 
 // Create boots a VM for the sandbox.
 func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
-	if spec.GuestOS != ownsandv1.GuestOs_GUEST_OS_LINUX {
-		return nil, fmt.Errorf("%w: this agent version runs only Linux guests on macOS hosts", vmruntime.ErrUnsupported)
+	switch spec.GuestOS {
+	case ownsandv1.GuestOs_GUEST_OS_LINUX:
+	case ownsandv1.GuestOs_GUEST_OS_MACOS:
+		return r.createMacOS(ctx, spec)
+	default:
+		return nil, fmt.Errorf("%w: macOS hosts run Linux and macOS guests", vmruntime.ErrUnsupported)
 	}
 	if !fileExists(r.opts.Kernel) {
 		return nil, fmt.Errorf("%w: the Linux kernel is missing", vmruntime.ErrUnsupported)
@@ -262,7 +247,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if err := os.MkdirAll(spec.Dir, 0o700); err != nil {
 		return nil, err
 	}
-	v := &vm{id: spec.SandboxID, dir: spec.Dir, network: spec.NetworkMode,
+	v := &vm{id: spec.SandboxID, dir: spec.Dir, network: spec.NetworkMode, guestOS: spec.GuestOS,
 		vcpu: spec.Resources.GetVcpuCount(), memMiB: spec.Resources.GetMemoryMib()}
 	// cleanup releases everything of a failed create: the sandbox manager
 	// records the sandbox as FAILED and never calls Delete for it.
@@ -398,7 +383,11 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 	cfg.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{serial})
 
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
-		dev, err := r.attachNetwork(v)
+		mac, err := netstack.RandomMAC()
+		if err != nil {
+			return nil, err
+		}
+		dev, err := r.attachNetwork(v, mac)
 		if err != nil {
 			return nil, err
 		}
@@ -411,11 +400,41 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 }
 
 // attachNetwork starts the userspace network stack of v and returns the
-// network device that is attached to it through a datagram socket pair.
-func (r *Runtime) attachNetwork(v *vm) (*vz.VirtioNetworkDeviceConfiguration, error) {
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+// network device with the MAC address mac that is attached to it through a
+// datagram socket pair.
+func (r *Runtime) attachNetwork(v *vm, mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfiguration, error) {
+	vmFile, conn, err := datagramPair()
 	if err != nil {
 		return nil, err
+	}
+	stack, err := netstack.New(netstack.Options{SandboxID: v.id, Link: guestLink, GuestMAC: mac, Filter: r.filter, Logger: r.logger})
+	if err != nil {
+		vmFile.Close()
+		conn.Close()
+		return nil, err
+	}
+	dev, err := networkDevice(vmFile, mac)
+	if err != nil {
+		stack.Close()
+		vmFile.Close()
+		conn.Close()
+		return nil, err
+	}
+	v.net, v.netConn = stack, conn
+	go func() {
+		if err := stack.Serve(context.Background(), conn, netstack.FramingDatagram); err != nil {
+			r.logger.Warn("sandbox network link ended", "sandbox_id", v.id, "error", err)
+		}
+	}()
+	return dev, nil
+}
+
+// datagramPair returns the VM end of a datagram socket pair for a
+// file-handle network attachment and the agent end as a connection.
+func datagramPair() (*os.File, net.Conn, error) {
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		return nil, nil, err
 	}
 	// Virtualization.framework recommends a send buffer of at least twice
 	// the receive buffer for datagram attachments.
@@ -430,49 +449,65 @@ func (r *Runtime) attachNetwork(v *vm) (*vz.VirtioNetworkDeviceConfiguration, er
 	agentFile.Close()
 	if err != nil {
 		vmFile.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	mac, err := netstack.RandomMAC()
-	if err != nil {
-		vmFile.Close()
-		conn.Close()
-		return nil, err
-	}
-	stack, err := netstack.New(netstack.Options{SandboxID: v.id, Link: guestLink, GuestMAC: mac, Filter: r.filter, Logger: r.logger})
-	if err != nil {
-		vmFile.Close()
-		conn.Close()
-		return nil, err
-	}
+	return vmFile, conn, nil
+}
+
+// networkDevice returns a virtio network device with the MAC address mac on
+// a file-handle attachment of vmFile.
+func networkDevice(vmFile *os.File, mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfiguration, error) {
 	attachment, err := vz.NewFileHandleNetworkDeviceAttachment(vmFile)
 	if err != nil {
-		stack.Close()
-		vmFile.Close()
-		conn.Close()
 		return nil, err
 	}
 	dev, err := vz.NewVirtioNetworkDeviceConfiguration(attachment)
 	if err != nil {
-		stack.Close()
-		vmFile.Close()
-		conn.Close()
 		return nil, err
 	}
 	vzMAC, err := vz.NewMACAddress(mac)
 	if err != nil {
-		stack.Close()
-		vmFile.Close()
-		conn.Close()
 		return nil, err
 	}
 	dev.SetMACAddress(vzMAC)
-	v.net, v.netConn = stack, conn
+	return dev, nil
+}
+
+// NewIdleNetworkDevice returns a network device with the MAC address mac
+// whose link carries no traffic, for the image build: it lets the guest
+// create its network service without network access. Close the returned
+// closer after the VM stopped.
+func NewIdleNetworkDevice(mac net.HardwareAddr) (*vz.VirtioNetworkDeviceConfiguration, io.Closer, error) {
+	vmFile, conn, err := datagramPair()
+	if err != nil {
+		return nil, nil, err
+	}
+	dev, err := networkDevice(vmFile, mac)
+	if err != nil {
+		vmFile.Close()
+		conn.Close()
+		return nil, nil, err
+	}
+	// Drain the guest's frames so the socket never fills.
 	go func() {
-		if err := stack.Serve(context.Background(), conn, netstack.FramingDatagram); err != nil {
-			r.logger.Warn("sandbox network link ended", "sandbox_id", v.id, "error", err)
+		buf := make([]byte, 65536)
+		for {
+			if _, err := conn.Read(buf); err != nil {
+				return
+			}
 		}
 	}()
-	return dev, nil
+	return dev, closers{vmFile, conn}, nil
+}
+
+type closers []io.Closer
+
+func (c closers) Close() error {
+	var errs []error
+	for _, x := range c {
+		errs = append(errs, x.Close())
+	}
+	return errors.Join(errs...)
 }
 
 // newMachine creates the VM object of v and watches its state.
@@ -481,16 +516,7 @@ func (r *Runtime) newMachine(v *vm, cfg *vz.VirtualMachineConfiguration) error {
 	if err != nil {
 		return err
 	}
-	exited := make(chan struct{})
-	notify := machine.StateChangedNotify()
-	go func() {
-		for state := range notify {
-			if state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError {
-				close(exited)
-				return
-			}
-		}
-	}()
+	exited := WatchStopped(machine)
 	v.mu.Lock()
 	v.machine, v.exited = machine, exited
 	v.mu.Unlock()
@@ -513,7 +539,11 @@ func (r *Runtime) coldBoot(ctx context.Context, v *vm, spec vmruntime.Spec) erro
 
 // waitGuest waits until the guest helper answers CheckReady.
 func (r *Runtime) waitGuest(ctx context.Context, v *vm) error {
-	rctx, cancel := context.WithTimeout(ctx, readyTimeout)
+	timeout := readyTimeout
+	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
+		timeout = macOSReadyTimeout
+	}
+	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	client := guestclient.New(v.Dial)
 	defer client.Close()
@@ -631,6 +661,9 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 				r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", err)
 			}
 		}()
+	}
+	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_MACOS {
+		return r.snapshotMacOS(v, dir)
 	}
 	info := vmruntime.SnapshotInfo{}
 	if memoryStateSupported && v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {

@@ -1208,6 +1208,51 @@ func TestDeleteSnapshot(t *testing.T) {
 	}
 }
 
+func TestMacOSSnapshotHardwareModels(t *testing.T) {
+	e := newEnv(t)
+	add := func(guest ownsandv1.GuestOs, model string) string {
+		id, _ := uuidv7.NewString()
+		dir, err := e.m.ImportDir(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(dir, contentDir), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		entry, err := e.m.AddImportedSnapshot(&ownsandv1.SnapshotStateEntry{
+			SnapshotId: id, GuestOs: guest, Resources: &ownsandv1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 64},
+			MacosHardwareModel: []byte(model),
+		})
+		if err != nil || string(entry.GetMacosHardwareModel()) != model {
+			t.Fatalf("import %v %v", entry, err)
+		}
+		return id
+	}
+	add(ownsandv1.GuestOs_GUEST_OS_MACOS, "model-a")
+	add(ownsandv1.GuestOs_GUEST_OS_MACOS, "model-a")
+	b := add(ownsandv1.GuestOs_GUEST_OS_MACOS, "model-b")
+	// A Linux snapshot never reports a macOS hardware model.
+	add(ownsandv1.GuestOs_GUEST_OS_LINUX, "model-c")
+	models := map[string]bool{}
+	for _, m := range e.m.MacOSHardwareModels() {
+		models[string(m)] = true
+	}
+	if len(models) != 2 || !models["model-a"] || !models["model-b"] {
+		t.Fatalf("models %v", models)
+	}
+	// The record keeps the model across an agent restart.
+	e.restart()
+	if len(e.m.MacOSHardwareModels()) != 2 {
+		t.Fatalf("models after restart %q", e.m.MacOSHardwareModels())
+	}
+	if err := e.m.DeleteSnapshot(&ownsandv1.DeleteSnapshotCommand{SnapshotId: b}); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.m.MacOSHardwareModels(); len(got) != 1 || string(got[0]) != "model-a" {
+		t.Fatalf("models after delete %q", got)
+	}
+}
+
 func waitFor(t *testing.T, cond func() bool) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)

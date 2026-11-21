@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -14,7 +15,7 @@ import (
 
 // LinuxImageDir is the directory of the Linux base image in the state
 // directory.
-const LinuxImageDir = "linux"
+const LinuxImageDir = images.LinuxDir
 
 // linuxImage returns the kernel and the root file system of the Linux base
 // image: the configured paths, or images/linux in the state directory.
