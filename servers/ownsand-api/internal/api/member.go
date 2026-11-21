@@ -197,11 +197,36 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 	hash := auth.HashSecret(secret)
 	var resp *ownsandv1.AcceptInvitationResponse
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock order: organization row first, invitation row second, the
+		// order of DeleteOrganization. The membership insert takes a share of
+		// the organization row through its foreign key, so holding the
+		// invitation row while waiting for that share would deadlock with a
+		// deletion that holds the organization row and waits for the
+		// invitation row. The first read takes no lock and only names the
+		// organization; every condition is checked again under both locks.
+		var preOrgID string
+		err := tx.QueryRow(ctx, `SELECT organization_id::text FROM invitations
+			WHERE secret_sha256 = $1 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $2`, hash, h.now()).Scan(&preOrgID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errInvitationInvalid()
+		}
+		if err != nil {
+			return err
+		}
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", preOrgID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A deletion removed the organization and its invitations.
+			return errInvitationInvalid()
+		}
+		if err != nil {
+			return err
+		}
 		var invID, orgID, orgName string
 		var role int16
 		var stored []byte
 		var orgCreated time.Time
-		err := tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time
+		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time
 			FROM invitations i JOIN organizations o ON o.organization_id = i.organization_id
 			WHERE i.secret_sha256 = $1 AND i.accept_time IS NULL AND i.revoke_time IS NULL AND i.expire_time > $2
 			FOR UPDATE OF i`, hash, h.now()).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated)
