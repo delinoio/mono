@@ -21,7 +21,7 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `apps/ownsand/`: Rsbuild React web console (workspace package `ownsand-console`) served at `https://ownsand.delino.io`.
 - `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
 - `packages/ownsand-sdk/`: TypeScript SDK (workspace package `ownsand-sdk`, not published) and the generated TypeScript bindings of the schemas.
-- `packages/ownsand-sdk-go/`: Go SDK: the client in the package root and the shared data path packages in its subpackages.
+- `go/ownsand/`: Go SDK: the client in the package root and the shared data path packages in its subpackages. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.
 
@@ -46,7 +46,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 | `ownsand-guest`   | `cmds/ownsand-guest/`       | Guest helper binary   | Installed into each guest image      |
 | `ownsand-cli`     | `cmds/ownsand/`             | CLI binary            | Release artifact                     |
 | `ownsand-sdk-ts`  | `packages/ownsand-sdk/`     | TypeScript package    | npm package                          |
-| `ownsand-sdk-go`  | `packages/ownsand-sdk-go/`  | Go package            | Root Go module import path           |
+| `ownsand-sdk-go`  | `go/ownsand/`               | Go package            | Root Go module import path           |
 | `ownsand-protos`  | `protos/delino/ownsand/v1/` | Schemas and bindings  | Root Go module and generated TS code |
 
 ### Protocol and API
@@ -79,7 +79,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 ### Licensing and code sharing
 
 - `servers/ownsand-api/` uses `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). Every other OwnSand path uses Apache-2.0.
-- The agent, the guest helper, the CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/ownsand/v1/` or `packages/ownsand-sdk-go/`.
+- The agent, the guest helper, the CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/ownsand/v1/` or `go/ownsand/`.
 
 ### Repository rules that apply without change
 

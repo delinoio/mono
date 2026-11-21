@@ -27,7 +27,7 @@ import (
 	"github.com/go-jose/go-jose/v4/jwt"
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	ownsand "github.com/delinoio/mono/packages/ownsand-sdk-go"
+	ownsand "github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 )

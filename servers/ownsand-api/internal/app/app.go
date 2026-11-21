@@ -15,7 +15,7 @@ import (
 
 	"connectrpc.com/connect"
 
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/uuidv7"
+	"github.com/delinoio/mono/go/ownsand/uuidv7"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/api"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"

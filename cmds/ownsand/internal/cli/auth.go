@@ -12,7 +12,7 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
 	"github.com/delinoio/mono/cmds/ownsand/internal/logto"
-	ownsand "github.com/delinoio/mono/packages/ownsand-sdk-go"
+	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
 // DefaultLogtoResource is the API resource indicator of the OwnSand API.

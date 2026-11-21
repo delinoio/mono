@@ -17,8 +17,8 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
-	"github.com/delinoio/mono/packages/ownsand-sdk-go/relaybinding"
+	"github.com/delinoio/mono/go/ownsand/datapath"
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 

@@ -29,7 +29,7 @@ All paths are `planned`. This project is in the documentation-only phase. Create
 - `cmds/tide/` (`planned`): Go command-line interface. The same binary serves the `tide mcp` MCP server for coding agents.
 - `protos/delino/tide/v1/` (`planned`): Connect RPC schemas and the committed Go bindings.
 - `packages/tide-sdk/` (`planned`): TypeScript SDK.
-- `packages/tide-sdk-go/` (`planned`): Go SDK.
+- `go/tide/` (`planned`): Go SDK. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and one distributed program (the CLI). tide distributes no device program: OwnSand owns every program that runs on a device. The project has no `crates` paths.
 
@@ -51,7 +51,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 | `tide-console` | `apps/tide/`             | Cloudflare Pages site | `https://tide.delino.io`             |
 | `tide-cli`     | `cmds/tide/`             | CLI binary            | Release artifact                     |
 | `tide-sdk-ts`  | `packages/tide-sdk/`     | TypeScript package    | npm package                          |
-| `tide-sdk-go`  | `packages/tide-sdk-go/`  | Go package            | Root Go module import path           |
+| `tide-sdk-go`  | `go/tide/`               | Go package            | Root Go module import path           |
 | `tide-protos`  | `protos/delino/tide/v1/` | Schemas and bindings  | Root Go module and generated TS code |
 
 ### Layering on OwnSand
@@ -106,7 +106,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 ### Licensing and code sharing
 
 - `servers/tide-api/` uses `FSL-1.1-ALv2` according to the [license contract](repository-license-contract.md). Every other tide path uses Apache-2.0.
-- The CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/tide/v1/` or `packages/tide-sdk-go/`.
+- The CLI and the SDKs must not import code from `servers/`. Code that the control plane shares with them lives in `protos/delino/tide/v1/` or `go/tide/`.
 
 ### Repository rules that apply without change
 

@@ -43,7 +43,7 @@ interface Vector {
 const vectors: Vector[] = JSON.parse(
   readFileSync(
     new URL(
-      "../../ownsand-sdk-go/relaybinding/testdata/request-digest-vectors.json",
+      "../../../go/ownsand/relaybinding/testdata/request-digest-vectors.json",
       import.meta.url,
     ),
     "utf8",
