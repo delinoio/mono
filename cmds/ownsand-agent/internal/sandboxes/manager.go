@@ -555,10 +555,18 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	defer sb.cmdMu.Unlock()
 	m.sandboxes[id] = sb
 	err := m.commitLocked(sb, func(*Record) {})
+	if err != nil {
+		// The record was never saved and no VM exists yet. Unpublish the
+		// in-memory sandbox so that it does not count against the limits,
+		// keep the agent busy or appear in state reports, and so that a
+		// retry of the same command can create the sandbox.
+		delete(m.sandboxes, id)
+	}
 	outbox := m.outbox
 	entry := sb.rec.Entry(m.epoch)
 	m.mu.Unlock()
 	if err != nil {
+		m.logger.Error("sandbox record failed", "sandbox_id", id, "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "agent could not record the sandbox")
 	}
 	if outbox != nil {
@@ -597,15 +605,18 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	m.mu.Lock()
 	sb.vm, sb.guest, sb.createCancel = vm, guest, nil
 	m.mu.Unlock()
+	// Supervise the VM before the fallible running save: when the save fails,
+	// the VM still runs, and its later exit must end the record.
+	go m.watchVM(sb, vm)
 	entry, err = m.update(sb, func(r *Record) {
 		r.State = ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 		r.RestorePath = vm.RestorePath()
 		r.IdleDeadline = m.now().Add(r.IdleTTL)
 	})
 	if err != nil {
+		m.logger.Error("sandbox running record failed", "sandbox_id", id, "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "agent could not record the sandbox")
 	}
-	go m.watchVM(sb, vm)
 	return entry, nil
 }
 
