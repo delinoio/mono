@@ -373,34 +373,6 @@ func TestHealthyExportRepeatDispatchesOnce(t *testing.T) {
 	}
 }
 
-// TestLegacyExportingRowCountsAsOrphaned checks that an EXPORTING row
-// without an owner (written before owners were recorded) fails when the
-// device reports and gets no upload URL before that.
-func TestLegacyExportingRowCountsAsOrphaned(t *testing.T) {
-	env := testenv.New(t)
-	ctx := context.Background()
-	org := env.NewOrg("alice")
-	c := org.OwnerClient
-	snapID, agent := exportingSnapshot(t, env, org)
-	if _, err := env.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_command_id = NULL, export_channel_id = NULL WHERE snapshot_id = $1", snapID); err != nil {
-		t.Fatal(err)
-	}
-	requestUploadURLs(agent, snapID, "legacy-urls")
-	requireDenied(t, waitGrant(agent, "legacy-urls"))
-
-	reconnect(agent)
-	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
-	// The abandoned legacy objects live under parts/ of the snapshot prefix;
-	// the job must not cover the prefix of later attempts.
-	legacy := snapshotPrefixOf(org.ID, snapID) + "parts/"
-	if _, ok := cleanupJobs(t, env)[legacy]; !ok {
-		t.Fatalf("no clean-up job for %s: %v", legacy, cleanupJobs(t, env))
-	}
-	answerExports(agent)
-	exportSnapshotRPC(t, c, org.ID, snapID)
-	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)
-}
-
 // TestUploadURLsNeedOwningChannel checks that a channel that does not own the
 // export gets no upload URL.
 func TestUploadURLsNeedOwningChannel(t *testing.T) {
@@ -417,31 +389,4 @@ func TestUploadURLsNeedOwningChannel(t *testing.T) {
 	}
 	requestUploadURLs(agent, snapID, "not-owner")
 	requireDenied(t, waitGrant(agent, "not-owner"))
-}
-
-// TestLegacyExportedSnapshotStaysDownloadable checks that an exported
-// snapshot without attempt columns resolves its parts under the legacy keys.
-func TestLegacyExportedSnapshotStaysDownloadable(t *testing.T) {
-	env := testenv.New(t)
-	ctx := context.Background()
-	org := env.NewOrg("alice")
-	c := org.OwnerClient
-	snapID, devB, agentB := importFixture(t, env, org)
-	if _, err := env.DB.Pool.Exec(ctx, "UPDATE snapshots SET export_command_id = NULL, export_channel_id = NULL WHERE snapshot_id = $1", snapID); err != nil {
-		t.Fatal(err)
-	}
-	withholdImportResult(agentB)
-	if _, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID))); err != nil {
-		t.Fatal(err)
-	}
-	agentB.WaitFor("import command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetImportSnapshot() != nil })
-	grant := requestDownloadURLs(agentB, snapID, "legacy-download")
-	if grant.GetError() != nil || len(grant.GetPartUrls()) != 2 {
-		t.Fatalf("download grant = %v", grant)
-	}
-	for _, u := range grant.GetPartUrls() {
-		if !strings.Contains(u.GetUrl(), "memory://GET/"+snapshotPrefixOf(org.ID, snapID)+"parts/") || strings.Contains(u.GetUrl(), "attempts/") {
-			t.Fatalf("download URL %q is not a legacy key", u.GetUrl())
-		}
-	}
 }

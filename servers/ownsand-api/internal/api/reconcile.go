@@ -372,11 +372,7 @@ func (s *Service) reconcileSnapshotsTx(ctx context.Context, tx pgx.Tx, deviceID,
 				}
 			}
 			if ownsandv1.SnapshotExportState(sn.export) == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING && sn.channel != channelID {
-				reason := "owner_channel_replaced"
-				if sn.channel == "" {
-					reason = "owner_unknown"
-				}
-				if err := s.failExportTx(ctx, tx, sn.org, sn.id, sn.command, reason); err != nil {
+				if err := s.failExportTx(ctx, tx, sn.org, sn.id, sn.command, "owner_channel_replaced"); err != nil {
 					return 0, err
 				}
 			}
