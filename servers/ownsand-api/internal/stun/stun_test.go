@@ -70,16 +70,46 @@ func TestRateLimitPerSource(t *testing.T) {
 		req := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest)
 		_, _ = client.WriteTo(req.Raw, pc.LocalAddr())
 	}
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if req, _, _ := s.Stats(); req == 10 {
-			break
+	req, resp, limited := waitForOutcomes(s.Stats, 10, 5*time.Second)
+	if req != 10 || resp == 0 || resp > 3 || limited != req-resp {
+		t.Fatalf("requests %d, responses %d, limited %d", req, resp, limited)
+	}
+}
+
+// waitForOutcomes polls stats until at least want outcomes (responses plus
+// limited drops) are recorded, or the timeout passes. Request receipt is not a
+// completion signal because the server records the outcome after it counts the
+// request. It returns the last snapshot so callers assert on one consistent sample.
+func waitForOutcomes(stats func() (int64, int64, int64), want int64, timeout time.Duration) (req, resp, limited int64) {
+	deadline := time.Now().Add(timeout)
+	for {
+		req, resp, limited = stats()
+		if resp+limited >= want || !time.Now().Before(deadline) {
+			return req, resp, limited
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	req, resp, limited := s.Stats()
-	if req != 10 || resp == 0 || resp > 3 || limited != req-resp {
-		t.Fatalf("requests %d, responses %d, limited %d", req, resp, limited)
+}
+
+func TestWaitForOutcomes(t *testing.T) {
+	samples := [][3]int64{{10, 5, 4}, {10, 5, 4}, {10, 6, 4}}
+	calls := 0
+	stats := func() (int64, int64, int64) {
+		i := calls
+		if i >= len(samples) {
+			i = len(samples) - 1
+		}
+		calls++
+		return samples[i][0], samples[i][1], samples[i][2]
+	}
+	req, resp, limited := waitForOutcomes(stats, 10, 5*time.Second)
+	if req != 10 || resp != 6 || limited != 4 || calls != 3 {
+		t.Fatalf("got %d/%d/%d after %d calls", req, resp, limited, calls)
+	}
+	// Missing outcomes return the incomplete sample at the deadline.
+	req, resp, limited = waitForOutcomes(func() (int64, int64, int64) { return 10, 5, 4 }, 10, 30*time.Millisecond)
+	if resp+limited != 9 || req != 10 {
+		t.Fatalf("timeout sample %d/%d/%d", req, resp, limited)
 	}
 }
 
