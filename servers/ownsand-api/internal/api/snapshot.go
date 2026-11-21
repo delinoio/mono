@@ -220,11 +220,20 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 		case result == nil || len(result.GetParts()) == 0:
 			reason = "no_parts"
 		default:
+			// A part number that repeats is invalid: the manifest keys its
+			// parts by number, so the database would reject the second
+			// insert and abort the transaction instead of failing the attempt.
+			seen := make(map[int32]struct{}, len(result.GetParts()))
 			for _, part := range result.GetParts() {
 				if part.GetPartNumber() < 1 || part.GetPartNumber() > maxSnapshotParts || len(part.GetSha256()) != 32 || part.GetSizeBytes() < 0 {
 					reason = "invalid_part"
 					break
 				}
+				if _, dup := seen[part.GetPartNumber()]; dup {
+					reason = "invalid_part"
+					break
+				}
+				seen[part.GetPartNumber()] = struct{}{}
 			}
 		}
 		if reason != "" {
