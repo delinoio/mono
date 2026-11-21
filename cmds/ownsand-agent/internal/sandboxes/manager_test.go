@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -66,6 +67,10 @@ type fakeRuntime struct {
 	// pauseErr and resumeErr, when set, make Pause and Resume fail.
 	pauseErr  error
 	resumeErr error
+	// pauseCalls and resumeCalls count the Pause and Resume calls that
+	// reached the fake, including failing ones.
+	pauseCalls  int
+	resumeCalls int
 	// onCreate, when set, runs in Create after the VM started.
 	onCreate func(spec vmruntime.Spec)
 	// files holds the sandbox IDs whose runtime files exist. Create adds an
@@ -114,6 +119,9 @@ func (r *fakeRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntim
 	return v, nil
 }
 func (r *fakeRuntime) Pause(_ context.Context, vm vmruntime.VM) error {
+	r.mu.Lock()
+	r.pauseCalls++
+	r.mu.Unlock()
 	if r.pauseErr != nil {
 		return r.pauseErr
 	}
@@ -123,6 +131,9 @@ func (r *fakeRuntime) Pause(_ context.Context, vm vmruntime.VM) error {
 	return nil
 }
 func (r *fakeRuntime) Resume(_ context.Context, vm vmruntime.VM) error {
+	r.mu.Lock()
+	r.resumeCalls++
+	r.mu.Unlock()
 	if r.resumeErr != nil {
 		return r.resumeErr
 	}
@@ -1072,6 +1083,124 @@ func TestFailedPauseAndResumeKeepTheRecordedState(t *testing.T) {
 	}
 	if got := e.m.StateReport(2, nil).GetSandboxes()[0].GetState(); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		t.Fatalf("state after the failed resume = %v; want PAUSED", got)
+	}
+}
+
+// vmState reports the pause and call counters of the fake runtime for a sandbox.
+func (r *fakeRuntime) vmState(id string) (paused bool, pauseCalls, resumeCalls int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.paused[id], r.pauseCalls, r.resumeCalls
+}
+
+// breakFile replaces the file at path with a directory so that the atomic
+// write of that file fails, and returns the function that restores the bytes.
+func breakFile(t *testing.T, path string) (restore func()) {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return func() {
+		t.Helper()
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// TestPauseAndResumeUndoTheRuntimeWhenTheRevisionSaveFails checks that a pause
+// or a resume that the runtime accepted is undone when the revision counter
+// cannot be persisted, so that the VM keeps matching the unchanged record.
+func TestPauseAndResumeUndoTheRuntimeWhenTheRevisionSaveFails(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	agentPath := filepath.Join(e.st.Dir(), store.AgentFile)
+	pauseCmd := &ownsandv1.PauseSandboxCommand{SandboxId: id}
+	resumeCmd := &ownsandv1.ResumeSandboxCommand{SandboxId: id}
+	check := func(step string, en *ownsandv1.SandboxStateEntry, err error, wantErr bool, state ownsandv1.SandboxState, paused bool, pauseCalls, resumeCalls int) {
+		t.Helper()
+		if wantErr {
+			if err == nil || !strings.Contains(err.Error(), "sandboxes: persist revision:") || en != nil {
+				t.Fatalf("%s: entry %v, error %v; want a nil entry and a persist-revision error", step, en, err)
+			}
+		} else if err != nil || en.GetState() != state {
+			t.Fatalf("%s: entry %v, error %v; want state %v", step, en, err, state)
+		}
+		if got, _ := e.m.State(id); got != state {
+			t.Fatalf("%s: record state = %v; want %v", step, got, state)
+		}
+		gotPaused, gotPause, gotResume := e.rt.vmState(id)
+		if gotPaused != paused || gotPause != pauseCalls || gotResume != resumeCalls {
+			t.Fatalf("%s: paused=%v pause calls=%d resume calls=%d; want %v %d %d", step, gotPaused, gotPause, gotResume, paused, pauseCalls, resumeCalls)
+		}
+	}
+
+	restore := breakFile(t, agentPath)
+	en, err := e.m.Pause(ctx, pauseCmd)
+	check("pause with a failing revision save", en, err, true, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, false, 1, 1)
+	restore()
+	en, err = e.m.Pause(ctx, pauseCmd)
+	check("pause after the store recovered", en, err, false, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, true, 2, 1)
+
+	restore = breakFile(t, agentPath)
+	en, err = e.m.Resume(ctx, resumeCmd)
+	check("resume with a failing revision save", en, err, true, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, true, 3, 2)
+	restore()
+	en, err = e.m.Resume(ctx, resumeCmd)
+	check("resume after the store recovered", en, err, false, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, false, 3, 3)
+}
+
+// TestFailedUndoJoinsTheErrors checks that a failed undo is returned together
+// with the revision error and that the record stays unchanged.
+func TestFailedUndoJoinsTheErrors(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	restore := breakFile(t, filepath.Join(e.st.Dir(), store.AgentFile))
+	defer restore()
+	undoErr := errors.New("injected undo failure")
+	e.rt.resumeErr = undoErr
+	en, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id})
+	if en != nil || err == nil || !strings.Contains(err.Error(), "sandboxes: persist revision:") || !errors.Is(err, undoErr) {
+		t.Fatalf("pause = %v, %v; want the persist-revision error joined with the undo error", en, err)
+	}
+	if got, _ := e.m.State(id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("record state = %v; want RUNNING", got)
+	}
+}
+
+// TestPauseDoesNotUndoWhenOnlyTheRecordSaveFails checks that a failure of
+// SaveSandbox after the in-memory change applied keeps the new state and does
+// not call the opposite runtime method.
+func TestPauseDoesNotUndoWhenOnlyTheRecordSaveFails(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	breakFile(t, filepath.Join(e.st.Dir(), store.SandboxesDir, id+".json"))
+	if en, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err == nil || en != nil {
+		t.Fatalf("pause = %v, %v; want an error and a nil entry", en, err)
+	}
+	if got, _ := e.m.State(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("record state = %v; want PAUSED", got)
+	}
+	if paused, pauseCalls, resumeCalls := e.rt.vmState(id); !paused || pauseCalls != 1 || resumeCalls != 0 {
+		t.Fatalf("paused=%v pause calls=%d resume calls=%d; want true 1 0", paused, pauseCalls, resumeCalls)
+	}
+	if _, err := e.m.Pause(ctx, &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil {
+		t.Fatalf("second pause = %v", err)
+	}
+	if paused, pauseCalls, _ := e.rt.vmState(id); !paused || pauseCalls != 1 {
+		t.Fatalf("paused=%v pause calls=%d after the second pause; want true 1", paused, pauseCalls)
 	}
 }
 

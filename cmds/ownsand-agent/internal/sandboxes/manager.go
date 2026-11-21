@@ -821,7 +821,11 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 			m.logger.Error("pause failed", "sandbox_id", id, "error", err)
 			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "sandbox could not be paused")
 		}
-		return m.update(sb, func(r *Record) { r.State = to })
+		updated, err := m.update(sb, func(r *Record) { r.State = to })
+		if err != nil {
+			err = m.undoRuntimeMove(sb, id, from, err)
+		}
+		return updated, err
 	}
 	if err := m.rt.Resume(ctx, vm); err != nil {
 		m.logger.Error("resume failed", "sandbox_id", id, "error", err)
@@ -832,10 +836,50 @@ func (m *Manager) pauseResume(ctx context.Context, id string, pause bool) (*owns
 		m.logger.Warn("set guest clock after resume failed", "sandbox_id", id, "error", err)
 	}
 	cancel()
-	return m.update(sb, func(r *Record) {
+	updated, err := m.update(sb, func(r *Record) {
 		r.State = to
 		r.IdleDeadline = m.now().Add(r.IdleTTL)
 	})
+	if err != nil {
+		err = m.undoRuntimeMove(sb, id, from, err)
+	}
+	return updated, err
+}
+
+// undoRuntimeMove runs after a pause or resume that the runtime accepted but
+// whose record update failed. When the record is still in state from, nextRevision
+// failed before the change applied, so the VM is in the opposite state from
+// the record: it moves the VM back, because a later opposite command would
+// otherwise see the old state as its target, return success and never reach
+// the runtime. When the record already holds the new state, SaveSandbox failed
+// after the change applied; the VM matches the record and a retry returns the
+// current entry, so nothing is undone. It returns updateErr, joined with the
+// error of the undo when the undo fails.
+//
+// The undo calls the runtime directly and uses a fresh bounded context: the
+// request context can already be canceled, and the undo must not depend on it.
+func (m *Manager) undoRuntimeMove(sb *sandbox, id string, from ownsandv1.SandboxState, updateErr error) error {
+	m.mu.Lock()
+	state, vm := sb.rec.State, sb.vm
+	m.mu.Unlock()
+	if state != from {
+		return updateErr
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var err error
+	if from == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		// The runtime paused the VM; the record is still RUNNING.
+		err = m.rt.Resume(ctx, vm)
+	} else {
+		err = m.rt.Pause(ctx, vm)
+	}
+	if err != nil {
+		m.logger.Error("undo of the runtime move after a failed record update failed; the VM no longer matches the record", "sandbox_id", id, "state", from.String(), "error", err)
+		return errors.Join(updateErr, err)
+	}
+	m.logger.Warn("undid the runtime move after a failed record update", "sandbox_id", id, "state", from.String(), "error", updateErr)
+	return updateErr
 }
 
 // Tick enforces the TTLs, reports moved idle deadlines at most once per
