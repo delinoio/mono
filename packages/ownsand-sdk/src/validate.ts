@@ -36,10 +36,26 @@ export function validateTtl(
   if (!Number.isFinite(maxTtlMs) || maxTtlMs <= 0) {
     throw new OwnSandValidationError("max_ttl", "must be greater than zero");
   }
-  if (maxTtlMs > MAX_TTL_MS) {
+  // Compare the values that go on the wire, so that a positive TTL that rounds
+  // to zero nanoseconds is rejected and the checks match the sent durations.
+  const idleNanos = nanosFromMs(idleTtlMs);
+  const maxNanos = nanosFromMs(maxTtlMs);
+  if (idleNanos <= 0n) {
+    throw new OwnSandValidationError(
+      "idle_ttl",
+      "must be at least one nanosecond",
+    );
+  }
+  if (maxNanos <= 0n) {
+    throw new OwnSandValidationError(
+      "max_ttl",
+      "must be at least one nanosecond",
+    );
+  }
+  if (maxNanos > BigInt(MAX_TTL_MS) * 1_000_000n) {
     throw new OwnSandValidationError("max_ttl", "must be at most 7 days");
   }
-  if (idleTtlMs > maxTtlMs) {
+  if (idleNanos > maxNanos) {
     throw new OwnSandValidationError(
       "idle_ttl",
       "must not be greater than max_ttl",
@@ -140,6 +156,18 @@ export function validateExec(input: {
   ) {
     throw new OwnSandValidationError("timeout", "must not be negative");
   }
+  // Zero means no timeout, but a positive value that rounds to zero
+  // nanoseconds would silently mean the same, so reject it.
+  if (
+    input.timeoutMs !== undefined &&
+    input.timeoutMs > 0 &&
+    nanosFromMs(input.timeoutMs) <= 0n
+  ) {
+    throw new OwnSandValidationError(
+      "timeout",
+      "must be zero or at least one nanosecond",
+    );
+  }
 }
 
 /** Checks that a path is absolute for some guest OS. */
@@ -162,11 +190,25 @@ export function validateGuestPath(field: string, path: string): void {
   }
 }
 
-/** Converts milliseconds to a protobuf Duration. */
-export function durationFromMs(ms: number): { seconds: bigint; nanos: number } {
+/**
+ * Converts milliseconds to a whole number of nanoseconds, rounding half up to
+ * the nearest nanosecond. The integer and fractional millisecond parts are
+ * converted separately so that large values do not lose precision.
+ */
+function nanosFromMs(ms: number): bigint {
   const whole = Math.floor(ms);
+  const fraction = ms - whole;
+  return BigInt(whole) * 1_000_000n + BigInt(Math.round(fraction * 1_000_000));
+}
+
+/**
+ * Converts milliseconds to a protobuf Duration at nanosecond precision.
+ * Fractions of a nanosecond round to the nearest nanosecond.
+ */
+export function durationFromMs(ms: number): { seconds: bigint; nanos: number } {
+  const total = nanosFromMs(ms);
   return {
-    seconds: BigInt(Math.floor(whole / 1000)),
-    nanos: (whole % 1000) * 1_000_000,
+    seconds: total / 1_000_000_000n,
+    nanos: Number(total % 1_000_000_000n),
   };
 }
