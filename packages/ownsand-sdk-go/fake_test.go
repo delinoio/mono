@@ -89,6 +89,8 @@ type p2pAction struct {
 	endAfter  int // send a session-end frame after N output events
 	reason    ownsandv1.SessionEndReason
 	failAfter int // close the data channel without a session-end frame
+	// raw, when set, answers the request with this frame only.
+	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
 
 // authAction scripts one AuthorizeRelay call.
@@ -1015,6 +1017,10 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 	frame := func(p proto.Message) *ownsandv1.DataFrame { return datapath.MustNewFrame(id, s.sandboxID, p) }
 	errFrame := func(err error) {
 		_ = s.send(frame(&ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode(connect.CodeOf(err)), Message: err.Error()}))
+	}
+	if act.raw != nil {
+		_ = s.send(act.raw(id, s.sandboxID))
+		return
 	}
 	outputs := 0
 	sendExec := func(ev *ownsandv1.ExecEvent) error {

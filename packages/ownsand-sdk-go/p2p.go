@@ -227,19 +227,28 @@ func (s *p2pSession) dispatch(f *ownsandv1.DataFrame) {
 		s.end(&errSessionEnded{reason: f.GetSessionEnd().GetReason()})
 		return
 	}
-	if err := datapath.ValidateFrame(f); err != nil {
-		// Unknown kinds of a newer schema on stream 0 are ignored; other
-		// malformed frames fail only their stream.
-		var uk *datapath.UnknownKindError
-		if errors.As(err, &uk) && f.GetStreamId() == datapath.ConnectionStreamID {
-			return
-		}
-	}
 	s.mu.Lock()
 	st := s.streams[f.GetStreamId()]
 	s.mu.Unlock()
+	if err := datapath.ValidateFrame(f); err != nil {
+		// Unknown kinds of a newer schema on stream 0 are ignored, and so is
+		// a malformed frame on stream 0 or on a stream that is not open
+		// (stream 0 has no p2pStream). Any other invalid frame fails only
+		// its stream, so the operation ends with the error instead of
+		// waiting for a frame that it can use.
+		if st != nil {
+			st.fail(&errInvalidFrame{cause: err})
+		}
+		return
+	}
 	if st == nil {
 		return
+	}
+	select {
+	case <-st.failed:
+		// A failed stream receives no more frames.
+		return
+	default:
 	}
 	select {
 	case st.ch <- f:
@@ -278,6 +287,19 @@ func (s *p2pSession) send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	return nil
 }
 
+// errInvalidFrame reports a frame that the agent sent on a stream and that
+// does not follow the framing rules (for example a kind of a newer schema).
+// It ends the operation: a new attempt would receive the same frame.
+type errInvalidFrame struct {
+	cause error
+}
+
+func (e *errInvalidFrame) Error() string {
+	return "ownsand: invalid frame on the peer-to-peer data channel: " + e.cause.Error()
+}
+
+func (e *errInvalidFrame) Unwrap() error { return e.cause }
+
 // p2pStream is one request stream on a session.
 type p2pStream struct {
 	s      *p2pSession
@@ -285,13 +307,28 @@ type p2pStream struct {
 	ch     chan *ownsandv1.DataFrame
 	closed chan struct{}
 	once   sync.Once
+
+	// failed is closed when the receiver fails the stream with failErr.
+	// Frames queued before the failure are still delivered first.
+	failed   chan struct{}
+	failOnce sync.Once
+	failErr  error
+}
+
+// fail ends the stream with err for its receiver. Only the receive
+// callback calls it, so no frame is queued after the failure.
+func (st *p2pStream) fail(err error) {
+	st.failOnce.Do(func() {
+		st.failErr = err
+		close(st.failed)
+	})
 }
 
 // openStream allocates a new stream_id and sends the request payload.
 func (s *p2pSession) openStream(ctx context.Context, payload proto.Message) (*p2pStream, error) {
 	s.mu.Lock()
 	s.nextID++
-	st := &p2pStream{s: s, id: s.nextID, ch: make(chan *ownsandv1.DataFrame, 64), closed: make(chan struct{})}
+	st := &p2pStream{s: s, id: s.nextID, ch: make(chan *ownsandv1.DataFrame, 64), closed: make(chan struct{}), failed: make(chan struct{})}
 	s.streams[st.id] = st
 	s.mu.Unlock()
 	f, err := datapath.NewFrame(st.id, s.sandboxID, payload)
@@ -306,7 +343,8 @@ func (s *p2pSession) openStream(ctx context.Context, payload proto.Message) (*p2
 	return st, nil
 }
 
-// recv returns the next frame of the stream, or the session's end error.
+// recv returns the next frame of the stream, or the stream's failure or the
+// session's end error after the queued frames.
 func (st *p2pStream) recv(ctx context.Context) (*ownsandv1.DataFrame, error) {
 	select {
 	case f := <-st.ch:
@@ -316,6 +354,13 @@ func (st *p2pStream) recv(ctx context.Context) (*ownsandv1.DataFrame, error) {
 	select {
 	case f := <-st.ch:
 		return f, nil
+	case <-st.failed:
+		select {
+		case f := <-st.ch:
+			return f, nil
+		default:
+		}
+		return nil, st.failErr
 	case <-st.s.done:
 		select {
 		case f := <-st.ch:

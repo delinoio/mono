@@ -15,6 +15,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/delinoio/mono/packages/ownsand-sdk-go/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -853,4 +854,42 @@ func TestGrantLifetimeUsesExpiresInNotCallerClock(t *testing.T) {
 	}
 	res, r := runExec(t, s)
 	checkLines(t, res, r, 4)
+}
+
+// TestInvalidFrameFailsItsStream checks that a frame that does not follow
+// the framing rules (an unknown kind of a newer schema, or a kind that does
+// not match its payload) ends the operation at once on the peer-to-peer
+// path instead of leaving it waiting for another frame.
+func TestInvalidFrameFailsItsStream(t *testing.T) {
+	frames := map[string]func(uint64, string) *ownsandv1.DataFrame{
+		"unknown kind": func(id uint64, sb string) *ownsandv1.DataFrame {
+			return &ownsandv1.DataFrame{StreamId: id, SandboxId: sb, Kind: ownsandv1.DataFrameKind(99)}
+		},
+		"kind and payload differ": func(id uint64, sb string) *ownsandv1.DataFrame {
+			f := datapath.MustNewFrame(id, sb, &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND})
+			f.Kind = ownsandv1.DataFrameKind_DATA_FRAME_KIND_EXEC_EVENT
+			return f
+		},
+	}
+	for name, raw := range frames {
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(1, 0)
+			cp.agent.setFile("/f", []byte("data"))
+			cp.p2pScript = func(int) p2pAction { return p2pAction{raw: raw} }
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			var invalid *errInvalidFrame
+			_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+			var dp *DataPathError
+			if !errors.As(err, &dp) || !errors.As(err, &invalid) {
+				t.Fatalf("exec: want a DataPathError with an invalid frame, got %v", err)
+			}
+			_, err = s.ReadFileBytes(ctx, "/f")
+			if !errors.As(err, &dp) || !errors.As(err, &invalid) {
+				t.Fatalf("read: want a DataPathError with an invalid frame, got %v", err)
+			}
+		})
+	}
 }
