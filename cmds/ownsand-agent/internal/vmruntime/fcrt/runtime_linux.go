@@ -513,7 +513,7 @@ func (r *Runtime) Resume(ctx context.Context, m vmruntime.VM) error {
 // OUTBOUND sandboxes get disk-only snapshots: their guest network
 // configuration is in memory and would not match the link of a restored
 // sandbox.
-func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (info vmruntime.SnapshotInfo, err error) {
 	v, err := r.lookup(m.SandboxID())
 	if err != nil {
 		return vmruntime.SnapshotInfo{}, err
@@ -530,12 +530,19 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 			return vmruntime.SnapshotInfo{}, err
 		}
 		defer func() {
-			if err := r.Resume(context.Background(), m); err != nil {
-				r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", err)
+			rerr := r.Resume(context.Background(), m)
+			if rerr == nil {
+				return
+			}
+			r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", rerr)
+			// A VM left paused while the manager reports it running must not
+			// yield a READY snapshot; an earlier capture error takes priority.
+			if err == nil {
+				info = vmruntime.SnapshotInfo{}
+				err = fmt.Errorf("fcrt: resume after snapshot: %w", rerr)
 			}
 		}()
 	}
-	info := vmruntime.SnapshotInfo{}
 	if v.network == ownsandv1.NetworkMode_NETWORK_MODE_NONE {
 		absDir, _ := filepath.Abs(dir)
 		if err := v.api.call(ctx, http.MethodPut, "/snapshot/create", snapshotCreate{
