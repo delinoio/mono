@@ -57,6 +57,16 @@ export interface FakeWebRtcOptions {
   neverOpen?: boolean;
 }
 
+/** Test control over the send buffer of a fake data channel. */
+export interface FakeChannelControl {
+  /** The reported send buffer size; a test sets it to model back-pressure. */
+  bufferedAmount: number;
+  /** Runs after each message that the SDK sent, before the next one. */
+  afterSend: (bytes: Uint8Array) => void;
+  /** Sets `bufferedAmount` and emits `bufferedamountlow`, as a drained buffer. */
+  drain(bufferedAmount?: number): void;
+}
+
 /** Records of every fake peer connection. */
 export interface FakeWebRtc {
   RTCPeerConnection: PeerConnectionConstructor;
@@ -68,15 +78,21 @@ export interface FakeWebRtc {
   /** Frames that the SDK sent, in order. */
   frames: DataFrame[];
   peers: FakeAgentPeer[];
+  /** One control per data channel, in creation order. */
+  channels: FakeChannelControl[];
 }
 
-class FakeChannel extends Emitter implements DataChannelLike {
+class FakeChannel
+  extends Emitter
+  implements DataChannelLike, FakeChannelControl
+{
   readyState = "connecting";
   binaryType = "blob";
   bufferedAmount = 0;
   bufferedAmountLowThreshold = 0;
   readonly label: string;
   onSend: (bytes: Uint8Array) => void = () => {};
+  afterSend: (bytes: Uint8Array) => void = () => {};
 
   constructor(label: string) {
     super();
@@ -86,6 +102,12 @@ class FakeChannel extends Emitter implements DataChannelLike {
   send(data: Uint8Array): void {
     if (this.readyState !== "open") throw new Error("channel not open");
     this.onSend(data);
+    this.afterSend(data);
+  }
+
+  drain(bufferedAmount = 0): void {
+    this.bufferedAmount = bufferedAmount;
+    this.emit("bufferedamountlow");
   }
 
   close(): void {
@@ -106,6 +128,7 @@ export function fakeWebRtc(
     connections: [],
     frames: [],
     peers: [],
+    channels: [],
   };
   class FakePeerConnection extends Emitter implements PeerConnectionLike {
     iceGatheringState = "new";
@@ -124,6 +147,7 @@ export function fakeWebRtc(
     ): DataChannelLike {
       const channel = new FakeChannel(label);
       this.channel = channel;
+      record.channels.push(channel);
       record.connections.push({
         config: this.#config,
         label,
