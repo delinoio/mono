@@ -125,7 +125,9 @@ func (m *readManager) begin(readID, path string) (*readEntry, error) {
 }
 
 // end ends one call. A failed snapshot is forgotten when its last call
-// ends, so a retry can try again.
+// ends, or by prepare when the failure comes after the last call ended, so a
+// retry can try again. A snapshot that succeeded after the last call ended
+// stays until the retention time passes.
 func (m *readManager) end(readID string, e *readEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -142,12 +144,26 @@ func (m *readManager) end(readID string, e *readEntry) {
 	}
 }
 
+// prepare makes the snapshot and publishes the result. It publishes under
+// m.mu so that it is ordered against end(): a failure published after the
+// last call ended removes the entry here, and a failure published before it
+// is removed by end(). Either way a retry of the read_id snapshots again.
 func (m *readManager) prepare(readID string, e *readEntry) {
-	defer close(e.ready)
 	kind, size, err := m.makeSnapshot(e.path, e.snapshot)
 	if err != nil {
 		os.Remove(e.snapshot)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	defer close(e.ready)
+	if err != nil {
 		e.err = err
+		// No call is left to receive the failure, and sweep keeps no
+		// failed entry: forget it so the next call for the read_id starts
+		// a new snapshot instead of returning this stale error.
+		if e.open == 0 && m.entries[readID] == e {
+			delete(m.entries, readID)
+		}
 		m.logger.Info("read snapshot failed", "read_id", readID, "error", err.Error())
 		return
 	}
