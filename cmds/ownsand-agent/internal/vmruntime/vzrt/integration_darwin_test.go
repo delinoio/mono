@@ -23,6 +23,7 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime/vzrt"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/uuidv7"
@@ -123,6 +124,18 @@ func (e *env) exec(sandboxID string, cmd ...string) (string, *ownsandv1.ExecExit
 	return out.String(), exited
 }
 
+// waitFor polls cond until it holds or 30 seconds passed.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // hostLANAddress returns an IPv4 address of a host interface that is not
 // loopback, which the OUTBOUND policy must block.
 func hostLANAddress() string {
@@ -200,6 +213,33 @@ func TestVirtualizationIntegration(t *testing.T) {
 	}
 	if out, _ := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
 		t.Fatalf("after resume %q", out)
+	}
+
+	// The guest console log is capped at 1 MiB per sandbox. A console that
+	// stays below the cap is recorded; a guest that floods /dev/hvc0 neither
+	// blocks nor grows console.log past the cap, and the sandbox keeps
+	// answering exec requests.
+	consoleLog := st.Path(store.VMsDir, sb.GetSandboxId(), "console.log")
+	const marker = "OWNSAND-CONSOLE-MARKER"
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "echo "+marker+" > /dev/hvc0"); ex.GetExitCode() != 0 {
+		t.Fatalf("console write %q exited %v", out, ex)
+	}
+	waitFor(t, "the marker in console.log", func() bool {
+		data, _ := os.ReadFile(consoleLog)
+		return strings.Contains(string(data), marker)
+	})
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/sh", "-c", "head -c 3145728 /dev/zero | tr '\\0' x > /dev/hvc0"); ex.GetExitCode() != 0 {
+		t.Fatalf("console flood %q exited %v", out, ex)
+	}
+	waitFor(t, "console.log at the cap", func() bool {
+		fi, err := os.Stat(consoleLog)
+		return err == nil && fi.Size() == vmruntime.ConsoleLogLimit
+	})
+	if out, ex := e.exec(sb.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" || ex.GetExitCode() != 0 {
+		t.Fatalf("exec after the console flood %q %v", out, ex)
+	}
+	if fi, err := os.Stat(consoleLog); err != nil || fi.Size() != vmruntime.ConsoleLogLimit {
+		t.Fatalf("console.log %v %v, want exactly %d bytes", fi, err, vmruntime.ConsoleLogLimit)
 	}
 	snapID, _ := uuidv7.NewString()
 	snap, err := m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sb.GetSandboxId()})

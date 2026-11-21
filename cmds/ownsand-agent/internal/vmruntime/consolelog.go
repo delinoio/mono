@@ -28,6 +28,7 @@ const (
 	// a firecracker process, which include the guest serial console.
 	ConsoleLogKindFirecracker
 	// ConsoleLogKindConsole is console.log: the COM1 output of a Hyper-V
+	// guest, or the virtio console of a Virtualization.framework Linux
 	// guest.
 	ConsoleLogKindConsole
 )
@@ -49,8 +50,8 @@ func (k ConsoleLogKind) valid() bool {
 
 // CappedLog is a writer that keeps the first limit bytes that a log file
 // receives over all of its openings (a memory-state restore that falls back
-// to a cold boot starts a second Firecracker process, and the Hyper-V
-// runtime re-dials the console pipe) and consumes and discards everything
+// to a cold boot starts a second Firecracker process or a second VM, and the
+// Hyper-V runtime re-dials the console pipe) and consumes and discards everything
 // after that, so the producer never blocks on a full pipe and never sees a
 // write error. It is safe for concurrent writers. It never logs the console
 // content.

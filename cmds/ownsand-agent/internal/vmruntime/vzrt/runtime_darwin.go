@@ -164,6 +164,15 @@ type vm struct {
 	memMiB        int64
 	mu            sync.Mutex
 	paused        bool
+	// console is the bounded writer of console.log. Create opens it once, so
+	// the memory-restore attempt and the cold-boot fallback share one file and
+	// one byte counter. Delete and the failed-create cleanup close it after the
+	// VM stopped; stopVM must not, because the fallback boots again.
+	console *vmruntime.CappedLog
+	// consoleIn is the write end of the guest console input pipe of the
+	// current VM configuration. It stays open and unused, so that the guest
+	// never reads an EOF from its console; stopVM closes it.
+	consoleIn *os.File
 	// stopMu serializes stopVM calls of one VM, so a retry of a failed stop
 	// never overlaps the attempt before it.
 	stopMu sync.Mutex
@@ -255,6 +264,13 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	// cleanup releases everything of a failed create: the sandbox manager
 	// records the sandbox as FAILED and never calls Delete for it.
 	cleanup := func() { r.discard(v) }
+	console, err := vmruntime.OpenCappedLog(filepath.Join(spec.Dir, consoleFile), vmruntime.ConsoleLogLimit,
+		r.logger, spec.SandboxID, vmruntime.ConsoleLogKindConsole)
+	if err != nil {
+		cleanup()
+		return nil, fmt.Errorf("vzrt: open the console log: %w", err)
+	}
+	v.console = console
 
 	memoryRestore := spec.Snapshot != nil && spec.Snapshot.HasMemoryState && spec.MemoryRestoreAllowed &&
 		memoryStateSupported &&
@@ -372,14 +388,17 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 	}
 	cfg.SetEntropyDevicesVirtualMachineConfiguration([]*vz.VirtioEntropyDeviceConfiguration{entropy})
 
-	console, err := vz.NewFileSerialPortAttachment(filepath.Join(v.dir, consoleFile), true)
+	serial, abortConsole, err := r.attachConsole(v)
 	if err != nil {
 		return nil, err
 	}
-	serial, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(console)
-	if err != nil {
-		return nil, err
-	}
+	// Release the console pipes on every later error return.
+	configured := false
+	defer func() {
+		if !configured {
+			abortConsole()
+		}
+	}()
 	cfg.SetSerialPortsVirtualMachineConfiguration([]*vz.VirtioConsoleDeviceSerialPortConfiguration{serial})
 
 	if spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
@@ -396,7 +415,85 @@ func (r *Runtime) configure(v *vm, spec vmruntime.Spec, machineID []byte) (*vz.V
 	if ok, err := cfg.Validate(); !ok || err != nil {
 		return nil, fmt.Errorf("vzrt: invalid VM configuration: %w", err)
 	}
+	configured = true
 	return cfg, nil
+}
+
+// attachConsole connects the virtio console of v to the bounded console log
+// through a pair of pipes and a file-handle serial attachment, so the agent
+// counts and caps every guest console byte; a file attachment would let the
+// guest grow console.log without a limit.
+//
+// The framework duplicates both descriptors it receives, so the agent closes
+// its copies of the guest-side ends right after the attachment exists. The
+// output pipe then reports EOF when the framework releases its copy. A
+// goroutine drains the output pipe into v.console, which discards everything
+// past the cap. The write end of the input pipe stays open on v: nothing is
+// sent to the guest, and a closed input would read as EOF there.
+//
+// The returned abort releases the pipes when the caller does not use the
+// returned port after all; it must not be called otherwise.
+func (r *Runtime) attachConsole(v *vm) (*vz.VirtioConsoleDeviceSerialPortConfiguration, func(), error) {
+	if v.console == nil {
+		return nil, nil, errors.New("vzrt: the console log is not open")
+	}
+	outRead, outWrite, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+	inRead, inWrite, err := os.Pipe()
+	if err != nil {
+		outRead.Close()
+		outWrite.Close()
+		return nil, nil, err
+	}
+	// The framework reads guest input from inRead and writes guest output to
+	// outWrite.
+	attachment, err := vz.NewFileHandleSerialPortAttachment(inRead, outWrite)
+	inRead.Close()
+	outWrite.Close()
+	if err != nil {
+		outRead.Close()
+		inWrite.Close()
+		return nil, nil, err
+	}
+	serial, err := vz.NewVirtioConsoleDeviceSerialPortConfiguration(attachment)
+	if err != nil {
+		outRead.Close()
+		inWrite.Close()
+		return nil, nil, err
+	}
+	v.mu.Lock()
+	previous := v.consoleIn
+	v.consoleIn = inWrite
+	v.mu.Unlock()
+	if previous != nil {
+		previous.Close()
+	}
+	go drainConsole(outRead, v.console)
+	abort := func() {
+		// Closing the read end ends the drain; closing the write end of the
+		// input pipe releases it.
+		outRead.Close()
+		v.mu.Lock()
+		if v.consoleIn == inWrite {
+			v.consoleIn = nil
+		}
+		v.mu.Unlock()
+		inWrite.Close()
+	}
+	return serial, abort, nil
+}
+
+// closeConsole closes the bounded console log of v after its VM stopped. It
+// is safe for a VM without a console log.
+func (r *Runtime) closeConsole(v *vm) {
+	if v.console == nil {
+		return
+	}
+	if err := v.console.Close(); err != nil {
+		r.logger.Warn("close console log failed", "sandbox_id", v.id, "error", err)
+	}
 }
 
 // attachNetwork starts the userspace network stack of v and returns the
@@ -754,12 +851,17 @@ func (r *Runtime) stopVM(v *vm) error {
 	v.mu.Lock()
 	stack, conn := v.net, v.netConn
 	v.net, v.netConn = nil, nil
+	consoleIn := v.consoleIn
+	v.consoleIn = nil
 	v.mu.Unlock()
 	if stack != nil {
 		stack.Close()
 	}
 	if conn != nil {
 		conn.Close()
+	}
+	if consoleIn != nil {
+		consoleIn.Close()
 	}
 	return nil
 }
@@ -779,7 +881,10 @@ func (r *Runtime) removeVMDir(sandboxID string) error {
 func (r *Runtime) discard(v *vm) {
 	err := releaseAfterStop(&r.mu, r.vms, v.id, v,
 		func() error { return r.stopVM(v) },
-		func() error { return os.RemoveAll(v.dir) })
+		func() error {
+			r.closeConsole(v)
+			return os.RemoveAll(v.dir)
+		})
 	if err != nil {
 		r.logger.Error("discard of a failed create incomplete; the VM stays tracked for a retry", "sandbox_id", v.id, "error", err)
 	}
@@ -798,7 +903,11 @@ func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 		return remove()
 	}
 	return releaseAfterStop(&r.mu, r.vms, sandboxID, v,
-		func() error { return r.stopVM(v) }, remove)
+		func() error { return r.stopVM(v) },
+		func() error {
+			r.closeConsole(v)
+			return remove()
+		})
 }
 
 // Running lists the sandboxes with a running or paused VM. VMs run inside
