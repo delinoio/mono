@@ -58,6 +58,7 @@ type finishFields struct {
 
 type writeEntry struct {
 	mu         sync.Mutex
+	id         string // write_id
 	path       string // exact path string of the binding
 	target     string // path that the finish renames to
 	tmp        string
@@ -69,6 +70,12 @@ type writeEntry struct {
 	finishedAt time.Time
 	result     *ownsandv1.WriteFileResponse
 	gone       bool
+	// identity is the identity of the staging file that the helper created;
+	// nil when the platform has none, which also means that no record is kept.
+	identity *fileIdentity
+	// recovered marks a write of an earlier helper process: it has a staging
+	// file but no open file and no written ranges, so it can only expire.
+	recovered bool
 }
 
 // writeManager keeps the temporary file and written ranges of each
@@ -80,16 +87,29 @@ type writeManager struct {
 	now       func() time.Time
 	retention time.Duration
 	logger    *slog.Logger
+	// dir holds the durable write records; see writestate.go.
+	dir string
+	// removeFile removes a staging file; tests replace it to fail a cleanup.
+	removeFile func(string) error
 }
 
-func newWriteManager(now func() time.Time, logger *slog.Logger) *writeManager {
-	return &writeManager{
-		entries:   map[string]*writeEntry{},
-		expired:   map[string]time.Time{},
-		now:       now,
-		retention: OperationRetention,
-		logger:    logger,
+// newWriteManager returns a manager that keeps its write records in dir and
+// registers the writes of an earlier helper process from them. An empty dir
+// keeps no records.
+func newWriteManager(dir string, now func() time.Time, logger *slog.Logger) (*writeManager, error) {
+	m := &writeManager{
+		entries:    map[string]*writeEntry{},
+		expired:    map[string]time.Time{},
+		now:        now,
+		retention:  OperationRetention,
+		logger:     logger,
+		dir:        dir,
+		removeFile: os.Remove,
 	}
+	if err := m.loadRecords(); err != nil {
+		return nil, err
+	}
+	return m, nil
 }
 
 // tempPath returns the temporary file of a write. It lives next to the
@@ -136,6 +156,12 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 		return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write expired")
 	}
 	if e, ok := m.entries[id]; ok {
+		if e.recovered {
+			// The ranges and the open file of the write died with the
+			// earlier helper process, so the upload cannot continue. The
+			// staging file is removed when the write expires.
+			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "write was lost in a helper restart")
+		}
 		if req.GetPath() != "" && nativePath(req.GetPath()) != e.path {
 			return nil, errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write_id is bound to another path")
 		}
@@ -167,7 +193,13 @@ func (m *writeManager) entry(req *ownsandv1.WriteFileRequest) (*writeEntry, erro
 	if err != nil {
 		return nil, fsError("write", err)
 	}
-	e := &writeEntry{path: bound, target: target, tmp: tmp, file: f, lastChunk: m.now()}
+	e := &writeEntry{id: id, path: bound, target: target, tmp: tmp, file: f, lastChunk: m.now()}
+	if identity, err := identityOfFile(f); err == nil {
+		e.identity = &identity
+		m.persistRecord(e, true)
+	} else if !errors.Is(err, errors.ErrUnsupported) {
+		m.logger.Warn("read write staging file identity failed", "write_id", id, "error", sanitizedError(err))
+	}
 	m.entries[id] = e
 	m.logger.Info("write started", "write_id", id)
 	return e, nil
@@ -204,6 +236,7 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 	if err := e.writeChunk(req.GetOffset(), req.GetData()); err != nil {
 		return nil, err
 	}
+	m.persistRecord(e, false)
 	resp := &ownsandv1.WriteFileResponse{WriteId: req.GetWriteId(), Offset: req.GetOffset(), Length: int64(len(req.GetData()))}
 	if finish == nil {
 		return resp, nil
@@ -214,6 +247,12 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 	e.finished = true
 	e.finish = fieldsOf(req)
 	e.finishedAt = m.now()
+	// The staging file is the target now. A failure keeps the record, which
+	// the next start drops (its staging file is gone) and the sweep removes
+	// after the retention time.
+	if err := m.removeRecord(req.GetWriteId()); err != nil {
+		m.logger.Warn("remove write record failed", "write_id", req.GetWriteId(), "error", sanitizedError(err))
+	}
 	resp.Finished = true
 	resp.SizeBytes = finish.GetSizeBytes()
 	e.result = resp
@@ -282,11 +321,10 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if !covered {
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "written ranges do not cover exactly [0, size_bytes)")
 	}
-	mode := wireToFileMode(finish.GetMode())
 	if err := e.file.Truncate(size); err != nil {
 		return fsError("write", err)
 	}
-	if err := e.file.Chmod(mode); err != nil && !errors.Is(err, errors.ErrUnsupported) {
+	if err := applyFileMode(e.file, finish.GetMode()); err != nil {
 		return fsError("write", err)
 	}
 	if err := e.file.Sync(); err != nil {
@@ -307,13 +345,17 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 }
 
 // sweep deletes the temporary files of writes without a chunk for the
-// retention time and forgets finished writes after the retention time.
+// retention time and forgets finished writes after the retention time. A
+// write whose cleanup fails stays registered, marked gone, and the next sweep
+// tries again; the helper remembers the ID as expired only after the cleanup
+// succeeded.
 func (m *writeManager) sweep(now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for id, e := range m.entries {
 		e.mu.Lock()
-		expired := (e.finished && now.Sub(e.finishedAt) >= m.retention) ||
+		expired := e.gone ||
+			(e.finished && now.Sub(e.finishedAt) >= m.retention) ||
 			(!e.finished && now.Sub(e.lastChunk) >= m.retention)
 		if expired {
 			e.gone = true
@@ -321,14 +363,13 @@ func (m *writeManager) sweep(now time.Time) {
 				e.file.Close()
 				e.file = nil
 			}
-			if !e.finished {
-				if err := os.Remove(e.tmp); err != nil && !errors.Is(err, os.ErrNotExist) {
-					m.logger.Warn("remove write temporary file failed", "write_id", id, "error", err)
-				}
+			if err := m.cleanup(e); err != nil {
+				m.logger.Warn("clean up write failed", "write_id", id, "error", sanitizedError(err))
+			} else {
+				delete(m.entries, id)
+				m.expired[id] = now
+				m.logger.Info("write expired", "write_id", id, "finished", e.finished, "recovered", e.recovered)
 			}
-			delete(m.entries, id)
-			m.expired[id] = now
-			m.logger.Info("write expired", "write_id", id, "finished", e.finished)
 		}
 		e.mu.Unlock()
 	}
