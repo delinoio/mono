@@ -387,7 +387,7 @@ export class PeerSession {
     const previous = this.#sendTail;
     const turn = previous.then(() => {
       throwIfAborted(signal);
-      return this.#writeMessages(messages);
+      return this.#writeMessages(messages, signal);
     });
     // The next sender waits for this turn to finish, whether it failed or
     // not; the failure itself reaches only the caller of this frame.
@@ -395,30 +395,44 @@ export class PeerSession {
     await turn;
   }
 
-  async #writeMessages(messages: Uint8Array[]): Promise<void> {
-    for (const message of messages) {
-      // The wait loops: after it wakes, another condition (a session end or a
-      // buffer that filled again) can hold, so re-check before every send.
+  async #writeMessages(
+    messages: Uint8Array[],
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    for (const [index, message] of messages.entries()) {
+      // Only the first message may be cancelled: once it is sent, the frame
+      // must complete or the byte stream would be corrupted.
+      const cancellable = index === 0 ? signal : undefined;
+      // The wait loops: after it wakes, another condition (a session end, an
+      // abort or a buffer that filled again) can hold, so re-check before
+      // every send.
       while (!this.#ended && this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
-        await this.#waitForBufferLow();
+        throwIfAborted(cancellable);
+        await this.#waitForBufferLow(cancellable);
       }
       if (this.#ended) {
         throw this.#ended;
       }
+      throwIfAborted(cancellable);
       this.#channel.send(message);
     }
   }
 
-  /** Resolves when the send buffer drains or the channel closes. */
-  #waitForBufferLow(): Promise<void> {
+  /**
+   * Resolves when the send buffer drains, the channel closes or the optional
+   * signal aborts.
+   */
+  #waitForBufferLow(signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
       const done = () => {
         this.#channel.removeEventListener("bufferedamountlow", done);
         this.#channel.removeEventListener("close", done);
+        signal?.removeEventListener("abort", done);
         resolve();
       };
       this.#channel.addEventListener("bufferedamountlow", done);
       this.#channel.addEventListener("close", done);
+      signal?.addEventListener("abort", done, { once: true });
     });
   }
 

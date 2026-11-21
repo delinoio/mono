@@ -1222,6 +1222,37 @@ describe("peer-to-peer data path", () => {
       ).toBe(false);
     });
 
+    test("a caller aborted while its first message waits for the buffer sends nothing", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const cancelled = sandbox
+        .run({ command: ["rm", "-rf", "/data"], signal: controller.signal })
+        .catch((e) => e);
+      await h.clock.settle();
+      expect(messages).toBe(0);
+      controller.abort(reason);
+      await h.clock.settle();
+      channel.drain(0);
+      await h.clock.settle();
+      expect(await h.clock.run(cancelled)).toBe(reason);
+      expect(messages).toBe(0);
+      expect(
+        rtc.frames.some((frame) => frame.kind === DataFrameKind.EXEC_REQUEST),
+      ).toBe(false);
+      // The send turn is released, so a later request still goes out.
+      const written = await h.clock.run(
+        sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7)),
+      );
+      expect(written.sizeBytes).toBe(BigInt(40 << 10));
+      expect(messages).toBe(3);
+    });
+
     test("an abort during a frame in progress lets that frame finish", async () => {
       const p = p2pSetup(writeAgent());
       const { h, rtc } = p;
