@@ -398,8 +398,7 @@ type Device struct {
 	PendingIdleSince *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=pending_idle_since,json=pendingIdleSince,proto3" json:"pending_idle_since,omitempty"`
 	// The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
 	// that the scheduler uses for placement. It is 0 for a device with zero
-	// limits. A server that predates this field never sets it; a client then
-	// derives the value from limits.
+	// limits.
 	EffectiveVcpuLimitCount int64 `protobuf:"varint,16,opt,name=effective_vcpu_limit_count,json=effectiveVcpuLimitCount,proto3" json:"effective_vcpu_limit_count,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache

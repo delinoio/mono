@@ -19,23 +19,13 @@ func TestDeviceRowsEffectiveVCPULimit(t *testing.T) {
 		want   string
 	}{
 		{
-			name:   "exact value from an updated server",
+			name:   "exact value above the int32 range",
 			device: &ownsandv1.Device{Limits: limits(536870912, 400), EffectiveVcpuLimit: 2147483647, EffectiveVcpuLimitCount: 2147483648},
 			want:   "0/2147483648 vCPU",
 		},
 		{
-			name:   "derived from the limits for a server that predates the count",
-			device: &ownsandv1.Device{Limits: limits(536870912, 400), EffectiveVcpuLimit: -2147483648},
-			want:   "0/2147483648 vCPU",
-		},
-		{
-			name:   "in-range value on an updated server",
+			name:   "in-range value",
 			device: &ownsandv1.Device{Limits: limits(5, 150), EffectiveVcpuLimit: 7, EffectiveVcpuLimitCount: 7},
-			want:   "0/7 vCPU",
-		},
-		{
-			name:   "in-range value on an older server",
-			device: &ownsandv1.Device{Limits: limits(5, 150), EffectiveVcpuLimit: 7},
 			want:   "0/7 vCPU",
 		},
 		{

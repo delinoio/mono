@@ -301,8 +301,7 @@ export type Device = Message<"delino.ownsand.v1.Device"> & {
   /**
    * The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
    * that the scheduler uses for placement. It is 0 for a device with zero
-   * limits. A server that predates this field never sets it; a client then
-   * derives the value from limits.
+   * limits.
    *
    * @generated from field: int64 effective_vcpu_limit_count = 16;
    */

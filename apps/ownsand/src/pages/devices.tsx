@@ -20,7 +20,6 @@ import {
   PageHeader,
 } from "../components/ui.tsx";
 import {
-  deviceEffectiveVcpuLimit,
   effectiveVcpuLimit,
   errorMessage,
   formatBytes,
@@ -36,7 +35,7 @@ function vcpuSummary(d: Device): string {
   const l = d.limits;
   if (l === undefined) return "—";
   const ratio = l.vcpuOvercommitPercent / 100;
-  return `${d.allocation?.vcpuCount ?? 0} of ${deviceEffectiveVcpuLimit(d)} (${l.vcpuCount} × ${ratio})`;
+  return `${d.allocation?.vcpuCount ?? 0} of ${d.effectiveVcpuLimitCount} (${l.vcpuCount} × ${ratio})`;
 }
 
 /** Route `devices`: devices with state, limits, allocation and agent version. */
