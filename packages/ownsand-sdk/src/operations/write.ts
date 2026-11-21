@@ -79,8 +79,10 @@ export async function* chunkSource(
     // Own the piece before the loop asks the source for another one: a source
     // can reuse its buffer between yields, and the caller can change a buffer
     // while a chunk waits to be sent. Each byte is copied here once and in
-    // `take` once, so the copy volume stays linear in the input size.
-    pieces.push(piece.slice());
+    // `take` once, so the copy volume stays linear in the input size. The
+    // constructor always copies: a Node.js `Buffer` overrides `slice` to
+    // return a view over the same memory, so `piece.slice()` would alias it.
+    pieces.push(new Uint8Array(piece));
     pendingLength += piece.length;
     while (pendingLength >= size) {
       if (held !== undefined) {

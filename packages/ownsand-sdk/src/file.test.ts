@@ -382,6 +382,33 @@ describe("chunkSource", () => {
     ]);
   });
 
+  test("keeps pending bytes when the source reuses a Node.js Buffer between pieces", async () => {
+    // `Buffer.prototype.slice` returns a view, so a copy made with `slice`
+    // would still alias the reused Buffer.
+    const reused = Buffer.alloc(2);
+    async function* refill() {
+      for (const value of [1, 2]) {
+        reused.fill(value);
+        yield reused;
+      }
+    }
+    const chunks: { data: number[]; last: boolean }[] = [];
+    for await (const c of chunkSource(refill(), 4)) {
+      chunks.push({ data: [...c.data], last: c.last });
+    }
+    expect(chunks).toEqual([{ data: [1, 1, 2, 2], last: true }]);
+  });
+
+  test("keeps the next chunks when the caller overwrites a Buffer input after the first chunk", async () => {
+    const input = Buffer.from([1, 1, 1, 1, 2, 2, 2, 2, 3]);
+    const seen: number[][] = [];
+    for await (const c of chunkSource(input, 4)) {
+      seen.push([...c.data]);
+      input.fill(9);
+    }
+    expect(seen).toEqual([[1, 1, 1, 1], [2, 2, 2, 2], [3]]);
+  });
+
   test("keeps a yielded chunk when the caller overwrites its buffer afterwards", async () => {
     const input = new Uint8Array([1, 1, 1, 1, 2, 2, 2, 2, 3]);
     const seen: number[][] = [];
