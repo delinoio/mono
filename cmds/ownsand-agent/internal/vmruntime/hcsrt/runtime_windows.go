@@ -348,7 +348,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 // so the runtime connects as a client once the VM runs.
 func (r *Runtime) copyConsole(v *vm) {
 	defer close(v.consoleDone)
-	out, err := os.OpenFile(filepath.Join(v.dir, consoleFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// The guest controls this output, so it goes through the capped writer:
+	// the file keeps the first 1 MiB over all pipe re-dials, and io.Copy
+	// keeps draining the pipe after the cap so the guest never blocks.
+	out, err := vmruntime.OpenCappedLog(filepath.Join(v.dir, consoleFile), vmruntime.ConsoleLogLimit, r.logger, v.id, vmruntime.ConsoleLogKindConsole)
 	if err != nil {
 		r.logger.Warn("open console log failed", "sandbox_id", v.id, "error", err)
 		return
