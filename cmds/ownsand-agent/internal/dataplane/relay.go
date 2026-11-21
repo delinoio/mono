@@ -119,10 +119,13 @@ type rconn struct {
 	// probeFailed is set before an unanswered echo probe cancels the
 	// connection; only then does the loop dial again without back-off.
 	probeFailed atomic.Bool
-	streams     map[uint64]*rstream
-	highest     uint64
-	credit      int64
-	kinds       map[ownsandv1.DataFrameKind]bool
+	// queueFullLogged limits the log of the queue-full fallback of a
+	// terminal frame to one entry per connection.
+	queueFullLogged atomic.Bool
+	streams         map[uint64]*rstream
+	highest         uint64
+	credit          int64
+	kinds           map[ownsandv1.DataFrameKind]bool
 }
 
 // closeAfterFlush closes the connection after every queued frame was
