@@ -256,6 +256,93 @@ func (s *Service) applyExportResult(ctx context.Context, info commandInfo, comma
 	})
 }
 
+// Retry of the application of an export result after a transient database
+// error.
+const (
+	// DefaultExportApplyRetryWindow bounds the retry of an export result.
+	DefaultExportApplyRetryWindow = 15 * time.Second
+	// DefaultExportApplyRetryBackoff is the first wait between two attempts.
+	DefaultExportApplyRetryBackoff = 250 * time.Millisecond
+	// exportApplyRetryBackoffMax caps the doubling wait between attempts.
+	exportApplyRetryBackoffMax = 2 * time.Second
+)
+
+// errExportResultNotApplied is the cause that closes a channel whose export
+// result could not be applied before the retry window ended.
+var errExportResultNotApplied = errors.New("the export result could not be applied")
+
+func (s *Service) exportApplyRetryWindow() time.Duration {
+	if s.Timing.ExportApplyRetryWindow > 0 {
+		return s.Timing.ExportApplyRetryWindow
+	}
+	return DefaultExportApplyRetryWindow
+}
+
+func (s *Service) exportApplyRetryBackoff() time.Duration {
+	if s.Timing.ExportApplyRetryBackoff > 0 {
+		return s.Timing.ExportApplyRetryBackoff
+	}
+	return DefaultExportApplyRetryBackoff
+}
+
+// applyExportResultWithRetry applies an export result and retries after a
+// transient database error (see isTransientDBError) with a doubling backoff
+// until the retry window ends or the channel closes. The server removed the
+// command record before it applied the result, and the row stays EXPORTING
+// with a live owner channel, which neither a repeat ExportSnapshot nor the
+// owner's state report would release, so a result that is lost here would
+// strand the export. A permanent error is returned at once. Every attempt
+// reruns the snapshot row lock and the command ID check of applyExportResult,
+// so a retry after a commit whose outcome is unknown, after a newer attempt
+// or after the deletion of the snapshot changes nothing more. When the
+// window ends while conn is still the current channel of its device, the
+// channel is closed: the state report of the replacement channel then fails
+// the abandoned attempt with a clean-up job, and an explicit retry of the
+// export sends a new command.
+func (s *Service) applyExportResultWithRetry(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+	commandID := res.GetCommandId()
+	retryCtx, cancel := context.WithTimeout(ctx, s.exportApplyRetryWindow())
+	defer cancel()
+	backoff := s.exportApplyRetryBackoff()
+	for attempt := 1; ; attempt++ {
+		err := s.applyExportResult(retryCtx, info, commandID, res)
+		if err == nil {
+			if attempt > 1 {
+				s.Logger.InfoContext(ctx, "export_result_apply_recovered", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("attempts", attempt))
+			}
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err // the channel closed; the replacement channel's state report settles the attempt
+		}
+		if retryCtx.Err() == nil {
+			if !isTransientDBError(err) {
+				return err
+			}
+			s.Logger.WarnContext(ctx, "export_result_apply_retry", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
+				slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-retryCtx.Done():
+				timer.Stop()
+			}
+			if backoff *= 2; backoff > exportApplyRetryBackoffMax {
+				backoff = exportApplyRetryBackoffMax
+			}
+			continue
+		}
+		// The retry window ended.
+		current := s.Hub.Get(info.deviceID) == conn
+		s.Logger.ErrorContext(ctx, "export_result_apply_abandoned", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
+			slog.Int("attempts", attempt), slog.Bool("channel_current", current), slog.Any("error", err))
+		if current {
+			conn.Close(errExportResultNotApplied)
+		}
+		return err
+	}
+}
+
 // failExportTx sets the EXPORTING snapshot snapshotID to EXPORT_FAILED and
 // records a clean-up job for the objects that the attempt attemptID may have
 // uploaded. The caller holds

@@ -161,6 +161,15 @@ type Timing struct {
 	// channel closed; a writer that is still blocked in a send after it
 	// loses its transport write (5 seconds); zero means the default.
 	WriterDrainTimeout time.Duration
+	// ExportApplyRetryWindow bounds how long the channel read loop retries
+	// to apply an export result after a transient database error (15
+	// seconds, below the heartbeat timeout because the loop reads no
+	// heartbeat meanwhile); zero means the default.
+	ExportApplyRetryWindow time.Duration
+	// ExportApplyRetryBackoff is the first wait between two attempts to
+	// apply an export result (250 milliseconds); it doubles up to 2 seconds;
+	// zero means the default.
+	ExportApplyRetryBackoff time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -175,6 +184,9 @@ func DefaultTiming() Timing {
 		CommandGrace:     DefaultCommandGrace,
 
 		WriterDrainTimeout: DefaultWriterDrainTimeout,
+
+		ExportApplyRetryWindow:  DefaultExportApplyRetryWindow,
+		ExportApplyRetryBackoff: DefaultExportApplyRetryBackoff,
 	}
 }
 
