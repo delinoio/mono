@@ -17,7 +17,11 @@ import {
   type WriteFileResponse,
 } from "../gen/delino/ownsand/v1/data_frame_pb.ts";
 import { LogEvent, safeLog } from "../logger.ts";
-import { type OperationContext, Timing } from "../relay/context.ts";
+import {
+  type OperationContext,
+  throwIfAborted,
+  Timing,
+} from "../relay/context.ts";
 import { AsyncQueue } from "./queue.ts";
 import {
   DATA_CHANNEL_LABEL,
@@ -242,6 +246,10 @@ export class PeerSession {
     if (this.#ended) {
       throw this.#ended;
     }
+    // A caller can abort while it waits for the shared session setup. The
+    // abort event already fired then, so the listener below would never see
+    // it. Reject before registering a stream or sending a frame.
+    throwIfAborted(signal);
     const streamId = this.#nextStreamId++;
     const queue = new AsyncQueue<DataFrame>();
     this.#streams.set(streamId, queue);
