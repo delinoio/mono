@@ -744,7 +744,11 @@ export function createMockTransport(
         const existing = org.sandboxes.find(
           (s) => s.labels["mock-idempotency-key"] === req.idempotencyKey,
         );
-        if (existing !== undefined) return { sandbox: existing };
+        // A retry returns the same view as the first call: without the
+        // fake's idempotency bookkeeping label.
+        if (existing !== undefined) {
+          return { sandbox: withoutMockLabels(existing) };
+        }
         const device =
           org.devices.find((d) => d.deviceId === req.placement?.deviceId) ??
           org.devices.find((d) => d.state === DeviceState.ONLINE);

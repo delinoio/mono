@@ -2,12 +2,14 @@
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import {
+  BaseImage,
   DeviceState,
   SandboxEndReason,
   SandboxState,
 } from "ownsand-sdk/gen/common_pb";
 import { DeviceService } from "ownsand-sdk/gen/device_pb";
 import { SandboxService } from "ownsand-sdk/gen/sandbox_pb";
+import { uuidV7 } from "../uuid.ts";
 import { createMockTransport, MOCK_IDS } from "./mock-api.ts";
 
 describe("mock device list", () => {
@@ -75,6 +77,51 @@ describe("mock device list", () => {
       });
       expect(sandbox?.state).toBe(SandboxState.DELETED);
       expect(sandbox?.endReason).toBe(SandboxEndReason.DEVICE_REMOVED);
+    }
+  });
+});
+
+describe("mock idempotent createSandbox", () => {
+  const organizationId = MOCK_IDS.acme;
+  const request = (idempotencyKey: string) => ({
+    organizationId,
+    idempotencyKey,
+    source: {
+      source: { case: "baseImage" as const, value: BaseImage.LINUX },
+    },
+    resources: { vcpuCount: 1, memoryMib: 1024n, diskGib: 10n },
+    idleTtl: { seconds: 600n },
+    maxTtl: { seconds: 3600n },
+    labels: { team: "ci" },
+  });
+
+  test("a retry returns the same sandbox and the request labels", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    const first = await client.createSandbox(request(key));
+    const retry = await client.createSandbox(request(key));
+
+    expect(retry.sandbox?.sandboxId).toBe(first.sandbox?.sandboxId);
+    expect(retry.sandbox?.labels).toEqual({ team: "ci" });
+    expect(retry.sandbox?.labels).toEqual(first.sandbox?.labels);
+    expect(retry.sandbox?.labels).not.toHaveProperty("mock-idempotency-key");
+  });
+
+  test("a new key creates another sandbox and reads hide the key", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const first = await client.createSandbox(request(uuidV7()));
+    const second = await client.createSandbox(request(uuidV7()));
+    expect(second.sandbox?.sandboxId).not.toBe(first.sandbox?.sandboxId);
+    expect(second.sandbox?.labels).toEqual({ team: "ci" });
+
+    const got = await client.getSandbox({
+      organizationId,
+      sandboxId: first.sandbox!.sandboxId,
+    });
+    expect(got.sandbox?.labels).toEqual({ team: "ci" });
+    const list = await client.listSandboxes({ organizationId });
+    for (const s of list.sandboxes) {
+      expect(s.labels).not.toHaveProperty("mock-idempotency-key");
     }
   });
 });
