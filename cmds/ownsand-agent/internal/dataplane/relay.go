@@ -165,6 +165,25 @@ func (c *rconn) enqueue(f *ownsandv1.DataFrame) error {
 	}
 }
 
+// enqueueCtx queues a frame like enqueue and also stops waiting when ctx ends
+// (a stream context that a close frame canceled). It returns ctx.Err() then,
+// and queues no frame when ctx has already ended, so a frame of a closed
+// stream never follows the close. Connection-level and terminal frames keep
+// the connection-lifetime enqueue.
+func (c *rconn) enqueueCtx(ctx context.Context, f *ownsandv1.DataFrame) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case c.out <- f:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.ctx.Done():
+		return errors.New("dataplane: relay connection closed")
+	}
+}
+
 type relay struct {
 	d      *DataPlane
 	limits RelayLimits

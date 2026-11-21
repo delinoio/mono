@@ -1195,3 +1195,117 @@ func TestRelayProbeWithFullQueueSkipsEchoAndKeepsTimeout(t *testing.T) {
 		}
 	}
 }
+
+// blockedSendFixture is a relay with a one-slot outbound queue that nobody
+// drains and one admitted stream with credit, so an operation send or the
+// request accepted notice blocks on the queue.
+func blockedSendFixture(t *testing.T) (*revokeFixture, *grant, *rstream) {
+	t.Helper()
+	f := newRevokeFixture(t, 1)
+	g, streams := f.grant(time.Hour, time.Now(), 1)
+	st := streams[0]
+	st.send, _ = datapath.NewSendWindow(1 << 20)
+	st.recv, _ = datapath.NewReceiveWindow(f.r.limits.StreamReceiveWindow)
+	f.c.credit = f.r.limits.StreamReceiveWindow
+	f.fillQueue()
+	return f, g, st
+}
+
+func closeFrame(id uint64) *ownsandv1.DataFrame {
+	return datapath.MustNewFrame(id, "sandbox", &ownsandv1.RelayStreamClose{})
+}
+
+// TestRelayStreamCloseCancelsBlockedOperationSend checks that a stream close
+// frame ends an operation send that waits on a full outbound queue, before the
+// queue drains, and that no frame of the closed stream is queued afterwards,
+// while the connection keeps serving other streams.
+func TestRelayStreamCloseCancelsBlockedOperationSend(t *testing.T) {
+	f, g, st := blockedSendFixture(t)
+	frame := datapath.MustNewFrame(1, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("payload")}}})
+	result := make(chan error, 1)
+	go func() { result <- relaySink{st}.Send(st.ctx, frame) }()
+	select {
+	case err := <-result:
+		t.Fatalf("send returned %v while the queue was full", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	f.r.onFrame(f.c, closeFrame(1))
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("send returned %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the blocked send was not canceled by the stream close frame")
+	}
+	if len(f.c.out) != cap(f.c.out) {
+		t.Fatalf("queue changed before it drained: %d frames", len(f.c.out))
+	}
+
+	// Only the frame queued before the blocked send remains.
+	if first := <-f.c.out; first.GetKind() != keepaliveFrame(false).GetKind() {
+		t.Fatalf("queued frame %v", first)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if len(f.c.out) != 0 {
+		t.Fatalf("a frame of the closed stream was queued after the drain: %d frames", len(f.c.out))
+	}
+	// A send on the canceled stream context queues nothing, even with room.
+	if err := (relaySink{st}).Send(st.ctx, frame); !errors.Is(err, context.Canceled) || len(f.c.out) != 0 {
+		t.Fatalf("send after the close returned %v with %d queued", err, len(f.c.out))
+	}
+
+	// The connection stays open and serves another stream.
+	if f.c.ctx.Err() != nil {
+		t.Fatal("the connection was closed")
+	}
+	ctx, cancel := context.WithCancel(f.c.ctx)
+	defer cancel()
+	other := &rstream{id: 3, g: g, conn: f.c, ctx: ctx, cancel: cancel}
+	other.send, _ = datapath.NewSendWindow(1 << 20)
+	if err := (relaySink{other}).Send(ctx, datapath.MustNewFrame(3, "sandbox", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte("other")}}})); err != nil {
+		t.Fatalf("send on another stream: %v", err)
+	}
+	if got := <-f.c.out; got.GetStreamId() != 3 {
+		t.Fatalf("queued frame %v", got)
+	}
+}
+
+// TestRelayStreamCloseCancelsBlockedRequestAccepted checks that the request
+// accepted notice waits on the stream context: a close frame ends the wait and
+// the notice is never queued afterwards.
+func TestRelayStreamCloseCancelsBlockedRequestAccepted(t *testing.T) {
+	w := newWorld(t)
+	f, g, st := blockedSendFixture(t)
+	f.r.d.opts.Dispatcher = w.d
+	req := w.execReq("/bin/sh", "-c", "sleep 30")
+	g.sandboxID = w.sandbox
+	g.opID = req.GetExecId()
+	g.digest = relaybinding.ExecDigest(req)
+	f.r.mu.Lock()
+	f.r.ch = g.ch
+	f.r.mu.Unlock()
+
+	f.r.onFrame(f.c, datapath.MustNewFrame(st.id, w.sandbox, req))
+	// The dispatcher accepted the request and now waits to queue the notice.
+	waitFor(t, "accepted request", func() bool {
+		f.r.mu.Lock()
+		defer f.r.mu.Unlock()
+		return g.opened
+	})
+	time.Sleep(100 * time.Millisecond)
+	if len(f.c.out) != cap(f.c.out) {
+		t.Fatalf("the notice was queued on a full queue: %d frames", len(f.c.out))
+	}
+
+	f.r.onFrame(f.c, closeFrame(st.id))
+	<-f.c.out
+	time.Sleep(200 * time.Millisecond)
+	if len(f.c.out) != 0 {
+		t.Fatalf("a frame of the closed stream was queued after the close: %d frames", len(f.c.out))
+	}
+	if f.c.ctx.Err() != nil {
+		t.Fatal("the connection was closed")
+	}
+}
