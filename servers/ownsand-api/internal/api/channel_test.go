@@ -5,6 +5,7 @@ package api_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -683,6 +684,287 @@ func TestConfigurationPushAndAgentUpdates(t *testing.T) {
 	// The revoked version makes the device ineligible (transient).
 	if _, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID))); testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("create on a revoked agent: %v", err)
+	}
+}
+
+// TestHoldWithdrawsQueuedAgentUpdate checks the withdrawal of a queued update
+// under HOLD: a live change to HOLD sends one withdrawal and no target, a
+// change back to FOLLOW_DEFAULT sends the target again, a revoked running
+// version still gets the revocation recovery instead of a withdrawal, and an
+// older agent that answers UNIMPLEMENTED only produces a log line.
+func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
+	const (
+		follow = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT
+		hold   = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD
+	)
+	setPolicy := func(t *testing.T, org *testenv.Org, mode ownsandv1.AgentVersionPolicyMode) {
+		t.Helper()
+		if _, err := org.OwnerClient.Device.UpdateAgentVersionPolicy(context.Background(), connect.NewRequest(&ownsandv1.UpdateAgentVersionPolicyRequest{OrganizationId: org.ID, Mode: mode})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	isWithdraw := func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetWithdrawAgentUpdate() != nil }
+	// settle waits until the lease holder evaluated every earlier policy
+	// event: it processes control events in order, so the configuration that a
+	// later limits change pushes shows that the earlier policy events ran. A
+	// heartbeat then shows that the channel handled its earlier envelopes.
+	var settleN int32
+	settle := func(t *testing.T, org *testenv.Org, dev *testenv.Device, agent *testenv.FakeAgent) {
+		settleN++
+		if _, err := org.OwnerClient.Device.UpdateDeviceLimits(context.Background(), connect.NewRequest(&ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: org.ID, DeviceId: dev.ID,
+			Limits: &ownsandv1.DeviceLimits{VcpuCount: 10 + settleN, MemoryMib: 8192, DiskGib: 100, VcpuOvercommitPercent: 200}})); err != nil {
+			t.Fatal(err)
+		}
+		agent.WaitFor("new configuration", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetConfiguration().GetLimits().GetVcpuCount() == 10+settleN
+		})
+		agent.Heartbeat(uint64(settleN))
+		agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == uint64(settleN) })
+	}
+	count := func(agent *testenv.FakeAgent) (updates, withdrawals int) {
+		for _, c := range agent.Commands() {
+			if c.GetUpdateAgent() != nil {
+				updates++
+			}
+			if c.GetWithdrawAgentUpdate() != nil {
+				withdrawals++
+			}
+		}
+		return
+	}
+
+	t.Run("hold withdraws and follow default resends the target", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev, agent := setupAgent(t, env, org, nil)
+		agent.WaitFor("update command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil })
+
+		setPolicy(t, org, hold)
+		agent.WaitFor("withdrawal", isWithdraw)
+		// A repeated evaluation under HOLD sends no second withdrawal.
+		setPolicy(t, org, hold)
+		settle(t, org, dev, agent)
+		if u, w := count(agent); u != 1 || w != 1 {
+			t.Fatalf("under HOLD: %d updates, %d withdrawals, want 1 and 1", u, w)
+		}
+
+		setPolicy(t, org, follow)
+		agent.Eventually("the target again", func() bool { u, _ := count(agent); return u == 2 })
+		var last *ownsandv1.UpdateAgentCommand
+		for _, c := range agent.Commands() {
+			if c.GetUpdateAgent() != nil {
+				last = c.GetUpdateAgent()
+			}
+		}
+		if last.GetTargetVersion() != "1.1.0" || last.GetRevocationRecovery() {
+			t.Fatalf("resent update = %v", last)
+		}
+
+		setPolicy(t, org, hold)
+		agent.Eventually("a second withdrawal", func() bool { _, w := count(agent); return w == 2 })
+		if !strings.Contains(env.Logs.String(), `"command":"withdraw_agent_update"`) {
+			t.Fatalf("the withdrawal is not in the command logs")
+		}
+	})
+
+	t.Run("a reconnect under hold sends one withdrawal", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, false)"); err != nil {
+			t.Fatal(err)
+		}
+		setPolicy(t, org, hold)
+		dev, agent := setupAgent(t, env, org, nil)
+		agent.WaitFor("withdrawal", isWithdraw)
+		settle(t, org, dev, agent)
+		if u, w := count(agent); u != 0 || w != 1 {
+			t.Fatalf("after reconciliation: %d updates, %d withdrawals, want 0 and 1", u, w)
+		}
+	})
+
+	t.Run("a revoked running version recovers instead of withdrawing", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, true)"); err != nil {
+			t.Fatal(err)
+		}
+		setPolicy(t, org, hold)
+		dev, agent := setupAgent(t, env, org, nil)
+		up := agent.WaitFor("recovery update", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil }).GetCommand().GetUpdateAgent()
+		if up.GetTargetVersion() != "1.1.0" || !up.GetRevocationRecovery() {
+			t.Fatalf("update = %v", up)
+		}
+		settle(t, org, dev, agent)
+		if _, w := count(agent); w != 0 {
+			t.Fatalf("%d withdrawals under a revocation recovery", w)
+		}
+	})
+
+	t.Run("an older agent answers UNIMPLEMENTED", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+		agent := env.NewFakeAgent(dev)
+		agent.SetOnCommand(func(a *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
+			if cmd.GetWithdrawAgentUpdate() != nil {
+				return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}}
+			}
+			return a.DefaultAnswer(cmd)
+		})
+		agent.Connect()
+		agent.WaitFor("update command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil })
+		setPolicy(t, org, hold)
+		agent.WaitFor("withdrawal", isWithdraw)
+		settle(t, org, dev, agent)
+		testenv.Eventually(t, "the UNIMPLEMENTED result in the logs", func() bool {
+			logs := env.Logs.String()
+			return strings.Contains(logs, "agent_command_result") && strings.Contains(logs, `"result":"ERROR_CODE_UNIMPLEMENTED"`)
+		})
+		// The channel stays open and the server does not retry.
+		select {
+		case <-agent.Closed():
+			t.Fatal("the channel closed after UNIMPLEMENTED")
+		default:
+		}
+		if _, w := count(agent); w != 1 {
+			t.Fatalf("%d withdrawals, want 1", w)
+		}
+	})
+
+	// The channel handler and the control event processor both evaluate the
+	// update of one channel. While another decision for the channel runs, a
+	// policy change must wait: a decision that read an older policy could
+	// otherwise queue its command after the command of a newer decision.
+	t.Run("an update decision waits for the decision that runs on the channel", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev, agent := setupAgent(t, env, org, nil)
+		agent.WaitFor("update command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil })
+		conn := env.App.Service.Hub.Live(dev.ID)
+		if conn == nil {
+			t.Fatal("the device has no live channel")
+		}
+
+		unlock := conn.LockUpdates()
+		unlocked := false
+		defer func() {
+			if !unlocked {
+				unlock()
+			}
+		}()
+		setPolicy(t, org, hold)
+		time.Sleep(500 * time.Millisecond)
+		if _, w := count(agent); w != 0 {
+			t.Fatalf("%d withdrawals while another decision held the channel", w)
+		}
+		unlock()
+		unlocked = true
+		agent.WaitFor("withdrawal after the decision ended", isWithdraw)
+	})
+}
+
+// TestAgentUpdateTargetOrdering checks which update target the control
+// plane sends for a running version, the releases of the platform and the
+// organization policy: an ordinary default is a target only when it is
+// strictly newer, a pin is sent as it is, and a revocation recovery selects
+// the default even when it is lower.
+func TestAgentUpdateTargetOrdering(t *testing.T) {
+	type release struct {
+		version            string
+		isDefault, revoked bool
+	}
+	const (
+		follow = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT
+		pin    = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_PIN
+		hold   = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD
+	)
+	cases := []struct {
+		name         string
+		running      string
+		releases     []release
+		mode         ownsandv1.AgentVersionPolicyMode
+		pinned       string
+		wantTarget   string // empty: no update command
+		wantRecovery bool
+		wantWarning  bool
+	}{
+		{name: "lower default is not a downgrade", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, false}}, mode: follow},
+		{name: "numeric minor ordering sends a newer default", running: "1.9.0", releases: []release{{"1.10.0", true, false}, {"1.9.0", false, false}}, mode: follow, wantTarget: "1.10.0"},
+		{name: "numeric patch ordering sends a newer default", running: "1.2.9", releases: []release{{"1.2.10", true, false}}, mode: follow, wantTarget: "1.2.10"},
+		{name: "equal default with a v prefix", running: "1.9.0", releases: []release{{"v1.9.0", true, false}}, mode: follow},
+		{name: "a release is newer than its pre-release", running: "1.9.0-rc.1", releases: []release{{"1.9.0", true, false}}, mode: follow, wantTarget: "1.9.0"},
+		{name: "a pre-release default is older than the release", running: "1.9.0", releases: []release{{"1.9.0-rc.1", true, false}}, mode: follow},
+		{name: "unrecognized running version", running: "dev-build", releases: []release{{"1.9.0", true, false}}, mode: follow, wantWarning: true},
+		{name: "unrecognized default version", running: "1.9.0", releases: []release{{"latest", true, false}}, mode: follow, wantWarning: true},
+		{name: "no default release", running: "1.9.0", releases: []release{{"1.8.0", false, false}}, mode: follow},
+		{name: "lower pin is sent without recovery", running: "1.10.0", releases: []release{{"1.10.0", true, false}, {"1.9.0", false, false}}, mode: pin, pinned: "1.9.0", wantTarget: "1.9.0"},
+		{name: "healthy hold sends nothing", running: "1.0.0", releases: []release{{"1.1.0", true, false}}, mode: hold},
+		{name: "revoked running version recovers to a lower default", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, true}}, mode: follow, wantTarget: "1.9.0", wantRecovery: true},
+		{name: "revoked running version recovers under hold", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, true}}, mode: hold, wantTarget: "1.9.0", wantRecovery: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			env := testenv.New(t)
+			ctx := context.Background()
+			org := env.NewOrg("alice")
+			for _, r := range c.releases {
+				if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ($1, 1, 1, $2, $3)", r.version, r.isDefault, r.revoked); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if c.mode != follow {
+				if _, err := org.OwnerClient.Device.UpdateAgentVersionPolicy(ctx, connect.NewRequest(&ownsandv1.UpdateAgentVersionPolicyRequest{OrganizationId: org.ID, Mode: c.mode, PinnedVersion: c.pinned})); err != nil {
+					t.Fatal(err)
+				}
+			}
+			dev := env.EnrollDevice(org.ID, org.OwnerClient, ownsandv1.HostOs_HOST_OS_LINUX, ownsandv1.Arch_ARCH_AMD64)
+			agent := env.NewFakeAgent(dev)
+			agent.AgentVersion = c.running
+			agent.Connect()
+			if c.wantTarget != "" {
+				up := agent.WaitFor("update command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetUpdateAgent() != nil }).GetCommand().GetUpdateAgent()
+				if up.GetTargetVersion() != c.wantTarget || up.GetRevocationRecovery() != c.wantRecovery {
+					t.Fatalf("update = %v, want target %q recovery %t", up, c.wantTarget, c.wantRecovery)
+				}
+			}
+			// The channel handles envelopes in order, so the acknowledgement
+			// of a heartbeat that follows the capability and state reports
+			// shows that their update evaluation finished.
+			agent.Heartbeat(1)
+			agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 1 })
+			var updates []*ownsandv1.UpdateAgentCommand
+			for _, e := range agent.Received() {
+				if u := e.GetCommand().GetUpdateAgent(); u != nil {
+					updates = append(updates, u)
+				}
+			}
+			wantCount := 0
+			if c.wantTarget != "" {
+				wantCount = 1
+			}
+			if len(updates) != wantCount {
+				t.Fatalf("update commands = %v, want %d", updates, wantCount)
+			}
+			logs := env.Logs.String()
+			warned := strings.Contains(logs, "agent_update_skipped") && strings.Contains(logs, fmt.Sprintf(`"device_id":%q`, dev.ID)) && strings.Contains(logs, "version_not_comparable")
+			if warned != c.wantWarning || (!c.wantWarning && strings.Contains(logs, "agent_update_skipped")) {
+				t.Fatalf("warning logged = %t, want %t", warned, c.wantWarning)
+			}
+		})
 	}
 }
 

@@ -42,7 +42,7 @@ Current packages:
 | `github.com/delinoio/mono/internal/backoff`   | Jittered exponential reconnect delays and a context-aware sleep.                                                                                       | `ownsand-agent`                  |
 | `github.com/delinoio/mono/internal/fsutil`    | Directory tree copy and size, and tar packing and unpacking that confines entries to the target, also through symbolic links of the same archive.      | `ownsand-agent`                  |
 | `github.com/delinoio/mono/internal/procgroup` | Starting a command in a new process group and signaling that group (Linux and macOS); on Windows a new process group and `SIGKILL` of the leader only. | `ownsand-agent`, `ownsand-guest` |
-| `github.com/delinoio/mono/internal/semver`    | `MAJOR.MINOR.PATCH` parsing with an optional pre-release suffix, and version comparison.                                                               | `ownsand-agent`                  |
+| `github.com/delinoio/mono/internal/semver`    | `MAJOR.MINOR.PATCH` parsing with an optional pre-release suffix, and version comparison.                                                               | `ownsand-agent`, `ownsand-api`   |
 
 Current `servers/internal/` packages:
 

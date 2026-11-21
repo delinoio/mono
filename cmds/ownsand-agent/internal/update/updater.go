@@ -35,6 +35,10 @@ var ErrInstalling = errors.New("update: an agent update is installing")
 // ErrRunningRevoked rejects creates while the running version is revoked.
 var ErrRunningRevoked = errors.New("update: the running agent version is revoked")
 
+// ErrSuperseded rejects an update command that a newer update or withdrawal
+// command overtook before it published its artifact.
+var ErrSuperseded = errors.New("update: a newer update command superseded this one")
+
 // Installer replaces the agent executable.
 type Installer interface {
 	Install(artifactPath string) error
@@ -97,6 +101,12 @@ type Updater struct {
 	installing     bool
 	creating       int
 	wake           chan struct{}
+	// issued is the last order handed out by NextOrder; applied is the order
+	// of the newest update or withdrawal command that took effect. Commands
+	// run in their own goroutines, so the order is what lets a late older
+	// command, and the download that it started, lose against a newer one.
+	issued  uint64
+	applied uint64
 }
 
 // New returns an updater. It confirms an installation of the previous
@@ -170,6 +180,31 @@ func (u *Updater) setState(s ownsandv1.AgentUpdateState, target string) {
 	u.opts.Logger.Info("agent update state", "update_state", s.String(), "target_version", target)
 }
 
+// NextOrder returns the order of the next update or withdrawal command. The
+// agent takes it synchronously when it receives the command, before the
+// command runs in its own goroutine, so the order is the receive order.
+func (u *Updater) NextOrder() uint64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.issued++
+	return u.issued
+}
+
+// setStateFor sets the state on behalf of the command with the given order
+// and reports whether it did. A command that a newer one superseded must not
+// overwrite the state of the newer command.
+func (u *Updater) setStateFor(order uint64, s ownsandv1.AgentUpdateState, target string) bool {
+	u.mu.Lock()
+	if u.applied != order {
+		u.mu.Unlock()
+		return false
+	}
+	u.state, u.target = s, target
+	u.mu.Unlock()
+	u.opts.Logger.Info("agent update state", "update_state", s.String(), "target_version", target)
+	return true
+}
+
 // clearPendingLocked drops the queued artifact and removes its downloaded
 // file. The caller holds u.mu. revokedRunning is kept: it describes the
 // running version, not the queued artifact.
@@ -179,6 +214,18 @@ func (u *Updater) clearPendingLocked() {
 	}
 	os.Remove(filepath.Clean(u.artifact))
 	u.artifact = ""
+}
+
+// recordRunningRevocation stores whether a verified manifest revokes the
+// running version, on behalf of the command with the given order. A command
+// that a newer one superseded leaves the value to the newer command.
+func (u *Updater) recordRunningRevocation(order uint64, revoked bool) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.applied != order {
+		return
+	}
+	u.revokedRunning = revoked
 }
 
 func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, error) {
@@ -207,6 +254,11 @@ func (u *Updater) fetch(ctx context.Context, url string, limit int64) ([]byte, e
 // Handle runs an update command up to the verified download. The
 // installation waits until the device is idle; Run performs it.
 func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand) error {
+	return u.HandleOrdered(ctx, cmd, u.NextOrder())
+}
+
+// HandleOrdered is Handle for a command with an order from NextOrder.
+func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand, order uint64) error {
 	target := cmd.GetTargetVersion()
 	if _, err := semver.Parse(target); err != nil {
 		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
@@ -217,24 +269,34 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 		u.mu.Unlock()
 		return ErrInstalling
 	}
+	if order < u.applied {
+		u.mu.Unlock()
+		u.opts.Logger.Info("agent update command superseded", "target_version", target, "order", order)
+		return ErrSuperseded
+	}
 	// A new command supersedes the queued artifact, whatever its outcome:
 	// a failed or same-version target must not install the stale artifact.
+	u.applied = order
 	u.clearPendingLocked()
 	u.mu.Unlock()
 	if c, _ := semver.CompareStrings(target, u.opts.Running); c == 0 {
-		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
+		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 		return nil
 	}
 	if u.opts.ManifestURL == "" {
-		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
+		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
 		return errors.New("update: no release manifest URL is configured")
 	}
-	u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING, target)
-	m, artifactPath, err := u.download(ctx, target)
+	if !u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING, target) {
+		return ErrSuperseded
+	}
+	m, artifactPath, err := u.download(ctx, target, order)
 	if err != nil {
-		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
-		u.opts.Logger.Error("agent update verification failed", "target_version", target, "error", err)
-		return err
+		if u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target) {
+			u.opts.Logger.Error("agent update verification failed", "target_version", target, "error", err)
+			return err
+		}
+		return ErrSuperseded
 	}
 	// The control plane decides lower targets: a pinned version or a
 	// revocation recovery. The agent cannot see the organization policy,
@@ -243,6 +305,15 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 		u.opts.Logger.Info("agent update installs a lower version", "target_version", target, "revocation_recovery", cmd.GetRevocationRecovery())
 	}
 	u.mu.Lock()
+	if u.applied != order {
+		// A newer update or a withdrawal took effect during the download:
+		// drop the artifact instead of queueing it. The file name is unique
+		// to this command, so this cannot remove the artifact of another one.
+		u.mu.Unlock()
+		os.Remove(filepath.Clean(artifactPath))
+		u.opts.Logger.Info("agent update download discarded", "target_version", target, "order", order)
+		return ErrSuperseded
+	}
 	u.revokedRunning = m.Revoked(u.opts.Running)
 	u.artifact = artifactPath
 	u.target = target
@@ -258,7 +329,48 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 	return nil
 }
 
-func (u *Updater) download(ctx context.Context, target string) (*Manifest, string, error) {
+// Withdraw drops the queued update and invalidates a download that is still
+// running, so the installer is not called for a target that the control
+// plane withdrew. It runs under the updater lock, which TryInstall also
+// holds when it starts the installation: a withdrawal before that point
+// prevents the installation; after it, the withdrawal returns ErrInstalling
+// and changes nothing, because an installation that started cannot be taken
+// back. While the running version is revoked it also changes nothing and
+// returns ErrRunningRevoked, because the revocation recovery must proceed.
+func (u *Updater) Withdraw() error {
+	return u.WithdrawOrdered(u.NextOrder())
+}
+
+// WithdrawOrdered is Withdraw for a command with an order from NextOrder.
+func (u *Updater) WithdrawOrdered(order uint64) error {
+	u.mu.Lock()
+	if u.installing {
+		u.mu.Unlock()
+		u.opts.Logger.Warn("agent update withdrawal too late", "reason", "installing", "target_version", u.target)
+		return ErrInstalling
+	}
+	if u.revokedRunning {
+		u.mu.Unlock()
+		u.opts.Logger.Warn("agent update withdrawal ignored", "reason", "running_version_revoked", "running_version", u.opts.Running)
+		return ErrRunningRevoked
+	}
+	if order < u.applied {
+		// A newer update command already replaced the state that this
+		// withdrawal refers to.
+		u.mu.Unlock()
+		u.opts.Logger.Info("agent update withdrawal superseded", "order", order)
+		return nil
+	}
+	u.applied = order
+	previous, target := u.state, u.target
+	u.clearPendingLocked()
+	u.state, u.target = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, ""
+	u.mu.Unlock()
+	u.opts.Logger.Info("agent update withdrawn", "previous_update_state", previous.String(), "withdrawn_target_version", target)
+	return nil
+}
+
+func (u *Updater) download(ctx context.Context, target string, order uint64) (*Manifest, string, error) {
 	manifest, err := u.fetch(ctx, u.opts.ManifestURL, maxManifestBytes)
 	if err != nil {
 		return nil, "", fmt.Errorf("update: download manifest: %w", err)
@@ -276,6 +388,11 @@ func (u *Updater) download(ctx context.Context, target string) (*Manifest, strin
 	if err != nil {
 		return nil, "", err
 	}
+	// The signed manifest is the evidence that the running version is revoked,
+	// so record it now and not when the artifact is published: a withdrawal
+	// that arrives during the artifact download must already see it and leave
+	// the revocation recovery alone.
+	u.recordRunningRevocation(order, m.Revoked(u.opts.Running))
 	if m.Revoked(target) {
 		return nil, "", ErrRevoked
 	}
@@ -291,7 +408,9 @@ func (u *Updater) download(ctx context.Context, target string) (*Manifest, strin
 	if hex.EncodeToString(sum[:]) != art.SHA256 {
 		return nil, "", ErrHashMismatch
 	}
-	path := u.opts.Store.Path(store.UpdateDir, "ownsand-agent-"+target)
+	// The order makes the file name unique to the command, so a superseded
+	// download never removes or replaces the artifact of a newer command.
+	path := u.opts.Store.Path(store.UpdateDir, fmt.Sprintf("ownsand-agent-%s-%d", target, order))
 	if err := store.WriteFileAtomic(path, data, 0o700); err != nil {
 		return nil, "", err
 	}
@@ -315,12 +434,12 @@ func (u *Updater) TryInstall() (bool, error) {
 		a.PendingUpdate = &store.PendingUpdate{TargetVersion: target, PreviousVersion: u.opts.Running}
 		return nil
 	}); err != nil {
-		u.fail(target)
+		u.fail(target, artifact)
 		return false, err
 	}
 	if err := u.opts.Installer.Install(artifact); err != nil {
 		u.opts.Store.UpdateAgent(func(a *store.AgentState) error { a.PendingUpdate = nil; return nil })
-		u.fail(target)
+		u.fail(target, artifact)
 		return false, fmt.Errorf("update: install: %w", err)
 	}
 	os.Remove(filepath.Clean(artifact))
@@ -331,7 +450,13 @@ func (u *Updater) TryInstall() (bool, error) {
 	return true, nil
 }
 
-func (u *Updater) fail(target string) {
+// fail ends a failed installation attempt. It deletes the downloaded
+// artifact before it forgets the path: every command writes its own file, so
+// a file that no longer has a path in u.artifact would stay on disk, and a
+// device that fails to install repeatedly would collect one executable per
+// retry.
+func (u *Updater) fail(target, artifact string) {
+	os.Remove(filepath.Clean(artifact))
 	u.mu.Lock()
 	u.installing = false
 	u.artifact = ""
