@@ -8,11 +8,17 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import { Code, ConnectError, type Transport } from "@connectrpc/connect";
+import {
+  Code,
+  ConnectError,
+  createClient,
+  type Transport,
+} from "@connectrpc/connect";
+import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
-import { AuthMode } from "./config.ts";
+import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
 import {
   createMockTransport,
@@ -32,7 +38,11 @@ const config = {
 
 function renderConsole(
   path: string,
-  options: { signedIn?: boolean; transport?: Transport } = {},
+  options: {
+    signedIn?: boolean;
+    transport?: Transport;
+    config?: ConsoleConfig;
+  } = {},
 ) {
   window.history.replaceState(null, "", path);
   const signIns: number[] = [];
@@ -53,7 +63,7 @@ function renderConsole(
   render(
     <AuthContextProvider value={auth}>
       <Console
-        config={config}
+        config={options.config ?? config}
         transport={options.transport ?? createMockTransport()}
         queryClient={queryClient}
       />
@@ -86,6 +96,28 @@ describe("organizations", () => {
     expect(
       screen.getByRole("link", { name: /Northwind Labs/ }).textContent,
     ).toContain("Member");
+  });
+
+  test("requests the first 200 organizations on the page and in the switcher", async () => {
+    const mock = createMockTransport();
+    const client = createClient(OrganizationService, mock);
+    for (let i = 0; i < 50; i++) {
+      await client.createOrganization({ name: `Extra ${i}` });
+    }
+    const pageSizes: number[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary: (method, ...rest) => {
+        if (method.name === "ListOrganizations") {
+          pageSizes.push((rest[3] as { pageSize: number }).pageSize);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole("/", { transport });
+    expect(await screen.findByRole("link", { name: /Extra 49/ })).toBeTruthy();
+    expect(pageSizes.length).toBeGreaterThan(0);
+    expect(pageSizes.every((size) => size === 200)).toBe(true);
   });
 
   test("opens an organization's sandboxes and hides ended sandboxes by default", async () => {
@@ -164,6 +196,116 @@ describe("API keys", () => {
   });
 });
 
+describe("confirmation dialog errors", () => {
+  /** A transport whose RevokeApiKey fails for the first `failures` calls. */
+  function revokeTransport(failures: number) {
+    const mock = createMockTransport();
+    const state = { calls: 0 };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "RevokeApiKey") {
+          state.calls += 1;
+          if (state.calls <= failures) {
+            throw new ConnectError("revoke failed", Code.Unavailable);
+          }
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  /** The error notice inside a dialog; the live-region announcer also has the alert role. */
+  const noticeIn = (dialog: HTMLElement) =>
+    dialog.querySelector(".notice-error");
+
+  async function openRevoke() {
+    await act(async () => {
+      fireEvent.click(screen.getAllByRole("button", { name: /Revoke/ })[0]);
+    });
+    await settle();
+    return screen.findByRole("alertdialog");
+  }
+
+  async function confirmRevoke() {
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Revoke key" }),
+      );
+    });
+    await settle(60);
+  }
+
+  test("a failed action keeps the dialog open with a notice that a retry removes", async () => {
+    const { transport, state } = revokeTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    await openRevoke();
+    await confirmRevoke();
+    expect(noticeIn(screen.getByRole("alertdialog"))).toBeTruthy();
+    // The retry removes the old notice while it runs and closes on success.
+    await confirmRevoke();
+    expect(state.calls).toBe(2);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(document.querySelector(".notice-error")).toBeNull();
+    expect(document.querySelector(".notice-error")).toBeNull();
+  });
+
+  test("a notice does not survive Cancel and reopening", async () => {
+    const { transport } = revokeTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    await openRevoke();
+    await confirmRevoke();
+    expect(noticeIn(screen.getByRole("alertdialog"))).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    });
+    await settle(60);
+    await screen.findByText(/ci-runner/);
+    const dialog = await openRevoke();
+    expect(noticeIn(dialog)).toBeNull();
+  });
+
+  test("a failure that arrives after Escape does not show on the next opening", async () => {
+    const mock = createMockTransport();
+    let release: (() => void) | undefined;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "RevokeApiKey") {
+          await new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          throw new ConnectError("revoke failed", Code.Unavailable);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openRevoke();
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Revoke key" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    await settle(60);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await act(async () => {
+      release?.();
+    });
+    await settle(60);
+    const reopened = await openRevoke();
+    expect(noticeIn(reopened)).toBeNull();
+  });
+});
+
 describe("devices", () => {
   test("shows the overcommitted and effective vCPU limit", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices`);
@@ -179,6 +321,32 @@ describe("devices", () => {
     expect(effective.textContent).toContain("24");
     expect(screen.getByRole("button", { name: "Save limits" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Remove device" })).toBeTruthy();
+  });
+
+  test("shows an effective vCPU limit above the int32 range exactly", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    const vcpu = await screen.findByLabelText("vCPU limit");
+    await settle();
+    await act(async () => {
+      fireEvent.input(vcpu, { target: { value: "2000000000" } });
+      fireEvent.blur(vcpu);
+    });
+    await settle();
+    // 2000000000 vCPUs at the existing 150 percent exceed the int32 range.
+    const effective = screen.getByRole("status", {
+      name: "Effective vCPU limit",
+    });
+    expect(effective.textContent).toContain("3000000000");
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    });
+    await settle(60);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Devices" }));
+    });
+    expect(
+      await screen.findByText("10 of 3000000000 (2000000000 × 1.5)"),
+    ).toBeTruthy();
   });
 
   test("a removed device disappears from the device list", async () => {
@@ -197,6 +365,29 @@ describe("devices", () => {
     await settle(100);
     expect(await screen.findByText("studio-mac")).toBeTruthy();
     expect(screen.queryByText("build-box-1")).toBeNull();
+  });
+});
+
+describe("device limits", () => {
+  test("saves an explicit zero with the strict RPC", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
+    const disk = await screen.findByLabelText("Disk limit (GiB)");
+    await settle();
+    await act(async () => {
+      fireEvent.input(disk, { target: { value: "0" } });
+      fireEvent.blur(disk);
+    });
+    await settle();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    });
+    await settle(60);
+    expect(
+      (await screen.findAllByText("The device limits are saved.")).length,
+    ).toBeGreaterThan(0);
+    expect(
+      (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
+    ).toBe("0");
   });
 });
 
@@ -308,11 +499,95 @@ describe("invitations", () => {
     ).toBeTruthy();
   });
 
+  /** Delays AcceptInvitation until the returned function releases it. */
+  function delayedAcceptTransport() {
+    const mock = createMockTransport();
+    let release = () => {};
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "AcceptInvitation") {
+          await gate;
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, release };
+  }
+
+  test("does not navigate when an earlier accept succeeds after a new link opened", async () => {
+    const { transport, release } = delayedAcceptTransport();
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await act(async () => {
+      window.location.hash = `secret=${MOCK_ACME_INVITATION_SECRET}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    release();
+    await settle(60);
+    expect(window.location.pathname).toBe("/invitations/accept");
+    expect(
+      screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+  });
+
+  test("does not navigate when an earlier accept succeeds after the user left the page", async () => {
+    const { transport, release } = delayedAcceptTransport();
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Not now" }));
+    });
+    expect(window.location.pathname).not.toBe("/invitations/accept");
+    const leftPath = window.location.pathname;
+    release();
+    await settle(60);
+    expect(window.location.pathname).toBe(leftPath);
+  });
+
   test("shows the missing-secret screen when the page opens without a secret", async () => {
     renderConsole("/invitations/accept");
     expect(await screen.findByText(/needs an invitation link/)).toBeTruthy();
     expect(
       screen.queryByRole("button", { name: "Accept invitation" }),
     ).toBeNull();
+  });
+});
+
+describe("sign-in callback", () => {
+  test("shows the sign-in configuration notice when Logto is not configured", async () => {
+    // The default build: Logto mode without a registration, so no Logto
+    // provider exists and the Logto callback hook has nothing to complete.
+    renderConsole("/callback", {
+      signedIn: false,
+      config: {
+        apiOrigin: "https://api.test",
+        authMode: AuthMode.Logto,
+        logto: undefined,
+      },
+    });
+    // The toast region has its own alert announcer, so match the text.
+    expect(
+      await screen.findByText("Sign-in is not configured for this build."),
+    ).toBeTruthy();
+  });
+
+  test("the mock callback still returns to the organizations", async () => {
+    renderConsole("/callback", { signedIn: false });
+    await settle(60);
+    expect(window.location.pathname).toBe("/");
   });
 });

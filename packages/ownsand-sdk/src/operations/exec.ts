@@ -172,6 +172,11 @@ export async function* runExec(
             sendExec
               ? ctx.relay.exec(request!, options)
               : ctx.relay.attachExec(attachRequest(), options),
+          {
+            window,
+            isAccepted: (response) =>
+              response.event?.event?.case === "accepted",
+          },
         ),
       );
     } else {
@@ -323,7 +328,7 @@ export async function* runExec(
 
     throwIfAborted(signal);
     if (failure instanceof SessionEndedError) {
-      selector.sessionEnded();
+      if (session !== undefined) selector.sessionEnded(session);
       mode = Mode.Attach;
       continue;
     }
@@ -380,7 +385,7 @@ export async function* runExec(
       mode = Mode.Exec;
       continue;
     }
-    if (onRelay) grants.discard();
+    if (onRelay) grants.discardFor(failure);
     await recoverOrThrow(ctx, window, failure, signal);
     mode = Mode.Attach;
   }
@@ -409,6 +414,7 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
   readonly #selector: DataPathSelector;
   #iterated = false;
   #result: ExecResult | undefined;
+  #draining: Promise<void> | undefined;
 
   constructor(
     execId: string,
@@ -433,7 +439,8 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     for (;;) {
       const next = await this.#generator.next();
       if (next.done) {
-        this.#result = next.value;
+        // Keep a result that a concurrent wait() already stored.
+        this.#result ??= next.value;
         return;
       }
       yield next.value;
@@ -442,15 +449,35 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
 
   /** Drains the remaining events and returns the result. */
   async wait(): Promise<ExecResult> {
-    if (!this.#iterated) {
-      for await (const _ of this) {
-        // Discard events.
-      }
+    // Decide on whether the underlying generator finished, not on whether
+    // iteration started: a consumer can break out of a for-await early, which
+    // leaves the generator suspended with its stream open and no result yet.
+    this.#iterated = true;
+    if (this.#result === undefined) {
+      // Overlapping wait() calls share one drain. A second reader of the
+      // generator would see its exhausted `{ done: true }` and must never be
+      // able to erase the terminal result that the first reader stored.
+      this.#draining ??= this.#drain().finally(() => {
+        this.#draining = undefined;
+      });
+      await this.#draining;
     }
     if (this.#result === undefined) {
       throw new OwnSandError("the exec ended without a result");
     }
     return this.#result;
+  }
+
+  async #drain(): Promise<void> {
+    while (this.#result === undefined) {
+      const next = await this.#generator.next();
+      if (next.done) {
+        // Keep a result that a concurrent reader already stored.
+        this.#result ??= next.value;
+        return;
+      }
+      // Discard events.
+    }
   }
 }
 

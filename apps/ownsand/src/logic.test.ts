@@ -6,16 +6,24 @@ import {
   SnapshotExportState,
   SnapshotState,
 } from "ownsand-sdk/gen/common_pb";
+import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
+import { CreateSandboxRequestSchema } from "ownsand-sdk/gen/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
 import { clearInvitationOnLeave } from "./App.tsx";
-import { AuthMode, DEFAULT_API_ORIGIN, readConsoleConfig } from "./config.ts";
 import {
+  AuthMode,
+  DEFAULT_API_ORIGIN,
+  normalizeMockFlag,
+  readConsoleConfig,
+} from "./config.ts";
+import {
+  deviceAllocatedVcpu,
   effectiveVcpuLimit,
   formatDuration,
   formatMib,
   OVERCOMMIT_PERCENTAGES,
 } from "./format.ts";
-import { parseLabels, ttlErrors } from "./forms.ts";
+import { deviceLimitsInput, parseLabels, ttlErrors } from "./forms.ts";
 import {
   invitationLink,
   PENDING_INVITATION_KEY,
@@ -26,6 +34,39 @@ import {
 } from "./invitation.ts";
 import { can, canManageMember, Permission } from "./roles.ts";
 import { parseRoute, RouteId, routePath } from "./router.tsx";
+
+describe("deviceAllocatedVcpu", () => {
+  test("prefers the exact 64-bit total above the int32 range", () => {
+    expect(
+      deviceAllocatedVcpu({
+        allocation: { vcpuCount: 2147483647, vcpuTotalCount: 4294967294n },
+      }),
+    ).toBe(4294967294n);
+    expect(
+      deviceAllocatedVcpu({
+        allocation: { vcpuCount: 3, vcpuTotalCount: 3n },
+      }),
+    ).toBe(3n);
+  });
+
+  test("a present zero total is exact", () => {
+    expect(
+      deviceAllocatedVcpu({ allocation: { vcpuCount: 0, vcpuTotalCount: 0n } }),
+    ).toBe(0n);
+  });
+
+  test("falls back to the int32 count for a server without the total", () => {
+    expect(
+      deviceAllocatedVcpu({
+        allocation: { vcpuCount: 7, vcpuTotalCount: undefined },
+      }),
+    ).toBe(7n);
+  });
+
+  test("is 0 without an allocation", () => {
+    expect(deviceAllocatedVcpu({})).toBe(0n);
+  });
+});
 
 describe("console configuration", () => {
   test("defaults to the production API origin and Logto mode", () => {
@@ -92,6 +133,38 @@ describe("console configuration", () => {
         { production: false },
       ),
     ).toThrow("true or false");
+  });
+});
+
+describe("mock mode decision", () => {
+  test("a padded value selects the mock mode and normalizes to true", () => {
+    const env = { PUBLIC_OWNSAND_MOCK_API: " true " };
+    expect(readConsoleConfig(env, { production: false }).authMode).toBe(
+      AuthMode.Mock,
+    );
+    // src/index.tsx compares the inlined value with "true".
+    expect(normalizeMockFlag(env.PUBLIC_OWNSAND_MOCK_API)).toBe("true");
+  });
+
+  test("false, empty and unset values stay out of the mock mode", () => {
+    for (const value of ["false", " false ", "", "  ", undefined]) {
+      expect(normalizeMockFlag(value)).not.toBe("true");
+      expect(
+        readConsoleConfig(
+          { PUBLIC_OWNSAND_MOCK_API: value },
+          { production: false },
+        ).authMode,
+      ).toBe(AuthMode.Logto);
+    }
+  });
+
+  test("a padded mock value is still rejected in a production build", () => {
+    expect(() =>
+      readConsoleConfig(
+        { PUBLIC_OWNSAND_MOCK_API: " true " },
+        { production: true },
+      ),
+    ).toThrow(/production/);
   });
 });
 
@@ -196,6 +269,7 @@ describe("formatting and form rules", () => {
     expect(effectiveVcpuLimit(1.5, 200)).toBe(2);
     expect(effectiveVcpuLimit(Number.NaN, 200)).toBe(0);
     expect(effectiveVcpuLimit(-3, 200)).toBe(0);
+    expect(effectiveVcpuLimit(536870912, 400)).toBe(2147483648);
     expect(OVERCOMMIT_PERCENTAGES[0]).toBe(100);
     expect(OVERCOMMIT_PERCENTAGES.at(-1)).toBe(400);
     expect(OVERCOMMIT_PERCENTAGES).toHaveLength(13);
@@ -231,6 +305,42 @@ describe("formatting and form rules", () => {
       parseLabels(Array.from({ length: 33 }, (_, i) => `k${i}=v`).join("\n")),
     ).toHaveProperty("error");
   });
+
+  test("keeps labels whose keys match object prototype properties", () => {
+    const parsed = parseLabels(
+      "__proto__=x\nconstructor=y\ntoString=z\n__proto__=w",
+    );
+    if ("error" in parsed) throw new Error(parsed.error);
+    expect(Object.keys(parsed.labels).sort()).toEqual([
+      "__proto__",
+      "constructor",
+      "toString",
+    ]);
+    expect(Object.hasOwn(parsed.labels, "__proto__")).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(parsed.labels, "__proto__")?.value,
+    ).toBe("w");
+    // The request that the console sends keeps the label through protobuf.
+    const request = create(CreateSandboxRequestSchema, {
+      labels: parsed.labels,
+    });
+    const decoded = fromBinary(
+      CreateSandboxRequestSchema,
+      toBinary(CreateSandboxRequestSchema, request),
+    );
+    expect(Object.hasOwn(request.labels, "__proto__")).toBe(true);
+    expect(Object.hasOwn(decoded.labels, "__proto__")).toBe(true);
+    expect(
+      Object.getOwnPropertyDescriptor(decoded.labels, "__proto__")?.value,
+    ).toBe("w");
+  });
+
+  test("counts a prototype-named key toward the label limit", () => {
+    const lines = Array.from({ length: 32 }, (_, i) => `k${i}=v`);
+    expect(parseLabels([...lines, "__proto__=v"].join("\n"))).toHaveProperty(
+      "error",
+    );
+  });
 });
 
 describe("router", () => {
@@ -264,6 +374,31 @@ describe("router", () => {
     expect(parseRoute("/orgs/o1/unknown").id).toBe(RouteId.NotFound);
     expect(parseRoute("/elsewhere").id).toBe(RouteId.NotFound);
   });
+
+  test("treats inherited object property names as unknown sections", () => {
+    for (const name of [
+      "constructor",
+      "toString",
+      "__proto__",
+      "hasOwnProperty",
+    ]) {
+      expect(parseRoute(`/orgs/o1/${name}`)).toEqual({ id: RouteId.NotFound });
+    }
+  });
+
+  test("malformed percent escapes are not found instead of throwing", () => {
+    expect(parseRoute("/orgs/%/sandboxes")).toEqual({ id: RouteId.NotFound });
+    expect(parseRoute("/orgs/o1/sandboxes/%E0%A4%A")).toEqual({
+      id: RouteId.NotFound,
+    });
+  });
+
+  test("valid encoded segments are decoded", () => {
+    expect(parseRoute("/orgs/o%201/sandboxes")).toEqual({
+      id: RouteId.Sandboxes,
+      organizationId: "o 1",
+    });
+  });
 });
 
 describe("polling", () => {
@@ -286,5 +421,40 @@ describe("polling", () => {
         exportState: SnapshotExportState.EXPORTING,
       }),
     ).toBe(true);
+  });
+});
+
+describe("deviceLimitsInput", () => {
+  test("sends an explicit zero as a present value", () => {
+    const result = deviceLimitsInput({
+      vcpu: 0,
+      memoryMib: 0,
+      diskGib: 0,
+      overcommitPercent: 100,
+    });
+    expect("limits" in result).toBe(true);
+    if (!("limits" in result)) return;
+    expect(result.limits.vcpuCount).toBe(0);
+    expect(result.limits.memoryMib).toBe(0n);
+    expect(result.limits.diskGib).toBe(0n);
+    expect(result.limits.vcpuOvercommitPercent).toBe(100);
+  });
+
+  test("asks for a blank field instead of sending zero", () => {
+    const base = {
+      vcpu: 4,
+      memoryMib: 8192,
+      diskGib: 100,
+      overcommitPercent: 150,
+    };
+    expect(deviceLimitsInput({ ...base, vcpu: null })).toEqual({
+      error: "vCPU limit is required. Enter 0 to allow none.",
+    });
+    expect(deviceLimitsInput({ ...base, memoryMib: null })).toEqual({
+      error: "Memory limit is required. Enter 0 to allow none.",
+    });
+    expect(deviceLimitsInput({ ...base, diskGib: null })).toEqual({
+      error: "Disk limit is required. Enter 0 to allow none.",
+    });
   });
 });

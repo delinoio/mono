@@ -4,6 +4,7 @@ package ownsand
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -108,7 +109,34 @@ func (c *Client) CreateSandbox(ctx context.Context, p CreateSandboxParams) (*San
 	}
 	rec := newRecovery(c.timing.createRetryWindow)
 	for {
-		res, err := c.sandboxes.CreateSandbox(ctx, connect.NewRequest(req))
+		// The first attempt is not bounded: the window starts with the
+		// first lost response. Each retry is bounded by the time left in
+		// the window, because a response that stalls on an open connection
+		// must not outlive it (the default HTTP client has no overall
+		// timeout). A timer cancels the attempt instead of a context
+		// deadline, so Connect sends no timeout header and the server
+		// cannot answer it first with a terminal deadline_exceeded status.
+		attemptCtx, cancel := ctx, context.CancelCauseFunc(func(error) {})
+		var timer *time.Timer
+		if rec.inRecovery() {
+			left := rec.remaining()
+			if left <= 0 {
+				return nil, rec.err()
+			}
+			attemptCtx, cancel = context.WithCancelCause(ctx)
+			timer = time.AfterFunc(left, func() { cancel(errCreateDeadline) })
+		}
+		res, err := c.sandboxes.CreateSandbox(attemptCtx, connect.NewRequest(req))
+		if timer != nil {
+			timer.Stop()
+		}
+		timedOut := err != nil && ctx.Err() == nil && errors.Is(context.Cause(attemptCtx), errCreateDeadline)
+		cancel(context.Canceled)
+		if timedOut {
+			// The window ended during the attempt: end with the last
+			// failure of the window, not with the cancellation.
+			return nil, rec.err()
+		}
 		if err == nil {
 			c.logger.DebugContext(ctx, "ownsand sandbox created", "sandbox_id", res.Msg.GetSandbox().GetSandboxId())
 			return c.handle(org, res.Msg.GetSandbox()), nil
@@ -136,7 +164,7 @@ func (c *Client) Sandbox(org, sandboxID string) (*Sandbox, error) {
 
 func (c *Client) handle(org string, sb *ownsandv1.Sandbox) *Sandbox {
 	s := &Sandbox{c: c, org: org, id: sb.GetSandboxId(), info: sb}
-	s.dp = &dataPath{s: s}
+	s.dp = newDataPath(s)
 	return s
 }
 
@@ -223,8 +251,13 @@ func (s *Sandbox) Snapshot(ctx context.Context) (*ownsandv1.Snapshot, error) {
 	return res.Msg.GetSnapshot(), nil
 }
 
-// Close closes the handle's peer-to-peer session. Running execs continue on
-// the agent and can be attached again.
+// Close closes the handle's peer-to-peer session and cancels a session setup
+// that is in flight: that operation returns a "sandbox handle closed" error,
+// and a session that the setup still opens is closed and never installed.
+// A closed handle rejects later operations that use the peer-to-peer path
+// (every transport except TransportRelay) with the same error. Running execs
+// continue on the agent and can be attached again with a new handle. Close is
+// idempotent.
 func (s *Sandbox) Close() error {
 	s.dp.close()
 	return nil

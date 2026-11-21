@@ -1,11 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package netpolicy computes the OUTBOUND network policy of sandbox guests:
 // the destination prefixes that guests must never reach (the fixed private,
 // loopback, link-local, multicast and reserved ranges with their
 // IPv4-mapped and NAT64 forms, and every on-link or non-default-route
 // prefix of the host routing table, where a complementary /1 pair through
-// one interface counts as a default route), the per-sandbox addresses, and
+// one interface of one routing table counts as a default route), the per-sandbox addresses, and
 // the nftables ruleset that enforces it on Linux. The rule generation is
 // pure Go so that it is tested on every host.
 package netpolicy
@@ -47,6 +47,10 @@ var (
 type Route struct {
 	Prefix    netip.Prefix
 	Interface string
+	// Table names the routing table of the route on Linux, where policy
+	// routing rules select among several IPv4 tables. It is empty for the
+	// IPv6 routes and on the other host OSes, which have one table.
+	Table string
 }
 
 // embed4 returns the form of an IPv4 prefix inside a /96 IPv6 prefix.
@@ -61,8 +65,10 @@ func embed4(base netip.Prefix, p netip.Prefix) netip.Prefix {
 func isDefault(r Route) bool { return r.Prefix.Bits() == 0 }
 
 // halfDefaults returns the /1 routes that form a complementary pair
-// through the same interface (for example a full-tunnel VPN); they count
-// as a default route.
+// through the same interface of the same routing table (for example a
+// full-tunnel VPN); they count as a default route. A half whose
+// complement lives in another table stays an ordinary route: a packet
+// that policy routing sends to one table never uses the other half.
 func halfDefaults(routes []Route) map[Route]bool {
 	out := map[Route]bool{}
 	for _, a := range routes {
@@ -70,7 +76,7 @@ func halfDefaults(routes []Route) map[Route]bool {
 			continue
 		}
 		for _, b := range routes {
-			if b.Prefix.Bits() == 1 && a.Interface == b.Interface && a.Prefix.Addr().Is4() == b.Prefix.Addr().Is4() && a.Prefix.Masked() != b.Prefix.Masked() {
+			if b.Prefix.Bits() == 1 && a.Interface == b.Interface && a.Table == b.Table && a.Prefix.Addr().Is4() == b.Prefix.Addr().Is4() && a.Prefix.Masked() != b.Prefix.Masked() {
 				out[a] = true
 			}
 		}
@@ -139,13 +145,48 @@ func joinPrefixes(ps []netip.Prefix) string {
 	return strings.Join(parts, ", ")
 }
 
+// TapGateway is the DNS exception of one sandbox: the tap device of its
+// link and the gateway address on which the agent serves its DNS.
+type TapGateway struct {
+	Tap     string
+	Gateway netip.Addr
+}
+
+// dnsAcceptRules returns the input chain rules that accept DNS (UDP and
+// TCP port 53) from each assigned tap to the gateway address of the same
+// assignment only. The output is sorted by tap so that equal assignments
+// render the same text. An assignment without a tap name or with an
+// invalid or non-IPv4 gateway renders no rule: the final drop applies.
+func dnsAcceptRules(assignments []TapGateway) string {
+	sorted := slices.Clone(assignments)
+	slices.SortFunc(sorted, func(a, b TapGateway) int {
+		if c := strings.Compare(a.Tap, b.Tap); c != 0 {
+			return c
+		}
+		return a.Gateway.Compare(b.Gateway)
+	})
+	sorted = slices.Compact(sorted)
+	var sb strings.Builder
+	for _, a := range sorted {
+		if a.Tap == "" || !a.Gateway.Is4() {
+			continue
+		}
+		for _, proto := range []string{"udp", "tcp"} {
+			fmt.Fprintf(&sb, "\t\tiifname %q ip daddr %s %s dport 53 accept\n", a.Tap, a.Gateway, proto)
+		}
+	}
+	return sb.String()
+}
+
 // Ruleset returns the nftables script that replaces the agent's table
 // atomically. Guests reach only the internet: packets to blocked prefixes
 // are dropped in forward, packets to the host itself are dropped in input
-// except DNS to the gateway, DHCP and IPv6 neighbor and router discovery on
-// the guest link, inbound connections to guests are dropped, and guest
-// traffic leaves through NAT.
-func Ruleset(v4, v6 []netip.Prefix) string {
+// except DNS from each sandbox tap to that sandbox's own gateway address
+// (assignments), DHCP and IPv6 neighbor and router discovery on the guest
+// link, inbound connections to guests are dropped, and guest traffic leaves
+// through NAT. DNS to any other host address, such as the LAN address or
+// the gateway of another sandbox, falls through to the drop.
+func Ruleset(v4, v6 []netip.Prefix, assignments []TapGateway) string {
 	tap := TapPrefix + "*"
 	return fmt.Sprintf(`table inet %[1]s
 delete table inet %[1]s
@@ -164,9 +205,7 @@ table inet %[1]s {
 	}
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
-		iifname "%[4]s" udp dport 53 accept
-		iifname "%[4]s" tcp dport 53 accept
-		iifname "%[4]s" udp sport 68 udp dport 67 accept
+%[6]s		iifname "%[4]s" udp sport 68 udp dport 67 accept
 		iifname "%[4]s" udp sport 546 udp dport 547 accept
 		iifname "%[4]s" icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
 		iifname "%[4]s" drop
@@ -183,7 +222,7 @@ table inet %[1]s {
 		ip saddr %[5]s oifname != "%[4]s" masquerade
 	}
 }
-`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet)
+`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments))
 }
 
 // Link is the /30 link of one sandbox.
@@ -217,14 +256,13 @@ func (l Link) KernelIPArg() string {
 	return fmt.Sprintf("ip=%s::%s:%d.%d.%d.%d::eth0:off:%s", l.Guest, l.Gateway, byte(m>>24), byte(m>>16), byte(m>>8), byte(m), l.Gateway)
 }
 
-// TapName returns the tap device name of a sandbox: TapPrefix and 11 hex
-// characters of the sandbox ID, 15 bytes in total (the Linux limit).
-func TapName(sandboxID string) string {
-	hex := strings.ReplaceAll(sandboxID, "-", "")
-	if len(hex) > 11 {
-		hex = hex[len(hex)-11:]
-	}
-	return TapPrefix + hex
+// TapName returns the tap device name of the link with the given index:
+// TapPrefix and the index as 11 zero-padded lower-case hex digits, 15 bytes
+// in total (the Linux interface-name limit). The manager reserves a link
+// index for one attachment until its teardown ends, so two live or pending
+// attachments never share a tap name.
+func TapName(linkIndex int) string {
+	return fmt.Sprintf("%s%011x", TapPrefix, linkIndex)
 }
 
 var errNoLinks = errors.New("netpolicy: no free sandbox link")

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package hcsrt
 
@@ -390,7 +390,10 @@ func (r *Runtime) prepareLinuxDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
 // so the runtime connects as a client once the VM runs.
 func (r *Runtime) copyConsole(v *vm) {
 	defer close(v.consoleDone)
-	out, err := os.OpenFile(filepath.Join(v.dir, consoleFile), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	// The guest controls this output, so it goes through the capped writer:
+	// the file keeps the first 1 MiB over all pipe re-dials, and io.Copy
+	// keeps draining the pipe after the cap so the guest never blocks.
+	out, err := vmruntime.OpenCappedLog(filepath.Join(v.dir, consoleFile), vmruntime.ConsoleLogLimit, r.logger, v.id, vmruntime.ConsoleLogKindConsole)
 	if err != nil {
 		r.logger.Warn("open console log failed", "sandbox_id", v.id, "error", err)
 		return
@@ -456,8 +459,11 @@ func (r *Runtime) attachNetwork(ctx context.Context, v *vm) error {
 		return err
 	}
 	v.mu.Lock()
+	// done is owned by this call and the tunnel worker. stopVM clears
+	// v.netDone, so the worker must never read it.
+	done := make(chan struct{})
 	v.net = stack
-	v.netDone = make(chan struct{})
+	v.netDone = done
 	v.mu.Unlock()
 	tctx, cancel := context.WithTimeout(ctx, tunnelTimeout)
 	defer cancel()
@@ -469,21 +475,23 @@ func (r *Runtime) attachNetwork(ctx context.Context, v *vm) error {
 		}
 		select {
 		case <-tctx.Done():
-			close(v.netDone)
+			close(done)
 			return fmt.Errorf("hcsrt: connect the network tunnel: %w", err)
 		case <-v.exited:
-			close(v.netDone)
+			close(done)
 			return errors.New("hcsrt: the VM stopped before the network tunnel connected")
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	go r.runTunnel(v, stack, conn)
+	go r.runTunnel(v, stack, conn, done)
 	return nil
 }
 
-// runTunnel serves the tunnel connections of v until the VM stops.
-func (r *Runtime) runTunnel(v *vm, stack *netstack.Network, conn net.Conn) {
-	defer close(v.netDone)
+// runTunnel serves the tunnel connections of v until the VM stops and then
+// closes done. done is a parameter, not read from v, because stopVM clears
+// v.netDone and may run before this goroutine starts.
+func (r *Runtime) runTunnel(v *vm, stack *netstack.Network, conn net.Conn, done chan struct{}) {
+	defer close(done)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {

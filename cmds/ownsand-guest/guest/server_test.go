@@ -1,13 +1,17 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package guest
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -203,5 +207,139 @@ func TestUnknownKindGetsErrorFrame(t *testing.T) {
 	s.send(8, &ownsandv1.ExecEvent{})
 	if got := s.recv(); got.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
 		t.Fatalf("non-request kind: %v", got)
+	}
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) records(t *testing.T) []map[string]any {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []map[string]any
+	for _, line := range bytes.Split(bytes.TrimSpace(b.buf.Bytes()), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal(line, &rec); err != nil {
+			t.Fatalf("log line %q: %v", line, err)
+		}
+		out = append(out, rec)
+	}
+	return out
+}
+
+func findRecord(recs []map[string]any, msg string) map[string]any {
+	for _, r := range recs {
+		if r["msg"] == msg {
+			return r
+		}
+	}
+	return nil
+}
+
+func TestSetClockLogsAppliedOffset(t *testing.T) {
+	base := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name   string
+		offset time.Duration
+	}{
+		{"guest behind", 5 * time.Second},
+		{"guest ahead", -3 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			var mu sync.Mutex
+			var calls []time.Time
+			h := newHarness(t, func(cfg *Config) {
+				cfg.Clock = ClockModeSet
+				cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+				cfg.Now = func() time.Time { return base }
+				cfg.setClock = func(tm time.Time) error {
+					mu.Lock()
+					defer mu.Unlock()
+					calls = append(calls, tm)
+					return nil
+				}
+			})
+			want := base.Add(tc.offset)
+			if _, err := h.client.SetClock(context.Background(), connect.NewRequest(&ownsandv1.SetClockRequest{Now: timestamppb.New(want)})); err != nil {
+				t.Fatal(err)
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(calls) != 1 || !calls[0].Equal(want) {
+				t.Fatalf("setter calls %v, want one call with %v", calls, want)
+			}
+			rec := findRecord(logs.records(t), "clock set")
+			if rec == nil {
+				t.Fatal("no clock set record")
+			}
+			if got := rec["offset_ms"]; got != float64(tc.offset.Milliseconds()) {
+				t.Fatalf("offset_ms = %v, want %d", got, tc.offset.Milliseconds())
+			}
+		})
+	}
+}
+
+func TestSetClockSetterErrorMapping(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code connect.Code
+	}{
+		{"unsupported", errors.ErrUnsupported, connect.CodeUnimplemented},
+		{"other", errors.New("boom"), connect.CodeInternal},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := &lockedBuffer{}
+			h := newHarness(t, func(cfg *Config) {
+				cfg.Clock = ClockModeSet
+				cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+				cfg.setClock = func(time.Time) error { return tc.err }
+			})
+			_, err := h.client.SetClock(context.Background(), connect.NewRequest(&ownsandv1.SetClockRequest{Now: timestamppb.Now()}))
+			if errorCode(err) != tc.code {
+				t.Fatalf("code = %v, want %v", errorCode(err), tc.code)
+			}
+			recs := logs.records(t)
+			if findRecord(recs, "set clock failed") == nil {
+				t.Fatal("no set clock failed record")
+			}
+			if findRecord(recs, "clock set") != nil {
+				t.Fatal("unexpected clock set record")
+			}
+		})
+	}
+}
+
+func TestSetClockIgnoreModeNeverCallsSetter(t *testing.T) {
+	logs := &lockedBuffer{}
+	var called atomic.Bool
+	h := newHarness(t, func(cfg *Config) {
+		cfg.Clock = ClockModeIgnore
+		cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+		cfg.setClock = func(time.Time) error { called.Store(true); return nil }
+	})
+	if _, err := h.client.SetClock(context.Background(), connect.NewRequest(&ownsandv1.SetClockRequest{Now: timestamppb.Now()})); err != nil {
+		t.Fatal(err)
+	}
+	if called.Load() {
+		t.Fatal("setter called in ignore mode")
+	}
+	if findRecord(logs.records(t), "set clock ignored") == nil {
+		t.Fatal("no set clock ignored record")
 	}
 }

@@ -1645,12 +1645,26 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 // script on standard input) against stubbed `docker` and `curl`. `old` lists
 // the IDs of running containers of the service. Stub behavior:
 //   STUB_STATUS   `docker inspect` container status (default running).
-//   STUB_HEALTHY  `curl` succeeds when 1 (default 1).
+//   STUB_HEALTHY  `curl` completes a request when 1 (default 1); otherwise it
+//                 fails with a transport error and no status.
+//   STUB_HTTP_CODE  HTTP status that a completed `curl` request prints (default 200).
+//   STUB_PS_EXIT exit code of `docker ps` (default 0).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
+//   STUB_LOGS     exit code of `docker logs` (default 0).
+// `stubs` adds stub commands (name -> shell body) that shadow system tools, and
+// `prepare(deployRoot)` changes the scratch state before the run.
 function runDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
-  { env = {}, old = [], envFile = "LOG_LEVEL=info\n", route, state } = {},
+  {
+    env = {},
+    old = [],
+    envFile = "LOG_LEVEL=info\n",
+    route,
+    state,
+    stubs = {},
+    prepare,
+  } = {},
 ) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
@@ -1661,7 +1675,7 @@ function runDroplet(
   writeFileSync(join(dir, "calls.log"), "");
   // `null` leaves the env file out.
   if (envFile !== null) {
-    writeFileSync(join(deployRoot, "env", "api.env"), envFile);
+    writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
   }
   if (state !== undefined) {
     mkdirSync(join(deployRoot, "state"));
@@ -1674,17 +1688,27 @@ function runDroplet(
     bin,
     "docker",
     `case "$1" in
-  ps) printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
+  ps)
+    [[ "\${STUB_PS_EXIT:-0}" == 0 ]] || exit "\$STUB_PS_EXIT"
+    printf '%s\\n' ${old.map((id) => `'${id}'`).join(" ")} | grep . || true ;;
   inspect)
     case "$3" in
       *State.Status*) echo "\${STUB_STATUS:-running}" ;;
       *) echo 172.18.0.5 ;;
     esac ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
-  logs) echo "server log line" ;;
+  logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
 esac`,
   );
-  shellStub(bin, "curl", '[[ "${STUB_HEALTHY:-1}" == 1 ]]');
+  shellStub(
+    bin,
+    "curl",
+    '[[ "${STUB_HEALTHY:-1}" == 1 ]] || exit 7; printf "%s" "${STUB_HTTP_CODE:-200}"',
+  );
+  for (const [name, body] of Object.entries(stubs)) {
+    shellStub(bin, name, body);
+  }
+  prepare?.(deployRoot);
   const result = spawnSync("bash", ["-s", "--", ...args], {
     encoding: "utf8",
     input: readFileSync(dropletDeploy, "utf8"),
@@ -1726,15 +1750,20 @@ test(
       "docker run",
       "docker inspect",
       "docker inspect",
-      "curl --fail",
+      "curl --silent",
       "docker exec",
       "docker stop",
       "docker rm",
       "docker image",
     ]);
     const run = result.calls.find((call) => call.startsWith("docker run"));
+    // The replacement joins a unique alias, never the alias of the running
+    // container, so the live route cannot reach it before the health check.
+    const alias = run.match(/--network-alias (\S+)/)[1];
+    assert.match(alias, /^api-\d{14}-e{12}$/);
+    assert.ok(!/--network-alias api /.test(run), run);
     for (const part of [
-      "--network delino --network-alias api",
+      `--network delino --network-alias ${alias}`,
       "--label io.delino.service=api",
       "--restart unless-stopped",
       "/srv/env/api.env",
@@ -1757,26 +1786,61 @@ test(
     );
     const route = result.read("caddy/sites/api.caddy");
     assert.match(route, /^api\.example\.com \{$/m);
-    assert.match(route, /reverse_proxy api:8080 \{/);
+    assert.equal(route.includes(`reverse_proxy ${alias}:8080 {`), true, route);
+    assert.ok(!/reverse_proxy api:/.test(route), route);
     assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
   },
 );
 
-test("droplet deploy does not reload an unchanged route", { skip }, (t) => {
-  const first = runDroplet(t);
-  assert.equal(first.status, 0, first.stderr);
-  const route = first.read("caddy/sites/api.caddy");
-  const next = `registry.digitalocean.com/delino/api@sha256:${"f".repeat(64)}`;
-  // A second run in a fresh root with the state of the first run.
-  const second = runDroplet(t, ["api", next, "8080", "api.example.com"], {
-    old: ["old1"],
-    route,
-  });
-  assert.equal(second.status, 0, second.stderr);
-  // The route did not change, so the proxy is not reloaded.
-  assert.ok(!second.calls.some((call) => call.startsWith("docker exec")));
-  assert.equal(second.read("state/api.current"), `${next}\n`);
-});
+test(
+  "droplet deploy switches the route to the new alias on every deployment",
+  { skip },
+  (t) => {
+    const first = runDroplet(t);
+    assert.equal(first.status, 0, first.stderr);
+    const route = first.read("caddy/sites/api.caddy");
+    // A second run of the same image, in a fresh root with the route of the
+    // first run, still reloads the proxy: every deployment has its own alias.
+    const second = runDroplet(t, undefined, { old: ["old1"], route });
+    assert.equal(second.status, 0, second.stderr);
+    assert.ok(second.calls.some((call) => call.startsWith("docker exec")));
+    assert.equal(second.read("state/api.current"), `${dropletImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy keeps the alias of a long service name a valid DNS label",
+  { skip },
+  (t) => {
+    // The service name may have 63 characters, and cutting the name can leave a
+    // trailing hyphen.
+    const services = [
+      "a".repeat(63),
+      `${"b".repeat(34)}-${"c".repeat(28)}`,
+      "d".repeat(36),
+      "api",
+    ];
+    for (const service of services) {
+      const result = runDroplet(
+        t,
+        [service, dropletImage, "8080", "api.example.com"],
+        { old: ["old1"] },
+      );
+      assert.equal(result.status, 0, `${service}: ${result.stderr}`);
+      const run = result.calls.find((call) => call.startsWith("docker run"));
+      const alias = run.match(/--network-alias (\S+)/)[1];
+      assert.match(alias, /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/, service);
+      assert.match(alias, /-\d{14}-e{12}$/, service);
+      assert.ok(!alias.includes("--"), alias);
+      assert.ok(alias.startsWith(service.slice(0, 35).replace(/-+$/, "")));
+      assert.ok(
+        result
+          .read(`caddy/sites/${service}.caddy`)
+          .includes(`reverse_proxy ${alias}:8080 {`),
+      );
+    }
+  },
+);
 
 test(
   "droplet deploy keeps the previous image for a rollback",
@@ -1791,6 +1855,23 @@ test(
       result.read("state/api.previous"),
       `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`,
     );
+  },
+);
+
+test(
+  "droplet deploy fails before it starts a container when the container list cannot be read",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_PS_EXIT: "1" },
+    });
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /::error::could not list the existing containers/,
+    );
+    assert.deepEqual(commands(result.calls), ["docker pull", "docker ps"]);
   },
 );
 
@@ -1814,9 +1895,44 @@ test(
       );
       assert.equal(result.read("caddy/sites/api.caddy"), undefined, label);
       assert.equal(result.read("state/api.current"), undefined, label);
+      // The route is not written, so the live route still targets only the
+      // current container.
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker exec")),
+        label,
+      );
     }
   },
 );
+
+test("droplet deploy accepts only a 2xx health status", { skip }, (t) => {
+  for (const code of ["200", "204"]) {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_HTTP_CODE: code },
+    });
+    assert.equal(result.status, 0, code + result.stdout + result.stderr);
+    assert.ok(result.calls.some((call) => call.startsWith("docker stop")));
+  }
+  for (const code of ["302", "307", "404", "500", "000"]) {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_HTTP_CODE: code },
+    });
+    assert.equal(result.status, 1, code);
+    assert.match(result.stderr, /did not pass the health check/, code);
+    assert.ok(
+      result.calls.some((call) => call.startsWith("docker rm --force api-")),
+      code,
+    );
+    assert.ok(
+      !result.calls.some((call) => call.startsWith("docker stop")),
+      code,
+    );
+    assert.equal(result.read("caddy/sites/api.caddy"), undefined, code);
+    assert.equal(result.read("state/api.current"), undefined, code);
+  }
+});
 
 test(
   "droplet deploy restores the route when the proxy rejects it",
@@ -1829,8 +1945,10 @@ test(
       env: { STUB_RELOAD: "1" },
     });
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /did not accept the route/);
+    assert.match(result.stderr, /proxy rejected the route/);
+    assert.match(result.stderr, /route of api was not switched/);
     assert.equal(result.read("caddy/sites/api.caddy"), previous);
+    assert.equal(result.read("caddy/sites/api.caddy.new"), undefined);
     assert.ok(
       result.calls.some((call) => call.startsWith("docker rm --force api-")),
     );
@@ -1839,6 +1957,98 @@ test(
     const first = runDroplet(t, undefined, { env: { STUB_RELOAD: "1" } });
     assert.equal(first.status, 1);
     assert.equal(first.read("caddy/sites/api.caddy"), undefined);
+  },
+);
+
+test(
+  "droplet deploy fails and keeps the route when a route step fails",
+  { skip },
+  (t) => {
+    const previous = "# old route\nold.example.com {\n}\n";
+    const current = `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`;
+    const cases = [
+      {
+        name: "directory",
+        message: /could not create the directory of the route file/,
+        stubs: {
+          mkdir: `case "\${@: -1}" in */caddy/sites) exit 1 ;; esac\nexec /bin/mkdir "$@"`,
+        },
+      },
+      {
+        name: "backup",
+        message: /could not back up the route file/,
+        stubs: { cp: "exit 1" },
+      },
+      {
+        name: "write",
+        message: /could not write the new route/,
+        // A directory in the place of the temporary file makes the write fail
+        // also when the tests run as root.
+        prepare: (root) => mkdirSync(join(root, "caddy/sites/api.caddy.new")),
+      },
+      {
+        name: "install",
+        message: /could not install the new route/,
+        stubs: { mv: "exit 1" },
+      },
+    ];
+    for (const { name, message, stubs, prepare } of cases) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        route: previous,
+        state: current,
+        stubs,
+        prepare,
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, message, name);
+      assert.match(result.stderr, /route of api was not switched/, name);
+      // The proxy still has the original route and nothing reloaded it.
+      assert.equal(result.read("caddy/sites/api.caddy"), previous, name);
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker exec")),
+        name,
+      );
+      // The old container keeps serving and the replacement is removed.
+      assert.ok(
+        !result.calls.some((call) => call.startsWith("docker stop")),
+        name,
+      );
+      assert.ok(
+        result.calls.some((call) => call.startsWith("docker rm --force api-")),
+        name,
+      );
+      assert.match(result.stdout, /Last log lines of api-/, name);
+      assert.equal(result.read("state/api.current"), current, name);
+      assert.equal(result.read("state/api.previous"), undefined, name);
+    }
+  },
+);
+
+test(
+  "droplet deploy prints the replacement logs before it removes it when the route fails",
+  { skip },
+  (t) => {
+    // A failing `docker logs` must neither stop the cleanup nor change the
+    // verdict.
+    for (const logs of ["0", "1"]) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        env: { STUB_RELOAD: "1", STUB_LOGS: logs },
+      });
+      assert.equal(result.status, 1, logs);
+      assert.match(result.stdout, /Last log lines of api-/, logs);
+      assert.match(result.stdout, /server log line/, logs);
+      const logsAt = result.calls.findIndex((call) =>
+        /^docker logs --tail 200 api-/.test(call),
+      );
+      const removeAt = result.calls.findIndex((call) =>
+        call.startsWith("docker rm --force api-"),
+      );
+      assert.ok(logsAt >= 0, logs);
+      assert.ok(removeAt > logsAt, `${logs}: logs before rm`);
+      assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+    }
   },
 );
 
@@ -1861,6 +2071,12 @@ test(
       [["api", image, "8080", "localhost"], {}, /host name/],
       [["api", image, "8080", "a.example.com;x"], {}, /host name/],
       [
+        ["api", image, "8080", `${"a".repeat(64)}.example.com`],
+        {},
+        /host name/,
+      ],
+      [["api", image, "8080", `api.${"a".repeat(64)}.com`], {}, /host name/],
+      [
         ["api", image, "8080", "api.example.com"],
         { envFile: null },
         /api\.env does not exist/,
@@ -1877,6 +2093,13 @@ test(
       assert.match(result.stderr, message, label);
       assert.deepEqual(result.calls, [""], label);
     }
+    // A 63-character label is the longest valid one and passes validation.
+    const valid = runDroplet(
+      t,
+      ["api", image, "8080", `${"a".repeat(63)}.example.com`],
+      {},
+    );
+    assert.doesNotMatch(valid.stderr, /host name/);
   },
 );
 

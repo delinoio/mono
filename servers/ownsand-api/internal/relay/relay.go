@@ -13,6 +13,8 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -35,7 +37,20 @@ type Limits struct {
 	Keepalive time.Duration
 	// IdleTimeout closes a connection that received nothing.
 	IdleTimeout time.Duration
+	// MaxQueuedControlFrames bounds the frames that carry no credit (request
+	// accepted, session end, error, stream close and stream open frames) that
+	// wait in one stream queue for the handler. Zero selects the default.
+	MaxQueuedControlFrames int
+	// MaxQueuedControlBytes bounds the encoded bytes of those frames in one
+	// stream queue. A frame without credit can be as large as a maximum frame,
+	// so the count alone does not bound the memory. Zero selects the default.
+	MaxQueuedControlBytes int64
 }
+
+const (
+	defaultMaxQueuedControlFrames       = 4
+	defaultMaxQueuedControlBytes  int64 = 64 << 10
+)
 
 // DefaultLimits returns the recorded limits.
 func DefaultLimits() Limits {
@@ -45,18 +60,31 @@ func DefaultLimits() Limits {
 		MaxStreamsPerGrant: 4,
 		Keepalive:          30 * time.Second,
 		IdleTimeout:        90 * time.Second,
+
+		MaxQueuedControlFrames: defaultMaxQueuedControlFrames,
+		MaxQueuedControlBytes:  defaultMaxQueuedControlBytes,
 	}
 }
 
-// outboundQueue bounds the frames waiting for the connection writer.
+// writerGrace is how long Conn.Run waits for the writer after the connection
+// closed. A send that makes progress finishes within it; a send blocked on
+// the peer's flow control does not, and Run returns without it.
+const writerGrace = 100 * time.Millisecond
+
+// outboundQueue bounds the ordinary frames waiting for the connection writer.
+// Every admitted stream also owns one reserved place for its final frame (see
+// Conn.out), so the physical queue holds outboundQueue plus
+// Limits.MaxStreamsPerConn frames at most.
 const outboundQueue = 1024
 
 // Errors.
 var (
 	ErrConnClosed     = errors.New("the agent relay connection closed")
 	ErrReplaced       = errors.New("a newer agent relay connection replaced this one")
+	ErrStaleChannel   = errors.New("the agent channel of this relay connection is no longer current")
 	ErrTooManyStreams = errors.New("too many relay streams")
 	ErrWindowExceeded = errors.New("the agent sent beyond its credit window")
+	ErrControlFlood   = errors.New("the agent queued too many frames without credit on one stream")
 	ErrStreamClosed   = errors.New("the relay stream closed")
 	ErrIdle           = errors.New("no byte received for the idle timeout")
 	ErrUnknownKind    = errors.New("unknown frame kind on a stream")
@@ -71,31 +99,83 @@ type Conn struct {
 	Generation uint64
 	limits     Limits
 
-	out    chan *ownsandv1.DataFrame
+	// out is the outbound queue drained by the single writer. Its capacity is
+	// outboundQueue plus MaxStreamsPerConn. An ordinary frame takes one of the
+	// outboundQueue tokens of slots first and returns the token when the writer
+	// dequeues it, so ordinary frames never use more than outboundQueue places.
+	// A stream's final frame (stream close or error) bypasses the tokens and
+	// uses the place that the stream reserved by being admitted: Open admits a
+	// stream only while the open streams and the finals that wait for the
+	// writer stay within MaxStreamsPerConn, so the physical queue always has
+	// room for every final and closeWith never blocks or drops one.
+	out    chan outFrame
+	slots  chan struct{}
 	ctx    context.Context
 	cancel context.CancelCauseFunc
 
+	// sendInterrupt is set by SetSendInterrupt before Run starts.
+	sendInterrupt func() error
+
 	lastRecv atomic.Int64
 	lastSend atomic.Int64
+	// lastLarge is when the connection last received a large frame of an
+	// open stream (zero before the first one); see LargeFrameBytes.
+	lastLarge atomic.Int64
 
-	mu        sync.Mutex
-	next      uint64
-	streams   map[uint64]*Stream
+	// openGate serializes Open: a holder allocates a stream_id and enqueues
+	// the stream open frame before the next Open starts, so the stream open
+	// frames reach the agent in increasing stream_id order. It is a channel
+	// and not a mutex so that a waiting Open honors its context and the
+	// connection closing.
+	openGate chan struct{}
+
+	mu      sync.Mutex
+	next    uint64
+	streams map[uint64]*Stream
+	// pendingFinals counts the final frames that wait for the writer (in out
+	// or in its hands). They keep their admission slot, in pendingFinals for
+	// the connection and in perGrant for the grant, until the writer is done
+	// with them.
+	pendingFinals int
+	// perGrant counts, for each grant, the open streams plus the pending
+	// final frames.
 	perGrant  map[string]int
 	peerKinds map[ownsandv1.DataFrameKind]bool
+}
+
+// outFrame is a frame in the outbound queue. final marks a stream's final
+// frame, which owns a reserved place instead of an ordinary token.
+type outFrame struct {
+	frame   *ownsandv1.DataFrame
+	final   bool
+	grantID string
 }
 
 // NewConn returns a connection for the device bound to an agent channel
 // generation.
 func NewConn(parent context.Context, deviceID string, gen uint64, limits Limits) *Conn {
+	if limits.MaxQueuedControlFrames <= 0 {
+		limits.MaxQueuedControlFrames = defaultMaxQueuedControlFrames
+	}
+	if limits.MaxQueuedControlBytes <= 0 {
+		limits.MaxQueuedControlBytes = defaultMaxQueuedControlBytes
+	}
 	ctx, cancel := context.WithCancelCause(parent)
-	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan *ownsandv1.DataFrame, outboundQueue),
-		ctx: ctx, cancel: cancel, streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
+	reserved := max(limits.MaxStreamsPerConn, 0)
+	c := &Conn{DeviceID: deviceID, Generation: gen, limits: limits, out: make(chan outFrame, outboundQueue+reserved),
+		slots: make(chan struct{}, outboundQueue), ctx: ctx, cancel: cancel, openGate: make(chan struct{}, 1), streams: map[uint64]*Stream{}, perGrant: map[string]int{}}
 	now := time.Now().UnixNano()
 	c.lastRecv.Store(now)
 	c.lastSend.Store(now)
 	return c
 }
+
+// SetSendInterrupt registers the function that makes a blocked send fail
+// (for an HTTP response, a write deadline in the past). Run calls it once
+// after the connection closed. It returns an error when it cannot interrupt
+// the send; Run then falls back to a bounded wait for the writer. Call it
+// before Run.
+func (c *Conn) SetSendInterrupt(interrupt func() error) { c.sendInterrupt = interrupt }
 
 // Done is closed when the connection closes.
 func (c *Conn) Done() <-chan struct{} { return c.ctx.Done() }
@@ -125,14 +205,65 @@ func (c *Conn) StreamCount() int {
 // LastReceive returns when the connection last received a frame.
 func (c *Conn) LastReceive() time.Time { return time.Unix(0, c.lastRecv.Load()) }
 
+// LargeFrameBytes is the encoded size from which a received stream frame
+// counts as large. The control plane cannot see a frame in transit, because
+// Connect delivers whole frames, so only a large frame, which can still have
+// been arriving when the agent's request accepted notice was ready, extends
+// the wait for that notice.
+const LargeFrameBytes = 64 << 10
+
+// LastLargeReceive returns when the connection last received a frame of an
+// open stream that is at least LargeFrameBytes large, or the zero time when
+// it received none. Keepalives, other connection-level frames, frames of a
+// closed stream and small frames do not count.
+func (c *Conn) LastLargeReceive() time.Time {
+	n := c.lastLarge.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+// enqueue queues an ordinary frame. It waits for one of the outboundQueue
+// tokens, and returns when ctx ends or the connection closes.
 func (c *Conn) enqueue(ctx context.Context, f *ownsandv1.DataFrame) error {
 	select {
-	case c.out <- f:
-		return nil
+	case c.slots <- struct{}{}:
 	case <-c.ctx.Done():
 		return ErrConnClosed
 	case <-ctx.Done():
 		return ctx.Err()
+	}
+	// The token guarantees room: ordinary frames never exceed outboundQueue,
+	// and the queue also holds the reserved places of the finals.
+	c.out <- outFrame{frame: f}
+	return nil
+}
+
+// dequeued runs when the writer took of from the queue. An ordinary frame
+// returns its token at once, so enqueue can proceed while the frame is sent.
+func (c *Conn) dequeued(of outFrame) {
+	if !of.final {
+		<-c.slots
+	}
+}
+
+// sent runs when the writer is done with of (sent or failed). A final frame
+// then releases the admission slots of its stream.
+func (c *Conn) sent(of outFrame) {
+	if !of.final {
+		return
+	}
+	c.mu.Lock()
+	c.releaseFinalLocked(of.grantID)
+	c.mu.Unlock()
+}
+
+// releaseFinalLocked releases the admission slots that a final frame kept.
+func (c *Conn) releaseFinalLocked(grantID string) {
+	c.pendingFinals--
+	if c.perGrant[grantID]--; c.perGrant[grantID] <= 0 {
+		delete(c.perGrant, grantID)
 	}
 }
 
@@ -150,28 +281,67 @@ func (c *Conn) Supports(kind ownsandv1.DataFrameKind) bool {
 // Run serves the connection: it sends the supported frame kinds, writes
 // queued frames with send, reads frames with recv, sends keepalives and
 // closes an idle connection. It returns when the connection closes.
+//
+// The idle check runs in its own goroutine because send can block on the
+// peer's flow control: a peer that stops reading and sends nothing would
+// otherwise stall the writer, and with it the idle check, forever. For the
+// same reason Run waits for the writer only for writerGrace, enough for a
+// send that makes progress to finish before the caller ends the underlying
+// stream, and returns without a send that is still blocked. Returning lets
+// the caller end the stream, which unblocks that send.
+//
+// That fallback is unsafe when the send writes to an HTTP response: the
+// handler that returns then finishes the response while the send still
+// writes to it. A caller whose send can be interrupted registers the
+// interrupt with SetSendInterrupt. Run then calls it once the connection
+// closed and waits for the writer without a limit, so Run returns only after
+// the last send ended.
 func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsandv1.DataFrame) error) error {
-	writerDone := make(chan struct{})
+	// guardedSend skips send once the connection closed, so the writer does
+	// not start a send after Run returned. A send that is already blocked
+	// ends when the caller ends the underlying stream.
+	guardedSend := func(f *ownsandv1.DataFrame) error {
+		if c.ctx.Err() != nil {
+			return context.Cause(c.ctx)
+		}
+		return send(f)
+	}
+	tick := c.limits.Keepalive / 3
 	go func() {
-		defer close(writerDone)
-		ticker := time.NewTicker(c.limits.Keepalive / 3)
+		ticker := time.NewTicker(tick)
 		defer ticker.Stop()
 		for {
 			select {
-			case f := <-c.out:
-				if err := send(f); err != nil {
+			case <-ticker.C:
+				if time.Since(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
+					c.Close(ErrIdle)
+					return
+				}
+			case <-c.ctx.Done():
+				return
+			}
+		}
+	}()
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		ticker := time.NewTicker(tick)
+		defer ticker.Stop()
+		for {
+			select {
+			case of := <-c.out:
+				c.dequeued(of)
+				err := guardedSend(of.frame)
+				c.sent(of)
+				if err != nil {
 					c.Close(err)
 					return
 				}
 				c.lastSend.Store(time.Now().UnixNano())
 			case <-ticker.C:
 				now := time.Now()
-				if now.Sub(time.Unix(0, c.lastRecv.Load())) > c.limits.IdleTimeout {
-					c.Close(ErrIdle)
-					return
-				}
 				if now.Sub(time.Unix(0, c.lastSend.Load())) >= c.limits.Keepalive {
-					if err := send(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
+					if err := guardedSend(datapath.MustNewFrame(0, "", &ownsandv1.RelayKeepalive{})); err != nil {
 						c.Close(err)
 						return
 					}
@@ -198,12 +368,25 @@ func (c *Conn) Run(recv func() (*ownsandv1.DataFrame, error), send func(*ownsand
 		}
 	}()
 	<-c.ctx.Done()
-	<-writerDone
+	if c.sendInterrupt != nil && c.sendInterrupt() == nil {
+		// The interrupt makes a blocked send fail, so the writer ends soon
+		// and Run can wait for it without a limit. The caller owns the
+		// stream again only after the writer stopped using it.
+		<-writerDone
+		return c.Err()
+	}
+	grace := time.NewTimer(writerGrace)
+	defer grace.Stop()
+	select {
+	case <-writerDone:
+	case <-grace.C:
+	}
 	return c.Err()
 }
 
 func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
-	if datapath.CheckFrameSize(f) != nil {
+	size := datapath.EncodedSize(f)
+	if size > datapath.MaxFrameSize {
 		return errMalformedFrame
 	}
 	if f.GetStreamId() == 0 {
@@ -236,11 +419,22 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 		// A late frame of a closed stream is dropped.
 		return nil
 	}
+	if size >= LargeFrameBytes {
+		c.lastLarge.Store(time.Now().UnixNano())
+	}
 	if err := datapath.ValidateFrame(f); err != nil {
 		var unknown *datapath.UnknownKindError
 		if errors.As(err, &unknown) {
+			// End the stream with an error frame, not a stream close frame:
+			// the agent ends the stream on it without a reply. The stream
+			// closes before it fails, so the RPC, which wakes on the failure,
+			// finds it closed and sends no stream close frame behind the
+			// error frame.
+			s.closeWith(datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.ErrorDetail{
+				Code:    ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED,
+				Message: fmt.Sprintf("unknown frame kind %d on stream %d", int32(unknown.Kind), unknown.StreamID),
+			}))
 			s.fail(ErrUnknownKind)
-			s.Close(true)
 			return nil
 		}
 		return errMalformedFrame
@@ -256,8 +450,7 @@ func (c *Conn) dispatch(f *ownsandv1.DataFrame) error {
 			return ErrWindowExceeded
 		}
 	}
-	s.push(f)
-	return nil
+	return s.push(f)
 }
 
 // Stream is one relay stream.
@@ -269,23 +462,47 @@ type Stream struct {
 	recv      *datapath.ReceiveWindow
 	send      *datapath.SendWindow
 
-	mu     sync.Mutex
-	queue  []*ownsandv1.DataFrame
-	notify chan struct{}
-	err    error
-	closed bool
+	mu    sync.Mutex
+	queue []*ownsandv1.DataFrame
+	// controlFrames and controlBytes count the queued frames that carry no
+	// credit. The receive credit window bounds every other queued frame.
+	controlFrames int
+	controlBytes  int64
+	notify        chan struct{}
+	err           error
+	closed        bool
 	// Started is when the stream_id was allocated.
 	Started time.Time
 }
 
 // Open allocates a new stream_id (increasing from 1, never reused) and
 // sends the stream open frame with the first credit window.
+//
+// The agent treats the highest stream_id that it has seen as its replay
+// protection and drops a stream open frame whose stream_id is not above it,
+// without a reply. Open therefore holds the connection's open gate from the
+// stream_id allocation until the stream open frame is in the outbound queue
+// (the single writer preserves the queue order), so that concurrent opens
+// reach the agent in increasing stream_id order. An Open that waits for the
+// gate, or for room in a full outbound queue, returns when ctx ends or the
+// connection closes; it then holds no stream slot, and the stream_id of an
+// Open that allocated one is not reused. Only Open waits on the gate: frames
+// of existing streams, including a sender that waits for the agent's
+// credit, never do.
 func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, error) {
 	recv, err := datapath.NewReceiveWindow(c.limits.StreamBuffer)
 	if err != nil {
 		return nil, err
 	}
 	send, _ := datapath.NewSendWindow(0)
+	select {
+	case c.openGate <- struct{}{}:
+	case <-c.ctx.Done():
+		return nil, ErrConnClosed
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-c.openGate }()
 	c.mu.Lock()
 	select {
 	case <-c.ctx.Done():
@@ -293,7 +510,7 @@ func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, er
 		return nil, ErrConnClosed
 	default:
 	}
-	if len(c.streams) >= c.limits.MaxStreamsPerConn || c.perGrant[grantID] >= c.limits.MaxStreamsPerGrant {
+	if len(c.streams)+c.pendingFinals >= c.limits.MaxStreamsPerConn || c.perGrant[grantID] >= c.limits.MaxStreamsPerGrant {
 		c.mu.Unlock()
 		return nil, ErrTooManyStreams
 	}
@@ -303,6 +520,8 @@ func (c *Conn) Open(ctx context.Context, grantID, sandboxID string) (*Stream, er
 	c.perGrant[grantID]++
 	c.mu.Unlock()
 	if err := c.enqueue(ctx, datapath.MustNewFrame(s.ID, sandboxID, &ownsandv1.RelayStreamOpen{GrantId: grantID, InitialWindowBytes: recv.InitialWindow()})); err != nil {
+		// The agent never saw the stream open frame, so no stream close
+		// frame is sent; the stream_id stays used.
 		s.Close(false)
 		return nil, err
 	}
@@ -333,17 +552,33 @@ func (s *Stream) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	return s.conn.enqueue(ctx, f)
 }
 
-func (s *Stream) push(f *ownsandv1.DataFrame) {
+// push queues a frame from the agent. Frames that consume credit are bounded
+// by the receive window. Frames that carry no credit bypass it, so push
+// bounds them by count and by bytes and returns ErrControlFlood beyond a
+// limit; dispatch then closes the connection, like a window violation. A
+// compliant agent sends one request accepted frame and one terminal frame
+// per stream, which never reaches the limits even when the handler is slow.
+func (s *Stream) push(f *ownsandv1.DataFrame) error {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
-		return
+		return nil
+	}
+	if !datapath.ConsumesCredit(f.GetKind()) {
+		size := int64(datapath.EncodedSize(f))
+		if s.controlFrames+1 > s.conn.limits.MaxQueuedControlFrames || s.controlBytes+size > s.conn.limits.MaxQueuedControlBytes {
+			s.mu.Unlock()
+			return ErrControlFlood
+		}
+		s.controlFrames++
+		s.controlBytes += size
 	}
 	s.queue = append(s.queue, f)
 	ch := s.notify
 	s.notify = make(chan struct{})
 	s.mu.Unlock()
 	close(ch)
+	return nil
 }
 
 func (s *Stream) fail(err error) {
@@ -367,6 +602,10 @@ func (s *Stream) Next(ctx context.Context, wake <-chan time.Time) (*ownsandv1.Da
 			f := s.queue[0]
 			s.queue[0] = nil
 			s.queue = s.queue[1:]
+			if !datapath.ConsumesCredit(f.GetKind()) {
+				s.controlFrames--
+				s.controlBytes -= int64(datapath.EncodedSize(f))
+			}
 			s.mu.Unlock()
 			return f, nil
 		}
@@ -404,6 +643,22 @@ func (s *Stream) Consumed(ctx context.Context, f *ownsandv1.DataFrame) {
 // stream close frame, which the control plane does whenever an RPC ends
 // for a reason other than an agent session-end or error frame.
 func (s *Stream) Close(sendClose bool) {
+	var final *ownsandv1.DataFrame
+	if sendClose {
+		final = datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayStreamClose{})
+	}
+	s.closeWith(final)
+}
+
+// closeWith removes the stream from its connection like Close and enqueues
+// final, when not nil, as the last frame of the stream. The enqueue never
+// blocks, because the callers include the receive loop, and never drops the
+// frame: the stream reserved a place for it when Open admitted it. The stream
+// keeps its connection and grant admission slots until the writer is done with
+// final, so the pending finals stay bounded by MaxStreamsPerConn. A closed
+// connection ends the stream on the agent too, so then no frame is queued. A
+// stream that already closed sends nothing.
+func (s *Stream) closeWith(final *ownsandv1.DataFrame) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -411,23 +666,34 @@ func (s *Stream) Close(sendClose bool) {
 	}
 	s.closed = true
 	s.queue = nil
+	s.controlFrames, s.controlBytes = 0, 0
 	s.mu.Unlock()
 	c := s.conn
 	c.mu.Lock()
 	if c.streams[s.ID] == s {
 		delete(c.streams, s.ID)
 	}
+	if final != nil && c.ctx.Err() == nil {
+		// Keep the admission slots, and with them the reserved place.
+		c.pendingFinals++
+		select {
+		case c.out <- outFrame{frame: final, final: true, grantID: s.GrantID}:
+			c.mu.Unlock()
+			return
+		default:
+			// Unreachable while the admission invariant holds: log it and
+			// release the slots instead of leaking them.
+			c.releaseFinalLocked(s.GrantID)
+			c.mu.Unlock()
+			slog.Error("relay final frame dropped: the outbound queue has no reserved place",
+				slog.String("device_id", c.DeviceID), slog.Uint64("stream_id", s.ID), slog.String("grant_id", s.GrantID))
+			return
+		}
+	}
 	if c.perGrant[s.GrantID]--; c.perGrant[s.GrantID] <= 0 {
 		delete(c.perGrant, s.GrantID)
 	}
 	c.mu.Unlock()
-	if sendClose {
-		// Best effort: a closed connection ends the stream on the agent too.
-		select {
-		case c.out <- datapath.MustNewFrame(s.ID, s.SandboxID, &ownsandv1.RelayStreamClose{}):
-		default:
-		}
-	}
 }
 
 // Registry maps devices to their current relay connection.
@@ -443,9 +709,18 @@ func NewRegistry() *Registry {
 }
 
 // Register makes c the device's connection and closes an older one, whose
-// RPCs end with unavailable.
-func (r *Registry) Register(c *Conn) {
+// RPCs end with unavailable. current reports whether the agent channel that c
+// is bound to is still the device's current channel; it runs under the
+// registry lock, so a stale channel cannot replace a newer connection between
+// the caller's channel lookup and the swap. When it returns false, Register
+// changes nothing and returns ErrStaleChannel. current must not call back
+// into the registry. A nil current accepts every connection.
+func (r *Registry) Register(c *Conn, current func() bool) error {
 	r.mu.Lock()
+	if current != nil && !current() {
+		r.mu.Unlock()
+		return ErrStaleChannel
+	}
 	old := r.conns[c.DeviceID]
 	r.conns[c.DeviceID] = c
 	ch := r.changed
@@ -455,6 +730,7 @@ func (r *Registry) Register(c *Conn) {
 	if old != nil {
 		old.Close(ErrReplaced)
 	}
+	return nil
 }
 
 // Unregister removes c when it is still current.

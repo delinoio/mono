@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Command ownsand-agent is the OwnSand device agent. See
 // docs/cmds-ownsand-agent-foundation.md.
@@ -112,7 +112,17 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.IntVar(&ib.cpus, "cpus", 0, "vCPUs of the build VM (image build)")
 	fs.Int64Var(&ib.memoryMiB, "memory-mib", 0, "memory of the build VM in MiB (image build)")
 	fs.StringVar(&ib.guestBinary, "guest-binary", "", "guest helper executable for the guest OS (image build)")
+	// Hidden flag (not in the usage text): the launchd daemon definition
+	// passes it so that `run` maps its exit codes to the launchd KeepAlive
+	// predicate. See service.LaunchdExitCode.
+	manager := fs.String(strings.TrimPrefix(service.ManagerFlag, "--"), "", "service manager that starts run (launchd)")
 	if err := fs.Parse(rest); err != nil {
+		return exitUsage
+	}
+	switch service.Manager(*manager) {
+	case "", service.ManagerLaunchd:
+	default:
+		fmt.Fprintf(stderr, "ownsand-agent: unknown service manager %q\n", *manager)
 		return exitUsage
 	}
 	c := colors{on: !*noColor && os.Getenv("NO_COLOR") == ""}
@@ -123,6 +133,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "enroll":
 		return enroll(cfg, *apiURL, *tokenFile, *name, stdin, stdout, stderr, c)
 	case "run":
+		if service.Manager(*manager) == service.ManagerLaunchd {
+			return runLaunchd(cfg)
+		}
 		return runService(cfg)
 	case "status":
 		return status(cfg, stdout, stderr, c)
@@ -193,21 +206,29 @@ func enroll(cfg config.Config, apiURL, tokenFile, name string, stdin io.Reader, 
 
 // runAgent runs the agent until ctx ends and returns the exit code.
 func runAgent(ctx context.Context, cfg config.Config) int {
+	code, _ := runAgentOutcome(ctx, cfg)
+	return code
+}
+
+// runAgentOutcome runs the agent until ctx ends and returns the exit code
+// and whether the agent installed an update and stops so that the service
+// manager starts the new executable.
+func runAgentOutcome(ctx context.Context, cfg config.Config) (code int, updated bool) {
 	logger := newLogger(cfg)
 	st, err := store.Open(cfg.StateDir)
 	if err != nil {
 		logger.Error("open state directory failed", "error", err)
-		return exitError
+		return exitError, false
 	}
 	id, err := st.LoadIdentity()
 	if err != nil || id.DeviceID == "" {
 		logger.Error("the device is not enrolled; run `ownsand-agent enroll`")
-		return exitNotEnrolled
+		return exitNotEnrolled, false
 	}
 	agentState, err := st.LoadAgent()
 	if err != nil {
 		logger.Error("read agent state failed", "error", err)
-		return exitError
+		return exitError, false
 	}
 	apiURL := agentState.APIURL
 	if cfg.APIURLOverride != "" {
@@ -216,12 +237,12 @@ func runAgent(ctx context.Context, cfg config.Config) int {
 	cp, err := cpclient.New(apiURL, nil)
 	if err != nil {
 		logger.Error("control plane client failed", "error", err)
-		return exitError
+		return exitError, false
 	}
 	rt, err := runtimes.New(cfg, st, logger)
 	if err != nil {
 		logger.Error("sandbox runtime unavailable", "runtime", cfg.Runtime.String(), "error", err)
-		return exitError
+		return exitError, false
 	}
 	exe, _ := os.Executable()
 	a, err := agent.New(ctx, agent.Options{
@@ -238,17 +259,19 @@ func runAgent(ctx context.Context, cfg config.Config) int {
 	if err != nil {
 		rt.Close()
 		logger.Error("agent start failed", "error", err)
-		return exitError
+		return exitError, false
 	}
 	logger.Info("agent starting", "agent_version", version.Version, "device_id", id.DeviceID, "runtime", cfg.Runtime.String())
 	switch err := a.Run(ctx); {
 	case errors.Is(err, agent.ErrRemoved):
-		return exitNotEnrolled
-	case errors.Is(err, agent.ErrRestart), err == nil:
-		return exitOK
+		return exitNotEnrolled, false
+	case errors.Is(err, agent.ErrRestart):
+		return exitOK, true
+	case err == nil:
+		return exitOK, false
 	default:
 		logger.Error("agent stopped", "error", err)
-		return exitError
+		return exitError, false
 	}
 }
 
@@ -256,6 +279,20 @@ func runInteractive(cfg config.Config) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	return runAgent(ctx, cfg)
+}
+
+// runLaunchd runs the agent under the launchd daemon definition and maps the
+// exit code to the launchd KeepAlive predicate (SuccessfulExit=false): an
+// installed update exits nonzero so that launchd starts the new executable,
+// and a missing enrollment or a finished removal exits 0 so that launchd does
+// not restart the agent.
+func runLaunchd(cfg config.Config) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	code, updated := runAgentOutcome(ctx, cfg)
+	mapped := service.LaunchdExitCode(code, updated)
+	newLogger(cfg).Info("agent exits under launchd", "exit_code", code, "update_installed", updated, "launchd_exit_code", mapped)
+	return mapped
 }
 
 func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
@@ -316,15 +353,21 @@ func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
+	// A failed host clean-up does not stop the deletion of the local data, so
+	// that one reset removes everything that it can; it still makes the reset
+	// fail, and running reset again deletes the remaining host resources.
+	code := exitOK
 	if err := resetHost(cfg, st); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: reset host resources:", err)
+		fmt.Fprintln(stderr, "ownsand-agent: run reset again, as an operator with CAP_NET_ADMIN, to delete the remaining host resources")
+		code = exitError
 	}
 	if err := st.Reset(); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
 	fmt.Fprintln(stdout, "Local agent data deleted from", filepath.Clean(cfg.StateDir))
-	return exitOK
+	return code
 }
 
 func servicePrint(stdout, stderr io.Writer) int {

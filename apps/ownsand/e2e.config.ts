@@ -15,12 +15,20 @@ export default {
         url: "http://127.0.0.1:0",
         command: {
           executable: "rsbuild",
-          args: ["dev", "--host", "127.0.0.1", "--port", "{port}"],
+          // `--no-env` stops Rsbuild from loading `.env` and `.env.local` from the
+          // app root, so a developer's local values (for example an invalid
+          // `PUBLIC_API_ORIGIN`) cannot break the suite.
+          args: ["dev", "--no-env", "--host", "127.0.0.1", "--port", "{port}"],
           // The runner passes only PATH, HOME and temporary-directory
           // variables to the app command. The suite runs against the
           // in-browser fake API with a fake signed-in user, because it has no
           // control plane and no Logto tenant.
-          env: { PUBLIC_OWNSAND_MOCK_API: "true" },
+          //
+          // The value is deliberately padded with spaces. The build must
+          // trim it so the mock sign-in and the mock transport agree; if the
+          // trimming in rsbuild.config.ts is reverted, sign-in succeeds but
+          // the console calls the real API and the seeded data never loads.
+          env: { PUBLIC_OWNSAND_MOCK_API: " true " },
           log: ".e2e/logs/app.log",
         },
       },

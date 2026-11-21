@@ -265,6 +265,22 @@ message DeviceLimits {
   int32 vcpu_overcommit_percent = 4;
 }
 
+// Device limits of a ReplaceDeviceLimits request. Every field has explicit
+// presence, so the server tells an omitted value from an explicit zero. The
+// server rejects a request that leaves a field unset with `invalid_argument`
+// that names the field. This message is only a request; responses and the
+// agent configuration use DeviceLimits. See the device limits section of the
+// protos contract.
+message DeviceLimitsInput {
+  // Upper limit of vCPUs of all sandboxes on the device, before overcommit.
+  // Zero makes the device ineligible for new sandboxes.
+  optional int32 vcpu_count = 1;
+  optional int64 memory_mib = 2;
+  optional int64 disk_gib = 3;
+  // 100 to 400 in steps of 25.
+  optional int32 vcpu_overcommit_percent = 4;
+}
+
 // Error detail of a frame or an agent channel result. The message never
 // contains secrets or sandbox content.
 message ErrorDetail {

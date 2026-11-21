@@ -305,14 +305,20 @@ func (x *DeviceCapabilities) GetHypervisorChecks() []*HypervisorCheck {
 
 // Resources that the sandboxes of a device use together.
 type DeviceAllocation struct {
-	state     protoimpl.MessageState `protogen:"open.v1"`
-	VcpuCount int32                  `protobuf:"varint,1,opt,name=vcpu_count,json=vcpuCount,proto3" json:"vcpu_count,omitempty"`
-	MemoryMib int64                  `protobuf:"varint,2,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
-	DiskGib   int64                  `protobuf:"varint,3,opt,name=disk_gib,json=diskGib,proto3" json:"disk_gib,omitempty"`
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// The allocated vCPUs. It is exact when the value fits in 32 bits and
+	// 2147483647 for a larger value; vcpu_total_count carries the exact value.
+	VcpuCount int32 `protobuf:"varint,1,opt,name=vcpu_count,json=vcpuCount,proto3" json:"vcpu_count,omitempty"`
+	MemoryMib int64 `protobuf:"varint,2,opt,name=memory_mib,json=memoryMib,proto3" json:"memory_mib,omitempty"`
+	DiskGib   int64 `protobuf:"varint,3,opt,name=disk_gib,json=diskGib,proto3" json:"disk_gib,omitempty"`
 	// macOS guests in CREATING, RUNNING, PAUSED or DELETING state.
 	MacosGuestCount int32 `protobuf:"varint,4,opt,name=macos_guest_count,json=macosGuestCount,proto3" json:"macos_guest_count,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// The exact allocated vCPUs, which the scheduler uses for placement. The
+	// server always sets it; it is absent when an older server sent the
+	// message, and a client then reads vcpu_count.
+	VcpuTotalCount *int64 `protobuf:"varint,5,opt,name=vcpu_total_count,json=vcpuTotalCount,proto3,oneof" json:"vcpu_total_count,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *DeviceAllocation) Reset() {
@@ -373,6 +379,13 @@ func (x *DeviceAllocation) GetMacosGuestCount() int32 {
 	return 0
 }
 
+func (x *DeviceAllocation) GetVcpuTotalCount() int64 {
+	if x != nil && x.VcpuTotalCount != nil {
+		return *x.VcpuTotalCount
+	}
+	return 0
+}
+
 type Device struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	DeviceId       string                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
@@ -386,15 +399,22 @@ type Device struct {
 	UpdateState  AgentUpdateState    `protobuf:"varint,8,opt,name=update_state,json=updateState,proto3,enum=delino.ownsand.v1.AgentUpdateState" json:"update_state,omitempty"`
 	Capabilities *DeviceCapabilities `protobuf:"bytes,9,opt,name=capabilities,proto3" json:"capabilities,omitempty"`
 	Limits       *DeviceLimits       `protobuf:"bytes,10,opt,name=limits,proto3" json:"limits,omitempty"`
-	// floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100).
+	// floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100), capped at
+	// 2147483647 (the largest int32 value). Kept for v1 compatibility with
+	// clients that read this field; effective_vcpu_limit_count carries the exact
+	// value.
 	EffectiveVcpuLimit int32                  `protobuf:"varint,11,opt,name=effective_vcpu_limit,json=effectiveVcpuLimit,proto3" json:"effective_vcpu_limit,omitempty"`
 	Allocation         *DeviceAllocation      `protobuf:"bytes,12,opt,name=allocation,proto3" json:"allocation,omitempty"`
 	CreateTime         *timestamppb.Timestamp `protobuf:"bytes,13,opt,name=create_time,json=createTime,proto3" json:"create_time,omitempty"`
 	LastSeenTime       *timestamppb.Timestamp `protobuf:"bytes,14,opt,name=last_seen_time,json=lastSeenTime,proto3" json:"last_seen_time,omitempty"`
 	// Time of the first PENDING_IDLE report of the current update, if any.
 	PendingIdleSince *timestamppb.Timestamp `protobuf:"bytes,15,opt,name=pending_idle_since,json=pendingIdleSince,proto3" json:"pending_idle_since,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
+	// that the scheduler uses for placement. It is 0 for a device with zero
+	// limits.
+	EffectiveVcpuLimitCount int64 `protobuf:"varint,16,opt,name=effective_vcpu_limit_count,json=effectiveVcpuLimitCount,proto3" json:"effective_vcpu_limit_count,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Device) Reset() {
@@ -530,6 +550,13 @@ func (x *Device) GetPendingIdleSince() *timestamppb.Timestamp {
 		return x.PendingIdleSince
 	}
 	return nil
+}
+
+func (x *Device) GetEffectiveVcpuLimitCount() int64 {
+	if x != nil {
+		return x.EffectiveVcpuLimitCount
+	}
+	return 0
 }
 
 type CreateEnrollmentTokenRequest struct {
@@ -1064,11 +1091,13 @@ func (x *GetDeviceResponse) GetDevice() *Device {
 	return nil
 }
 
+// Legacy request of UpdateDeviceLimits. Use ReplaceDeviceLimitsRequest,
+// which distinguishes an omitted value from zero.
 type UpdateDeviceLimitsRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
 	DeviceId       string                 `protobuf:"bytes,2,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
-	// Every value is required.
+	// Every value is required, but a missing value cannot be told from zero.
 	Limits        *DeviceLimits `protobuf:"bytes,3,opt,name=limits,proto3" json:"limits,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -1169,6 +1198,111 @@ func (x *UpdateDeviceLimitsResponse) GetDevice() *Device {
 	return nil
 }
 
+type ReplaceDeviceLimitsRequest struct {
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
+	DeviceId       string                 `protobuf:"bytes,2,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	// Every value must be present.
+	Limits        *DeviceLimitsInput `protobuf:"bytes,3,opt,name=limits,proto3" json:"limits,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplaceDeviceLimitsRequest) Reset() {
+	*x = ReplaceDeviceLimitsRequest{}
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplaceDeviceLimitsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplaceDeviceLimitsRequest) ProtoMessage() {}
+
+func (x *ReplaceDeviceLimitsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplaceDeviceLimitsRequest.ProtoReflect.Descriptor instead.
+func (*ReplaceDeviceLimitsRequest) Descriptor() ([]byte, []int) {
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *ReplaceDeviceLimitsRequest) GetOrganizationId() string {
+	if x != nil {
+		return x.OrganizationId
+	}
+	return ""
+}
+
+func (x *ReplaceDeviceLimitsRequest) GetDeviceId() string {
+	if x != nil {
+		return x.DeviceId
+	}
+	return ""
+}
+
+func (x *ReplaceDeviceLimitsRequest) GetLimits() *DeviceLimitsInput {
+	if x != nil {
+		return x.Limits
+	}
+	return nil
+}
+
+type ReplaceDeviceLimitsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Device        *Device                `protobuf:"bytes,1,opt,name=device,proto3" json:"device,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplaceDeviceLimitsResponse) Reset() {
+	*x = ReplaceDeviceLimitsResponse{}
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplaceDeviceLimitsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplaceDeviceLimitsResponse) ProtoMessage() {}
+
+func (x *ReplaceDeviceLimitsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplaceDeviceLimitsResponse.ProtoReflect.Descriptor instead.
+func (*ReplaceDeviceLimitsResponse) Descriptor() ([]byte, []int) {
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *ReplaceDeviceLimitsResponse) GetDevice() *Device {
+	if x != nil {
+		return x.Device
+	}
+	return nil
+}
+
 type RemoveDeviceRequest struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	OrganizationId string                 `protobuf:"bytes,1,opt,name=organization_id,json=organizationId,proto3" json:"organization_id,omitempty"`
@@ -1179,7 +1313,7 @@ type RemoveDeviceRequest struct {
 
 func (x *RemoveDeviceRequest) Reset() {
 	*x = RemoveDeviceRequest{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[17]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1191,7 +1325,7 @@ func (x *RemoveDeviceRequest) String() string {
 func (*RemoveDeviceRequest) ProtoMessage() {}
 
 func (x *RemoveDeviceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[17]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1204,7 +1338,7 @@ func (x *RemoveDeviceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveDeviceRequest.ProtoReflect.Descriptor instead.
 func (*RemoveDeviceRequest) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{17}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *RemoveDeviceRequest) GetOrganizationId() string {
@@ -1230,7 +1364,7 @@ type RemoveDeviceResponse struct {
 
 func (x *RemoveDeviceResponse) Reset() {
 	*x = RemoveDeviceResponse{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[18]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1242,7 +1376,7 @@ func (x *RemoveDeviceResponse) String() string {
 func (*RemoveDeviceResponse) ProtoMessage() {}
 
 func (x *RemoveDeviceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[18]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1255,7 +1389,7 @@ func (x *RemoveDeviceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RemoveDeviceResponse.ProtoReflect.Descriptor instead.
 func (*RemoveDeviceResponse) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{18}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *RemoveDeviceResponse) GetDevice() *Device {
@@ -1279,7 +1413,7 @@ type AgentVersionPolicy struct {
 
 func (x *AgentVersionPolicy) Reset() {
 	*x = AgentVersionPolicy{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[19]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1291,7 +1425,7 @@ func (x *AgentVersionPolicy) String() string {
 func (*AgentVersionPolicy) ProtoMessage() {}
 
 func (x *AgentVersionPolicy) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[19]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1304,7 +1438,7 @@ func (x *AgentVersionPolicy) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AgentVersionPolicy.ProtoReflect.Descriptor instead.
 func (*AgentVersionPolicy) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{19}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *AgentVersionPolicy) GetOrganizationId() string {
@@ -1351,7 +1485,7 @@ type GetAgentVersionPolicyRequest struct {
 
 func (x *GetAgentVersionPolicyRequest) Reset() {
 	*x = GetAgentVersionPolicyRequest{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[20]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1363,7 +1497,7 @@ func (x *GetAgentVersionPolicyRequest) String() string {
 func (*GetAgentVersionPolicyRequest) ProtoMessage() {}
 
 func (x *GetAgentVersionPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[20]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1376,7 +1510,7 @@ func (x *GetAgentVersionPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAgentVersionPolicyRequest.ProtoReflect.Descriptor instead.
 func (*GetAgentVersionPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{20}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *GetAgentVersionPolicyRequest) GetOrganizationId() string {
@@ -1395,7 +1529,7 @@ type GetAgentVersionPolicyResponse struct {
 
 func (x *GetAgentVersionPolicyResponse) Reset() {
 	*x = GetAgentVersionPolicyResponse{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[21]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1407,7 +1541,7 @@ func (x *GetAgentVersionPolicyResponse) String() string {
 func (*GetAgentVersionPolicyResponse) ProtoMessage() {}
 
 func (x *GetAgentVersionPolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[21]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1420,7 +1554,7 @@ func (x *GetAgentVersionPolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAgentVersionPolicyResponse.ProtoReflect.Descriptor instead.
 func (*GetAgentVersionPolicyResponse) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{21}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *GetAgentVersionPolicyResponse) GetPolicy() *AgentVersionPolicy {
@@ -1443,7 +1577,7 @@ type UpdateAgentVersionPolicyRequest struct {
 
 func (x *UpdateAgentVersionPolicyRequest) Reset() {
 	*x = UpdateAgentVersionPolicyRequest{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[22]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1455,7 +1589,7 @@ func (x *UpdateAgentVersionPolicyRequest) String() string {
 func (*UpdateAgentVersionPolicyRequest) ProtoMessage() {}
 
 func (x *UpdateAgentVersionPolicyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[22]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1468,7 +1602,7 @@ func (x *UpdateAgentVersionPolicyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateAgentVersionPolicyRequest.ProtoReflect.Descriptor instead.
 func (*UpdateAgentVersionPolicyRequest) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{22}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *UpdateAgentVersionPolicyRequest) GetOrganizationId() string {
@@ -1501,7 +1635,7 @@ type UpdateAgentVersionPolicyResponse struct {
 
 func (x *UpdateAgentVersionPolicyResponse) Reset() {
 	*x = UpdateAgentVersionPolicyResponse{}
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[23]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1513,7 +1647,7 @@ func (x *UpdateAgentVersionPolicyResponse) String() string {
 func (*UpdateAgentVersionPolicyResponse) ProtoMessage() {}
 
 func (x *UpdateAgentVersionPolicyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_device_proto_msgTypes[23]
+	mi := &file_delino_ownsand_v1_device_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1526,7 +1660,7 @@ func (x *UpdateAgentVersionPolicyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use UpdateAgentVersionPolicyResponse.ProtoReflect.Descriptor instead.
 func (*UpdateAgentVersionPolicyResponse) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{23}
+	return file_delino_ownsand_v1_device_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *UpdateAgentVersionPolicyResponse) GetPolicy() *AgentVersionPolicy {
@@ -1568,14 +1702,16 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\x11built_base_images\x18\x05 \x03(\x0e2\x1c.delino.ownsand.v1.BaseImageR\x0fbuiltBaseImages\x124\n" +
 	"\x16macos_guests_supported\x18\x06 \x01(\bR\x14macosGuestsSupported\x122\n" +
 	"\x15macos_hardware_models\x18\a \x03(\fR\x13macosHardwareModels\x12O\n" +
-	"\x11hypervisor_checks\x18\b \x03(\v2\".delino.ownsand.v1.HypervisorCheckR\x10hypervisorChecks\"\x97\x01\n" +
+	"\x11hypervisor_checks\x18\b \x03(\v2\".delino.ownsand.v1.HypervisorCheckR\x10hypervisorChecks\"\xdb\x01\n" +
 	"\x10DeviceAllocation\x12\x1d\n" +
 	"\n" +
 	"vcpu_count\x18\x01 \x01(\x05R\tvcpuCount\x12\x1d\n" +
 	"\n" +
 	"memory_mib\x18\x02 \x01(\x03R\tmemoryMib\x12\x19\n" +
 	"\bdisk_gib\x18\x03 \x01(\x03R\adiskGib\x12*\n" +
-	"\x11macos_guest_count\x18\x04 \x01(\x05R\x0fmacosGuestCount\"\xaa\x06\n" +
+	"\x11macos_guest_count\x18\x04 \x01(\x05R\x0fmacosGuestCount\x12-\n" +
+	"\x10vcpu_total_count\x18\x05 \x01(\x03H\x00R\x0evcpuTotalCount\x88\x01\x01B\x13\n" +
+	"\x11_vcpu_total_count\"\xe7\x06\n" +
 	"\x06Device\x12\x1b\n" +
 	"\tdevice_id\x18\x01 \x01(\tR\bdeviceId\x12'\n" +
 	"\x0forganization_id\x18\x02 \x01(\tR\x0eorganizationId\x12\x12\n" +
@@ -1595,7 +1731,8 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\vcreate_time\x18\r \x01(\v2\x1a.google.protobuf.TimestampR\n" +
 	"createTime\x12@\n" +
 	"\x0elast_seen_time\x18\x0e \x01(\v2\x1a.google.protobuf.TimestampR\flastSeenTime\x12H\n" +
-	"\x12pending_idle_since\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x10pendingIdleSince\"t\n" +
+	"\x12pending_idle_since\x18\x0f \x01(\v2\x1a.google.protobuf.TimestampR\x10pendingIdleSince\x12;\n" +
+	"\x1aeffective_vcpu_limit_count\x18\x10 \x01(\x03R\x17effectiveVcpuLimitCount\"t\n" +
 	"\x1cCreateEnrollmentTokenRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12+\n" +
 	"\x03ttl\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x03ttl\"\x84\x01\n" +
@@ -1635,6 +1772,12 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\tdevice_id\x18\x02 \x01(\tR\bdeviceId\x127\n" +
 	"\x06limits\x18\x03 \x01(\v2\x1f.delino.ownsand.v1.DeviceLimitsR\x06limits\"O\n" +
 	"\x1aUpdateDeviceLimitsResponse\x121\n" +
+	"\x06device\x18\x01 \x01(\v2\x19.delino.ownsand.v1.DeviceR\x06device\"\xa0\x01\n" +
+	"\x1aReplaceDeviceLimitsRequest\x12'\n" +
+	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12\x1b\n" +
+	"\tdevice_id\x18\x02 \x01(\tR\bdeviceId\x12<\n" +
+	"\x06limits\x18\x03 \x01(\v2$.delino.ownsand.v1.DeviceLimitsInputR\x06limits\"P\n" +
+	"\x1bReplaceDeviceLimitsResponse\x121\n" +
 	"\x06device\x18\x01 \x01(\v2\x19.delino.ownsand.v1.DeviceR\x06device\"[\n" +
 	"\x13RemoveDeviceRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x12\x1b\n" +
@@ -1658,14 +1801,15 @@ const file_delino_ownsand_v1_device_proto_rawDesc = "" +
 	"\x04mode\x18\x02 \x01(\x0e2).delino.ownsand.v1.AgentVersionPolicyModeR\x04mode\x12%\n" +
 	"\x0epinned_version\x18\x03 \x01(\tR\rpinnedVersion\"a\n" +
 	" UpdateAgentVersionPolicyResponse\x12=\n" +
-	"\x06policy\x18\x01 \x01(\v2%.delino.ownsand.v1.AgentVersionPolicyR\x06policy2\x8c\b\n" +
+	"\x06policy\x18\x01 \x01(\v2%.delino.ownsand.v1.AgentVersionPolicyR\x06policy2\x82\t\n" +
 	"\rDeviceService\x12z\n" +
 	"\x15CreateEnrollmentToken\x12/.delino.ownsand.v1.CreateEnrollmentTokenRequest\x1a0.delino.ownsand.v1.CreateEnrollmentTokenResponse\x12w\n" +
 	"\x14ListEnrollmentTokens\x12..delino.ownsand.v1.ListEnrollmentTokensRequest\x1a/.delino.ownsand.v1.ListEnrollmentTokensResponse\x12z\n" +
 	"\x15RevokeEnrollmentToken\x12/.delino.ownsand.v1.RevokeEnrollmentTokenRequest\x1a0.delino.ownsand.v1.RevokeEnrollmentTokenResponse\x12\\\n" +
 	"\vListDevices\x12%.delino.ownsand.v1.ListDevicesRequest\x1a&.delino.ownsand.v1.ListDevicesResponse\x12V\n" +
 	"\tGetDevice\x12#.delino.ownsand.v1.GetDeviceRequest\x1a$.delino.ownsand.v1.GetDeviceResponse\x12q\n" +
-	"\x12UpdateDeviceLimits\x12,.delino.ownsand.v1.UpdateDeviceLimitsRequest\x1a-.delino.ownsand.v1.UpdateDeviceLimitsResponse\x12_\n" +
+	"\x12UpdateDeviceLimits\x12,.delino.ownsand.v1.UpdateDeviceLimitsRequest\x1a-.delino.ownsand.v1.UpdateDeviceLimitsResponse\x12t\n" +
+	"\x13ReplaceDeviceLimits\x12-.delino.ownsand.v1.ReplaceDeviceLimitsRequest\x1a..delino.ownsand.v1.ReplaceDeviceLimitsResponse\x12_\n" +
 	"\fRemoveDevice\x12&.delino.ownsand.v1.RemoveDeviceRequest\x1a'.delino.ownsand.v1.RemoveDeviceResponse\x12z\n" +
 	"\x15GetAgentVersionPolicy\x12/.delino.ownsand.v1.GetAgentVersionPolicyRequest\x1a0.delino.ownsand.v1.GetAgentVersionPolicyResponse\x12\x83\x01\n" +
 	"\x18UpdateAgentVersionPolicy\x122.delino.ownsand.v1.UpdateAgentVersionPolicyRequest\x1a3.delino.ownsand.v1.UpdateAgentVersionPolicyResponseB=Z;github.com/delinoio/mono/protos/delino/ownsand/v1;ownsandv1b\x06proto3"
@@ -1682,7 +1826,7 @@ func file_delino_ownsand_v1_device_proto_rawDescGZIP() []byte {
 	return file_delino_ownsand_v1_device_proto_rawDescData
 }
 
-var file_delino_ownsand_v1_device_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
+var file_delino_ownsand_v1_device_proto_msgTypes = make([]protoimpl.MessageInfo, 26)
 var file_delino_ownsand_v1_device_proto_goTypes = []any{
 	(*EnrollmentToken)(nil),                  // 0: delino.ownsand.v1.EnrollmentToken
 	(*HypervisorCheck)(nil),                  // 1: delino.ownsand.v1.HypervisorCheck
@@ -1701,84 +1845,91 @@ var file_delino_ownsand_v1_device_proto_goTypes = []any{
 	(*GetDeviceResponse)(nil),                // 14: delino.ownsand.v1.GetDeviceResponse
 	(*UpdateDeviceLimitsRequest)(nil),        // 15: delino.ownsand.v1.UpdateDeviceLimitsRequest
 	(*UpdateDeviceLimitsResponse)(nil),       // 16: delino.ownsand.v1.UpdateDeviceLimitsResponse
-	(*RemoveDeviceRequest)(nil),              // 17: delino.ownsand.v1.RemoveDeviceRequest
-	(*RemoveDeviceResponse)(nil),             // 18: delino.ownsand.v1.RemoveDeviceResponse
-	(*AgentVersionPolicy)(nil),               // 19: delino.ownsand.v1.AgentVersionPolicy
-	(*GetAgentVersionPolicyRequest)(nil),     // 20: delino.ownsand.v1.GetAgentVersionPolicyRequest
-	(*GetAgentVersionPolicyResponse)(nil),    // 21: delino.ownsand.v1.GetAgentVersionPolicyResponse
-	(*UpdateAgentVersionPolicyRequest)(nil),  // 22: delino.ownsand.v1.UpdateAgentVersionPolicyRequest
-	(*UpdateAgentVersionPolicyResponse)(nil), // 23: delino.ownsand.v1.UpdateAgentVersionPolicyResponse
-	(EnrollmentTokenState)(0),                // 24: delino.ownsand.v1.EnrollmentTokenState
-	(*Principal)(nil),                        // 25: delino.ownsand.v1.Principal
-	(*timestamppb.Timestamp)(nil),            // 26: google.protobuf.Timestamp
-	(GuestOs)(0),                             // 27: delino.ownsand.v1.GuestOs
-	(BaseImage)(0),                           // 28: delino.ownsand.v1.BaseImage
-	(DeviceState)(0),                         // 29: delino.ownsand.v1.DeviceState
-	(HostOs)(0),                              // 30: delino.ownsand.v1.HostOs
-	(Arch)(0),                                // 31: delino.ownsand.v1.Arch
-	(AgentUpdateState)(0),                    // 32: delino.ownsand.v1.AgentUpdateState
-	(*DeviceLimits)(nil),                     // 33: delino.ownsand.v1.DeviceLimits
-	(*durationpb.Duration)(nil),              // 34: google.protobuf.Duration
-	(AgentVersionPolicyMode)(0),              // 35: delino.ownsand.v1.AgentVersionPolicyMode
+	(*ReplaceDeviceLimitsRequest)(nil),       // 17: delino.ownsand.v1.ReplaceDeviceLimitsRequest
+	(*ReplaceDeviceLimitsResponse)(nil),      // 18: delino.ownsand.v1.ReplaceDeviceLimitsResponse
+	(*RemoveDeviceRequest)(nil),              // 19: delino.ownsand.v1.RemoveDeviceRequest
+	(*RemoveDeviceResponse)(nil),             // 20: delino.ownsand.v1.RemoveDeviceResponse
+	(*AgentVersionPolicy)(nil),               // 21: delino.ownsand.v1.AgentVersionPolicy
+	(*GetAgentVersionPolicyRequest)(nil),     // 22: delino.ownsand.v1.GetAgentVersionPolicyRequest
+	(*GetAgentVersionPolicyResponse)(nil),    // 23: delino.ownsand.v1.GetAgentVersionPolicyResponse
+	(*UpdateAgentVersionPolicyRequest)(nil),  // 24: delino.ownsand.v1.UpdateAgentVersionPolicyRequest
+	(*UpdateAgentVersionPolicyResponse)(nil), // 25: delino.ownsand.v1.UpdateAgentVersionPolicyResponse
+	(EnrollmentTokenState)(0),                // 26: delino.ownsand.v1.EnrollmentTokenState
+	(*Principal)(nil),                        // 27: delino.ownsand.v1.Principal
+	(*timestamppb.Timestamp)(nil),            // 28: google.protobuf.Timestamp
+	(GuestOs)(0),                             // 29: delino.ownsand.v1.GuestOs
+	(BaseImage)(0),                           // 30: delino.ownsand.v1.BaseImage
+	(DeviceState)(0),                         // 31: delino.ownsand.v1.DeviceState
+	(HostOs)(0),                              // 32: delino.ownsand.v1.HostOs
+	(Arch)(0),                                // 33: delino.ownsand.v1.Arch
+	(AgentUpdateState)(0),                    // 34: delino.ownsand.v1.AgentUpdateState
+	(*DeviceLimits)(nil),                     // 35: delino.ownsand.v1.DeviceLimits
+	(*durationpb.Duration)(nil),              // 36: google.protobuf.Duration
+	(*DeviceLimitsInput)(nil),                // 37: delino.ownsand.v1.DeviceLimitsInput
+	(AgentVersionPolicyMode)(0),              // 38: delino.ownsand.v1.AgentVersionPolicyMode
 }
 var file_delino_ownsand_v1_device_proto_depIdxs = []int32{
-	24, // 0: delino.ownsand.v1.EnrollmentToken.state:type_name -> delino.ownsand.v1.EnrollmentTokenState
-	25, // 1: delino.ownsand.v1.EnrollmentToken.created_by:type_name -> delino.ownsand.v1.Principal
-	26, // 2: delino.ownsand.v1.EnrollmentToken.create_time:type_name -> google.protobuf.Timestamp
-	26, // 3: delino.ownsand.v1.EnrollmentToken.expire_time:type_name -> google.protobuf.Timestamp
-	26, // 4: delino.ownsand.v1.EnrollmentToken.use_time:type_name -> google.protobuf.Timestamp
-	27, // 5: delino.ownsand.v1.DeviceCapabilities.guest_oses:type_name -> delino.ownsand.v1.GuestOs
-	28, // 6: delino.ownsand.v1.DeviceCapabilities.built_base_images:type_name -> delino.ownsand.v1.BaseImage
+	26, // 0: delino.ownsand.v1.EnrollmentToken.state:type_name -> delino.ownsand.v1.EnrollmentTokenState
+	27, // 1: delino.ownsand.v1.EnrollmentToken.created_by:type_name -> delino.ownsand.v1.Principal
+	28, // 2: delino.ownsand.v1.EnrollmentToken.create_time:type_name -> google.protobuf.Timestamp
+	28, // 3: delino.ownsand.v1.EnrollmentToken.expire_time:type_name -> google.protobuf.Timestamp
+	28, // 4: delino.ownsand.v1.EnrollmentToken.use_time:type_name -> google.protobuf.Timestamp
+	29, // 5: delino.ownsand.v1.DeviceCapabilities.guest_oses:type_name -> delino.ownsand.v1.GuestOs
+	30, // 6: delino.ownsand.v1.DeviceCapabilities.built_base_images:type_name -> delino.ownsand.v1.BaseImage
 	1,  // 7: delino.ownsand.v1.DeviceCapabilities.hypervisor_checks:type_name -> delino.ownsand.v1.HypervisorCheck
-	29, // 8: delino.ownsand.v1.Device.state:type_name -> delino.ownsand.v1.DeviceState
-	30, // 9: delino.ownsand.v1.Device.host_os:type_name -> delino.ownsand.v1.HostOs
-	31, // 10: delino.ownsand.v1.Device.arch:type_name -> delino.ownsand.v1.Arch
-	32, // 11: delino.ownsand.v1.Device.update_state:type_name -> delino.ownsand.v1.AgentUpdateState
+	31, // 8: delino.ownsand.v1.Device.state:type_name -> delino.ownsand.v1.DeviceState
+	32, // 9: delino.ownsand.v1.Device.host_os:type_name -> delino.ownsand.v1.HostOs
+	33, // 10: delino.ownsand.v1.Device.arch:type_name -> delino.ownsand.v1.Arch
+	34, // 11: delino.ownsand.v1.Device.update_state:type_name -> delino.ownsand.v1.AgentUpdateState
 	2,  // 12: delino.ownsand.v1.Device.capabilities:type_name -> delino.ownsand.v1.DeviceCapabilities
-	33, // 13: delino.ownsand.v1.Device.limits:type_name -> delino.ownsand.v1.DeviceLimits
+	35, // 13: delino.ownsand.v1.Device.limits:type_name -> delino.ownsand.v1.DeviceLimits
 	3,  // 14: delino.ownsand.v1.Device.allocation:type_name -> delino.ownsand.v1.DeviceAllocation
-	26, // 15: delino.ownsand.v1.Device.create_time:type_name -> google.protobuf.Timestamp
-	26, // 16: delino.ownsand.v1.Device.last_seen_time:type_name -> google.protobuf.Timestamp
-	26, // 17: delino.ownsand.v1.Device.pending_idle_since:type_name -> google.protobuf.Timestamp
-	34, // 18: delino.ownsand.v1.CreateEnrollmentTokenRequest.ttl:type_name -> google.protobuf.Duration
+	28, // 15: delino.ownsand.v1.Device.create_time:type_name -> google.protobuf.Timestamp
+	28, // 16: delino.ownsand.v1.Device.last_seen_time:type_name -> google.protobuf.Timestamp
+	28, // 17: delino.ownsand.v1.Device.pending_idle_since:type_name -> google.protobuf.Timestamp
+	36, // 18: delino.ownsand.v1.CreateEnrollmentTokenRequest.ttl:type_name -> google.protobuf.Duration
 	0,  // 19: delino.ownsand.v1.CreateEnrollmentTokenResponse.token:type_name -> delino.ownsand.v1.EnrollmentToken
 	0,  // 20: delino.ownsand.v1.ListEnrollmentTokensResponse.tokens:type_name -> delino.ownsand.v1.EnrollmentToken
 	0,  // 21: delino.ownsand.v1.RevokeEnrollmentTokenResponse.token:type_name -> delino.ownsand.v1.EnrollmentToken
-	29, // 22: delino.ownsand.v1.ListDevicesRequest.state:type_name -> delino.ownsand.v1.DeviceState
+	31, // 22: delino.ownsand.v1.ListDevicesRequest.state:type_name -> delino.ownsand.v1.DeviceState
 	4,  // 23: delino.ownsand.v1.ListDevicesResponse.devices:type_name -> delino.ownsand.v1.Device
 	4,  // 24: delino.ownsand.v1.GetDeviceResponse.device:type_name -> delino.ownsand.v1.Device
-	33, // 25: delino.ownsand.v1.UpdateDeviceLimitsRequest.limits:type_name -> delino.ownsand.v1.DeviceLimits
+	35, // 25: delino.ownsand.v1.UpdateDeviceLimitsRequest.limits:type_name -> delino.ownsand.v1.DeviceLimits
 	4,  // 26: delino.ownsand.v1.UpdateDeviceLimitsResponse.device:type_name -> delino.ownsand.v1.Device
-	4,  // 27: delino.ownsand.v1.RemoveDeviceResponse.device:type_name -> delino.ownsand.v1.Device
-	35, // 28: delino.ownsand.v1.AgentVersionPolicy.mode:type_name -> delino.ownsand.v1.AgentVersionPolicyMode
-	26, // 29: delino.ownsand.v1.AgentVersionPolicy.update_time:type_name -> google.protobuf.Timestamp
-	25, // 30: delino.ownsand.v1.AgentVersionPolicy.updated_by:type_name -> delino.ownsand.v1.Principal
-	19, // 31: delino.ownsand.v1.GetAgentVersionPolicyResponse.policy:type_name -> delino.ownsand.v1.AgentVersionPolicy
-	35, // 32: delino.ownsand.v1.UpdateAgentVersionPolicyRequest.mode:type_name -> delino.ownsand.v1.AgentVersionPolicyMode
-	19, // 33: delino.ownsand.v1.UpdateAgentVersionPolicyResponse.policy:type_name -> delino.ownsand.v1.AgentVersionPolicy
-	5,  // 34: delino.ownsand.v1.DeviceService.CreateEnrollmentToken:input_type -> delino.ownsand.v1.CreateEnrollmentTokenRequest
-	7,  // 35: delino.ownsand.v1.DeviceService.ListEnrollmentTokens:input_type -> delino.ownsand.v1.ListEnrollmentTokensRequest
-	9,  // 36: delino.ownsand.v1.DeviceService.RevokeEnrollmentToken:input_type -> delino.ownsand.v1.RevokeEnrollmentTokenRequest
-	11, // 37: delino.ownsand.v1.DeviceService.ListDevices:input_type -> delino.ownsand.v1.ListDevicesRequest
-	13, // 38: delino.ownsand.v1.DeviceService.GetDevice:input_type -> delino.ownsand.v1.GetDeviceRequest
-	15, // 39: delino.ownsand.v1.DeviceService.UpdateDeviceLimits:input_type -> delino.ownsand.v1.UpdateDeviceLimitsRequest
-	17, // 40: delino.ownsand.v1.DeviceService.RemoveDevice:input_type -> delino.ownsand.v1.RemoveDeviceRequest
-	20, // 41: delino.ownsand.v1.DeviceService.GetAgentVersionPolicy:input_type -> delino.ownsand.v1.GetAgentVersionPolicyRequest
-	22, // 42: delino.ownsand.v1.DeviceService.UpdateAgentVersionPolicy:input_type -> delino.ownsand.v1.UpdateAgentVersionPolicyRequest
-	6,  // 43: delino.ownsand.v1.DeviceService.CreateEnrollmentToken:output_type -> delino.ownsand.v1.CreateEnrollmentTokenResponse
-	8,  // 44: delino.ownsand.v1.DeviceService.ListEnrollmentTokens:output_type -> delino.ownsand.v1.ListEnrollmentTokensResponse
-	10, // 45: delino.ownsand.v1.DeviceService.RevokeEnrollmentToken:output_type -> delino.ownsand.v1.RevokeEnrollmentTokenResponse
-	12, // 46: delino.ownsand.v1.DeviceService.ListDevices:output_type -> delino.ownsand.v1.ListDevicesResponse
-	14, // 47: delino.ownsand.v1.DeviceService.GetDevice:output_type -> delino.ownsand.v1.GetDeviceResponse
-	16, // 48: delino.ownsand.v1.DeviceService.UpdateDeviceLimits:output_type -> delino.ownsand.v1.UpdateDeviceLimitsResponse
-	18, // 49: delino.ownsand.v1.DeviceService.RemoveDevice:output_type -> delino.ownsand.v1.RemoveDeviceResponse
-	21, // 50: delino.ownsand.v1.DeviceService.GetAgentVersionPolicy:output_type -> delino.ownsand.v1.GetAgentVersionPolicyResponse
-	23, // 51: delino.ownsand.v1.DeviceService.UpdateAgentVersionPolicy:output_type -> delino.ownsand.v1.UpdateAgentVersionPolicyResponse
-	43, // [43:52] is the sub-list for method output_type
-	34, // [34:43] is the sub-list for method input_type
-	34, // [34:34] is the sub-list for extension type_name
-	34, // [34:34] is the sub-list for extension extendee
-	0,  // [0:34] is the sub-list for field type_name
+	37, // 27: delino.ownsand.v1.ReplaceDeviceLimitsRequest.limits:type_name -> delino.ownsand.v1.DeviceLimitsInput
+	4,  // 28: delino.ownsand.v1.ReplaceDeviceLimitsResponse.device:type_name -> delino.ownsand.v1.Device
+	4,  // 29: delino.ownsand.v1.RemoveDeviceResponse.device:type_name -> delino.ownsand.v1.Device
+	38, // 30: delino.ownsand.v1.AgentVersionPolicy.mode:type_name -> delino.ownsand.v1.AgentVersionPolicyMode
+	28, // 31: delino.ownsand.v1.AgentVersionPolicy.update_time:type_name -> google.protobuf.Timestamp
+	27, // 32: delino.ownsand.v1.AgentVersionPolicy.updated_by:type_name -> delino.ownsand.v1.Principal
+	21, // 33: delino.ownsand.v1.GetAgentVersionPolicyResponse.policy:type_name -> delino.ownsand.v1.AgentVersionPolicy
+	38, // 34: delino.ownsand.v1.UpdateAgentVersionPolicyRequest.mode:type_name -> delino.ownsand.v1.AgentVersionPolicyMode
+	21, // 35: delino.ownsand.v1.UpdateAgentVersionPolicyResponse.policy:type_name -> delino.ownsand.v1.AgentVersionPolicy
+	5,  // 36: delino.ownsand.v1.DeviceService.CreateEnrollmentToken:input_type -> delino.ownsand.v1.CreateEnrollmentTokenRequest
+	7,  // 37: delino.ownsand.v1.DeviceService.ListEnrollmentTokens:input_type -> delino.ownsand.v1.ListEnrollmentTokensRequest
+	9,  // 38: delino.ownsand.v1.DeviceService.RevokeEnrollmentToken:input_type -> delino.ownsand.v1.RevokeEnrollmentTokenRequest
+	11, // 39: delino.ownsand.v1.DeviceService.ListDevices:input_type -> delino.ownsand.v1.ListDevicesRequest
+	13, // 40: delino.ownsand.v1.DeviceService.GetDevice:input_type -> delino.ownsand.v1.GetDeviceRequest
+	15, // 41: delino.ownsand.v1.DeviceService.UpdateDeviceLimits:input_type -> delino.ownsand.v1.UpdateDeviceLimitsRequest
+	17, // 42: delino.ownsand.v1.DeviceService.ReplaceDeviceLimits:input_type -> delino.ownsand.v1.ReplaceDeviceLimitsRequest
+	19, // 43: delino.ownsand.v1.DeviceService.RemoveDevice:input_type -> delino.ownsand.v1.RemoveDeviceRequest
+	22, // 44: delino.ownsand.v1.DeviceService.GetAgentVersionPolicy:input_type -> delino.ownsand.v1.GetAgentVersionPolicyRequest
+	24, // 45: delino.ownsand.v1.DeviceService.UpdateAgentVersionPolicy:input_type -> delino.ownsand.v1.UpdateAgentVersionPolicyRequest
+	6,  // 46: delino.ownsand.v1.DeviceService.CreateEnrollmentToken:output_type -> delino.ownsand.v1.CreateEnrollmentTokenResponse
+	8,  // 47: delino.ownsand.v1.DeviceService.ListEnrollmentTokens:output_type -> delino.ownsand.v1.ListEnrollmentTokensResponse
+	10, // 48: delino.ownsand.v1.DeviceService.RevokeEnrollmentToken:output_type -> delino.ownsand.v1.RevokeEnrollmentTokenResponse
+	12, // 49: delino.ownsand.v1.DeviceService.ListDevices:output_type -> delino.ownsand.v1.ListDevicesResponse
+	14, // 50: delino.ownsand.v1.DeviceService.GetDevice:output_type -> delino.ownsand.v1.GetDeviceResponse
+	16, // 51: delino.ownsand.v1.DeviceService.UpdateDeviceLimits:output_type -> delino.ownsand.v1.UpdateDeviceLimitsResponse
+	18, // 52: delino.ownsand.v1.DeviceService.ReplaceDeviceLimits:output_type -> delino.ownsand.v1.ReplaceDeviceLimitsResponse
+	20, // 53: delino.ownsand.v1.DeviceService.RemoveDevice:output_type -> delino.ownsand.v1.RemoveDeviceResponse
+	23, // 54: delino.ownsand.v1.DeviceService.GetAgentVersionPolicy:output_type -> delino.ownsand.v1.GetAgentVersionPolicyResponse
+	25, // 55: delino.ownsand.v1.DeviceService.UpdateAgentVersionPolicy:output_type -> delino.ownsand.v1.UpdateAgentVersionPolicyResponse
+	46, // [46:56] is the sub-list for method output_type
+	36, // [36:46] is the sub-list for method input_type
+	36, // [36:36] is the sub-list for extension type_name
+	36, // [36:36] is the sub-list for extension extendee
+	0,  // [0:36] is the sub-list for field type_name
 }
 
 func init() { file_delino_ownsand_v1_device_proto_init() }
@@ -1787,6 +1938,7 @@ func file_delino_ownsand_v1_device_proto_init() {
 		return
 	}
 	file_delino_ownsand_v1_common_proto_init()
+	file_delino_ownsand_v1_device_proto_msgTypes[3].OneofWrappers = []any{}
 	file_delino_ownsand_v1_device_proto_msgTypes[11].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
@@ -1794,7 +1946,7 @@ func file_delino_ownsand_v1_device_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_ownsand_v1_device_proto_rawDesc), len(file_delino_ownsand_v1_device_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   24,
+			NumMessages:   26,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

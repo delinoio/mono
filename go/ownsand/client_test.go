@@ -39,9 +39,11 @@ func TestNewReadsEnvironment(t *testing.T) {
 	if _, err := New(Options{APIKey: "osk_x", TokenSource: func(context.Context) (string, error) { return "", nil }}); err == nil {
 		t.Fatal("want an error for two credentials")
 	}
-	for _, bad := range []string{"ftp://x", "https://x/path", "x"} {
+	for _, bad := range []string{"ftp://x", "https://x/path", "x", "https://x#f", "https://x#", "https://x?", "https://x/?", "https://x?a=b", "https://u:p@x"} {
 		if _, err := New(Options{BaseURL: bad, APIKey: "osk_x"}); err == nil {
 			t.Fatalf("base URL %q accepted", bad)
+		} else if strings.Contains(err.Error(), bad) {
+			t.Fatalf("error echoes the base URL: %v", err)
 		}
 	}
 }
@@ -204,6 +206,86 @@ func TestCreateSandboxRetriesLostResponseWithSameKey(t *testing.T) {
 	}
 }
 
+func TestCreateSandboxStalledRetryEndsWithWindow(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.mu.Lock()
+	cp.dropCreates = 1
+	cp.stallCreates = 1
+	cp.mu.Unlock()
+	c := cp.client(t, TransportRelay)
+	window := c.timing.createRetryWindow
+	type result struct {
+		sb  *Sandbox
+		err error
+	}
+	done := make(chan result, 1)
+	start := time.Now()
+	// A caller context without a deadline: only the retry window can end
+	// the stalled retry.
+	go func() {
+		sb, err := c.CreateSandbox(context.Background(), validParams())
+		done <- result{sb, err}
+	}()
+	var r result
+	select {
+	case r = <-done:
+	case <-time.After(window + 5*time.Second):
+		t.Fatal("CreateSandbox did not end with the retry window")
+	}
+	elapsed := time.Since(start)
+	if r.err == nil || r.sb != nil {
+		t.Fatalf("CreateSandbox returned %v, %v; want the last retryable error", r.sb, r.err)
+	}
+	if kind, _ := classify(context.Background(), r.err); kind != failInterrupted {
+		t.Fatalf("error %v is %v, want the last transport interruption", r.err, kind)
+	}
+	if errors.Is(r.err, context.Canceled) || errors.Is(r.err, errCreateDeadline) {
+		t.Fatalf("error %v is the SDK cancellation, want the last failure of the window", r.err)
+	}
+	if elapsed < window*8/10 || elapsed > window+2*time.Second {
+		t.Fatalf("CreateSandbox ended after %v, want about %v", elapsed, window)
+	}
+	cp.mu.Lock()
+	calls, keys := cp.createCalls, append([]string(nil), cp.createKeys...)
+	cp.mu.Unlock()
+	if calls != 2 || len(keys) != 2 || keys[0] == "" || keys[0] != keys[1] {
+		t.Fatalf("calls=%d keys=%q, want 2 attempts with one idempotency key", calls, keys)
+	}
+}
+
+func TestCreateSandboxCancelDuringStalledRetryIsTerminal(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.mu.Lock()
+	cp.dropCreates = 1
+	cp.stallCreates = 1
+	cp.mu.Unlock()
+	c := cp.client(t, TransportRelay)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		// Cancel once the stalled retry is in flight.
+		for {
+			cp.mu.Lock()
+			n := cp.createCalls
+			cp.mu.Unlock()
+			if n >= 2 {
+				break
+			}
+			time.Sleep(time.Millisecond)
+		}
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	_, err := c.CreateSandbox(ctx, validParams())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error %v, want the caller's context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed >= c.timing.createRetryWindow {
+		t.Fatalf("cancellation took %v, want before the retry window", elapsed)
+	}
+}
+
 func TestSandboxLifecycle(t *testing.T) {
 	cp := newFakeCP(t)
 	c := cp.client(t, TransportRelay)
@@ -229,5 +311,79 @@ func TestParseTransport(t *testing.T) {
 	}
 	if _, err := ParseTransport("x"); err == nil {
 		t.Fatal("want an error")
+	}
+}
+
+func TestRedactKeepsWireProvenance(t *testing.T) {
+	c := &Client{}
+	detail, err := connect.NewErrorDetail(&ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, wire := range []bool{true, false} {
+		raw := errors.New("bad credential " + testAPIKey)
+		var in *connect.Error
+		if wire {
+			in = connect.NewWireError(connect.CodeUnauthenticated, raw)
+		} else {
+			in = connect.NewError(connect.CodeUnauthenticated, raw)
+		}
+		in.AddDetail(detail)
+		in.Meta().Set("X-Test", "1")
+		out := c.redact(in, testAPIKey)
+		if strings.Contains(out.Error(), testAPIKey) {
+			t.Fatalf("wire=%v: error contains the credential: %v", wire, out)
+		}
+		var ce *connect.Error
+		if !errors.As(out, &ce) {
+			t.Fatalf("wire=%v: not a connect error", wire)
+		}
+		if connect.IsWireError(out) != wire {
+			t.Fatalf("wire=%v: IsWireError=%v", wire, connect.IsWireError(out))
+		}
+		if ce.Code() != connect.CodeUnauthenticated || len(ce.Details()) != 1 || ce.Meta().Get("X-Test") != "1" {
+			t.Fatalf("wire=%v: code, details or meta lost: %v", wire, ce)
+		}
+		wantKind, _ := classify(context.Background(), in)
+		if gotKind, _ := classify(context.Background(), out); gotKind != wantKind {
+			t.Fatalf("wire=%v: classify %v, want %v", wire, gotKind, wantKind)
+		}
+	}
+	if kind, _ := classify(context.Background(), c.redact(connect.NewWireError(connect.CodeUnauthenticated, errors.New(testAPIKey)), testAPIKey)); kind != failTerminal {
+		t.Fatalf("redacted terminal wire error classified %v", kind)
+	}
+}
+
+func TestOrganizationDefaultKeepsCallerRequestUnchanged(t *testing.T) {
+	cp := newFakeCP(t)
+	newClient := func(org string) *Client {
+		c, err := New(Options{BaseURL: cp.srv.URL, APIKey: testAPIKey, OrganizationID: org, LookupEnv: func(string) (string, bool) { return "", false }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	first, second := newClient("org-first"), newClient("org-second")
+	req := &ownsandv1.GetOrganizationRequest{}
+	for _, tc := range []struct {
+		c    *Client
+		want string
+	}{{first, "org-first"}, {second, "org-second"}} {
+		res, err := tc.c.Organizations().Get(context.Background(), req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := res.GetOrganization().GetOrganizationId(); got != tc.want {
+			t.Fatalf("RPC saw organization %q, want %q", got, tc.want)
+		}
+		if req.GetOrganizationId() != "" {
+			t.Fatalf("caller request was modified: organization_id=%q", req.GetOrganizationId())
+		}
+	}
+	// An explicit organization wins and stays as the caller set it.
+	explicit := &ownsandv1.GetOrganizationRequest{OrganizationId: "org-explicit"}
+	res, err := first.Organizations().Get(context.Background(), explicit)
+	if err != nil || res.GetOrganization().GetOrganizationId() != "org-explicit" {
+		t.Fatalf("explicit organization: %v %v", res, err)
 	}
 }

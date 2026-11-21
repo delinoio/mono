@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package vmruntime defines the sandbox runtime interface of the agent. A
 // runtime runs each sandbox in a VM (or, for the process test runtime, in a

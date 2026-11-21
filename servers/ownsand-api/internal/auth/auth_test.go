@@ -225,6 +225,9 @@ type jwksOutage struct {
 	fetches atomic.Int32
 	mode    atomic.Int32 // 0 valid, 1 status 503, 2 malformed JSON
 	extra   atomic.Pointer[tokenFactory]
+	// block, when non-nil, holds every healthy response until it is closed.
+	block   chan struct{}
+	started chan struct{}
 }
 
 func (o *jwksOutage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -235,6 +238,13 @@ func (o *jwksOutage) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case 2:
 		_, _ = w.Write([]byte("{not json"))
 	default:
+		if o.block != nil {
+			select {
+			case o.started <- struct{}{}:
+			default:
+			}
+			<-o.block
+		}
 		set := jose.JSONWebKeySet{}
 		for _, f := range []*tokenFactory{&o.f, o.extra.Load()} {
 			if f != nil {
@@ -328,5 +338,58 @@ func TestLogtoValidatorBacksOffEmptyKeySet(t *testing.T) {
 	}
 	if got := o.fetches.Load(); got != 2 {
 		t.Fatalf("fetches after cooldown = %d, want 2", got)
+	}
+}
+
+func TestLogtoValidatorCanceledCallerDoesNotArmCooldown(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	o := &jwksOutage{f: tokenFactory{key: key, kid: "k1", issuer: "https://tenant.logto.app/oidc"}}
+	srv := httptest.NewServer(o)
+	defer srv.Close()
+	now := time.Now()
+	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
+	token := o.f.sign(t, "at+jwt", outageClaims(o.f, now))
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := v.Validate(canceled, token); err != ErrInvalidToken {
+		t.Fatalf("canceled caller: %v", err)
+	}
+	if got := o.fetches.Load(); got != 0 {
+		t.Fatalf("fetches for canceled caller = %d, want 0", got)
+	}
+	if sub, err := v.Validate(context.Background(), token); err != nil || sub != "user-1" {
+		t.Fatalf("live caller after canceled one: %q %v", sub, err)
+	}
+}
+
+func TestLogtoValidatorCallerCancelDoesNotAbortFetch(t *testing.T) {
+	key, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	o := &jwksOutage{
+		f:       tokenFactory{key: key, kid: "k1", issuer: "https://tenant.logto.app/oidc"},
+		block:   make(chan struct{}),
+		started: make(chan struct{}, 1),
+	}
+	srv := httptest.NewServer(o)
+	defer srv.Close()
+	now := time.Now()
+	v := NewLogtoValidator(LogtoConfig{Issuer: o.f.issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: func() time.Time { return now }})
+	token := o.f.sign(t, "at+jwt", outageClaims(o.f, now))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := v.Validate(ctx, token)
+		done <- err
+	}()
+	<-o.started
+	cancel()
+	// The shared fetch keeps running after the caller left.
+	time.Sleep(50 * time.Millisecond)
+	close(o.block)
+	<-done
+	if sub, err := v.Validate(context.Background(), token); err != nil || sub != "user-1" {
+		t.Fatalf("live caller after mid-flight cancel: %q %v", sub, err)
+	}
+	if got := o.fetches.Load(); got != 1 {
+		t.Fatalf("fetches = %d, want 1", got)
 	}
 }

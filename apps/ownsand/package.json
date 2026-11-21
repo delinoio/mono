@@ -10,12 +10,17 @@
   },
   "scripts": {
     "build": "rsbuild build",
-    "dev": "rsbuild dev",
+    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/apps/ownsand -- node node_modules/portless/dist/cli.js run --prefix=",
+    "dev:app": "rsbuild dev",
     "preview": "rsbuild preview",
     "lint": "tsc --noEmit -p tsconfig.json",
     "test": "rstest run",
     "typecheck": "tsc --noEmit",
     "test:e2e": "e2e run"
+  },
+  "portless": {
+    "name": "ownsand.delino",
+    "script": "dev:app"
   },
   "dependencies": {
     "@bufbuild/protobuf": "2.16.0",
@@ -42,6 +47,7 @@
     "ai": "7.0.173",
     "e2e": "0.24.0",
     "happy-dom": "21.0.4",
+    "portless": "0.18.1",
     "typescript": "6.0.3"
   }
 }

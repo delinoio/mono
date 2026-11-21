@@ -59,6 +59,27 @@ func requestHash(req *ownsandv1.CreateSandboxRequest) ([]byte, error) {
 	return sum[:], nil
 }
 
+// canonicalizeCreateSandbox rewrites the identifiers of a validated create
+// request to their lowercase text form in place. The API accepts either hex
+// case, but the request hash, the idempotency lock, the scheduler's device
+// filter and the stored records compare identifiers as text, so one request
+// spelled in two cases must read as one request.
+func canonicalizeCreateSandbox(m *ownsandv1.CreateSandboxRequest) {
+	m.OrganizationId = canonicalID(m.GetOrganizationId())
+	m.IdempotencyKey = canonicalID(m.GetIdempotencyKey())
+	if src := m.GetSource(); src != nil {
+		switch s := src.GetSource().(type) {
+		case *ownsandv1.SandboxSource_SnapshotId:
+			s.SnapshotId = canonicalID(s.SnapshotId)
+		case *ownsandv1.SandboxSource_TemplateId:
+			s.TemplateId = canonicalID(s.TemplateId)
+		}
+	}
+	if p := m.GetPlacement(); p != nil && p.DeviceId != nil {
+		p.DeviceId = proto.String(canonicalID(p.GetDeviceId()))
+	}
+}
+
 // lookupIdempotent returns the sandbox of a known idempotency key, or nil.
 // A known key with other parameters fails with already_exists.
 func (s *Service) lookupIdempotent(ctx context.Context, q db.Querier, orgID, key string, hash []byte) (*sandboxRow, error) {
@@ -103,7 +124,7 @@ func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string,
 		d.vcpu_overcommit_percent, d.update_state, d.pending_idle_since, `+versionRevokedQuery()+`,
 		COALESCE(a.vcpu, 0), COALESCE(a.memory, 0), COALESCE(a.disk, 0), COALESCE(a.macos, 0), COALESCE(a.unreported, 0)
 		FROM devices d LEFT JOIN LATERAL (
-			SELECT sum(s.vcpu_count)::int AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
+			SELECT sum(s.vcpu_count)::bigint AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
 				count(*) FILTER (WHERE s.guest_os = 2)::int AS macos,
 				COALESCE(sum(s.disk_gib) FILTER (WHERE s.agent_state = 1 AND s.revision_epoch = ''), 0)::bigint AS unreported
 			FROM sandboxes s WHERE s.device_id = d.device_id AND s.agent_state IN (1, 2, 3, 4)
@@ -120,8 +141,9 @@ func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string,
 		var caps []byte
 		limits := &ownsandv1.DeviceLimits{}
 		alloc := &ownsandv1.DeviceAllocation{}
+		var vcpuTotal int64
 		if err := rows.Scan(&d.ID, &state, &host, &arch, &caps, &limits.VcpuCount, &limits.MemoryMib, &limits.DiskGib, &limits.VcpuOvercommitPercent,
-			&update, &d.PendingIdleSince, &d.VersionRevoked, &alloc.VcpuCount, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount, &d.UnreportedCreatingDiskGiB); err != nil {
+			&update, &d.PendingIdleSince, &d.VersionRevoked, &vcpuTotal, &alloc.MemoryMib, &alloc.DiskGib, &alloc.MacosGuestCount, &d.UnreportedCreatingDiskGiB); err != nil {
 			return nil, err
 		}
 		d.Online = ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_ONLINE
@@ -133,6 +155,7 @@ func (s *Service) placementDevices(ctx context.Context, tx pgx.Tx, orgID string,
 				return nil, err
 			}
 		}
+		setAllocationVCPU(alloc, vcpuTotal)
 		d.Limits, d.Allocation = limits, alloc
 		d.UpdateState = ownsandv1.AgentUpdateState(update)
 		d.MachineIdentifierReserved = reserved
@@ -222,6 +245,10 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	if err := validate.CreateSandboxRequest(m); err != nil {
 		return nil, errInvalid(err)
 	}
+	// Every identifier is valid now: use one spelling for the request hash,
+	// the idempotency lock, the scheduler and the records.
+	canonicalizeCreateSandbox(m)
+	orgID = m.GetOrganizationId()
 	network, _ := validate.NetworkMode(m.GetNetwork())
 	hash, err := requestHash(m)
 	if err != nil {
@@ -235,42 +262,66 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		}
 		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: existing.proto()}), nil
 	}
-	src, err := h.resolveSource(ctx, h.DB.Pool, orgID, m.GetSource())
-	if err != nil {
-		return nil, h.internal(ctx, "create sandbox", err)
-	}
-	sreq := scheduler.Request{
-		VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
-		NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
-		DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
-	}
-	lineage := ""
-	if src != nil {
-		sn := src.snapshot.pb
-		if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
-			return nil, errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
-		}
-		sreq.GuestOS = sn.GetGuestOs()
-		sreq.Snapshot = &scheduler.Snapshot{
-			ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
-			Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
-			HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
-			MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
-			MacOSHardwareModel: sn.GetMacosHardwareModel(),
-		}
-		if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
-			lineage = src.snapshot.lineage
-		}
-	} else {
-		sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
-	}
-
 	sandboxID := newID()
 	now := h.now()
-	var created *sandboxRow
+	var src *resolvedSource
+	var sreq scheduler.Request
+	var created, replayed *sandboxRow
 	var decision scheduler.Decision
 	var limits *ownsandv1.DeviceLimits
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// A miss on the pool is not final: an identical request may be
+		// reserving the same key right now. Serialize on the key, then look
+		// it up again in this transaction before anything that can fail with
+		// a capacity error. The lock is transaction-scoped and keyed by the
+		// organization and key; orgID is a fixed-length UUID, so the joined
+		// text is unambiguous. Only this handler takes it, and it never waits
+		// for it while holding a device row lock (the device lock comes
+		// later in this transaction), so the lock order stays acyclic.
+		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))", orgID, m.GetIdempotencyKey()); err != nil {
+			return err
+		}
+		existing, err := h.lookupIdempotent(ctx, tx, orgID, m.GetIdempotencyKey(), hash)
+		if err != nil || existing != nil {
+			// Another request committed the key first: return its sandbox
+			// without a reservation, audit event or command.
+			replayed = existing
+			return err
+		}
+		// Lock the organization row before any device row, as
+		// DeleteOrganization does: the sandbox insert below takes FOR KEY
+		// SHARE on it through its foreign key.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
+		if src, err = h.resolveSource(ctx, tx, orgID, m.GetSource()); err != nil {
+			return err
+		}
+		sreq = scheduler.Request{
+			VCPUCount: m.GetResources().GetVcpuCount(), MemoryMiB: m.GetResources().GetMemoryMib(), DiskGiB: m.GetResources().GetDiskGib(),
+			NetworkMode: network, BaseImage: m.GetSource().GetBaseImage(),
+			DeviceID: m.GetPlacement().GetDeviceId(), HostOS: m.GetPlacement().GetHostOs(), Arch: m.GetPlacement().GetArch(),
+		}
+		lineage := ""
+		if src != nil {
+			sn := src.snapshot.pb
+			if m.GetResources().GetDiskGib() < sn.GetResources().GetDiskGib() {
+				return errInvalidf("invalid resources.disk_gib: must be at least the snapshot's disk size")
+			}
+			sreq.GuestOS = sn.GetGuestOs()
+			sreq.Snapshot = &scheduler.Snapshot{
+				ID: sn.GetSnapshotId(), DeviceID: sn.GetDeviceId(), CopyDeviceIDs: src.copies,
+				Exported: sn.GetExportState() == ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED,
+				HostOS:   sn.GetHostOs(), Arch: sn.GetArch(), GuestOS: sn.GetGuestOs(), VCPUCount: sn.GetResources().GetVcpuCount(),
+				MemoryMiB: sn.GetResources().GetMemoryMib(), NetworkMode: sn.GetNetworkMode(), HasMemoryState: sn.GetHasMemoryState(),
+				MacOSHardwareModel: sn.GetMacosHardwareModel(),
+			}
+			if sn.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
+				lineage = src.snapshot.lineage
+			}
+		} else {
+			sreq.GuestOS = guestOfBaseImage(sreq.BaseImage)
+		}
 		devices, err := h.placementDevices(ctx, tx, orgID, lineage)
 		if err != nil {
 			return err
@@ -348,6 +399,9 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, h.internal(ctx, "create sandbox", err)
 	}
+	if replayed != nil {
+		return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: replayed.proto()}), nil
+	}
 	h.Logger.InfoContext(ctx, "sandbox_created", slog.String("sandbox_id", sandboxID), slog.String("device_id", decision.DeviceID),
 		slog.Bool("memory_restore", decision.MemoryRestore), slog.Bool("import", decision.NeedsImport))
 
@@ -408,33 +462,89 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	}}}
 	wait := s.Hub.Commands.Register(importCmd.CommandId)
 	defer s.Hub.Commands.Cancel(importCmd.CommandId)
+	// The assignment is recorded before the command is sent, so the agent's
+	// first download URL request finds it. It is cleared when the import
+	// ends: on a result, a send failure, the wait timeout or a closed channel
+	// (every return below) and as soon as the result arrives.
+	releaseImport := s.imports.register(conn, sn.GetSnapshotId(), importCmd.CommandId)
+	defer releaseImport()
 	if _, err := s.sendCommand(ctx, conn, commandInfo{kind: cmdImportSnapshot, orgID: info.orgID, snapshotID: sn.GetSnapshotId()}, importCmd); err != nil {
+		s.failImportSendDeadline(ctx, conn, info, err)
 		return
 	}
 	select {
 	case res := <-wait:
+		releaseImport()
 		if res.GetError() != nil {
 			_ = s.failCreateRejected(context.WithoutCancel(ctx), info.sandboxID)
 			s.watch.fire(info.sandboxID)
 			return
 		}
 	case <-ctx.Done():
+		// A closed channel keeps reconnect reconciliation as the owner of the
+		// sandbox. An expired wait on a live connection would otherwise leave
+		// the CREATING reservation committed forever, so fail the create.
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.failImportTimeout(ctx, conn, info)
+		}
 		return
 	}
 	if _, err := s.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
 		s.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", info.sandboxID), slog.Any("error", err))
+		s.failImportSendDeadline(ctx, conn, info, err)
 	}
 }
 
+// failImportSendDeadline fails the create when a send of the import flow
+// returned because the import deadline expired while the channel stayed
+// connected (a full outbound queue held the send until then). Other send
+// errors keep reconnect reconciliation as the owner of the sandbox: a closed
+// channel, including one closed by a queue that stayed full, is reconciled
+// when the device reconnects.
+func (s *Service) failImportSendDeadline(ctx context.Context, conn *hub.Conn, info commandInfo, err error) {
+	if errors.Is(err, context.DeadlineExceeded) && conn.Context().Err() == nil {
+		s.failImportTimeout(ctx, conn, info)
+	}
+}
+
+// importFailTimeout bounds the database update that fails a create whose
+// import wait expired; the expired wait context cannot be used for it.
+const importFailTimeout = 5 * time.Second
+
+// failImportTimeout moves a sandbox whose import wait expired to FAILED with
+// CREATE_FAILED through the guarded rejection transition and notifies
+// watchers. It does not retry the import. A late import success cannot revive
+// the sandbox because the transition only acts on CREATING and the create
+// command is never sent after the import goroutine returned.
+func (s *Service) failImportTimeout(ctx context.Context, conn *hub.Conn, info commandInfo) {
+	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importFailTimeout)
+	defer cancel()
+	err := s.failCreateRejected(dbCtx, info.sandboxID)
+	attrs := []any{
+		slog.String("sandbox_id", info.sandboxID),
+		slog.Duration("import_wait", s.Timing.ImportWait),
+	}
+	if err != nil {
+		s.Logger.ErrorContext(dbCtx, "import_timeout_fail_create_failed", append(attrs, slog.Any("error", err))...)
+		return
+	}
+	s.Logger.WarnContext(dbCtx, "import_timeout_create_failed", attrs...)
+	s.watch.fire(info.sandboxID)
+}
+
 func (h SandboxHandler) GetSandbox(ctx context.Context, req *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("sandbox_id", req.Msg.GetSandboxId()); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", req.Msg.GetSandboxId())
+	if err != nil {
 		return nil, err
 	}
-	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, req.Msg.GetSandboxId(), false)
+	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)
 	if err != nil {
 		return nil, h.internal(ctx, "get sandbox", err)
 	}
@@ -448,7 +558,10 @@ const shownStateSQL = `(CASE WHEN s.agent_state IN (5, 6) THEN s.agent_state WHE
 
 func (h SandboxHandler) ListSandboxes(ctx context.Context, req *connect.Request[ownsandv1.ListSandboxesRequest]) (*connect.Response[ownsandv1.ListSandboxesResponse], error) {
 	m := req.Msg
-	orgID := m.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", m.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
@@ -459,10 +572,11 @@ func (h SandboxHandler) ListSandboxes(ctx context.Context, req *connect.Request[
 	where := []string{"s.organization_id = $1", "s.sandbox_id > $2"}
 	args := []any{orgID, afterKey(after)}
 	if m.DeviceId != nil {
-		if err := validateID("device_id", m.GetDeviceId()); err != nil {
+		deviceID, err := normalizeID("device_id", m.GetDeviceId())
+		if err != nil {
 			return nil, err
 		}
-		args = append(args, m.GetDeviceId())
+		args = append(args, deviceID)
 		where = append(where, fmt.Sprintf("s.device_id = $%d", len(args)))
 	}
 	if m.State != nil {
@@ -509,32 +623,51 @@ func (s *Service) waitSandbox(ctx context.Context, orgID, sandboxID string, done
 	poll := time.NewTicker(time.Second)
 	defer poll.Stop()
 	for {
-		changed := s.watch.watch(sandboxID)
-		sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		if err != nil || done(sb) {
+		sb, err, finished := s.waitSandboxOnce(ctx, orgID, sandboxID, done, poll.C, deadline.C)
+		if finished {
 			return sb, err
-		}
-		select {
-		case <-changed:
-		case <-poll.C:
-		case <-deadline.C:
-			return loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
-		case <-ctx.Done():
-			return nil, ctx.Err()
 		}
 	}
 }
 
+// waitSandboxOnce is one iteration of waitSandbox. It subscribes before it
+// reads, so a change between the read and the wait is not lost, and it
+// unregisters the subscription on every exit.
+func (s *Service) waitSandboxOnce(ctx context.Context, orgID, sandboxID string, done func(*sandboxRow) bool, poll, deadline <-chan time.Time) (sb *sandboxRow, err error, finished bool) {
+	changed, unregister := s.watch.watch(sandboxID)
+	defer unregister()
+	sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+	if err != nil || done(sb) {
+		return sb, err, true
+	}
+	select {
+	case <-changed:
+		return nil, nil, false
+	case <-poll:
+		return nil, nil, false
+	case <-deadline:
+		sb, err = loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
+		return sb, err, true
+	case <-ctx.Done():
+		return nil, ctx.Err(), true
+	}
+}
+
 func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[ownsandv1.DeleteSandboxRequest]) (*connect.Response[ownsandv1.DeleteSandboxResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	sandboxID := req.Msg.GetSandboxId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawSandboxID := req.Msg.GetSandboxId()
 	var sb *sandboxRow
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	var sandboxID string
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionUseSandboxes)
 		if err != nil {
 			return err
 		}
-		if err := validateID("sandbox_id", sandboxID); err != nil {
+		sandboxID, err = normalizeID("sandbox_id", rawSandboxID)
+		if err != nil {
 			return err
 		}
 		sb, err = loadSandbox(ctx, tx, orgID, sandboxID, true)
@@ -564,11 +697,16 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 }
 
 // pauseOrResume runs PauseSandbox (pause true) or ResumeSandbox.
-func (h SandboxHandler) pauseOrResume(ctx context.Context, orgID, sandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
+func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
+	orgID, err := normalizeID("organization_id", rawOrgID)
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return nil, err
 	}
-	if err := validateID("sandbox_id", sandboxID); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", rawSandboxID)
+	if err != nil {
 		return nil, err
 	}
 	sb, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false)

@@ -57,6 +57,7 @@ func testTiming() timing {
 		backoffMax:           100 * time.Millisecond,
 		pollInterval:         20 * time.Millisecond,
 		createRetryWindow:    time.Second,
+		callerDeadlineSkew:   250 * time.Millisecond,
 	}
 }
 
@@ -83,6 +84,18 @@ type relayAction struct {
 	stallAccepted    bool          // send accepted, then nothing
 	endAfterTime     time.Duration // end OK at the first event after this time
 	delay            time.Duration
+	// holdOpen keeps the stream open without any event (no accepted) until
+	// the caller cancels it.
+	holdOpen bool
+	// keepalivesOnly sends relay keepalives every 10 ms without accepted
+	// until the caller cancels the stream.
+	keepalivesOnly bool
+	// acceptedKeepalives sends accepted, then keepalives every 10 ms for
+	// this long, and then serves the request as usual.
+	acceptedKeepalives time.Duration
+	// abortAfterKeepalives aborts the connection after the accepted
+	// keepalives, without any data.
+	abortAfterKeepalives bool
 }
 
 // p2pAction scripts one data channel request.
@@ -90,6 +103,16 @@ type p2pAction struct {
 	endAfter  int // send a session-end frame after N output events
 	reason    ownsandv1.SessionEndReason
 	failAfter int // close the data channel without a session-end frame
+	// endNow answers an exec request with a session-end frame before any
+	// frame, so the session ends before the agent accepted the request.
+	endNow bool
+	// failNow closes the data channel at an exec request without any frame
+	// and without a session-end frame.
+	failNow bool
+	// endAfterStarted sends a session-end frame right after the started
+	// event of an exec, with no output: a quiet exec whose session expires
+	// after the agent accepted the continuation.
+	endAfterStarted bool
 	// raw, when set, answers the request with this frame only.
 	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
@@ -124,6 +147,10 @@ type fakeCP struct {
 	created     map[string]*ownsandv1.Sandbox
 	createCalls int
 	dropCreates int
+	// stallCreates holds that many CreateSandbox requests open without a
+	// response, after the dropped ones, until the caller gives up.
+	stallCreates int
+	createKeys   []string // idempotency_key of each CreateSandbox request
 
 	expiresIn   time.Duration
 	clockOffset time.Duration // added to expire_time: a server clock that differs from the caller's
@@ -133,10 +160,31 @@ type fakeCP struct {
 	authScript  func(n int, req *ownsandv1.AuthorizeRelayRequest) authAction
 	relayCalls  map[string]int
 	relayLog    []string
+	// heldEnded records when a held (holdOpen or keepalivesOnly) relay
+	// stream ended because the caller cancelled it, and when it began.
+	heldStarts  []time.Time
+	heldEnds    []time.Time
 	relayScript func(method string, n int) relayAction
 
 	openSessions int
 	iceFail      bool
+	// iceGate and openGate hold every GetIceServers or OpenSession request
+	// until the gate closes or the request context ends. The channel is
+	// created by the test before the first request and never replaced.
+	iceGate  chan struct{}
+	openGate chan struct{}
+	// gateErr, when set, is the error that a held request returns right
+	// after it reaches its gate, in place of waiting for the gate.
+	gateErr error
+	// iceServers are the ICE server URLs that GetIceServers returns.
+	iceServers []string
+	iceCalls   int // GetIceServers requests
+	// gateHits receives one value for each request that reached a closed
+	// gate (kind "ice" or "open"), so a test can wait for the stall.
+	gateHits chan string
+	// gateCanceled counts held requests whose context ended before the gate
+	// opened (the SDK gave up on them).
+	gateCanceled int
 	p2pRequests  int
 	p2pScript    func(n int) p2pAction
 	answerers    []*webrtc.PeerConnection
@@ -241,6 +289,18 @@ func (cp *fakeCP) authRequests() []*ownsandv1.AuthorizeRelayRequest {
 	return append([]*ownsandv1.AuthorizeRelayRequest(nil), cp.authReqs...)
 }
 
+func (cp *fakeCP) iceCallCount() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.iceCalls
+}
+
+func (cp *fakeCP) gateCanceledCount() int {
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+	return cp.gateCanceled
+}
+
 func (cp *fakeCP) openSessionCount() int {
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
@@ -330,11 +390,12 @@ func (f *fakeSandboxes) record() *ownsandv1.Sandbox {
 	return sb
 }
 
-func (f *fakeSandboxes) CreateSandbox(_ context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
+func (f *fakeSandboxes) CreateSandbox(ctx context.Context, req *connect.Request[ownsandv1.CreateSandboxRequest]) (*connect.Response[ownsandv1.CreateSandboxResponse], error) {
 	cp := f.cp
 	cp.mu.Lock()
 	cp.createCalls++
 	key := req.Msg.GetIdempotencyKey()
+	cp.createKeys = append(cp.createKeys, key)
 	sb, ok := cp.created[key]
 	if !ok {
 		sb = &ownsandv1.Sandbox{SandboxId: mustID(cp.t), OrganizationId: req.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_CREATING}
@@ -348,6 +409,18 @@ func (f *fakeSandboxes) CreateSandbox(_ context.Context, req *connect.Request[ow
 	if drop {
 		// The reservation exists but the response is lost.
 		panic(http.ErrAbortHandler)
+	}
+	cp.mu.Lock()
+	stall := cp.stallCreates > 0
+	if stall {
+		cp.stallCreates--
+	}
+	cp.mu.Unlock()
+	if stall {
+		// The response never comes; the request ends when the caller
+		// closes the connection.
+		<-ctx.Done()
+		return nil, ctx.Err()
 	}
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: sb}), nil
 }
@@ -398,8 +471,52 @@ type fakeDataPath struct {
 	cp *fakeCP
 }
 
-func (f *fakeDataPath) GetIceServers(context.Context, *connect.Request[ownsandv1.GetIceServersRequest]) (*connect.Response[ownsandv1.GetIceServersResponse], error) {
-	return connect.NewResponse(&ownsandv1.GetIceServersResponse{}), nil
+// hold blocks a request at a gate until the gate closes or the request ends.
+// A nil gate never blocks.
+func (f *fakeDataPath) hold(ctx context.Context, gate chan struct{}, kind string) error {
+	if gate == nil {
+		return nil
+	}
+	select {
+	case <-gate:
+		return nil
+	default:
+	}
+	if f.cp.gateHits != nil {
+		select {
+		case f.cp.gateHits <- kind:
+		default:
+		}
+	}
+	if err := f.cp.gateErr; err != nil {
+		return err
+	}
+	select {
+	case <-gate:
+		return nil
+	case <-ctx.Done():
+		f.cp.mu.Lock()
+		f.cp.gateCanceled++
+		f.cp.mu.Unlock()
+		return ctx.Err()
+	}
+}
+
+func (f *fakeDataPath) GetIceServers(ctx context.Context, _ *connect.Request[ownsandv1.GetIceServersRequest]) (*connect.Response[ownsandv1.GetIceServersResponse], error) {
+	cp := f.cp
+	cp.mu.Lock()
+	cp.iceCalls++
+	gate := cp.iceGate
+	urls := cp.iceServers
+	cp.mu.Unlock()
+	if err := f.hold(ctx, gate, "ice"); err != nil {
+		return nil, err
+	}
+	res := &ownsandv1.GetIceServersResponse{}
+	if len(urls) > 0 {
+		res.IceServers = []*ownsandv1.IceServer{{Urls: urls}}
+	}
+	return connect.NewResponse(res), nil
 }
 
 func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[ownsandv1.OpenSessionRequest]) (*connect.Response[ownsandv1.OpenSessionResponse], error) {
@@ -408,7 +525,11 @@ func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[own
 	cp.openSessions++
 	iceFail := cp.iceFail
 	state := cp.state
+	gate := cp.openGate
 	cp.mu.Unlock()
+	if err := f.hold(ctx, gate, "open"); err != nil {
+		return nil, err
+	}
 	switch state {
 	case ownsandv1.SandboxState_SANDBOX_STATE_RUNNING:
 	case ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE:
@@ -590,10 +711,66 @@ func (r *relaySender) sendEvent(ev *ownsandv1.ExecEvent) error {
 	return nil
 }
 
+// hold serves the pre-acceptance hold actions. It reports whether it held
+// the stream; the caller then returns the result.
+func (f *fakeRelay) hold(ctx context.Context, act relayAction, keepalive func() error) (bool, error) {
+	if !act.holdOpen && !act.keepalivesOnly {
+		return false, nil
+	}
+	cp := f.cp
+	cp.mu.Lock()
+	cp.heldStarts = append(cp.heldStarts, time.Now())
+	cp.mu.Unlock()
+	defer func() {
+		cp.mu.Lock()
+		cp.heldEnds = append(cp.heldEnds, time.Now())
+		cp.mu.Unlock()
+	}()
+	if act.holdOpen {
+		<-ctx.Done()
+		return true, ctx.Err()
+	}
+	t := time.NewTicker(10 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return true, ctx.Err()
+		case <-t.C:
+			if err := keepalive(); err != nil {
+				<-ctx.Done()
+				return true, ctx.Err()
+			}
+		}
+	}
+}
+
+// sendKeepalives sends keepalives for d, as an accepted stream that waits
+// for its operation.
+func sendKeepalives(ctx context.Context, d time.Duration, keepalive func() error) error {
+	end := time.Now().Add(d)
+	for time.Now().Before(end) {
+		if err := keepalive(); err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	return nil
+}
+
 func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, attach *ownsandv1.AttachExecRequest, execReq *ownsandv1.ExecRequest, send func(*ownsandv1.ExecEvent) error) error {
 	g, act, err := f.begin(method, h, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC)
 	if err != nil {
 		return err
+	}
+	if held, herr := f.hold(ctx, act, func() error {
+		return send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}})
+	}); held {
+		return herr
 	}
 	if act.noAccept {
 		return nil
@@ -635,6 +812,16 @@ func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, 
 		<-ctx.Done()
 		return ctx.Err()
 	}
+	if act.acceptedKeepalives > 0 {
+		if err := sendKeepalives(ctx, act.acceptedKeepalives, func() error {
+			return send(&ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}})
+		}); err != nil {
+			return err
+		}
+		if act.abortAfterKeepalives {
+			panic(http.ErrAbortHandler)
+		}
+	}
 	rs := &relaySender{act: act, send: send, ctx: ctx, start: time.Now()}
 	err = cp.agent.serveExec(ctx, cp, e, outOff, errOff, rs.sendEvent)
 	if errors.Is(err, errRotate) {
@@ -663,6 +850,12 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 	if g.opID != req.Msg.GetReadId() || !relaybinding.Equal(g.digest, relaybinding.ReadFileDigest(req.Msg)) {
 		return connect.NewError(connect.CodePermissionDenied, errors.New("digest mismatch"))
 	}
+	readKeepalive := func() error {
+		return stream.Send(&ownsandv1.ReadFileResponse{Event: &ownsandv1.FileReadEvent{Event: &ownsandv1.FileReadEvent_Keepalive{Keepalive: &ownsandv1.Keepalive{}}}})
+	}
+	if held, herr := f.hold(ctx, act, readKeepalive); held {
+		return herr
+	}
 	if act.noAccept {
 		return nil
 	}
@@ -672,6 +865,14 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 	if act.stallAccepted {
 		<-ctx.Done()
 		return ctx.Err()
+	}
+	if act.acceptedKeepalives > 0 {
+		if err := sendKeepalives(ctx, act.acceptedKeepalives, readKeepalive); err != nil {
+			return err
+		}
+		if act.abortAfterKeepalives {
+			panic(http.ErrAbortHandler)
+		}
 	}
 	chunks := 0
 	err = f.cp.agent.serveRead(req.Msg, func(ev *ownsandv1.FileReadEvent) error {
@@ -1030,10 +1231,25 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 	}
 	outputs := 0
 	sendExec := func(ev *ownsandv1.ExecEvent) error {
+		if act.endNow || act.failNow {
+			if act.endNow {
+				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
+				time.Sleep(20 * time.Millisecond)
+			}
+			_ = s.pc.Close()
+			return errSessionGone
+		}
 		if err := s.send(frame(ev)); err != nil {
 			return err
 		}
 		switch ev.GetEvent().(type) {
+		case *ownsandv1.ExecEvent_Started:
+			if act.endAfterStarted {
+				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
+				time.Sleep(20 * time.Millisecond)
+				_ = s.pc.Close()
+				return errSessionGone
+			}
 		case *ownsandv1.ExecEvent_Stdout, *ownsandv1.ExecEvent_Stderr:
 			outputs++
 			if act.endAfter > 0 && outputs >= act.endAfter {

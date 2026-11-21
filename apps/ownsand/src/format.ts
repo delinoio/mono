@@ -156,6 +156,23 @@ export function effectiveVcpuLimit(
   return Number((wholeCount(vcpuCount) * wholeCount(overcommitPercent)) / 100n);
 }
 
+/** The int32 maximum, which the int32 `Device.effective_vcpu_limit` caps at. */
+export const MAX_INT32 = 2147483647;
+
+/**
+ * The exact allocated vCPUs of a device. `allocation.vcpuTotalCount` is the
+ * exact 64-bit total; a server that predates it leaves it unset, and the
+ * int32 `allocation.vcpuCount` (capped at 2147483647 for a larger total) is
+ * then the best value. The result is a bigint because the field is an int64.
+ */
+export function deviceAllocatedVcpu(device: {
+  allocation?: { vcpuCount: number; vcpuTotalCount?: bigint | undefined };
+}): bigint {
+  const a = device.allocation;
+  if (a === undefined) return 0n;
+  return a.vcpuTotalCount ?? BigInt(a.vcpuCount);
+}
+
 /** Formats a memory size in MiB. */
 export function formatMib(mib: bigint | number): string {
   const n = Number(mib);

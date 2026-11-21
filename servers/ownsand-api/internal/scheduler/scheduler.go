@@ -191,7 +191,7 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 	if alloc == nil {
 		alloc = &ownsandv1.DeviceAllocation{}
 	}
-	if int64(alloc.GetVcpuCount())+int64(req.VCPUCount) > validate.EffectiveVCPULimit(limits) {
+	if allocatedVCPU(alloc)+int64(req.VCPUCount) > validate.EffectiveVCPULimit(limits) {
 		return Transient, "running sandboxes hold the vCPU capacity"
 	}
 	if alloc.GetMemoryMib()+req.MemoryMiB > limits.GetMemoryMib() {
@@ -227,6 +227,16 @@ func memoryRestore(req Request, deviceID string) bool {
 		req.VCPUCount == s.VCPUCount && req.MemoryMiB == s.MemoryMiB && req.NetworkMode == s.NetworkMode
 }
 
+// allocatedVCPU returns the exact allocated vCPUs. The 64-bit total is
+// exact; vcpu_count is capped at 2147483647, so it serves only a record that
+// lacks the total.
+func allocatedVCPU(alloc *ownsandv1.DeviceAllocation) int64 {
+	if alloc != nil && alloc.VcpuTotalCount != nil {
+		return alloc.GetVcpuTotalCount()
+	}
+	return int64(alloc.GetVcpuCount())
+}
+
 // share returns the allocated share of the device's most constrained
 // resource.
 func share(d Device) float64 {
@@ -241,7 +251,7 @@ func share(d Device) float64 {
 		return float64(used) / float64(limit)
 	}
 	return max(
-		ratio(int64(alloc.GetVcpuCount()), validate.EffectiveVCPULimit(d.Limits)),
+		ratio(allocatedVCPU(alloc), validate.EffectiveVCPULimit(d.Limits)),
 		ratio(alloc.GetMemoryMib(), d.Limits.GetMemoryMib()),
 		ratio(alloc.GetDiskGib(), d.Limits.GetDiskGib()),
 	)

@@ -45,7 +45,7 @@ The API server is the system of record for account and billing information. It i
 | ----------- | --------------- | -------------- | ----------------------------------------------------------------------- |
 | `healthz`   | `GET /healthz`  | none           | `200` with `{"status":"ok"}` while the process can serve HTTP requests. |
 
-- Business APIs (`planned`): Connect RPC services generated from `protos/delino/accounts/v1/`. Planned services:
+- Business APIs (`planned`): Connect RPC services generated from `protos/delino/accounts/`. Planned services:
 
 | Service ID       | Responsibility                                                                        |
 | ---------------- | ------------------------------------------------------------------------------------- |
@@ -59,15 +59,15 @@ The API server is the system of record for account and billing information. It i
 
 ## Configuration
 
-| Variable    | Required | Default          | Values                           |
-| ----------- | -------- | ---------------- | -------------------------------- |
-| `ADDR`      | no       | `127.0.0.1:8100` | `host:port` listen address       |
-| `LOG_LEVEL` | no       | `info`           | `debug`, `info`, `warn`, `error` |
+| Variable    | Required | Default           | Values                           |
+| ----------- | -------- | ----------------- | -------------------------------- |
+| `ADDR`      | no       | `127.0.0.1:18100` | `host:port` listen address       |
+| `LOG_LEVEL` | no       | `info`            | `debug`, `info`, `warn`, `error` |
 
 - The server validates the configuration at startup and exits with a non-zero status when a value is not valid.
 - The server removes only ASCII white space (space, tab, line feed, vertical tab, form feed and carriage return) from the start and end of `ADDR` and `LOG_LEVEL`. A value that consists only of ASCII white space counts as unset and selects the default. Unicode white space, such as U+00A0 (no-break space) and U+3000 (ideographic space), is not removed, so a value that contains it is not valid, also when the whole value consists of such characters. The server matches `LOG_LEVEL` against the level names with ASCII letter case folding only (`INFO` and `iNfO` select `info`). Any other character makes the value not valid, so a value that lower-cases to a level name only under Unicode case mapping, such as `İNFO` (U+0130 followed by `NFO`), stops the server at startup like any other invalid value.
 - `ADDR` accepts an empty host (all interfaces), an IP address (IPv6 in brackets, with an optional zone) or an RFC 1123 hostname; configuration validation checks only the host syntax, so a hostname that does not resolve still fails when the server starts listening.
-- Root `pnpm dev` and `pnpm exec turbo run dev --filter=accounts-api` pass `ADDR` and `LOG_LEVEL` from the shell to the server through Turbo `passThroughEnv` in `servers/accounts-api/turbo.json`. Add every new configuration variable to that list in the change that makes the server read it.
+- Root `pnpm dev` and `pnpm exec turbo run dev --filter=accounts-api` pass `ADDR` and `LOG_LEVEL` from the shell to the server through Turbo `passThroughEnv` in `servers/accounts-api/turbo.json`. Add every new configuration variable to that list in the change that makes the server read it. Values from the Infisical `/servers/accounts-api` development folder do not need that list, because the injection runs inside the task, and they override shell values.
 - Production must set `ADDR` explicitly for its deployment target. The default listens on loopback only.
 - Logto settings (`planned`): the tenant endpoint and the API resource indicator. Add them to this table and to `.env.example` in the same change that adds token validation.
 
@@ -125,7 +125,7 @@ The scaffold has no persistent storage. The database is PlanetScale Postgres, ac
 
 Run from the repository root:
 
-- `pnpm --filter accounts-api dev`: run the server through the development launcher `scripts/dev.mjs` (see [Development Launcher](#development-launcher)).
+- `pnpm --filter accounts-api dev`: run the server through the development launcher `scripts/dev.mjs` (see [Development Launcher](#development-launcher)). The `dev` script starts the launcher through the shared `scripts/dev/with-infisical.mjs`, which injects the Infisical `dev` variables of the `/servers/accounts-api` folder when the checkout has a local Infisical project configuration, according to the [environment contract](repository-environment-contract.md#local-development-injection).
 - `pnpm exec turbo run build --filter=accounts-api`: build the binary into `servers/accounts-api/dist/`.
 - `pnpm exec turbo run lint --filter=accounts-api`: `go vet ./...`.
 - `pnpm exec turbo run test --filter=accounts-api`: `go test ./...` followed by the launcher tests, `node --test "scripts/*.test.mjs"`.

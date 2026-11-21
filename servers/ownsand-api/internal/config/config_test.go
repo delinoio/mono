@@ -3,6 +3,7 @@
 package config
 
 import (
+	"os"
 	"strings"
 	"testing"
 )
@@ -27,7 +28,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.Addr != DefaultAddr || cfg.LogtoAudience != DefaultAudience || cfg.LogtoJWKSURL != "https://tenant.logto.app/oidc/jwks" ||
-		!cfg.RunMigrations || cfg.NonceKey != nil || cfg.TrustProxyClientAddress || len(cfg.CORSOrigins) != 1 {
+		!cfg.RunMigrations || cfg.NonceKey != nil || cfg.TrustProxyClientAddress || cfg.AllowDirectClientAddress || cfg.ClientAddressMode != ClientAddressNone || len(cfg.CORSOrigins) != 1 {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }
@@ -61,7 +62,10 @@ func TestLoadRejects(t *testing.T) {
 		"short nonce key":    func(v map[string]string) { v[EnvNonceKey] = "c2hvcnQ" },
 		"previous alone":     func(v map[string]string) { v[EnvNonceKeyPrevious] = strings.Repeat("A", 43) },
 		"bad origin":         func(v map[string]string) { v[EnvCORSOrigins] = "https://x/path" },
+		"origin fragment":    func(v map[string]string) { v[EnvCORSOrigins] = "https://x#frag" },
+		"origin bare hash":   func(v map[string]string) { v[EnvCORSOrigins] = "https://ownsand.example#" },
 		"bad trust boolean":  func(v map[string]string) { v[EnvTrustProxyClientAddress] = "maybe" },
+		"bad direct boolean": func(v map[string]string) { v[EnvAllowDirectClientAddress] = "maybe" },
 		"bad migrate switch": func(v map[string]string) { v[EnvRunMigrations] = "sometimes" },
 	} {
 		v := minimal()
@@ -97,5 +101,132 @@ func TestLoadR2AndSTUN(t *testing.T) {
 		if _, err := Load(env(w)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestLoadSTUNURLs(t *testing.T) {
+	for _, tc := range []struct {
+		name, urls string
+		ok         bool
+	}{
+		{"hostname and port", "stun:localhost:13478", true},
+		{"hostname default port", "stun:example.com", true},
+		{"bracketed IPv6", "stun:[::1]:3478", true},
+		{"list", "stun:a:3478, stun:[::1]:3478", true},
+		{"hostless", "stun:", false},
+		{"hostless after valid", "stun:a:3478, stun:", false},
+		{"hostless with port", "stun::3478", false},
+		{"query", "stun:a:3478?transport=udp", false},
+		{"turn", "turn:a:3478", false},
+		{"stuns", "stuns:a:5349", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := minimal()
+			v[EnvSTUNURLs] = tc.urls
+			_, err := Load(env(v))
+			if tc.ok != (err == nil) {
+				t.Fatalf("Load(%q) err = %v, want ok=%v", tc.urls, err, tc.ok)
+			}
+			if want := EnvSTUNURLs + " must list stun: URLs with a host"; err != nil && err.Error() != want {
+				t.Fatalf("error = %q, want %q (no URL echo)", err, want)
+			}
+		})
+	}
+}
+
+func TestLoadClientAddressMode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		trust, allow string
+		want         ClientAddressMode
+	}{
+		{"neither", "", "", ClientAddressNone},
+		{"both false", "false", "false", ClientAddressNone},
+		{"direct", "", "true", ClientAddressDirect},
+		{"verified proxy", "true", "", ClientAddressVerifiedProxy},
+		{"verified proxy takes precedence", "true", "true", ClientAddressVerifiedProxy},
+		{"trust false allows direct", "false", "true", ClientAddressDirect},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := minimal()
+			if tc.trust != "" {
+				v[EnvTrustProxyClientAddress] = tc.trust
+			}
+			if tc.allow != "" {
+				v[EnvAllowDirectClientAddress] = tc.allow
+			}
+			cfg, err := Load(env(v))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.ClientAddressMode != tc.want {
+				t.Fatalf("mode = %q, want %q", cfg.ClientAddressMode, tc.want)
+			}
+		})
+	}
+}
+
+func TestLoadRejectsNonASCIILogLevelThatFoldsToLevelName(t *testing.T) {
+	for name, value := range map[string]string{
+		"U+0130 NFO":            "\u0130NFO",
+		"U+0130 nfo":            "\u0130nfo",
+		"U+0130 NFO with space": " \u0130NFO ",
+		"loud":                  "loud",
+		"KNFO":                  "KNFO",
+		"dotless i nfo":         "\u0131nfo",
+	} {
+		v := minimal()
+		v[EnvLogLevel] = value
+		_, err := Load(env(v))
+		if err == nil || err.Error() != "LOG_LEVEL must be one of debug, info, warn, error" {
+			t.Errorf("%s: err = %v", name, err)
+		}
+	}
+}
+
+func TestLoadAcceptsASCIILogLevelInAnyCase(t *testing.T) {
+	for value, want := range map[string]LogLevel{
+		"DEBUG": LogLevelDebug,
+		"WARN":  LogLevelWarn,
+		"Error": LogLevelError,
+		"INFO":  LogLevelInfo,
+		"iNfO":  LogLevelInfo,
+		" Warn": LogLevelWarn,
+		"":      LogLevelInfo,
+		" \t ":  LogLevelInfo,
+	} {
+		v := minimal()
+		v[EnvLogLevel] = value
+		cfg, err := Load(env(v))
+		if err != nil {
+			t.Errorf("%q: %v", value, err)
+			continue
+		}
+		if cfg.LogLevel != want {
+			t.Errorf("%q: level = %q, want %q", value, cfg.LogLevel, want)
+		}
+	}
+}
+
+// TestSTUNAddrDefaults pins the standalone binary default and requires the
+// runtime image to override it with the wildcard address, because a
+// loopback-bound listener cannot receive datagrams from a published UDP port.
+func TestSTUNAddrDefaults(t *testing.T) {
+	cfg, err := Load(env(minimal()))
+	if err != nil || cfg.STUNAddr != "127.0.0.1:13478" {
+		t.Fatalf("default STUNAddr = %q, %v", cfg.STUNAddr, err)
+	}
+	v := minimal()
+	v[EnvSTUNAddr] = "0.0.0.0:3478"
+	cfg, err = Load(env(v))
+	if err != nil || cfg.STUNAddr != "0.0.0.0:3478" {
+		t.Fatalf("explicit STUNAddr = %q, %v", cfg.STUNAddr, err)
+	}
+	dockerfile, err := os.ReadFile("../../Dockerfile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(dockerfile), "\nENV "+EnvSTUNAddr+"=0.0.0.0:3478\n") {
+		t.Errorf("Dockerfile does not set %s=0.0.0.0:3478", EnvSTUNAddr)
 	}
 }

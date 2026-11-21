@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build !linux
 
@@ -12,4 +12,4 @@ func isInitChild() bool { return false }
 
 func runInit([]string) int { return 1 }
 
-func startTunnel(*slog.Logger) error { return nil }
+func startTunnel(*slog.Logger) (<-chan error, error) { return nil, nil }

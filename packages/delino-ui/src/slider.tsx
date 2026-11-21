@@ -75,20 +75,31 @@ export function Slider({
   // adjusted during render, which React supports for state derived from props.
   // Remove when the UI SDK resets its state when a controlled value becomes
   // undefined.
+  const currentDefaultValue = isEmptyArray(defaultValueProp)
+    ? undefined
+    : defaultValueProp;
+  // The UI SDK reads `defaultValue` only when its root mounts, so the thumb
+  // count must follow the default of that mount and not a later prop. The
+  // mounted default is captured with the epoch and captured again when the
+  // root remounts.
   const [resetState, setResetState] = React.useState({
     hadValue: hasValue,
     epoch: 0,
+    mountedDefault: currentDefaultValue,
   });
   let resetEpoch = resetState.epoch;
+  let defaultValue = resetState.mountedDefault;
   if (resetState.hadValue !== hasValue) {
     if (resetState.hadValue && valueIsEmpty) {
       resetEpoch += 1;
+      defaultValue = currentDefaultValue;
     }
-    setResetState({ hadValue: hasValue, epoch: resetEpoch });
+    setResetState({
+      hadValue: hasValue,
+      epoch: resetEpoch,
+      mountedDefault: defaultValue,
+    });
   }
-  const defaultValue = isEmptyArray(defaultValueProp)
-    ? undefined
-    : defaultValueProp;
   const initial = value ?? defaultValue;
   const thumbCount = Array.isArray(initial) ? initial.length : 1;
   // The UI SDK treats only an array of more than one value as a range. A

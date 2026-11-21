@@ -74,6 +74,11 @@ export async function* runReadFile(
           grantId,
           signal,
           (options) => ctx.relay.readFile(request, options),
+          {
+            window,
+            isAccepted: (response) =>
+              response.event?.event?.case === "accepted",
+          },
         )) {
           yield response.event;
         }
@@ -142,7 +147,7 @@ export async function* runReadFile(
 
     throwIfAborted(signal);
     if (failure instanceof SessionEndedError) {
-      selector.sessionEnded();
+      if (session !== undefined) selector.sessionEnded(session);
       continue;
     }
     if (failure instanceof PeerUnavailableError) {
@@ -156,7 +161,7 @@ export async function* runReadFile(
         cause: failure,
       });
     }
-    if (onRelay) grants.discard();
+    if (onRelay) grants.discardFor(failure);
     await recoverOrThrow(ctx, window, failure, signal);
   }
 }

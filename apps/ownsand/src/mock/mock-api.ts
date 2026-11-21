@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { create, type MessageInitShape } from "@bufbuild/protobuf";
+import { create, type MessageInitShape, toBinary } from "@bufbuild/protobuf";
 import {
   type Duration,
   type Timestamp,
@@ -22,6 +22,8 @@ import {
   ApiKeyState,
   Arch,
   BaseImage,
+  type DeviceLimits,
+  DeviceLimitsSchema,
   DeviceState,
   EnrollmentTokenState,
   GuestOs,
@@ -59,6 +61,7 @@ import {
 } from "ownsand-sdk/gen/organization_pb";
 import {
   type Sandbox,
+  CreateSandboxRequestSchema,
   SandboxSchema,
   SandboxService,
 } from "ownsand-sdk/gen/sandbox_pb";
@@ -69,7 +72,7 @@ import {
   type Template,
   TemplateSchema,
 } from "ownsand-sdk/gen/snapshot_pb";
-import { effectiveVcpuLimit } from "../format.ts";
+import { effectiveVcpuLimit, MAX_INT32 } from "../format.ts";
 import { uuidV7 } from "../uuid.ts";
 
 /**
@@ -112,6 +115,12 @@ interface OrgState {
   tokens: EnrollmentToken[];
   apiKeys: ApiKey[];
   sandboxes: Sandbox[];
+  /**
+   * Create idempotency bookkeeping, kept apart from the user-visible sandbox
+   * labels. Maps an idempotency key to the sandbox it created and to the
+   * encoded request it is bound to, like the real API.
+   */
+  createKeys: Map<string, { sandboxId: string; request: string }>;
   snapshots: Snapshot[];
   templates: Template[];
   policy: AgentVersionPolicy;
@@ -145,6 +154,7 @@ function emptyOrg(id: string, name: string): OrgState {
     tokens: [],
     apiKeys: [],
     sandboxes: [],
+    createKeys: new Map(),
     snapshots: [],
     templates: [],
     policy: create(AgentVersionPolicySchema, {
@@ -198,7 +208,13 @@ function seed(): Map<string, OrgState> {
         vcpuOvercommitPercent: 150,
       },
       effectiveVcpuLimit: 24,
-      allocation: { vcpuCount: 10, memoryMib: 20480n, diskGib: 80n },
+      effectiveVcpuLimitCount: 24n,
+      allocation: {
+        vcpuCount: 10,
+        vcpuTotalCount: 10n,
+        memoryMib: 20480n,
+        diskGib: 80n,
+      },
       createTime: ts(-50 * 24 * HOUR),
       lastSeenTime: ts(-5),
     }),
@@ -225,7 +241,13 @@ function seed(): Map<string, OrgState> {
         vcpuOvercommitPercent: 100,
       },
       effectiveVcpuLimit: 0,
-      allocation: { vcpuCount: 2, memoryMib: 4096n, diskGib: 20n },
+      effectiveVcpuLimitCount: 0n,
+      allocation: {
+        vcpuCount: 2,
+        vcpuTotalCount: 2n,
+        memoryMib: 4096n,
+        diskGib: 20n,
+      },
       createTime: ts(-3 * 24 * HOUR),
       lastSeenTime: ts(-2 * HOUR),
     }),
@@ -394,6 +416,39 @@ export function createMockTransport(
       throw new ConnectError("device not found", Code.NotFound);
     return d;
   };
+  // Shared by the legacy and the strict limits RPC: the numeric rules and the
+  // derived effective vCPU limit of the server.
+  const applyDeviceLimits = (
+    org: OrgState,
+    deviceId: string,
+    l: DeviceLimits | undefined,
+  ) => {
+    if (
+      l === undefined ||
+      l.vcpuCount < 0 ||
+      l.memoryMib < 0n ||
+      l.diskGib < 0n
+    ) {
+      throw new ConnectError(
+        "limits must not be negative",
+        Code.InvalidArgument,
+      );
+    }
+    const p = l.vcpuOvercommitPercent;
+    if (p < 100 || p > 400 || p % 25 !== 0) {
+      throw new ConnectError(
+        "limits.vcpu_overcommit_percent must be 100 to 400 in steps of 25",
+        Code.InvalidArgument,
+      );
+    }
+    const device = findDevice(org, deviceId);
+    device.limits = l;
+    // Like the server: the exact int64 value, and the int32 field capped.
+    const effective = effectiveVcpuLimit(l.vcpuCount, p);
+    device.effectiveVcpuLimitCount = BigInt(effective);
+    device.effectiveVcpuLimit = Math.min(effective, MAX_INT32);
+    return device;
+  };
   const findSnapshot = (org: OrgState, id: string) => {
     const s = org.snapshots.find((x) => x.snapshotId === id);
     if (s === undefined)
@@ -421,14 +476,17 @@ export function createMockTransport(
         const { org, role } = membership(req.organizationId);
         return { organization: withRole(org.organization, role) };
       },
-      listOrganizations() {
+      listOrganizations(req) {
+        // Mirror the control plane page size: 50 by default, at most 200.
+        const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
         const organizations = [...orgs.values()]
           .map((org) => ({
             org,
             m: org.members.find((x) => x.userId === userId),
           }))
           .filter((x) => x.m !== undefined)
-          .map((x) => withRole(x.org.organization, x.m!.role));
+          .map((x) => withRole(x.org.organization, x.m!.role))
+          .slice(0, pageSize);
         return { organizations };
       },
       deleteOrganization(req) {
@@ -632,31 +690,47 @@ export function createMockTransport(
         return { device: findDevice(org, req.deviceId) };
       },
       updateDeviceLimits(req) {
+        // Legacy RPC: a missing value reads as zero.
         const { org, role } = membership(req.organizationId);
         requireAdmin(role);
-        const device = findDevice(org, req.deviceId);
+        return { device: applyDeviceLimits(org, req.deviceId, req.limits) };
+      },
+      replaceDeviceLimits(req) {
+        const { org, role } = membership(req.organizationId);
+        requireAdmin(role);
         const l = req.limits;
-        if (
-          l === undefined ||
-          l.vcpuCount < 0 ||
-          l.memoryMib < 0n ||
-          l.diskGib < 0n
-        ) {
+        // Like the server: every value must be present, and an explicit zero
+        // is a value. The first missing field in schema order is named.
+        const missing =
+          l === undefined
+            ? "limits"
+            : l.vcpuCount === undefined
+              ? "limits.vcpu_count"
+              : l.memoryMib === undefined
+                ? "limits.memory_mib"
+                : l.diskGib === undefined
+                  ? "limits.disk_gib"
+                  : l.vcpuOvercommitPercent === undefined
+                    ? "limits.vcpu_overcommit_percent"
+                    : undefined;
+        if (l === undefined || missing !== undefined) {
           throw new ConnectError(
-            "limits must not be negative",
+            `${missing} is required`,
             Code.InvalidArgument,
           );
         }
-        const p = l.vcpuOvercommitPercent;
-        if (p < 100 || p > 400 || p % 25 !== 0) {
-          throw new ConnectError(
-            "limits.vcpu_overcommit_percent must be 100 to 400 in steps of 25",
-            Code.InvalidArgument,
-          );
-        }
-        device.limits = l;
-        device.effectiveVcpuLimit = effectiveVcpuLimit(l.vcpuCount, p);
-        return { device };
+        return {
+          device: applyDeviceLimits(
+            org,
+            req.deviceId,
+            create(DeviceLimitsSchema, {
+              vcpuCount: l.vcpuCount,
+              memoryMib: l.memoryMib,
+              diskGib: l.diskGib,
+              vcpuOvercommitPercent: l.vcpuOvercommitPercent,
+            }),
+          ),
+        };
       },
       removeDevice(req) {
         const { org, role } = membership(req.organizationId);
@@ -741,13 +815,31 @@ export function createMockTransport(
     router.service(SandboxService, {
       createSandbox(req) {
         const { org } = membership(req.organizationId);
-        const existing = org.sandboxes.find(
-          (s) => s.labels["mock-idempotency-key"] === req.idempotencyKey,
-        );
-        // A retry returns the same view as the first call: without the
-        // fake's idempotency bookkeeping label.
-        if (existing !== undefined) {
-          return { sandbox: withoutMockLabels(existing) };
+        // Map entries serialize in insertion order, so sort labels first to make
+        // the comparison independent of label order (the real API hashes a
+        // deterministic encoding).
+        const canonical = create(CreateSandboxRequestSchema, {
+          ...req,
+          labels: Object.fromEntries(
+            Object.entries(req.labels).sort(([a], [b]) =>
+              a < b ? -1 : a > b ? 1 : 0,
+            ),
+          ),
+        });
+        const request = Array.from(
+          toBinary(CreateSandboxRequestSchema, canonical),
+          (b) => b.toString(16).padStart(2, "0"),
+        ).join("");
+        const known = org.createKeys.get(req.idempotencyKey);
+        if (known !== undefined) {
+          // Same as the real API: a known key bound to other parameters fails.
+          if (known.request !== request) {
+            throw new ConnectError(
+              "the idempotency_key was used with other parameters",
+              Code.AlreadyExists,
+            );
+          }
+          return { sandbox: findSandbox(org, known.sandboxId) };
         }
         const device =
           org.devices.find((d) => d.deviceId === req.placement?.deviceId) ??
@@ -769,7 +861,7 @@ export function createMockTransport(
           arch: device.arch,
           guestOs: GuestOs.LINUX,
           network: req.network ?? { mode: NetworkMode.OUTBOUND },
-          labels: { ...req.labels, "mock-idempotency-key": req.idempotencyKey },
+          labels: { ...req.labels },
           idleTtl: req.idleTtl,
           maxTtl: req.maxTtl,
           idleDeadline: ts(Number(req.idleTtl?.seconds ?? 0n)),
@@ -777,14 +869,17 @@ export function createMockTransport(
           createdBy: { kind: PrincipalKind.USER, id: userId },
           createTime: ts(),
         });
-        // The fake hides its idempotency bookkeeping from the labels it returns.
         org.sandboxes.unshift(sandbox);
-        return { sandbox: { ...sandbox, labels: { ...req.labels } } };
+        org.createKeys.set(req.idempotencyKey, {
+          sandboxId: sandbox.sandboxId,
+          request,
+        });
+        return { sandbox };
       },
       getSandbox(req) {
         const { org } = membership(req.organizationId);
         const s = findSandbox(org, req.sandboxId);
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
       listSandboxes(req) {
         const { org } = membership(req.organizationId);
@@ -797,8 +892,7 @@ export function createMockTransport(
           .filter((s) => req.state === undefined || s.state === req.state)
           .filter(
             (s) => req.deviceId === undefined || s.deviceId === req.deviceId,
-          )
-          .map(withoutMockLabels);
+          );
         return { sandboxes };
       },
       deleteSandbox(req) {
@@ -812,7 +906,7 @@ export function createMockTransport(
           s.endReason = SandboxEndReason.DELETED_BY_CALLER;
           s.endTime = ts();
         }
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
       pauseSandbox(req) {
         const { org } = membership(req.organizationId);
@@ -827,7 +921,7 @@ export function createMockTransport(
           );
         }
         s.state = SandboxState.PAUSED;
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
       resumeSandbox(req) {
         const { org } = membership(req.organizationId);
@@ -842,7 +936,7 @@ export function createMockTransport(
           );
         }
         s.state = SandboxState.RUNNING;
-        return { sandbox: withoutMockLabels(s) };
+        return { sandbox: s };
       },
     });
 
@@ -939,9 +1033,4 @@ export function createMockTransport(
       },
     });
   });
-}
-
-function withoutMockLabels(s: Sandbox): Sandbox {
-  const { "mock-idempotency-key": _key, ...labels } = s.labels;
-  return { ...s, labels };
 }

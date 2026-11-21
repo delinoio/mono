@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package fcrt
 
@@ -24,6 +24,8 @@ import (
 type recorder struct {
 	mu     sync.Mutex
 	events []string
+	// rejectResume makes the fake API answer a Resumed state with an error.
+	rejectResume bool
 }
 
 func (r *recorder) add(e string) {
@@ -127,6 +129,12 @@ func startFakeVM(t *testing.T, r *Runtime, id string, rec *recorder) *vm {
 	api := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, _ := io.ReadAll(req.Body)
 		rec.add("api " + req.Method + " " + req.URL.Path + " " + string(body))
+		if rec.rejectResume && strings.Contains(string(body), `"Resumed"`) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"fault_message":"resume rejected"}`))
+			return
+		}
 		w.WriteHeader(http.StatusNoContent)
 	})}
 	go api.Serve(al)
@@ -194,5 +202,47 @@ func TestSnapshotOfRunningVMFlushesOnce(t *testing.T) {
 	want := []string{"exec sync", `api PATCH /vm {"state":"Paused"}`, `api PATCH /vm {"state":"Resumed"}`}
 	if got := rec.list(); strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("snapshot events %q, want %q", got, want)
+	}
+}
+
+// A resume that Firecracker rejects after a completed capture fails the
+// snapshot, so no READY record is saved for a VM that stays paused.
+func TestSnapshotReportsResumeFailure(t *testing.T) {
+	r, err := New(Options{Logger: quiet()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{rejectResume: true}
+	v := startFakeVM(t, r, "s3", rec)
+	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
+	if err := os.WriteFile(filepath.Join(v.dir, diskFile), []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := r.Snapshot(context.Background(), v, filepath.Join(t.TempDir(), "snap"))
+	if err == nil || !strings.Contains(err.Error(), "resume after snapshot") {
+		t.Fatalf("snapshot error %v, want a resume error", err)
+	}
+	if info.SizeBytes != 0 || info.HasMemoryState {
+		t.Fatalf("snapshot info %+v, want zero", info)
+	}
+}
+
+// A capture error stays the result when the resume that follows fails too,
+// and the runtime still attempts the resume.
+func TestSnapshotCaptureErrorWinsOverResumeFailure(t *testing.T) {
+	r, err := New(Options{Logger: quiet()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{rejectResume: true}
+	v := startFakeVM(t, r, "s4", rec)
+	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
+	// The source disk is missing, so the copy fails.
+	_, err = r.Snapshot(context.Background(), v, filepath.Join(t.TempDir(), "snap"))
+	if err == nil || strings.Contains(err.Error(), "resume after snapshot") {
+		t.Fatalf("snapshot error %v, want the disk error", err)
+	}
+	if got := strings.Join(rec.list(), "\n"); !strings.Contains(got, `"state":"Resumed"`) {
+		t.Fatalf("no resume attempted: %q", got)
 	}
 }

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package store
 
@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 )
@@ -91,5 +92,88 @@ func TestSandboxAndSnapshotRecords(t *testing.T) {
 	}
 	if _, err := os.Stat(s.Path(SnapshotsDir, "partial")); !os.IsNotExist(err) {
 		t.Fatal("partial snapshot kept")
+	}
+}
+
+func TestLoadSnapshotsRemovesAbandonedTransferArchives(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := s.Path(SnapshotsDir)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	abandoned := []string{".export-snap1-456.tar", ".import-snap1-123.tar"}
+	kept := []string{"notes.txt", ".export-snap1-abc.tar", ".import-.tar", "export-snap1-1.tar"}
+	for _, n := range append(append([]string{}, abandoned...), kept...) {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SaveSnapshot("ready", map[string]string{"id": "ready"}); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		n := 0
+		if err := s.LoadSnapshots(func([]byte) error { n++; return nil }); err != nil {
+			t.Fatalf("load %d: %v", i, err)
+		}
+		if n != 1 {
+			t.Fatalf("load %d: snapshots %d", i, n)
+		}
+		for _, name := range abandoned {
+			if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
+				t.Fatalf("load %d: %s kept", i, name)
+			}
+		}
+		for _, name := range kept {
+			if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+				t.Fatalf("load %d: %s removed: %v", i, name, err)
+			}
+		}
+	}
+}
+
+// Reset keeps deleting the other entries when one entry cannot be deleted,
+// so that a stuck log file never keeps identity.json on disk, and it reports
+// the failure.
+func TestResetDeletesIdentityWhenAnotherEntryFails(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("directory permissions do not block deletion on Windows")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root deletes entries of a read-only directory")
+	}
+	dir := t.TempDir()
+	// "a-stuck" sorts first, so the failure comes before every other entry,
+	// as the first failing entry of a lexical removal order.
+	stuck := filepath.Join(dir, "a-stuck")
+	if err := os.Mkdir(stuck, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(stuck, "x"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(stuck, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(stuck, 0o700) })
+	for _, name := range []string{AgentFile, IdentityFile, "agent.log"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	st, err := Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Reset(); err == nil {
+		t.Fatal("Reset did not report the entry that it could not delete")
+	}
+	for _, name := range []string{AgentFile, IdentityFile, "agent.log"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("%s still exists after Reset: %v", name, err)
+		}
 	}
 }

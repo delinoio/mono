@@ -135,7 +135,14 @@ function ApiProviders({
 function Routes({ config }: { config: ConsoleConfig }) {
   const auth = useAuth();
   const { route } = useRouter();
+  const configured =
+    config.authMode === AuthMode.Mock || config.logto !== undefined;
   if (route.id === RouteId.Callback) {
+    // Without a Logto registration there is no provider for the Logto
+    // callback hook, which would render nothing. Show the notice instead.
+    if (!configured) {
+      return <SignIn configured={false} />;
+    }
     return config.authMode === AuthMode.Mock ? (
       <MockCallbackPage />
     ) : (
@@ -149,13 +156,7 @@ function Routes({ config }: { config: ConsoleConfig }) {
     return <InvitationPage />;
   }
   if (!auth.isAuthenticated) {
-    return (
-      <SignIn
-        configured={
-          config.authMode === AuthMode.Mock || config.logto !== undefined
-        }
-      />
-    );
+    return <SignIn configured={configured} />;
   }
   switch (route.id) {
     case RouteId.Organizations:

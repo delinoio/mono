@@ -42,37 +42,110 @@ export interface WriteFileResult {
 
 /**
  * Splits a source into chunks of exactly `size` bytes, except the last one.
- * It reads one chunk ahead so that the last chunk is known.
+ * It reads one chunk ahead so that the last chunk is known. An abort of
+ * `signal` ends the iteration with the signal's reason, also while the source
+ * has not produced its next piece.
  */
 export async function* chunkSource(
   source: WriteSource,
   size: number = MAX_FILE_CHUNK_SIZE,
+  signal?: AbortSignal,
 ): AsyncGenerator<{ data: Uint8Array; last: boolean }> {
-  let pending = new Uint8Array(0);
+  // Unconsumed pieces plus a read offset into the first one. Each piece and
+  // each chunk is copied once, so the total copy volume is linear in the
+  // input size. The caller's buffers are never aliased: an unacknowledged
+  // chunk can be resent after a failure while the caller mutates its own
+  // buffer.
+  const pieces: Uint8Array[] = [];
+  let offset = 0;
+  let pendingLength = 0;
   let held: Uint8Array | undefined;
-  for await (const piece of iterateSource(source)) {
-    const joined = new Uint8Array(pending.length + piece.length);
-    joined.set(pending, 0);
-    joined.set(piece, pending.length);
-    pending = joined;
-    while (pending.length >= size) {
+  const take = (n: number): Uint8Array => {
+    const out = new Uint8Array(n);
+    let filled = 0;
+    while (filled < n) {
+      const head = pieces[0]!;
+      const count = Math.min(n - filled, head.length - offset);
+      out.set(head.subarray(offset, offset + count), filled);
+      filled += count;
+      offset += count;
+      if (offset === head.length) {
+        pieces.shift();
+        offset = 0;
+      }
+    }
+    pendingLength -= n;
+    return out;
+  };
+  for await (const piece of iterateSource(source, signal)) {
+    if (piece.length === 0) continue;
+    // Own the piece before the loop asks the source for another one: a source
+    // can reuse its buffer between yields, and the caller can change a buffer
+    // while a chunk waits to be sent. Each byte is copied here once and in
+    // `take` once, so the copy volume stays linear in the input size. The
+    // constructor always copies: a Node.js `Buffer` overrides `slice` to
+    // return a view over the same memory, so `piece.slice()` would alias it.
+    pieces.push(new Uint8Array(piece));
+    pendingLength += piece.length;
+    while (pendingLength >= size) {
       if (held !== undefined) {
         yield { data: held, last: false };
       }
-      held = pending.slice(0, size);
-      pending = pending.slice(size);
+      held = take(size);
     }
   }
-  if (pending.length > 0) {
+  if (pendingLength > 0) {
     if (held !== undefined) {
       yield { data: held, last: false };
     }
-    held = pending;
+    held = take(pendingLength);
   }
   yield { data: held ?? new Uint8Array(0), last: true };
 }
 
-async function* iterateSource(source: WriteSource): AsyncGenerator<Uint8Array> {
+/**
+ * Settles with `promise`, or rejects with the signal's reason as soon as the
+ * signal aborts, even if `promise` never settles. The late outcome of
+ * `promise` is ignored (and never reported as an unhandled rejection).
+ */
+function abortable<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) return promise;
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
+function ignoreFailure(): void {}
+
+/**
+ * Yields the pieces of a source. The signal is observed while the source is
+ * idle: an abort rejects with the signal's reason at once, even when a pending
+ * read or `next()` never settles, and the source is released without waiting
+ * for it to cooperate.
+ */
+async function* iterateSource(
+  source: WriteSource,
+  signal: AbortSignal | undefined,
+): AsyncGenerator<Uint8Array> {
+  throwIfAborted(signal);
   if (typeof source === "string") {
     yield new TextEncoder().encode(source);
   } else if (source instanceof Uint8Array) {
@@ -81,18 +154,62 @@ async function* iterateSource(source: WriteSource): AsyncGenerator<Uint8Array> {
     yield new Uint8Array(source);
   } else if (source instanceof ReadableStream) {
     const reader = source.getReader();
+    let finished = false;
     try {
       for (;;) {
-        const { done, value } = await reader.read();
-        if (done) return;
+        throwIfAborted(signal);
+        const { done, value } = await abortable(reader.read(), signal);
+        if (done) {
+          finished = true;
+          return;
+        }
         yield value;
       }
     } finally {
-      reader.releaseLock();
+      if (!finished) {
+        // Cancel first: it settles a pending read, which a lock release
+        // alone does not on every runtime. The source's own cancel callback
+        // may never return, so the outcome is not awaited.
+        reader.cancel(signal?.reason).catch(ignoreFailure);
+      }
+      try {
+        reader.releaseLock();
+      } catch {
+        // A runtime that refuses to release a lock with a pending read has
+        // already had the stream canceled above.
+      }
     }
   } else {
-    for await (const piece of source as AsyncIterable<Uint8Array>) {
-      yield piece instanceof Uint8Array ? piece : new Uint8Array(piece);
+    const iterable = source as Iterable<Uint8Array> | AsyncIterable<Uint8Array>;
+    const iterator: Iterator<Uint8Array> | AsyncIterator<Uint8Array> =
+      Symbol.asyncIterator in iterable
+        ? iterable[Symbol.asyncIterator]()
+        : (iterable as Iterable<Uint8Array>)[Symbol.iterator]();
+    let finished = false;
+    try {
+      for (;;) {
+        throwIfAborted(signal);
+        const result = await abortable(
+          Promise.resolve(iterator.next()),
+          signal,
+        );
+        if (result.done) {
+          finished = true;
+          return;
+        }
+        const piece = await abortable(Promise.resolve(result.value), signal);
+        yield piece instanceof Uint8Array ? piece : new Uint8Array(piece);
+      }
+    } finally {
+      if (!finished) {
+        // Request the iterator's cleanup but do not wait for it: an iterator
+        // that is stuck in `next()` can never finish `return()` either.
+        try {
+          Promise.resolve(iterator.return?.()).catch(ignoreFailure);
+        } catch {
+          // A synchronous failure of the cleanup has no caller to report to.
+        }
+      }
     }
   }
 }
@@ -116,7 +233,8 @@ export async function runWriteFile(
   let grants: GrantKeeper | undefined;
   let offset = 0n;
   let first = true;
-  for await (const chunk of chunkSource(source)) {
+  throwIfAborted(signal);
+  for await (const chunk of chunkSource(source, MAX_FILE_CHUNK_SIZE, signal)) {
     const request = create(WriteFileRequestSchema, {
       organizationId: ctx.organizationId,
       sandboxId: ctx.sandboxId,
@@ -185,7 +303,7 @@ async function sendChunk(
       }
       throwIfAborted(signal);
       if (failure instanceof SessionEndedError) {
-        selector.sessionEnded();
+        if (session !== undefined) selector.sessionEnded(session);
         continue;
       }
       if (failure instanceof PeerUnavailableError) {
@@ -216,10 +334,12 @@ async function sendChunk(
       grants.streamEnded();
     }
     throwIfAborted(signal);
-    grants.discard();
     // The control plane's 5-minute call limit is retryable for a write,
-    // which the write_id rules make safe.
-    await recoverOrThrow(ctx, window, asRetryableDeadline(failure), signal);
+    // which the write_id rules make safe. The grant decision and the
+    // recovery rules must see the same (wrapped) failure.
+    const retryable = asRetryableDeadline(failure);
+    grants.discardFor(retryable);
+    await recoverOrThrow(ctx, window, retryable, signal);
   }
 }
 

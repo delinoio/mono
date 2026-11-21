@@ -64,6 +64,45 @@ func TestGeneratorClockGoesBackwards(t *testing.T) {
 	}
 }
 
+func TestGeneratorSeedsCounterAtUnixEpoch(t *testing.T) {
+	epoch := func() time.Time { return time.UnixMilli(0) }
+	counterOf := func(id UUID) uint16 {
+		return uint16(id[6]&0x0f)<<8 | uint16(id[7])
+	}
+
+	// The first call at 0 ms seeds rand_a from the random bytes.
+	random := make([]byte, 20)
+	random[0], random[1] = 0x02, 0x34
+	g := NewGenerator(epoch, bytes.NewReader(random))
+	id, err := g.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !id.Time().Equal(time.UnixMilli(0)) {
+		t.Fatalf("timestamp = %v, want the Unix epoch", id.Time())
+	}
+	if got := counterOf(id); got != 0x234 {
+		t.Fatalf("rand_a = %#x, want 0x234", got)
+	}
+
+	// A seed of 0 still counts up on the next call in the same millisecond.
+	g = NewGenerator(epoch, bytes.NewReader(make([]byte, 20)))
+	first, err := g.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := g.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if counterOf(first) != 0x000 || counterOf(second) != 0x001 {
+		t.Fatalf("counters = %#x, %#x; want 0x000, 0x001", counterOf(first), counterOf(second))
+	}
+	if second.String() <= first.String() {
+		t.Fatalf("second value does not sort after first: %s <= %s", second, first)
+	}
+}
+
 func TestFromTime(t *testing.T) {
 	at := time.Date(2026, 11, 20, 12, 0, 0, 123_000_000, time.UTC)
 	id, err := FromTime(at, bytes.NewReader(make([]byte, 10)))

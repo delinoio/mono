@@ -17,7 +17,8 @@
 - Do not add issue or pull-request links or identifying numbers, including Linear `DELI-<number>` identifiers, to repository instruction files or documentation. Describe requirements directly and link to the owning repository-local contracts. Domain, service and technical-documentation links remain allowed; record issue/PR traceability in pull requests, Linear issues or CI records instead.
 
 - Use the `@docs/` directory as the source of truth for project contracts and implementation documents.
-- License repository-owned source and future distributions under Apache-2.0, except `servers/`, which uses FSL-1.1-ALv2 with an Apache-2.0 future license. Keep imported code and bundled fonts under their original licenses with notices intact; follow `docs/repository-license-contract.md`.
+- License repository-owned source and future distributions under Apache-2.0, except `servers/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/`, which use FSL-1.1-ALv2 with an Apache-2.0 future license. Apache-2.0 code must not import FSL-1.1-ALv2 code. Keep imported code and bundled fonts under their original licenses with notices intact; follow `docs/repository-license-contract.md`.
+- Keep the upstream `LICENSE` in each imported agent skill directory; when upstream publishes none, add a `NOTICE` file there that records the source, skill path and commit from `skills-lock.json` and the upstream license declaration without an invented holder, year or license text, and never hand-edit the recorded hash in `skills-lock.json`. Follow `docs/repository-workflow-contract.md` and `docs/repository-license-contract.md`.
 - All repository-wide rules must be defined in the appropriate AGENTS.md.
 - Every repository-owned directory named `dist` is ignored generated output and must never be tracked. Generate required `dist` content explicitly before compilation, testing, or packaging, and remove generated `dist` directories from the final worktree.
 - Track repository asset files of at least 512 KiB through exact-path Git LFS attributes. Checkouts that compile, test, or package those assets must hydrate LFS objects first; preserve source licenses and notices. Follow `docs/repository-workflow-contract.md`.
@@ -33,9 +34,10 @@
 - Commit your work as frequent as possible using git. Do NOT use `--no-verify` flag.
 - Run `git commit` only after `git add`; once files are staged, commit without unnecessary delay so staged changes are preserved in history.
 - Committing may require workspace binaries (for example, git hooks). If required binaries are missing, run `pnpm install` at the repository root and retry the commit.
-- CI changes must preserve affected manual validation and exclude macOS runners from PRs, main pushes and affected manual runs. Follow `docs/repository-workflow-contract.md`.
+- CI changes must preserve affected manual validation. Follow `docs/repository-workflow-contract.md`.
 - Add a changeset with `pnpm changeset` to every pull request whose change must be deployed or released. `.github/workflows/deploy.yml` deploys only packages released by pending changesets. Follow `docs/repository-workflow-contract.md#deployment-workflow`.
-- Keep `.infisical.json`, `.dev-environment/`, real `.env` files, user credentials, and production/release/signing credentials uncommitted. Service-local `.env.example` files contain names, validation guidance, placeholders, and safe loopback defaults only; do not add a root environment example or expose internal secret paths in public product docs.
+- Keep `.infisical.yaml`, `.infisical.json`, `.dev-environment/`, real `.env` files, user credentials, and production/release/signing credentials uncommitted. Service-local `.env.example` files contain names, validation guidance, placeholders, and safe loopback defaults only; do not add a root environment example or expose internal secret paths in public product docs.
+- Use Infisical only for local development variables. Package `dev` scripts that read configuration start their command through `scripts/dev/with-infisical.mjs` with an Infisical folder equal to their package directory (for example `/servers/accounts-api`); never commit Infisical project IDs, tokens or values. Follow `docs/repository-environment-contract.md#local-development-injection`.
 - After addressing pull request review comments and pushing updates, mark the corresponding review threads as resolved.
 - When no explicit scope is specified and you are currently working within a pull request scope, interpret instructions within the current pull request scope.
 - Do not guess; rather search for the web.
@@ -55,7 +57,7 @@
 - `docs/`: Source of truth for project contracts and repository documentation.
 - `apps/`: User-facing apps and documentation web surfaces.
 - `crates/`: Rust crates and Rust-based tooling.
-- `cmds/`: Go command-line tools and device-side programs.
+- `cmds/`: Go command-line tools and device-side programs. The device agent and guest helper are licensed under FSL-1.1-ALv2; the other commands use Apache-2.0.
 - `servers/`: Backend services, licensed under FSL-1.1-ALv2.
 - `protos/`: Versioned protocol schemas and committed Go bindings.
 - `go/`: Go packages that external users import, in the root Go module.

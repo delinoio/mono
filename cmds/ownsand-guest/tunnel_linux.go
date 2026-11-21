@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package main
 
@@ -70,45 +70,84 @@ func parseTunnelSpec(cmdline string) (tunnelSpec, bool, error) {
 
 // startTunnel starts the network tunnel when the kernel command line asks
 // for it. It returns after the interface is configured; the relay runs
-// until the process ends.
-func startTunnel(logger *slog.Logger) error {
+// until the process ends. The returned channel is nil when no tunnel runs.
+// Otherwise it receives the terminal error of the relay (the TAP device or
+// the listener failed) after the tunnel closed its connection, listener and
+// TAP device; the caller must then end the helper so that the init process
+// restarts it and the host reconnects. A setup failure is returned as an
+// error and leaves no tunnel running.
+func startTunnel(logger *slog.Logger) (<-chan error, error) {
 	cmdline, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
-		return nil
+		return nil, nil
 	}
 	spec, ok, err := parseTunnelSpec(string(cmdline))
 	if !ok || err != nil {
-		return err
+		return nil, err
 	}
 	tapFile, err := openTap(tunnelInterface)
 	if err != nil {
-		return fmt.Errorf("tunnel: create %s: %w", tunnelInterface, err)
+		return nil, fmt.Errorf("tunnel: create %s: %w", tunnelInterface, err)
 	}
 	if err := configureInterface(tunnelInterface, spec.guest, spec.gateway); err != nil {
 		tapFile.Close()
-		return fmt.Errorf("tunnel: configure %s: %w", tunnelInterface, err)
+		return nil, fmt.Errorf("tunnel: configure %s: %w", tunnelInterface, err)
 	}
 	_ = os.WriteFile("/etc/resolv.conf", []byte("nameserver "+spec.gateway.String()+"\n"), 0o644)
 	l, err := guestlisten.Listen(fmt.Sprintf("vsock://:%d", spec.port))
 	if err != nil {
 		tapFile.Close()
-		return fmt.Errorf("tunnel: listen: %w", err)
+		return nil, fmt.Errorf("tunnel: listen: %w", err)
 	}
-	t := &tunnel{tap: tapFile, logger: logger}
-	go t.readTap()
-	go t.accept(l)
+	t := newTunnel(tapFile, l, logger)
+	t.start()
 	logger.Info("network tunnel started", "port", spec.port)
-	return nil
+	return t.fatal, nil
 }
 
 // tunnel relays frames between the TAP device and the current agent
 // connection; a new connection replaces the previous one.
 type tunnel struct {
-	tap    *os.File
-	logger *slog.Logger
-	mu     sync.Mutex
-	conn   net.Conn
-	wmu    sync.Mutex
+	tap      io.ReadWriteCloser
+	listener net.Listener
+	logger   *slog.Logger
+	// fatal receives the first terminal error of a worker (capacity 1, so
+	// reporting never blocks). Losing only the current agent connection
+	// is not terminal: a new connection replaces it.
+	fatal    chan error
+	failOnce sync.Once
+	mu       sync.Mutex
+	conn     net.Conn
+	wmu      sync.Mutex
+}
+
+func newTunnel(tap io.ReadWriteCloser, l net.Listener, logger *slog.Logger) *tunnel {
+	return &tunnel{tap: tap, listener: l, logger: logger, fatal: make(chan error, 1)}
+}
+
+// start runs the TAP reader and the accept loop.
+func (t *tunnel) start() {
+	go t.readTap()
+	go t.accept(t.listener)
+}
+
+// fail records the first terminal error of a worker and releases every
+// resource of the tunnel, which also makes the other worker fail and
+// disconnects the agent so that its reconnect loop sees the loss at once.
+// Later calls change nothing.
+func (t *tunnel) fail(err error) {
+	t.failOnce.Do(func() {
+		t.fatal <- err
+		t.listener.Close()
+		t.tap.Close()
+		t.mu.Lock()
+		c := t.conn
+		t.conn = nil
+		t.mu.Unlock()
+		if c != nil {
+			c.Close()
+		}
+	})
 }
 
 func (t *tunnel) accept(l net.Listener) {
@@ -116,6 +155,7 @@ func (t *tunnel) accept(l net.Listener) {
 		c, err := l.Accept()
 		if err != nil {
 			t.logger.Error("network tunnel accept failed", "error", err)
+			t.fail(fmt.Errorf("tunnel: accept: %w", err))
 			return
 		}
 		t.mu.Lock()
@@ -166,6 +206,7 @@ func (t *tunnel) readTap() {
 		n, err := t.tap.Read(buf[4:])
 		if err != nil {
 			t.logger.Error("network tunnel TAP read failed", "error", err)
+			t.fail(fmt.Errorf("tunnel: TAP read: %w", err))
 			return
 		}
 		binary.BigEndian.PutUint32(buf[:4], uint32(n))

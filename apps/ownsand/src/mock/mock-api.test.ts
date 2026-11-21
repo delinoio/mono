@@ -104,10 +104,9 @@ describe("mock idempotent createSandbox", () => {
     expect(retry.sandbox?.sandboxId).toBe(first.sandbox?.sandboxId);
     expect(retry.sandbox?.labels).toEqual({ team: "ci" });
     expect(retry.sandbox?.labels).toEqual(first.sandbox?.labels);
-    expect(retry.sandbox?.labels).not.toHaveProperty("mock-idempotency-key");
   });
 
-  test("a new key creates another sandbox and reads hide the key", async () => {
+  test("a new key creates another sandbox and reads keep the labels", async () => {
     const client = createClient(SandboxService, createMockTransport());
     const first = await client.createSandbox(request(uuidV7()));
     const second = await client.createSandbox(request(uuidV7()));
@@ -120,8 +119,64 @@ describe("mock idempotent createSandbox", () => {
     });
     expect(got.sandbox?.labels).toEqual({ team: "ci" });
     const list = await client.listSandboxes({ organizationId });
-    for (const s of list.sandboxes) {
-      expect(s.labels).not.toHaveProperty("mock-idempotency-key");
-    }
+    const listed = list.sandboxes.find(
+      (s) => s.sandboxId === first.sandbox?.sandboxId,
+    );
+    expect(listed?.labels).toEqual({ team: "ci" });
+  });
+
+  test("a user label named like the old bookkeeping key is preserved", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const labels = { "mock-idempotency-key": "mine" };
+    const key = uuidV7();
+    const first = await client.createSandbox({ ...request(key), labels });
+    expect(first.sandbox?.labels).toEqual(labels);
+    const retry = await client.createSandbox({ ...request(key), labels });
+    expect(retry.sandbox?.sandboxId).toBe(first.sandbox?.sandboxId);
+    expect(retry.sandbox?.labels).toEqual(labels);
+    const got = await client.getSandbox({
+      organizationId,
+      sandboxId: first.sandbox!.sandboxId,
+    });
+    expect(got.sandbox?.labels).toEqual(labels);
+    const list = await client.listSandboxes({ organizationId });
+    expect(
+      list.sandboxes.find((s) => s.sandboxId === first.sandbox?.sandboxId)
+        ?.labels,
+    ).toEqual(labels);
+  });
+
+  test("a user label equal to another request's key is not a replay", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    const first = await client.createSandbox({
+      ...request(uuidV7()),
+      labels: { "mock-idempotency-key": key },
+    });
+    const second = await client.createSandbox(request(key));
+    expect(second.sandbox?.sandboxId).not.toBe(first.sandbox?.sandboxId);
+  });
+
+  test("a known key with other parameters fails with AlreadyExists", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    await client.createSandbox(request(key));
+    await expect(
+      client.createSandbox({ ...request(key), labels: { team: "other" } }),
+    ).rejects.toMatchObject({ code: Code.AlreadyExists });
+  });
+
+  test("label order does not change the idempotency result", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    const first = await client.createSandbox({
+      ...request(key),
+      labels: { team: "ci", env: "dev" },
+    });
+    const retry = await client.createSandbox({
+      ...request(key),
+      labels: { env: "dev", team: "ci" },
+    });
+    expect(retry.sandbox?.sandboxId).toBe(first.sandbox?.sandboxId);
   });
 });

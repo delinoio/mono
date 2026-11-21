@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -89,7 +90,7 @@ func TestUsageErrors(t *testing.T) {
 		}
 	}
 	for _, c := range r.f.callNames() {
-		if c == "CreateSandbox" || c == "AcceptInvitation" || c == "UpdateDeviceLimits" {
+		if c == "CreateSandbox" || c == "AcceptInvitation" || c == "ReplaceDeviceLimits" {
 			t.Fatalf("%s sent for an invalid command", c)
 		}
 	}
@@ -425,8 +426,32 @@ func TestDeviceSetLimitsKeepsCurrentOvercommit(t *testing.T) {
 	if l.GetVcpuCount() != 8 || l.GetMemoryMib() != 16384 || l.GetDiskGib() != 200 || l.GetVcpuOvercommitPercent() != 150 {
 		t.Fatalf("limits %v", l)
 	}
+	for _, c := range r.f.callNames() {
+		if c == "UpdateDeviceLimits" {
+			t.Fatal("device set-limits called the legacy UpdateDeviceLimits")
+		}
+	}
 	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "8", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "110"); res.code != ExitUsage {
 		t.Fatalf("overcommit not in steps of 25 accepted: %+v", res)
+	}
+}
+
+// TestDeviceSetLimitsSendsExplicitZero checks that a zero flag value is sent
+// as a present zero, which the strict RPC accepts, and that every field of
+// the request is present.
+func TestDeviceSetLimitsSendsExplicitZero(t *testing.T) {
+	r := newRunner(t)
+	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "0", "--memory", "0", "--disk", "0", "--vcpu-overcommit", "100"); res.code != 0 {
+		t.Fatalf("%+v", res)
+	}
+	r.f.mu.Lock()
+	l := r.f.limit
+	r.f.mu.Unlock()
+	if l.VcpuCount == nil || l.MemoryMib == nil || l.DiskGib == nil || l.VcpuOvercommitPercent == nil {
+		t.Fatalf("a field is missing in %v", l)
+	}
+	if l.GetVcpuCount() != 0 || l.GetMemoryMib() != 0 || l.GetDiskGib() != 0 || l.GetVcpuOvercommitPercent() != 100 {
+		t.Fatalf("limits %v", l)
 	}
 }
 
@@ -620,6 +645,88 @@ func TestFileReadDanglingSymlinkMissingDirectory(t *testing.T) {
 	}
 }
 
+func TestFileReadDanglingSymlinkDotDotAfterSymlink(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	// alias -> real/sub and link -> alias/../out.txt: the kernel resolves
+	// alias first and applies ".." to real/sub, so the target of link is
+	// real/out.txt. A lexical clean would pick the unrelated path "out.txt"
+	// beside link.
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "real", "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("real", "sub"), filepath.Join(dir, "alias")); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	link := filepath.Join(dir, "link")
+	// Build the target without filepath.Join, which would clean it.
+	if err := os.Symlink("alias"+string(filepath.Separator)+".."+string(filepath.Separator)+"out.txt", link); err != nil {
+		t.Fatal(err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("read --to: %+v", res)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, "real", "out.txt")); err != nil || string(b) != "downloaded contents" {
+		t.Fatalf("target content %q %v", b, err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, "out.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the download created the lexically cleaned path: %v", err)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the download replaced the symbolic link")
+	}
+	for _, d := range []string{dir, filepath.Join(dir, "real")} {
+		for _, e := range mustReadDir(t, d) {
+			if strings.HasSuffix(e, ".tmp") {
+				t.Fatalf("temporary file left in %s: %s", d, e)
+			}
+		}
+	}
+}
+
+func TestFileReadDanglingSymlinkDotDotAfterMissingDirectory(t *testing.T) {
+	r := newRunner(t)
+	r.stdin = "downloaded contents"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	// missing does not exist, so the kernel fails the lookup of
+	// missing/../out.txt. A lexical clean would turn it into out.txt beside
+	// the link and create that file.
+	dir := t.TempDir()
+	link := filepath.Join(dir, "link")
+	// Build the target without filepath.Join, which would clean it.
+	if err := os.Symlink("missing"+string(filepath.Separator)+".."+string(filepath.Separator)+"out.txt", link); err != nil {
+		t.Skipf("symlink: %v", err)
+	}
+	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code == 0 {
+		t.Fatalf("read --to a link through a missing directory succeeded: %+v", res)
+	}
+	if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the failed download replaced the symbolic link")
+	}
+	if entries := mustReadDir(t, dir); len(entries) != 1 {
+		t.Fatalf("the failed download changed the directory: %v", entries)
+	}
+}
+
+func mustReadDir(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
+}
+
 func TestFileReadSymlinkLoop(t *testing.T) {
 	r := newRunner(t)
 	r.stdin = "downloaded contents"
@@ -721,5 +828,173 @@ func TestLogtoScopesAlwaysIncludeRequiredScope(t *testing.T) {
 	}
 	if got := logtoScopes(" extra:one  extra:two "); !slices.Equal(got, []string{RequiredLogtoScope, "extra:one", "extra:two"}) {
 		t.Fatalf("logtoScopes(extra) = %v", got)
+	}
+}
+
+// TestFileReadLongDestinationName checks that the staging file name does not
+// depend on the destination name, so names at the filesystem limit work.
+func TestFileReadLongDestinationName(t *testing.T) {
+	probe := t.TempDir()
+	if f, err := os.Create(filepath.Join(probe, strings.Repeat("p", 255))); err != nil {
+		t.Skipf("the temporary directory cannot hold a 255-byte name: %v", err)
+	} else {
+		_ = f.Close()
+	}
+	r := newRunner(t)
+	r.stdin = "sandbox bytes"
+	if res := r.run("file", "write", r.f.sb, "/tmp/x"); res.code != 0 {
+		t.Fatalf("write: %+v", res)
+	}
+	names := map[string]string{
+		"255":       strings.Repeat("a", 255),
+		"234":       strings.Repeat("b", 234),
+		"multibyte": strings.Repeat("é", 120), // 240 bytes
+		"multi238":  strings.Repeat("é", 119), // 238 bytes
+	}
+	for label, name := range names {
+		t.Run(label+"/new", func(t *testing.T) {
+			dir := t.TempDir()
+			to := filepath.Join(dir, name)
+			if res := r.run("file", "read", "--to", to, r.f.sb, "/tmp/x"); res.code != 0 {
+				t.Fatalf("read --to: %+v", res)
+			}
+			if b, _ := os.ReadFile(to); string(b) != "sandbox bytes" {
+				t.Fatalf("content %q", b)
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+				t.Fatalf("temporary files left: %v", entries)
+			}
+		})
+		t.Run(label+"/existing", func(t *testing.T) {
+			dir := t.TempDir()
+			to := filepath.Join(dir, name)
+			if err := os.WriteFile(to, []byte("previous"), 0o640); err != nil {
+				t.Fatal(err)
+			}
+			if res := r.run("file", "read", "--to", to, r.f.sb, "/missing"); res.code != ExitError {
+				t.Fatalf("missing: %+v", res)
+			}
+			if b, _ := os.ReadFile(to); string(b) != "previous" {
+				t.Fatalf("a failed read changed the destination: %q", b)
+			}
+			if res := r.run("file", "read", "--to", to, r.f.sb, "/tmp/x"); res.code != 0 {
+				t.Fatalf("read --to: %+v", res)
+			}
+			if b, _ := os.ReadFile(to); string(b) != "sandbox bytes" {
+				t.Fatalf("content %q", b)
+			}
+			if info, _ := os.Stat(to); runtime.GOOS != "windows" && info.Mode().Perm() != 0o640 {
+				t.Fatalf("mode %v", info.Mode().Perm())
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 1 {
+				t.Fatalf("temporary files left: %v", entries)
+			}
+		})
+	}
+	t.Run("link to long target", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, strings.Repeat("t", 255))
+		if err := os.WriteFile(target, []byte("old"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		link := filepath.Join(dir, "link")
+		if err := os.Symlink(target, link); err != nil {
+			t.Skipf("symlink: %v", err)
+		}
+		if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code != 0 {
+			t.Fatalf("read --to: %+v", res)
+		}
+		if b, _ := os.ReadFile(target); string(b) != "sandbox bytes" {
+			t.Fatalf("content %q", b)
+		}
+		if info, err := os.Lstat(link); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatal("the download replaced the symbolic link")
+		}
+	})
+	t.Run("name over the limit", func(t *testing.T) {
+		dir := t.TempDir()
+		res := r.run("file", "read", "--to", filepath.Join(dir, strings.Repeat("a", 256)), r.f.sb, "/tmp/x")
+		if res.code != ExitError || !strings.Contains(res.stderr, "file name too long") {
+			t.Fatalf("over limit: %+v", res)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Fatalf("files created: %v", entries)
+		}
+	})
+}
+
+// TestOutOfRangeInt32FlagsAreUsageErrors covers values that a 64-bit int flag
+// would accept and the int32 request field would silently wrap (4294967297
+// becomes 1).
+func TestOutOfRangeInt32FlagsAreUsageErrors(t *testing.T) {
+	const wrapping = "4294967297"
+	const firstOverflow = "2147483648"
+	createBase := []string{"sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "1h", "--memory", "512", "--disk", "5"}
+	for _, c := range []struct {
+		flag string
+		args []string
+	}{
+		{"vcpu", append(slices.Clone(createBase), "--vcpu", wrapping)},
+		{"vcpu", append(slices.Clone(createBase), "--vcpu", firstOverflow)},
+		{"vcpu", []string{"device", "set-limits", "01900000-0000-7000-8000-000000000001", "--memory", "1", "--disk", "1", "--vcpu", wrapping}},
+		{"vcpu-overcommit", []string{"device", "set-limits", "01900000-0000-7000-8000-000000000001", "--memory", "1", "--disk", "1", "--vcpu", "1", "--vcpu-overcommit", wrapping}},
+		{"vcpu-overcommit", []string{"device", "set-limits", "01900000-0000-7000-8000-000000000001", "--memory", "1", "--disk", "1", "--vcpu", "1", "--vcpu-overcommit", "-2147483649"}},
+		{"page-size", []string{"org", "list", "--page-size", wrapping}},
+		{"page-size", []string{"member", "list", "--page-size", firstOverflow}},
+		{"page-size", []string{"member", "invitations", "--page-size", wrapping}},
+		{"page-size", []string{"device", "list", "--page-size", wrapping}},
+		{"page-size", []string{"enrollment-token", "list", "--page-size", wrapping}},
+		{"page-size", []string{"api-key", "list", "--page-size", wrapping}},
+		{"page-size", []string{"sandbox", "list", "--page-size", wrapping}},
+		{"page-size", []string{"snapshot", "list", "--page-size", wrapping}},
+		{"page-size", []string{"template", "list", "--page-size", wrapping}},
+	} {
+		r := newRunner(t)
+		res := r.run(c.args...)
+		if res.code != ExitUsage || !strings.Contains(res.stderr, "-"+c.flag) || !strings.Contains(res.stderr, "out of range") {
+			t.Errorf("%v: %+v", c.args, res)
+		}
+		if calls := r.f.callNames(); len(calls) != 0 {
+			t.Errorf("%v: sent %v for an out-of-range value", c.args, calls)
+		}
+	}
+}
+
+func TestInt32FlagBoundariesAreAccepted(t *testing.T) {
+	r := newRunner(t)
+	if res := r.run("org", "list", "--page-size", "2147483647"); res.code != 0 {
+		t.Fatalf("largest page size: %+v", res)
+	}
+	if res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "1h", "--vcpu", "2147483647", "--memory", "512", "--disk", "5"); res.code != ExitUsage && res.code != 0 {
+		// The server (or SDK validation) may reject the huge count, but the
+		// value must reach the request unchanged and not wrap.
+		t.Logf("create with the largest vCPU: %+v", res)
+	}
+	r.f.mu.Lock()
+	defer r.f.mu.Unlock()
+	for _, req := range r.f.creat {
+		if req.GetResources().GetVcpuCount() != 2147483647 {
+			t.Fatalf("vCPU count %d, want 2147483647", req.GetResources().GetVcpuCount())
+		}
+	}
+}
+
+func TestParseDurationDayOverflow(t *testing.T) {
+	const maxDays = 106751 // floor(MaxInt64 / 24h)
+	if d, err := parseDuration("max-ttl", "7d"); err != nil || d != 7*24*time.Hour {
+		t.Fatalf("7d: %v, %v", d, err)
+	}
+	if d, err := parseDuration("max-ttl", "106751d"); err != nil || d != maxDays*24*time.Hour || d <= 0 {
+		t.Fatalf("largest day count: %v, %v", d, err)
+	}
+	for _, s := range []string{"106752d", "213504d", "9223372036854775807d", "-106752d", "-9223372036854775808d"} {
+		if d, err := parseDuration("max-ttl", s); err == nil || !strings.Contains(err.Error(), "--max-ttl") {
+			t.Errorf("%s: %v, %v", s, d, err)
+		}
+	}
+	r := newRunner(t)
+	res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "213504d", "--vcpu", "1", "--memory", "512", "--disk", "5")
+	if res.code != ExitUsage || !strings.Contains(res.stderr, "invalid duration") || len(r.f.callNames()) != 0 {
+		t.Fatalf("%+v %v", res, r.f.callNames())
 	}
 }

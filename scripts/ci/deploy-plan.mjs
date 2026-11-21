@@ -309,7 +309,7 @@ function topologicalOrder(selected, packagesByName) {
     );
     const reached = new Set();
     for (const dep of [...deps].sort()) {
-      if (!packagesByName.has(dep)) continue;
+      if (dep === undefined || !packagesByName.has(dep)) continue;
       if (selected.has(dep)) reached.add(dep);
       for (const transitive of visit(dep, [...path, name])) {
         reached.add(transitive);
@@ -418,8 +418,16 @@ function rejectSharedDestinations(packages) {
 // Builds the deployment plan from the `changeset status` JSON and the
 // workspace packages.
 export function plan(status, packages) {
+  // Only named packages can be released, depended on or ordered. A package
+  // without a usable name is still passed whole to the destination checks, so
+  // a nameless deployable keeps its own diagnostic.
   const packagesByName = new Map(
-    packages.map((pkg) => [pkg.manifest.name, pkg]),
+    packages
+      .filter(
+        ({ manifest }) =>
+          typeof manifest.name === "string" && manifest.name !== "",
+      )
+      .map((pkg) => [pkg.manifest.name, pkg]),
   );
   const allReleases = (status.releases ?? []).map(
     ({ name, type, newVersion }) => {

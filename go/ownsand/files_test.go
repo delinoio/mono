@@ -94,6 +94,147 @@ func TestReadFileResumesWithSameReadID(t *testing.T) {
 	}
 }
 
+func TestReadFileStreamClosedWithoutAcceptedResumesAtNextOffset(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.readChunk = 10
+	want := randomBytes(t, 95)
+	cp.agent.setFile("/f", want)
+	cp.relayScript = func(_ string, n int) relayAction {
+		switch n {
+		case 1:
+			return relayAction{abortAfter: 2}
+		case 2:
+			return relayAction{noAccept: true}
+		}
+		return relayAction{}
+	}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	var out bytes.Buffer
+	size, err := s.ReadFile(context.Background(), "/f", &out)
+	if err != nil || size != int64(len(want)) || !bytes.Equal(out.Bytes(), want) {
+		t.Fatalf("read %d bytes: %v", size, err)
+	}
+	if n := cp.relayCount("ReadFile"); n != 3 {
+		t.Fatalf("%d ReadFile calls, want 3", n)
+	}
+	cp.agent.mu.Lock()
+	reads := len(cp.agent.reads)
+	cp.agent.mu.Unlock()
+	if reads != 1 {
+		t.Fatalf("%d read snapshots, want 1 (one read_id)", reads)
+	}
+}
+
+func TestReadFileStreamClosedWithoutAcceptedEndsWithLastErrorAtWindow(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.setFile("/f", randomBytes(t, 20))
+	cp.relayScript = func(string, int) relayAction { return relayAction{noAccept: true} }
+	c := cp.client(t, TransportRelay)
+	s := cp.handle(t, c)
+	start := time.Now()
+	_, err := s.ReadFileBytes(context.Background(), "/f")
+	var dp *DataPathError
+	if !errors.As(err, &dp) || !errors.Is(err, errNotAccepted) {
+		t.Fatalf("want a DataPathError with errNotAccepted, got %v", err)
+	}
+	if time.Since(start) > c.timing.recoveryWindow+time.Second {
+		t.Fatal("unaccepted streams must end within the recovery window")
+	}
+	if n := cp.relayCount("ReadFile"); n < 3 {
+		t.Fatalf("%d ReadFile calls, want repeated attempts", n)
+	}
+}
+
+func TestReadFileContinuationNotAcceptedEndsAtRecoveryDeadline(t *testing.T) {
+	for name, act := range map[string]relayAction{
+		"blocked receive": {holdOpen: true},
+		"keepalives only": {keepalivesOnly: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.readChunk = 10
+			cp.agent.setFile("/f", randomBytes(t, 95))
+			cp.relayScript = func(_ string, n int) relayAction {
+				if n == 1 {
+					return relayAction{abortAfter: 2}
+				}
+				return act
+			}
+			c := recoveryDeadlineClient(t, cp, 300*time.Millisecond)
+			s := cp.handle(t, c)
+			start := time.Now()
+			var out bytes.Buffer
+			_, err := s.ReadFile(context.Background(), "/f", &out)
+			elapsed := time.Since(start)
+			var dp *DataPathError
+			if !errors.As(err, &dp) || !errors.Is(err, errRecoveryDeadline) {
+				t.Fatalf("want a DataPathError with errRecoveryDeadline, got %v", err)
+			}
+			if elapsed > c.timing.recoveryWindow+time.Second {
+				t.Fatalf("operation took %v, want about the recovery window %v", elapsed, c.timing.recoveryWindow)
+			}
+			held := cp.heldDurations()
+			if len(held) != 1 || held[0] > c.timing.recoveryWindow+500*time.Millisecond {
+				t.Fatalf("held streams %v, want one that the SDK cancelled within the recovery window", held)
+			}
+			if n := cp.relayCount("ReadFile"); n != 2 {
+				t.Fatalf("%d ReadFile calls, want 2: no continuation starts after expiry", n)
+			}
+			if out.Len() == 0 || out.Len() >= 95 {
+				t.Fatalf("delivered %d bytes before the interruption", out.Len())
+			}
+		})
+	}
+}
+
+func TestReadFileContinuationAcceptedBeforeDeadlineStaysOpenPastIt(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.readChunk = 10
+	want := randomBytes(t, 95)
+	cp.agent.setFile("/f", want)
+	cp.relayScript = func(_ string, n int) relayAction {
+		if n == 1 {
+			return relayAction{abortAfter: 2}
+		}
+		return relayAction{acceptedKeepalives: 700 * time.Millisecond}
+	}
+	c := recoveryDeadlineClient(t, cp, 300*time.Millisecond)
+	s := cp.handle(t, c)
+	start := time.Now()
+	got, err := s.ReadFileBytes(context.Background(), "/f")
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("read: %v", err)
+	}
+	if time.Since(start) < 2*c.timing.recoveryWindow {
+		t.Fatalf("read took %v; the accepted continuation did not outlive the window", time.Since(start))
+	}
+}
+
+func TestReadFileInterruptedAfterAcceptanceResumesSavedBudget(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.readChunk = 10
+	cp.agent.setFile("/f", randomBytes(t, 95))
+	cp.relayScript = func(_ string, n int) relayAction {
+		switch n {
+		case 1:
+			return relayAction{abortAfter: 2}
+		case 2:
+			return relayAction{delay: 300 * time.Millisecond, acceptedKeepalives: 800 * time.Millisecond, abortAfterKeepalives: true}
+		}
+		return relayAction{holdOpen: true}
+	}
+	c := recoveryDeadlineClient(t, cp, 600*time.Millisecond)
+	s := cp.handle(t, c)
+	_, err := s.ReadFileBytes(context.Background(), "/f")
+	if !errors.Is(err, errRecoveryDeadline) {
+		t.Fatalf("want errRecoveryDeadline, got %v", err)
+	}
+	held := cp.heldDurations()
+	if len(held) != 1 || held[0] > 480*time.Millisecond {
+		t.Fatalf("held streams %v, want one bounded by the saved budget", held)
+	}
+}
+
 func TestReadFileResumesOnNewSession(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.agent.readChunk = 10
@@ -177,6 +318,52 @@ func TestWriteFileChunkedBothTransports(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// truncatedReader yields data and then err, in one Read call per piece.
+type truncatedReader struct {
+	data []byte
+	err  error
+}
+
+func (r *truncatedReader) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func TestWriteFileSourceEnd(t *testing.T) {
+	chunk := datapath.MaxFileChunkSize
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		for _, size := range []int{10, chunk + 10} {
+			t.Run(tr.String(), func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				data := randomBytes(t, size)
+				_, err := s.WriteFile(context.Background(), "/trunc", &truncatedReader{data: data, err: io.ErrUnexpectedEOF}, WriteOptions{})
+				if !errors.Is(err, io.ErrUnexpectedEOF) {
+					t.Fatalf("size %d: want io.ErrUnexpectedEOF, got %v", size, err)
+				}
+				for _, r := range cp.agent.writeRequests() {
+					if r.GetFinish() != nil {
+						t.Fatalf("size %d: finish sent for a truncated source", size)
+					}
+				}
+				if _, ok := cp.agent.file("/trunc"); ok {
+					t.Fatalf("size %d: file written", size)
+				}
+
+				// A clean end of a short stream finishes with exactly those bytes.
+				n, err := s.WriteFile(context.Background(), "/clean", &truncatedReader{data: data, err: io.EOF}, WriteOptions{})
+				if err != nil || n != int64(size) || !bytes.Equal(must(cp.agent.file("/clean")), data) {
+					t.Fatalf("size %d: clean EOF wrote %d bytes, err %v", size, n, err)
+				}
+			})
+		}
 	}
 }
 

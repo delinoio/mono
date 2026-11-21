@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guestsync flushes the page cache of a sandbox guest through its
 // guest helper, for the pause and snapshot rules of the runtimes.
@@ -60,11 +60,28 @@ func Run(ctx context.Context, sandboxID string, dial guestclient.Dialer, command
 		case resp.GetFrame().GetError() != nil:
 			return 0, errors.New(resp.GetFrame().GetError().GetMessage())
 		case ev.GetExited() != nil:
-			return ev.GetExited().GetExitCode(), nil
+			return exitCode(ev.GetExited())
 		case ev.GetFailed() != nil:
 			return 0, errors.New(ev.GetFailed().GetMessage())
 		case ev.GetSandboxEnded() != nil:
 			return 0, errors.New("the guest ended during the command")
 		}
+	}
+}
+
+// exitCode returns the exit code of a command that exited normally. The
+// status is a oneof, so GetExitCode alone would read a signaled or unset
+// status as a zero exit; those and a timeout are errors.
+func exitCode(exited *ownsandv1.ExecExited) (int64, error) {
+	if exited.GetTimedOut() {
+		return 0, errors.New("the command timed out")
+	}
+	switch status := exited.GetStatus().(type) {
+	case *ownsandv1.ExecExited_ExitCode:
+		return status.ExitCode, nil
+	case *ownsandv1.ExecExited_Signal:
+		return 0, fmt.Errorf("the command was killed by signal %d", status.Signal)
+	default:
+		return 0, errors.New("the command exited without a status")
 	}
 }

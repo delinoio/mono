@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
@@ -7,6 +7,12 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,7 +22,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,18 +99,28 @@ func enrollDevice(t *testing.T, cp *testcp.Server) (*store.Store, *store.Identit
 
 func start(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity) *harness {
 	t.Helper()
+	return startWith(t, cp, st, id, nil)
+}
+
+// startWith starts the agent like start, after tweak changed its options.
+func startWith(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity, tweak func(*Options)) *harness {
+	t.Helper()
 	logger := quietLogger()
 	rt, err := processrt.New(guestBinary, logger)
 	if err != nil {
 		t.Fatal(err)
 	}
 	client, _ := cpclient.New(cp.URL, nil)
-	a, err := New(context.Background(), Options{
+	opts := Options{
 		Store: st, Identity: id, Control: client, Runtime: rt, Logger: logger,
 		HeartbeatInterval: 50 * time.Millisecond, AckTimeout: 500 * time.Millisecond,
 		BackoffMin: 20 * time.Millisecond, BackoffMax: 100 * time.Millisecond,
 		Update: update.Options{Platform: "linux-amd64", Running: "1.0.0", Installer: update.ExecutableInstaller{Path: filepath.Join(t.TempDir(), "exe")}},
-	})
+	}
+	if tweak != nil {
+		tweak(&opts)
+	}
+	a, err := New(context.Background(), opts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -303,9 +321,23 @@ func TestUnknownDeviceKeepsData(t *testing.T) {
 
 // bucket is a fake R2 bucket: PUT stores, GET returns.
 func bucket(t *testing.T) *httptest.Server {
+	return bucketWithHook(t, nil)
+}
+
+// bucketWithHook is bucket with a hook that sees every request before the
+// bucket serves it, without holding the bucket lock, so that it can block.
+// When the hook returns a non-zero status, the bucket answers with it and
+// does not serve the request.
+func bucketWithHook(t *testing.T, hook func(r *http.Request) int) *httptest.Server {
 	var mu sync.Mutex
 	objects := map[string][]byte{}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hook != nil {
+			if status := hook(r); status != 0 {
+				http.Error(w, "injected failure", status)
+				return
+			}
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		switch r.Method {
@@ -379,5 +411,540 @@ func TestSnapshotExportImport(t *testing.T) {
 	b3.SnapshotId = bad
 	if res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{Snapshot: b3, Parts: parts}}}); res.GetError() == nil {
 		t.Fatal("tampered import accepted")
+	}
+}
+
+// sendCommand sends a command without waiting for its result.
+func (h *harness) sendCommand(cmd *ownsandv1.AgentCommand) string {
+	h.t.Helper()
+	cmd.CommandId, _ = uuidv7.NewString()
+	if !h.cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: cmd}}) {
+		h.t.Fatal("no channel")
+	}
+	return cmd.GetCommandId()
+}
+
+func (h *harness) result(commandID string) *ownsandv1.AgentCommandResult {
+	h.t.Helper()
+	res := h.cp.CommandResult(30*time.Second, commandID)
+	if res == nil {
+		h.t.Fatal("no command result")
+	}
+	return res
+}
+
+// importFixture holds a snapshot that was exported from the agent and whose
+// parts the fake bucket serves under other snapshot IDs.
+type importFixture struct {
+	h         *harness
+	b         *httptest.Server
+	sandboxID string
+	snap      *ownsandv1.SnapshotStateEntry
+	parts     []*ownsandv1.SnapshotPart
+}
+
+func newImportFixture(t *testing.T, hook func(r *http.Request) int) *importFixture {
+	t.Helper()
+	return newImportFixtureWith(t, hook, nil)
+}
+
+// newImportFixtureWith is newImportFixture with options that tweak the agent.
+func newImportFixtureWith(t *testing.T, hook func(r *http.Request) int, tweak func(*Options)) *importFixture {
+	t.Helper()
+	cp := testcp.New(t)
+	b := bucketWithHook(t, hook)
+	cp.SetSignedURLBase(b.URL)
+	st, id := enrollDevice(t, cp)
+	h := startWith(t, cp, st, id, tweak)
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetError() != nil {
+		t.Fatal(res.GetError())
+	}
+	snapID, _ := uuidv7.NewString()
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}})
+	snap := res.GetCreateSnapshot().GetSnapshot()
+	res = h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{SnapshotId: snapID, PartSizeBytes: 512}}})
+	if res.GetError() != nil || len(res.GetExportSnapshot().GetParts()) == 0 {
+		t.Fatalf("export %v", res)
+	}
+	return &importFixture{h: h, b: b, sandboxID: sandboxID, snap: snap, parts: res.GetExportSnapshot().GetParts()}
+}
+
+// stage copies the exported parts to the bucket under a new snapshot ID and
+// returns an import command for it. With badHash the command carries a
+// wrong hash for the first part, so the import fails its hash check.
+func (f *importFixture) stage(t *testing.T, id string, badHash bool) *ownsandv1.AgentCommand {
+	t.Helper()
+	src := f.snap.GetSnapshotId()
+	for _, p := range f.parts {
+		resp, err := http.Get(fmt.Sprintf("%s/%s/%d", f.b.URL, src, p.GetPartNumber()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		req, _ := http.NewRequest(http.MethodPut, fmt.Sprintf("%s/%s/%d", f.b.URL, id, p.GetPartNumber()), bytes.NewReader(data))
+		resp2, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp2.Body.Close()
+	}
+	return f.command(id, badHash)
+}
+
+func (f *importFixture) command(id string, badHash bool) *ownsandv1.AgentCommand {
+	entry := proto.Clone(f.snap).(*ownsandv1.SnapshotStateEntry)
+	entry.SnapshotId = id
+	parts := make([]*ownsandv1.SnapshotPart, len(f.parts))
+	for i, p := range f.parts {
+		parts[i] = proto.Clone(p).(*ownsandv1.SnapshotPart)
+	}
+	if badHash {
+		parts[0].Sha256[0] ^= 1
+	}
+	return &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ImportSnapshot{ImportSnapshot: &ownsandv1.ImportSnapshotCommand{Snapshot: entry, Parts: parts}}}
+}
+
+// requireRestorable checks that the snapshot content is on disk and that a
+// sandbox restores from it.
+func (f *importFixture) requireRestorable(t *testing.T, id string) {
+	t.Helper()
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "content")); err != nil {
+		t.Fatalf("snapshot content after the import: %v", err)
+	}
+	fromSnap, _ := uuidv7.NewString()
+	cmd := createCommand(fromSnap)
+	cmd.GetCreateSandbox().Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: id}
+	if res := f.h.command(cmd); res.GetError() != nil || res.GetCreateSandbox().GetSandbox().GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+		t.Fatalf("create from the imported snapshot %v", res)
+	}
+}
+
+// getGate counts the part downloads of one snapshot ID and blocks the first
+// of them until release is closed.
+type getGate struct {
+	id      string
+	mu      sync.Mutex
+	gets    int
+	started chan struct{}
+	release chan struct{}
+}
+
+func newGetGate(id string) *getGate {
+	return &getGate{id: id, started: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (g *getGate) hook(r *http.Request) int {
+	if r.Method != http.MethodGet || !strings.HasPrefix(r.URL.Path, "/"+g.id+"/") {
+		return 0
+	}
+	g.mu.Lock()
+	g.gets++
+	first := g.gets == 1
+	g.mu.Unlock()
+	if first {
+		close(g.started)
+		<-g.release
+	}
+	return 0
+}
+
+func (g *getGate) count() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.gets
+}
+
+func waitClosed(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// settle gives a command that waits for a lock time to reach it. The
+// assertions below hold whether or not it arrived, so the delay only makes
+// the contended path likely and never makes the test flaky.
+func settle() { time.Sleep(300 * time.Millisecond) }
+
+// TestConcurrentImportsOfOneSnapshotDownloadOnce checks that two imports of
+// the same absent snapshot return the same ready entry after one download.
+func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	gate := newGetGate(id)
+	f := newImportFixture(t, gate.hook)
+	first := f.h.sendCommand(f.stage(t, id, false))
+	waitClosed(t, gate.started, "the first download")
+	second := f.h.sendCommand(f.command(id, false))
+	settle()
+	close(gate.release)
+	r1, r2 := f.h.result(first), f.h.result(second)
+	for _, r := range []*ownsandv1.AgentCommandResult{r1, r2} {
+		if r.GetError() != nil || r.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+			t.Fatalf("import %v", r)
+		}
+	}
+	if !proto.Equal(r1.GetImportSnapshot().GetSnapshot(), r2.GetImportSnapshot().GetSnapshot()) {
+		t.Fatalf("entries differ: %v and %v", r1.GetImportSnapshot().GetSnapshot(), r2.GetImportSnapshot().GetSnapshot())
+	}
+	if got := gate.count(); got != len(f.parts) {
+		t.Fatalf("part downloads = %d, want one download of %d parts", got, len(f.parts))
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestFailedImportDoesNotDeleteAPublishedCopy checks that a failing import
+// of a snapshot neither blocks the waiting import of the same snapshot from
+// downloading and publishing it nor deletes the copy it publishes, and that
+// a later import reuses the copy.
+func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	gate := newGetGate(id)
+	f := newImportFixture(t, gate.hook)
+	bad := f.h.sendCommand(f.stage(t, id, true))
+	waitClosed(t, gate.started, "the first download")
+	good := f.h.sendCommand(f.command(id, false))
+	// Without the per-snapshot lock the good import publishes the copy while
+	// the bad one still waits at its gate, and the bad one then deletes it.
+	settle()
+	close(gate.release)
+	badRes, goodRes := f.h.result(bad), f.h.result(good)
+	if badRes.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
+		t.Fatalf("bad import = %v", badRes)
+	}
+	if goodRes.GetError() != nil || goodRes.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("good import = %v", goodRes)
+	}
+	f.requireRestorable(t, id)
+	// A later import reuses the copy: even one that would fail its hash check
+	// returns the ready entry and leaves the content alone.
+	if res := f.h.command(f.command(id, true)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("later import = %v", res)
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestImportStopsWithItsChannelContext checks that an import whose channel
+// context ends during a download publishes nothing: no ready snapshot, no
+// content directory and no leftover files, and that an import of the same
+// snapshot afterwards still succeeds.
+func TestImportStopsWithItsChannelContext(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var downloads atomic.Int32
+	f := newImportFixture(t, func(r *http.Request) int {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+id+"/") && downloads.Add(1) == 2 {
+			// The channel closes while the import still downloads.
+			cancel()
+		}
+		return 0
+	})
+	cmd := f.stage(t, id, false).GetImportSnapshot()
+	if len(cmd.GetParts()) < 3 {
+		t.Fatalf("the fixture needs at least 3 parts, has %d", len(cmd.GetParts()))
+	}
+	if _, err := f.h.agent.importSnapshot(ctx, cmd); err == nil {
+		t.Fatal("import succeeded with a closed channel context")
+	}
+	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+		t.Fatal("a cancelled import left a ready snapshot")
+	}
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after a cancelled import: %v", err)
+	}
+	if left, _ := filepath.Glob(filepath.Join(f.h.st.Path(store.SnapshotsDir), ".import-*")); len(left) != 0 {
+		t.Fatalf("temporary archives left: %v", left)
+	}
+	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
+		t.Fatalf("import after the cancelled one = %v", res)
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestImportsOfDifferentSnapshotsStayConcurrent checks that an import that
+// waits on its download does not block the import of another snapshot.
+func TestImportsOfDifferentSnapshotsStayConcurrent(t *testing.T) {
+	slow, _ := uuidv7.NewString()
+	fast, _ := uuidv7.NewString()
+	gate := newGetGate(slow)
+	f := newImportFixture(t, gate.hook)
+	slowID := f.h.sendCommand(f.stage(t, slow, false))
+	waitClosed(t, gate.started, "the first download")
+	fastCmd := f.stage(t, fast, false)
+	// The fast import finishes while the slow one still waits.
+	if res := f.h.command(fastCmd); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("fast import = %v", res)
+	}
+	close(gate.release)
+	if res := f.h.result(slowID); res.GetError() != nil {
+		t.Fatalf("slow import = %v", res)
+	}
+	f.requireRestorable(t, fast)
+	f.requireRestorable(t, slow)
+}
+
+// TestEnrollRetriesAfterOriginWriteFailure checks that a failed agent.json
+// write leaves only the pending-key identity, so a retry with the same token
+// and key completes the enrollment.
+func TestEnrollRetriesAfterOriginWriteFailure(t *testing.T) {
+	cp := testcp.New(t)
+	st, err := store.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := cpclient.New(cp.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory at agent.json makes the atomic rename fail.
+	blocker := st.Path(store.AgentFile)
+	if err := os.MkdirAll(filepath.Join(blocker, "keep"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); err == nil {
+		t.Fatal("enroll succeeded with a blocked agent.json")
+	}
+	pending, err := st.LoadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pending.DeviceID != "" || pending.PrivateKeySeed == nil {
+		t.Fatalf("pending identity: %+v", pending)
+	}
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	id, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger())
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if id.DeviceID == "" || string(id.PrivateKeySeed) != string(pending.PrivateKeySeed) {
+		t.Fatalf("retry identity: %+v", id)
+	}
+	loaded, err := st.LoadIdentity()
+	if err != nil || loaded.DeviceID != id.DeviceID {
+		t.Fatalf("loaded identity: %+v, %v", loaded, err)
+	}
+	a, err := st.LoadAgent()
+	if err != nil || a.APIURL != client.APIURL {
+		t.Fatalf("agent state: %+v, %v", a, err)
+	}
+	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); !errors.Is(err, ErrAlreadyEnrolled) {
+		t.Fatalf("third enroll: %v", err)
+	}
+}
+
+// TestWithdrawAgentUpdateCommand checks that the agent answers the withdrawal
+// command with success when no update is queued, and keeps reporting the
+// UP_TO_DATE update state.
+func TestWithdrawAgentUpdateCommand(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	h := start(t, cp, st, id)
+	h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+	res := h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_WithdrawAgentUpdate{WithdrawAgentUpdate: &ownsandv1.WithdrawAgentUpdateCommand{}}})
+	if res.GetError() != nil {
+		t.Fatalf("withdrawal failed: %v", res.GetError())
+	}
+	if state, target := h.agent.updater.State(); state != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE || target != "" {
+		t.Fatalf("update state %v %q", state, target)
+	}
+}
+
+// updateEnv serves a signed release and counts installer calls, so that a test
+// can stage a verified update on the agent. The installer blocks in Install
+// until unblock is closed when block is set.
+type updateEnv struct {
+	installs atomic.Int32
+	entered  chan struct{}
+	unblock  chan struct{}
+	block    bool
+	keys     []ed25519.PublicKey
+	manifest string
+}
+
+func (e *updateEnv) Install(string) error {
+	if e.installs.Add(1) == 1 {
+		close(e.entered)
+	}
+	if e.block {
+		<-e.unblock
+	}
+	return nil
+}
+
+func newUpdateEnv(t *testing.T, block bool) *updateEnv {
+	t.Helper()
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	e := &updateEnv{entered: make(chan struct{}), unblock: make(chan struct{}), block: block, keys: []ed25519.PublicKey{pub}}
+	artifact := []byte("new agent binary")
+	mux := http.NewServeMux()
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	sum := sha256.Sum256(artifact)
+	manifest, _ := json.Marshal(update.Manifest{Schema: 1, Releases: []update.Release{{Version: "1.1.0", Default: true, Artifacts: []update.Artifact{{Platform: "linux-amd64", URL: srv.URL + "/agent", SHA256: hex.EncodeToString(sum[:])}}}}})
+	sig := base64.StdEncoding.EncodeToString(ed25519.Sign(priv, manifest))
+	mux.HandleFunc("/manifest.json", func(w http.ResponseWriter, _ *http.Request) { w.Write(manifest) })
+	mux.HandleFunc("/manifest.json.sig", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte(sig)) })
+	mux.HandleFunc("/agent", func(w http.ResponseWriter, _ *http.Request) { w.Write(artifact) })
+	e.manifest = srv.URL + "/manifest.json"
+	return e
+}
+
+func (e *updateEnv) tweak(o *Options) {
+	o.Update.Keys = e.keys
+	o.Update.ManifestURL = e.manifest
+	o.Update.Installer = e
+}
+
+// stageUpdate sends an update command, so the agent holds a verified
+// artifact, and deletes the fixture sandbox, so that only transfers and the
+// installer decide whether the device is idle.
+func (f *importFixture) stageUpdate(t *testing.T) {
+	t.Helper()
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}}}); res.GetError() != nil {
+		t.Fatalf("update command: %v", res.GetError())
+	}
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: f.sandboxID}}}); res.GetError() != nil {
+		t.Fatalf("delete sandbox: %v", res.GetError())
+	}
+}
+
+func waitInstalls(t *testing.T, e *updateEnv, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for e.installs.Load() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("installer calls = %d, want %d", e.installs.Load(), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestUpdateWaitsForRunningImport checks that a pending verified update does
+// not call the installer while an import holds its reservation and installs
+// once after the import ended.
+func TestUpdateWaitsForRunningImport(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	gate := newGetGate(id)
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, gate.hook, env.tweak)
+	f.stageUpdate(t)
+	cmdID := f.h.sendCommand(f.stage(t, id, false))
+	waitClosed(t, gate.started, "the import download")
+	// A failed assertion must not leave the import blocked: the agent cleanup
+	// waits for its commands.
+	t.Cleanup(func() {
+		select {
+		case <-gate.release:
+		default:
+			close(gate.release)
+		}
+	})
+	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil {
+		t.Fatalf("install during an import: %v %v", ok, err)
+	}
+	settle()
+	if n := env.installs.Load(); n != 0 {
+		t.Fatalf("installer calls during an import = %d", n)
+	}
+	close(gate.release)
+	if res := f.h.result(cmdID); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	// The release wakes the installation loop.
+	waitInstalls(t, env, 1)
+}
+
+// TestFailedImportReleasesTransferReservation checks that an import that
+// fails its hash check does not keep the update from installing.
+func TestFailedImportReleasesTransferReservation(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, nil, env.tweak)
+	f.stageUpdate(t)
+	// The command runs the transfer before it fails, and the update waits for
+	// it only until it released the reservation.
+	if res := f.h.command(f.stage(t, id, true)); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
+		t.Fatalf("bad import = %v", res)
+	}
+	waitInstalls(t, env, 1)
+}
+
+// TestTransfersRefusedWhileUpdateInstalls checks that export and uncached
+// import commands fail with UNAVAILABLE before any transfer I/O once the
+// installation reserved the device, and that an import of a ready copy still
+// returns it.
+func TestTransfersRefusedWhileUpdateInstalls(t *testing.T) {
+	ready, _ := uuidv7.NewString()
+	fresh, _ := uuidv7.NewString()
+	gate := newGetGate(fresh)
+	env := newUpdateEnv(t, true)
+	f := newImportFixtureWith(t, gate.hook, env.tweak)
+	// Cleanups run last in, first out: release the installer before the agent
+	// cleanup waits for Run to end.
+	t.Cleanup(func() { close(env.unblock) })
+	// A copy that exists before the installation starts.
+	if res := f.h.command(f.stage(t, ready, false)); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	staged := f.stage(t, fresh, false)
+	f.stageUpdate(t)
+	// The installation loop only ticks every 10 seconds; start it now. The
+	// blocked installer keeps the installing flag set.
+	go f.h.agent.updater.TryInstall()
+	waitClosed(t, env.entered, "the installer")
+	export := &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{SnapshotId: f.snap.GetSnapshotId(), PartSizeBytes: 512}}}
+	if res := f.h.command(export); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("export during the installation = %v", res)
+	}
+	if res := f.h.command(staged); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("import during the installation = %v", res)
+	}
+	if n := gate.count(); n != 0 {
+		t.Fatalf("part downloads of the refused import = %d", n)
+	}
+	dir, err := f.h.st.SnapshotDir(fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused import changed the snapshot directory: %v", err)
+	}
+	if res := f.h.command(f.command(ready, false)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("cached import during the installation = %v", res)
+	}
+	if n := env.installs.Load(); n != 1 {
+		t.Fatalf("installer calls = %d, want 1", n)
+	}
+}
+
+// TestUpdateDefersToSandboxDuringTransfers checks that a live sandbox still
+// defers the installation after the transfers ended.
+func TestUpdateDefersToSandboxDuringTransfers(t *testing.T) {
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, nil, env.tweak)
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_UpdateAgent{UpdateAgent: &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}}}); res.GetError() != nil {
+		t.Fatalf("update command: %v", res.GetError())
+	}
+	id, _ := uuidv7.NewString()
+	if res := f.h.command(f.stage(t, id, false)); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil || env.installs.Load() != 0 {
+		t.Fatalf("installed with a running sandbox: %v %v", ok, err)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -17,14 +18,17 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/go-jose/go-jose/v4"
 	"github.com/go-jose/go-jose/v4/jwt"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsand "github.com/delinoio/mono/go/ownsand"
@@ -57,6 +61,13 @@ type stack struct {
 	apiKey   string
 	logs     *logSink
 	objects  *fakeS3
+	// apiEnv and api are the environment and process of the control plane,
+	// so a test can kill it and start it again over the same database. The
+	// name of api prefixes its lines in logs.
+	apiEnv []string
+	api    *proc
+	// work is the directory of the agent state directories.
+	work string
 }
 
 // requireE2E skips unless the suite is enabled and a database is set.
@@ -141,15 +152,26 @@ func freeUDPPort(t *testing.T) string {
 }
 
 // logSink keeps the output of the child processes and prints it when the
-// test fails. Lines are prefixed with the process name.
+// test fails. Lines are prefixed with the process name and ": ".
 type logSink struct {
 	mu    sync.Mutex
 	lines []string
+	// scanners counts the scanner goroutines that still run, so a test can
+	// check that a finished process released its log resources.
+	scanners atomic.Int32
 }
 
-func (l *logSink) writer(name string) io.Writer {
+// writer returns a writer for one output stream of the process name. A
+// goroutine stores the lines written to it until the writer is closed; the
+// returned channel closes after that goroutine stored the last line and
+// exited. exec.Cmd does not close a custom writer, so the owner must.
+func (l *logSink) writer(name string) (io.WriteCloser, <-chan struct{}) {
 	r, w := io.Pipe()
+	done := make(chan struct{})
+	l.scanners.Add(1)
 	go func() {
+		defer close(done)
+		defer l.scanners.Add(-1)
 		s := bufio.NewScanner(r)
 		s.Buffer(make([]byte, 64<<10), 1<<20)
 		for s.Scan() {
@@ -157,8 +179,12 @@ func (l *logSink) writer(name string) io.Writer {
 			l.lines = append(l.lines, name+": "+s.Text())
 			l.mu.Unlock()
 		}
+		// Closing the reader fails later writes of the process instead of
+		// blocking it when the scan stopped on an error, such as a line that
+		// is too long.
+		_ = r.CloseWithError(s.Err())
 	}()
-	return w
+	return w, done
 }
 
 func (l *logSink) dump(t *testing.T) {
@@ -172,29 +198,109 @@ func (l *logSink) dump(t *testing.T) {
 	}
 }
 
-// startProcess starts a child process that is stopped with SIGTERM when the
-// test ends.
-func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *exec.Cmd {
+// hasLine reports whether the sink stored the exact prefixed line.
+func (l *logSink) hasLine(line string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Contains(l.lines, line)
+}
+
+// hasStateReport reports whether the process name logged an
+// agent_state_report event for the device. The control plane logs this event
+// after it marked the connection of the device as reconciled, which is when
+// placement can use the device.
+func (l *logSink) hasStateReport(name, deviceID string) bool {
+	prefix := name + ": "
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		text, ok := strings.CutPrefix(line, prefix)
+		if !ok {
+			continue
+		}
+		var event struct {
+			Msg      string `json:"msg"`
+			DeviceID string `json:"device_id"`
+		}
+		// Lines that are not JSON log records are not events.
+		if json.Unmarshal([]byte(text), &event) != nil {
+			continue
+		}
+		if event.Msg == "agent_state_report" && event.DeviceID == deviceID {
+			return true
+		}
+	}
+	return false
+}
+
+// proc is a child process that startProcess started.
+type proc struct {
+	name string
+	cmd  *exec.Cmd
+	// done closes after the process exited and its log writers are closed
+	// and drained.
+	done chan struct{}
+}
+
+// killProcess kills a child process that startProcess started and waits for
+// it to exit, as a crash does: the process gets no chance to shut down.
+func killProcess(t *testing.T, p *proc) {
 	t.Helper()
+	_ = p.cmd.Process.Kill()
+	select {
+	case <-p.done:
+	case <-time.After(15 * time.Second):
+		t.Fatalf("the killed process %s did not exit", p.name)
+	}
+}
+
+// launchProcess starts a child process and logs its output to logs. When the
+// process exits, it closes both log writers and waits for their scanners
+// before it closes the done channel of the process.
+func launchProcess(logs *logSink, name string, env []string, bin string, args ...string) (*proc, error) {
 	cmd := exec.Command(bin, args...)
 	cmd.Env = append(os.Environ(), env...)
-	cmd.Stdout = logs.writer(name)
-	cmd.Stderr = logs.writer(name)
+	stdout, stdoutDone := logs.writer(name)
+	stderr, stderrDone := logs.writer(name)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	release := func() {
+		_ = stdout.Close()
+		_ = stderr.Close()
+		<-stdoutDone
+		<-stderrDone
+	}
 	if err := cmd.Start(); err != nil {
+		release()
+		return nil, err
+	}
+	p := &proc{name: name, cmd: cmd, done: make(chan struct{})}
+	go func() {
+		_ = cmd.Wait()
+		release()
+		close(p.done)
+	}()
+	return p, nil
+}
+
+// startProcess starts a child process that is stopped with SIGTERM when the
+// test ends.
+func startProcess(t *testing.T, logs *logSink, name string, env []string, bin string, args ...string) *proc {
+	t.Helper()
+	p, err := launchProcess(logs, name, env, bin, args...)
+	if err != nil {
 		t.Fatalf("start %s: %v", name, err)
 	}
-	done := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(done) }()
 	t.Cleanup(func() {
-		_ = cmd.Process.Signal(syscall.SIGTERM)
+		_ = p.cmd.Process.Signal(syscall.SIGTERM)
 		select {
-		case <-done:
+		case <-p.done:
 		case <-time.After(15 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+			_ = p.cmd.Process.Kill()
+			<-p.done
 		}
 	})
-	return cmd
+	return p
 }
 
 // stackOptions configures newStack.
@@ -211,6 +317,10 @@ type stackOptions struct {
 type agentProc struct {
 	deviceID string
 	stateDir string
+	// env and proc are the environment and process of the agent, so a test
+	// can kill it and start it again over the same state directory.
+	env  []string
+	proc *proc
 }
 
 // newStack starts the control plane, creates an organization with a user
@@ -250,6 +360,9 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	s := &stack{t: t, bins: bins, apiURL: "http://" + addr, stunAddr: stunAddr, key: key, userSub: "e2e-user-" + randomSuffix(t), logs: logs}
 	apiEnv := []string{
 		"ADDR=" + addr,
+		// The e2e clients connect to the server directly, so the TCP peer is
+		// the client address for rate limits.
+		"ALLOW_DIRECT_CLIENT_ADDRESS=true",
 		"LOG_LEVEL=debug",
 		"DATABASE_URL=" + dbtest.NewURL(t),
 		"LOGTO_ISSUER=" + testIssuer,
@@ -269,7 +382,9 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 			"SNAPSHOT_PART_SIZE_BYTES=5242880",
 		)
 	}
-	startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))
+	s.apiEnv = apiEnv
+	s.work = work
+	s.api = startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))
 	s.waitHealthy()
 
 	ctx := s.ctx(2 * time.Minute)
@@ -318,18 +433,45 @@ func (s *stack) startAgent(ctx context.Context, user *ownsand.Client, work strin
 	if out, err := enroll.CombinedOutput(); err != nil {
 		t.Fatalf("ownsand-agent enroll: %v\n%s", err, out)
 	}
-	startProcess(t, s.logs, fmt.Sprintf("agent%d", i), agentEnv, filepath.Join(s.bins, "ownsand-agent"), "run")
+	agent := startProcess(t, s.logs, fmt.Sprintf("agent%d", i), agentEnv, filepath.Join(s.bins, "ownsand-agent"), "run")
 
 	known := map[string]bool{}
 	for _, a := range s.agents {
 		known[a.deviceID] = true
 	}
 	deviceID := s.waitDeviceOnline(user, known)
-	if _, err := user.Devices().UpdateLimits(ctx, &ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: s.orgID, DeviceId: deviceID,
-		Limits: &ownsandv1.DeviceLimits{VcpuCount: 8, MemoryMib: 16384, DiskGib: 100, VcpuOvercommitPercent: 100}}); err != nil {
-		t.Fatalf("UpdateDeviceLimits: %v", err)
+	if _, err := user.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: s.orgID, DeviceId: deviceID,
+		Limits: &ownsandv1.DeviceLimitsInput{VcpuCount: proto.Int32(8), MemoryMib: proto.Int64(16384), DiskGib: proto.Int64(100), VcpuOvercommitPercent: proto.Int32(100)}}); err != nil {
+		t.Fatalf("ReplaceDeviceLimits: %v", err)
 	}
-	return agentProc{deviceID: deviceID, stateDir: stateDir}
+	return agentProc{deviceID: deviceID, stateDir: stateDir, env: agentEnv, proc: agent}
+}
+
+// killAgent kills agent i, as a crash does.
+func (s *stack) killAgent(i int) {
+	s.t.Helper()
+	killProcess(s.t, s.agents[i].proc)
+}
+
+// restartAgent starts agent i again over its state directory.
+func (s *stack) restartAgent(i int) {
+	s.t.Helper()
+	a := &s.agents[i]
+	a.proc = startProcess(s.t, s.logs, fmt.Sprintf("agent%d-restarted", i), a.env, filepath.Join(s.bins, "ownsand-agent"), "run")
+}
+
+// killAPI kills the control plane, as a crash does.
+func (s *stack) killAPI() {
+	s.t.Helper()
+	killProcess(s.t, s.api)
+}
+
+// restartAPI starts the control plane again on the same address over the
+// same database.
+func (s *stack) restartAPI() {
+	s.t.Helper()
+	s.api = startProcess(s.t, s.logs, "api-restarted", s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
+	s.waitHealthy()
 }
 
 func randomSuffix(t *testing.T) string {
@@ -346,20 +488,47 @@ func (s *stack) ctx(d time.Duration) context.Context {
 	return ctx
 }
 
+// healthStartupBudget bounds the whole wait for the control plane: every
+// request and every retry delay stops when it expires.
+const healthStartupBudget = 60 * time.Second
+
+// healthPollInterval is the delay between health probes.
+const healthPollInterval = 200 * time.Millisecond
+
 func (s *stack) waitHealthy() {
 	s.t.Helper()
-	deadline := time.Now().Add(60 * time.Second)
-	for time.Now().Before(deadline) {
-		resp, err := http.Get(s.apiURL + "/healthz")
+	if err := pollHealthy(s.apiURL+"/healthz", healthStartupBudget); err != nil {
+		s.t.Fatalf("the control plane did not become healthy: %v", err)
+	}
+}
+
+// pollHealthy probes url until it answers 200. The budget covers the HTTP
+// requests too, so a connection that is accepted but never answered cannot
+// outlive it.
+func pollHealthy(url string, budget time.Duration) error {
+	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	defer cancel()
+	var lastErr error
+	for {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return
+				return nil
 			}
+			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
-		time.Sleep(200 * time.Millisecond)
+		lastErr = err
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("not healthy within %s: %w", budget, lastErr)
+		case <-time.After(healthPollInterval):
+		}
 	}
-	s.t.Fatal("the control plane did not become healthy")
 }
 
 // userToken signs an RFC 9068 access token for the test issuer.
@@ -418,24 +587,77 @@ func (s *stack) apiKeyClient(transport ownsand.Transport) *ownsand.Client {
 	return c
 }
 
-// waitDeviceOnline returns the ID of an online device that is not in skip.
+// deviceWaitTimeout bounds how long a started agent may take to come online
+// and to be reconciled by the control plane.
+const deviceWaitTimeout = time.Minute
+
+// waitDeviceOnline returns the ID of a device that is not in skip, is ONLINE
+// and has been reconciled by the current control plane process. ONLINE is
+// stored when the control plane handles the first state report, but placement
+// only uses the device after the connection is marked as reconciled, which
+// the control plane logs as agent_state_report afterwards. A sandbox created
+// right after this returns must not race with that.
 func (s *stack) waitDeviceOnline(c *ownsand.Client, skip map[string]bool) string {
 	s.t.Helper()
-	ctx := s.ctx(time.Minute)
-	for {
-		res, err := c.Devices().List(ctx, &ownsandv1.ListDevicesRequest{OrganizationId: s.orgID})
-		if err != nil {
-			s.t.Fatalf("ListDevices: %v", err)
-		}
-		for _, d := range res.GetDevices() {
-			if d.GetState() == ownsandv1.DeviceState_DEVICE_STATE_ONLINE && !skip[d.GetDeviceId()] {
-				return d.GetDeviceId()
+	ctx, cancel := context.WithTimeout(context.Background(), deviceWaitTimeout)
+	defer cancel()
+	apiName := s.api.name
+	id, err := awaitDeviceReconciled(ctx, 200*time.Millisecond, skip,
+		func(ctx context.Context) ([]string, error) {
+			res, err := c.Devices().List(ctx, &ownsandv1.ListDevicesRequest{OrganizationId: s.orgID})
+			if err != nil {
+				return nil, err
 			}
+			var online []string
+			for _, d := range res.GetDevices() {
+				if d.GetState() == ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
+					online = append(online, d.GetDeviceId())
+				}
+			}
+			return online, nil
+		},
+		func(id string) bool { return s.logs.hasStateReport(apiName, id) },
+		apiName)
+	if err != nil {
+		s.t.Fatal(err)
+	}
+	return id
+}
+
+// awaitDeviceReconciled polls until a device that is not in skip is listed as
+// online and reconciled(id) reports true, and returns its ID. When ctx ends
+// first, the error names the condition that was missing. process names the
+// control plane process for that message.
+func awaitDeviceReconciled(ctx context.Context, interval time.Duration, skip map[string]bool,
+	listOnline func(context.Context) ([]string, error), reconciled func(id string) bool, process string) (string, error) {
+	// pending is the last online device that was not reconciled.
+	pending := ""
+	for {
+		online, err := listOnline(ctx)
+		switch {
+		case err == nil:
+			pending = ""
+			for _, id := range online {
+				if skip[id] {
+					continue
+				}
+				if reconciled(id) {
+					return id, nil
+				}
+				if pending == "" {
+					pending = id
+				}
+			}
+		case ctx.Err() == nil:
+			return "", fmt.Errorf("ListDevices: %w", err)
 		}
 		select {
 		case <-ctx.Done():
-			s.t.Fatal("the device did not come online")
-		case <-time.After(200 * time.Millisecond):
+			if pending == "" {
+				return "", errors.New("the device did not come online: no new device is ONLINE")
+			}
+			return "", fmt.Errorf("device %s is ONLINE but agent_state_report was not observed for it in the logs of process %s", pending, process)
+		case <-time.After(interval):
 		}
 	}
 }

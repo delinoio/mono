@@ -151,7 +151,7 @@ export const GuestService: GenService<{
    * Serve DataFrame exec and file requests. The agent sends request frames
    * (EXEC_REQUEST, EXEC_ATTACH_REQUEST, FILE_READ_REQUEST, FILE_WRITE_CHUNK)
    * and the guest helper answers with EXEC_EVENT, FILE_READ_EVENT,
-   * FILE_WRITE_RESULT, REQUEST_ACCEPTED and ERROR frames of the same
+   * FILE_WRITE_RESULT and ERROR frames of the same
    * stream_id.
    *
    * @generated from rpc delino.ownsand.v1.GuestService.Serve

@@ -214,8 +214,7 @@ func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]stri
 			return nil, usageErr("%s: %v", fs.Name(), err)
 		}
 		rest := fs.Args()
-		// fs.Parse consumes a "--" terminator; detect it by the length.
-		consumedDash := len(args) > len(rest) && len(args)-len(rest) >= 1 && args[len(args)-len(rest)-1] == "--"
+		consumedDash := endedWithTerminator(fs, args[:len(args)-len(rest)])
 		if len(rest) == 0 || consumedDash {
 			if consumedDash && len(positional) > 0 && stopAfter >= 0 {
 				positional = append(positional, "--")
@@ -234,6 +233,30 @@ func (a *app) parseUntil(fs *flag.FlagSet, args []string, stopAfter int) ([]stri
 		return nil, err
 	}
 	return positional, nil
+}
+
+// endedWithTerminator reports whether the tokens fs.Parse consumed end with a
+// "--" option terminator. A "--" that is the separate value of a non-boolean
+// flag (`--org --`) is consumed too but is not a terminator, so the consumed
+// tokens are walked the way flag.FlagSet does.
+func endedWithTerminator(fs *flag.FlagSet, consumed []string) bool {
+	for i := 0; i < len(consumed); i++ {
+		tok := consumed[i]
+		if tok == "--" {
+			return true
+		}
+		name := strings.TrimPrefix(strings.TrimPrefix(tok, "-"), "-")
+		if strings.Contains(name, "=") {
+			continue
+		}
+		if f := fs.Lookup(name); f != nil {
+			if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+				continue
+			}
+		}
+		i++ // the next token is this flag's value
+	}
+	return false
 }
 
 func (a *app) printFlags(fs *flag.FlagSet) {

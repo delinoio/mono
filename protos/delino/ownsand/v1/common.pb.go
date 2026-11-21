@@ -1531,6 +1531,83 @@ func (x *DeviceLimits) GetVcpuOvercommitPercent() int32 {
 	return 0
 }
 
+// Device limits of a ReplaceDeviceLimits request. Every field has explicit
+// presence, so the server tells an omitted value from an explicit zero. The
+// server rejects a request that leaves a field unset with `invalid_argument`
+// that names the field. This message is only a request; responses and the
+// agent configuration use DeviceLimits. See the device limits section of the
+// protos contract.
+type DeviceLimitsInput struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Upper limit of vCPUs of all sandboxes on the device, before overcommit.
+	// Zero makes the device ineligible for new sandboxes.
+	VcpuCount *int32 `protobuf:"varint,1,opt,name=vcpu_count,json=vcpuCount,proto3,oneof" json:"vcpu_count,omitempty"`
+	MemoryMib *int64 `protobuf:"varint,2,opt,name=memory_mib,json=memoryMib,proto3,oneof" json:"memory_mib,omitempty"`
+	DiskGib   *int64 `protobuf:"varint,3,opt,name=disk_gib,json=diskGib,proto3,oneof" json:"disk_gib,omitempty"`
+	// 100 to 400 in steps of 25.
+	VcpuOvercommitPercent *int32 `protobuf:"varint,4,opt,name=vcpu_overcommit_percent,json=vcpuOvercommitPercent,proto3,oneof" json:"vcpu_overcommit_percent,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
+}
+
+func (x *DeviceLimitsInput) Reset() {
+	*x = DeviceLimitsInput{}
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeviceLimitsInput) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeviceLimitsInput) ProtoMessage() {}
+
+func (x *DeviceLimitsInput) ProtoReflect() protoreflect.Message {
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeviceLimitsInput.ProtoReflect.Descriptor instead.
+func (*DeviceLimitsInput) Descriptor() ([]byte, []int) {
+	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DeviceLimitsInput) GetVcpuCount() int32 {
+	if x != nil && x.VcpuCount != nil {
+		return *x.VcpuCount
+	}
+	return 0
+}
+
+func (x *DeviceLimitsInput) GetMemoryMib() int64 {
+	if x != nil && x.MemoryMib != nil {
+		return *x.MemoryMib
+	}
+	return 0
+}
+
+func (x *DeviceLimitsInput) GetDiskGib() int64 {
+	if x != nil && x.DiskGib != nil {
+		return *x.DiskGib
+	}
+	return 0
+}
+
+func (x *DeviceLimitsInput) GetVcpuOvercommitPercent() int32 {
+	if x != nil && x.VcpuOvercommitPercent != nil {
+		return *x.VcpuOvercommitPercent
+	}
+	return 0
+}
+
 // Error detail of a frame or an agent channel result. The message never
 // contains secrets or sandbox content.
 type ErrorDetail struct {
@@ -1548,7 +1625,7 @@ type ErrorDetail struct {
 
 func (x *ErrorDetail) Reset() {
 	*x = ErrorDetail{}
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[3]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1560,7 +1637,7 @@ func (x *ErrorDetail) String() string {
 func (*ErrorDetail) ProtoMessage() {}
 
 func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[3]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1573,7 +1650,7 @@ func (x *ErrorDetail) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ErrorDetail.ProtoReflect.Descriptor instead.
 func (*ErrorDetail) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{3}
+	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *ErrorDetail) GetCode() ErrorCode {
@@ -1614,7 +1691,7 @@ type RequestAccepted struct {
 
 func (x *RequestAccepted) Reset() {
 	*x = RequestAccepted{}
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[4]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1626,7 +1703,7 @@ func (x *RequestAccepted) String() string {
 func (*RequestAccepted) ProtoMessage() {}
 
 func (x *RequestAccepted) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[4]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1639,7 +1716,7 @@ func (x *RequestAccepted) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RequestAccepted.ProtoReflect.Descriptor instead.
 func (*RequestAccepted) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{4}
+	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{5}
 }
 
 // A keepalive inside an exec event or a file read stream. It carries no
@@ -1652,7 +1729,7 @@ type Keepalive struct {
 
 func (x *Keepalive) Reset() {
 	*x = Keepalive{}
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[5]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1664,7 +1741,7 @@ func (x *Keepalive) String() string {
 func (*Keepalive) ProtoMessage() {}
 
 func (x *Keepalive) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[5]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1677,7 +1754,7 @@ func (x *Keepalive) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use Keepalive.ProtoReflect.Descriptor instead.
 func (*Keepalive) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{5}
+	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{6}
 }
 
 // Revision of a sandbox on its device. A revision from a newer epoch is newer
@@ -1695,7 +1772,7 @@ type SandboxRevision struct {
 
 func (x *SandboxRevision) Reset() {
 	*x = SandboxRevision{}
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[6]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1707,7 +1784,7 @@ func (x *SandboxRevision) String() string {
 func (*SandboxRevision) ProtoMessage() {}
 
 func (x *SandboxRevision) ProtoReflect() protoreflect.Message {
-	mi := &file_delino_ownsand_v1_common_proto_msgTypes[6]
+	mi := &file_delino_ownsand_v1_common_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1720,7 +1797,7 @@ func (x *SandboxRevision) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SandboxRevision.ProtoReflect.Descriptor instead.
 func (*SandboxRevision) Descriptor() ([]byte, []int) {
-	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{6}
+	return file_delino_ownsand_v1_common_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *SandboxRevision) GetEpoch() string {
@@ -1757,7 +1834,18 @@ const file_delino_ownsand_v1_common_proto_rawDesc = "" +
 	"\n" +
 	"memory_mib\x18\x02 \x01(\x03R\tmemoryMib\x12\x19\n" +
 	"\bdisk_gib\x18\x03 \x01(\x03R\adiskGib\x126\n" +
-	"\x17vcpu_overcommit_percent\x18\x04 \x01(\x05R\x15vcpuOvercommitPercent\"\xe8\x01\n" +
+	"\x17vcpu_overcommit_percent\x18\x04 \x01(\x05R\x15vcpuOvercommitPercent\"\xff\x01\n" +
+	"\x11DeviceLimitsInput\x12\"\n" +
+	"\n" +
+	"vcpu_count\x18\x01 \x01(\x05H\x00R\tvcpuCount\x88\x01\x01\x12\"\n" +
+	"\n" +
+	"memory_mib\x18\x02 \x01(\x03H\x01R\tmemoryMib\x88\x01\x01\x12\x1e\n" +
+	"\bdisk_gib\x18\x03 \x01(\x03H\x02R\adiskGib\x88\x01\x01\x12;\n" +
+	"\x17vcpu_overcommit_percent\x18\x04 \x01(\x05H\x03R\x15vcpuOvercommitPercent\x88\x01\x01B\r\n" +
+	"\v_vcpu_countB\r\n" +
+	"\v_memory_mibB\v\n" +
+	"\t_disk_gibB\x1a\n" +
+	"\x18_vcpu_overcommit_percent\"\xe8\x01\n" +
 	"\vErrorDetail\x120\n" +
 	"\x04code\x18\x01 \x01(\x0e2\x1c.delino.ownsand.v1.ErrorCodeR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12:\n" +
@@ -1931,7 +2019,7 @@ func file_delino_ownsand_v1_common_proto_rawDescGZIP() []byte {
 }
 
 var file_delino_ownsand_v1_common_proto_enumTypes = make([]protoimpl.EnumInfo, 23)
-var file_delino_ownsand_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
+var file_delino_ownsand_v1_common_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_delino_ownsand_v1_common_proto_goTypes = []any{
 	(Role)(0),                   // 0: delino.ownsand.v1.Role
 	(HostOs)(0),                 // 1: delino.ownsand.v1.HostOs
@@ -1959,16 +2047,17 @@ var file_delino_ownsand_v1_common_proto_goTypes = []any{
 	(*Principal)(nil),           // 23: delino.ownsand.v1.Principal
 	(*Resources)(nil),           // 24: delino.ownsand.v1.Resources
 	(*DeviceLimits)(nil),        // 25: delino.ownsand.v1.DeviceLimits
-	(*ErrorDetail)(nil),         // 26: delino.ownsand.v1.ErrorDetail
-	(*RequestAccepted)(nil),     // 27: delino.ownsand.v1.RequestAccepted
-	(*Keepalive)(nil),           // 28: delino.ownsand.v1.Keepalive
-	(*SandboxRevision)(nil),     // 29: delino.ownsand.v1.SandboxRevision
-	(*durationpb.Duration)(nil), // 30: google.protobuf.Duration
+	(*DeviceLimitsInput)(nil),   // 26: delino.ownsand.v1.DeviceLimitsInput
+	(*ErrorDetail)(nil),         // 27: delino.ownsand.v1.ErrorDetail
+	(*RequestAccepted)(nil),     // 28: delino.ownsand.v1.RequestAccepted
+	(*Keepalive)(nil),           // 29: delino.ownsand.v1.Keepalive
+	(*SandboxRevision)(nil),     // 30: delino.ownsand.v1.SandboxRevision
+	(*durationpb.Duration)(nil), // 31: google.protobuf.Duration
 }
 var file_delino_ownsand_v1_common_proto_depIdxs = []int32{
 	13, // 0: delino.ownsand.v1.Principal.kind:type_name -> delino.ownsand.v1.PrincipalKind
 	22, // 1: delino.ownsand.v1.ErrorDetail.code:type_name -> delino.ownsand.v1.ErrorCode
-	30, // 2: delino.ownsand.v1.ErrorDetail.retry_after:type_name -> google.protobuf.Duration
+	31, // 2: delino.ownsand.v1.ErrorDetail.retry_after:type_name -> google.protobuf.Duration
 	18, // 3: delino.ownsand.v1.ErrorDetail.session_end_reason:type_name -> delino.ownsand.v1.SessionEndReason
 	4,  // [4:4] is the sub-list for method output_type
 	4,  // [4:4] is the sub-list for method input_type
@@ -1982,13 +2071,14 @@ func file_delino_ownsand_v1_common_proto_init() {
 	if File_delino_ownsand_v1_common_proto != nil {
 		return
 	}
+	file_delino_ownsand_v1_common_proto_msgTypes[3].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_delino_ownsand_v1_common_proto_rawDesc), len(file_delino_ownsand_v1_common_proto_rawDesc)),
 			NumEnums:      23,
-			NumMessages:   7,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

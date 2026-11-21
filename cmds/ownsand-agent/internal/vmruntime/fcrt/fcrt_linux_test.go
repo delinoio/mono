@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package fcrt
 
@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -203,12 +204,22 @@ func TestCreateFailureReleasesVM(t *testing.T) {
 	}
 }
 
-// The runtime runs the network policy refresh loop of its manager and
-// stops it on Close.
+// The runtime runs the startup clean-up once and then the network policy
+// refresh loop of its manager, and stops the loop on Close. The test passes
+// an in-memory clean-up and a manager without attachments, so it never
+// reaches the live host network, whatever the capabilities of the test
+// process are. Never call New here: with CAP_NET_ADMIN it would delete the
+// tap devices and the nftables table of the host.
 func TestRuntimeRunsNetworkRefresh(t *testing.T) {
-	r, err := New(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()})
+	cleanups := 0
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()}, func() {
+		cleanups++
+	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cleanups != 1 {
+		t.Fatalf("startup clean-up ran %d times, want 1", cleanups)
 	}
 	if r.refreshDone == nil {
 		t.Fatal("refresh loop not started")
@@ -225,5 +236,130 @@ func TestRuntimeRunsNetworkRefresh(t *testing.T) {
 	case <-r.refreshDone:
 	default:
 		t.Fatal("refresh loop still runs after Close")
+	}
+}
+
+// Without a network manager the startup skips the clean-up and the refresh
+// loop.
+func TestRuntimeWithoutNetworkSkipsCleanupAndRefresh(t *testing.T) {
+	cleanups := 0
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Logger: quiet()}, func() {
+		cleanups++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cleanups != 0 {
+		t.Fatalf("startup clean-up ran %d times without a network manager, want 0", cleanups)
+	}
+	if r.refreshDone != nil || r.stopRefresh != nil {
+		t.Fatal("refresh loop started without a network manager")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// stubOutbound builds a runtime with a network manager (never started) and
+// stubbed capability and executable lookups.
+func stubOutbound(t *testing.T, netAdmin bool, present ...string) *Runtime {
+	t.Helper()
+	r := &Runtime{
+		opts:        Options{Binary: filepath.Join(t.TempDir(), "missing"), Kernel: "/nonexistent", Rootfs: "/nonexistent", Network: netpolicy.NewManager(quiet()), Logger: quiet()},
+		logger:      quiet(),
+		vms:         map[string]*vm{},
+		hasNetAdmin: func() bool { return netAdmin },
+		lookPath: func(name string) (string, error) {
+			for _, p := range present {
+				if p == name {
+					return "/bin/" + name, nil
+				}
+			}
+			return "", exec.ErrNotFound
+		},
+	}
+	return r
+}
+
+func outboundCheck(t *testing.T, r *Runtime) (bool, string) {
+	t.Helper()
+	for _, c := range r.Capabilities(context.Background()).Checks {
+		if c.GetCheckId() == "outbound-network" {
+			return c.GetPassed(), c.GetDetail()
+		}
+	}
+	t.Fatal("no outbound-network check")
+	return false, ""
+}
+
+func TestOutboundNetworkReportsMissingTools(t *testing.T) {
+	cases := []struct {
+		name    string
+		admin   bool
+		present []string
+		ok      bool
+		detail  string
+	}{
+		{"all present", true, []string{"ip", "nft"}, true, ""},
+		{"missing nft", true, []string{"ip"}, false, "nft"},
+		{"missing ip", true, []string{"nft"}, false, "ip"},
+		{"missing both", true, nil, false, "ip, nft"},
+		{"missing capability", false, []string{"ip", "nft"}, false, "CAP_NET_ADMIN is missing"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ok, detail := outboundCheck(t, stubOutbound(t, tc.admin, tc.present...))
+			if ok != tc.ok || !strings.Contains(detail, tc.detail) {
+				t.Fatalf("passed=%v detail=%q, want passed=%v containing %q", ok, detail, tc.ok, tc.detail)
+			}
+		})
+	}
+}
+
+// A missing tool fails an OUTBOUND create at the preflight, before the VM
+// directory exists; with the tools present, OUTBOUND proceeds to the later
+// checks, and NONE ignores the tools.
+func TestCreateOutboundPreflightChecksTools(t *testing.T) {
+	spec := func(mode ownsandv1.NetworkMode) vmruntime.Spec {
+		return vmruntime.Spec{GuestOS: ownsandv1.GuestOs_GUEST_OS_LINUX, NetworkMode: mode, Dir: filepath.Join(t.TempDir(), "vm")}
+	}
+	s := spec(ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND)
+	_, err := stubOutbound(t, true, "ip").Create(context.Background(), s)
+	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "nft") {
+		t.Fatalf("outbound create with missing nft: %v", err)
+	}
+	if _, statErr := os.Stat(s.Dir); statErr == nil {
+		t.Fatal("VM directory created before the preflight failed")
+	}
+	_, err = stubOutbound(t, true, "ip", "nft").Create(context.Background(), spec(ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND))
+	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "base image") {
+		t.Fatalf("outbound create with tools: %v", err)
+	}
+	_, err = stubOutbound(t, true).Create(context.Background(), spec(ownsandv1.NetworkMode_NETWORK_MODE_NONE))
+	if !errors.Is(err, vmruntime.ErrUnsupported) || !strings.Contains(err.Error(), "base image") {
+		t.Fatalf("NONE create without tools: %v", err)
+	}
+}
+
+// TestDeleteRemovesFilesOfSandboxWithoutProcess checks the idempotent file
+// removal that the agent relies on at start for a sandbox that lost its VM:
+// the VM directory exists, but no firecracker process or tracked VM does.
+func TestDeleteRemovesFilesOfSandboxWithoutProcess(t *testing.T) {
+	vmsDir := t.TempDir()
+	r := &Runtime{opts: Options{VMsDir: vmsDir}, logger: quiet(), vms: map[string]*vm{}, host: newLinuxProcs(), stopTimeout: exitTimeout}
+	dir := r.vmDir("01a1fd14-c825-72ac-926c-3bd6b87a8ba5")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "disk.ext4"), []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ { // the second call checks idempotence
+		if err := r.Delete(context.Background(), "01a1fd14-c825-72ac-926c-3bd6b87a8ba5"); err != nil {
+			t.Fatalf("delete %d: %v", i, err)
+		}
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("VM directory kept: %v", err)
 	}
 }

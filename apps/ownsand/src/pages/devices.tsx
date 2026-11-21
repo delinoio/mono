@@ -20,6 +20,7 @@ import {
   PageHeader,
 } from "../components/ui.tsx";
 import {
+  deviceAllocatedVcpu,
   effectiveVcpuLimit,
   errorMessage,
   formatBytes,
@@ -28,6 +29,7 @@ import {
   labels,
   OVERCOMMIT_PERCENTAGES,
 } from "../format.ts";
+import { deviceLimitsInput } from "../forms.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -35,7 +37,7 @@ function vcpuSummary(d: Device): string {
   const l = d.limits;
   if (l === undefined) return "—";
   const ratio = l.vcpuOvercommitPercent / 100;
-  return `${d.allocation?.vcpuCount ?? 0} of ${d.effectiveVcpuLimit} (${l.vcpuCount} × ${ratio})`;
+  return `${deviceAllocatedVcpu(d)} of ${d.effectiveVcpuLimitCount} (${l.vcpuCount} × ${ratio})`;
 }
 
 /** Route `devices`: devices with state, limits, allocation and agent version. */
@@ -138,7 +140,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     organizationId,
     deviceId,
   });
-  const update = useMutation(DeviceService.method.updateDeviceLimits, {
+  const update = useMutation(DeviceService.method.replaceDeviceLimits, {
     onSuccess: () => invalidateServices(queryClient, DeviceService),
   });
   const remove = useMutation(DeviceService.method.removeDevice, {
@@ -171,16 +173,23 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
 
   const save = async (event: FormEvent) => {
     event.preventDefault();
+    // ReplaceDeviceLimits needs every value. A blank field is not zero: the
+    // form asks for the value instead of sending a silent zero.
+    const input = deviceLimitsInput({
+      vcpu,
+      memoryMib: memory,
+      diskGib: disk,
+      overcommitPercent: Number(overcommit),
+    });
+    if ("error" in input) {
+      toast.error(input.error);
+      return;
+    }
     try {
       await update.mutateAsync({
         organizationId,
         deviceId,
-        limits: {
-          vcpuCount: vcpu ?? 0,
-          memoryMib: BigInt(memory ?? 0),
-          diskGib: BigInt(disk ?? 0),
-          vcpuOvercommitPercent: Number(overcommit),
-        },
+        limits: input.limits,
       });
       toast.success("The device limits are saved.");
     } catch (error) {
@@ -212,7 +221,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             "—"}
         </Detail>
         <Detail term="Allocated">
-          {`${d.allocation?.vcpuCount ?? 0} vCPU · ${formatMib(d.allocation?.memoryMib ?? 0n)} · ${d.allocation?.diskGib ?? 0n} GiB disk`}
+          {`${deviceAllocatedVcpu(d)} vCPU · ${formatMib(d.allocation?.memoryMib ?? 0n)} · ${d.allocation?.diskGib ?? 0n} GiB disk`}
         </Detail>
       </dl>
       <section className="section" aria-labelledby="limits-title">

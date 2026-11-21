@@ -55,6 +55,8 @@ func TestExecRequest(t *testing.T) {
 	}{
 		{"missing exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = "" }, "exec_id"},
 		{"v4 exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = "0192f4b6-7c3a-4def-8abc-000000000003" }, "exec_id"},
+		{"uppercase exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = strings.ToUpper(opID) }, "exec_id"},
+		{"mixed-case exec_id", func(r *ownsandv1.ExecRequest) { r.ExecId = "0192f4b6-7c3a-7DEF-8abc-000000000003" }, "exec_id"},
 		{"bad sandbox", func(r *ownsandv1.ExecRequest) { r.SandboxId = "x" }, "sandbox_id"},
 		{"bad organization", func(r *ownsandv1.ExecRequest) { r.OrganizationId = "" }, "organization_id"},
 		{"no command", func(r *ownsandv1.ExecRequest) { r.Command = nil }, "command"},
@@ -96,12 +98,40 @@ func TestExecRequestSizeLimit(t *testing.T) {
 	r.Env = map[string]string{"BIG": strings.Repeat("v", MaxExecFieldsSize)}
 	wantInvalid(t, "env over limit", ExecRequest(r), "command")
 	// Fields outside the three do not count.
-	r = validExec()
+	r = &ownsandv1.ExecRequest{
+		Command:          []string{"/bin/sh", "-c", "true"},
+		Env:              map[string]string{"A": "B"},
+		WorkingDirectory: "/",
+	}
 	before := ExecFieldsSize(r)
-	r.BindingSalt = make([]byte, 32)
 	r.OrganizationId = orgID
+	r.SandboxId = sandboxID
+	r.ExecId = opID
+	r.Timeout = durationpb.New(time.Minute)
+	r.BindingSalt = make([]byte, 32)
 	if ExecFieldsSize(r) != before {
 		t.Fatal("other fields counted")
+	}
+}
+
+func TestExecIDRequiresLowercase(t *testing.T) {
+	if err := ExecID("exec_id", opID); err != nil {
+		t.Fatal(err)
+	}
+	upper := strings.ToUpper(opID)
+	err := ExecID("exec_id", upper)
+	wantInvalid(t, "uppercase", err, "exec_id")
+	if strings.Contains(err.Error(), upper) {
+		t.Errorf("error must omit the value: %v", err)
+	}
+	wantInvalid(t, "empty", ExecID("exec_id", ""), "exec_id")
+	wantInvalid(t, "v4", ExecID("exec_id", "0192f4b6-7c3a-4def-8abc-000000000003"), "exec_id")
+	// Other UUID fields stay case tolerant.
+	if err := UUIDv7("sandbox_id", upper); err != nil {
+		t.Errorf("UUIDv7 must accept uppercase: %v", err)
+	}
+	if err := ExecRequest(func() *ownsandv1.ExecRequest { r := validExec(); r.SandboxId = upper; return r }()); err != nil {
+		t.Errorf("uppercase sandbox_id: %v", err)
 	}
 }
 
@@ -109,25 +139,39 @@ func TestAttachReadWrite(t *testing.T) {
 	if err := AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID}); err != nil {
 		t.Fatal(err)
 	}
-	wantInvalid(t, "negative offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StderrOffset: -1}), "")
+	if err := AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: 1 << 40, StderrOffset: 7}); err != nil {
+		t.Fatal(err)
+	}
+	wantInvalid(t, "attach uppercase exec_id", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: strings.ToUpper(opID)}), "exec_id")
+	wantInvalid(t, "negative stderr offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StderrOffset: -1}), "stderr_offset")
+	wantInvalid(t, "negative stdout offset", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: -1}), "stdout_offset")
+	wantInvalid(t, "both offsets negative", AttachExecRequest(&ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: sandboxID, ExecId: opID, StdoutOffset: -1, StderrOffset: -1}), "stdout_offset")
 
 	read := &ownsandv1.ReadFileRequest{OrganizationId: orgID, SandboxId: sandboxID, ReadId: opID, Path: "/etc/hosts", BindingSalt: make([]byte, 32)}
 	if err := ReadFileRequest(read); err != nil {
 		t.Fatal(err)
 	}
-	for _, path := range []string{`C:\Users\x`, "C:/x", `\\server\share`} {
+	for _, path := range []string{`C:\Users\x`, "C:/x", `\\server\share`, `\/server/share`, `\??\C:\file.txt`} {
 		r := proto.Clone(read).(*ownsandv1.ReadFileRequest)
 		r.Path = path
 		if err := ReadFileRequest(r); err != nil {
 			t.Errorf("path %q: %v", path, err)
 		}
 	}
-	for _, path := range []string{"", "relative/file", "C:", "\xff"} {
+	for _, path := range []string{"", "relative/file", "C:", "\xff", `\file.txt`, `\`, `\?x`} {
 		r := proto.Clone(read).(*ownsandv1.ReadFileRequest)
 		r.Path = path
 		wantInvalid(t, "path "+path, ReadFileRequest(r), "path")
 	}
+	if err := ReadFileRequest(proto.Clone(read).(*ownsandv1.ReadFileRequest)); err != nil {
+		t.Fatal(err)
+	}
 	r := proto.Clone(read).(*ownsandv1.ReadFileRequest)
+	r.Path = `\file.txt`
+	if err := ReadFileRequest(r); err == nil || strings.Contains(err.Error(), "file.txt") {
+		t.Errorf("root-relative path error must exist and omit the value: %v", err)
+	}
+	r = proto.Clone(read).(*ownsandv1.ReadFileRequest)
 	r.BindingSalt = nil
 	wantInvalid(t, "read without salt", ReadFileRequest(r), "binding_salt")
 
@@ -135,6 +179,10 @@ func TestAttachReadWrite(t *testing.T) {
 	if err := WriteFileRequest(first, true); err != nil {
 		t.Fatal(err)
 	}
+	rootRel := proto.Clone(first).(*ownsandv1.WriteFileRequest)
+	rootRel.Path = `\file.txt`
+	wantInvalid(t, "write first root-relative", WriteFileRequest(rootRel, true), "path")
+	wantInvalid(t, "write later root-relative", WriteFileRequest(rootRel, false), "path")
 	later := &ownsandv1.WriteFileRequest{OrganizationId: orgID, SandboxId: sandboxID, WriteId: opID, Offset: 1, Data: []byte("y"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 2, Mode: 0o644}}
 	if err := WriteFileRequest(later, false); err != nil {
 		t.Fatal(err)
@@ -205,6 +253,13 @@ func TestResourcesSourceNetwork(t *testing.T) {
 	wantInvalid(t, "unspecified image", SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_BaseImage{}}), "source.base_image")
 	wantInvalid(t, "unknown image", SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_BaseImage{BaseImage: 42}}), "source.base_image")
 	wantInvalid(t, "bad template", SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_TemplateId{TemplateId: "t"}}), "source.template_id")
+	// A typed nil wrapper inside the oneof must be reported, not dereferenced.
+	wantInvalid(t, "typed nil base image", SandboxSource(&ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_BaseImage)(nil)}), "source")
+	wantInvalid(t, "typed nil snapshot id", SandboxSource(&ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_SnapshotId)(nil)}), "source")
+	wantInvalid(t, "typed nil template id", SandboxSource(&ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_TemplateId)(nil)}), "source")
+	if err := SandboxSource(&ownsandv1.SandboxSource{Source: &ownsandv1.SandboxSource_TemplateId{TemplateId: opID}}); err != nil {
+		t.Fatal(err)
+	}
 
 	if mode, err := NetworkMode(nil); err != nil || mode != ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND {
 		t.Fatalf("absent network: %v %v", mode, err)
@@ -248,6 +303,51 @@ func TestCreateSandboxRequest(t *testing.T) {
 	r = valid()
 	r.Network = &ownsandv1.Network{}
 	wantInvalid(t, "network", CreateSandboxRequest(r), "network.mode")
+	r = valid()
+	r.Source = &ownsandv1.SandboxSource{Source: (*ownsandv1.SandboxSource_SnapshotId)(nil)}
+	wantInvalid(t, "typed nil source", CreateSandboxRequest(r), "source")
+}
+
+func TestDeviceLimitsInput(t *testing.T) {
+	i32 := func(v int32) *int32 { return &v }
+	i64 := func(v int64) *int64 { return &v }
+	full := func() *ownsandv1.DeviceLimitsInput {
+		return &ownsandv1.DeviceLimitsInput{VcpuCount: i32(4), MemoryMib: i64(8), DiskGib: i64(2), VcpuOvercommitPercent: i32(150)}
+	}
+	got, err := DeviceLimitsInput(full())
+	if err != nil || got.GetVcpuCount() != 4 || got.GetMemoryMib() != 8 || got.GetDiskGib() != 2 || got.GetVcpuOvercommitPercent() != 150 {
+		t.Fatalf("complete input: %v, %v", got, err)
+	}
+	// Explicit zeros are present and valid.
+	zero := &ownsandv1.DeviceLimitsInput{VcpuCount: i32(0), MemoryMib: i64(0), DiskGib: i64(0), VcpuOvercommitPercent: i32(100)}
+	if _, err := DeviceLimitsInput(zero); err != nil {
+		t.Fatalf("explicit zeros rejected: %v", err)
+	}
+	_, err = DeviceLimitsInput(nil)
+	wantInvalid(t, "nil", err, "limits")
+	for field, clear := range map[string]func(*ownsandv1.DeviceLimitsInput){
+		"limits.vcpu_count":              func(l *ownsandv1.DeviceLimitsInput) { l.VcpuCount = nil },
+		"limits.memory_mib":              func(l *ownsandv1.DeviceLimitsInput) { l.MemoryMib = nil },
+		"limits.disk_gib":                func(l *ownsandv1.DeviceLimitsInput) { l.DiskGib = nil },
+		"limits.vcpu_overcommit_percent": func(l *ownsandv1.DeviceLimitsInput) { l.VcpuOvercommitPercent = nil },
+	} {
+		l := full()
+		clear(l)
+		_, err := DeviceLimitsInput(l)
+		wantInvalid(t, "missing "+field, err, field)
+	}
+	// Presence comes before the numeric rules.
+	l := &ownsandv1.DeviceLimitsInput{VcpuCount: i32(-1)}
+	_, err = DeviceLimitsInput(l)
+	wantInvalid(t, "presence first", err, "limits.memory_mib")
+	l = full()
+	l.DiskGib = i64(-1)
+	_, err = DeviceLimitsInput(l)
+	wantInvalid(t, "negative disk", err, "limits.disk_gib")
+	l = full()
+	l.VcpuOvercommitPercent = i32(110)
+	_, err = DeviceLimitsInput(l)
+	wantInvalid(t, "overcommit", err, "limits.vcpu_overcommit_percent")
 }
 
 func TestDeviceLimits(t *testing.T) {

@@ -182,6 +182,11 @@ func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
 }
 
 func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
+	// A caller that is already gone must not arm the process-wide cooldown
+	// for later live callers.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	v.attemptedAt = v.cfg.Now()
 	var body []byte
 	var err error
@@ -206,7 +211,9 @@ func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
 }
 
 func (v *LogtoValidator) fetch(ctx context.Context) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	// The fetch serves every caller and arms a shared cooldown, so one
+	// caller's cancellation must not abort it; only the timeout bounds it.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.cfg.JWKSURL, nil)
 	if err != nil {

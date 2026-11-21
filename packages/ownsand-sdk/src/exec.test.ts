@@ -3,6 +3,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { execBinding, requestDigest } from "./digest.ts";
 import { DataPathError } from "./errors.ts";
+import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import {
   DataPathTransport,
   RelayOperationKind,
@@ -99,6 +100,83 @@ describe("exec over the relay", () => {
     expect(exec!.headers.get("authorization")).toBe(`Bearer ${API_KEY}`);
     expect(exec!.headers.get("x-ownsand-sdk-activity")).toBeNull();
     expect(execReq.organizationId).toBe(ORG);
+  });
+
+  test("wait() drains the remaining events after a partial iteration and returns the same result each time", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.stdout(1, "b"));
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    const handle = sandbox.exec({ command: ["sh", "-c", "echo a; echo b"] });
+    const first = await h.clock.run(
+      (async () => {
+        for await (const e of handle) return e;
+        return undefined;
+      })(),
+    );
+    expect(first?.type).toBe(ExecEventType.Started);
+    const result = await h.clock.run(handle.wait());
+    expect(result).toMatchObject({
+      kind: ExecResultKind.Exited,
+      exitCode: 0n,
+      complete: true,
+    });
+    expect(await handle.wait()).toBe(result);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+  });
+
+  test("wait() without iterating returns the result and is repeatable", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["true"] });
+    const result = await h.clock.run(handle.wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(await handle.wait()).toBe(result);
+  });
+
+  test("overlapping wait() calls share one drain and keep the terminal result", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["true"] });
+    const [first, second] = await h.clock.run(
+      Promise.all([handle.wait(), handle.wait()]),
+    );
+    expect(first.kind).toBe(ExecResultKind.Exited);
+    expect(second).toBe(first);
+    expect(await handle.wait()).toBe(first);
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+  });
+
+  test("wait() during an unfinished iteration keeps the result that iteration reaches", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["true"] });
+    const [events, result] = await h.clock.run(
+      Promise.all([collect(handle), handle.wait()]),
+    );
+    expect(events.length).toBeLessThanOrEqual(2);
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    expect(await handle.wait()).toBe(result);
   });
 
   test("reports a command that could not start, a timeout and a sandbox end as distinct results", async () => {
@@ -504,6 +582,108 @@ describe("exec over the relay", () => {
     expect(h.api.callsOf("AttachExec")).toHaveLength(1);
   });
 
+  describe("a recovery continuation that the agent does not accept", () => {
+    const failFirstExec = (h: ReturnType<typeof setup>) =>
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        yield new Disconnect();
+      });
+
+    test("ends at the remaining window while only keepalives arrive", async () => {
+      const h = setup();
+      failFirstExec(h);
+      let continuation: AbortSignal | undefined;
+      h.api.stream(RelayService, "AttachExec", async function* (_req, call) {
+        continuation = call.signal;
+        // A keepalive every 10 seconds, never `accepted`, never idle for 90.
+        for (;;) {
+          yield attachMsg(ev.keepalive());
+          yield new Sleep(10_000);
+        }
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+      expect(error.code).toBe(Code.Unavailable);
+      // The window started at the failure at 0 s; the budget ends at 60 s.
+      expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+      expect(h.clock.now()).toBeLessThan(MIN + 1_000);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+      expect(continuation?.aborted).toBe(true);
+    });
+
+    test("ends at the remaining window while no frame arrives", async () => {
+      const h = setup();
+      failFirstExec(h);
+      h.api.stream(RelayService, "AttachExec", async function* () {
+        yield new Hang();
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(AcceptanceDeadlineError);
+      // Before the fix, the 90-second idle watcher ended this stream.
+      expect(h.clock.now()).toBeGreaterThanOrEqual(MIN);
+      expect(h.clock.now()).toBeLessThan(MIN + 1_000);
+      expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+    });
+
+    test("keeps running past the window when accepted arrives in time", async () => {
+      const h = setup();
+      failFirstExec(h);
+      h.api.stream(RelayService, "AttachExec", async function* () {
+        yield new Sleep(30_000);
+        yield attachMsg(ev.accepted());
+        // Silent for longer than the window, with keepalives.
+        for (let i = 0; i < 12; i++) {
+          yield new Sleep(10_000);
+          yield attachMsg(ev.keepalive());
+        }
+        yield attachMsg(ev.exited(0));
+      });
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      );
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(h.clock.now()).toBeGreaterThan(MIN + 30_000);
+    });
+
+    test("does not bound the first attempt outside recovery", async () => {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", async function* () {
+        for (let i = 0; i < 9; i++) {
+          yield execMsg(ev.keepalive());
+          yield new Sleep(10_000);
+        }
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      );
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(h.clock.now()).toBeGreaterThanOrEqual(90_000);
+    });
+  });
+
   test("an accepted continuation pauses the recovery clock and only data resets it", async () => {
     const h = setup();
     h.api.stream(RelayService, "Exec", async function* () {
@@ -672,6 +852,39 @@ describe("exec over the relay", () => {
         .wait(),
     );
     expect(result.kind).toBe(ExecResultKind.Exited);
+    // A rejection at capacity says nothing about the grant: one
+    // authorization, and the same grant ID in the header of every call.
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+    const calls = [...h.api.callsOf("Exec"), ...h.api.callsOf("AttachExec")];
+    expect(calls.length).toBeGreaterThanOrEqual(4);
+    for (const call of calls) {
+      expect(call.headers.get("ownsand-relay-grant-id")).toBe("grant-1");
+    }
+  });
+
+  test("renews the grant with replaces_grant_id after an unavailable stream", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", async function* (_req, call) {
+      if (call.index === 0) {
+        throw ownsandError(Code.Unavailable, "agent unreachable");
+      }
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    h.api.stream(RelayService, "AttachExec", async function* () {
+      throw new ConnectError("no exec", Code.NotFound);
+    });
+    const result = await h.clock.run(
+      h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"] })
+        .wait(),
+    );
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    const auths = h.api.callsOf("AuthorizeRelay").map((c) => c.request as any);
+    expect(auths).toHaveLength(2);
+    expect(auths[1].replacesGrantId).toBe("grant-1");
   });
 
   test("waits at least the retry delay after AuthorizeRelay fails with resource_exhausted", async () => {
@@ -724,6 +937,124 @@ describe("exec over the relay", () => {
     );
     expect(issued).toHaveLength(2);
     expect(issued[0]).toBe(issued[1]);
+  });
+
+  describe("a stalled AuthorizeRelay call", () => {
+    /** A response that never arrives; the fake aborts it with its signal. */
+    const stall = () => new Promise<never>(() => {});
+
+    test("ends the operation with a DataPathError at the end of its own 60-second window, also without a signal", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", stall);
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"] })
+        .wait()
+        .catch((e) => e);
+      let settled = false;
+      outcome.then(() => (settled = true));
+      await h.clock.advance(60_000 - 1);
+      expect(settled).toBe(false);
+      await h.clock.advance(1);
+      const error = await outcome;
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(error.outcomeUnknown).toBe(false);
+      expect(h.clock.now()).toBe(60_000);
+      // The deadline is not retried and sends no Connect timeout.
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      expect(h.api.calls[0]!.headers.get("connect-timeout-ms")).toBeNull();
+      expect(h.api.callsOf("Exec")).toHaveLength(0);
+    });
+
+    test("ends a recovering operation with a DataPathError when the recovery window ends", async () => {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        yield new Sleep(10_000);
+        yield new Disconnect();
+      });
+      h.api.unary(DataPathService, "AuthorizeRelay", (_req, call) =>
+        call.index === 0
+          ? { grantId: "g", expiresIn: { seconds: 900n } }
+          : stall(),
+      );
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.Unavailable);
+      // The window starts at the interruption (10 s) and lasts 60 s.
+      expect(h.clock.now()).toBe(70_000);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+    });
+
+    test("ends with the caller's abort error when the caller cancels first", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", stall);
+      const abort = new AbortController();
+      const reason = new Error("caller gave up");
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: abort.signal })
+        .wait()
+        .catch((e) => e);
+      await h.clock.advance(10_000);
+      abort.abort(reason);
+      const error = await outcome;
+      expect(error).toBe(reason);
+      expect(h.clock.now()).toBe(10_000);
+    });
+
+    test("uses a grant that arrives within the window", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", async () => {
+        await h.clock.sleep(5_000);
+        return { grantId: "late", expiresIn: { seconds: 900n } };
+      });
+      h.api.stream(RelayService, "Exec", async function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      const result = await h.clock.run(
+        h.client
+          .sandbox(SANDBOX)
+          .exec({ command: ["x"] })
+          .wait(),
+      );
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(h.clock.now()).toBe(5_000);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      expect(
+        h.api.callsOf("Exec")[0]!.headers.get("ownsand-relay-grant-id"),
+      ).toBe("late");
+    });
+
+    test("ends with the last error when an attempt fails as the window ends", async () => {
+      const h = setup();
+      h.api.unary(DataPathService, "AuthorizeRelay", async () => {
+        // The response arrives with an error just before the window ends.
+        await h.clock.sleep(59_900);
+        throw ownsandError(Code.Unavailable, "sandbox unreachable");
+      });
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(h.clock.now()).toBe(59_900);
+    });
   });
 
   test("retries a lost renewal response with the same authorization_id and replaces_grant_id", async () => {
@@ -1004,7 +1335,25 @@ describe("exec over the relay", () => {
     expect(() => sandbox.exec({ command: ["x"], timeoutMs: -1 })).toThrow(
       "timeout",
     );
+    expect(() => sandbox.exec({ command: ["x"], timeoutMs: 1e-7 })).toThrow(
+      "timeout",
+    );
     expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("sends a fractional millisecond timeout at nanosecond precision", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(
+      sandbox.exec({ command: ["x"], timeoutMs: 1500.5 }).wait(),
+    );
+    const timeout = (h.api.callsOf("Exec")[0]!.request as any).timeout;
+    expect(timeout.seconds).toBe(1n);
+    expect(timeout.nanos).toBe(500_000_000 + 500_000);
   });
 });
 

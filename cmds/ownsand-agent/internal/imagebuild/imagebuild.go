@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package imagebuild builds the macOS and Windows base images on the device
 // (`ownsand-agent image build`). Delino distributes no macOS or Windows

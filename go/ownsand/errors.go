@@ -109,6 +109,12 @@ const (
 // timeout; the SDK cancels it and treats it as a transport interruption.
 var errStall = errors.New("ownsand: relay stream received nothing for 90 seconds")
 
+// errRecoveryDeadline reports a relay continuation that the agent did not
+// accept before the recovery budget of its operation ended. The SDK cancels
+// the stream locally; it is a transport interruption, and the operation
+// then ends with the last failure of the recovery window.
+var errRecoveryDeadline = errors.New("ownsand: relay continuation was not accepted within the recovery window")
+
 // errAttemptDeadline reports a WriteFile attempt that passed its SDK-side
 // deadline; it is a transport interruption.
 var errAttemptDeadline = errors.New("ownsand: WriteFile attempt passed its deadline")
@@ -118,6 +124,12 @@ var errAttemptDeadline = errors.New("ownsand: WriteFile attempt passed its deadl
 // so the window then ends the operation with it.
 var errAuthorizeDeadline = errors.New("ownsand: AuthorizeRelay got no response within the recovery window")
 
+// errCreateDeadline is the cancellation cause of a CreateSandbox retry that
+// was still in flight when the retry window ended. CreateSandbox then returns
+// the last failure of the window; the cause only tells the SDK deadline apart
+// from a caller cancellation.
+var errCreateDeadline = errors.New("ownsand: CreateSandbox retry got no response within the retry window")
+
 // classify returns the failure kind of err and the retry delay of a
 // resource_exhausted error, if the error detail carries one. ctx is the
 // caller context: a cancelled caller is always terminal.
@@ -125,7 +137,9 @@ func classify(ctx context.Context, err error) (failureKind, time.Duration) {
 	if ctx.Err() != nil {
 		return failTerminal, 0
 	}
-	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) || errors.Is(err, errStreamOverrun) || errors.Is(err, errAuthorizeDeadline) {
+	if errors.Is(err, errStall) || errors.Is(err, errAttemptDeadline) || errors.Is(err, errStreamOverrun) || errors.Is(err, errAuthorizeDeadline) || errors.Is(err, errNotAccepted) || errors.Is(err, errRecoveryDeadline) {
+		// A relay stream that closed cleanly before the agent accepted it
+		// carries no terminal status, so it is a transport interruption.
 		return failInterrupted, 0
 	}
 	var fe *frameError

@@ -13,38 +13,41 @@ import (
 	"strconv"
 	"strings"
 
+	pionstun "github.com/pion/stun/v3"
+
 	"github.com/delinoio/mono/servers/internal/listenaddr"
 )
 
 // Environment variable names read by the server.
 const (
-	EnvAddr                    = "ADDR"
-	EnvLogLevel                = "LOG_LEVEL"
-	EnvDatabaseURL             = "DATABASE_URL"
-	EnvLogtoIssuer             = "LOGTO_ISSUER"
-	EnvLogtoJWKSURL            = "LOGTO_JWKS_URL"
-	EnvLogtoJWKSFile           = "LOGTO_JWKS_FILE"
-	EnvLogtoAudience           = "LOGTO_AUDIENCE"
-	EnvNonceKey                = "NONCE_KEY"
-	EnvNonceKeyPrevious        = "NONCE_KEY_PREVIOUS"
-	EnvCORSOrigins             = "CORS_ORIGINS"
-	EnvTrustProxyClientAddress = "TRUST_PROXY_CLIENT_ADDRESS"
-	EnvRunMigrations           = "RUN_MIGRATIONS"
-	EnvSTUNURLs                = "STUN_URLS"
-	EnvR2Endpoint              = "R2_ENDPOINT"
-	EnvR2Bucket                = "R2_BUCKET"
-	EnvR2AccessKeyID           = "R2_ACCESS_KEY_ID"
-	EnvR2SecretAccessKey       = "R2_SECRET_ACCESS_KEY"
-	EnvSnapshotPartSizeBytes   = "SNAPSHOT_PART_SIZE_BYTES"
-	EnvSTUNAddr                = "STUN_ADDR"
-	EnvSTUNRateBytesPerSecond  = "STUN_RATE_LIMIT_BYTES_PER_SECOND"
-	EnvSTUNRateBurstBytes      = "STUN_RATE_LIMIT_BURST_BYTES"
+	EnvAddr                     = "ADDR"
+	EnvLogLevel                 = "LOG_LEVEL"
+	EnvDatabaseURL              = "DATABASE_URL"
+	EnvLogtoIssuer              = "LOGTO_ISSUER"
+	EnvLogtoJWKSURL             = "LOGTO_JWKS_URL"
+	EnvLogtoJWKSFile            = "LOGTO_JWKS_FILE"
+	EnvLogtoAudience            = "LOGTO_AUDIENCE"
+	EnvNonceKey                 = "NONCE_KEY"
+	EnvNonceKeyPrevious         = "NONCE_KEY_PREVIOUS"
+	EnvCORSOrigins              = "CORS_ORIGINS"
+	EnvTrustProxyClientAddress  = "TRUST_PROXY_CLIENT_ADDRESS"
+	EnvAllowDirectClientAddress = "ALLOW_DIRECT_CLIENT_ADDRESS"
+	EnvRunMigrations            = "RUN_MIGRATIONS"
+	EnvSTUNURLs                 = "STUN_URLS"
+	EnvR2Endpoint               = "R2_ENDPOINT"
+	EnvR2Bucket                 = "R2_BUCKET"
+	EnvR2AccessKeyID            = "R2_ACCESS_KEY_ID"
+	EnvR2SecretAccessKey        = "R2_SECRET_ACCESS_KEY"
+	EnvSnapshotPartSizeBytes    = "SNAPSHOT_PART_SIZE_BYTES"
+	EnvSTUNAddr                 = "STUN_ADDR"
+	EnvSTUNRateBytesPerSecond   = "STUN_RATE_LIMIT_BYTES_PER_SECOND"
+	EnvSTUNRateBurstBytes       = "STUN_RATE_LIMIT_BURST_BYTES"
 )
 
 // Defaults.
 const (
 	// DefaultAddr is the development port of the control plane (h2c).
-	DefaultAddr = "127.0.0.1:8300"
+	DefaultAddr = "127.0.0.1:18300"
 	// DefaultAudience is the Logto API resource indicator of OwnSand.
 	DefaultAudience = "https://ownsand.api.delino.io"
 	// DefaultCORSOrigin is the production console origin.
@@ -52,7 +55,7 @@ const (
 	// DefaultSTUNURL is the production STUN URL that callers and agents get.
 	DefaultSTUNURL = "stun:ownsand.api.delino.io:3478"
 	// DefaultSTUNAddr is the UDP listen address of the STUN service.
-	DefaultSTUNAddr = "127.0.0.1:3478"
+	DefaultSTUNAddr = "127.0.0.1:13478"
 	// DefaultSTUNRateBytesPerSecond and DefaultSTUNRateBurstBytes are the
 	// response byte budget per source address: about 25 binding responses
 	// per second sustained with a burst of about 100.
@@ -63,6 +66,57 @@ const (
 	// minNonceKeySize is the smallest accepted nonce key.
 	minNonceKeySize = 32
 )
+
+// ClientAddressMode selects where the client address of a request comes
+// from. The address keys the per-client rate limits. The mode is resolved
+// once at startup by Load.
+type ClientAddressMode string
+
+const (
+	// ClientAddressNone gives requests no client address, so the per-client
+	// rate limits do not apply. It is the default: behind a reverse proxy
+	// that is not verified, the TCP peer is the proxy and would put every
+	// caller in one bucket.
+	ClientAddressNone ClientAddressMode = "none"
+	// ClientAddressDirect uses the TCP peer address and ignores forwarded
+	// headers. Use it only when callers connect to the server directly.
+	ClientAddressDirect ClientAddressMode = "direct"
+	// ClientAddressVerifiedProxy uses the last entry of the last
+	// X-Forwarded-For header, which is the value that the verified Caddy
+	// reverse proxy appends.
+	ClientAddressVerifiedProxy ClientAddressMode = "verified_proxy"
+)
+
+// ResolveClientAddressMode returns the client address mode for the two
+// settings. The verified proxy takes precedence over direct connections.
+func ResolveClientAddressMode(trustProxy, allowDirect bool) ClientAddressMode {
+	switch {
+	case trustProxy:
+		return ClientAddressVerifiedProxy
+	case allowDirect:
+		return ClientAddressDirect
+	default:
+		return ClientAddressNone
+	}
+}
+
+// asciiLower returns value with only the ASCII letters A-Z converted to lower
+// case. It deliberately does not use strings.ToLower, which applies Unicode
+// case mapping: U+0130 (capital I with dot above) followed by "NFO" would
+// lower-case to "info" and pass validation, although the value is not one of
+// the documented level names.
+func asciiLower(value string) string {
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if 'A' <= c && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		b.WriteByte(c)
+	}
+	return b.String()
+}
 
 // LogLevel is the accepted set of log level values.
 type LogLevel string
@@ -123,6 +177,12 @@ type Config struct {
 	// that the Caddy reverse proxy appends) as the client address for rate
 	// limits.
 	TrustProxyClientAddress bool
+	// AllowDirectClientAddress uses the TCP peer address as the client
+	// address when TrustProxyClientAddress is false. Set it only for direct
+	// connections, such as development and tests.
+	AllowDirectClientAddress bool
+	// ClientAddressMode is the mode that the two settings above resolve to.
+	ClientAddressMode ClientAddressMode
 
 	// STUNURLs are the STUN server URLs for callers and agents.
 	STUNURLs []string
@@ -161,7 +221,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.Addr = v
 	}
 	if v := get(EnvLogLevel); v != "" {
-		switch level := LogLevel(strings.ToLower(v)); level {
+		switch level := LogLevel(asciiLower(v)); level {
 		case LogLevelDebug, LogLevelInfo, LogLevelWarn, LogLevelError:
 			cfg.LogLevel = level
 		default:
@@ -216,7 +276,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.CORSOrigins = nil
 		for _, origin := range splitList(v) {
 			u, err := url.Parse(origin)
-			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" {
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
+				// A bare "#" leaves u.Fragment empty, so check the raw value too. Browsers never send a fragment in Origin.
+				u.Fragment != "" || strings.Contains(origin, "#") {
 				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
 			}
 			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)
@@ -229,12 +291,20 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.TrustProxyClientAddress = b
 	}
+	if v := get(EnvAllowDirectClientAddress); v != "" {
+		b, err := strconv.ParseBool(v)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be true or false", EnvAllowDirectClientAddress)
+		}
+		cfg.AllowDirectClientAddress = b
+	}
+	cfg.ClientAddressMode = ResolveClientAddressMode(cfg.TrustProxyClientAddress, cfg.AllowDirectClientAddress)
 
 	if v := get(EnvSTUNURLs); v != "" {
 		cfg.STUNURLs = nil
 		for _, u := range splitList(v) {
-			if !strings.HasPrefix(u, "stun:") {
-				return Config{}, fmt.Errorf("%s must list stun: URLs", EnvSTUNURLs)
+			if !validSTUNURL(u) {
+				return Config{}, fmt.Errorf("%s must list stun: URLs with a host", EnvSTUNURLs)
 			}
 			cfg.STUNURLs = append(cfg.STUNURLs, u)
 		}
@@ -256,8 +326,10 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvSnapshotPartSizeBytes); v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
-		// Each part is one R2 object; 5 MiB to 5 GiB keeps the part count
-		// below 10,000 for disks up to 50 TiB and inside the object size limit.
+		// Each part is one R2 object. A snapshot may have at most 10,000
+		// parts, so the largest snapshot is the part size times 10,000: about
+		// 48.8 GiB at 5 MiB and 625 GiB at the 64 MiB default. The agent
+		// rejects a larger snapshot before it uploads any part.
 		if err != nil || n < 5<<20 || n > 5<<30 {
 			return Config{}, fmt.Errorf("%s must be 5 MiB to 5 GiB", EnvSnapshotPartSizeBytes)
 		}
@@ -321,4 +393,15 @@ func validateURL(name, value string) error {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil
+}
+
+// validSTUNURL reports whether u is a stun: URL that the same parser as Pion
+// WebRTC accepts and that names a host. A hostless or otherwise malformed URL
+// would be published to agents and make their peer connection setup fail.
+func validSTUNURL(u string) bool {
+	if !strings.HasPrefix(u, "stun:") {
+		return false
+	}
+	uri, err := pionstun.ParseURI(u)
+	return err == nil && uri.Scheme == pionstun.SchemeTypeSTUN && uri.Host != ""
 }

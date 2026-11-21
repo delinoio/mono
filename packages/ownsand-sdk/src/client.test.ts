@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { OwnSandClient } from "./client.ts";
 import {
   ActivityRegistry,
+  createApiTransport,
   DEFAULT_API_ORIGIN,
   guardedFetch,
   resolveApiOrigin,
@@ -12,11 +14,20 @@ import { OwnSandConfigError, OwnSandValidationError } from "./errors.ts";
 import { BaseImage, SandboxState } from "./gen/delino/ownsand/v1/common_pb.ts";
 import { MemberService } from "./gen/delino/ownsand/v1/member_pb.ts";
 import { OrganizationService } from "./gen/delino/ownsand/v1/organization_pb.ts";
+import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
 import { SandboxService } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
+import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { isUuidV7 } from "./uuidv7.ts";
 import { LostResponse } from "./testing/fake-api.ts";
-import { API_KEY, ORG, SANDBOX, setup } from "./testing/harness.ts";
+import {
+  API_KEY,
+  ev,
+  execMsg,
+  ORG,
+  SANDBOX,
+  setup,
+} from "./testing/harness.ts";
 
 const HOUR = 3_600_000;
 
@@ -141,11 +152,30 @@ describe("credentials", () => {
 
   test("sends relay RPCs with the credential only to the configured origin", async () => {
     const h = setup();
-    h.api.unary(SandboxService, "GetSandbox", () => ({ sandbox: {} }));
-    await h.client.sandbox(SANDBOX).get();
-    expect(h.api.fetchedUrls.every((u) => u.startsWith(h.api.origin))).toBe(
-      true,
+    h.api.stream(RelayService, "Exec", function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["/bin/true"] });
+    const result = await h.clock.run(handle.wait());
+    expect(result.kind).toBe(ExecResultKind.Exited);
+
+    const execCalls = h.api.callsOf("Exec");
+    expect(execCalls).toHaveLength(1);
+    expect(execCalls[0]!.headers.get("authorization")).toBe(
+      `Bearer ${API_KEY}`,
     );
+    const execUrls = h.api.fetchedUrls.filter((u) =>
+      new URL(u).pathname.endsWith("/Exec"),
+    );
+    expect(execUrls).toHaveLength(1);
+    expect(new URL(execUrls[0]!).origin).toBe(new URL(h.api.origin).origin);
+    expect(
+      h.api.fetchedUrls.every(
+        (u) => new URL(u).origin === new URL(h.api.origin).origin,
+      ),
+    ).toBe(true);
   });
 
   test("redacts the credential from errors", async () => {
@@ -164,6 +194,95 @@ describe("credentials", () => {
     expect(error.message).not.toContain(API_KEY);
     expect(error.message).toContain("[redacted]");
     expect(String(error.stack)).not.toContain(API_KEY);
+  });
+
+  test("redacts the per-request access token from concurrent unary errors", async () => {
+    const h = setup();
+    let n = 0;
+    const client = new OwnSandClient({
+      origin: h.api.origin,
+      fetch: h.api.fetch,
+      clock: h.clock,
+      env: {},
+      organizationId: ORG,
+      accessToken: async () => `sentinel-token-${"ABC"[n++ % 3]}`,
+    });
+    h.api.unary(SandboxService, "GetSandbox", (_req, call) => {
+      throw new ConnectError(
+        `rejected ${call.headers.get("authorization")}`,
+        Code.Unauthenticated,
+      );
+    });
+    const errors = await Promise.all(
+      [0, 1, 2].map(() =>
+        client
+          .sandbox(SANDBOX)
+          .get()
+          .catch((e) => e),
+      ),
+    );
+    for (const error of errors) {
+      expect(error.message).toContain("[redacted]");
+      for (const t of ["A", "B", "C"]) {
+        expect(error.message).not.toContain(`sentinel-token-${t}`);
+        expect(String(error.stack)).not.toContain(`sentinel-token-${t}`);
+      }
+    }
+  });
+
+  test("redacts the per-request access token from streaming errors", async () => {
+    const h = setup();
+    const transport = createApiTransport({
+      origin: h.api.origin,
+      credential: { accessToken: async () => "sentinel-token-stream" },
+      organizationId: ORG,
+      fetch: h.api.fetch,
+      logger: undefined,
+      activity: new ActivityRegistry(),
+      now: () => 0,
+    });
+    h.api.stream(RelayService, "Exec", (_req, call) => {
+      throw new ConnectError(
+        `rejected ${call.headers.get("authorization")}`,
+        Code.Unauthenticated,
+      );
+    });
+    const res = await transport.stream(
+      RelayService.method.exec,
+      undefined,
+      undefined,
+      undefined,
+      (async function* () {
+        yield create(RelayService.method.exec.input, {});
+      })(),
+    );
+    const error = await (async () => {
+      try {
+        for await (const _ of res.message) {
+          // Drain until the stream error.
+        }
+      } catch (e) {
+        return e as Error;
+      }
+      return undefined;
+    })();
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error!.message).toContain("[redacted]");
+    expect(error!.message).not.toContain("sentinel-token-stream");
+  });
+
+  test("returns an error without the secret unchanged", async () => {
+    const h = setup();
+    const original = new ConnectError("plain failure", Code.Internal);
+    h.api.unary(SandboxService, "GetSandbox", () => {
+      throw original;
+    });
+    const error = await h.client
+      .sandbox(SANDBOX)
+      .get()
+      .catch((e) => e);
+    expect(error.message).toContain("plain failure");
+    expect(error.code).toBe(Code.Internal);
   });
 
   test("the logger receives RPC names and codes but no credential or content", async () => {
@@ -186,6 +305,12 @@ describe("createSandbox", () => {
     ["a missing idle TTL", { idleTtl: undefined }, "idle_ttl"],
     ["a missing max TTL", { maxTtl: undefined }, "max_ttl"],
     ["a zero idle TTL", { idleTtl: 0 }, "idle_ttl"],
+    ["an idle TTL below one nanosecond", { idleTtl: 1e-7 }, "idle_ttl"],
+    [
+      "a max TTL below one nanosecond",
+      { maxTtl: 1e-7, idleTtl: 1e-6 },
+      "max_ttl",
+    ],
     ["an idle TTL above the max TTL", { idleTtl: 3 * HOUR }, "idle_ttl"],
     ["a max TTL above 7 days", { maxTtl: 7 * 24 * HOUR + 1 }, "max_ttl"],
     [
@@ -215,6 +340,39 @@ describe("createSandbox", () => {
     expect(sandbox.sandboxId).toBe(SANDBOX);
     const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
     expect(req.maxTtl.seconds).toBe(604800n);
+  });
+
+  test.each([
+    [0.5, 0n, 500_000],
+    [1.5, 0n, 1_500_000],
+    [1000.25, 1n, 250_000],
+    [1.0000004, 0n, 1_000_000 + 0],
+  ])(
+    "keeps the fractional part of a %s ms TTL on the wire",
+    async (ms, seconds, nanos) => {
+      const h = setup();
+      h.api.unary(SandboxService, "CreateSandbox", () => ({
+        sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+      }));
+      await h.client.createSandbox({
+        ...validCreate,
+        idleTtl: ms,
+        maxTtl: HOUR,
+      });
+      const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
+      expect(req.idleTtl.seconds).toBe(seconds);
+      expect(req.idleTtl.nanos).toBe(nanos);
+    },
+  );
+
+  test("compares the TTL ordering on the precise values", async () => {
+    const h = setup();
+    const error = await h.client
+      .createSandbox({ ...validCreate, idleTtl: 1.5, maxTtl: 1.4 })
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandValidationError);
+    expect(error.field).toBe("idle_ttl");
+    expect(h.api.calls).toHaveLength(0);
   });
 
   test("reuses one idempotency key for every retry of a create", async () => {

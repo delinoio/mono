@@ -86,6 +86,7 @@ const workspaceTaskInputs = new Set([
 export function isWorkspaceInput(path) {
   return (
     workspaceTaskInputs.has(path) ||
+    path === relayDigestVectors ||
     new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/`).test(path)
   );
 }
@@ -135,6 +136,17 @@ const goWorkspaceInputs = new Set([
 // the Postgres-backed tests and the end-to-end suite that the go-test job runs.
 const ownsandApiMigrations = "servers/ownsand-api/internal/db/migrations/";
 
+// The relay request digest vectors are read by the Go relaybinding tests and by
+// the TypeScript SDK digest test of `packages/ownsand-sdk`, so a change selects
+// both the Go checks and the workspace jobs.
+const relayDigestVectors =
+  "go/ownsand/relaybinding/testdata/request-digest-vectors.json";
+
+// Fixture data under a `testdata` directory of a Go tree is read by Go tests
+// (the Go tool ignores such directories as packages, so it holds no `.go`
+// package sources that the `.go` selector would catch).
+const goTestdata = /^(?:go|cmds|internal|servers)\/(?:.+\/)?testdata\//;
+
 // Go sources, module files, protobuf schema inputs and the inputs of the
 // OwnSand end-to-end suite select the repository Go checks.
 export function isGoInput(path) {
@@ -145,7 +157,9 @@ export function isGoInput(path) {
     protoInputs.has(path) ||
     goWorkspaceInputs.has(path) ||
     path.startsWith(ownsandSdkPackage) ||
-    path.startsWith(ownsandApiMigrations)
+    path.startsWith(ownsandApiMigrations) ||
+    path === relayDigestVectors ||
+    goTestdata.test(path)
   );
 }
 
@@ -203,6 +217,9 @@ export function plan(cwd, base, head) {
     (path) =>
       fixtureInputs.has(path) ||
       path.startsWith("scripts/ci/") ||
+      // The development scripts (the root `dev` portless preflight and the
+      // Infisical launcher) have fixtures in `test:tooling`.
+      path.startsWith("scripts/dev/") ||
       // A pending changeset is validated in the quality job, so that an
       // invalid one cannot reach main and stop every deployment.
       path.startsWith(".changeset/") ||

@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //go:build linux || darwin
 
@@ -73,7 +73,18 @@ type env struct {
 	sandbox string
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWith(t, envOptions{}) }
+
+// envOptions tune the fixture of one test.
+type envOptions struct {
+	// managerNow is the clock of the sandbox manager; nil uses the real clock.
+	managerNow func() time.Time
+	// wrap lets a test observe or pause the calls of the dispatcher into the
+	// sandbox manager; nil passes the manager itself.
+	wrap func(*sandboxes.Manager) ops.Sandboxes
+}
+
+func newEnvWith(t *testing.T, o envOptions) *env {
 	t.Helper()
 	st, err := store.Open(t.TempDir())
 	if err != nil {
@@ -84,12 +95,16 @@ func newEnv(t *testing.T) *env {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: rt, Logger: logger})
+	m, err := sandboxes.New(context.Background(), sandboxes.Options{Store: st, Runtime: rt, Logger: logger, Now: o.managerNow})
 	if err != nil {
 		t.Fatal(err)
 	}
 	e := &env{t: t, st: st, m: m, clk: &clock{}}
-	e.d, err = ops.New(m, st, ops.Options{Now: e.clk.Now, Logger: logger})
+	var dispatcherSandboxes ops.Sandboxes = m
+	if o.wrap != nil {
+		dispatcherSandboxes = o.wrap(m)
+	}
+	e.d, err = ops.New(dispatcherSandboxes, st, ops.Options{Now: e.clk.Now, Logger: logger})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,6 +201,16 @@ func stdout(frames []*ownsandv1.DataFrame) string {
 	return b.String()
 }
 
+// started reports whether a frame says that a command started.
+func started(frames []*ownsandv1.DataFrame) bool {
+	for _, f := range frames {
+		if f.GetExecEvent().GetStarted() != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func last(frames []*ownsandv1.DataFrame) *ownsandv1.DataFrame { return frames[len(frames)-1] }
 
 func TestExecAtMostOnce(t *testing.T) {
@@ -208,6 +233,24 @@ func TestExecAtMostOnce(t *testing.T) {
 	out, _, _ = e.handle(other, nil)
 	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_ALREADY_EXISTS || !out.Terminal {
 		t.Fatalf("other request with the same exec_id: %+v", out)
+	}
+	// Another spelling of the same exec_id is rejected before admission, so
+	// the command does not run a second time: its output would be "run\nrun\n".
+	upper := proto.Clone(req).(*ownsandv1.ExecRequest)
+	upper.ExecId = strings.ToUpper(req.GetExecId())
+	if upper.GetExecId() == req.GetExecId() {
+		t.Fatal("test exec_id has no letter to change the case of")
+	}
+	out, frames, accepted = e.handle(upper, nil)
+	if out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT || !out.Terminal || accepted || started(frames) {
+		t.Fatalf("uppercase exec_id: %+v accepted %v started %v", out, accepted, started(frames))
+	}
+	attachUpper := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: upper.GetExecId()}
+	if out, _, _ = e.handle(attachUpper, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT {
+		t.Fatalf("attach with an uppercase exec_id: %+v", out)
+	}
+	if out, frames, _ = e.handle(req, nil); !out.Finished || stdout(frames) != "run\n" {
+		t.Fatalf("lowercase retry after the uppercase request: %+v %q", out, stdout(frames))
 	}
 	// The record survives an agent restart; the command never runs again.
 	d2, err := ops.New(e.m, e.st, ops.Options{Now: e.clk.Now, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
@@ -336,6 +379,105 @@ func TestExecSandboxEnded(t *testing.T) {
 	}
 }
 
+// pausedSandboxes pauses the first State call of the dispatcher after it read
+// the state of the sandbox, so that a test can end the sandbox between the
+// state check of an exec and its admission.
+type pausedSandboxes struct {
+	*sandboxes.Manager
+	once     sync.Once
+	observed chan struct{}
+	release  chan struct{}
+}
+
+func newPausedSandboxes(m *sandboxes.Manager) *pausedSandboxes {
+	return &pausedSandboxes{Manager: m, observed: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (p *pausedSandboxes) State(id string) (ownsandv1.SandboxState, bool) {
+	state, ok := p.Manager.State(id)
+	p.once.Do(func() {
+		close(p.observed)
+		<-p.release
+	})
+	return state, ok
+}
+
+// TestExecAdmissionRacesSandboxEnd covers an exec that read a running state
+// and then lost the race with the end of its sandbox: the exec is refused and
+// leaves no record and no forwarding goroutine behind.
+func TestExecAdmissionRacesSandboxEnd(t *testing.T) {
+	ends := []struct {
+		name string
+		// end ends the sandbox and returns when the manager has recorded the end.
+		end func(t *testing.T, e *env, mgrClk *clock)
+	}{
+		{"delete", func(t *testing.T, e *env, _ *clock) {
+			if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"ttl", func(t *testing.T, e *env, mgrClk *clock) {
+			mgrClk.Advance(3 * time.Hour)
+			e.m.Tick(context.Background(), false)
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				if state, _ := e.m.State(e.sandbox); state == ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+					return
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("sandbox did not end after its TTL")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+		}},
+	}
+	for _, tc := range ends {
+		t.Run(tc.name, func(t *testing.T) {
+			var gate *pausedSandboxes
+			mgrClk := &clock{}
+			e := newEnvWith(t, envOptions{
+				managerNow: mgrClk.Now,
+				wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+					gate = newPausedSandboxes(m)
+					return gate
+				},
+			})
+			req := e.execReq("/bin/sh", "-c", "sleep 60")
+			type result struct {
+				out      ops.Outcome
+				frames   []*ownsandv1.DataFrame
+				accepted bool
+			}
+			done := make(chan result, 1)
+			go func() {
+				out, frames, accepted := e.handle(req, nil)
+				done <- result{out, frames, accepted}
+			}()
+			<-gate.observed
+			tc.end(t, e, mgrClk)
+			close(gate.release)
+			var r result
+			select {
+			case r = <-done:
+			case <-time.After(20 * time.Second):
+				t.Fatal("exec of an ended sandbox did not return")
+			}
+			if r.accepted || r.out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION || !r.out.Terminal {
+				t.Fatalf("outcome %+v accepted %v", r.out, r.accepted)
+			}
+			if e.d.HasRunningExec(e.sandbox) {
+				t.Fatal("exec registered for an ended sandbox")
+			}
+			if _, kept := e.d.ExecContextErr(req.GetExecId()); kept {
+				t.Fatal("exec record kept for an ended sandbox")
+			}
+			if e.d.ExecEnded(req.GetExecId()) {
+				t.Fatal("exec reported as accepted and ended")
+			}
+		})
+	}
+}
+
 func TestGrantChecks(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/echo", "hi")
@@ -435,4 +577,60 @@ func TestReadAndWrite(t *testing.T) {
 	if out, _, _ := e.handle(r, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
 		t.Fatalf("expired read: %+v", out)
 	}
+}
+
+func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
+	e := newEnv(t)
+	// Control: a running exec keeps its context live.
+	running := e.execReq("/bin/sh", "-c", "sleep 60")
+	rs := &sink{}
+	rdone := make(chan ops.Outcome, 1)
+	go func() {
+		rdone <- e.d.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, running), SandboxID: e.sandbox}, rs)
+	}()
+	for !e.d.HasRunningExec(e.sandbox) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err, kept := e.d.ExecContextErr(running.GetExecId()); !kept || err != nil {
+		t.Fatalf("running exec context: kept %v err %v", kept, err)
+	}
+
+	// A finished exec cancels its context and keeps its result.
+	req := e.execReq("/bin/sh", "-c", "echo done")
+	if out, _, _ := e.handle(req, nil); !out.Finished {
+		t.Fatalf("exec: %+v", out)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err, kept := e.d.ExecContextErr(req.GetExecId())
+		if !kept {
+			t.Fatal("finished exec is not kept")
+		}
+		if err != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exec context not canceled after forwarding ended")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	attach := &ownsandv1.AttachExecRequest{OrganizationId: orgID, SandboxId: e.sandbox, ExecId: req.GetExecId()}
+	out, frames, _ := e.handle(attach, nil)
+	if !out.Finished || stdout(frames) != "done\n" {
+		t.Fatalf("attach after cancel: %+v %q", out, stdout(frames))
+	}
+	e.clk.Advance(11 * time.Minute)
+	e.d.Sweep()
+	if out, _, _ := e.handle(attach, nil); out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {
+		t.Fatalf("attach after sweep: %+v", out)
+	}
+
+	// The running exec is still live, and SandboxEnded cancels it.
+	if err, _ := e.d.ExecContextErr(running.GetExecId()); err != nil {
+		t.Fatalf("running exec context canceled early: %v", err)
+	}
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
+		t.Fatal(err)
+	}
+	<-rdone
 }

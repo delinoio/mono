@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { defineConfig } from "@rsbuild/core";
 import { pluginReact } from "@rsbuild/plugin-react";
-import { readConsoleConfig } from "./src/config.ts";
+import { normalizeMockFlag, readConsoleConfig } from "./src/config.ts";
 
 // Fail the build and the dev server early when the configuration is not
 // valid, and refuse the mock API in a production build. The Rsbuild CLI
@@ -16,9 +16,11 @@ export default defineConfig({
   source: {
     define: {
       // Always inline the mock setting, also when it is unset, so the
-      // minifier removes the mock API chunk from builds without it.
+      // minifier removes the mock API chunk from builds without it. The value
+      // is normalized like readConsoleConfig does, so a padded value selects
+      // both the mock sign-in and the mock transport.
       "import.meta.env.PUBLIC_OWNSAND_MOCK_API": JSON.stringify(
-        process.env.PUBLIC_OWNSAND_MOCK_API ?? "",
+        normalizeMockFlag(process.env.PUBLIC_OWNSAND_MOCK_API),
       ),
     },
   },
@@ -30,7 +32,7 @@ export default defineConfig({
   server: {
     // Fixed loopback port; fail instead of picking another port on conflict.
     host: "127.0.0.1",
-    port: 3300,
+    port: 13300,
     strictPort: true,
     // Single-page application: every route serves index.html.
     historyApiFallback: true,

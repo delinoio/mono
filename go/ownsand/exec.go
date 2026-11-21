@@ -235,6 +235,11 @@ type attempt struct {
 	result   *ExecResult
 	err      error // io.EOF for a stream that ended cleanly without a result
 	accepted bool
+	// served reports that the agent served the request on a peer-to-peer
+	// session: it sent the accepted frame or any exec event. The agent
+	// sends no accepted frame on a session, only on the relay, so an exec
+	// event is the evidence of an accepted continuation there.
+	served   bool
 	data     bool
 	paused   bool
 	sentExec bool
@@ -317,6 +322,17 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			err = errNotAccepted
 		}
 		if sess != nil && s.dp.handleSessionError(sess, err) {
+			var ended *errSessionEnded
+			if (at.accepted || at.served) && errors.As(err, &ended) {
+				// A routine session end (idle, the 1-hour expiry) of a
+				// continuation that the agent accepted shows that the
+				// operation recovered on its new session. It is not a
+				// failure, so a quiet exec can outlive any number of
+				// session expiries. Only failed sessions (a data channel
+				// failure, an end before the agent accepted) count.
+				sessionErrors = 0
+				continue
+			}
 			sessionErrors++
 			if sessionErrors > 5 {
 				return nil, op.dpErr(err, false)
@@ -406,6 +422,7 @@ func (op *execOp) p2pAttempt(ctx context.Context, sess *p2pSession) attempt {
 		}
 		switch f.GetKind() {
 		case ownsandv1.DataFrameKind_DATA_FRAME_KIND_EXEC_EVENT:
+			at.served = true
 			if done := op.handleEvent(f.GetExecEvent(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_PEER_TO_PEER); done {
 				return at
 			}
@@ -437,7 +454,14 @@ func (op *execOp) relayAttempt(ctx context.Context) attempt {
 		return at
 	}
 	at.sentExec = isExec
-	actx, stop := c.stallContext(ctx)
+	budget := op.rec.streamBudget()
+	if budget < 0 {
+		// The recovery window ended while the grant was renewed: start no
+		// continuation.
+		at.err = op.rec.deadlineErr()
+		return at
+	}
+	actx, disarm, stop := c.stallContext(ctx, budget)
 	defer stop()
 	defer op.grant.streamEnded()
 	var stream serverStream
@@ -445,26 +469,32 @@ func (op *execOp) relayAttempt(ctx context.Context) attempt {
 	if isExec {
 		s, err := c.relay.Exec(actx, relayRequest(op.grant, payload.(*ownsandv1.ExecRequest)))
 		if err != nil {
-			at.err = streamErr(actx, err)
+			at.err = streamErr(actx, err, op.rec)
 			return at
 		}
 		stream, next = s, func() *ownsandv1.ExecEvent { return s.Msg().GetEvent() }
 	} else {
 		s, err := c.relay.AttachExec(actx, relayRequest(op.grant, payload.(*ownsandv1.AttachExecRequest)))
 		if err != nil {
-			at.err = streamErr(actx, err)
+			at.err = streamErr(actx, err, op.rec)
 			return at
 		}
 		stream, next = s, func() *ownsandv1.ExecEvent { return s.Msg().GetEvent() }
 	}
 	defer stream.Close()
 	for stream.Receive() {
-		if done := op.handleEvent(next(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY); done {
+		done := op.handleEvent(next(), &at, ownsandv1.DataPathTransport_DATA_PATH_TRANSPORT_RELAY)
+		if at.accepted || !op.rec.inRecovery() {
+			// The agent accepted the continuation, or progress ended the
+			// window: the recovery budget no longer bounds the stream.
+			disarm()
+		}
+		if done {
 			return at
 		}
 	}
 	if err := stream.Err(); err != nil {
-		at.err = streamErr(actx, err)
+		at.err = streamErr(actx, err, op.rec)
 		return at
 	}
 	at.err = io.EOF

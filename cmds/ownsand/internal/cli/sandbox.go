@@ -66,7 +66,7 @@ func (a *app) sandboxCreate(ctx context.Context, name string, args []string) err
 	template := fs.String("template", "", "source template ID")
 	idle := fs.String("idle-ttl", "", "idle TTL, for example 30m (required)")
 	maxTTL := fs.String("max-ttl", "", "maximum TTL, at most 7d (required)")
-	vcpu := fs.Int("vcpu", 0, "vCPU count (required)")
+	vcpu := int32Var(fs, "vcpu", 0, "vCPU count (required)")
 	memory := fs.Int64("memory", 0, "memory in MiB (required)")
 	disk := fs.Int64("disk", 0, "disk in GiB (required)")
 	device := fs.String("device", "", "device ID")
@@ -109,7 +109,7 @@ func (a *app) sandboxCreate(ctx context.Context, name string, args []string) err
 	if p.MaxTTL, err = parseDuration("max-ttl", *maxTTL); err != nil {
 		return err
 	}
-	p.Resources = ownsand.Resources{VCPUCount: int32(*vcpu), MemoryMiB: *memory, DiskGiB: *disk}
+	p.Resources = ownsand.Resources{VCPUCount: *vcpu, MemoryMiB: *memory, DiskGiB: *disk}
 	if *hostOS != "" {
 		v, err := parseHostOS(*hostOS)
 		if err != nil {
@@ -233,7 +233,7 @@ func (a *app) sandboxList(ctx context.Context, name string, args []string) error
 	if err != nil {
 		return err
 	}
-	req := &ownsandv1.ListSandboxesRequest{OrganizationId: org, PageSize: int32(page.size), PageToken: page.token, IncludeEnded: *ended}
+	req := &ownsandv1.ListSandboxesRequest{OrganizationId: org, PageSize: page.size, PageToken: page.token, IncludeEnded: *ended}
 	if *device != "" {
 		req.DeviceId = device
 	}
@@ -657,13 +657,15 @@ func openDownloadTarget(to string) (*downloadTarget, error) {
 			return nil, err
 		}
 	}
-	dir, base := filepath.Split(path)
+	dir, _ := filepath.Split(path)
 	for range 100 {
 		var b [8]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return nil, err
 		}
-		tmp := filepath.Join(dir, "."+base+"."+hex.EncodeToString(b[:])+".tmp")
+		// The staging name does not contain the destination base name, so a
+		// destination name at the filesystem limit still has room for it.
+		tmp := filepath.Join(dir, ".ownsand-"+hex.EncodeToString(b[:])+".tmp")
 		// 0666 before the umask gives a new destination the mode that
 		// os.Create would give it.
 		f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
@@ -731,9 +733,13 @@ func resolveMissingTarget(to string) (string, error) {
 			return "", err
 		}
 		if !filepath.IsAbs(target) {
-			// path already has real directory components (see above), so
-			// ".." in the target is applied to the real directory.
-			target = filepath.Join(filepath.Dir(path), target)
+			// path already has real directory components (see above). Prefix
+			// the target with that directory without cleaning it: filepath.Join
+			// would collapse "x/.." lexically, before the next iteration
+			// resolves x (a symbolic link, or a directory that is missing) the
+			// way the kernel does.
+			dir, _ := filepath.Split(path)
+			target = dir + target
 		}
 		path = target
 	}

@@ -44,7 +44,9 @@ func New(logger *slog.Logger, bytesPerSecond, burst int) *Server {
 }
 
 // Respond returns the binding response for a datagram from src, or nil when
-// the datagram is not a binding request or has a reserved header bit set.
+// the datagram is not a binding request or has a reserved header bit set. A
+// request with unknown comprehension-required attributes gets a 420 error
+// response with UNKNOWN-ATTRIBUTES.
 func Respond(datagram []byte, src *net.UDPAddr) ([]byte, error) {
 	if !pionstun.IsMessage(datagram) {
 		return nil, errors.New("not a STUN message")
@@ -62,6 +64,22 @@ func Respond(datagram []byte, src *net.UDPAddr) ([]byte, error) {
 	if req.Type != pionstun.BindingRequest {
 		return nil, errors.New("not a binding request")
 	}
+	// RFC 8489 section 6.3.1: a request with comprehension-required
+	// attributes that this server does not understand gets a 420 error
+	// response that lists them. Unknown optional attributes are ignored.
+	if unknown := unknownRequired(req); len(unknown) > 0 {
+		resp, err := pionstun.Build(
+			pionstun.NewTransactionIDSetter(req.TransactionID),
+			pionstun.BindingError,
+			pionstun.CodeUnknownAttribute,
+			unknown,
+			pionstun.Fingerprint,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return resp.Raw, nil
+	}
 	resp, err := pionstun.Build(
 		pionstun.NewTransactionIDSetter(req.TransactionID),
 		pionstun.BindingSuccess,
@@ -72,6 +90,53 @@ func Respond(datagram []byte, src *net.UDPAddr) ([]byte, error) {
 		return nil, err
 	}
 	return resp.Raw, nil
+}
+
+// knownRequired is the set of comprehension-required attribute types
+// (below 0x8000) that RFC 8489 defines; the server treats these as
+// understood. Every other required type makes the request unacceptable.
+var knownRequired = map[pionstun.AttrType]struct{}{
+	pionstun.AttrMappedAddress:          {},
+	pionstun.AttrUsername:               {},
+	pionstun.AttrMessageIntegrity:       {},
+	pionstun.AttrErrorCode:              {},
+	pionstun.AttrUnknownAttributes:      {},
+	pionstun.AttrRealm:                  {},
+	pionstun.AttrNonce:                  {},
+	pionstun.AttrMessageIntegritySHA256: {},
+	pionstun.AttrPasswordAlgorithm:      {},
+	pionstun.AttrUserhash:               {},
+	pionstun.AttrXORMappedAddress:       {},
+}
+
+// unknownRequired returns the distinct comprehension-required attribute
+// types of req that the server does not understand, in request order.
+// RFC 8489 section 9: attributes after MESSAGE-INTEGRITY are ignored, as are
+// those after MESSAGE-INTEGRITY-SHA256 when MESSAGE-INTEGRITY is absent. The
+// only exempt attributes (MESSAGE-INTEGRITY-SHA256 and FINGERPRINT) are
+// understood types, so scanning stops at the boundary.
+func unknownRequired(req *pionstun.Message) pionstun.UnknownAttributes {
+	var unknown pionstun.UnknownAttributes
+	seen := map[pionstun.AttrType]struct{}{}
+	hasIntegrity := req.Contains(pionstun.AttrMessageIntegrity)
+	for _, a := range req.Attributes {
+		if a.Type == pionstun.AttrMessageIntegrity ||
+			(a.Type == pionstun.AttrMessageIntegritySHA256 && !hasIntegrity) {
+			break
+		}
+		if !a.Type.Required() {
+			continue
+		}
+		if _, ok := knownRequired[a.Type]; ok {
+			continue
+		}
+		if _, dup := seen[a.Type]; dup {
+			continue
+		}
+		seen[a.Type] = struct{}{}
+		unknown = append(unknown, a.Type)
+	}
+	return unknown
 }
 
 // Serve answers binding requests on pc until ctx ends.

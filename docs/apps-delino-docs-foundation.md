@@ -70,11 +70,12 @@ The site has no runtime server logs. Build diagnostics come from the Rspress CLI
 Run from the repository root:
 
 - `pnpm install --frozen-lockfile`
-- `pnpm --filter delino-docs dev`: development server at `http://127.0.0.1:3500`. The server fails when the port is in use and does not start on another port. `PORT` does not change the port.
+- `pnpm --filter delino-docs dev`: development server through portless at `https://docs.delino.localhost`, in every checkout. See [Frontend development URLs](repository-environment-contract.md#frontend-development-urls).
+- `pnpm --filter delino-docs dev:app`, or `dev` with `PORTLESS=0`: development server at `http://127.0.0.1:13500`. The server fails when the port is in use and does not start on another port. `PORT` changes the port only when portless also sets `PORTLESS_URL`.
 - `pnpm exec turbo run build --filter=delino-docs`: production build into `apps/delino-docs/dist/`.
 - `pnpm exec turbo run typecheck --filter=delino-docs`: TypeScript type check, including the e2e config and tests.
-- `pnpm exec turbo run test:e2e --filter=delino-docs`: browser end-to-end tests against the development server on a free loopback port. The suite also starts `rspress dev` without a port flag while a loopback listener holds port 3500, and with an explicit port that a listener holds, and expects a non-zero exit with the `Port <n> is occupied` message. See the [e2e contract](repository-e2e-contract.md).
-- `pnpm --filter delino-docs preview`: serve the production build at `http://127.0.0.1:3500`. Preview uses the same port as the development server and fails when the port is in use, so the development server and preview of one site cannot run together.
+- `pnpm exec turbo run test:e2e --filter=delino-docs`: browser end-to-end tests against the development server on a free loopback port. The suite also starts `rspress dev` without a port flag while a loopback listener holds port 13500, and with an explicit port that a listener holds, and expects a non-zero exit with the `Port <n> is occupied` message. See the [e2e contract](repository-e2e-contract.md).
+- `pnpm --filter delino-docs preview`: serve the production build at `http://127.0.0.1:13500`. Preview uses the same port as the development server and fails when the port is in use, so the development server and preview of one site cannot run together.
 
 Remove `apps/delino-docs/dist/` after validation. CI runs the e2e suite in the `e2e` job. CI builds and type-checks this site in the `workspace-packages` job of the [workflow contract](repository-workflow-contract.md#validation) but does not deploy it. The [deployment workflow](repository-workflow-contract.md#deployment-workflow) builds and deploys it when a pending changeset releases it.
 

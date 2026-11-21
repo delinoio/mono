@@ -14,6 +14,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
@@ -41,10 +42,24 @@ type session struct {
 	expireAt                       time.Time
 }
 
+// revocationTarget is what a pending revocation ends, for logs.
+type revocationTarget string
+
+const (
+	revocationTargetSession    revocationTarget = "session"
+	revocationTargetRelayGrant revocationTarget = "relay_grant"
+)
+
 // revocation is a session revocation that waits for its acknowledgement.
 type revocation struct {
 	deviceID string
 	gen      uint64
+	target   revocationTarget
+	// expireAt is when the revoked session reaches its absolute expiry or the
+	// revoked grant stops being revocable. The agent never needs the
+	// revocation after that, so the sweep deletes it even when no
+	// acknowledgement arrived.
+	expireAt time.Time
 }
 
 // DataPlane holds the in-memory data path state of the lease holder:
@@ -64,6 +79,51 @@ type DataPlane struct {
 	mu          sync.Mutex
 	sessions    map[string]*session
 	revocations map[string]revocation
+	// grantSender replaces the agent channel enqueue of a relay grant; nil
+	// uses hub.Conn.Send. Tests set it to inject an enqueue failure on a live
+	// channel, which a running channel produces only when the outbound queue
+	// is full and the caller's context ends.
+	grantSender func(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error
+	// grantWaitObserver is called with the grant ID when a retried call finds
+	// an existing reservation and is about to wait for its outcome; nil does
+	// nothing. Tests use it to know that a concurrent call is waiting.
+	grantWaitObserver func(grantID string)
+}
+
+// SetGrantWaitObserver sets a callback that AuthorizeRelay calls just before
+// a call for an already reserved grant waits for the outcome (tests only); nil
+// removes it. It never changes how the call behaves.
+func (p *DataPlane) SetGrantWaitObserver(fn func(grantID string)) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.grantWaitObserver = fn
+}
+
+func (p *DataPlane) observeGrantWait(grantID string) {
+	p.mu.Lock()
+	fn := p.grantWaitObserver
+	p.mu.Unlock()
+	if fn != nil {
+		fn(grantID)
+	}
+}
+
+// SetGrantSender replaces how AuthorizeRelay enqueues a relay grant for the
+// agent (tests only); nil restores hub.Conn.Send.
+func (p *DataPlane) SetGrantSender(fn func(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.grantSender = fn
+}
+
+func (p *DataPlane) sendGrant(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) error {
+	p.mu.Lock()
+	fn := p.grantSender
+	p.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, conn, env)
+	}
+	return conn.Send(ctx, env)
 }
 
 // RelayTiming holds the relay stream durations; tests shorten them.
@@ -74,8 +134,10 @@ type RelayTiming struct {
 	Keepalive time.Duration
 	// Acceptance is the wait for the agent's accepted notice (30 s).
 	Acceptance time.Duration
-	// RequestDeadline bounds forwarding the request frame (5 min), and the
-	// whole WriteFile call.
+	// RequestDeadline bounds the request upload and forwarding the request
+	// frame (5 min), and the whole WriteFile call. It counts from the
+	// stream_id allocation at the relay request gate, before Connect reads
+	// the request body.
 	RequestDeadline time.Duration
 	// GrantAck bounds the wait for a relay grant acknowledgement (10 s) and
 	// Signaling the wait for an SDP answer (30 s).
@@ -170,7 +232,7 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 		return matchPrincipal(g.OrgID, g.Principal) || matchSandbox(g.SandboxID, g.DeviceID)
 	})
 	for _, g := range revoked {
-		p.sendRevocation(ctx, g.DeviceID, g.ChannelGen, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.ID}})
+		p.sendRevocation(ctx, g.DeviceID, g.ChannelGen, revocationTargetRelayGrant, g.RevocableUntil(), &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_RelayGrantId{RelayGrantId: g.ID}})
 	}
 	p.mu.Lock()
 	var sessions []*session
@@ -182,11 +244,14 @@ func (p *DataPlane) HandleEvent(ctx context.Context, e events.Event) {
 	}
 	p.mu.Unlock()
 	for _, s := range sessions {
-		p.sendRevocation(ctx, s.deviceID, s.gen, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: s.id}})
+		p.sendRevocation(ctx, s.deviceID, s.gen, revocationTargetSession, s.expireAt, &ownsandv1.SessionRevocation{Target: &ownsandv1.SessionRevocation_SessionId{SessionId: s.id}})
 	}
 }
 
-func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uint64, r *ownsandv1.SessionRevocation) {
+// sendRevocation sends r to the agent and keeps it pending until the agent
+// acknowledges it, its send fails, its channel closes or expireAt passes.
+func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uint64, target revocationTarget, expireAt time.Time, r *ownsandv1.SessionRevocation) {
+	p.sweepRevocations(ctx, p.S.now())
 	conn := p.S.Hub.Get(deviceID)
 	if conn == nil || conn.Generation != gen {
 		// The channel that signaled the session or sent the grant is gone,
@@ -194,9 +259,13 @@ func (p *DataPlane) sendRevocation(ctx context.Context, deviceID string, gen uin
 		return
 	}
 	r.RevocationId = newID()
-	p.mu.Lock()
-	p.revocations[r.RevocationId] = revocation{deviceID: deviceID, gen: gen}
-	p.mu.Unlock()
+	// A target that already ended needs no pending record: the agent ended it
+	// on its own, and nothing would ever delete the record.
+	if p.S.now().Before(expireAt) {
+		p.mu.Lock()
+		p.revocations[r.RevocationId] = revocation{deviceID: deviceID, gen: gen, target: target, expireAt: expireAt}
+		p.mu.Unlock()
+	}
 	if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_SessionRevocation{SessionRevocation: r}}); err != nil {
 		p.mu.Lock()
 		delete(p.revocations, r.RevocationId)
@@ -212,6 +281,36 @@ func (p *DataPlane) PendingRevocations() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.revocations)
+}
+
+// SweepExpired deletes the pending revocations whose session or grant has
+// ended. It implements DataPathHooks and runs periodically, so an idle lease
+// holder with open agent channels stays bounded as well.
+func (p *DataPlane) SweepExpired(ctx context.Context) {
+	p.sweepRevocations(ctx, p.S.now())
+}
+
+// sweepRevocations deletes the pending revocations whose end time passed
+// without an acknowledgement: the session reached its absolute expiry or the
+// grant stopped being revocable, so the agent ended it by itself.
+func (p *DataPlane) sweepRevocations(ctx context.Context, now time.Time) {
+	type expired struct {
+		id string
+		revocation
+	}
+	var gone []expired
+	p.mu.Lock()
+	for id, r := range p.revocations {
+		if !now.Before(r.expireAt) {
+			gone = append(gone, expired{id: id, revocation: r})
+			delete(p.revocations, id)
+		}
+	}
+	p.mu.Unlock()
+	for _, e := range gone {
+		p.S.Logger.InfoContext(ctx, "session_revocation_expired", slog.String("revocation_id", e.id), slog.String("device_id", e.deviceID),
+			slog.String("target", string(e.target)), slog.Time("expire_time", e.expireAt))
+	}
 }
 
 // sweepSessions forgets sessions past their absolute expiry.
@@ -245,7 +344,8 @@ func (h DataPathHandler) GetIceServers(ctx context.Context, req *connect.Request
 // rule: UNREACHABLE is unavailable, a state outside allowed is
 // failed_precondition, and a device without a live channel is unavailable.
 func (p *DataPlane) liveSandbox(ctx context.Context, orgID, sandboxID string, allowed ...ownsandv1.SandboxState) (*sandboxRow, *hub.Conn, error) {
-	if err := validateID("sandbox_id", sandboxID); err != nil {
+	sandboxID, err := normalizeID("sandbox_id", sandboxID)
+	if err != nil {
 		return nil, nil, err
 	}
 	sb, err := loadSandbox(ctx, p.S.DB.Pool, orgID, sandboxID, false)
@@ -269,19 +369,24 @@ func (p *DataPlane) liveSandbox(ctx context.Context, orgID, sandboxID string, al
 
 func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[ownsandv1.OpenSessionRequest]) (*connect.Response[ownsandv1.OpenSessionResponse], error) {
 	m := req.Msg
-	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes)
+	orgID, err := normalizeID("organization_id", m.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
 		return nil, err
 	}
 	if m.GetSdpOffer() == "" || len(m.GetSdpOffer()) > 64<<10 {
 		return nil, errInvalidf("invalid sdp_offer: must be 1 byte to 64 KiB")
 	}
-	sb, conn, err := h.liveSandbox(ctx, m.GetOrganizationId(), m.GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	sb, conn, err := h.liveSandbox(ctx, orgID, m.GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	if err != nil {
 		return nil, h.S.internal(ctx, "open session", err)
 	}
 	now := h.S.now()
 	h.sweepSessions(now)
+	h.sweepRevocations(ctx, now)
 	sess := &session{id: newID(), orgID: sb.OrgID, sandboxID: sb.ID, deviceID: sb.DeviceID, gen: conn.Generation, principal: pr, expireAt: now.Add(sessionLifetime)}
 	// Register the session as pending first, so a revocation processed
 	// before the answer ends it as well.
@@ -295,7 +400,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		return nil, err
 	}
 	// Authorize again after registering, as the contract requires.
-	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes); err != nil {
+	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return fail(err)
 	}
 	key := conn.DeviceID + "/" + sess.id
@@ -348,20 +453,54 @@ func errorFromDetail(d *ownsandv1.ErrorDetail) error {
 	return e
 }
 
+// enqueueErrorCategory names why queueing a message for the agent failed, for
+// logs: the channel closed, or the caller's context ended before the queue
+// accepted it.
+func enqueueErrorCategory(err error) string {
+	switch {
+	case errors.Is(err, hub.ErrChannelClosed):
+		return "channel_closed"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline_exceeded"
+	default:
+		return "other"
+	}
+}
+
 func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Request[ownsandv1.AuthorizeRelayRequest]) (*connect.Response[ownsandv1.AuthorizeRelayResponse], error) {
 	m := req.Msg
-	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes)
+	orgID, err := normalizeID("organization_id", m.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	pr, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes)
 	if err != nil {
 		return nil, err
 	}
 	if ok, retry := h.limiter.Allow(fmt.Sprintf("%d/%s", pr.Kind, pr.ID), 1); !ok {
 		return nil, errRateLimited(retry)
 	}
-	if err := validateID("authorization_id", m.GetAuthorizationId()); err != nil {
+	// The grant registry and the agent compare identifiers as text, so the
+	// grant carries the lowercase spelling of every identifier.
+	authorizationID, err := normalizeID("authorization_id", m.GetAuthorizationId())
+	if err != nil {
 		return nil, err
 	}
-	if err := validateID("operation_id", m.GetOperationId()); err != nil {
+	operationID, err := normalizeID("operation_id", m.GetOperationId())
+	if err != nil {
 		return nil, err
+	}
+	// The agent compares exec IDs as raw text and the request is required to
+	// use the lowercase spelling, so an exec grant accepts only that
+	// spelling; the other operation IDs accept either hex case and are
+	// normalized above.
+	switch m.GetOperationKind() {
+	case ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_ATTACH_EXEC:
+		if err := validate.ExecID("operation_id", m.GetOperationId()); err != nil {
+			return nil, errInvalid(err)
+		}
 	}
 	allowed := []ownsandv1.SandboxState{ownsandv1.SandboxState_SANDBOX_STATE_RUNNING}
 	switch m.GetOperationKind() {
@@ -380,16 +519,20 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	default:
 		return nil, errInvalidf("invalid operation_kind")
 	}
-	if m.ReplacesGrantId != nil && !uuidv7.Valid(m.GetReplacesGrantId()) {
-		return nil, errInvalidf("invalid replaces_grant_id")
+	replacesID := ""
+	if m.ReplacesGrantId != nil {
+		if !uuidv7.Valid(m.GetReplacesGrantId()) {
+			return nil, errInvalidf("invalid replaces_grant_id")
+		}
+		replacesID = canonicalID(m.GetReplacesGrantId())
 	}
-	sb, conn, err := h.liveSandbox(ctx, m.GetOrganizationId(), m.GetSandboxId(), allowed...)
+	sb, conn, err := h.liveSandbox(ctx, orgID, m.GetSandboxId(), allowed...)
 	if err != nil {
 		return nil, h.S.internal(ctx, "authorize relay", err)
 	}
 	g, existing, err := h.Grants.Reserve(grants.Request{
-		AuthorizationID: m.GetAuthorizationId(), OrgID: sb.OrgID, SandboxID: sb.ID, DeviceID: sb.DeviceID, ChannelGen: conn.Generation,
-		Principal: pr, Kind: m.GetOperationKind(), OperationID: m.GetOperationId(), Digest: m.GetRequestDigest(), ReplacesID: m.GetReplacesGrantId(),
+		AuthorizationID: authorizationID, OrgID: sb.OrgID, SandboxID: sb.ID, DeviceID: sb.DeviceID, ChannelGen: conn.Generation,
+		Principal: pr, Kind: m.GetOperationKind(), OperationID: operationID, Digest: m.GetRequestDigest(), ReplacesID: replacesID,
 	}, newID)
 	switch {
 	case errors.Is(err, grants.ErrLimit):
@@ -403,7 +546,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	// The caller's authorization is checked again after the grant is
 	// registered, so a revocation in between reaches the pending grant.
-	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, m.GetOrganizationId(), authz.ActionUseSandboxes); err != nil {
+	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		if !existing {
 			h.Grants.RemoveMatching(func(x *grants.Grant) bool { return x.ID == g.ID })
 		}
@@ -411,17 +554,32 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	if !existing {
 		now := h.S.now()
+		// Snapshot the predecessor once under the registry mutex: the registry
+		// clears the field on release or ack while the writer still serializes
+		// the queued message.
+		replaces := h.Grants.ReplacesOf(g)
 		msg := &ownsandv1.RelayGrant{
 			GrantId: g.ID, SandboxId: g.SandboxID, OperationKind: g.Kind, OperationId: g.OperationID, RequestDigest: g.Digest,
 			Principal: pr.Proto(), ExpireTime: ts(g.ExpireAt), StreamDeadline: ts(g.StreamDeadline),
 			ExpiresIn: durationpb.New(g.ExpireAt.Sub(now)), StreamDeadlineIn: durationpb.New(g.StreamDeadlineIn),
 		}
-		if g.Replaces != "" {
-			msg.ReplacesGrantId = &g.Replaces
+		if replaces != "" {
+			msg.ReplacesGrantId = &replaces
 		}
-		if err := conn.Send(ctx, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrant{RelayGrant: msg}}); err != nil {
+		if err := h.sendGrant(ctx, conn, &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrant{RelayGrant: msg}}); err != nil {
+			// The grant never entered the outbound queue, so the agent cannot
+			// acknowledge it. Release the exact reservation (and the
+			// predecessor's pending-successor link) before the caller sees the
+			// failure; a grant that was queued is never removed here.
+			removed := h.Grants.RemoveUndelivered(g.ID)
+			h.S.Logger.WarnContext(ctx, "relay_grant_enqueue_failed", slog.String("grant_id", g.ID), slog.String("sandbox_id", g.SandboxID),
+				slog.String("operation_kind", g.Kind.String()), slog.Bool("replacement", replaces != ""),
+				slog.String("error_category", enqueueErrorCategory(err)), slog.Bool("reservation_removed", removed))
 			return nil, errUnavailable("the agent channel closed")
 		}
+	}
+	if existing {
+		h.observeGrantWait(g.ID)
 	}
 	timer := time.NewTimer(h.Timing.GrantAck)
 	defer timer.Stop()
@@ -434,8 +592,19 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
-	if g.Rejected() {
+	switch g.Outcome() {
+	case grants.OutcomeAccepted:
+	case grants.OutcomeRejectedLimit:
 		return nil, errRateLimited(time.Second)
+	case grants.OutcomeDeliveryFailed:
+		// Another call of the same authorization_id failed to queue the grant;
+		// the reservation is gone, so a retry sends it again.
+		return nil, errUnavailable("the relay grant could not be delivered to the agent")
+	default:
+		// The pending grant was removed without an acknowledgement (the agent
+		// channel closed, a revocation, a release or the expiry): not a
+		// capacity rejection, so the caller retries without the grant-limit delay.
+		return nil, errUnavailable("the agent channel closed before it acknowledged the relay grant")
 	}
 	now := h.S.now()
 	h.S.Logger.InfoContext(ctx, "relay_grant_issued", slog.String("grant_id", g.ID), slog.String("sandbox_id", g.SandboxID),

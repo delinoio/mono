@@ -25,11 +25,30 @@ type Control struct {
 	mu sync.Mutex
 	// cursor is the last processed control event; -1 means unset.
 	cursor int64
+	// cursorGen counts the lease transitions that stored the cursor. Every
+	// LeaseAcquired and LeaseLost increments it in the same critical section
+	// as its cursor store, even when the stored value is unchanged. A batch
+	// in processEvents copies it together with the cursor and stops as soon
+	// as it differs, so a batch that started under an earlier lease period
+	// never delivers an event or stores a cursor in a later one.
+	cursorGen uint64
+
+	// Seams of the event processor. NewControl sets them to the database
+	// functions; tests replace them to interleave lease transitions with a
+	// batch deterministically.
+	latestID    func(ctx context.Context) (int64, error)
+	readEvents  func(ctx context.Context, after int64, limit int) ([]events.Event, error)
+	handleEvent func(ctx context.Context, e events.Event)
 }
 
 // NewControl returns the background worker of s and installs s.Notify.
 func NewControl(s *Service) *Control {
 	c := &Control{S: s, kick: make(chan struct{}, 1), cursor: -1}
+	c.latestID = func(ctx context.Context) (int64, error) { return events.LatestID(ctx, s.DB.Pool) }
+	c.readEvents = func(ctx context.Context, after int64, limit int) ([]events.Event, error) {
+		return events.After(ctx, s.DB.Pool, after, limit)
+	}
+	c.handleEvent = c.handle
 	s.Notify = c.Kick
 	return c
 }
@@ -44,17 +63,21 @@ func (c *Control) Kick() {
 
 // LeaseAcquired starts the event processor at the newest event: events
 // older than the lease belong to channels of the previous holder, and the
-// state reports of reconnecting agents trigger pending deletes again.
-func (c *Control) LeaseAcquired() {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+// state reports of reconnecting agents trigger pending deletes again. The
+// lease cancels ctx at the confirmed expiry of the ownership period, so the
+// database read cannot delay the loss transition; a failed read leaves the
+// cursor unset and the event processor repeats it while the lease is held.
+func (c *Control) LeaseAcquired(ctx context.Context) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	id, err := events.LatestID(ctx, c.S.DB.Pool)
+	id, err := c.latestID(ctx)
 	if err != nil {
 		c.S.Logger.Warn("control_event_cursor_failed", slog.Any("error", err))
 		id = -1
 	}
 	c.mu.Lock()
 	c.cursor = id
+	c.cursorGen++
 	c.mu.Unlock()
 }
 
@@ -63,6 +86,7 @@ func (c *Control) LeaseLost() {
 	c.S.Hub.CloseAll(errLeaseLost)
 	c.mu.Lock()
 	c.cursor = -1
+	c.cursorGen++
 	c.mu.Unlock()
 }
 
@@ -100,16 +124,25 @@ func (c *Control) runEvents(ctx context.Context) {
 	}
 }
 
+// processEvents delivers the events after the cursor. The cursor belongs to
+// the lease period in which the batch started: when LeaseLost or
+// LeaseAcquired runs while the batch is in flight, the batch stops before
+// its next read, its next delivery and its cursor store, so it neither
+// delivers an event of a newer period nor replaces the cursor that
+// LeaseAcquired stored. Deliveries that already returned are not undone.
 func (c *Control) processEvents(ctx context.Context) {
 	c.mu.Lock()
-	cursor := c.cursor
+	cursor, gen := c.cursor, c.cursorGen
 	c.mu.Unlock()
 	if cursor < 0 {
-		c.LeaseAcquired()
+		c.LeaseAcquired(ctx)
 		return
 	}
 	for {
-		batch, err := events.After(ctx, c.S.DB.Pool, cursor, 500)
+		if !c.cursorCurrent(gen) {
+			return
+		}
+		batch, err := c.readEvents(ctx, cursor, 500)
 		if err != nil {
 			if ctx.Err() == nil {
 				c.S.Logger.Warn("control_events_read_failed", slog.Any("error", err))
@@ -117,18 +150,33 @@ func (c *Control) processEvents(ctx context.Context) {
 			return
 		}
 		for _, e := range batch {
-			c.handle(ctx, e)
+			if !c.cursorCurrent(gen) {
+				c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", cursor))
+				return
+			}
+			c.handleEvent(ctx, e)
 			cursor = e.ID
 		}
 		c.mu.Lock()
-		if c.cursor >= 0 {
-			c.cursor = cursor
+		if c.cursorGen != gen {
+			c.mu.Unlock()
+			c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", cursor))
+			return
 		}
+		c.cursor = cursor
 		c.mu.Unlock()
 		if len(batch) < 500 {
 			return
 		}
 	}
+}
+
+// cursorCurrent reports whether no lease transition stored the cursor since
+// the batch copied generation gen.
+func (c *Control) cursorCurrent(gen uint64) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cursorGen == gen
 }
 
 func (c *Control) handle(ctx context.Context, e events.Event) {
@@ -180,6 +228,16 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 	}
 }
 
+// expireCommands removes the command records whose channel closed longer
+// ago than the command grace period. It changes no durable state and
+// synthesizes no command failure: the result of an expired command was lost,
+// and the agent's next state report reconciles the sandbox as usual.
+func (s *Service) expireCommands(ctx context.Context) {
+	if n := s.commands.expire(s.now(), s.commandGrace()); n > 0 {
+		s.Logger.InfoContext(ctx, "agent_commands_expired", slog.Int("commands", n), slog.Duration("grace", s.commandGrace()))
+	}
+}
+
 // runOfflineSweep marks devices offline that are ONLINE in the database
 // but have no channel on the lease holder and were not heard from for the
 // heartbeat timeout (for example after a lease handover or a crash).
@@ -192,10 +250,22 @@ func (c *Control) runOfflineSweep(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		// The sweep also drops the expired command records. It runs without
+		// the lease: a record outlives the lease only when its channel closed
+		// at the lease release, and it must expire then too.
+		c.S.expireCommands(ctx)
+		// Pending revocations are bound to channels of this instance, so
+		// they expire without the lease as well.
+		if c.S.DataPath != nil {
+			c.S.DataPath.SweepExpired(ctx)
+		}
 		if !c.held() {
 			continue
 		}
-		var live []string
+		// A non-nil slice: pgx binds a nil slice as SQL NULL, which turns
+		// NOT (x = ANY(NULL)) into NULL and matches no row when the channel
+		// registry is empty.
+		live := []string{}
 		for _, conn := range c.S.Hub.All() {
 			live = append(live, conn.DeviceID)
 		}

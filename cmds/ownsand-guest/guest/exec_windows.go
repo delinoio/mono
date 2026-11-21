@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package guest
 
@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"unsafe"
 
@@ -15,6 +16,11 @@ import (
 
 // forceAfterTerminate: Windows guests terminate the process tree at once.
 const forceAfterTerminate = false
+
+// envKeyFold: Windows environment variable names are case-insensitive. Go's
+// os/exec folds with strings.ToLower when it removes duplicates, so the merge
+// must fold the same way.
+func envKeyFold(key string) string { return strings.ToLower(key) }
 
 // treeRounds is how often terminateTree walks the process tree. A process
 // that an unassigned tree member starts during a walk joins no job, so a
@@ -40,6 +46,15 @@ func terminate(p *os.Process) {
 func kill(p *os.Process) {
 	_ = p.Kill()
 }
+
+// processGroupAlive is never consulted on Windows because forceAfterTerminate
+// is false; taskkill ends the tree at once.
+func processGroupAlive(*os.Process) bool { return false }
+
+// processExited is not implemented on Windows; the timeout there relies on
+// the waited flag only. Remove this stub once Windows guests detect the
+// direct child's exit before the output pipes drain.
+func processExited(*os.Process) bool { return false }
 
 // exitStatus keeps the full 32-bit exit code; Windows has no signals.
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {

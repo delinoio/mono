@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package guest implements the GuestService of the guest helper: the
 // readiness check, the clock setting and the DataFrame exec and file
@@ -18,7 +18,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"runtime"
 	"sync"
@@ -51,7 +50,8 @@ const DefaultKeepaliveInterval = 30 * time.Second
 
 // Config configures a Server.
 type Config struct {
-	// StateDir holds the read snapshots. It must be on the guest disk.
+	// StateDir holds the read snapshots and the write records. It must be on
+	// the guest disk, so that the records survive a restart of the helper.
 	StateDir string
 	// Version is the helper version that CheckReady reports.
 	Version string
@@ -59,6 +59,9 @@ type Config struct {
 	Logger  *slog.Logger
 	// Now returns the current time; nil means time.Now.
 	Now func() time.Time
+	// setClock changes the system clock; nil means setSystemClock. Tests
+	// replace it so that they never change the host clock.
+	setClock func(time.Time) error
 	// KeepaliveInterval defaults to DefaultKeepaliveInterval.
 	KeepaliveInterval time.Duration
 	// SweepInterval is how often expired operations are removed; it
@@ -78,7 +81,9 @@ type Server struct {
 
 var _ ownsandv1connect.GuestServiceHandler = (*Server)(nil)
 
-// New returns a server. It clears read snapshots of an earlier process.
+// New returns a server. It clears read snapshots of an earlier process and
+// registers the unfinished writes that an earlier process recorded, so that
+// the sweep removes their staging files.
 func New(cfg Config) (*Server, error) {
 	if cfg.StateDir == "" {
 		return nil, errors.New("guest: state directory is required")
@@ -88,6 +93,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
+	}
+	if cfg.setClock == nil {
+		cfg.setClock = setSystemClock
 	}
 	if cfg.KeepaliveInterval <= 0 {
 		cfg.KeepaliveInterval = DefaultKeepaliveInterval
@@ -102,13 +110,17 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	writes, err := newWriteManager(filepath.Join(cfg.StateDir, "writes"), cfg.Now, cfg.Logger)
+	if err != nil {
+		return nil, err
+	}
 	return &Server{
 		cfg:    cfg,
 		logger: cfg.Logger,
 		now:    cfg.Now,
 		execs:  newExecManager(cfg.Now, cfg.Logger),
 		reads:  reads,
-		writes: newWriteManager(cfg.Now, cfg.Logger),
+		writes: writes,
 	}, nil
 }
 
@@ -140,14 +152,18 @@ func (s *Server) SetClock(_ context.Context, req *connect.Request[ownsandv1.SetC
 		s.logger.Info("set clock ignored", "clock_mode", "ignore")
 		return connect.NewResponse(&ownsandv1.SetClockResponse{}), nil
 	}
-	if err := setSystemClock(t); err != nil {
+	// Read the clock before the change: after it, the offset would be ~0.
+	before := s.now()
+	if err := s.cfg.setClock(t); err != nil {
 		s.logger.Warn("set clock failed", "error", err)
 		if errors.Is(err, errors.ErrUnsupported) {
 			return nil, connect.NewError(connect.CodeUnimplemented, err)
 		}
 		return nil, connect.NewError(connect.CodeInternal, errors.New("set clock failed"))
 	}
-	s.logger.Info("clock set", "offset_ms", time.Until(t).Milliseconds())
+	// offset_ms is the applied correction: the requested time minus the
+	// guest clock before the change. It is positive when the guest was behind.
+	s.logger.Info("clock set", "offset_ms", t.Sub(before).Milliseconds())
 	return connect.NewResponse(&ownsandv1.SetClockResponse{}), nil
 }
 
@@ -297,26 +313,83 @@ wait:
 		s.sendError(out, f, errorf(ownsandv1.ErrorCode_ERROR_CODE_OUT_OF_RANGE, "offset is beyond the end of the file"))
 		return
 	}
-	file, err := os.Open(e.snapshot)
+	// The snapshot is opened and read on a worker goroutine, so a stalled
+	// disk never blocks the keepalive ticker or the cancellation of this
+	// handler. The worker only reads; every frame is sent from this
+	// goroutine, so nothing is sent after the end or an error frame.
+	chunks := make(chan readChunk)
+	stop := make(chan struct{})
+	defer close(stop)
+	go s.readChunks(e, req.GetOffset(), chunks, stop)
+	for {
+		select {
+		case c, ok := <-chunks:
+			if !ok {
+				_ = send(&ownsandv1.FileReadEnd{SizeBytes: e.size})
+				return
+			}
+			if c.err != nil {
+				s.sendError(out, f, c.err)
+				return
+			}
+			if send(c.chunk) != nil {
+				return
+			}
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if send(nil) != nil {
+				return
+			}
+		}
+	}
+}
+
+// readChunk is one result of the chunk worker: a chunk or the error that
+// ends the read.
+type readChunk struct {
+	chunk *ownsandv1.FileChunk
+	err   error
+}
+
+// readChunks opens the snapshot of e and publishes its chunks from offset to
+// the end of the snapshot in order, then closes out. It publishes at most
+// one error, as its last result. It stops when stop is closed and always
+// closes the file it opened, also when it finishes a read that the handler
+// no longer waits for.
+func (s *Server) readChunks(e *readEntry, offset int64, out chan<- readChunk, stop <-chan struct{}) {
+	defer close(out)
+	publish := func(c readChunk) bool {
+		select {
+		case out <- c:
+			return true
+		case <-stop:
+			return false
+		}
+	}
+	file, err := s.reads.open(e.snapshot)
 	if err != nil {
-		s.sendError(out, f, fsError("read snapshot", err))
+		publish(readChunk{err: fsError("read snapshot", err)})
 		return
 	}
 	defer file.Close()
 	buf := make([]byte, datapath.MaxFileChunkSize)
-	for off := req.GetOffset(); off < e.size; {
+	for off := offset; off < e.size; {
+		select {
+		case <-stop:
+			return
+		default:
+		}
 		n, err := file.ReadAt(buf[:min(int64(len(buf)), e.size-off)], off)
 		if n == 0 && err != nil {
-			s.sendError(out, f, fsError("read snapshot", err))
+			publish(readChunk{err: fsError("read snapshot", err)})
 			return
 		}
-		chunk := &ownsandv1.FileChunk{Offset: off, Data: append([]byte(nil), buf[:n]...)}
-		if send(chunk) != nil {
+		if !publish(readChunk{chunk: &ownsandv1.FileChunk{Offset: off, Data: append([]byte(nil), buf[:n]...)}}) {
 			return
 		}
 		off += int64(n)
 	}
-	_ = send(&ownsandv1.FileReadEnd{SizeBytes: e.size})
 }
 
 // Handler returns the HTTP handler of the GuestService. Compression is off:

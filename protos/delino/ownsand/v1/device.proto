@@ -23,8 +23,14 @@ service DeviceService {
   rpc ListDevices(ListDevicesRequest) returns (ListDevicesResponse);
   // Read one device.
   rpc GetDevice(GetDeviceRequest) returns (GetDeviceResponse);
-  // Set all four device limits.
+  // Legacy: set all four device limits with implicit field presence. A
+  // missing value reads as zero, so an omitted `disk_gib` is stored as zero.
+  // Kept for v1 clients; new clients call ReplaceDeviceLimits.
   rpc UpdateDeviceLimits(UpdateDeviceLimitsRequest) returns (UpdateDeviceLimitsResponse);
+  // Replace all four device limits. Every value must be present: a missing
+  // value is rejected with `invalid_argument`, and an explicit zero for
+  // `vcpu_count`, `memory_mib` or `disk_gib` is stored as zero.
+  rpc ReplaceDeviceLimits(ReplaceDeviceLimitsRequest) returns (ReplaceDeviceLimitsResponse);
   // Revoke the device credentials and request local clean-up.
   rpc RemoveDevice(RemoveDeviceRequest) returns (RemoveDeviceResponse);
   // Read the agent version policy of the organization.
@@ -74,11 +80,17 @@ message DeviceCapabilities {
 
 // Resources that the sandboxes of a device use together.
 message DeviceAllocation {
+  // The allocated vCPUs. It is exact when the value fits in 32 bits and
+  // 2147483647 for a larger value; vcpu_total_count carries the exact value.
   int32 vcpu_count = 1;
   int64 memory_mib = 2;
   int64 disk_gib = 3;
   // macOS guests in CREATING, RUNNING, PAUSED or DELETING state.
   int32 macos_guest_count = 4;
+  // The exact allocated vCPUs, which the scheduler uses for placement. The
+  // server always sets it; it is absent when an older server sent the
+  // message, and a client then reads vcpu_count.
+  optional int64 vcpu_total_count = 5;
 }
 
 message Device {
@@ -93,13 +105,20 @@ message Device {
   AgentUpdateState update_state = 8;
   DeviceCapabilities capabilities = 9;
   DeviceLimits limits = 10;
-  // floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100).
+  // floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100), capped at
+  // 2147483647 (the largest int32 value). Kept for v1 compatibility with
+  // clients that read this field; effective_vcpu_limit_count carries the exact
+  // value.
   int32 effective_vcpu_limit = 11;
   DeviceAllocation allocation = 12;
   google.protobuf.Timestamp create_time = 13;
   google.protobuf.Timestamp last_seen_time = 14;
   // Time of the first PENDING_IDLE report of the current update, if any.
   google.protobuf.Timestamp pending_idle_since = 15;
+  // The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
+  // that the scheduler uses for placement. It is 0 for a device with zero
+  // limits.
+  int64 effective_vcpu_limit_count = 16;
 }
 
 message CreateEnrollmentTokenRequest {
@@ -157,14 +176,27 @@ message GetDeviceResponse {
   Device device = 1;
 }
 
+// Legacy request of UpdateDeviceLimits. Use ReplaceDeviceLimitsRequest,
+// which distinguishes an omitted value from zero.
 message UpdateDeviceLimitsRequest {
   string organization_id = 1;
   string device_id = 2;
-  // Every value is required.
+  // Every value is required, but a missing value cannot be told from zero.
   DeviceLimits limits = 3;
 }
 
 message UpdateDeviceLimitsResponse {
+  Device device = 1;
+}
+
+message ReplaceDeviceLimitsRequest {
+  string organization_id = 1;
+  string device_id = 2;
+  // Every value must be present.
+  DeviceLimitsInput limits = 3;
+}
+
+message ReplaceDeviceLimitsResponse {
   Device device = 1;
 }
 

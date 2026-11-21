@@ -1,10 +1,11 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package agent
 
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -22,9 +23,14 @@ const sendQueue = 1024
 
 // conn is one agent channel connection.
 type conn struct {
-	gen    uint64
-	queue  chan *ownsandv1.AgentEnvelope
-	done   chan struct{}
+	gen   uint64
+	queue chan *ownsandv1.AgentEnvelope
+	done  chan struct{}
+	// cancel cancels the stream context of the connection. close calls it so
+	// that a closed connection also aborts a stream whose writer is blocked
+	// in a send and whose receiver is blocked in a receive.
+	cancel context.CancelFunc
+	logger *slog.Logger
 	once   sync.Once
 	mu     sync.Mutex
 	acked  time.Time
@@ -34,8 +40,9 @@ type conn struct {
 func (c *conn) Generation() uint64    { return c.gen }
 func (c *conn) Done() <-chan struct{} { return c.done }
 
-// Send queues env. It never blocks: a full queue closes the channel, so a
-// stalled control plane leads to a reconnect and a full state report.
+// Send queues env. It never blocks: a full queue closes the channel and
+// cancels its stream, even when the writer is blocked in a send, so a stalled
+// control plane leads to a reconnect and a full state report.
 func (c *conn) Send(env *ownsandv1.AgentEnvelope) bool {
 	select {
 	case <-c.done:
@@ -46,12 +53,21 @@ func (c *conn) Send(env *ownsandv1.AgentEnvelope) bool {
 	case c.queue <- env:
 		return true
 	default:
+		c.logger.Warn("agent channel send queue full", "generation", c.gen, "queue_size", cap(c.queue))
 		c.close()
 		return false
 	}
 }
 
-func (c *conn) close() { c.once.Do(func() { close(c.done) }) }
+// close ends the connection once: it signals done and cancels the stream.
+func (c *conn) close() {
+	c.once.Do(func() {
+		close(c.done)
+		if c.cancel != nil {
+			c.cancel()
+		}
+	})
+}
 
 // runChannel authenticates, opens one agent channel and serves it until it
 // closes.
@@ -87,7 +103,7 @@ func (a *Agent) runChannel(ctx context.Context) error {
 
 	a.mu.Lock()
 	a.generation++
-	c := &conn{gen: a.generation, queue: make(chan *ownsandv1.AgentEnvelope, sendQueue), done: make(chan struct{}), acked: time.Now()}
+	c := &conn{gen: a.generation, queue: make(chan *ownsandv1.AgentEnvelope, sendQueue), done: make(chan struct{}), cancel: cancel, logger: a.logger, acked: time.Now()}
 	a.conn = c
 	a.mu.Unlock()
 	defer func() {
@@ -260,7 +276,13 @@ func (a *Agent) dispatch(ctx context.Context, c *conn, env *ownsandv1.AgentEnvel
 			a.Sandboxes.AckSandboxUpdate(ack.SandboxUpdate)
 		}
 	case *ownsandv1.AgentEnvelope_Command:
-		go a.handleCommand(ctx, m.Command)
+		// An update or withdrawal command takes its order here, in receive
+		// order, because the commands run in separate goroutines.
+		var order uint64
+		if isUpdateCommand(m.Command) {
+			order = a.updater.NextOrder()
+		}
+		go a.handleCommand(ctx, m.Command, order)
 	case *ownsandv1.AgentEnvelope_Configuration:
 		cfg := m.Configuration
 		a.Sandboxes.SetLimits(cfg.GetLimits())

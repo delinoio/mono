@@ -60,7 +60,10 @@ func (h OrganizationHandler) CreateOrganization(ctx context.Context, req *connec
 }
 
 func (h OrganizationHandler) GetOrganization(ctx context.Context, req *connect.Request[ownsandv1.GetOrganizationRequest]) (*connect.Response[ownsandv1.GetOrganizationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	_, role, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadOrganization)
 	if err != nil {
 		return nil, err
@@ -114,16 +117,16 @@ func (h OrganizationHandler) ListOrganizations(ctx context.Context, req *connect
 }
 
 func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connect.Request[ownsandv1.DeleteOrganizationRequest]) (*connect.Response[ownsandv1.DeleteOrganizationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	var removedDevices []string
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
-		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionOwnerOnly)
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// The organization lock also serializes the deletion with concurrent
+		// creates in the organization and with an ownership transfer.
+		p, _, err := h.authorizeOwnerLocked(ctx, tx, orgID)
 		if err != nil {
-			return err
-		}
-		// Lock the organization so concurrent creates in it serialize with the
-		// deletion.
-		if _, err := tx.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", orgID); err != nil {
 			return err
 		}
 		removedDevices, err = h.deleteOrganizationTx(ctx, tx, orgID, p)
@@ -138,15 +141,71 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 	return connect.NewResponse(&ownsandv1.DeleteOrganizationResponse{}), nil
 }
 
+// authorizeOwnerLocked authorizes an owner-only RPC that takes the
+// organization lock: DeleteOrganization and TransferOwnership. Both mutations
+// decide on the owner role, so they take the same organization row lock
+// before the authoritative owner check and keep it until the transaction
+// ends. A mutation that commits first is then visible to the owner check of
+// the other one (read committed gives each statement a fresh snapshot):
+// after a transfer, the former owner's deletion gets permission_denied, and
+// after a deletion, a transfer gets not_found.
+//
+// The first authorize call is only a pre-check, so that API keys, non-members
+// and members without the owner role fail without queueing on the lock; its
+// result is not authoritative and is checked again after the lock.
+func (s *Service) authorizeOwnerLocked(ctx context.Context, tx pgx.Tx, orgID string) (auth.Principal, ownsandv1.Role, error) {
+	if _, _, err := s.authorize(ctx, tx, orgID, authz.ActionOwnerOnly); err != nil {
+		return auth.Principal{}, 0, err
+	}
+	if err := lockOrganization(ctx, tx, orgID); err != nil {
+		return auth.Principal{}, 0, err
+	}
+	return s.authorize(ctx, tx, orgID, authz.ActionOwnerOnly)
+}
+
+// lockOrganization takes the row lock of the organization (held until the
+// transaction ends). The query returns a row, so an organization that a
+// concurrent deletion removed while the caller waited for the lock yields
+// not_found and stops the transaction. orgID must be validated.
+func lockOrganization(ctx context.Context, tx pgx.Tx, orgID string) error {
+	var locked int
+	err := tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errNotFound("organization")
+	}
+	return err
+}
+
+// lockOrganizationShare takes FOR KEY SHARE on the organization row (held
+// until the transaction ends). DeleteOrganization takes the row FOR UPDATE
+// first and then updates the devices, sandboxes and snapshots of the
+// organization, and the foreign key of every row that an RPC inserts for the
+// organization takes FOR KEY SHARE on it. An RPC that locks child rows
+// before its insert reaches that foreign key would wait for the deletion
+// while the deletion waits for those child rows: a deadlock. Such an RPC
+// calls this helper before it locks any child row, which gives it the same
+// order as the deletion. Callers that only insert or update child rows share
+// the lock with each other, so they still run concurrently. An organization
+// that a concurrent deletion removed while the caller waited yields
+// not_found and stops the transaction. orgID must be validated.
+func lockOrganizationShare(ctx context.Context, tx pgx.Tx, orgID string) error {
+	var locked int
+	err := tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", orgID).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return errNotFound("organization")
+	}
+	return err
+}
+
 // deleteOrganizationTx marks the organization deleted and deletes its
 // records, except the device removal tombstones, the audit events and the
 // R2 clean-up job state. It removes every device of the organization as
 // RemoveDevice does, with ORGANIZATION_DELETED as the sandbox end reason,
-// and starts the R2 clean-up job of the organization prefix, which deletes
-// its exported snapshots, retries until it succeeds and sweeps the prefix
-// once more after every signed upload URL expired. Deleting the records in
-// the same transaction stops every signed URL issuance for the
-// organization. It returns the removed device IDs.
+// and, after the records are deleted, starts the R2 clean-up job of the
+// organization prefix, which deletes its exported snapshots, retries until
+// it succeeds and sweeps the prefix once more after every signed upload URL
+// expired. Deleting the records in the same transaction stops every signed
+// URL issuance for the organization. It returns the removed device IDs.
 func (s *Service) deleteOrganizationTx(ctx context.Context, tx pgx.Tx, orgID string, actor auth.Principal) ([]string, error) {
 	rows, err := tx.Query(ctx, "SELECT device_id::text FROM devices WHERE organization_id = $1 AND state <> $2",
 		orgID, int16(ownsandv1.DeviceState_DEVICE_STATE_REMOVED))
@@ -176,9 +235,6 @@ func (s *Service) deleteOrganizationTx(ctx context.Context, tx pgx.Tx, orgID str
 	if err := s.endSandboxesTx(ctx, tx, "organization_id = $1", []any{orgID}, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_ORGANIZATION_DELETED, actor); err != nil {
 		return nil, err
 	}
-	if err := s.startCleanupJobTx(ctx, tx, orgID, organizationKeyPrefix+orgID+"/"); err != nil {
-		return nil, err
-	}
 	if err := s.writeAudit(ctx, tx, auditEvent{
 		OrganizationID: orgID, Action: ownsandv1.AuditAction_AUDIT_ACTION_ORGANIZATION_DELETED, Actor: actor,
 		TargetKind: ownsandv1.AuditTargetKind_AUDIT_TARGET_KIND_ORGANIZATION, TargetID: orgID,
@@ -191,8 +247,18 @@ func (s *Service) deleteOrganizationTx(ctx context.Context, tx pgx.Tx, orgID str
 	// The foreign keys delete memberships, invitations, API keys, enrollment
 	// tokens, sandboxes, snapshots, templates, idempotency keys and the
 	// agent version policy with the organization.
-	_, err = tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", orgID)
-	return devices, err
+	if _, err := tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", orgID); err != nil {
+		return nil, err
+	}
+	// The job is recorded after the cascade: the DELETE waits for every
+	// signing transaction that holds a snapshot row of the organization
+	// (handleSignedURLRequest takes FOR SHARE), so final_sweep_after is
+	// computed after the last URL that can exist for the prefix was signed
+	// and is never earlier than its expiry.
+	if err := s.startCleanupJobTx(ctx, tx, orgID, organizationKeyPrefix+orgID+"/"); err != nil {
+		return nil, err
+	}
+	return devices, nil
 }
 
 // startCleanupJobTx records an R2 clean-up job for prefix.
@@ -204,13 +270,16 @@ func (s *Service) startCleanupJobTx(ctx context.Context, q pgx.Tx, orgID, prefix
 }
 
 func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect.Request[ownsandv1.TransferOwnershipRequest]) (*connect.Response[ownsandv1.TransferOwnershipResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	target := req.Msg.GetUserId()
 	if target == "" {
 		return nil, errInvalidf("invalid user_id: is required")
 	}
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
-		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionOwnerOnly)
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		p, _, err := h.authorizeOwnerLocked(ctx, tx, orgID)
 		if err != nil {
 			return err
 		}

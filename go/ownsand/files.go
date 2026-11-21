@@ -226,22 +226,35 @@ func (op *readOp) relayAttempt(ctx context.Context) readAttempt {
 		at.err, at.authErr = err, true
 		return at
 	}
-	actx, stop := c.stallContext(ctx)
+	budget := op.rec.streamBudget()
+	if budget < 0 {
+		// The recovery window ended while the grant was renewed: start no
+		// continuation.
+		at.err = op.rec.deadlineErr()
+		return at
+	}
+	actx, disarm, stop := c.stallContext(ctx, budget)
 	defer stop()
 	defer op.grant.streamEnded()
 	stream, err := c.relay.ReadFile(actx, relayRequest(op.grant, op.request()))
 	if err != nil {
-		at.err = streamErr(actx, err)
+		at.err = streamErr(actx, err, op.rec)
 		return at
 	}
 	defer stream.Close()
 	for stream.Receive() {
-		if op.handleEvent(stream.Msg().GetEvent(), &at) {
+		done := op.handleEvent(stream.Msg().GetEvent(), &at)
+		if at.accepted || !op.rec.inRecovery() {
+			// The agent accepted the continuation, or progress ended the
+			// window: the recovery budget no longer bounds the stream.
+			disarm()
+		}
+		if done {
 			return at
 		}
 	}
 	if err := stream.Err(); err != nil {
-		at.err = streamErr(actx, err)
+		at.err = streamErr(actx, err, op.rec)
 		return at
 	}
 	at.err = io.EOF
@@ -287,11 +300,11 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 
 	buf := make([]byte, datapath.MaxFileChunkSize)
 	nextBuf := make([]byte, datapath.MaxFileChunkSize)
-	n, rerr := io.ReadFull(r, buf)
+	n, rerr := readChunk(r, buf)
 	var offset int64
 	isFirst := true
 	for {
-		if rerr != nil && !errors.Is(rerr, io.EOF) && !errors.Is(rerr, io.ErrUnexpectedEOF) {
+		if rerr != nil && rerr != io.EOF {
 			return offset, rerr
 		}
 		last := rerr != nil
@@ -299,11 +312,12 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 		var nerr error
 		if !last {
 			// Read ahead to learn whether this chunk is the last one.
-			m, nerr = io.ReadFull(r, nextBuf)
-			if m == 0 && errors.Is(nerr, io.EOF) {
-				last = true
-			} else if nerr != nil && !errors.Is(nerr, io.EOF) && !errors.Is(nerr, io.ErrUnexpectedEOF) {
+			m, nerr = readChunk(r, nextBuf)
+			if nerr != nil && nerr != io.EOF {
 				return offset, nerr
+			}
+			if m == 0 && nerr == io.EOF {
+				last = true
 			}
 		}
 		req := &ownsandv1.WriteFileRequest{
@@ -340,6 +354,30 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 		buf, nextBuf = nextBuf, buf
 		n, rerr = m, nerr
 	}
+}
+
+// readChunk fills buf from r. It returns io.EOF, also together with n > 0,
+// only when r reports a clean end of input, and returns every other error from
+// r unchanged. Unlike io.ReadFull, it never turns a short read into
+// io.ErrUnexpectedEOF, so a source that reports io.ErrUnexpectedEOF (for
+// example a truncated compressed stream) is not mistaken for the end of input.
+func readChunk(r io.Reader, buf []byte) (int, error) {
+	const maxEmptyReads = 100
+	n, empty := 0, 0
+	for n < len(buf) {
+		m, err := r.Read(buf[n:])
+		n += m
+		if err != nil {
+			return n, err
+		}
+		if m > 0 {
+			empty = 0
+		} else if empty++; empty >= maxEmptyReads {
+			// Guard against a reader that makes no progress without an error.
+			return n, io.ErrNoProgress
+		}
+	}
+	return n, nil
 }
 
 // WriteFileBytes writes data to the guest file at path.

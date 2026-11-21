@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
 import { useQuery } from "@connectrpc/connect-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
@@ -89,7 +90,10 @@ export function canOpenSection(role: Role | undefined, id: RouteId): boolean {
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
   const { route, navigate } = useRouter();
-  const orgs = useQuery(OrganizationService.method.listOrganizations, {});
+  const orgs = useQuery(
+    OrganizationService.method.listOrganizations,
+    LIST_ORGANIZATIONS_REQUEST,
+  );
   const section =
     "organizationId" in route &&
     route.id !== RouteId.Sandbox &&

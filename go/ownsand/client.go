@@ -93,9 +93,10 @@ func ParseTransport(s string) (Transport, error) {
 // Options configures a Client.
 type Options struct {
 	// BaseURL is the API origin, for example https://ownsand.api.delino.io
-	// or http://127.0.0.1:8300 for a local control plane. An http:// origin
-	// uses HTTP/2 without TLS (h2c with prior knowledge). Empty means
-	// DefaultBaseURL.
+	// or http://127.0.0.1:18300 for a local control plane. An http:// origin
+	// uses HTTP/2 without TLS (h2c with prior knowledge). It must not have a
+	// path, query marker ("?"), fragment marker ("#") or user info. Empty
+	// means DefaultBaseURL.
 	BaseURL string
 	// APIKey is an organization API key (osk_...). Set at most one of
 	// APIKey and TokenSource. When both are empty, the client reads
@@ -165,8 +166,11 @@ func New(opts Options) (*Client, error) {
 	if err != nil || origin.Host == "" || (origin.Scheme != "https" && origin.Scheme != "http") {
 		return nil, fmt.Errorf("ownsand: invalid base URL: want an http or https origin")
 	}
-	if origin.Path != "" || origin.RawQuery != "" || origin.User != nil {
-		return nil, fmt.Errorf("ownsand: invalid base URL: want an origin without path, query or user info")
+	// url.Parse drops an empty fragment and records a bare "?" only as
+	// ForceQuery, so check the raw string. The Connect clients append the RPC
+	// path to it, which a query marker or fragment would swallow.
+	if strings.ContainsAny(base, "?#") || origin.Path != "" || origin.RawQuery != "" || origin.User != nil || origin.Opaque != "" {
+		return nil, fmt.Errorf("ownsand: invalid base URL: want an origin without path, query, fragment or user info")
 	}
 
 	var cred credential

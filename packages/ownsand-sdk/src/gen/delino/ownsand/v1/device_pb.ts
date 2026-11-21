@@ -6,7 +6,7 @@
 
 import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv2";
-import type { AgentUpdateState, AgentVersionPolicyMode, Arch, BaseImage, DeviceLimits, DeviceState, EnrollmentTokenState, GuestOs, HostOs, Principal } from "./common_pb.ts";
+import type { AgentUpdateState, AgentVersionPolicyMode, Arch, BaseImage, DeviceLimits, DeviceLimitsInput, DeviceState, EnrollmentTokenState, GuestOs, HostOs, Principal } from "./common_pb.ts";
 import { file_delino_ownsand_v1_common } from "./common_pb.ts";
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import { file_google_protobuf_duration, file_google_protobuf_timestamp } from "@bufbuild/protobuf/wkt";
@@ -16,7 +16,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file delino/ownsand/v1/device.proto.
  */
 export const file_delino_ownsand_v1_device: GenFile = /*@__PURE__*/
-  fileDesc("Ch5kZWxpbm8vb3duc2FuZC92MS9kZXZpY2UucHJvdG8SEWRlbGluby5vd25zYW5kLnYxIuoCCg9FbnJvbGxtZW50VG9rZW4SGwoTZW5yb2xsbWVudF90b2tlbl9pZBgBIAEoCRIXCg9vcmdhbml6YXRpb25faWQYAiABKAkSNgoFc3RhdGUYAyABKA4yJy5kZWxpbm8ub3duc2FuZC52MS5FbnJvbGxtZW50VG9rZW5TdGF0ZRIwCgpjcmVhdGVkX2J5GAQgASgLMhwuZGVsaW5vLm93bnNhbmQudjEuUHJpbmNpcGFsEi8KC2NyZWF0ZV90aW1lGAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIvCgtleHBpcmVfdGltZRgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLAoIdXNlX3RpbWUYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhEKCWRldmljZV9pZBgIIAEoCRIUCgx0b2tlbl9wcmVmaXgYCSABKAkiQwoPSHlwZXJ2aXNvckNoZWNrEhAKCGNoZWNrX2lkGAEgASgJEg4KBnBhc3NlZBgCIAEoCBIOCgZkZXRhaWwYAyABKAkiwwIKEkRldmljZUNhcGFiaWxpdGllcxIZChFsb2dpY2FsX2NwdV9jb3VudBgBIAEoBRISCgptZW1vcnlfbWliGAIgASgDEhcKD2ZyZWVfZGlza19ieXRlcxgDIAEoAxIuCgpndWVzdF9vc2VzGAQgAygOMhouZGVsaW5vLm93bnNhbmQudjEuR3Vlc3RPcxI3ChFidWlsdF9iYXNlX2ltYWdlcxgFIAMoDjIcLmRlbGluby5vd25zYW5kLnYxLkJhc2VJbWFnZRIeChZtYWNvc19ndWVzdHNfc3VwcG9ydGVkGAYgASgIEh0KFW1hY29zX2hhcmR3YXJlX21vZGVscxgHIAMoDBI9ChFoeXBlcnZpc29yX2NoZWNrcxgIIAMoCzIiLmRlbGluby5vd25zYW5kLnYxLkh5cGVydmlzb3JDaGVjayJnChBEZXZpY2VBbGxvY2F0aW9uEhIKCnZjcHVfY291bnQYASABKAUSEgoKbWVtb3J5X21pYhgCIAEoAxIQCghkaXNrX2dpYhgDIAEoAxIZChFtYWNvc19ndWVzdF9jb3VudBgEIAEoBSL4BAoGRGV2aWNlEhEKCWRldmljZV9pZBgBIAEoCRIXCg9vcmdhbml6YXRpb25faWQYAiABKAkSDAoEbmFtZRgDIAEoCRItCgVzdGF0ZRgEIAEoDjIeLmRlbGluby5vd25zYW5kLnYxLkRldmljZVN0YXRlEioKB2hvc3Rfb3MYBSABKA4yGS5kZWxpbm8ub3duc2FuZC52MS5Ib3N0T3MSJQoEYXJjaBgGIAEoDjIXLmRlbGluby5vd25zYW5kLnYxLkFyY2gSFQoNYWdlbnRfdmVyc2lvbhgHIAEoCRI5Cgx1cGRhdGVfc3RhdGUYCCABKA4yIy5kZWxpbm8ub3duc2FuZC52MS5BZ2VudFVwZGF0ZVN0YXRlEjsKDGNhcGFiaWxpdGllcxgJIAEoCzIlLmRlbGluby5vd25zYW5kLnYxLkRldmljZUNhcGFiaWxpdGllcxIvCgZsaW1pdHMYCiABKAsyHy5kZWxpbm8ub3duc2FuZC52MS5EZXZpY2VMaW1pdHMSHAoUZWZmZWN0aXZlX3ZjcHVfbGltaXQYCyABKAUSNwoKYWxsb2NhdGlvbhgMIAEoCzIjLmRlbGluby5vd25zYW5kLnYxLkRldmljZUFsbG9jYXRpb24SLwoLY3JlYXRlX3RpbWUYDSABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjIKDmxhc3Rfc2Vlbl90aW1lGA4gASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBI2ChJwZW5kaW5nX2lkbGVfc2luY2UYDyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wIl8KHENyZWF0ZUVucm9sbG1lbnRUb2tlblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEiYKA3R0bBgCIAEoCzIZLmdvb2dsZS5wcm90b2J1Zi5EdXJhdGlvbiJsCh1DcmVhdGVFbnJvbGxtZW50VG9rZW5SZXNwb25zZRIxCgV0b2tlbhgBIAEoCzIiLmRlbGluby5vd25zYW5kLnYxLkVucm9sbG1lbnRUb2tlbhIYChBlbnJvbGxtZW50X3Rva2VuGAIgASgJIl0KG0xpc3RFbnJvbGxtZW50VG9rZW5zUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJcGFnZV9zaXplGAIgASgFEhIKCnBhZ2VfdG9rZW4YAyABKAkiawocTGlzdEVucm9sbG1lbnRUb2tlbnNSZXNwb25zZRIyCgZ0b2tlbnMYASADKAsyIi5kZWxpbm8ub3duc2FuZC52MS5FbnJvbGxtZW50VG9rZW4SFwoPbmV4dF9wYWdlX3Rva2VuGAIgASgJIlQKHFJldm9rZUVucm9sbG1lbnRUb2tlblJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhsKE2Vucm9sbG1lbnRfdG9rZW5faWQYAiABKAkiUgodUmV2b2tlRW5yb2xsbWVudFRva2VuUmVzcG9uc2USMQoFdG9rZW4YASABKAsyIi5kZWxpbm8ub3duc2FuZC52MS5FbnJvbGxtZW50VG9rZW4ikgEKEkxpc3REZXZpY2VzUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJcGFnZV9zaXplGAIgASgFEhIKCnBhZ2VfdG9rZW4YAyABKAkSMgoFc3RhdGUYBCABKA4yHi5kZWxpbm8ub3duc2FuZC52MS5EZXZpY2VTdGF0ZUgAiAEBQggKBl9zdGF0ZSJaChNMaXN0RGV2aWNlc1Jlc3BvbnNlEioKB2RldmljZXMYASADKAsyGS5kZWxpbm8ub3duc2FuZC52MS5EZXZpY2USFwoPbmV4dF9wYWdlX3Rva2VuGAIgASgJIj4KEEdldERldmljZVJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEhEKCWRldmljZV9pZBgCIAEoCSI+ChFHZXREZXZpY2VSZXNwb25zZRIpCgZkZXZpY2UYASABKAsyGS5kZWxpbm8ub3duc2FuZC52MS5EZXZpY2UieAoZVXBkYXRlRGV2aWNlTGltaXRzUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEi8KBmxpbWl0cxgDIAEoCzIfLmRlbGluby5vd25zYW5kLnYxLkRldmljZUxpbWl0cyJHChpVcGRhdGVEZXZpY2VMaW1pdHNSZXNwb25zZRIpCgZkZXZpY2UYASABKAsyGS5kZWxpbm8ub3duc2FuZC52MS5EZXZpY2UiQQoTUmVtb3ZlRGV2aWNlUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJIkEKFFJlbW92ZURldmljZVJlc3BvbnNlEikKBmRldmljZRgBIAEoCzIZLmRlbGluby5vd25zYW5kLnYxLkRldmljZSLhAQoSQWdlbnRWZXJzaW9uUG9saWN5EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRI3CgRtb2RlGAIgASgOMikuZGVsaW5vLm93bnNhbmQudjEuQWdlbnRWZXJzaW9uUG9saWN5TW9kZRIWCg5waW5uZWRfdmVyc2lvbhgDIAEoCRIvCgt1cGRhdGVfdGltZRgEIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMAoKdXBkYXRlZF9ieRgFIAEoCzIcLmRlbGluby5vd25zYW5kLnYxLlByaW5jaXBhbCI3ChxHZXRBZ2VudFZlcnNpb25Qb2xpY3lSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCSJWCh1HZXRBZ2VudFZlcnNpb25Qb2xpY3lSZXNwb25zZRI1CgZwb2xpY3kYASABKAsyJS5kZWxpbm8ub3duc2FuZC52MS5BZ2VudFZlcnNpb25Qb2xpY3kiiwEKH1VwZGF0ZUFnZW50VmVyc2lvblBvbGljeVJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEjcKBG1vZGUYAiABKA4yKS5kZWxpbm8ub3duc2FuZC52MS5BZ2VudFZlcnNpb25Qb2xpY3lNb2RlEhYKDnBpbm5lZF92ZXJzaW9uGAMgASgJIlkKIFVwZGF0ZUFnZW50VmVyc2lvblBvbGljeVJlc3BvbnNlEjUKBnBvbGljeRgBIAEoCzIlLmRlbGluby5vd25zYW5kLnYxLkFnZW50VmVyc2lvblBvbGljeTKMCAoNRGV2aWNlU2VydmljZRJ6ChVDcmVhdGVFbnJvbGxtZW50VG9rZW4SLy5kZWxpbm8ub3duc2FuZC52MS5DcmVhdGVFbnJvbGxtZW50VG9rZW5SZXF1ZXN0GjAuZGVsaW5vLm93bnNhbmQudjEuQ3JlYXRlRW5yb2xsbWVudFRva2VuUmVzcG9uc2USdwoUTGlzdEVucm9sbG1lbnRUb2tlbnMSLi5kZWxpbm8ub3duc2FuZC52MS5MaXN0RW5yb2xsbWVudFRva2Vuc1JlcXVlc3QaLy5kZWxpbm8ub3duc2FuZC52MS5MaXN0RW5yb2xsbWVudFRva2Vuc1Jlc3BvbnNlEnoKFVJldm9rZUVucm9sbG1lbnRUb2tlbhIvLmRlbGluby5vd25zYW5kLnYxLlJldm9rZUVucm9sbG1lbnRUb2tlblJlcXVlc3QaMC5kZWxpbm8ub3duc2FuZC52MS5SZXZva2VFbnJvbGxtZW50VG9rZW5SZXNwb25zZRJcCgtMaXN0RGV2aWNlcxIlLmRlbGluby5vd25zYW5kLnYxLkxpc3REZXZpY2VzUmVxdWVzdBomLmRlbGluby5vd25zYW5kLnYxLkxpc3REZXZpY2VzUmVzcG9uc2USVgoJR2V0RGV2aWNlEiMuZGVsaW5vLm93bnNhbmQudjEuR2V0RGV2aWNlUmVxdWVzdBokLmRlbGluby5vd25zYW5kLnYxLkdldERldmljZVJlc3BvbnNlEnEKElVwZGF0ZURldmljZUxpbWl0cxIsLmRlbGluby5vd25zYW5kLnYxLlVwZGF0ZURldmljZUxpbWl0c1JlcXVlc3QaLS5kZWxpbm8ub3duc2FuZC52MS5VcGRhdGVEZXZpY2VMaW1pdHNSZXNwb25zZRJfCgxSZW1vdmVEZXZpY2USJi5kZWxpbm8ub3duc2FuZC52MS5SZW1vdmVEZXZpY2VSZXF1ZXN0GicuZGVsaW5vLm93bnNhbmQudjEuUmVtb3ZlRGV2aWNlUmVzcG9uc2USegoVR2V0QWdlbnRWZXJzaW9uUG9saWN5Ei8uZGVsaW5vLm93bnNhbmQudjEuR2V0QWdlbnRWZXJzaW9uUG9saWN5UmVxdWVzdBowLmRlbGluby5vd25zYW5kLnYxLkdldEFnZW50VmVyc2lvblBvbGljeVJlc3BvbnNlEoMBChhVcGRhdGVBZ2VudFZlcnNpb25Qb2xpY3kSMi5kZWxpbm8ub3duc2FuZC52MS5VcGRhdGVBZ2VudFZlcnNpb25Qb2xpY3lSZXF1ZXN0GjMuZGVsaW5vLm93bnNhbmQudjEuVXBkYXRlQWdlbnRWZXJzaW9uUG9saWN5UmVzcG9uc2VCPVo7Z2l0aHViLmNvbS9kZWxpbm9pby9tb25vL3Byb3Rvcy9kZWxpbm8vb3duc2FuZC92MTtvd25zYW5kdjFiBnByb3RvMw", [file_delino_ownsand_v1_common, file_google_protobuf_duration, file_google_protobuf_timestamp]);
+  fileDesc("Ch5kZWxpbm8vb3duc2FuZC92MS9kZXZpY2UucHJvdG8SEWRlbGluby5vd25zYW5kLnYxIuoCCg9FbnJvbGxtZW50VG9rZW4SGwoTZW5yb2xsbWVudF90b2tlbl9pZBgBIAEoCRIXCg9vcmdhbml6YXRpb25faWQYAiABKAkSNgoFc3RhdGUYAyABKA4yJy5kZWxpbm8ub3duc2FuZC52MS5FbnJvbGxtZW50VG9rZW5TdGF0ZRIwCgpjcmVhdGVkX2J5GAQgASgLMhwuZGVsaW5vLm93bnNhbmQudjEuUHJpbmNpcGFsEi8KC2NyZWF0ZV90aW1lGAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcBIvCgtleHBpcmVfdGltZRgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLAoIdXNlX3RpbWUYByABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEhEKCWRldmljZV9pZBgIIAEoCRIUCgx0b2tlbl9wcmVmaXgYCSABKAkiQwoPSHlwZXJ2aXNvckNoZWNrEhAKCGNoZWNrX2lkGAEgASgJEg4KBnBhc3NlZBgCIAEoCBIOCgZkZXRhaWwYAyABKAkiwwIKEkRldmljZUNhcGFiaWxpdGllcxIZChFsb2dpY2FsX2NwdV9jb3VudBgBIAEoBRISCgptZW1vcnlfbWliGAIgASgDEhcKD2ZyZWVfZGlza19ieXRlcxgDIAEoAxIuCgpndWVzdF9vc2VzGAQgAygOMhouZGVsaW5vLm93bnNhbmQudjEuR3Vlc3RPcxI3ChFidWlsdF9iYXNlX2ltYWdlcxgFIAMoDjIcLmRlbGluby5vd25zYW5kLnYxLkJhc2VJbWFnZRIeChZtYWNvc19ndWVzdHNfc3VwcG9ydGVkGAYgASgIEh0KFW1hY29zX2hhcmR3YXJlX21vZGVscxgHIAMoDBI9ChFoeXBlcnZpc29yX2NoZWNrcxgIIAMoCzIiLmRlbGluby5vd25zYW5kLnYxLkh5cGVydmlzb3JDaGVjayKbAQoQRGV2aWNlQWxsb2NhdGlvbhISCgp2Y3B1X2NvdW50GAEgASgFEhIKCm1lbW9yeV9taWIYAiABKAMSEAoIZGlza19naWIYAyABKAMSGQoRbWFjb3NfZ3Vlc3RfY291bnQYBCABKAUSHQoQdmNwdV90b3RhbF9jb3VudBgFIAEoA0gAiAEBQhMKEV92Y3B1X3RvdGFsX2NvdW50IpwFCgZEZXZpY2USEQoJZGV2aWNlX2lkGAEgASgJEhcKD29yZ2FuaXphdGlvbl9pZBgCIAEoCRIMCgRuYW1lGAMgASgJEi0KBXN0YXRlGAQgASgOMh4uZGVsaW5vLm93bnNhbmQudjEuRGV2aWNlU3RhdGUSKgoHaG9zdF9vcxgFIAEoDjIZLmRlbGluby5vd25zYW5kLnYxLkhvc3RPcxIlCgRhcmNoGAYgASgOMhcuZGVsaW5vLm93bnNhbmQudjEuQXJjaBIVCg1hZ2VudF92ZXJzaW9uGAcgASgJEjkKDHVwZGF0ZV9zdGF0ZRgIIAEoDjIjLmRlbGluby5vd25zYW5kLnYxLkFnZW50VXBkYXRlU3RhdGUSOwoMY2FwYWJpbGl0aWVzGAkgASgLMiUuZGVsaW5vLm93bnNhbmQudjEuRGV2aWNlQ2FwYWJpbGl0aWVzEi8KBmxpbWl0cxgKIAEoCzIfLmRlbGluby5vd25zYW5kLnYxLkRldmljZUxpbWl0cxIcChRlZmZlY3RpdmVfdmNwdV9saW1pdBgLIAEoBRI3CgphbGxvY2F0aW9uGAwgASgLMiMuZGVsaW5vLm93bnNhbmQudjEuRGV2aWNlQWxsb2NhdGlvbhIvCgtjcmVhdGVfdGltZRgNIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMgoObGFzdF9zZWVuX3RpbWUYDiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjYKEnBlbmRpbmdfaWRsZV9zaW5jZRgPIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASIgoaZWZmZWN0aXZlX3ZjcHVfbGltaXRfY291bnQYECABKAMiXwocQ3JlYXRlRW5yb2xsbWVudFRva2VuUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSJgoDdHRsGAIgASgLMhkuZ29vZ2xlLnByb3RvYnVmLkR1cmF0aW9uImwKHUNyZWF0ZUVucm9sbG1lbnRUb2tlblJlc3BvbnNlEjEKBXRva2VuGAEgASgLMiIuZGVsaW5vLm93bnNhbmQudjEuRW5yb2xsbWVudFRva2VuEhgKEGVucm9sbG1lbnRfdG9rZW4YAiABKAkiXQobTGlzdEVucm9sbG1lbnRUb2tlbnNSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRIRCglwYWdlX3NpemUYAiABKAUSEgoKcGFnZV90b2tlbhgDIAEoCSJrChxMaXN0RW5yb2xsbWVudFRva2Vuc1Jlc3BvbnNlEjIKBnRva2VucxgBIAMoCzIiLmRlbGluby5vd25zYW5kLnYxLkVucm9sbG1lbnRUb2tlbhIXCg9uZXh0X3BhZ2VfdG9rZW4YAiABKAkiVAocUmV2b2tlRW5yb2xsbWVudFRva2VuUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSGwoTZW5yb2xsbWVudF90b2tlbl9pZBgCIAEoCSJSCh1SZXZva2VFbnJvbGxtZW50VG9rZW5SZXNwb25zZRIxCgV0b2tlbhgBIAEoCzIiLmRlbGluby5vd25zYW5kLnYxLkVucm9sbG1lbnRUb2tlbiKSAQoSTGlzdERldmljZXNSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRIRCglwYWdlX3NpemUYAiABKAUSEgoKcGFnZV90b2tlbhgDIAEoCRIyCgVzdGF0ZRgEIAEoDjIeLmRlbGluby5vd25zYW5kLnYxLkRldmljZVN0YXRlSACIAQFCCAoGX3N0YXRlIloKE0xpc3REZXZpY2VzUmVzcG9uc2USKgoHZGV2aWNlcxgBIAMoCzIZLmRlbGluby5vd25zYW5kLnYxLkRldmljZRIXCg9uZXh0X3BhZ2VfdG9rZW4YAiABKAkiPgoQR2V0RGV2aWNlUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJIj4KEUdldERldmljZVJlc3BvbnNlEikKBmRldmljZRgBIAEoCzIZLmRlbGluby5vd25zYW5kLnYxLkRldmljZSJ4ChlVcGRhdGVEZXZpY2VMaW1pdHNSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRIRCglkZXZpY2VfaWQYAiABKAkSLwoGbGltaXRzGAMgASgLMh8uZGVsaW5vLm93bnNhbmQudjEuRGV2aWNlTGltaXRzIkcKGlVwZGF0ZURldmljZUxpbWl0c1Jlc3BvbnNlEikKBmRldmljZRgBIAEoCzIZLmRlbGluby5vd25zYW5kLnYxLkRldmljZSJ+ChpSZXBsYWNlRGV2aWNlTGltaXRzUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJEjQKBmxpbWl0cxgDIAEoCzIkLmRlbGluby5vd25zYW5kLnYxLkRldmljZUxpbWl0c0lucHV0IkgKG1JlcGxhY2VEZXZpY2VMaW1pdHNSZXNwb25zZRIpCgZkZXZpY2UYASABKAsyGS5kZWxpbm8ub3duc2FuZC52MS5EZXZpY2UiQQoTUmVtb3ZlRGV2aWNlUmVxdWVzdBIXCg9vcmdhbml6YXRpb25faWQYASABKAkSEQoJZGV2aWNlX2lkGAIgASgJIkEKFFJlbW92ZURldmljZVJlc3BvbnNlEikKBmRldmljZRgBIAEoCzIZLmRlbGluby5vd25zYW5kLnYxLkRldmljZSLhAQoSQWdlbnRWZXJzaW9uUG9saWN5EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCRI3CgRtb2RlGAIgASgOMikuZGVsaW5vLm93bnNhbmQudjEuQWdlbnRWZXJzaW9uUG9saWN5TW9kZRIWCg5waW5uZWRfdmVyc2lvbhgDIAEoCRIvCgt1cGRhdGVfdGltZRgEIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASMAoKdXBkYXRlZF9ieRgFIAEoCzIcLmRlbGluby5vd25zYW5kLnYxLlByaW5jaXBhbCI3ChxHZXRBZ2VudFZlcnNpb25Qb2xpY3lSZXF1ZXN0EhcKD29yZ2FuaXphdGlvbl9pZBgBIAEoCSJWCh1HZXRBZ2VudFZlcnNpb25Qb2xpY3lSZXNwb25zZRI1CgZwb2xpY3kYASABKAsyJS5kZWxpbm8ub3duc2FuZC52MS5BZ2VudFZlcnNpb25Qb2xpY3kiiwEKH1VwZGF0ZUFnZW50VmVyc2lvblBvbGljeVJlcXVlc3QSFwoPb3JnYW5pemF0aW9uX2lkGAEgASgJEjcKBG1vZGUYAiABKA4yKS5kZWxpbm8ub3duc2FuZC52MS5BZ2VudFZlcnNpb25Qb2xpY3lNb2RlEhYKDnBpbm5lZF92ZXJzaW9uGAMgASgJIlkKIFVwZGF0ZUFnZW50VmVyc2lvblBvbGljeVJlc3BvbnNlEjUKBnBvbGljeRgBIAEoCzIlLmRlbGluby5vd25zYW5kLnYxLkFnZW50VmVyc2lvblBvbGljeTKCCQoNRGV2aWNlU2VydmljZRJ6ChVDcmVhdGVFbnJvbGxtZW50VG9rZW4SLy5kZWxpbm8ub3duc2FuZC52MS5DcmVhdGVFbnJvbGxtZW50VG9rZW5SZXF1ZXN0GjAuZGVsaW5vLm93bnNhbmQudjEuQ3JlYXRlRW5yb2xsbWVudFRva2VuUmVzcG9uc2USdwoUTGlzdEVucm9sbG1lbnRUb2tlbnMSLi5kZWxpbm8ub3duc2FuZC52MS5MaXN0RW5yb2xsbWVudFRva2Vuc1JlcXVlc3QaLy5kZWxpbm8ub3duc2FuZC52MS5MaXN0RW5yb2xsbWVudFRva2Vuc1Jlc3BvbnNlEnoKFVJldm9rZUVucm9sbG1lbnRUb2tlbhIvLmRlbGluby5vd25zYW5kLnYxLlJldm9rZUVucm9sbG1lbnRUb2tlblJlcXVlc3QaMC5kZWxpbm8ub3duc2FuZC52MS5SZXZva2VFbnJvbGxtZW50VG9rZW5SZXNwb25zZRJcCgtMaXN0RGV2aWNlcxIlLmRlbGluby5vd25zYW5kLnYxLkxpc3REZXZpY2VzUmVxdWVzdBomLmRlbGluby5vd25zYW5kLnYxLkxpc3REZXZpY2VzUmVzcG9uc2USVgoJR2V0RGV2aWNlEiMuZGVsaW5vLm93bnNhbmQudjEuR2V0RGV2aWNlUmVxdWVzdBokLmRlbGluby5vd25zYW5kLnYxLkdldERldmljZVJlc3BvbnNlEnEKElVwZGF0ZURldmljZUxpbWl0cxIsLmRlbGluby5vd25zYW5kLnYxLlVwZGF0ZURldmljZUxpbWl0c1JlcXVlc3QaLS5kZWxpbm8ub3duc2FuZC52MS5VcGRhdGVEZXZpY2VMaW1pdHNSZXNwb25zZRJ0ChNSZXBsYWNlRGV2aWNlTGltaXRzEi0uZGVsaW5vLm93bnNhbmQudjEuUmVwbGFjZURldmljZUxpbWl0c1JlcXVlc3QaLi5kZWxpbm8ub3duc2FuZC52MS5SZXBsYWNlRGV2aWNlTGltaXRzUmVzcG9uc2USXwoMUmVtb3ZlRGV2aWNlEiYuZGVsaW5vLm93bnNhbmQudjEuUmVtb3ZlRGV2aWNlUmVxdWVzdBonLmRlbGluby5vd25zYW5kLnYxLlJlbW92ZURldmljZVJlc3BvbnNlEnoKFUdldEFnZW50VmVyc2lvblBvbGljeRIvLmRlbGluby5vd25zYW5kLnYxLkdldEFnZW50VmVyc2lvblBvbGljeVJlcXVlc3QaMC5kZWxpbm8ub3duc2FuZC52MS5HZXRBZ2VudFZlcnNpb25Qb2xpY3lSZXNwb25zZRKDAQoYVXBkYXRlQWdlbnRWZXJzaW9uUG9saWN5EjIuZGVsaW5vLm93bnNhbmQudjEuVXBkYXRlQWdlbnRWZXJzaW9uUG9saWN5UmVxdWVzdBozLmRlbGluby5vd25zYW5kLnYxLlVwZGF0ZUFnZW50VmVyc2lvblBvbGljeVJlc3BvbnNlQj1aO2dpdGh1Yi5jb20vZGVsaW5vaW8vbW9uby9wcm90b3MvZGVsaW5vL293bnNhbmQvdjE7b3duc2FuZHYxYgZwcm90bzM", [file_delino_ownsand_v1_common, file_google_protobuf_duration, file_google_protobuf_timestamp]);
 
 /**
  * Enrollment token metadata. It never carries the secret.
@@ -181,6 +181,9 @@ export const DeviceCapabilitiesSchema: GenMessage<DeviceCapabilities> = /*@__PUR
  */
 export type DeviceAllocation = Message<"delino.ownsand.v1.DeviceAllocation"> & {
   /**
+   * The allocated vCPUs. It is exact when the value fits in 32 bits and
+   * 2147483647 for a larger value; vcpu_total_count carries the exact value.
+   *
    * @generated from field: int32 vcpu_count = 1;
    */
   vcpuCount: number;
@@ -201,6 +204,15 @@ export type DeviceAllocation = Message<"delino.ownsand.v1.DeviceAllocation"> & {
    * @generated from field: int32 macos_guest_count = 4;
    */
   macosGuestCount: number;
+
+  /**
+   * The exact allocated vCPUs, which the scheduler uses for placement. The
+   * server always sets it; it is absent when an older server sent the
+   * message, and a client then reads vcpu_count.
+   *
+   * @generated from field: optional int64 vcpu_total_count = 5;
+   */
+  vcpuTotalCount?: bigint | undefined;
 };
 
 /**
@@ -267,7 +279,10 @@ export type Device = Message<"delino.ownsand.v1.Device"> & {
   limits?: DeviceLimits | undefined;
 
   /**
-   * floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100).
+   * floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100), capped at
+   * 2147483647 (the largest int32 value). Kept for v1 compatibility with
+   * clients that read this field; effective_vcpu_limit_count carries the exact
+   * value.
    *
    * @generated from field: int32 effective_vcpu_limit = 11;
    */
@@ -294,6 +309,15 @@ export type Device = Message<"delino.ownsand.v1.Device"> & {
    * @generated from field: google.protobuf.Timestamp pending_idle_since = 15;
    */
   pendingIdleSince?: Timestamp | undefined;
+
+  /**
+   * The exact floor(limits.vcpu_count * limits.vcpu_overcommit_percent / 100)
+   * that the scheduler uses for placement. It is 0 for a device with zero
+   * limits.
+   *
+   * @generated from field: int64 effective_vcpu_limit_count = 16;
+   */
+  effectiveVcpuLimitCount: bigint;
 };
 
 /**
@@ -536,6 +560,9 @@ export const GetDeviceResponseSchema: GenMessage<GetDeviceResponse> = /*@__PURE_
   messageDesc(file_delino_ownsand_v1_device, 14);
 
 /**
+ * Legacy request of UpdateDeviceLimits. Use ReplaceDeviceLimitsRequest,
+ * which distinguishes an omitted value from zero.
+ *
  * @generated from message delino.ownsand.v1.UpdateDeviceLimitsRequest
  */
 export type UpdateDeviceLimitsRequest = Message<"delino.ownsand.v1.UpdateDeviceLimitsRequest"> & {
@@ -550,7 +577,7 @@ export type UpdateDeviceLimitsRequest = Message<"delino.ownsand.v1.UpdateDeviceL
   deviceId: string;
 
   /**
-   * Every value is required.
+   * Every value is required, but a missing value cannot be told from zero.
    *
    * @generated from field: delino.ownsand.v1.DeviceLimits limits = 3;
    */
@@ -582,6 +609,52 @@ export const UpdateDeviceLimitsResponseSchema: GenMessage<UpdateDeviceLimitsResp
   messageDesc(file_delino_ownsand_v1_device, 16);
 
 /**
+ * @generated from message delino.ownsand.v1.ReplaceDeviceLimitsRequest
+ */
+export type ReplaceDeviceLimitsRequest = Message<"delino.ownsand.v1.ReplaceDeviceLimitsRequest"> & {
+  /**
+   * @generated from field: string organization_id = 1;
+   */
+  organizationId: string;
+
+  /**
+   * @generated from field: string device_id = 2;
+   */
+  deviceId: string;
+
+  /**
+   * Every value must be present.
+   *
+   * @generated from field: delino.ownsand.v1.DeviceLimitsInput limits = 3;
+   */
+  limits?: DeviceLimitsInput | undefined;
+};
+
+/**
+ * Describes the message delino.ownsand.v1.ReplaceDeviceLimitsRequest.
+ * Use `create(ReplaceDeviceLimitsRequestSchema)` to create a new message.
+ */
+export const ReplaceDeviceLimitsRequestSchema: GenMessage<ReplaceDeviceLimitsRequest> = /*@__PURE__*/
+  messageDesc(file_delino_ownsand_v1_device, 17);
+
+/**
+ * @generated from message delino.ownsand.v1.ReplaceDeviceLimitsResponse
+ */
+export type ReplaceDeviceLimitsResponse = Message<"delino.ownsand.v1.ReplaceDeviceLimitsResponse"> & {
+  /**
+   * @generated from field: delino.ownsand.v1.Device device = 1;
+   */
+  device?: Device | undefined;
+};
+
+/**
+ * Describes the message delino.ownsand.v1.ReplaceDeviceLimitsResponse.
+ * Use `create(ReplaceDeviceLimitsResponseSchema)` to create a new message.
+ */
+export const ReplaceDeviceLimitsResponseSchema: GenMessage<ReplaceDeviceLimitsResponse> = /*@__PURE__*/
+  messageDesc(file_delino_ownsand_v1_device, 18);
+
+/**
  * @generated from message delino.ownsand.v1.RemoveDeviceRequest
  */
 export type RemoveDeviceRequest = Message<"delino.ownsand.v1.RemoveDeviceRequest"> & {
@@ -601,7 +674,7 @@ export type RemoveDeviceRequest = Message<"delino.ownsand.v1.RemoveDeviceRequest
  * Use `create(RemoveDeviceRequestSchema)` to create a new message.
  */
 export const RemoveDeviceRequestSchema: GenMessage<RemoveDeviceRequest> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 17);
+  messageDesc(file_delino_ownsand_v1_device, 19);
 
 /**
  * @generated from message delino.ownsand.v1.RemoveDeviceResponse
@@ -618,7 +691,7 @@ export type RemoveDeviceResponse = Message<"delino.ownsand.v1.RemoveDeviceRespon
  * Use `create(RemoveDeviceResponseSchema)` to create a new message.
  */
 export const RemoveDeviceResponseSchema: GenMessage<RemoveDeviceResponse> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 18);
+  messageDesc(file_delino_ownsand_v1_device, 20);
 
 /**
  * @generated from message delino.ownsand.v1.AgentVersionPolicy
@@ -657,7 +730,7 @@ export type AgentVersionPolicy = Message<"delino.ownsand.v1.AgentVersionPolicy">
  * Use `create(AgentVersionPolicySchema)` to create a new message.
  */
 export const AgentVersionPolicySchema: GenMessage<AgentVersionPolicy> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 19);
+  messageDesc(file_delino_ownsand_v1_device, 21);
 
 /**
  * @generated from message delino.ownsand.v1.GetAgentVersionPolicyRequest
@@ -674,7 +747,7 @@ export type GetAgentVersionPolicyRequest = Message<"delino.ownsand.v1.GetAgentVe
  * Use `create(GetAgentVersionPolicyRequestSchema)` to create a new message.
  */
 export const GetAgentVersionPolicyRequestSchema: GenMessage<GetAgentVersionPolicyRequest> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 20);
+  messageDesc(file_delino_ownsand_v1_device, 22);
 
 /**
  * @generated from message delino.ownsand.v1.GetAgentVersionPolicyResponse
@@ -691,7 +764,7 @@ export type GetAgentVersionPolicyResponse = Message<"delino.ownsand.v1.GetAgentV
  * Use `create(GetAgentVersionPolicyResponseSchema)` to create a new message.
  */
 export const GetAgentVersionPolicyResponseSchema: GenMessage<GetAgentVersionPolicyResponse> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 21);
+  messageDesc(file_delino_ownsand_v1_device, 23);
 
 /**
  * @generated from message delino.ownsand.v1.UpdateAgentVersionPolicyRequest
@@ -721,7 +794,7 @@ export type UpdateAgentVersionPolicyRequest = Message<"delino.ownsand.v1.UpdateA
  * Use `create(UpdateAgentVersionPolicyRequestSchema)` to create a new message.
  */
 export const UpdateAgentVersionPolicyRequestSchema: GenMessage<UpdateAgentVersionPolicyRequest> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 22);
+  messageDesc(file_delino_ownsand_v1_device, 24);
 
 /**
  * @generated from message delino.ownsand.v1.UpdateAgentVersionPolicyResponse
@@ -738,7 +811,7 @@ export type UpdateAgentVersionPolicyResponse = Message<"delino.ownsand.v1.Update
  * Use `create(UpdateAgentVersionPolicyResponseSchema)` to create a new message.
  */
 export const UpdateAgentVersionPolicyResponseSchema: GenMessage<UpdateAgentVersionPolicyResponse> = /*@__PURE__*/
-  messageDesc(file_delino_ownsand_v1_device, 23);
+  messageDesc(file_delino_ownsand_v1_device, 25);
 
 /**
  * DeviceService manages enrollment tokens, devices, device limits and the
@@ -798,7 +871,9 @@ export const DeviceService: GenService<{
     output: typeof GetDeviceResponseSchema;
   },
   /**
-   * Set all four device limits.
+   * Legacy: set all four device limits with implicit field presence. A
+   * missing value reads as zero, so an omitted `disk_gib` is stored as zero.
+   * Kept for v1 clients; new clients call ReplaceDeviceLimits.
    *
    * @generated from rpc delino.ownsand.v1.DeviceService.UpdateDeviceLimits
    */
@@ -806,6 +881,18 @@ export const DeviceService: GenService<{
     methodKind: "unary";
     input: typeof UpdateDeviceLimitsRequestSchema;
     output: typeof UpdateDeviceLimitsResponseSchema;
+  },
+  /**
+   * Replace all four device limits. Every value must be present: a missing
+   * value is rejected with `invalid_argument`, and an explicit zero for
+   * `vcpu_count`, `memory_mib` or `disk_gib` is stored as zero.
+   *
+   * @generated from rpc delino.ownsand.v1.DeviceService.ReplaceDeviceLimits
+   */
+  replaceDeviceLimits: {
+    methodKind: "unary";
+    input: typeof ReplaceDeviceLimitsRequestSchema;
+    output: typeof ReplaceDeviceLimitsResponseSchema;
   },
   /**
    * Revoke the device credentials and request local clean-up.

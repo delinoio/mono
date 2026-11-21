@@ -55,7 +55,7 @@ import {
 } from "./segmented-control.tsx";
 import { Skeleton } from "./skeleton.tsx";
 import { Slider } from "./slider.tsx";
-import { block } from "./stylesheet-source.ts";
+import { block, css, findRuleBlock } from "./stylesheet-source.ts";
 import { Toggle, ToggleGroup } from "./toggle.tsx";
 
 afterEach(() => {
@@ -596,6 +596,54 @@ describe("Slider", () => {
     ).toBe("20");
   });
 
+  describe("when an uncontrolled defaultValue changes after mount", () => {
+    const sliderValues = () =>
+      screen
+        .getAllByRole("slider")
+        .map((thumb) => (thumb as HTMLInputElement).value);
+
+    test.each([
+      ["a number", 40],
+      ["an empty array", []],
+    ])("keeps two thumbs when the default becomes %s", (_name, next) => {
+      const { rerender } = render(
+        <Slider label="Price" defaultValue={[20, 80]} />,
+      );
+
+      rerender(<Slider label="Price" defaultValue={next} />);
+
+      expect(sliderValues()).toEqual(["20", "80"]);
+      for (const thumb of screen.getAllByRole("slider")) {
+        expect(thumb.getAttribute("aria-labelledby")).toMatch(/\S+ \S+-\d/);
+      }
+    });
+
+    test("keeps one thumb when the default becomes an array", () => {
+      const { rerender } = render(<Slider label="Price" defaultValue={40} />);
+
+      rerender(<Slider label="Price" defaultValue={[20, 80]} />);
+
+      expect(sliderValues()).toEqual(["40"]);
+    });
+
+    test("uses the new default after an empty array value resets the slider", () => {
+      const { rerender } = render(
+        <Slider label="Price" value={[20, 80]} onValueChange={() => {}} />,
+      );
+
+      rerender(
+        <Slider
+          label="Price"
+          value={[]}
+          defaultValue={[10, 50]}
+          onValueChange={() => {}}
+        />,
+      );
+
+      expect(sliderValues()).toEqual(["10", "50"]);
+    });
+  });
+
   describe("when an empty array replaces a value", () => {
     function thumbValues() {
       return screen
@@ -1107,6 +1155,28 @@ describe("SegmentedControl", () => {
   // the indicator, which the borderless design must reset.
   test("resets the UI SDK border on the track and the indicator", () => {
     expect(block(".dui-segmented-control")).toContain("border: 0;");
+    expect(block(".dui-segmented-control-indicator")).toContain("border: 0;");
+  });
+
+  // The forced-colors rules come after the default ones, so extract the media
+  // block and search inside it.
+  test("keeps the checked item visible in forced colors", () => {
+    const start = css.indexOf("@media (forced-colors: active)");
+    expect(start).toBeGreaterThan(-1);
+    const forced = css.slice(start);
+    const indicator = findRuleBlock(forced, ".dui-segmented-control-indicator");
+    expect(indicator).toContain("border: 2px solid Highlight;");
+    expect(indicator).toContain("background: Canvas;");
+    expect(
+      findRuleBlock(forced, ".dui-segmented-control-item[data-checked]"),
+    ).toContain("color: CanvasText;");
+    const focus = findRuleBlock(
+      forced,
+      ".dui-segmented-control-item:focus-visible",
+    );
+    expect(focus).toContain("outline: 2px solid CanvasText;");
+    expect(focus).toContain("outline-offset: 2px;");
+    // The default (non-forced) indicator keeps its borderless design.
     expect(block(".dui-segmented-control-indicator")).toContain("border: 0;");
   });
 });

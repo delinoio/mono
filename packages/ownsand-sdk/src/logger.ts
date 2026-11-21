@@ -7,6 +7,8 @@ export enum LogEvent {
   RelayRecovery = "relay_recovery",
   RelayGrant = "relay_grant",
   SessionEnded = "session_ended",
+  InvalidFrame = "invalid_frame",
+  StreamOverrun = "stream_overrun",
 }
 
 /**
@@ -22,6 +24,9 @@ export interface LogRecord {
   durationMs?: number;
   code?: string;
   reason?: string;
+  /** Frames and bytes that a slow consumer left queued (`stream_overrun`). */
+  queuedFrames?: number;
+  queuedBytes?: number;
 }
 
 /** The SDK logs nothing unless the caller passes a logger. */

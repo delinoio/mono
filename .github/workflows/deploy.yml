@@ -19,6 +19,7 @@ jobs:
   plan:
     name: Plan deployment
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     outputs:
       sha: ${{ steps.revision.outputs.sha }}
       releases: ${{ steps.plan.outputs.releases }}
@@ -92,6 +93,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.has_servers == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       # Every server builds in parallel. One failed build stops the run before
       # any server is deployed.
@@ -164,6 +166,7 @@ jobs:
     needs: [plan, build-servers, build-static-sites]
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_servers == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     environment: servers
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -249,6 +252,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.has_static_sites == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # No deployment environment and no secrets: the build runs third-party
     # build plugins, so it runs on its own runner. The deploy job receives
     # only the built output, never this workspace.
@@ -290,6 +294,7 @@ jobs:
     # Run after the servers, also when no server was selected.
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_static_sites == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     environment: static-sites
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -374,6 +379,7 @@ jobs:
     # (no server or no static site selected) do not block the release.
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_changesets == 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     # Job permissions replace the workflow permissions, so repeat
     # `actions: read` for the stale-plan check.
     permissions:

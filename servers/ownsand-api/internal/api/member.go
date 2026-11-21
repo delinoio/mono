@@ -54,10 +54,13 @@ func (s *Service) scanInvitation(row pgx.Row) (*ownsandv1.Invitation, error) {
 }
 
 func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Request[ownsandv1.CreateInvitationRequest]) (*connect.Response[ownsandv1.CreateInvitationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	role := req.Msg.GetRole()
 	var resp *ownsandv1.CreateInvitationResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
 			return err
@@ -94,7 +97,10 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 }
 
 func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request[ownsandv1.ListInvitationsRequest]) (*connect.Response[ownsandv1.ListInvitationsResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionManageMembers); err != nil {
 		return nil, err
 	}
@@ -129,15 +135,19 @@ func (h MemberHandler) ListInvitations(ctx context.Context, req *connect.Request
 }
 
 func (h MemberHandler) RevokeInvitation(ctx context.Context, req *connect.Request[ownsandv1.RevokeInvitationRequest]) (*connect.Response[ownsandv1.RevokeInvitationResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
-	invID := req.Msg.GetInvitationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
+	rawInvID := req.Msg.GetInvitationId()
 	var resp *ownsandv1.RevokeInvitationResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
 			return err
 		}
-		if err := validateID("invitation_id", invID); err != nil {
+		invID, err := normalizeID("invitation_id", rawInvID)
+		if err != nil {
 			return err
 		}
 		inv, err := h.scanInvitation(tx.QueryRow(ctx, "SELECT "+invitationColumns+" FROM invitations WHERE organization_id = $1 AND invitation_id = $2 FOR UPDATE", orgID, invID))
@@ -187,7 +197,7 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		return nil, errRateLimited(retry)
 	}
 	if addr := clientAddr(ctx); addr != "" {
-		if ok, retry := h.Limits.PerClient.Allow("invitation:"+addr, 1); !ok {
+		if ok, retry := h.Limits.PerClient.Allow(addr, 1); !ok {
 			return nil, errRateLimited(retry)
 		}
 	}
@@ -197,11 +207,36 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 	hash := auth.HashSecret(secret)
 	var resp *ownsandv1.AcceptInvitationResponse
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		// Lock order: organization row first, invitation row second, the
+		// order of DeleteOrganization. The membership insert takes a share of
+		// the organization row through its foreign key, so holding the
+		// invitation row while waiting for that share would deadlock with a
+		// deletion that holds the organization row and waits for the
+		// invitation row. The first read takes no lock and only names the
+		// organization; every condition is checked again under both locks.
+		var preOrgID string
+		err := tx.QueryRow(ctx, `SELECT organization_id::text FROM invitations
+			WHERE secret_sha256 = $1 AND accept_time IS NULL AND revoke_time IS NULL AND expire_time > $2`, hash, h.now()).Scan(&preOrgID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errInvitationInvalid()
+		}
+		if err != nil {
+			return err
+		}
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", preOrgID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// A deletion removed the organization and its invitations.
+			return errInvitationInvalid()
+		}
+		if err != nil {
+			return err
+		}
 		var invID, orgID, orgName string
 		var role int16
 		var stored []byte
 		var orgCreated time.Time
-		err := tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time
+		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time
 			FROM invitations i JOIN organizations o ON o.organization_id = i.organization_id
 			WHERE i.secret_sha256 = $1 AND i.accept_time IS NULL AND i.revoke_time IS NULL AND i.expire_time > $2
 			FOR UPDATE OF i`, hash, h.now()).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated)
@@ -221,9 +256,17 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		}
 		now := h.now()
 		membershipID := newID()
-		if _, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, $3, $4, $5)",
-			membershipID, orgID, p.ID, role, now); err != nil {
+		// Two concurrent acceptances by the same user can both pass the
+		// existence check above. ON CONFLICT turns the loser's unique
+		// violation into zero affected rows, so it gets already_exists
+		// instead of an internal error. Other SQL errors stay internal.
+		tag, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (organization_id, user_id) DO NOTHING",
+			membershipID, orgID, p.ID, role, now)
+		if err != nil {
 			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return errAlreadyExists("the caller is already a member of the organization")
 		}
 		if _, err := tx.Exec(ctx, "UPDATE invitations SET accept_time = $2, accepted_by = $3 WHERE invitation_id = $1", invID, now, p.ID); err != nil {
 			return err
@@ -247,7 +290,10 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 }
 
 func (h MemberHandler) ListMembers(ctx context.Context, req *connect.Request[ownsandv1.ListMembersRequest]) (*connect.Response[ownsandv1.ListMembersResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	if _, _, err := h.authorize(ctx, h.DB.Pool, orgID, authz.ActionReadOrganization); err != nil {
 		return nil, err
 	}
@@ -308,11 +354,14 @@ func loadMembership(ctx context.Context, q db.Querier, orgID, userID string) (st
 }
 
 func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Request[ownsandv1.UpdateMemberRoleRequest]) (*connect.Response[ownsandv1.UpdateMemberRoleResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	target := req.Msg.GetUserId()
 	role := req.Msg.GetRole()
 	var resp *ownsandv1.UpdateMemberRoleResponse
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, _, err := h.authorize(ctx, tx, orgID, authz.ActionManageMembers)
 		if err != nil {
 			return err
@@ -350,9 +399,12 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 }
 
 func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ownsandv1.RemoveMemberRequest]) (*connect.Response[ownsandv1.RemoveMemberResponse], error) {
-	orgID := req.Msg.GetOrganizationId()
+	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
+	if err != nil {
+		return nil, err
+	}
 	target := req.Msg.GetUserId()
-	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
 		p, err := principal(ctx)
 		if err != nil {
 			return err

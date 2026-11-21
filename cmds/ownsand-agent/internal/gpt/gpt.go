@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 // Package gpt edits the GUID partition table of a raw disk image file. The
 // macOS runtime and image build use it on guest disks without attaching

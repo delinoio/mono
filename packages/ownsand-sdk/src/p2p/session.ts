@@ -1,8 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { encodeMessages, FrameCodecError, FrameDecoder } from "../codec.ts";
-import { connectErrorFromDetail, OwnSandError } from "../errors.ts";
+import {
+  encodeMessages,
+  FrameCodecError,
+  FrameDecoder,
+  MAX_FRAME_SIZE,
+  validateFrame,
+} from "../codec.ts";
+import {
+  connectErrorFromDetail,
+  InvalidFrameError,
+  OwnSandError,
+  PeerStreamOverrunError,
+} from "../errors.ts";
 import { SessionEndReason } from "../gen/delino/ownsand/v1/common_pb.ts";
 import {
   type AttachExecRequest,
@@ -17,7 +28,11 @@ import {
   type WriteFileResponse,
 } from "../gen/delino/ownsand/v1/data_frame_pb.ts";
 import { LogEvent, safeLog } from "../logger.ts";
-import { type OperationContext, Timing } from "../relay/context.ts";
+import {
+  type OperationContext,
+  throwIfAborted,
+  Timing,
+} from "../relay/context.ts";
 import { AsyncQueue } from "./queue.ts";
 import {
   DATA_CHANNEL_LABEL,
@@ -46,18 +61,68 @@ export class PeerUnavailableError extends OwnSandError {
   override name = "PeerUnavailableError";
 }
 
+/**
+ * `OpenSession` reported `failed_precondition`: the sandbox is not `RUNNING`
+ * (for example `PAUSED`, where an `AttachExec` still works on the relay). The
+ * operation uses the relay for this attempt and the handle stays on
+ * peer-to-peer, so the next operation calls `OpenSession` again. This is
+ * neither a `PeerUnavailableError` (that moves the handle to the relay for
+ * good) nor an authorization error (that ends the operation). `cause` is the
+ * `ConnectError` that a forced peer-to-peer transport returns to the caller.
+ */
+export class SessionNotOpenError extends OwnSandError {
+  override name = "SessionNotOpenError";
+  declare readonly cause: ConnectError;
+
+  constructor(cause: ConnectError) {
+    super("OpenSession reported a sandbox that is not running", { cause });
+  }
+}
+
 /** Connect codes of an `OpenSession` failure that end the operation. */
 const AUTHORIZATION_CODES: ReadonlySet<Code> = new Set([
   Code.Unauthenticated,
   Code.PermissionDenied,
   Code.NotFound,
   Code.InvalidArgument,
-  Code.FailedPrecondition,
 ]);
 
 /** Largest data channel send buffer before the session waits. */
 const SEND_BUFFER_HIGH = 1 << 20;
 const SEND_BUFFER_LOW = 256 << 10;
+
+/**
+ * Most frames that one stream queues for a consumer that is not ready, as in
+ * the Go SDK.
+ */
+export const STREAM_QUEUE_MAX_FRAMES = 64;
+/**
+ * Most payload bytes (file chunk and exec output data) that one stream
+ * queues. It is at least one maximum frame, so a single frame never fails a
+ * stream whose consumer is caught up.
+ */
+export const STREAM_QUEUE_MAX_BYTES = 8 << 20;
+if (STREAM_QUEUE_MAX_BYTES < MAX_FRAME_SIZE) {
+  throw new Error("the stream queue byte limit is below one frame");
+}
+
+/** The bytes of file or output data that a frame adds to a stream queue. */
+function queuedBytesOf(frame: DataFrame): number {
+  switch (frame.payload.case) {
+    case "fileReadEvent": {
+      const event = frame.payload.value.event;
+      return event.case === "chunk" ? event.value.data.length : 0;
+    }
+    case "execEvent": {
+      const event = frame.payload.value.event;
+      return event.case === "stdout" || event.case === "stderr"
+        ? event.value.data.length
+        : 0;
+    }
+    default:
+      return 0;
+  }
+}
 
 /**
  * One peer-to-peer data channel session with the device agent for one
@@ -72,6 +137,8 @@ export class PeerSession {
   readonly #streams = new Map<bigint, AsyncQueue<DataFrame>>();
   #nextStreamId = 1n;
   #ended: Error | undefined;
+  /** Tail of the send queue; a frame sends after the previous one finished. */
+  #sendTail: Promise<void> = Promise.resolve();
 
   private constructor(
     ctx: OperationContext,
@@ -99,7 +166,10 @@ export class PeerSession {
 
   /**
    * Opens a session: `GetIceServers`, a non-trickle offer with all
-   * candidates, `OpenSession`, and the data channel open within 10 seconds.
+   * candidates (10 seconds at most), `OpenSession`, and the data channel
+   * open within 10 seconds after the answer is applied. `OpenSession` has no
+   * limit of its own here, so a slow signaling call does not use up the time
+   * that the channel needs to open.
    */
   static async open(
     ctx: OperationContext,
@@ -118,9 +188,10 @@ export class PeerSession {
         ordered: true,
       });
       channel.binaryType = "arraybuffer";
-      const opened = waitForEvent(channel, "open", ctx, signal);
-      // Awaited below; this keeps an early timeout from being unhandled.
-      opened.catch(() => {});
+      // Listens from now on, so an `open` event that fires before the answer
+      // is applied still counts. It never rejects; the 10 second limit
+      // starts only after the answer is applied (below).
+      const opened = channelOpened(channel);
       await pc.setLocalDescription(await pc.createOffer());
       await waitForGathering(pc, ctx, signal);
       const offer = pc.localDescription?.sdp;
@@ -139,18 +210,30 @@ export class PeerSession {
         );
         answer = res.sdpAnswer;
       } catch (error) {
+        if (signal?.aborted) {
+          // A cancelled call is not an OpenSession failure: a transport can
+          // report the abort as Canceled, which must not move the handle to
+          // the relay.
+          throw error;
+        }
         if (
           error instanceof ConnectError &&
           AUTHORIZATION_CODES.has(error.code)
         ) {
           throw error;
         }
+        if (
+          error instanceof ConnectError &&
+          error.code === Code.FailedPrecondition
+        ) {
+          throw new SessionNotOpenError(error);
+        }
         throw new PeerUnavailableError("OpenSession failed", { cause: error });
       }
       // The answer carries the agent's DTLS fingerprint; the WebRTC stack
       // accepts only that fingerprint for the data channel.
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
-      await opened;
+      await waitForOpen(opened, ctx, signal);
       if (channel.readyState !== "open") {
         throw new PeerUnavailableError("data channel did not open");
       }
@@ -161,6 +244,7 @@ export class PeerSession {
       if (
         error instanceof ConnectError ||
         error instanceof PeerUnavailableError ||
+        error instanceof SessionNotOpenError ||
         signal?.aborted
       ) {
         throw error;
@@ -242,6 +326,10 @@ export class PeerSession {
     if (this.#ended) {
       throw this.#ended;
     }
+    // A caller can abort while it waits for the shared session setup. The
+    // abort event already fired then, so the listener below would never see
+    // it. Reject before registering a stream or sending a frame.
+    throwIfAborted(signal);
     const streamId = this.#nextStreamId++;
     const queue = new AsyncQueue<DataFrame>();
     this.#streams.set(streamId, queue);
@@ -259,6 +347,7 @@ export class PeerSession {
           kind,
           payload,
         }),
+        signal,
       );
       for await (const frame of queue) {
         if (frame.payload.case === "error") {
@@ -284,24 +373,73 @@ export class PeerSession {
     }
   }
 
-  async #send(frame: DataFrame): Promise<void> {
-    for (const message of encodeMessages(frame)) {
+  /**
+   * Sends one frame. The data channel carries one length-prefixed byte
+   * stream, so the messages of two frames must never interleave. A frame
+   * spans many messages and waits for the send buffer between them; the
+   * sends of concurrent requests therefore run one after another, and each
+   * holds the turn for all messages of its frame. A caller can abort while
+   * its frame waits for the turn, so the turn re-checks the signal before it
+   * sends the first message and skips a cancelled frame; a frame that is
+   * already in progress always completes, because a partial frame would
+   * corrupt the byte stream.
+   */
+  async #send(
+    frame: DataFrame,
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    // Encode before the turn so that the critical section is only I/O.
+    const messages = encodeMessages(frame);
+    const previous = this.#sendTail;
+    const turn = previous.then(() => {
+      throwIfAborted(signal);
+      return this.#writeMessages(messages, signal);
+    });
+    // The next sender waits for this turn to finish, whether it failed or
+    // not; the failure itself reaches only the caller of this frame.
+    this.#sendTail = turn.catch(() => {});
+    await turn;
+  }
+
+  async #writeMessages(
+    messages: Uint8Array[],
+    signal: AbortSignal | undefined,
+  ): Promise<void> {
+    for (const [index, message] of messages.entries()) {
+      // Only the first message may be cancelled: once it is sent, the frame
+      // must complete or the byte stream would be corrupted.
+      const cancellable = index === 0 ? signal : undefined;
+      // The wait loops: after it wakes, another condition (a session end, an
+      // abort or a buffer that filled again) can hold, so re-check before
+      // every send.
+      while (!this.#ended && this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
+        throwIfAborted(cancellable);
+        await this.#waitForBufferLow(cancellable);
+      }
       if (this.#ended) {
         throw this.#ended;
       }
-      if (this.#channel.bufferedAmount > SEND_BUFFER_HIGH) {
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            this.#channel.removeEventListener("bufferedamountlow", done);
-            this.#channel.removeEventListener("close", done);
-            resolve();
-          };
-          this.#channel.addEventListener("bufferedamountlow", done);
-          this.#channel.addEventListener("close", done);
-        });
-      }
+      throwIfAborted(cancellable);
       this.#channel.send(message);
     }
+  }
+
+  /**
+   * Resolves when the send buffer drains, the channel closes or the optional
+   * signal aborts.
+   */
+  #waitForBufferLow(signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const done = () => {
+        this.#channel.removeEventListener("bufferedamountlow", done);
+        this.#channel.removeEventListener("close", done);
+        signal?.removeEventListener("abort", done);
+        resolve();
+      };
+      this.#channel.addEventListener("bufferedamountlow", done);
+      this.#channel.addEventListener("close", done);
+      signal?.addEventListener("abort", done, { once: true });
+    });
   }
 
   #onMessage(event: unknown): void {
@@ -343,8 +481,67 @@ export class PeerSession {
         this.#terminate(new SessionEndedError(reason));
         return;
       }
-      this.#streams.get(frame.streamId)?.push(frame);
+      const invalid = validateFrame(frame);
+      if (invalid !== undefined) {
+        // A frame of a newer schema or one that breaks a framing rule fails
+        // only its own stream, so the operation ends with the error instead
+        // of waiting for a frame that it can use. On stream_id 0 and on a
+        // stream that is not open there is nothing to fail, so the frame is
+        // ignored. Frames that the stream already queued are delivered first.
+        const queue = this.#streams.get(frame.streamId);
+        if (queue !== undefined) {
+          safeLog(this.#ctx.logger, {
+            event: LogEvent.InvalidFrame,
+            sandboxId: this.#ctx.sandboxId,
+            reason: invalid.message,
+          });
+          queue.fail(
+            new InvalidFrameError(invalid.message, { cause: invalid }),
+          );
+          this.#streams.delete(frame.streamId);
+        }
+        continue;
+      }
+      this.#enqueue(frame);
     }
+  }
+
+  /**
+   * Queues a frame for its stream. The receive callback cannot wait for a
+   * slow consumer, and the data channel cannot be paused from JavaScript, so
+   * a stream that already holds the maximum frames or bytes fails at once
+   * instead of waiting as the Go SDK does for 10 seconds. The overflowing
+   * frame is dropped and the frames that follow on that stream find no
+   * stream. The consumer first takes the frames that are queued, so every
+   * delivered frame keeps its offset, and the operation continues on a new
+   * stream from the delivered offsets. Other streams and the session are not
+   * affected.
+   */
+  #enqueue(frame: DataFrame): void {
+    const queue = this.#streams.get(frame.streamId);
+    if (queue === undefined) {
+      return;
+    }
+    const size = queuedBytesOf(frame);
+    if (
+      queue.length >= STREAM_QUEUE_MAX_FRAMES ||
+      queue.bytes + size > STREAM_QUEUE_MAX_BYTES
+    ) {
+      safeLog(this.#ctx.logger, {
+        event: LogEvent.StreamOverrun,
+        sandboxId: this.#ctx.sandboxId,
+        queuedFrames: queue.length,
+        queuedBytes: queue.bytes,
+      });
+      queue.fail(
+        new PeerStreamOverrunError(
+          "the consumer did not keep up with the peer-to-peer stream",
+        ),
+      );
+      this.#streams.delete(frame.streamId);
+      return;
+    }
+    queue.push(frame, size);
   }
 
   #terminate(error: Error): void {
@@ -372,35 +569,45 @@ const KIND_OF_REQUEST: Readonly<Record<string, DataFrameKind>> = {
   fileWriteChunk: DataFrameKind.FILE_WRITE_CHUNK,
 };
 
-function waitForEvent(
-  target: DataChannelLike,
-  type: string,
+/**
+ * A promise that resolves when the channel opens. It listens from the call on
+ * and never rejects, so it needs no timer and no handler before it is awaited.
+ */
+function channelOpened(channel: DataChannelLike): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const onOpen = () => {
+      channel.removeEventListener("open", onOpen);
+      resolve();
+    };
+    channel.addEventListener("open", onOpen);
+  });
+}
+
+/**
+ * Waits for `opened` for at most `Timing.dataChannelOpenMs`, counted from the
+ * call. The caller calls it right after it applied the answer, so the time
+ * that gathering and `OpenSession` took does not count. An abort ends the wait
+ * with the abort reason.
+ */
+async function waitForOpen(
+  opened: Promise<void>,
   ctx: OperationContext,
   signal: AbortSignal | undefined,
 ): Promise<void> {
-  return new Promise<void>((resolve, reject) => {
-    const stop = new AbortController();
-    const onEvent = () => {
-      stop.abort();
-      target.removeEventListener(type, onEvent);
-      resolve();
-    };
-    target.addEventListener(type, onEvent);
-    ctx.clock
-      .sleep(Timing.dataChannelOpenMs, anySignal(stop.signal, signal))
-      .then(
-        () => {
-          target.removeEventListener(type, onEvent);
-          reject(new PeerUnavailableError("data channel did not open in time"));
-        },
-        (error: unknown) => {
-          if (!stop.signal.aborted) {
-            target.removeEventListener(type, onEvent);
-            reject(error);
-          }
-        },
-      );
-  });
+  const stop = new AbortController();
+  try {
+    await Promise.race([
+      opened,
+      ctx.clock
+        .sleep(Timing.dataChannelOpenMs, anySignal(stop.signal, signal))
+        .then(() => {
+          throw new PeerUnavailableError("data channel did not open in time");
+        }),
+    ]);
+  } finally {
+    // Cancels the timer when the channel opened first.
+    stop.abort();
+  }
 }
 
 async function waitForGathering(

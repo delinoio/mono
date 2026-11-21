@@ -12,21 +12,28 @@ import (
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
-// fillOrganization sets the organization_id field of req from the client
-// default when the request leaves it empty. A request type with the field
-// fails with ErrNoOrganization when no organization is known.
-func (c *Client) fillOrganization(req proto.Message) error {
+// withOrganization returns the message to send for req: req itself when it has
+// no organization_id field or sets one, otherwise a clone with the client
+// default applied. The caller-owned request is never modified, so one request
+// can be reused across clients with different defaults. A request type with
+// the field fails with ErrNoOrganization when no organization is known.
+func withOrganization[M proto.Message](c *Client, req M) (M, error) {
 	m := req.ProtoReflect()
 	fd := m.Descriptor().Fields().ByName("organization_id")
 	if fd == nil || fd.Kind() != protoreflect.StringKind {
-		return nil
+		return req, nil
 	}
-	org, err := c.organization(m.Get(fd).String())
+	explicit := m.Get(fd).String()
+	org, err := c.organization(explicit)
 	if err != nil {
-		return err
+		return req, err
 	}
-	m.Set(fd, protoreflect.ValueOfString(org))
-	return nil
+	if explicit != "" {
+		return req, nil
+	}
+	cloned := proto.Clone(req).(M)
+	cloned.ProtoReflect().Set(fd, protoreflect.ValueOfString(org))
+	return cloned, nil
 }
 
 // unary sends one unary RPC with the organization filled in.
@@ -37,10 +44,11 @@ func unary[Req, Res any, PReq interface {
 	if req == nil {
 		req = PReq(new(Req))
 	}
-	if err := c.fillOrganization(req); err != nil {
+	send, err := withOrganization(c, req)
+	if err != nil {
 		return nil, err
 	}
-	res, err := fn(ctx, connect.NewRequest((*Req)(req)))
+	res, err := fn(ctx, connect.NewRequest((*Req)(send)))
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +184,16 @@ func (s *DeviceService) Get(ctx context.Context, req *ownsandv1.GetDeviceRequest
 	return unary(ctx, s.c, s.c.devices.GetDevice, req)
 }
 
-// UpdateLimits sets all four device limits.
+// ReplaceLimits replaces all four device limits. Every value must be present;
+// the server rejects a missing value with invalid_argument, and an explicit
+// zero is stored. New code uses this method.
+func (s *DeviceService) ReplaceLimits(ctx context.Context, req *ownsandv1.ReplaceDeviceLimitsRequest) (*ownsandv1.ReplaceDeviceLimitsResponse, error) {
+	return unary(ctx, s.c, s.c.devices.ReplaceDeviceLimits, req)
+}
+
+// UpdateLimits sets all four device limits with implicit field presence: a
+// missing value reads as zero. Legacy, kept for v1 clients; use
+// ReplaceLimits.
 func (s *DeviceService) UpdateLimits(ctx context.Context, req *ownsandv1.UpdateDeviceLimitsRequest) (*ownsandv1.UpdateDeviceLimitsResponse, error) {
 	return unary(ctx, s.c, s.c.devices.UpdateDeviceLimits, req)
 }

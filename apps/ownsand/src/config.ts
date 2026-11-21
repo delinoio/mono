@@ -82,6 +82,15 @@ export function resolveOrigin(
 }
 
 /**
+ * Normalizes the raw mock setting. `readConsoleConfig` and the value that the
+ * bundler inlines for `src/index.tsx` both use it, so the auth mode and the
+ * API transport always follow one decision.
+ */
+export function normalizeMockFlag(value: string | undefined): string {
+  return (value ?? "").trim();
+}
+
+/**
  * Reads the console configuration. `production` is true for production
  * builds, which must not enable the mock API.
  */
@@ -94,7 +103,7 @@ export function readConsoleConfig(
     env.PUBLIC_API_ORIGIN,
     DEFAULT_API_ORIGIN,
   );
-  const mock = (env.PUBLIC_OWNSAND_MOCK_API ?? "").trim();
+  const mock = normalizeMockFlag(env.PUBLIC_OWNSAND_MOCK_API);
   if (mock !== "" && mock !== "true" && mock !== "false") {
     throw new Error("PUBLIC_OWNSAND_MOCK_API must be true or false");
   }

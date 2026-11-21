@@ -110,8 +110,41 @@ func TestLimitsReleaseAndRejection(t *testing.T) {
 	g, _, _ := r2.Reserve(req("r", "u", "op"), newID)
 	r2.Ack(g.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT, "")
 	<-g.Done()
-	if !g.Rejected() || r2.Len() != 0 {
+	if g.Outcome() != OutcomeRejectedLimit || r2.Len() != 0 {
 		t.Fatal("rejected grant kept")
+	}
+	// Removal of a pending grant without an acknowledgement (channel loss,
+	// release, revocation or another non-accepting result) is not a rejection.
+	r3 := New(c.now)
+	lost, _, _ := r3.Reserve(req("lost", "u", "op"), newID)
+	r3.RemoveChannel(lost.DeviceID, lost.ChannelGen)
+	<-lost.Done()
+	if lost.Outcome() != OutcomeRemoved || r3.Len() != 0 {
+		t.Fatalf("channel loss outcome = %v", lost.Outcome())
+	}
+	released, _, _ := r3.Reserve(req("released", "u", "op2"), newID)
+	r3.Release(released.ID, released.DeviceID)
+	<-released.Done()
+	if released.Outcome() != OutcomeRemoved {
+		t.Fatalf("release outcome = %v", released.Outcome())
+	}
+	revoked, _, _ := r3.Reserve(req("revoked", "u", "op3"), newID)
+	r3.RemoveMatching(func(x *Grant) bool { return x.ID == revoked.ID })
+	<-revoked.Done()
+	if revoked.Outcome() != OutcomeRemoved {
+		t.Fatalf("revocation outcome = %v", revoked.Outcome())
+	}
+	odd, _, _ := r3.Reserve(req("odd", "u", "op4"), newID)
+	r3.Ack(odd.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_UNSPECIFIED, "")
+	<-odd.Done()
+	if odd.Outcome() != OutcomeRemoved {
+		t.Fatalf("unspecified result outcome = %v", odd.Outcome())
+	}
+	accepted, _, _ := r3.Reserve(req("accepted", "u", "op5"), newID)
+	r3.Ack(accepted.ID, ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED, "")
+	<-accepted.Done()
+	if accepted.Outcome() != OutcomeAccepted {
+		t.Fatalf("accepted outcome = %v", accepted.Outcome())
 	}
 }
 
@@ -172,5 +205,190 @@ func TestRevocationMatchingAndLateAck(t *testing.T) {
 	r.Ack(g.ID, accepted, "")
 	if r.Admittable(g.ID) != nil {
 		t.Fatal("a late acknowledgement revived a revoked grant")
+	}
+}
+
+// TestRemoveUndelivered covers the removal after a failed enqueue: the exact
+// reservation is released, the outcome is recorded before the waiters wake and
+// a replacement leaves its predecessor installed and free of a successor.
+func TestRemoveUndelivered(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	g, _, _ := r.Reserve(req("a", "u", "op"), newID)
+	woken := make(chan Outcome, 1)
+	go func() { <-g.Done(); woken <- g.Outcome() }()
+	if !r.RemoveUndelivered(g.ID) {
+		t.Fatal("pending grant not removed")
+	}
+	if got := <-woken; got != OutcomeDeliveryFailed {
+		t.Fatalf("waiter outcome = %v", got)
+	}
+	if r.Len() != 0 || r.Get(g.ID) != nil {
+		t.Fatal("removed grant is still registered")
+	}
+	// The authorization_id slot is free: the same ID reserves a new grant.
+	again, existing, err := r.Reserve(req("a", "u", "op"), newID)
+	if err != nil || existing || again.ID == g.ID {
+		t.Fatalf("reserve after removal: %v existing=%v same=%v", err, existing, again.ID == g.ID)
+	}
+	// A second removal of the removed grant changes nothing.
+	if r.RemoveUndelivered(g.ID) || r.Len() != 1 {
+		t.Fatal("removal of a removed grant touched the registry")
+	}
+	// An installed grant is never removed.
+	r.Ack(again.ID, accepted, "")
+	if r.RemoveUndelivered(again.ID) || r.Admittable(again.ID) == nil {
+		t.Fatal("installed grant removed")
+	}
+	// A failed replacement keeps the predecessor and frees its successor link.
+	repl := req("b", "u", "op")
+	repl.ReplacesID = again.ID
+	succ, _, err := r.Reserve(repl, newID)
+	if err != nil || succ.Replaces != again.ID {
+		t.Fatalf("replacement: %v", err)
+	}
+	second := req("c", "u", "op")
+	second.ReplacesID = again.ID
+	if _, _, err := r.Reserve(second, newID); !errors.Is(err, ErrReplaceActive) {
+		t.Fatalf("second replacement: %v", err)
+	}
+	if !r.RemoveUndelivered(succ.ID) {
+		t.Fatal("pending replacement not removed")
+	}
+	if succ.Outcome() != OutcomeDeliveryFailed {
+		t.Fatalf("replacement outcome = %v", succ.Outcome())
+	}
+	if r.Admittable(again.ID) == nil || again.Successor != "" || r.Len() != 1 {
+		t.Fatalf("predecessor not kept clean: successor=%q len=%d", again.Successor, r.Len())
+	}
+	if _, _, err := r.Reserve(repl, newID); err != nil {
+		t.Fatalf("replacement retry after the failed one: %v", err)
+	}
+}
+
+// installedWithReplacement installs a grant and reserves a pending
+// replacement of it.
+func installedWithReplacement(t *testing.T, r *Registry) (pred, succ *Grant) {
+	t.Helper()
+	pred, _, err := r.Reserve(req("pred", "u", "op"), newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.Ack(pred.ID, accepted, "")
+	repl := req("succ", "u", "op")
+	repl.ReplacesID = pred.ID
+	succ, _, err = r.Reserve(repl, newID)
+	if err != nil || succ.Replaces != pred.ID {
+		t.Fatalf("replacement: %v", err)
+	}
+	return pred, succ
+}
+
+// TestAckWithoutReplacedGrantFreesPredecessor covers an accepting
+// acknowledgement that does not name the predecessor: the predecessor stays
+// installed and can be replaced again.
+func TestAckWithoutReplacedGrantFreesPredecessor(t *testing.T) {
+	for _, replacedID := range []string{"", "another-grant"} {
+		t.Run("replaced="+replacedID, func(t *testing.T) {
+			c := &clock{t: time.Unix(1000, 0)}
+			r := New(c.now)
+			pred, succ := installedWithReplacement(t, r)
+			// While the successor is pending, a second replacement is refused.
+			again := req("again", "u", "op")
+			again.ReplacesID = pred.ID
+			if _, _, err := r.Reserve(again, newID); !errors.Is(err, ErrReplaceActive) {
+				t.Fatalf("replacement while pending: %v", err)
+			}
+			r.Ack(succ.ID, accepted, replacedID)
+			if r.Get(pred.ID) == nil {
+				t.Fatal("predecessor removed by an acknowledgement that did not name it")
+			}
+			if pred.Successor != "" || succ.Replaces != "" {
+				t.Fatalf("links not cleared: successor=%q replaces=%q", pred.Successor, succ.Replaces)
+			}
+			// The predecessor can be replaced again.
+			next, _, err := r.Reserve(again, newID)
+			if err != nil || next.Replaces != pred.ID {
+				t.Fatalf("replacement after the ack: %v", err)
+			}
+		})
+	}
+}
+
+// TestAckNamingPredecessorRemovesIt keeps the contract path: the named
+// predecessor is removed and the successor stays installed.
+func TestAckNamingPredecessorRemovesIt(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	r.Ack(succ.ID, accepted, pred.ID)
+	<-succ.Done()
+	if r.Get(pred.ID) != nil || r.Admittable(succ.ID) == nil || succ.Replaces != "" {
+		t.Fatal("swap not applied")
+	}
+}
+
+// TestReplacesOf covers the locked snapshot of the predecessor link.
+func TestReplacesOf(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	if got := r.ReplacesOf(succ); got != pred.ID {
+		t.Fatalf("ReplacesOf = %q", got)
+	}
+	r.Release(pred.ID, pred.DeviceID)
+	if got := r.ReplacesOf(succ); got != "" {
+		t.Fatalf("ReplacesOf after the release = %q", got)
+	}
+	if r.ReplacesOf(pred) != "" {
+		t.Fatal("grant without predecessor reports one")
+	}
+}
+
+// TestReplacesOfConcurrentRelease runs the snapshot against releases and acks
+// of the link; the race detector reports an unlocked read.
+func TestReplacesOfConcurrentRelease(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	pred, succ := installedWithReplacement(t, r)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		r.Release(pred.ID, pred.DeviceID)
+		r.Ack(succ.ID, accepted, pred.ID)
+	}()
+	for i := 0; i < 1000; i++ {
+		if got := r.ReplacesOf(succ); got != "" && got != pred.ID {
+			t.Fatalf("ReplacesOf = %q", got)
+		}
+	}
+	<-done
+}
+
+// TestRevocableUntil pins the end of the revocable time of a grant: the stream
+// deadline plus the delivery margin, or the acknowledgement plus the sent
+// stream deadline duration when that is later.
+func TestRevocableUntil(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	g, _, err := r.Reserve(req("a1", "u", "op"), newID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := c.t
+	if got, want := g.RevocableUntil(), start.Add(StreamDeadline+DeliveryMargin); !got.Equal(want) {
+		t.Fatalf("pending grant revocable until %v, want %v", got, want)
+	}
+	// A late acknowledgement extends the end past the margin.
+	c.t = start.Add(2 * time.Minute)
+	r.Ack(g.ID, accepted, "")
+	if got, want := r.Get(g.ID).RevocableUntil(), start.Add(2*time.Minute+StreamDeadline); !got.Equal(want) {
+		t.Fatalf("acknowledged grant revocable until %v, want %v", got, want)
+	}
+	// The registry stops matching the grant exactly at that end.
+	c.t = start.Add(2*time.Minute + StreamDeadline - time.Second)
+	cp := r.RemoveMatching(func(*Grant) bool { return true })
+	if len(cp) != 1 || !cp[0].RevocableUntil().Equal(start.Add(2*time.Minute+StreamDeadline)) {
+		t.Fatalf("RemoveMatching before the end returned %v", cp)
 	}
 }

@@ -1698,6 +1698,27 @@
     cursor: not-allowed;
   }
 
+  /* Forced colors discard the indicator background and shadow, which are the
+     only visual cue of the checked item. Draw the indicator as a system-color
+     border instead, and keep the focus ring on another system color with an
+     offset so it stays distinct from the selection. */
+  @media (forced-colors: active) {
+    .dui-segmented-control-indicator {
+      box-sizing: border-box;
+      border: 2px solid Highlight;
+      background: Canvas;
+    }
+
+    .dui-segmented-control-item[data-checked] {
+      color: CanvasText;
+    }
+
+    .dui-segmented-control-item:focus-visible {
+      outline: 2px solid CanvasText;
+      outline-offset: 2px;
+    }
+  }
+
   /* Toggle */
   .dui-toggle {
     display: inline-flex;

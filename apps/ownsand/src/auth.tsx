@@ -73,10 +73,32 @@ export function LogtoAuthProvider({
   );
 }
 
-function LogtoBridge({ children }: { children: ReactNode }) {
+/**
+ * Adapts the Logto SDK state to `Auth`. Exported for tests, which render it
+ * inside a `LogtoProvider` with a fake client.
+ */
+export function LogtoBridge({ children }: { children: ReactNode }) {
   const logto = useLogto();
   const [userId, setUserId] = useState<string | undefined>();
-  const { isAuthenticated, getIdTokenClaims } = logto;
+  const [initialized, setInitialized] = useState(false);
+  const {
+    isAuthenticated,
+    isLoading: sdkLoading,
+    getIdTokenClaims,
+    getAccessToken,
+    signIn,
+    signOut,
+  } = logto;
+  // The SDK sets `isLoading` for every token request, not only while it
+  // restores the session. The console unmounts its pages while `isLoading`
+  // is true, so each page that requested a token unmounted itself, mounted
+  // again and requested the token again without end. Report loading only
+  // until the SDK has restored the session for the first time.
+  useEffect(() => {
+    if (!sdkLoading) {
+      setInitialized(true);
+    }
+  }, [sdkLoading]);
   useEffect(() => {
     if (!isAuthenticated) {
       setUserId(undefined);
@@ -86,17 +108,25 @@ function LogtoBridge({ children }: { children: ReactNode }) {
   }, [isAuthenticated, getIdTokenClaims]);
   const value: Auth = useMemo(
     () => ({
-      isLoading: logto.isLoading,
-      isAuthenticated: logto.isAuthenticated,
+      isLoading: sdkLoading && !initialized,
+      isAuthenticated,
       userId,
-      signIn: () => logto.signIn(window.location.origin + CALLBACK_PATH),
+      signIn: () => signIn(window.location.origin + CALLBACK_PATH),
       signOut: async () => {
-        await logto.signOut(window.location.origin);
+        await signOut(window.location.origin);
       },
       getAccessToken: async () =>
-        (await logto.getAccessToken(API_RESOURCE)) ?? undefined,
+        (await getAccessToken(API_RESOURCE)) ?? undefined,
     }),
-    [logto, userId],
+    [
+      sdkLoading,
+      initialized,
+      isAuthenticated,
+      userId,
+      signIn,
+      signOut,
+      getAccessToken,
+    ],
   );
   return <AuthContextProvider value={value}>{children}</AuthContextProvider>;
 }

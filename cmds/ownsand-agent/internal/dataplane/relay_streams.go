@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 package dataplane
 
@@ -56,6 +56,19 @@ func (r *relay) onFrame(c *rconn, f *ownsandv1.DataFrame) {
 		r.mu.Unlock()
 		if st != nil {
 			// Releases the output subscription; the operation continues.
+			r.finishStream(st, nil)
+		}
+	case *ownsandv1.DataFrame_Error:
+		// The control plane ended the stream with an error frame (for example
+		// for a frame kind that it does not know). Like a stream close frame,
+		// it releases the output subscription and the operation continues. The
+		// agent sends nothing back, because the control plane already closed
+		// the stream, and does not mark the grant done, because the frame
+		// reports no outcome of the operation.
+		r.mu.Lock()
+		st := c.streams[f.GetStreamId()]
+		r.mu.Unlock()
+		if st != nil {
 			r.finishStream(st, nil)
 		}
 	case *ownsandv1.DataFrame_RelayWindowUpdate:
@@ -131,7 +144,6 @@ func (r *relay) openStream(c *rconn, f *ownsandv1.DataFrame, open *ownsandv1.Rel
 	c.streams[id] = st
 	c.credit += r.limits.StreamReceiveWindow
 	g.streams[st] = true
-	g.opened = true
 	r.mu.Unlock()
 	r.sendFrame(c, id, g.sandboxID, &ownsandv1.RelayWindowUpdate{IncrementBytes: recvWin.InitialWindow()})
 }
@@ -171,7 +183,13 @@ func (r *relay) request(c *rconn, f *ownsandv1.DataFrame) {
 			SandboxID: g.sandboxID,
 			Grant:     &ops.GrantCheck{Kind: g.kind, OperationID: g.opID, Digest: g.digest},
 			OnAccepted: func() {
-				r.sendFrame(c, st.id, g.sandboxID, &ownsandv1.RequestAccepted{})
+				// The dispatcher accepted a request under the grant: only now
+				// does the grant count as used (see grant.opened). The notice
+				// waits on the stream context, so a close frame ends the wait.
+				r.mu.Lock()
+				g.opened = true
+				r.mu.Unlock()
+				_ = c.enqueueCtx(st.ctx, datapath.MustNewFrame(st.id, g.sandboxID, &ownsandv1.RequestAccepted{}))
 			},
 		}, relaySink{st})
 		_, _ = st.recv.Release(datapath.FrameCost(f))
@@ -182,17 +200,16 @@ func (r *relay) request(c *rconn, f *ownsandv1.DataFrame) {
 type relaySink struct{ st *rstream }
 
 // Send sends payload frames only within the credit window that the control
-// plane granted for the stream.
+// plane granted for the stream. A wait for a free outbound slot ends with
+// ctx, so a stream close frame releases an operation that is blocked on a full
+// queue instead of letting it queue a frame for the closed stream later.
 func (k relaySink) Send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	if cost := datapath.FrameCost(f); cost > 0 {
 		if err := k.st.send.Consume(ctx, cost); err != nil {
 			return err
 		}
 	}
-	if ctx.Err() != nil {
-		return ctx.Err()
-	}
-	return k.st.conn.enqueue(f)
+	return k.st.conn.enqueueCtx(ctx, f)
 }
 
 // finishStream removes a stream. out is the operation outcome when the
@@ -220,7 +237,12 @@ func (r *relay) finishStream(st *rstream, out *ops.Outcome) {
 }
 
 // endGrantStreams ends every open stream of a grant with a session-end
-// frame.
+// frame. It never waits on the outbound queue: revoke and the grant
+// replacement run on the agent channel receive loop, and the deadline sweep
+// runs on the housekeeping goroutine, so a wait on a stalled writer would
+// block the agent channel or every grant sweep. A connection that cannot
+// take the terminal frame is closed instead, and the reconnect rules of the
+// relay loop apply.
 func (r *relay) endGrantStreams(g *grant, reason ownsandv1.SessionEndReason) {
 	r.mu.Lock()
 	streams := make([]*rstream, 0, len(g.streams))
@@ -229,9 +251,31 @@ func (r *relay) endGrantStreams(g *grant, reason ownsandv1.SessionEndReason) {
 	}
 	r.mu.Unlock()
 	for _, st := range streams {
-		r.sendFrame(st.conn, st.id, g.sandboxID, &ownsandv1.SessionEnd{Reason: reason})
+		r.sendSessionEnd(st, g, reason)
 		r.finishStream(st, nil)
 	}
+}
+
+// sendSessionEnd offers the session-end frame of a stream without waiting.
+// When the queue has no free slot, the connection is canceled: the caller
+// of the stream learns of the end from the closed connection, and
+// connClosed finishes the remaining streams of the connection. Streams
+// whose frame was queued keep their frame order; the fallback is logged
+// once per connection.
+func (r *relay) sendSessionEnd(st *rstream, g *grant, reason ownsandv1.SessionEndReason) {
+	c := st.conn
+	if c.ctx.Err() != nil {
+		// The connection is already closing; no frame can follow.
+		return
+	}
+	if c.tryEnqueue(datapath.MustNewFrame(st.id, g.sandboxID, &ownsandv1.SessionEnd{Reason: reason})) {
+		return
+	}
+	if c.queueFullLogged.CompareAndSwap(false, true) {
+		r.d.logger.Warn("relay outbound queue is full; closing the connection instead of queueing a session end",
+			"generation", c.gen, "termination_reason", reason.String(), "grant_id", g.id)
+	}
+	c.cancel()
 }
 
 // revoke ends a grant at once.

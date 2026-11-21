@@ -28,6 +28,8 @@ type FakeAgent struct {
 	HostOS       ownsandv1.HostOs
 	Arch         ownsandv1.Arch
 	Capabilities *ownsandv1.DeviceCapabilities
+	// AgentVersion is the running agent version reported at connect.
+	AgentVersion string
 	// OnCommand, when set, answers a command instead of the default
 	// behavior; returning nil sends no result.
 	OnCommand func(a *FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult
@@ -50,6 +52,14 @@ type FakeAgent struct {
 	changed   chan struct{}
 	closed    chan struct{}
 	closeErr  error
+	// noRevocationAck, when set, makes the read loop skip the revocation
+	// acknowledgement (see SetAckRevocations).
+	noRevocationAck bool
+	// readGate, when set, holds the read loop before its next receive.
+	readGate chan struct{}
+	// stallAfter, when set, arms readGate once the read loop received an
+	// envelope that it matches (see StallReadsAfter).
+	stallAfter func(*ownsandv1.AgentEnvelope) bool
 }
 
 // DefaultLinuxCapabilities reports a Linux host that runs Linux guests.
@@ -66,7 +76,8 @@ func (e *Env) NewFakeAgent(d *Device) *FakeAgent {
 	return &FakeAgent{
 		T: e.T, Env: e, Device: d,
 		HostOS: ownsandv1.HostOs_HOST_OS_LINUX, Arch: ownsandv1.Arch_ARCH_AMD64, Capabilities: DefaultLinuxCapabilities(),
-		sandboxes: map[string]*ownsandv1.SandboxStateEntry{}, snapshots: map[string]*ownsandv1.SnapshotStateEntry{},
+		AgentVersion: "1.0.0",
+		sandboxes:    map[string]*ownsandv1.SandboxStateEntry{}, snapshots: map[string]*ownsandv1.SnapshotStateEntry{},
 		changed: make(chan struct{}),
 	}
 }
@@ -85,7 +96,7 @@ func (a *FakeAgent) Connect() {
 	a.closed = make(chan struct{})
 	go a.read()
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CapabilityReport{CapabilityReport: &ownsandv1.CapabilityReport{
-		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: "1.0.0", Capabilities: a.Capabilities,
+		HostOs: a.HostOS, Arch: a.Arch, AgentVersion: a.AgentVersion, Capabilities: a.Capabilities,
 	}}})
 	a.SendStateReport()
 	a.Eventually("device online", func() bool { return a.Env.App.Service.Hub.Live(a.Device.ID) != nil })
@@ -131,6 +142,13 @@ func (a *FakeAgent) AddSnapshot(e *ownsandv1.SnapshotStateEntry) {
 	a.mu.Unlock()
 }
 
+// ForgetSnapshot removes a local snapshot, as after the agent lost the copy.
+func (a *FakeAgent) ForgetSnapshot(id string) {
+	a.mu.Lock()
+	delete(a.snapshots, id)
+	a.mu.Unlock()
+}
+
 // HasSnapshot reports whether the fake holds a local snapshot.
 func (a *FakeAgent) HasSnapshot(id string) bool {
 	a.mu.Lock()
@@ -154,9 +172,40 @@ func (a *FakeAgent) SendStateReport() {
 	a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_StateReport{StateReport: report}})
 }
 
+// StallReadsAfter stops the agent from reading its channel right after it
+// received the first envelope that match accepts, until ResumeReads or
+// Close. The read loop evaluates match under the agent lock and arms the
+// stall before it publishes the envelope, so a WaitFor for that envelope
+// returns only when the stall is in effect, however far the read loop was
+// in processing earlier envelopes. match must not call agent methods.
+func (a *FakeAgent) StallReadsAfter(match func(*ownsandv1.AgentEnvelope) bool) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.stallAfter = match
+}
+
+// ResumeReads lets a stalled agent read its channel again.
+func (a *FakeAgent) ResumeReads() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.readGate != nil {
+		close(a.readGate)
+		a.readGate = nil
+	}
+}
+
 func (a *FakeAgent) read() {
 	defer close(a.closed)
 	for {
+		a.mu.Lock()
+		gate := a.readGate
+		a.mu.Unlock()
+		if gate != nil {
+			select {
+			case <-gate:
+			case <-a.ctx.Done():
+			}
+		}
 		resp, err := a.stream.Receive()
 		if err != nil {
 			a.mu.Lock()
@@ -167,6 +216,12 @@ func (a *FakeAgent) read() {
 		env := resp.GetEnvelope()
 		a.mu.Lock()
 		a.received = append(a.received, env)
+		if a.stallAfter != nil && a.stallAfter(env) {
+			a.stallAfter = nil
+			if a.readGate == nil {
+				a.readGate = make(chan struct{})
+			}
+		}
 		ch := a.changed
 		a.changed = make(chan struct{})
 		a.mu.Unlock()
@@ -180,10 +235,24 @@ func (a *FakeAgent) read() {
 		if o := env.GetSignaling().GetOffer(); o != nil {
 			go a.answerOffer(o)
 		}
-		if r := env.GetSessionRevocation(); r != nil {
+		if r := env.GetSessionRevocation(); r != nil && !a.skipsRevocationAck() {
 			go a.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RevocationAck{RevocationAck: &ownsandv1.RevocationAck{RevocationId: r.GetRevocationId()}}})
 		}
 	}
+}
+
+// SetAckRevocations sets whether the agent acknowledges a session revocation
+// (the default) or stays silent, like an agent that never answers.
+func (a *FakeAgent) SetAckRevocations(ack bool) {
+	a.mu.Lock()
+	a.noRevocationAck = !ack
+	a.mu.Unlock()
+}
+
+func (a *FakeAgent) skipsRevocationAck() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.noRevocationAck
 }
 
 // SetOnGrant replaces the relay grant hook while the agent runs.
@@ -340,7 +409,7 @@ func (a *FakeAgent) DefaultAnswer(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentC
 		delete(a.snapshots, c.DeleteSnapshot.GetSnapshotId())
 		a.mu.Unlock()
 		return &ownsandv1.AgentCommandResult{}
-	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent:
+	case *ownsandv1.AgentCommand_CleanUp, *ownsandv1.AgentCommand_UpdateAgent, *ownsandv1.AgentCommand_WithdrawAgentUpdate:
 		return &ownsandv1.AgentCommandResult{}
 	}
 	return &ownsandv1.AgentCommandResult{Error: &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_UNIMPLEMENTED, Message: "unknown command"}}

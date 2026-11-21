@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
-	"sync"
 	"time"
 
 	"connectrpc.com/connect"
@@ -58,7 +57,9 @@ type Limits struct {
 	// key validations per key prefix.
 	PerPrefix *ratelimit.Limiter
 	// PerClient limits the same RPCs per client address when a trusted
-	// client address is known.
+	// client address is known. It holds one bucket per address, keyed by the
+	// bare address, that the device RPCs, AcceptInvitation and failed API key
+	// validations share.
 	PerClient *ratelimit.Limiter
 }
 
@@ -106,12 +107,22 @@ type Service struct {
 	DataPath DataPathHooks
 
 	watch    sandboxWatch
-	commands sync.Map // command ID -> commandInfo
+	commands commandStore // pending commands by command ID
+	// imports holds the snapshot imports that importThenCreate waits for;
+	// only a channel with an entry gets download URLs for that snapshot.
+	imports activeImports
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.
 type LeaseHolder interface {
 	Held() bool
+	// WhileHeld runs fn only while the instance holds the lease, with the
+	// ownership lock held, and reports whether it ran. The transition that
+	// clears ownership takes the same lock before it closes the agent
+	// channels, so a channel registered in fn is either closed by that
+	// transition or never registered. fn must do no I/O and must not call
+	// the lease.
+	WhileHeld(fn func()) bool
 }
 
 // DataPathHooks receives the data path parts of the agent channel.
@@ -121,6 +132,8 @@ type DataPathHooks interface {
 	HandleEnvelope(ctx context.Context, conn *hub.Conn, env *ownsandv1.AgentEnvelope) bool
 	// HandleEvent applies a revocation event.
 	HandleEvent(ctx context.Context, e events.Event)
+	// SweepExpired deletes the pending revocations that ended.
+	SweepExpired(ctx context.Context)
 }
 
 // Timing holds the durations of the agent channel rules.
@@ -139,6 +152,24 @@ type Timing struct {
 	CleanupPoll time.Duration
 	// ImportWait bounds a snapshot import before the create.
 	ImportWait time.Duration
+	// CommandGrace is how long the server keeps the record of a command
+	// whose channel closed before it was answered (2 minutes); zero means
+	// the default. The sweep that removes expired records runs every
+	// OfflineSweep.
+	CommandGrace time.Duration
+	// WriterDrainTimeout bounds the wait for the channel writer after a
+	// channel closed; a writer that is still blocked in a send after it
+	// loses its transport write (5 seconds); zero means the default.
+	WriterDrainTimeout time.Duration
+	// ExportApplyRetryWindow bounds how long the channel read loop retries
+	// to apply an export result after a transient database error (15
+	// seconds, below the heartbeat timeout because the loop reads no
+	// heartbeat meanwhile); zero means the default.
+	ExportApplyRetryWindow time.Duration
+	// ExportApplyRetryBackoff is the first wait between two attempts to
+	// apply an export result (250 milliseconds); it doubles up to 2 seconds;
+	// zero means the default.
+	ExportApplyRetryBackoff time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -150,8 +181,36 @@ func DefaultTiming() Timing {
 		OfflineSweep:     5 * time.Second,
 		CleanupPoll:      30 * time.Second,
 		ImportWait:       2 * time.Hour,
+		CommandGrace:     DefaultCommandGrace,
+
+		WriterDrainTimeout: DefaultWriterDrainTimeout,
+
+		ExportApplyRetryWindow:  DefaultExportApplyRetryWindow,
+		ExportApplyRetryBackoff: DefaultExportApplyRetryBackoff,
 	}
 }
+
+// writerDrainTimeout returns the wait for the channel writer after a channel
+// closed.
+func (s *Service) writerDrainTimeout() time.Duration {
+	if s.Timing.WriterDrainTimeout > 0 {
+		return s.Timing.WriterDrainTimeout
+	}
+	return DefaultWriterDrainTimeout
+}
+
+// commandGrace returns the retention window of unanswered commands whose
+// channel closed.
+func (s *Service) commandGrace() time.Duration {
+	if s.Timing.CommandGrace > 0 {
+		return s.Timing.CommandGrace
+	}
+	return DefaultCommandGrace
+}
+
+// PendingCommands returns the number of command records that wait for a
+// result, including the records that started to expire (tests).
+func (s *Service) PendingCommands() int { return s.commands.len() }
 
 func (s *Service) notify() {
 	if s.Notify != nil {
@@ -246,6 +305,27 @@ func validateID(field, value string) error {
 	return nil
 }
 
+// normalizeID validates a required UUID v7 field like validateID and returns
+// its lowercase canonical text. The API accepts either hex case, but identity
+// comparisons and rate-limit keys must use the value, not its spelling.
+func normalizeID(field, value string) (string, error) {
+	if err := validateID(field, value); err != nil {
+		return "", err
+	}
+	id, err := uuidv7.Parse(value)
+	if err != nil {
+		return "", errInvalid(err)
+	}
+	return id.String(), nil
+}
+
+// canonicalID returns the lowercase text form of a UUID that validateID or
+// validate.UUIDv7 already accepted. Use normalizeID when the value is not
+// validated yet.
+func canonicalID(value string) string {
+	return strings.ToLower(value)
+}
+
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without
 // control characters.
 func validateName(field, name string) error {
@@ -281,7 +361,8 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 	if err != nil {
 		return p, 0, err
 	}
-	if err := validateID("organization_id", orgID); err != nil {
+	orgID, err = normalizeID("organization_id", orgID)
+	if err != nil {
 		return p, 0, err
 	}
 	setRPCOrganization(ctx, orgID)

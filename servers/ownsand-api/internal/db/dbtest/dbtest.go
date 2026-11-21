@@ -38,6 +38,19 @@ func URL(t testing.TB) string {
 // URL. The database is dropped when the test ends.
 func NewURL(t testing.TB) string {
 	t.Helper()
+	return newURL(t, 0)
+}
+
+// NewURLAtVersion is like NewURL but applies only the migrations up to and
+// including maxVersion, so an upgrade test can insert legacy data and then
+// apply the later migrations with db.MigrateUpTo or db.Migrate.
+func NewURLAtVersion(t testing.TB, maxVersion int) string {
+	t.Helper()
+	return newURL(t, maxVersion)
+}
+
+func newURL(t testing.TB, maxVersion int) string {
+	t.Helper()
 	admin := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -72,7 +85,7 @@ func NewURL(t testing.TB) string {
 		t.Fatalf("open test database: %v", err)
 	}
 	defer d.Close()
-	if err := d.Migrate(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil))); err != nil {
+	if err := d.MigrateUpTo(ctx, slog.New(slog.NewJSONHandler(io.Discard, nil)), maxVersion); err != nil {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
