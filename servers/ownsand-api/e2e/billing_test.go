@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -65,6 +66,60 @@ func (l *logSink) hasLogMessage(name, msg string) bool {
 		}
 	}
 	return false
+}
+
+const (
+	// logWaitBudget bounds how long requireLogMessages waits for the log
+	// records of a child process. The scanner goroutine of the logSink stores
+	// a record some time after the process wrote it, so a test that checks
+	// right after its functional checks must wait for the record.
+	logWaitBudget = 10 * time.Second
+	// logWaitInterval is the polling interval of waitForLogMessages.
+	logWaitInterval = 25 * time.Millisecond
+)
+
+// waitForLogMessages polls until the process name logged a JSON record for
+// every message in msgs, for at most budget or until ctx ends. It returns the
+// messages that are still missing, in the order of msgs; the result is empty
+// when all of them arrived.
+func (l *logSink) waitForLogMessages(ctx context.Context, name string, budget time.Duration, msgs ...string) []string {
+	ctx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	ticker := time.NewTicker(logWaitInterval)
+	defer ticker.Stop()
+	for {
+		var missing []string
+		for _, msg := range msgs {
+			if !l.hasLogMessage(name, msg) {
+				missing = append(missing, msg)
+			}
+		}
+		if len(missing) == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			// One last check: a record may have arrived with the end.
+			missing = missing[:0]
+			for _, msg := range msgs {
+				if !l.hasLogMessage(name, msg) {
+					missing = append(missing, msg)
+				}
+			}
+			return missing
+		case <-ticker.C:
+		}
+	}
+}
+
+// requireLogMessages fails the test when the process name did not log every
+// message in msgs within logWaitBudget of the test context ctx. The failure
+// names the missing messages.
+func (l *logSink) requireLogMessages(ctx context.Context, t *testing.T, name string, msgs ...string) {
+	t.Helper()
+	if missing := l.waitForLogMessages(ctx, name, logWaitBudget, msgs...); len(missing) > 0 {
+		t.Fatalf("the %s process did not log %q within %s", name, missing, logWaitBudget)
+	}
 }
 
 // TestBillingBlockSuspendRecover runs the billing phases against the real
@@ -185,7 +240,6 @@ func TestBillingBlockSuspendRecover(t *testing.T) {
 	if _, _, linked := s.accounts.Link(s.orgID); linked {
 		t.Fatal("the fake delino-accounts still has the link")
 	}
-	if !s.logs.hasLogMessage("api", "billing_sandbox_resumed") || !s.logs.hasLogMessage("api", "billing_sandbox_paused") {
-		t.Fatal("the control plane did not log the billing pause and resume")
-	}
+	// The log scanner stores the records asynchronously, so wait for them.
+	s.logs.requireLogMessages(ctx, t, "api", "billing_sandbox_paused", "billing_sandbox_resumed")
 }
