@@ -291,6 +291,109 @@ func TestLinkKeepsEarlierBlockStart(t *testing.T) {
 	}
 }
 
+// removeLink removes the link of the organization like removeBillingLinkTx
+// does for TransferOwnership and DeleteOrganization, and commits the change
+// through Committed. It returns the former billing account ID.
+func (f *statusFixture) removeLink(t *testing.T, org, source string) string {
+	t.Helper()
+	ctx := context.Background()
+	var former string
+	var change billing.Change
+	if err := f.db.InTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		_, former, change, err = billing.UnlinkTx(ctx, tx, org, source, f.clock.Now())
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.statuses.Committed(ctx, change)
+	return former
+}
+
+// TestLinkRemovalIsLogged checks that every removal of a link writes one
+// billing_status_changed record and runs the change hooks once, also when
+// the phase stays BLOCKED or SUSPENDED, and that an organization without a
+// link logs nothing and runs no hook.
+func TestLinkRemovalIsLogged(t *testing.T) {
+	cases := []struct {
+		name    string
+		source  string
+		status  accountsv1.BillingStatus
+		phase   string
+		allowed bool
+	}{
+		{name: "blocked transfer", source: billing.SourceTransfer, status: accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, phase: "blocked"},
+		{name: "blocked delete", source: billing.SourceDelete, status: accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, phase: "blocked"},
+		{name: "suspended transfer", source: billing.SourceTransfer, status: accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED, phase: "suspended"},
+		{name: "suspended delete", source: billing.SourceDelete, status: accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED, phase: "suspended"},
+		{name: "allowed transfer", source: billing.SourceTransfer, status: accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, phase: "allowed", allowed: true},
+		{name: "allowed delete", source: billing.SourceDelete, status: accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, phase: "allowed", allowed: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t0 := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
+			f := newStatusFixture(t, t0)
+			f.addOrg(t, org1)
+			// A linked organization keeps the earlier block start of its
+			// non-payment, so it is SUSPENDED when the link comes 3 days after
+			// the creation of the organization.
+			f.clock.Advance(time.Hour)
+			if tc.status == accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED {
+				f.clock.Advance(3 * 24 * time.Hour)
+			}
+			if tc.status != accountsv1.BillingStatus_BILLING_STATUS_ALLOWED {
+				f.fake.SetAccountStatus(accountA, tc.status, f.clock.Now())
+			}
+			f.link(t, org1, accountA)
+			if got := f.load(t, org1).Confirmed(f.clock.Now()); billing.PhaseName(got) != tc.phase {
+				t.Fatalf("linked phase = %v, want %s", got, tc.phase)
+			}
+
+			// Count the records and hooks of the removal only.
+			var hooks int
+			f.statuses.OnChange(func() { hooks++ })
+			logsBefore := f.logText()
+			f.clock.Advance(time.Minute)
+			if former := f.removeLink(t, org1, tc.source); former != accountA {
+				t.Fatalf("former billing account = %q", former)
+			}
+			logs := strings.TrimPrefix(f.logText(), logsBefore)
+			if got := strings.Count(logs, `"msg":"billing_status_changed"`); got != 1 {
+				t.Fatalf("%d billing_status_changed records, want 1: %s", got, logs)
+			}
+			for _, want := range []string{
+				`"source":"` + tc.source + `"`, `"organization_id":"` + org1 + `"`, `"billing_account_id":"` + accountA + `"`,
+				`"from_phase":"` + tc.phase + `"`, `"linked":false`,
+			} {
+				if !strings.Contains(logs, want) {
+					t.Fatalf("record lacks %s: %s", want, logs)
+				}
+			}
+			// An ALLOWED organization becomes BLOCKED; the others keep their phase.
+			wantTo := tc.phase
+			if tc.allowed {
+				wantTo = "blocked"
+			}
+			if !strings.Contains(logs, `"to_phase":"`+wantTo+`"`) {
+				t.Fatalf("record lacks to_phase %s: %s", wantTo, logs)
+			}
+			if hooks != 1 {
+				t.Fatalf("change hooks ran %d times, want 1", hooks)
+			}
+
+			// A second removal finds no link: no record and no hook.
+			f.clock.Advance(time.Minute)
+			logsBefore = f.logText()
+			if former := f.removeLink(t, org1, tc.source); former != "" {
+				t.Fatalf("former billing account after removal = %q", former)
+			}
+			if got := f.logText(); got != logsBefore || hooks != 1 {
+				t.Fatalf("removal without a link logged %q, hooks = %d", strings.TrimPrefix(got, logsBefore), hooks)
+			}
+		})
+	}
+}
+
 // TestPendingUnlinkRetries checks that a pending unlink is retried with
 // back-off until delino-accounts accepts it.
 func TestPendingUnlinkRetries(t *testing.T) {

@@ -225,9 +225,16 @@ type Change struct {
 	Source string
 }
 
-// Changed reports whether the phase or the link changed.
+// Changed reports whether the phase or the link changed. Every removal of a
+// link counts, whatever its source (unlink, transfer or delete): a removal
+// from BLOCKED or SUSPENDED keeps the phase, but the organization loses its
+// billing account, so it is logged and runs the change hooks.
 func (c Change) Changed() bool {
-	return c.From != c.To || c.Source == SourceLink || c.Source == SourceUnlink
+	switch c.Source {
+	case SourceLink, SourceUnlink, SourceTransfer, SourceDelete:
+		return true
+	}
+	return c.From != c.To
 }
 
 // Sources of a status change.
