@@ -303,14 +303,27 @@ func TestCursorWindowsNeedsGitBash(t *testing.T) {
 }
 
 // TestCursorOrganizationDeletion: deleting the organization stops the
-// watch and fails the queued request's turn while the key still exists.
+// watch and fails the queued request's turn while the key still exists; a
+// failed release stops the deletion.
 func TestCursorOrganizationDeletion(t *testing.T) {
 	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	w.cursor.AddRequest("bc-org", true)
-	w.requestBySource(t, "bc-org")
+	req := w.requestBySource(t, "bc-org")
+	// A release that fails stops the deletion and keeps the claim.
+	w.cursor.FailClaimCalls(true)
+	if _, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(context.Background(), connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); err == nil {
+		t.Fatal("the deletion went on after a failed release")
+	}
+	if c, err := w.l.Agents.Claim(context.Background(), req.GetRequestId()); err != nil || c.State != agent.ClaimHeld {
+		t.Fatalf("claim %+v %v", c, err)
+	}
+	if _, ok := w.cursor.Claim("bc-org"); !ok {
+		t.Fatal("the vendor claim is gone")
+	}
+	w.cursor.FailClaimCalls(false)
 	if _, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(context.Background(), connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); err != nil {
 		t.Fatal(err)
 	}

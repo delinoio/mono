@@ -47,6 +47,8 @@ type Fake struct {
 	nextID   int
 	lists    int
 	auth     []string
+	// failClaimCalls makes release and fail answer 503.
+	failClaimCalls bool
 }
 
 // New starts a fake for a pool with one service account key.
@@ -129,6 +131,10 @@ func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
 		id, action, _ := strings.Cut(rest, "/")
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if f.failClaimCalls {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "unavailable"})
+			return
+		}
 		worker, ok := f.claims[id]
 		if !ok {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no live claim"})
@@ -322,6 +328,13 @@ func (f *Fake) Disconnect(workerID string) {
 			delete(f.claims, id)
 		}
 	}
+}
+
+// FailClaimCalls makes release and fail answer 503 while on is true.
+func (f *Fake) FailClaimCalls(on bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failClaimCalls = on
 }
 
 // AuthHeaders returns every Authorization header that the fake received.

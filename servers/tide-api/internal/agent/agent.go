@@ -359,7 +359,10 @@ func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Reques
 // prepareOrgDeletion stops the watchers of the organization and releases
 // the claims of its queued requests while the credentials still exist. The
 // work layer's hook (registered earlier) already deleted the runners, which
-// released the claims of their requests.
+// released the claims of their requests. A release that the vendor does not
+// confirm fails the step, which stops the deletion and keeps the
+// credentials and the claim for a retry: after the deletion, no poller can
+// release it.
 func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion) error {
 	h.mu.Lock()
 	h.stopped[d.OrganizationID] = true
@@ -378,12 +381,18 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 	if err != nil {
 		return err
 	}
+	var errs []error
 	for _, hc := range claims {
-		if _, err := h.releaseClaim(ctx, hc.claim, hc.req); err != nil {
+		done, err := h.releaseClaim(ctx, hc.claim, hc.req)
+		if err == nil && !done {
+			err = errors.New("the vendor did not confirm the release")
+		}
+		if err != nil {
 			h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", d.OrganizationID), slog.String("request_id", hc.claim.RequestID), slog.Any("error", err))
+			errs = append(errs, fmt.Errorf("release the vendor claim of request %s: %w", hc.claim.RequestID, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (h *Hub) resumeOrg(orgID string) {
