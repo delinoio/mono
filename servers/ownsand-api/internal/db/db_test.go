@@ -672,3 +672,64 @@ func TestLinkAttemptMigrationKeepsPendingUnlinks(t *testing.T) {
 		t.Fatal("a call deadline without an attempt ID was accepted")
 	}
 }
+
+// sandboxTTLMigration is the version of 0011_sandbox_ttl_nanoseconds.sql.
+const sandboxTTLMigration = 11
+
+// TestSandboxTTLMigrationKeepsMillisecondRows upgrades a database at the
+// schema of migration 0010 that holds a sandbox with millisecond TTLs, and
+// checks that the row keeps its values (the nanosecond columns are NULL, so
+// readers use COALESCE(ns, ms * 1000000)), that the previous release's
+// column list still inserts rows, and that a row can carry both columns.
+func TestSandboxTTLMigrationKeepsMillisecondRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, sandboxTTLMigration-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const org = "018f0000-0000-7000-8000-0000000000d1"
+	const device = "018f0000-0000-7000-8000-0000000000d2"
+	if _, err := d.Pool.Exec(ctx, "INSERT INTO organizations (organization_id, name, create_time) VALUES ($1, 'org', now())", org); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, insertInventoryDevice, device, org, int16(1)); err != nil {
+		t.Fatal(err)
+	}
+	const oldInsert = `INSERT INTO sandboxes (sandbox_id, organization_id, device_id, agent_state, vcpu_count, memory_mib, disk_gib,
+		guest_os, host_os, arch, network_mode, idle_ttl_ms, max_ttl_ms, max_deadline, created_by_kind, created_by_id, create_time)
+		VALUES ($1, $2, $3, 2, 1, 512, 1, 1, 1, 1, 1, 90000, 3600500, now() + interval '1 hour', 1, 'alice', now())`
+	const before, after = "018f0000-0000-7000-8000-0000000000e1", "018f0000-0000-7000-8000-0000000000e2"
+	if _, err := d.Pool.Exec(ctx, oldInsert, before, org, device); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	// The previous release keeps serving during a rolling deployment.
+	if _, err := d.Pool.Exec(ctx, oldInsert, after, org, device); err != nil {
+		t.Fatalf("insert with the previous column list: %v", err)
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE sandboxes SET idle_ttl_ns = 1500007, max_ttl_ns = 3600500000001 WHERE sandbox_id = $1", after); err != nil {
+		t.Fatalf("store exact TTLs: %v", err)
+	}
+	const read = `SELECT COALESCE(idle_ttl_ns, idle_ttl_ms * 1000000), COALESCE(max_ttl_ns, max_ttl_ms * 1000000), idle_ttl_ns IS NULL
+		FROM sandboxes WHERE sandbox_id = $1`
+	for _, tc := range []struct {
+		id        string
+		idle, max int64
+		legacy    bool
+	}{
+		{before, 90_000_000_000, 3_600_500_000_000, true},
+		{after, 1_500_007, 3_600_500_000_001, false},
+	} {
+		var idle, maxTTL int64
+		var legacy bool
+		if err := d.Pool.QueryRow(ctx, read, tc.id).Scan(&idle, &maxTTL, &legacy); err != nil {
+			t.Fatal(err)
+		}
+		if idle != tc.idle || maxTTL != tc.max || legacy != tc.legacy {
+			t.Fatalf("sandbox %s = %d %d legacy=%v, want %d %d legacy=%v", tc.id, idle, maxTTL, legacy, tc.idle, tc.max, tc.legacy)
+		}
+	}
+}
