@@ -323,26 +323,59 @@ type SummaryKey struct {
 // account in windows that start in [from, to), after the key (from the
 // start when nil), and the total amount of every row of the period. The
 // total and the sums of the rows saturate at math.MaxInt64.
+//
+// One statement computes the total and the page, so both come from the same
+// snapshot of committed reports even when q is a pool: separate statements
+// would each take their own snapshot, and a report committed between them
+// would show in one but not the other. The total is the root of a LEFT JOIN
+// to the page, so a page without rows (an empty period or a page after the
+// last row) still returns the total, with NULL row columns.
 func UsageSummary(ctx context.Context, q db.Querier, accountID string, from, to time.Time, after *SummaryKey, limit int) ([]SummaryRow, int64, error) {
-	var total int64
-	if err := q.QueryRow(ctx, `SELECT `+saturatedSum("amount_usd_micros")+` FROM usage_reports
-		WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3`, accountID, from, to).Scan(&total); err != nil {
-		return nil, 0, err
-	}
 	var k SummaryKey
 	if after != nil {
 		k = *after
 	}
-	rows, err := q.Query(ctx, `SELECT service, organization_id, meter, `+saturatedSum("quantity")+`, `+saturatedSum("amount_usd_micros")+`
-		FROM usage_reports
-		WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3
-			AND ($4 = false OR (service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C") > ($5, $6, $7))
-		GROUP BY service, organization_id, meter
-		ORDER BY service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C"
-		LIMIT $8`, accountID, from, to, after != nil, k.Service, k.OrganizationID, k.Meter, limit)
+	rows, err := q.Query(ctx, `WITH base AS NOT MATERIALIZED (
+			SELECT service, organization_id, meter, quantity, amount_usd_micros FROM usage_reports
+			WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3
+		), tot AS (
+			SELECT `+saturatedSum("amount_usd_micros")+` AS total FROM base
+		), page AS (
+			SELECT service, organization_id, meter, `+saturatedSum("quantity")+` AS quantity, `+saturatedSum("amount_usd_micros")+` AS amount
+			FROM base
+			WHERE ($4 = false OR (service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C") > ($5, $6, $7))
+			GROUP BY service, organization_id, meter
+			ORDER BY service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C"
+			LIMIT $8
+		)
+		SELECT tot.total, page.service, page.organization_id, page.meter, page.quantity, page.amount
+		FROM tot LEFT JOIN page ON true
+		ORDER BY page.service COLLATE "C", page.organization_id COLLATE "C", page.meter COLLATE "C"`,
+		accountID, from, to, after != nil, k.Service, k.OrganizationID, k.Meter, limit)
 	if err != nil {
 		return nil, 0, err
 	}
-	out, err := pgx.CollectRows(rows, pgx.RowToStructByPos[SummaryRow])
-	return out, total, err
+	defer rows.Close()
+	var (
+		total int64
+		out   = []SummaryRow{}
+	)
+	for rows.Next() {
+		var (
+			service, organizationID, meter *string
+			quantity, amount               *int64
+		)
+		if err := rows.Scan(&total, &service, &organizationID, &meter, &quantity, &amount); err != nil {
+			return nil, 0, err
+		}
+		if service == nil {
+			// No row on the page: this row only carries the total.
+			continue
+		}
+		out = append(out, SummaryRow{Service: *service, OrganizationID: *organizationID, Meter: *meter, Quantity: *quantity, Amount: *amount})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
 }
