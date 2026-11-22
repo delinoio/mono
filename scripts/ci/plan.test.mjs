@@ -1511,7 +1511,7 @@ test("CI workflow runs each Rust check in its own job", () => {
 
 // Read-only text check: each Go check runs in its own job. Only the test job
 // starts Postgres and installs the workspace dependencies that the OwnSand
-// end-to-end suite needs, and only it saves the `go.sum` Go cache.
+// end-to-end suite needs, and only it uses the Linux `go.sum` Go cache.
 test("CI workflow runs each Go check in its own job", () => {
   const jobs = workflowJobs();
   const fmtJob = jobs.get("go-fmt");
@@ -1522,12 +1522,43 @@ test("CI workflow runs each Go check in its own job", () => {
   assert.match(vetJob, /^\s+cache: false$/m);
   const testJob = jobs.get("go-test");
   assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
-  assert.match(testJob, /^\s+cache: true$/m);
+  assert.match(testJob, /^\s+cache: false$/m);
+  assert.match(testJob, /prefix="go-test-\$RUNNER_OS-/);
   assert.match(testJob, /^ {4}services:\n {6}postgres:$/m);
   assert.match(testJob, /^\s+OWNSAND_E2E: "1"$/m);
   assert.match(testJob, /pnpm install --frozen-lockfile --ignore-scripts/);
   for (const job of [fmtJob, vetJob]) {
     assert.doesNotMatch(job, /services:|go test|pnpm install/);
+  }
+});
+
+// Read-only text check: setup-go saves its cache from every ref, so no job
+// enables it. Each job that uses the Go cache restores it in every run and
+// saves it only on main, like the Rust jobs, so pull requests do not save
+// entries that evict the main caches.
+test("CI workflow saves the Go cache only on main", () => {
+  const jobs = workflowJobs();
+  for (const [name, job] of jobs) {
+    if (job.includes("actions/setup-go@")) {
+      assert.doesNotMatch(job, /^\s+cache: true$/m, name);
+    }
+  }
+  for (const name of ["go-test", "protos", "go-platforms"]) {
+    const job = jobs.get(name);
+    assert.match(job, /actions\/cache\/restore@[0-9a-f]{40} # v/, name);
+    assert.match(job, /^\s+go env GOCACHE GOMODCACHE$/m, name);
+    const save = job.indexOf("actions/cache/save@");
+    assert.notEqual(save, -1, name);
+    assert.match(job, /actions\/cache\/save@[0-9a-f]{40} # v/, name);
+    const condition = job
+      .slice(0, save)
+      .match(/^\s+if: (.*)$/gm)
+      .at(-1);
+    assert.match(
+      condition,
+      /if: github\.ref == 'refs\/heads\/main' && steps\.go-cache\.outputs\.cache-hit != 'true'$/,
+      name,
+    );
   }
 });
 
