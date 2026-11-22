@@ -10,6 +10,7 @@ package layers
 import (
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent/claude"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/cursor"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/devin"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
@@ -43,6 +44,9 @@ type Options struct {
 	Cursor cursor.Options
 	// Devin configures the Devin vendor (API origin, release grace).
 	Devin devin.Options
+	// Claude configures the Claude Code vendor (binaries, orchestrator
+	// process starter, expected spawn time).
+	Claude claude.Options
 	// CodexGuestOSes replaces the verified guest OSes of OPENAI_CODEX
 	// runner profiles (profile.VerifiedCodexGuestOSes). Only the
 	// in-process tests and an acceptance run set it; see the OpenAI Codex
@@ -62,6 +66,7 @@ type Layers struct {
 	Agents       *agent.Hub
 	Cursor       *cursor.Vendor
 	Devin        *devin.Vendor
+	Claude       *claude.Vendor
 }
 
 // Extensions returns the extensions; New fills out while it wires the app.
@@ -92,6 +97,7 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 			out.Agents = agent.Register(r, out.Engine, out.Integrations, opts.AgentTiming)
 			out.Cursor = cursor.Register(out.Agents, opts.Cursor)
 			out.Devin = devin.Register(out.Agents, opts.Devin)
+			out.Claude = claude.Register(out.Agents, opts.Claude)
 			return nil
 		},
 	}
