@@ -11,6 +11,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -361,7 +362,15 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 	if req != nil {
 		r.PoolKey = req.PoolKey
 	}
-	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+	// The request is stored with the runner, so every retry sends the same
+	// parameters with the key.
+	sreq := sandboxRequest(p, r)
+	createReq, err := proto.MarshalOptions{Deterministic: true}.Marshal(sreq)
+	if err != nil {
+		e.svc.Logger.WarnContext(ctx, "dispatch_create_runner_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
+		return createFailed
+	}
+	err = e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, p.OrganizationID); err != nil {
 			return err
 		}
@@ -391,9 +400,9 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		}
 		now := e.svc.NowUTC()
 		created, err := scanRunner(tx.QueryRow(ctx, `INSERT INTO runners (runner_id, organization_id, runner_profile_id, kind, guest_os, state, request_id, pool_key,
-			idempotency_key, workspace_path, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11) RETURNING `+runnerColumns,
+			idempotency_key, create_request, workspace_path, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12) RETURNING `+runnerColumns,
 			r.ID, r.OrganizationID, r.ProfileID, int16(r.Kind), int16(r.GuestOS), int16(runCreating), nullable(r.RequestID), nullable(r.PoolKey),
-			r.IdempotencyKey, r.WorkspacePath, now))
+			r.IdempotencyKey, createReq, r.WorkspacePath, now))
 		if err != nil {
 			return err
 		}
@@ -408,8 +417,22 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		e.svc.Logger.WarnContext(ctx, "dispatch_create_runner_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
 		return createFailed
 	}
-	sb, err := client.CreateSandbox(ctx, sandboxRequest(p, r))
+	sb, err := client.CreateSandbox(ctx, sreq)
 	return e.applyCreate(ctx, r, sb, err)
+}
+
+// storedCreateRequest returns the CreateSandbox request that the runner was
+// created with.
+func (e *Engine) storedCreateRequest(ctx context.Context, runnerID string) (*ownsandv1.CreateSandboxRequest, error) {
+	var raw []byte
+	if err := e.svc.DB.Pool.QueryRow(ctx, "SELECT create_request FROM runners WHERE runner_id = $1", runnerID).Scan(&raw); err != nil {
+		return nil, err
+	}
+	req := &ownsandv1.CreateSandboxRequest{}
+	if err := proto.Unmarshal(raw, req); err != nil {
+		return nil, err
+	}
+	return req, nil
 }
 
 var errSkip = errors.New("skip")

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -334,5 +335,30 @@ func TestConcurrentCancelRequest(t *testing.T) {
 	}
 	if countAudit(t, w.env, w.org.ID, tidev1.AuditAction_AUDIT_ACTION_REQUEST_CANCELED) != 1 {
 		t.Fatal("audit events")
+	}
+}
+
+// TestCreateRetryAfterProfileChange: when the CreateSandbox response is
+// lost and an admin then changes the profile, the retry sends the original
+// parameters with the key and recovers the created sandbox.
+func TestCreateRetryAfterProfileChange(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateResponseError = connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
+	})
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	eventually(t, "a sandbox with a lost response", func() bool { return len(w.fake.Sandboxes(w.osOrg)) == 1 })
+	if _, err := w.env.User(w.org.Admin).Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{OrganizationId: w.org.ID,
+		RunnerProfileId: profileID, Profile: &tidev1.RunnerProfile{Resources: &tidev1.Resources{VcpuCount: 4, MemoryMib: 4096, DiskGib: 20}},
+		UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"resources"}}})); err != nil {
+		t.Fatal(err)
+	}
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateResponseError = nil })
+	s = w.waitState(t, s.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	sandboxes := w.fake.Sandboxes(w.osOrg)
+	if len(sandboxes) != 1 || w.runner(t, s.GetRunnerId()).GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() || sandboxes[0].GetResources().GetVcpuCount() != 2 {
+		t.Fatalf("sandboxes %v", sandboxes)
 	}
 }

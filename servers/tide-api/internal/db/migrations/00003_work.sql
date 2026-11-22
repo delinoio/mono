@@ -79,6 +79,11 @@ CREATE TABLE runners (
     -- Stored before CreateSandbox, so a retry after a lost response does
     -- not create a second sandbox.
     idempotency_key uuid NOT NULL UNIQUE,
+    -- The CreateSandbox request (protobuf encoding) that the first call
+    -- sent with the key. Every retry sends it unchanged, because OwnSand
+    -- binds the key to the request parameters and a later profile change
+    -- would fail the retry with already_exists.
+    create_request bytea NOT NULL,
     ownsand_sandbox_id uuid,
     ownsand_device_id text NOT NULL DEFAULT '',
     ownsand_end_reason text NOT NULL DEFAULT '',

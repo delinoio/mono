@@ -188,16 +188,19 @@ func (e *Engine) orphaned(ctx context.Context, r *Runner) bool {
 	return true
 }
 
-// stepCreating creates the sandbox (again with the stored key when the
-// response was lost) and waits for RUNNING.
+// stepCreating creates the sandbox (again with the stored request and key
+// when the response was lost) and waits for RUNNING.
 func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, r *Runner) time.Duration {
 	if r.SandboxID == "" {
-		p, err := e.profiles.Get(ctx, e.svc.DB.Pool, r.OrganizationID, r.ProfileID)
+		// The stored request, not the profile as it is now: OwnSand rejects
+		// the key with other parameters, and a deleted profile must not
+		// leave a created sandbox behind.
+		req, err := e.storedCreateRequest(ctx, r.ID)
 		if err != nil {
-			e.startFailed(ctx, r.ID, "profile_deleted")
-			return 0
+			e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+			return e.timing.SandboxPoll
 		}
-		sb, err := client.CreateSandbox(ctx, sandboxRequest(p, r))
+		sb, err := client.CreateSandbox(ctx, req)
 		switch e.applyCreate(ctx, r, sb, err) {
 		case createOK:
 			return 0

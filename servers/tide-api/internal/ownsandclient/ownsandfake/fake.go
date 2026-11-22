@@ -59,6 +59,10 @@ type Org struct {
 	MaxSandboxes int
 	// CreateError, when set, is the error of the next CreateSandbox calls.
 	CreateError error
+	// CreateResponseError, when set, models a lost response: CreateSandbox
+	// creates the sandbox (or finds the one of its key) and returns this
+	// error instead of it.
+	CreateResponseError error
 	// DeleteError, when set, is the error of the next DeleteSandbox calls
 	// (for example a transient OwnSand failure).
 	DeleteError error
@@ -68,6 +72,9 @@ type Org struct {
 
 	sandboxes map[string]*fakeSandbox
 	keys      map[string]string // idempotency key -> sandbox ID
+	// requests holds the encoded request of each key: like OwnSand, a key
+	// that comes again with other parameters fails with already_exists.
+	requests map[string][]byte
 }
 
 type fakeSandbox struct {
@@ -98,7 +105,7 @@ func (f *Fake) AddOrg(id, apiKey string) *Org {
 		return o
 	}
 	o := &Org{ID: id, APIKey: apiKey, Templates: map[string]ownsandv1.GuestOs{}, StartRunning: true,
-		sandboxes: map[string]*fakeSandbox{}, keys: map[string]string{}}
+		sandboxes: map[string]*fakeSandbox{}, keys: map[string]string{}, requests: map[string][]byte{}}
 	f.orgs[id] = o
 	return o
 }
@@ -254,7 +261,17 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 	if req.GetIdempotencyKey() == "" || req.GetPlacement().GetDeviceId() != "" {
 		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("tide sends an idempotency key and no device ID"))
 	}
+	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
 	if id, ok := o.keys[req.GetIdempotencyKey()]; ok {
+		if !bytes.Equal(o.requests[req.GetIdempotencyKey()], encoded) {
+			return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the idempotency_key was used with other parameters"))
+		}
+		if o.CreateResponseError != nil {
+			return nil, o.CreateResponseError
+		}
 		return proto.Clone(o.sandboxes[id].sb).(*ownsandv1.Sandbox), nil
 	}
 	if o.CreateError != nil {
@@ -274,6 +291,10 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 	}
 	o.sandboxes[id] = &fakeSandbox{sb: sb, files: map[string][]byte{}, writes: map[string]*fakeWrite{}, reads: map[string][]byte{}}
 	o.keys[req.GetIdempotencyKey()] = id
+	o.requests[req.GetIdempotencyKey()] = encoded
+	if o.CreateResponseError != nil {
+		return nil, o.CreateResponseError
+	}
 	return proto.Clone(sb).(*ownsandv1.Sandbox), nil
 }
 
