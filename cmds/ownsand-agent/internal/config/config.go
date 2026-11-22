@@ -54,6 +54,12 @@ var EnvNames = []string{
 // DefaultAPIURL is the production control plane origin.
 const DefaultAPIURL = "https://ownsand.api.delino.io"
 
+// DefaultReleaseManifestURL is the signed release manifest that the release
+// workflow publishes (deploy.updateManifest.publicUrl in
+// cmds/ownsand-agent/package.json). OWNSAND_AGENT_RELEASE_MANIFEST_URL
+// replaces it.
+const DefaultReleaseManifestURL = "https://releases.delino.io/ownsand-agent/manifest.json"
+
 // RuntimeKind selects the sandbox runtime backend.
 type RuntimeKind int
 
@@ -174,6 +180,9 @@ func FromEnv(lookup Lookup) (Config, error) {
 	}
 	if cfg.StateDir == "" {
 		cfg.StateDir = DefaultStateDir()
+	}
+	if cfg.ReleaseManifestURL == "" {
+		cfg.ReleaseManifestURL = DefaultReleaseManifestURL
 	}
 	if v := get(EnvRuntime); v != "" {
 		kind, err := ParseRuntimeKind(v)

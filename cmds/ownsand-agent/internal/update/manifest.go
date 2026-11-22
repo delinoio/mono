@@ -6,13 +6,13 @@
 // artifact SHA-256, waits until the device is idle and installs the new
 // executable.
 //
-// Release signing (recorded decision; the signing tool and key custody stay
-// open): the manifest is JSON, and its signature is a detached Ed25519
-// signature over the exact manifest bytes, served base64-encoded at the
-// manifest URL plus ".sig". BuiltinKeys is empty until the release process
-// has key custody; until then an operator configures the public keys with
-// OWNSAND_AGENT_RELEASE_PUBLIC_KEYS, and without any key every update fails
-// verification and reports FAILED.
+// Release signing (recorded decision): the manifest is JSON, and its
+// signature is a detached Ed25519 signature over the exact manifest bytes,
+// served base64-encoded at the manifest URL plus ".sig". The release workflow
+// signs it with cmds/ownsand-agent/release-manifest. BuiltinKeys comes from
+// package releasekeys; while that list is empty, an operator configures the
+// public keys with OWNSAND_AGENT_RELEASE_PUBLIC_KEYS, and without any key
+// every update fails verification and reports FAILED.
 package update
 
 import (
@@ -23,13 +23,25 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/releasekeys"
 	"github.com/delinoio/mono/internal/semver"
 )
 
 // BuiltinKeys are the release public keys built into the agent. A release
 // signed with the current key can introduce the next key by shipping an
-// agent with both keys here.
-var BuiltinKeys []ed25519.PublicKey
+// agent with both keys in package releasekeys.
+var BuiltinKeys = mustBuiltinKeys()
+
+// mustBuiltinKeys decodes the built-in keys. The releasekeys tests reject an
+// invalid entry, so a panic here means that the agent was built from a
+// broken key list.
+func mustBuiltinKeys() []ed25519.PublicKey {
+	keys, err := releasekeys.PublicKeys()
+	if err != nil {
+		panic(err)
+	}
+	return keys
+}
 
 // ManifestSchema is the manifest schema version this agent reads.
 const ManifestSchema = 1
