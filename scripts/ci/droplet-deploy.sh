@@ -10,15 +10,21 @@
 # A maintainer rolls a service back with the same command and the image of
 # the previous deployment (`/srv/delino/state/<service>.previous`).
 #
+# A lock file `state/<service>.lock` (`flock`) serializes deployments and
+# rollbacks of one service: a second run waits until the first one ends.
+#
 # Steps: pull the image by digest, start a new container next to the running
 # one under its own unique network alias (it does not join the alias of the
 # running one), wait until `GET /healthz` returns a success status, write the
 # reverse proxy route to the new alias and reload the proxy, and only then
 # stop the old container. The proxy route selects the old container until the
 # reload succeeds, so a container that is starting or unhealthy never receives
-# a request. A failure before the old container stops removes the new
-# container, so the old one keeps serving. The exit code is the deployment
-# verdict.
+# a request. A failure before the proxy reload removes the new container, so
+# the old one keeps serving. After the reload the replacement is the deployed
+# image: the script records it in the state files first, and then stops and
+# removes the old containers. A failed stop or removal makes the script exit
+# non-zero and name the container, but the state files already name the
+# replacement. The exit code is the deployment verdict.
 #
 # Arguments:
 #   service   Droplet service name: container name prefix, label value and
@@ -39,6 +45,9 @@
 #   DROPLET_HEALTH_TIMEOUT  seconds to wait for the health check (default 120).
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL when the old
 #                           container stops (default 30).
+#   DROPLET_LOCK_TIMEOUT    seconds to wait for a running deployment of the
+#                           same service to finish before the script gives up
+#                           without a change (default 600).
 set -euo pipefail
 
 # The whole script is one function that the last line calls with standard
@@ -48,6 +57,10 @@ set -euo pipefail
 main() {
   if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     echo "::error::droplet-deploy.sh needs Bash 4.4 or newer, not $BASH_VERSION." >&2
+    exit 2
+  fi
+  if ! command -v flock > /dev/null; then
+    echo "::error::droplet-deploy.sh needs flock (util-linux) for the deployment lock." >&2
     exit 2
   fi
   if (( $# != 4 )); then
@@ -77,6 +90,7 @@ main() {
   local proxy="${DROPLET_PROXY:-caddy}"
   local health_timeout="${DROPLET_HEALTH_TIMEOUT:-120}"
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
+  local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
   local env_file="$root/env/$service.env"
   local site="$root/caddy/sites/$service.caddy"
   local state="$root/state/$service"
@@ -88,6 +102,20 @@ main() {
   # process agree on the port.
   if grep -Eq '^[[:space:]]*ADDR=' "$env_file"; then
     fail "$env_file sets ADDR. Remove it; the deployment sets ADDR=:$port."
+  fi
+
+  # One deployment of a service at a time. A deployment from the workflow and
+  # a rollback that a maintainer runs by hand both run this script on the
+  # Droplet, so they take the same lock. Without it, one run could stop and
+  # remove the container that the route of the other run names, and both runs
+  # would write the same route staging and backup files. The lock belongs to
+  # the open file description of the file descriptor below and the kernel
+  # releases it when the script exits, however it ends.
+  mkdir -p "$root/state" || fail "could not create the state directory $root/state."
+  local lock_fd
+  { exec {lock_fd}> "$state.lock"; } 2> /dev/null || fail "could not open the lock file $state.lock."
+  if ! flock --wait "$lock_timeout" "$lock_fd"; then
+    fail "another deployment of $service held $state.lock for $lock_timeout seconds; nothing was changed. Run the deployment again when it has finished."
   fi
 
   echo "Pull $image"
@@ -133,27 +161,52 @@ main() {
     fail "the route of $service was not switched; the previous container keeps serving."
   fi
 
+  # The proxy routes to the replacement now, so it is the deployed image.
+  # Record it before the cleanup: a failed cleanup must not leave the state
+  # files naming the image that the route no longer serves.
+  record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
+
+  local -a failed=()
   local id
   for id in "${old[@]}"; do
     echo "Stop the previous container $id"
-    docker stop --time "$stop_timeout" "$id" > /dev/null
-    docker rm "$id" > /dev/null
+    if ! docker stop --time "$stop_timeout" "$id" > /dev/null; then
+      echo "::error::docker stop failed for the previous container $id." >&2
+      failed+=("docker stop $id")
+      continue
+    fi
+    if ! docker rm "$id" > /dev/null; then
+      echo "::error::docker rm failed for the previous container $id." >&2
+      failed+=("docker rm $id")
+    fi
   done
-
-  mkdir -p "$root/state"
-  if [[ -f "$state.current" ]] && [[ "$(< "$state.current")" != "$image" ]]; then
-    mv "$state.current" "$state.previous"
-  fi
-  echo "$image" > "$state.current"
   # Removes images that no container uses any more. A rollback pulls the
   # previous image from the registry again.
   docker image prune --force > /dev/null || true
+  if (( ${#failed[@]} > 0 )); then
+    fail "the replacement $new already serves $service as $image, but the cleanup of the previous containers failed (${failed[*]}). Remove them by hand, or deploy the same image again to retry."
+  fi
   echo "$service runs $image behind https://$hostname"
 }
 
 fail() {
   echo "::error::$1" >&2
   exit 1
+}
+
+# Records the image that the route serves: `<state>.current` becomes the image
+# and `<state>.previous` the image that `<state>.current` held. A retry with
+# the same image keeps `<state>.previous`, so a rollback still finds the image
+# that served before the first attempt. The caller evaluates this function as
+# an `if` or `||` operand, which disables `set -e` inside it, so every step
+# checks its own status.
+record_state() {
+  local state="$1" image="$2"
+  mkdir -p "$(dirname "$state")" || return 1
+  if [[ -f "$state.current" ]] && [[ "$(< "$state.current")" != "$image" ]]; then
+    mv -f "$state.current" "$state.previous" || return 1
+  fi
+  echo "$image" > "$state.current"
 }
 
 # Prints the unique network alias of a replacement container. The alias is a
