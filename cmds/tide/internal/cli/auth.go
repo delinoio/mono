@@ -217,11 +217,12 @@ func (a *app) callerUserID(ctx context.Context) (string, error) {
 	if a.getenv(EnvAPIKey) != "" {
 		return "", errors.New("leaving an organization needs the stored Logto tokens of 'tide login'; a personal API key works only for 'tide session' and 'tide mcp'")
 	}
-	src, err := a.tokenSource()
-	if err != nil {
+	// Use the token source of the client, so that a refresh here is not
+	// repeated by the client with the old refresh token.
+	if _, err := a.sdk(); err != nil {
 		return "", err
 	}
-	tok, err := src(ctx)
+	tok, err := a.tokens(ctx)
 	if err != nil {
 		return "", err
 	}

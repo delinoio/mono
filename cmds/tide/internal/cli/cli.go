@@ -118,6 +118,10 @@ type app struct {
 	color  bool
 	logger *slog.Logger
 	client *tide.Client
+	// tokens is the Logto token source of client, or nil with an API key.
+	// Every caller in one invocation must use it: a second source would
+	// refresh with a refresh token that the first one already rotated.
+	tokens tide.TokenSource
 }
 
 func (a *app) getenv(k string) string {
@@ -550,6 +554,7 @@ func (a *app) sdk() (*tide.Client, error) {
 			return nil, err
 		}
 		opts.TokenSource = src
+		a.tokens = src
 		a.logger.Debug("tide credential selected", "kind", "logto")
 	}
 	c, err := tide.New(opts)
