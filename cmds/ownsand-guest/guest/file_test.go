@@ -564,6 +564,64 @@ func TestWriteReadOnlyFinishMode(t *testing.T) {
 	}
 }
 
+// TestWriteFinishRetryAfterRenameFailureKeepsReadOnlyMode covers a finish with
+// mode 0444 whose rename fails once. The staging file already has the
+// read-only mode then; an unprivileged guest user must still be able to repeat
+// the same finish and get the file with the requested mode.
+func TestWriteFinishRetryAfterRenameFailureKeepsReadOnlyMode(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows guests ignore the finish mode")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the directory permission that induces the rename failure")
+	}
+	h := newHarness(t, nil)
+	dir := t.TempDir()
+	target := filepath.Join(dir, "out.bin")
+	id := newID(t)
+	first := &ownsandv1.WriteFileRequest{
+		SandboxId: testSandbox, WriteId: id, Path: target, BindingSalt: make([]byte, 32),
+		Data: []byte("hello"),
+	}
+	if _, errd := h.write(first); errd != nil {
+		t.Fatalf("first chunk: %v", errd)
+	}
+	fin := &ownsandv1.WriteFileRequest{
+		SandboxId: testSandbox, WriteId: id, Path: target, BindingSalt: make([]byte, 32),
+		Data:   []byte("hello"),
+		Finish: &ownsandv1.WriteFileFinish{SizeBytes: 5, Mode: 0o444},
+	}
+	// Without write permission on the directory the rename fails, while the
+	// owner can still open the staging file.
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	if _, errd := h.write(fin); errd == nil {
+		t.Fatal("finish succeeded although the rename must fail")
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("target exists after failed rename: %v", err)
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resp, errd := h.write(fin)
+	if errd != nil || !resp.GetFinished() || resp.GetSizeBytes() != 5 {
+		t.Fatalf("repeated finish %v %v", resp, errd)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != "hello" {
+		t.Fatalf("target %q %v", got, err)
+	}
+	if st, err := os.Stat(target); err != nil || st.Mode().Perm() != 0o444 {
+		t.Fatalf("target mode %v %v, want 0444", st.Mode(), err)
+	}
+	if _, err := os.Stat(tempPath(target, id)); !os.IsNotExist(err) {
+		t.Fatal("temporary file left")
+	}
+}
+
 func TestWriteEmptyFileAndErrors(t *testing.T) {
 	h := newHarness(t, nil)
 	dir := t.TempDir()
