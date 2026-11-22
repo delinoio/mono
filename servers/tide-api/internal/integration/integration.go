@@ -328,8 +328,11 @@ func (st *Store) Reencrypt(ctx context.Context, ring *secrets.Keyring) (int64, e
 		if !changed {
 			continue
 		}
+		// The ciphertext condition skips a credential that was replaced
+		// after the scan: a replacement on an instance that still has the
+		// old primary key keeps key_id, and its new value must stay.
 		tag, err := s.DB.Pool.Exec(ctx, `UPDATE agent_integration_credentials SET key_id = $3, ciphertext = $4
-			WHERE agent_integration_id = $1 AND credential = $2 AND key_id = $5`, r.id, r.cred, out.KeyID, out.Ciphertext, r.sealed.KeyID)
+			WHERE agent_integration_id = $1 AND credential = $2 AND key_id = $5 AND ciphertext = $6`, r.id, r.cred, out.KeyID, out.Ciphertext, r.sealed.KeyID, r.sealed.Ciphertext)
 		if err != nil {
 			return n, err
 		}

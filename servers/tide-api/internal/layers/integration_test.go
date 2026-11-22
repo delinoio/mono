@@ -13,6 +13,7 @@ import (
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/secrets"
 )
 
@@ -177,4 +178,64 @@ func TestAgentIntegrations(t *testing.T) {
 func keyOf(t *testing.T, w *world) []secrets.Key {
 	t.Helper()
 	return []secrets.Key{w.env.SecretKey}
+}
+
+// A credential or OwnSand key that is replaced after the re-encryption job
+// read it keeps its new value: the replacement on an instance that still
+// has the old primary key keeps the key ID, so the job must not write the
+// value that it read before.
+func TestReencryptKeepsConcurrentReplacement(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	resp, err := w.env.User(w.org.Admin).Integration.CreateAgentIntegration(ctx, connect.NewRequest(&tidev1.CreateAgentIntegrationRequest{
+		OrganizationId: w.org.ID, Vendor: tidev1.AgentVendor_AGENT_VENDOR_CURSOR, Name: "cursor",
+		Settings:    &tidev1.CreateAgentIntegrationRequest_Cursor{Cursor: &tidev1.CursorSettings{PoolName: "pool-a"}},
+		Credentials: &tidev1.CreateAgentIntegrationRequest_CursorCredentials{CursorCredentials: &tidev1.CursorCredentials{ServiceAccountApiKey: "cursor-key"}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	integrationID := resp.Msg.GetIntegration().GetAgentIntegrationId()
+	osOrg := api.NewID()
+	w.fake.AddOrg(osOrg, ownsandKey('a'))
+	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('a')); err != nil {
+		t.Fatal(err)
+	}
+	newKey, _ := secrets.GenerateKey("next")
+	ring, _ := secrets.NewKeyring(append([]secrets.Key{newKey}, keyOf(t, w)...)...)
+	replaced := []byte("replaced")
+	for _, tc := range []struct {
+		name, hold, read string
+		arg              string
+		run              func() (int64, error)
+	}{
+		{"credential", "UPDATE agent_integration_credentials SET ciphertext = $2 WHERE agent_integration_id = $1",
+			"SELECT key_id, ciphertext FROM agent_integration_credentials WHERE agent_integration_id = $1", integrationID,
+			func() (int64, error) { return w.l.Integrations.Reencrypt(ctx, ring) }},
+		{"ownsand link", "UPDATE ownsand_links SET api_key_ciphertext = $2 WHERE organization_id = $1",
+			"SELECT api_key_key_id, api_key_ciphertext FROM ownsand_links WHERE organization_id = $1", w.org.ID,
+			func() (int64, error) { return w.l.Links.Reencrypt(ctx, ring) }},
+	} {
+		// The held update stands in for a replacement that commits after
+		// the job's scan.
+		commit := holdTx(t, w.env, tc.hold, tc.arg, replaced)
+		type result struct {
+			n   int64
+			err error
+		}
+		done := make(chan result, 1)
+		go func() {
+			n, err := tc.run()
+			done <- result{n, err}
+		}()
+		waitForLockWaiter(t, w.env)
+		commit()
+		if r := <-done; r.err != nil || r.n != 0 {
+			t.Fatalf("%s: resealed %d, %v; want 0", tc.name, r.n, r.err)
+		}
+		var keyID string
+		var ciphertext []byte
+		if err := w.env.DB.Pool.QueryRow(ctx, tc.read, tc.arg).Scan(&keyID, &ciphertext); err != nil || keyID == "next" || !bytes.Equal(ciphertext, replaced) {
+			t.Fatalf("%s: stored %q %q, %v; want the replacement", tc.name, keyID, ciphertext, err)
+		}
+	}
 }

@@ -239,8 +239,11 @@ func (l *Links) Reencrypt(ctx context.Context, ring *secrets.Keyring) (int64, er
 		if !changed {
 			continue
 		}
-		tag, err := s.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET api_key_key_id = $2, api_key_ciphertext = $3 WHERE organization_id = $1 AND api_key_key_id = $4",
-			r.org, out.KeyID, out.Ciphertext, r.sealed.KeyID)
+		// The ciphertext condition skips a key that was replaced after the
+		// scan: a replacement on an instance that still has the old primary
+		// key keeps api_key_key_id, and its new value must stay.
+		tag, err := s.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET api_key_key_id = $2, api_key_ciphertext = $3 WHERE organization_id = $1 AND api_key_key_id = $4 AND api_key_ciphertext = $5",
+			r.org, out.KeyID, out.Ciphertext, r.sealed.KeyID, r.sealed.Ciphertext)
 		if err != nil {
 			return n, err
 		}
