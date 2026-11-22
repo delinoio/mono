@@ -253,7 +253,7 @@ func (m *Manager) Attach(sandboxID string) (Link, string, error) {
 		}
 	}
 	m.mu.Lock()
-	m.gateways[tap] = TapGateway{Tap: tap, Gateway: link.Gateway}
+	m.gateways[tap] = TapGateway{Tap: tap, Gateway: link.Gateway, Guest: link.Guest}
 	m.mu.Unlock()
 	if err := m.refresh(); err != nil {
 		return fail(err)
