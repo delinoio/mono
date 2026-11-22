@@ -250,7 +250,7 @@ func (m *Manager) reconcile(ctx context.Context) error {
 			}
 			cleaned[id] = true
 		}
-		reason := sb.rec.ttlReason(now)
+		reason := sb.rec.endReasonAt(now)
 		state := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 		switch {
 		case reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED:
@@ -676,7 +676,7 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 		m.mu.Unlock()
 		return
 	}
-	reason := sb.rec.ttlReason(m.now())
+	reason := sb.rec.endReasonAt(m.now())
 	m.mu.Unlock()
 	state := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
@@ -909,7 +909,7 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			sb.idleDirty = true
 		}
 		if sb.rec.Live() {
-			if reason := sb.rec.ttlReason(now); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
+			if reason := sb.rec.endReasonAt(now); reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
 				sb.ending = true
 				if sb.createCancel != nil {
 					sb.createCancel()

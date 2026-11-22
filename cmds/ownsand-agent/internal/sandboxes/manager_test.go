@@ -699,6 +699,166 @@ func TestMaxTTLReasonSurvivesRetryOfPausedSandbox(t *testing.T) {
 	}
 }
 
+// failCallerDelete pauses the sandbox when pause is set, makes the next
+// runtime Delete fail and runs a caller delete. It returns when the failed
+// attempt left the record in DELETING with the ending flag cleared.
+func (e *env) failCallerDelete(id string, pause bool) {
+	e.t.Helper()
+	if pause {
+		if en, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+			e.t.Fatalf("pause: %v %v", en, err)
+		}
+	}
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.mu.Unlock()
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err == nil {
+		e.t.Fatal("delete succeeded although the runtime Delete failed")
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		e.t.Fatalf("state after failed delete %v, want DELETING", s)
+	}
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
+		// A non-terminal entry carries no end reason on the wire.
+		e.t.Fatalf("entry end reason %v while DELETING", r)
+	}
+	waitFor(e.t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+}
+
+// TestCallerDeleteRetryKeepsReasonWhenIdleDeadlinePassed checks that a Tick
+// retry of a failed caller delete of a paused sandbox ends it as
+// DELETED_BY_CALLER. The pause suspended the idle deadline, but the record in
+// DELETING no longer says paused, so the stale idle deadline counts as passed
+// and used to replace the caller reason with IDLE_TTL_EXPIRED.
+func TestCallerDeleteRetryKeepsReasonWhenIdleDeadlinePassed(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 24*time.Hour).GetSandboxId()
+	e.failCallerDelete(id, true)
+	// Only the stale idle deadline passed; the maximum deadline did not.
+	e.clk.Advance(time.Hour)
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("end reason after retry %v, want DELETED_BY_CALLER", r)
+	}
+	e.ex.mu.Lock()
+	r, ended := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if !ended || r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("exec tracker end reason %v (notified %v), want DELETED_BY_CALLER", r, ended)
+	}
+}
+
+// TestCallerDeleteRetryKeepsReasonWhenMaxDeadlinePassed checks that the
+// recorded caller reason also wins over MAX_TTL_EXPIRED on a Tick retry.
+func TestCallerDeleteRetryKeepsReasonWhenMaxDeadlinePassed(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	e.failCallerDelete(id, true)
+	e.clk.Advance(2 * time.Hour)
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("end reason after retry %v, want DELETED_BY_CALLER", r)
+	}
+}
+
+// TestCallerDeleteRetryWaitsForDeadline checks that the retry cadence stays
+// as it was: Tick does not retry a failed caller delete while no deadline
+// passed, so a stuck delete is not retried every second.
+func TestCallerDeleteRetryWaitsForDeadline(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 24*time.Hour).GetSandboxId()
+	e.failCallerDelete(id, false)
+	e.rt.mu.Lock()
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	e.m.Tick(context.Background(), false)
+	time.Sleep(50 * time.Millisecond)
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 0 {
+		t.Fatalf("Tick retried the runtime Delete %d times before a deadline passed", calls)
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state %v, want DELETING", s)
+	}
+}
+
+// TestRestartKeepsCallerReasonOfDeletingSandbox checks that an agent start
+// finishes a caller delete that failed before the restart with
+// DELETED_BY_CALLER, also when the idle deadline or both deadlines passed
+// while the agent was stopped.
+func TestRestartKeepsCallerReasonOfDeletingSandbox(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		pause bool
+		wait  time.Duration
+	}{
+		{"idle deadline passed", true, time.Hour},
+		{"both deadlines passed", true, 48 * time.Hour},
+		{"no deadline passed", false, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			id := e.create(10*time.Minute, 24*time.Hour).GetSandboxId()
+			e.failCallerDelete(id, tc.pause)
+			// The agent restarts; the VM ended with the agent process.
+			e.rt = newFakeRuntime()
+			e.clk.Advance(tc.wait)
+			e.restart()
+			if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Fatalf("state after restart %v, want DELETED", s)
+			}
+			if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+				t.Fatalf("end reason after restart %v, want DELETED_BY_CALLER", r)
+			}
+		})
+	}
+}
+
+// TestCallerDeleteEndsFailedTTLEnd checks that a caller delete after a failed
+// TTL end records DELETED_BY_CALLER, and that a failed TTL end keeps its TTL
+// reason when Tick retries it (see TestTTLEndRetriesAfterStopFailure and
+// TestMaxTTLReasonSurvivesRetryOfPausedSandbox for the Tick retry).
+func TestCallerDeleteEndsFailedTTLEnd(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.mu.Unlock()
+	e.clk.Advance(11 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.rt.mu.Lock()
+		defer e.rt.mu.Unlock()
+		return e.rt.deleteCalls == 1
+	})
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return !e.m.sandboxes[id].ending
+	})
+	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil {
+		t.Fatalf("caller delete after a failed TTL end: %v", err)
+	}
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("end reason %v, want DELETED_BY_CALLER", r)
+	}
+	e.ex.mu.Lock()
+	r := e.ex.ended[id]
+	e.ex.mu.Unlock()
+	if r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("exec tracker end reason %v, want DELETED_BY_CALLER", r)
+	}
+}
+
 // TestCloseWaitsForTTLEnds checks that Close returns only after the TTL
 // ends that Tick started have written their records, and that a Tick after
 // Close starts no end.
@@ -734,6 +894,37 @@ func TestEqualDeadlinesGiveMaxTTL(t *testing.T) {
 	}
 	if got := r.ttlReason(now.Add(-2 * time.Second)); got != 0 {
 		t.Fatalf("no deadline passed: %v", got)
+	}
+}
+
+func TestEndReasonAtKeepsRecordedReasonOfDeletingRecord(t *testing.T) {
+	now := time.Now()
+	deleting := func(reason ownsandv1.SandboxEndReason, idle, max time.Time) Record {
+		return Record{State: ownsandv1.SandboxState_SANDBOX_STATE_DELETING, EndReason: reason, IdleDeadline: idle, MaxDeadline: max}
+	}
+	const (
+		caller = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER
+		idle   = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED
+		maxTTL = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED
+		none   = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED
+	)
+	past, future := now.Add(-time.Minute), now.Add(time.Hour)
+	for _, tc := range []struct {
+		name string
+		rec  Record
+		want ownsandv1.SandboxEndReason
+	}{
+		{"caller, idle passed", deleting(caller, past, future), caller},
+		{"caller, max passed", deleting(caller, future, past), caller},
+		{"caller, both passed", deleting(caller, past, past), caller},
+		{"caller, none passed", deleting(caller, future, future), none},
+		{"idle TTL, max passed", deleting(idle, future, past), idle},
+		{"max TTL, idle passed", deleting(maxTTL, past, future), maxTTL},
+		{"running, idle passed", Record{State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, IdleDeadline: past, MaxDeadline: future}, idle},
+	} {
+		if got := tc.rec.endReasonAt(now); got != tc.want {
+			t.Errorf("%s: %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
 
