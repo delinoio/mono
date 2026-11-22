@@ -241,16 +241,24 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		var invID, orgID, orgName string
 		var role int16
 		var stored []byte
-		var orgCreated time.Time
-		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time
+		var orgCreated, expireTime time.Time
+		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time, i.expire_time
 			FROM invitations i JOIN organizations o ON o.organization_id = i.organization_id
 			WHERE i.secret_sha256 = $1 AND i.accept_time IS NULL AND i.revoke_time IS NULL AND i.expire_time > $2
-			FOR UPDATE OF i`, hash, h.now()).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated)
+			FOR UPDATE OF i`, hash, h.now()).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated, &expireTime)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !auth.HashEqual(stored, hash)) {
 			return errInvitationInvalid()
 		}
 		if err != nil {
 			return err
+		}
+		// The expiry predicate above binds a timestamp taken before the wait
+		// for the row lock, so an invitation can expire while the statement
+		// waits. Compare again with the time after the lock and before any
+		// write.
+		now := h.now()
+		if !now.Before(expireTime) {
+			return errInvitationInvalid()
 		}
 		setRPCOrganization(ctx, orgID)
 		var exists bool
@@ -260,7 +268,6 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		if exists {
 			return errAlreadyExists("the caller is already a member of the organization")
 		}
-		now := h.now()
 		membershipID := newID()
 		// Two concurrent acceptances by the same user can both pass the
 		// existence check above. ON CONFLICT turns the loser's unique
