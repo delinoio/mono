@@ -17,7 +17,6 @@ import (
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/accounts-api/internal/config"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
-	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 )
 
 // TestNewHandlerServesTheBillingServices checks the production wiring
@@ -50,7 +49,7 @@ func TestNewHandlerServesTheBillingServices(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer database.Close()
-	handler, _, err := newHandler(cfg, database, slog.New(slog.NewJSONHandler(io.Discard, nil)), metrics.New())
+	handler, _, err := newHandler(cfg, database, slog.New(slog.NewJSONHandler(io.Discard, nil)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

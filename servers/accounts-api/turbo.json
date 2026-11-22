@@ -18,6 +18,7 @@
         "RESEND_API_KEY",
         "EMAIL_FROM",
         "METRICS_ADDR",
+        "OTEL_*",
         "PADDLE_ENVIRONMENT",
         "PADDLE_API_KEY",
         "PADDLE_WEBHOOK_SECRET",

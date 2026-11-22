@@ -12,10 +12,23 @@ import (
 	"testing"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
+	"github.com/delinoio/mono/servers/internal/telemetry"
 )
 
 func TestServeAndShutdown(t *testing.T) {
-	m := metrics.New()
+	tel, err := telemetry.New(context.Background(), telemetry.Options{
+		ServiceName: "accounts-api",
+		Stdout:      io.Discard,
+		LookupEnv:   func(string) (string, bool) { return "", false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Shutdown(context.Background())
+	m, err := metrics.New(tel.MeterProvider)
+	if err != nil {
+		t.Fatal(err)
+	}
 	m.Webhook("transaction.completed", "applied")
 	m.TopUpAttempt("auto", "rejected")
 	m.TopUpResult("manual", "completed")
@@ -32,7 +45,9 @@ func TestServeAndShutdown(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- metrics.Serve(ctx, listener, m, slog.New(slog.NewJSONHandler(io.Discard, nil))) }()
+	go func() {
+		done <- metrics.Serve(ctx, listener, tel.MetricsHandler(nil), slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	}()
 
 	resp, err := http.Get("http://" + listener.Addr().String() + "/metrics")
 	if err != nil {
@@ -50,7 +65,7 @@ func TestServeAndShutdown(t *testing.T) {
 		`accounts_usage_reports_total{result="charged",service="ownsand"} 1`,
 		`accounts_billing_status_changes_total{status="blocked"} 1`,
 		`accounts_linked_organizations{status="suspended"} 3`,
-		`go_goroutines`,
+		`go_goroutine_count`,
 	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("metrics lack %q", want)
@@ -79,4 +94,7 @@ func TestNilMetricsRecordNothing(t *testing.T) {
 	m.Email("a", "b")
 	m.CreditGrant("a")
 	m.AutoTopUpDisabled()
+	m.UsageReport("a", "b")
+	m.StatusChange("a")
+	m.LinkedOrganizations("a", 1)
 }

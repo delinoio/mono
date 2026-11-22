@@ -46,6 +46,7 @@ const expectedPassThroughEnv = {
     "LOGTO_MANAGEMENT_ENDPOINT",
     "LOG_LEVEL",
     "METRICS_ADDR",
+    "OTEL_*",
     "PADDLE_API_KEY",
     "PADDLE_ENVIRONMENT",
     "PADDLE_SUBSCRIPTION_PRICE_ID",
