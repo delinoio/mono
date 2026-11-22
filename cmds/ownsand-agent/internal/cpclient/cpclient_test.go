@@ -19,6 +19,18 @@ import (
 // production default is DefaultAuthTimeout.
 const authTestTimeout = 300 * time.Millisecond
 
+// authTestSlack is how far below authTestTimeout an attempt may end. The
+// deadline timer and the test's own clock readings are separate clocks: on
+// Windows the coarse timer granularity let an attempt end about 0.3 ms before
+// the measured 300 ms. The slack keeps the lower bound a check that the
+// attempt waited for its deadline instead of failing fast, without asserting
+// timer precision. Keep it well under authTestTimeout.
+const authTestSlack = 50 * time.Millisecond
+
+// authTestMaxElapsed is the generous upper bound of a stalled attempt. It only
+// proves that the attempt ends instead of hanging.
+const authTestMaxElapsed = 10 * time.Second
+
 // enrolled returns a client with a short attempt deadline and a device that
 // the fake control plane knows.
 func enrolled(t *testing.T) (*testcp.Server, *Client, string, *identity.Key) {
@@ -77,7 +89,7 @@ func TestAuthenticateEndsWhenTheControlPlaneStalls(t *testing.T) {
 			if errors.Is(err, ErrUnknownDevice) {
 				t.Fatalf("a stalled attempt was reported as an unknown device: %v", err)
 			}
-			if elapsed < authTestTimeout || elapsed > 10*time.Second {
+			if elapsed < authTestTimeout-authTestSlack || elapsed > authTestMaxElapsed {
 				t.Fatalf("Authenticate returned after %s, want about %s", elapsed, authTestTimeout)
 			}
 
@@ -126,7 +138,7 @@ func TestConfirmRemovalEndsWhenTheControlPlaneStalls(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error %v does not match context.DeadlineExceeded", err)
 	}
-	if elapsed < authTestTimeout || elapsed > 10*time.Second {
+	if elapsed < authTestTimeout-authTestSlack || elapsed > authTestMaxElapsed {
 		t.Fatalf("ConfirmRemoval returned after %s, want about %s", elapsed, authTestTimeout)
 	}
 }
