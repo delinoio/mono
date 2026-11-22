@@ -42,6 +42,11 @@ type Manager struct {
 	// the sandbox and removes it when the attachment fails or ends.
 	gateways map[string]TapGateway
 	rules    string
+	// cleanups counts the host clean-ups of CleanupHost. Refresh reads the
+	// host routes outside the mutex and applies its ruleset only when no
+	// clean-up ran meanwhile, so that a refresh in flight cannot apply the
+	// table again after the device removal deleted it.
+	cleanups uint64
 	// interval and refresh are RefreshInterval and Refresh; tests replace
 	// them.
 	interval time.Duration
@@ -181,6 +186,9 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 // Refresh recomputes the ruleset from the host routes and the current DNS
 // assignments of the attached sandboxes and applies it when it changed.
 func (m *Manager) Refresh() error {
+	m.mu.Lock()
+	cleanups := m.cleanups
+	m.mu.Unlock()
 	routes, onLink, err := m.hostRoutes()
 	if err != nil {
 		return err
@@ -188,6 +196,13 @@ func (m *Manager) Refresh() error {
 	v4, v6 := Blocked(routes, onLink)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.cleanups != cleanups {
+		// CleanupHost deleted the table while this refresh read the routes.
+		// It runs only without attached sandboxes, and the next Attach
+		// applies the table with its own refresh.
+		m.logger.Debug("network policy refresh skipped after host clean-up")
+		return nil
+	}
 	assignments := make([]TapGateway, 0, len(m.gateways))
 	for _, g := range m.gateways {
 		assignments = append(assignments, g)
@@ -407,7 +422,9 @@ var errAttached = errors.New("netpolicy: sandboxes are still attached")
 // device removal after it deleted every sandbox. A removed agent exits for
 // good, so the clean-up of the next agent start would never run. It also
 // forgets the applied ruleset, so that a later Attach applies the table
-// again. With attached sandboxes it changes nothing and returns an error.
+// again, and makes a refresh that is in flight apply nothing (see
+// Manager.cleanups). With attached sandboxes it changes nothing and returns
+// an error.
 func (m *Manager) CleanupHost() error {
 	m.mu.Lock()
 	if len(m.attached) > 0 {
@@ -415,6 +432,7 @@ func (m *Manager) CleanupHost() error {
 		return errAttached
 	}
 	m.rules = ""
+	m.cleanups++
 	m.mu.Unlock()
 	return cleanupHost(m.logger, hostCleanupOps{listTaps: m.listTaps, run: m.run, tapExists: m.tapExists})
 }

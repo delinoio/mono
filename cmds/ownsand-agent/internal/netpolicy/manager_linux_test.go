@@ -780,6 +780,43 @@ func TestManagerCleanupHost(t *testing.T) {
 	}
 }
 
+// A periodic refresh that reads the host routes while the device removal
+// runs CleanupHost applies nothing, so the table that the clean-up deleted
+// stays deleted.
+func TestManagerRefreshInFlightDuringCleanupHost(t *testing.T) {
+	m, _ := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	mustAttach(t, m, "sandbox-a")
+	m.Detach("sandbox-a")
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	m.hostRoutes = func() ([]Route, []netip.Prefix, error) {
+		close(entered)
+		<-release
+		return nil, nil, nil
+	}
+	done := make(chan error, 1)
+	go func() { done <- m.Refresh() }()
+	<-entered
+	if err := m.CleanupHost(); err != nil {
+		t.Fatalf("CleanupHost: %v", err)
+	}
+	n := len(applied())
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if got := len(applied()); got != n {
+		t.Fatalf("the refresh in flight applied %d rulesets after CleanupHost, want 0", got-n)
+	}
+	m.mu.Lock()
+	rules := m.rules
+	m.mu.Unlock()
+	if rules != "" {
+		t.Fatal("the refresh in flight recorded a ruleset after CleanupHost")
+	}
+}
+
 // Every tap and the table are deleted, and the clean-up reports no error.
 func TestCleanupHostDeletesEverything(t *testing.T) {
 	f := &fakeCleanupHost{taps: []string{"osb-00000000001", "osb-00000000002"}}
