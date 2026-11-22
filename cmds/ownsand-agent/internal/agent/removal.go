@@ -16,7 +16,18 @@ import (
 // the finished clean-up, confirms the removal with a signed nonce (an
 // unknown device means that an earlier confirmation succeeded) and only
 // then deletes the device key.
-func (a *Agent) removeDevice(ctx context.Context) error {
+func (a *Agent) removeDevice(ctx context.Context) (err error) {
+	// Fence the status file first: statusLoop is still running when the
+	// removal notice arrives through Authenticate or the clean-up command,
+	// and a write after Reset would leave status.json behind. A removal
+	// that fails keeps the agent enrolled and retries, so it then lifts
+	// the fence to keep the status renewing.
+	a.stopStatusWriter()
+	defer func() {
+		if !errors.Is(err, ErrRemoved) {
+			a.resumeStatusWriter()
+		}
+	}()
 	st, err := a.st.UpdateAgent(func(s *store.AgentState) error {
 		s.Removal.NoticeReceived = true
 		return nil
