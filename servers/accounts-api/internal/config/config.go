@@ -369,11 +369,12 @@ func serviceFromKey(key string) (accountsv1.ServiceId, bool) {
 	return accountsv1.ServiceId(v), true
 }
 
-// httpURL checks that value is an absolute http or https URL without a query
+// httpURL checks that value is an absolute http or https URL with a host name
+// (a port alone such as https://:443 has none), without a query
 // or fragment and returns it without a trailing slash.
 func httpURL(name, value string) (string, error) {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
 		u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
 		return "", fmt.Errorf("%s must be an http or https URL", name)
 	}
@@ -384,7 +385,7 @@ func httpURL(name, value string) (string, error) {
 // and a host with an optional port, without a path, query or fragment.
 func parseOrigin(name, value string) (string, error) {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
 		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
 		return "", fmt.Errorf("%s must hold origins such as https://accounts.delino.io", name)
 	}

@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -411,6 +412,48 @@ func TestLoadRejectsInvalidBillingValues(t *testing.T) {
 				t.Fatal("Load() error = nil, want an error")
 			}
 		})
+	}
+}
+
+func TestLoadRejectsHostlessURLsAndOrigins(t *testing.T) {
+	for name, tc := range map[string]struct{ env, value string }{
+		"issuer https port only":       {EnvLogtoIssuer, "https://:443/oidc"},
+		"issuer http port only":        {EnvLogtoIssuer, "http://:80"},
+		"management port only":         {EnvLogtoManagementEndpoint, "https://:443"},
+		"cors port only":               {EnvCORSOrigins, "https://:443"},
+		"cors port only in a list":     {EnvCORSOrigins, "https://accounts.delino.io, https://:443"},
+		"web origin port only":         {EnvWebOrigin, "https://:443"},
+		"web origin http port only":    {EnvWebOrigin, "http://:80"},
+		"cors empty bracketed address": {EnvCORSOrigins, "http://[]:80"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(lookupFrom(map[string]string{tc.env: tc.value}))
+			if err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error %q does not name %s", err, tc.env)
+			}
+			if strings.Contains(err.Error(), ":443") || strings.Contains(err.Error(), ":80") {
+				t.Errorf("error %q contains the value", err)
+			}
+		})
+	}
+}
+
+func TestLoadKeepsLoopbackAndIPv6Hosts(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvCORSOrigins: "http://127.0.0.1:13100,http://[::1]:80",
+		EnvWebOrigin:   "http://[::1]:13100",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := []string{"http://127.0.0.1:13100", "http://[::1]:80"}; !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	if cfg.WebOrigin != "http://[::1]:13100" {
+		t.Errorf("WebOrigin = %q", cfg.WebOrigin)
 	}
 }
 
