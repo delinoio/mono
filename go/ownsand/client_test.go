@@ -253,6 +253,41 @@ func TestCreateSandboxStalledRetryEndsWithWindow(t *testing.T) {
 	}
 }
 
+// awaitCreateCalls polls the fake control plane until it has seen at least n
+// CreateSandbox calls. It reports false when ctx ends first, so a call that
+// never arrives cannot keep the poll loop running.
+func awaitCreateCalls(ctx context.Context, cp *fakeCP, n int) bool {
+	for {
+		cp.mu.Lock()
+		calls := cp.createCalls
+		cp.mu.Unlock()
+		if calls >= n {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func TestAwaitCreateCallsStopsWhenTheCallNeverArrives(t *testing.T) {
+	cp := newFakeCP(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() { done <- awaitCreateCalls(ctx, cp, 1) }()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Fatal("awaitCreateCalls reported a CreateSandbox call that never happened")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("awaitCreateCalls kept polling after its context ended")
+	}
+}
+
 func TestCreateSandboxCancelDuringStalledRetryIsTerminal(t *testing.T) {
 	cp := newFakeCP(t)
 	cp.mu.Lock()
@@ -260,24 +295,33 @@ func TestCreateSandboxCancelDuringStalledRetryIsTerminal(t *testing.T) {
 	cp.stallCreates = 1
 	cp.mu.Unlock()
 	c := cp.client(t, TransportRelay)
-	ctx, cancel := context.WithCancel(context.Background())
+	// The test-local deadline makes a retry that never arrives fail fast, and
+	// ends the poll goroutine, instead of waiting for the retry window.
+	base, stop := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stop()
+	ctx, cancel := context.WithCancel(base)
 	defer cancel()
+	var poll sync.WaitGroup
+	poll.Add(1)
+	t.Cleanup(poll.Wait)
+	retried := make(chan bool, 1)
 	go func() {
+		defer poll.Done()
 		// Cancel once the stalled retry is in flight.
-		for {
-			cp.mu.Lock()
-			n := cp.createCalls
-			cp.mu.Unlock()
-			if n >= 2 {
-				break
-			}
-			time.Sleep(time.Millisecond)
+		if !awaitCreateCalls(ctx, cp, 2) {
+			retried <- false
+			return
 		}
+		retried <- true
 		time.Sleep(50 * time.Millisecond)
 		cancel()
 	}()
 	start := time.Now()
 	_, err := c.CreateSandbox(ctx, validParams())
+	cancel()
+	if !<-retried {
+		t.Fatalf("the stalled retry never arrived; CreateSandbox returned %v", err)
+	}
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error %v, want the caller's context.Canceled", err)
 	}
