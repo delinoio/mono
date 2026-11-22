@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -54,6 +53,14 @@ func (s *Server) ExecRequests() []*tidev1.ExecDevSessionRequest {
 	s.guest.mu.Lock()
 	defer s.guest.mu.Unlock()
 	return slices.Clone(s.guest.requests)
+}
+
+// ReadRequests returns the ReadDevSessionFile requests that the server
+// received, in order.
+func (s *Server) ReadRequests() []*tidev1.ReadDevSessionFileRequest {
+	s.guest.mu.Lock()
+	defer s.guest.mu.Unlock()
+	return slices.Clone(s.guest.reads)
 }
 
 type devSessionService struct {
@@ -282,41 +289,58 @@ func (d *devSessionService) ReadDevSessionFile(ctx context.Context, req *connect
 	if err != nil {
 		return err
 	}
-	f, err := os.Open(guestPath(ds, req.Msg.GetPath()))
-	if errors.Is(err, fs.ErrNotExist) {
-		return notFound("file")
+	if req.Msg.GetReadId() == "" {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("read_id is required"))
 	}
-	if err != nil {
-		return connect.NewError(connect.CodeFailedPrecondition, err)
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		return connect.NewError(connect.CodeFailedPrecondition, errors.New("not a regular file"))
-	}
-	off := req.Msg.GetOffset()
-	if _, err := f.Seek(off, io.SeekStart); err != nil {
-		return connect.NewError(connect.CodeInvalidArgument, err)
-	}
-	buf := make([]byte, 1<<20)
-	for {
-		n, err := io.ReadFull(f, buf)
-		if n > 0 {
-			if serr := stream.Send(&tidev1.ReadDevSessionFileResponse{Event: &tidev1.ReadDevSessionFileResponse_Chunk{Chunk: &tidev1.DevSessionFileChunk{Offset: off, Data: slices.Clone(buf[:n])}}}); serr != nil {
-				return serr
-			}
-			off += int64(n)
-		}
-		if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
-			return stream.Send(&tidev1.ReadDevSessionFileResponse{Event: &tidev1.ReadDevSessionFileResponse_End{End: &tidev1.DevSessionFileEnd{SizeBytes: off}}})
+	// Like the OwnSand guest helper, the first call of a read_id takes a
+	// private snapshot of the file, and every later call of that read_id
+	// reads the snapshot.
+	g := d.s.guest
+	g.mu.Lock()
+	g.reads = append(g.reads, proto.CloneOf(req.Msg))
+	data, ok := g.snapshots[req.Msg.GetReadId()]
+	g.mu.Unlock()
+	if !ok {
+		p := guestPath(ds, req.Msg.GetPath())
+		info, err := os.Stat(p)
+		if errors.Is(err, fs.ErrNotExist) {
+			return notFound("file")
 		}
 		if err != nil {
-			return connect.NewError(connect.CodeInternal, err)
+			return connect.NewError(connect.CodeFailedPrecondition, err)
 		}
+		if info.IsDir() {
+			return connect.NewError(connect.CodeFailedPrecondition, errors.New("not a regular file"))
+		}
+		if data, err = os.ReadFile(p); err != nil {
+			return connect.NewError(connect.CodeFailedPrecondition, err)
+		}
+		g.mu.Lock()
+		g.snapshots[req.Msg.GetReadId()] = data
+		g.mu.Unlock()
+	}
+	off := req.Msg.GetOffset()
+	if off < 0 || off > int64(len(data)) {
+		return connect.NewError(connect.CodeInvalidArgument, errors.New("the offset is outside the file"))
+	}
+	sent := 0
+	for off < int64(len(data)) {
+		if d.s.ReadStreamChunkLimit > 0 && sent >= d.s.ReadStreamChunkLimit {
+			// Like the stream limit of tide-api: an OK status without the
+			// end message.
+			return nil
+		}
+		n := min(int64(len(data))-off, 1<<20)
+		if err := stream.Send(&tidev1.ReadDevSessionFileResponse{Event: &tidev1.ReadDevSessionFileResponse_Chunk{Chunk: &tidev1.DevSessionFileChunk{Offset: off, Data: slices.Clone(data[off : off+n])}}}); err != nil {
+			return err
+		}
+		off += n
+		sent++
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
 	}
+	return stream.Send(&tidev1.ReadDevSessionFileResponse{Event: &tidev1.ReadDevSessionFileResponse_End{End: &tidev1.DevSessionFileEnd{SizeBytes: off}}})
 }
 
 func (d *devSessionService) WriteDevSessionFile(_ context.Context, req *connect.Request[tidev1.WriteDevSessionFileRequest]) (*connect.Response[tidev1.WriteDevSessionFileResponse], error) {
@@ -389,12 +413,16 @@ type guest struct {
 	execs    map[string]*proc
 	writes   map[string]*pendingWrite
 	requests []*tidev1.ExecDevSessionRequest
-	wg       sync.WaitGroup
+	// snapshots holds the file snapshot of each read_id, reads the read
+	// requests in order.
+	snapshots map[string][]byte
+	reads     []*tidev1.ReadDevSessionFileRequest
+	wg        sync.WaitGroup
 }
 
 func newGuest(s *Server) *guest {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[string]*pendingWrite{}}
+	return &guest{s: s, ctx: ctx, cancel: cancel, execs: map[string]*proc{}, writes: map[string]*pendingWrite{}, snapshots: map[string][]byte{}}
 }
 
 func (g *guest) close() {

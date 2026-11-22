@@ -428,6 +428,48 @@ func TestDownloadFileAndDirectory(t *testing.T) {
 	}
 }
 
+// TestDownloadResumeKeepsReadID checks that a read that continues after a
+// stream ended early uses the same read_id, so it reads the same snapshot
+// also when the guest file changes in between.
+func TestDownloadResumeKeepsReadID(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	srv.ReadStreamChunkLimit = 1
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	guestFile := filepath.Join(ds.GetWorkspacePath(), "data.bin")
+	size := 2*ChunkSize + 10
+	if err := os.WriteFile(guestFile, bytes.Repeat([]byte("a"), size), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	changed := false
+	local := filepath.Join(t.TempDir(), "data.bin")
+	_, err := c.Download(context.Background(), DownloadParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), GuestPath: "data.bin", LocalPath: local, Progress: func(p TransferProgress) {
+		if p.Phase == TransferDownloading && p.BytesDone > 0 && !changed {
+			// A same-size replacement after the first stream.
+			changed = true
+			if err := os.WriteFile(guestFile, bytes.Repeat([]byte("b"), size), 0o644); err != nil {
+				t.Error(err)
+			}
+		}
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(local); !bytes.Equal(b, bytes.Repeat([]byte("a"), size)) {
+		t.Fatal("the resumed download joined two versions of the file")
+	}
+	reads := srv.ReadRequests()
+	var ids []string
+	for _, r := range reads {
+		if r.GetPath() == guestFile {
+			ids = append(ids, r.GetReadId())
+		}
+	}
+	if len(ids) != 3 || ids[0] != ids[1] || ids[1] != ids[2] {
+		t.Fatalf("read_ids of the download = %v, want one read_id in 3 calls", ids)
+	}
+}
+
 // tarOf builds an archive from headers; regular entries get body content.
 func tarOf(t *testing.T, entries ...*tar.Header) *bytes.Reader {
 	t.Helper()

@@ -71,6 +71,10 @@ type Server struct {
 	// PromoteAfterGets moves a QUEUED or STARTING dev session to RUNNING
 	// after this many GetDevSession calls for it. Zero never promotes.
 	PromoteAfterGets int
+	// ReadStreamChunkLimit ends every ReadDevSessionFile stream with an OK
+	// status and no end message after this many chunks, like the stream
+	// limit of tide-api. Zero means no limit.
+	ReadStreamChunkLimit int
 	// WatchEventLimit ends every WatchQueue stream with an OK status after
 	// this many events. Zero means no limit (the stream ends with the
 	// request).

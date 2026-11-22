@@ -122,18 +122,21 @@ func (c *Client) writeGuestFile(ctx context.Context, s *tidev1.DevSession, path 
 
 // readGuestFile streams the guest file at path into w with
 // ReadDevSessionFile and returns its size. It stops with an error when the
-// file is larger than limit bytes. After a transient failure it continues
-// from the last offset with a new read_id. progress receives the bytes
-// read so far.
+// file is larger than limit bytes. After a transient failure or a stream
+// that ends without its end message, it continues from the last offset with
+// the same read_id, because the guest serves every call of a read_id from
+// one snapshot of the file: a new read_id would join the start of one
+// version of the file to the rest of a later version. progress receives the
+// bytes read so far.
 func (c *Client) readGuestFile(ctx context.Context, s *tidev1.DevSession, path string, limit int64, w io.Writer, progress func(int64)) (int64, error) {
 	var offset int64
 	bo := backoff{min: c.timing.backoffMin, max: c.timing.backoffMax}
 	lastProgress := time.Now()
+	readID, err := uuidv7.NewString()
+	if err != nil {
+		return 0, err
+	}
 	for attempt := 0; ; attempt++ {
-		readID, err := uuidv7.NewString()
-		if err != nil {
-			return offset, err
-		}
 		stream, err := c.devSessions.ReadDevSessionFile(ctx, connect.NewRequest(&tidev1.ReadDevSessionFileRequest{
 			OrganizationId: s.GetOrganizationId(),
 			DevSessionId:   s.GetDevSessionId(),
