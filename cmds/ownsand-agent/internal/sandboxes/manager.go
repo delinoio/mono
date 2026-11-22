@@ -858,10 +858,29 @@ func (m *Manager) Delete(ctx context.Context, cmd *ownsandv1.DeleteSandboxComman
 	sb, ok := m.sandboxes[id]
 	if !ok {
 		sb = &sandbox{rec: Record{SandboxID: id, State: ownsandv1.SandboxState_SANDBOX_STATE_DELETED, EndReason: reason, DeleteMarker: true, CreateTime: m.now()}}
+		// Publish and save the marker in one m.mu section. A marker that
+		// is only in memory must never be visible: a retried delete would
+		// find it terminal and report success although a restart would lose
+		// it, and a delayed create would then start the sandbox.
 		m.sandboxes[id] = sb
+		err := m.commitLocked(sb, func(*Record) {})
+		if err != nil {
+			// Unpublish the unsaved marker, as Create does for its
+			// record, so that a retry of the delete saves it again.
+			delete(m.sandboxes, id)
+		}
+		entry := sb.rec.Entry(m.epoch)
+		outbox := m.outbox
 		m.mu.Unlock()
+		if err != nil {
+			m.logger.Error("delete marker failed", "sandbox_id", id, "error", err)
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "agent could not record the delete marker")
+		}
 		m.logger.Info("delete before create; leaving a delete marker", "sandbox_id", id)
-		return m.update(sb, func(*Record) {})
+		if outbox != nil {
+			outbox.SendSandboxUpdate(entry)
+		}
+		return entry, nil
 	}
 	if cancel := sb.createCancel; cancel != nil {
 		sb.ending = true

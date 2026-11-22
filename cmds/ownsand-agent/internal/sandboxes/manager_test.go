@@ -414,6 +414,64 @@ func TestDeleteBeforeCreateRejectsCreate(t *testing.T) {
 	}
 }
 
+// TestDeleteMarkerIsNotReportedUntilItIsSaved checks that a delete of an
+// unknown sandbox whose marker cannot be saved fails, leaves no in-memory
+// marker, and that a retry saves the marker so that it survives a restart and
+// a delayed create is still rejected. The marker file is blocked in one case
+// and the revision counter in the other.
+func TestDeleteMarkerIsNotReportedUntilItIsSaved(t *testing.T) {
+	cases := []struct {
+		name  string
+		fault func(t *testing.T, e *env, id string) (restore func())
+	}{
+		{"record save fails", func(t *testing.T, e *env, id string) func() {
+			blockRecord(t, e.st, id)
+			return func() { unblockRecord(t, e.st, id) }
+		}},
+		{"revision save fails", func(t *testing.T, e *env, id string) func() {
+			return failRevisions(t, e.st)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			ctx := context.Background()
+			cmd := e.createCmd(1, time.Hour, time.Hour)
+			id := cmd.GetSandboxId()
+			del := &ownsandv1.DeleteSandboxCommand{SandboxId: id}
+			restore := tc.fault(t, e, id)
+			for attempt := 1; attempt <= 2; attempt++ {
+				en, err := e.m.Delete(ctx, del)
+				requireInternal(t, err)
+				if en != nil {
+					t.Fatalf("delete attempt %d returned entry %v with its error", attempt, en)
+				}
+				if _, ok := e.m.State(id); ok {
+					t.Fatalf("delete attempt %d left an unsaved marker in memory", attempt)
+				}
+				if got := e.out.states(id); len(got) != 0 {
+					t.Fatalf("delete attempt %d sent updates %v for an unsaved marker", attempt, got)
+				}
+			}
+			restore()
+			en, err := e.m.Delete(ctx, del)
+			if err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Fatalf("delete after the store recovered = %v, %v", en, err)
+			}
+			if got := persistedState(t, e.st, id); got != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Fatalf("persisted state = %v; want DELETED", got)
+			}
+			e.restart()
+			if _, err := e.m.Create(ctx, cmd); err == nil {
+				t.Fatal("create after the restart accepted; the delete marker was lost")
+			}
+			if e.rt.startCount() != 0 {
+				t.Fatal("VM created after the delete")
+			}
+		})
+	}
+}
+
 // blockingGate is a CreateGate whose BeginCreate waits until release is closed.
 // entered receives one value per BeginCreate call that started waiting.
 type blockingGate struct {
