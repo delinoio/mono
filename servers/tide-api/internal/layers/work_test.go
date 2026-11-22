@@ -11,6 +11,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
+	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
@@ -413,5 +414,30 @@ func TestDeleteAfterLostCreateResponse(t *testing.T) {
 	sandboxes := w.fake.Sandboxes(w.osOrg)
 	if len(sandboxes) != 1 || sandboxes[0].GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || w.runner(t, runnerID).GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() {
 		t.Fatalf("sandboxes %v", sandboxes)
+	}
+}
+
+// TestStartFailureCleanupRetry: when the sandbox deletion after a start
+// failure fails, tide retries it until OwnSand deletes the sandbox.
+func TestStartFailureCleanupRetry(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	w.fake.SetExec(func(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+		code := int64(1)
+		return &ownsand.ExecResult{ExecID: p.ExecID, Kind: ownsand.ExecResultExited, ExitCode: &code}, nil
+	}, nil)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("device busy"))
+	})
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	s = w.waitState(t, s.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_FAILED)
+	if s.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_RUNNER_START_FAILED || w.fake.Active(w.osOrg) != 3 {
+		t.Fatalf("session %v with %d active sandboxes", s, w.fake.Active(w.osOrg))
+	}
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+	eventually(t, "the failed starts' sandboxes deleted", func() bool { return w.fake.Active(w.osOrg) == 0 })
+	var pending int
+	if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE organization_id = $1 AND sandbox_cleanup", w.org.ID).Scan(&pending); err != nil || pending != 0 {
+		t.Fatalf("%d runners still marked (%v)", pending, err)
 	}
 }

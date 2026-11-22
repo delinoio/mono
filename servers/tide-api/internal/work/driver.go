@@ -4,6 +4,7 @@ package work
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"time"
@@ -44,7 +45,7 @@ func (e *Engine) RunReconciler(ctx context.Context) error {
 }
 
 func (e *Engine) reconcile(ctx context.Context) {
-	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE state = ANY($1)", openRunnerStates)
+	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE state = ANY($1) OR sandbox_cleanup", openRunnerStates)
 	if err != nil {
 		if ctx.Err() == nil {
 			e.svc.Logger.WarnContext(ctx, "reconcile_list_failed", slog.Any("error", err))
@@ -123,7 +124,10 @@ func (e *Engine) drive(ctx context.Context, runnerID string, kick chan struct{})
 			continue
 		}
 		if RunnerTerminal(r.State) {
-			return
+			if e.cleanUpEnded(ctx, r) || !wait(e.timing.SandboxPoll) {
+				return
+			}
+			continue
 		}
 		client, _, err := e.links.ClientForRemoval(ctx, r.OrganizationID)
 		if err != nil {
@@ -517,7 +521,10 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 		if err != nil || (cur.State != runCreating && cur.State != runPrep && cur.State != runWarm) {
 			return err
 		}
-		r, err = e.setRunnerTx(ctx, tx, runnerID, []tidev1.RunnerState{cur.State}, runFailed, "end_reason = $4", int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED))
+		// sandbox_cleanup keeps the sandbox deletion below durable: the
+		// reconciler retries it when it fails.
+		r, err = e.setRunnerTx(ctx, tx, runnerID, []tidev1.RunnerState{cur.State}, runFailed, "end_reason = $4, sandbox_cleanup = $5",
+			int16(tidev1.RunnerEndReason_RUNNER_END_REASON_START_FAILED), cur.SandboxID != "")
 		if err != nil || r == nil || r.RequestID == "" {
 			return err
 		}
@@ -538,17 +545,45 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 		return
 	}
 	e.svc.Logger.WarnContext(ctx, "runner_start_failure", slog.String("runner_id", runnerID), slog.String("organization_id", r.OrganizationID), slog.String("cause", cause))
-	if r.SandboxID != "" {
-		if client, _, err := e.links.ClientForRemoval(ctx, r.OrganizationID); err == nil {
-			if _, err := client.DeleteSandbox(context.WithoutCancel(ctx), r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) {
-				e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", runnerID), slog.Any("error", err))
-			}
-		}
+	if r.SandboxID != "" && !e.deleteEndedSandbox(context.WithoutCancel(ctx), r) {
+		e.ensureDriver(r.ID)
 	}
 	if ended != nil {
 		e.releaseClaim(ctx, ended)
 	}
 	e.Kick(r.OrganizationID)
+}
+
+// cleanUpEnded deletes the sandbox of an ended runner that is marked with
+// sandbox_cleanup. It reports whether no clean-up remains.
+func (e *Engine) cleanUpEnded(ctx context.Context, r *Runner) bool {
+	var pending bool
+	if err := e.svc.DB.Pool.QueryRow(ctx, "SELECT sandbox_cleanup FROM runners WHERE runner_id = $1", r.ID).Scan(&pending); err != nil {
+		return errors.Is(err, pgx.ErrNoRows)
+	}
+	return !pending || e.deleteEndedSandbox(ctx, r)
+}
+
+// deleteEndedSandbox deletes the sandbox of an ended runner and clears its
+// sandbox_cleanup mark. It reports whether the mark is clear. A link that
+// is gone, or a key that OwnSand no longer accepts, cannot delete the
+// sandbox; its idle_ttl ends it.
+func (e *Engine) deleteEndedSandbox(ctx context.Context, r *Runner) bool {
+	client, _, err := e.links.ClientForRemoval(ctx, r.OrganizationID)
+	if err != nil && connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		return false
+	}
+	if err == nil && r.SandboxID != "" {
+		if _, err := client.DeleteSandbox(ctx, r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+			return false
+		}
+	}
+	if _, err := e.svc.DB.Pool.Exec(ctx, "UPDATE runners SET sandbox_cleanup = false WHERE runner_id = $1 AND sandbox_cleanup", r.ID); err != nil {
+		e.svc.Logger.WarnContext(ctx, "runner_update_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		return false
+	}
+	return true
 }
 
 // deleteRunner changes an open runner to DELETING with reason and ends its

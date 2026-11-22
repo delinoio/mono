@@ -92,6 +92,10 @@ CREATE TABLE runners (
     workspace_path text NOT NULL DEFAULT '',
     -- The exec of the runner program that tide follows with AttachExec.
     program_exec_id uuid,
+    -- True while the sandbox of an ended runner (for example after a start
+    -- failure) still has to be deleted; the reconciler retries until the
+    -- deletion succeeds.
+    sandbox_cleanup boolean NOT NULL DEFAULT false,
     create_time timestamptz NOT NULL,
     ready_time timestamptz,
     end_time timestamptz,
@@ -100,6 +104,7 @@ CREATE TABLE runners (
 );
 CREATE INDEX runners_open_idx ON runners (organization_id, runner_profile_id, state) WHERE state NOT IN (7, 8);
 CREATE UNIQUE INDEX runners_request_idx ON runners (request_id) WHERE request_id IS NOT NULL AND state NOT IN (7, 8);
+CREATE INDEX runners_cleanup_idx ON runners (runner_id) WHERE sandbox_cleanup;
 CREATE INDEX runners_change_idx ON runners (organization_id, change_seq);
 CREATE INDEX runners_end_idx ON runners (end_time) WHERE end_time IS NOT NULL;
 CREATE TRIGGER runners_touch BEFORE INSERT OR UPDATE ON runners FOR EACH ROW EXECUTE FUNCTION work_touch();

@@ -448,12 +448,19 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 				return err
 			}
 			cur, err := e.lockRunner(ctx, tx, r.ID)
-			if err != nil || cur.State != runCreating {
-				// A DELETING runner keeps the sandbox ID, so its driver deletes
-				// the sandbox, and starts nothing. A deletion resolves the key
-				// before the runner ends, so an ended runner gets no sandbox
-				// here.
+			if err != nil {
 				return err
+			}
+			if RunnerTerminal(cur.State) {
+				// The runner ended while the call ran: the reconciler deletes
+				// the sandbox.
+				_, err := tx.Exec(ctx, "UPDATE runners SET sandbox_cleanup = true WHERE runner_id = $1", r.ID)
+				return err
+			}
+			if cur.State != runCreating {
+				// A DELETING runner keeps the sandbox ID, so its driver deletes
+				// the sandbox, and starts nothing.
+				return nil
 			}
 			return e.bindStartTx(ctx, tx, cur)
 		})
