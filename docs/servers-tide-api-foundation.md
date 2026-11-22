@@ -326,7 +326,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
 
 - The `kind` label includes `DEV_SESSION`. `tide_dev_session_execs_total` counts ended dev session execs by `result` (`exited`, `failed`, `sandbox_ended`). `tide_dev_session_transfer_bytes_total` counts the file bytes that `tide-api` relays, with `direction` `upload` or `download`, so that operators can see the Droplet bandwidth that dev sessions use.
 
-Open decision: the collection, retention, dashboards and alerts for these metrics. The repository has no metrics collection infrastructure today.
+Open decision: the collection, retention, dashboards and alerts for these metrics. Grafana Cloud is the default observability backend ([repository defaults](repository-defaults.md#default-technology-choices)), but the repository has no metrics collection infrastructure today.
 
 ### Audit events
 

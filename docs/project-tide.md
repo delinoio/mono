@@ -135,7 +135,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 
 Record each decision in the owning domain contract before the implementation that depends on it. The cross-domain ones are:
 
-- The collection, retention and alerting of the Prometheus metrics. The repository has no metrics collection infrastructure today ([control plane contract](servers-tide-api-foundation.md#metrics)).
+- The collection, retention and alerting of the Prometheus metrics. Grafana Cloud is the default observability backend ([repository defaults](repository-defaults.md#default-technology-choices)), but the repository has no metrics collection infrastructure today ([control plane contract](servers-tide-api-foundation.md#metrics)).
 - The pinned versions and the update policy of the GitHub Actions runner and of each vendor runner program that tide installs ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
 - The retention period of ended requests, ended runners and audit events ([control plane contract](servers-tide-api-foundation.md#storage)).
 - The npm package name and publication workflow of the TypeScript SDK, together with the same open decision of OwnSand.
