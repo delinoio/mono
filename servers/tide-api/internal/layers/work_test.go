@@ -299,3 +299,40 @@ func TestOrganizationDeletionFailureKeepsDispatch(t *testing.T) {
 	next := w.createSession(t, w.env.User(w.org.Member), profileID)
 	w.waitState(t, next.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 }
+
+// TestConcurrentCancelRequest: parallel cancellations of one queued request
+// cancel it once; the others get failed_precondition.
+func TestConcurrentCancelRequest(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+	})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	owner := w.env.User(w.org.Owner)
+	const n = 8
+	errs := make(chan error, n)
+	for range n {
+		go func() {
+			_, err := owner.Work.CancelRequest(ctx, connect.NewRequest(&tidev1.CancelRequestRequest{OrganizationId: w.org.ID, RequestId: s.GetDevSessionId()}))
+			errs <- err
+		}()
+	}
+	ok := 0
+	for range n {
+		err := <-errs
+		switch {
+		case err == nil:
+			ok++
+		case connect.CodeOf(err) != connect.CodeFailedPrecondition:
+			t.Fatalf("cancel: %v", err)
+		}
+	}
+	if ok != 1 {
+		t.Fatalf("%d successful cancellations", ok)
+	}
+	if countAudit(t, w.env, w.org.ID, tidev1.AuditAction_AUDIT_ACTION_REQUEST_CANCELED) != 1 {
+		t.Fatal("audit events")
+	}
+}

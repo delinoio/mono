@@ -155,7 +155,13 @@ func (h *Handler) CancelRequest(ctx context.Context, req *connect.Request[tidev1
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		cur, err := e.GetRequest(ctx, tx, c.OrganizationID, id)
+		if _, err := e.GetRequest(ctx, tx, c.OrganizationID, id); err != nil {
+			return err
+		}
+		// Check the state under the row lock that the end takes, so a
+		// dispatch or another cancellation that changes the request
+		// meanwhile is seen.
+		cur, err := e.lockRequest(ctx, tx, id)
 		if err != nil {
 			return err
 		}
