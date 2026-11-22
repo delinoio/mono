@@ -135,6 +135,81 @@ func TestGrowDisk(t *testing.T) {
 	}
 }
 
+// TestGrowDiskE2fsckOutcome runs growDisk with stub e2fsck and resize2fs
+// tools on PATH. Only e2fsck exit codes 0 and 1 may reach resize2fs; a
+// signal-terminated e2fsck (ExitCode -1) and any other exit code must fail
+// before resize2fs runs.
+func TestGrowDiskE2fsckOutcome(t *testing.T) {
+	cases := []struct {
+		name      string
+		e2fsck    string
+		wantErr   string
+		wantRsize bool
+	}{
+		{name: "clean", e2fsck: "exit 0", wantRsize: true},
+		{name: "corrected", e2fsck: "exit 1", wantRsize: true},
+		{name: "uncorrected", e2fsck: "echo bad >&2; exit 4", wantErr: "exit status 4"},
+		{name: "operational", e2fsck: "exit 8", wantErr: "exit status 8"},
+		{name: "signal", e2fsck: "kill -9 $$", wantErr: "signal: killed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bin := t.TempDir()
+			marker := filepath.Join(bin, "resize2fs.ran")
+			writeStub := func(name, body string) {
+				if err := os.WriteFile(filepath.Join(bin, name), []byte("#!/bin/sh\n"+body+"\n"), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			writeStub("e2fsck", tc.e2fsck)
+			writeStub("resize2fs", "touch '"+marker+"'")
+			t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+			img := filepath.Join(t.TempDir(), "disk.ext4")
+			if err := os.WriteFile(img, make([]byte, 1<<20), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			err := growDisk(context.Background(), img, 4<<20)
+			_, statErr := os.Stat(marker)
+			ran := statErr == nil
+			if tc.wantErr == "" && err != nil {
+				t.Fatalf("growDisk: %v", err)
+			}
+			if tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), "e2fsck") || !strings.Contains(err.Error(), tc.wantErr)) {
+				t.Fatalf("growDisk error %v, want e2fsck %q", err, tc.wantErr)
+			}
+			if ran != tc.wantRsize {
+				t.Fatalf("resize2fs ran %v, want %v", ran, tc.wantRsize)
+			}
+		})
+	}
+}
+
+// TestGrowDiskCanceledE2fsck covers a context that ends while e2fsck runs.
+func TestGrowDiskCanceledE2fsck(t *testing.T) {
+	bin := t.TempDir()
+	marker := filepath.Join(bin, "resize2fs.ran")
+	if err := os.WriteFile(filepath.Join(bin, "e2fsck"), []byte("#!/bin/sh\nexec sleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "resize2fs"), []byte("#!/bin/sh\ntouch '"+marker+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	img := filepath.Join(t.TempDir(), "disk.ext4")
+	if err := os.WriteFile(img, make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := growDisk(ctx, img, 4<<20)
+	if err == nil || !strings.Contains(err.Error(), "e2fsck") {
+		t.Fatalf("growDisk error %v, want e2fsck failure", err)
+	}
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatal("resize2fs ran after e2fsck was canceled")
+	}
+}
+
 func TestCapabilitiesWithoutFirecracker(t *testing.T) {
 	r, err := New(Options{Binary: filepath.Join(t.TempDir(), "missing"), Kernel: "/nonexistent", Rootfs: "/nonexistent", Logger: quiet()})
 	if err != nil {

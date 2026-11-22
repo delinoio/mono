@@ -941,10 +941,13 @@ func growDisk(ctx context.Context, path string, size int64) error {
 	if err := os.Truncate(path, size); err != nil {
 		return err
 	}
-	// e2fsck exits with 1 when it corrected the file system.
+	// e2fsck exits with 1 when it corrected the file system. Only exit codes
+	// 0 and 1 let the resize continue: ExitCode reports -1 when a signal
+	// ended e2fsck (for example the context kill or the OOM killer), and a
+	// check that did not finish leaves the file system in an unknown state.
 	if out, err := exec.CommandContext(ctx, tool("e2fsck"), "-fy", path).CombinedOutput(); err != nil {
 		var ee *exec.ExitError
-		if !errors.As(err, &ee) || ee.ExitCode() > 1 {
+		if ctx.Err() != nil || !errors.As(err, &ee) || ee.ExitCode() != 1 {
 			return fmt.Errorf("e2fsck: %v: %s", err, bytes.TrimSpace(out))
 		}
 	}
