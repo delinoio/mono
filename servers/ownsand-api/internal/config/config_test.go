@@ -89,6 +89,10 @@ func TestLoadCORSOrigins(t *testing.T) {
 		{"https origin", "https://console.example.org", true},
 		{"http with port", "http://127.0.0.1:13300", true},
 		{"list", "https://a.example, http://b.example:8080", true},
+		{"IPv6 literal with port", "http://[::1]:80", true},
+		{"loopback with port", "http://127.0.0.1:13100", true},
+		{"hostless with port", "https://:443", false},
+		{"hostless after valid", "https://a.example, https://:443", false},
 		{"bare query", "https://console.example.org?", false},
 		{"user info", "https://user@console.example.org", false},
 		{"user and password", "https://user:pw@console.example.org", false},
@@ -344,5 +348,50 @@ func TestLoadAccountsAPIOriginQuery(t *testing.T) {
 		if err != nil || cfg.Accounts.APIOrigin != want {
 			t.Errorf("%q: origin = %q, err = %v, want %q", origin, cfg.Accounts.APIOrigin, err, want)
 		}
+	}
+}
+
+func TestLoadRejectsHostlessURLs(t *testing.T) {
+	const rejected = "https://:443"
+	for _, tc := range []struct {
+		env, value string
+	}{
+		{EnvAccountsAPIOrigin, rejected},
+		{EnvLogtoIssuer, "https://:443/oidc"},
+		{EnvLogtoJWKSURL, "https://:443/oidc/jwks"},
+		{EnvR2Endpoint, rejected},
+		{EnvLogtoTokenEndpoint, "https://:443/oidc/token"},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			v := minimal()
+			v[EnvR2Endpoint], v[EnvR2Bucket], v[EnvR2AccessKeyID], v[EnvR2SecretAccessKey] = "https://acct.r2.cloudflarestorage.com", "b", "k", "s"
+			v[EnvLogtoTokenEndpoint] = "https://logto.example.org/oidc/token"
+			v[EnvAccountsM2MClientID], v[EnvAccountsM2MClientSecret] = "id", "secret"
+			v[tc.env] = tc.value
+			_, err := Load(env(v))
+			if err == nil {
+				t.Fatalf("Load accepted %s=%q", tc.env, tc.value)
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error %q does not name %s", err, tc.env)
+			}
+			if strings.Contains(err.Error(), ":443") {
+				t.Errorf("error %q contains the rejected value", err)
+			}
+		})
+	}
+}
+
+func TestLoadAcceptsLoopbackURLs(t *testing.T) {
+	for _, value := range []string{"http://127.0.0.1:13100", "http://[::1]:80"} {
+		t.Run(value, func(t *testing.T) {
+			v := minimal()
+			v[EnvAccountsAPIOrigin] = value
+			v[EnvLogtoIssuer] = value + "/oidc"
+			v[EnvR2Endpoint], v[EnvR2Bucket], v[EnvR2AccessKeyID], v[EnvR2SecretAccessKey] = value, "b", "k", "s"
+			if _, err := Load(env(v)); err != nil {
+				t.Fatalf("Load(%q) = %v", value, err)
+			}
+		})
 	}
 }

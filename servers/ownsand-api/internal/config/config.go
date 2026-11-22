@@ -302,7 +302,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.CORSOrigins = nil
 		for _, origin := range splitList(v) {
 			u, err := url.Parse(origin)
-			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" ||
 				// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, and user information is not part of an origin.
 				u.ForceQuery || u.User != nil ||
 				// A bare "#" leaves u.Fragment empty, so check the raw value too. Browsers never send a fragment in Origin.
@@ -386,7 +386,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvAccountsAPIOrigin); v != "" {
 		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
 			u.ForceQuery || u.Fragment != "" || strings.Contains(v, "#") {
 			return Config{}, fmt.Errorf("%s must be an origin such as https://accounts.api.delino.io", EnvAccountsAPIOrigin)
@@ -448,7 +448,7 @@ func parseKey(name, value string) ([]byte, error) {
 
 func validateURL(name, value string) error {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil
