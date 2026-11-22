@@ -772,6 +772,186 @@ func TestReadSuccessAfterLastCallEndedIsKept(t *testing.T) {
 	}
 }
 
+// readTestClock is a controllable clock for the read manager.
+type readTestClock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *readTestClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *readTestClock) Advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
+}
+
+// preOpenReadManager returns a read manager with a controllable clock whose
+// snapshot worker blocks before it opens the source, so before it creates the
+// snapshot file, until release is closed. started receives one value per
+// worker that reaches the hook.
+func preOpenReadManager(t *testing.T) (m *readManager, clock *readTestClock, started chan struct{}, release chan struct{}) {
+	t.Helper()
+	clock = &readTestClock{now: time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)}
+	m, err := newReadManager(filepath.Join(t.TempDir(), "reads"), clock.Now, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	started = make(chan struct{}, 4)
+	release = make(chan struct{})
+	m.forceCopy = true
+	m.openHook = func() {
+		started <- struct{}{}
+		<-release
+	}
+	return m, clock, started, release
+}
+
+func snapshotFiles(t *testing.T, m *readManager) []string {
+	t.Helper()
+	items, err := os.ReadDir(m.dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, item := range items {
+		names = append(names, item.Name())
+	}
+	return names
+}
+
+// A sweep must not delete an entry whose snapshot is still being prepared:
+// the worker would create a snapshot file after the sweep that no entry owns.
+// The retention time of the snapshot then starts when it became ready.
+func TestReadSweepKeepsSnapshotInPreparation(t *testing.T) {
+	m, clock, started, release := preOpenReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-sweep-in-preparation"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	// The only call is cancelled while the worker has not created the file.
+	m.end(readID, e)
+	clock.Advance(m.retention + time.Minute)
+	m.sweep(clock.Now())
+	if !m.hasEntry(readID) {
+		t.Fatal("sweep removed an entry whose snapshot is still being prepared")
+	}
+	// A retry of the read_id still joins the preparation.
+	retry, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatalf("retry after the sweep: %v", err)
+	}
+	if retry != e {
+		t.Fatal("retry did not reuse the entry in preparation")
+	}
+	m.end(readID, retry)
+	clock.Advance(time.Minute)
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err != nil {
+		t.Fatalf("snapshot failed: %v", e.err)
+	}
+	ready := clock.Now()
+	if names := snapshotFiles(t, m); len(names) != 1 || names[0] != readID {
+		t.Fatalf("snapshot files %v, want exactly the snapshot of the entry", names)
+	}
+	// The retention time counts from the moment the snapshot became ready,
+	// not from the last call end that happened more than the retention
+	// time ago.
+	m.sweep(ready.Add(m.retention - time.Minute))
+	if !m.hasEntry(readID) {
+		t.Fatal("snapshot was swept before its retention time after it became ready")
+	}
+	if got, err := os.ReadFile(e.snapshot); err != nil || string(got) != "0123456789" {
+		t.Fatalf("snapshot %q err %v", got, err)
+	}
+	m.sweep(ready.Add(m.retention))
+	if m.hasEntry(readID) {
+		t.Fatal("snapshot was kept after its retention time")
+	}
+	if names := snapshotFiles(t, m); len(names) != 0 {
+		t.Fatalf("snapshot files %v remain after the sweep", names)
+	}
+	if _, err := m.begin(readID, path); err == nil {
+		t.Fatal("expected an expired read_id after the sweep")
+	}
+}
+
+// A preparation that fails while a sweep skips it leaves neither an entry nor
+// a file.
+func TestReadSweepKeepsFailingSnapshotInPreparation(t *testing.T) {
+	m, clock, started, release := preOpenReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-sweep-failing-preparation"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	m.end(readID, e)
+	clock.Advance(m.retention + time.Minute)
+	m.sweep(clock.Now())
+	if !m.hasEntry(readID) {
+		t.Fatal("sweep removed an entry whose snapshot is still being prepared")
+	}
+	// The source disappears before the worker opens it.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err == nil {
+		t.Fatal("expected the snapshot to fail")
+	}
+	if m.hasEntry(readID) {
+		t.Fatal("failed entry stayed after the last call ended")
+	}
+	if names := snapshotFiles(t, m); len(names) != 0 {
+		t.Fatalf("snapshot files %v remain after the failure", names)
+	}
+}
+
+// Any file that cannot be retained is removed: if an entry vanished by any
+// other path while its worker still ran, the worker removes the file it made.
+func TestReadSnapshotOfForgottenEntryIsRemoved(t *testing.T) {
+	m, _, started, release := preOpenReadManager(t)
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, []byte("0123456789"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	const readID = "read-forgotten-entry"
+	e, err := m.begin(readID, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitStarted(t, started)
+	m.mu.Lock()
+	delete(m.entries, readID)
+	m.mu.Unlock()
+	close(release)
+	waitClosed(t, e.ready)
+	if e.err == nil {
+		t.Fatal("expected the snapshot of a forgotten entry to fail")
+	}
+	if names := snapshotFiles(t, m); len(names) != 0 {
+		t.Fatalf("snapshot files %v remain for an entry that nothing tracks", names)
+	}
+	m.end(readID, e)
+}
+
 func TestReadCopyZeroSizeProcfs(t *testing.T) {
 	if runtime.GOOS != "linux" {
 		t.Skip("procfs exists only on Linux")
