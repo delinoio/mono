@@ -190,3 +190,21 @@ func TestEnvelope(t *testing.T) {
 		t.Fatalf("marshal without key ID: %v", err)
 	}
 }
+
+func TestDerive(t *testing.T) {
+	k1, _ := GenerateKey("k1")
+	k2, _ := GenerateKey("k2")
+	a, _ := NewKeyring(k1)
+	b, _ := NewKeyring(k1, k2)
+	c, _ := NewKeyring(k2, k1)
+	x := a.Derive("salt", "op-1")
+	if len(x) != 32 || !bytes.Equal(x, b.Derive("salt", "op-1")) {
+		t.Fatal("the same primary key derives the same bytes")
+	}
+	if bytes.Equal(x, a.Derive("salt", "op-2")) || bytes.Equal(x, a.Derive("salt2", "op-1")) || bytes.Equal(x, c.Derive("salt", "op-1")) {
+		t.Fatal("derived bytes must differ per value, purpose and primary key")
+	}
+	if bytes.Equal(a.Derive("a", "bc"), a.Derive("ab", "c")) {
+		t.Fatal("purpose and value are ambiguous")
+	}
+}
