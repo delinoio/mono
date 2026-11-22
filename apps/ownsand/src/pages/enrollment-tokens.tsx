@@ -11,10 +11,9 @@ import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
   SecretDialog,
   ShortId,
   toastError,
@@ -50,54 +49,55 @@ export function EnrollmentTokensPage() {
         description="A token adds exactly one device to this organization. It works once and expires within 24 hours."
         action={<Button onClick={() => setCreating(true)}>Create token</Button>}
       />
-      {list.isPending ? (
-        <Loading label="Loading enrollment tokens" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : list.data.tokens.length === 0 ? (
-        <Empty title="No enrollment tokens" />
-      ) : (
-        <ul className="list" aria-label="Enrollment tokens">
-          {list.data.tokens.map((t) => (
-            <li key={t.enrollmentTokenId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  <code>{t.tokenPrefix}…</code> · {labels.tokenState[t.state]}
-                </span>
-                <span className="muted">
-                  Created {formatTime(t.createTime)} · expires{" "}
-                  {formatTime(t.expireTime)}
-                  {t.deviceId ? (
-                    <>
-                      {" "}
-                      · device <ShortId id={t.deviceId} />
-                    </>
+      <QueryBoundary query={list} loading="Loading enrollment tokens">
+        {(data) =>
+          data.tokens.length === 0 ? (
+            <Empty title="No enrollment tokens" />
+          ) : (
+            <ul className="list" aria-label="Enrollment tokens">
+              {data.tokens.map((t) => (
+                <li key={t.enrollmentTokenId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      <code>{t.tokenPrefix}…</code> ·{" "}
+                      {labels.tokenState[t.state]}
+                    </span>
+                    <span className="muted">
+                      Created {formatTime(t.createTime)} · expires{" "}
+                      {formatTime(t.expireTime)}
+                      {t.deviceId ? (
+                        <>
+                          {" "}
+                          · device <ShortId id={t.deviceId} />
+                        </>
+                      ) : null}
+                    </span>
+                  </div>
+                  {t.state === EnrollmentTokenState.PENDING ? (
+                    <Button
+                      variant={ButtonVariant.Secondary}
+                      size={ButtonSize.Small}
+                      onClick={async () => {
+                        try {
+                          await revoke.mutateAsync({
+                            organizationId,
+                            enrollmentTokenId: t.enrollmentTokenId,
+                          });
+                          toast.success("The token is revoked.");
+                        } catch (error) {
+                          toastError(error);
+                        }
+                      }}
+                    >
+                      Revoke
+                    </Button>
                   ) : null}
-                </span>
-              </div>
-              {t.state === EnrollmentTokenState.PENDING ? (
-                <Button
-                  variant={ButtonVariant.Secondary}
-                  size={ButtonSize.Small}
-                  onClick={async () => {
-                    try {
-                      await revoke.mutateAsync({
-                        organizationId,
-                        enrollmentTokenId: t.enrollmentTokenId,
-                      });
-                      toast.success("The token is revoked.");
-                    } catch (error) {
-                      toastError(error);
-                    }
-                  }}
-                >
-                  Revoke
-                </Button>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
+                </li>
+              ))}
+            </ul>
+          )
+        }
+      </QueryBoundary>
       <FormDialog
         open={creating}
         onOpenChange={setCreating}

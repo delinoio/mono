@@ -12,7 +12,12 @@ import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { BillingBanner } from "./billing.tsx";
-import { ErrorNotice, Loading } from "./ui.tsx";
+import {
+  ErrorNotice,
+  Loading,
+  RefreshFailedNotice,
+  showsFullError,
+} from "./ui.tsx";
 
 interface OrgContextValue {
   organizationId: string;
@@ -177,7 +182,11 @@ export function OrgShell({
   let body: ReactNode;
   if (org.isPending) {
     body = <Loading label="Loading the organization" />;
-  } else if (org.error) {
+  } else if (org.data === undefined || showsFullError(org)) {
+    // No loaded organization, or an error that a retry cannot fix
+    // (`not_found`, `permission_denied`, `unauthenticated`): replace the
+    // layout. A transient failure of a refetch keeps the layout mounted, so
+    // open dialogs and typed values survive; the notice below reports it.
     body = <ErrorNotice error={org.error} onRetry={() => void org.refetch()} />;
   } else {
     const organization = org.data.organization!;
@@ -214,6 +223,7 @@ export function OrgShell({
             </ul>
           </nav>
           <main className="content">
+            {org.error ? <RefreshFailedNotice query={org} /> : null}
             <BillingBanner organizationId={organizationId} role={role} />
             {canOpenSection(role, current) ? (
               children

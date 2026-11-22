@@ -19,6 +19,8 @@ import {
   ErrorNotice,
   FormDialog,
   Loading,
+  RefreshFailedNotice,
+  showsFullError,
 } from "../components/ui.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import {
@@ -91,7 +93,7 @@ export function BillingSection() {
   let body;
   if (status.isPending) {
     body = <Loading label="Loading the billing status" />;
-  } else if (status.error) {
+  } else if (status.data === undefined || showsFullError(status)) {
     body = (
       <ErrorNotice error={status.error} onRetry={() => void status.refetch()} />
     );
@@ -115,7 +117,7 @@ export function BillingSection() {
     );
   } else if (usage.isPending) {
     body = <Loading label="Loading the billing usage" />;
-  } else if (usage.error) {
+  } else if (usage.data === undefined || showsFullError(usage)) {
     body = (
       <ErrorNotice error={usage.error} onRetry={() => void usage.refetch()} />
     );
@@ -182,6 +184,11 @@ export function BillingSection() {
         OwnSand charges the usage of this organization to a Delino billing
         account. Pay, top up and manage billing accounts at <AccountsLink />.
       </p>
+      {[status, usage].map((query, i) =>
+        query.error && !showsFullError(query) ? (
+          <RefreshFailedNotice key={i} query={query} />
+        ) : null,
+      )}
       {body}
       {owner ? (
         <>
@@ -248,7 +255,7 @@ function LinkBillingDialog({
   let content;
   if (accounts.isPending) {
     content = <Loading label="Loading your billing accounts" />;
-  } else if (accounts.error) {
+  } else if (accounts.data === undefined || showsFullError(accounts)) {
     content = (
       <ErrorNotice
         error={accounts.error}
@@ -311,6 +318,9 @@ function LinkBillingDialog({
         toast.success(`${res.billingAccountName} is linked.`);
       }}
     >
+      {accounts.error && !showsFullError(accounts) ? (
+        <RefreshFailedNotice query={accounts} />
+      ) : null}
       {content}
     </FormDialog>
   );

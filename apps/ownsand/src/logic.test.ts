@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { describe, expect, test } from "@rstest/core";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   Role,
   SandboxState,
@@ -9,7 +10,11 @@ import {
 import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
 import { CreateSandboxRequestSchema } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
-import { shortIdText } from "./components/ui.tsx";
+import {
+  isTerminalError,
+  showsFullError,
+  shortIdText,
+} from "./components/ui.tsx";
 import { clearInvitationOnLeave, clearInvitationOutsideFlow } from "./App.tsx";
 import {
   AuthMode,
@@ -799,5 +804,47 @@ describe("billing amounts", () => {
     expect(formatCount(9_223_372_036_854_775_807n)).toBe(
       "9,223,372,036,854,775,807",
     );
+  });
+});
+
+describe("query failure display", () => {
+  const query = (data: unknown, error: unknown) => ({
+    data,
+    error,
+    isPending: false,
+    isFetching: false,
+    refetch: () => undefined,
+  });
+
+  test("a not_found, permission_denied or unauthenticated error is terminal", () => {
+    for (const code of [
+      Code.NotFound,
+      Code.PermissionDenied,
+      Code.Unauthenticated,
+    ]) {
+      expect(isTerminalError(new ConnectError("x", code))).toBe(true);
+    }
+  });
+
+  test("a transient or non-RPC error is not terminal", () => {
+    for (const code of [
+      Code.Unavailable,
+      Code.Internal,
+      Code.DeadlineExceeded,
+      Code.ResourceExhausted,
+    ]) {
+      expect(isTerminalError(new ConnectError("x", code))).toBe(false);
+    }
+    expect(isTerminalError(new TypeError("Failed to fetch"))).toBe(false);
+    expect(isTerminalError(null)).toBe(false);
+  });
+
+  test("the full error shows without data or for a terminal error only", () => {
+    const transient = new ConnectError("x", Code.Unavailable);
+    const gone = new ConnectError("x", Code.NotFound);
+    expect(showsFullError(query(undefined, transient))).toBe(true);
+    expect(showsFullError(query({}, transient))).toBe(false);
+    expect(showsFullError(query({}, gone))).toBe(true);
+    expect(showsFullError(query({}, null))).toBe(false);
   });
 });

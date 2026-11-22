@@ -157,6 +157,106 @@ export function ErrorNotice({
   );
 }
 
+/**
+ * Whether a failed read can never succeed on a retry, so the page must not
+ * keep showing its last loaded data: the resource is gone (`not_found`), the
+ * caller lost access (`permission_denied`) or the session ended
+ * (`unauthenticated`). Every other error (a network failure, `unavailable`,
+ * `internal`, a deadline) is transient, so loaded data stays on screen.
+ */
+export function isTerminalError(error: unknown): boolean {
+  return (
+    error instanceof ConnectError &&
+    (error.code === Code.NotFound ||
+      error.code === Code.PermissionDenied ||
+      error.code === Code.Unauthenticated)
+  );
+}
+
+/** The part of a React Query result that the boundary reads. */
+export interface BoundaryQuery<T> {
+  data: T | undefined;
+  error: unknown;
+  isPending: boolean;
+  isFetching: boolean;
+  refetch: () => unknown;
+}
+
+/**
+ * Whether a query failure replaces the content with a full error notice:
+ * there is no loaded data to show, or the error is terminal. A failed
+ * refetch of loaded data with a transient error returns false, because
+ * React Query keeps `data` next to the `error` and the content, with its
+ * open dialogs and typed values, must stay mounted.
+ */
+export function showsFullError(query: BoundaryQuery<unknown>): boolean {
+  if (query.error === null || query.error === undefined) return false;
+  return query.data === undefined || isTerminalError(query.error);
+}
+
+/**
+ * The non-blocking notice of a failed refetch of loaded data. The content
+ * stays visible and may be out of date. The notice goes away on the next
+ * successful fetch, because the query then clears its error.
+ */
+export function RefreshFailedNotice({
+  query,
+}: {
+  query: BoundaryQuery<unknown>;
+}) {
+  const billing = billingReasonOf(query.error) !== undefined;
+  return (
+    <div className="notice notice-error" role="alert">
+      <p>
+        The last refresh failed, so this page may be out of date.{" "}
+        <TextWithAccountsLink text={errorMessage(query.error)} />
+      </p>
+      {billing ? null : (
+        <Button
+          variant={ButtonVariant.Secondary}
+          disabled={query.isFetching}
+          onClick={() => void query.refetch()}
+        >
+          Try again
+        </Button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Renders the state of a query: a loading placeholder while the first load
+ * runs, the full error notice when there is no data or the error is terminal
+ * (see `showsFullError`), and otherwise the content. A failed refetch of
+ * loaded data with a transient error renders the content with a
+ * `RefreshFailedNotice` above it, so the content never unmounts.
+ */
+export function QueryBoundary<T>({
+  query,
+  loading,
+  children,
+}: {
+  query: BoundaryQuery<T>;
+  loading: string;
+  children: (data: T) => ReactNode;
+}) {
+  const failed = query.error !== null && query.error !== undefined;
+  if (query.isPending || (query.data === undefined && !failed)) {
+    return <Loading label={loading} />;
+  }
+  if (showsFullError(query)) {
+    return (
+      <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
+    );
+  }
+  return (
+    <>
+      {failed ? <RefreshFailedNotice query={query} /> : null}
+      {children(query.data as T)}
+    </>
+  );
+}
+
 export function Empty({
   title,
   children,
