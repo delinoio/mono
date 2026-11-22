@@ -24,6 +24,7 @@ export {
   isBillingError,
   OwnSandConfigError,
   OwnSandError,
+  OwnSandHandleClosedError,
   OwnSandValidationError,
   PeerStreamOverrunError,
 } from "./errors.ts";

@@ -6,6 +6,7 @@ import {
   DataPathError,
   InvalidFrameError,
   OwnSandConfigError,
+  OwnSandHandleClosedError,
 } from "./errors.ts";
 import { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 import {
@@ -19,6 +20,7 @@ import {
   DataFrameKind,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
 import type { Sandbox } from "./sandbox.ts";
 import {
@@ -1781,6 +1783,158 @@ describe("peer-to-peer data path", () => {
       }
       expect(rtc.channels).toHaveLength(2);
       expect(messages).toBe(0);
+    });
+  });
+
+  describe("closing the sandbox handle", () => {
+    const exiting: FakeAgent = (frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    };
+
+    test("a close while the shared setup is pending ends every waiter and sends no OpenSession", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      const sandbox = h.client.sandbox(SANDBOX);
+      const controller = new AbortController();
+      const withSignal = sandbox
+        .run({ command: ["a"], signal: controller.signal })
+        .catch((e) => e);
+      const withoutSignal = sandbox.run({ command: ["b"] }).catch((e) => e);
+      // Setup is pending (ICE gathering takes virtual time).
+      await h.clock.advance(50);
+      sandbox.close();
+      const errors = await h.clock.run(
+        Promise.all([withSignal, withoutSignal]),
+      );
+      expect(errors[0]).toBeInstanceOf(OwnSandHandleClosedError);
+      expect(errors[1]).toBeInstanceOf(OwnSandHandleClosedError);
+      expect((errors[0] as Error).message).toBe("sandbox handle closed");
+      // The setup was cancelled before the offer: no session was created.
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      // The close is not a peer failure: the handle stays on peer-to-peer.
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("a session that opens after the close is closed and never installed", async () => {
+      const { h, rtc } = p2pSetup(exiting, { openSessionMs: 5_000 });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
+      // 100 ms of gathering, then OpenSession is in flight.
+      await h.clock.advance(1_000);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      sandbox.close();
+      const error = await h.clock.run(pending);
+      expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      expect(rtc.frames).toHaveLength(0);
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      // A later operation is rejected before any new setup.
+      await expect(
+        h.clock.run(sandbox.run({ command: ["b"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(rtc.connections).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("a Canceled error from OpenSession after the close still ends with the closed error", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      h.api.unary(DataPathService, "OpenSession", async () => {
+        await h.clock.sleep(5_000);
+        throw new ConnectError("canceled", Code.Canceled);
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
+      await h.clock.advance(1_000);
+      sandbox.close();
+      expect(await h.clock.run(pending)).toBeInstanceOf(
+        OwnSandHandleClosedError,
+      );
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+    });
+
+    test("close is idempotent and a closed handle rejects before GetIceServers", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      const sandbox = h.client.sandbox(SANDBOX);
+      // No session was ever opened.
+      sandbox.close();
+      sandbox.close();
+      await expect(
+        h.clock.run(sandbox.run({ command: ["a"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+      expect(rtc.connections).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      sandbox.close();
+    });
+
+    test("a close after the session opened closes it and rejects later operations", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      const sandbox = h.client.sandbox(SANDBOX);
+      await h.clock.run(sandbox.run({ command: ["a"] }));
+      sandbox.close();
+      sandbox.close();
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      await expect(
+        h.clock.run(sandbox.run({ command: ["b"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(rtc.connections).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("a closed relay-only handle keeps serving", async () => {
+      for (const options of [
+        { transport: DataPathTransport.RELAY },
+        // A WebRTC-less client uses the relay too.
+        undefined,
+      ]) {
+        const h =
+          options === undefined ? setup() : p2pSetup(() => {}, options).h;
+        h.api.stream(RelayService, "Exec", function* () {
+          yield execMsg(ev.accepted());
+          yield execMsg(ev.exited(0));
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        sandbox.close();
+        const result = await h.clock.run(
+          sandbox.exec({ command: ["x"] }).wait(),
+        );
+        expect(result.kind).toBe(ExecResultKind.Exited);
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      }
+    });
+
+    test("delete closes the handle only after DeleteSandbox succeeded", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      let fail = true;
+      h.api.unary(SandboxService, "DeleteSandbox", (req) => {
+        if (fail) {
+          throw new ConnectError("busy", Code.Unavailable);
+        }
+        return { sandbox: { sandboxId: req.sandboxId } };
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      await h.clock.run(sandbox.run({ command: ["a"] }));
+      await expect(h.clock.run(sandbox.delete())).rejects.toBeInstanceOf(
+        ConnectError,
+      );
+      // The failed delete left the handle and its session usable.
+      expect(rtc.channels[0]!.readyState).not.toBe("closed");
+      await h.clock.run(sandbox.run({ command: ["b"] }));
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      fail = false;
+      await h.clock.run(sandbox.delete());
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      await expect(
+        h.clock.run(sandbox.run({ command: ["c"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
     });
   });
 });
