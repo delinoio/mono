@@ -14,6 +14,11 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import {
+  type DeviceLimitsInput,
+  type Resources,
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
@@ -516,6 +521,174 @@ describe("device limits", () => {
     expect(
       (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
     ).toBe("0");
+  });
+
+  /**
+   * A mock transport whose build box has the given limits and that records
+   * the ReplaceDeviceLimits and CreateSandbox requests.
+   */
+  async function recordingTransport(limits: {
+    vcpuCount: number;
+    memoryMib: bigint;
+    diskGib: bigint;
+  }) {
+    const mock = createMockTransport();
+    await createClient(DeviceService, mock).replaceDeviceLimits({
+      organizationId: MOCK_IDS.acme,
+      deviceId: MOCK_IDS.buildBox,
+      limits: { ...limits, vcpuOvercommitPercent: 150 },
+    });
+    const replaced: DeviceLimitsInput[] = [];
+    const created: Resources[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        const request = rest[3] as {
+          limits?: DeviceLimitsInput;
+          resources?: Resources;
+        };
+        if (method.name === "ReplaceDeviceLimits") {
+          replaced.push(request.limits!);
+        }
+        if (method.name === "CreateSandbox") created.push(request.resources!);
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, replaced, created };
+  }
+
+  const commit = async (input: HTMLElement, value: string) => {
+    await act(async () => {
+      fireEvent.input(input, { target: { value } });
+      fireEvent.blur(input);
+    });
+    await settle();
+  };
+
+  const save = async () => {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    });
+    await settle(60);
+  };
+
+  test("changing only the vCPU limit keeps memory and disk above 2^53 exact", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 9223372036854775807n,
+      diskGib: 9007199254740993n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const vcpu = await screen.findByLabelText("vCPU limit");
+    await settle();
+    expect(
+      (screen.getByLabelText("Memory limit (MiB)") as HTMLInputElement).value,
+    ).toBe("9223372036854775807");
+    expect(
+      (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
+    ).toBe("9007199254740993");
+    await commit(vcpu, "8");
+    await save();
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]?.vcpuCount).toBe(8);
+    expect(replaced[0]?.memoryMib).toBe(9223372036854775807n);
+    expect(replaced[0]?.diskGib).toBe(9007199254740993n);
+    expect(replaced[0]?.vcpuOvercommitPercent).toBe(150);
+  });
+
+  test("an explicitly edited limit keeps its exact precision", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const disk = await screen.findByLabelText("Disk limit (GiB)");
+    await settle();
+    await commit(disk, "9007199254740993");
+    await save();
+    expect(replaced[0]?.diskGib).toBe(9007199254740993n);
+    expect(replaced[0]?.memoryMib).toBe(65536n);
+  });
+
+  test("keeps an off-grid memory limit and sends 1000 as typed", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 1000n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const disk = await screen.findByLabelText("Disk limit (GiB)");
+    await settle();
+    // Saving a different limit keeps the off-grid memory value.
+    await commit(disk, "600");
+    await save();
+    expect(replaced[0]?.memoryMib).toBe(1000n);
+    const memory = screen.getByLabelText("Memory limit (MiB)");
+    await commit(memory, "1500");
+    await commit(memory, "1000");
+    expect((memory as HTMLInputElement).value).toBe("1000");
+    await save();
+    expect(replaced[1]?.memoryMib).toBe(1000n);
+    expect(replaced[1]?.diskGib).toBe(600n);
+  });
+
+  test("shows a validation error for an out-of-range limit and sends nothing", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const memory = await screen.findByLabelText("Memory limit (MiB)");
+    await settle();
+    const message =
+      "Memory limit must be a whole number from 0 to 9223372036854775807.";
+    for (const value of ["9223372036854775808", "-1", "1.5"]) {
+      await commit(memory, value);
+      await save();
+      expect(memory.getAttribute("aria-invalid")).toBe("true");
+      expect(screen.getAllByText(message).length).toBeGreaterThan(0);
+    }
+    expect(replaced).toHaveLength(0);
+    // Editing the field clears its error; the maximum is a valid value.
+    await commit(memory, "9223372036854775807");
+    expect(memory.getAttribute("aria-invalid")).not.toBe("true");
+    await save();
+    expect(replaced[0]?.memoryMib).toBe(9223372036854775807n);
+  });
+
+  test("a blank limit asks for the value and zero is a value", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const memory = await screen.findByLabelText("Memory limit (MiB)");
+    await settle();
+    await commit(memory, "");
+    await save();
+    expect(
+      screen.getAllByText("Memory limit is required. Enter 0 to allow none.")
+        .length,
+    ).toBeGreaterThan(0);
+    expect(replaced).toHaveLength(0);
+    await commit(memory, "0");
+    await save();
+    expect(replaced[0]?.memoryMib).toBe(0n);
+    expect(replaced[0]?.vcpuCount).toBe(16);
+    expect(replaced[0]?.diskGib).toBe(500n);
   });
 });
 

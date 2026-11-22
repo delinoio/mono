@@ -29,7 +29,13 @@ import {
   formatUsdMicros,
   OVERCOMMIT_PERCENTAGES,
 } from "./format.ts";
-import { deviceLimitsInput, parseLabels, ttlErrors } from "./forms.ts";
+import {
+  DeviceLimitField,
+  deviceLimitsInput,
+  parseInt64Limit,
+  parseLabels,
+  ttlErrors,
+} from "./forms.ts";
 import {
   invitationLink,
   openInvitationFromAddress,
@@ -457,12 +463,55 @@ describe("polling", () => {
   });
 });
 
+describe("parseInt64Limit", () => {
+  test("keeps every value of the int64 range exact", () => {
+    expect(parseInt64Limit("0")).toEqual({ value: 0n });
+    expect(parseInt64Limit("1000")).toEqual({ value: 1000n });
+    // 2^53 + 1 is not representable as a number.
+    expect(parseInt64Limit("9007199254740993")).toEqual({
+      value: 9007199254740993n,
+    });
+    expect(parseInt64Limit("9223372036854775807")).toEqual({
+      value: 9223372036854775807n,
+    });
+  });
+
+  test("trims whitespace and treats an empty input as blank", () => {
+    expect(parseInt64Limit(" 42 ")).toEqual({ value: 42n });
+    expect(parseInt64Limit("")).toEqual({ error: "blank" });
+    expect(parseInt64Limit("   ")).toEqual({ error: "blank" });
+  });
+
+  test("rejects values that are not a whole number of the int64 range", () => {
+    for (const text of [
+      "9223372036854775808",
+      "-1",
+      "+1",
+      "1.5",
+      "1e3",
+      "1,000",
+      "0x10",
+      "12 34",
+      "abc",
+    ]) {
+      expect(parseInt64Limit(text)).toEqual({ error: "invalid" });
+    }
+  });
+});
+
 describe("deviceLimitsInput", () => {
+  const base = {
+    vcpu: 4,
+    memoryMib: "8192",
+    diskGib: "100",
+    overcommitPercent: 150,
+  };
+
   test("sends an explicit zero as a present value", () => {
     const result = deviceLimitsInput({
       vcpu: 0,
-      memoryMib: 0,
-      diskGib: 0,
+      memoryMib: "0",
+      diskGib: "0",
       overcommitPercent: 100,
     });
     expect("limits" in result).toBe(true);
@@ -473,21 +522,48 @@ describe("deviceLimitsInput", () => {
     expect(result.limits.vcpuOvercommitPercent).toBe(100);
   });
 
+  test("sends memory and disk above 2^53 exactly", () => {
+    const result = deviceLimitsInput({
+      ...base,
+      memoryMib: "9223372036854775807",
+      diskGib: "9007199254740993",
+    });
+    expect("limits" in result).toBe(true);
+    if (!("limits" in result)) return;
+    expect(result.limits.memoryMib).toBe(9223372036854775807n);
+    expect(result.limits.diskGib).toBe(9007199254740993n);
+  });
+
   test("asks for a blank field instead of sending zero", () => {
-    const base = {
-      vcpu: 4,
-      memoryMib: 8192,
-      diskGib: 100,
-      overcommitPercent: 150,
-    };
     expect(deviceLimitsInput({ ...base, vcpu: null })).toEqual({
       error: "vCPU limit is required. Enter 0 to allow none.",
+      field: DeviceLimitField.Vcpu,
     });
-    expect(deviceLimitsInput({ ...base, memoryMib: null })).toEqual({
+    expect(deviceLimitsInput({ ...base, memoryMib: "" })).toEqual({
       error: "Memory limit is required. Enter 0 to allow none.",
+      field: DeviceLimitField.Memory,
     });
-    expect(deviceLimitsInput({ ...base, diskGib: null })).toEqual({
+    expect(deviceLimitsInput({ ...base, diskGib: "  " })).toEqual({
       error: "Disk limit is required. Enter 0 to allow none.",
+      field: DeviceLimitField.Disk,
+    });
+  });
+
+  test("rejects an out-of-range memory or disk limit", () => {
+    expect(deviceLimitsInput({ ...base, memoryMib: "-1" })).toEqual({
+      error:
+        "Memory limit must be a whole number from 0 to 9223372036854775807.",
+      field: DeviceLimitField.Memory,
+    });
+    expect(
+      deviceLimitsInput({ ...base, diskGib: "9223372036854775808" }),
+    ).toEqual({
+      error: "Disk limit must be a whole number from 0 to 9223372036854775807.",
+      field: DeviceLimitField.Disk,
+    });
+    expect(deviceLimitsInput({ ...base, diskGib: "1.5" })).toEqual({
+      error: "Disk limit must be a whole number from 0 to 9223372036854775807.",
+      field: DeviceLimitField.Disk,
     });
   });
 });

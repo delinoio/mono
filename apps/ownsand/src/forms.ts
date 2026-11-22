@@ -74,11 +74,40 @@ export function parseLabels(
   return { labels: Object.fromEntries(labels) };
 }
 
-/** The limit fields of the device form; `null` is a blank input. */
+/** The largest value of an `int64` device limit: 2^63 - 1. */
+export const MAX_INT64 = 9223372036854775807n;
+
+/** Parses a non-negative whole number of the `int64` range without rounding. */
+export function parseInt64Limit(
+  text: string,
+): { value: bigint } | { error: "blank" | "invalid" } {
+  const trimmed = text.trim();
+  if (trimmed === "") return { error: "blank" };
+  // Digits only: a sign, a decimal point, an exponent or a separator is not a
+  // whole number. `Number` would round above 2^53, so the digits go straight
+  // to `BigInt`.
+  if (!/^\d+$/.test(trimmed)) return { error: "invalid" };
+  const value = BigInt(trimmed);
+  if (value > MAX_INT64) return { error: "invalid" };
+  return { value };
+}
+
+/** The limit fields of the device form that can carry an error. */
+export enum DeviceLimitField {
+  Vcpu = "vcpu",
+  Memory = "memory",
+  Disk = "disk",
+}
+
+/**
+ * The limit fields of the device form. A blank vCPU input is `null`. Memory
+ * and disk are the text of their inputs: an `int64` limit above 2^53 is not
+ * exact as a `number`, so the form keeps the digits and parses them on save.
+ */
 export interface DeviceLimitsForm {
   vcpu: number | null;
-  memoryMib: number | null;
-  diskGib: number | null;
+  memoryMib: string;
+  diskGib: string;
   overcommitPercent: number;
 }
 
@@ -86,24 +115,45 @@ export interface DeviceLimitsForm {
  * Builds the ReplaceDeviceLimits input of the device form. The RPC needs
  * every value, and a blank input is not zero: it returns the message to show
  * for the first blank field, so the form never sends a silent zero. An
- * explicit zero is a value.
+ * explicit zero is a value. A memory or disk limit must be a whole number
+ * from 0 to 9223372036854775807 and keeps its exact value.
  */
 export function deviceLimitsInput(
   form: DeviceLimitsForm,
-): { limits: DeviceLimitsInput } | { error: string } {
-  const blank = [
-    [form.vcpu, "vCPU limit"],
-    [form.memoryMib, "Memory limit"],
-    [form.diskGib, "Disk limit"],
-  ].find(([value]) => value === null);
+): { limits: DeviceLimitsInput } | { error: string; field: DeviceLimitField } {
+  const memory = parseInt64Limit(form.memoryMib);
+  const disk = parseInt64Limit(form.diskGib);
+  const blank: [DeviceLimitField, string] | undefined =
+    form.vcpu === null
+      ? [DeviceLimitField.Vcpu, "vCPU limit"]
+      : "error" in memory && memory.error === "blank"
+        ? [DeviceLimitField.Memory, "Memory limit"]
+        : "error" in disk && disk.error === "blank"
+          ? [DeviceLimitField.Disk, "Disk limit"]
+          : undefined;
   if (blank !== undefined) {
-    return { error: `${blank[1]} is required. Enter 0 to allow none.` };
+    return {
+      error: `${blank[1]} is required. Enter 0 to allow none.`,
+      field: blank[0],
+    };
+  }
+  if ("error" in memory) {
+    return {
+      error: `Memory limit must be a whole number from 0 to ${MAX_INT64}.`,
+      field: DeviceLimitField.Memory,
+    };
+  }
+  if ("error" in disk) {
+    return {
+      error: `Disk limit must be a whole number from 0 to ${MAX_INT64}.`,
+      field: DeviceLimitField.Disk,
+    };
   }
   return {
     limits: create(DeviceLimitsInputSchema, {
       vcpuCount: form.vcpu!,
-      memoryMib: BigInt(form.memoryMib!),
-      diskGib: BigInt(form.diskGib!),
+      memoryMib: memory.value,
+      diskGib: disk.value,
       vcpuOvercommitPercent: form.overcommitPercent,
     }),
   };
