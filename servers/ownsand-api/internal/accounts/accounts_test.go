@@ -39,6 +39,18 @@ type tokenServer struct {
 	expires  int64
 	status   int
 	errorStr string
+	// When block is set, a request announces itself on entered and then
+	// waits until block is closed.
+	block       chan struct{}
+	entered     chan struct{}
+	releaseOnce sync.Once
+}
+
+// release lets the held requests continue. It is safe to call twice.
+func (s *tokenServer) release() {
+	if s.block != nil {
+		s.releaseOnce.Do(func() { close(s.block) })
+	}
 }
 
 func (s *tokenServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +62,10 @@ func (s *tokenServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost || !ok || id != "client%2Fid" || secret != "s%26cret" ||
 		r.PostForm.Get("grant_type") != "client_credentials" || r.PostForm.Get("resource") != Resource || r.PostForm.Get("scope") != ScopeReportUsage {
 		s.t.Errorf("token request: %s %v %q %q %v", r.Method, ok, id, secret, r.PostForm)
+	}
+	if s.block != nil {
+		s.entered <- struct{}{}
+		<-s.block
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if s.status != 0 {
@@ -63,6 +79,8 @@ func (s *tokenServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func newSource(t *testing.T, ts *tokenServer, c *clock) *TokenSource {
 	srv := httptest.NewServer(ts)
 	t.Cleanup(srv.Close)
+	// Runs before srv.Close, so a failed test never hangs on a held request.
+	t.Cleanup(ts.release)
 	return NewTokenSource(TokenConfig{Endpoint: srv.URL + "/oidc/token", ClientID: "client/id", ClientSecret: "s&cret", HTTPClient: srv.Client(), Now: c.Now})
 }
 
@@ -89,6 +107,118 @@ func TestTokenSourceCachesUntilShortlyBeforeExpiry(t *testing.T) {
 	src.Invalidate()
 	if tok, _ := src.Token(ctx); tok != "token-3" || ts.calls.Load() != 3 {
 		t.Fatalf("token after invalidate = %q (calls %d)", tok, ts.calls.Load())
+	}
+}
+
+type tokenResult struct {
+	token string
+	err   error
+}
+
+func tokenAsync(src *TokenSource, ctx context.Context) <-chan tokenResult {
+	ch := make(chan tokenResult, 1)
+	go func() {
+		token, err := src.Token(ctx)
+		ch <- tokenResult{token, err}
+	}()
+	return ch
+}
+
+func receive(t *testing.T, ch <-chan tokenResult, what string) tokenResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s did not return", what)
+		return tokenResult{}
+	}
+}
+
+func TestTokenSourceWaiterCancelDoesNotEndTheSharedRefresh(t *testing.T) {
+	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
+	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}
+	src := newSource(t, ts, c)
+
+	first := tokenAsync(src, context.Background())
+	<-ts.entered // the first caller's request is held open
+	waiterCtx, cancel := context.WithCancel(context.Background())
+	waiter := tokenAsync(src, waiterCtx)
+	cancel()
+	// The cancelled waiter returns while the request is still held open.
+	if r := receive(t, waiter, "the cancelled waiter"); !errors.Is(r.err, context.Canceled) || r.token != "" {
+		t.Fatalf("cancelled waiter = %+v", r)
+	}
+	select {
+	case r := <-first:
+		t.Fatalf("the first caller returned early: %+v", r)
+	default:
+	}
+	// Invalidate does not wait for the request either.
+	invalidated := make(chan struct{})
+	go func() { src.Invalidate(); close(invalidated) }()
+	select {
+	case <-invalidated:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Invalidate blocked behind the token request")
+	}
+	ts.release()
+	// The first caller still gets the token of the request it started.
+	if r := receive(t, first, "the first caller"); r.err != nil || r.token != "token-1" {
+		t.Fatalf("first caller = %+v", r)
+	}
+}
+
+func TestTokenSourceCallersShareOneRefreshAndTheCache(t *testing.T) {
+	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
+	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}
+	src := newSource(t, ts, c)
+
+	first := tokenAsync(src, context.Background())
+	<-ts.entered
+	second := tokenAsync(src, context.Background())
+	ts.release()
+	for name, ch := range map[string]<-chan tokenResult{"first": first, "second": second} {
+		if r := receive(t, ch, name); r.err != nil || r.token != "token-1" {
+			t.Fatalf("%s caller = %+v", name, r)
+		}
+	}
+	// A third caller reuses the cached token.
+	if tok, err := src.Token(context.Background()); err != nil || tok != "token-1" || ts.calls.Load() != 1 {
+		t.Fatalf("third caller = %q, %v (calls %d)", tok, err, ts.calls.Load())
+	}
+}
+
+func TestTokenSourceCancelledCallerDoesNotStartARequest(t *testing.T) {
+	c := &clock{now: time.Now()}
+	ts := &tokenServer{t: t, expires: 3600}
+	src := newSource(t, ts, c)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := src.Token(ctx); !errors.Is(err, context.Canceled) || ts.calls.Load() != 0 {
+		t.Fatalf("cancelled caller: %v (calls %d)", err, ts.calls.Load())
+	}
+}
+
+func TestTokenSourceInvalidateDuringRefreshStartsANewRefresh(t *testing.T) {
+	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
+	ts := &tokenServer{t: t, expires: 3600, block: make(chan struct{}), entered: make(chan struct{}, 4)}
+	src := newSource(t, ts, c)
+
+	stale := tokenAsync(src, context.Background())
+	<-ts.entered
+	src.Invalidate()
+	fresh := tokenAsync(src, context.Background())
+	<-ts.entered // the invalidated source started a second request
+	ts.release()
+	receive(t, stale, "the caller of the invalidated request")
+	r := receive(t, fresh, "the caller of the new request")
+	if r.err != nil || r.token != "token-2" {
+		t.Fatalf("new request = %+v", r)
+	}
+	// Only the new request is cached.
+	if tok, _ := src.Token(context.Background()); tok != "token-2" || ts.calls.Load() != 2 {
+		t.Fatalf("cached token = %q (calls %d)", tok, ts.calls.Load())
 	}
 }
 
