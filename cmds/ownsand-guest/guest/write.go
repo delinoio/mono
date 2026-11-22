@@ -275,6 +275,10 @@ func (e *writeEntry) writeChunk(off int64, data []byte) error {
 	if len(data) == 0 {
 		return nil
 	}
+	if e.file == nil {
+		// A failed finish could not reopen the staging file.
+		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: staging file is not open")
+	}
 	end := off + int64(len(data))
 	for _, r := range e.ranges {
 		lo, hi := max(r.start, off), min(r.end, end)
@@ -321,6 +325,9 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 	if !covered {
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "written ranges do not cover exactly [0, size_bytes)")
 	}
+	if e.file == nil {
+		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "write: staging file is not open")
+	}
 	if err := e.file.Truncate(size); err != nil {
 		return fsError("write", err)
 	}
@@ -334,7 +341,15 @@ func (e *writeEntry) complete(finish *ownsandv1.WriteFileFinish) error {
 		return fsError("write", err)
 	}
 	if err := os.Rename(e.tmp, e.target); err != nil {
-		// Reopen so a retry of the finish can try again.
+		// Reopen so a retry of the finish can try again. The mode of the
+		// finish is already on the staging file, and a mode without the owner
+		// write bit (0444) would make the reopen fail for an unprivileged
+		// guest user. Restore a writable mode first; the retry applies the
+		// requested mode again before it renames.
+		e.file = nil
+		if chmodErr := restoreStagingMode(e.tmp); chmodErr != nil {
+			return fsError("write", err)
+		}
 		if f, openErr := os.OpenFile(e.tmp, os.O_RDWR, 0); openErr == nil {
 			e.file = f
 		}

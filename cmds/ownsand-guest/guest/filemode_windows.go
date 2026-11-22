@@ -16,3 +16,9 @@ import "os"
 func applyFileMode(_ *os.File, _ uint32) error {
 	return nil
 }
+
+// restoreStagingMode does nothing on Windows: applyFileMode never changes the
+// mode of the staging file there, so it stays writable.
+func restoreStagingMode(_ string) error {
+	return nil
+}
