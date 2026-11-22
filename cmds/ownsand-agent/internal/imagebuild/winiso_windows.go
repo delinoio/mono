@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,8 +50,13 @@ type mountedISO struct {
 	path string
 	// Root is the volume root, for example `E:\`.
 	Root string
-	// ours is set when the build attached the ISO and must detach it.
+	// ours is set when the build attached the ISO and must detach it. A
+	// successful dismount clears it; a failed one keeps it, so a later
+	// dismount retries.
 	ours bool
+	// run replaces powershell in tests, so they need no Windows image mount.
+	// It is nil in production.
+	run func(ctx context.Context, script string, env ...string) ([]byte, error)
 }
 
 // mountISO attaches the ISO read-only, or uses it where it is attached
@@ -81,13 +87,30 @@ $letter = ($img | Get-Volume).DriveLetter
 	return m, nil
 }
 
-// dismount detaches an ISO that the build attached.
+// dismount detaches an ISO that the build attached. It clears m.ours only
+// when the detach succeeded, so a dismount that failed, for example with a
+// canceled context, can run again.
 func (m *mountedISO) dismount(ctx context.Context) error {
 	if !m.ours {
 		return nil
 	}
-	_, err := powershell(ctx, `Dismount-DiskImage -ImagePath $env:OWNSAND_ISO | Out-Null`, "OWNSAND_ISO="+m.path)
-	return err
+	run := m.run
+	if run == nil {
+		run = powershell
+	}
+	if _, err := run(ctx, `Dismount-DiskImage -ImagePath $env:OWNSAND_ISO | Out-Null`, "OWNSAND_ISO="+m.path); err != nil {
+		return err
+	}
+	m.ours = false
+	return nil
+}
+
+// release dismounts the ISO and logs a failure without failing the build: an
+// attached ISO leaks a volume only, and the caller may call release again.
+func (m *mountedISO) release(ctx context.Context, logger *slog.Logger) {
+	if err := m.dismount(ctx); err != nil {
+		logger.Warn("dismount the ISO failed", "error", err)
+	}
 }
 
 // installImage returns sources\install.wim or sources\install.esd of the
