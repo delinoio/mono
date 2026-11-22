@@ -329,6 +329,12 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, service, orgID, acco
 	if linkID, err = newID(); err != nil {
 		return err
 	}
+	// The billing account lock is held; take the organization lock after it
+	// (see billing.LockOrganization) so an unattributed report of the
+	// organization either commits before this link is inserted or finds it.
+	if err := billing.LockOrganization(ctx, tx, service, orgID); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `INSERT INTO organization_links (organization_link_id, service, organization_id,
 			billing_account_id, organization_name, link_time) VALUES ($1, $2, $3, $4, $5, $6)`,
 		linkID, service, orgID, accountID, name, now); err != nil {

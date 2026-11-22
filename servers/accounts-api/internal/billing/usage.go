@@ -95,6 +95,24 @@ func attribute(ctx context.Context, q db.Querier, r UsageReport) (attribution, b
 	return a, err == nil, err
 }
 
+// LockOrganization takes a transaction-scoped advisory lock on one
+// organization of a service. It serializes the creation of a link of the
+// organization with the unattributed report of the organization, whose
+// last attribution read and insert would otherwise miss a link that
+// commits in between. The lock is held until tx ends.
+//
+// Lock order: a transaction that takes a billing account lock takes it
+// first and this lock second (a new link). The unattributed report path
+// takes only this lock and no billing account lock, and the attributed path
+// takes only the billing account lock, so the two orders cannot form a
+// cycle. A report that must lock a billing account after it found a link
+// rolls back, which releases this lock, and retries.
+func LockOrganization(ctx context.Context, tx pgx.Tx, service, organizationID string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('usage_attr:' || $1::text || ':' || $2::text, 0))`,
+		service, organizationID)
+	return err
+}
+
 // errAttributionChanged makes ReportUsage retry when a link changed between
 // the attribution and the billing account lock.
 var errAttributionChanged = errors.New("the attribution of the usage report changed")
@@ -158,11 +176,20 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 			if !ok || again != link {
 				return errAttributionChanged
 			}
-		} else if _, ok, err := attribute(ctx, tx, r); err != nil || ok {
-			if ok {
-				return errAttributionChanged
+		} else {
+			// Serialize with the creation of a link of the organization: a
+			// link that commits before this lock is seen by the read below,
+			// and a link that waits for this lock inserts after the
+			// unattributed row. The lock is held to the commit.
+			if err := LockOrganization(ctx, tx, r.Service, r.OrganizationID); err != nil {
+				return err
 			}
-			return err
+			if _, ok, err := attribute(ctx, tx, r); err != nil || ok {
+				if ok {
+					return errAttributionChanged
+				}
+				return err
+			}
 		}
 		id, err := newID()
 		if err != nil {
