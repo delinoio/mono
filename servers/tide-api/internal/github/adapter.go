@@ -101,12 +101,14 @@ func (a *Adapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, e
 			return work.StartResult{}, fmt.Errorf("remove the previous registration: %w", err)
 		}
 	}
-	if _, err := l.svc.DB.Pool.Exec(ctx, `INSERT INTO github_runners (runner_id, organization_id, github_installation_id) VALUES ($1, $2, $3)
-		ON CONFLICT (runner_id) DO UPDATE SET github_runner_id = NULL, registration_removed = false`, r.ID, r.OrganizationID, inst.GitHubID); err != nil {
+	label := g.Profile.GitHubLabel()
+	if _, err := l.svc.DB.Pool.Exec(ctx, `INSERT INTO github_runners (runner_id, organization_id, github_installation_id, github_label) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (runner_id) DO UPDATE SET github_runner_id = NULL, registration_removed = false, github_label = EXCLUDED.github_label`,
+		r.ID, r.OrganizationID, inst.GitHubID, label); err != nil {
 		return work.StartResult{}, err
 	}
 	name := RunnerNamePrefix + r.ID
-	labels := []string{g.Profile.GitHubLabel()}
+	labels := []string{label}
 	jit, err := l.gh.GenerateJITConfig(ctx, inst.GitHubID, inst.Login, name, inst.RunnerGroupID, labels)
 	if errors.Is(err, githubapi.ErrRunnerNameTaken) {
 		// GitHub does not document the cause of 409; a registration with the

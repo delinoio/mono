@@ -341,6 +341,12 @@ func (l *Layer) workflowJob(ctx context.Context, tx pgx.Tx, body []byte, o *outc
 			return o.ignore("labels match no runner profile")
 		}
 		o.requestID = req.ID
+		org, profileID, pool := inst.OrganizationID, req.ProfileID, inst.PoolKey()
+		o.after = append(o.after, func(ctx context.Context) {
+			ctx, cancel := context.WithTimeout(ctx, surplusTimeout)
+			defer cancel()
+			l.retireRenamed(ctx, org, profileID, pool)
+		})
 		return nil
 	case "in_progress":
 		return l.jobInProgress(ctx, tx, inst, &ev, o)
@@ -446,9 +452,62 @@ func (l *Layer) jobCompleted(ctx context.Context, tx pgx.Tx, inst *Installation,
 		l.svc.WorkChanged(org)
 		ctx, cancel := context.WithTimeout(ctx, surplusTimeout)
 		defer cancel()
+		l.retireRenamed(ctx, org, profileID, pool)
 		l.removeSurplus(ctx, org, profileID, pool)
 	})
 	return nil
+}
+
+// retireRenamed deletes the runners of a pool that wait for a job and whose
+// registration has another label than the profile now (the profile was
+// renamed): jobs with the new label never go to them, but the dispatcher
+// counts them as runners of the pool, so the new jobs would wait. They are
+// removed with removeIdleRunner (CLEAN_UP), and the dispatcher starts
+// runners with the new label. A runner whose removal GitHub refuses took a
+// job of the old label and stays.
+func (l *Layer) retireRenamed(ctx context.Context, orgID, profileID, pool string) {
+	p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID)
+	if err != nil {
+		return
+	}
+	rows, err := l.svc.DB.Pool.Query(ctx, `SELECT r.runner_id::text FROM runners r JOIN github_runners g ON g.runner_id = r.runner_id
+		WHERE r.organization_id = $1 AND r.runner_profile_id = $2 AND r.pool_key = $3 AND r.request_id IS NULL AND r.state = ANY($4)
+		AND lower(g.github_label) <> lower($5) ORDER BY r.create_time, r.runner_id`, orgID, profileID, pool,
+		[]int16{int16(tidev1.RunnerState_RUNNER_STATE_CREATING), int16(tidev1.RunnerState_RUNNER_STATE_PREPARING), int16(tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)},
+		p.GitHubLabel())
+	if err != nil {
+		l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+		return
+	}
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err == nil {
+			ids = append(ids, id)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil || len(ids) == 0 {
+		if err != nil {
+			l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+		}
+		return
+	}
+	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, orgID, pool)
+	if err != nil {
+		l.svc.Logger.WarnContext(ctx, "github_renamed_runners_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+		return
+	}
+	for _, id := range ids {
+		deleted, err := l.removeIdleRunner(ctx, inst, orgID, id, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP)
+		if err != nil {
+			l.svc.Logger.WarnContext(ctx, "github_renamed_runner_delete_failed", slog.String("organization_id", orgID), slog.String("runner_id", id), slog.Any("error", err))
+			continue
+		}
+		if deleted {
+			l.svc.Logger.InfoContext(ctx, "github_renamed_runner_removed", slog.String("organization_id", orgID), slog.String("runner_id", id))
+		}
+	}
 }
 
 // removeSurplus compares the pool's runners in CREATING, PREPARING or

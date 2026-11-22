@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"google.golang.org/protobuf/types/known/fieldmaskpb"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
@@ -404,6 +405,37 @@ func TestWarmRunnerReclaim(t *testing.T) {
 		}
 		return false
 	})
+}
+
+// TestRenamedProfile: after a profile rename, the runners that wait with
+// the old label are replaced, so a job with the new label starts.
+func TestRenamedProfile(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.link(t, 501, "acme")
+	profileID := w.createProfile(t, ghProfile("linux", 1))
+	eventually(t, "a warm runner", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1 })
+	old := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)[0]
+	if _, err := w.env.User(w.org.Admin).Profile.UpdateRunnerProfile(context.Background(), connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: profileID, Profile: &tidev1.RunnerProfile{Name: "linux2"}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"name"}},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	w.send(t, "workflow_job", job("queued", 501, 1, []string{"tide-linux2"}, ""))
+	w.l.GitHub.Wait()
+	if r := w.runner(t, old.GetRunnerId()); r.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETED || r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP {
+		t.Fatalf("runner with the old label %v", r)
+	}
+	if _, ok := w.gh.RunnerByName("tide-" + old.GetRunnerId()); ok {
+		t.Fatal("the old registration was not removed")
+	}
+	// The job and the warm count get runners with the new label.
+	eventually(t, "runners with the new label", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 2 })
+	for _, r := range w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK) {
+		reg, ok := w.gh.RunnerByName("tide-" + r.GetRunnerId())
+		if !ok || !strings.Contains(strings.Join(reg.Labels, ","), "tide-linux2") {
+			t.Fatalf("registration %+v", reg)
+		}
+	}
 }
 
 // TestLostDeliveries: a delivery that GitHub could not deliver is

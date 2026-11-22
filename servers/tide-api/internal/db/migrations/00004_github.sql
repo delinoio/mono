@@ -63,6 +63,9 @@ CREATE TABLE github_runners (
     runner_id uuid PRIMARY KEY REFERENCES runners ON DELETE CASCADE,
     organization_id uuid NOT NULL REFERENCES organizations ON DELETE CASCADE,
     github_installation_id bigint NOT NULL,
+    -- The label tide-<profile name> of the registration. A runner whose
+    -- profile was renamed since keeps the old label.
+    github_label text NOT NULL,
     -- Set when GitHub created the JIT configuration.
     github_runner_id bigint,
     -- true after tide removed the registration (or found it gone).
