@@ -77,6 +77,7 @@ import {
   type Sandbox,
   CreateSandboxRequestSchema,
   SandboxSchema,
+  type SandboxSource,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
@@ -547,31 +548,94 @@ export interface MockTransportOptions {
    * the user can link, instead of MOCK_BILLING_ACCOUNTS.
    */
   linkableBillingAccounts?: readonly MockBillingAccount[];
+  /**
+   * Capabilities that replace the guest operating systems and the built base
+   * images that seeded devices advertise, keyed by device ID. A field that is
+   * absent keeps the seeded value. The seeded devices advertise only the guests
+   * and images they can run, so a test uses this to add a device that can run
+   * another guest.
+   */
+  deviceCapabilities?: Readonly<Record<string, MockDeviceCapabilities>>;
 }
 
-/** Creates a transport backed by a fresh fake control plane. */
+/** The capability fields of a seeded device that a fixture can replace. */
+export interface MockDeviceCapabilities {
+  guestOses?: readonly GuestOs[];
+  builtBaseImages?: readonly BaseImage[];
+}
+
+/** The guest operating system that a base image boots. */
+export function guestOsOfBaseImage(image: BaseImage): GuestOs {
+  switch (image) {
+    case BaseImage.LINUX:
+      return GuestOs.LINUX;
+    case BaseImage.MACOS:
+      return GuestOs.MACOS;
+    case BaseImage.WINDOWS:
+      return GuestOs.WINDOWS;
+    default:
+      throw new ConnectError(
+        "invalid source: the base image must be specified",
+        Code.InvalidArgument,
+      );
+  }
+}
+
+/** What a device must offer to run a new sandbox. */
+interface PlacementRequirement {
+  guestOs: GuestOs;
+  /** The base image of a base-image source; absent for a snapshot source. */
+  baseImage?: BaseImage;
+}
+
+/** The permanent rule: whether the device advertises the guest and image. */
+function deviceCanRun(device: Device, need: PlacementRequirement): boolean {
+  const caps = device.capabilities;
+  if (caps === undefined) return false;
+  if (!caps.guestOses.includes(need.guestOs)) return false;
+  return (
+    need.baseImage === undefined ||
+    caps.builtBaseImages.includes(need.baseImage)
+  );
+}
+
 /**
  * Picks the device for a new sandbox like the control plane scheduler.
  *
- * An explicit device ID is an exclusive selection: the request never falls back
- * to another device. An ID that names no visible device fails with `NotFound`
- * (a removed device is a tombstone, so it counts as not found), and a device
- * that is not `ONLINE` fails with `Unavailable`, the code for a transient
- * condition. Without an ID, the first `ONLINE` device runs the sandbox, and the
- * result is `undefined` when none is online.
+ * A device can run a sandbox only when it advertises the guest operating
+ * system of the source and, for a base-image source, has built that base
+ * image. An explicit device ID is an exclusive selection: the request never
+ * falls back to another device. An ID that names no visible device fails with
+ * `NotFound` (a removed device is a tombstone, so it counts as not found), a
+ * device that cannot run the source fails with `FailedPrecondition` (a
+ * permanent rule, checked before the online state like the scheduler does),
+ * and a device that is not `ONLINE` fails with `Unavailable`, the code for a
+ * transient condition. Without an ID, the first `ONLINE` device that can run
+ * the source runs the sandbox, and the result is `undefined` when none can.
  */
 function placeSandbox(
   devices: Device[],
   deviceId: string | undefined,
+  need: PlacementRequirement,
 ): Device | undefined {
   if (deviceId === undefined || deviceId === "") {
-    return devices.find((d) => d.state === DeviceState.ONLINE);
+    return devices.find(
+      (d) => d.state === DeviceState.ONLINE && deviceCanRun(d, need),
+    );
   }
   const device = devices.find(
     (d) => d.deviceId === deviceId && d.state !== DeviceState.REMOVED,
   );
   if (device === undefined) {
     throw new ConnectError("device not found", Code.NotFound);
+  }
+  if (!deviceCanRun(device, need)) {
+    throw new ConnectError(
+      need.baseImage === undefined
+        ? "the device does not support the guest OS"
+        : "the device does not support the guest OS or has not built the base image",
+      Code.FailedPrecondition,
+    );
   }
   if (device.state !== DeviceState.ONLINE) {
     throw new ConnectError("the device is offline", Code.Unavailable);
@@ -590,6 +654,16 @@ export function createMockTransport(
   })) {
     const org = orgs.get(orgId);
     if (org !== undefined) applyBillingState(org, state);
+  }
+  for (const org of orgs.values()) {
+    for (const device of org.devices) {
+      const caps = options.deviceCapabilities?.[device.deviceId];
+      if (caps === undefined || device.capabilities === undefined) continue;
+      if (caps.guestOses !== undefined)
+        device.capabilities.guestOses = [...caps.guestOses];
+      if (caps.builtBaseImages !== undefined)
+        device.capabilities.builtBaseImages = [...caps.builtBaseImages];
+    }
   }
   const linkable = (
     options.linkableBillingAccounts ?? MOCK_BILLING_ACCOUNTS
@@ -743,6 +817,38 @@ export function createMockTransport(
     if (s === undefined)
       throw new ConnectError("snapshot not found", Code.NotFound);
     return s;
+  };
+  /**
+   * The guest operating system of a sandbox source, like the control plane: a
+   * base image boots its own guest, a snapshot keeps the guest of its sandbox,
+   * and a template has the guest of its snapshot. `baseImage` is set for a
+   * base-image source only, because only that source needs a built image.
+   */
+  const sourceGuest = (
+    org: OrgState,
+    source: SandboxSource | undefined,
+  ): PlacementRequirement => {
+    switch (source?.source.case) {
+      case "baseImage":
+        return {
+          guestOs: guestOsOfBaseImage(source.source.value),
+          baseImage: source.source.value,
+        };
+      case "snapshotId":
+        return { guestOs: findSnapshot(org, source.source.value).guestOs };
+      case "templateId": {
+        const id = source.source.value;
+        const template = org.templates.find((t) => t.templateId === id);
+        if (template === undefined)
+          throw new ConnectError("template not found", Code.NotFound);
+        return { guestOs: findSnapshot(org, template.snapshotId).guestOs };
+      }
+      default:
+        throw new ConnectError(
+          "invalid source: set a base image, a snapshot or a template",
+          Code.InvalidArgument,
+        );
+    }
   };
   const secret = (prefix: string) =>
     `${prefix}_${Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) =>
@@ -1134,7 +1240,11 @@ export function createMockTransport(
           }
           return { sandbox: findSandbox(org, known.sandboxId) };
         }
-        const device = placeSandbox(org.devices, req.placement?.deviceId);
+        const { guestOs, baseImage } = sourceGuest(org, req.source);
+        const device = placeSandbox(org.devices, req.placement?.deviceId, {
+          guestOs,
+          baseImage,
+        });
         if (device === undefined) {
           throw new ConnectError(
             "no device can run this sandbox",
@@ -1150,7 +1260,7 @@ export function createMockTransport(
           resources: req.resources,
           hostOs: device.hostOs,
           arch: device.arch,
-          guestOs: GuestOs.LINUX,
+          guestOs,
           network: req.network ?? { mode: NetworkMode.OUTBOUND },
           labels: { ...req.labels },
           idleTtl: req.idleTtl,

@@ -11,12 +11,14 @@ import {
   BillingReason,
   DeviceState,
   ErrorDetailSchema,
+  GuestOs,
   SandboxEndReason,
   SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { uuidV7 } from "../uuid.ts";
 import { createMockTransport, MOCK_IDS, MockBillingState } from "./mock-api.ts";
 
@@ -267,6 +269,257 @@ describe("mock createSandbox placement", () => {
       idempotencyKey: key,
     });
     expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+  });
+});
+
+describe("mock createSandbox base image placement", () => {
+  const organizationId = MOCK_IDS.acme;
+  const request = (image: BaseImage, deviceId?: string) => ({
+    organizationId,
+    idempotencyKey: uuidV7(),
+    source: { source: { case: "baseImage" as const, value: image } },
+    resources: { vcpuCount: 1, memoryMib: 1024n, diskGib: 10n },
+    idleTtl: { seconds: 600n },
+    maxTtl: { seconds: 3600n },
+    placement: deviceId === undefined ? undefined : { deviceId },
+  });
+  // Another build box that runs every guest, next to the Linux-only seeded one.
+  const allGuests = {
+    [MOCK_IDS.studioMac]: {
+      guestOses: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
+      builtBaseImages: [BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS],
+    },
+  };
+
+  test.each([BaseImage.MACOS, BaseImage.WINDOWS])(
+    "the default fixture has no online device for base image %s",
+    async (image) => {
+      const client = createClient(SandboxService, createMockTransport());
+      const before = await client.listSandboxes({ organizationId });
+      await expect(client.createSandbox(request(image))).rejects.toMatchObject({
+        code: Code.FailedPrecondition,
+      });
+      await expect(
+        client.createSandbox(request(image, MOCK_IDS.buildBox)),
+      ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      const after = await client.listSandboxes({ organizationId });
+      expect(after.sandboxes).toHaveLength(before.sandboxes.length);
+    },
+  );
+
+  test("a rejected create stores no idempotency key", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    await expect(
+      client.createSandbox({
+        ...request(BaseImage.WINDOWS),
+        idempotencyKey: key,
+      }),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    // The same key with another request is a new request, not a conflict.
+    const { sandbox } = await client.createSandbox({
+      ...request(BaseImage.LINUX),
+      idempotencyKey: key,
+    });
+    expect(sandbox?.guestOs).toBe(GuestOs.LINUX);
+  });
+
+  test("a Linux create is unchanged", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const { sandbox } = await client.createSandbox(request(BaseImage.LINUX));
+    expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+    expect(sandbox?.guestOs).toBe(GuestOs.LINUX);
+  });
+
+  test("a device needs both the guest and the built image", async () => {
+    // The online build box advertises the Windows guest but has not built the
+    // image, then the other way round; neither can run a Windows sandbox.
+    for (const caps of [
+      { guestOses: [GuestOs.LINUX, GuestOs.WINDOWS] },
+      { builtBaseImages: [BaseImage.LINUX, BaseImage.WINDOWS] },
+    ]) {
+      const client = createClient(
+        SandboxService,
+        createMockTransport({
+          deviceCapabilities: { [MOCK_IDS.buildBox]: caps },
+        }),
+      );
+      await expect(
+        client.createSandbox(request(BaseImage.WINDOWS)),
+      ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+      await expect(
+        client.createSandbox(request(BaseImage.WINDOWS, MOCK_IDS.buildBox)),
+      ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    }
+    const client = createClient(
+      SandboxService,
+      createMockTransport({
+        deviceCapabilities: {
+          [MOCK_IDS.buildBox]: {
+            guestOses: [GuestOs.LINUX, GuestOs.WINDOWS],
+            builtBaseImages: [BaseImage.LINUX, BaseImage.WINDOWS],
+          },
+        },
+      }),
+    );
+    const { sandbox } = await client.createSandbox(request(BaseImage.WINDOWS));
+    expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+  });
+
+  test("automatic placement ignores an offline device that can run the image", async () => {
+    // Only the offline studio-mac advertises Windows; it must not host it.
+    const client = createClient(
+      SandboxService,
+      createMockTransport({ deviceCapabilities: allGuests }),
+    );
+    await expect(
+      client.createSandbox(request(BaseImage.WINDOWS)),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+  });
+
+  test("an explicit incompatible device fails even when another device could run it", async () => {
+    // build-box-1 is online and runs Windows; the explicit Linux-only device
+    // must not hand the request over to it.
+    const client = createClient(
+      SandboxService,
+      createMockTransport({
+        deviceCapabilities: {
+          [MOCK_IDS.buildBox]: {
+            guestOses: [GuestOs.LINUX, GuestOs.WINDOWS],
+            builtBaseImages: [BaseImage.LINUX, BaseImage.WINDOWS],
+          },
+          [MOCK_IDS.studioMac]: {
+            guestOses: [GuestOs.LINUX],
+            builtBaseImages: [BaseImage.LINUX],
+          },
+        },
+      }),
+    );
+    await expect(
+      client.createSandbox(request(BaseImage.WINDOWS, MOCK_IDS.studioMac)),
+    ).rejects.toMatchObject({ code: Code.FailedPrecondition });
+    const { sandbox } = await client.createSandbox(request(BaseImage.WINDOWS));
+    expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+  });
+
+  test("an explicit offline device that can run the image is Unavailable", async () => {
+    const client = createClient(
+      SandboxService,
+      createMockTransport({ deviceCapabilities: allGuests }),
+    );
+    await expect(
+      client.createSandbox(request(BaseImage.MACOS, MOCK_IDS.studioMac)),
+    ).rejects.toMatchObject({ code: Code.Unavailable });
+  });
+});
+
+describe("mock sandbox guest OS", () => {
+  const organizationId = MOCK_IDS.acme;
+  const request = (source: Parameters<typeof sourceOf>[0]) => ({
+    organizationId,
+    idempotencyKey: uuidV7(),
+    source: sourceOf(source),
+    resources: { vcpuCount: 1, memoryMib: 1024n, diskGib: 10n },
+    idleTtl: { seconds: 600n },
+    maxTtl: { seconds: 3600n },
+  });
+  function sourceOf(
+    s:
+      | { baseImage: BaseImage }
+      | { snapshotId: string }
+      | { templateId: string }
+      | undefined,
+  ) {
+    if (s === undefined) return undefined;
+    if ("baseImage" in s)
+      return { source: { case: "baseImage" as const, value: s.baseImage } };
+    if ("snapshotId" in s)
+      return { source: { case: "snapshotId" as const, value: s.snapshotId } };
+    return { source: { case: "templateId" as const, value: s.templateId } };
+  }
+  const capable = {
+    [MOCK_IDS.buildBox]: {
+      guestOses: [GuestOs.LINUX, GuestOs.MACOS, GuestOs.WINDOWS],
+      builtBaseImages: [BaseImage.LINUX, BaseImage.MACOS, BaseImage.WINDOWS],
+    },
+  };
+
+  test.each([
+    [BaseImage.LINUX, GuestOs.LINUX],
+    [BaseImage.MACOS, GuestOs.MACOS],
+    [BaseImage.WINDOWS, GuestOs.WINDOWS],
+  ])("a sandbox of base image %s runs guest %s", async (image, guestOs) => {
+    const client = createClient(
+      SandboxService,
+      createMockTransport({ deviceCapabilities: capable }),
+    );
+    const { sandbox } = await client.createSandbox(
+      request({ baseImage: image }),
+    );
+    expect(sandbox?.guestOs).toBe(guestOs);
+  });
+
+  test.each([
+    [BaseImage.MACOS, GuestOs.MACOS],
+    [BaseImage.WINDOWS, GuestOs.WINDOWS],
+  ])(
+    "a snapshot, a template and a sandbox from them keep guest %s",
+    async (image, guestOs) => {
+      const transport = createMockTransport({ deviceCapabilities: capable });
+      const sandboxes = createClient(SandboxService, transport);
+      const snapshots = createClient(SnapshotService, transport);
+      const { sandbox } = await sandboxes.createSandbox(
+        request({ baseImage: image }),
+      );
+      const { snapshot } = await snapshots.createSnapshot({
+        organizationId,
+        sandboxId: sandbox!.sandboxId,
+      });
+      expect(snapshot?.guestOs).toBe(guestOs);
+
+      const fromSnapshot = await sandboxes.createSandbox(
+        request({ snapshotId: snapshot!.snapshotId }),
+      );
+      expect(fromSnapshot.sandbox?.guestOs).toBe(guestOs);
+
+      const { template } = await snapshots.createTemplate({
+        organizationId,
+        snapshotId: snapshot!.snapshotId,
+        name: "guest-template",
+      });
+      const fromTemplate = await sandboxes.createSandbox(
+        request({ templateId: template!.templateId }),
+      );
+      expect(fromTemplate.sandbox?.guestOs).toBe(guestOs);
+    },
+  );
+
+  test("the seeded snapshot and template keep the Linux guest", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const a = await client.createSandbox(
+      request({ snapshotId: MOCK_IDS.snapshot }),
+    );
+    const b = await client.createSandbox(
+      request({ templateId: MOCK_IDS.template }),
+    );
+    expect(a.sandbox?.guestOs).toBe(GuestOs.LINUX);
+    expect(b.sandbox?.guestOs).toBe(GuestOs.LINUX);
+  });
+
+  test("an unknown snapshot or template, or no source, is rejected", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    await expect(
+      client.createSandbox(request({ snapshotId: uuidV7() })),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+    await expect(
+      client.createSandbox(request({ templateId: uuidV7() })),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+    await expect(
+      client.createSandbox(request(undefined)),
+    ).rejects.toMatchObject({ code: Code.InvalidArgument });
+    await expect(
+      client.createSandbox(request({ baseImage: BaseImage.UNSPECIFIED })),
+    ).rejects.toMatchObject({ code: Code.InvalidArgument });
   });
 });
 
