@@ -101,7 +101,7 @@ func (r *Runtime) prepareWindowsDisk(spec vmruntime.Spec) (vmSpec, int64, error)
 	src, metaDir := r.windowsSource(spec)
 	disk := filepath.Join(spec.Dir, windowsDiskFile)
 	start := time.Now()
-	if err := copyFile(src, disk); err != nil {
+	if err := copyFile(context.Background(), src, disk); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
 	copied := time.Now()
@@ -109,7 +109,7 @@ func (r *Runtime) prepareWindowsDisk(spec vmruntime.Spec) (vmSpec, int64, error)
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
-	if err := copyFile(filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
+	if err := copyFile(context.Background(), filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: copy the image metadata: %w", err)
 	}
 	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {

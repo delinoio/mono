@@ -4,6 +4,7 @@ package fcrt
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -301,7 +302,7 @@ func TestGrowDisk(t *testing.T) {
 		t.Fatalf("mkfs: %v %s", err, out)
 	}
 	cp := img + ".copy"
-	if err := copyDisk(img, cp); err != nil {
+	if err := copyDisk(context.Background(), img, cp); err != nil {
 		t.Fatal(err)
 	}
 	if err := growDisk(context.Background(), cp, 64<<20); err != nil {
@@ -687,5 +688,50 @@ func TestDeleteRemovesFilesOfSandboxWithoutProcess(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("VM directory kept: %v", err)
+	}
+}
+
+// TestCopyDiskEndsWithItsContext checks that a canceled context stops a disk
+// copy and leaves no partial destination file, and that a live context copies
+// the whole file.
+func TestCopyDiskEndsWithItsContext(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	if err := os.WriteFile(src, bytes.Repeat([]byte{7}, 3*diskCopyChunk+5), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	dst := filepath.Join(dir, "dst")
+	if err := copyDisk(canceled, src, dst); !errors.Is(err, context.Canceled) {
+		t.Fatalf("copy on a canceled context = %v, want context.Canceled", err)
+	}
+	if _, err := os.Stat(dst); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("partial copy remains after a canceled copy: %v", err)
+	}
+	// A context that ends between two chunks stops the chunked read. The
+	// reader is exercised directly, because a reflink-capable file system
+	// copies without chunks.
+	mid, cancelMid := context.WithCancel(context.Background())
+	in, err := os.Open(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	r := &ctxReader{ctx: mid, r: in}
+	buf := make([]byte, 2*diskCopyChunk)
+	if n, err := r.Read(buf); err != nil || n == 0 || n > diskCopyChunk {
+		t.Fatalf("first read = %d, %v; want a chunk of at most %d bytes", n, err, diskCopyChunk)
+	}
+	cancelMid()
+	if n, err := r.Read(buf); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Fatalf("read after cancel = %d, %v", n, err)
+	}
+	if err := copyDisk(context.Background(), src, dst); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(dst)
+	if err != nil || len(got) != 3*diskCopyChunk+5 {
+		t.Fatalf("copy = %d bytes, %v", len(got), err)
 	}
 }
