@@ -63,7 +63,47 @@ export function validateTtl(
   }
 }
 
-/** Checks sandbox resources: all three are required and positive. */
+/** Largest `vcpu_count`: the `int32` range of the protobuf field. */
+const MAX_VCPU_COUNT = 2n ** 31n - 1n;
+/** Largest `memory_mib` and `disk_gib`: the `int64` range of the protobuf fields. */
+const MAX_INT64 = 2n ** 63n - 1n;
+/** Longest protobuf Duration in seconds (`google.protobuf.Duration` range). */
+const MAX_DURATION_SECONDS = 315_576_000_000n;
+
+/**
+ * Checks one resource value. The value must be a positive integer within the
+ * range of its protobuf field. A number must be a safe integer, so a fraction,
+ * NaN, an infinity and a number that has lost integer precision are rejected;
+ * a bigint is compared with the range directly. The check never relies on
+ * `BigInt()` throwing, and the error names the rule, never the value.
+ */
+function validateResource(
+  field: string,
+  value: number | bigint,
+  max: bigint,
+): void {
+  const rule = `must be an integer from 1 to ${max}`;
+  let integer: bigint;
+  if (typeof value === "bigint") {
+    integer = value;
+  } else if (typeof value === "number" && Number.isSafeInteger(value)) {
+    integer = BigInt(value);
+  } else {
+    throw new OwnSandValidationError(field, rule);
+  }
+  if (integer <= 0n) {
+    throw new OwnSandValidationError(field, "must be greater than zero");
+  }
+  if (integer > max) {
+    throw new OwnSandValidationError(field, rule);
+  }
+}
+
+/**
+ * Checks sandbox resources: all three are required, positive integers within
+ * the range of their protobuf fields (`int32` for `vcpu_count`, `int64` for
+ * `memory_mib` and `disk_gib`).
+ */
 export function validateResources(
   resources:
     | {
@@ -76,24 +116,9 @@ export function validateResources(
   if (resources === undefined) {
     throw new OwnSandValidationError("resources", "is required");
   }
-  if (!(resources.vcpuCount > 0)) {
-    throw new OwnSandValidationError(
-      "resources.vcpu_count",
-      "must be greater than zero",
-    );
-  }
-  if (!(BigInt(resources.memoryMib) > 0n)) {
-    throw new OwnSandValidationError(
-      "resources.memory_mib",
-      "must be greater than zero",
-    );
-  }
-  if (!(BigInt(resources.diskGib) > 0n)) {
-    throw new OwnSandValidationError(
-      "resources.disk_gib",
-      "must be greater than zero",
-    );
-  }
+  validateResource("resources.vcpu_count", resources.vcpuCount, MAX_VCPU_COUNT);
+  validateResource("resources.memory_mib", resources.memoryMib, MAX_INT64);
+  validateResource("resources.disk_gib", resources.diskGib, MAX_INT64);
 }
 
 /** Checks sandbox labels. */
@@ -167,6 +192,14 @@ export function validateExec(input: {
       "timeout",
       "must be zero or at least one nanosecond",
     );
+  }
+  // The wire type is a protobuf Duration, which holds at most 315576000000
+  // seconds; the Go validator rejects a larger timeout the same way.
+  if (
+    input.timeoutMs !== undefined &&
+    nanosFromMs(input.timeoutMs) > MAX_DURATION_SECONDS * 1_000_000_000n
+  ) {
+    throw new OwnSandValidationError("timeout", "is not a valid duration");
   }
 }
 

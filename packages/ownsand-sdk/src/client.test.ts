@@ -328,6 +328,109 @@ describe("createSandbox", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  const MAX_INT64 = 2n ** 63n - 1n;
+  const goodResources = { vcpuCount: 2, memoryMib: 2048, diskGib: 10 };
+  test.each([
+    ["a fractional vCPU count", { vcpuCount: 1.5 }, "resources.vcpu_count"],
+    ["a NaN vCPU count", { vcpuCount: NaN }, "resources.vcpu_count"],
+    ["an infinite vCPU count", { vcpuCount: Infinity }, "resources.vcpu_count"],
+    ["a vCPU count of 2**31", { vcpuCount: 2 ** 31 }, "resources.vcpu_count"],
+    ["a negative vCPU count", { vcpuCount: -1 }, "resources.vcpu_count"],
+    ["a fractional memory size", { memoryMib: 512.5 }, "resources.memory_mib"],
+    ["a NaN memory size", { memoryMib: NaN }, "resources.memory_mib"],
+    ["a zero memory size", { memoryMib: 0 }, "resources.memory_mib"],
+    ["a negative memory size", { memoryMib: -1 }, "resources.memory_mib"],
+    ["a zero bigint memory size", { memoryMib: 0n }, "resources.memory_mib"],
+    [
+      "a memory size of 2**63 as a number",
+      { memoryMib: 2 ** 63 },
+      "resources.memory_mib",
+    ],
+    [
+      "a memory size of 2**53 as a number",
+      { memoryMib: 2 ** 53 },
+      "resources.memory_mib",
+    ],
+    [
+      "a memory size of 2n**63n",
+      { memoryMib: 2n ** 63n },
+      "resources.memory_mib",
+    ],
+    ["a fractional disk size", { diskGib: 0.5 }, "resources.disk_gib"],
+    ["a NaN disk size", { diskGib: NaN }, "resources.disk_gib"],
+    ["a zero disk size", { diskGib: 0 }, "resources.disk_gib"],
+    ["a negative disk size", { diskGib: -5 }, "resources.disk_gib"],
+    ["a disk size of 2**63", { diskGib: 2 ** 63 }, "resources.disk_gib"],
+    ["a disk size of 2n**63n", { diskGib: 2n ** 63n }, "resources.disk_gib"],
+  ])("rejects %s before the request", async (_name, resources, field) => {
+    const h = setup();
+    const error = await h.client
+      .createSandbox({
+        ...validCreate,
+        resources: { ...goodResources, ...resources },
+      } as never)
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(OwnSandValidationError);
+    expect(error.field).toBe(field);
+    expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("keeps the zero and negative resource messages", async () => {
+    const h = setup();
+    const messages = await Promise.all(
+      [{ vcpuCount: 0 }, { memoryMib: -1 }, { diskGib: 0n }].map((resources) =>
+        h.client
+          .createSandbox({
+            ...validCreate,
+            resources: { ...goodResources, ...resources },
+          } as never)
+          .catch((e) => e.message),
+      ),
+    );
+    for (const message of messages) {
+      expect(message).toContain("must be greater than zero");
+    }
+  });
+
+  test("never puts the rejected resource value in the error", async () => {
+    const h = setup();
+    const error = await h.client
+      .createSandbox({
+        ...validCreate,
+        resources: { ...goodResources, memoryMib: 123456.789 },
+      } as never)
+      .catch((e) => e);
+    expect(error.message).not.toContain("123456");
+  });
+
+  test.each([
+    ["the largest vCPU count", { vcpuCount: 2 ** 31 - 1 }],
+    [
+      "the largest safe integer sizes",
+      {
+        memoryMib: Number.MAX_SAFE_INTEGER,
+        diskGib: Number.MAX_SAFE_INTEGER,
+      },
+    ],
+    ["bigint sizes", { memoryMib: 4096n, diskGib: 20n }],
+    ["the largest bigint sizes", { memoryMib: MAX_INT64, diskGib: MAX_INT64 }],
+  ])("accepts %s", async (_name, resources) => {
+    const h = setup();
+    h.api.unary(SandboxService, "CreateSandbox", () => ({
+      sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+    }));
+    await h.client.createSandbox({
+      ...validCreate,
+      resources: { ...goodResources, ...resources },
+    } as never);
+    const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
+    expect(req.resources.vcpuCount).toBe(
+      (resources as { vcpuCount?: number }).vcpuCount ?? 2,
+    );
+    expect(typeof req.resources.memoryMib).toBe("bigint");
+    expect(typeof req.resources.diskGib).toBe("bigint");
+  });
+
   test("accepts a max TTL of exactly 7 days", async () => {
     const h = setup();
     h.api.unary(SandboxService, "CreateSandbox", () => ({
