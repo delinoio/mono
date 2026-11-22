@@ -205,6 +205,74 @@ func started(frames []*ownsandv1.DataFrame) bool {
 
 func last(frames []*ownsandv1.DataFrame) *ownsandv1.DataFrame { return frames[len(frames)-1] }
 
+// exitEvent returns the exit event of an exec. It reports an error when no
+// frame carries one: the generated getter returns the zero exit code for an
+// absent event, so a check of GetExitCode alone passes for a stream that never
+// ended.
+func exitEvent(frames []*ownsandv1.DataFrame) (*ownsandv1.ExecExited, error) {
+	for _, f := range frames {
+		if exited := f.GetExecEvent().GetExited(); exited != nil {
+			return exited, nil
+		}
+	}
+	return nil, fmt.Errorf("no exited event in %d frames", len(frames))
+}
+
+// requireCleanExit fails the test unless the frames carry an exit event with
+// exit code 0.
+func requireCleanExit(t *testing.T, frames []*ownsandv1.DataFrame) {
+	t.Helper()
+	exited, err := exitEvent(frames)
+	if err != nil {
+		t.Fatalf("%v (stdout %q)", err, stdout(frames))
+	}
+	// A command that a signal ended also reads as exit code 0, so check the
+	// status variant too.
+	if _, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode); !ok || exited.GetExitCode() != 0 {
+		t.Fatalf("exited %v, want exit code 0 (stdout %q)", exited, stdout(frames))
+	}
+}
+
+func stdoutFrame(data string) *ownsandv1.DataFrame {
+	return &ownsandv1.DataFrame{Payload: &ownsandv1.DataFrame_ExecEvent{ExecEvent: &ownsandv1.ExecEvent{
+		Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte(data)}},
+	}}}
+}
+
+func exitedFrame(code int64) *ownsandv1.DataFrame {
+	return &ownsandv1.DataFrame{Payload: &ownsandv1.DataFrame_ExecEvent{ExecEvent: &ownsandv1.ExecEvent{
+		Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: code}}},
+	}}}
+}
+
+func TestExitEvent(t *testing.T) {
+	cases := []struct {
+		name    string
+		frames  []*ownsandv1.DataFrame
+		wantErr bool
+		code    int64
+	}{
+		{name: "stdout without an exited event", frames: []*ownsandv1.DataFrame{stdoutFrame("run\n")}, wantErr: true},
+		{name: "no frames", wantErr: true},
+		{name: "exited with code 0", frames: []*ownsandv1.DataFrame{stdoutFrame("run\n"), exitedFrame(0)}},
+		{name: "exited with a non-zero code", frames: []*ownsandv1.DataFrame{stdoutFrame("run\n"), exitedFrame(3)}, code: 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exited, err := exitEvent(tc.frames)
+			if tc.wantErr {
+				if err == nil || exited != nil {
+					t.Fatalf("exit event %v err %v, want an error", exited, err)
+				}
+				return
+			}
+			if err != nil || exited.GetExitCode() != tc.code {
+				t.Fatalf("exit event %v err %v, want code %d", exited, err, tc.code)
+			}
+		})
+	}
+}
+
 func TestExecAtMostOnce(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/sh", "-c", "echo run >> count; cat count")
@@ -212,14 +280,16 @@ func TestExecAtMostOnce(t *testing.T) {
 	if !out.Finished || !accepted || frames[0].GetExecEvent().GetStarted() == nil {
 		t.Fatalf("outcome %+v accepted %v first %v", out, accepted, frames[0])
 	}
-	if stdout(frames) != "run\n" || last(frames).GetExecEvent().GetExited().GetExitCode() != 0 {
+	if stdout(frames) != "run\n" {
 		t.Fatalf("stdout %q last %v", stdout(frames), last(frames))
 	}
+	requireCleanExit(t, frames)
 	// The identical request attaches and does not run the command again.
 	out, frames, _ = e.handle(req, nil)
 	if !out.Finished || stdout(frames) != "run\n" {
 		t.Fatalf("repeat: %+v %q", out, stdout(frames))
 	}
+	requireCleanExit(t, frames)
 	other := proto.Clone(req).(*ownsandv1.ExecRequest)
 	other.Command = []string{"/bin/true"}
 	out, _, _ = e.handle(other, nil)
