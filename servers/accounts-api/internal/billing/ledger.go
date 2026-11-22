@@ -61,10 +61,14 @@ func payoff(balance, amount int64) (debtPaid, kept int64) {
 	if balance >= 0 {
 		return 0, amount
 	}
-	debt := -balance
-	if debt >= amount {
+	// Negating the balance overflows at math.MinInt64, so the debt is
+	// compared with the grant first. amount is positive for a grant, so
+	// -amount cannot overflow; once balance > -amount, the balance is above
+	// math.MinInt64 and -balance cannot overflow either.
+	if balance <= -amount {
 		return amount, 0
 	}
+	debt := -balance
 	return debt, amount - debt
 }
 
