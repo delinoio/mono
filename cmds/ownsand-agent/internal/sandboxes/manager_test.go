@@ -1642,6 +1642,69 @@ func TestDeleteSnapshotDuringCreate(t *testing.T) {
 	}
 }
 
+// TestSnapshotCanceledDuringCreateNeverYieldsReady checks that a runtime that
+// returns success after the capture context ended (a copy that ignores its
+// cancellation) leaves no snapshot record, no snapshot content, no READY
+// entry and no pending capture, and that a retry on a live context publishes
+// the snapshot.
+func TestSnapshotCanceledDuringCreateNeverYieldsReady(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	e.rt.snapStarted = make(chan struct{})
+	e.rt.snapBlock = make(chan struct{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		entry *ownsandv1.SnapshotStateEntry
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		entry, err := e.m.CreateSnapshot(ctx, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		done <- result{entry, err}
+	}()
+	<-e.rt.snapStarted
+	// The channel ends while the capture runs; the runtime still succeeds.
+	cancel()
+	close(e.rt.snapBlock)
+	res := <-done
+	var ce *CommandError
+	if res.entry != nil || !errors.As(res.err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("create after cancel = %v, %v; want ABORTED and no entry", res.entry, res.err)
+	}
+	if e.m.HasSnapshot(snapID) {
+		t.Fatal("canceled snapshot is known to the manager")
+	}
+	for _, s := range e.m.StateReport(2, nil).GetSnapshots() {
+		t.Fatalf("state report holds the snapshot %v after a canceled capture", s)
+	}
+	dir, err := e.st.SnapshotDir(snapID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after the canceled create: %v", err)
+	}
+	// The sandbox and its VM are untouched, and the pending entry is
+	// released: a retry on a live context publishes READY.
+	e.rt.snapStarted = nil
+	entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+	if err != nil || entry.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("retry after cancel = %v, %v", entry, err)
+	}
+	// A later create with a canceled context returns the published snapshot
+	// and does not remove it.
+	canceled, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	if again, err := e.m.CreateSnapshot(canceled, &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id}); err != nil || again.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("create of a published snapshot on a canceled context = %v, %v", again, err)
+	}
+	if !e.m.HasSnapshot(snapID) {
+		t.Fatal("published snapshot lost after a canceled duplicate create")
+	}
+}
+
 func TestDeleteSnapshot(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()

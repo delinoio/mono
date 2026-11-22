@@ -1491,4 +1491,12 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	if err := <-rt.ctxErr; err == nil {
 		t.Fatal("snapshot capture ran on a context that outlives its channel")
 	}
+	// The runtime completed the capture although its channel ended. The
+	// snapshot must not become known or ready.
+	if h.agent.Sandboxes.HasSnapshot(snapID) {
+		t.Fatal("snapshot captured after its channel ended is known to the manager")
+	}
+	for _, s := range h.agent.Sandboxes.StateReport(2, nil).GetSnapshots() {
+		t.Fatalf("state report holds the snapshot %v after its channel ended", s)
+	}
 }
