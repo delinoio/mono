@@ -25,12 +25,14 @@ import (
 // encoded lists the base64 (standard alphabet, padded) Ed25519 release
 // public keys.
 //
-// The list is empty until a maintainer generates the release key pair and
-// adds its public key here, according to the release provisioning checklist
-// in docs/repository-workflow-contract.md. While it is empty, every update
-// fails verification unless OWNSAND_AGENT_RELEASE_PUBLIC_KEYS configures a
-// key, and the release workflow refuses to publish an agent release.
-var encoded = []string{}
+// The entry is the public key of the release key pair from the release
+// provisioning checklist in docs/repository-workflow-contract.md. The
+// private key is the OWNSAND_AGENT_RELEASE_SIGNING_KEY secret of the
+// releases environment. Rotate it according to the key custody rules in
+// docs/cmds-ownsand-agent-foundation.md.
+var encoded = []string{
+	"noI2kKbgHxh3ayBRHhQ5f+UL3NW0gxvbgbT+ew/1/+I=",
+}
 
 // PublicKeys returns the built-in release public keys. It fails when an entry
 // is not a base64 Ed25519 public key.
