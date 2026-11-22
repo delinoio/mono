@@ -170,17 +170,26 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 		// The send failed before the command was queued, often because the
 		// request context ended, so the failure transition must not use it.
 		// It acts only while the record is still CREATING, so it never
-		// overwrites a state that another writer set.
-		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotFailTimeout)
-		defer cancel()
-		tag, execErr := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", snap.pb.GetSnapshotId(),
-			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
+		// overwrites a state that another writer set. A transient database
+		// error is retried inside Timing.CreateFailTimeout; a failure that
+		// remains closes conn while it is the current channel, so that the
+		// state report of the replacement channel settles the CREATING
+		// record. The response stays unavailable either way.
+		var applied bool
+		attempts, channelClosed, execErr := h.failUnsentCreate(ctx, conn, "snapshot_create_fail_transition_retry",
+			[]any{slog.String("snapshot_id", snap.pb.GetSnapshotId()), slog.String("channel_id", conn.ID)},
+			func(dbCtx context.Context) error {
+				tag, err := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", snap.pb.GetSnapshotId(),
+					int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
+				applied = err == nil && tag.RowsAffected() > 0
+				return err
+			})
 		attrs := []any{slog.String("snapshot_id", snap.pb.GetSnapshotId()), slog.String("channel_id", conn.ID), slog.Any("send_error", err),
-			slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0)}
+			slog.Bool("applied", applied), slog.Int("attempts", attempts)}
 		if execErr != nil {
-			h.Logger.ErrorContext(dbCtx, "snapshot_create_fail_transition_failed", append(attrs, slog.Any("error", execErr))...)
+			h.Logger.ErrorContext(ctx, "snapshot_create_fail_transition_failed", append(attrs, slog.Bool("channel_closed", channelClosed), slog.Any("error", execErr))...)
 		} else {
-			h.Logger.WarnContext(dbCtx, "snapshot_create_send_failed", attrs...)
+			h.Logger.WarnContext(ctx, "snapshot_create_send_failed", attrs...)
 		}
 		return nil, errUnavailable("the agent channel closed")
 	}
