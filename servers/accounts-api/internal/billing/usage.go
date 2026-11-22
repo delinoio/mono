@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"math"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -255,7 +257,22 @@ func (s *Service) duplicate(ctx context.Context, r UsageReport, first storedRepo
 	s.logger.LogAttrs(ctx, slog.LevelDebug, "billing_usage_report_duplicate", attrs...)
 }
 
-// MeterUsage is the usage of one meter in a period.
+// satCeiling is the largest value that a monthly usage sum returns. Postgres
+// sums bigint columns as numeric, so a sum of stored rows can exceed the int64
+// range that the API fields use; the read queries saturate such a sum here
+// instead of failing the cast. The stored rows stay exact.
+var satCeiling = strconv.FormatInt(math.MaxInt64, 10)
+
+// saturatedSum returns the SQL expression that sums a bigint column over the
+// rows of a group (0 without rows) as a bigint that saturates at
+// math.MaxInt64. Both usage columns are constrained to be non-negative, so
+// the sum needs no lower bound.
+func saturatedSum(column string) string {
+	return "LEAST(COALESCE(SUM(" + column + "), 0), " + satCeiling + ")::bigint"
+}
+
+// MeterUsage is the usage of one meter in a period. Quantity and Amount
+// saturate at math.MaxInt64.
 type MeterUsage struct {
 	Meter    string
 	Quantity int64
@@ -266,7 +283,7 @@ type MeterUsage struct {
 // organization (charged to any billing account or unattributed) in windows
 // that start in [from, to), by meter.
 func OrganizationMonthUsage(ctx context.Context, q db.Querier, service, organizationID string, from, to time.Time) (map[string]MeterUsage, error) {
-	rows, err := q.Query(ctx, `SELECT meter, COALESCE(SUM(quantity), 0)::bigint, COALESCE(SUM(amount_usd_micros), 0)::bigint
+	rows, err := q.Query(ctx, `SELECT meter, `+saturatedSum("quantity")+`, `+saturatedSum("amount_usd_micros")+`
 		FROM usage_reports WHERE service = $1 AND organization_id = $2 AND window_start >= $3 AND window_start < $4
 		GROUP BY meter`, service, organizationID, from, to)
 	if err != nil {
@@ -284,7 +301,8 @@ func OrganizationMonthUsage(ctx context.Context, q db.Querier, service, organiza
 }
 
 // SummaryRow is the usage of one organization and meter that was charged
-// to a billing account in a period.
+// to a billing account in a period. Quantity and Amount saturate at
+// math.MaxInt64.
 type SummaryRow struct {
 	Service        string
 	OrganizationID string
@@ -303,10 +321,11 @@ type SummaryKey struct {
 
 // UsageSummary returns up to limit rows of the usage charged to the billing
 // account in windows that start in [from, to), after the key (from the
-// start when nil), and the total amount of every row of the period.
+// start when nil), and the total amount of every row of the period. The
+// total and the sums of the rows saturate at math.MaxInt64.
 func UsageSummary(ctx context.Context, q db.Querier, accountID string, from, to time.Time, after *SummaryKey, limit int) ([]SummaryRow, int64, error) {
 	var total int64
-	if err := q.QueryRow(ctx, `SELECT COALESCE(SUM(amount_usd_micros), 0)::bigint FROM usage_reports
+	if err := q.QueryRow(ctx, `SELECT `+saturatedSum("amount_usd_micros")+` FROM usage_reports
 		WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3`, accountID, from, to).Scan(&total); err != nil {
 		return nil, 0, err
 	}
@@ -314,7 +333,7 @@ func UsageSummary(ctx context.Context, q db.Querier, accountID string, from, to 
 	if after != nil {
 		k = *after
 	}
-	rows, err := q.Query(ctx, `SELECT service, organization_id, meter, SUM(quantity)::bigint, SUM(amount_usd_micros)::bigint
+	rows, err := q.Query(ctx, `SELECT service, organization_id, meter, `+saturatedSum("quantity")+`, `+saturatedSum("amount_usd_micros")+`
 		FROM usage_reports
 		WHERE billing_account_id = $1 AND window_start >= $2 AND window_start < $3
 			AND ($4 = false OR (service COLLATE "C", organization_id COLLATE "C", meter COLLATE "C") > ($5, $6, $7))

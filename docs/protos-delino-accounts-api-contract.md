@@ -122,6 +122,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 - `UsageReportResult` echoes the key and returns `duplicate`, `unattributed`, the `billing_account_id` that was charged and the `ledger_entry_id` of the `USAGE` entry (both empty when unattributed). Results are in request order.
 - The response also returns the current `OrganizationBillingStatus` of each linked organization that the request names, one entry per organization, after the deductions.
 - Months: `GetOrganizationBilling` and `ListUsageSummary` count a report in the UTC calendar month in which its window starts. `ListUsageSummary` orders its rows by the stable service identifier, the organization ID and the stable meter identifier, each in byte order.
+- Saturation: `ReportUsage` stores each `quantity` and `amount_usd_micros` exactly, but the monthly sums that `GetOrganizationBilling` (the `MeterUsage` values) and `ListUsageSummary` (the row values and `total_amount_usd_micros`) return can exceed the `int64` range. Such a sum saturates at `9223372036854775807` (`math.MaxInt64`) instead of failing the RPC; a sum of exactly that value, a sum without reports (0) and the sums of other meters and rows are unchanged, and the paging and the meaning of `total_amount_usd_micros` do not change. The same limit applies to a sum of amounts, which are never negative.
 
 ### Billing status
 
