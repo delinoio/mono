@@ -1426,6 +1426,12 @@ func TestHandlerExpectationFailedIsNotClaimedAsARejection(t *testing.T) {
 // POST, so it answers the request that follows (here a 417) and the observer
 // must still log that 417; with five bytes or after another method net/http
 // answers 400, which is an http_request_rejected record.
+//
+// A case sends no bytes after the bytes that net/http answers with a closing
+// response. net/http closes the socket right after a 400 without reading the
+// rest, so bytes that arrive later make the server's OS reset the connection.
+// Windows then discards the response that the client has not read yet, and
+// the client reads nothing.
 func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 	const (
 		post   = "POST /post HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n"
@@ -1434,7 +1440,8 @@ func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 	)
 	for _, tc := range []struct {
 		name string
-		// writes are sent one by one over one connection.
+		// writes are sent one by one over one connection. The last write
+		// completes the request that net/http answers with a closing response.
 		writes []string
 		// statuses are the response statuses the client must read, in order.
 		statuses []string
@@ -1462,19 +1469,26 @@ func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 			records:  []string{`"path":"/post"`, `"path":"/missing","status":417`},
 		},
 		{
+			// net/http discards four bytes and rejects the fifth as an empty
+			// request line, before any request that follows.
 			name:     "POST, five bytes",
-			writes:   []string{post, "\r\n\r\n\n", expect},
+			writes:   []string{post, "\r\n\r\n\n"},
 			statuses: []string{"200", "400"},
 			records:  []string{`"path":"/post"`},
 			rejected: 1,
 		},
 		{
+			// net/http rejects the empty request line at once.
 			name:     "CRLF as the first bytes",
-			writes:   []string{"\r\n", expect},
+			writes:   []string{"\r\n"},
 			statuses: []string{"400"},
 			rejected: 1,
 		},
 		{
+			// net/http waits for four bytes before it reads the request that
+			// follows a keep-alive response, so it reads the CRLF together with
+			// the expectation request and then rejects the empty request line.
+			// No bytes arrive after the rejection.
 			name:     "GET, CRLF",
 			writes:   []string{get, "\r\n", expect},
 			statuses: []string{"200", "400"},
@@ -1506,7 +1520,10 @@ func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 				time.Sleep(100 * time.Millisecond)
 				_ = conn.(*net.TCPConn).CloseWrite()
 			}
-			response, _ := io.ReadAll(conn)
+			response, err := io.ReadAll(conn)
+			if err != nil {
+				t.Errorf("read: %v after %q", err, response)
+			}
 			// A handler body has no line end, so find the status lines anywhere.
 			var got []string
 			for _, m := range regexp.MustCompile(`HTTP/1\.1 (\d{3}) `).FindAllStringSubmatch(string(response), -1) {
