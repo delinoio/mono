@@ -138,6 +138,15 @@ const expectedPassThroughEnv = {
     "PUBLIC_LOGTO_SCOPES",
     "PUBLIC_OWNSAND_MOCK_API",
   ],
+  "tide-console#dev": [
+    "PORTLESS",
+    "PORTLESS_*",
+    "PUBLIC_API_ORIGIN",
+    "PUBLIC_LOGTO_APP_ID",
+    "PUBLIC_LOGTO_ENDPOINT",
+    "PUBLIC_LOGTO_SCOPES",
+    "PUBLIC_TIDE_MOCK_API",
+  ],
 };
 
 // Workspace directories named by the patterns of `pnpm-workspace.yaml`.

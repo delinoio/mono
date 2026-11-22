@@ -1414,6 +1414,7 @@ test("repository deployables use the documented targets", () => {
       ["delino-docs", "delino-docs", "apps/delino-docs/dist"],
       ["delino-site", "delino-site", "apps/delino-site/dist"],
       ["ownsand-console", "ownsand-console", "apps/ownsand/dist"],
+      ["tide-console", "tide-console", "apps/tide/dist"],
     ],
   );
   assert.deepEqual(

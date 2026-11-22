@@ -1,0 +1,192 @@
+// SPDX-License-Identifier: Apache-2.0
+import { create } from "@bufbuild/protobuf";
+import { FieldMaskSchema } from "@bufbuild/protobuf/wkt";
+import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "delino-ui/toast";
+import { Button, ButtonVariant } from "delino-ui/button";
+import { NumberInput } from "delino-ui/number-input";
+import { Select, SelectOption } from "delino-ui/select";
+import { Role } from "@delino/tide-protos/v1/common_pb";
+import { MemberService } from "@delino/tide-protos/v1/member_pb";
+import { OrganizationService } from "@delino/tide-protos/v1/organization_pb";
+import { type FormEvent, useState } from "react";
+import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import { useOrg } from "../components/shell.tsx";
+import { ConfirmDialog, ErrorNotice, PageHeader } from "../components/ui.tsx";
+import { devSessionLimitError } from "../forms.ts";
+import { can, Permission } from "../roles.ts";
+import { useRouter } from "../router.tsx";
+
+/**
+ * Route `settings`: the per-user dev session limit (`admin`), ownership
+ * transfer and organization deletion (`owner`).
+ */
+export function SettingsPage() {
+  const { role } = useOrg();
+  return (
+    <>
+      <PageHeader title="Settings" />
+      <DevSessionLimit />
+      {can(role, Permission.TransferOwnership) ? <OwnerActions /> : null}
+    </>
+  );
+}
+
+function DevSessionLimit() {
+  const { organizationId, organization } = useOrg();
+  const queryClient = useQueryClient();
+  const stored = organization.settings?.maxDevSessionsPerUser;
+  const [value, setValue] = useState<number | null>(stored ?? null);
+  const [error, setError] = useState<string>();
+  const update = useMutation(
+    OrganizationService.method.updateOrganizationSettings,
+    { onSuccess: () => invalidateServices(queryClient, OrganizationService) },
+  );
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    const found = devSessionLimitError(value);
+    if (found !== undefined) {
+      setError(found);
+      return;
+    }
+    try {
+      await update.mutateAsync({
+        organizationId,
+        settings: value === null ? {} : { maxDevSessionsPerUser: value },
+        updateMask: create(FieldMaskSchema, {
+          paths: ["max_dev_sessions_per_user"],
+        }),
+      });
+      toast.success(
+        value === null
+          ? "Dev sessions have no per-user limit."
+          : "The dev session limit is saved.",
+      );
+    } catch {
+      // The notice below shows the error.
+    }
+  };
+  return (
+    <section className="section" aria-labelledby="limit-title">
+      <h2 id="limit-title">Dev sessions per user</h2>
+      <p className="muted">
+        The most dev sessions that one user can have queued, starting or running
+        at the same time. Leave it empty for no limit. Lowering it ends no
+        existing dev session.
+      </p>
+      <form className="inline-form" onSubmit={submit} noValidate>
+        <NumberInput
+          label="Limit per user"
+          value={value}
+          onValueChange={(v) => {
+            setValue(v);
+            setError(undefined);
+          }}
+          min={1}
+          error={error}
+          autoFocus
+        />
+        <Button type="submit" disabled={update.isPending}>
+          Save limit
+        </Button>
+      </form>
+      {update.error ? <ErrorNotice error={update.error} /> : null}
+    </section>
+  );
+}
+
+function OwnerActions() {
+  const { organizationId, name } = useOrg();
+  const { navigate } = useRouter();
+  const queryClient = useQueryClient();
+  const members = useQuery(MemberService.method.listMembers, {
+    organizationId,
+    pageSize: MAX_PAGE_SIZE,
+  });
+  const transfer = useMutation(OrganizationService.method.transferOwnership, {
+    onSuccess: () =>
+      invalidateServices(queryClient, OrganizationService, MemberService),
+  });
+  const remove = useMutation(OrganizationService.method.deleteOrganization, {
+    onSuccess: () => invalidateServices(queryClient, OrganizationService),
+  });
+  const [target, setTarget] = useState<string | null>(null);
+  const [confirmTransfer, setConfirmTransfer] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const candidates =
+    members.data?.members.filter((m) => m.role !== Role.OWNER) ?? [];
+  const targetName = (() => {
+    const m = candidates.find((c) => c.userId === target);
+    return m ? m.displayName || m.userId : "";
+  })();
+
+  return (
+    <>
+      <section className="section" aria-labelledby="transfer-title">
+        <h2 id="transfer-title">Transfer ownership</h2>
+        <p className="muted">
+          The new owner gets every permission. You become an admin.
+        </p>
+        <div className="inline-form">
+          <Select
+            label="New owner"
+            placeholder="Choose a member"
+            value={target}
+            onValueChange={setTarget}
+          >
+            {candidates.map((m) => (
+              <SelectOption key={m.userId} value={m.userId}>
+                {m.displayName || m.userId}
+              </SelectOption>
+            ))}
+          </Select>
+          <Button
+            variant={ButtonVariant.Secondary}
+            disabled={target === null}
+            onClick={() => setConfirmTransfer(true)}
+          >
+            Transfer
+          </Button>
+        </div>
+      </section>
+      <section className="section danger-zone" aria-labelledby="delete-title">
+        <h2 id="delete-title">Delete organization</h2>
+        <p className="muted">
+          Cancels every queued request, deletes every runner and removes the
+          OwnSand link, the GitHub installations, the agent integrations and
+          every member. The tide GitHub App stays installed in GitHub: uninstall
+          it in the settings of each GitHub organization, because tide cannot
+          uninstall it.
+        </p>
+        <Button
+          variant={ButtonVariant.Danger}
+          onClick={() => setConfirmDelete(true)}
+        >
+          Delete organization
+        </Button>
+      </section>
+      <ConfirmDialog
+        open={confirmTransfer}
+        onOpenChange={setConfirmTransfer}
+        title={`Make ${targetName} the owner?`}
+        description="You become an admin. Only the new owner can give ownership back."
+        confirmLabel="Transfer ownership"
+        onConfirm={() =>
+          transfer.mutateAsync({ organizationId, userId: target! })
+        }
+      />
+      <ConfirmDialog
+        open={confirmDelete}
+        onOpenChange={setConfirmDelete}
+        title={`Delete ${name}?`}
+        description="Every runner is deleted and every queued request is canceled. Uninstall the tide GitHub App in GitHub yourself, because tide cannot uninstall it. This cannot be undone."
+        confirmLabel="Delete organization"
+        onConfirm={async () => {
+          await remove.mutateAsync({ organizationId });
+          navigate("/");
+        }}
+      />
+    </>
+  );
+}
