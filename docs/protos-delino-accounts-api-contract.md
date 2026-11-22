@@ -49,6 +49,7 @@ The schemas are the single source of truth for the API of [`accounts-api`](serve
 - List RPCs take `page_size` (0 selects the default 50; values above 200 are lowered to 200; a negative value fails with `invalid_argument`) and an opaque `page_token` from the previous response. A token that the server did not issue for the same request fails with `invalid_argument`. An empty `next_page_token` means that no more results exist.
 - Request and response messages follow the buf `STANDARD` lint rules: each RPC has its own `<Rpc>Request` and `<Rpc>Response` message.
 - Errors use Connect error codes. Messages never contain secrets, tokens or payment data.
+- Request size: a request message is limited to 1 MiB after decompression, for every RPC. A larger message, or a compressed message that inflates over 1 MiB, fails with `resource_exhausted` (HTTP `429` over Connect) before the server checks the credential, so such a request gets no `unauthenticated`. The largest valid request, `ReportUsage` with 500 reports, has about 81 KiB in binary and about 163 KiB in protojson (128-byte organization IDs and large `int64` values), far under the limit.
 
 ### Services and scopes
 
