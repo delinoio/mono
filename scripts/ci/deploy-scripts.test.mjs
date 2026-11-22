@@ -1778,6 +1778,9 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
 //                 (`docker rm --force` of a replacement still succeeds).
 //   STUB_START_FAIL glob of the container names that `docker start` fails for.
+//   STUB_RUN_EXIT   exit code of `docker run` (default 0), printed with a
+//                 Docker diagnostic when not 0.
+//   STUB_CREATE_EXIT exit code of `docker create` (default 0), like STUB_RUN_EXIT.
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
@@ -1828,6 +1831,11 @@ function setupDroplet(
       *State.Status*) echo "\${STUB_STATUS:-running}" ;;
       *) echo 172.18.0.5 ;;
     esac ;;
+  run|create)
+    code="\${STUB_RUN_EXIT:-0}"
+    [[ "\$1" == run ]] || code="\${STUB_CREATE_EXIT:-0}"
+    [[ "\$code" == 0 ]] || echo "docker: Error response from daemon: OCI runtime create failed" >&2
+    exit "\$code" ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
   stop) [[ " \${STUB_STOP_FAIL:-} " != *" \$4 "* ]] || exit 1 ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
@@ -2318,6 +2326,81 @@ test(
         label,
       );
     }
+  },
+);
+
+test(
+  "droplet deploy removes the replacement and keeps everything else when docker run fails",
+  { skip },
+  (t) => {
+    const route = "# old route\n";
+    const options = {
+      old: ["old1"],
+      route,
+      state: `${olderImage}\n`,
+      previous: `${oldestImage}\n`,
+    };
+    for (const [label, env] of [
+      ["run fails", { STUB_RUN_EXIT: "125" }],
+      // A failed log read or removal must not hide the start failure.
+      [
+        "cleanup fails",
+        { STUB_RUN_EXIT: "125", STUB_LOGS: "1", STUB_RM_FAIL: "old1" },
+      ],
+    ]) {
+      const result = runDroplet(t, undefined, { ...options, env });
+      assert.equal(result.status, 1, `${label}: ${result.stderr}`);
+      assert.match(
+        result.stderr,
+        /::error::api-\d{14}-e{12} did not start; the previous container keeps serving\./,
+        label,
+      );
+      // Docker's own diagnostic stays visible.
+      assert.match(result.stderr, /OCI runtime create failed/, label);
+      assert.deepEqual(
+        commands(result.calls),
+        ["docker pull", "docker ps", "docker run", "docker logs", "docker rm"],
+        label,
+      );
+      assert.match(result.calls.at(-1), /^docker rm --force api-/, label);
+      assert.equal(result.read("caddy/sites/api.caddy"), route, label);
+      assert.equal(result.read("state/api.current"), `${olderImage}\n`, label);
+      assert.equal(
+        result.read("state/api.previous"),
+        `${oldestImage}\n`,
+        label,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy removes the replacement and stops nothing when docker create fails",
+  { skip },
+  (t) => {
+    const route = "# old route\n";
+    const result = runDroplet(t, udpArgs, {
+      old: ["old1"],
+      route,
+      state: `${olderImage}\n`,
+      env: { STUB_CREATE_EXIT: "125" },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /::error::api-\d{14}-e{12} was not created; the previous containers keep serving\./,
+    );
+    assert.deepEqual(commands(result.calls), [
+      "docker pull",
+      "docker ps",
+      "docker ps",
+      "docker create",
+      "docker logs",
+      "docker rm",
+    ]);
+    assert.match(result.calls.at(-1), /^docker rm --force api-/);
+    assert.equal(result.read("caddy/sites/api.caddy"), route);
+    assert.equal(result.read("state/api.current"), `${olderImage}\n`);
   },
 );
 

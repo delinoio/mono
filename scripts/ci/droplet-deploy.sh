@@ -197,7 +197,13 @@ main() {
   local -a stopped=()
   if (( ${#publish[@]} == 0 )); then
     echo "Start $new as $upstream"
-    docker run --detach "${create[@]}" > /dev/null
+    # A failed `docker run` can leave a created container that did not start
+    # (for example an OCI runtime or entrypoint error). `set -e` would end the
+    # script before any cleanup, so the call is an `if` operand.
+    if ! docker run --detach "${create[@]}" > /dev/null; then
+      discard_replacement "$new"
+      fail "$new did not start; the previous container keeps serving."
+    fi
     if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
       discard_replacement "$new"
       fail "$new did not pass the health check; the previous container keeps serving."
@@ -213,7 +219,11 @@ main() {
       fi
     done <<< "$running_ids"
     echo "Create $new as $upstream with the UDP ports $udp_ports"
-    docker create "${create[@]}" > /dev/null
+    # No container is stopped yet, so the previous containers keep serving.
+    if ! docker create "${create[@]}" > /dev/null; then
+      discard_replacement "$new"
+      fail "$new was not created; the previous containers keep serving."
+    fi
     for running_id in "${stopped[@]}"; do
       echo "Stop the previous container $running_id to free the UDP ports"
       if ! docker stop --time "$stop_timeout" "$running_id" > /dev/null; then
