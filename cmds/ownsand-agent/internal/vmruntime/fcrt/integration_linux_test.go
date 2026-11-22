@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -59,12 +60,17 @@ type env struct {
 
 func (e *env) create(snapshotID string, memMiB int64, memoryRestore bool) *ownsandv1.SandboxStateEntry {
 	e.t.Helper()
+	return e.createSized(snapshotID, memMiB, 1, memoryRestore)
+}
+
+func (e *env) createSized(snapshotID string, memMiB, diskGiB int64, memoryRestore bool) *ownsandv1.SandboxStateEntry {
+	e.t.Helper()
 	id, _ := uuidv7.NewString()
 	now := time.Now()
 	cmd := &ownsandv1.CreateSandboxCommand{
 		SandboxId:            id,
 		Source:               &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
-		Resources:            &ownsandv1.Resources{VcpuCount: 1, MemoryMib: memMiB, DiskGib: 1},
+		Resources:            &ownsandv1.Resources{VcpuCount: 1, MemoryMib: memMiB, DiskGib: diskGiB},
 		NetworkMode:          ownsandv1.NetworkMode_NETWORK_MODE_NONE,
 		GuestOs:              ownsandv1.GuestOs_GUEST_OS_LINUX,
 		IdleTtl:              durationpb.New(time.Hour),
@@ -82,6 +88,13 @@ func (e *env) create(snapshotID string, memMiB int64, memoryRestore bool) *ownsa
 		e.t.Fatalf("create: %v", err)
 	}
 	return entry
+}
+
+func fieldOr(fields []string, i int) string {
+	if i < len(fields) {
+		return fields[i]
+	}
+	return ""
 }
 
 // collectExec joins the output of an exec stream and returns its ExecExited
@@ -263,7 +276,23 @@ func TestFirecrackerIntegration(t *testing.T) {
 	if out, ex := e.exec(cold.GetSandboxId(), "/bin/cat", "/root/marker"); ex == nil || ex.GetExitCode() != 0 || out != "state\n" {
 		t.Fatalf("cold-booted sandbox %q", out)
 	}
-	for _, id := range []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId()} {
+	// A larger disk never restores the memory state: the sandbox boots the
+	// snapshot disk cold and the guest sees the requested capacity.
+	grown := e.createSized(snapID, 256, 2, true)
+	if grown.GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
+		t.Fatalf("larger-disk restore path %v", grown.GetRestorePath())
+	}
+	if out, _ := e.exec(grown.GetSandboxId(), "/bin/cat", "/root/marker"); out != "state\n" {
+		t.Fatalf("larger-disk sandbox %q", out)
+	}
+	// The root file system of the 2 GiB disk is larger than the 1 GiB snapshot
+	// disk could hold (df reports 1 KiB blocks in the second field).
+	dfOut, _ := e.exec(grown.GetSandboxId(), "/bin/sh", "-c", "df -k / | tail -1")
+	fields := strings.Fields(dfOut)
+	if blocks, err := strconv.ParseInt(fieldOr(fields, 1), 10, 64); err != nil || blocks < 3<<19 {
+		t.Fatalf("larger-disk root file system %q", dfOut)
+	}
+	for _, id := range []string{sb.GetSandboxId(), restored.GetSandboxId(), cold.GetSandboxId(), grown.GetSandboxId()} {
 		if en, err := m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
 			t.Fatalf("delete %v %v", en, err)
 		}

@@ -40,7 +40,8 @@ type Spec struct {
 	// Snapshot is set when the sandbox starts from a snapshot.
 	Snapshot *SnapshotSource
 	// MemoryRestoreAllowed allows a memory-state restore when the snapshot
-	// has one and the resources match.
+	// has one and the resources (vCPU count, memory and disk size) match; see
+	// MemoryRestoreEligible.
 	MemoryRestoreAllowed bool
 }
 
