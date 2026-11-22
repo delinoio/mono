@@ -240,6 +240,7 @@ export function ConfirmDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<unknown>();
+  const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
   if (open !== wasOpen) {
     // Adjust state while rendering: every time the dialog opens again it
@@ -248,6 +249,20 @@ export function ConfirmDialog({
     setWasOpen(open);
     if (open) setError(undefined);
   }
+  const confirm = async () => {
+    if (pending) return;
+    setPending(true);
+    // A retry removes the notice of the previous failure.
+    setError(undefined);
+    try {
+      await onConfirm();
+      onOpenChange(false);
+    } catch (e) {
+      setError(e);
+    } finally {
+      setPending(false);
+    }
+  };
   return (
     <AlertDialog
       open={open}
@@ -264,16 +279,8 @@ export function ConfirmDialog({
           <AlertDialogClose>Cancel</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
-            onClick={async () => {
-              // A retry removes the notice of the previous failure.
-              setError(undefined);
-              try {
-                await onConfirm();
-                onOpenChange(false);
-              } catch (e) {
-                setError(e);
-              }
-            }}
+            disabled={pending}
+            onClick={confirm}
           >
             {confirmLabel}
           </Button>

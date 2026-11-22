@@ -18,6 +18,7 @@ import {
   type DeviceLimitsInput,
   type Resources,
 } from "@delino/ownsand-protos/v1/common_pb";
+import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
@@ -317,6 +318,115 @@ describe("confirmation dialog errors", () => {
     await settle(60);
     const reopened = await openRevoke();
     expect(noticeIn(reopened)).toBeNull();
+  });
+});
+
+describe("confirmation dialog requests", () => {
+  /** One RevokeApiKey request that waits until the test settles it. */
+  interface RevokeCall {
+    apiKeyId: string;
+    /** Fails the request when `error` is set and lets it succeed otherwise. */
+    settle(error?: ConnectError): void;
+  }
+
+  /** A transport that holds every RevokeApiKey request until the test settles it. */
+  function gatedRevokeTransport() {
+    const mock = createMockTransport();
+    const calls: RevokeCall[] = [];
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "RevokeApiKey") {
+          const input = rest[3] as { apiKeyId: string };
+          const error = await new Promise<ConnectError | undefined>(
+            (resolve) => {
+              calls.push({ apiKeyId: input.apiKeyId, settle: resolve });
+            },
+          );
+          if (error !== undefined) throw error;
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, calls };
+  }
+
+  /** The error notice inside a dialog; the live-region announcer also has the alert role. */
+  const noticeIn = (dialog: HTMLElement) =>
+    dialog.querySelector(".notice-error");
+
+  /** Renders the API keys page with the seeded ci-runner key and a newer deploy-bot key. */
+  async function renderKeys(transport: Transport) {
+    await createClient(ApiKeyService, transport).createApiKey({
+      organizationId: MOCK_IDS.acme,
+      name: "deploy-bot",
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+  }
+
+  async function openRevokeOf(name: string) {
+    const row = screen.getByText(new RegExp(`^${name} `)).closest("li")!;
+    await act(async () => {
+      fireEvent.click(within(row).getByRole("button", { name: "Revoke" }));
+    });
+    await settle();
+    return screen.findByRole("alertdialog", { name: `Revoke ${name}?` });
+  }
+
+  const confirmButton = (dialog: HTMLElement) =>
+    within(dialog).getByRole("button", {
+      name: "Revoke key",
+    }) as HTMLButtonElement;
+
+  async function press(button: HTMLElement) {
+    await act(async () => {
+      fireEvent.click(button);
+    });
+    await settle();
+  }
+
+  async function settleCall(
+    call: RevokeCall | undefined,
+    error?: ConnectError,
+  ) {
+    await act(async () => {
+      call?.settle(error);
+    });
+    await settle(60);
+  }
+
+  test("two clicks before the request settles send it once and the button is disabled", async () => {
+    const { transport, calls } = gatedRevokeTransport();
+    await renderKeys(transport);
+    const dialog = await openRevokeOf("ci-runner");
+    const button = confirmButton(dialog);
+    await press(button);
+    await press(button);
+    expect(calls.length).toBe(1);
+    expect(button.disabled).toBe(true);
+    await settleCall(calls[0]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(calls.length).toBe(1);
+  });
+
+  test("after a failure the button is enabled again, shows the error and sends a new request", async () => {
+    const { transport, calls } = gatedRevokeTransport();
+    await renderKeys(transport);
+    const dialog = await openRevokeOf("ci-runner");
+    await press(confirmButton(dialog));
+    await settleCall(
+      calls[0],
+      new ConnectError("revoke failed", Code.Unavailable),
+    );
+    expect(noticeIn(dialog)).toBeTruthy();
+    expect(confirmButton(dialog).disabled).toBe(false);
+    await press(confirmButton(dialog));
+    expect(calls.length).toBe(2);
+    // The retry removes the notice while it runs.
+    expect(noticeIn(dialog)).toBeNull();
+    await settleCall(calls[1]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
   });
 });
 
