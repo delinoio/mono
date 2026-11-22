@@ -47,9 +47,8 @@ func TestTypeScriptSDKRelay(t *testing.T) {
 		t.Fatalf("TypeScript SDK end-to-end test: %v\n%s", err, out)
 	}
 	t.Logf("TypeScript SDK end-to-end test:\n%s", out)
-	if !s.logs.hasLogMessage("api", "billing_sandbox_paused") || !s.logs.hasLogMessage("api", "billing_sandbox_resumed") {
-		t.Fatal("the control plane did not log the billing pause and resume of the TypeScript SDK test")
-	}
+	// The log scanner stores the records asynchronously, so wait for them.
+	s.logs.requireLogMessages(ctx, t, "api", "billing_sandbox_paused", "billing_sandbox_resumed")
 }
 
 // billingControlPath is the path prefix of the billing control endpoint.
