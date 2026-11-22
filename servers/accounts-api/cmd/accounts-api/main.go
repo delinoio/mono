@@ -95,6 +95,18 @@ func run() error {
 		return err
 	}
 
+	// Bind the internal metrics listener before any background task starts. A
+	// bind failure then returns before the billing worker exists, so run never
+	// returns while a worker, and the Paddle call it may start, still runs.
+	var metricsListener net.Listener
+	if cfg.MetricsAddr != "" {
+		metricsListener, err = net.Listen("tcp", cfg.MetricsAddr)
+		if err != nil {
+			_ = listener.Close()
+			return err
+		}
+	}
+
 	// The background tasks (the billing worker and the internal metrics
 	// listener) run until the HTTP server has drained, and run waits for
 	// them before it returns. The worker finishes the run in progress, so a
@@ -105,12 +117,7 @@ func run() error {
 		billingService.RunWorker(background, billing.DefaultWorkerInterval)
 		return nil
 	})}
-	if cfg.MetricsAddr != "" {
-		metricsListener, err := net.Listen("tcp", cfg.MetricsAddr)
-		if err != nil {
-			_ = listener.Close()
-			return err
-		}
+	if metricsListener != nil {
 		backgroundErrs = append(backgroundErrs, runAsync(func() error {
 			return metrics.Serve(background, metricsListener, appMetrics, logger)
 		}))
