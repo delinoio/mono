@@ -444,6 +444,11 @@ export const VENDOR_CREDENTIALS: Record<
       credential: AgentCredential.WEBHOOK_SECRET,
       label: "Webhook secret",
     },
+    {
+      key: "apiKey",
+      credential: AgentCredential.API_KEY,
+      label: "OpenAI API key (api.agents.read)",
+    },
   ],
   [AgentVendor.DEVIN]: [
     {
@@ -463,6 +468,7 @@ type CredentialKey =
   | "environmentKey"
   | "serviceAccountApiKey"
   | "webhookSecret"
+  | "apiKey"
   | "apiToken"
   | "outpostToken";
 
@@ -516,6 +522,7 @@ export function vendorCredentials(
         value: {
           environmentKey: values.environmentKey ?? "",
           webhookSecret: values.webhookSecret ?? "",
+          apiKey: values.apiKey ?? "",
         },
       };
     case AgentVendor.DEVIN:

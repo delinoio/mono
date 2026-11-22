@@ -79,6 +79,7 @@ export const labels = {
     ENVIRONMENT_KEY: "Environment key",
     SERVICE_ACCOUNT_API_KEY: "Service account API key",
     WEBHOOK_SECRET: "Webhook secret",
+    API_KEY: "OpenAI API key",
     API_TOKEN: "API token",
     OUTPOST_TOKEN: "Outpost token",
   }),

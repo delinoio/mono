@@ -281,6 +281,11 @@ function seed(userId: string): Map<string, OrgState> {
           credentialSet: true,
           credentialSetAt: ts(-8 * 86400),
         },
+        {
+          credential: AgentCredential.API_KEY,
+          credentialSet: true,
+          credentialSetAt: ts(-8 * 86400),
+        },
       ],
       webhookUrl: `${MOCK_API_ORIGIN}/webhooks/openai/${MOCK_IDS.codexIntegration}`,
       createTime: ts(-8 * 86400),
@@ -807,6 +812,7 @@ export function createMockTransport(
         supplied.push(
           [AgentCredential.ENVIRONMENT_KEY, c.value.environmentKey],
           [AgentCredential.WEBHOOK_SECRET, c.value.webhookSecret],
+          [AgentCredential.API_KEY, c.value.apiKey],
         );
         break;
       case "devinCredentials":
