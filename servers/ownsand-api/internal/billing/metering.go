@@ -430,7 +430,8 @@ func (m *Metering) Seal(ctx context.Context) (int, error) {
 	return n, nil
 }
 
-// Report sends the due unreported outbox rows to delino-accounts in batches
+// Report sends the due unreported outbox rows of the OwnSand meters to
+// delino-accounts in batches
 // of at most MaxReportBatch until none is due or a batch fails. A failed
 // batch is retried with exponential back-off.
 func (m *Metering) Report(ctx context.Context) error {
@@ -439,6 +440,7 @@ func (m *Metering) Report(ctx context.Context) error {
 	}
 	m.reportMu.Lock()
 	defer m.reportMu.Unlock()
+	m.logUnsupportedOutbox(ctx)
 	for {
 		rows, err := dueRows(ctx, m.db.Pool, m.now(), MaxReportBatch)
 		if err != nil {
@@ -556,10 +558,13 @@ func (m *Metering) recordFailure(ctx context.Context, rows []outboxRow, cause er
 	}
 }
 
-// nextDue returns the earliest next attempt time of an unreported row.
+// nextDue returns the earliest next attempt time of an unreported row of a
+// supported meter (a row of another meter is never reported, so it must not
+// keep the reporter waking up).
 func (m *Metering) nextDue(ctx context.Context) (time.Time, bool, error) {
 	var due *time.Time
-	if err := m.db.Pool.QueryRow(ctx, "SELECT min(next_attempt_time) FROM usage_outbox WHERE report_time IS NULL").Scan(&due); err != nil {
+	if err := m.db.Pool.QueryRow(ctx,
+		"SELECT min(next_attempt_time) FROM usage_outbox WHERE report_time IS NULL AND meter = ANY($1::smallint[])", supportedMeters()).Scan(&due); err != nil {
 		return time.Time{}, false, err
 	}
 	if due == nil {
@@ -568,13 +573,44 @@ func (m *Metering) nextDue(ctx context.Context) (time.Time, bool, error) {
 	return *due, true, nil
 }
 
-// OutboxStats returns the number of unreported outbox rows and the start of
-// the oldest unreported window.
+// OutboxStats returns the number of unreported outbox rows of a supported
+// meter and the start of the oldest such window. Rows of another meter value
+// are counted by unsupportedOutbox instead, so they do not raise the report
+// lag that no report can lower.
 func (m *Metering) OutboxStats(ctx context.Context) (int64, *time.Time, error) {
 	var depth int64
 	var oldest *time.Time
-	err := m.db.Pool.QueryRow(ctx, "SELECT count(*), min(window_start) FROM usage_outbox WHERE report_time IS NULL").Scan(&depth, &oldest)
+	err := m.db.Pool.QueryRow(ctx, "SELECT count(*), min(window_start) FROM usage_outbox WHERE report_time IS NULL AND meter = ANY($1::smallint[])",
+		supportedMeters()).Scan(&depth, &oldest)
 	return depth, oldest, err
+}
+
+// unsupportedOutbox returns the number of unreported outbox rows whose meter
+// is not an OwnSand meter, the start of the oldest such window and the
+// distinct meter values.
+func (m *Metering) unsupportedOutbox(ctx context.Context) (int64, *time.Time, []int16, error) {
+	var count int64
+	var oldest *time.Time
+	var meters []int16
+	err := m.db.Pool.QueryRow(ctx, `SELECT count(*), min(window_start), COALESCE(array_agg(DISTINCT meter), '{}'::smallint[])
+		FROM usage_outbox WHERE report_time IS NULL AND NOT (meter = ANY($1::smallint[]))`, supportedMeters()).Scan(&count, &oldest, &meters)
+	return count, oldest, meters, err
+}
+
+// logUnsupportedOutbox logs the unreported rows that the reporter skips
+// because their meter is not an OwnSand meter. The rows stay in the outbox
+// unchanged, so a later version that supports the meter can report them.
+// Report calls it once per pass, which rate-limits the record.
+func (m *Metering) logUnsupportedOutbox(ctx context.Context) {
+	count, oldest, meters, err := m.unsupportedOutbox(ctx)
+	if err != nil || count == 0 {
+		return
+	}
+	attrs := []any{slog.Int64("rows", count), slog.Any("meters", meters)}
+	if oldest != nil {
+		attrs = append(attrs, slog.Time("oldest_window_start", oldest.UTC()))
+	}
+	m.logger.Error("billing_usage_unknown_meter_unsent", attrs...)
 }
 
 // RefreshMetrics updates the outbox depth and report lag gauges.
@@ -591,5 +627,10 @@ func (m *Metering) RefreshMetrics(ctx context.Context) error {
 		}
 	}
 	m.metrics.reportLag.Record(ctx, lag)
+	unsupported, _, _, err := m.unsupportedOutbox(ctx)
+	if err != nil {
+		return err
+	}
+	m.metrics.unsupportedDepth.Record(ctx, unsupported)
 	return nil
 }
