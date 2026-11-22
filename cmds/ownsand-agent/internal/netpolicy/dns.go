@@ -50,6 +50,11 @@ type dnsLimits struct {
 	// tcpDeadline bounds one TCP connection (dial and copy). Zero means
 	// DefaultDNSTCPDeadline; tests set a short value.
 	tcpDeadline time.Duration
+	// afterAdmit, when set, runs in serveTCP after a connection took its TCP
+	// slot and before it is registered. It is a test hook that holds the
+	// accept path open at the point where Close can overtake it; production
+	// never sets it.
+	afterAdmit func()
 }
 
 // dnsRejectLog logs rejections of one transport at most once per interval,
@@ -230,10 +235,26 @@ func (f *DNSForwarder) serveTCP() {
 			f.tcpRej.note(f.logger, DNSTransportTCP, f.limits.maxTCPConns)
 			continue
 		}
+		if f.limits.afterAdmit != nil {
+			f.limits.afterAdmit()
+		}
+		// Register under the lock that Close holds while it closes the
+		// registered connections, and check closed in the same critical
+		// section: a connection accepted while Close ran is either closed by
+		// Close or refused here, never left open for a handler that Close
+		// would wait for until the TCP deadline.
 		f.mu.Lock()
+		select {
+		case <-f.closed:
+			f.mu.Unlock()
+			c.Close()
+			<-f.tcpSlots
+			return
+		default:
+		}
 		f.conns[c] = true
-		f.mu.Unlock()
 		f.wg.Add(1)
+		f.mu.Unlock()
 		go func() {
 			defer f.wg.Done()
 			defer func() { <-f.tcpSlots }()

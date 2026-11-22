@@ -522,3 +522,127 @@ func TestDNSForwarderLimitsAreIndependentPerForwarder(t *testing.T) {
 	waitForCount(t, "udp queries of the other forwarder", &g.udpQueries, 2)
 	g.open()
 }
+
+// pauseAfterAdmit returns a dnsLimits hook that blocks the first admitted
+// connection in serveTCP until resume is called, and a channel that reports
+// the pause.
+func pauseAfterAdmit() (hook func(), paused <-chan struct{}, resume func()) {
+	p := make(chan struct{})
+	r := make(chan struct{})
+	var once, rOnce sync.Once
+	hook = func() {
+		once.Do(func() {
+			close(p)
+			<-r
+		})
+	}
+	return hook, p, func() { rOnce.Do(func() { close(r) }) }
+}
+
+// closeInBackground calls f.Close in a goroutine and returns a channel that
+// closes when it returns.
+func closeInBackground(f *DNSForwarder) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.Close()
+	}()
+	return done
+}
+
+func TestDNSForwarderRefusesConnAcceptedDuringClose(t *testing.T) {
+	// A silent upstream would hold a registered connection for the whole
+	// default 30-second deadline.
+	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+	hook, paused, resume := pauseAfterAdmit()
+	defer resume()
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 2, afterAdmit: hook})
+	defer f.Close()
+
+	c, err := net.Dial("tcp", f.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCP did not admit the connection")
+	}
+	// Close runs while the accept path holds an admitted, unregistered
+	// connection. Once Close has closed the listener, let the accept path go on.
+	done := closeInBackground(f)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case <-f.closed:
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("Close did not start")
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		break
+	}
+	resume()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for a connection accepted during Close")
+	}
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("connection accepted during Close stayed open: %v", err)
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
+	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+	hook, paused, resume := pauseAfterAdmit()
+	defer resume()
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, afterAdmit: hook})
+	defer f.Close()
+
+	// The only slot is held by the paused connection; a second connection is
+	// refused at capacity and does not disturb the paused one.
+	first, err := net.Dial("tcp", f.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCP did not admit the connection")
+	}
+	// serveTCP is paused, so it does not even accept the second connection;
+	// it waits in the kernel queue until the loop resumes and refuses it.
+	second, err := net.Dial("tcp", f.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	done := closeInBackground(f)
+	time.Sleep(50 * time.Millisecond)
+	resume()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for connections accepted during Close")
+	}
+	for name, c := range map[string]net.Conn{"first": first, "second": second} {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Read(make([]byte, 1)); err == nil {
+			t.Fatalf("%s connection delivered data", name)
+		} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Fatalf("%s connection stayed open after Close: %v", name, err)
+		}
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
