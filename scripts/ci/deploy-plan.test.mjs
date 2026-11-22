@@ -17,6 +17,7 @@ import {
   DeployPlanError,
   DeployTarget,
   ReleaseType,
+  UpstreamProtocol,
   check,
   main,
   plan,
@@ -161,6 +162,8 @@ test("deployables follow workspace dependency order within each kind", () => {
     service: "api-svc",
     hostname: "api-svc.example.com",
     port: "8080",
+    upstreamProtocol: UpstreamProtocol.Http1,
+    udpPorts: "none",
     version: "0.1.0",
   });
   assert.equal(result.staticSites[0].output, "apps/web/dist");
@@ -200,6 +203,12 @@ test("two deployables with the same destination fail", () => {
       droplet("two", { hostname: "api.example.com" }),
       /one and two both deploy to droplet-hostname:api\.example\.com/,
     ],
+    [
+      "servers",
+      droplet("one", { udpPorts: [3478, 3479] }),
+      droplet("two", { udpPorts: [3479] }),
+      /one and two both deploy to droplet-udp:3479/,
+    ],
   ];
   for (const [root, first, second, message] of cases) {
     const shared = [
@@ -208,6 +217,27 @@ test("two deployables with the same destination fail", () => {
     ];
     assert.throws(() => plan(status(["one", "1.0.0"]), shared), message);
   }
+});
+
+test("a Droplet server passes its upstream protocol and UDP ports to the deploy loop", () => {
+  const servers = [
+    pkg("servers/one", {
+      name: "one",
+      deploy: droplet("one", {
+        upstreamProtocol: UpstreamProtocol.H2c,
+        udpPorts: [3478, 5349],
+      }),
+    }),
+    pkg("servers/two", { name: "two", deploy: droplet("two") }),
+  ];
+  const result = plan(status(["one", "1.0.0"], ["two", "1.0.0"]), servers);
+  assert.deepEqual(
+    result.servers.map((d) => [d.name, d.upstreamProtocol, d.udpPorts]),
+    [
+      ["one", "h2c", "3478,5349"],
+      ["two", "http1", "none"],
+    ],
+  );
 });
 
 test("two Droplet services may use the same container port", () => {
@@ -244,6 +274,20 @@ test("invalid Droplet service names, host names and ports fail", () => {
     [{ port: 80 }, /deploy\.port must be/],
     [{ port: 65536 }, /deploy\.port must be/],
     [{ port: 8080.5 }, /deploy\.port must be/],
+    [
+      { upstreamProtocol: "h2" },
+      /deploy\.upstreamProtocol must be one of http1, h2c/,
+    ],
+    [{ upstreamProtocol: "" }, /deploy\.upstreamProtocol must be/],
+    [{ upstreamProtocol: ["h2c"] }, /deploy\.upstreamProtocol must be/],
+    [{ udpPorts: [] }, /deploy\.udpPorts must be a nonempty list/],
+    [{ udpPorts: 3478 }, /deploy\.udpPorts must be/],
+    [{ udpPorts: ["3478"] }, /deploy\.udpPorts must be/],
+    [{ udpPorts: [443] }, /deploy\.udpPorts must be/],
+    [{ udpPorts: [65536] }, /deploy\.udpPorts must be/],
+    [{ udpPorts: [3478.5] }, /deploy\.udpPorts must be/],
+    [{ udpPorts: [3478, 3478] }, /deploy\.udpPorts must be/],
+    [{ udpPorts: null }, /deploy\.udpPorts must be/],
   ];
   for (const [fields, message] of cases) {
     const deploy = droplet("api", fields);
@@ -267,6 +311,9 @@ test("invalid Droplet service names, host names and ports fail", () => {
     { hostname: "a-b.c.example" },
     { port: 1024 },
     { port: 65535 },
+    { upstreamProtocol: UpstreamProtocol.Http1 },
+    { upstreamProtocol: UpstreamProtocol.H2c },
+    { udpPorts: [1024, 65535] },
   ]) {
     assert.doesNotThrow(
       () =>

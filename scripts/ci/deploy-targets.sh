@@ -64,7 +64,7 @@ check_plan() {
 # Droplet. `droplet-deploy.sh` waits for the health check on the Droplet, so
 # its exit code is the verdict.
 deploy_servers() {
-  require_targets SERVERS "${SERVERS:-}" name version service hostname port
+  require_targets SERVERS "${SERVERS:-}" name version service hostname port upstreamProtocol udpPorts
   if [[ ! "${DROPLET_REGISTRY:-}" =~ ^[a-z0-9.-]+(:[0-9]+)?(/[a-z0-9._-]+)+$ ]]; then
     echo "::error::DROPLET_REGISTRY is not a registry repository prefix: ${DROPLET_REGISTRY:-<empty>}" >&2
     exit 1
@@ -74,8 +74,8 @@ deploy_servers() {
     exit 1
   fi
   echo "## Servers" >> "$summary"
-  local name version service hostname port ref digest image
-  while IFS=$'\t' read -r -u 3 name version service hostname port; do
+  local name version service hostname port protocol udp_ports ref digest image
+  while IFS=$'\t' read -r -u 3 name version service hostname port protocol udp_ports; do
     echo "::group::Deploy $name@$version to Droplet service $service"
     docker load --quiet --input "$RUNNER_TEMP/servers/$name.tar.gz" < /dev/null
     ref="$DROPLET_REGISTRY/$service:$SHA"
@@ -92,10 +92,10 @@ deploy_servers() {
     image="$DROPLET_REGISTRY/$service@$digest"
     check_plan
     ssh -F "$DROPLET_SSH_CONFIG" droplet bash -s -- \
-      "$service" "$image" "$port" "$hostname" < "$remote_deploy"
+      "$service" "$image" "$port" "$hostname" "$protocol" "$udp_ports" < "$remote_deploy"
     echo "::endgroup::"
     echo "- $name@$version: Droplet service \`$service\` at \`https://$hostname\`, image \`$image\`" >> "$summary"
-  done 3< <(jq -r '.[] | [.name, .version, .service, .hostname, .port] | @tsv' <<< "$SERVERS")
+  done 3< <(jq -r '.[] | [.name, .version, .service, .hostname, .port, .upstreamProtocol, .udpPorts] | @tsv' <<< "$SERVERS")
 }
 
 # Builds every site in plan order. The workflow runs this in a step without

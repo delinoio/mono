@@ -5,10 +5,12 @@
 # `deploy-targets.sh servers` runs this script on the Droplet as the `deploy`
 # user over SSH, with the script on standard input:
 #
-#   ssh <droplet> bash -s -- <service> <image> <port> <hostname> < droplet-deploy.sh
+#   ssh <droplet> bash -s -- <service> <image> <port> <hostname> \
+#     <upstream-protocol> <udp-ports> < droplet-deploy.sh
 #
-# A maintainer rolls a service back with the same command and the image of
-# the previous deployment (`/srv/delino/state/<service>.previous`).
+# A maintainer rolls a service back with the same command, the image of the
+# previous deployment (`/srv/delino/state/<service>.previous`) and the other
+# values from the `deploy` field of the server's package.json.
 #
 # A lock file `state/<service>.lock` (`flock`) serializes deployments and
 # rollbacks of one service: a second run waits until the first one ends.
@@ -26,6 +28,15 @@
 # non-zero and name the container, but the state files already name the
 # replacement. The exit code is the deployment verdict.
 #
+# A service that publishes UDP host ports cannot run next to its replacement,
+# because only one container can publish a host port. For such a service the
+# script creates the replacement, stops the running containers to free the
+# ports, and only then starts the replacement and waits for its health check.
+# The service does not answer between the stop and the route switch. When the
+# replacement fails to start, fails its health check or the route switch
+# fails, the script removes it and starts the stopped containers again; the
+# route still names them.
+#
 # Arguments:
 #   service   Droplet service name: container name prefix, label value and
 #             env file name. A deployment by an earlier version of this
@@ -36,6 +47,12 @@
 #   port      port that the server listens on inside the container. The
 #             script sets `ADDR=:<port>`.
 #   hostname  public host name that the reverse proxy routes to the service.
+#   upstream-protocol
+#             protocol from the reverse proxy to the container: `http1`
+#             (HTTP/1.1) or `h2c` (HTTP/2 without TLS, for bidirectional
+#             streams).
+#   udp-ports UDP ports that the Droplet publishes on the same host ports, as
+#             a comma-separated list, or `none`.
 #
 # Environment (defaults match `scripts/droplet/provision.sh`):
 #   DROPLET_ROOT            state directory (default /srv/delino).
@@ -63,11 +80,11 @@ main() {
     echo "::error::droplet-deploy.sh needs flock (util-linux) for the deployment lock." >&2
     exit 2
   fi
-  if (( $# != 4 )); then
-    echo "usage: droplet-deploy.sh <service> <image> <port> <hostname>" >&2
+  if (( $# != 6 )); then
+    echo "usage: droplet-deploy.sh <service> <image> <port> <hostname> <upstream-protocol> <udp-ports>" >&2
     exit 2
   fi
-  local service="$1" image="$2" port="$3" hostname="$4"
+  local service="$1" image="$2" port="$3" hostname="$4" protocol="$5" udp_ports="$6"
   # The planner already checks these values; check them again, because they
   # become file names, container names and proxy configuration here.
   # A DNS label has at most 63 characters, as in the planner's host check.
@@ -83,6 +100,30 @@ main() {
   fi
   if [[ ! "$hostname" =~ ^$label(\.$label)+$ ]] || (( ${#hostname} > 253 )); then
     fail "the host name ${hostname@Q} is not valid."
+  fi
+  if [[ "$protocol" != http1 && "$protocol" != h2c ]]; then
+    fail "the upstream protocol ${protocol@Q} is not http1 or h2c."
+  fi
+  # Each UDP port is published on the same host port: `--publish <p>:<p>/udp`.
+  local -a publish=()
+  if [[ "$udp_ports" != none ]]; then
+    if [[ ! "$udp_ports" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+      fail "the UDP ports ${udp_ports@Q} are not a comma-separated list of ports or none."
+    fi
+    local -A seen=()
+    local udp_port
+    local -a udp_list
+    IFS=, read -r -a udp_list <<< "$udp_ports"
+    for udp_port in "${udp_list[@]}"; do
+      if [[ ! "$udp_port" =~ ^[1-9][0-9]{3,4}$ ]] || (( udp_port < 1024 || udp_port > 65535 )); then
+        fail "the UDP port ${udp_port@Q} is not a number from 1024 to 65535."
+      fi
+      if [[ -n "${seen[$udp_port]:-}" ]]; then
+        fail "the UDP port $udp_port is listed twice."
+      fi
+      seen[$udp_port]=1
+      publish+=(--publish "$udp_port:$udp_port/udp")
+    done
   fi
 
   local root="${DROPLET_ROOT:-/srv/delino}"
@@ -138,26 +179,63 @@ main() {
   stamp="$(date -u +%Y%m%d%H%M%S)-${image: -12}"
   new="$service-$stamp"
   upstream="$(upstream_alias "$service" "$stamp")"
-  echo "Start $new as $upstream"
   # The replacement takes no `--network-alias "$service"`. The running
   # container keeps that alias (and the route still names it), and Docker DNS
   # would hand out the replacement address with the shared alias while the
   # replacement still starts or fails its health check. The route switches to
   # the unique alias only after the health check passed.
-  docker run --detach --name "$new" \
-    --network "$network" --network-alias "$upstream" \
-    --label "io.delino.service=$service" --label "io.delino.image=$image" \
-    --restart unless-stopped \
-    --env-file "$env_file" --env "ADDR=:$port" \
-    "$image" > /dev/null
-
-  if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
-    discard_replacement "$new"
-    fail "$new did not pass the health check; the previous container keeps serving."
+  local -a create=(--name "$new"
+    --network "$network" --network-alias "$upstream"
+    --label "io.delino.service=$service" --label "io.delino.image=$image"
+    --restart unless-stopped
+    --env-file "$env_file" --env "ADDR=:$port"
+    "${publish[@]}"
+    "$image")
+  # Running containers that the script stops before the replacement starts
+  # (only for a service with UDP ports), and starts again when the
+  # replacement fails.
+  local -a stopped=()
+  if (( ${#publish[@]} == 0 )); then
+    echo "Start $new as $upstream"
+    docker run --detach "${create[@]}" > /dev/null
+    if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
+      discard_replacement "$new"
+      fail "$new did not pass the health check; the previous container keeps serving."
+    fi
+  else
+    local running_ids
+    running_ids="$(docker ps --quiet --filter "label=io.delino.service=$service")" ||
+      fail "could not list the running containers of $service; no replacement was started."
+    local running_id
+    while IFS= read -r running_id; do
+      if [[ -n "$running_id" ]]; then
+        stopped+=("$running_id")
+      fi
+    done <<< "$running_ids"
+    echo "Create $new as $upstream with the UDP ports $udp_ports"
+    docker create "${create[@]}" > /dev/null
+    for running_id in "${stopped[@]}"; do
+      echo "Stop the previous container $running_id to free the UDP ports"
+      if ! docker stop --time "$stop_timeout" "$running_id" > /dev/null; then
+        docker rm --force "$new" > /dev/null || true
+        restart_previous "${stopped[@]}"
+        fail "docker stop failed for the previous container $running_id; the replacement was removed and the previous containers were started again."
+      fi
+    done
+    echo "Start $new"
+    if ! docker start "$new" > /dev/null || ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
+      discard_replacement "$new"
+      restart_previous "${stopped[@]}"
+      fail "$new did not start or did not pass the health check; the previous containers were started again."
+    fi
   fi
 
-  if ! write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy"; then
+  if ! write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
     discard_replacement "$new"
+    if (( ${#stopped[@]} > 0 )); then
+      restart_previous "${stopped[@]}"
+      fail "the route of $service was not switched; the previous containers were started again."
+    fi
     fail "the route of $service was not switched; the previous container keeps serving."
   fi
 
@@ -192,6 +270,20 @@ main() {
 fail() {
   echo "::error::$1" >&2
   exit 1
+}
+
+# Starts the previous containers again after a failed replacement of a
+# service with UDP ports. The replacement is already removed, so the host
+# ports are free. A container that does not start is named, and the caller
+# still reports the deployment failure.
+restart_previous() {
+  local id
+  for id in "$@"; do
+    echo "Start the previous container $id again"
+    if ! docker start "$id" > /dev/null; then
+      echo "::error::docker start failed for the previous container $id; $id does not serve until it is started by hand." >&2
+    fi
+  done
 }
 
 # Records the image that the route serves: `<state>.current` becomes the image
@@ -268,15 +360,26 @@ wait_healthy() {
 # the route file), and the proxy reloads only after that. Restores the
 # previous route when the proxy rejects the new one.
 write_route() {
-  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6"
+  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6" protocol="$7"
   local route
   # `lb_try_duration` retries a failed connection for 10 seconds, so a request
   # that reaches the old container while it stops is sent to the new one.
+  # `versions h2c` proxies HTTP/2 without TLS to the container, so that
+  # bidirectional streams stay HTTP/2 from end to end. The route sets no
+  # stream timeout, and a reload keeps the streams of the previous
+  # configuration open. The server-wide 1-minute `read_body_idle` and
+  # `write_idle` defaults of Caddy still apply (see the Droplet section of
+  # docs/repository-workflow-contract.md).
+  local -a transport=()
+  if [[ "$protocol" == h2c ]]; then
+    transport=("		transport http {" "			versions h2c" "		}")
+  fi
   route="$(printf '%s\n' \
     "# Written by scripts/ci/droplet-deploy.sh for $service. Do not edit." \
     "$hostname {" \
     "	reverse_proxy $upstream:$port {" \
     "		lb_try_duration 10s" \
+    "${transport[@]}" \
     "	}" \
     "}")"
   # The proxy imports `sites/*.caddy`; the suffixes below keep the backup and
