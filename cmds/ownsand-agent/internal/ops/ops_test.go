@@ -205,6 +205,74 @@ func started(frames []*ownsandv1.DataFrame) bool {
 
 func last(frames []*ownsandv1.DataFrame) *ownsandv1.DataFrame { return frames[len(frames)-1] }
 
+// exitEvent returns the exit event of an exec. It reports an error when no
+// frame carries one: the generated getter returns the zero exit code for an
+// absent event, so a check of GetExitCode alone passes for a stream that never
+// ended.
+func exitEvent(frames []*ownsandv1.DataFrame) (*ownsandv1.ExecExited, error) {
+	for _, f := range frames {
+		if exited := f.GetExecEvent().GetExited(); exited != nil {
+			return exited, nil
+		}
+	}
+	return nil, fmt.Errorf("no exited event in %d frames", len(frames))
+}
+
+// requireCleanExit fails the test unless the frames carry an exit event with
+// exit code 0.
+func requireCleanExit(t *testing.T, frames []*ownsandv1.DataFrame) {
+	t.Helper()
+	exited, err := exitEvent(frames)
+	if err != nil {
+		t.Fatalf("%v (stdout %q)", err, stdout(frames))
+	}
+	// A command that a signal ended also reads as exit code 0, so check the
+	// status variant too.
+	if _, ok := exited.GetStatus().(*ownsandv1.ExecExited_ExitCode); !ok || exited.GetExitCode() != 0 {
+		t.Fatalf("exited %v, want exit code 0 (stdout %q)", exited, stdout(frames))
+	}
+}
+
+func stdoutFrame(data string) *ownsandv1.DataFrame {
+	return &ownsandv1.DataFrame{Payload: &ownsandv1.DataFrame_ExecEvent{ExecEvent: &ownsandv1.ExecEvent{
+		Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte(data)}},
+	}}}
+}
+
+func exitedFrame(code int64) *ownsandv1.DataFrame {
+	return &ownsandv1.DataFrame{Payload: &ownsandv1.DataFrame_ExecEvent{ExecEvent: &ownsandv1.ExecEvent{
+		Event: &ownsandv1.ExecEvent_Exited{Exited: &ownsandv1.ExecExited{Status: &ownsandv1.ExecExited_ExitCode{ExitCode: code}}},
+	}}}
+}
+
+func TestExitEvent(t *testing.T) {
+	cases := []struct {
+		name    string
+		frames  []*ownsandv1.DataFrame
+		wantErr bool
+		code    int64
+	}{
+		{name: "stdout without an exited event", frames: []*ownsandv1.DataFrame{stdoutFrame("run\n")}, wantErr: true},
+		{name: "no frames", wantErr: true},
+		{name: "exited with code 0", frames: []*ownsandv1.DataFrame{stdoutFrame("run\n"), exitedFrame(0)}},
+		{name: "exited with a non-zero code", frames: []*ownsandv1.DataFrame{stdoutFrame("run\n"), exitedFrame(3)}, code: 3},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			exited, err := exitEvent(tc.frames)
+			if tc.wantErr {
+				if err == nil || exited != nil {
+					t.Fatalf("exit event %v err %v, want an error", exited, err)
+				}
+				return
+			}
+			if err != nil || exited.GetExitCode() != tc.code {
+				t.Fatalf("exit event %v err %v, want code %d", exited, err, tc.code)
+			}
+		})
+	}
+}
+
 func TestExecAtMostOnce(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/sh", "-c", "echo run >> count; cat count")
@@ -212,14 +280,16 @@ func TestExecAtMostOnce(t *testing.T) {
 	if !out.Finished || !accepted || frames[0].GetExecEvent().GetStarted() == nil {
 		t.Fatalf("outcome %+v accepted %v first %v", out, accepted, frames[0])
 	}
-	if stdout(frames) != "run\n" || last(frames).GetExecEvent().GetExited().GetExitCode() != 0 {
+	if stdout(frames) != "run\n" {
 		t.Fatalf("stdout %q last %v", stdout(frames), last(frames))
 	}
+	requireCleanExit(t, frames)
 	// The identical request attaches and does not run the command again.
 	out, frames, _ = e.handle(req, nil)
 	if !out.Finished || stdout(frames) != "run\n" {
 		t.Fatalf("repeat: %+v %q", out, stdout(frames))
 	}
+	requireCleanExit(t, frames)
 	other := proto.Clone(req).(*ownsandv1.ExecRequest)
 	other.Command = []string{"/bin/true"}
 	out, _, _ = e.handle(other, nil)
@@ -350,22 +420,84 @@ func TestAttachOffsetsAndPaused(t *testing.T) {
 	}
 }
 
+// waitBound bounds every wait of a test on the exec of a guest command, so a
+// command that never starts or never completes fails the test and does not
+// hang it until the test binary times out.
+const waitBound = 15 * time.Second
+
+// waitUntil polls cond until it holds and reports whether it held within bound.
+func waitUntil(bound time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(bound)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
+// awaitOutcome receives the outcome of an exec and reports whether it arrived
+// within bound.
+func awaitOutcome(done <-chan ops.Outcome, bound time.Duration) (ops.Outcome, bool) {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case out := <-done:
+		return out, true
+	case <-timer.C:
+		return ops.Outcome{}, false
+	}
+}
+
+func TestWaitHelpersAreBounded(t *testing.T) {
+	const bound = 50 * time.Millisecond
+	begin := time.Now()
+	if waitUntil(bound, func() bool { return false }) {
+		t.Fatal("waitUntil reported a condition that never holds")
+	}
+	if _, ok := awaitOutcome(make(chan ops.Outcome), bound); ok {
+		t.Fatal("awaitOutcome reported an outcome that never came")
+	}
+	if elapsed := time.Since(begin); elapsed > 5*time.Second {
+		t.Fatalf("the bounded waits took %v", elapsed)
+	}
+	calls := 0
+	if !waitUntil(bound, func() bool { calls++; return calls == 3 }) {
+		t.Fatal("waitUntil missed a condition that holds")
+	}
+	done := make(chan ops.Outcome, 1)
+	done <- ops.Outcome{Finished: true}
+	if out, ok := awaitOutcome(done, bound); !ok || !out.Finished {
+		t.Fatalf("awaitOutcome: %+v %v", out, ok)
+	}
+}
+
 func TestExecSandboxEnded(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/sh", "-c", "sleep 60")
 	s := &sink{}
+	// Cancelling the context ends the forwarding of the exec, and with it the
+	// handler goroutine, when the test fails before the sandbox ends.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan ops.Outcome, 1)
 	go func() {
-		done <- e.d.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, req), SandboxID: e.sandbox}, s)
+		done <- e.d.Handle(ctx, ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, req), SandboxID: e.sandbox}, s)
 	}()
-	for !e.d.HasRunningExec(e.sandbox) {
-		time.Sleep(10 * time.Millisecond)
+	if !waitUntil(waitBound, func() bool { return e.d.HasRunningExec(e.sandbox) }) {
+		cancel()
+		t.Fatalf("exec did not start within %v", waitBound)
 	}
 	time.Sleep(200 * time.Millisecond)
 	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
 		t.Fatal(err)
 	}
-	out := <-done
+	out, ok := awaitOutcome(done, waitBound)
+	if !ok {
+		cancel()
+		t.Fatalf("exec did not complete within %v after its sandbox was deleted", waitBound)
+	}
 	if !out.Finished || last(s.frames).GetExecEvent().GetSandboxEnded().GetReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("outcome %+v last %v", out, last(s.frames))
 	}
