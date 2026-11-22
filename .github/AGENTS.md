@@ -1,4 +1,10 @@
-# GitHub workflow instructions
+# .github working instructions
+
+- Follow the root instruction-update policy and the nearest parent instructions.
+- This file covers `.github/` and its descendants unless a more specific instruction file applies.
+- Read the owning contracts below before changing behavior, including affected cross-domain consumers.
+
+## Development and validation
 
 - Follow root `AGENTS.md` and [the workflow contract](../docs/repository-workflow-contract.md).
 - Connect every new PR validation job to `ci-result` through its `needs` list and its `job_outputs` table. Keep `ci-result` running after dependency failures and cancellations so it reports the aggregate result.
@@ -9,3 +15,7 @@
 - Add release workflows only with an owning project contract and explicit credential boundaries.
 - Keep `deploy.yml` a `workflow_dispatch`-only workflow without inputs that selects deployables from pending changesets, builds servers in parallel, deploys in dependency order and pushes the version commit and tags last. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow).
 - Keep exactly two GitHub deployment environments: `static-sites` for static sites under `apps/` and `servers` for services under `servers/`. Do not add per-app, per-server, per-stage or per-branch environments. Follow [the workflow contract](../docs/repository-workflow-contract.md#deployment-environments).
+
+## Owning contracts
+
+- [Repository workflow](../docs/repository-workflow-contract.md)

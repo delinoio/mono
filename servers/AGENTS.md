@@ -15,7 +15,6 @@
 ## Development and validation
 
 - Follow root `AGENTS.md` and the owning project/domain contracts.
-
 - Each server deployed to the shared DigitalOcean Droplet declares a `deploy` field in its `package.json`, keeps a `Dockerfile` in its package root, reads its listen address from `ADDR` and serves `GET /healthz`. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow). A server that needs a public port other than its reverse proxy route (for example a UDP port) declares no `deploy` field until the deployment workflow supports that port.
 - Read runtime configuration from environment variables without a project or service prefix (`DATABASE_URL`, not `OWNSAND_DATABASE_URL`). Follow [the environment contract](../docs/repository-environment-contract.md#configuration-ownership).
 - Server Go code uses the root Go module `github.com/delinoio/mono`; do not add a `go.mod` under `servers/`. Each server has a workspace `package.json` whose scripts wrap the Go toolchain and also run the server's launcher tests. Before finishing, run the root Go checks and, from the repository root, `pnpm exec turbo run test --filter=./servers/<server>` for each changed server (`go test ./...` followed by the launcher tests).

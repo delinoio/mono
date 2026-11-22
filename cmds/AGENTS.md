@@ -7,13 +7,9 @@
 ## Development and validation
 
 - Follow root `AGENTS.md` and command-specific docs in `docs/project-*.md` plus relevant `docs/cmds-*.md` files.
-
 - Keep command boundaries explicit and documented.
-
 - Keep configuration schemas documented and synchronized with implementation.
-
 - Keep integration boundaries with `apps/`, `servers/`, and other domains explicit in docs.
-
 - Avoid undocumented cross-domain coupling.
 
 ## Licensing
