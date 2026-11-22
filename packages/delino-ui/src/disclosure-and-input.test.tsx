@@ -1181,6 +1181,46 @@ describe("SegmentedControl", () => {
   });
 });
 
+// happy-dom does not compute the cascade or forced colors, so these check the
+// stylesheet text of the single forced-colors block. The block comes after
+// the component rules, because it has the same specificity and wins by order.
+describe("Forced colors", () => {
+  const marker = "@media (forced-colors: active)";
+  const forced = css.slice(css.indexOf(marker));
+
+  test("keeps one forced-colors block after the component rules", () => {
+    expect(css.split(marker)).toHaveLength(2);
+    expect(css.indexOf(marker)).toBeGreaterThan(
+      css.indexOf(
+        '.dui-tabs-tab[data-orientation="vertical"][data-selected] {',
+      ),
+    );
+  });
+
+  test("draws the selected tab with Highlight and hides the idle ones", () => {
+    expect(findRuleBlock(forced, ".dui-tabs-tab")).toContain(
+      "border-bottom-color: Canvas;",
+    );
+    expect(findRuleBlock(forced, ".dui-tabs-tab[data-selected]")).toContain(
+      "border-bottom-color: Highlight;",
+    );
+    expect(
+      findRuleBlock(forced, '.dui-tabs-tab[data-orientation="vertical"]'),
+    ).toContain("border-inline-end-color: Canvas;");
+    expect(
+      findRuleBlock(
+        forced,
+        '.dui-tabs-tab[data-orientation="vertical"][data-selected]',
+      ),
+    ).toContain("border-inline-end-color: Highlight;");
+    // The default selected cue and the 2px border that keeps the size stay.
+    expect(block(".dui-tabs-tab[data-selected]")).toContain(
+      "border-bottom-color: var(--dui-color-text);",
+    );
+    expect(block(".dui-tabs-tab")).toContain("border-bottom: 2px solid");
+  });
+});
+
 describe("Toggle", () => {
   test("reports its pressed state", async () => {
     render(<Toggle aria-label="Bold">B</Toggle>);
