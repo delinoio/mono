@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -199,23 +200,52 @@ func requireNothingOutside(t *testing.T, parent string) {
 }
 
 // requireLinkInside fails when the symbolic link name below dir resolves to
-// a path outside dir. A link that resolves to nothing passes.
+// the parent of dir or to secret.txt in it. It asks the operating system
+// through os.Stat and compares file identities, because filepath.EvalSymlinks
+// follows ".." after a link as the parent of the link destination, which
+// Windows does not do for the links of these tests. A link that resolves to
+// nothing passes.
 func requireLinkInside(t *testing.T, dir, name string) {
 	t.Helper()
-	resolved, err := filepath.EvalSymlinks(filepath.Join(dir, name))
-	if errors.Is(err, os.ErrNotExist) {
+	info, err := os.Stat(filepath.Join(dir, name))
+	if err != nil {
+		// The operating system could not resolve the link, so it does not
+		// reach anything outside the root.
 		return
 	}
-	if err != nil {
-		t.Fatal(err)
+	parent := filepath.Dir(dir)
+	for _, outside := range []string{parent, filepath.Join(parent, "secret.txt")} {
+		outsideInfo, err := os.Stat(outside)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if os.SameFile(info, outsideInfo) {
+			t.Fatalf("link %s resolves outside the root: it is %s", name, outside)
+		}
 	}
-	realDir, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestRecoverStatReturnsPanicAsError(t *testing.T) {
+	err := recoverStat(func() (fs.FileInfo, error) {
+		var parts []string
+		_ = parts[1] // index out of range, like os.doInRoot on Windows
+		return nil, nil
+	})
+	if !errors.Is(err, errRootStatPanic) {
+		t.Fatalf("panic not returned as errRootStatPanic: %v", err)
 	}
-	rel, err := filepath.Rel(realDir, resolved)
-	if err != nil || !filepath.IsLocal(rel) && rel != "." {
-		t.Fatalf("link %s resolves outside the root: %s", name, resolved)
+	if !strings.Contains(err.Error(), "index out of range") {
+		t.Fatalf("error lost the panic value: %v", err)
+	}
+}
+
+func TestRecoverStatKeepsStatResult(t *testing.T) {
+	want := fs.ErrNotExist
+	if err := recoverStat(func() (fs.FileInfo, error) { return nil, want }); !errors.Is(err, want) {
+		t.Fatalf("error changed: %v", err)
+	}
+	if err := recoverStat(func() (fs.FileInfo, error) { return nil, nil }); err != nil {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

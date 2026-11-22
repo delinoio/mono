@@ -269,13 +269,47 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 // directory, is dangling and stays allowed.
 func checkLinksConfined(root *os.Root, links []string) error {
 	for _, name := range links {
-		_, err := root.Stat(name)
+		err := recoverStat(func() (fs.FileInfo, error) { return root.Stat(name) })
 		if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
 			continue
+		}
+		if errors.Is(err, errRootStatPanic) {
+			return fmt.Errorf("fsutil: tar symbolic link %q cannot be confirmed inside the target directory: %w", name, err)
 		}
 		return fmt.Errorf("fsutil: tar symbolic link %q resolves outside the target directory: %w", name, err)
 	}
 	return nil
+}
+
+// errRootStatPanic marks a panic of os.Root.Stat that recoverStat turned
+// into an error.
+var errRootStatPanic = errors.New("os.Root.Stat panicked")
+
+// recoverStat calls stat, which is os.Root.Stat on one link, and returns a
+// panic of it as an error that wraps errRootStatPanic.
+//
+// Workaround: on Windows, Go 1.26.1 os.Root resolves a symbolic link with
+// rootCleanPath, which cleans the prefix, the link target and the rest of
+// the path lexically. When that result is the path that the walk already
+// opened up to the link, such as "d/x" -> "up/.." or "d/self" -> ".", the new
+// path has no more elements than the walk index, and doInRoot (os/root_openat.go)
+// panics with "index out of range" instead of returning an error. ReadTar
+// must not crash on archive content, so the panic becomes an error, and
+// checkLinksConfined then fails the archive: it fails closed, which also
+// rejects such a link that stays inside the root. The panic happens only on
+// Windows; on other systems recoverStat returns the result of stat
+// unchanged. Remove recoverStat when go.mod requires a Go version in which
+// os.Root.Stat returns a result or an error for such a link on Windows. The
+// doInRoot source of Go 1.27.4 still compares len(newparts) < i without the
+// equal case.
+func recoverStat(stat func() (fs.FileInfo, error)) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", errRootStatPanic, r)
+		}
+	}()
+	_, err = stat()
+	return err
 }
 
 // confinedLinkTarget reports whether the symbolic link target linkname of
