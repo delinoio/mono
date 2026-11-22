@@ -11,7 +11,6 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -163,9 +162,9 @@ func startFailure(err error) *ownsandv1.ExecEvent {
 	switch {
 	case errors.Is(err, exec.ErrNotFound), errors.Is(err, fs.ErrNotExist):
 		return failedEvent(ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PROGRAM_NOT_FOUND, "program not found")
-	case errors.Is(err, fs.ErrPermission), errors.Is(err, syscall.ENOEXEC):
+	case errors.Is(err, fs.ErrPermission), isNotExecutable(err):
 		return failedEvent(ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_PERMISSION_DENIED, "program cannot be executed")
-	case errors.Is(err, syscall.EAGAIN), errors.Is(err, syscall.ENOMEM):
+	case isOutOfMemory(err):
 		return failedEvent(ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_RESOURCE_EXHAUSTED, "guest has no resources to start the process")
 	}
 	return failedEvent(ownsandv1.ExecFailureReason_EXEC_FAILURE_REASON_OTHER, "process could not start")
