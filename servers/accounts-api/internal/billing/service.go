@@ -63,6 +63,12 @@ type Service struct {
 	productID     string
 	webOrigin     string
 
+	// paddleCallTimeout and outcomeTimeout are the deadlines of the Paddle
+	// call of a top-up and of the transaction that records its outcome. They
+	// are fields so that tests can shorten them.
+	paddleCallTimeout time.Duration
+	outcomeTimeout    time.Duration
+
 	// wake asks the worker to charge queued automatic top-ups at once.
 	wake chan struct{}
 }
@@ -87,7 +93,10 @@ func New(cfg Config) *Service {
 		priceID:       cfg.SubscriptionPriceID,
 		productID:     cfg.TopUpProductID,
 		webOrigin:     cfg.WebOrigin,
-		wake:          make(chan struct{}, 1),
+
+		paddleCallTimeout: paddleCallTimeout,
+		outcomeTimeout:    topUpOutcomeTimeout,
+		wake:              make(chan struct{}, 1),
 	}
 }
 
