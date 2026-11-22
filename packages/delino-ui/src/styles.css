@@ -1698,27 +1698,6 @@
     cursor: not-allowed;
   }
 
-  /* Forced colors discard the indicator background and shadow, which are the
-     only visual cue of the checked item. Draw the indicator as a system-color
-     border instead, and keep the focus ring on another system color with an
-     offset so it stays distinct from the selection. */
-  @media (forced-colors: active) {
-    .dui-segmented-control-indicator {
-      box-sizing: border-box;
-      border: 2px solid Highlight;
-      background: Canvas;
-    }
-
-    .dui-segmented-control-item[data-checked] {
-      color: CanvasText;
-    }
-
-    .dui-segmented-control-item:focus-visible {
-      outline: 2px solid CanvasText;
-      outline-offset: 2px;
-    }
-  }
-
   /* Toggle */
   .dui-toggle {
     display: inline-flex;
@@ -1994,6 +1973,106 @@
 
     .dui-skeleton {
       animation: none;
+    }
+  }
+
+  /* Forced colors. The browser replaces author colors, and drops shadows, on
+     every element, so a state that only a background, a border color or a
+     shadow carries looks the same in every state. System-color keywords in
+     author CSS survive, so each state cue below is redrawn with one. This
+     block must stay the only forced-colors block and must stay after the
+     component rules above, because it has the same specificity as them and
+     wins by order. Windows high-contrast themes map the keywords differently,
+     so every cue pairs a fill or a border with the idle state instead of
+     relying on one fixed color. */
+  @media (forced-colors: active) {
+    /* SegmentedControl: the indicator background and shadow are the only cue
+       of the checked item. Draw the indicator as a system-color border, and
+       keep the focus ring on another system color with an offset so it stays
+       distinct from the selection. */
+    .dui-segmented-control-indicator {
+      box-sizing: border-box;
+      border: 2px solid Highlight;
+      background: Canvas;
+    }
+
+    .dui-segmented-control-item[data-checked] {
+      color: CanvasText;
+    }
+
+    .dui-segmented-control-item:focus-visible {
+      outline: 2px solid CanvasText;
+      outline-offset: 2px;
+    }
+
+    /* Tabs: the selected cue is a border color only, which forced colors
+       replace with the same system color for every tab. Hide the idle
+       underline (or inline-end bar) with `Canvas` and draw the selected one
+       with `Highlight`. The 2px border already exists, so the sizes stay. */
+    .dui-tabs-tab {
+      border-bottom-color: Canvas;
+    }
+
+    .dui-tabs-tab[data-selected] {
+      border-bottom-color: Highlight;
+    }
+
+    .dui-tabs-tab[data-orientation="vertical"] {
+      border-inline-end-color: Canvas;
+    }
+
+    .dui-tabs-tab[data-orientation="vertical"][data-selected] {
+      border-inline-end-color: Highlight;
+    }
+
+    /* Progress, Meter and Slider: the track and the filled part are
+       backgrounds only. Outline the track (border-box keeps the height and
+       width) and fill the indicator with `Highlight`. */
+    .dui-progress-track,
+    .dui-slider-track {
+      box-sizing: border-box;
+      border: 1px solid CanvasText;
+    }
+
+    .dui-progress-indicator,
+    .dui-slider-indicator,
+    .dui-radio-indicator {
+      background: Highlight;
+    }
+
+    /* Switch: the track and thumb are backgrounds only. Border the track (the
+       1px padding keeps the 3px inset, so the sizes and the thumb travel stay
+       the same), fill it with `Highlight` when on, and draw the thumb with
+       `CanvasText` in both states because `HighlightText` is not visible on
+       the on track. */
+    .dui-switch {
+      border: 2px solid CanvasText;
+      padding: 1px;
+    }
+
+    .dui-switch[data-checked] {
+      border-color: Highlight;
+      background: Highlight;
+    }
+
+    .dui-switch-thumb {
+      background: CanvasText;
+    }
+
+    /* Toggle and Pagination: the pressed and the current surface is a
+       background only. Fill it with `Highlight` and `HighlightText`. A border
+       would widen these controls, because their size follows their content
+       and a `min-width` that already includes the border box, while a fill
+       changes no size. The focus ring is an outline, so it stays visible on
+       the fill. Chromium paints a Canvas text backplate behind the label of
+       a filled control, which hides the HighlightText label; opting out of
+       the adjustment removes the backplate, and both colors are already
+       system colors. Remove the opt-out if engines stop painting it. */
+    .dui-toggle[data-pressed],
+    .dui-pagination-link[data-current] {
+      forced-color-adjust: none;
+      background: Highlight;
+      color: HighlightText;
     }
   }
 }
