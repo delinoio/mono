@@ -81,12 +81,15 @@ type attribution struct {
 
 // attribute returns the link of the organization that overlapped the window
 // [start, start + 5 minutes): a link from link_time until unlink_time (open
-// while current). When several links overlapped, the latest one, which was
+// while current). An empty link, whose unlink_time equals its link_time (a
+// link that was unlinked at the instant it started), covers no time and never
+// overlaps a window. When several links overlapped, the latest one, which was
 // active at the end of the window, wins. ok is false without such a link.
 func attribute(ctx context.Context, q db.Querier, r UsageReport) (attribution, bool, error) {
 	var a attribution
 	err := q.QueryRow(ctx, `SELECT organization_link_id::text, billing_account_id::text FROM organization_links
 		WHERE service = $1 AND organization_id = $2 AND link_time < $4 AND (unlink_time IS NULL OR unlink_time > $3)
+		AND (unlink_time IS NULL OR unlink_time > link_time)
 		ORDER BY link_time DESC, organization_link_id DESC LIMIT 1`,
 		r.Service, r.OrganizationID, r.WindowStart, r.WindowStart.Add(WindowLength)).Scan(&a.LinkID, &a.AccountID)
 	if errors.Is(err, pgx.ErrNoRows) {
