@@ -91,6 +91,27 @@ export function readAccountsConfig(env: AccountsAppBuildEnv): AccountsConfig {
   return { apiOrigin, logto, paddle: readPaddleSettings(env) };
 }
 
+/**
+ * Returns the raw text that follows the authority of a URL string, before the
+ * URL parser normalizes it. `url.pathname` collapses `/..`, `/.`, `/%2e` and
+ * `/a/..` to `/` and treats a backslash as a slash, so a validator that must
+ * accept only a bare origin checks this text as well.
+ *
+ * The URL parser removes leading and trailing C0 control characters and
+ * spaces, and drops tab, CR and LF anywhere; the scheme is followed by any run
+ * of `/` or `\` (`https:host` and `https:///host` are accepted by the parser),
+ * which is stripped together with the authority. The control characters are
+ * matched by code point range through `RegExp` so the pattern mirrors the
+ * parser without a control character in a regular expression literal.
+ */
+function rawPathAfterAuthority(raw: string): string {
+  return raw
+    .replace(PARSER_EDGE_STRIP, "")
+    .replace(/[\t\n\r]/g, "")
+    .replace(/^[A-Za-z][A-Za-z0-9+.-]*:[/\\]*/, "")
+    .replace(/^[^/\\?#]*/, "");
+}
+
 function resolveLogtoEndpoint(value: string): string {
   let url: URL;
   try {
@@ -104,7 +125,15 @@ function resolveLogtoEndpoint(value: string): string {
   if (url.protocol !== "https:" && url.protocol !== "http:") {
     throw new Error("PUBLIC_LOGTO_ENDPOINT must use http or https");
   }
-  if (url.pathname !== "/" || value.includes("?") || value.includes("#")) {
+  // `url.pathname` hides dot segments and backslashes, so the raw text after
+  // the authority is checked too. The message never echoes the value.
+  const rawPath = rawPathAfterAuthority(value);
+  if (
+    url.pathname !== "/" ||
+    value.includes("?") ||
+    value.includes("#") ||
+    (rawPath !== "" && rawPath !== "/")
+  ) {
     throw new Error(
       "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
     );
@@ -192,18 +221,8 @@ export function resolveAccountsApiOrigin(value: string | undefined): string {
   //
   // `url.pathname` is normalized, so `/..`, `/.`, `/%2e` and `/a/..` collapse to
   // `/` and a backslash acts as a slash. The raw text after the authority is
-  // therefore checked too. The URL parser removes leading and trailing C0
-  // control characters and spaces, and drops tab, CR and LF anywhere; the
-  // scheme is followed by any run of `/` or `\` (`https:host` and
-  // `https:///host` are accepted by the parser), which is stripped together
-  // with the authority. The control characters are matched by code point range
-  // through `RegExp` so the pattern mirrors the parser without a control
-  // character in a regular expression literal.
-  const rawPath = raw
-    .replace(PARSER_EDGE_STRIP, "")
-    .replace(/[\t\n\r]/g, "")
-    .replace(/^[A-Za-z][A-Za-z0-9+.-]*:[/\\]*/, "")
-    .replace(/^[^/\\?#]*/, "");
+  // therefore checked too.
+  const rawPath = rawPathAfterAuthority(raw);
   if (
     url.pathname !== "/" ||
     url.search !== "" ||
