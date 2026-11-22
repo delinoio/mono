@@ -403,7 +403,8 @@ export class PeerSession {
    * its frame waits for the turn, so the turn re-checks the signal before it
    * sends the first message and skips a cancelled frame; a frame that is
    * already in progress always completes, because a partial frame would
-   * corrupt the byte stream.
+   * corrupt the byte stream. The caller itself returns as soon as its signal
+   * aborts, whether its frame waits for the turn or is in progress.
    */
   async #send(
     frame: DataFrame,
@@ -419,7 +420,11 @@ export class PeerSession {
     // The next sender waits for this turn to finish, whether it failed or
     // not; the failure itself reaches only the caller of this frame.
     this.#sendTail = turn.catch(() => {});
-    await turn;
+    // The caller does not wait for the turn longer than its signal allows:
+    // an abort returns the abort reason at once, even while a frame of
+    // another request holds the turn. The queued turn stays in the chain and
+    // re-checks the signal when it starts, so it writes nothing.
+    await rejectOnAbort(turn, signal);
   }
 
   async #writeMessages(
@@ -665,6 +670,38 @@ async function waitForGathering(
           }
         },
       );
+  });
+}
+
+/**
+ * Settles with `promise`, or rejects with the abort reason as soon as the
+ * signal aborts. `promise` keeps running; a later failure of it is handled
+ * by this race, so it never becomes an unhandled rejection.
+ */
+function rejectOnAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
   });
 }
 
