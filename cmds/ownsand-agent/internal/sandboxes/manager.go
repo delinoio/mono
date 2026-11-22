@@ -269,15 +269,16 @@ func (m *Manager) reconcile(ctx context.Context) error {
 			cleaned[id] = true
 		}
 		reason := sb.rec.endReasonAt(now)
-		state := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 		switch {
 		case reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED:
 		case sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING:
+			// A failed end attempt recorded its reason; the final state
+			// follows from it, so a lost VM stays FAILED/LOST_ON_DEVICE.
 			reason = sb.rec.EndReason
 		default:
-			state = ownsandv1.SandboxState_SANDBOX_STATE_FAILED
 			reason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
 		}
+		state := finalStateFor(reason)
 		m.logger.Info("sandbox ended while the agent was stopped", "sandbox_id", id, "state", state.String(), "end_reason", reason.String())
 		if err := m.commitLocked(sb, func(r *Record) {
 			r.State = state
@@ -287,6 +288,19 @@ func (m *Manager) reconcile(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// finalStateFor returns the terminal state that ends a sandbox with reason:
+// FAILED for LOST_ON_DEVICE (the VM ended without a command) and DELETED for
+// every other reason (a delete or a TTL end). The record in DELETING keeps
+// its end reason across a failed end attempt, so an end that retries later,
+// also after an agent restart, derives the same state without a new record
+// field.
+func finalStateFor(reason ownsandv1.SandboxEndReason) ownsandv1.SandboxState {
+	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		return ownsandv1.SandboxState_SANDBOX_STATE_FAILED
+	}
+	return ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 }
 
 // nextRevision persists and returns the next revision counter.
@@ -777,12 +791,11 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 	}
 	reason := sb.rec.endReasonAt(m.now())
 	m.mu.Unlock()
-	state := ownsandv1.SandboxState_SANDBOX_STATE_DELETED
 	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
-		state, reason = ownsandv1.SandboxState_SANDBOX_STATE_FAILED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
+		reason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
 	}
 	m.logger.Warn("sandbox VM ended unexpectedly", "sandbox_id", sb.rec.SandboxID)
-	if _, err := m.endLocked(context.Background(), sb, state, reason); err != nil {
+	if _, err := m.endLocked(context.Background(), sb, finalStateFor(reason), reason); err != nil {
 		m.logger.Error("record lost sandbox failed", "sandbox_id", sb.rec.SandboxID, "error", err)
 	}
 }
@@ -1007,6 +1020,9 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	type expiry struct {
 		sb     *sandbox
 		reason ownsandv1.SandboxEndReason
+		// retry is true for the retry of a failed end of a lost VM, which no
+		// deadline caused.
+		retry bool
 	}
 	var expired []expiry
 	// idleReport is one pending idle-deadline report. previous is the
@@ -1046,7 +1062,15 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 				if sb.createCancel != nil {
 					sb.createCancel()
 				}
-				expired = append(expired, expiry{sb, reason})
+				expired = append(expired, expiry{sb: sb, reason: reason})
+				continue
+			}
+			// The end of a lost VM failed at its first attempt and left the
+			// record in DELETING with LOST_ON_DEVICE. No deadline passed, so
+			// nothing else retries it before the next agent start.
+			if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING && sb.rec.EndReason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+				sb.ending = true
+				expired = append(expired, expiry{sb: sb, reason: sb.rec.EndReason, retry: true})
 				continue
 			}
 		}
@@ -1063,12 +1087,16 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	m.bg.Add(len(expired))
 	m.mu.Unlock()
 	for _, e := range expired {
-		m.logger.Info("sandbox TTL expired", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
+		if e.retry {
+			m.logger.Info("retrying the end of a lost sandbox", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
+		} else {
+			m.logger.Info("sandbox TTL expired", "sandbox_id", e.sb.rec.SandboxID, "end_reason", e.reason.String())
+		}
 		go func(e expiry) {
 			defer m.bg.Done()
 			e.sb.cmdMu.Lock()
 			defer e.sb.cmdMu.Unlock()
-			if _, err := m.endLocked(ctx, e.sb, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, e.reason); err != nil {
+			if _, err := m.endLocked(ctx, e.sb, finalStateFor(e.reason), e.reason); err != nil {
 				m.logger.Error("end expired sandbox failed", "sandbox_id", e.sb.rec.SandboxID, "error", err)
 			}
 		}(e)

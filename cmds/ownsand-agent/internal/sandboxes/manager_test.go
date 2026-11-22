@@ -235,6 +235,8 @@ type execs struct {
 	mu      sync.Mutex
 	running map[string]bool
 	ended   map[string]ownsandv1.SandboxEndReason
+	// calls counts the SandboxEnded notifications of each sandbox.
+	calls map[string]int
 }
 
 func (e *execs) HasRunningExec(id string) bool {
@@ -246,6 +248,16 @@ func (e *execs) SandboxEnded(id string, r ownsandv1.SandboxEndReason) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.ended[id] = r
+	if e.calls == nil {
+		e.calls = map[string]int{}
+	}
+	e.calls[id]++
+}
+
+func (e *execs) endedCalls(id string) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.calls[id]
 }
 
 type env struct {
@@ -1147,6 +1159,126 @@ func TestLostVM(t *testing.T) {
 	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
 	if endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
 		t.Fatal("lost VM reason")
+	}
+}
+
+// loseVMWithFailedEnd stops the VM of the sandbox as a lost VM while the next
+// runtime Delete fails, and returns when the failed end left the record in
+// DELETING with the ending flag cleared and the runtime Delete was called once.
+func (e *env) loseVMWithFailedEnd(id string) {
+	e.t.Helper()
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.deleteCalls = 0
+	e.rt.vms[id].stop()
+	e.rt.mu.Unlock()
+	waitFor(e.t, func() bool {
+		e.rt.mu.Lock()
+		calls := e.rt.deleteCalls
+		e.rt.mu.Unlock()
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		return calls == 1 && !e.m.sandboxes[id].ending
+	})
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		e.t.Fatalf("state after the failed end %v, want DELETING", s)
+	}
+	e.m.mu.Lock()
+	reason := e.m.sandboxes[id].rec.EndReason
+	e.m.mu.Unlock()
+	if reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		e.t.Fatalf("recorded end reason %v, want LOST_ON_DEVICE", reason)
+	}
+}
+
+// TestRestartEndsLostVMAsFailedAfterFailedEnd checks that a lost VM whose end
+// failed (the record stays in DELETING with LOST_ON_DEVICE) ends FAILED with
+// LOST_ON_DEVICE at the next start, not DELETED.
+func TestRestartEndsLostVMAsFailedAfterFailedEnd(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.loseVMWithFailedEnd(id)
+	e.restart()
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("state after restart %v %v, want FAILED LOST_ON_DEVICE", s, endReason(e.m, id))
+	}
+}
+
+// TestTickRetriesFailedEndOfLostVM checks that a running agent ends a lost VM
+// whose first end failed as FAILED/LOST_ON_DEVICE at a later Tick, without a
+// passed deadline, and notifies the exec tracker exactly once.
+func TestTickRetriesFailedEndOfLostVM(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.loseVMWithFailedEnd(id)
+	if n := e.ex.endedCalls(id); n != 0 {
+		t.Fatalf("exec tracker notified %d times before the VM was stopped", n)
+	}
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("end reason %v, want LOST_ON_DEVICE", r)
+	}
+	// Further Ticks leave the terminal record alone.
+	e.m.Tick(context.Background(), false)
+	e.m.Tick(context.Background(), true)
+	time.Sleep(50 * time.Millisecond)
+	if n := e.ex.endedCalls(id); n != 1 {
+		t.Fatalf("exec tracker notified %d times, want 1", n)
+	}
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 2 {
+		t.Fatalf("runtime Delete calls %d, want 2", calls)
+	}
+}
+
+// TestFailedEndOfLostVMKeepsDeadlineWinning checks that a passed TTL deadline
+// wins over the recorded LOST_ON_DEVICE of a failed end, at a Tick and at a
+// restart.
+func TestFailedEndOfLostVMKeepsDeadlineWinning(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		e := newEnv(t)
+		id := e.create(5*time.Minute, 2*time.Hour).GetSandboxId()
+		e.loseVMWithFailedEnd(id)
+		e.clk.Advance(10 * time.Minute)
+		if restart {
+			e.restart()
+		} else {
+			e.m.Tick(context.Background(), false)
+		}
+		waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+		if r := endReason(e.m, id); r != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+			t.Fatalf("restart=%v: end reason %v, want IDLE_TTL_EXPIRED", restart, r)
+		}
+	}
+}
+
+// TestRestartEndsFailedCallerDeleteAsDeleted checks that a DELETING record
+// with a caller or TTL reason still ends DELETED with that reason at a start.
+func TestRestartEndsFailedCallerDeleteAsDeleted(t *testing.T) {
+	e := newEnv(t)
+	caller := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.failCallerDelete(caller, false)
+	ttl := e.create(10*time.Minute, time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteFails = 1
+	e.rt.mu.Unlock()
+	e.clk.Advance(11 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	waitFor(t, func() bool {
+		e.m.mu.Lock()
+		defer e.m.mu.Unlock()
+		sb := e.m.sandboxes[ttl]
+		return !sb.ending && sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING
+	})
+	e.restart()
+	if s, _ := e.m.State(caller); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || endReason(e.m, caller) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		t.Fatalf("caller delete %v %v", s, endReason(e.m, caller))
+	}
+	if s, _ := e.m.State(ttl); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || endReason(e.m, ttl) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED {
+		t.Fatalf("ttl end %v %v", s, endReason(e.m, ttl))
 	}
 }
 
