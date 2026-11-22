@@ -96,6 +96,12 @@ function BillingAccountBody() {
   const visible = TABS.filter(
     (t) => t.permission === undefined || can(role, t.permission),
   );
+  // The caller's role can change while the page is open (a refetch of the
+  // account). Fall back to Overview when the selected tab is no longer
+  // visible, so that exactly one tab stays selected.
+  const effectiveTab = visible.some((t) => t.id === tab)
+    ? tab
+    : BillingTab.Overview;
   return (
     <>
       <p className="breadcrumb">
@@ -105,7 +111,10 @@ function BillingAccountBody() {
         title={name}
         description={`Your role: ${labels.role[role]}`}
       />
-      <Tabs value={tab} onValueChange={(value) => setTab(value as BillingTab)}>
+      <Tabs
+        value={effectiveTab}
+        onValueChange={(value) => setTab(value as BillingTab)}
+      >
         <TabsList aria-label="Billing account sections">
           {visible.map((t) => (
             <TabsTab key={t.id} value={t.id}>

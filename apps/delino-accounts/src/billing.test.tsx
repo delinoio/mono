@@ -683,6 +683,63 @@ describe("invoices", () => {
   test("a viewer has no invoices tab", async () => {
     await renderAccount(VIEWER);
     expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
+    expect(
+      screen
+        .getByRole("tab", { name: "Overview" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+  });
+
+  /** Changes the caller's role in the fake API and refetches the account. */
+  async function changeRoleAndRefetch(
+    api: ReturnType<typeof createFakeApi>,
+    userId: string,
+    role: BillingAccountRole,
+  ) {
+    const member = api.accounts
+      .get(ACCOUNT_ID)
+      ?.members.find((m) => m.userId === userId);
+    if (member === undefined) throw new Error("member missing");
+    member.role = role;
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+    });
+    await settle();
+  }
+
+  test("demotion to viewer while Invoices is open selects Overview", async () => {
+    const api = createFakeApi();
+    await renderAccount(ADMIN, { api });
+    await openTab("Invoices");
+    expect(
+      screen
+        .getByRole("tab", { name: "Invoices" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+
+    await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.VIEWER);
+
+    expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
+    const selected = screen
+      .getAllByRole("tab")
+      .filter((t) => t.getAttribute("aria-selected") === "true");
+    expect(selected.map((t) => t.textContent)).toEqual(["Overview"]);
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  });
+
+  test("a role change that keeps access keeps the Invoices tab selected", async () => {
+    const api = createFakeApi();
+    await renderAccount(undefined, { api });
+    await openTab("Invoices");
+
+    await changeRoleAndRefetch(api, OWNER, BillingAccountRole.ADMIN);
+
+    expect(screen.getByText("Your role: Admin")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Invoices" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
   });
 
   test("opens the invoice link that GetInvoiceUrl returns without storing it", async () => {
