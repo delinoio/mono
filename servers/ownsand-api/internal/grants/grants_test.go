@@ -45,6 +45,13 @@ func TestIdempotencyAndAdmission(t *testing.T) {
 	if _, _, err := r.Reserve(req("a1", "u", "other"), newID); !errors.Is(err, ErrReuse) {
 		t.Fatalf("reuse: %v", err)
 	}
+	// A changed or added predecessor under a known authorization ID is a
+	// reuse of the ID for another request.
+	withPred := req("a1", "u", "op")
+	withPred.ReplacesID = "gone"
+	if _, _, err := r.Reserve(withPred, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("added predecessor: %v", err)
+	}
 	r.Ack(g.ID, accepted, "")
 	<-g.Done()
 	if r.Admittable(g.ID) == nil {
@@ -71,6 +78,58 @@ func TestIdempotencyAndAdmission(t *testing.T) {
 	r.Reserve(req("a9", "u", "x"), newID)
 	if r.Get(g.ID) != nil {
 		t.Fatal("grant kept past the revocation window")
+	}
+}
+
+func TestReplacementRetryIdempotency(t *testing.T) {
+	c := &clock{t: time.Unix(1000, 0)}
+	r := New(c.now)
+	first, _, _ := r.Reserve(req("a0", "u", "op"), newID)
+	r.Ack(first.ID, accepted, "")
+	other, _, _ := r.Reserve(req("a1", "u", "op"), newID)
+	r.Ack(other.ID, accepted, "")
+
+	rep := req("rep", "u", "op")
+	rep.ReplacesID = first.ID
+	succ, existing, err := r.Reserve(rep, newID)
+	if err != nil || existing || succ.Replaces != first.ID {
+		t.Fatalf("replacement: %v %v", err, existing)
+	}
+	// A different predecessor or none under the same authorization ID is a
+	// reuse, also after a retry that names the original predecessor.
+	changed := rep
+	changed.ReplacesID = other.ID
+	if _, _, err := r.Reserve(changed, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("changed predecessor: %v", err)
+	}
+	dropped := rep
+	dropped.ReplacesID = ""
+	if _, _, err := r.Reserve(dropped, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("dropped predecessor: %v", err)
+	}
+	// An exact retry returns the existing grant, also after the predecessor
+	// went away and the grant's resolved link was cleared.
+	r.Ack(succ.ID, accepted, first.ID)
+	if r.Get(first.ID) != nil {
+		t.Fatal("predecessor kept")
+	}
+	again, existing, err := r.Reserve(rep, newID)
+	if err != nil || !existing || again.ID != succ.ID {
+		t.Fatalf("exact retry: %v %v", err, existing)
+	}
+	// A grant that never resolved a predecessor keeps the requested one.
+	stale := req("stale", "u", "op")
+	stale.ReplacesID = "gone"
+	sg, _, err := r.Reserve(stale, newID)
+	if err != nil || sg.Replaces != "" {
+		t.Fatalf("unresolved predecessor: %v", err)
+	}
+	if again, existing, err := r.Reserve(stale, newID); err != nil || !existing || again.ID != sg.ID {
+		t.Fatalf("retry of an unresolved predecessor: %v", err)
+	}
+	stale.ReplacesID = ""
+	if _, _, err := r.Reserve(stale, newID); !errors.Is(err, ErrReuse) {
+		t.Fatalf("dropped unresolved predecessor: %v", err)
 	}
 }
 
