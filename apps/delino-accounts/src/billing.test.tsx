@@ -1283,6 +1283,58 @@ describe("settings", () => {
     ]);
   });
 
+  test("rejects an automatic top-up threshold and monthly cap above the int64 bound without a request", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    await click(
+      await screen.findByRole("switch", { name: "Automatic top-up" }),
+    );
+    const threshold = screen.getByRole("textbox", { name: "Threshold (USD)" });
+    const amount = screen.getByRole("textbox", { name: "Top-up amount (USD)" });
+    const cap = screen.getByRole("textbox", { name: "Monthly cap (USD)" });
+    const save = within(threshold.closest("form")!).getByRole("button", {
+      name: "Save",
+    });
+    await type(threshold, "99999999999999");
+    await type(amount, "25");
+    await type(cap, "99999999999999");
+    await click(save);
+    expect(
+      screen.getAllByText("Enter at most $9,223,372,036,854.77."),
+    ).toHaveLength(2);
+    expect(calls(api, "UpdateAutoTopUpSettings")).toHaveLength(0);
+    await type(threshold, "9223372036854.77");
+    await type(cap, "9223372036854.77");
+    await click(save);
+    await settle(60);
+    expect(calls(api, "UpdateAutoTopUpSettings")).toEqual([
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          thresholdUsdMicros: 9_223_372_036_854_770_000n,
+          monthlyCapUsdMicros: 9_223_372_036_854_770_000n,
+        }),
+      }),
+    ]);
+  });
+
+  test("rejects an alert threshold above the int64 bound without a request", async () => {
+    const api = createFakeApi();
+    await renderAccount(undefined, { api });
+    await openTab("Settings");
+    const input = await screen.findByRole("textbox", {
+      name: "Alert threshold (USD)",
+    });
+    const save = within(input.closest("form")!).getByRole("button", {
+      name: "Save",
+    });
+    await type(input, "9223372036854.78");
+    await click(save);
+    expect(
+      screen.getByText("Enter at most $9,223,372,036,854.77."),
+    ).toBeTruthy();
+    expect(calls(api, "UpdateAlertSettings")).toHaveLength(0);
+  });
+
   test("saves the low-balance alert threshold from $0 with the $10 default", async () => {
     const api = createFakeApi();
     await renderAccount(undefined, { api });

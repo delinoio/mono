@@ -14,6 +14,15 @@ export const MICROS_PER_USD = 1_000_000n;
 /** Micro-USD in one cent. Paddle amounts are whole cents. */
 export const MICROS_PER_CENT = 10_000n;
 
+/**
+ * The largest whole-cent amount that fits a signed 64-bit integer, in
+ * micro-USD (the largest `int64` is 9223372036854775807, which is not a
+ * whole number of cents). Every amount a user enters is sent as an `int64`
+ * `*_usd_micros` field, so an entered amount above this value cannot be
+ * sent (docs/repository-billing-contract.md).
+ */
+export const MAX_WHOLE_CENT_INT64_USD_MICROS = 9_223_372_036_854_770_000n;
+
 /** Converts whole USD to micro-USD. */
 export function usd(whole: bigint): bigint {
   return whole * MICROS_PER_USD;

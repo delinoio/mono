@@ -3,6 +3,7 @@ import { describe, expect, test } from "@rstest/core";
 import {
   checkAccountName,
   checkAlertThreshold,
+  checkAmount,
   checkAutoTopUp,
   checkEmail,
   checkTopUpAmount,
@@ -13,6 +14,7 @@ import {
   formatQuantity,
   meterLabel,
 } from "./format.ts";
+import { usd } from "./money.ts";
 import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Meter } from "@delino/accounts-protos/v1/usage_pb";
 import {
@@ -206,6 +208,90 @@ describe("forms", () => {
         monthlyCap: "",
       }).ok,
     ).toBe(false);
+  });
+
+  test("limits every amount to the largest whole-cent int64 value", () => {
+    const atMost = "Enter at most $9,223,372,036,854.77.";
+    expect(checkAmount("9223372036854.77")).toEqual({
+      ok: true,
+      value: 9_223_372_036_854_770_000n,
+    });
+    expect(checkAmount("9223372036854.78")).toEqual({
+      ok: false,
+      error: atMost,
+    });
+    expect(checkAmount("99999999999999")).toEqual({ ok: false, error: atMost });
+    expect(checkAlertThreshold("9223372036854.77").ok).toBe(true);
+    expect(checkAlertThreshold("9223372036854.78")).toEqual({
+      ok: false,
+      error: atMost,
+    });
+    // A smaller limit wins: the top-up amount keeps its $10,000 maximum.
+    expect(checkAmount("10001", { max: usd(10_000n) })).toEqual({
+      ok: false,
+      error: "Enter at most $10,000.00.",
+    });
+    expect(checkTopUpAmount("10001")).toEqual({
+      ok: false,
+      error: "Enter at most $10,000.00.",
+    });
+    // A limit above the int64 bound does not raise it.
+    expect(checkAmount("9223372036854.78", { max: 10n ** 19n })).toEqual({
+      ok: false,
+      error: atMost,
+    });
+  });
+
+  test("limits every automatic top-up amount to the int64 bound", () => {
+    const atMost = "Enter at most $9,223,372,036,854.77.";
+    const big = "9223372036854.78";
+    expect(
+      checkAutoTopUp({
+        enabled: true,
+        threshold: big,
+        amount: "25",
+        monthlyCap: big,
+      }),
+    ).toEqual({
+      ok: false,
+      errors: { threshold: atMost, monthlyCap: atMost },
+    });
+    expect(
+      checkAutoTopUp({
+        enabled: true,
+        threshold: "10",
+        amount: "10001",
+        monthlyCap: "99999999999999",
+      }),
+    ).toEqual({
+      ok: false,
+      errors: { amount: "Enter at most $10,000.00.", monthlyCap: atMost },
+    });
+    // The bound also applies to the kept values of a disabled setting.
+    expect(
+      checkAutoTopUp({
+        enabled: false,
+        threshold: "",
+        amount: "",
+        monthlyCap: big,
+      }),
+    ).toEqual({ ok: false, errors: { monthlyCap: atMost } });
+    expect(
+      checkAutoTopUp({
+        enabled: false,
+        threshold: "9223372036854.77",
+        amount: "",
+        monthlyCap: "9223372036854.77",
+      }),
+    ).toEqual({
+      ok: true,
+      value: {
+        enabled: false,
+        thresholdUsdMicros: 9_223_372_036_854_770_000n,
+        amountUsdMicros: 0n,
+        monthlyCapUsdMicros: 9_223_372_036_854_770_000n,
+      },
+    });
   });
 
   test("accepts an alert threshold of $0 and whole cents only", () => {

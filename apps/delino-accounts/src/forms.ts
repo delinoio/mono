@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { amountErrorMessage, formatUsd, parseUsdCents, usd } from "./money.ts";
+import {
+  amountErrorMessage,
+  formatUsd,
+  MAX_WHOLE_CENT_INT64_USD_MICROS,
+  parseUsdCents,
+  usd,
+} from "./money.ts";
 
 /** A field value that passed validation, or the message of the field error. */
 export type Checked<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -63,7 +69,9 @@ export const DEFAULT_ALERT_THRESHOLD_USD_MICROS = usd(10n);
 
 /**
  * Checks an amount in whole cents with optional limits (inclusive). Every
- * comparison is between `bigint` micro-USD values.
+ * comparison is between `bigint` micro-USD values. An amount never exceeds
+ * `MAX_WHOLE_CENT_INT64_USD_MICROS`, the largest value that the API field
+ * (`int64`) can carry; a smaller `limits.max` takes precedence.
  */
 export function checkAmount(
   input: string,
@@ -79,10 +87,14 @@ export function checkAmount(
       error: `Enter at least ${formatUsd(limits.min)}.`,
     };
   }
-  if (limits.max !== undefined && parsed.micros > limits.max) {
+  const max =
+    limits.max !== undefined && limits.max < MAX_WHOLE_CENT_INT64_USD_MICROS
+      ? limits.max
+      : MAX_WHOLE_CENT_INT64_USD_MICROS;
+  if (parsed.micros > max) {
     return {
       ok: false,
-      error: `Enter at most ${formatUsd(limits.max)}.`,
+      error: `Enter at most ${formatUsd(max)}.`,
     };
   }
   return { ok: true, value: parsed.micros };
