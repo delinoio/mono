@@ -43,6 +43,8 @@ const clockLeeway = 30 * time.Second
 const (
 	jwksRefreshInterval = 10 * time.Minute
 	jwksMinRefresh      = time.Minute
+	// jwksFetchTimeout bounds one fetch of the key set.
+	jwksFetchTimeout = 10 * time.Second
 )
 
 // ErrInvalidToken is returned for every token that fails validation. The
@@ -73,8 +75,14 @@ type LogtoValidator struct {
 	fetchedAt time.Time
 	// attemptedAt is the start time of the last refresh attempt, successful
 	// or not. It gates both refresh paths so that a failing key set endpoint
-	// is not fetched again within jwksMinRefresh while it holds the mutex.
+	// is not fetched again within jwksMinRefresh.
 	attemptedAt time.Time
+	// inflight is the running key set fetch, or nil. The fetch runs without
+	// the mutex, so the mutex only guards the fields above.
+	inflight *jwksFetch
+
+	// fetchTimeout bounds one key set fetch; tests shorten it.
+	fetchTimeout time.Duration
 }
 
 // NewLogtoValidator returns a validator. It does not fetch keys until the
@@ -89,7 +97,7 @@ func NewLogtoValidator(cfg LogtoConfig) *LogtoValidator {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &LogtoValidator{cfg: cfg}
+	return &LogtoValidator{cfg: cfg, fetchTimeout: jwksFetchTimeout}
 }
 
 type logtoClaims struct {
@@ -142,33 +150,88 @@ func (v *LogtoValidator) Validate(ctx context.Context, raw string) (string, erro
 	return claims.Subject, nil
 }
 
+// key returns the verification key for kid. A caller that holds a cached key
+// never waits for a key set fetch: a stale cache starts a refresh in the
+// background. A caller whose key is not cached waits for the running fetch
+// (or starts one when the cooldown allows) until the fetch ends, its own
+// context ends or the fetch timeout passes, so a hung key set endpoint blocks
+// only those callers and never the callers with a cached key.
 func (v *LogtoValidator) key(ctx context.Context, kid string) (*jose.JSONWebKey, error) {
 	v.mu.Lock()
-	defer v.mu.Unlock()
 	now := v.cfg.Now()
-	cooling := func() bool {
-		return !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
-	}
-	if (v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval) && !cooling() {
-		if err := v.refreshLocked(ctx); err != nil && v.fetchedAt.IsZero() {
-			return nil, err
+	cooling := !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
+	stale := v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval
+	// A caller that is already gone must not start a fetch: the fetch arms
+	// the process-wide cooldown for later live callers.
+	canStart := v.inflight == nil && !cooling && ctx.Err() == nil
+	if k := v.findLocked(kid); k != nil {
+		if stale && canStart {
+			v.startFetchLocked(now)
 		}
-	}
-	if k := v.findLocked(kid); k != nil {
+		v.mu.Unlock()
 		return k, nil
 	}
-	// An unknown key ID refreshes the key set at most once per
-	// jwksMinRefresh, counted from the last attempt even when it failed.
-	if cooling() {
-		return nil, errors.New("unknown key id")
+	call := v.inflight
+	switch {
+	case call != nil:
+	case cooling:
+		// An unknown key ID refreshes the key set at most once per
+		// jwksMinRefresh, counted from the last attempt even when it failed.
+		v.mu.Unlock()
+		return nil, errUnknownKeyID
+	case ctx.Err() != nil:
+		v.mu.Unlock()
+		return nil, ctx.Err()
+	default:
+		call = v.startFetchLocked(now)
 	}
-	if err := v.refreshLocked(ctx); err != nil {
-		return nil, err
+	v.mu.Unlock()
+
+	select {
+	case <-call.done:
+	case <-ctx.Done():
+		// The fetch keeps running for the other callers and the next one.
+		return nil, ctx.Err()
 	}
-	if k := v.findLocked(kid); k != nil {
-		return k, nil
+	if call.err != nil {
+		return nil, call.err
 	}
-	return nil, errors.New("unknown key id")
+	v.mu.Lock()
+	k := v.findLocked(kid)
+	v.mu.Unlock()
+	if k == nil {
+		return nil, errUnknownKeyID
+	}
+	return k, nil
+}
+
+var errUnknownKeyID = errors.New("unknown key id")
+
+// jwksFetch is one running key set fetch. err is set before done is closed.
+type jwksFetch struct {
+	done chan struct{}
+	err  error
+}
+
+// startFetchLocked records a new in-flight fetch and runs it in its own
+// goroutine without the mutex. The caller holds v.mu.
+func (v *LogtoValidator) startFetchLocked(now time.Time) *jwksFetch {
+	call := &jwksFetch{done: make(chan struct{})}
+	v.inflight = call
+	v.attemptedAt = now
+	go func() {
+		set, err := v.load()
+		v.mu.Lock()
+		if err == nil {
+			v.keys = set
+			v.fetchedAt = now
+		}
+		v.inflight = nil
+		v.mu.Unlock()
+		call.err = err
+		close(call.done)
+	}()
+	return call
 }
 
 func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
@@ -181,39 +244,33 @@ func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
 	return nil
 }
 
-func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
-	// A caller that is already gone must not arm the process-wide cooldown
-	// for later live callers.
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	v.attemptedAt = v.cfg.Now()
+// load reads and parses the key set without holding the mutex.
+func (v *LogtoValidator) load() (jose.JSONWebKeySet, error) {
+	var set jose.JSONWebKeySet
 	var body []byte
 	var err error
 	if v.cfg.JWKSFile != "" {
 		body, err = os.ReadFile(v.cfg.JWKSFile)
 	} else {
-		body, err = v.fetch(ctx)
+		body, err = v.fetch()
 	}
 	if err != nil {
 		v.cfg.Logger.Warn("logto_jwks_fetch_failed", slog.Any("error", err))
-		return err
+		return set, err
 	}
-	var set jose.JSONWebKeySet
 	if err := json.Unmarshal(body, &set); err != nil {
 		v.cfg.Logger.Warn("logto_jwks_parse_failed", slog.Any("error", err))
-		return err
+		return jose.JSONWebKeySet{}, err
 	}
-	v.keys = set
-	v.fetchedAt = v.cfg.Now()
 	v.cfg.Logger.Info("logto_jwks_loaded", slog.Int("keys", len(set.Keys)))
-	return nil
+	return set, nil
 }
 
-func (v *LogtoValidator) fetch(ctx context.Context) ([]byte, error) {
-	// The fetch serves every caller and arms a shared cooldown, so one
-	// caller's cancellation must not abort it; only the timeout bounds it.
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+func (v *LogtoValidator) fetch() ([]byte, error) {
+	// The fetch serves every caller and arms a shared cooldown, so it has no
+	// caller context: no caller's cancellation aborts it, and only the
+	// timeout bounds it.
+	ctx, cancel := context.WithTimeout(context.Background(), v.fetchTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, v.cfg.JWKSURL, nil)
 	if err != nil {

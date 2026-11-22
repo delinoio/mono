@@ -9,11 +9,13 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -391,5 +393,297 @@ func TestLogtoValidatorCallerCancelDoesNotAbortFetch(t *testing.T) {
 	}
 	if got := o.fetches.Load(); got != 1 {
 		t.Fatalf("fetches = %d, want 1", got)
+	}
+}
+
+// fakeClock is a clock that tests advance while key set fetches run in
+// other goroutines.
+type fakeClock struct{ ns atomic.Int64 }
+
+func newFakeClock() *fakeClock {
+	c := &fakeClock{}
+	c.ns.Store(time.Now().UnixNano())
+	return c
+}
+
+func (c *fakeClock) Now() time.Time          { return time.Unix(0, c.ns.Load()) }
+func (c *fakeClock) Advance(d time.Duration) { c.ns.Add(int64(d)) }
+
+// parkedJWKS serves a key set whose handler a test can park: while parked,
+// a request does not answer until the test releases it or the client gives
+// up. It reads its switches atomically because the handler runs in another
+// goroutine than the test.
+type parkedJWKS struct {
+	keys    []tokenFactory
+	fetches atomic.Int32
+	parked  atomic.Bool
+	release chan struct{}
+	started chan struct{}
+	once    sync.Once
+}
+
+func newParkedJWKS(keys ...tokenFactory) *parkedJWKS {
+	return &parkedJWKS{keys: keys, release: make(chan struct{}), started: make(chan struct{}, 16)}
+}
+
+func (p *parkedJWKS) Release() { p.once.Do(func() { close(p.release) }) }
+
+func (p *parkedJWKS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	p.fetches.Add(1)
+	p.started <- struct{}{}
+	if p.parked.Load() {
+		select {
+		case <-p.release:
+		case <-r.Context().Done():
+			return
+		}
+	}
+	set := jose.JSONWebKeySet{}
+	for _, f := range p.keys {
+		set.Keys = append(set.Keys, jose.JSONWebKey{Key: &f.key.PublicKey, KeyID: f.kid, Algorithm: string(jose.ES384), Use: "sig"})
+	}
+	b, _ := json.Marshal(set)
+	_, _ = w.Write(b)
+}
+
+type parkedEnv struct {
+	p     *parkedJWKS
+	v     *LogtoValidator
+	clock *fakeClock
+	known tokenFactory
+	other tokenFactory
+}
+
+// newParkedEnv returns a validator whose key set contains the key "k1" and,
+// after the first fetch, "k2" (the key of the token that is not cached yet).
+func newParkedEnv(t *testing.T) *parkedEnv {
+	t.Helper()
+	issuer := "https://tenant.logto.app/oidc"
+	k1, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	k2, _ := ecdsa.GenerateKey(elliptic.P384(), rand.Reader)
+	e := &parkedEnv{
+		known: tokenFactory{key: k1, kid: "k1", issuer: issuer},
+		other: tokenFactory{key: k2, kid: "k2", issuer: issuer},
+		clock: newFakeClock(),
+	}
+	e.p = newParkedJWKS(e.known)
+	srv := httptest.NewServer(e.p)
+	t.Cleanup(srv.Close)
+	// Cleanups run last in, first out: release parked handlers before Close.
+	t.Cleanup(e.p.Release)
+	e.v = NewLogtoValidator(LogtoConfig{Issuer: issuer, Audience: "https://ownsand.api.delino.io", JWKSURL: srv.URL, Now: e.clock.Now})
+	e.v.fetchTimeout = 10 * time.Second
+	return e
+}
+
+func (e *parkedEnv) token(t *testing.T, f tokenFactory) string {
+	t.Helper()
+	return f.sign(t, "at+jwt", outageClaims(f, e.clock.Now()))
+}
+
+// load fetches the first key set with the one key "k1", lets the server also
+// serve "k2" so that a "k2" token is an unknown key ID, and moves the clock
+// past the cooldown of the first fetch while the cache stays fresh.
+func (e *parkedEnv) load(t *testing.T) {
+	t.Helper()
+	if _, err := e.v.Validate(context.Background(), e.token(t, e.known)); err != nil {
+		t.Fatal(err)
+	}
+	e.p.keys = append(e.p.keys, e.other)
+	<-e.p.started
+	// Leave the cooldown of the first fetch.
+	e.clock.Advance(jwksMinRefresh)
+}
+
+type validateResult struct {
+	sub string
+	err error
+	dur time.Duration
+}
+
+func (e *parkedEnv) validateAsync(ctx context.Context, raw string) <-chan validateResult {
+	out := make(chan validateResult, 1)
+	go func() {
+		start := time.Now()
+		sub, err := e.v.Validate(ctx, raw)
+		out <- validateResult{sub, err, time.Since(start)}
+	}()
+	return out
+}
+
+func waitResult(t *testing.T, ch <-chan validateResult, within time.Duration) validateResult {
+	t.Helper()
+	select {
+	case r := <-ch:
+		return r
+	case <-time.After(within):
+		t.Fatalf("validation did not return within %s", within)
+		return validateResult{}
+	}
+}
+
+func assertPending(t *testing.T, ch <-chan validateResult) {
+	t.Helper()
+	select {
+	case r := <-ch:
+		t.Fatalf("validation returned while the fetch was parked: %+v", r)
+	case <-time.After(100 * time.Millisecond):
+	}
+}
+
+func TestLogtoValidatorCachedKeyDoesNotWaitForStaleRefresh(t *testing.T) {
+	e := newParkedEnv(t)
+	e.load(t)
+	e.clock.Advance(jwksRefreshInterval + time.Minute)
+	e.p.parked.Store(true)
+	// The first caller with a cached key starts the refresh in the
+	// background and returns the cached key at once.
+	r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.known)), 2*time.Second)
+	if r.err != nil || r.sub != "user-1" {
+		t.Fatalf("cached key during stale refresh: %+v", r)
+	}
+	<-e.p.started
+	// More callers with a cached key use the key while the fetch runs, and
+	// none of them starts another fetch.
+	for i := 0; i < 3; i++ {
+		r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.known)), 2*time.Second)
+		if r.err != nil || r.sub != "user-1" {
+			t.Fatalf("cached key %d while the fetch runs: %+v", i, r)
+		}
+	}
+	e.p.Release()
+	// The stale refresh adds the new key for the next callers.
+	r = waitResult(t, e.validateAsync(context.Background(), e.token(t, e.other)), 2*time.Second)
+	if r.err != nil || r.sub != "user-1" {
+		t.Fatalf("new key after the refresh: %+v", r)
+	}
+	if got := e.p.fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2", got)
+	}
+}
+
+func TestLogtoValidatorCachedKeyDoesNotWaitForUnknownKeyFetch(t *testing.T) {
+	e := newParkedEnv(t)
+	e.load(t)
+	e.p.parked.Store(true)
+	// The caller with the unknown key ID waits for the parked fetch.
+	waiter := e.validateAsync(context.Background(), e.token(t, e.other))
+	<-e.p.started
+	assertPending(t, waiter)
+	// The cached key validates at once during the fetch, with a fresh cache.
+	r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.known)), 2*time.Second)
+	if r.err != nil || r.sub != "user-1" {
+		t.Fatalf("cached key during unknown key fetch: %+v", r)
+	}
+	// A second caller with the same unknown key ID joins the running fetch.
+	second := e.validateAsync(context.Background(), e.token(t, e.other))
+	assertPending(t, second)
+	e.p.Release()
+	for i, ch := range []<-chan validateResult{waiter, second} {
+		if r := waitResult(t, ch, 2*time.Second); r.err != nil || r.sub != "user-1" {
+			t.Fatalf("waiter %d after the fetch: %+v", i, r)
+		}
+	}
+	if got := e.p.fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2", got)
+	}
+}
+
+func TestLogtoValidatorCanceledWaiterReturnsAndFetchContinues(t *testing.T) {
+	e := newParkedEnv(t)
+	e.load(t)
+	e.p.parked.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	canceled := e.validateAsync(ctx, e.token(t, e.other))
+	<-e.p.started
+	assertPending(t, canceled)
+	cancel()
+	r := waitResult(t, canceled, 2*time.Second)
+	if r.err != ErrInvalidToken {
+		t.Fatalf("canceled waiter: %v", r.err)
+	}
+	if _, err := e.v.key(ctx, "k2"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("key with a canceled context = %v, want context.Canceled", err)
+	}
+	// The fetch keeps running: a later live caller joins it and sees the new
+	// key once the fetch ends.
+	live := e.validateAsync(context.Background(), e.token(t, e.other))
+	assertPending(t, live)
+	e.p.Release()
+	if r := waitResult(t, live, 2*time.Second); r.err != nil || r.sub != "user-1" {
+		t.Fatalf("live caller after the canceled waiter: %+v", r)
+	}
+	if got := e.p.fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2", got)
+	}
+}
+
+func TestLogtoValidatorCanceledCallerDoesNotWaitOrArmCooldown(t *testing.T) {
+	e := newParkedEnv(t)
+	e.load(t)
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	// A caller that is already gone neither waits nor starts a fetch for a
+	// key ID that is not cached.
+	r := waitResult(t, e.validateAsync(canceled, e.token(t, e.other)), 2*time.Second)
+	if r.err != ErrInvalidToken {
+		t.Fatalf("canceled caller: %v", r.err)
+	}
+	// It does not start the stale refresh either.
+	e.clock.Advance(jwksRefreshInterval + time.Minute)
+	r = waitResult(t, e.validateAsync(canceled, e.token(t, e.known)), 2*time.Second)
+	if r.err != nil || r.sub != "user-1" {
+		t.Fatalf("canceled caller with a cached key: %+v", r)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if got := e.p.fetches.Load(); got != 1 {
+		t.Fatalf("fetches for canceled callers = %d, want 1", got)
+	}
+	// The cooldown is not armed: the next live caller fetches at once.
+	if r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.other)), 2*time.Second); r.err != nil || r.sub != "user-1" {
+		t.Fatalf("live caller after canceled ones: %+v", r)
+	}
+	if got := e.p.fetches.Load(); got != 2 {
+		t.Fatalf("fetches = %d, want 2", got)
+	}
+}
+
+func TestLogtoValidatorHungEndpointBlocksOnlyUncachedKeysForTheFetchTimeout(t *testing.T) {
+	e := newParkedEnv(t)
+	e.v.fetchTimeout = 300 * time.Millisecond
+	e.load(t)
+	e.p.parked.Store(true)
+	start := time.Now()
+	hung := e.validateAsync(context.Background(), e.token(t, e.other))
+	<-e.p.started
+	// While the endpoint hangs, callers with a cached key are not blocked.
+	r := waitResult(t, e.validateAsync(context.Background(), e.token(t, e.known)), 2*time.Second)
+	if r.err != nil || r.sub != "user-1" {
+		t.Fatalf("cached key during the hang: %+v", r)
+	}
+	// The uncached key waits for the fetch timeout and no longer.
+	r = waitResult(t, hung, 5*time.Second)
+	if r.err != ErrInvalidToken {
+		t.Fatalf("uncached key after the hang: %v", r.err)
+	}
+	if elapsed := time.Since(start); elapsed < 250*time.Millisecond {
+		t.Fatalf("uncached key returned after %s, before the fetch timeout", elapsed)
+	}
+	// Within the cooldown no caller fetches or waits again.
+	r = waitResult(t, e.validateAsync(context.Background(), e.token(t, e.other)), time.Second)
+	if r.err != ErrInvalidToken || r.dur > 200*time.Millisecond {
+		t.Fatalf("uncached key during the cooldown: %+v", r)
+	}
+	if got := e.p.fetches.Load(); got != 2 {
+		t.Fatalf("fetches within the cooldown = %d, want 2", got)
+	}
+	// One minute after the attempt the next uncached key fetches again.
+	e.clock.Advance(jwksMinRefresh)
+	r = waitResult(t, e.validateAsync(context.Background(), e.token(t, e.other)), 5*time.Second)
+	if r.err != ErrInvalidToken {
+		t.Fatalf("uncached key after the cooldown: %v", r.err)
+	}
+	if got := e.p.fetches.Load(); got != 3 {
+		t.Fatalf("fetches after the cooldown = %d, want 3", got)
 	}
 }

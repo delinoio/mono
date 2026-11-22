@@ -268,65 +268,75 @@ export class FakeApi {
     let finished = false;
     const stream = new ReadableStream<Uint8Array>({
       async pull(controller) {
-        if (finished) return;
-        let next: IteratorResult<StreamStep>;
-        try {
-          next = await steps.next();
-        } catch (error) {
-          finished = true;
-          controller.enqueue(
-            envelope(
-              2,
-              new TextEncoder().encode(
-                JSON.stringify({ error: errorJson(ConnectError.from(error)) }),
+        for (;;) {
+          if (finished) return;
+          let next: IteratorResult<StreamStep>;
+          try {
+            next = await steps.next();
+          } catch (error) {
+            finished = true;
+            controller.enqueue(
+              envelope(
+                2,
+                new TextEncoder().encode(
+                  JSON.stringify({
+                    error: errorJson(ConnectError.from(error)),
+                  }),
+                ),
               ),
-            ),
-          );
-          controller.close();
-          return;
-        }
-        if (next.done) {
-          finished = true;
-          controller.enqueue(envelope(2, new TextEncoder().encode("{}")));
-          controller.close();
-          return;
-        }
-        const step = next.value;
-        if (step instanceof Sleep) {
-          await clock.sleep(step.ms, signal).catch(() => {});
-          return;
-        }
-        if (step instanceof Disconnect) {
-          finished = true;
-          controller.error(new TypeError("terminated: other side closed"));
-          return;
-        }
-        if (step instanceof Eof) {
-          finished = true;
-          controller.close();
-          return;
-        }
-        if (step instanceof Hang) {
-          await new Promise<void>((resolve) => {
-            if (signal.aborted) resolve();
-            signal.addEventListener("abort", () => resolve(), { once: true });
-          });
-          finished = true;
-          controller.error(signal.reason ?? new TypeError("aborted"));
-          return;
-        }
-        if (step instanceof Trickle) {
-          const bytes = envelope(0, toBinary(output, step.message as never));
-          const size = Math.ceil(bytes.length / step.pieces);
-          for (let i = 0; i < bytes.length; i += size) {
-            if (i > 0) {
-              await clock.sleep(step.gapMs, signal).catch(() => {});
-            }
-            controller.enqueue(bytes.subarray(i, i + size));
+            );
+            controller.close();
+            return;
           }
+          if (next.done) {
+            finished = true;
+            controller.enqueue(envelope(2, new TextEncoder().encode("{}")));
+            controller.close();
+            return;
+          }
+          const step = next.value;
+          if (step instanceof Sleep) {
+            await clock.sleep(step.ms, signal).catch(() => {});
+            // A Sleep step enqueues nothing, and a web stream pulls again only
+            // when a read is outstanding while a pull runs. Keep reading steps
+            // in this pull so consecutive Sleep steps cannot stall the stream.
+            // Stop once the call is aborted or the reader cancelled.
+            if (signal.aborted || finished) return;
+            continue;
+          }
+          if (step instanceof Disconnect) {
+            finished = true;
+            controller.error(new TypeError("terminated: other side closed"));
+            return;
+          }
+          if (step instanceof Eof) {
+            finished = true;
+            controller.close();
+            return;
+          }
+          if (step instanceof Hang) {
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve();
+              signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+            finished = true;
+            controller.error(signal.reason ?? new TypeError("aborted"));
+            return;
+          }
+          if (step instanceof Trickle) {
+            const bytes = envelope(0, toBinary(output, step.message as never));
+            const size = Math.ceil(bytes.length / step.pieces);
+            for (let i = 0; i < bytes.length; i += size) {
+              if (i > 0) {
+                await clock.sleep(step.gapMs, signal).catch(() => {});
+              }
+              controller.enqueue(bytes.subarray(i, i + size));
+            }
+            return;
+          }
+          controller.enqueue(envelope(0, toBinary(output, step as never)));
           return;
         }
-        controller.enqueue(envelope(0, toBinary(output, step as never)));
       },
       async cancel() {
         finished = true;

@@ -33,12 +33,15 @@ const invoiceWindow = {
     }
     return {
       navigate(url) {
-        if (opened === null || opened.closed) {
+        if (opened === null) {
           // A blocked pop-up: open the invoice in this tab instead.
           window.location.assign(url);
-        } else {
+        } else if (!opened.closed) {
           opened.location.replace(url);
         }
+        // Otherwise the user closed the blank tab while the link was in
+        // flight. They no longer want the invoice, so discard the link and
+        // leave the billing page where it is.
       },
       close() {
         opened?.close();

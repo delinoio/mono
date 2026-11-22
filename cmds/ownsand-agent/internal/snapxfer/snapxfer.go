@@ -137,8 +137,17 @@ func (t *Transfer) Export(ctx context.Context, snapshotID, contentDir string, pa
 		if err := t.put(ctx, url, tmp, off, n); err != nil {
 			return nil, 0, fmt.Errorf("snapxfer: upload part %d: %w", p, err)
 		}
+		// A cancellation during the upload must not turn into a success.
+		if err := ctx.Err(); err != nil {
+			return nil, 0, err
+		}
 		parts = append(parts, &ownsandv1.SnapshotPart{PartNumber: p, SizeBytes: n, Sha256: hash.Sum(nil)})
 		t.Logger.Info("snapshot export progress", "snapshot_id", snapshotID, "part_number", p, "part_count", count, "size_bytes", n)
+	}
+	// The loop-top check covers only the next part; check once more so that
+	// a cancellation during the final part is reported.
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
 	}
 	return parts, size, nil
 }
@@ -169,7 +178,15 @@ func (t *Transfer) put(ctx context.Context, url string, f *os.File, off, n int64
 		return errors.New("upload request failed")
 	}
 	defer resp.Body.Close()
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16))
+	// Drain a bounded part of the response so that the connection can be
+	// reused. A cancellation that interrupts this read is reported, so that
+	// a cancelled upload never counts as done. Any other read error after
+	// the response headers is ignored on purpose: the status line already
+	// tells whether the object store accepted the part, and a broken tail of
+	// the body must not fail an accepted upload.
+	if _, err := io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<16)); err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
 	if resp.StatusCode/100 != 2 {
 		return fmt.Errorf("upload returned HTTP %d", resp.StatusCode)
 	}

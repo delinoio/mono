@@ -41,6 +41,8 @@ import { SettingsPage } from "./pages/settings.tsx";
 import { SnapshotsPage } from "./pages/snapshots.tsx";
 import {
   Link,
+  isInvitationFlowRoute,
+  parseRoute,
   type Route,
   RouteId,
   RouterProvider,
@@ -48,14 +50,21 @@ import {
 } from "./router.tsx";
 
 /**
- * Clears a pending invitation secret when the user navigates inside the
- * console away from the invitation flow. The sign-in callback is part of
- * the flow.
+ * Clears a pending invitation secret when the route is outside the
+ * invitation flow. The sign-in callback is part of the flow.
  */
-export function clearInvitationOnLeave(_from: Route, to: Route): void {
-  if (to.id !== RouteId.Invitation && to.id !== RouteId.Callback) {
+export function clearInvitationOutsideFlow(route: Route): void {
+  if (!isInvitationFlowRoute(route)) {
     pendingInvitation.clear();
   }
+}
+
+/**
+ * Clears a pending invitation secret when the user navigates inside the
+ * console away from the invitation flow.
+ */
+export function clearInvitationOnLeave(_from: Route, to: Route): void {
+  clearInvitationOutsideFlow(to);
 }
 
 /** The whole console with the auth provider of its configuration. */
@@ -96,6 +105,14 @@ export function Console({
     () => queryClient ?? createQueryClient(),
     [queryClient],
   );
+  // A page load starts at its route without any in-console navigation, so
+  // the navigation listener never sees it. A secret that an abandoned
+  // sign-in redirect left behind must not survive a load outside the flow.
+  // A reload of the invitation page and the sign-in return stay in the flow
+  // and keep the secret.
+  useEffect(() => {
+    clearInvitationOutsideFlow(parseRoute(window.location.pathname));
+  }, []);
   return (
     <ApiProviders config={config} transport={transport} queryClient={client}>
       <RouterProvider onNavigate={clearInvitationOnLeave}>
@@ -150,16 +167,15 @@ function Routes({ config }: { config: ConsoleConfig }) {
   const configured =
     config.authMode === AuthMode.Mock || config.logto !== undefined;
   if (route.id === RouteId.Callback) {
+    if (config.authMode === AuthMode.Mock) {
+      return <MockCallbackPage />;
+    }
     // Without a Logto registration there is no provider for the Logto
     // callback hook, which would render nothing. Show the notice instead.
-    if (!configured) {
+    if (config.logto === undefined) {
       return <SignIn configured={false} />;
     }
-    return config.authMode === AuthMode.Mock ? (
-      <MockCallbackPage />
-    ) : (
-      <LogtoCallbackPage />
-    );
+    return <LogtoCallbackPage appId={config.logto.appId} />;
   }
   if (auth.isLoading) {
     return null;

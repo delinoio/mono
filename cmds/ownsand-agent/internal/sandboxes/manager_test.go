@@ -1840,3 +1840,43 @@ func TestLockSnapshotImportWaitEndsWithItsContext(t *testing.T) {
 	}
 	again()
 }
+
+func TestLockSnapshotImportCanceledContextAbortsWithFreeLock(t *testing.T) {
+	e := newEnv(t)
+	id, _ := uuidv7.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// With a free lock and a canceled context both select cases are ready, so
+	// repeat to make a random pick of the lock case practically certain.
+	for i := 0; i < 200; i++ {
+		unlock, err := e.m.LockSnapshotImport(ctx, id)
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+			if unlock != nil {
+				unlock()
+			}
+			t.Fatalf("iteration %d: pre-canceled import with a free lock = %v, want ABORTED", i, err)
+		}
+		if unlock != nil {
+			t.Fatalf("iteration %d: aborted import returned an unlock function", i)
+		}
+		e.m.mu.Lock()
+		left := len(e.m.importLocks)
+		e.m.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("iteration %d: %d import locks remain after the aborted import", i, left)
+		}
+	}
+	// The aborted imports left no token behind: a live context takes the lock.
+	again, err := e.m.LockSnapshotImport(context.Background(), id)
+	if err != nil {
+		t.Fatalf("lock after aborted imports = %v", err)
+	}
+	again()
+	e.m.mu.Lock()
+	left := len(e.m.importLocks)
+	e.m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d import locks remain after every release", left)
+	}
+}
