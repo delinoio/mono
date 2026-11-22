@@ -97,7 +97,17 @@ if (process.argv[3] === "wait") {
 // fixture as its repository root.
 function fixture(t, { config = null, cli = true, env = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), "with-infisical-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // Launchers started from this fixture register their teardown here. It runs
+  // before the directory is removed, because the teardown reads the command's
+  // start record from that directory and `t.after` hooks run in order.
+  const teardowns = [];
+  t.after(async () => {
+    try {
+      for (const teardown of teardowns.reverse()) await teardown();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   mkdirSync(join(root, "scripts", "dev"), { recursive: true });
   const launcher = join(root, "scripts", "dev", "with-infisical.mjs");
   copyFileSync(launcherSource, launcher);
@@ -122,6 +132,7 @@ function fixture(t, { config = null, cli = true, env = {} } = {}) {
     packageDir,
     launcher,
     out,
+    teardowns,
     infisicalArgs: join(root, "infisical-args.json"),
     env: {
       // Only the fake CLI directory and Node.js: a real `infisical` on the
@@ -135,8 +146,22 @@ function fixture(t, { config = null, cli = true, env = {} } = {}) {
   };
 }
 
+// Sends SIGKILL to a process or, for a negative ID, to a process group, and
+// ignores a target that is already gone.
+function forceKill(id) {
+  try {
+    process.kill(id, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+}
+
 // Starts the launcher in its own process group, as a terminal or Turborepo
-// starts a job, and collects its output.
+// starts a job, and collects its output. The fixture's teardown force-stops
+// the group, a command that left it, and the output pipes when the test ends
+// for any reason, for example when a readiness wait fails before the test
+// signals the launcher. Without it, the detached group and its pipes outlive
+// the failed test and keep the test runner from exiting.
 function startLauncher(f, args) {
   const child = spawn(process.execPath, [f.launcher, ...args], {
     cwd: f.packageDir,
@@ -154,6 +179,34 @@ function startLauncher(f, args) {
     child.once("close", (code, signal) =>
       resolve({ code, signal, stdout, stderr }),
     );
+  });
+  f.teardowns.push(async () => {
+    if (child.pid === undefined) return;
+    let commandPid = null;
+    try {
+      commandPid = JSON.parse(readFileSync(`${f.out}.start`, "utf8")).pid;
+    } catch {
+      // The command did not start, or its record is unreadable.
+    }
+    forceKill(-child.pid);
+    if (commandPid !== null) forceKill(commandPid);
+    // A survivor would keep the pipes open, so close them from this side.
+    child.stdout.destroy();
+    child.stderr.destroy();
+    let timer;
+    try {
+      await Promise.race([
+        exited,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("the launcher did not exit after SIGKILL")),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   });
   return { child, exited, output: () => stdout };
 }
@@ -612,6 +665,63 @@ test(
     const result = await launcher.exited;
     assert.equal(result.code, 130, result.stderr);
     assert.equal(existsSync(`${f.out}.start`), false);
+  },
+);
+
+test(
+  "the teardown removes a launcher group whose test failed before it signalled",
+  posixOnly,
+  async () => {
+    // A fake `t` collects the fixture hooks, so that the test runs the
+    // teardown itself, as it runs after a failed readiness wait.
+    const hooks = [];
+    const fakeT = { after: (hook) => hooks.push(hook) };
+    let hooksRan = false;
+    const runHooks = async () => {
+      hooksRan = true;
+      for (const hook of hooks) await hook();
+    };
+    const waiting = (config) => ({
+      config,
+      args: commandArgs(0, "wait"),
+      ready: (launcher) => launcher.output().includes("ready"),
+    });
+    const scenarios = [
+      ["direct", waiting(null)],
+      ["configured", waiting(ProjectConfigFile.Yaml)],
+      [
+        "fetching",
+        {
+          config: ProjectConfigFile.Yaml,
+          env: { FAKE_INFISICAL_DELAY_MS: "30000" },
+          args: commandArgs(0),
+          ready: (_launcher, f) => existsSync(f.infisicalArgs),
+        },
+      ],
+    ];
+    for (const [name, scenario] of scenarios) {
+      hooks.length = 0;
+      hooksRan = false;
+      const f = fixture(fakeT, scenario);
+      const launcher = startLauncher(f, ["--path=/api", ...scenario.args]);
+      const groupId = launcher.child.pid;
+      let commandPid = null;
+      try {
+        await waitFor(() => scenario.ready(launcher, f), name);
+        if (name !== "fetching") commandPid = started(f).pid;
+        assert.equal(alive(-groupId), true, `${name}: the group is running`);
+      } finally {
+        await runHooks();
+      }
+      assert.equal(hooksRan, true);
+      await waitFor(() => !alive(-groupId), `${name}: the group to stop`);
+      if (commandPid !== null) {
+        await waitFor(() => !alive(commandPid), `${name}: the command to stop`);
+      }
+      assert.equal(launcher.child.stdout.destroyed, true, name);
+      assert.equal(launcher.child.stderr.destroyed, true, name);
+      assert.equal(existsSync(f.root), false, `${name}: fixture removed`);
+    }
   },
 );
 
