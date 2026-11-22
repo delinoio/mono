@@ -86,7 +86,11 @@ type p2pSession struct {
 	pc        *webrtc.PeerConnection
 	dc        *webrtc.DataChannel
 
-	sendMu   sync.Mutex
+	// sendTurn is the send turn: a semaphore of capacity 1 (a token in the
+	// channel means a sender holds the turn). It is a channel and not a
+	// sync.Mutex so that a sender that waits for the turn also observes its
+	// context and the end of the session.
+	sendTurn chan struct{}
 	lowWater chan struct{}
 	// bufferedAmount reports the bytes queued on the data channel. It is a
 	// field only so that tests can hold a send at a chosen fragment, which
@@ -167,6 +171,7 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 		streams:   map[uint64]*p2pStream{},
 		dec:       datapath.NewDecoder(),
 		done:      make(chan struct{}),
+		sendTurn:  make(chan struct{}, 1),
 		lowWater:  make(chan struct{}, 1),
 
 		bufferedAmount: dc.BufferedAmount,
@@ -333,6 +338,31 @@ func (s *p2pSession) dispatch(f *ownsandv1.DataFrame) {
 // the operation continues on a new stream from its delivered offsets.
 var errStreamOverrun = errors.New("ownsand: peer-to-peer stream consumer fell behind; the stream was failed")
 
+// acquireSendTurn waits for the send turn. A request whose context is done
+// (or whose session ended) while it waits returns that error without a write,
+// so it neither blocks behind a stalled sender nor changes the session state.
+func (s *p2pSession) acquireSendTurn(ctx context.Context) error {
+	// Check first: select picks at random among ready cases, and a request
+	// that is already done must not take a free turn. A session end wins over
+	// the context, as it does after the turn is taken.
+	if s.isDone() {
+		return s.endErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case s.sendTurn <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.done:
+		return s.endErr
+	}
+}
+
+func (s *p2pSession) releaseSendTurn() { <-s.sendTurn }
+
 // send writes one frame as data channel messages of at most 16 KiB.
 //
 // The frame is a varint length prefix and a body split over the messages, so
@@ -345,8 +375,10 @@ func (s *p2pSession) send(ctx context.Context, f *ownsandv1.DataFrame) error {
 	if err != nil {
 		return err
 	}
-	s.sendMu.Lock()
-	defer s.sendMu.Unlock()
+	if err := s.acquireSendTurn(ctx); err != nil {
+		return err
+	}
+	defer s.releaseSendTurn()
 	for i, m := range msgs {
 		for s.bufferedAmount() > maxBufferedAmount {
 			select {
