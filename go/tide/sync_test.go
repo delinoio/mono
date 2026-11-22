@@ -6,6 +6,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
@@ -340,6 +342,59 @@ func TestPruneDirs(t *testing.T) {
 	want := []string{"a/b/c", "a/b", "x/y", "a"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("pruneDirs = %v, want %v", got, want)
+	}
+}
+
+// TestSyncPlansAgainUnderTheLock checks that a sync whose manifest changed
+// between its first read and its lock makes its plan again from the new
+// manifest: another sync that wrote a.txt and released its lock in that
+// time must not make this sync skip a.txt.
+func TestSyncPlansAgainUnderTheLock(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	ws := ds.GetWorkspacePath()
+	dir := newRepo(t, map[string]string{"a.txt": "v1"}, nil, "")
+	ctx := context.Background()
+	if _, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.txt"), []byte("b"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other := false
+	srv.BeforeExec = func(req *tidev1.ExecDevSessionRequest) {
+		if other || req.GetEnv()[guestEnvLock] == "" || req.GetEnv()[guestEnvForce] == "" {
+			return
+		}
+		// The other sync ends just before this sync takes the lock.
+		other = true
+		if err := os.WriteFile(filepath.Join(ws, "a.txt"), []byte("v2"), 0o644); err != nil {
+			t.Error(err)
+		}
+		m := guestManifest(t, ds)
+		sum := sha256.Sum256([]byte("v2"))
+		m.Files["a.txt"] = manifestEntry{Size: 2, SHA256: hex.EncodeToString(sum[:]), Mode: modeFile}
+		b, _ := json.Marshal(m)
+		if err := os.WriteFile(ws+manifestSuffix, b, 0o644); err != nil {
+			t.Error(err)
+		}
+	}
+	res, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !other {
+		t.Fatal("the sync took no lock")
+	}
+	if res.Uploaded != 2 || readGuest(t, ds, "a.txt") != "v1" || readGuest(t, ds, "b.txt") != "b" {
+		t.Fatalf("sync = %+v, a.txt = %q", res, readGuest(t, ds, "a.txt"))
+	}
+	if m := guestManifest(t, ds); len(m.Files) != 2 {
+		t.Fatalf("manifest %+v", m)
+	}
+	if _, err := os.Stat(ws + lockSuffix); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the sync kept its lock")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"maps"
 	"path"
 	"sort"
 	"strings"
@@ -121,49 +122,9 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		return nil, err
 	}
 
-	res := &SyncResult{Submodules: local.skipped, Skipped: len(local.skipped)}
-	current := map[string]bool{}
-	var changed []localFile
-	var changedTotal int64
-	for _, f := range local.files {
-		current[f.rel] = true
-		if prev, ok := old.Files[f.rel]; ok && prev == f.entry {
-			res.Skipped++
-			continue
-		}
-		changed = append(changed, f)
-		if f.entry.Mode != modeSymlink {
-			changedTotal += f.entry.Size
-		}
-	}
-	skippedDirs := map[string]bool{}
-	for _, d := range local.skipped {
-		skippedDirs[d] = true
-	}
-	var deleted []string
-	for rel := range old.Files {
-		if !current[rel] && !skippedDirs[rel] {
-			deleted = append(deleted, rel)
-		}
-	}
-	sort.Strings(deleted)
-
-	// Step 4: limits.
-	var big []PathSize
-	for _, f := range changed {
-		if f.entry.Mode != modeSymlink && f.entry.Size > SyncFileLimit {
-			big = append(big, PathSize{Path: f.rel, Size: f.entry.Size})
-		}
-	}
-	if len(big) > 0 || changedTotal > SyncTotalLimit {
-		le := &LimitError{Operation: "sync", Paths: big, FileLimit: SyncFileLimit, TotalLimit: SyncTotalLimit}
-		if changedTotal > SyncTotalLimit {
-			le.Total = changedTotal
-			if len(big) == 0 {
-				le.Paths = largest(changed, 10)
-			}
-		}
-		return nil, localError(connect.CodeFailedPrecondition, le)
+	plan, err := planSync(local, old)
+	if err != nil {
+		return nil, err
 	}
 	// Step 5: path rules for every local path.
 	paths := make([]string, 0, len(local.files))
@@ -186,9 +147,9 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 			return nil, localError(connect.CodeFailedPrecondition, &PathRuleError{Rule: PathRuleInvalidWindowsName, Paths: bad})
 		}
 	}
-	if len(changed) == 0 && len(deleted) == 0 {
+	if plan.empty() {
 		report(TransferProgress{Phase: TransferDone})
-		return res, nil
+		return plan.res, nil
 	}
 
 	// Step 6: the lock.
@@ -209,11 +170,6 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		return nil, lr.failure(opLock)
 	}
 
-	// Step 7: archive, deletions, manifest and clean-up.
-	syncID, err := uuidv7.NewString()
-	if err != nil {
-		return nil, err
-	}
 	cleanupEnv := map[string]string{guestEnvLock: lock}
 	succeeded := false
 	defer func() {
@@ -226,6 +182,35 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 			c.logger.DebugContext(ctx, "tide sync clean-up failed", "dev_session_id", s.GetDevSessionId(), "code", codeText(err))
 		}
 	}()
+
+	// Another sync can write the manifest after the first read and release
+	// its lock before this sync takes it. The plan is therefore made again
+	// from the manifest that the lock now protects when that manifest
+	// differs from the first one.
+	if cur, err := c.readManifest(ctx, s); err != nil {
+		return nil, err
+	} else if !maps.Equal(cur.Files, old.Files) {
+		c.logger.DebugContext(ctx, "tide sync manifest changed before the lock", "dev_session_id", s.GetDevSessionId())
+		if plan, err = planSync(local, cur); err != nil {
+			return nil, err
+		}
+		if plan.empty() {
+			succeeded = true
+			res := plan.res
+			if r, err := c.runGuest(ctx, s, opCleanup, cleanupEnv); err != nil || r.exitCode != 0 {
+				res.Warnings = append(res.Warnings, "the guest could not release the sync lock; the next sync may need force")
+			}
+			report(TransferProgress{Phase: TransferDone})
+			return res, nil
+		}
+	}
+	res, changed, deleted, changedTotal := plan.res, plan.changed, plan.deleted, plan.changedTotal
+
+	// Step 7: archive, deletions, manifest and clean-up.
+	syncID, err := uuidv7.NewString()
+	if err != nil {
+		return nil, err
+	}
 	windows := osys == tidev1.GuestOs_GUEST_OS_WINDOWS
 	applyEnv := map[string]string{guestEnvWorkspace: s.GetWorkspacePath(), guestEnvArchive: "", guestEnvDeletes: "", guestEnvPrunes: "", guestEnvLinks: ""}
 
@@ -358,6 +343,64 @@ func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession) (manife
 		return parseManifest(nil), nil
 	}
 	return parseManifest(b.Bytes()), nil
+}
+
+// syncPlan is what a sync changes in the guest for one manifest.
+type syncPlan struct {
+	// res holds the skipped counts and the submodules.
+	res          *SyncResult
+	changed      []localFile
+	deleted      []string
+	changedTotal int64
+}
+
+func (p *syncPlan) empty() bool { return len(p.changed) == 0 && len(p.deleted) == 0 }
+
+// planSync compares the local files with the guest manifest old (steps 3
+// and 4): the new and changed files, the deleted manifest paths and the
+// size limits of the changed files.
+func planSync(local *localList, old manifest) (*syncPlan, error) {
+	plan := &syncPlan{res: &SyncResult{Submodules: local.skipped, Skipped: len(local.skipped)}}
+	current := map[string]bool{}
+	for _, f := range local.files {
+		current[f.rel] = true
+		if prev, ok := old.Files[f.rel]; ok && prev == f.entry {
+			plan.res.Skipped++
+			continue
+		}
+		plan.changed = append(plan.changed, f)
+		if f.entry.Mode != modeSymlink {
+			plan.changedTotal += f.entry.Size
+		}
+	}
+	skippedDirs := map[string]bool{}
+	for _, d := range local.skipped {
+		skippedDirs[d] = true
+	}
+	for rel := range old.Files {
+		if !current[rel] && !skippedDirs[rel] {
+			plan.deleted = append(plan.deleted, rel)
+		}
+	}
+	sort.Strings(plan.deleted)
+
+	var big []PathSize
+	for _, f := range plan.changed {
+		if f.entry.Mode != modeSymlink && f.entry.Size > SyncFileLimit {
+			big = append(big, PathSize{Path: f.rel, Size: f.entry.Size})
+		}
+	}
+	if len(big) > 0 || plan.changedTotal > SyncTotalLimit {
+		le := &LimitError{Operation: "sync", Paths: big, FileLimit: SyncFileLimit, TotalLimit: SyncTotalLimit}
+		if plan.changedTotal > SyncTotalLimit {
+			le.Total = plan.changedTotal
+			if len(big) == 0 {
+				le.Paths = largest(plan.changed, 10)
+			}
+		}
+		return nil, localError(connect.CodeFailedPrecondition, le)
+	}
+	return plan, nil
 }
 
 // pathList returns the guest list file of relative paths: NUL-separated

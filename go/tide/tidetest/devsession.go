@@ -252,6 +252,9 @@ func (d *devSessionService) ExecDevSession(ctx context.Context, req *connect.Req
 	if len(req.Msg.GetCommand()) == 0 || req.Msg.GetExecId() == "" {
 		return connect.NewError(connect.CodeInvalidArgument, errors.New("exec_id and command are required"))
 	}
+	if d.s.BeforeExec != nil {
+		d.s.BeforeExec(proto.CloneOf(req.Msg))
+	}
 	p, err := d.s.guest.start(ds, req.Msg)
 	if err != nil {
 		return err
