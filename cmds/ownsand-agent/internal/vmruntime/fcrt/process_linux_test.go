@@ -754,6 +754,10 @@ func TestStartProcessRecordsLaunchAndStopKillsChild(t *testing.T) {
 	if err := r.startProcess(ctx, v); err == nil {
 		t.Fatal("start without an API socket succeeded")
 	}
+	// startProcess keeps the child in v.cmd even when it fails, so a failed
+	// assertion below must still end and reap the child. stop is idempotent:
+	// after the explicit stop below, v.cmd is nil and this does nothing.
+	t.Cleanup(func() { _ = r.stop(v) })
 	rec, reason, err := readLaunchRecord(dir, "sb1")
 	if err != nil || reason != "" {
 		t.Fatalf("launch record: %q %v", reason, err)
