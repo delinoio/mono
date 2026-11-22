@@ -205,12 +205,62 @@ func encodePowerShell(script string) string {
 // guestResult is the captured result of a guest command.
 type guestResult struct {
 	exitCode int64
-	stdout   []byte
-	stderr   []byte
+	// stdout and stderr hold at most the first guestOutputLimit bytes.
+	stdout []byte
+	stderr []byte
+	// linkFailures lists the paths of all linkFailedPrefix lines of
+	// stdout, also those after the captured start of stdout.
+	linkFailures []string
+	// outputLost is true when linkFailures can be incomplete: the exec
+	// lost output, or a stdout line was longer than guestOutputLimit.
+	outputLost bool
 }
 
-// guestOutputLimit bounds the captured output of a guest command.
+// guestOutputLimit bounds the captured output of a guest command and the
+// length of one stdout line that the link failure scan reads.
 const guestOutputLimit = 64 << 10
+
+// linkFailureScan finds the linkFailedPrefix lines in a stdout stream
+// that arrives in chunks.
+type linkFailureScan struct {
+	line  []byte
+	long  bool // the current line is longer than guestOutputLimit
+	lost  bool
+	paths []string
+}
+
+func (s *linkFailureScan) write(b []byte) {
+	for len(b) > 0 {
+		i := bytes.IndexByte(b, '\n')
+		part := b
+		if i >= 0 {
+			part = b[:i]
+		}
+		if !s.long {
+			if len(s.line)+len(part) > guestOutputLimit {
+				s.long, s.lost, s.line = true, true, s.line[:0]
+			} else {
+				s.line = append(s.line, part...)
+			}
+		}
+		if i < 0 {
+			return
+		}
+		s.end()
+		b = b[i+1:]
+	}
+}
+
+// end ends the current line.
+func (s *linkFailureScan) end() {
+	if !s.long {
+		line := strings.TrimRight(string(s.line), "\r")
+		if rel, ok := strings.CutPrefix(line, linkFailedPrefix); ok {
+			s.paths = append(s.paths, rel)
+		}
+	}
+	s.line, s.long = s.line[:0], false
+}
 
 // runGuest runs one guest command through Exec and captures its output. A
 // command that cannot start, that a signal ends or whose sandbox ends is an
@@ -225,6 +275,7 @@ func (c *Client) runGuest(ctx context.Context, s *tidev1.DevSession, op guestOp,
 		env["COPYFILE_DISABLE"] = "1"
 	}
 	var out, errb bytes.Buffer
+	var scan linkFailureScan
 	res, err := c.Exec(ctx, ExecParams{
 		OrganizationID: s.GetOrganizationId(),
 		DevSessionID:   s.GetDevSessionId(),
@@ -236,6 +287,7 @@ func (c *Client) runGuest(ctx context.Context, s *tidev1.DevSession, op guestOp,
 				if out.Len() < guestOutputLimit {
 					out.Write(ev.Data)
 				}
+				scan.write(ev.Data)
 			case ExecEventStderr:
 				if errb.Len() < guestOutputLimit {
 					errb.Write(ev.Data)
@@ -257,7 +309,8 @@ func (c *Client) runGuest(ctx context.Context, s *tidev1.DevSession, op guestOp,
 	if res.Signal != nil {
 		return nil, localError(connect.CodeInternal, fmt.Errorf("tide: the guest %s command ended with signal %d", op, *res.Signal))
 	}
-	r := &guestResult{stdout: out.Bytes(), stderr: errb.Bytes()}
+	scan.end()
+	r := &guestResult{stdout: out.Bytes(), stderr: errb.Bytes(), linkFailures: scan.paths, outputLost: scan.lost || res.Incomplete}
 	if res.ExitCode != nil {
 		r.exitCode = *res.ExitCode
 	}

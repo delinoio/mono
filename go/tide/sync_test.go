@@ -683,6 +683,55 @@ func TestExtractRejectsPathTraversal(t *testing.T) {
 	}
 }
 
+func TestLinkFailureScan(t *testing.T) {
+	var s linkFailureScan
+	for _, chunk := range []string{"noise\nTIDE-LINK-", "FAILED a\\l1\r\n", "TIDE-LINK-FAILED b\n", "TIDE-LINK-FAILED last"} {
+		s.write([]byte(chunk))
+	}
+	s.end()
+	if !slices.Equal(s.paths, []string{`a\l1`, "b", "last"}) || s.lost {
+		t.Fatalf("scan = %q lost %v", s.paths, s.lost)
+	}
+	var long linkFailureScan
+	long.write([]byte(linkFailedPrefix + strings.Repeat("x", guestOutputLimit) + "\nTIDE-LINK-FAILED c\n"))
+	long.end()
+	if !slices.Equal(long.paths, []string{"c"}) || !long.lost {
+		t.Fatalf("long line scan = %q lost %v", long.paths, long.lost)
+	}
+}
+
+// TestRunGuestReadsEveryLinkFailure checks that the link failures after
+// the captured start of stdout are not lost.
+func TestRunGuestReadsEveryLinkFailure(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+	saved := posixScripts[opApply]
+	t.Cleanup(func() { posixScripts[opApply] = saved })
+	const n = 5000
+	posixScripts[opApply] = `i=0; while [ $i -lt 5000 ]; do echo "TIDE-LINK-FAILED dir/link-$i"; i=$((i+1)); done`
+	r, err := c.runGuest(context.Background(), ds, opApply, map[string]string{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.stdout) > guestOutputLimit+ChunkSize || len(r.linkFailures) != n || r.outputLost || r.linkFailures[n-1] != "dir/link-4999" {
+		t.Fatalf("captured %d bytes, %d link failures, lost %v", len(r.stdout), len(r.linkFailures), r.outputLost)
+	}
+}
+
+func TestLinkOutcome(t *testing.T) {
+	links := []localFile{{rel: "a/l1"}, {rel: "l2"}, {rel: "l3"}}
+	failed, warnings := linkOutcome(links, &guestResult{linkFailures: []string{`a\l1`, "a/l1", "not-sent"}})
+	if len(failed) != 1 || !failed["a/l1"] || len(warnings) != 1 {
+		t.Fatalf("failed %v warnings %q", failed, warnings)
+	}
+	// Incomplete output: no link counts as created.
+	failed, warnings = linkOutcome(links, &guestResult{linkFailures: []string{"l2"}, outputLost: true})
+	if len(failed) != 3 || len(warnings) != 3 {
+		t.Fatalf("incomplete output: failed %v warnings %q", failed, warnings)
+	}
+}
+
 func TestGuestCommandsAndPaths(t *testing.T) {
 	cmd, err := guestCommand(tidev1.GuestOs_GUEST_OS_WINDOWS, opApply)
 	if err != nil || cmd[0] != "powershell.exe" || cmd[len(cmd)-2] != "-EncodedCommand" {

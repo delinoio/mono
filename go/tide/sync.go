@@ -287,14 +287,10 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	if ar.exitCode != 0 {
 		return nil, ar.failure(opApply)
 	}
-	failedLinks := map[string]bool{}
-	for _, line := range strings.Split(string(ar.stdout), "\n") {
-		line = strings.TrimRight(line, "\r")
-		if rel, ok := strings.CutPrefix(line, linkFailedPrefix); ok {
-			rel = strings.ReplaceAll(rel, `\`, "/")
-			failedLinks[rel] = true
-			res.Warnings = append(res.Warnings, rel+": the guest could not create the symbolic link")
-		}
+	failedLinks, warnings := linkOutcome(links, ar)
+	res.Warnings = append(res.Warnings, warnings...)
+	if ar.outputLost && len(links) > 0 {
+		c.logger.WarnContext(ctx, "tide sync apply output incomplete; links left out of the manifest", "dev_session_id", s.GetDevSessionId(), "links", len(links))
 	}
 
 	next := manifest{Version: manifestVersion, Files: map[string]manifestEntry{}}
@@ -343,6 +339,36 @@ func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession) (manife
 		return parseManifest(nil), nil
 	}
 	return parseManifest(b.Bytes()), nil
+}
+
+// linkOutcome returns the symbolic links of a Windows apply command that
+// the new manifest leaves out, so that the next sync creates them again,
+// and their warnings. These are the links that the guest reported with
+// linkFailedPrefix lines. When the apply output is incomplete, the SDK
+// cannot tell which links the guest created, so it leaves out every link.
+func linkOutcome(links []localFile, r *guestResult) (map[string]bool, []string) {
+	sent := map[string]bool{}
+	for _, l := range links {
+		sent[l.rel] = true
+	}
+	failed := map[string]bool{}
+	var warnings []string
+	for _, rel := range r.linkFailures {
+		rel = strings.ReplaceAll(rel, `\`, "/")
+		if sent[rel] && !failed[rel] {
+			failed[rel] = true
+			warnings = append(warnings, rel+": the guest could not create the symbolic link")
+		}
+	}
+	if r.outputLost {
+		for _, l := range links {
+			if !failed[l.rel] {
+				failed[l.rel] = true
+				warnings = append(warnings, l.rel+": the sync could not confirm the symbolic link because the guest output was incomplete; the next sync creates it again")
+			}
+		}
+	}
+	return failed, warnings
 }
 
 // syncPlan is what a sync changes in the guest for one manifest.
