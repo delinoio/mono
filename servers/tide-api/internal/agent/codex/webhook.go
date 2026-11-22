@@ -324,9 +324,19 @@ func (v *Vendor) connectionRequired(ctx context.Context, tx pgx.Tx, in integrati
 	return nil
 }
 
-// validRemote reports whether a remote URL is an absolute https URL.
+// validRemote reports whether a remote URL is an absolute https URL of at
+// most 2048 bytes of printable ASCII without spaces. It does not use safe,
+// whose 200-byte log limit would refuse longer valid URLs.
 func validRemote(u string) bool {
-	return strings.HasPrefix(u, "https://") && len(u) <= 2048 && safe(u) == u && len(u) > len("https://")
+	if !strings.HasPrefix(u, "https://") || len(u) > 2048 || len(u) <= len("https://") {
+		return false
+	}
+	for i := 0; i < len(u); i++ {
+		if c := u[i]; c <= ' ' || c >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 // sessionFailed releases the compute of a session that is still failed:

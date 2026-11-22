@@ -97,6 +97,24 @@ func TestNeedsConnection(t *testing.T) {
 	}
 }
 
+func TestValidRemote(t *testing.T) {
+	long := "https://relay.openai.example/" + strings.Repeat("a", 2048-len("https://relay.openai.example/"))
+	for u, want := range map[string]bool{
+		"https://relay.openai.example/env/1":                       true,
+		"https://relay.openai.example/" + strings.Repeat("a", 300): true,
+		long:                                true,
+		long + "a":                          false,
+		"https://":                          false,
+		"http://relay.openai.example":       false,
+		"https://relay.openai.example/a b":  false,
+		"https://relay.openai.example/\x00": false,
+	} {
+		if got := validRemote(u); got != want {
+			t.Errorf("validRemote(%q) = %v", u, got)
+		}
+	}
+}
+
 func TestValidWorkspace(t *testing.T) {
 	for dir, ok := range map[string]bool{"/workspace": true, "/home/u/w": true, "workspace": false, "/a/../b": false, "/a\nb": false, "": false} {
 		if validWorkspace(dir) != ok {
