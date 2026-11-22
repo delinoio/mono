@@ -92,6 +92,9 @@ func TestUsageErrors(t *testing.T) {
 		{"member", "accept", "osi_secret_as_argument"},
 		{"device", "set-limits", r.f.dev, "--vcpu", "1"},
 		{"--format", "yaml", "org", "list"},
+		{"file", "write", r.f.sb, "/tmp/x", "--mode", "0"},
+		{"file", "write", r.f.sb, "/tmp/x", "--mode", "0000"},
+		{"file", "write", r.f.sb, "/tmp/x", "--mode", "00"},
 	} {
 		res := r.run(args...)
 		if res.code != ExitUsage {
@@ -101,6 +104,54 @@ func TestUsageErrors(t *testing.T) {
 	for _, c := range r.f.callNames() {
 		if c == "CreateSandbox" || c == "AcceptInvitation" || c == "ReplaceDeviceLimits" {
 			t.Fatalf("%s sent for an invalid command", c)
+		}
+	}
+	r.f.mu.Lock()
+	writes := r.f.writes
+	r.f.mu.Unlock()
+	if writes != 0 {
+		t.Fatalf("%d WriteFile requests sent for an invalid --mode", writes)
+	}
+}
+
+// TestFileWriteMode checks that file write rejects a zero --mode, which the
+// SDK would turn into 0644, names --mode in the error, and sends every other
+// valid mode, including the 0644 default, to the relay unchanged.
+func TestFileWriteMode(t *testing.T) {
+	for _, mode := range []string{"0", "0000", "00"} {
+		r := newRunner(t)
+		r.stdin = "x"
+		res := r.run("file", "write", r.f.sb, "/tmp/x", "--mode", mode)
+		if res.code != ExitUsage || !strings.Contains(res.stderr, "--mode") {
+			t.Errorf("--mode %s: %+v", mode, res)
+		}
+		r.f.mu.Lock()
+		writes := r.f.writes
+		r.f.mu.Unlock()
+		if writes != 0 {
+			t.Errorf("--mode %s sent %d write requests", mode, writes)
+		}
+	}
+	for _, c := range []struct {
+		args []string
+		want uint32
+	}{
+		{nil, 0o644},
+		{[]string{"--mode", "0600"}, 0o600},
+		{[]string{"--mode", "07777"}, 0o7777},
+	} {
+		r := newRunner(t)
+		r.stdin = "x"
+		res := r.run(append([]string{"file", "write", r.f.sb, "/tmp/x"}, c.args...)...)
+		if res.code != ExitOK {
+			t.Errorf("%v: %+v", c.args, res)
+			continue
+		}
+		r.f.mu.Lock()
+		modes := append([]uint32(nil), r.f.writeModes...)
+		r.f.mu.Unlock()
+		if len(modes) != 1 || modes[0] != c.want {
+			t.Errorf("%v: finish modes %v, want [%#o]", c.args, modes, c.want)
 		}
 	}
 }
