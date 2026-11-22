@@ -396,6 +396,13 @@ describe("confirmation dialog requests", () => {
     await settle(60);
   }
 
+  async function pressEscape(dialog: HTMLElement) {
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    await settle(60);
+  }
+
   test("two clicks before the request settles send it once and the button is disabled", async () => {
     const { transport, calls } = gatedRevokeTransport();
     await renderKeys(transport);
@@ -427,6 +434,71 @@ describe("confirmation dialog requests", () => {
     expect(noticeIn(dialog)).toBeNull();
     await settleCall(calls[1]);
     expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  test("a late success of a dismissed confirmation leaves the next confirmation open", async () => {
+    const { transport, calls } = gatedRevokeTransport();
+    await renderKeys(transport);
+    const first = await openRevokeOf("ci-runner");
+    await press(confirmButton(first));
+    await pressEscape(first);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    const second = await openRevokeOf("deploy-bot");
+    expect(confirmButton(second).disabled).toBe(false);
+    await settleCall(calls[0]);
+    const open = screen.getByRole("alertdialog");
+    expect(open.textContent).toContain("Revoke deploy-bot?");
+    expect(confirmButton(open).disabled).toBe(false);
+    // The next confirmation still works for its own target.
+    await press(confirmButton(open));
+    expect(calls.length).toBe(2);
+    expect(calls[1].apiKeyId).not.toBe(calls[0].apiKeyId);
+    await settleCall(calls[1]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+  });
+
+  test("a late failure of a dismissed confirmation does not show on the next opening, also for the same target", async () => {
+    const { transport, calls } = gatedRevokeTransport();
+    await renderKeys(transport);
+    const first = await openRevokeOf("ci-runner");
+    await press(confirmButton(first));
+    await press(within(first).getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    await openRevokeOf("ci-runner");
+    await settleCall(
+      calls[0],
+      new ConnectError("revoke failed", Code.Unavailable),
+    );
+    const open = screen.getByRole("alertdialog");
+    expect(noticeIn(open)).toBeNull();
+    expect(confirmButton(open).disabled).toBe(false);
+  });
+
+  test("a failure that arrives while the dialog is open shows its own notice", async () => {
+    const { transport, calls } = gatedRevokeTransport();
+    await renderKeys(transport);
+    const dialog = await openRevokeOf("ci-runner");
+    await press(confirmButton(dialog));
+    await settleCall(
+      calls[0],
+      new ConnectError("revoke failed", Code.Unavailable),
+    );
+    expect(noticeIn(screen.getByRole("alertdialog"))).toBeTruthy();
+  });
+
+  test("Escape and Cancel still dismiss a confirmation that is pending", async () => {
+    const { transport, calls } = gatedRevokeTransport();
+    await renderKeys(transport);
+    const first = await openRevokeOf("ci-runner");
+    await press(confirmButton(first));
+    await pressEscape(first);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    const second = await openRevokeOf("deploy-bot");
+    await press(confirmButton(second));
+    await press(within(second).getByRole("button", { name: "Cancel" }));
+    await settle(60);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(calls.length).toBe(2);
   });
 });
 
