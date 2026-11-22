@@ -58,16 +58,23 @@ func pauseRPC(c *testenv.Clients, orgID, sandboxID string) (*ownsandv1.Sandbox, 
 type markerFixture struct {
 	env   *testenv.Env
 	org   *testenv.Org
+	dev   *testenv.Device
 	agent *testenv.FakeAgent
 }
 
 func newMarkerFixture(t *testing.T) *markerFixture {
 	t.Helper()
-	env, _ := billingEnv(t)
+	return newMarkerFixtureWith(t)
+}
+
+// newMarkerFixtureWith is newMarkerFixture with more control plane options.
+func newMarkerFixtureWith(t *testing.T, extra ...testenv.Option) *markerFixture {
+	t.Helper()
+	env, _ := billingEnvWith(t, extra...)
 	org := env.NewOrg("alice")
 	big := &ownsandv1.DeviceLimits{VcpuCount: 64, MemoryMib: 65536, DiskGib: 1000, VcpuOvercommitPercent: 100}
-	_, agent := setupAgent(t, env, org, big)
-	return &markerFixture{env: env, org: org, agent: agent}
+	dev, agent := setupAgent(t, env, org, big)
+	return &markerFixture{env: env, org: org, dev: dev, agent: agent}
 }
 
 func (f *markerFixture) create(t *testing.T) string {
@@ -139,7 +146,7 @@ func TestCallerPauseAdoptsBillingPause(t *testing.T) {
 	setOrgPhase(t, f.env, f.org, billing.PhaseAllowed)
 	enforceBilling(t, f.env)
 	waitState(t, f.org.OwnerClient, f.org.ID, control, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	testenv.Eventually(t, "the control sandbox loses its mark", func() bool { return !pausedByBilling(t, f.env, control) })
+	expectMarkRetained(t, f, control)
 	if got := resumeCommands(f.agent, adopted); got != 0 {
 		t.Fatalf("resume commands for the caller-paused sandbox = %d, want 0", got)
 	}
@@ -393,11 +400,26 @@ func TestCallerPauseCancelsSelectedResumeAcrossInstances(t *testing.T) {
 		t.Fatalf("the adopted sandbox is %v, want PAUSED", s.GetState())
 	}
 	waitState(t, f.org.OwnerClient, f.org.ID, control, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	testenv.Eventually(t, "the control sandbox loses its mark", func() bool { return !pausedByBilling(t, f.env, control) })
+	expectMarkRetained(t, f, control)
 	// A later pass does not resume the adopted sandbox either.
 	enforceBilling(t, f.env)
 	if got := resumeCommands(f.agent, adopted); got != 0 || pausedByBilling(t, f.env, adopted) {
 		t.Fatalf("after the next pass: resume commands=%d marked=%v", got, pausedByBilling(t, f.env, adopted))
+	}
+}
+
+// expectMarkRetained checks that a sandbox that billing resumed keeps its
+// mark (durable billing pause ownership) and that a further pass sends it no
+// command.
+func expectMarkRetained(t *testing.T, f *markerFixture, sandboxID string) {
+	t.Helper()
+	if !pausedByBilling(t, f.env, sandboxID) {
+		t.Fatalf("the resumed sandbox %s lost its billing mark", sandboxID)
+	}
+	resumes, pauses := resumeCommands(f.agent, sandboxID), pauseCommands(f.agent, sandboxID)
+	enforceBilling(t, f.env)
+	if !pausedByBilling(t, f.env, sandboxID) || resumeCommands(f.agent, sandboxID) != resumes || pauseCommands(f.agent, sandboxID) != pauses {
+		t.Fatalf("a pass changed the marked RUNNING sandbox %s", sandboxID)
 	}
 }
 
@@ -532,12 +554,17 @@ func TestCallerPauseThroughSecondInstanceWaitsForResumeInFlight(t *testing.T) {
 	if s := getSandbox(t, f.org.OwnerClient, f.org.ID, adopted); s.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("the resumed sandbox is %v, want RUNNING", s.GetState())
 	}
-	if pausedByBilling(t, f.env, adopted) {
-		t.Fatal("the resumed sandbox kept its billing mark")
+	// The failed pause did not take ownership: billing keeps its mark of the
+	// resumed sandbox.
+	if !pausedByBilling(t, f.env, adopted) {
+		t.Fatal("the failed PauseSandbox cleared the billing mark")
 	}
 	sb, err := pauseRPC(f.org.OwnerClient, f.org.ID, adopted)
 	if err != nil || sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		t.Fatalf("retried PauseSandbox = %v, %v", sb.GetState(), err)
+	}
+	if pausedByBilling(t, f.env, adopted) {
+		t.Fatal("the retried PauseSandbox left the billing mark")
 	}
 }
 
@@ -567,7 +594,7 @@ func TestCallerPauseSurvivesControlPlaneReplacement(t *testing.T) {
 	setOrgPhase(t, f.env, f.org, billing.PhaseAllowed)
 	enforceBilling(t, f.env)
 	waitState(t, c, f.org.ID, control, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	testenv.Eventually(t, "the control sandbox loses its mark", func() bool { return !pausedByBilling(t, f.env, control) })
+	expectMarkRetained(t, f, control)
 	enforceBilling(t, f.env)
 	if got := resumeCommands(f.agent, adopted); got != 0 {
 		t.Fatalf("resume commands for the adopted sandbox = %d, want 0", got)
