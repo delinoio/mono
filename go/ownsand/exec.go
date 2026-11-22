@@ -381,6 +381,16 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			}
 			return nil, op.dpErr(err, false)
 		}
+		if kind == failDeadline {
+			// Only WriteFile retries deadline_exceeded, because its retry
+			// is idempotent by write_id. For an exec, the status is the
+			// control plane's final answer; unless the caller's own
+			// deadline caused it, the operation ends with it.
+			if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
+				return nil, cerr
+			}
+			return nil, op.dpErr(err, false)
+		}
 		op.rec.fail(err)
 		if sess == nil && kind != failExhausted {
 			op.grant.discard()
