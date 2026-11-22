@@ -15,7 +15,7 @@ Planned layout, following the `accounts-api` server conventions:
 ## Runtime and Language
 
 - Language: Go in the root module `github.com/delinoio/mono`. Import path: `github.com/delinoio/mono/servers/tide-api/...`. Logging: `log/slog`.
-- Runtime: one long-running process. It serves HTTP with Connect handlers and the webhook endpoints on the `ADDR` that the deployment sets, and Prometheus metrics on a separate `METRICS_ADDR`.
+- Runtime: one long-running process. It serves HTTP with Connect handlers and the webhook endpoints on the `ADDR` that the deployment sets, and its metrics in the Prometheus format on a separate `METRICS_ADDR`.
 - Replicas: the service runs as exactly one replica. A deployment briefly runs the new container next to the old one, so only the instance that holds a lease row in Postgres runs the dispatcher, the vendor watchers, the Claude Code orchestrator processes and the reconciliation jobs. The old instance releases the lease when it starts to drain and stops these components at that moment. The lease expires 30 seconds after its last renewal, and the holder renews it every 10 seconds. RPCs and webhooks work on both instances, because they only read and write Postgres.
 - Deployment target: a Docker container on the shared DigitalOcean Droplet, deployed by the [deployment workflow](repository-workflow-contract.md#deployment-workflow) with the `deploy` target `droplet`, like `accounts-api`. Production origin: `https://tide.api.delino.io`. The Caddy reverse proxy terminates TLS and proxies to the container. tide needs no public port other than HTTPS.
 - Container image: the image contains the `claude` binary at a pinned version of at least 2.1.224, because the [Claude Code adapter](#claude-code) runs the Claude Code orchestrator in the container.
@@ -35,7 +35,7 @@ Planned layout, following the `accounts-api` server conventions:
 
 - Business APIs: the public services of the [protos contract](protos-tide-api-contract.md).
 - Webhook endpoints: see [Webhooks](#webhooks).
-- Operational endpoints: `GET /healthz` without authentication returns `200` with `{"status":"ok"}` while the process can serve HTTP requests. `GET /metrics` on `METRICS_ADDR` serves Prometheus metrics; see [Metrics](#metrics).
+- Operational endpoints: `GET /healthz` without authentication returns `200` with `{"status":"ok"}` while the process can serve HTTP requests. `GET /metrics` on `METRICS_ADDR` serves the metrics in the Prometheus format; see [Metrics](#metrics).
 - Browser access: CORS allows only `https://tide.delino.io` in production and the console's loopback development origin locally.
 
 ### Authentication
@@ -308,7 +308,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
 
 ### Metrics
 
-`GET /metrics` on `METRICS_ADDR` serves Prometheus metrics. Caddy does not route `METRICS_ADDR`, so the endpoint is not public. Metric labels never contain organization IDs, user IDs, repository names or other user data.
+The server records its metrics with the OpenTelemetry SDK through the shared `servers/internal/telemetry` package, like `accounts-api` ([accounts-api metrics](servers-accounts-api-foundation.md#metrics)). `GET /metrics` on `METRICS_ADDR` serves them in the Prometheus format through the OpenTelemetry Prometheus exporter. Caddy does not route `METRICS_ADDR`, so the endpoint is not public. Metric labels never contain organization IDs, user IDs, repository names or other user data.
 
 | Metric                                    | Type      | Labels                        |
 | ----------------------------------------- | --------- | ----------------------------- |
@@ -326,7 +326,7 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
 
 - The `kind` label includes `DEV_SESSION`. `tide_dev_session_execs_total` counts ended dev session execs by `result` (`exited`, `failed`, `sandbox_ended`). `tide_dev_session_transfer_bytes_total` counts the file bytes that `tide-api` relays, with `direction` `upload` or `download`, so that operators can see the Droplet bandwidth that dev sessions use.
 
-Open decision: the collection, retention, dashboards and alerts for these metrics. Grafana Cloud is the default observability backend ([repository defaults](repository-defaults.md#default-technology-choices)), but the repository has no metrics collection infrastructure today.
+Open decision: the retention, dashboards and alerts for these metrics. When the OTLP endpoint is configured, the shared telemetry package sends the metrics over OTLP to Grafana Cloud, the default observability backend ([repository defaults](repository-defaults.md#default-technology-choices)), as for `accounts-api`.
 
 ### Audit events
 
@@ -376,7 +376,7 @@ The server records audit events for: organization creation and deletion, ownersh
 - Upstream: [`ownsand-api`](servers-ownsand-api-foundation.md) through the [OwnSand Go SDK](packages-ownsand-sdk-foundation.md); the GitHub REST API and webhooks; the Claude Code CLI; the Cursor, OpenAI and Devin APIs; Logto; PlanetScale Postgres.
 - Downstream: the [web console](apps-tide-console-foundation.md), the [CLI](cmds-tide-cli-foundation.md) and the [SDKs](packages-tide-sdk-foundation.md).
 - tide depends on a working OwnSand runtime. tide runtime implementation starts after the OwnSand sandbox lifecycle (create, exec, delete) works on real devices.
-- New dependencies (Connect, protobuf, a Postgres driver, a Prometheus client and any GitHub or vendor client library) need owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds them.
+- New dependencies (Connect, protobuf, a Postgres driver and any GitHub or vendor client library) need owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds them.
 
 ## Change Triggers
 
