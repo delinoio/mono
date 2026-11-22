@@ -593,13 +593,35 @@ func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) e
 		limits.VcpuOvercommitPercent = proto.Int32(dev.GetDevice().GetLimits().GetVcpuOvercommitPercent())
 	}
 	if _, err := validate.DeviceLimitsInput(limits); err != nil {
-		return usageErr("%v", err)
+		return deviceLimitsUsageErr(err)
 	}
 	res, err := a.client.Devices().ReplaceLimits(ctx, &ownsandv1.ReplaceDeviceLimitsRequest{OrganizationId: org, DeviceId: rest[0], Limits: limits})
 	if err != nil {
 		return err
 	}
 	return a.printMessage(res.GetDevice())
+}
+
+// deviceLimitFlags maps the limit field paths that validate reports to the
+// flags of device set-limits that supply them.
+var deviceLimitFlags = map[string]string{
+	"limits.vcpu_count":              "--vcpu",
+	"limits.memory_mib":              "--memory",
+	"limits.disk_gib":                "--disk",
+	"limits.vcpu_overcommit_percent": "--vcpu-overcommit",
+}
+
+// deviceLimitsUsageErr turns a limits validation failure into a usage error
+// that names the offending option, so the user sees which flag to fix, and
+// keeps the field path of the message.
+func deviceLimitsUsageErr(err error) error {
+	var verr *validate.Error
+	if errors.As(err, &verr) {
+		if flagName, ok := deviceLimitFlags[verr.Field]; ok {
+			return usageErr("%s: %v", flagName, err)
+		}
+	}
+	return usageErr("%v", err)
 }
 
 func (a *app) deviceRemove(ctx context.Context, name string, args []string) error {

@@ -701,8 +701,8 @@ func TestDeviceSetLimitsOvercommitFlag(t *testing.T) {
 			l := r.f.limit
 			r.f.mu.Unlock()
 			if tc.wantCode != 0 {
-				if !strings.Contains(res.stderr, "limits.vcpu_overcommit_percent") || !strings.Contains(res.stderr, "100 to 400 in steps of 25") {
-					t.Fatalf("stderr does not name the field and the allowed range: %q", res.stderr)
+				if !strings.Contains(res.stderr, "--vcpu-overcommit") || !strings.Contains(res.stderr, "limits.vcpu_overcommit_percent") || !strings.Contains(res.stderr, "100 to 400 in steps of 25") {
+					t.Fatalf("stderr does not name the option, the field and the allowed range: %q", res.stderr)
 				}
 				if l != nil {
 					t.Fatalf("limits were sent: %v", l)
