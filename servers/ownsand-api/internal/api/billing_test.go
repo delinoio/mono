@@ -841,3 +841,379 @@ func TestBillingLegacyWriterOrganization(t *testing.T) {
 		t.Fatalf("fake link = %q, %v", account, ok)
 	}
 }
+
+// linkAttemptFixture is an unlinked organization whose owner administers
+// billingAccountA, on a fake delino-accounts that the test can make lose
+// responses of the link call.
+type linkAttemptFixture struct {
+	env  *testenv.Env
+	fake *accountstest.Server
+	org  *testenv.Org
+}
+
+func newLinkAttemptFixture(t *testing.T, owner string) *linkAttemptFixture {
+	t.Helper()
+	env, fake := billingEnv(t)
+	fake.AddAccount(billingAccountA, "Account of "+owner, map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	return &linkAttemptFixture{env: env, fake: fake, org: env.NewUnlinkedOrg(owner)}
+}
+
+func (f *linkAttemptFixture) link(c *testenv.Clients, account string) error {
+	_, err := c.Billing.LinkBillingAccount(context.Background(), connect.NewRequest(&ownsandv1.LinkBillingAccountRequest{OrganizationId: f.org.ID, BillingAccountId: account}))
+	return err
+}
+
+func (f *linkAttemptFixture) unlink(c *testenv.Clients) error {
+	_, err := c.Billing.UnlinkBillingAccount(context.Background(), connect.NewRequest(&ownsandv1.UnlinkBillingAccountRequest{OrganizationId: f.org.ID}))
+	return err
+}
+
+// loseLinkResponse makes delino-accounts commit every later link and fail
+// the response, and returns the error that the owner's link call gets.
+func (f *linkAttemptFixture) loseLinkResponse(t *testing.T) {
+	t.Helper()
+	f.fake.FailReply(accountstest.MethodLinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("response lost")))
+	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("link with a lost response: %v", err)
+	}
+	f.fake.FailReply(accountstest.MethodLinkOrganization, nil)
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, false)
+	if a, p := f.rows(t); a != 1 || p != 1 {
+		t.Fatalf("link attempt rows = %d of %d rows, want 1 of 1", a, p)
+	}
+}
+
+// rows returns the number of link attempt rows and of all rows of
+// billing_pending_unlinks of the organization.
+func (f *linkAttemptFixture) rows(t *testing.T) (attempts, all int) {
+	t.Helper()
+	if err := f.env.DB.Pool.QueryRow(context.Background(), `SELECT count(*) FILTER (WHERE link_attempt_id IS NOT NULL), count(*)
+		FROM billing_pending_unlinks WHERE organization_id = $1`, f.org.ID).Scan(&attempts, &all); err != nil {
+		t.Fatal(err)
+	}
+	return attempts, all
+}
+
+func (f *linkAttemptFixture) wantRows(t *testing.T, attempts, all int) {
+	t.Helper()
+	if a, p := f.rows(t); a != attempts || p != all {
+		t.Fatalf("link attempt rows = %d of %d rows, want %d of %d", a, p, attempts, all)
+	}
+}
+
+func (f *linkAttemptFixture) wantRemoteLink(t *testing.T, want bool) {
+	t.Helper()
+	if _, _, ok := f.fake.Link(f.org.ID); ok != want {
+		t.Fatalf("delino-accounts link = %v, want %v", ok, want)
+	}
+}
+
+func (f *linkAttemptFixture) wantLocalLink(t *testing.T, want bool) {
+	t.Helper()
+	if b := billingStatus(t, f.org.OwnerClient, f.org.ID); b.GetLinked() != want {
+		t.Fatalf("local link = %v, want %v (%v)", b.GetLinked(), want, b)
+	}
+}
+
+// restart returns a status cache over the same database, like the one of a
+// restarted instance; it has no memory of the attempt.
+func (f *linkAttemptFixture) restart() *billing.Statuses {
+	return billing.NewStatuses(billing.StatusOptions{DB: f.env.DB, Logger: testenv.Discard(), Now: f.env.Clock.Now, Client: f.fake.Client(),
+		Timing: &billing.StatusTiming{Poll: time.Hour, Tick: time.Hour, UnlinkBackoffMin: time.Second, UnlinkBackoffMax: 5 * time.Minute}})
+}
+
+// TestBillingLinkLostResponseIsReconciled checks that a link whose response
+// delino-accounts lost stays recorded across a restart, that the lease
+// holder removes the unconfirmed remote link, and that a retry then links.
+func TestBillingLinkLostResponseIsReconciled(t *testing.T) {
+	f := newLinkAttemptFixture(t, "ivy")
+	ctx := context.Background()
+	f.loseLinkResponse(t)
+
+	// The restarted instance reconciles the attempt: not before the first
+	// back-off, then by removing the remote link.
+	restarted := f.restart()
+	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true)
+	f.env.Clock.Advance(2 * time.Second)
+	if err := restarted.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantRows(t, 0, 0)
+	f.wantLocalLink(t, false)
+
+	// The authorized retry recovers the link.
+	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, true)
+	f.wantRows(t, 0, 0)
+	if b := billingStatus(t, f.org.OwnerClient, f.org.ID); b.GetPhase() != billing.PhaseAllowed {
+		t.Fatalf("status after the retry = %v", b)
+	}
+}
+
+// TestBillingLinkLostResponseRetryRecovers checks that an authorized retry
+// of the same account recovers the link at once, without the lease holder.
+func TestBillingLinkLostResponseRetryRecovers(t *testing.T) {
+	f := newLinkAttemptFixture(t, "jack")
+	f.loseLinkResponse(t)
+	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, true)
+	f.wantRows(t, 0, 0)
+	// The unconfirmed link was removed first, then linked again.
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 1 {
+		t.Fatalf("UnlinkOrganization calls = %d, want 1", n)
+	}
+	// Nothing is left for the lease holder to remove.
+	f.env.Clock.Advance(time.Hour)
+	if err := f.restart().RetryPendingUnlinks(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true)
+}
+
+// TestBillingLinkLostResponseThenRejectedRetry checks that a retry that
+// delino-accounts rejects leaves neither a local link nor the unconfirmed
+// remote link of the earlier attempt.
+func TestBillingLinkLostResponseThenRejectedRetry(t *testing.T) {
+	f := newLinkAttemptFixture(t, "kim")
+	f.loseLinkResponse(t)
+	// The owner is only a viewer of the billing account now.
+	f.fake.AddAccount(billingAccountA, "Account of kim", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER})
+	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodePermissionDenied && testenv.Code(err) != connect.CodeNotFound {
+		t.Fatalf("rejected retry: %v", err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantLocalLink(t, false)
+	f.wantRows(t, 0, 0)
+}
+
+// TestBillingUnlinkRemovesUnconfirmedLink checks that an explicit unlink
+// removes the remote link of an attempt that has no cached account ID, and
+// stays idempotent without a record.
+func TestBillingUnlinkRemovesUnconfirmedLink(t *testing.T) {
+	f := newLinkAttemptFixture(t, "lena")
+	f.loseLinkResponse(t)
+	before := f.fake.Calls(accountstest.MethodUnlinkOrganization)
+	if err := f.unlink(f.org.OwnerClient); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantRows(t, 0, 0)
+	f.wantLocalLink(t, false)
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != before+1 {
+		t.Fatalf("UnlinkOrganization calls = %d, want %d", n, before+1)
+	}
+	// A second unlink has nothing to remove and sends nothing.
+	if err := f.unlink(f.org.OwnerClient); err != nil {
+		t.Fatal(err)
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != before+1 {
+		t.Fatalf("UnlinkOrganization calls after a repeated unlink = %d, want %d", n, before+1)
+	}
+	// While delino-accounts is down, the unlink fails and the record stays.
+	f2 := newLinkAttemptFixture(t, "lena2")
+	f2.loseLinkResponse(t)
+	f2.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if err := f2.unlink(f2.org.OwnerClient); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("unlink while delino-accounts is down: %v", err)
+	}
+	f2.wantRows(t, 1, 1)
+	f2.wantRemoteLink(t, true)
+}
+
+// TestBillingTransferAndDeletionRemoveUnconfirmedLink checks that an
+// ownership transfer and an organization deletion remove the remote link of
+// an attempt that has no cached account ID.
+func TestBillingTransferAndDeletionRemoveUnconfirmedLink(t *testing.T) {
+	ctx := context.Background()
+	f := newLinkAttemptFixture(t, "mona")
+	f.loseLinkResponse(t)
+	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantRows(t, 0, 0)
+
+	g := newLinkAttemptFixture(t, "nora")
+	g.loseLinkResponse(t)
+	if _, err := g.org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: g.org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	g.wantRemoteLink(t, false)
+	g.wantRows(t, 0, 0)
+
+	// A deletion while delino-accounts is down keeps the record, which the
+	// lease holder works off later; the organization row is gone.
+	h := newLinkAttemptFixture(t, "olga")
+	h.loseLinkResponse(t)
+	h.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	if _, err := h.org.OwnerClient.Organization.DeleteOrganization(ctx, connect.NewRequest(&ownsandv1.DeleteOrganizationRequest{OrganizationId: h.org.ID})); err != nil {
+		t.Fatal(err)
+	}
+	h.wantRemoteLink(t, true)
+	h.wantRows(t, 0, 1)
+	h.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	h.env.Clock.Advance(time.Hour)
+	if err := h.restart().RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	h.wantRemoteLink(t, false)
+	h.wantRows(t, 0, 0)
+}
+
+// TestBillingLinkLocalCommitFailure checks that a link that delino-accounts
+// accepted but that the local transaction could not record stays available
+// for reconciliation, and that a retry recovers.
+func TestBillingLinkLocalCommitFailure(t *testing.T) {
+	f := newLinkAttemptFixture(t, "pia")
+	ctx := context.Background()
+	// A trigger fails the local write of the link, as a failed local commit
+	// would.
+	for _, stmt := range []string{
+		`CREATE FUNCTION fail_billing_link() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'injected local failure'; END $$ LANGUAGE plpgsql`,
+		`CREATE TRIGGER fail_billing_link BEFORE UPDATE ON organization_billing FOR EACH ROW WHEN (NEW.billing_account_id IS NOT NULL) EXECUTE FUNCTION fail_billing_link()`,
+	} {
+		if _, err := f.env.DB.Pool.Exec(ctx, stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodeInternal {
+		t.Fatalf("link with a failing local write: %v", err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, false)
+	f.wantRows(t, 1, 1)
+
+	// After a restart the lease holder removes the unconfirmed link.
+	f.env.Clock.Advance(2 * time.Second)
+	if err := f.restart().RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantRows(t, 0, 0)
+
+	// A retry recovers once the local write works.
+	if _, err := f.env.DB.Pool.Exec(ctx, "DROP TRIGGER fail_billing_link ON organization_billing"); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, true)
+	f.wantRows(t, 0, 0)
+}
+
+// TestBillingLinkDefinitiveFailureLeavesNothing checks that a link that
+// delino-accounts rejects leaves no record and sends no unlink.
+func TestBillingLinkDefinitiveFailureLeavesNothing(t *testing.T) {
+	f := newLinkAttemptFixture(t, "quin")
+	f.fake.AddAccount(billingAccountC, "Viewed", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER})
+	for _, tc := range []struct {
+		account string
+		want    connect.Code
+	}{
+		{billingAccountC, connect.CodePermissionDenied},
+		{"01900000-0000-7000-8000-00000000ffff", connect.CodeNotFound},
+	} {
+		if err := f.link(f.org.OwnerClient, tc.account); testenv.Code(err) != tc.want {
+			t.Fatalf("link %s: %v, want %v", tc.account, err, tc.want)
+		}
+		f.wantRows(t, 0, 0)
+		f.wantLocalLink(t, false)
+	}
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 0 {
+		t.Fatalf("UnlinkOrganization calls = %d, want none", n)
+	}
+	// The record of a rejected repeat link of the linked account does not
+	// remove the working link.
+	if err := f.link(f.org.OwnerClient, billingAccountA); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.AddAccount(billingAccountA, "Account of quin", map[string]accountsv1.BillingAccountRole{f.org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_VIEWER})
+	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodePermissionDenied && testenv.Code(err) != connect.CodeNotFound {
+		t.Fatalf("rejected repeat link: %v", err)
+	}
+	f.wantRemoteLink(t, true)
+	f.wantLocalLink(t, true)
+	f.wantRows(t, 0, 0)
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 0 {
+		t.Fatalf("UnlinkOrganization calls = %d, want none", n)
+	}
+}
+
+// TestBillingLinkStaleCompletionDoesNothing checks that the completion of an
+// old link attempt cannot record a link after a newer authorized operation
+// took the attempt over, and that no unlink overtakes the running call.
+func TestBillingLinkStaleCompletionDoesNothing(t *testing.T) {
+	f := newLinkAttemptFixture(t, "rosa")
+	ctx := context.Background()
+	gate := f.fake.Hold(accountstest.MethodLinkOrganization)
+	done := make(chan error, 1)
+	go func() { done <- f.link(f.org.OwnerClient, billingAccountA) }()
+	<-gate.Entered
+	f.wantRows(t, 1, 1)
+
+	// While the call runs, other link operations wait for it.
+	if err := f.link(f.org.OwnerClient, billingAccountA); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("second link while the first runs: %v", err)
+	}
+	if err := f.unlink(f.org.OwnerClient); testenv.Code(err) != connect.CodeUnavailable {
+		t.Fatalf("unlink while the link runs: %v", err)
+	}
+	f.wantRows(t, 1, 1)
+
+	// An ownership transfer is not refused: it takes the attempt over, and
+	// its unlink waits for the running call.
+	if _, err := f.org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: f.org.ID, UserId: f.org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRows(t, 0, 1)
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 0 {
+		t.Fatalf("an unlink overtook the running link call: %d calls", n)
+	}
+
+	// The old call lands and its completion records nothing.
+	gate.Release()
+	if err := <-done; testenv.Code(err) != connect.CodeAborted {
+		t.Fatalf("stale completion: %v, want aborted", err)
+	}
+	f.wantLocalLink(t, false)
+	f.wantRemoteLink(t, true)
+	if err := f.env.App.Billing.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, true) // not due before the call deadline
+
+	// After the deadline, the pending unlink removes the link that the old
+	// call created.
+	f.env.Clock.Advance(time.Minute)
+	if err := f.env.App.Billing.RetryPendingUnlinks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.wantRemoteLink(t, false)
+	f.wantRows(t, 0, 0)
+	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 1 {
+		t.Fatalf("UnlinkOrganization calls = %d, want 1", n)
+	}
+
+	// The new owner links afterwards.
+	newOwner := f.env.User(f.org.Admin)
+	f.fake.AddAccount(billingAccountB, "New owner", map[string]accountsv1.BillingAccountRole{f.org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	if err := f.link(newOwner, billingAccountB); err != nil {
+		t.Fatal(err)
+	}
+	if account, _, ok := f.fake.Link(f.org.ID); !ok || account != billingAccountB {
+		t.Fatalf("remote link after the new owner's link = %q, %v", account, ok)
+	}
+}
