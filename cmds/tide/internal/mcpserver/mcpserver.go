@@ -503,6 +503,17 @@ func newCollector(so, se int64) *collector {
 	return &collector{out: window{from: so, next: so}, err: window{from: se, next: se}, started: make(chan struct{})}
 }
 
+// hasStarted reports whether the stream reported its first event, which
+// for an exec is the started event.
+func (c *collector) hasStarted() bool {
+	select {
+	case <-c.started:
+		return true
+	default:
+		return false
+	}
+}
+
 func (c *collector) on(ev tide.ExecEvent) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -555,6 +566,11 @@ func (c *collector) result(execID string, res *tide.ExecResult) execResult {
 	return r
 }
 
+// errStartUnconfirmed is returned by runWithWait when the wait and the
+// start grace passed before the exec reported its started event, so the
+// command may not run.
+var errStartUnconfirmed = errors.New("start unconfirmed")
+
 type execOutcome struct {
 	res *tide.ExecResult
 	err error
@@ -563,7 +579,8 @@ type execOutcome struct {
 // runWithWait runs fn in the background and waits up to wait for it. When
 // the wait passes, it waits further (at most startGrace, and never beyond
 // MaxWait in total) until the stream reported its first event, then cancels
-// the stream; the command keeps running in the guest.
+// the stream; the command keeps running in the guest. When the stream did
+// not report its first event, it returns errStartUnconfirmed.
 func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *collector, fn func(context.Context) (*tide.ExecResult, error)) (*tide.ExecResult, error) {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -594,6 +611,11 @@ func (s *Server) runWithWait(ctx context.Context, wait time.Duration, col *colle
 	}
 	var se *tide.ExecStreamError
 	if errors.As(o.err, &se) && errors.Is(se.Err, context.Canceled) && ctx.Err() == nil {
+		if !col.hasStarted() {
+			// Without the started event, the command may not exist, so
+			// its exec_id must not be returned as running.
+			return nil, errStartUnconfirmed
+		}
 		return nil, nil // still running
 	}
 	return nil, o.err
@@ -643,6 +665,11 @@ func (s *Server) exec(ctx context.Context, _ *mcp.CallToolRequest, in execArgs) 
 			Timeout: time.Duration(in.TimeoutSeconds) * time.Second, OnEvent: col.on,
 		})
 	})
+	if errors.Is(err, errStartUnconfirmed) {
+		s.cfg.Logger.WarnContext(ctx, "tide mcp exec start unconfirmed", "dev_session_id", in.SessionID, "exec_id", execID)
+		return nil, execResult{}, toolError(connect.NewError(connect.CodeDeadlineExceeded, fmt.Errorf(
+			"exec %s did not confirm its start before the wait passed, so it may not run; exec_output with this exec_id returns not_found if it did not start", execID)))
+	}
 	if err != nil {
 		return nil, execResult{}, toolError(err)
 	}

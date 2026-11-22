@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -423,3 +424,31 @@ func TestErrorMapping(t *testing.T) {
 }
 
 func fieldMask(paths ...string) *fieldmaskpb.FieldMask { return &fieldmaskpb.FieldMask{Paths: paths} }
+
+// TestExecStartUnconfirmed checks that an exec whose start is not
+// confirmed before the wait passes is an error, not a running exec. A
+// token source that blocks, like a slow Logto refresh, holds the exec
+// request until the stream is canceled.
+func TestExecStartUnconfirmed(t *testing.T) {
+	var block atomic.Bool
+	var srv *tidetest.Server
+	h := newHarness(t, Config{maxWait: time.Second, Client: func() (*tide.Client, error) {
+		return tide.New(tide.Options{BaseURL: srv.URL, TokenSource: func(ctx context.Context) (string, error) {
+			if block.Load() {
+				<-ctx.Done()
+				return "", ctx.Err()
+			}
+			return srv.AccessToken, nil
+		}})
+	}})
+	srv = h.srv
+	id := h.running()
+	block.Store(true)
+	text, isErr := h.call("exec", map[string]any{"session_id": id, "command": []string{"true"}, "wait_seconds": 1}, nil)
+	if !isErr || !strings.HasPrefix(text, "deadline_exceeded") || !strings.Contains(text, "did not confirm its start") {
+		t.Fatalf("unconfirmed exec = %q %v", text, isErr)
+	}
+	if n := len(h.srv.ExecRequests()); n != 0 {
+		t.Fatalf("exec requests = %d", n)
+	}
+}
