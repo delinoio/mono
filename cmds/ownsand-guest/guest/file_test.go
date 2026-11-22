@@ -924,6 +924,42 @@ func TestWriteExpiryOfLongTargetRemovesTemporaryFile(t *testing.T) {
 	}
 }
 
+// statSource keeps the identity of the file that the path named when it ran.
+// On Windows, os.Stat keeps only the path and os.SameFile opens it again when
+// it compares, so a swap after the stat would not be seen.
+func TestStatSourceKeepsIdentityAfterPathSwap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	other := filepath.Join(dir, "other")
+	if err := os.WriteFile(path, []byte("aaaa"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(other, []byte("bbbb"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, err := statSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	same, err := statSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, same) {
+		t.Fatal("two stats of an unchanged path name different files")
+	}
+	if err := os.Rename(other, path); err != nil {
+		t.Fatal(err)
+	}
+	after, err := statSource(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(before, after) {
+		t.Fatal("the stat before the swap names the file after the swap")
+	}
+}
+
 // A path swapped to another same-size file between the first stat and the
 // open must abort the snapshot and leave no snapshot file behind.
 func TestReadSnapshotAbortsWhenPathSwappedBeforeOpen(t *testing.T) {
