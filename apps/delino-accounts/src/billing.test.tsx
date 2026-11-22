@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -22,6 +29,7 @@ import {
   INVITATION_TOKEN,
   numbered,
   OUTSIDER,
+  OWNER,
   VIEWER,
 } from "./testing/fake-api.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
@@ -73,6 +81,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  rs.useRealTimers();
 });
 
 describe("sign-in", () => {
@@ -355,6 +364,204 @@ describe("subscription", () => {
     expect(
       screen.queryByRole("button", { name: "Start subscription" }),
     ).toBeNull();
+  });
+});
+
+describe("pending subscription polling", () => {
+  /** The subscription poll interval of the overview. */
+  const POLL_MS = 2000;
+  /** Enough fake time for the loading skeleton delay and the first reads. */
+  const SETTLE_MS = 100;
+
+  /** Runs the fake clock forward inside `act`, flushing pending requests. */
+  async function advance(ms: number) {
+    await act(async () => {
+      await rs.advanceTimersByTimeAsync(ms);
+      await new Promise((resolve) =>
+        rs.getRealTimers().setTimeout(resolve, 20),
+      );
+    });
+  }
+
+  /** Renders the overview under fake timers and lets the first reads finish. */
+  async function renderPending(
+    status: SubscriptionStatus,
+    options: {
+      userId?: string;
+      checkout?: ReturnType<typeof fakeCheckout>;
+    } = {},
+  ) {
+    const api = createFakeApi();
+    api.userId = options.userId ?? OWNER;
+    api.accounts.get(ACCOUNT_ID)!.subscription = {
+      status,
+      cancelAtPeriodEnd: false,
+    };
+    rs.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "Date",
+      ],
+    });
+    renderApp(ACCOUNT_PATH, { api, checkout: options.checkout });
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    return api;
+  }
+
+  /** Confirms the payment on the server like the verified webhook does. */
+  function confirm(api: ReturnType<typeof createFakeApi>) {
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    account.subscription = {
+      status: SubscriptionStatus.ACTIVE,
+      cancelAtPeriodEnd: false,
+      periodEnd: new Date("2026-12-01T00:00:00Z"),
+    };
+    account.balance += 10_000_000n;
+  }
+
+  /** The balance text without `waitFor`, which cannot run on fake timers. */
+  const balanceNow = () =>
+    screen.getByRole("region", { name: "Balance" }).querySelector(".balance")
+      ?.textContent;
+
+  const topUpDisabled = () =>
+    (screen.getByRole("button", { name: "Top up" }) as HTMLButtonElement)
+      .disabled;
+
+  test("a delayed confirmation updates the page without a reload and then stops polling", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+    expect(topUpDisabled()).toBe(true);
+    expect(balanceNow()).toBe("$12.35");
+
+    // Still PENDING: the page reads the subscription every 2 s and nothing else.
+    api.calls.length = 0;
+    await advance(POLL_MS);
+    await advance(POLL_MS);
+    expect(calls(api, "GetSubscription")).toHaveLength(2);
+    // Every read stays on the account of the page.
+    expect(
+      calls(api, "GetSubscription").map((r) => r.billingAccountId),
+    ).toEqual([ACCOUNT_ID, ACCOUNT_ID]);
+    expect(calls(api, "GetBalance")).toHaveLength(0);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+
+    // The webhook confirms the payment between two polls.
+    confirm(api);
+    api.calls.length = 0;
+    await advance(POLL_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+    expect(topUpDisabled()).toBe(false);
+    expect(balanceNow()).toBe("$22.35");
+    expect(calls(api, "GetBalance").length).toBeGreaterThan(0);
+
+    // The transition invalidated the credit reads once; no timer remains.
+    await advance(POLL_MS);
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(api.calls).toEqual([]);
+  });
+
+  test("an admin can top up after the confirmation", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING, {
+      userId: ADMIN,
+    });
+    expect(topUpDisabled()).toBe(true);
+    confirm(api);
+    await advance(POLL_MS);
+    expect(topUpDisabled()).toBe(false);
+  });
+
+  test("a reload while PENDING polls from the initial load", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    expect(calls(api, "GetSubscription")).toHaveLength(1);
+    await advance(POLL_MS);
+    expect(calls(api, "GetSubscription")).toHaveLength(2);
+    confirm(api);
+    await advance(POLL_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+  });
+
+  test("no timer is scheduled for a subscription that is not PENDING", async () => {
+    for (const status of [
+      SubscriptionStatus.ACTIVE,
+      SubscriptionStatus.NONE,
+      SubscriptionStatus.CANCELED,
+    ]) {
+      const api = await renderPending(status);
+      api.calls.length = 0;
+      await advance(POLL_MS * 5);
+      expect(api.calls).toEqual([]);
+      cleanup();
+      rs.useRealTimers();
+    }
+  });
+
+  test("a confirmation before the checkout closes does not poll or refresh twice", async () => {
+    const checkout = fakeCheckout();
+    const api = await renderPending(SubscriptionStatus.NONE, { checkout });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Start subscription" }),
+      );
+    });
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    expect(checkout.opened).toEqual(["txn_checkout1"]);
+    // The webhook arrives before the poll runs and before the close callback.
+    confirm(api);
+    await act(async () => checkout.close());
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+    expect(topUpDisabled()).toBe(false);
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(api.calls).toEqual([]);
+  });
+
+  test("an unpaid closed checkout stays pending with reads only", async () => {
+    const checkout = fakeCheckout();
+    const api = await renderPending(SubscriptionStatus.PENDING, { checkout });
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+    expect(topUpDisabled()).toBe(true);
+    const methods = new Set(api.calls.map((c) => c.method));
+    expect(methods).toEqual(new Set(["GetSubscription"]));
+    expect(calls(api, "GetSubscription")).toHaveLength(5);
+    expect(calls(api, "StartSubscription")).toHaveLength(0);
+    expect(calls(api, "CreateTopUp")).toHaveLength(0);
+    expect(checkout.opened).toEqual([]);
+  });
+
+  test("unmounting stops the polling", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    await advance(POLL_MS);
+    cleanup();
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(api.calls).toEqual([]);
+  });
+
+  test("a transient Unavailable during polling does not stop it", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    api.failNext.set(
+      "GetSubscription",
+      new ConnectError("try again", Code.Unavailable),
+    );
+    await advance(POLL_MS);
+    // The next poll succeeds and sees the confirmation.
+    confirm(api);
+    await advance(POLL_MS);
+    await advance(SETTLE_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+    expect(topUpDisabled()).toBe(false);
+    expect(balanceNow()).toBe("$22.35");
   });
 });
 

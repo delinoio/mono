@@ -5,7 +5,7 @@ import { Badge, BadgeVariant } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
@@ -30,6 +30,27 @@ import { formatUsd, usd } from "../../money.ts";
 import { useCheckout } from "../../paddle.tsx";
 import { can, Permission } from "../../roles.ts";
 import { uuidV7 } from "../../uuid.ts";
+
+/**
+ * How often the overview reads a `PENDING` subscription again. A subscription
+ * leaves `PENDING` only when the verified payment webhook reaches the server,
+ * which the page cannot observe except by reading the subscription.
+ */
+export const PENDING_SUBSCRIPTION_POLL_MS = 2000;
+
+/**
+ * The React Query `refetchInterval` of the subscription read: poll only while
+ * the cached subscription is `PENDING`. React Query pauses the interval while
+ * the tab is in the background (`refetchIntervalInBackground` is off), stops
+ * it when the status changes and drops it when the component unmounts.
+ */
+function pendingSubscriptionInterval(query: {
+  state: { data?: { subscription?: Subscription } };
+}): number | false {
+  return query.state.data?.subscription?.status === SubscriptionStatus.PENDING
+    ? PENDING_SUBSCRIPTION_POLL_MS
+    : false;
+}
 
 /** The subscription price when the server does not send one. */
 const DEFAULT_PRICE_USD_MICROS = usd(10n);
@@ -190,10 +211,35 @@ function SubscriptionCard() {
   const { billingAccountId, role } = useBillingAccount();
   const queryClient = useQueryClient();
   const checkout = useCheckout();
-  const subscription = useQuery(CreditService.method.getSubscription, {
-    billingAccountId,
-  });
+  const subscription = useQuery(
+    CreditService.method.getSubscription,
+    { billingAccountId },
+    { refetchInterval: pendingSubscriptionInterval },
+  );
   const refresh = () => invalidateServices(queryClient, CreditService);
+
+  // The payment webhook confirms the subscription and adds the first credit
+  // grant on the server. When the polled status leaves PENDING, read the
+  // balance and the credit grants again so that Top up and the grants update
+  // without a reload. This runs once per transition: the previous status is
+  // kept per billing account, so switching accounts and a read that has no
+  // data yet never count as a transition.
+  const polledStatus = subscription.data?.subscription?.status;
+  const previous = useRef<
+    { accountId: string; status?: SubscriptionStatus } | undefined
+  >(undefined);
+  useEffect(() => {
+    const last = previous.current;
+    previous.current = { accountId: billingAccountId, status: polledStatus };
+    if (
+      last?.accountId === billingAccountId &&
+      last.status === SubscriptionStatus.PENDING &&
+      polledStatus !== undefined &&
+      polledStatus !== SubscriptionStatus.PENDING
+    ) {
+      void invalidateServices(queryClient, CreditService);
+    }
+  }, [billingAccountId, polledStatus, queryClient]);
   const start = useMutation(CreditService.method.startSubscription);
   const cancel = useMutation(CreditService.method.cancelSubscription, {
     onSuccess: refresh,
