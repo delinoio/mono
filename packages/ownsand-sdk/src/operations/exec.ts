@@ -25,7 +25,7 @@ import {
 } from "../relay/context.ts";
 import { GrantKeeper, RelayCallKind } from "../relay/grant.ts";
 import { RecoveryWindow } from "../relay/recovery.ts";
-import { watchedRelayStream } from "../relay/stream.ts";
+import { type ConsumerHold, watchedRelayStream } from "../relay/stream.ts";
 import { uuidV7TimestampMs } from "../uuidv7.ts";
 import {
   isNotFound,
@@ -119,6 +119,7 @@ export async function* runExec(
   selector: DataPathSelector,
   plan: ExecPlan,
   signal: AbortSignal | undefined,
+  hold?: ConsumerHold,
 ): AsyncGenerator<ExecStreamEvent, ExecResult> {
   const request = plan.request;
   const attachOnly = request === undefined;
@@ -177,6 +178,7 @@ export async function* runExec(
             isAccepted: (response) =>
               response.event?.event?.case === "accepted",
           },
+          hold,
         ),
       );
     } else {
@@ -412,6 +414,7 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
   readonly execId: string;
   readonly #generator: AsyncGenerator<ExecStreamEvent, ExecResult>;
   readonly #selector: DataPathSelector;
+  readonly #hold: ConsumerHold | undefined;
   #iterated = false;
   #result: ExecResult | undefined;
   #draining: Promise<void> | undefined;
@@ -420,7 +423,9 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     execId: string,
     generator: AsyncGenerator<ExecStreamEvent, ExecResult>,
     selector: DataPathSelector,
+    hold?: ConsumerHold,
   ) {
+    this.#hold = hold;
     this.execId = execId;
     this.#generator = generator;
     this.#selector = selector;
@@ -436,14 +441,23 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
       throw new OwnSandError("an exec handle can be iterated only once");
     }
     this.#iterated = true;
-    for (;;) {
-      const next = await this.#generator.next();
-      if (next.done) {
-        // Keep a result that a concurrent wait() already stored.
-        this.#result ??= next.value;
-        return;
+    try {
+      for (;;) {
+        const next = await this.#generator.next();
+        if (next.done) {
+          // Keep a result that a concurrent wait() already stored.
+          this.#result ??= next.value;
+          return;
+        }
+        yield next.value;
       }
-      yield next.value;
+    } finally {
+      // Leaving the loop early (`break`, `return` or a thrown error) leaves
+      // the generator suspended with its stream open. Tell the stream that
+      // no event is held, so the idle limit applies and an abandoned stream
+      // ends. A later wait() resumes the same stream, or continues with
+      // `AttachExec` after the idle limit.
+      this.#hold?.release();
     }
   }
 

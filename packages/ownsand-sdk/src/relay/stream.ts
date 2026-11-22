@@ -75,11 +75,49 @@ export function linkedController(signal: AbortSignal | undefined): {
 }
 
 /**
+ * Tells a relay stream that its consumer no longer holds an event. A consumer
+ * that leaves its iteration early (`break`, `return` or an exception in the
+ * loop body) releases the hold, so the idle limit starts again for the
+ * suspended stream instead of treating the last event as held forever. The
+ * release is forward-only: a released hold never becomes active again.
+ */
+export class ConsumerHold {
+  #released = false;
+  readonly #listeners = new Set<() => void>();
+
+  get released(): boolean {
+    return this.#released;
+  }
+
+  release(): void {
+    if (this.#released) {
+      return;
+    }
+    this.#released = true;
+    for (const listener of [...this.#listeners]) {
+      listener();
+    }
+  }
+
+  /** Registers a release listener and returns the function that removes it. */
+  onRelease(listener: () => void): () => void {
+    this.#listeners.add(listener);
+    return () => {
+      this.#listeners.delete(listener);
+    };
+  }
+}
+
+/**
  * Runs one relay server stream with the grant header, byte activity
  * tracking and the idle limit. The idle clock runs only while the SDK waits
  * for the stream, not while the caller holds an event. While the recovery
  * window of `bound` is active, the stream also ends when the window's
- * remaining time passes before the agent accepts it.
+ * remaining time passes before the agent accepts it. When the consumer
+ * releases `hold` (it left its iteration early), the held event no longer
+ * pauses the idle clock: the call is aborted after the idle limit and the
+ * stream's timers and listeners are released even if nobody resumes the
+ * generator.
  */
 export async function* watchedRelayStream<T>(
   ctx: OperationContext,
@@ -87,6 +125,7 @@ export async function* watchedRelayStream<T>(
   callerSignal: AbortSignal | undefined,
   open: (options: CallOptions) => AsyncIterable<T>,
   bound?: AcceptanceBound<T>,
+  hold?: ConsumerHold,
 ): AsyncGenerator<T> {
   const clock = ctx.clock;
   const { controller: call, dispose: unlink } = linkedController(callerSignal);
@@ -97,17 +136,43 @@ export async function* watchedRelayStream<T>(
   const registration = ctx.activity.register(() => {
     lastActivity = clock.now();
   });
+  // A release wakes the watcher's sleep so that it recomputes its wait.
+  let wake = new AbortController();
+  const offRelease = hold?.onRelease(() => {
+    lastActivity = clock.now();
+    wake.abort();
+  });
   const watcher = (async () => {
     for (;;) {
-      const wait = holding
+      const held = holding && hold?.released !== true;
+      const wait = held
         ? Timing.streamIdleMs
         : lastActivity + Timing.streamIdleMs - clock.now();
       if (wait <= 0) {
         idleFired = true;
         call.abort(new StreamIdleError("relay stream idle limit reached"));
+        if (holding) {
+          // The consumer abandoned the iteration, so the generator stays
+          // suspended at its `yield` and its `finally` does not run until
+          // someone resumes it. Release what the stream holds now; the
+          // later `finally` repeats both calls harmlessly.
+          registration.dispose();
+          unlink();
+        }
         return;
       }
-      await clock.sleep(wait, stopWatch.signal);
+      try {
+        await clock.sleep(
+          wait,
+          AbortSignal.any([stopWatch.signal, call.signal, wake.signal]),
+        );
+      } catch {
+        if (stopWatch.signal.aborted || call.signal.aborted) {
+          return;
+        }
+        // A release woke the sleep: arm a new wake signal and look again.
+        wake = new AbortController();
+      }
     }
   })().catch(() => {});
   // The acceptance bound applies only to a continuation in recovery, and ends
@@ -177,6 +242,7 @@ export async function* watchedRelayStream<T>(
     }
   } finally {
     stopWatch.abort();
+    offRelease?.();
     stopDeadline.abort();
     registration.dispose();
     call.abort(new OwnSandError("relay stream closed"));
