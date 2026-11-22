@@ -836,7 +836,11 @@ func addProfileFlags(fs *flag.FlagSet, create bool) *profileFlags {
 	return f
 }
 
-// apply copies the set flags into p and returns the field mask paths.
+// setsResources reports whether a resource flag is set.
+func (f *profileFlags) setsResources() bool { return f.vcpu.set || f.memory.set || f.disk.set }
+
+// apply copies the set flags into p and returns the field mask paths of
+// UpdateRunnerProfile.
 func (f *profileFlags) apply(p *tidev1.RunnerProfile) ([]string, error) {
 	var paths []string
 	if f.name.set {
@@ -856,27 +860,28 @@ func (f *profileFlags) apply(p *tidev1.RunnerProfile) ([]string, error) {
 			return nil, err
 		}
 		p.Source = &tidev1.RunnerProfile_BaseImage{BaseImage: os}
-		paths = append(paths, "base_image")
+		paths = append(paths, "source")
 	case f.template.set:
 		p.Source = &tidev1.RunnerProfile_OwnsandTemplateId{OwnsandTemplateId: f.template.v}
-		paths = append(paths, "ownsand_template_id")
+		paths = append(paths, "source")
 	}
-	if f.vcpu.set || f.memory.set || f.disk.set {
+	// The update mask has only the whole "resources" path, so the
+	// message must carry every resource value. profileUpdate fills the
+	// values without a flag from the current profile first.
+	if f.setsResources() {
 		if p.Resources == nil {
 			p.Resources = &tidev1.Resources{}
 		}
 		if f.vcpu.set {
 			p.Resources.VcpuCount = f.vcpu.v
-			paths = append(paths, "resources.vcpu_count")
 		}
 		if f.memory.set {
 			p.Resources.MemoryMib = f.memory.v
-			paths = append(paths, "resources.memory_mib")
 		}
 		if f.disk.set {
 			p.Resources.DiskGib = f.disk.v
-			paths = append(paths, "resources.disk_gib")
 		}
+		paths = append(paths, "resources")
 	}
 	for _, d := range []struct {
 		f     *stringFlag
@@ -1001,15 +1006,27 @@ func (a *app) profileUpdate(ctx context.Context, name string, args []string) err
 	if err != nil {
 		return err
 	}
-	p := &tidev1.RunnerProfile{}
-	paths, err := f.apply(p)
-	if err != nil {
+	// The first apply checks the flags before any request is sent.
+	if paths, err := f.apply(&tidev1.RunnerProfile{}); err != nil {
 		return err
-	}
-	if len(paths) == 0 {
+	} else if len(paths) == 0 {
 		return usageErr("nothing to update: pass at least one profile flag")
 	}
 	org, c, err := a.orgSetup()
+	if err != nil {
+		return err
+	}
+	p := &tidev1.RunnerProfile{}
+	if f.setsResources() && !(f.vcpu.set && f.memory.set && f.disk.set) {
+		// The "resources" path replaces all resource values, so keep the
+		// current values of the resources without a flag.
+		cur, err := c.RunnerProfiles().GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{OrganizationId: org, RunnerProfileId: rest[0]}))
+		if err != nil {
+			return err
+		}
+		p.Resources = proto.CloneOf(cur.Msg.GetProfile().GetResources())
+	}
+	paths, err := f.apply(p)
 	if err != nil {
 		return err
 	}
