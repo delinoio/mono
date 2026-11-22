@@ -350,7 +350,8 @@ wait_healthy() {
 # replacement container and reloads the proxy. An `h2c` upstream proxies
 # HTTP/2 without TLS (`transport http { versions h2c }`). Caddy forwards every
 # response without a Content-Length at once, so streams need no
-# `flush_interval`.
+# `flush_interval`; servers/ownsand-api/cmd/ownsand-api/caddy_route_test.go
+# verifies the route against a real Caddy binary.
 #
 # The caller evaluates this function as an `if` condition, which disables
 # `set -e` inside it, so every step checks its own status and names

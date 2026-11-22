@@ -1227,11 +1227,21 @@ test("repository deployables use the documented targets", () => {
         UpstreamProtocol.Http1,
         "none",
       ],
+      [
+        "ownsand-api",
+        "ownsand-api",
+        "ownsand.api.delino.io",
+        UpstreamProtocol.H2c,
+        "3478",
+      ],
     ],
   );
   assert.deepEqual(
     result.databases.map((d) => [d.name, d.database, d.branch]),
-    [["accounts-api", "accounts-api", "main"]],
+    [
+      ["accounts-api", "accounts-api", "main"],
+      ["ownsand-api", "ownsand-api", "main"],
+    ],
   );
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.project, d.output]),

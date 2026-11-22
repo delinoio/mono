@@ -3,6 +3,19 @@
   "version": "0.0.0",
   "private": true,
   "license": "FSL-1.1-ALv2",
+  "deploy": {
+    "target": "droplet",
+    "service": "ownsand-api",
+    "hostname": "ownsand.api.delino.io",
+    "port": 8080,
+    "upstream": "h2c",
+    "udpPorts": [
+      3478
+    ],
+    "database": {
+      "name": "ownsand-api"
+    }
+  },
   "scripts": {
     "build": "go build -buildvcs=false -o dist/ownsand-api ./cmd/ownsand-api",
     "dev": "node ../../scripts/dev/with-infisical.mjs --path=/servers/ownsand-api -- node scripts/dev.mjs",

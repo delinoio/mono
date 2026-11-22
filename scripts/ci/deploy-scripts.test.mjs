@@ -2423,7 +2423,9 @@ test(
   },
 );
 
-// The route text that droplet-deploy.sh writes for each upstream protocol.
+// The route text of servers/ownsand-api/cmd/ownsand-api/caddy_route_test.go
+// (`caddyRoute`), which verifies it against a real Caddy binary. Keep both
+// equal.
 const caddyRoute = (service, hostname, upstream, h2c) =>
   [
     `# Written by scripts/ci/droplet-deploy.sh for ${service}. Do not edit.`,

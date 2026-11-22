@@ -3,9 +3,9 @@
 # Runtime image of ownsand-api. The image build context contains the
 # `dist/ownsand-api` binary (linux/amd64, CGO disabled), `servers/LICENSE` as
 # `LICENSE` and the Go toolchain license as `GO-LICENSE`, like accounts-api.
-# The package declares no `deploy` field yet: STUN needs a public UDP port
-# that the deployment workflow does not publish (see
-# docs/servers-ownsand-api-foundation.md, Runtime and Language).
+# The `deploy` field of package.json publishes the STUN port 3478/udp on
+# IPv4 and selects the h2c upstream (see docs/servers-ownsand-api-foundation.md,
+# Runtime and Language).
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
 COPY dist/ownsand-api /usr/local/bin/ownsand-api
 # FSL-1.1-ALv2 terms and copyright notice (servers/LICENSE).
