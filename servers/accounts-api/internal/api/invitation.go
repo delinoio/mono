@@ -406,10 +406,11 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 		return nil, notFound("invitation not found")
 	}
 	hash := hashInvitationToken(token)
-	now := h.timestamp()
+	early := h.timestamp()
 
 	// Check the invitation before the Logto call, so that an unknown or
-	// used token costs no Management API request.
+	// used token costs no Management API request. This check uses an early
+	// timestamp; the transaction below repeats it with a fresh one.
 	inv, err := scanInvitation(h.db.Pool.QueryRow(ctx, `SELECT `+invitationColumns+`
 		FROM billing_account_invitations WHERE token_sha256 = $1`, hash))
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -418,7 +419,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, h.internal(ctx, "accept_invitation", err)
 	}
-	if inv.state(now) != accountsv1.InvitationState_INVITATION_STATE_PENDING {
+	if inv.state(early) != accountsv1.InvitationState_INVITATION_STATE_PENDING {
 		return nil, failedPrecondition("the invitation is no longer valid")
 	}
 
@@ -435,6 +436,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 	}
 
 	var account billingAccount
+	var acceptTime time.Time
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		// Lock the billing account first, as every other change does, then
@@ -455,9 +457,14 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 		if err != nil {
 			return err
 		}
+		// Sample the clock after the Logto lookup and the lock wait, so that
+		// an invitation that expired meanwhile is rejected and the acceptance
+		// time is the time of the check. A retried transaction samples again.
+		now := h.timestamp()
 		if inv.state(now) != accountsv1.InvitationState_INVITATION_STATE_PENDING {
 			return failedPrecondition("the invitation is no longer valid")
 		}
+		acceptTime = now
 		var member bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM billing_account_members
 			WHERE billing_account_id = $1 AND user_id = $2)`, inv.BillingAccountID, userID).Scan(&member); err != nil {
@@ -491,7 +498,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 			UserId:           userID,
 			Role:             inv.Role.Proto(),
 			DisplayName:      user.Name,
-			CreateTime:       timestamppb.New(now),
+			CreateTime:       timestamppb.New(acceptTime),
 		},
 	}), nil
 }

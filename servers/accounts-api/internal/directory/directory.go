@@ -270,6 +270,9 @@ type Fake struct {
 	users map[string]User
 	// Err, when set, is returned by every call.
 	Err error
+	// onUser, when set, runs at the start of every User call, outside the
+	// lock. Tests use it to move time or hold locks during a lookup.
+	onUser func()
 }
 
 // NewFake returns an empty fake directory.
@@ -289,8 +292,22 @@ func (f *Fake) SetErr(err error) {
 	f.Err = err
 }
 
+// SetOnUser registers fn to run at the start of every User call; nil removes
+// it. It lets tests change the world while a lookup is in flight.
+func (f *Fake) SetOnUser(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onUser = fn
+}
+
 // User implements Directory.
 func (f *Fake) User(_ context.Context, userID string) (User, error) {
+	f.mu.Lock()
+	hook := f.onUser
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {
