@@ -703,6 +703,10 @@ func (h DeviceHandler) UpdateAgentVersionPolicy(ctx context.Context, req *connec
 			if pinned == "" || len(pinned) > maxVersionLength || strings.ContainsAny(pinned, " \t\r\n") {
 				return errInvalidf("invalid pinned_version: a version is required for PIN")
 			}
+			// PostgreSQL text cannot store U+0000.
+			if err := validate.NoNUL("pinned_version", pinned); err != nil {
+				return errInvalid(err)
+			}
 			var revoked bool
 			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM agent_releases WHERE version = $1 AND revoked)", pinned).Scan(&revoked); err != nil {
 				return err

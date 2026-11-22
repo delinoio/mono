@@ -276,8 +276,24 @@ func isLetter(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
 }
 
+// NoNUL checks that value holds no U+0000 character. U+0000 is valid UTF-8
+// and passes protobuf, but PostgreSQL text and jsonb values cannot store it,
+// so a request that carries one would fail inside its transaction as an
+// internal error. Rejecting it up front gives the caller invalid_argument.
+// Every other control character stays valid. The error names the field and
+// never contains the value.
+func NoNUL(field, value string) error {
+	if hasNUL(value) {
+		return fail(field, "must not contain a NUL byte")
+	}
+	return nil
+}
+
+func hasNUL(value string) bool { return strings.IndexByte(value, 0) >= 0 }
+
 // Labels checks the label limits: at most 32 entries, keys of 1 to 63
-// bytes and values of at most 255 bytes.
+// bytes and values of at most 255 bytes, none of them with a NUL byte (see
+// NoNUL).
 func Labels(labels map[string]string) error {
 	if len(labels) > MaxLabels {
 		return fail("labels", "at most %d entries", MaxLabels)
@@ -291,6 +307,12 @@ func Labels(labels map[string]string) error {
 		}
 		if len(value) > MaxLabelValueSize {
 			return fail("labels", "values must be at most %d bytes", MaxLabelValueSize)
+		}
+		if hasNUL(key) {
+			return fail("labels", "keys must not contain a NUL byte")
+		}
+		if hasNUL(value) {
+			return fail("labels", "values must not contain a NUL byte")
 		}
 	}
 	return nil
