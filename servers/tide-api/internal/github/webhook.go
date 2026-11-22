@@ -383,14 +383,24 @@ func (l *Layer) jobInProgress(ctx context.Context, tx pgx.Tx, inst *Installation
 
 // jobCompleted ends the job's request: ENDED and COMPLETED when the job ran
 // on a tide runner, CANCELED and CANCELED_BY_SOURCE when it never started.
-// After the commit, the surplus runners of the pool are removed.
+// A job without a request gets an ended request. After the commit, the
+// surplus runners of the pool are removed.
 func (l *Layer) jobCompleted(ctx context.Context, tx pgx.Tx, inst *Installation, ev *workflowJobEvent, o *outcome) error {
 	req, err := l.requestOfJob(ctx, tx, inst.OrganizationID, ev.WorkflowJob.ID)
 	if err != nil {
 		return err
 	}
 	if req == nil {
-		return o.ignore("no request for the job")
+		// The queued delivery failed or was lost, and its redelivery may
+		// still come. The request is created and ended at once, so a late
+		// queued or in_progress delivery finds an ended request and does not
+		// start runners for a job that ended.
+		if req, err = l.createRequestTx(ctx, tx, inst, ev, o); err != nil {
+			return err
+		}
+		if req == nil {
+			return o.ignore("labels match no runner profile")
+		}
 	}
 	o.requestID = req.ID
 	if !work.RequestTerminal(req.State) {

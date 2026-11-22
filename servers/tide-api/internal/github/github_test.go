@@ -15,6 +15,7 @@ import (
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
+	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/github"
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
 	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
@@ -308,6 +309,33 @@ func TestLostDeliveries(t *testing.T) {
 		t.Fatalf("request %v", req)
 	}
 	w.l.GitHub.Wait()
+}
+
+// TestCompletedBeforeQueued: a completed event of a job without a request
+// (its queued delivery failed and waits for the redelivery) stores an
+// ended request, so the late queued and in_progress deliveries start
+// nothing.
+func TestCompletedBeforeQueued(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	w.send(t, "workflow_job", job("completed", 501, 40, tideLinux, ""))
+	w.l.GitHub.Wait()
+	req := w.requestOfJob(t, 40)
+	if req == nil || req.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED || req.GetEndReason() != tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_SOURCE {
+		t.Fatalf("request %v", req)
+	}
+	w.send(t, "workflow_job", job("queued", 501, 40, tideLinux, ""))
+	w.send(t, "workflow_job", job("in_progress", 501, 40, tideLinux, "tide-"+api.NewID()))
+	stays(t, "no runner", func() bool { return len(w.runners(t)) == 0 })
+	if got := w.requestOfJob(t, 40); got.GetRequestId() != req.GetRequestId() || got.GetState() != tidev1.RequestState_REQUEST_STATE_CANCELED || len(w.requests(t)) != 1 {
+		t.Fatalf("request after the late deliveries %v", got)
+	}
+	// A completed event of a job that matches no profile stores nothing.
+	w.send(t, "workflow_job", job("completed", 501, 41, []string{"ubuntu-latest"}, ""))
+	if w.requestOfJob(t, 41) != nil {
+		t.Fatal("a request for a job that matches no profile")
+	}
 }
 
 // TestInstallationSuspendedAndDeleted: suspend and deleted make the link
