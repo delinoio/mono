@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { NumberInput } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
+import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
 import { DeviceState } from "@delino/ownsand-protos/v1/common_pb";
 import {
@@ -32,7 +33,7 @@ import {
   labels,
   OVERCOMMIT_PERCENTAGES,
 } from "../format.ts";
-import { deviceLimitsInput } from "../forms.ts";
+import { DeviceLimitField, deviceLimitsInput } from "../forms.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -150,8 +151,15 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     onSuccess: () => invalidateServices(queryClient, DeviceService),
   });
   const [vcpu, setVcpu] = useState<number | null>(null);
-  const [memory, setMemory] = useState<number | null>(null);
-  const [disk, setDisk] = useState<number | null>(null);
+  // Memory and disk are the digits of the stored int64 limits: a number
+  // cannot hold a value above 2^53 exactly, so saving another limit would
+  // otherwise round them.
+  const [memory, setMemory] = useState("");
+  const [disk, setDisk] = useState("");
+  const [fieldError, setFieldError] = useState<{
+    field: DeviceLimitField;
+    message: string;
+  } | null>(null);
   const [overcommit, setOvercommit] = useState("100");
   const [confirmRemove, setConfirmRemove] = useState(false);
   const device = query.data?.device;
@@ -159,8 +167,8 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   useEffect(() => {
     if (device?.limits === undefined) return;
     setVcpu(device.limits.vcpuCount);
-    setMemory(Number(device.limits.memoryMib));
-    setDisk(Number(device.limits.diskGib));
+    setMemory(String(device.limits.memoryMib));
+    setDisk(String(device.limits.diskGib));
     setOvercommit(String(device.limits.vcpuOvercommitPercent || 100));
   }, [device?.limits]);
 
@@ -174,6 +182,17 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     can(role, Permission.ManageDevices) && d.state !== DeviceState.REMOVED;
   const effective = effectiveVcpuLimit(vcpu ?? 0, Number(overcommit));
 
+  const errorOf = (field: DeviceLimitField) =>
+    fieldError?.field === field ? fieldError.message : undefined;
+
+  // Editing a field clears its error: the message describes the old value.
+  const edit =
+    <T,>(field: DeviceLimitField, set: (value: T) => void) =>
+    (value: T) => {
+      set(value);
+      setFieldError((current) => (current?.field === field ? null : current));
+    };
+
   const save = async (event: FormEvent) => {
     event.preventDefault();
     // ReplaceDeviceLimits needs every value. A blank field is not zero: the
@@ -185,9 +204,11 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
       overcommitPercent: Number(overcommit),
     });
     if ("error" in input) {
+      setFieldError({ field: input.field, message: input.error });
       toast.error(input.error);
       return;
     }
+    setFieldError(null);
     try {
       await update.mutateAsync({
         organizationId,
@@ -239,23 +260,25 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
             <NumberInput
               label="vCPU limit"
               value={vcpu}
-              onValueChange={setVcpu}
+              onValueChange={edit(DeviceLimitField.Vcpu, setVcpu)}
               min={0}
+              error={errorOf(DeviceLimitField.Vcpu)}
               disabled={!admin}
             />
-            <NumberInput
+            <TextField
               label="Memory limit (MiB)"
               value={memory}
-              onValueChange={setMemory}
-              min={0}
-              step={256}
+              onValueChange={edit(DeviceLimitField.Memory, setMemory)}
+              inputMode="numeric"
+              error={errorOf(DeviceLimitField.Memory)}
               disabled={!admin}
             />
-            <NumberInput
+            <TextField
               label="Disk limit (GiB)"
               value={disk}
-              onValueChange={setDisk}
-              min={0}
+              onValueChange={edit(DeviceLimitField.Disk, setDisk)}
+              inputMode="numeric"
+              error={errorOf(DeviceLimitField.Disk)}
               disabled={!admin}
             />
           </div>
