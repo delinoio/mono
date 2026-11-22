@@ -428,9 +428,6 @@ jobs:
                 # The dangling-symlink and long-destination-name file read
                 # tests expect Linux errors.
                 cmds/ownsand/internal/cli
-                # The read snapshot does not abort when the path is swapped
-                # before open.
-                cmds/ownsand-guest/guest
                 # The peer-to-peer data channel never opens, so the
                 # peer-to-peer tests time out.
                 go/ownsand
