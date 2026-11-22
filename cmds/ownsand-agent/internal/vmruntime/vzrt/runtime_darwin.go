@@ -164,6 +164,9 @@ type vm struct {
 	memMiB        int64
 	mu            sync.Mutex
 	paused        bool
+	// stopMu serializes stopVM calls of one VM, so a retry of a failed stop
+	// never overlaps the attempt before it.
+	stopMu sync.Mutex
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -251,15 +254,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		vcpu: spec.Resources.GetVcpuCount(), memMiB: spec.Resources.GetMemoryMib()}
 	// cleanup releases everything of a failed create: the sandbox manager
 	// records the sandbox as FAILED and never calls Delete for it.
-	cleanup := func() {
-		r.stopVM(v)
-		r.mu.Lock()
-		if r.vms[spec.SandboxID] == v {
-			delete(r.vms, spec.SandboxID)
-		}
-		r.mu.Unlock()
-		os.RemoveAll(spec.Dir)
-	}
+	cleanup := func() { r.discard(v) }
 
 	memoryRestore := spec.Snapshot != nil && spec.Snapshot.HasMemoryState && spec.MemoryRestoreAllowed &&
 		memoryStateSupported &&
@@ -294,7 +289,12 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		// Virtualization.framework could not restore the saved state: boot
 		// the snapshot disk cold.
 		r.logger.Warn("memory-state restore failed; booting the snapshot disk cold", "sandbox_id", v.id, "error", err)
-		r.stopVM(v)
+		// Never boot the snapshot disk cold while the failed attempt's VM may
+		// still run on the same disk.
+		if stopErr := r.stopVM(v); stopErr != nil {
+			cleanup()
+			return nil, fmt.Errorf("vzrt: stop the VM of the failed memory-state restore: %w", stopErr)
+		}
 		if err := copyFile(src, disk); err != nil {
 			cleanup()
 			return nil, fmt.Errorf("vzrt: prepare disk: %w", err)
@@ -717,47 +717,88 @@ func (r *Runtime) restoreMemory(ctx context.Context, v *vm, spec vmruntime.Spec)
 	return r.waitGuest(ctx, v)
 }
 
-// stopVM stops the VM of v, if it runs, and its network stack.
-func (r *Runtime) stopVM(v *vm) {
+// vzMachine adapts a Virtualization.framework VM to stoppableMachine.
+type vzMachine struct{ m *vz.VirtualMachine }
+
+func (z vzMachine) Terminal() bool {
+	state := z.m.State()
+	return state == vz.VirtualMachineStateStopped || state == vz.VirtualMachineStateError
+}
+func (z vzMachine) CanStop() bool { return z.m.CanStop() }
+func (z vzMachine) Stop() error   { return z.m.Stop() }
+
+// stopVM stops the VM of v, if it runs, and then its network stack. It
+// returns an error, and keeps the VM handle and the network stack, when the
+// framework rejects the stop or the VM does not reach a terminal state in
+// time: the VM may still run then, so the caller must keep the sandbox state
+// and may call stopVM again. A VM that never started, or that an earlier call
+// already stopped, succeeds at once.
+func (r *Runtime) stopVM(v *vm) error {
+	v.stopMu.Lock()
+	defer v.stopMu.Unlock()
 	v.mu.Lock()
 	machine, exited := v.machine, v.exited
-	v.machine = nil
+	v.mu.Unlock()
+	if machine != nil {
+		if err := stopMachine(vzMachine{machine}, exited, stopTimeout); err != nil {
+			r.logger.Error("VM did not stop", "sandbox_id", v.id, "error", err)
+			return err
+		}
+		v.mu.Lock()
+		if v.machine == machine {
+			v.machine = nil
+		}
+		v.mu.Unlock()
+	}
+	// The VM is gone: nothing uses the network stack any more.
+	v.mu.Lock()
 	stack, conn := v.net, v.netConn
 	v.net, v.netConn = nil, nil
 	v.mu.Unlock()
-	if machine != nil && machine.State() != vz.VirtualMachineStateStopped && machine.State() != vz.VirtualMachineStateError {
-		if machine.CanStop() {
-			if err := machine.Stop(); err != nil {
-				r.logger.Warn("stop VM failed", "sandbox_id", v.id, "error", err)
-			}
-		}
-		select {
-		case <-exited:
-		case <-time.After(stopTimeout):
-			r.logger.Error("VM did not stop", "sandbox_id", v.id)
-		}
-	}
 	if stack != nil {
 		stack.Close()
 	}
 	if conn != nil {
 		conn.Close()
 	}
+	return nil
 }
 
-// Delete stops the VM of the sandbox and removes its files.
+// removeVMDir removes the VM directory of the sandbox.
+func (r *Runtime) removeVMDir(sandboxID string) error {
+	if r.opts.VMsDir == "" {
+		return nil
+	}
+	return os.RemoveAll(r.vmDir(sandboxID))
+}
+
+// discard releases the VM of a failed create: it stops the VM and then
+// removes the sandbox directory. When the VM does not stop, it keeps the
+// tracked handle and the directory, because the files are still in use; the
+// runtime lists the VM in Running, and Delete and Close retry the stop.
+func (r *Runtime) discard(v *vm) {
+	err := releaseAfterStop(&r.mu, r.vms, v.id, v,
+		func() error { return r.stopVM(v) },
+		func() error { return os.RemoveAll(v.dir) })
+	if err != nil {
+		r.logger.Error("discard of a failed create incomplete; the VM stays tracked for a retry", "sandbox_id", v.id, "error", err)
+	}
+}
+
+// Delete stops the VM of the sandbox and removes its files. When the VM does
+// not stop, it returns an error and keeps the VM handle and the files, so
+// the sandbox manager can retry the delete; the files are removed only after
+// the VM reached a terminal state.
 func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	r.mu.Lock()
 	v, ok := r.vms[sandboxID]
-	delete(r.vms, sandboxID)
 	r.mu.Unlock()
-	if ok {
-		r.stopVM(v)
+	remove := func() error { return r.removeVMDir(sandboxID) }
+	if !ok {
+		return remove()
 	}
-	if r.opts.VMsDir != "" {
-		return os.RemoveAll(r.vmDir(sandboxID))
-	}
-	return nil
+	return releaseAfterStop(&r.mu, r.vms, sandboxID, v,
+		func() error { return r.stopVM(v) }, remove)
 }
 
 // Running lists the sandboxes with a running or paused VM. VMs run inside
