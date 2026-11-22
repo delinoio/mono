@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -1446,5 +1447,225 @@ func TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime(t *testing.T) {
 	waitFor(t, "release after the stream ended past the expiry", func() bool { return e.ch.released(g.GetGrantId()) })
 	if d := time.Since(ended); d > 3*time.Second {
 		t.Fatalf("the grant was released %v after its last stream ended past the expiry", d)
+	}
+}
+
+// TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker checks that
+// the shutdown deadline of a lost channel's connection covers the whole
+// flush, not only the enqueue of the flush marker: when the queue takes the
+// marker but the writer never reaches it (a writer that HTTP/2 flow control
+// blocks), and when the writer took the marker but its request close never
+// returns, the connection is still canceled at the deadline.
+func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T) {
+	const deadline = 300 * time.Millisecond
+	for _, tc := range []string{"marker_never_dequeued", "marker_taken_close_request_stalls", "queue_full"} {
+		t.Run(tc, func(t *testing.T) {
+			_, c := newManualConn(t, Timing{}, 4)
+			c.flushDeadline = deadline
+			switch tc {
+			case "marker_taken_close_request_stalls":
+				// The writer dequeues the marker and then blocks in the
+				// request close; it never starts its own 2-second timer.
+				go func() { <-c.out; select {} }()
+			case "queue_full":
+				for i := 0; i < cap(c.out); i++ {
+					c.out <- keepaliveFrame(false)
+				}
+			}
+			start := time.Now()
+			go c.closeAfterFlush()
+			select {
+			case <-c.ctx.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the connection was not canceled after the shutdown deadline")
+			}
+			if d := time.Since(start); d < deadline*8/10 || d > deadline+time.Second {
+				t.Fatalf("the connection was canceled after %v, want about %v", d, deadline)
+			}
+		})
+	}
+}
+
+// TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds checks that a
+// connection that ends before the deadline is not canceled again: the timer
+// stops with the connection's context.
+func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
+	_, c := newManualConn(t, Timing{}, 4)
+	c.flushDeadline = 200 * time.Millisecond
+	canceled := make(chan struct{}, 2)
+	inner := c.cancel
+	c.cancel = func() { canceled <- struct{}{}; inner() }
+	go func() { <-c.out; inner() }()
+	c.closeAfterFlush()
+	time.Sleep(600 * time.Millisecond)
+	if len(canceled) != 0 {
+		t.Fatal("the shutdown timer canceled a connection that had ended")
+	}
+}
+
+// TestRelayChannelLossCancelsConnectionWithBlockedWriter runs the lost
+// channel with the real transport: the control plane stops reading the
+// relay stream, so HTTP/2 flow control blocks the agent's writer while the
+// outbound queue still has room and the control plane keeps sending bytes.
+// The queue takes the flush marker, but the writer never reaches it. The
+// agent must still cancel the connection at the shutdown deadline, and the
+// live grant of the new channel must get a new connection after the bounded
+// teardown.
+func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
+	const flush = time.Second
+	e := newRelayEnv(t, Timing{FlushDeadline: flush, ReceiveTimeout: time.Hour, KeepaliveInterval: time.Hour, ProbeIdle: time.Hour}, RelayLimits{})
+	var (
+		count   atomic.Int32
+		stalled atomic.Bool
+		sendMu  sync.Mutex
+		release = make(chan struct{})
+	)
+	t.Cleanup(func() { close(release) })
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		rc := &relayConn{t: t, ctx: ctx, frames: make(chan *ownsandv1.DataFrame, 4096), stream: stream}
+		e.conns <- rc
+		if count.Add(1) > 1 {
+			for {
+				req, err := stream.Receive()
+				if err != nil {
+					return nil
+				}
+				rc.frames <- req.GetFrame()
+			}
+		}
+		// First connection: read the startup frames, then stop reading, so
+		// the transport blocks the writer, but keep sending keepalives.
+		for i := 0; i < 2; i++ {
+			if _, err := stream.Receive(); err != nil {
+				return nil
+			}
+		}
+		stalled.Store(true)
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return nil
+			case <-tick.C:
+				sendMu.Lock()
+				_ = stream.Send(&ownsandv1.ConnectResponse{Frame: keepaliveFrame(false)})
+				sendMu.Unlock()
+			}
+		}
+	})
+	req := e.execReq("/bin/sh", "-c", "head -c 3000000 /dev/zero; sleep 30")
+	g := e.execGrant(req)
+	rc := <-e.conns
+	waitFor(t, "stalled relay handler", stalled.Load)
+	sendMu.Lock()
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamOpen{GrantId: g.GetGrantId(), InitialWindowBytes: 64 << 20}))
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	sendMu.Unlock()
+	e.dp.relay.mu.Lock()
+	old := e.dp.relay.conn
+	e.dp.relay.mu.Unlock()
+	// Wait until the writer is blocked: the queue stops draining while it
+	// still has free slots.
+	var queued int
+	waitFor(t, "a blocked writer with a partly filled queue", func() bool {
+		n := len(old.out)
+		blocked := n > 0 && n == queued
+		queued = n
+		time.Sleep(300 * time.Millisecond)
+		return blocked
+	})
+	if len(old.out) >= cap(old.out) {
+		t.Fatalf("the outbound queue is full (%d frames), so the test does not cover a queue with free slots", len(old.out))
+	}
+
+	e.dp.ChannelLost(e.ch)
+	e.ch.Close()
+	lost := time.Now()
+	select {
+	case <-old.ctx.Done():
+	case <-time.After(flush + 3*time.Second):
+		t.Fatalf("the connection was not canceled %v after the channel loss", time.Since(lost))
+	}
+	if d := time.Since(lost); d < flush*8/10 {
+		t.Fatalf("the connection was canceled after %v, before the %v flush deadline", d, flush)
+	}
+	// The grant of the new channel gets a new connection after the bounded
+	// teardown.
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-e.conns:
+	case <-time.After(teardownGrace + 5*time.Second):
+		t.Fatal("no new relay connection for the live grant of the new channel")
+	}
+	if d := time.Since(lost); d > flush+teardownGrace+4*time.Second {
+		t.Fatalf("the new connection took %v after the channel loss", d)
+	}
+}
+
+// TestRelayChannelLossFlushesSessionEndBeforeClosingRequest checks the
+// unblocked case: with a transport that reads, the queued session-end frame
+// leaves before the request side closes, and the connection ends by that
+// request close, well before the shutdown deadline.
+func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
+	const flush = 10 * time.Second
+	e := newRelayEnv(t, Timing{FlushDeadline: flush}, RelayLimits{})
+	type event struct {
+		frame *ownsandv1.DataFrame
+		err   error
+	}
+	events := make(chan event, 4096)
+	connected := make(chan struct{}, 1)
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		rc := &relayConn{t: t, ctx: ctx, frames: make(chan *ownsandv1.DataFrame, 4096), stream: stream}
+		e.conns <- rc
+		connected <- struct{}{}
+		for {
+			req, err := stream.Receive()
+			if err != nil {
+				events <- event{err: err}
+				return nil
+			}
+			rc.frames <- req.GetFrame()
+			events <- event{frame: req.GetFrame()}
+		}
+	})
+	req := e.execReq("/bin/sh", "-c", "sleep 30")
+	g := e.execGrant(req)
+	rc := e.conn()
+	<-connected
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	rc.nextOn(1)
+	lost := time.Now()
+	e.dp.ChannelLost(e.ch)
+	e.ch.Close()
+	var sawSessionEnd bool
+	for {
+		select {
+		case ev := <-events:
+			if ev.err == nil {
+				if ev.frame.GetSessionEnd().GetReason() == ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST {
+					sawSessionEnd = true
+				}
+				continue
+			}
+			if !errors.Is(ev.err, io.EOF) {
+				t.Fatalf("the request side ended with %v, want a clean close", ev.err)
+			}
+			if !sawSessionEnd {
+				t.Fatal("the request closed before the session-end frame arrived")
+			}
+			if d := time.Since(lost); d > flush/2 {
+				t.Fatalf("the request closed %v after the channel loss, not at the end of the flush", d)
+			}
+			return
+		case <-time.After(flush):
+			t.Fatal("the request side never closed")
+		}
 	}
 }
