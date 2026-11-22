@@ -23,7 +23,8 @@ import (
 // test process must run elevated, because the agent calls the Host Compute
 // Service. It also checks the reconnect after a control plane restart, the
 // reconciliation after an agent crash and the clean-up of a device removal:
-// no compute system and no VM directory of the agent is left.
+// no compute system is left, and the removal leaves the state directory
+// empty.
 func TestLifecycleHyperV(t *testing.T) {
 	requireE2E(t)
 	kernel, rootfs := os.Getenv("OWNSAND_HV_TEST_KERNEL"), os.Getenv("OWNSAND_HV_TEST_ROOTFS")
@@ -116,6 +117,17 @@ func hyperVControlPlaneRestart(t *testing.T, s *stack) {
 	sb := createHyperVSandbox(ctx, t, c)
 	s.killAPI()
 	s.restartAPI()
+	// After a crash the device stays ONLINE in the database until the
+	// offline sweep of the new process, so a RUNNING sandbox does not show
+	// that the agent reconnected: wait until the new process reconciled the
+	// agent's connection, which it logs as agent_state_report.
+	for !s.logs.hasStateReport(s.api.name, s.deviceID) {
+		select {
+		case <-ctx.Done():
+			t.Fatalf("the agent did not reconnect to the restarted control plane")
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 	waitSandboxState(ctx, t, sb, "RUNNING after the reconnect", func(info *ownsandv1.Sandbox) bool {
 		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 	})
@@ -125,17 +137,7 @@ func hyperVControlPlaneRestart(t *testing.T, s *stack) {
 		t.Fatal(err)
 	}
 	defer again.Close()
-	var out string
-	var res *ownsand.ExecResult
-	// The first exec after the reconnect can race the new relay
-	// connection of the agent, so retry it for a short time.
-	for range 20 {
-		out, _, res = execCollect(ctx, t, again, "/bin/cat", "/root/marker")
-		if exitCode(res) == 0 {
-			break
-		}
-		time.Sleep(time.Second)
-	}
+	out, _, res := execCollect(ctx, t, again, "/bin/cat", "/root/marker")
 	if out != "marker\n" || exitCode(res) != 0 {
 		t.Fatalf("exec after the reconnect = %q exit %d", out, exitCode(res))
 	}
@@ -183,10 +185,16 @@ func hyperVDeviceRemoval(t *testing.T, s *stack) {
 		t.Fatalf("agent exit code after the removal = %d, want 3", code)
 	}
 	requireNoComputeSystem(t, sb.ID())
-	for _, dir := range []string{"vms", "snapshots", "images"} {
-		entries, err := os.ReadDir(filepath.Join(s.agents[0].stateDir, dir))
-		if err == nil && len(entries) != 0 {
-			t.Fatalf("%s is not empty after the removal: %v", dir, entries)
+	// A finished removal leaves the state directory empty: no VM disk,
+	// snapshot, image, record or device key.
+	var left []string
+	_ = filepath.WalkDir(s.agents[0].stateDir, func(path string, d os.DirEntry, err error) error {
+		if err == nil && path != s.agents[0].stateDir {
+			left = append(left, path)
 		}
+		return nil
+	})
+	if len(left) != 0 {
+		t.Fatalf("the state directory is not empty after the removal: %v", left)
 	}
 }
