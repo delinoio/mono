@@ -241,9 +241,41 @@ export function connectErrorFromDetail(detail: ErrorDetail): ConnectError {
 }
 
 /**
+ * Returns the `cause` for a Connect error that `redactError` rebuilds. The
+ * original cause can hold a secret in its message, stack or own causes, so it
+ * is never kept, but `classifyFailure` reads it: a Connect error with a
+ * defined cause that is not a Connect error is a transport interruption, and
+ * a credential error as cause is terminal. The replacement keeps exactly that
+ * signal, so redaction never changes how the relay recovery rules and the
+ * `createSandbox` retry treat the error:
+ *
+ * - no cause, or a Connect error as cause (`classifyFailure` ignores it and
+ *   decides by the code): no cause;
+ * - an `OwnSandCredentialError`: a new one with the redacted message;
+ * - any other cause: a generic `Error` with a fixed message.
+ */
+function replacementCause(
+  cause: unknown,
+  secrets: readonly string[],
+): Error | undefined {
+  if (cause === undefined || cause instanceof ConnectError) {
+    return undefined;
+  }
+  if (cause instanceof OwnSandCredentialError) {
+    const redacted = redactError(cause, secrets) as OwnSandCredentialError;
+    return redacted === cause
+      ? new OwnSandCredentialError(cause.message)
+      : redacted;
+  }
+  return new Error("transport failure");
+}
+
+/**
  * Replaces every occurrence of each secret in the error message. Connect
  * errors never contain request headers, but this keeps a credential out of
- * an error even when a lower layer echoed it.
+ * an error even when a lower layer echoed it. A rebuilt Connect error keeps
+ * its code, metadata and details and never its original cause, but it keeps
+ * the classification of the original (see `replacementCause`).
  */
 export function redactError(
   error: unknown,
@@ -269,7 +301,13 @@ export function redactError(
     if (!changed) {
       return error;
     }
-    const copy = new ConnectError(raw, error.code, error.metadata);
+    const copy = new ConnectError(
+      raw,
+      error.code,
+      error.metadata,
+      undefined,
+      replacementCause(error.cause, secrets),
+    );
     copy.details = error.details;
     return copy;
   }

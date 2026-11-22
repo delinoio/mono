@@ -9,6 +9,7 @@ import {
   FailureClass,
   OwnSandConfigError,
   OwnSandCredentialError,
+  redactError,
 } from "./errors.ts";
 import { BaseImage, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
@@ -268,4 +269,277 @@ describe("an access token that is no header value", () => {
     expect(error.code).toBe(Code.Unauthenticated);
     expect(chainText(error)).not.toContain("sentinel-edge");
   });
+});
+
+const KEY = "sentinel-key-0123456789";
+
+describe("redactError keeps the classification of a rebuilt Connect error", () => {
+  function leaky(code = Code.Unknown) {
+    const nested = new Error(`nested diagnostic ${KEY}`);
+    const cause = new Error(`adapter diagnostic ${KEY}`, { cause: nested });
+    const error = new ConnectError(
+      `adapter diagnostic ${KEY}`,
+      code,
+      { "x-trace": "abc" },
+      undefined,
+      cause,
+    );
+    return { error, cause };
+  }
+
+  test("a transport failure with a cause stays an interruption, also with code unknown", () => {
+    const { error, cause } = leaky();
+    expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+    const redacted = redactError(error, [KEY]) as ConnectError;
+    expect(redacted).not.toBe(error);
+    expect(redacted).toBeInstanceOf(ConnectError);
+    expect(classifyFailure(redacted)).toBe(FailureClass.Interruption);
+    expect(redacted.code).toBe(Code.Unknown);
+    expect(redacted.rawMessage).toBe("adapter diagnostic [redacted]");
+    // The replacement cause is generic and holds no reference to the
+    // original cause or to the secret.
+    expect(redacted.cause).toBeInstanceOf(Error);
+    expect(redacted.cause).not.toBeInstanceOf(ConnectError);
+    expect(redacted.cause).not.toBe(cause);
+    expect((redacted.cause as Error).message).toBe("transport failure");
+    expect((redacted.cause as Error).cause).toBeUndefined();
+    expect(chainText(redacted)).not.toContain(KEY);
+    // The input stays as it was.
+    expect(error.cause).toBe(cause);
+    expect(error.rawMessage).toContain(KEY);
+  });
+
+  test("keeps metadata and details", () => {
+    const { error } = leaky(Code.Unavailable);
+    error.details = [];
+    const redacted = redactError(error, [KEY]) as ConnectError;
+    expect(redacted.metadata.get("x-trace")).toBe("abc");
+    expect(redacted.details).toBe(error.details);
+    expect(redacted.code).toBe(Code.Unavailable);
+    expect(classifyFailure(redacted)).toBe(FailureClass.Interruption);
+  });
+
+  test("a cause-free error stays terminal and an unchanged error keeps its identity", () => {
+    const bare = new ConnectError(`rejected ${KEY}`, Code.Unknown);
+    expect(classifyFailure(bare)).toBe(FailureClass.Terminal);
+    const redacted = redactError(bare, [KEY]) as ConnectError;
+    expect(redacted.cause).toBeUndefined();
+    expect(classifyFailure(redacted)).toBe(FailureClass.Terminal);
+    const { error } = leaky();
+    expect(redactError(error, ["unrelated-secret"])).toBe(error);
+    expect(redactError(error, [])).toBe(error);
+  });
+
+  test("a Connect error as cause is not kept and the code decides", () => {
+    const inner = new ConnectError(`inner ${KEY}`, Code.Unavailable);
+    const outer = new ConnectError(
+      `outer ${KEY}`,
+      Code.Unavailable,
+      undefined,
+      undefined,
+      inner,
+    );
+    const redacted = redactError(outer, [KEY]) as ConnectError;
+    expect(redacted.cause).toBeUndefined();
+    expect(classifyFailure(redacted)).toBe(classifyFailure(outer));
+    expect(classifyFailure(redacted)).toBe(FailureClass.Unavailable);
+  });
+
+  test("a redacted credential failure never becomes retryable", () => {
+    const credential = new OwnSandCredentialError(`token source ${KEY}`);
+    const wrapped = new ConnectError(
+      `token source ${KEY}`,
+      Code.Unknown,
+      undefined,
+      undefined,
+      credential,
+    );
+    expect(classifyFailure(wrapped)).toBe(FailureClass.Terminal);
+    const redacted = redactError(wrapped, [KEY]) as ConnectError;
+    expect(redacted.cause).toBeInstanceOf(OwnSandCredentialError);
+    expect(redacted.cause).not.toBe(credential);
+    expect((redacted.cause as Error).cause).toBeUndefined();
+    expect(classifyFailure(redacted)).toBe(FailureClass.Terminal);
+    expect(chainText(redacted)).not.toContain(KEY);
+    // A bare credential error keeps its class when its message changes.
+    const bare = redactError(credential, [KEY]);
+    expect(bare).toBeInstanceOf(OwnSandCredentialError);
+    expect(classifyFailure(bare)).toBe(FailureClass.Terminal);
+  });
+});
+
+describe("transport failures keep their classification through the client redaction", () => {
+  const protoHeaders = (type: string) => ({ "content-type": type });
+  const failingBody = () =>
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.error(new Error(`body failure ${KEY}`));
+      },
+    });
+  // The adapter fails with a plain error, or with a Connect error that
+  // already wraps the original error as its cause (a Connect-aware adapter).
+  const failures: [string, () => Error][] = [
+    ["a plain error", () => new Error(`adapter diagnostic ${KEY}`)],
+    [
+      "a Connect error with a cause",
+      () => ConnectError.from(new Error(`adapter diagnostic ${KEY}`)),
+    ],
+  ];
+  const credentials = [
+    ["an API key", { apiKey: KEY }],
+    ["an access token", { accessToken: () => KEY }],
+  ] as const;
+
+  describe.each(credentials)("with %s", (_name, credential) => {
+    const transportOf = (fetch: typeof globalThis.fetch) =>
+      createApiTransport({
+        origin: setup().api.origin,
+        credential,
+        organizationId: ORG,
+        fetch,
+        logger: undefined,
+        activity: new ActivityRegistry(),
+        now: () => 0,
+      });
+    const unary = (transport: ReturnType<typeof transportOf>) =>
+      transport.unary(
+        SandboxService.method.getSandbox,
+        undefined,
+        undefined,
+        undefined,
+        { sandboxId: SANDBOX },
+      );
+    const stream = (transport: ReturnType<typeof transportOf>) =>
+      transport.stream(
+        RelayService.method.exec,
+        undefined,
+        undefined,
+        undefined,
+        (async function* () {
+          yield create(RelayService.method.exec.input, {});
+        })(),
+      );
+
+    test.each(failures)(
+      "unary: a failed fetch (%s) stays an interruption without the secret",
+      async (_kind, fail) => {
+        const transport = transportOf(async () => {
+          throw fail();
+        });
+        const error: any = await unary(transport).catch((e) => e);
+        expect(error).toBeInstanceOf(ConnectError);
+        expect(error.message).toContain("[redacted]");
+        expect(chainText(error)).not.toContain(KEY);
+        expect(error.cause).toBeDefined();
+        expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+      },
+    );
+
+    test("unary: a failed response body read stays an interruption without the secret", async () => {
+      const transport = transportOf(
+        async () =>
+          new Response(failingBody(), {
+            status: 200,
+            headers: protoHeaders("application/proto"),
+          }),
+      );
+      const error: any = await unary(transport).catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(chainText(error)).not.toContain(KEY);
+      expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+    });
+
+    test.each(failures)(
+      "stream: a failed fetch (%s) stays an interruption without the secret",
+      async (_kind, fail) => {
+        const transport = transportOf(async () => {
+          throw fail();
+        });
+        const error: any = await stream(transport).catch((e) => e);
+        expect(error).toBeInstanceOf(ConnectError);
+        expect(chainText(error)).not.toContain(KEY);
+        expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+      },
+    );
+
+    test("stream: a failed response body read stays an interruption without the secret", async () => {
+      const transport = transportOf(
+        async () =>
+          new Response(failingBody(), {
+            status: 200,
+            headers: protoHeaders("application/connect+proto"),
+          }),
+      );
+      const res = await stream(transport);
+      const error: any = await (async () => {
+        try {
+          for await (const _ of res.message) {
+            // Drain until the stream error.
+          }
+        } catch (e) {
+          return e;
+        }
+        return undefined;
+      })();
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(chainText(error)).not.toContain(KEY);
+      expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+    });
+  });
+
+  const credentialsAndFailures = credentials.flatMap(([name, credential]) =>
+    failures.map(([kind, fail]) => [name, kind, credential, fail] as const),
+  );
+  test.each(credentialsAndFailures)(
+    "createSandbox with %s retries a one-off adapter failure (%s) with the same idempotency key",
+    async (_name, _kind, credential, fail) => {
+      const h = setup();
+      let failed = 0;
+      const client = new OwnSandClient({
+        origin: h.api.origin,
+        ...credential,
+        organizationId: ORG,
+        clock: h.clock,
+        webrtc: false,
+        env: {},
+        fetch: async (input, init) => {
+          const url = typeof input === "string" ? input : String(input);
+          if (url.endsWith("/CreateSandbox") && failed++ === 0) {
+            throw fail();
+          }
+          return h.api.fetch(input, init);
+        },
+      });
+      h.api.unary(SandboxService, "CreateSandbox", () => ({
+        sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+      }));
+      const sandbox = await h.clock.run(client.createSandbox(validCreate));
+      expect(sandbox.sandboxId).toBe(SANDBOX);
+      expect(failed).toBe(2);
+      expect(h.api.callsOf("CreateSandbox")).toHaveLength(1);
+    },
+  );
+
+  test.each(failures)(
+    "createSandbox ends after its attempts when every adapter call fails (%s), without the secret",
+    async (_kind, fail) => {
+      const h = setup();
+      const client = new OwnSandClient({
+        origin: h.api.origin,
+        apiKey: KEY,
+        organizationId: ORG,
+        clock: h.clock,
+        webrtc: false,
+        env: {},
+        fetch: async () => {
+          throw fail();
+        },
+      });
+      const error: any = await h.clock
+        .run(client.createSandbox(validCreate))
+        .catch((e) => e);
+      expect(chainText(error)).not.toContain(KEY);
+      expect(classifyFailure(error)).toBe(FailureClass.Interruption);
+    },
+  );
 });
