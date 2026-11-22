@@ -148,7 +148,11 @@ function Routes({ config }: { config: AccountsConfig }) {
   if (route.id === RouteId.Callback) {
     // Without a Logto registration there is no provider for the Logto
     // callback hook. Show the notice instead.
-    return configured ? <LogtoCallbackPage /> : <SignIn configured={false} />;
+    return config.logto !== undefined ? (
+      <LogtoCallbackPage appId={config.logto.appId} />
+    ) : (
+      <SignIn configured={false} />
+    );
   }
   if (auth.isLoading) {
     return null;
