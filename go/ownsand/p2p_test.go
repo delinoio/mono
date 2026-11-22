@@ -22,8 +22,8 @@ import (
 func holdSendAt(sess *p2pSession, n int64) <-chan struct{} {
 	waiting := make(chan struct{})
 	var calls atomic.Int64
-	sess.sendMu.Lock()
-	defer sess.sendMu.Unlock()
+	sess.sendTurn <- struct{}{}
+	defer func() { <-sess.sendTurn }()
 	sess.bufferedAmount = func() uint64 {
 		call := calls.Add(1)
 		if call < n {
@@ -176,7 +176,16 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 			if err != nil || sess == nil {
 				t.Fatalf("route: %v, %v", sess, err)
 			}
-			sess.sendMu.Lock()
+			// Hold the send turn like a stalled sender, so the request queues.
+			sess.sendTurn <- struct{}{}
+			held := true
+			releaseTurn := func() {
+				if held {
+					held = false
+					<-sess.sendTurn
+				}
+			}
+			defer releaseTurn()
 			reqCtx, stop, _ := tc.mk(ctx)
 			defer stop()
 			errc := make(chan error, 1)
@@ -199,10 +208,17 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 				stop()
 			}
 			<-reqCtx.Done()
-			sess.sendMu.Unlock()
-			if err := <-errc; !errors.Is(err, tc.want) {
-				t.Fatalf("openStream: want %v, got %v", tc.want, err)
+			// The request must return while the turn is still held: it
+			// observes its own context and does not wait for the sender.
+			select {
+			case err := <-errc:
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("openStream: want %v, got %v", tc.want, err)
+				}
+			case <-time.After(15 * time.Second):
+				t.Fatal("openStream did not return while the send turn was held")
 			}
+			releaseTurn()
 			if sess.isDone() {
 				t.Fatal("the session ended")
 			}
@@ -226,6 +242,155 @@ func TestSendContextDoneWhileWaitingForSendTurnWritesNothing(t *testing.T) {
 				t.Fatalf("%d sessions opened, want 1", n)
 			}
 		})
+	}
+}
+
+// TestSendQueuedBehindHeldTurnCancelsIndependently checks that, with the send
+// turn held, a canceled request returns at once and sends nothing, while an
+// older request that stays queued still sends its frame after the turn is
+// released, and that a canceled request does not change the session.
+func TestSendQueuedBehindHeldTurnCancelsIndependently(t *testing.T) {
+	cp := newFakeCP(t)
+	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := s.dp.route(ctx)
+	if err != nil || sess == nil {
+		t.Fatalf("route: %v, %v", sess, err)
+	}
+	sess.sendTurn <- struct{}{}
+	held := true
+	releaseTurn := func() {
+		if held {
+			held = false
+			<-sess.sendTurn
+		}
+	}
+	defer releaseTurn()
+
+	write := func(path string) *ownsandv1.WriteFileRequest {
+		return &ownsandv1.WriteFileRequest{
+			WriteId: mustID(t), Path: path, Data: []byte("x"),
+			Finish: &ownsandv1.WriteFileFinish{SizeBytes: 1, Mode: 0o644},
+		}
+	}
+	streamCount := func() int {
+		sess.mu.Lock()
+		defer sess.mu.Unlock()
+		return len(sess.streams)
+	}
+	waitStreams := func(n int) {
+		for deadline := time.Now().Add(15 * time.Second); streamCount() != n; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("%d streams registered, want %d", streamCount(), n)
+			}
+		}
+	}
+
+	keepCtx, keepCancel := context.WithCancel(ctx)
+	defer keepCancel()
+	keepErr := make(chan error, 1)
+	var kept *p2pStream
+	go func() {
+		st, err := sess.openStream(keepCtx, write("/kept"))
+		kept = st
+		keepErr <- err
+	}()
+	waitStreams(1)
+	dropCtx, dropCancel := context.WithCancel(ctx)
+	dropErr := make(chan error, 1)
+	go func() {
+		_, err := sess.openStream(dropCtx, write("/dropped"))
+		dropErr <- err
+	}()
+	waitStreams(2)
+
+	dropCancel()
+	select {
+	case err := <-dropErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled request: want context.Canceled, got %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the canceled request did not return while the send turn was held")
+	}
+	waitStreams(1)
+	select {
+	case err := <-keepErr:
+		t.Fatalf("the queued request returned while the turn was held: %v", err)
+	default:
+	}
+
+	releaseTurn()
+	select {
+	case err := <-keepErr:
+		if err != nil {
+			t.Fatalf("queued request: %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the queued request did not send after the turn was released")
+	}
+	defer kept.close()
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(time.Millisecond) {
+		if _, ok := cp.agent.file("/kept"); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the agent did not receive the queued request")
+		}
+	}
+	if _, ok := cp.agent.file("/dropped"); ok {
+		t.Fatal("the agent received the canceled request")
+	}
+	if sess.isDone() {
+		t.Fatal("the session ended")
+	}
+	if err := s.WriteFileBytes(ctx, "/after", []byte("after"), WriteOptions{}); err != nil {
+		t.Fatalf("write on the same session: %v", err)
+	}
+	if n := cp.openSessionCount(); n != 1 {
+		t.Fatalf("%d sessions opened, want 1", n)
+	}
+}
+
+// TestSendWaitingForSendTurnObservesSessionEnd checks that a request that waits
+// for the send turn returns the session's end error when the session ends.
+func TestSendWaitingForSendTurnObservesSessionEnd(t *testing.T) {
+	cp := newFakeCP(t)
+	s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	sess, err := s.dp.route(ctx)
+	if err != nil || sess == nil {
+		t.Fatalf("route: %v, %v", sess, err)
+	}
+	sess.sendTurn <- struct{}{}
+	defer func() { <-sess.sendTurn }()
+	errc := make(chan error, 1)
+	go func() {
+		_, err := sess.openStream(ctx, &ownsandv1.WriteFileRequest{WriteId: mustID(t), Path: "/never", Data: []byte("x")})
+		errc <- err
+	}()
+	for deadline := time.Now().Add(15 * time.Second); ; time.Sleep(time.Millisecond) {
+		sess.mu.Lock()
+		n := len(sess.streams)
+		sess.mu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the request did not register its stream")
+		}
+	}
+	sess.close()
+	select {
+	case err := <-errc:
+		var failed *errP2PFailed
+		if !errors.As(err, &failed) {
+			t.Fatalf("want the session end error, got %v", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("the request did not return when the session ended")
 	}
 }
 
