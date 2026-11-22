@@ -10,6 +10,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
@@ -292,6 +293,9 @@ func (h OrganizationHandler) TransferOwnership(ctx context.Context, req *connect
 	target := req.Msg.GetUserId()
 	if target == "" {
 		return nil, errInvalidf("invalid user_id: is required")
+	}
+	if err := validate.NoNUL("user_id", target); err != nil {
+		return nil, errInvalid(err)
 	}
 	var unlink billing.Change
 	var unlinkPending bool
