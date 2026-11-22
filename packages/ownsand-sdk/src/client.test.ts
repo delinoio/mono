@@ -3,7 +3,7 @@ import { getEventListeners } from "node:events";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
-import { OwnSandClient } from "./client.ts";
+import { type CreateSandboxInput, OwnSandClient } from "./client.ts";
 import {
   ActivityRegistry,
   createApiTransport,
@@ -709,18 +709,46 @@ describe("createSandbox", () => {
     expect(error.message).not.toContain("123456");
   });
 
-  test.each([
-    ["the largest vCPU count", { vcpuCount: 2 ** 31 - 1 }],
+  type Resources = CreateSandboxInput["resources"];
+  const acceptedResources: [
+    name: string,
+    resources: Partial<Resources>,
+    want: { vcpuCount: number; memoryMib: bigint; diskGib: bigint },
+  ][] = [
+    [
+      "the largest vCPU count",
+      { vcpuCount: 2 ** 31 - 1 },
+      { vcpuCount: 2 ** 31 - 1, memoryMib: 2048n, diskGib: 10n },
+    ],
     [
       "the largest safe integer sizes",
       {
         memoryMib: Number.MAX_SAFE_INTEGER,
         diskGib: Number.MAX_SAFE_INTEGER,
       },
+      {
+        vcpuCount: 2,
+        memoryMib: BigInt(Number.MAX_SAFE_INTEGER),
+        diskGib: BigInt(Number.MAX_SAFE_INTEGER),
+      },
     ],
-    ["bigint sizes", { memoryMib: 4096n, diskGib: 20n }],
-    ["the largest bigint sizes", { memoryMib: MAX_INT64, diskGib: MAX_INT64 }],
-  ])("accepts %s", async (_name, resources) => {
+    [
+      "bigint sizes",
+      { memoryMib: 4096n, diskGib: 20n },
+      { vcpuCount: 2, memoryMib: 4096n, diskGib: 20n },
+    ],
+    [
+      "the largest bigint sizes",
+      { memoryMib: MAX_INT64, diskGib: MAX_INT64 },
+      { vcpuCount: 2, memoryMib: MAX_INT64, diskGib: MAX_INT64 },
+    ],
+    [
+      "a bigint size next to a number size",
+      { memoryMib: 4096n, diskGib: 20 },
+      { vcpuCount: 2, memoryMib: 4096n, diskGib: 20n },
+    ],
+  ];
+  test.each(acceptedResources)("accepts %s", async (_name, resources, want) => {
     const h = setup();
     h.api.unary(SandboxService, "CreateSandbox", () => ({
       sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
@@ -728,13 +756,21 @@ describe("createSandbox", () => {
     await h.client.createSandbox({
       ...validCreate,
       resources: { ...goodResources, ...resources },
-    } as never);
+    });
     const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
-    expect(req.resources.vcpuCount).toBe(
-      (resources as { vcpuCount?: number }).vcpuCount ?? 2,
-    );
-    expect(typeof req.resources.memoryMib).toBe("bigint");
-    expect(typeof req.resources.diskGib).toBe("bigint");
+    expect(req.resources.vcpuCount).toBe(want.vcpuCount);
+    expect(req.resources.memoryMib).toBe(want.memoryMib);
+    expect(req.resources.diskGib).toBe(want.diskGib);
+  });
+
+  test("types vcpuCount as a number only", () => {
+    const resources: Resources = {
+      // @ts-expect-error vcpuCount is an int32 and takes no bigint.
+      vcpuCount: 1n,
+      memoryMib: 1n,
+      diskGib: 1n,
+    };
+    expect(resources.memoryMib).toBe(1n);
   });
 
   test("accepts a max TTL of exactly 7 days", async () => {
