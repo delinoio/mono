@@ -1886,9 +1886,6 @@ func TestLockSnapshotImportCanceledContextAbortsWithFreeLock(t *testing.T) {
 // current deadline with a newer revision after storage recovers, without
 // another activity event, and a successful report still follows the throttle.
 func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
-	if os.Getuid() == 0 {
-		t.Skip("permission faults do not apply to root")
-	}
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	acked := e.out.lastEntry(id)
@@ -1899,21 +1896,39 @@ func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
 	e.m.Touch(id)
 	wantDeadline := e.clk.Now().Add(10 * time.Minute)
 
-	// A read-only state directory makes the revision write in agent.json
-	// fail. The sandbox record directory stays writable, so only the revision
-	// persistence fails.
-	root := e.st.Path()
-	if err := os.Chmod(root, 0o500); err != nil {
+	// A directory in place of agent.json makes the revision write fail: the
+	// store cannot read the file that holds the revision counter. The fault
+	// does not depend on directory permissions, which neither block file
+	// creation on Windows nor apply to root, and the sandbox record directory
+	// stays writable, so only the revision persistence fails.
+	agentFile := e.st.Path(store.AgentFile)
+	savedAgentFile := agentFile + ".saved"
+	if err := os.Rename(agentFile, savedAgentFile); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+	if err := os.Mkdir(agentFile, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// restoreAgentFile puts agent.json back; it is idempotent so that the
+	// cleanup also covers a failed assertion before the explicit restore.
+	restoreAgentFile := func() {
+		if _, err := os.Stat(savedAgentFile); err != nil {
+			return
+		}
+		if err := os.Remove(agentFile); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(savedAgentFile, agentFile); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(restoreAgentFile)
 	e.m.Tick(context.Background(), false)
 	if e.out.count() != n {
 		t.Fatal("idle deadline reported although the revision write failed")
 	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	restoreAgentFile()
 
 	// Storage recovered; no new Touch. The next tick retries.
 	e.m.Tick(context.Background(), false)
