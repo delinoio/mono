@@ -13,6 +13,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  readdirSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -1479,6 +1480,121 @@ test("targets build sites without uploading them", { skip }, (t) => {
     "pnpm exec turbo run build --filter=site",
   ]);
 });
+
+// Sites whose `deploy.buildEnv` maps build variables to repository variables.
+const sitesWithBuildEnv = JSON.stringify([
+  {
+    name: "docs",
+    version: "1.0.0",
+    project: "docs",
+    output: "apps/docs/dist",
+    buildEnv: {
+      PUBLIC_LOGTO_ENDPOINT: "LOGTO_ENDPOINT",
+      PUBLIC_LOGTO_APP_ID: "DOCS_LOGTO_APP_ID",
+    },
+  },
+  {
+    name: "site",
+    version: "1.0.0",
+    project: "site",
+    output: "apps/site/dist",
+    buildEnv: {
+      PUBLIC_LOGTO_ENDPOINT: "LOGTO_ENDPOINT",
+      PUBLIC_LOGTO_APP_ID: "SITE_LOGTO_APP_ID",
+    },
+  },
+]);
+
+// Records the build variables that each `pnpm` call received.
+const pnpmEnvBody =
+  'printf "%s|%s|%s\\n" "${PUBLIC_LOGTO_ENDPOINT-unset}" "${PUBLIC_LOGTO_APP_ID-unset}" "${PUBLIC_OTHER-unset}" >> "$STUB_DIR/env.log"';
+
+test("targets build each site with its mapped variables", { skip }, (t) => {
+  const result = runTargets(t, "build-static-sites", {
+    env: {
+      SITES: sitesWithBuildEnv,
+      PUBLIC_OTHER: "from runner",
+      BUILD_VARIABLES: JSON.stringify({
+        // GitHub variable names are case-insensitive.
+        logto_endpoint: "https://auth.example.com",
+        DOCS_LOGTO_APP_ID: "docs app\nwith a line feed",
+        SITE_LOGTO_APP_ID: "site-app",
+        UNUSED: "x",
+      }),
+    },
+    pnpmBody: pnpmEnvBody,
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  assert.deepEqual(result.calls, [
+    "pnpm exec turbo run build --filter=docs",
+    "pnpm exec turbo run build --filter=site",
+  ]);
+  assert.equal(
+    readFileSync(join(result.dir, "env.log"), "utf8"),
+    "https://auth.example.com|docs app\nwith a line feed|from runner\n" +
+      "https://auth.example.com|site-app|from runner\n",
+  );
+  // Names only: the log does not repeat the values.
+  assert.match(
+    result.stdout,
+    /Build variables: PUBLIC_LOGTO_ENDPOINT,PUBLIC_LOGTO_APP_ID/,
+  );
+  assert.doesNotMatch(result.stdout, /site-app/);
+  assert.deepEqual(
+    readdirSync(result.dir).filter((f) => f.startsWith("build-env-")),
+    [],
+  );
+});
+
+test(
+  "targets fail before a site build when a mapped variable is missing",
+  { skip },
+  (t) => {
+    for (const variables of [
+      undefined,
+      "",
+      JSON.stringify({ LOGTO_ENDPOINT: "https://auth.example.com" }),
+      JSON.stringify({
+        LOGTO_ENDPOINT: "https://auth.example.com",
+        DOCS_LOGTO_APP_ID: "",
+      }),
+      JSON.stringify({
+        LOGTO_ENDPOINT: "https://auth.example.com",
+        DOCS_LOGTO_APP_ID: "a\u0000b",
+      }),
+    ]) {
+      const result = runTargets(t, "build-static-sites", {
+        env: {
+          SITES: sitesWithBuildEnv,
+          ...(variables === undefined ? {} : { BUILD_VARIABLES: variables }),
+        },
+        pnpmBody: pnpmEnvBody,
+      });
+      assert.equal(result.status, 1, variables);
+      assert.match(
+        result.stderr,
+        /::error::The build of docs needs repository variables that are not set, are empty or contain NUL: .*PUBLIC_LOGTO_APP_ID \(repository variable DOCS_LOGTO_APP_ID\)/,
+        variables,
+      );
+      assert.deepEqual(result.calls, [""], variables);
+    }
+  },
+);
+
+test(
+  "targets reject BUILD_VARIABLES that is not an object of strings",
+  { skip },
+  (t) => {
+    for (const variables of ["[]", "not json", '{"A":1}']) {
+      const result = runTargets(t, "build-static-sites", {
+        env: { BUILD_VARIABLES: variables },
+      });
+      assert.equal(result.status, 1, variables);
+      assert.match(result.stderr, /BUILD_VARIABLES is not a JSON object/);
+      assert.deepEqual(result.calls, [""], variables);
+    }
+  },
+);
 
 test(
   "targets fail when a site build or its output is missing",

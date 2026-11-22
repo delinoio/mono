@@ -57,17 +57,36 @@ const selectAccess = `SELECT a.billing_account_id::text, a.name, a.create_time, 
 	JOIN billing_account_members m ON m.billing_account_id = a.billing_account_id AND m.user_id = $2
 	WHERE a.billing_account_id = $1 AND a.delete_time IS NULL`
 
+// lockAccountRow locks the live billing account row until the transaction
+// ends.
+const lockAccountRow = `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 AND delete_time IS NULL FOR UPDATE`
+
 // loadAccess returns the billing account and the caller's role. A missing or
 // deleted billing account and a caller without a membership are all
 // not_found, so callers cannot discover other billing accounts.
+//
+// With lockAccount the account row is locked in its own statement before the
+// membership is read. A single statement that joins the membership and
+// appends FOR UPDATE OF the account reads the unlocked membership row in the
+// snapshot taken before the lock wait (READ COMMITTED does not re-read it),
+// so a role changed by the transaction that held the lock would be missed.
+// Every membership change takes the account lock first, so the second
+// statement, which takes its snapshot after the lock is granted, sees the
+// committed membership.
 func loadAccess(ctx context.Context, q db.Querier, accountID, userID string, mode lockMode) (billingAccount, error) {
-	query := selectAccess
 	if mode == lockAccount {
-		query += " FOR UPDATE OF a"
+		var locked int
+		err := q.QueryRow(ctx, lockAccountRow, accountID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return billingAccount{}, notFound("billing account not found")
+		}
+		if err != nil {
+			return billingAccount{}, err
+		}
 	}
 	var a billingAccount
 	var role string
-	err := q.QueryRow(ctx, query, accountID, userID).Scan(&a.ID, &a.Name, &a.CreateTime, &a.Balance, &role)
+	err := q.QueryRow(ctx, selectAccess, accountID, userID).Scan(&a.ID, &a.Name, &a.CreateTime, &a.Balance, &role)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return billingAccount{}, notFound("billing account not found")
 	}

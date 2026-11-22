@@ -530,6 +530,60 @@ func TestReportUsageAttributionThroughLinkHistory(t *testing.T) {
 	}
 }
 
+// startOfNextWindow advances the clock to 30 seconds into the next 5-minute
+// window and returns the start of that window.
+func startOfNextWindow(env *testenv.Env) time.Time {
+	now := env.Clock.Now()
+	start := window(now).Add(billing.WindowLength)
+	env.Clock.Advance(start.Add(30 * time.Second).Sub(now))
+	return start
+}
+
+// emptyLink makes the link of the organization an empty interval, as a link
+// that was unlinked at the instant it started. It changes only the current
+// link.
+func emptyLink(t *testing.T, env *testenv.Env, org string) {
+	t.Helper()
+	tag, err := env.DB.Pool.Exec(ctx(), `UPDATE organization_links SET unlink_time = link_time WHERE organization_id = $1 AND unlink_time IS NULL`, org)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("empty the link: %v (%d rows)", err, tag.RowsAffected())
+	}
+}
+
+func TestReportUsageIgnoresEmptyLinkInterval(t *testing.T) {
+	env := testenv.New(t)
+	a := newFixture(t, env)
+	b := newFixture(t, env)
+	subscribe(t, env, a)
+	subscribe(t, env, b)
+
+	// An empty link that is the latest one inside the window does not take
+	// the report from the older link that overlapped the window.
+	org := newOrg(t)
+	start := startOfNextWindow(env)
+	link(t, env, a.AccountID, org, a.Owner.ID, "")
+	env.Clock.Advance(30 * time.Second)
+	unlink(t, env, org)
+	link(t, env, b.AccountID, org, b.Owner.ID, "")
+	emptyLink(t, env, org)
+	env.Clock.Advance(4 * time.Minute) // the window may end at most a minute after the server time
+	res := reportUsage(t, env.Service(), report(org, meterStorage, start, 3, 5_000)).GetResults()[0]
+	if res.GetUnattributed() || res.GetBillingAccountId() != a.AccountID {
+		t.Fatalf("report with an empty newer link = %v, want billing account %q", res, a.AccountID)
+	}
+
+	// Without another overlapping link the report is unattributed.
+	org2 := newOrg(t)
+	start2 := startOfNextWindow(env)
+	link(t, env, a.AccountID, org2, a.Owner.ID, "")
+	emptyLink(t, env, org2)
+	env.Clock.Advance(4 * time.Minute)
+	res2 := reportUsage(t, env.Service(), report(org2, meterStorage, start2, 3, 5_000)).GetResults()[0]
+	if !res2.GetUnattributed() || res2.GetBillingAccountId() != "" || res2.GetLedgerEntryId() != "" {
+		t.Fatalf("report with only an empty link = %v, want unattributed", res2)
+	}
+}
+
 func TestBillingStatusPollCursor(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)

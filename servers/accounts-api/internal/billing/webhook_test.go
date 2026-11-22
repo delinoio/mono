@@ -5,6 +5,7 @@ package billing
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -242,6 +243,93 @@ func TestEmailDeliveryRetry(t *testing.T) {
 	}
 }
 
+// emailsTo counts the recorded emails of one recipient address.
+func emailsTo(f *fixture, addr string) int {
+	n := 0
+	for _, m := range f.email.Messages() {
+		if m.To == addr {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEmailDeliveryContinuesAfterRecipientFailure pins that one recipient
+// that keeps failing does not keep a later recipient from getting the
+// email, and that the notification is still abandoned after the retry
+// budget.
+func TestEmailDeliveryContinuesAfterRecipientFailure(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	// Recipients sort by user ID: "admin-N" comes before "owner-N".
+	var adminID, ownerID string
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT
+		(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'admin'),
+		(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'owner')`,
+		acct).Scan(&adminID, &ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if adminID >= ownerID {
+		t.Fatalf("admin %q must sort before owner %q", adminID, ownerID)
+	}
+	adminAddr, ownerAddr := adminID+"@example.com", ownerID+"@example.com"
+	f.grant(acct, LedgerManualTopUp, 25*usd)
+	f.deduct(acct, 20*usd)
+
+	// The first sorted recipient always fails, the second succeeds.
+	f.email.SetErrFor(adminAddr, errSendTest)
+	for i := 0; i < notificationMaxAttempts+2; i++ {
+		if err := f.s.DeliverNotifications(ctx()); err != nil {
+			t.Fatal(err)
+		}
+		f.clock.Advance(time.Hour)
+	}
+	if got := emailsTo(f, ownerAddr); got != 1 {
+		t.Fatalf("emails to the second recipient = %d, want exactly 1", got)
+	}
+	if got := emailsTo(f, adminAddr); got != 0 {
+		t.Fatalf("emails to the failing recipient = %d", got)
+	}
+	var attempts int
+	var abandoned bool
+	var delivered int
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT n.attempts, n.abandon_time IS NOT NULL,
+			(SELECT count(*) FROM billing_notification_deliveries d WHERE d.notification_id = n.notification_id)
+		FROM billing_notifications n WHERE n.billing_account_id = $1 AND n.kind = $2`,
+		acct, string(NotifyLowBalance)).Scan(&attempts, &abandoned, &delivered); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != notificationMaxAttempts || !abandoned || delivered != 1 {
+		t.Fatalf("attempts %d abandoned %v deliveries %d", attempts, abandoned, delivered)
+	}
+
+	// A transient failure of the first recipient delivers to both after the
+	// retry, and the second recipient is not emailed twice.
+	acct2 := f.account()
+	var admin2 string
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT user_id FROM billing_account_members
+		WHERE billing_account_id = $1 AND role = 'admin'`, acct2).Scan(&admin2); err != nil {
+		t.Fatal(err)
+	}
+	f.grant(acct2, LedgerManualTopUp, 25*usd)
+	f.deduct(acct2, 20*usd)
+	f.email.SetErrFor(admin2+"@example.com", errSendTest)
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	f.email.SetErrFor(admin2+"@example.com", nil)
+	f.clock.Advance(2 * time.Minute)
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := emailsTo(f, admin2+"@example.com"); got != 1 {
+		t.Fatalf("emails to the recovered recipient = %d, want 1", got)
+	}
+}
+
 type sendError struct{}
 
 func (sendError) Error() string { return "send failed" }
@@ -328,6 +416,105 @@ func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
 	f.webhook("subscription.created", map[string]any{"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": f.clock.Now()})
 	sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
 	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub {
+		t.Fatalf("subscription = %+v", sub)
+	}
+}
+
+// TestLateActiveEventDoesNotReplaceNewCheckout checks that a late event of an
+// earlier subscription, in any status, leaves the row of a new open checkout
+// PENDING, also when its updated_at is after the cancellation, and that the
+// subscription of the checkout transaction still completes it. A PENDING row
+// without a checkout transaction accepts the first entity.
+func TestLateActiveEventDoesNotReplaceNewCheckout(t *testing.T) {
+	for _, status := range []string{
+		paddle.SubscriptionStatusActive, paddle.SubscriptionStatusTrialing,
+		paddle.SubscriptionStatusPastDue, paddle.SubscriptionStatusPaused,
+	} {
+		for _, afterCancel := range []bool{false, true} {
+			name := status
+			if afterCancel {
+				name += " after the cancellation"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newFixture(t)
+				acct := f.account()
+				f.credit(acct, 1000)
+				oldSub := f.activate(acct)
+				cancelTime := f.clock.Now()
+				f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": cancelTime})
+				txnID := f.checkout(acct)
+				org := f.link(acct, "Acme")
+				logs := f.captureLogs()
+
+				updatedAt := cancelTime.Add(-time.Hour)
+				if afterCancel {
+					updatedAt = cancelTime.Add(time.Hour)
+				}
+				f.webhook("subscription.updated", map[string]any{"id": oldSub, "status": status, "updated_at": updatedAt})
+				sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+				if sub.Status != SubscriptionPending || sub.CheckoutTransactionID != txnID || sub.PaddleSubscriptionID != "" {
+					t.Fatalf("subscription after the late %s event = %+v", status, sub)
+				}
+				if got := f.status(org).Status; got == StatusAllowed {
+					t.Fatalf("organization status = %s after the late event", got)
+				}
+				if !strings.Contains(logs.String(), "billing_subscription_entity_ignored") ||
+					!strings.Contains(logs.String(), `"billing_account_id":"`+acct+`"`) ||
+					!strings.Contains(logs.String(), `"paddle_subscription_id":"`+oldSub+`"`) {
+					t.Fatalf("logs do not name the ignored entity: %s", logs)
+				}
+				// The open checkout is still returned, not already_exists.
+				if again := f.checkout(acct); again != txnID {
+					t.Fatalf("second StartSubscription = %s, want %s", again, txnID)
+				}
+				// The subscription of the checkout transaction completes it.
+				newSub := f.paddle.NewID("sub")
+				f.webhook("subscription.created", map[string]any{"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": f.clock.Now()})
+				sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+				if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub || sub.CheckoutTransactionID != "" {
+					t.Fatalf("subscription after subscription.created = %+v", sub)
+				}
+			})
+		}
+	}
+}
+
+// TestUpdateBeforeCreatedActivatesNewCheckout checks that an update of the
+// new subscription that arrives before its subscription.created is accepted,
+// because its ID was not recorded before.
+func TestUpdateBeforeCreatedActivatesNewCheckout(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	oldSub := f.activate(acct)
+	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now()})
+	f.checkout(acct)
+	newSub := f.paddle.NewID("sub")
+	f.webhook("subscription.updated", map[string]any{
+		"id": newSub, "status": "active", "updated_at": f.clock.Now().Add(time.Minute),
+		"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
+	})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub {
+		t.Fatalf("subscription = %+v", sub)
+	}
+}
+
+// TestPendingWithoutCheckoutAcceptsFirstEntity checks that a PENDING row
+// without a checkout transaction accepts the first entity of an earlier
+// subscription.
+func TestPendingWithoutCheckoutAcceptsFirstEntity(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.tx(func(tx pgx.Tx) error {
+		return saveSubscription(ctx(), tx, acct, Subscription{Status: SubscriptionPending}, "", f.s.timestamp())
+	})
+	first := f.paddle.NewID("sub")
+	f.webhook("subscription.updated", map[string]any{
+		"id": first, "status": "active", "updated_at": f.clock.Now(),
+		"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
+	})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != first {
 		t.Fatalf("subscription = %+v", sub)
 	}
 }
