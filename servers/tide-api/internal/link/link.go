@@ -74,6 +74,8 @@ type RemovalHook struct {
 	Name    string
 	Prepare func(ctx context.Context, orgID string) error
 	InTx    func(ctx context.Context, tx pgx.Tx, orgID string) error
+	// AfterCommit runs after the link is deleted (best effort).
+	AfterCommit func(ctx context.Context, orgID string)
 }
 
 // Links reads links and builds the OwnSand clients of organizations.
@@ -445,6 +447,11 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		return nil, s.Internal(ctx, "remove ownsand link", err)
 	}
 	l.forget(c.OrganizationID)
+	for _, hook := range l.hooks {
+		if hook.AfterCommit != nil {
+			hook.AfterCommit(context.WithoutCancel(ctx), c.OrganizationID)
+		}
+	}
 	s.Logger.InfoContext(ctx, "ownsand_link_removed", slog.String("organization_id", c.OrganizationID))
 	return connect.NewResponse(&tidev1.RemoveOwnSandLinkResponse{}), nil
 }

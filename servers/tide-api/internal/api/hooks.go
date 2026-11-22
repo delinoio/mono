@@ -98,6 +98,10 @@ type OrganizationDeletionHook struct {
 	// AfterCommit runs after the organization is deleted, for example to
 	// stop in-memory vendor watchers of the organization at once.
 	AfterCommit func(ctx context.Context, d OrganizationDeletion)
+	// Abort runs when the deletion fails after Prepare ran (for example,
+	// the owner transferred the ownership meanwhile), so a hook can undo
+	// what Prepare stopped. It runs for every hook whose Prepare succeeded.
+	Abort func(ctx context.Context, d OrganizationDeletion)
 }
 
 // Hooks holds the registered extension hooks.
@@ -130,17 +134,28 @@ func (s *Service) membershipEndAfterCommit(ctx context.Context, e MembershipEnd)
 }
 
 func (s *Service) organizationDeletionPrepare(ctx context.Context, d OrganizationDeletion) error {
-	for _, h := range s.Hooks.OrganizationDeletion {
+	for i, h := range s.Hooks.OrganizationDeletion {
 		if h.Prepare == nil {
 			continue
 		}
 		if err := h.Prepare(ctx, d); err != nil {
 			s.Logger.WarnContext(ctx, "organization_deletion_prepare_failed", slog.String("hook", h.Name),
 				slog.String("organization_id", d.OrganizationID), slog.Any("error", err))
+			s.organizationDeletionAbort(ctx, d, i)
 			return err
 		}
 	}
 	return nil
+}
+
+// organizationDeletionAbort runs the Abort hooks of the first n hooks.
+func (s *Service) organizationDeletionAbort(ctx context.Context, d OrganizationDeletion, n int) {
+	ctx = context.WithoutCancel(ctx)
+	for _, h := range s.Hooks.OrganizationDeletion[:n] {
+		if h.Abort != nil {
+			h.Abort(ctx, d)
+		}
+	}
 }
 
 func (s *Service) organizationDeletionInTx(ctx context.Context, tx pgx.Tx, d OrganizationDeletion) error {

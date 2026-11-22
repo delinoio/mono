@@ -167,6 +167,7 @@ func (h OrganizationHandler) DeleteOrganization(ctx context.Context, req *connec
 		return err
 	})
 	if err != nil {
+		h.organizationDeletionAbort(ctx, d, len(h.Hooks.OrganizationDeletion))
 		return nil, h.Internal(ctx, "delete organization", err)
 	}
 	h.organizationDeletionAfterCommit(ctx, d)
