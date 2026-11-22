@@ -157,6 +157,8 @@ type Fake struct {
 	mu       sync.Mutex
 	messages []Message
 	err      error
+	// errFor holds the per-recipient errors, keyed by the To address.
+	errFor map[string]error
 }
 
 // NewFake returns an empty fake sender.
@@ -169,6 +171,9 @@ func (f *Fake) Send(_ context.Context, msg Message) error {
 	if f.err != nil {
 		return f.err
 	}
+	if err := f.errFor[msg.To]; err != nil {
+		return err
+	}
 	f.messages = append(f.messages, msg)
 	return nil
 }
@@ -179,6 +184,22 @@ func (f *Fake) SetErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = err
+}
+
+// SetErrFor makes every Send to the address to fail with err without
+// recording the message, while other recipients still succeed; nil restores
+// normal delivery for that address. SetErr takes precedence.
+func (f *Fake) SetErrFor(to string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err == nil {
+		delete(f.errFor, to)
+		return
+	}
+	if f.errFor == nil {
+		f.errFor = map[string]error{}
+	}
+	f.errFor[to] = err
 }
 
 // Messages returns a copy of the recorded messages in send order.
