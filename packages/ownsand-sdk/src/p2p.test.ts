@@ -1609,6 +1609,83 @@ describe("peer-to-peer data path", () => {
       expect(readOffsets(p.rtc)).toEqual([0n]);
     });
 
+    test("a read cancelled while the consumer is paused delivers no buffered chunk and no success", async () => {
+      // Three chunks and the end frame arrive while the consumer holds the
+      // first chunk: the queue then holds a buffered terminal frame.
+      const file = source(3 << 10);
+      const p = p2pSetup(readAgent(file, 1 << 10));
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const chunks: Uint8Array[] = [];
+      const wait = gate();
+      const done = (async () => {
+        for await (const chunk of p.h.client
+          .sandbox(SANDBOX)
+          .readFile("/big", { signal: controller.signal })) {
+          chunks.push(chunk);
+          if (chunks.length === 1) await wait.promise;
+        }
+        return "completed";
+      })().catch((e: unknown) => e);
+      await p.h.clock.advance(1000);
+      expect(chunks).toHaveLength(1);
+      controller.abort(reason);
+      wait.open();
+      expect(await p.h.clock.run(done)).toBe(reason);
+      // Only the chunk that was delivered before the abort.
+      expect(chunks).toHaveLength(1);
+    });
+
+    test("a transport failure still lets the consumer drain the buffered chunks", async () => {
+      const file = source(3 << 10);
+      let peerRef: FakeAgentPeer | undefined;
+      const p = p2pSetup((frame, peer) => {
+        if (frame.payload.case !== "fileReadRequest") return;
+        peerRef = peer;
+        for (let at = 0; at < file.length; at += 1 << 10) {
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_READ_EVENT,
+            payload: {
+              case: "fileReadEvent",
+              value: {
+                event: {
+                  case: "chunk",
+                  value: {
+                    offset: BigInt(at),
+                    data: file.subarray(at, at + (1 << 10)),
+                  },
+                },
+              },
+            },
+          });
+        }
+      });
+      const chunks: Uint8Array[] = [];
+      const wait = gate();
+      const done = (async () => {
+        for await (const chunk of p.h.client
+          .sandbox(SANDBOX)
+          .readFile("/big")) {
+          chunks.push(chunk);
+          if (chunks.length === 1) await wait.promise;
+        }
+      })().catch((e: unknown) => e);
+      await p.h.clock.advance(1000);
+      expect(chunks).toHaveLength(1);
+      // The channel fails while two chunks are still buffered.
+      peerRef!.fail();
+      await p.h.clock.settle();
+      wait.open();
+      await p.h.clock.run(done);
+      // The buffered chunks were delivered before the failure took effect;
+      // the read then continued from the delivered offset.
+      expect(chunks.length).toBeGreaterThanOrEqual(3);
+      expect(chunks[1]!.length).toBe(1 << 10);
+      expect(readOffsets(p.rtc)[0]).toBe(0n);
+    });
+
     test("a burst below both limits is queued without failing the stream", async () => {
       // 64 frames of 1 KiB: the chunks and the end frame reach 64 frames at
       // the most, below 8 MiB.

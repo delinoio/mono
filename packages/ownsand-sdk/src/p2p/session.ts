@@ -371,6 +371,12 @@ export class PeerSession {
         signal,
       );
       for await (const frame of queue) {
+        // The queue hands out its buffered frames before it reports a stored
+        // failure, which is right for a transport failure but not for the
+        // caller's own cancellation: a cancelled caller gets the abort reason
+        // before any more output, and a buffered final frame cannot turn the
+        // cancellation into a success.
+        throwIfAborted(signal);
         if (frame.payload.case === "error") {
           throw connectErrorFromDetail(frame.payload.value);
         }
@@ -381,6 +387,8 @@ export class PeerSession {
           continue;
         }
         yield accepted.value;
+        // The consumer can abort while it handles the yielded value.
+        throwIfAborted(signal);
         if (accepted.final) {
           return;
         }
