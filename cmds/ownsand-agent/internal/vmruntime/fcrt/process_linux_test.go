@@ -497,7 +497,10 @@ func (f *fixture) trackedVM(id string, pid int) (*vm, chan struct{}) {
 		f.t.Fatal(err)
 	}
 	exited := make(chan struct{})
+	// The fixture has no reaper: the test closes exited, so the launch gate
+	// stays open and a stop signals the group.
 	v := &vm{id: id, dir: dir, dirFile: dirFile, exited: exited, cmd: &exec.Cmd{Process: &os.Process{Pid: pid}}}
+	v.launch = &launch{pid: pid, exited: exited}
 	f.r.mu.Lock()
 	f.r.vms[id] = v
 	f.r.mu.Unlock()
