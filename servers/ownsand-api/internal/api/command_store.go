@@ -56,20 +56,42 @@ func (c *commandStore) remove(id string) {
 	c.mu.Unlock()
 }
 
-// take removes and returns the record of a command. A record whose grace
-// period has passed counts as absent, also before the sweep removed it.
-func (c *commandStore) take(id string, now time.Time, grace time.Duration) (commandInfo, bool) {
+// takeOutcome is the result of commandStore.take.
+type takeOutcome int
+
+const (
+	// takeUnknown means the command has no live record: it never existed,
+	// was already consumed, or its grace period has passed.
+	takeUnknown takeOutcome = iota
+	// takeFound means the record belongs to the reporting device; take
+	// consumed it.
+	takeFound
+	// takeWrongDevice means a live record exists for another device; take
+	// left it in place.
+	takeWrongDevice
+)
+
+// take consumes the record of a command for the device that reports its
+// result. A record whose grace period has passed counts as absent, also
+// before the sweep removed it, and is removed. A live record of another
+// device stays in the store, so a result from the wrong device cannot
+// discard the command that its expected device still has to complete.
+func (c *commandStore) take(id, deviceID string, now time.Time, grace time.Duration) (commandInfo, takeOutcome) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	p, ok := c.m[id]
 	if !ok {
-		return commandInfo{}, false
+		return commandInfo{}, takeUnknown
+	}
+	if p.expired(now, grace) {
+		delete(c.m, id)
+		return commandInfo{}, takeUnknown
+	}
+	if p.info.deviceID != deviceID {
+		return commandInfo{}, takeWrongDevice
 	}
 	delete(c.m, id)
-	if p.expired(now, grace) {
-		return commandInfo{}, false
-	}
-	return p.info, true
+	return p.info, takeFound
 }
 
 // markClosed starts the expiry of the commands that were sent on the

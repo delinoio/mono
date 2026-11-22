@@ -237,3 +237,72 @@ func TestLostResultAfterGraceChangesNothing(t *testing.T) {
 		t.Fatalf("the ignored result changed the sandbox: %v", sb.GetState())
 	}
 }
+
+// TestWrongDeviceResultKeepsPendingCommand checks that a result for a
+// command that another device reports is rejected without discarding the
+// pending command: the device that received the command still completes it
+// exactly once and its sandbox state is applied.
+func TestWrongDeviceResultKeepsPendingCommand(t *testing.T) {
+	timing := commandExpiryTiming()
+	env := testenv.New(t, func(o *app.Options) { o.Timing = timing })
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	svc := env.App.Service
+	c := org.OwnerClient
+	_, agentA := setupAgent(t, env, org, nil)
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(createReq(org.ID)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxID := created.Msg.GetSandbox().GetSandboxId()
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
+	// A second device of the organization connects after the sandbox is placed.
+	_, agentB := setupAgent(t, env, org, nil)
+	agentB.WaitFor("state report ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateAck().GetStateReport() != nil })
+
+	withholdAll(agentA)
+	if _, err := c.Sandbox.PauseSandbox(ctx, connect.NewRequest(&ownsandv1.PauseSandboxRequest{OrganizationId: org.ID, SandboxId: sandboxID})); err != nil {
+		t.Fatal(err)
+	}
+	var commandID string
+	for _, cmd := range agentA.Commands() {
+		if cmd.GetPauseSandbox() != nil {
+			commandID = cmd.GetCommandId()
+		}
+	}
+	if commandID == "" {
+		t.Fatal("device A received no pause command")
+	}
+	if got := svc.PendingCommands(); got != 1 {
+		t.Fatalf("pending commands after the pause = %d, want 1", got)
+	}
+
+	// Device B reports a result for the command of device A.
+	agentB.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{CommandId: commandID}}})
+	testenv.Eventually(t, "the wrong-device result was logged", func() bool { return countLogs(env, "agent_command_result_wrong_device") == 1 })
+	if got := svc.PendingCommands(); got != 1 {
+		t.Fatalf("pending commands after the wrong device's result = %d, want 1", got)
+	}
+
+	// Device A completes the command, and its sandbox state is applied.
+	paused := agentA.SetSandbox(sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED)
+	result := &ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_CommandResult{CommandResult: &ownsandv1.AgentCommandResult{
+		CommandId: commandID, Result: &ownsandv1.AgentCommandResult_Sandbox{Sandbox: &ownsandv1.SandboxCommandResult{Sandbox: paused}},
+	}}}
+	agentA.Send(result)
+	waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)
+	testenv.Eventually(t, "the result removed the record", func() bool { return svc.PendingCommands() == 0 })
+
+	// A repeated result finds no record.
+	agentA.Send(result)
+	testenv.Eventually(t, "the repeated result was unknown", func() bool { return countLogs(env, "agent_command_result_unknown") == 1 })
+	applied := 0
+	for _, line := range strings.Split(env.Logs.String(), "\n") {
+		if strings.Contains(line, `"msg":"agent_command_result"`) && strings.Contains(line, commandID) {
+			applied++
+		}
+	}
+	if applied != 1 {
+		t.Fatalf("applied results of the pause command = %d, want 1", applied)
+	}
+}
