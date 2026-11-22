@@ -9,6 +9,7 @@ package layers
 
 import (
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent/cursor"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/devsession"
 	"github.com/delinoio/mono/servers/tide-api/internal/github"
@@ -36,6 +37,8 @@ type Options struct {
 	// AgentTiming overrides the agent session watcher and claim poller
 	// intervals (tests); zero selects the production values.
 	AgentTiming agent.Timing
+	// Cursor configures the Cursor vendor (API origin, intervals).
+	Cursor cursor.Options
 }
 
 // Layers holds the shared parts of the wired layers, for tests.
@@ -48,6 +51,7 @@ type Layers struct {
 	DevSessions  *devsession.Handler
 	GitHub       *github.Layer
 	Agents       *agent.Hub
+	Cursor       *cursor.Vendor
 }
 
 // Extensions returns the extensions; New fills out while it wires the app.
@@ -72,6 +76,7 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 			out.DevSessions = devsession.Register(r, out.Engine, opts.DevSessionTiming)
 			out.GitHub = github.Register(r, out.Engine, m, opts.GitHub)
 			out.Agents = agent.Register(r, out.Engine, out.Integrations, opts.AgentTiming)
+			out.Cursor = cursor.Register(out.Agents, opts.Cursor)
 			return nil
 		},
 	}

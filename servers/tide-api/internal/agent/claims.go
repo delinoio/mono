@@ -193,10 +193,10 @@ func (h *Hub) profileFor(ctx context.Context, q db.Querier, in integration.Integ
 // admit claims a pending vendor request and creates its tide request:
 //
 //   - When an open request of the vendor request exists and is QUEUED or
-//     STARTING, the vendor shows the entry as pending again, so tide's
-//     claim lapsed (for example, a Devin claim deadline): tide claims it
-//     again with the same worker ID. When another worker took it, a QUEUED
-//     request ends with CANCELED and CANCELED_BY_SOURCE.
+//     STARTING, the vendor shows the entry as pending again: either a
+//     repeated event, or tide's claim lapsed (for example, at a Devin claim
+//     deadline). tide claims it again with the same worker ID; a conflict
+//     changes nothing, because the claim can still be tide's.
 //   - When the newest request of the vendor request ended because a user
 //     canceled it in tide, the same pending entry (same marker) is not
 //     claimed again.
@@ -217,8 +217,10 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		}
 		err := d.Claim(ctx, c.WorkerID)
 		if errors.Is(err, ErrClaimTaken) {
-			h.log.LogAttrs(ctx, slog.LevelInfo, "agent_claim_lost", append(logAttrs, slog.String("request_id", c.RequestID))...)
-			return h.lost(ctx, c, req)
+			// The claim may still be tide's (a repeated event of an entry
+			// that tide holds) or another worker's; only an explicit vendor
+			// report (Watch.Lost) ends the request.
+			return nil
 		}
 		if err != nil {
 			return err
