@@ -43,7 +43,9 @@ const secretValue = "s3cr3t-value-that-must-not-be-logged";
 // A fake `infisical` CLI. For `export` it records its arguments and working
 // directory, optionally waits, and then prints FAKE_INFISICAL_OUTPUT on
 // standard output and exits with FAKE_INFISICAL_EXIT. The file has no
-// extension, so Node.js runs it as CommonJS.
+// extension, so Node.js picks its module type from the nearest enclosing
+// package.json; fixture() writes a CommonJS one next to it, because the file
+// uses require().
 const fakeInfisical = `#!/usr/bin/env node
 const { writeFileSync } = require("node:fs");
 writeFileSync(
@@ -102,6 +104,10 @@ function fixture(t, { config = null, cli = true, env = {} } = {}) {
   if (config) writeFileSync(join(root, config), "version: 1\n");
   const bin = join(root, "bin");
   mkdirSync(bin);
+  // The fake CLI uses require(); keep it CommonJS even when the temporary
+  // directory sits inside a package with "type": "module" (for example when
+  // TMPDIR points into the repository checkout).
+  writeFileSync(join(bin, "package.json"), '{"type":"commonjs"}\n');
   if (cli) {
     writeFileSync(join(bin, "infisical"), fakeInfisical);
     chmodSync(join(bin, "infisical"), 0o755);
@@ -606,5 +612,45 @@ test(
     const result = await launcher.exited;
     assert.equal(result.code, 130, result.stderr);
     assert.equal(existsSync(`${f.out}.start`), false);
+  },
+);
+
+test("the fixture pins its fake CLI to CommonJS", (t) => {
+  const f = fixture(t);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(f.root, "bin", "package.json"), "utf8")),
+    { type: "commonjs" },
+  );
+});
+
+test(
+  "the fake CLI runs when the temporary directory is inside the repository",
+  posixOnly,
+  async (t) => {
+    // The repository root package.json has "type": "module", so an
+    // unpinned extensionless fake CLI would fail with "require is not
+    // defined" whenever TMPDIR points into the checkout.
+    const repositoryRoot = join(dirname(launcherSource), "..", "..");
+    const inside = mkdtempSync(join(repositoryRoot, "with-infisical-tmp-"));
+    const previous = process.env.TMPDIR;
+    t.after(() => {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+      rmSync(inside, { recursive: true, force: true });
+    });
+    process.env.TMPDIR = inside;
+    const f = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: {
+        FAKE_INFISICAL_OUTPUT: exported([
+          { key: "DEV_VALUE", value: secretValue },
+        ]),
+      },
+    });
+    assert.ok(f.root.startsWith(inside), "the fixture must be inside TMPDIR");
+    const result = await startLauncher(f, ["--path=/api", ...commandArgs(0)])
+      .exited;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(started(f).DEV_VALUE, secretValue);
   },
 );
