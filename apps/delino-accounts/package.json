@@ -6,7 +6,13 @@
   "type": "module",
   "deploy": {
     "target": "cloudflare-pages",
-    "project": "delino-accounts"
+    "project": "delino-accounts",
+    "buildEnv": {
+      "PUBLIC_LOGTO_ENDPOINT": "LOGTO_ENDPOINT",
+      "PUBLIC_LOGTO_APP_ID": "DELINO_ACCOUNTS_LOGTO_APP_ID",
+      "PUBLIC_PADDLE_CLIENT_TOKEN": "DELINO_ACCOUNTS_PADDLE_CLIENT_TOKEN",
+      "PUBLIC_PADDLE_ENVIRONMENT": "DELINO_ACCOUNTS_PADDLE_ENVIRONMENT"
+    }
   },
   "scripts": {
     "build": "rsbuild build",
