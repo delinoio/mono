@@ -1265,7 +1265,11 @@ func (m *Manager) Entries() []*ownsandv1.SandboxStateEntry {
 }
 
 // RemoveAll stops and deletes every sandbox and snapshot for a device
-// removal. Records are deleted without updates: the device is removed.
+// removal. Records are deleted without updates: the device is removed. When
+// the runtime fails to delete a sandbox, RemoveAll keeps that sandbox
+// tracked, leaves the local data on disk and returns the error, so that a
+// retry deletes the sandbox again; a retry after a complete clean-up is a
+// no-op.
 func (m *Manager) RemoveAll(ctx context.Context) error {
 	m.mu.Lock()
 	sbs := make([]*sandbox, 0, len(m.sandboxes))
@@ -1277,6 +1281,7 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 	}
 	m.mu.Unlock()
 	var errs []error
+	deleted := make(map[string]bool, len(sbs))
 	for _, sb := range sbs {
 		sb.cmdMu.Lock()
 		m.mu.Lock()
@@ -1284,6 +1289,8 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 		m.mu.Unlock()
 		if err := m.rt.Delete(ctx, sb.rec.SandboxID); err != nil {
 			errs = append(errs, err)
+		} else {
+			deleted[sb.rec.SandboxID] = true
 		}
 		m.mu.Lock()
 		execs := m.execs
@@ -1293,10 +1300,24 @@ func (m *Manager) RemoveAll(ctx context.Context) error {
 		}
 		sb.cmdMu.Unlock()
 	}
+	// Forget only the sandboxes that the runtime deleted. A sandbox whose
+	// deletion failed stays tracked, together with its record and VM files
+	// on disk, so that the retry of the removal deletes it again instead of
+	// leaving a running VM that no record refers to.
 	m.mu.Lock()
-	m.sandboxes = map[string]*sandbox{}
-	m.snapshots = map[string]*snapshot{}
+	for id := range deleted {
+		delete(m.sandboxes, id)
+	}
+	if len(errs) == 0 {
+		m.snapshots = map[string]*snapshot{}
+	}
 	m.mu.Unlock()
+	if len(errs) > 0 {
+		// Do not wipe the local data: the wipe would remove the records
+		// and VM files of the failed sandboxes. The wipe is idempotent, so
+		// the retry that finds no failure runs it.
+		return errors.Join(errs...)
+	}
 	if err := m.st.WipeLocalData(); err != nil {
 		errs = append(errs, err)
 	}

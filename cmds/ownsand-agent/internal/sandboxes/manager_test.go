@@ -1100,6 +1100,59 @@ func TestRestartKeepsRecordLiveWhenFileRemovalFails(t *testing.T) {
 	}
 }
 
+// TestRemoveAllRetriesFailedDeletion checks that a device removal whose
+// runtime deletion fails keeps the failed sandbox tracked, with its record
+// and files, and returns the error; the retry deletes it again and wipes the
+// local data, and a further call after the complete clean-up does nothing.
+func TestRemoveAllRetriesFailedDeletion(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	failed := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	other := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.rt.deleteFails = 1
+	if err := e.m.RemoveAll(ctx); err == nil {
+		t.Fatal("RemoveAll returned nil although a runtime Delete failed")
+	}
+	if e.rt.deleteCalls != 2 {
+		t.Fatalf("Delete calls after the first attempt = %d, want 2", e.rt.deleteCalls)
+	}
+	// Exactly one sandbox is still tracked and still has its record and files.
+	tracked := e.m.Entries()
+	if len(tracked) != 1 {
+		t.Fatalf("tracked sandboxes after a failed deletion = %d, want 1", len(tracked))
+	}
+	left := tracked[0].GetSandboxId()
+	if left != failed && left != other {
+		t.Fatalf("unexpected tracked sandbox %q", left)
+	}
+	if !e.rt.hasFiles(left) {
+		t.Fatal("runtime files of the failed sandbox were removed")
+	}
+	if _, err := os.Stat(e.st.Path(store.SandboxesDir, left+".json")); err != nil {
+		t.Fatalf("record of the failed sandbox was wiped: %v", err)
+	}
+
+	if err := e.m.RemoveAll(ctx); err != nil {
+		t.Fatalf("retry returned %v", err)
+	}
+	if e.rt.deleteCalls != 3 {
+		t.Fatalf("Delete calls after the retry = %d, want 3 (only the failed sandbox again)", e.rt.deleteCalls)
+	}
+	if len(e.m.Entries()) != 0 || e.rt.hasFiles(left) {
+		t.Fatalf("sandbox kept after the retry: %v", e.m.Entries())
+	}
+	if _, err := os.Stat(e.st.Path(store.SandboxesDir, left+".json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("record kept after the complete clean-up: %v", err)
+	}
+
+	if err := e.m.RemoveAll(ctx); err != nil {
+		t.Fatalf("RemoveAll after a complete clean-up returned %v", err)
+	}
+	if e.rt.deleteCalls != 3 {
+		t.Fatalf("Delete calls after a complete clean-up = %d, want 3", e.rt.deleteCalls)
+	}
+}
+
 // TestRestartPendingCleanupRejectsVMOperations checks that a live record kept
 // for a cleanup retry has no VM, so pause, resume and snapshot are rejected
 // instead of passing a nil VM to the runtime.
