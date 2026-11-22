@@ -17,6 +17,7 @@ import {
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
+import { createQueryClient } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
@@ -44,6 +45,7 @@ function renderConsole(
     signedIn?: boolean;
     transport?: Transport;
     config?: ConsoleConfig;
+    queryClient?: QueryClient;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -59,9 +61,14 @@ function renderConsole(
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  const queryClient =
+    options.queryClient ??
+    new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
   render(
     <AuthContextProvider value={auth}>
       <Console
@@ -410,6 +417,33 @@ describe("invitations", () => {
     expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
   });
 
+  test("shows the sign-in configuration notice instead of a sign-in button when Logto is not configured", async () => {
+    // The default build: Logto mode without a registration, so no sign-in
+    // can complete and the secret has no redirect to survive.
+    const { signIns } = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      {
+        signedIn: false,
+        config: {
+          apiOrigin: "https://api.test",
+          authMode: AuthMode.Logto,
+          logto: undefined,
+        },
+      },
+    );
+    expect(
+      await screen.findByText("Sign-in is not configured for this build."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in to accept" })).toBe(
+      null,
+    );
+    expect(signIns).toHaveLength(0);
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.sessionStorage.length).toBe(0);
+    // The page still removes the secret from the address bar.
+    expect(window.location.hash).toBe("");
+  });
+
   test("accepts the pending invitation after sign-in and deletes the stored secret", async () => {
     pendingInvitation.save(MOCK_INVITATION_SECRET);
     renderConsole("/invitations/accept");
@@ -538,6 +572,85 @@ describe("invitations", () => {
     expect(window.location.pathname).toBe("/invitations/accept");
     expect(
       screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+  });
+
+  /** Counts ListOrganizations calls. */
+  function listOrganizationsProbe() {
+    const mock = createMockTransport();
+    const state = { calls: 0 };
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "ListOrganizations") {
+          state.calls += 1;
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  /** Pastes the Contoso invitation link on the organizations page and accepts it. */
+  async function joinContosoFromOrganizations() {
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+    fireEvent.input(screen.getByLabelText("Invitation link"), {
+      target: {
+        value: `https://console.test/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+  }
+
+  test("lists the joined organization in the switcher while the organization list is still fresh", async () => {
+    const { transport, state } = listOrganizationsProbe();
+    // The production client: ListOrganizations stays fresh for 10 seconds.
+    renderConsole("/", { transport, queryClient: createQueryClient() });
+    await joinContosoFromOrganizations();
+    await settle(100);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+    );
+    // The page and the switcher read the list once. Accepting refetches it.
+    expect(state.calls).toBeGreaterThan(1);
+    const trigger = await screen.findByRole("combobox", {
+      name: "Organization",
+    });
+    expect(trigger.textContent).toContain("Contoso Research");
+  });
+
+  test("refreshes the organizations when an earlier accept succeeds after the user left the page", async () => {
+    const { transport, release } = delayedAcceptTransport();
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", {
+      transport,
+      queryClient: createQueryClient(),
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Not now" }));
+    });
+    expect(window.location.pathname).toBe("/");
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+    expect(screen.queryByRole("link", { name: /Contoso Research/ })).toBeNull();
+    release();
+    await settle(100);
+    // The late success does not navigate, and the list shows the new
+    // organization although it was fetched less than 10 seconds before.
+    expect(window.location.pathname).toBe("/");
+    expect(
+      await screen.findByRole("link", { name: /Contoso Research/ }),
     ).toBeTruthy();
   });
 

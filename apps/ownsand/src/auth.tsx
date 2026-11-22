@@ -43,6 +43,10 @@ export function AuthContextProvider({
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }
 
+/** The notice of a build that has no sign-in configuration. */
+export const SIGN_IN_NOT_CONFIGURED =
+  "Sign-in is not configured for this build.";
+
 /** Path of the sign-in callback route. */
 export const CALLBACK_PATH = "/callback";
 
