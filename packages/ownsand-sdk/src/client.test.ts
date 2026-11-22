@@ -11,11 +11,11 @@ import {
   resolveApiOrigin,
 } from "./connection.ts";
 import { OwnSandConfigError, OwnSandValidationError } from "./errors.ts";
-import { BaseImage, SandboxState } from "./gen/delino/ownsand/v1/common_pb.ts";
-import { MemberService } from "./gen/delino/ownsand/v1/member_pb.ts";
-import { OrganizationService } from "./gen/delino/ownsand/v1/organization_pb.ts";
-import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
-import { SandboxService } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
+import { BaseImage, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { isUuidV7 } from "./uuidv7.ts";

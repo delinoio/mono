@@ -72,6 +72,9 @@ importers:
       '@connectrpc/connect-web':
         specifier: 2.3.0
         version: 2.3.0(@bufbuild/protobuf@2.16.0)(@connectrpc/connect@2.3.0(@bufbuild/protobuf@2.16.0))
+      '@delino/accounts-protos':
+        specifier: workspace:*
+        version: link:../../protos/delino/accounts
       '@logto/react':
         specifier: 4.1.3
         version: 4.1.3(react@19.3.1)
@@ -91,9 +94,6 @@ importers:
         specifier: 19.3.1
         version: 19.3.1(react@19.3.1)
     devDependencies:
-      '@bufbuild/protoc-gen-es':
-        specifier: 2.16.0
-        version: 2.16.0(@bufbuild/protobuf@2.16.0)
       '@e2e-dev/web':
         specifier: 0.16.1
         version: 0.16.1(@e2e-dev/core@0.24.0(ai@7.0.173(zod@4.6.7)))(e2e@0.24.0(ai@7.0.173(zod@4.6.7)))
@@ -225,6 +225,9 @@ importers:
       '@connectrpc/connect-web':
         specifier: 2.3.0
         version: 2.3.0(@bufbuild/protobuf@2.16.0)(@connectrpc/connect@2.3.0(@bufbuild/protobuf@2.16.0))
+      '@delino/ownsand-protos':
+        specifier: workspace:*
+        version: link:../../protos/delino/ownsand
       '@logto/react':
         specifier: 4.1.3
         version: 4.1.3(react@19.3.1)
@@ -234,9 +237,6 @@ importers:
       delino-ui:
         specifier: workspace:*
         version: link:../../packages/delino-ui
-      ownsand-sdk:
-        specifier: workspace:*
-        version: link:../../packages/ownsand-sdk
       react:
         specifier: 19.3.1
         version: 19.3.1
@@ -335,16 +335,42 @@ importers:
       '@connectrpc/connect-web':
         specifier: 2.3.0
         version: 2.3.0(@bufbuild/protobuf@2.16.0)(@connectrpc/connect@2.3.0(@bufbuild/protobuf@2.16.0))
+      '@delino/ownsand-protos':
+        specifier: workspace:*
+        version: link:../../protos/delino/ownsand
     devDependencies:
-      '@bufbuild/protoc-gen-es':
-        specifier: 2.16.0
-        version: 2.16.0(@bufbuild/protobuf@2.16.0)
       '@rstest/core':
         specifier: 0.12.6
         version: 0.12.6(happy-dom@21.0.4)
       '@types/node':
         specifier: 24.19.2
         version: 24.19.2
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+
+  protos/delino/accounts:
+    dependencies:
+      '@bufbuild/protobuf':
+        specifier: 2.16.0
+        version: 2.16.0
+    devDependencies:
+      '@bufbuild/protoc-gen-es':
+        specifier: 2.16.0
+        version: 2.16.0(@bufbuild/protobuf@2.16.0)
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+
+  protos/delino/ownsand:
+    dependencies:
+      '@bufbuild/protobuf':
+        specifier: 2.16.0
+        version: 2.16.0
+    devDependencies:
+      '@bufbuild/protoc-gen-es':
+        specifier: 2.16.0
+        version: 2.16.0(@bufbuild/protobuf@2.16.0)
       typescript:
         specifier: 6.0.3
         version: 6.0.3

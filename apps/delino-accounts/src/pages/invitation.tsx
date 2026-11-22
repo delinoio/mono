@@ -5,7 +5,7 @@ import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth.tsx";
 import { Page } from "../components/shell.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";
-import { BillingAccountService } from "../gen/delino/accounts/v1/billing_account_pb.ts";
+import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { pendingInvitation, takeTokenFromAddress } from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 

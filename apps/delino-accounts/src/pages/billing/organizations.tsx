@@ -9,7 +9,7 @@ import {
   BillingStatus,
   BillingUsageService,
   type LinkedOrganization,
-} from "../../gen/delino/accounts/v1/usage_pb.ts";
+} from "@delino/accounts-protos/v1/usage_pb";
 
 function statusBadge(org: LinkedOrganization) {
   const status = org.status?.status ?? BillingStatus.UNSPECIFIED;

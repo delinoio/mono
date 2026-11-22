@@ -21,8 +21,8 @@ import {
   CreditService,
   type LedgerEntry,
   LedgerEntryKind,
-} from "../../gen/delino/accounts/v1/credit_pb.ts";
-import { BillingUsageService } from "../../gen/delino/accounts/v1/usage_pb.ts";
+} from "@delino/accounts-protos/v1/credit_pb";
+import { BillingUsageService } from "@delino/accounts-protos/v1/usage_pb";
 import { formatUsageCost, formatUsd } from "../../money.ts";
 
 /** The usage tab: the monthly usage summary and the ledger. */

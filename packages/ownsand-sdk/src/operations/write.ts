@@ -5,12 +5,12 @@ import { MAX_FILE_CHUNK_SIZE } from "../codec.ts";
 import type { DataPathSelector } from "../datapath.ts";
 import { newBindingSalt, requestDigest, writeFileBinding } from "../digest.ts";
 import { DataPathError } from "../errors.ts";
-import { RelayOperationKind } from "../gen/delino/ownsand/v1/common_pb.ts";
+import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type WriteFileRequest,
   WriteFileRequestSchema,
   type WriteFileResponse,
-} from "../gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 import { PeerUnavailableError, SessionEndedError } from "../p2p/session.ts";
 import {
   type OperationContext,

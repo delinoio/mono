@@ -5,7 +5,7 @@ import {
   type DataFrame,
   DataFrameKind,
   DataFrameSchema,
-} from "../gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 import type {
   DataChannelLike,
   PeerConnectionConfig,

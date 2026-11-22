@@ -1,26 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { DescEnum, DescFile } from "@bufbuild/protobuf";
 import { describe, expect, test } from "@rstest/core";
-import { file_delino_ownsand_v1_agent } from "./gen/delino/ownsand/v1/agent_pb.ts";
-import { file_delino_ownsand_v1_api_key } from "./gen/delino/ownsand/v1/api_key_pb.ts";
-import { file_delino_ownsand_v1_audit } from "./gen/delino/ownsand/v1/audit_pb.ts";
+import { file_delino_ownsand_v1_agent } from "@delino/ownsand-protos/v1/agent_pb";
+import { file_delino_ownsand_v1_api_key } from "@delino/ownsand-protos/v1/api_key_pb";
+import { file_delino_ownsand_v1_audit } from "@delino/ownsand-protos/v1/audit_pb";
 import {
   ErrorCode,
   file_delino_ownsand_v1_common,
-} from "./gen/delino/ownsand/v1/common_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
 import {
   DataFrameKind,
   DataFrameSchema,
   file_delino_ownsand_v1_data_frame,
-} from "./gen/delino/ownsand/v1/data_frame_pb.ts";
-import { file_delino_ownsand_v1_data_path } from "./gen/delino/ownsand/v1/data_path_pb.ts";
-import { file_delino_ownsand_v1_device } from "./gen/delino/ownsand/v1/device_pb.ts";
-import { file_delino_ownsand_v1_guest } from "./gen/delino/ownsand/v1/guest_pb.ts";
-import { file_delino_ownsand_v1_member } from "./gen/delino/ownsand/v1/member_pb.ts";
-import { file_delino_ownsand_v1_organization } from "./gen/delino/ownsand/v1/organization_pb.ts";
-import { file_delino_ownsand_v1_relay } from "./gen/delino/ownsand/v1/relay_pb.ts";
-import { file_delino_ownsand_v1_sandbox } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
-import { file_delino_ownsand_v1_snapshot } from "./gen/delino/ownsand/v1/snapshot_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
+import { file_delino_ownsand_v1_data_path } from "@delino/ownsand-protos/v1/data_path_pb";
+import { file_delino_ownsand_v1_device } from "@delino/ownsand-protos/v1/device_pb";
+import { file_delino_ownsand_v1_guest } from "@delino/ownsand-protos/v1/guest_pb";
+import { file_delino_ownsand_v1_member } from "@delino/ownsand-protos/v1/member_pb";
+import { file_delino_ownsand_v1_organization } from "@delino/ownsand-protos/v1/organization_pb";
+import { file_delino_ownsand_v1_relay } from "@delino/ownsand-protos/v1/relay_pb";
+import { file_delino_ownsand_v1_sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { file_delino_ownsand_v1_snapshot } from "@delino/ownsand-protos/v1/snapshot_pb";
 
 const files: DescFile[] = [
   file_delino_ownsand_v1_agent,

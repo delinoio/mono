@@ -4,12 +4,12 @@ import { Code } from "@connectrpc/connect";
 import type { DataPathSelector } from "../datapath.ts";
 import { newBindingSalt, readFileBinding, requestDigest } from "../digest.ts";
 import { DataPathError, OwnSandError } from "../errors.ts";
-import { RelayOperationKind } from "../gen/delino/ownsand/v1/common_pb.ts";
+import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type FileReadEvent,
   type ReadFileRequest,
   ReadFileRequestSchema,
-} from "../gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 import { PeerUnavailableError, SessionEndedError } from "../p2p/session.ts";
 import { type OperationContext, throwIfAborted } from "../relay/context.ts";
 import { GrantKeeper, RelayCallKind } from "../relay/grant.ts";

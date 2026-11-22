@@ -8,7 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { SubscriptionStatus } from "./gen/delino/accounts/v1/credit_pb.ts";
+import { SubscriptionStatus } from "@delino/accounts-protos/v1/credit_pb";
 import { pendingInvitation } from "./invitation.ts";
 import {
   ACCOUNT_ID,

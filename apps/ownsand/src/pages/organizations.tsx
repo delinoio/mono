@@ -4,7 +4,7 @@ import { useMutation, useQuery } from "@connectrpc/connect-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
-import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { type FormEvent, useState } from "react";
 import { TopBar } from "../components/shell.tsx";
 import {

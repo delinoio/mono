@@ -5,7 +5,7 @@ import {
   BillingMeter,
   BillingPhase,
   BillingService,
-} from "ownsand-sdk/gen/billing_pb";
+} from "@delino/ownsand-protos/v1/billing_pb";
 import {
   BaseImage,
   BillingReason,
@@ -13,10 +13,10 @@ import {
   ErrorDetailSchema,
   SandboxEndReason,
   SandboxState,
-} from "ownsand-sdk/gen/common_pb";
-import { DeviceService } from "ownsand-sdk/gen/device_pb";
-import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
-import { SandboxService } from "ownsand-sdk/gen/sandbox_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { uuidV7 } from "../uuid.ts";
 import { createMockTransport, MOCK_IDS, MockBillingState } from "./mock-api.ts";
 

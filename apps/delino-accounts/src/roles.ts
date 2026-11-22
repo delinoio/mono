@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { BillingAccountRole } from "./gen/delino/accounts/v1/billing_account_pb.ts";
+import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 
 /**
  * Actions that the pages show or hide by the caller's role, according to the

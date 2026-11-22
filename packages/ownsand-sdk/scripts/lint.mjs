@@ -17,7 +17,7 @@ function walk(dir) {
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     const path = join(dir, entry.name);
     if (entry.isDirectory()) {
-      if (entry.name !== "gen") walk(path);
+      walk(path);
     } else if (entry.name.endsWith(".ts")) {
       check(path);
     }

@@ -15,7 +15,7 @@ import {
   type ApiKey,
   ApiKeySchema,
   ApiKeyService,
-} from "ownsand-sdk/gen/api_key_pb";
+} from "@delino/ownsand-protos/v1/api_key_pb";
 import {
   BillingAccountRole,
   BillingMeter,
@@ -26,7 +26,7 @@ import {
   LinkableBillingAccountSchema,
   type OrganizationBilling,
   OrganizationBillingSchema,
-} from "ownsand-sdk/gen/billing_pb";
+} from "@delino/ownsand-protos/v1/billing_pb";
 import {
   AgentUpdateState,
   AgentVersionPolicyMode,
@@ -51,7 +51,7 @@ import {
   SandboxState,
   SnapshotExportState,
   SnapshotState,
-} from "ownsand-sdk/gen/common_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
 import {
   type AgentVersionPolicy,
   AgentVersionPolicySchema,
@@ -60,32 +60,32 @@ import {
   DeviceService,
   type EnrollmentToken,
   EnrollmentTokenSchema,
-} from "ownsand-sdk/gen/device_pb";
+} from "@delino/ownsand-protos/v1/device_pb";
 import {
   type Invitation,
   InvitationSchema,
   type Member,
   MemberSchema,
   MemberService,
-} from "ownsand-sdk/gen/member_pb";
+} from "@delino/ownsand-protos/v1/member_pb";
 import {
   type Organization,
   OrganizationSchema,
   OrganizationService,
-} from "ownsand-sdk/gen/organization_pb";
+} from "@delino/ownsand-protos/v1/organization_pb";
 import {
   type Sandbox,
   CreateSandboxRequestSchema,
   SandboxSchema,
   SandboxService,
-} from "ownsand-sdk/gen/sandbox_pb";
+} from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
   type Snapshot,
   SnapshotSchema,
   SnapshotService,
   type Template,
   TemplateSchema,
-} from "ownsand-sdk/gen/snapshot_pb";
+} from "@delino/ownsand-protos/v1/snapshot_pb";
 import { ACCOUNTS_URL } from "../config.ts";
 import { effectiveVcpuLimit, MAX_INT32 } from "../format.ts";
 import { uuidV7 } from "../uuid.ts";

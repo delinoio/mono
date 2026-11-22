@@ -13,8 +13,8 @@ import {
   formatQuantity,
   meterLabel,
 } from "./format.ts";
-import { BillingAccountRole } from "./gen/delino/accounts/v1/billing_account_pb.ts";
-import { Meter } from "./gen/delino/accounts/v1/usage_pb.ts";
+import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
+import { Meter } from "@delino/accounts-protos/v1/usage_pb";
 import {
   PENDING_INVITATION_KEY,
   pendingInvitation,

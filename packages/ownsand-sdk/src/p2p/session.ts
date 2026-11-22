@@ -15,7 +15,7 @@ import {
   OwnSandError,
   PeerStreamOverrunError,
 } from "../errors.ts";
-import { SessionEndReason } from "../gen/delino/ownsand/v1/common_pb.ts";
+import { SessionEndReason } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type AttachExecRequest,
   type DataFrame,
@@ -27,7 +27,7 @@ import {
   type ReadFileRequest,
   type WriteFileRequest,
   type WriteFileResponse,
-} from "../gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 import { LogEvent, safeLog } from "../logger.ts";
 import {
   type OperationContext,

@@ -41,9 +41,10 @@ export function isE2eInput(path) {
 }
 
 // Workspace package roots, as directories that hold one level of packages.
-// Keep these roots in sync with `pnpm-workspace.yaml`; plan.test.mjs
-// cross-checks them.
-export const workspaceRoots = ["apps", "packages", "servers"];
+// `protos/delino` holds the TypeScript binding packages, one per schema
+// directory. Keep these roots in sync with `pnpm-workspace.yaml`;
+// plan.test.mjs cross-checks them.
+export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 
 // Only the root `turbo.json` and the `turbo.json` placed directly inside a
 // workspace package configure the tasks that the Turbo fixtures inspect. Turbo
@@ -99,31 +100,28 @@ export function isWorkflowInput(path) {
   );
 }
 
-// Protobuf schema inputs: the schemas, the buf configuration, the generation
-// script and the TypeScript generation templates and plugin pins of the
-// OwnSand SDK and the delino-accounts web app. The protos job, which the `go`
-// output selects, lints them, checks breaking changes and fails when the
-// committed Go or TypeScript bindings differ from the generated output.
+// Protobuf schema inputs: the schemas, the buf configuration and the
+// generation script. The protos job, which the `go` output selects, lints
+// them, checks breaking changes and fails when the committed Go or TypeScript
+// bindings differ from the generated output.
 const protoInputs = new Set([
   "protos/buf.yaml",
   "protos/buf.gen.yaml",
   "protos/buf.lock",
   "scripts/protos.sh",
-  "packages/ownsand-sdk/buf.gen.yaml",
-  "packages/ownsand-sdk/package.json",
-  "apps/delino-accounts/buf.gen.yaml",
-  "apps/delino-accounts/package.json",
 ]);
 
-// The committed TypeScript bindings of the delino-accounts web app, which the
-// drift check of the protos job compares.
-const accountsWebBindings = "apps/delino-accounts/src/gen/";
+// The TypeScript binding packages in `protos/delino/<name>/`: the committed
+// `*_pb.ts` bindings that the drift check compares, and the package manifest,
+// TypeScript configuration and generation template that pin the plugin and
+// define how the OwnSand SDK end-to-end test resolves the bindings.
+const protoTypeScriptPackageInput =
+  /^protos\/delino\/[^/]+\/(?:.+_pb\.ts|package\.json|buf\.gen\.yaml|tsconfig(?:\.[^/]+)?\.json)$/;
 
-// The OwnSand SDK package. The drift check compares its committed TypeScript
-// bindings, and the OwnSand end-to-end suite (servers/ownsand-api/e2e) runs
-// its `src/e2e.test.ts` with rstest against the real components, so every
-// path of the package (sources, tests, rstest and TypeScript configuration)
-// selects the Go checks.
+// The OwnSand SDK package. The OwnSand end-to-end suite
+// (servers/ownsand-api/e2e) runs its `src/e2e.test.ts` with rstest against
+// the real components, so every path of the package (sources, tests, rstest
+// and TypeScript configuration) selects the Go checks.
 const ownsandSdkPackage = "packages/ownsand-sdk/";
 
 // The go-test and protos jobs install the workspace dependencies with the
@@ -165,9 +163,9 @@ export function isGoInput(path) {
     /(^|\/)go\.(mod|sum)$/.test(path) ||
     path.endsWith(".proto") ||
     protoInputs.has(path) ||
+    protoTypeScriptPackageInput.test(path) ||
     goWorkspaceInputs.has(path) ||
     path.startsWith(ownsandSdkPackage) ||
-    path.startsWith(accountsWebBindings) ||
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
     goTestdata.test(path)

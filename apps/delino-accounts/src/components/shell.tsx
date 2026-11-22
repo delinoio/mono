@@ -2,7 +2,7 @@
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { createContext, type ReactNode, useContext } from "react";
 import { useAuth } from "../auth.tsx";
-import type { BillingAccountRole } from "../gen/delino/accounts/v1/billing_account_pb.ts";
+import type { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /** The top bar: product name, billing link and sign-out. */

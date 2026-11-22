@@ -19,7 +19,7 @@ import {
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
-import { DeviceState, SandboxState } from "ownsand-sdk/gen/common_pb";
+import { DeviceState, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
 import { type FormEvent, type ReactNode, useState } from "react";
 import { billingReasonOf } from "../api.ts";
 import { ACCOUNTS_URL } from "../config.ts";

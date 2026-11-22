@@ -10,7 +10,6 @@ This contract owns the `delino-accounts-web` component of [`delino-accounts`](pr
 - `apps/delino-accounts/public/`: static files copied to the build root, including the Cloudflare Pages `_headers` file. The directory must not contain a top-level `404.html` or a `_redirects` file with a rule that rewrites to `/index.html`; `src/static-hosting.test.ts` enforces this.
 - `apps/delino-accounts/turbo.json`: package-local Turbo task configuration.
 - `apps/delino-accounts/e2e.config.ts` and `apps/delino-accounts/e2e/`: end-to-end test config and tests, according to the [e2e contract](repository-e2e-contract.md).
-- `apps/delino-accounts/src/gen/` and `apps/delino-accounts/buf.gen.yaml`: the generated TypeScript bindings of the [protos contract](protos-delino-accounts-api-contract.md) and their template.
 
 ## Runtime and Language
 
@@ -98,7 +97,7 @@ Billing tests: `src/billing.test.tsx` renders every billing page against an in-m
 ## Dependencies and Integrations
 
 - `@rsbuild/core`, `@rsbuild/plugin-react`, `react`, `react-dom` and `@rstest/core`, pinned in `apps/delino-accounts/package.json`.
-- Generated bindings: `@bufbuild/protobuf` `2.16.0` (runtime) and `@bufbuild/protoc-gen-es` `2.16.0` (development; the generator that `scripts/protos.sh` runs from this package), equal to the versions of the [OwnSand SDK](packages-ownsand-sdk-foundation.md#dependencies-and-integrations).
+- Generated bindings: the workspace package `@delino/accounts-protos` (`workspace:*`), imported as `@delino/accounts-protos/v1/<file>_pb`, which the [protos contract](protos-delino-accounts-api-contract.md#runtime-and-language) owns, and the `@bufbuild/protobuf` `2.16.0` runtime, equal to the version of the binding package.
 - Billing pages, at the exact versions that the [OwnSand console](apps-ownsand-console-foundation.md#dependencies-and-integrations) pins: `@connectrpc/connect` `2.3.0`, `@connectrpc/connect-web` `2.3.0`, `@connectrpc/connect-query` `2.3.1`, `@tanstack/react-query` `5.106.1` and `@logto/react` `4.1.3`; the shared UI [`delino-ui`](packages-delino-ui-foundation.md); `@paddle/paddle-js` `1.6.6` (Apache-2.0, released 2026-11-04) for the checkout; development: `@testing-library/react` `16.3.3`, `@testing-library/dom` `10.4.2` and `happy-dom` `21.0.4`, the versions of `delino-ui`. Record the [dependency security](repository-dependency-security-contract.md) results of each dependency change in the pull request.
 - Paddle: the checkout of the subscription; the payment provider of the [API server](servers-accounts-api-foundation.md#payments-and-credits).
 - `e2e`, `@e2e-dev/web` and `ai` for end-to-end tests, pinned in `apps/delino-accounts/package.json`.

@@ -5,9 +5,9 @@ import {
   SandboxState,
   SnapshotExportState,
   SnapshotState,
-} from "ownsand-sdk/gen/common_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
 import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
-import { CreateSandboxRequestSchema } from "ownsand-sdk/gen/sandbox_pb";
+import { CreateSandboxRequestSchema } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
 import { clearInvitationOnLeave } from "./App.tsx";
 import {

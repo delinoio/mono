@@ -3,8 +3,11 @@ import { useMutation, useQuery } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
-import { ApiKeyState } from "ownsand-sdk/gen/common_pb";
-import { type ApiKey, ApiKeyService } from "ownsand-sdk/gen/api_key_pb";
+import { ApiKeyState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  type ApiKey,
+  ApiKeyService,
+} from "@delino/ownsand-protos/v1/api_key_pb";
 import { useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";

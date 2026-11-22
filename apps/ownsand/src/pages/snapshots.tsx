@@ -4,12 +4,15 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
-import { SnapshotExportState, SnapshotState } from "ownsand-sdk/gen/common_pb";
+import {
+  SnapshotExportState,
+  SnapshotState,
+} from "@delino/ownsand-protos/v1/common_pb";
 import {
   type Snapshot,
   SnapshotService,
   type Template,
-} from "ownsand-sdk/gen/snapshot_pb";
+} from "@delino/ownsand-protos/v1/snapshot_pb";
 import { useState } from "react";
 import {
   invalidateServices,

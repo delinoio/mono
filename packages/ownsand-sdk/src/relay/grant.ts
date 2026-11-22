@@ -7,7 +7,7 @@ import {
   OwnSandError,
   retryAfterMs,
 } from "../errors.ts";
-import { RelayOperationKind } from "../gen/delino/ownsand/v1/common_pb.ts";
+import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import { LogEvent, safeLog } from "../logger.ts";
 import { type OperationContext, Timing, throwIfAborted } from "./context.ts";
 import { backoffMs, FixedBudget, type RetryBudget } from "./recovery.ts";

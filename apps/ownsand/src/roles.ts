@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Role } from "ownsand-sdk/gen/common_pb";
+import { Role } from "@delino/ownsand-protos/v1/common_pb";
 
 /** Console actions that depend on the caller's role. */
 export enum Permission {

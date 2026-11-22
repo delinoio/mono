@@ -16,7 +16,7 @@ import {
 import {
   DataFrameKind,
   DataFrameSchema,
-} from "./gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 
 function chunkFrame(streamId: bigint, size: number) {
   return create(DataFrameSchema, {
