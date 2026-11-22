@@ -192,7 +192,7 @@ build() {
   fi
   # An update-manifest release must not fail after the tags exist because
   # the agent has no built-in key.
-  if [[ "$mode" == cross ]] && jq -e 'any(.[]; .manifestObjectKey != "")' <<< "$BINARIES" > /dev/null; then
+  if [[ "$mode" == cross ]] && has_manifests > /dev/null; then
     run_manifest_tool check-keys
   fi
   echo "## Binary builds ($mode)" >> "$summary"
@@ -461,6 +461,16 @@ manifest_rows() {
   jq -r '.[] | select(.manifestObjectKey != "") | [.name, .version, .binary, .manifestObjectKey, .manifestPublicUrl] | @tsv' <<< "$BINARIES"
 }
 
+# Returns success when a planned binary has an update manifest. The manifest
+# steps do nothing, and need no secret, for a run without one.
+has_manifests() {
+  if jq -e 'any(.[]; .manifestObjectKey != "")' <<< "$BINARIES" > /dev/null; then
+    return 0
+  fi
+  echo "::notice::No planned binary release has an update manifest."
+  return 1
+}
+
 r2_url() {
   echo "https://$RELEASES_R2_ACCOUNT_ID.r2.cloudflarestorage.com/$RELEASES_R2_BUCKET/$1"
 }
@@ -506,6 +516,7 @@ require_r2() {
 fetch_manifests() {
   local dir="$1"
   require_binaries
+  has_manifests || return 0
   require_r2
   local name version binary key url manifest_code sig_code
   while IFS=$'\t' read -r -u 3 name version binary key url; do
@@ -527,6 +538,7 @@ fetch_manifests() {
 prepare_manifests() {
   local dir="$1" assets="$2"
   require_binaries
+  has_manifests || return 0
   require_env REPOSITORY
   if [[ -z "${RELEASE_MANIFEST_TOOL:-}" ]]; then
     # Build the tool here, without secrets, so that the signing step runs no
@@ -551,6 +563,7 @@ prepare_manifests() {
 sign_manifests() {
   local dir="$1"
   require_binaries
+  has_manifests || return 0
   require_env OWNSAND_AGENT_RELEASE_SIGNING_KEY RELEASE_MANIFEST_TOOL
   local name version binary key url
   while IFS=$'\t' read -r -u 3 name version binary key url; do
@@ -562,6 +575,7 @@ sign_manifests() {
 upload_manifests() {
   local dir="$1"
   require_binaries
+  has_manifests || return 0
   require_r2
   echo "## Release manifests" >> "$summary"
   local name version binary key url public

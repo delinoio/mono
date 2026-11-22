@@ -974,6 +974,29 @@ test(
   },
 );
 
+test(
+  "the manifest steps need no secret without an update manifest",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const dir = join(f.dir, "manifests");
+    for (const step of [
+      ["fetch-manifests", dir],
+      ["prepare-manifests", dir, join(f.dir, "assets")],
+      ["sign-manifests", dir],
+      ["upload-manifests", dir],
+    ]) {
+      const result = f.run(step, {}, [cli]);
+      assert.equal(result.status, 0, `${step[0]}: ${result.stderr}`);
+      assert.match(
+        result.stdout,
+        /No planned binary release has an update manifest/,
+      );
+    }
+    assert.doesNotMatch(readFileSync(f.log, "utf8"), /curl|release-manifest/);
+  },
+);
+
 test("malformed plans and arguments fail", { skip }, async (t) => {
   for (const binaries of [
     [],
