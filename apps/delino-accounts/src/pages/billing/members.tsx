@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
 import { useState } from "react";
-import { invalidateServices, LIST_PAGE_SIZE } from "../../api.ts";
+import { invalidateServices } from "../../api.ts";
 import { useAuth } from "../../auth.tsx";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
@@ -215,10 +215,12 @@ function Invitations() {
   const { billingAccountId } = useBillingAccount();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
-  const list = useQuery(BillingAccountService.method.listInvitations, {
-    billingAccountId,
-    pageSize: LIST_PAGE_SIZE,
-  });
+  const list = useAllPages(
+    BillingAccountService.method.listInvitations,
+    { billingAccountId },
+    (page) => ({ items: page.invitations, nextPageToken: page.nextPageToken }),
+    (i) => i.invitationId,
+  );
   const create = useMutation(BillingAccountService.method.createInvitation, {
     onSuccess: refresh,
   });
@@ -254,39 +256,42 @@ function Invitations() {
       {list.isPending ? (
         <Loading label="Loading invitations" />
       ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : list.data.invitations.length === 0 ? (
+        <ErrorNotice error={list.error} onRetry={list.refetch} />
+      ) : list.items.length === 0 ? (
         <Empty title="No pending invitations" />
       ) : (
-        <ul className="list" aria-label="Pending invitations">
-          {list.data.invitations.map((i) => (
-            <li key={i.invitationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">{i.email}</span>
-                <span className="muted">
-                  {labels.role[i.role]} · Expires {formatDate(i.expireTime)}
-                </span>
-              </div>
-              <Button
-                variant={ButtonVariant.Secondary}
-                size={ButtonSize.Small}
-                onClick={async () => {
-                  try {
-                    await revoke.mutateAsync({
-                      billingAccountId,
-                      invitationId: i.invitationId,
-                    });
-                    toast.success("The invitation is revoked.");
-                  } catch (error) {
-                    toast.error(errorMessage(error));
-                  }
-                }}
-              >
-                Revoke
-              </Button>
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="list" aria-label="Pending invitations">
+            {list.items.map((i) => (
+              <li key={i.invitationId} className="list-row">
+                <div className="list-main">
+                  <span className="list-title">{i.email}</span>
+                  <span className="muted">
+                    {labels.role[i.role]} · Expires {formatDate(i.expireTime)}
+                  </span>
+                </div>
+                <Button
+                  variant={ButtonVariant.Secondary}
+                  size={ButtonSize.Small}
+                  onClick={async () => {
+                    try {
+                      await revoke.mutateAsync({
+                        billingAccountId,
+                        invitationId: i.invitationId,
+                      });
+                      toast.success("The invitation is revoked.");
+                    } catch (error) {
+                      toast.error(errorMessage(error));
+                    }
+                  }}
+                >
+                  Revoke
+                </Button>
+              </li>
+            ))}
+          </ul>
+          <MorePages pages={list} />
+        </>
       )}
       <FormDialog
         open={creating}

@@ -15,6 +15,7 @@ import {
   ACCOUNT_ID,
   ADMIN,
   addBillingAccounts,
+  addInvitations,
   addLinkedOrganizations,
   addMembers,
   createFakeApi,
@@ -1251,6 +1252,92 @@ describe("paged lists", () => {
         billingAccountId: secondId,
         pageToken: "",
       });
+    });
+  });
+
+  describe("invitations", () => {
+    test("reads every page with a Revoke action for the last invitation", async () => {
+      const api = createFakeApi();
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 200);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", {
+        name: "Pending invitations",
+      });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toBe("pending@example.com");
+      expect(titles[200]).toBe(`invitee-${numbered(200)}@example.com`);
+      expect(
+        within(list).getAllByRole("button", { name: "Revoke" }),
+      ).toHaveLength(201);
+      expect(calls(api, "ListInvitations")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "",
+        }),
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "p1",
+        }),
+      ]);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      await click(within(last).getByRole("button", { name: "Revoke" }));
+      await settle(100);
+      expect(calls(api, "RevokeInvitation")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          invitationId: `0193a1b2-0002-7000-8000-${"200".padStart(12, "0")}`,
+        }),
+      ]);
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 199);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", {
+        name: "Pending invitations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListInvitations")).toEqual([""]);
+    });
+
+    test("no pending invitation keeps the empty state", async () => {
+      const api = createFakeApi();
+      api.accounts.get(ACCOUNT_ID)!.invitations = [];
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      expect(await screen.findByText("No pending invitations")).toBeTruthy();
+      await settle(100);
+      expect(pageTokens(api, "ListInvitations")).toEqual([""]);
+    });
+
+    test("a failed continuation retries without duplicates", async () => {
+      const api = createFakeApi();
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 200);
+      api.failContinuation.set(
+        "ListInvitations",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", {
+        name: "Pending invitations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Pending invitations" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(pageTokens(api, "ListInvitations")).toEqual(["", "p1", "p1"]);
     });
   });
 });
