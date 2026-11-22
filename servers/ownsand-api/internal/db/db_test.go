@@ -197,10 +197,6 @@ func TestMigrateIsIdempotent(t *testing.T) {
 	if got, want := appliedVersions(t, ctx, d), embeddedVersions(t); !slices.Equal(got, want) {
 		t.Fatalf("goose_db_version versions = %v, want %v", got, want)
 	}
-	var legacy bool
-	if err := d.Pool.QueryRow(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL").Scan(&legacy); err != nil || legacy {
-		t.Fatalf("a new database has schema_migrations = %v, %v", legacy, err)
-	}
 }
 
 // setDatabaseTimeZone sets the default time zone of new sessions of the test
@@ -213,99 +209,6 @@ func setDatabaseTimeZone(t *testing.T, ctx context.Context, d *db.DB, zone strin
 	}
 	if _, err := d.Pool.Exec(ctx, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" SET timezone = "+pgx.Identifier{zone}.Sanitize()); err != nil {
 		t.Fatal(err)
-	}
-}
-
-// legacyRunnerTable is the history table of the embedded runner that goose
-// replaced, with the columns that it wrote.
-const legacyRunnerTable = `CREATE TABLE schema_migrations (
-	version integer PRIMARY KEY,
-	name text NOT NULL,
-	sha256 bytea NOT NULL,
-	applied_at timestamptz NOT NULL DEFAULT now()
-)`
-
-// toLegacyRunner turns a database that goose migrated into a database that
-// the earlier embedded runner migrated: it moves the history into
-// schema_migrations and drops the goose version table.
-func toLegacyRunner(t *testing.T, ctx context.Context, d *db.DB) {
-	t.Helper()
-	for _, stmt := range []string{
-		legacyRunnerTable,
-		`INSERT INTO schema_migrations (version, name, sha256, applied_at)
-			SELECT version_id, 'legacy', '\x00', tstamp AT TIME ZONE 'UTC' FROM goose_db_version WHERE is_applied AND version_id > 0`,
-		"DROP TABLE goose_db_version",
-	} {
-		if _, err := d.Pool.Exec(ctx, stmt); err != nil {
-			t.Fatal(err)
-		}
-	}
-}
-
-// TestMigrateAdoptsLegacyRunnerHistory upgrades a database that the earlier
-// embedded runner migrated to version 8 and that a legacy writer used
-// afterwards. goose must not apply migrations 1 to 8 again, must apply
-// migration 9 with the application time of migration 8 from
-// schema_migrations, and must keep schema_migrations unchanged. The
-// database time zone is not UTC, so a migration session that used it would
-// store a shifted time.
-func TestMigrateAdoptsLegacyRunnerHistory(t *testing.T) {
-	ctx := context.Background()
-	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, billingStatusMigration))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(d.Close)
-	applied := appliedAt(t, ctx, d, billingStatusMigration)
-	toLegacyRunner(t, ctx, d)
-	setDatabaseTimeZone(t, ctx, d, "Pacific/Kiritimati")
-	early, late := "018f0000-0000-7000-8000-0000000000f1", "018f0000-0000-7000-8000-0000000000f2"
-	lateCreate := applied.Add(time.Hour)
-	if _, err := d.Pool.Exec(ctx, legacyOrg, early, applied.Add(-time.Hour)); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := d.Pool.Exec(ctx, legacyOrg, late, lateCreate); err != nil {
-		t.Fatal(err)
-	}
-
-	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := appliedVersions(t, ctx, d), embeddedVersions(t); !slices.Equal(got, want) {
-		t.Fatalf("goose_db_version versions = %v, want %v", got, want)
-	}
-	if got := appliedAt(t, ctx, d, billingStatusMigration); !got.Equal(applied) {
-		t.Fatalf("adopted application time of migration %d = %v, want %v", billingStatusMigration, got, applied)
-	}
-	wantBlocked(t, readBilling(t, ctx, d.Pool, early), applied)
-	wantBlocked(t, readBilling(t, ctx, d.Pool, late), lateCreate)
-	var legacyRows int
-	var legacyMax int64
-	if err := d.Pool.QueryRow(ctx, "SELECT count(*), max(version) FROM schema_migrations").Scan(&legacyRows, &legacyMax); err != nil ||
-		legacyRows != billingStatusMigration || legacyMax != billingStatusMigration {
-		t.Fatalf("schema_migrations rows = %d, max version = %d, %v, want it unchanged", legacyRows, legacyMax, err)
-	}
-
-	// The history is adopted once; a later run finds nothing to do.
-	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := appliedVersions(t, ctx, d), embeddedVersions(t); !slices.Equal(got, want) {
-		t.Fatalf("goose_db_version versions after a second run = %v, want %v", got, want)
-	}
-}
-
-// TestMigrateAdoptsFullyMigratedLegacyDatabase checks that a database that
-// the earlier runner migrated completely gets no migration applied again.
-func TestMigrateAdoptsFullyMigratedLegacyDatabase(t *testing.T) {
-	d := dbtest.New(t)
-	ctx := context.Background()
-	toLegacyRunner(t, ctx, d)
-	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := appliedVersions(t, ctx, d), embeddedVersions(t); !slices.Equal(got, want) {
-		t.Fatalf("goose_db_version versions = %v, want %v", got, want)
 	}
 }
 

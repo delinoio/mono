@@ -69,8 +69,7 @@ CREATE CONSTRAINT TRIGGER organizations_billing_status_insert
 --
 -- goose records the application time of migration 0008 in the tstamp column
 -- (timestamp without time zone) of goose_db_version. The migration runner in
--- internal/db opens its sessions with TimeZone=UTC and copies the history of
--- the earlier runner (schema_migrations) as UTC, so the column holds UTC.
+-- internal/db opens its sessions with TimeZone=UTC, so the column holds UTC.
 INSERT INTO organization_billing (organization_id, billing_account_id, phase, reason, blocked_since, suspend_time, update_time)
 SELECT o.organization_id, NULL, 2, 1, s.blocked_since, s.blocked_since + interval '72 hours', now()
 FROM organizations o
