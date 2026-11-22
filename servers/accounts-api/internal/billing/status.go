@@ -336,27 +336,56 @@ type SuspendFilter struct {
 	BillingAccountIDs []string
 }
 
+// suspendBatchSize is the number of billing accounts that SuspendDue selects
+// and recomputes in one batch.
+const suspendBatchSize = 100
+
 // SuspendDue records the suspension of every BLOCKED link whose suspension
 // time has passed: it recomputes the statuses of their billing accounts.
 // The worker calls it for every link; reads call it for the links they
 // return, so a status is never reported BLOCKED after its suspension time.
+//
+// The due billing accounts are selected in batches of suspendBatchSize in
+// billing account ID order, after the last account of the previous batch.
+// The cursor only moves forward, so the loop ends after at most one pass
+// over the accounts even when an account stays due after its recomputation.
+// A call without due links runs one query and recomputes nothing.
 func (s *Service) SuspendDue(ctx context.Context, f SuspendFilter) error {
 	now := s.timestamp()
-	rows, err := s.db.Pool.Query(ctx, `SELECT DISTINCT billing_account_id::text FROM organization_links
-		WHERE unlink_time IS NULL AND billing_status = 'blocked' AND suspend_time <= $1
-			AND ($2 = '' OR service = $2) AND (cardinality($3::uuid[]) = 0 OR billing_account_id = ANY($3::uuid[]))
-		LIMIT 100`, now, f.Service, nonNilIDs(f.BillingAccountIDs))
-	if err != nil {
-		return err
-	}
-	accounts, err := pgx.CollectRows(rows, pgx.RowTo[string])
-	if err != nil {
-		return err
-	}
-	for _, id := range accounts {
-		if err := s.SyncAccount(ctx, id); err != nil {
+	var after *string
+	processed, batches := 0, 0
+	for {
+		rows, err := s.db.Pool.Query(ctx, `SELECT billing_account_id::text FROM organization_links
+			WHERE unlink_time IS NULL AND billing_status = 'blocked' AND suspend_time <= $1
+				AND ($2 = '' OR service = $2) AND (cardinality($3::uuid[]) = 0 OR billing_account_id = ANY($3::uuid[]))
+				AND ($4::uuid IS NULL OR billing_account_id > $4::uuid)
+			GROUP BY billing_account_id ORDER BY billing_account_id LIMIT $5`,
+			now, f.Service, nonNilIDs(f.BillingAccountIDs), after, suspendBatchSize)
+		if err != nil {
 			return err
 		}
+		accounts, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		if err != nil {
+			return err
+		}
+		batches++
+		for _, id := range accounts {
+			if err := s.SyncAccount(ctx, id); err != nil {
+				return err
+			}
+			processed++
+		}
+		if len(accounts) < suspendBatchSize {
+			break
+		}
+		after = &accounts[len(accounts)-1]
+	}
+	if processed > 0 {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_suspend_due",
+			slog.String("service", f.Service),
+			slog.Int("filtered_accounts", len(f.BillingAccountIDs)),
+			slog.Int("accounts", processed),
+			slog.Int("batches", batches))
 	}
 	return nil
 }

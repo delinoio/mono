@@ -3,7 +3,9 @@
 package billing
 
 import (
+	"bytes"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
@@ -266,5 +268,125 @@ func TestStatusIgnoresUnlinkedOrganizations(t *testing.T) {
 	var status string
 	if err := f.db.Pool.QueryRow(ctx(), `SELECT billing_status FROM organization_links WHERE organization_id = $1`, org).Scan(&status); err != nil || status != "allowed" {
 		t.Fatalf("the unlinked row changed: %s, %v", status, err)
+	}
+}
+
+// dueLinks links n organizations to n distinct billing accounts without an
+// active subscription, so every link is BLOCKED at once, and returns the
+// billing accounts and organizations in link order.
+func (f *fixture) dueLinks(n int) (accounts, orgs []string) {
+	f.t.Helper()
+	for i := 0; i < n; i++ {
+		acct := f.account()
+		accounts = append(accounts, acct)
+		orgs = append(orgs, f.link(acct, fmt.Sprintf("Org %d", i)))
+	}
+	return accounts, orgs
+}
+
+func (f *fixture) countStatus(status LinkStatus) int {
+	f.t.Helper()
+	return f.count(`SELECT count(*) FROM organization_links WHERE unlink_time IS NULL AND billing_status = $1`, string(status))
+}
+
+// captureLogs replaces the logger of the service and returns the buffer of
+// its JSON records.
+func (f *fixture) captureLogs() *bytes.Buffer {
+	var buf bytes.Buffer
+	f.s.logger = slog.New(slog.NewJSONHandler(&buf, nil))
+	return &buf
+}
+
+func TestListStatusChangesSuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
+	// 101 accounts take two batches, 100 exactly one full batch and a second
+	// empty query, and 250 three batches.
+	for _, n := range []int{100, suspendBatchSize + 1, 250} {
+		t.Run(fmt.Sprintf("%d accounts", n), func(t *testing.T) {
+			f := newFixture(t)
+			_, orgs := f.dueLinks(n)
+			if got := f.countStatus(StatusBlocked); got != n {
+				t.Fatalf("%d blocked links before the suspension time, want %d", got, n)
+			}
+			logs := f.captureLogs()
+			f.clock.Advance(SuspendAfter)
+			statuses, err := f.s.ListStatusChanges(ctx(), "ownsand", 0, 1000)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(statuses) != n {
+				t.Fatalf("ListStatusChanges returned %d statuses, want %d", len(statuses), n)
+			}
+			for _, st := range statuses {
+				if st.Status != StatusSuspended {
+					t.Fatalf("%s is %s after its suspension time %v", st.OrganizationID, st.Status, st.SuspendTime)
+				}
+			}
+			if got := f.countStatus(StatusBlocked); got != 0 {
+				t.Fatalf("%d links stay blocked", got)
+			}
+			for _, org := range orgs {
+				f.wantStatus(org, StatusSuspended, ReasonNoActiveSubscription)
+			}
+			if want := fmt.Sprintf(`"accounts":%d`, n); !strings.Contains(logs.String(), `"msg":"billing_suspend_due"`) || !strings.Contains(logs.String(), want) {
+				t.Fatalf("log does not record %d processed accounts:\n%s", n, logs)
+			}
+		})
+	}
+}
+
+func TestSuspendDueFiltersStillSelectOnlyMatchingLinks(t *testing.T) {
+	f := newFixture(t)
+	accounts, orgs := f.dueLinks(suspendBatchSize + 5)
+	// The last five links belong to another service.
+	if _, err := f.db.Pool.Exec(ctx(), `UPDATE organization_links SET service = 'tide' WHERE organization_id = ANY($1)`, orgs[suspendBatchSize:]); err != nil {
+		t.Fatal(err)
+	}
+	f.clock.Advance(SuspendAfter)
+
+	// A billing account filter touches only the listed accounts.
+	picked := []string{accounts[0], accounts[1], accounts[suspendBatchSize+1]}
+	if err := f.s.SuspendDue(ctx(), SuspendFilter{BillingAccountIDs: picked}); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.countStatus(StatusSuspended); got != len(picked) {
+		t.Fatalf("%d suspended links after the account filter, want %d", got, len(picked))
+	}
+	f.wantStatus(orgs[0], StatusSuspended, ReasonNoActiveSubscription)
+	f.wantStatus(orgs[2], StatusBlocked, ReasonNoActiveSubscription)
+
+	// A service filter suspends the remaining links of that service in
+	// several batches and leaves the other service blocked.
+	if err := f.s.SuspendDue(ctx(), SuspendFilter{Service: "ownsand"}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'ownsand' AND billing_status = 'suspended'`), suspendBatchSize; got != want {
+		t.Fatalf("%d suspended ownsand links, want %d", got, want)
+	}
+	if got, want := f.count(`SELECT count(*) FROM organization_links WHERE service = 'tide' AND billing_status = 'blocked'`), 4; got != want {
+		t.Fatalf("%d blocked tide links, want %d (only one was picked by the account filter)", got, want)
+	}
+	if got := f.countStatus(StatusBlocked); got != 4 {
+		t.Fatalf("%d blocked links, want 4", got)
+	}
+}
+
+func TestSuspendDueWithoutDueLinksChangesNothing(t *testing.T) {
+	f := newFixture(t)
+	f.dueLinks(3)
+	// The links are blocked but not due yet.
+	logs := f.captureLogs()
+	before := f.count(`SELECT COALESCE(sum(last_sequence), 0)::bigint FROM billing_status_sequences`)
+	f.clock.Advance(SuspendAfter - time.Microsecond)
+	if err := f.s.SuspendDue(ctx(), SuspendFilter{}); err != nil {
+		t.Fatal(err)
+	}
+	if after := f.count(`SELECT COALESCE(sum(last_sequence), 0)::bigint FROM billing_status_sequences`); after != before {
+		t.Fatalf("status sequences changed from %d to %d without a due link", before, after)
+	}
+	if logs.Len() != 0 {
+		t.Fatalf("SuspendDue logged without a due link:\n%s", logs)
+	}
+	if got := f.countStatus(StatusBlocked); got != 3 {
+		t.Fatalf("%d blocked links, want 3", got)
 	}
 }
