@@ -84,6 +84,10 @@ func (h DeviceHandler) CreateEnrollmentToken(ctx context.Context, req *connect.R
 		if err := validate.EnrollmentTokenTTL(req.Msg.GetTtl()); err != nil {
 			return errInvalid(err)
 		}
+		// A deletion in flight yields not_found, not a foreign key violation.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		secret, err := auth.NewSecret(auth.SecretEnrollmentToken)
 		if err != nil {
 			return err
@@ -716,6 +720,11 @@ func (h DeviceHandler) UpdateAgentVersionPolicy(ctx context.Context, req *connec
 			}
 		default:
 			return errInvalidf("invalid mode: must be FOLLOW_DEFAULT, PIN or HOLD")
+		}
+		// A deletion in flight yields not_found, not a foreign key violation,
+		// with or without a stored policy row.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO agent_version_policies (organization_id, mode, pinned_version, update_time, updated_by_kind, updated_by_id)
 			VALUES ($1, $2, $3, $4, $5, $6)
