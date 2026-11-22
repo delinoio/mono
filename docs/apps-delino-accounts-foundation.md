@@ -103,7 +103,7 @@ Billing tests: `src/billing.test.tsx` renders every billing page against an in-m
 - `e2e`, `@e2e-dev/web` and `ai` for end-to-end tests, pinned in `apps/delino-accounts/package.json`.
 - [`accounts-api`](servers-accounts-api-foundation.md) at `https://accounts.api.delino.io`.
 - Logto shared tenant, according to the [authentication contract](repository-auth-contract.md).
-- Cloudflare Pages: static hosting for `accounts.delino.io`. The `deploy` field of `apps/delino-accounts/package.json` names the Direct Upload Pages project `delino-accounts`. The deployment workflow builds with `pnpm exec turbo run build --filter=delino-accounts` and uploads `apps/delino-accounts/dist`.
+- Cloudflare Pages: static hosting for `accounts.delino.io`. The `deploy` field of `apps/delino-accounts/package.json` names the Direct Upload Pages project `delino-accounts`. The deployment workflow builds with `pnpm exec turbo run build --filter=delino-accounts` and uploads `apps/delino-accounts/dist`. The `buildEnv` of the `deploy` field maps `PUBLIC_LOGTO_ENDPOINT` to the repository variable `LOGTO_ENDPOINT`, `PUBLIC_LOGTO_APP_ID` to `DELINO_ACCOUNTS_LOGTO_APP_ID`, `PUBLIC_PADDLE_CLIENT_TOKEN` to `DELINO_ACCOUNTS_PADDLE_CLIENT_TOKEN` and `PUBLIC_PADDLE_ENVIRONMENT` to `DELINO_ACCOUNTS_PADDLE_ENVIRONMENT`, so a production build always has the sign-in and checkout configuration and a missing variable fails the deployment (see [Deployment environments](repository-workflow-contract.md#deployment-environments)). The production build uses the default of `PUBLIC_API_ORIGIN`.
 
 ## Change Triggers
 

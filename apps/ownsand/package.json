@@ -6,7 +6,11 @@
   "type": "module",
   "deploy": {
     "target": "cloudflare-pages",
-    "project": "ownsand-console"
+    "project": "ownsand-console",
+    "buildEnv": {
+      "PUBLIC_LOGTO_ENDPOINT": "LOGTO_ENDPOINT",
+      "PUBLIC_LOGTO_APP_ID": "OWNSAND_CONSOLE_LOGTO_APP_ID"
+    }
   },
   "scripts": {
     "build": "rsbuild build",
