@@ -3,6 +3,7 @@
 package main
 
 import (
+	"context"
 	"io"
 	"log/slog"
 	"net/http"
@@ -10,17 +11,28 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/prometheus/client_golang/prometheus"
+	"github.com/delinoio/mono/servers/internal/telemetry"
 )
 
 // TestMetricsServer checks that the internal listener serves only
-// GET /metrics from its registry.
+// GET /metrics from the OpenTelemetry meter provider.
 func TestMetricsServer(t *testing.T) {
-	registry := prometheus.NewRegistry()
-	g := prometheus.NewGauge(prometheus.GaugeOpts{Name: "ownsand_test_gauge", Help: "test"})
-	g.Set(3)
-	registry.MustRegister(g)
-	srv := httptest.NewServer(newMetricsServer(registry, slog.New(slog.NewJSONHandler(io.Discard, nil))).Handler)
+	ctx := context.Background()
+	tel, err := telemetry.New(ctx, telemetry.Options{
+		ServiceName: "ownsand-api",
+		Stdout:      io.Discard,
+		LookupEnv:   func(string) (string, bool) { return "", false },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tel.Shutdown(ctx)
+	g, err := tel.MeterProvider.Meter("test").Int64Gauge("ownsand_test_gauge")
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.Record(ctx, 3)
+	srv := httptest.NewServer(newMetricsServer(tel, slog.New(slog.NewJSONHandler(io.Discard, nil))).Handler)
 	defer srv.Close()
 	resp, err := http.Get(srv.URL + "/metrics")
 	if err != nil {

@@ -89,6 +89,7 @@ const expectedPassThroughEnv = {
     "METRICS_ADDR",
     "NONCE_KEY",
     "NONCE_KEY_PREVIOUS",
+    "OTEL_*",
     "R2_ACCESS_KEY_ID",
     "R2_BUCKET",
     "R2_ENDPOINT",

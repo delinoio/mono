@@ -15,7 +15,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/delinoio/mono/go/uuidv7"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
@@ -91,8 +91,9 @@ type Options struct {
 	// BillingEnforceInterval is the interval of the suspension worker; zero
 	// selects the default (tests).
 	BillingEnforceInterval time.Duration
-	// Metrics registers the control plane metrics; nil registers none.
-	Metrics prometheus.Registerer
+	// Metrics provides the meters of the control plane metrics; nil records
+	// none.
+	Metrics metric.MeterProvider
 }
 
 // App is a wired control plane.

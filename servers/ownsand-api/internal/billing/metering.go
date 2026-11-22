@@ -13,7 +13,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
@@ -84,8 +85,8 @@ type Options struct {
 	Client accountsv1connect.UsageServiceClient
 	// Statuses receives the statuses of accepted reports; nil drops them.
 	Statuses StatusSink
-	// Metrics registers the metering metrics; nil registers none.
-	Metrics prometheus.Registerer
+	// Metrics provides the meter of the metering metrics; nil records none.
+	Metrics metric.MeterProvider
 	// Timing overrides DefaultTiming.
 	Timing *Timing
 }
@@ -261,7 +262,7 @@ func (m *Metering) Flush(ctx context.Context) error {
 	})
 	if err != nil {
 		m.rec.restore(counts)
-		m.metrics.flushFailures.Inc()
+		add(m.metrics.flushFailures)
 		m.logger.Warn("billing_usage_flush_failed", slog.Int("counters", len(counts)), slog.Any("error", err))
 		return err
 	}
@@ -411,7 +412,7 @@ func (m *Metering) Seal(ctx context.Context) (int, error) {
 			continue
 		}
 		n++
-		m.metrics.sealedRows.WithLabelValues(MeterID(r.meter)).Inc()
+		add(m.metrics.sealedRows, attribute.String("meter", MeterID(r.meter)))
 		m.logger.Info("billing_usage_sealed", slog.String("organization_id", r.org), slog.String("meter", MeterID(r.meter)),
 			slog.Time("window_start", r.windowStart), slog.Int64("quantity", r.quantity), slog.Int64("amount_usd_micros", r.amount))
 	}
@@ -489,7 +490,7 @@ func (m *Metering) reportBatch(ctx context.Context, rows []outboxRow) error {
 		case res.GetUnattributed():
 			result = resultUnattributed
 		}
-		m.metrics.reports.WithLabelValues(result).Inc()
+		add(m.metrics.reports, attribute.String("result", result))
 		m.logger.Info("billing_usage_reported", slog.String("organization_id", r.org), slog.String("meter", MeterID(r.meter)),
 			slog.Time("window_start", r.windowStart), slog.Int64("quantity", r.quantity), slog.Int64("amount_usd_micros", r.amount),
 			slog.String("result", result), slog.String("billing_account_id", res.GetBillingAccountId()), slog.Int("attempt", r.attempts+1))
@@ -527,7 +528,7 @@ func (m *Metering) backoff(attempt int) time.Duration {
 
 func (m *Metering) recordFailure(ctx context.Context, rows []outboxRow, cause error) {
 	code := connect.CodeOf(cause).String()
-	m.metrics.reportFailures.WithLabelValues(code).Inc()
+	add(m.metrics.reportFailures, attribute.String("code", code))
 	now := m.now()
 	orgs, meters, windows := rowKeys(rows)
 	next := make([]time.Time, len(rows))
@@ -574,13 +575,13 @@ func (m *Metering) RefreshMetrics(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	m.metrics.outboxDepth.Set(float64(depth))
+	m.metrics.outboxDepth.Record(ctx, depth)
 	lag := 0.0
 	if oldest != nil {
 		if d := m.now().Sub(oldest.Add(WindowLength)); d > 0 {
 			lag = d.Seconds()
 		}
 	}
-	m.metrics.reportLag.Set(lag)
+	m.metrics.reportLag.Record(ctx, lag)
 	return nil
 }

@@ -15,11 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/collectors"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
+	"github.com/delinoio/mono/servers/internal/telemetry"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
@@ -66,7 +63,20 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel.SlogLevel()}))
+	tel, err := telemetry.New(context.Background(), telemetry.Options{ServiceName: "ownsand-api", Level: cfg.LogLevel.SlogLevel()})
+	if err != nil {
+		return err
+	}
+	// This deferred call runs last, so the OTLP export flushes the records of
+	// the shutdown.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancel()
+		if err := tel.Shutdown(ctx); err != nil {
+			slog.Error("telemetry_shutdown_failed", slog.Any("error", err))
+		}
+	}()
+	logger := tel.Logger
 	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -83,10 +93,6 @@ func run() error {
 		}
 	}
 
-	// The registry of the internal metrics listener. The metering metrics
-	// register on it whether or not the listener runs.
-	registry := prometheus.NewRegistry()
-	registry.MustRegister(collectors.NewGoCollector(), collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
 	var usageClient accountsv1connect.UsageServiceClient
 	if cfg.Accounts.Enabled {
 		tokens := accounts.NewTokenSource(accounts.TokenConfig{
@@ -117,7 +123,9 @@ func run() error {
 		Objects:               objects,
 		SnapshotPartSizeBytes: cfg.SnapshotPartSizeBytes,
 		UsageClient:           usageClient,
-		Metrics:               registry,
+		// The metrics are recorded whether or not the internal listener
+		// runs.
+		Metrics: tel.MeterProvider,
 	})
 	if err != nil {
 		return err
@@ -167,7 +175,7 @@ func run() error {
 	var metricsSrv *http.Server
 	metricsAddr := ""
 	if metricsListener != nil {
-		metricsSrv = newMetricsServer(registry, logger)
+		metricsSrv = newMetricsServer(tel, logger)
 		metricsAddr = metricsListener.Addr().String()
 		go func() {
 			if err := metricsSrv.Serve(metricsListener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -177,7 +185,8 @@ func run() error {
 	}
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("stun_addr", udp.LocalAddr().String()), slog.String("log_level", string(cfg.LogLevel)),
-		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr), slog.Bool("usage_reporting", cfg.Accounts.Enabled))
+		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr), slog.Bool("usage_reporting", cfg.Accounts.Enabled),
+		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
 	err = serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
 	// RPCs that ended during the drain recorded usage after the metering
 	// worker stopped; write it before the process exits.
@@ -194,11 +203,9 @@ func run() error {
 
 // newMetricsServer returns the internal Prometheus listener. It serves only
 // GET /metrics and is never mounted on the public handler.
-func newMetricsServer(registry *prometheus.Registry, logger *slog.Logger) *http.Server {
-	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", promhttp.HandlerFor(registry, promhttp.HandlerOpts{ErrorLog: slog.NewLogLogger(logger.Handler(), slog.LevelError)}))
+func newMetricsServer(tel *telemetry.Telemetry, logger *slog.Logger) *http.Server {
 	return &http.Server{
-		Handler:           mux,
+		Handler:           tel.MetricsHandler(slog.NewLogLogger(logger.Handler(), slog.LevelError)),
 		ReadHeaderTimeout: readHeaderTimeout,
 		IdleTimeout:       idleTimeout,
 		ErrorLog:          slog.NewLogLogger(logger.Handler(), slog.LevelError),
