@@ -338,6 +338,47 @@ func TestCompletedBeforeQueued(t *testing.T) {
 	}
 }
 
+// TestJobWaitsForDeactivation: a queued delivery that arrives while a
+// deactivation of the installation holds the link waits for it and then
+// stores no request for the inactive installation.
+func TestJobWaitsForDeactivation(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	ctx := context.Background()
+	tx, err := w.env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM github_installations WHERE github_installation_id = 501 FOR UPDATE"); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		_, status := w.gh.Send("workflow_job", job("queued", 501, 60, tideLinux, ""))
+		done <- status
+	}()
+	select {
+	case status := <-done:
+		t.Fatalf("the delivery did not wait for the deactivation (status %d)", status)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if _, err := tx.Exec(ctx, "UPDATE github_installations SET state = $1 WHERE github_installation_id = 501",
+		int16(tidev1.GitHubInstallationState_GIT_HUB_INSTALLATION_STATE_SUSPENDED)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if status := <-done; status != http.StatusNoContent {
+		t.Fatalf("status %d", status)
+	}
+	if n := len(w.requests(t)); n != 0 {
+		t.Fatalf("%d requests for a suspended installation", n)
+	}
+}
+
 // TestInstallationSuspendedAndDeleted: suspend and deleted make the link
 // inactive, cancel its queued requests and delete its waiting runners;
 // unsuspend makes it ACTIVE again.

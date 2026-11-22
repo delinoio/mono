@@ -156,7 +156,7 @@ func (h *Handler) LinkGitHubInstallation(ctx context.Context, req *connect.Reque
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		existing, err := l.byGitHubID(ctx, tx, ghID, true)
+		existing, err := l.byGitHubID(ctx, tx, ghID, lockUpdate)
 		if err != nil {
 			return err
 		}
@@ -368,7 +368,7 @@ func (h *Handler) UnlinkGitHubInstallation(ctx context.Context, req *connect.Req
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		cur, err := l.byGitHubID(ctx, tx, inst.GitHubID, true)
+		cur, err := l.byGitHubID(ctx, tx, inst.GitHubID, lockUpdate)
 		if err != nil {
 			return err
 		}

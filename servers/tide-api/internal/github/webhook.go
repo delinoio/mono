@@ -306,7 +306,7 @@ func (l *Layer) workflowJob(ctx context.Context, tx pgx.Tx, body []byte, o *outc
 		return o.ignore("no installation or job")
 	}
 	o.githubInstID = ev.Installation.ID
-	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, false)
+	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, lockNone)
 	if err != nil {
 		return err
 	}
@@ -314,6 +314,23 @@ func (l *Layer) workflowJob(ctx context.Context, tx pgx.Tx, body []byte, o *outc
 		return o.ignore("installation not linked or not active")
 	}
 	o.organizationID = inst.OrganizationID
+	// The share lock of the link makes the job wait for a concurrent
+	// deactivation (installation event or unlink), which ends the pool's
+	// requests, and then read the new state, so no request is stored after
+	// it. The organization is locked first, in the order of the unlink.
+	if err := api.LockOrganizationShare(ctx, tx, inst.OrganizationID); err != nil {
+		if connect.CodeOf(err) == connect.CodeNotFound {
+			return o.ignore("organization is being deleted")
+		}
+		return err
+	}
+	org := inst.OrganizationID
+	if inst, err = l.byGitHubID(ctx, tx, ev.Installation.ID, lockShare); err != nil {
+		return err
+	}
+	if inst == nil || !inst.Active() || inst.OrganizationID != org {
+		return o.ignore("installation not linked or not active")
+	}
 	switch ev.Action {
 	case "queued":
 		req, err := l.createRequestTx(ctx, tx, inst, &ev, o)
@@ -498,7 +515,7 @@ func (l *Layer) installationEvent(ctx context.Context, tx pgx.Tx, body []byte, o
 	if ev.Installation.ID <= 0 {
 		return o.ignore("no installation")
 	}
-	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, true)
+	inst, err := l.byGitHubID(ctx, tx, ev.Installation.ID, lockUpdate)
 	if err != nil {
 		return err
 	}

@@ -167,11 +167,29 @@ func (l *Layer) installation(ctx context.Context, q db.Querier, orgID, id string
 	return i, err
 }
 
-// byGitHubID loads the link of a GitHub installation ID, or nil. lock takes
-// a row lock, so a webhook and an RPC on the same installation serialize.
-func (l *Layer) byGitHubID(ctx context.Context, q db.Querier, githubID int64, lock bool) (*Installation, error) {
+// rowLock is the row lock that byGitHubID takes.
+type rowLock int
+
+const (
+	// lockNone reads the row without a lock.
+	lockNone rowLock = iota
+	// lockShare serializes a reader (a workflow_job delivery) with the
+	// changes of the link, but not with other readers.
+	lockShare
+	// lockUpdate serializes a change of the link (an installation event or
+	// an RPC) with every other lock of the row.
+	lockUpdate
+)
+
+// byGitHubID loads the link of a GitHub installation ID, or nil, with the
+// row lock lock, so a webhook and an RPC on the same installation
+// serialize.
+func (l *Layer) byGitHubID(ctx context.Context, q db.Querier, githubID int64, lock rowLock) (*Installation, error) {
 	sql := "SELECT " + installationColumns + " FROM github_installations WHERE github_installation_id = $1"
-	if lock {
+	switch lock {
+	case lockShare:
+		sql += " FOR SHARE"
+	case lockUpdate:
 		sql += " FOR UPDATE"
 	}
 	i, err := scanInstallation(q.QueryRow(ctx, sql, githubID))
@@ -188,7 +206,7 @@ func (l *Layer) poolInstallation(ctx context.Context, q db.Querier, orgID, poolK
 	if err != nil {
 		return nil, nil
 	}
-	i, err := l.byGitHubID(ctx, q, id, false)
+	i, err := l.byGitHubID(ctx, q, id, lockNone)
 	if err != nil || i == nil || i.OrganizationID != orgID {
 		return nil, err
 	}
