@@ -518,13 +518,50 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 		err = s.applyExportResultWithRetry(ctx, conn, info, res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
-			_, err = s.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)
+			err = s.registerImportedCopy(ctx, conn, info, log)
 		}
 	}
 	if err != nil {
 		log.WarnContext(ctx, "agent_command_result_apply_failed", slog.Any("error", err))
 	}
 	s.Hub.Commands.Deliver(res.GetCommandId(), res)
+}
+
+// registerImportedCopy records the local copy that a successful import
+// result reports. The parent snapshot row is locked FOR SHARE while the
+// copy row is inserted, which conflicts with the FOR UPDATE lock that every
+// snapshot deletion takes before it lists the holders of the snapshot, so
+// the two orders are consistent: when the result commits first, the
+// deletion reads the copy row and includes the importer in its fanout, and
+// when the deletion commits first, the snapshot is absent here, no row is
+// written and the importer is sent the delete command itself, because the
+// deletion's fanout could not know a device that had not reported its copy
+// yet. The command is sent after the transaction ended, so no database
+// lock is held while the channel is written.
+func (s *Service) registerImportedCopy(ctx context.Context, conn *hub.Conn, info commandInfo, log *slog.Logger) error {
+	present := false
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		var one int
+		err := tx.QueryRow(ctx, "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR SHARE", info.snapshotID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			present = false
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		present = true
+		_, err = tx.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if !present {
+		log.InfoContext(ctx, "snapshot_import_result_late", slog.String("snapshot_id", info.snapshotID))
+		s.sendDeleteSnapshot(ctx, conn, info.orgID, info.snapshotID)
+	}
+	return nil
 }
 
 func (s *Service) applyResultEntry(ctx context.Context, conn *hub.Conn, e *ownsandv1.SandboxStateEntry) error {
