@@ -210,7 +210,9 @@ type grantInput struct {
 }
 
 // addGrant creates the credit grant of a verified purchase and its ledger
-// entry. A purchase that already has a grant adds nothing (created is false).
+// entry, then applies the pending adjustments of the purchase. A purchase
+// that already has a grant adds nothing (created is false). A webhook caller
+// holds the purchase lock (lockPurchase) before the lock of acct.
 func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, now time.Time) (grantID string, created bool, err error) {
 	if in.Amount <= 0 {
 		return "", false, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
@@ -253,6 +255,11 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		slog.Int64("amount_usd_micros", in.Amount),
 		slog.Int64("debt_paid_usd_micros", debtPaid),
 		slog.Int64("balance_after_usd_micros", acct.Balance))
+	// Approved refunds and chargebacks of this purchase that arrived before
+	// its payment now reduce the new grant, as if they had arrived after it.
+	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, now); err != nil {
+		return "", false, err
+	}
 	return grantID, true, nil
 }
 
