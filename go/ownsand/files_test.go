@@ -408,6 +408,81 @@ func TestWriteFileChunkedBothTransports(t *testing.T) {
 	}
 }
 
+// countingReader counts Read calls and runs onRead, when set, with the call
+// number before it serves the bytes.
+type countingReader struct {
+	r      io.Reader
+	reads  int
+	onRead func(n int)
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	c.reads++
+	if c.onRead != nil {
+		c.onRead(c.reads)
+	}
+	return c.r.Read(p)
+}
+
+func TestWriteFileObservesCancellationBeforeReadingTheSource(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			chunk := datapath.MaxFileChunkSize
+			t.Run("already canceled", func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				src := &countingReader{r: bytes.NewReader([]byte("data"))}
+				n, err := s.WriteFile(ctx, "/out", src, WriteOptions{})
+				if !errors.Is(err, context.Canceled) || n != 0 {
+					t.Fatalf("got %d, %v, want 0 and context.Canceled", n, err)
+				}
+				if src.reads != 0 {
+					t.Fatalf("source read %d times, want none", src.reads)
+				}
+				if got := len(cp.agent.writeRequests()); got != 0 {
+					t.Fatalf("%d write requests reached the agent", got)
+				}
+			})
+			t.Run("canceled before the read-ahead", func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				src := &countingReader{r: bytes.NewReader(randomBytes(t, 3*chunk)), onRead: func(n int) {
+					if n == 1 {
+						cancel()
+					}
+				}}
+				n, err := s.WriteFile(ctx, "/out", src, WriteOptions{})
+				if !errors.Is(err, context.Canceled) || n != 0 {
+					t.Fatalf("got %d, %v, want 0 and context.Canceled", n, err)
+				}
+				if src.reads != 1 {
+					t.Fatalf("source read %d times, want only the first read", src.reads)
+				}
+			})
+			t.Run("returns the acknowledged offset", func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				src := &countingReader{r: bytes.NewReader(randomBytes(t, 3*chunk))}
+				// Cancel once the first chunk is acknowledged, before the
+				// loop reads ahead for the third chunk.
+				n, err := s.WriteFile(ctx, "/out", src, WriteOptions{OnProgress: func(int64) { cancel() }})
+				if !errors.Is(err, context.Canceled) || n != int64(chunk) {
+					t.Fatalf("got %d, %v, want %d and context.Canceled", n, err, chunk)
+				}
+				if src.reads != 2 {
+					t.Fatalf("source read %d times, want 2 (first chunk and one read-ahead)", src.reads)
+				}
+			})
+		})
+	}
+}
+
 func TestWriteFileRejectsOutOfRangeModeBeforeUpload(t *testing.T) {
 	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
 		t.Run(tr.String(), func(t *testing.T) {
