@@ -301,41 +301,43 @@ type WriteOptions struct {
 // one acknowledged chunk at a time, and finishes the write with the last
 // chunk. It keeps the unacknowledged request and sends exactly that request
 // again after a failure or a session end, on a new session or on the relay,
-// before it reads more input. The target file changes only after finish.
+// before it reads more input. It generates the write_id when the first request
+// is ready to send, after it has read the first chunk and the lookahead, not
+// before it reads r, so a slow source does not use up the operation ID
+// admission window; the write_id, the binding salt and the grant digest then
+// stay the same for every retry and later chunk. It validates the path and the
+// mode before it reads r. The target file changes only after finish.
 func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts WriteOptions) (int64, error) {
-	writeID, err := uuidv7.NewString()
-	if err != nil {
-		return 0, err
-	}
-	salt, err := relaybinding.NewSalt()
-	if err != nil {
-		return 0, err
-	}
 	mode := opts.Mode
 	if mode == 0 {
 		mode = 0o644
 	}
-	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: writeID, Path: path, BindingSalt: salt}
-	if err := validate.WriteFileRequest(first, true); err != nil {
+	// Validate the path and the finish fields before the SDK reads r or sends
+	// anything. The write_id and the binding salt of the operation do not exist
+	// yet: the real write_id is generated only when the first request is ready
+	// to send (see below), so these checks use a throwaway ID and a zero salt
+	// that are never sent. The first request carries no Finish, so it cannot
+	// show a bad mode that only the last request would send; the copy with
+	// Finish covers it.
+	probeID, err := uuidv7.NewString()
+	if err != nil {
 		return 0, err
 	}
-	// The first request carries no Finish, so it cannot show a bad mode that
-	// only the last request would send. Check the finish fields on a copy
-	// before any upload; first stays unchanged because its digest binds the
-	// relay grant.
-	check := &ownsandv1.WriteFileRequest{
-		OrganizationId: first.OrganizationId, SandboxId: first.SandboxId, WriteId: first.WriteId,
-		Path: first.Path, BindingSalt: first.BindingSalt,
-		Finish: &ownsandv1.WriteFileFinish{Mode: mode},
+	probe := &ownsandv1.WriteFileRequest{
+		OrganizationId: s.org, SandboxId: s.id, WriteId: probeID,
+		Path: path, BindingSalt: make([]byte, relaybinding.SaltSize),
 	}
-	if err := validate.WriteFileRequest(check, true); err != nil {
+	if err := validate.WriteFileRequest(probe, true); err != nil {
 		return 0, err
 	}
-	op := &writeOp{
-		s:     s,
-		id:    writeID,
-		grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, writeID, relaybinding.WriteFileDigest(first)),
+	probe.Finish = &ownsandv1.WriteFileFinish{Mode: mode}
+	if err := validate.WriteFileRequest(probe, true); err != nil {
+		return 0, err
 	}
+	var (
+		op   *writeOp
+		salt []byte
+	)
 
 	buf := make([]byte, datapath.MaxFileChunkSize)
 	nextBuf := make([]byte, datapath.MaxFileChunkSize)
@@ -359,10 +361,31 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 				last = true
 			}
 		}
+		if op == nil {
+			// Chunk 1 and the lookahead have been read, so the first request
+			// is ready to send. Generate the write_id now: the agent admits an
+			// operation ID only within 15 minutes of its UUID v7 timestamp, and
+			// a slow source must not use that window up before the first send.
+			// The write_id, the salt and the grant digest stay the same for
+			// every retry and later chunk of this operation.
+			writeID, err := uuidv7.NewString()
+			if err != nil {
+				return offset, err
+			}
+			if salt, err = relaybinding.NewSalt(); err != nil {
+				return offset, err
+			}
+			first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: writeID, Path: path, BindingSalt: salt}
+			op = &writeOp{
+				s:     s,
+				id:    writeID,
+				grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, writeID, relaybinding.WriteFileDigest(first)),
+			}
+		}
 		req := &ownsandv1.WriteFileRequest{
 			OrganizationId: s.org,
 			SandboxId:      s.id,
-			WriteId:        writeID,
+			WriteId:        op.id,
 			Offset:         offset,
 			Data:           append([]byte(nil), buf[:n]...),
 		}
