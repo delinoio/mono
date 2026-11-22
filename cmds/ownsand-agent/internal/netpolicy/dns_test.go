@@ -19,47 +19,12 @@ import (
 )
 
 func TestDNSForwarder(t *testing.T) {
-	// Upstream: UDP and TCP echo with a marker.
-	up, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer up.Close()
-	go func() {
-		buf := make([]byte, 512)
-		for {
-			n, from, err := up.ReadFromUDPAddrPort(buf)
-			if err != nil {
-				return
-			}
-			up.WriteToUDPAddrPort(append([]byte("ok:"), buf[:n]...), from)
-		}
-	}()
-	upTCP, err := net.Listen("tcp", up.LocalAddr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer upTCP.Close()
-	go func() {
-		for {
-			c, err := upTCP.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				var l [2]byte
-				io.ReadFull(c, l[:])
-				msg := make([]byte, binary.BigEndian.Uint16(l[:]))
-				io.ReadFull(c, msg)
-				c.Write(append(l[:], msg...))
-			}()
-		}
-	}()
-	f, err := StartDNS(netip.MustParseAddrPort("127.0.0.1:0"), up.LocalAddr().String(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Upstream: UDP and TCP echo with a marker, answering at once. The helpers
+	// retry when the TCP port with the number of the kernel-chosen UDP port is
+	// taken already.
+	up := startGatedUpstream(t)
+	up.open()
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: DefaultDNSMaxUDPQueries, maxTCPConns: DefaultDNSMaxTCPConns})
 	defer f.Close()
 	c, err := net.Dial("udp", f.Addr().String())
 	if err != nil {
