@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { Button, ButtonVariant } from "delino-ui/button";
 import {
   AlertDialog,
@@ -18,6 +19,7 @@ import {
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
 import { type FormEvent, type ReactNode, useState } from "react";
+import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
 import type { AllPages } from "../paging.ts";
 
@@ -52,18 +54,33 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-/** A failed request, with a retry button. */
+/**
+ * A failed request. A request that ended with `Code.Unauthenticated` offers
+ * the sign-in redirect, because retrying cannot succeed: the Logto SDK keeps
+ * `isAuthenticated` true after a failed token refresh, so neither the route
+ * guard nor the top bar would offer it. Any other failure offers a retry
+ * when `onRetry` is set.
+ *
+ * `onSignIn` replaces the default `useAuth().signIn()` for a caller that has
+ * to prepare the redirect first.
+ */
 export function ErrorNotice({
   error,
   onRetry,
+  onSignIn,
 }: {
   error: unknown;
   onRetry?: () => void;
+  onSignIn?: () => Promise<void> | void;
 }) {
+  const unauthenticated =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
       <p>{errorMessage(error)}</p>
-      {onRetry ? (
+      {unauthenticated ? (
+        <SignInAgainButton onSignIn={onSignIn} />
+      ) : onRetry ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
@@ -96,6 +113,26 @@ export function MorePages({ pages }: { pages: AllPages<unknown> }) {
       Loading more
     </p>
   ) : null;
+}
+
+/**
+ * Starts the sign-in redirect. It reads the auth context only when it is
+ * rendered, so an `ErrorNotice` for another failure needs no auth provider.
+ */
+function SignInAgainButton({
+  onSignIn,
+}: {
+  onSignIn: (() => Promise<void> | void) | undefined;
+}) {
+  const auth = useAuth();
+  return (
+    <Button
+      variant={ButtonVariant.Secondary}
+      onClick={() => void (onSignIn ? onSignIn() : auth.signIn())}
+    >
+      Sign in with Delino
+    </Button>
+  );
 }
 
 export function Empty({

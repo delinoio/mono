@@ -117,6 +117,57 @@ describe("sign-in", () => {
   });
 });
 
+describe("ended session", () => {
+  const SESSION_ENDED = "Your session ended. Sign in again.";
+
+  test("an Unauthenticated answer offers the sign-in redirect and no retry", async () => {
+    const api = createFakeApi();
+    api.failNext.set(
+      "ListBillingAccounts",
+      new ConnectError("token expired", Code.Unauthenticated),
+    );
+    const { signIns } = renderApp("/billing", { api });
+    expect(await screen.findByText(SESSION_ENDED)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(signIns).toHaveLength(0);
+    await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("a token source without a token offers the sign-in redirect", async () => {
+    // The Logto SDK keeps isAuthenticated true after a failed refresh, and
+    // the app's own transport then throws Unauthenticated before any request.
+    const { signIns } = renderApp("/billing", {
+      appTransport: true,
+      getAccessToken: async () => undefined,
+    });
+    expect(await screen.findByText(SESSION_ENDED)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("an Unavailable answer keeps the retry button and offers no sign-in", async () => {
+    const api = createFakeApi();
+    api.failNext.set(
+      "ListBillingAccounts",
+      new ConnectError("down", Code.Unavailable),
+    );
+    const { signIns } = renderApp("/billing", { api });
+    expect(
+      await screen.findByText(/Delino Accounts is not available/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in with Delino" })).toBe(
+      null,
+    );
+    await click(screen.getByRole("button", { name: "Try again" }));
+    expect(
+      await screen.findByRole("link", { name: /Acme Robotics/ }),
+    ).toBeTruthy();
+    expect(signIns).toHaveLength(0);
+  });
+});
+
 describe("billing accounts", () => {
   test("lists the caller's billing accounts with the caller's role", async () => {
     renderApp("/billing");
@@ -748,6 +799,27 @@ describe("invitation acceptance", () => {
     await settle(60);
     expect(await screen.findByText(/already a member/)).toBeTruthy();
     expect(pendingInvitation.read()).toBeUndefined();
+  });
+
+  test("an ended session offers sign-in and keeps the token for the redirect", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    const api = createFakeApi();
+    api.userId = OUTSIDER;
+    api.failNext.set(
+      "AcceptInvitation",
+      new ConnectError("token expired", Code.Unauthenticated),
+    );
+    const { signIns } = renderApp("/billing/invitations/accept", { api });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    await settle(60);
+    // The failed attempt deleted the stored token.
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+    expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
   });
 
   test("a new link drops the stored token of an earlier link", async () => {

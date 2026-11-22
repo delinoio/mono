@@ -96,7 +96,17 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         title="Join the billing account"
         description="You join as the signed-in user. The invitation works only once and only for the invited email address."
       />
-      {accept.error ? <ErrorNotice error={accept.error} /> : null}
+      {accept.error ? (
+        <ErrorNotice
+          error={accept.error}
+          onSignIn={async () => {
+            // The accept handler deleted the token after the failure, and the
+            // fragment does not survive the sign-in redirect, so save it again.
+            pendingInvitation.save(token);
+            await auth.signIn();
+          }}
+        />
+      ) : null}
       <div className="actions">
         <Button
           onClick={async () => {
