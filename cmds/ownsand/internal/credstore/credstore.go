@@ -168,7 +168,7 @@ func (s Store) write(c *Credentials) error {
 	if err := tmp.Close(); err != nil {
 		return fmt.Errorf("credstore: close: %w", err)
 	}
-	if err := os.Rename(tmpName, s.Path()); err != nil {
+	if err := replaceFile(tmpName, s.Path()); err != nil {
 		return fmt.Errorf("credstore: replace: %w", err)
 	}
 	return nil
