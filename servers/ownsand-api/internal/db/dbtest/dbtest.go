@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -115,10 +116,21 @@ func childURL(admin, name string) (string, error) {
 	return u.String(), nil
 }
 
+// testPoolMaxConns is the pool size of the connections that New opens.
+const testPoolMaxConns = "32"
+
 // New returns an open pool on a fresh, migrated database.
 func New(t testing.TB) *db.DB {
 	t.Helper()
 	u := NewURL(t)
+	// The API serializes pauses and resumes of one sandbox with advisory
+	// locks that each hold a pooled connection, and allows half of the pool
+	// to hold them at once. pgx sizes the default pool by the CPU count, so a
+	// small CI runner would otherwise run fewer than the 8 commands that the
+	// billing worker keeps in flight.
+	if !strings.Contains(u, "pool_max_conns") {
+		u += "&pool_max_conns=" + testPoolMaxConns
+	}
 	d, err := db.Open(context.Background(), u)
 	if err != nil {
 		t.Fatalf("open test database: %v", err)
