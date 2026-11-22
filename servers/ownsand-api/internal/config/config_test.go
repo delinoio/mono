@@ -164,6 +164,38 @@ func TestLoadR2AndSTUN(t *testing.T) {
 	}
 }
 
+func TestLoadSTUNRateBurst(t *testing.T) {
+	for _, value := range []string{"1", "63"} {
+		v := minimal()
+		v[EnvSTUNRateBurstBytes] = value
+		_, err := Load(env(v))
+		if err == nil {
+			t.Errorf("burst %s: accepted", value)
+			continue
+		}
+		if !strings.Contains(err.Error(), EnvSTUNRateBurstBytes) || !strings.Contains(err.Error(), "at least 64 bytes") || strings.Contains(err.Error(), value+" ") {
+			t.Errorf("burst %s: error %q", value, err)
+		}
+	}
+	v := minimal()
+	cfg, err := Load(env(v))
+	if err != nil || cfg.STUNRateBurstBytes != DefaultSTUNRateBurstBytes {
+		t.Fatalf("default burst: %+v, %v", cfg, err)
+	}
+	v[EnvSTUNRateBurstBytes] = "64"
+	cfg, err = Load(env(v))
+	if err != nil || cfg.STUNRateBurstBytes != MinSTUNRateBurstBytes {
+		t.Fatalf("minimum burst: %+v, %v", cfg, err)
+	}
+	for _, value := range []string{"0", "-1", "abc"} {
+		v[EnvSTUNRateBurstBytes] = value
+		_, err := Load(env(v))
+		if err == nil || err.Error() != EnvSTUNRateBurstBytes+" must be a positive integer" {
+			t.Errorf("burst %s: error %v", value, err)
+		}
+	}
+}
+
 func TestLoadSTUNURLs(t *testing.T) {
 	for _, tc := range []struct {
 		name, urls string
