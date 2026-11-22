@@ -8,8 +8,10 @@ import {
   screen,
   within,
 } from "@testing-library/react";
-import type { Transport } from "@connectrpc/connect";
+import { createClient, type Transport } from "@connectrpc/connect";
+import { ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import { QueryClient } from "@tanstack/react-query";
+import { PAGE_SIZE } from "./api.ts";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode } from "./config.ts";
@@ -490,6 +492,28 @@ describe("personal API keys", () => {
     await settle(60);
     expect(screen.queryByText(value)).toBeNull();
     expect(await screen.findByText(/codex-agent/)).toBeTruthy();
+  });
+});
+
+describe("personal API key pages", () => {
+  test("shows the keys after the first page", async () => {
+    const transport = createMockTransport();
+    const apiKeys = createClient(ApiKeyService, transport);
+    for (let i = 1; i <= PAGE_SIZE; i++) {
+      await apiKeys.createApiKey({
+        organizationId: MOCK_IDS.acme,
+        name: `agent-${i}`,
+      });
+    }
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/claude-on-laptop/);
+    expect(screen.queryByText(new RegExp(`agent-${PAGE_SIZE} `))).toBeNull();
+    await click(screen.getByRole("button", { name: "Show more" }));
+    await settle(60);
+    expect(
+      await screen.findByText(new RegExp(`agent-${PAGE_SIZE} `)),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Show more" })).toBeNull();
   });
 });
 

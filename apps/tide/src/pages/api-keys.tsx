@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { timestampFromMs } from "@bufbuild/protobuf/wkt";
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useInfiniteQuery, useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
@@ -8,7 +8,7 @@ import { TextField } from "delino-ui/text-field";
 import { type ApiKey, ApiKeyService } from "@delino/tide-protos/v1/api_key_pb";
 import { ApiKeyState } from "@delino/tide-protos/v1/common_pb";
 import { useState } from "react";
-import { invalidateServices, MAX_PAGE_SIZE } from "../api.ts";
+import { invalidateServices, PAGE_SIZE } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
@@ -33,10 +33,14 @@ export function ApiKeysPage() {
   const { organizationId } = useOrg();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, ApiKeyService);
-  const list = useQuery(ApiKeyService.method.listApiKeys, {
-    organizationId,
-    pageSize: MAX_PAGE_SIZE,
-  });
+  const list = useInfiniteQuery(
+    ApiKeyService.method.listApiKeys,
+    { organizationId, pageSize: PAGE_SIZE, pageToken: "" },
+    {
+      pageParamKey: "pageToken",
+      getNextPageParam: (last) => last.nextPageToken || undefined,
+    },
+  );
   const create = useMutation(ApiKeyService.method.createApiKey, {
     onSuccess: refresh,
   });
@@ -49,7 +53,7 @@ export function ApiKeysPage() {
   const [nameError, setNameError] = useState<string>();
   const [secret, setSecret] = useState<string>();
   const [revoking, setRevoking] = useState<ApiKey>();
-  const keys = list.data?.apiKeys ?? [];
+  const keys = list.data?.pages.flatMap((p) => p.apiKeys) ?? [];
 
   return (
     <>
@@ -101,6 +105,14 @@ export function ApiKeysPage() {
           ))}
         </ul>
       )}
+      {list.hasNextPage ? (
+        <Button
+          variant={ButtonVariant.Secondary}
+          onClick={() => void list.fetchNextPage()}
+        >
+          Show more
+        </Button>
+      ) : null}
       <FormDialog
         open={creating}
         onOpenChange={(open) => {
