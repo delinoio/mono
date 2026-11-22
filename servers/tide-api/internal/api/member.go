@@ -354,6 +354,15 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 		if current == tidev1.Role_ROLE_OWNER {
 			return ErrPermission("the owner's role changes only with TransferOwnership")
 		}
+		// When the caller changes its own role, Authorize can have read a
+		// role that a concurrent change replaced before the row lock above.
+		// The locked role is the current one, so check the permission again
+		// with it; otherwise this update could undo a demotion of the
+		// caller. For another target the update is ordered before any later
+		// change of the caller's role, so the first check is enough.
+		if target == c.UserID && !authz.RoleAllowed(current, authz.ActionManageMembers) {
+			return ErrPermission("the caller's role does not allow this action")
+		}
 		var joined time.Time
 		if err := tx.QueryRow(ctx, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2 RETURNING join_time", c.OrganizationID, target, int16(role)).Scan(&joined); err != nil {
 			return err

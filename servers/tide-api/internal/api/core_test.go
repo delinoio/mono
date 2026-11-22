@@ -288,3 +288,26 @@ func TestRequestSizeLimit(t *testing.T) {
 	_, err := env.User("alice").Organization.CreateOrganization(context.Background(), connect.NewRequest(&tidev1.CreateOrganizationRequest{Name: strings.Repeat("x", api.MaxRequestBytes+1)}))
 	wantCode(t, "oversized", err, connect.CodeResourceExhausted)
 }
+
+// An admin's change of its own role that overlaps its demotion must not
+// restore the admin role.
+func TestSelfRoleUpdateAfterConcurrentDemotion(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	// The held update stands in for the owner's demotion that commits while
+	// the admin's request runs.
+	commit := holdTx(t, env, "UPDATE memberships SET role = $3 WHERE organization_id = $1 AND user_id = $2", org.ID, org.Admin, int16(tidev1.Role_ROLE_MEMBER))
+	errc := make(chan error, 1)
+	go func() {
+		_, err := env.User(org.Admin).Member.UpdateMemberRole(ctx, connect.NewRequest(&tidev1.UpdateMemberRoleRequest{OrganizationId: org.ID, UserId: org.Admin, Role: tidev1.Role_ROLE_ADMIN}))
+		errc <- err
+	}()
+	waitForLockWaiter(t, env)
+	commit()
+	wantCode(t, "self update after demotion", <-errc, connect.CodePermissionDenied)
+	var role int16
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT role FROM memberships WHERE organization_id = $1 AND user_id = $2", org.ID, org.Admin).Scan(&role); err != nil || tidev1.Role(role) != tidev1.Role_ROLE_MEMBER {
+		t.Fatalf("role = %v, %v; want ROLE_MEMBER", tidev1.Role(role), err)
+	}
+}
