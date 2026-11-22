@@ -38,15 +38,18 @@ func newID(t testing.TB) string {
 }
 
 type fakeServer struct {
-	t     testing.TB
-	srv   *httptest.Server
-	org   string
-	sb    string
-	dev   string
-	mu    sync.Mutex
-	auths []string
-	calls []string
-	files map[string][]byte
+	t   testing.TB
+	srv *httptest.Server
+	org string
+	sb  string
+	dev string
+	// labels are the labels of the sandbox that GetSandbox and ListSandboxes
+	// return; a test sets them before it runs a command.
+	labels map[string]string
+	mu     sync.Mutex
+	auths  []string
+	calls  []string
+	files  map[string][]byte
 	// limit is the last limits input of ReplaceDeviceLimits; its optional
 	// fields keep the presence that the CLI sent.
 	limit *ownsandv1.DeviceLimitsInput
@@ -203,12 +206,12 @@ func (h *fakeSandbox) CreateSandbox(_ context.Context, r *connect.Request[ownsan
 }
 
 func (h *fakeSandbox) GetSandbox(_ context.Context, r *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
-	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: &ownsandv1.Sandbox{SandboxId: r.Msg.GetSandboxId(), OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now()}}), nil
+	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: &ownsandv1.Sandbox{SandboxId: r.Msg.GetSandboxId(), OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now(), Labels: h.f.labels}}), nil
 }
 
 func (h *fakeSandbox) ListSandboxes(_ context.Context, r *connect.Request[ownsandv1.ListSandboxesRequest]) (*connect.Response[ownsandv1.ListSandboxesResponse], error) {
 	return connect.NewResponse(&ownsandv1.ListSandboxesResponse{
-		Sandboxes:     []*ownsandv1.Sandbox{{SandboxId: h.f.sb, OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now()}},
+		Sandboxes:     []*ownsandv1.Sandbox{{SandboxId: h.f.sb, OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now(), Labels: h.f.labels}},
 		NextPageToken: "next",
 	}), nil
 }

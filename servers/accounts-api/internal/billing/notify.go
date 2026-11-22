@@ -132,12 +132,25 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 		return err
 	}
 	lines := noticeLines(n)
+	// A failure for one recipient does not stop the others: a recipient that
+	// keeps failing must not keep later, independent recipients from getting
+	// the email before the notification is abandoned. failed keeps the first
+	// error for the retry bookkeeping and the log; every later error still
+	// counts in the email metrics. A canceled or expired context stops the
+	// loop, because every later call would fail the same way.
 	var failed error
+	failedRecipients := 0
 	for _, userID := range recipients {
+		if ctx.Err() != nil {
+			break
+		}
 		user, err := s.directory.User(ctx, userID)
 		if err != nil && !errors.Is(err, directory.ErrUserNotFound) {
-			failed = fmt.Errorf("read recipient profile: %w", err)
-			break
+			failedRecipients++
+			if failed == nil {
+				failed = fmt.Errorf("read recipient profile: %w", err)
+			}
+			continue
 		}
 		if user.PrimaryEmail != "" {
 			msg, err := email.NoticeMessage(email.Notice{
@@ -154,8 +167,11 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 			}
 			if err := s.email.Send(ctx, msg); err != nil {
 				s.metrics.Email(string(n.Kind), "failed")
-				failed = err
-				break
+				failedRecipients++
+				if failed == nil {
+					failed = err
+				}
+				continue
 			}
 			s.metrics.Email(string(n.Kind), "sent")
 		}
@@ -189,6 +205,7 @@ func (s *Service) deliver(ctx context.Context, tx pgx.Tx, n notification, now ti
 		slog.String("notification_id", n.ID),
 		slog.Int("attempts", attempts),
 		slog.Bool("abandoned", abandon != nil),
+		slog.Int("failed_recipients", failedRecipients),
 		slog.Any("error", failed))
 	_, err = tx.Exec(ctx, `UPDATE billing_notifications SET attempts = $2, next_attempt_time = $3, abandon_time = $4
 		WHERE notification_id = $1`, n.ID, attempts, now.Add(backoff), abandon)

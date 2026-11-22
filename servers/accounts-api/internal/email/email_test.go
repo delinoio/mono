@@ -114,6 +114,150 @@ func TestResendFailure(t *testing.T) {
 	}
 }
 
+func TestResendErrorKind(t *testing.T) {
+	const recipient = "b@example.com"
+	respond := func(status int, body string, header map[string]string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			for k, v := range header {
+				w.Header().Set(k, v)
+			}
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}
+	}
+	tests := []struct {
+		name string
+		want string
+		// handler gets the channel that the test closes after the send, so a
+		// blocking handler returns and srv.Close() does not hang.
+		handler func(block chan struct{}) http.HandlerFunc
+		// timeout is the http.Client.Timeout; zero keeps the default.
+		timeout time.Duration
+		// send builds the send context and returns a cleanup.
+		ctx func() (context.Context, func())
+		// closeServer closes the server before the send.
+		closeServer bool
+	}{
+		{
+			name: "canceled before the send",
+			want: "canceled",
+			handler: func(chan struct{}) http.HandlerFunc {
+				return respond(http.StatusOK, `{"id":"e1"}`, nil)
+			},
+			ctx: func() (context.Context, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+		},
+		{
+			name: "canceled in flight",
+			want: "canceled",
+			handler: func(block chan struct{}) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					select {
+					case <-r.Context().Done():
+					case <-block:
+					}
+				}
+			},
+			ctx: func() (context.Context, func()) {
+				ctx, cancel := context.WithCancel(context.Background())
+				timer := time.AfterFunc(50*time.Millisecond, cancel)
+				return ctx, func() { timer.Stop(); cancel() }
+			},
+		},
+		{
+			name: "context deadline exceeded",
+			want: "canceled",
+			handler: func(block chan struct{}) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					select {
+					case <-r.Context().Done():
+					case <-block:
+					}
+				}
+			},
+			ctx: func() (context.Context, func()) {
+				return context.WithTimeout(context.Background(), 50*time.Millisecond)
+			},
+		},
+		{
+			name: "client timeout with a live context",
+			want: "network",
+			handler: func(block chan struct{}) http.HandlerFunc {
+				return func(w http.ResponseWriter, r *http.Request) {
+					select {
+					case <-r.Context().Done():
+					case <-block:
+					}
+				}
+			},
+			timeout: 50 * time.Millisecond,
+		},
+		{
+			name: "connection refused",
+			want: "network",
+			handler: func(chan struct{}) http.HandlerFunc {
+				return respond(http.StatusOK, `{"id":"e1"}`, nil)
+			},
+			closeServer: true,
+		},
+		{
+			name: "rate limited",
+			want: "rate_limited",
+			handler: func(chan struct{}) http.HandlerFunc {
+				return respond(http.StatusTooManyRequests, `{"statusCode":429,"name":"rate_limit_exceeded","message":"Too many requests for b@example.com"}`,
+					map[string]string{"ratelimit-limit": "2", "ratelimit-remaining": "0", "ratelimit-reset": "1", "retry-after": "1"})
+			},
+		},
+		{
+			name: "validation error",
+			want: "provider",
+			handler: func(chan struct{}) http.HandlerFunc {
+				return respond(http.StatusUnprocessableEntity, `{"statusCode":422,"name":"validation_error","message":"Invalid to field: b@example.com"}`, nil)
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			block := make(chan struct{})
+			// close(block) is deferred after srv.Close, so it runs first.
+			srv := httptest.NewServer(tc.handler(block))
+			defer srv.Close()
+			defer close(block)
+			if tc.closeServer {
+				srv.Close()
+			}
+			var logs bytes.Buffer
+			cfg := email.ResendConfig{APIKey: "k", From: "billing@delino.io", BaseURL: srv.URL, Logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+			if tc.timeout > 0 {
+				cfg.Client = &http.Client{Timeout: tc.timeout}
+			}
+			sender, err := email.NewResend(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ctx, done := context.Background(), func() {}
+			if tc.ctx != nil {
+				ctx, done = tc.ctx()
+			}
+			defer done()
+			err = sender.Send(ctx, email.Message{Kind: email.KindInvitation, To: recipient})
+			if err == nil || strings.Contains(err.Error(), recipient) {
+				t.Fatalf("Send() error = %v", err)
+			}
+			if !strings.Contains(logs.String(), `"billing_email_failed"`) || !strings.Contains(logs.String(), `"error_kind":"`+tc.want+`"`) {
+				t.Fatalf("want error_kind %q, log = %s", tc.want, logs.String())
+			}
+			if strings.Contains(logs.String(), recipient) {
+				t.Fatalf("log contains the recipient: %s", logs.String())
+			}
+		})
+	}
+}
+
 func TestFake(t *testing.T) {
 	f := email.NewFake()
 	if err := f.Send(context.Background(), email.Message{To: "a@example.com"}); err != nil {

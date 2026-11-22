@@ -497,7 +497,10 @@ func (f *fixture) trackedVM(id string, pid int) (*vm, chan struct{}) {
 		f.t.Fatal(err)
 	}
 	exited := make(chan struct{})
+	// The fixture has no reaper: the test closes exited, so the launch gate
+	// stays open and a stop signals the group.
 	v := &vm{id: id, dir: dir, dirFile: dirFile, exited: exited, cmd: &exec.Cmd{Process: &os.Process{Pid: pid}}}
+	v.launch = &launch{pid: pid, exited: exited}
 	f.r.mu.Lock()
 	f.r.vms[id] = v
 	f.r.mu.Unlock()
@@ -647,8 +650,23 @@ func startHelper(t *testing.T, bin, dir, id string) *exec.Cmd {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	go cmd.Wait()
-	t.Cleanup(func() { syscall.Kill(cmd.Process.Pid, syscall.SIGKILL) })
+	done := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		// os.Process.Kill returns os.ErrProcessDone once Wait reaped the
+		// child, so a PID that the kernel may have reused is never signalled.
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("kill helper %d: %v", cmd.Process.Pid, err)
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("helper %d was not reaped within 10s of the kill", cmd.Process.Pid)
+		}
+	})
 	return cmd
 }
 
@@ -739,6 +757,10 @@ func TestStartProcessRecordsLaunchAndStopKillsChild(t *testing.T) {
 	if err := r.startProcess(ctx, v); err == nil {
 		t.Fatal("start without an API socket succeeded")
 	}
+	// startProcess keeps the child in v.cmd even when it fails, so a failed
+	// assertion below must still end and reap the child. stop is idempotent:
+	// after the explicit stop below, v.cmd is nil and this does nothing.
+	t.Cleanup(func() { _ = r.stop(v) })
 	rec, reason, err := readLaunchRecord(dir, "sb1")
 	if err != nil || reason != "" {
 		t.Fatalf("launch record: %q %v", reason, err)
