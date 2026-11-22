@@ -790,6 +790,147 @@ describe("invoices", () => {
       window.open = originalOpen;
     }
   });
+
+  describe("while the link is in flight", () => {
+    const INVOICE_URL = "https://sandbox-invoice.paddle.test/txn_top1.pdf";
+
+    /**
+     * Stands in for the blank tab that the click reserves. `closed` flips
+     * when the test plays the user closing the tab.
+     */
+    function fakeTab() {
+      const tab = {
+        opener: "app" as unknown,
+        closed: false,
+        replaced: [] as string[],
+        closeCalls: 0,
+        location: {
+          replace(url: string) {
+            tab.replaced.push(url);
+          },
+        },
+        close() {
+          tab.closeCalls += 1;
+          tab.closed = true;
+        },
+      };
+      return tab;
+    }
+
+    /**
+     * Opens the invoice with the given `window.open` result and holds the
+     * GetInvoiceUrl answer until `respond` runs. The location assignment
+     * that a blocked pop-up falls back to is recorded and not performed.
+     */
+    async function openInvoiceWith(
+      opened: ReturnType<typeof fakeTab> | null,
+      failure?: ConnectError,
+    ) {
+      const originalOpen = window.open;
+      const originalAssign = window.location.assign;
+      const assigned: string[] = [];
+      window.open = (() => opened) as unknown as typeof window.open;
+      window.location.assign = (url: string | URL) => {
+        assigned.push(String(url));
+      };
+      const api = createFakeApi();
+      if (failure !== undefined) api.failNext.set("GetInvoiceUrl", failure);
+      let respond!: () => void;
+      api.gates.set(
+        "GetInvoiceUrl",
+        new Promise<void>((resolve) => {
+          respond = resolve;
+        }),
+      );
+      await renderAccount(ADMIN, { api });
+      await openTab("Invoices");
+      const list = await screen.findByRole("list", { name: "Invoices" });
+      await click(
+        within(list).getByRole("button", { name: /Open the invoice/ }),
+      );
+      await settle(60);
+      expect(calls(api, "GetInvoiceUrl")).toHaveLength(1);
+      return {
+        api,
+        assigned,
+        respond: async () => {
+          respond();
+          await settle(60);
+        },
+        restore() {
+          window.open = originalOpen;
+          window.location.assign = originalAssign;
+        },
+      };
+    }
+
+    test("a tab the user closed discards the link and leaves the billing page alone", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(tab);
+      try {
+        const pathBefore = window.location.pathname;
+        tab.closed = true;
+        await harness.respond();
+        expect(tab.replaced).toEqual([]);
+        expect(harness.assigned).toEqual([]);
+        expect(window.location.pathname).toBe(pathBefore);
+        expect(
+          screen.getByRole("heading", { name: "Acme Robotics" }),
+        ).toBeTruthy();
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a tab that stays open receives the invoice", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(tab);
+      try {
+        await harness.respond();
+        expect(tab.replaced).toEqual([INVOICE_URL]);
+        expect(tab.opener).toBeNull();
+        expect(harness.assigned).toEqual([]);
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a blocked pop-up opens the invoice in the billing tab", async () => {
+      const harness = await openInvoiceWith(null);
+      try {
+        expect(harness.assigned).toEqual([]);
+        await harness.respond();
+        expect(harness.assigned).toEqual([INVOICE_URL]);
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a failed request closes the open tab and shows the error toast", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(
+        tab,
+        new ConnectError("unavailable", Code.Unavailable),
+      );
+      try {
+        expect(tab.closeCalls).toBe(1);
+        expect(tab.replaced).toEqual([]);
+        expect(harness.assigned).toEqual([]);
+        expect(
+          await screen.findByText(
+            "Delino Accounts is not available right now. Try again in a moment.",
+          ),
+        ).toBeTruthy();
+        const stored = JSON.stringify({
+          ...window.sessionStorage,
+          ...window.localStorage,
+        });
+        expect(stored).not.toContain("sandbox-invoice");
+      } finally {
+        harness.restore();
+      }
+    });
+  });
 });
 
 describe("members", () => {

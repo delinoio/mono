@@ -95,7 +95,7 @@ export interface FakeApi {
   /**
    * Holds every call of a method until the promise settles, so that a test
    * can observe what the page does while a request is still in flight. Only
-   * `GetBillingAccount` honors a gate.
+   * `GetBillingAccount` and `GetInvoiceUrl` honor a gate.
    */
   gates: Map<string, Promise<unknown>>;
   transport: ReturnType<typeof createRouterTransport>;
@@ -606,8 +606,9 @@ export function createFakeApi(): FakeApi {
           invoices: load(req.billingAccountId, PAYMENT_ROLES).account.invoices,
         };
       },
-      getInvoiceUrl(req) {
+      async getInvoiceUrl(req) {
         record("GetInvoiceUrl", req);
+        await api.gates.get("GetInvoiceUrl");
         load(req.billingAccountId, PAYMENT_ROLES);
         return {
           invoiceUrl: `https://sandbox-invoice.paddle.test/${req.paddleTransactionId}.pdf`,
