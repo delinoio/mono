@@ -17,6 +17,7 @@ export const ComparisonEvent = Object.freeze({
   PullRequest: "pull_request",
   Push: "push",
   WorkflowDispatch: "workflow_dispatch",
+  Schedule: "schedule",
 });
 
 // How the base of a resolved comparison was found. Logged in the
@@ -28,6 +29,8 @@ export const BaseSource = Object.freeze({
   MergeBase: "merge-base",
   // A local commit of the empty tree, for a push without a prior commit.
   EmptyTree: "empty-tree",
+  // The checkout itself, for the scheduled run.
+  Checkout: "checkout",
 });
 
 // The base branch revision for a manual dispatch without a `base` input.
@@ -155,6 +158,16 @@ export function resolveComparison(env, cwd = process.cwd()) {
         baseSource: BaseSource.MergeBase,
       };
     }
+    case ComparisonEvent.Schedule:
+      // The scheduled run validates the main head on the macOS and Windows
+      // runners only; `scripts/ci/plan.mjs` selects those jobs for it without
+      // a diff. An empty comparison keeps every diff-selected job skipped.
+      return {
+        base: head,
+        head,
+        requestedBase: head,
+        baseSource: BaseSource.Checkout,
+      };
     default:
       throw new Error(
         `Unsupported comparison event ${JSON.stringify(env.GITHUB_EVENT_NAME ?? null)}`,
