@@ -6,6 +6,8 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -144,6 +146,114 @@ func TestRemoveTrailingAndFit(t *testing.T) {
 	}
 	if err := Fit(path); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// diskEntries reads the entry array that the header at sector headerLBA
+// points to, straight from the bytes of the disk, and returns it with the
+// checksum that the header records. It parses the header fields at their
+// fixed offsets, independent of the package's own decoding.
+func diskEntries(t *testing.T, f *os.File, headerLBA uint64) (entries []byte, headerCRC uint32) {
+	t.Helper()
+	hdr := make([]byte, SectorSize)
+	if _, err := f.ReadAt(hdr, int64(headerLBA)*SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	if string(hdr[:8]) != signature {
+		t.Fatalf("no GPT header at sector %d", headerLBA)
+	}
+	lba := binary.LittleEndian.Uint64(hdr[72:80])
+	n := binary.LittleEndian.Uint32(hdr[80:84])
+	size := binary.LittleEndian.Uint32(hdr[84:88])
+	entries = make([]byte, int(n)*int(size))
+	if _, err := f.ReadAt(entries, int64(lba)*SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	return entries, binary.LittleEndian.Uint32(hdr[88:92])
+}
+
+// TestFitKeepsBothEntryArrays grows the disk by amounts around the length of
+// the entry array (32 sectors) and checks, from the bytes of the disk, that
+// both entry arrays match the checksum of their header and keep every used
+// partition. A growth of at most the array length puts the old backup header
+// inside the new backup entry array.
+func TestFitKeepsBothEntryArrays(t *testing.T) {
+	const sectors = 1 << 16
+	for _, grow := range []uint64{1, 10, 31, 32, 33, 34, 1000, sectors} {
+		t.Run(fmt.Sprintf("grow%d", grow), func(t *testing.T) {
+			path := newDisk(t, sectors)
+			want := read(t, path).Partitions()
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			oldEntries, _ := diskEntries(t, f, 1)
+			if err := f.Truncate(int64(sectors+grow) * SectorSize); err != nil {
+				t.Fatal(err)
+			}
+			if err := Fit(path); err != nil {
+				t.Fatal(err)
+			}
+			last := sectors + grow - 1
+			for name, lba := range map[string]uint64{"primary": 1, "backup": last} {
+				entries, crc := diskEntries(t, f, lba)
+				if got := crc32.ChecksumIEEE(entries); got != crc {
+					t.Errorf("%s entry array checksum %08x, header %08x", name, got, crc)
+				}
+				if !bytes.Equal(entries, oldEntries) {
+					t.Errorf("%s entry array lost or changed an entry", name)
+				}
+			}
+			tbl := read(t, path)
+			if got := tbl.Partitions(); len(got) != len(want) {
+				t.Fatalf("partitions after Fit %+v, want %+v", got, want)
+			}
+			for i, p := range tbl.Partitions() {
+				if p != want[i] {
+					t.Errorf("partition %d is %+v, want %+v", i, p, want[i])
+				}
+			}
+			// The old backup header is cleared when its sector is outside
+			// the new layout. Otherwise the sector holds new table data,
+			// which the checks above compare.
+			if grow > 32 {
+				old := make([]byte, SectorSize)
+				if _, err := f.ReadAt(old, (sectors-1)*SectorSize); err != nil {
+					t.Fatal(err)
+				}
+				if !bytes.Equal(old, make([]byte, SectorSize)) {
+					t.Error("the old backup header was not cleared")
+				}
+			}
+		})
+	}
+}
+
+func TestVerifyDetectsDamagedEntryArrays(t *testing.T) {
+	const sectors = 1 << 14
+	for _, c := range []struct {
+		name string
+		lba  uint64
+	}{{"primary", 2}, {"backup", sectors - 1 - 32}} {
+		t.Run(c.name, func(t *testing.T) {
+			path := newDisk(t, sectors)
+			f, err := os.OpenFile(path, os.O_RDWR, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			tbl := read(t, path)
+			if err := tbl.verify(f); err != nil {
+				t.Fatalf("verify of an intact table: %v", err)
+			}
+			if _, err := f.WriteAt(make([]byte, SectorSize), int64(c.lba)*SectorSize); err != nil {
+				t.Fatal(err)
+			}
+			if err := tbl.verify(f); err == nil || !strings.Contains(err.Error(), c.name) {
+				t.Fatalf("verify of a damaged %s entry array = %v", c.name, err)
+			}
+		})
 	}
 }
 
