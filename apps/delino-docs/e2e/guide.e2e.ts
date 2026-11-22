@@ -12,6 +12,7 @@ interface ColorKit {
   parse(color: string): Rgba;
   resolve(name: string): Rgba;
   over(foreground: Rgba, background: Rgba): Rgba;
+  stops(image: string): Rgba[];
   ratio(foreground: Rgba, background: Rgba): number;
 }
 
@@ -152,6 +153,15 @@ describe("brand colors", () => {
         b: foreground.b * foreground.a + background.b * (1 - foreground.a),
         a: 1,
       });
+      // Reads the color stops of a computed `linear-gradient(...)`.
+      const stops = (image: string): Rgba[] => {
+        const found =
+          image.match(/rgba?\([^)]*\)|color\(srgb [^)]*\)/g)?.map(parse) ?? [];
+        if (found.length < 2) {
+          throw new Error(`Expected a gradient with color stops, got ${image}`);
+        }
+        return found;
+      };
       const luminance = ({ r, g, b }: Rgba) => {
         const [lr, lg, lb] = [r, g, b].map((value) => {
           const channel = value / 255;
@@ -168,7 +178,7 @@ describe("brand colors", () => {
           (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
         );
       };
-      const kit: ColorKit = { parse, resolve, over, ratio };
+      const kit: ColorKit = { parse, resolve, over, stops, ratio };
       (window as unknown as { colorKit: ColorKit }).colorKit = kit;
       return true;
     };
@@ -215,6 +225,38 @@ describe("brand colors", () => {
         ratioOverBgSoft: kit.ratio(
           text,
           kit.over(hover, kit.resolve("--rp-c-bg-soft")),
+        ),
+      };
+    };
+
+  // Reads the hero button and wordmark gradients: the white button label
+  // against every button stop, and the wordmark stops against the page
+  // background and the hero glow behind the wordmark.
+  const readHeroContrast = () =>
+    function (glow: Rgba) {
+      const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+      const button = document.querySelector(".rp-button--brand");
+      const wordmark = document.querySelector(".rp-home-hero__title-brand");
+      if (!button || !wordmark) {
+        throw new Error("The hero button or the hero wordmark is missing");
+      }
+      const label = kit.parse(getComputedStyle(button).color);
+      const background = kit.resolve("--rp-c-bg");
+      const wordmarkStops = kit.stops(
+        getComputedStyle(wordmark).backgroundImage,
+      );
+      return {
+        label: [label.r, label.g, label.b].join(","),
+        buttonLabelLowest: Math.min(
+          ...kit
+            .stops(getComputedStyle(button).backgroundImage)
+            .map((stop) => kit.ratio(label, stop)),
+        ),
+        wordmarkBackgroundLowest: Math.min(
+          ...wordmarkStops.map((stop) => kit.ratio(stop, background)),
+        ),
+        wordmarkGlowLowest: Math.min(
+          ...wordmarkStops.map((stop) => kit.ratio(stop, glow)),
         ),
       };
     };
@@ -361,6 +403,54 @@ describe("brand colors", () => {
       expect(hovered.textMatchesBrand).toBe(true);
       expect(hovered.ratioOverBg).toBeGreaterThanOrEqual(4.5);
       expect(hovered.ratioOverBgSoft).toBeGreaterThanOrEqual(4.5);
+    });
+  }
+
+  // The glow is the darkest (dark) or lightest (light) color that the hero
+  // background gradients paint behind the wordmark, sampled from the rendered
+  // page: rgb(33, 25, 81) in dark mode and rgb(231, 232, 255) in light mode.
+  for (const mode of ["light", "dark"] as const) {
+    const glow: Rgba =
+      mode === "dark"
+        ? { r: 33, g: 25, b: 81, a: 1 }
+        : { r: 231, g: 232, b: 255, a: 1 };
+
+    test(`keeps the hero button label at 4.5:1 along its gradient in ${mode} mode`, async ({
+      app,
+      browser,
+    }) => {
+      await app.open("/");
+      await browser.evaluate(installColorKit());
+      if (mode === "dark") {
+        await browser.evaluate(() => {
+          document.documentElement.classList.add("rp-dark");
+          return true;
+        });
+      }
+
+      const hero = await browser.evaluate(readHeroContrast(), glow);
+
+      expect(hero.label).toBe("255,255,255");
+      expect(hero.buttonLabelLowest).toBeGreaterThanOrEqual(4.5);
+    });
+
+    test(`keeps the hero wordmark gradient at 3:1 in ${mode} mode`, async ({
+      app,
+      browser,
+    }) => {
+      await app.open("/");
+      await browser.evaluate(installColorKit());
+      if (mode === "dark") {
+        await browser.evaluate(() => {
+          document.documentElement.classList.add("rp-dark");
+          return true;
+        });
+      }
+
+      const hero = await browser.evaluate(readHeroContrast(), glow);
+
+      expect(hero.wordmarkBackgroundLowest).toBeGreaterThanOrEqual(3);
+      expect(hero.wordmarkGlowLowest).toBeGreaterThanOrEqual(3);
     });
   }
 });
