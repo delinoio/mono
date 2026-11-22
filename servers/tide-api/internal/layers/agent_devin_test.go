@@ -164,6 +164,36 @@ func TestDevinClaimRelease(t *testing.T) {
 	}
 }
 
+// TestDevinStartCheckPartialFailure: when the poller cannot read the queue
+// entry of one STARTING session, it still marks the runner of another
+// session BUSY when that session runs (a missed watch event).
+func TestDevinStartCheckPartialFailure(t *testing.T) {
+	w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	waiting := func(sid string) *tidev1.Runner {
+		req := w.requestBySource(t, sid)
+		var runner *tidev1.Runner
+		eventually(t, sid+" runner waits for work", func() bool {
+			r := w.request(t, req.GetRequestId())
+			if r.GetRunnerId() == "" {
+				return false
+			}
+			runner = w.runner(t, r.GetRunnerId())
+			return runner.GetState() == tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+		})
+		return runner
+	}
+	w.devin.AddSession("ses-gone", true)
+	waiting("ses-gone")
+	w.devin.AddSession("ses-ok", true)
+	ok := waiting("ses-ok")
+	w.devin.Forget("ses-gone")
+	w.devin.SetSessionStatusSilently("ses-ok", "running")
+	w.waitRunner(t, ok.GetRunnerId(), tidev1.RunnerState_RUNNER_STATE_BUSY)
+	if !strings.Contains(w.env.Logs.String(), "agent_session_check_failed") {
+		t.Fatal("the failed check was not logged")
+	}
+}
+
 // TestDevinWatchReconnect: a stream end (scheduled, at most 5 minutes) and
 // failing watch calls (backoff) both lead to a new list, so a session whose
 // event tide missed is claimed; repeated events create no second request.

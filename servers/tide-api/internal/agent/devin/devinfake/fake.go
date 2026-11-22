@@ -260,6 +260,22 @@ func (f *Fake) SetSessionStatus(sid, status string) {
 	f.broadcastLocked("MODIFIED", e)
 }
 
+// SetSessionStatusSilently changes the session status without a watch
+// event, as when tide misses the event.
+func (f *Fake) SetSessionStatusSilently(sid, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.entries[sid].SessionStatus = status
+}
+
+// Forget removes a session without a watch event, so that reading its
+// queue entry answers 404.
+func (f *Fake) Forget(sid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.entries, sid)
+}
+
 // ClaimElsewhere lets another acceptor take a pending session.
 func (f *Fake) ClaimElsewhere(sid string) {
 	f.mu.Lock()

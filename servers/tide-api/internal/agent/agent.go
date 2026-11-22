@@ -65,7 +65,9 @@ type Vendor interface {
 	Watch(ctx context.Context, w *Watch) error
 	// CheckStarted returns the request IDs of claims whose runner program
 	// took its session, among claims of one integration whose request is
-	// STARTING with a runner that waits for work.
+	// STARTING with a runner that waits for work. When the vendor cannot
+	// answer for some claims, it returns the request IDs that it confirmed
+	// together with an error; the Hub applies the confirmed ones.
 	CheckStarted(ctx context.Context, in integration.Integration, claims []*Claim) ([]string, error)
 	// Release gives up a held claim of a request that ended, or that the
 	// Hub gives up (organization deletion). done=false keeps the claim

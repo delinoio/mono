@@ -293,12 +293,11 @@ func (h *Hub) poll(ctx context.Context) {
 			claims[i] = hc.claim
 			reqs[hc.claim.RequestID] = hc.req
 		}
+		// A failed check of some claims does not discard the claims that the
+		// vendor confirmed: CheckStarted returns both.
 		taken, err := v.CheckStarted(ctx, in, claims)
-		if err != nil {
-			if ctx.Err() == nil {
-				h.log.WarnContext(ctx, "agent_session_check_failed", slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID), slog.Any("error", err))
-			}
-			continue
+		if err != nil && ctx.Err() == nil {
+			h.log.WarnContext(ctx, "agent_session_check_failed", slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID), slog.Any("error", err))
 		}
 		for _, reqID := range taken {
 			if req := reqs[reqID]; req != nil {
