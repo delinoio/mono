@@ -550,6 +550,35 @@ export interface MockTransportOptions {
 }
 
 /** Creates a transport backed by a fresh fake control plane. */
+/**
+ * Picks the device for a new sandbox like the control plane scheduler.
+ *
+ * An explicit device ID is an exclusive selection: the request never falls back
+ * to another device. An ID that names no visible device fails with `NotFound`
+ * (a removed device is a tombstone, so it counts as not found), and a device
+ * that is not `ONLINE` fails with `Unavailable`, the code for a transient
+ * condition. Without an ID, the first `ONLINE` device runs the sandbox, and the
+ * result is `undefined` when none is online.
+ */
+function placeSandbox(
+  devices: Device[],
+  deviceId: string | undefined,
+): Device | undefined {
+  if (deviceId === undefined || deviceId === "") {
+    return devices.find((d) => d.state === DeviceState.ONLINE);
+  }
+  const device = devices.find(
+    (d) => d.deviceId === deviceId && d.state !== DeviceState.REMOVED,
+  );
+  if (device === undefined) {
+    throw new ConnectError("device not found", Code.NotFound);
+  }
+  if (device.state !== DeviceState.ONLINE) {
+    throw new ConnectError("the device is offline", Code.Unavailable);
+  }
+  return device;
+}
+
 export function createMockTransport(
   options: MockTransportOptions = {},
 ): Transport {
@@ -1105,9 +1134,7 @@ export function createMockTransport(
           }
           return { sandbox: findSandbox(org, known.sandboxId) };
         }
-        const device =
-          org.devices.find((d) => d.deviceId === req.placement?.deviceId) ??
-          org.devices.find((d) => d.state === DeviceState.ONLINE);
+        const device = placeSandbox(org.devices, req.placement?.deviceId);
         if (device === undefined) {
           throw new ConnectError(
             "no device can run this sandbox",
