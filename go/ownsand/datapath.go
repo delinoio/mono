@@ -136,6 +136,14 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		// starts no relay recovery.
 		return nil, cerr
 	}
+	// Only OpenSession reports the state of the sandbox, so the marker of
+	// an OpenSession failure decides the failed_precondition case below. The
+	// router returns and logs the original error.
+	var openSessionErr *errOpenSessionFailed
+	fromOpenSession := errors.As(err, &openSessionErr)
+	if fromOpenSession {
+		err = openSessionErr.cause
+	}
 	if IsBillingError(err) {
 		// Billing enforcement rejected GetIceServers or OpenSession. The
 		// relay is rejected for the same reason, so the error ends the
@@ -151,6 +159,12 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeInvalidArgument, connect.CodeCanceled:
 			return nil, err
 		case connect.CodeFailedPrecondition:
+			if !fromOpenSession {
+				// GetIceServers has no sandbox state, so this is a
+				// control plane failure like any other: the handle moves
+				// to the relay below.
+				break
+			}
 			// The sandbox is not RUNNING (for example PAUSED, where an
 			// AttachExec still works on the relay). Use the relay for this
 			// attempt without moving the handle.

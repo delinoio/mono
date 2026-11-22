@@ -657,3 +657,146 @@ func TestCloseDuringOperationOnForcedPeerToPeer(t *testing.T) {
 		})
 	}
 }
+
+// execOnce runs one exec on s with a bounded context.
+func execOnce(t *testing.T, s *Sandbox) (*ExecResult, error) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	return s.Exec(ctx, ExecParams{Command: []string{"run"}})
+}
+
+func (s *Sandbox) usesRelay() bool {
+	s.dp.mu.Lock()
+	defer s.dp.mu.Unlock()
+	return s.dp.relay
+}
+
+// failedPrecondition is the status of a control plane request that the sandbox
+// state does not allow.
+func failedPrecondition() error {
+	return connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox not running"))
+}
+
+// TestGetIceServersFailedPreconditionMovesToRelay checks that a
+// failed_precondition from GetIceServers has no sandbox-state meaning: the
+// operation succeeds on the relay and the handle moves to the relay, so a
+// later operation does not call GetIceServers again.
+func TestGetIceServersFailedPreconditionMovesToRelay(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 0)
+	cp.iceGate = make(chan struct{})
+	cp.gateErr = failedPrecondition()
+	c := cp.client(t, TransportAuto)
+	logs := captureLogs(c)
+	s := cp.handle(t, c)
+
+	for i := range 2 {
+		res, err := execOnce(t, s)
+		if err != nil {
+			t.Fatalf("exec %d: %v", i, err)
+		}
+		if res.Transport != relayTransport {
+			t.Fatalf("exec %d transport %v, want relay", i, res.Transport)
+		}
+	}
+	if !s.usesRelay() || s.Transport() != relayTransport {
+		t.Fatalf("handle did not move to the relay: transport %v", s.Transport())
+	}
+	if n := cp.iceCallCount(); n != 1 {
+		t.Fatalf("%d GetIceServers calls, want 1: the second operation must use the relay directly", n)
+	}
+	if n := cp.openSessionCount(); n != 0 {
+		t.Fatalf("%d OpenSession calls, want 0", n)
+	}
+	if got := logs.String(); !strings.Contains(got, "falls back to the relay") || strings.Contains(got, "using the relay once") {
+		t.Fatalf("unexpected logs:\n%s", got)
+	}
+}
+
+// TestOpenSessionFailedPreconditionUsesRelayOnce checks that a
+// failed_precondition from OpenSession (a sandbox that is not RUNNING) still
+// uses the relay for that attempt only: the next operation sets up again.
+func TestOpenSessionFailedPreconditionUsesRelayOnce(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(3, 0)
+	cp.mu.Lock()
+	cp.openErr = failedPrecondition()
+	cp.mu.Unlock()
+	s := cp.handle(t, cp.client(t, TransportAuto))
+
+	for i := range 2 {
+		res, err := execOnce(t, s)
+		if err != nil {
+			t.Fatalf("exec %d: %v", i, err)
+		}
+		if res.Transport != relayTransport {
+			t.Fatalf("exec %d transport %v, want relay", i, res.Transport)
+		}
+	}
+	if s.usesRelay() {
+		t.Fatal("the handle moved to the relay on an OpenSession failed_precondition")
+	}
+	if ice, open := cp.iceCallCount(), cp.openSessionCount(); ice != 2 || open != 2 {
+		t.Fatalf("%d GetIceServers and %d OpenSession calls, want 2 and 2", ice, open)
+	}
+}
+
+// TestForcedPeerToPeerFailedPreconditionReturnsTheError checks that a forced
+// peer-to-peer handle returns the failed_precondition of either setup step
+// with its status code and asks for no relay grant.
+func TestForcedPeerToPeerFailedPreconditionReturnsTheError(t *testing.T) {
+	for _, stage := range []stalledStage{stageGetIceServers, stageOpenSession} {
+		t.Run(string(stage), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			if stage == stageGetIceServers {
+				cp.iceGate = make(chan struct{})
+				cp.gateErr = failedPrecondition()
+			} else {
+				cp.mu.Lock()
+				cp.openErr = failedPrecondition()
+				cp.mu.Unlock()
+			}
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			_, err := execOnce(t, s)
+			if got := connect.CodeOf(err); got != connect.CodeFailedPrecondition {
+				t.Fatalf("code %v, want failed_precondition (err %v)", got, err)
+			}
+			if n := len(cp.authRequests()); n != 0 {
+				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+			}
+		})
+	}
+}
+
+// TestGetIceServersTerminalErrorsEndTheOperation checks that the errors that
+// are terminal for OpenSession are terminal for GetIceServers too.
+func TestGetIceServersTerminalErrorsEndTheOperation(t *testing.T) {
+	billing := billingErr(ownsandv1.BillingReason_BILLING_REASON_SUSPENDED)
+	for _, err := range []error{
+		connect.NewError(connect.CodeUnauthenticated, errors.New("bad credential")),
+		connect.NewError(connect.CodePermissionDenied, errors.New("denied")),
+		connect.NewError(connect.CodeNotFound, errors.New("no such sandbox")),
+		connect.NewError(connect.CodeInvalidArgument, errors.New("bad request")),
+		billing,
+	} {
+		t.Run(connect.CodeOf(err).String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			cp.iceGate = make(chan struct{})
+			cp.gateErr = err
+			s := cp.handle(t, cp.client(t, TransportAuto))
+			_, got := execOnce(t, s)
+			if got == nil || connect.CodeOf(got) != connect.CodeOf(err) {
+				t.Fatalf("exec error %v, want code %v", got, connect.CodeOf(err))
+			}
+			if n := len(cp.authRequests()); n != 0 {
+				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+			}
+			if s.usesRelay() {
+				t.Fatal("the handle moved to the relay")
+			}
+		})
+	}
+}
