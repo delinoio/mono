@@ -9,7 +9,7 @@ import {
 import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
 import { CreateSandboxRequestSchema } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
-import { clearInvitationOnLeave } from "./App.tsx";
+import { clearInvitationOnLeave, clearInvitationOutsideFlow } from "./App.tsx";
 import {
   AuthMode,
   DEFAULT_API_ORIGIN,
@@ -46,7 +46,13 @@ import {
   takeSecretFromAddress,
 } from "./invitation.ts";
 import { can, canManageMember, Permission } from "./roles.ts";
-import { parseRoute, RouteId, routePath } from "./router.tsx";
+import {
+  isInvitationFlowRoute,
+  parseRoute,
+  type Route,
+  RouteId,
+  routePath,
+} from "./router.tsx";
 
 describe("deviceAllocatedVcpu", () => {
   test("prefers the exact 64-bit total above the int32 range", () => {
@@ -261,6 +267,32 @@ describe("invitation secrets", () => {
       { id: RouteId.Invitation },
       { id: RouteId.Organizations },
     );
+    expect(pendingInvitation.read()).toBeUndefined();
+  });
+
+  test("only the invitation and callback routes belong to the invitation flow", () => {
+    const flow = [RouteId.Invitation, RouteId.Callback];
+    for (const route of [
+      { id: RouteId.Organizations },
+      { id: RouteId.Invitation },
+      { id: RouteId.Callback },
+      { id: RouteId.NotFound },
+      { id: RouteId.Sandboxes, organizationId: "o" },
+      { id: RouteId.Settings, organizationId: "o" },
+    ] as Route[]) {
+      expect(isInvitationFlowRoute(route)).toBe(flow.includes(route.id));
+    }
+  });
+
+  test("the start-up check deletes the pending secret outside the invitation flow only", () => {
+    pendingInvitation.save("osi_pending");
+    clearInvitationOutsideFlow(parseRoute("/invitations/accept"));
+    clearInvitationOutsideFlow(parseRoute("/callback"));
+    expect(pendingInvitation.read()).toBe("osi_pending");
+    clearInvitationOutsideFlow(parseRoute("/orgs/o/members"));
+    expect(pendingInvitation.read()).toBeUndefined();
+    pendingInvitation.save("osi_pending");
+    clearInvitationOutsideFlow(parseRoute("/"));
     expect(pendingInvitation.read()).toBeUndefined();
   });
 });

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { LogtoProvider, useLogto } from "@logto/react";
+import { LogtoProvider, PersistKey, useLogto } from "@logto/react";
 import {
   createContext,
   type ReactNode,
@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { API_RESOURCE, type LogtoSettings } from "./config.ts";
+import { pendingInvitation } from "./invitation.ts";
 
 /** The signed-in state that the console needs, independent of the provider. */
 export interface Auth {
@@ -49,6 +50,60 @@ export const SIGN_IN_NOT_CONFIGURED =
 
 /** Path of the sign-in callback route. */
 export const CALLBACK_PATH = "/callback";
+
+/**
+ * Whether the Logto SDK has a sign-in redirect to complete at this address.
+ *
+ * `useHandleSignInCallback` reports nothing when no redirect is pending: no
+ * loading state, no error and no callback. Its `isLoading` is also `false`
+ * for a render while a real redirect starts, so the hook state cannot tell
+ * the two cases apart, and `@logto/react` exposes neither the client nor its
+ * `isSignInRedirected` method. The console therefore applies the same rule
+ * as `isSignInRedirected` (`@logto/client` 3.2.x) to the SDK's stored
+ * sign-in session: a redirect is pending when `sessionStorage` holds the
+ * session of the application (key `logto:<appId>:signInSession`, or the
+ * legacy key `logto:<appId>`) and, when the session is readable, its
+ * `redirectUri` equals the origin and path of this address. An unreadable
+ * session counts as pending, because the hook then reports an error that the
+ * page shows. Remove this check when `@logto/react` exposes the client or
+ * the pending state.
+ */
+export function isLogtoSignInPending(
+  appId: string,
+  location: Pick<Location, "origin" | "pathname">,
+  storage: Pick<Storage, "getItem"> | undefined = browserSessionStorage(),
+): boolean {
+  let stored: string | null;
+  try {
+    const key = `logto:${appId}`;
+    stored =
+      storage?.getItem(`${key}:${PersistKey.SignInSession}`) ??
+      storage?.getItem(key) ??
+      null;
+  } catch {
+    return false;
+  }
+  if (stored === null || stored === "") return false;
+  try {
+    const session: unknown = JSON.parse(stored);
+    const redirectUri =
+      typeof session === "object" && session !== null
+        ? (session as { redirectUri?: unknown }).redirectUri
+        : undefined;
+    if (typeof redirectUri !== "string") return true;
+    return redirectUri === `${location.origin}${location.pathname}`;
+  } catch {
+    return true;
+  }
+}
+
+function browserSessionStorage(): Storage | undefined {
+  try {
+    return window.sessionStorage;
+  } catch {
+    return undefined;
+  }
+}
 
 /**
  * Logto single-page application sign-in. The SDK requests access tokens for
@@ -117,6 +172,8 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
       userId,
       signIn: () => signIn(window.location.origin + CALLBACK_PATH),
       signOut: async () => {
+        // A pending invitation secret must not outlive the session.
+        pendingInvitation.clear();
         await signOut(window.location.origin);
       },
       getAccessToken: async () =>
@@ -163,6 +220,7 @@ export function MockAuthProvider({ children }: { children: ReactNode }) {
     window.location.assign(CALLBACK_PATH);
   }, []);
   const signOut = useCallback(async () => {
+    pendingInvitation.clear();
     try {
       window.sessionStorage.removeItem(key);
     } catch {
