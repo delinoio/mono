@@ -183,16 +183,26 @@ func (fs *frameSender) send(f *ownsandv1.DataFrame) error {
 // runs on its own goroutine; execs keep running after the stream ends.
 func (s *Server) Serve(ctx context.Context, stream *connect.BidiStream[ownsandv1.ServeRequest, ownsandv1.ServeResponse]) error {
 	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 	out := &frameSender{stream: stream}
 	var wg sync.WaitGroup
-	defer wg.Wait()
+	// The handlers end only when ctx ends or their work finishes. Deferred
+	// calls run last in, first out, so deferring cancel and then Wait would
+	// wait for the handlers before it cancels them, and a receive error
+	// (for example an oversize frame) would reach the client only after
+	// every running exec ended. A client half-close (io.EOF) keeps the wait
+	// without a cancel: the handlers finish the responses of the requests
+	// that already arrived. A receive error cancels first.
+	defer func() {
+		wg.Wait()
+		cancel()
+	}()
 	for {
 		req, err := stream.Receive()
 		if err != nil {
 			if errors.Is(err, io.EOF) || ctx.Err() != nil {
 				return nil
 			}
+			cancel()
 			return err
 		}
 		f := req.GetFrame()
