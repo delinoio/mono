@@ -64,9 +64,11 @@ func TestUnansweredCommandsExpireAfterChannelClose(t *testing.T) {
 		env.Clock.Advance(2 * time.Second)
 		testenv.Eventually(t, "the unanswered command expired", func() bool { return svc.PendingCommands() == 0 })
 	}
-	if got := countLogs(env, `"msg":"agent_commands_expired"`); got != 5 {
-		t.Fatalf("expiry log lines = %d, want 5", got)
-	}
+	// expireCommands removes the records before it writes the log line, so
+	// the line of the last round can follow the zero count above.
+	testenv.Eventually(t, "five expiry log lines", func() bool {
+		return countLogs(env, `"msg":"agent_commands_expired"`) == 5
+	})
 }
 
 // TestClosingOldGenerationKeepsReplacementCommands checks that the close of
