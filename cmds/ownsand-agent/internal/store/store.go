@@ -54,7 +54,10 @@ type Store struct {
 	mu  sync.Mutex
 }
 
-// Open creates the state directory (mode 0700) and its subdirectories.
+// Open creates the state directory and its subdirectories and restricts the
+// directory to the service account: mode 0700 on Linux and macOS, and a
+// protected ACL for SYSTEM and Administrators on Windows (see
+// restrictStateDir).
 func Open(dir string) (*Store, error) {
 	if dir == "" {
 		return nil, errors.New("store: state directory is required")
@@ -65,7 +68,7 @@ func Open(dir string) (*Store, error) {
 		}
 	}
 	// The directory may exist with wider permissions from an operator.
-	if err := os.Chmod(dir, 0o700); err != nil {
+	if err := restrictStateDir(dir); err != nil {
 		return nil, fmt.Errorf("store: restrict state directory: %w", err)
 	}
 	return &Store{dir: dir}, nil
