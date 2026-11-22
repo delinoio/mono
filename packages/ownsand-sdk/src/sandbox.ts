@@ -99,10 +99,12 @@ export class Sandbox {
   }
 
   async delete(signal?: AbortSignal): Promise<SandboxMessage> {
-    this.#selector.close();
     const res = await this.#ctx.sandboxes.deleteSandbox(this.#ids(), {
       signal,
     });
+    // Close only after the delete succeeded: a failed delete leaves the
+    // sandbox and its handle usable.
+    this.#selector.close();
     return this.#keep(res.sandbox);
   }
 

@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import { Code } from "@connectrpc/connect";
-import { DataPathError, OwnSandConfigError } from "./errors.ts";
+import {
+  DataPathError,
+  OwnSandConfigError,
+  OwnSandHandleClosedError,
+} from "./errors.ts";
 import { DataPathTransport } from "@delino/ownsand-protos/v1/common_pb";
 import { LogEvent, safeLog } from "./logger.ts";
 import {
@@ -35,6 +39,7 @@ export class DataPathSelector {
   #session: PeerSession | undefined;
   #setup: SessionSetup | undefined;
   #onRelay: boolean;
+  #closed = false;
 
   constructor(
     ctx: OperationContext,
@@ -64,13 +69,18 @@ export class DataPathSelector {
    * callers share one session setup. The setup has its own abort signal, so
    * the first caller's signal does not decide the outcome for the others: it
    * is cancelled only when every caller that waits for it has aborted. Each
-   * caller still ends promptly with its own abort reason.
+   * caller still ends promptly with its own abort reason. A closed handle
+   * rejects with `OwnSandHandleClosedError` before it starts a setup; the
+   * relay path keeps serving.
    */
   async select(
     signal: AbortSignal | undefined,
   ): Promise<PeerSession | undefined> {
     if (this.#onRelay) {
       return undefined;
+    }
+    if (this.#closed) {
+      throw new OwnSandHandleClosedError();
     }
     if (this.#session !== undefined && !this.#session.closed) {
       return this.#session;
@@ -144,9 +154,13 @@ export class DataPathSelector {
       return session;
     } catch (error) {
       if (signal.aborted) {
-        // Every caller aborted. The cancelled setup is not a peer failure, so
-        // the handle stays on peer-to-peer.
-        throw error;
+        // Every caller aborted, or the handle closed. The cancelled setup is
+        // not a peer failure, so the handle stays on peer-to-peer. A close
+        // ends every waiter with the closed error, also when a transport
+        // reported the abort as another error such as Canceled.
+        throw signal.reason instanceof OwnSandHandleClosedError
+          ? signal.reason
+          : error;
       }
       if (error instanceof SessionNotOpenError) {
         // The sandbox is not RUNNING (for example PAUSED, where an AttachExec
@@ -193,8 +207,18 @@ export class DataPathSelector {
     }
   }
 
-  /** Closes the session of the handle, if any. */
+  /**
+   * Closes the handle: it closes the session, if any, and cancels the setup
+   * in flight. Every caller that waits for that setup ends with
+   * `OwnSandHandleClosedError`, and a session that the setup still opens is
+   * closed and never installed. Later peer-to-peer calls of `select` reject
+   * with the same error. It is idempotent and also works with no session.
+   */
   close(): void {
+    this.#closed = true;
+    const setup = this.#setup;
+    this.#setup = undefined;
+    setup?.controller.abort(new OwnSandHandleClosedError());
     this.#session?.close();
     this.#session = undefined;
   }
