@@ -19,6 +19,7 @@ import (
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth/authtest"
 	"github.com/delinoio/mono/servers/accounts-api/internal/billing"
+	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/testenv"
 )
 
@@ -196,6 +197,55 @@ func TestReportUsageValidation(t *testing.T) {
 	}
 	reportUsage(t, c, report(org, meterEgress, current, 1, 0), report(org, meterEgress, time.Date(2001, 1, 1, 0, 0, 0, 0, time.UTC), 1, 0))
 	reportUsage(t, c, many[:500]...)
+}
+
+// TestZeroAmountReportExpiringGrantQueuesLowBalance reports usage of zero
+// after the only grant of the billing account is due. The report expires the
+// grant inline, which takes the balance below the alert threshold, so the
+// low-balance email is queued and sent once.
+func TestZeroAmountReportExpiringGrantQueuesLowBalance(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subscribe(t, env, f) // a 10 USD grant, equal to the default alert threshold
+	org := newOrg(t)
+	link(t, env, f.AccountID, org, f.Owner.ID, "Acme")
+	lowBalanceQueued := func() int {
+		var n int
+		if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_notifications WHERE kind = $1`,
+			string(billing.NotifyLowBalance)).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if n := lowBalanceQueued(); n != 0 {
+		t.Fatalf("%d low-balance notifications before the expiry", n)
+	}
+
+	env.Clock.Advance(time.Hour + (billing.GrantExpireTime(env.Clock.Now()).Sub(env.Clock.Now())))
+	w := window(env.Clock.Now()).Add(-billing.WindowLength)
+	reportUsage(t, env.Service(), report(org, meterEgress, w, 1, 0))
+
+	if b := balanceOf(t, env, f.Owner.ID, f.AccountID).GetBalanceUsdMicros(); b != 0 {
+		t.Fatalf("balance %d after the expiry", b)
+	}
+	if kinds := ledgerKinds(t, env, f.Owner.ID, f.AccountID); strings.Join(kinds, " ") != "USAGE EXPIRY SUBSCRIPTION_CREDIT" {
+		t.Fatalf("ledger = %v", kinds)
+	}
+	if n := lowBalanceQueued(); n != 1 {
+		t.Fatalf("%d low-balance notifications after the expiry, want 1", n)
+	}
+	if err := env.Billing.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	var sent int
+	for _, m := range env.Email.Messages() {
+		if m.Kind == email.KindLowBalance {
+			sent++
+		}
+	}
+	if sent == 0 {
+		t.Fatal("no low-balance email was sent")
+	}
 }
 
 func TestReportUsageIdempotency(t *testing.T) {

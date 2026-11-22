@@ -449,6 +449,139 @@ func TestLowBalanceAlertOncePerCrossing(t *testing.T) {
 	}
 }
 
+// lowBalanceState returns the number of queued low-balance notifications and
+// the low_balance_alerted flag of the billing account.
+func (f *fixture) lowBalanceState(accountID string) (queued int64, alerted bool) {
+	f.t.Helper()
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_notifications
+		WHERE billing_account_id = $1 AND kind = $2`, accountID, string(NotifyLowBalance)).Scan(&queued); err != nil {
+		f.t.Fatal(err)
+	}
+	st, err := LoadSettings(ctx(), f.db.Pool, accountID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return queued, st.LowBalanceAlerted
+}
+
+// wantLowBalance checks the low-balance notifications and alert flag.
+func (f *fixture) wantLowBalance(accountID string, queued int64, alerted bool) {
+	f.t.Helper()
+	if gotQueued, gotAlerted := f.lowBalanceState(accountID); gotQueued != queued || gotAlerted != alerted {
+		f.t.Fatalf("low-balance notifications = %d, alerted = %v, want %d and %v", gotQueued, gotAlerted, queued, alerted)
+	}
+}
+
+// expiringFixture returns a billing account with a 20 USD grant that is due
+// to expire and a 5 USD grant that is not, and sets the clock just after the
+// expiry of the first grant. The balance of 25 USD still includes the due
+// grant, because no job has expired it yet.
+func (f *fixture) expiringFixture() string {
+	f.t.Helper()
+	acct := f.account()
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+	f.wantLowBalance(acct, 0, false)
+	return acct
+}
+
+func TestZeroDeductionInlineExpiryQueuesLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.expiringFixture()
+	res := f.deduct(acct, 0)
+	if res.AutoTopUpQueued || res.BalanceAfterUSDMicros != 5*usd {
+		t.Fatalf("zero deduction result %+v", res)
+	}
+	f.wantLowBalance(acct, 1, true)
+	// The alert is not repeated while the balance stays below the threshold.
+	f.deduct(acct, 0)
+	f.deduct(acct, usd)
+	f.wantLowBalance(acct, 1, true)
+}
+
+func TestZeroDeductionInlineExpiryNeverQueuesAutoTopUp(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 50*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+
+	// With automatic top-up on, an expiry is no usage: it queues neither an
+	// automatic top-up nor a low-balance email.
+	if res := f.deduct(acct, 0); res.AutoTopUpQueued || res.BalanceAfterUSDMicros != 5*usd {
+		t.Fatalf("zero deduction result %+v", res)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 0 {
+		t.Fatalf("top-ups after a zero deduction = %v", got)
+	}
+	f.wantLowBalance(acct, 0, false)
+	// A positive usage below the threshold still queues it.
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("a usage deduction below the threshold queued no top-up")
+	}
+}
+
+func TestGrantAfterInlineExpiryQueuesLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.expiringFixture()
+	// 25 USD before, 5 USD after the expiry, 8 USD after the grant: a
+	// decrease that ends below the threshold.
+	f.grant(acct, LedgerManualTopUp, 3*usd)
+	if f.balance(acct) != 8*usd {
+		t.Fatalf("balance = %d", f.balance(acct))
+	}
+	f.wantLowBalance(acct, 1, true)
+}
+
+func TestGrantAfterInlineExpiryDoesNotQueueAutoTopUp(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 50*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+
+	f.grant(acct, LedgerManualTopUp, 3*usd)
+	if got := f.topUpStatuses(acct); len(got) != 0 {
+		t.Fatalf("top-ups after a grant = %v", got)
+	}
+	f.wantLowBalance(acct, 0, false)
+}
+
+func TestGrantRestoringBalanceRearmsLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.expiringFixture()
+	f.deduct(acct, 0) // the inline expiry brings the balance to 5 USD and alerts
+	f.wantLowBalance(acct, 1, true)
+
+	// A grant that reaches the threshold re-arms the alert and queues nothing.
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.wantLowBalance(acct, 1, false)
+}
+
+func TestInlineExpiryAboveThresholdQueuesNoLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 25*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+
+	// The expiry decreases the balance from 45 to 25 USD, above the threshold.
+	f.grant(acct, LedgerManualTopUp, usd)
+	f.wantLowBalance(acct, 0, false)
+	f.clock.Advance(time.Hour)
+	f.deduct(acct, 0)
+	f.wantLowBalance(acct, 0, false)
+}
+
 // activate gives the billing account an active Paddle subscription.
 func (f *fixture) activate(accountID string) string {
 	f.t.Helper()
