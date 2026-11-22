@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -119,5 +120,66 @@ func TestCreateSandboxRejectsNULInLabels(t *testing.T) {
 	req.Labels = map[string]string{"k\x01": "v\t\x7f"}
 	if _, err := org.OwnerClient.Sandbox.CreateSandbox(ctx, connect.NewRequest(req)); err != nil {
 		t.Fatalf("create with control characters other than NUL: %v", err)
+	}
+}
+
+// TestMemberRPCsRejectNULUserID sends a user_id with a NUL byte to
+// UpdateMemberRole, RemoveMember and TransferOwnership. PostgreSQL text
+// cannot store it, so before the check the lookup failed with an internal
+// error. Each call now fails with invalid_argument, and the memberships and
+// their roles stay unchanged. A user_id with another control character is
+// still an ordinary unknown member.
+func TestMemberRPCsRejectNULUserID(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	owner := org.OwnerClient
+	members := func() (total, owners, admins, plain int) {
+		q := "SELECT count(*) FROM memberships WHERE organization_id = $1"
+		return countRows(t, env, q, org.ID),
+			countRows(t, env, q+" AND role = $2", org.ID, int16(ownsandv1.Role_ROLE_OWNER)),
+			countRows(t, env, q+" AND role = $2", org.ID, int16(ownsandv1.Role_ROLE_ADMIN)),
+			countRows(t, env, q+" AND role = $2", org.ID, int16(ownsandv1.Role_ROLE_MEMBER))
+	}
+	total, owners, admins, plain := members()
+	calls := map[string]func(userID string) error{
+		"UpdateMemberRole": func(userID string) error {
+			_, err := owner.Member.UpdateMemberRole(ctx, connect.NewRequest(&ownsandv1.UpdateMemberRoleRequest{
+				OrganizationId: org.ID, UserId: userID, Role: ownsandv1.Role_ROLE_ADMIN,
+			}))
+			return err
+		},
+		"RemoveMember": func(userID string) error {
+			_, err := owner.Member.RemoveMember(ctx, connect.NewRequest(&ownsandv1.RemoveMemberRequest{
+				OrganizationId: org.ID, UserId: userID,
+			}))
+			return err
+		},
+		"TransferOwnership": func(userID string) error {
+			_, err := owner.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{
+				OrganizationId: org.ID, UserId: userID,
+			}))
+			return err
+		},
+	}
+	for name, call := range calls {
+		for _, userID := range []string{"abc\x00", "\x00", org.Member + "\x00"} {
+			requireInvalidNaming(t, env, name+" with user_id "+strconv.Quote(userID), call(userID), "user_id")
+		}
+		// Other control characters stay valid text: the user is unknown.
+		if err := call("a\x01b"); testenv.Code(err) != connect.CodeNotFound {
+			t.Fatalf("%s with user_id a\\x01b: code = %v (%v), want not_found", name, testenv.Code(err), err)
+		}
+	}
+	gotTotal, gotOwners, gotAdmins, gotPlain := members()
+	if gotTotal != total || gotOwners != owners || gotAdmins != admins || gotPlain != plain {
+		t.Fatalf("memberships after the rejected calls = total %d owner %d admin %d member %d, want %d %d %d %d",
+			gotTotal, gotOwners, gotAdmins, gotPlain, total, owners, admins, plain)
+	}
+	// A valid user ID still works.
+	if _, err := owner.Member.UpdateMemberRole(ctx, connect.NewRequest(&ownsandv1.UpdateMemberRoleRequest{
+		OrganizationId: org.ID, UserId: org.Member, Role: ownsandv1.Role_ROLE_ADMIN,
+	})); err != nil {
+		t.Fatalf("valid UpdateMemberRole: %v", err)
 	}
 }

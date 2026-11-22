@@ -48,7 +48,10 @@ export interface ConsoleConfig {
   logto: LogtoSettings | undefined;
 }
 
-/** Validates an http or https origin without path, query, fragment or credentials. */
+/**
+ * Validates an http or https origin without path, query, fragment, backslash
+ * or credentials.
+ */
 export function resolveOrigin(
   name: string,
   value: string | undefined,
@@ -72,6 +75,9 @@ export function resolveOrigin(
     url.pathname !== "/" ||
     raw.includes("?") ||
     raw.includes("#") ||
+    // The URL parser treats a backslash as a path separator for http(s), so
+    // it can hide a path (`https://host\tenant\..` normalizes to `/`).
+    raw.includes("\\") ||
     /^[a-z]+:\/\/[^/]+\/./i.test(raw.trim())
   ) {
     throw new Error(

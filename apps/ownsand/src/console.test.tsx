@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import { StrictMode } from "react";
 import {
   act,
   cleanup,
@@ -56,6 +57,7 @@ function renderConsole(
     queryClient?: QueryClient;
     /** The signed-in user; the mock user by default. */
     userId?: string;
+    strict?: boolean;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -79,15 +81,16 @@ function renderConsole(
         mutations: { retry: false },
       },
     });
-  render(
+  const tree = (
     <AuthContextProvider value={auth}>
       <Console
         config={options.config ?? config}
         transport={options.transport ?? createMockTransport()}
         queryClient={queryClient}
       />
-    </AuthContextProvider>,
+    </AuthContextProvider>
   );
+  render(options.strict ? <StrictMode>{tree}</StrictMode> : tree);
   return { signIns };
 }
 
@@ -1452,6 +1455,60 @@ describe("invitations", () => {
     expect(
       screen.queryByRole("button", { name: "Accept invitation" }),
     ).toBeNull();
+  });
+});
+
+describe("a page load outside the invitation flow", () => {
+  test.each([
+    ["the organization list", "/"],
+    ["an organization page", `/orgs/${MOCK_IDS.acme}/sandboxes`],
+    ["an unknown route", "/no-such-page"],
+  ])("deletes the stored secret on a fresh load of %s", async (_name, path) => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole(path);
+    await settle(60);
+    expect(pendingInvitation.read()).toBeUndefined();
+  });
+
+  test("deletes the stored secret on a fresh load while signed out", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/", { signedIn: false });
+    await settle(60);
+    expect(pendingInvitation.read()).toBeUndefined();
+  });
+
+  test("keeps the stored secret on a reload of the signed-out invitation page", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", { signedIn: false, strict: true });
+    expect(
+      await screen.findByRole("button", { name: "Sign in to accept" }),
+    ).toBeTruthy();
+    await settle(60);
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+  });
+
+  test("keeps the stored secret on a load of the sign-in callback and returns to the invitation", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/callback", { strict: true });
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe("/invitations/accept");
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+  });
+
+  test("a sign-in after an abandoned invitation returns to the organization list", async () => {
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    // The user abandoned the sign-in and loaded the console again ...
+    renderConsole("/");
+    await settle(60);
+    cleanup();
+    // ... and later signs in, which returns to the callback route.
+    renderConsole("/callback", { strict: true });
+    expect(
+      await screen.findByRole("link", { name: /Acme Robotics/ }),
+    ).toBeTruthy();
+    expect(window.location.pathname).toBe("/");
   });
 });
 
