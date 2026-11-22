@@ -531,8 +531,13 @@ func TestStreamWithoutAcceptedIsRetriedWithinRecoveryWindow(t *testing.T) {
 	start := time.Now()
 	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"echo"}})
 	var dp *DataPathError
-	if !errors.As(err, &dp) || !errors.Is(err, errNotAccepted) {
-		t.Fatalf("want a DataPathError with errNotAccepted, got %v", err)
+	// The window usually ends in a back-off or a stream attempt, and the
+	// operation ends with the last stream error. On a slow runner it can end
+	// while the renewal before the next attempt is in flight; the SDK then
+	// cancels that AuthorizeRelay call and ends with errAuthorizeDeadline
+	// (see TestStalledAuthorizeRelayEndsWithTheWindow).
+	if !errors.As(err, &dp) || !(errors.Is(err, errNotAccepted) || errors.Is(err, errAuthorizeDeadline)) {
+		t.Fatalf("want a DataPathError with errNotAccepted or errAuthorizeDeadline, got %v", err)
 	}
 	if time.Since(start) > c.timing.recoveryWindow+time.Second {
 		t.Fatal("unaccepted streams must end within the recovery window")
