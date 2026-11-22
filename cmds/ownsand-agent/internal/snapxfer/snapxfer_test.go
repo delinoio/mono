@@ -150,8 +150,10 @@ func TestImportRejectsSymlinkEscape(t *testing.T) {
 	if _, err := os.Lstat(filepath.Join(base, "evil")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("file written outside the restore root: %v", err)
 	}
-	if _, err := os.Lstat(dst); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("snapshot content installed after a failed import: %v", err)
+	if err != nil {
+		if _, err := os.Lstat(dst); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("snapshot content installed after a failed import: %v", err)
+		}
 	}
 	if _, err := os.Lstat(dst + ".importing"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("staging directory left behind: %v", err)
