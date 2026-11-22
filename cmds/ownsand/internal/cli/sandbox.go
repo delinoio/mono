@@ -711,12 +711,19 @@ const maxSymlinkHops = 255
 // when os.Stat reported that to does not exist. For a plain missing path that
 // is to itself. When to is a symbolic link whose target is missing (a dangling
 // link, possibly through a chain of links), it is the path of the missing
-// target, so that the download creates the target and keeps every link. A
-// target in a directory that does not exist is returned as is: the temporary
-// file cannot be created there, so the download fails before it touches a link.
+// target, so that the download creates the target and keeps every link.
+//
+// The links are resolved as Linux and macOS resolve them, on every target
+// including Windows: a link is resolved before a ".." that follows it, and a
+// directory of a link target must exist. When a directory of a link target
+// does not exist, the error wraps os.ErrNotExist, so the download fails
+// before it creates a file or touches a link. A to whose own directory does
+// not exist is returned as is: the user typed that path, so it keeps the
+// path rules of the platform, and the caller reports the failure when it
+// creates the temporary file.
 func resolveMissingTarget(to string) (string, error) {
 	path := to
-	for range maxSymlinkHops {
+	for hop := range maxSymlinkHops {
 		// Resolve the symbolic links in the directory part first. A relative
 		// link target that contains ".." is relative to the real directory of
 		// the link. Joining it with the lexical directory would collapse ".."
@@ -727,9 +734,17 @@ func resolveMissingTarget(to string) (string, error) {
 		if dir, base := filepath.Split(path); dir != "" {
 			realDir, err := filepath.EvalSymlinks(dir)
 			if errors.Is(err, os.ErrNotExist) {
-				// The directory is missing: the temporary file cannot be
-				// created there, so the caller reports the failure.
-				return path, nil
+				if hop == 0 {
+					// The directory of to is missing: the caller reports the
+					// failure when it creates the temporary file.
+					return path, nil
+				}
+				// A directory of a link target is missing. Fail here and do
+				// not leave the failure to the file system calls of the
+				// caller: Windows path handling collapses "missing\.."
+				// lexically, so there the temporary file and the rename
+				// would succeed and create a file beside the link.
+				return "", fmt.Errorf("resolve %s: a directory of the link target %s does not exist: %w", to, path, err)
 			}
 			if err != nil {
 				return "", err
