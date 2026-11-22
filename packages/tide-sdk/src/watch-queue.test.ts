@@ -9,6 +9,7 @@ import {
 } from "@delino/tide-protos/v1/work_pb";
 import { MAX_BACKOFF_MS } from "./backoff.ts";
 import { TideClient } from "./client.ts";
+import { TideConfigError } from "./errors.ts";
 import {
   FAKE_ORIGIN,
   fakeServer,
@@ -216,6 +217,25 @@ describe("watchQueue", () => {
       }
     })().catch((e: unknown) => e);
     expect((error as ConnectError).code).toBe(Code.PermissionDenied);
+  });
+
+  test("ends with the configuration error of a token source that returns no token", async () => {
+    const server = watchServer([["snapshot"]]);
+    const clock = new RecordingClock();
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      token: async () => "",
+      clock,
+    });
+    const error = await (async () => {
+      for await (const _ of client.watchQueue({ organizationId: ORG })) {
+        // No events.
+      }
+    })().catch((e: unknown) => e);
+    expect((error as ConnectError).cause).toBeInstanceOf(TideConfigError);
+    expect(clock.sleeps).toEqual([]);
+    expect(server.calls).toEqual([]);
   });
 
   test("ends without an error when the signal aborts an open stream", async () => {

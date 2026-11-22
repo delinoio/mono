@@ -43,12 +43,18 @@ export function connectCodeOf(error: unknown): Code | undefined {
  * body read failure, or a stream that ended without its end-of-stream
  * message), or a status that means "try again later" (`unavailable`,
  * `resource_exhausted`, `aborted` and `deadline_exceeded`). Every other
- * status is the server's answer and ends the helper with that error.
+ * status is the server's answer and ends the helper with that error. An
+ * SDK configuration error, also when Connect wraps it, is never retryable.
  */
 export function isRetryableStreamError(error: unknown): boolean {
   if (!(error instanceof ConnectError)) {
     // A fetch or body read failure that Connect did not wrap.
     return !(error instanceof TideError);
+  }
+  if (hasConfigErrorCause(error)) {
+    // Connect wraps an interceptor failure, for example a token source that
+    // returned no token. A new stream fails in the same way.
+    return false;
   }
   if (error.cause !== undefined && !(error.cause instanceof ConnectError)) {
     return true;
@@ -67,6 +73,21 @@ export function isRetryableStreamError(error: unknown): boolean {
     default:
       return false;
   }
+}
+
+/** Reports whether a `TideConfigError` is in the `cause` chain of an error. */
+function hasConfigErrorCause(error: Error): boolean {
+  let current: unknown = error.cause;
+  for (let depth = 0; depth < MAX_CAUSE_DEPTH; depth++) {
+    if (current instanceof TideConfigError) {
+      return true;
+    }
+    if (!(current instanceof Error)) {
+      return false;
+    }
+    current = current.cause;
+  }
+  return false;
 }
 
 /**
