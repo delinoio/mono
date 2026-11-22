@@ -2529,3 +2529,249 @@ describe("ended session", () => {
     expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
   });
 });
+
+describe("a failed refetch of loaded data", () => {
+  const REFRESH_NOTICE = /The last refresh failed/;
+
+  /** A transport that fails the listed methods with `code` while `failing.code` is set. */
+  function switchable() {
+    const mock = createMockTransport();
+    const state: { code: Code | undefined; methods: string[] } = {
+      code: undefined,
+      methods: [],
+    };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (state.code !== undefined && state.methods.includes(method.name)) {
+          throw new ConnectError("the request failed", state.code);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  function newQueryClient() {
+    return new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
+  }
+
+  const refetchAll = async (queryClient: QueryClient) => {
+    await act(async () => {
+      await queryClient.refetchQueries();
+    });
+    await settle(60);
+  };
+
+  test("keeps the page, the navigation and an open dialog with its typed value, and clears the notice on the next success", async () => {
+    const { transport, state } = switchable();
+    const queryClient = newQueryClient();
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+      transport,
+      queryClient,
+    });
+    await screen.findByText(/ci-runner/);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
+    });
+    await settle(60);
+    const input = screen.getByRole("textbox", { name: "Name" });
+    await act(async () => {
+      fireEvent.input(input, { target: { value: "deploy-bot" } });
+    });
+    const nav = document.querySelector(".sidenav");
+    expect(nav).not.toBeNull();
+
+    state.code = Code.Unavailable;
+    state.methods = ["GetOrganization", "ListApiKeys", "GetBillingStatus"];
+    await refetchAll(queryClient);
+
+    // The page, the sidenav, the dialog and the typed value stay mounted.
+    expect((await screen.findAllByText(REFRESH_NOTICE)).length).toBeGreaterThan(
+      0,
+    );
+    expect(document.querySelector(".sidenav")).toBe(nav);
+    expect(screen.getByText(/ci-runner/)).toBeTruthy();
+    expect(screen.getByRole("dialog")).toBeTruthy();
+    expect(screen.getByRole("textbox", { name: "Name" })).toBe(input);
+    expect((input as HTMLInputElement).value).toBe("deploy-bot");
+
+    // Try again succeeds once the failure is gone, and removes the notice.
+    state.code = undefined;
+    const retry = screen.getAllByRole("button", {
+      name: "Try again",
+      hidden: true,
+    })[0]!;
+    await act(async () => {
+      fireEvent.click(retry);
+    });
+    await settle(60);
+    await refetchAll(queryClient);
+    expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Name" })).toBe(input);
+    expect((input as HTMLInputElement).value).toBe("deploy-bot");
+  });
+
+  const pages = [
+    {
+      name: "sandboxes",
+      path: "sandboxes",
+      method: "ListSandboxes",
+      text: shortIdText(MOCK_IDS.runningSandbox),
+    },
+    {
+      name: "sandbox",
+      path: `sandboxes/${MOCK_IDS.runningSandbox}`,
+      method: "GetSandbox",
+      text: "Sandbox",
+    },
+    {
+      name: "snapshots",
+      path: "snapshots",
+      method: "ListSnapshots",
+      text: "Templates",
+    },
+    {
+      name: "devices",
+      path: "devices",
+      method: "ListDevices",
+      text: "build-box",
+    },
+    {
+      name: "device",
+      path: `devices/${MOCK_IDS.buildBox}`,
+      method: "GetDevice",
+      text: "Save limits",
+    },
+    {
+      name: "members",
+      path: "members",
+      method: "ListMembers",
+      text: "Invitations",
+    },
+    {
+      name: "enrollment tokens",
+      path: "enrollment-tokens",
+      method: "ListEnrollmentTokens",
+      text: "Create token",
+    },
+    {
+      name: "settings",
+      path: "settings",
+      method: "GetAgentVersionPolicy",
+      text: "Agent version policy",
+    },
+    {
+      name: "billing section",
+      path: "settings",
+      method: "GetBillingStatus",
+      text: "Billing",
+    },
+  ];
+
+  for (const page of pages) {
+    test(`keeps the ${page.name} page for a transient failure and replaces it for not_found`, async () => {
+      const { transport, state } = switchable();
+      const queryClient = newQueryClient();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/${page.path}`, {
+        transport,
+        queryClient,
+      });
+      await screen.findAllByText(page.text, { exact: false });
+      await settle(60);
+
+      state.code = Code.Unavailable;
+      state.methods = [page.method];
+      await refetchAll(queryClient);
+      expect(
+        (await screen.findAllByText(REFRESH_NOTICE)).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getAllByText(page.text, { exact: false }).length,
+      ).toBeGreaterThan(0);
+      expect(
+        screen.getByRole("navigation", { name: "Organization" }),
+      ).toBeTruthy();
+
+      // A terminal error replaces the content, with no stale data left.
+      state.code = Code.NotFound;
+      await refetchAll(queryClient);
+      expect(
+        (
+          await screen.findAllByText(
+            "It was not found, or you no longer have access to it.",
+          )
+        ).length,
+      ).toBeGreaterThan(0);
+      expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+    });
+  }
+
+  test("replaces the whole layout when the organization fails with a terminal error after loading", async () => {
+    for (const code of [
+      Code.NotFound,
+      Code.PermissionDenied,
+      Code.Unauthenticated,
+    ]) {
+      cleanup();
+      const { transport, state } = switchable();
+      const queryClient = newQueryClient();
+      renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, {
+        transport,
+        queryClient,
+      });
+      await screen.findByText(/ci-runner/);
+      state.code = code;
+      state.methods = ["GetOrganization"];
+      await refetchAll(queryClient);
+      expect(
+        screen.queryByRole("navigation", { name: "Organization" }),
+      ).toBeNull();
+      expect(screen.queryByText(/ci-runner/)).toBeNull();
+      expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+      expect(
+        (await screen.findAllByRole("alert")).some((el) =>
+          el.className.includes("notice"),
+        ),
+      ).toBe(true);
+    }
+  });
+
+  test("shows the full error, without the page, when the first load fails", async () => {
+    const { transport, state } = switchable();
+    state.code = Code.Unavailable;
+    state.methods = ["GetOrganization"];
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    expect(
+      await screen.findByText(
+        "OwnSand is not available right now. Try again in a moment.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("navigation", { name: "Organization" }),
+    ).toBeNull();
+    expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+  });
+
+  test("shows the full list error, without a stale list, when the first list load fails", async () => {
+    const { transport, state } = switchable();
+    state.code = Code.Unavailable;
+    state.methods = ["ListApiKeys"];
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    expect(
+      await screen.findByText(
+        "OwnSand is not available right now. Try again in a moment.",
+      ),
+    ).toBeTruthy();
+    expect(
+      screen.getByRole("navigation", { name: "Organization" }),
+    ).toBeTruthy();
+    expect(screen.queryByText(REFRESH_NOTICE)).toBeNull();
+    expect(screen.queryByText(/ci-runner/)).toBeNull();
+  });
+});

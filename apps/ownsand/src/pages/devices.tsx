@@ -24,6 +24,9 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  QueryBoundary,
+  RefreshFailedNotice,
+  showsFullError,
   toastError,
 } from "../components/ui.tsx";
 import {
@@ -69,67 +72,67 @@ export function DevicesPage() {
           ) : undefined
         }
       />
-      {list.isPending ? (
-        <Loading label="Loading devices" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : list.data.devices.length === 0 ? (
-        <Empty title="No devices yet">
-          An admin creates an enrollment token and installs the agent on a
-          device.
-        </Empty>
-      ) : (
-        <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th scope="col">Device</th>
-                <th scope="col">State</th>
-                <th scope="col">Platform</th>
-                <th scope="col">vCPUs allocated</th>
-                <th scope="col">Memory allocated</th>
-                <th scope="col">Disk allocated</th>
-                <th scope="col">Agent</th>
-              </tr>
-            </thead>
-            <tbody>
-              {list.data.devices.map((d) => (
-                <tr key={d.deviceId}>
-                  <td>
-                    <Link
-                      to={routePath({
-                        id: RouteId.Device,
-                        organizationId,
-                        deviceId: d.deviceId,
-                      })}
-                    >
-                      {d.name || d.deviceId}
-                    </Link>
-                  </td>
-                  <td>
-                    <DeviceStateBadge state={d.state} />
-                  </td>
-                  <td>
-                    {labels.hostOs[d.hostOs]} {labels.arch[d.arch]}
-                  </td>
-                  <td>{vcpuSummary(d)}</td>
-                  <td>
-                    {formatMib(d.allocation?.memoryMib ?? 0n)} of{" "}
-                    {formatMib(d.limits?.memoryMib ?? 0n)}
-                  </td>
-                  <td>
-                    {String(d.allocation?.diskGib ?? 0n)} of{" "}
-                    {String(d.limits?.diskGib ?? 0n)} GiB
-                  </td>
-                  <td>
-                    {d.agentVersion} · {labels.updateState[d.updateState]}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+      <QueryBoundary query={list} loading="Loading devices">
+        {(data) =>
+          data.devices.length === 0 ? (
+            <Empty title="No devices yet">
+              An admin creates an enrollment token and installs the agent on a
+              device.
+            </Empty>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Device</th>
+                    <th scope="col">State</th>
+                    <th scope="col">Platform</th>
+                    <th scope="col">vCPUs allocated</th>
+                    <th scope="col">Memory allocated</th>
+                    <th scope="col">Disk allocated</th>
+                    <th scope="col">Agent</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.devices.map((d) => (
+                    <tr key={d.deviceId}>
+                      <td>
+                        <Link
+                          to={routePath({
+                            id: RouteId.Device,
+                            organizationId,
+                            deviceId: d.deviceId,
+                          })}
+                        >
+                          {d.name || d.deviceId}
+                        </Link>
+                      </td>
+                      <td>
+                        <DeviceStateBadge state={d.state} />
+                      </td>
+                      <td>
+                        {labels.hostOs[d.hostOs]} {labels.arch[d.arch]}
+                      </td>
+                      <td>{vcpuSummary(d)}</td>
+                      <td>
+                        {formatMib(d.allocation?.memoryMib ?? 0n)} of{" "}
+                        {formatMib(d.limits?.memoryMib ?? 0n)}
+                      </td>
+                      <td>
+                        {String(d.allocation?.diskGib ?? 0n)} of{" "}
+                        {String(d.limits?.diskGib ?? 0n)} GiB
+                      </td>
+                      <td>
+                        {d.agentVersion} · {labels.updateState[d.updateState]}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+      </QueryBoundary>
     </>
   );
 }
@@ -182,7 +185,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
   }, [device?.limits]);
 
   if (query.isPending) return <Loading label="Loading the device" />;
-  if (query.error)
+  if (query.data === undefined || showsFullError(query))
     return (
       <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
     );
@@ -232,6 +235,7 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
 
   return (
     <>
+      {query.error ? <RefreshFailedNotice query={query} /> : null}
       <PageHeader
         title={d.name || "Device"}
         description={<DeviceStateBadge state={d.state} />}
