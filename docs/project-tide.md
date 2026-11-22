@@ -26,7 +26,7 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 
 - `servers/tide-api/`: Go control plane on the shared DigitalOcean Droplet, served at `https://tide.api.delino.io`. It owns the queue, the dispatcher, the GitHub App integration, the agent vendor adapters and the Claude Code orchestrator processes.
 - `apps/tide/` (`planned`): Rsbuild React web console served at `https://tide.delino.io`.
-- `cmds/tide/` (`planned`): Go command-line interface. The same binary serves the `tide mcp` MCP server for coding agents.
+- `cmds/tide/`: Go command-line interface. The same binary serves the `tide mcp` MCP server for coding agents.
 - `protos/delino/tide/`: the workspace package `@delino/tide-protos` with the Connect RPC schemas in `v1/`, the committed Go bindings and the committed TypeScript bindings.
 - `packages/tide-sdk/` (`planned`): TypeScript SDK.
 - `go/tide/`: Go SDK, with the test fake `go/tide/tidetest`. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
