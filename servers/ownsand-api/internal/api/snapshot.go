@@ -285,6 +285,13 @@ func (s *Service) exportApplyRetryWindow() time.Duration {
 	return DefaultExportApplyRetryWindow
 }
 
+func (s *Service) exportFailTimeout() time.Duration {
+	if s.Timing.ExportFailTimeout > 0 {
+		return s.Timing.ExportFailTimeout
+	}
+	return snapshotFailTimeout
+}
+
 func (s *Service) exportApplyRetryBackoff() time.Duration {
 	if s.Timing.ExportApplyRetryBackoff > 0 {
 		return s.Timing.ExportApplyRetryBackoff
@@ -347,6 +354,71 @@ func (s *Service) applyExportResultWithRetry(ctx context.Context, conn *hub.Conn
 			conn.Close(errExportResultNotApplied)
 		}
 		return err
+	}
+}
+
+// errExportClaimNotReleased is the cause that closes a channel whose unsent
+// export attempt could not be marked EXPORT_FAILED.
+var errExportClaimNotReleased = errors.New("the export claim of an unsent command could not be released")
+
+// failUnsentExport ends the export attempt commandID whose command send
+// failed before the command was queued. It runs the guarded update that sets
+// EXPORT_FAILED while the row still names the attempt and is EXPORTING, so a
+// concurrent retry that owns the row by now keeps its state; zero affected
+// rows (a newer attempt, a deleted or an already settled snapshot) count as
+// resolved. The update uses a bounded context that does not depend on the
+// request context, because a canceled request is a common cause of the send
+// failure, and retries after a transient database error (see
+// isTransientDBError) with the doubling backoff of the export result
+// application until Timing.ExportFailTimeout ends. No clean-up job is
+// recorded because the agent never received the command, so no upload URL
+// exists for the attempt.
+//
+// A permanent error or the end of the budget leaves the row EXPORTING and
+// owned by conn, which neither a repeat ExportSnapshot nor the owner's state
+// report would release while conn is live. The helper then closes conn, but
+// only while it is still the current channel of its device, so the state
+// report of the replacement channel fails the abandoned attempt (the
+// owner_channel_replaced rule of the reconciliation) and a replacement
+// channel that is already current is never closed. The caller keeps its
+// unavailable response either way.
+func (s *Service) failUnsentExport(ctx context.Context, conn *hub.Conn, snapshotID, commandID string, sendErr error) {
+	// Keep the context's values but not its cancellation.
+	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.exportFailTimeout())
+	defer cancel()
+	backoff := s.exportApplyRetryBackoff()
+	for attempt := 1; ; attempt++ {
+		// The export fail fault of the tests matches this query text; keep
+		// the predicate order when changing it.
+		tag, err := s.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
+			snapshotID, commandID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING))
+		if err == nil {
+			s.Logger.WarnContext(dbCtx, "export_failed", slog.String("snapshot_id", snapshotID), slog.String("command_id", commandID), slog.String("channel_id", conn.ID),
+				slog.String("reason", "send_failed"), slog.Any("send_error", sendErr), slog.Bool("applied", tag.RowsAffected() > 0), slog.Int("attempts", attempt))
+			return
+		}
+		if isTransientDBError(err) && dbCtx.Err() == nil {
+			s.Logger.WarnContext(dbCtx, "export_fail_transition_retry", slog.String("snapshot_id", snapshotID), slog.String("command_id", commandID),
+				slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
+			timer := time.NewTimer(backoff)
+			select {
+			case <-timer.C:
+			case <-dbCtx.Done():
+				timer.Stop()
+			}
+			if backoff *= 2; backoff > exportApplyRetryBackoffMax {
+				backoff = exportApplyRetryBackoffMax
+			}
+			continue
+		}
+		channelClosed := s.Hub.Get(conn.DeviceID) == conn
+		s.Logger.ErrorContext(dbCtx, "export_fail_transition_failed", slog.String("snapshot_id", snapshotID), slog.String("command_id", commandID), slog.String("channel_id", conn.ID),
+			slog.String("reason", "send_failed"), slog.Any("send_error", sendErr), slog.Bool("applied", false), slog.Int("attempts", attempt),
+			slog.Bool("channel_closed", channelClosed), slog.Any("error", err))
+		if channelClosed {
+			conn.Close(errExportClaimNotReleased)
+		}
+		return
 	}
 }
 
@@ -671,22 +743,10 @@ func (h SnapshotHandler) ExportSnapshot(ctx context.Context, req *connect.Reques
 			&ownsandv1.AgentCommand{CommandId: commandID, Command: &ownsandv1.AgentCommand_ExportSnapshot{ExportSnapshot: &ownsandv1.ExportSnapshotCommand{
 				SnapshotId: sn.pb.GetSnapshotId(), PartSizeBytes: h.SnapshotPartSizeBytes,
 			}}}); err != nil {
-			// The attempt fails only while the row still names it: a
-			// concurrent retry owns the row by now and keeps its state.
 			// The send failed before the command was queued, often because
-			// the request context ended, so the update uses a bounded
+			// the request context ended; the helper ends the attempt on a
 			// context that does not depend on it.
-			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotFailTimeout)
-			defer cancel()
-			tag, execErr := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET export_state = $3 WHERE snapshot_id = $1 AND export_command_id = $2 AND export_state = $4",
-				sn.pb.GetSnapshotId(), commandID, int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED), int16(ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING))
-			attrs := []any{slog.String("snapshot_id", sn.pb.GetSnapshotId()), slog.String("command_id", commandID), slog.String("channel_id", conn.ID),
-				slog.String("reason", "send_failed"), slog.Any("send_error", err), slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0)}
-			if execErr != nil {
-				h.Logger.ErrorContext(dbCtx, "export_fail_transition_failed", append(attrs, slog.Any("error", execErr))...)
-			} else {
-				h.Logger.WarnContext(dbCtx, "export_failed", attrs...)
-			}
+			h.failUnsentExport(ctx, conn, sn.pb.GetSnapshotId(), commandID, err)
 			return nil, errUnavailable("the agent channel closed")
 		}
 	}
