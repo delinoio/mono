@@ -10,11 +10,13 @@ import {
 } from "./forms.ts";
 import {
   addMonths,
+  formatDate,
   formatMonth,
   formatQuantity,
   meterLabel,
 } from "./format.ts";
 import { usd } from "./money.ts";
+import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Meter } from "@delino/accounts-protos/v1/usage_pb";
 import {
@@ -355,6 +357,15 @@ describe("forms", () => {
 });
 
 describe("format", () => {
+  // Guards the TZ pin in rstest.config.ts: fixtures use UTC-midnight
+  // timestamps that `formatDate` renders in the process time zone.
+  test("runs in UTC", () => {
+    expect(new Date().getTimezoneOffset()).toBe(0);
+    expect(
+      formatDate(timestampFromDate(new Date("2026-12-01T00:00:00Z"))),
+    ).toBe("Dec 1, 2026");
+  });
+
   test("moves and names UTC months", () => {
     expect(addMonths({ year: 2026, month: 1 }, -1)).toEqual({
       year: 2025,
