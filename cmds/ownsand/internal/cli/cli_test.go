@@ -105,6 +105,29 @@ func TestUsageErrors(t *testing.T) {
 	}
 }
 
+// TestRootHelpPrintsUsage checks that every form of the root help prints the
+// full command usage on standard output and exits with 0, also when the
+// help flag comes before the command (the root flag set reads it there).
+func TestRootHelpPrintsUsage(t *testing.T) {
+	r := newRunner(t)
+	for _, args := range [][]string{{"help"}, {"-h"}, {"--help"}, {"--no-color", "--help"}} {
+		res := r.run(args...)
+		if res.code != ExitOK {
+			t.Errorf("%v: exit %d, want %d (stderr %q)", args, res.code, ExitOK, res.stderr)
+		}
+		if !strings.HasPrefix(res.stdout, "Usage: ownsand [global flags] <command>") || !strings.Contains(res.stdout, "sandbox ") {
+			t.Errorf("%v: stdout %q, want the full usage", args, res.stdout)
+		}
+		if strings.Contains(res.stdout, "ownsand ownsand") {
+			t.Errorf("%v: stdout repeats the program name: %q", args, res.stdout)
+		}
+	}
+	// A subcommand help still lists the subcommand flags.
+	if res := r.run("sandbox", "create", "--help"); res.code != ExitOK || !strings.HasPrefix(res.stdout, "Usage: ownsand sandbox create [flags]") {
+		t.Errorf("sandbox create --help = (%d, %q)", res.code, res.stdout)
+	}
+}
+
 func TestMissingOrganizationFailsBeforeRequest(t *testing.T) {
 	r := newRunner(t)
 	delete(r.env, ownsand.EnvOrganization)

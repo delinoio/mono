@@ -263,6 +263,13 @@ func endedWithTerminator(fs *flag.FlagSet, consumed []string) bool {
 }
 
 func (a *app) printFlags(fs *flag.FlagSet) {
+	// The root flag set reads `ownsand --help` and `ownsand -h` before the
+	// command switch sees them, so it prints the full usage instead of the
+	// global flags under the name "ownsand ownsand".
+	if fs.Name() == rootFlagSetName {
+		a.usage(a.env.Stdout)
+		return
+	}
 	fmt.Fprintf(a.env.Stdout, "Usage: ownsand %s [flags]\n\nFlags:\n", fs.Name())
 	fs.SetOutput(a.env.Stdout)
 	fs.PrintDefaults()
@@ -285,9 +292,12 @@ func (a *app) applyGlobals() error {
 	return nil
 }
 
+// rootFlagSetName names the flag set of the global flags before the command.
+const rootFlagSetName = "ownsand"
+
 func (a *app) run(ctx context.Context, args []string) error {
 	a.g.format = "text"
-	root := a.newFlags("ownsand")
+	root := a.newFlags(rootFlagSetName)
 	rest, err := a.parseUntil(root, args, 1)
 	if err != nil {
 		return err
