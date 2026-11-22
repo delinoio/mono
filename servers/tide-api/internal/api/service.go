@@ -103,8 +103,21 @@ type Service struct {
 	// Hooks are the extension hooks of later layers (see hooks.go). They are
 	// set while the app is wired and must not change afterwards.
 	Hooks Hooks
+	// OnWorkChange is set by the work layer: it tells the dispatcher of this
+	// instance that the work of an organization changed (a request arrived,
+	// a profile or the link changed), so it runs a pass at once. Without it,
+	// or on an instance that does not hold the lease, the periodic pass
+	// picks the change up.
+	OnWorkChange func(orgID string)
 
 	apiKeyUses apiKeyUseCache
+}
+
+// WorkChanged calls OnWorkChange when it is set.
+func (s *Service) WorkChanged(orgID string) {
+	if s.OnWorkChange != nil {
+		s.OnWorkChange(orgID)
+	}
 }
 
 // NowUTC returns the current time in UTC.

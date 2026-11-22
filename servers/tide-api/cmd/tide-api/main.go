@@ -21,6 +21,8 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/auth"
 	"github.com/delinoio/mono/servers/tide-api/internal/config"
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 )
 
 // shutdownTimeout bounds the drain after a termination signal. Server
@@ -96,7 +98,10 @@ func run() error {
 		CORSOrigins:       cfg.CORSOrigins,
 		ClientAddressMode: cfg.ClientAddressMode,
 		Metrics:           tel.MeterProvider,
-		// Later layers add their app.Extension values here.
+		Extensions: layers.Extensions(layers.Options{
+			OwnSand:      ownsandclient.SDKFactory{BaseURL: cfg.OwnSandAPIOrigin, Logger: logger},
+			PublicOrigin: cfg.PublicOrigin,
+		}, &layers.Layers{}),
 	})
 	if err != nil {
 		return err

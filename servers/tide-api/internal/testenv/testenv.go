@@ -29,6 +29,8 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/config"
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/db/dbtest"
+	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/tide-api/internal/secrets"
 )
@@ -93,6 +95,8 @@ type Env struct {
 	Server *httptest.Server
 	Clock  *Clock
 	Logs   *SafeBuffer
+	// SecretKey is the key of the test keyring.
+	SecretKey secrets.Key
 }
 
 // Option changes the app options before New wires the app.
@@ -101,6 +105,14 @@ type Option func(*app.Options)
 // WithExtension adds a later layer (or a test fake of one).
 func WithExtension(ext app.Extension) Option {
 	return func(o *app.Options) { o.Extensions = append(o.Extensions, ext) }
+}
+
+// WithLayers wires every layer of tide-api with the fake OwnSand API and
+// fills out with the shared parts.
+func WithLayers(fake *ownsandfake.Fake, out *layers.Layers) Option {
+	return func(o *app.Options) {
+		o.Extensions = append(o.Extensions, layers.Extensions(layers.Options{OwnSand: fake, PublicOrigin: "https://tide.test"}, out)...)
+	}
 }
 
 // WithLimits replaces the generous test rate limits.
@@ -165,7 +177,7 @@ func New(t testing.TB, opts ...Option) *Env {
 		<-done
 		srv.Close()
 	})
-	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs}
+	return &Env{T: t, DB: database, App: a, Server: srv, Clock: clock, Logs: logs, SecretKey: key}
 }
 
 // Clients are the Connect clients of one credential.
@@ -175,6 +187,10 @@ type Clients struct {
 	APIKey       tidev1connect.ApiKeyServiceClient
 	Audit        tidev1connect.AuditServiceClient
 	DevSession   tidev1connect.DevSessionServiceClient
+	OwnSandLink  tidev1connect.OwnSandLinkServiceClient
+	Integration  tidev1connect.AgentIntegrationServiceClient
+	Profile      tidev1connect.RunnerProfileServiceClient
+	Work         tidev1connect.WorkServiceClient
 	// HTTP sends plain requests with the same credential.
 	HTTP *http.Client
 }
@@ -203,6 +219,10 @@ func (e *Env) Bearer(token string) *Clients {
 		APIKey:       tidev1connect.NewApiKeyServiceClient(hc, url),
 		Audit:        tidev1connect.NewAuditServiceClient(hc, url),
 		DevSession:   tidev1connect.NewDevSessionServiceClient(hc, url),
+		OwnSandLink:  tidev1connect.NewOwnSandLinkServiceClient(hc, url),
+		Integration:  tidev1connect.NewAgentIntegrationServiceClient(hc, url),
+		Profile:      tidev1connect.NewRunnerProfileServiceClient(hc, url),
+		Work:         tidev1connect.NewWorkServiceClient(hc, url),
 		HTTP:         hc,
 	}
 }
