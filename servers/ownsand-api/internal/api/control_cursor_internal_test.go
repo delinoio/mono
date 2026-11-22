@@ -350,3 +350,34 @@ func TestControlCursorInitKeepsGeneration(t *testing.T) {
 		t.Fatalf("cursorGen = %d, want 0 (an initialization is not a lease transition)", gen)
 	}
 }
+
+// TestControlProcessedCursor checks the cursor that the janitor reads: unset
+// before the lease and after its loss or a failed read, the last processed
+// delivery ID while the lease is held.
+func TestControlProcessedCursor(t *testing.T) {
+	h := newCursorHarness(t, 3)
+	if _, ok := h.c.ProcessedCursor(); ok {
+		t.Fatal("cursor reported before the lease was acquired")
+	}
+	h.acquire(1, nil)
+	if id, ok := h.c.ProcessedCursor(); !ok || id != 1 {
+		t.Fatalf("cursor after acquire = %d, %v; want 1, true (events up to the handover are not this holder's)", id, ok)
+	}
+	h.c.processEvents(context.Background())
+	if id, ok := h.c.ProcessedCursor(); !ok || id != 3 {
+		t.Fatalf("cursor after the batch = %d, %v; want 3, true", id, ok)
+	}
+	h.c.LeaseLost()
+	if _, ok := h.c.ProcessedCursor(); ok {
+		t.Fatal("cursor reported after the lease was lost")
+	}
+	h.acquire(0, errors.New("read failed"))
+	if _, ok := h.c.ProcessedCursor(); ok {
+		t.Fatal("cursor reported after a failed read at acquisition")
+	}
+	// Zero is a valid cursor: the table was empty at acquisition.
+	h.acquire(0, nil)
+	if id, ok := h.c.ProcessedCursor(); !ok || id != 0 {
+		t.Fatalf("cursor with an empty table = %d, %v; want 0, true", id, ok)
+	}
+}

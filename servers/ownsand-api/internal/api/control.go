@@ -107,6 +107,21 @@ func (c *Control) initCursor(ctx context.Context, gen uint64) {
 	c.cursor = id
 }
 
+// ProcessedCursor returns the delivery ID of the last control event that this
+// instance processed as the lease holder. ok is false when the cursor is
+// unset: LeaseLost clears it, so an instance that is not the lease holder
+// reports false, and so does a holder whose cursor read failed. The janitor
+// deletes control events only up to this cursor, so an event that no lease
+// holder has processed is never deleted by its age. A cursor that outlives
+// the lease by the moment before LeaseLost runs only covers events that this
+// instance processed, so the janitor cannot delete an unprocessed event then
+// either.
+func (c *Control) ProcessedCursor() (id int64, ok bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cursor, c.cursor >= 0
+}
+
 // LeaseLost closes every agent channel; agents reconnect to the new holder.
 func (c *Control) LeaseLost() {
 	c.S.Hub.CloseAll(errLeaseLost)

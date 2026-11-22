@@ -230,7 +230,7 @@ func (a *App) Run(ctx context.Context) {
 	wg.Add(6)
 	go func() {
 		defer wg.Done()
-		janitor.Run(ctx, a.opts.DB, a.opts.Logger, a.opts.Now, a.opts.JanitorInterval)
+		janitor.Run(ctx, a.opts.DB, a.opts.Logger, a.opts.Now, a.opts.JanitorInterval, a.Control.ProcessedCursor)
 	}()
 	go func() {
 		defer wg.Done()
