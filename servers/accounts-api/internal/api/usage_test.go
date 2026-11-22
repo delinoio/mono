@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"sync"
 	"testing"
@@ -710,5 +711,187 @@ func TestGetOrganizationBillingAndUsageViews(t *testing.T) {
 		BillingAccountId: f.AccountID, Year: 9999, Month: 12}))
 	if err != nil || len(future.Msg.GetRows()) != 0 || future.Msg.GetTotalAmountUsdMicros() != 0 {
 		t.Fatalf("future month = %v, %v", future, err)
+	}
+}
+
+// sameMonthWindows advances the clock and returns two usage windows that
+// start in the same UTC calendar month, the later one first.
+func sameMonthWindows(env *testenv.Env) (w, earlier time.Time) {
+	env.Clock.Advance(15 * time.Minute)
+	for {
+		w = window(env.Clock.Now()).Add(-billing.WindowLength)
+		earlier = w.Add(-billing.WindowLength)
+		if !earlier.Before(billing.MonthStart(w)) {
+			return w, earlier
+		}
+		env.Clock.Advance(billing.WindowLength)
+	}
+}
+
+// monthlyUsage reads the usage views of a linked organization and billing
+// account for the month of w: the meter usages of GetOrganizationBilling as
+// "meter=quantity/amount", the rows of ListUsageSummary (read page by page
+// with 2 rows per page) as "organization suffix/meter=quantity/amount" and
+// the total amount of the summary.
+func monthlyUsage(t *testing.T, env *testenv.Env, f fixture, org string, w time.Time) (meters, rows map[string]string, total int64) {
+	t.Helper()
+	resp, err := env.Service().GetOrganizationBilling(ctx(), connect.NewRequest(&accountsv1.GetOrganizationBillingRequest{Service: ownsand, OrganizationId: org}))
+	if err != nil {
+		t.Fatalf("GetOrganizationBilling: %v", err)
+	}
+	meters = map[string]string{}
+	for _, mu := range resp.Msg.GetMeterUsages() {
+		meters[mu.GetMeter().String()] = fmt.Sprintf("%d/%d", mu.GetQuantity(), mu.GetAmountUsdMicros())
+	}
+	rows = map[string]string{}
+	token := ""
+	for pages := 0; ; pages++ {
+		page, err := env.BillingUsage(f.Viewer.ID).ListUsageSummary(ctx(), connect.NewRequest(&accountsv1.ListUsageSummaryRequest{
+			BillingAccountId: f.AccountID, Year: int32(w.Year()), Month: int32(w.Month()), PageSize: 2, PageToken: token}))
+		if err != nil {
+			t.Fatalf("ListUsageSummary: %v", err)
+		}
+		if pages > 0 && page.Msg.GetTotalAmountUsdMicros() != total {
+			t.Fatalf("total changed between pages: %d then %d", total, page.Msg.GetTotalAmountUsdMicros())
+		}
+		total = page.Msg.GetTotalAmountUsdMicros()
+		for _, r := range page.Msg.GetRows() {
+			id := r.GetOrganizationId()
+			rows[fmt.Sprintf("%s/%s", id[len(id)-4:], r.GetMeter())] = fmt.Sprintf("%d/%d", r.GetQuantity(), r.GetAmountUsdMicros())
+		}
+		if token = page.Msg.GetNextPageToken(); token == "" {
+			return meters, rows, total
+		}
+	}
+}
+
+func storedSum(t *testing.T, env *testenv.Env, column, org string, meter accountsv1.Meter) string {
+	t.Helper()
+	key, _, _ := billing.MeterKey(meter)
+	var sum string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT COALESCE(SUM(`+column+`), 0)::text FROM usage_reports WHERE organization_id = $1 AND meter = $2`,
+		org, key).Scan(&sum); err != nil {
+		t.Fatal(err)
+	}
+	return sum
+}
+
+// A monthly quantity sum above the int64 range saturates at the maximum in
+// both read RPCs instead of failing them; a sum of exactly the maximum, the
+// other meters, the paging and the total are unchanged, and ReportUsage and
+// the stored rows stay exact.
+func TestUsageQuantitySumSaturates(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subscribe(t, env, f)
+	org1, org2 := newOrg(t), newOrg(t)
+	link(t, env, f.AccountID, org1, f.Owner.ID, "First")
+	link(t, env, f.AccountID, org2, f.Owner.ID, "Second")
+	w, earlier := sameMonthWindows(env)
+	// reportUsage fails the test when a report fails, also the one that
+	// pushes a sum beyond the int64 range.
+	reportUsage(t, env.Service(),
+		report(org1, meterEgress, w, math.MaxInt64, 10),
+		report(org1, meterEgress, earlier, 2, 20),
+		report(org1, meterStorage, w, math.MaxInt64-5, 30),
+		report(org1, meterStorage, earlier, 5, 40),
+		report(org1, meterClassA, w, 9, 50),
+		report(org1, meterClassA, earlier, 1, 60),
+		report(org2, meterClassB, w, 7, 70),
+	)
+
+	meters, rows, total := monthlyUsage(t, env, f, org1, w)
+	wantMeters := map[string]string{
+		"METER_OWNSAND_RELAY_EGRESS": fmt.Sprintf("%d/30", int64(math.MaxInt64)), // saturated
+		"METER_OWNSAND_R2_STORAGE":   fmt.Sprintf("%d/70", int64(math.MaxInt64)), // exactly the maximum
+		"METER_OWNSAND_CLASS_A_RPC":  "10/110",
+		"METER_OWNSAND_CLASS_B_RPC":  "0/0",
+	}
+	for meter, want := range wantMeters {
+		if meters[meter] != want {
+			t.Errorf("GetOrganizationBilling %s = %q, want %q", meter, meters[meter], want)
+		}
+	}
+	suffix := func(org string) string { return org[len(org)-4:] }
+	wantRows := map[string]string{
+		suffix(org1) + "/METER_OWNSAND_RELAY_EGRESS": fmt.Sprintf("%d/30", int64(math.MaxInt64)),
+		suffix(org1) + "/METER_OWNSAND_R2_STORAGE":   fmt.Sprintf("%d/70", int64(math.MaxInt64)),
+		suffix(org1) + "/METER_OWNSAND_CLASS_A_RPC":  "10/110",
+		suffix(org2) + "/METER_OWNSAND_CLASS_B_RPC":  "7/70",
+	}
+	if fmt.Sprint(rows) != fmt.Sprint(wantRows) {
+		t.Errorf("ListUsageSummary rows = %v, want %v", rows, wantRows)
+	}
+	if total != 10+20+30+40+50+60+70 {
+		t.Errorf("total_amount_usd_micros = %d, want 280", total)
+	}
+
+	// The stored rows keep the exact quantities.
+	if got := storedSum(t, env, "quantity", org1, meterEgress); got != "9223372036854775809" {
+		t.Errorf("stored egress quantity sum = %s, want 9223372036854775809", got)
+	}
+}
+
+// A monthly amount sum above the int64 range saturates in the same way,
+// including the total of ListUsageSummary. The rows are inserted directly,
+// because the ledger rejects a deduction that overflows the balance.
+func TestUsageAmountSumSaturates(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subscribe(t, env, f)
+	org := newOrg(t)
+	link(t, env, f.AccountID, org, f.Owner.ID, "First")
+	w, earlier := sameMonthWindows(env)
+	var linkID string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT organization_link_id::text FROM organization_links WHERE organization_id = $1 AND unlink_time IS NULL`, org).Scan(&linkID); err != nil {
+		t.Fatal(err)
+	}
+	insert := func(meter accountsv1.Meter, start time.Time, quantity, amount int64) {
+		t.Helper()
+		id, err := uuidv7.NewString()
+		if err != nil {
+			t.Fatal(err)
+		}
+		key, _, _ := billing.MeterKey(meter)
+		if _, err := env.DB.Pool.Exec(ctx(), `INSERT INTO usage_reports
+			(usage_report_id, service, organization_id, meter, window_start, quantity, amount_usd_micros, billing_account_id, organization_link_id, create_time)
+			VALUES ($1, 'ownsand', $2, $3, $4, $5, $6, $7, $8, now())`, id, org, key, start, quantity, amount, f.AccountID, linkID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insert(meterEgress, w, 1, math.MaxInt64)
+	insert(meterEgress, earlier, 2, math.MaxInt64)
+	insert(meterStorage, w, 3, math.MaxInt64-5)
+	insert(meterStorage, earlier, 4, 5)
+	insert(meterClassA, w, 9, 10)
+	insert(meterClassA, earlier, 1, 20)
+
+	meters, rows, total := monthlyUsage(t, env, f, org, w)
+	maxInt := int64(math.MaxInt64)
+	wantMeters := map[string]string{
+		"METER_OWNSAND_RELAY_EGRESS": fmt.Sprintf("3/%d", maxInt), // saturated
+		"METER_OWNSAND_R2_STORAGE":   fmt.Sprintf("7/%d", maxInt), // exactly the maximum
+		"METER_OWNSAND_CLASS_A_RPC":  "10/30",
+		"METER_OWNSAND_CLASS_B_RPC":  "0/0",
+	}
+	for meter, want := range wantMeters {
+		if meters[meter] != want {
+			t.Errorf("GetOrganizationBilling %s = %q, want %q", meter, meters[meter], want)
+		}
+	}
+	suffix := org[len(org)-4:]
+	wantRows := map[string]string{
+		suffix + "/METER_OWNSAND_RELAY_EGRESS": wantMeters["METER_OWNSAND_RELAY_EGRESS"],
+		suffix + "/METER_OWNSAND_R2_STORAGE":   wantMeters["METER_OWNSAND_R2_STORAGE"],
+		suffix + "/METER_OWNSAND_CLASS_A_RPC":  wantMeters["METER_OWNSAND_CLASS_A_RPC"],
+	}
+	if fmt.Sprint(rows) != fmt.Sprint(wantRows) {
+		t.Errorf("ListUsageSummary rows = %v, want %v", rows, wantRows)
+	}
+	if total != maxInt {
+		t.Errorf("total_amount_usd_micros = %d, want the saturated %d", total, maxInt)
+	}
+	if got := storedSum(t, env, "amount_usd_micros", org, meterEgress); got != "18446744073709551614" {
+		t.Errorf("stored egress amount sum = %s, want 18446744073709551614", got)
 	}
 }
