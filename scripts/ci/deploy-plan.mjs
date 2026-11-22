@@ -28,9 +28,9 @@ export const DeployKind = Object.freeze({
   StaticSite: "static-site",
 });
 
-// Kind order of a deployment: the database stage (not implemented yet; see
-// the deployment workflow contract) comes first, then servers, then static
-// sites, which call the servers.
+// Kind order of a deployment: servers, then static sites, which call the
+// servers. There is no database stage: each server applies its own embedded
+// migrations at startup (see the deployment workflow contract).
 const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 
 // A Map, not a plain object: `Map.get` matches by SameValueZero, so inherited
