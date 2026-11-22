@@ -178,7 +178,10 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	info, err := m.rt.Snapshot(ctx, vm, filepath.Join(dir, contentDir))
 	if err != nil {
 		os.RemoveAll(dir)
-		m.logger.Error("snapshot failed", "snapshot_id", id, "error", err)
+		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId(), "error", err)
+		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && info.SourceState == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+			m.recordSourcePausedAfterSnapshot(sb)
+		}
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
 	}
 	// A runtime can return success after ctx ended, for example when it
@@ -236,6 +239,25 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	published = true
 	m.logger.Info("snapshot ready", "snapshot_id", snap.rec.SnapshotID, "size_bytes", snap.rec.SizeBytes, "has_memory_state", snap.rec.HasMemoryState)
 	return snap.entry(), nil
+}
+
+// recordSourcePausedAfterSnapshot publishes the paused state of a source
+// sandbox that the runtime paused for a capture and could not resume (see
+// vmruntime.SnapshotInfo.SourceState). The VM is paused while the record says
+// running, and a resume command that finds a running record returns success
+// without reaching the runtime, so the record must follow the VM. The caller
+// holds sb.cmdMu, so no other command of the sandbox moves its state meanwhile;
+// the guard skips a sandbox that ended or was dropped in the meantime. The
+// snapshot stays failed when the state cannot be published: the failure is
+// only logged, because the snapshot error is the result of the command.
+func (m *Manager) recordSourcePausedAfterSnapshot(sb *sandbox) {
+	id := sb.rec.SandboxID
+	_, err := m.updateIf(sb, func() bool {
+		return m.sandboxes[id] == sb && !sb.ending && sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+	}, func(r *Record) { r.State = ownsandv1.SandboxState_SANDBOX_STATE_PAUSED })
+	if err != nil {
+		m.logger.Error("sandbox paused by a failed snapshot could not be recorded as paused", "sandbox_id", id, "error", err)
+	}
 }
 
 // existingSnapshotEntry answers a create for a snapshot ID that the device
