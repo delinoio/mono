@@ -522,7 +522,19 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	switch info.kind {
 	case cmdCreateSandbox:
 		if res.GetError() != nil {
-			err = s.failCreateRejected(ctx, info.sandboxID)
+			// A transient database error is retried inside
+			// Timing.CreateFailTimeout; a failure that remains closes this
+			// channel while it is current, so the replacement channel's
+			// state report settles the CREATING sandbox.
+			var attempts int
+			var channelClosed bool
+			attempts, channelClosed, err = s.failUnsentCreate(ctx, conn, "create_fail_transition_retry",
+				[]any{slog.String("sandbox_id", info.sandboxID), slog.String("channel_id", conn.ID)},
+				func(dbCtx context.Context) error { return s.failCreateRejected(dbCtx, info.sandboxID) })
+			if err != nil {
+				log.ErrorContext(ctx, "create_fail_transition_failed", slog.String("sandbox_id", info.sandboxID), slog.String("reason", "agent_rejected"),
+					slog.Int("attempts", attempts), slog.Bool("channel_closed", channelClosed), slog.Any("error", err))
+			}
 			s.watch.fire(info.sandboxID)
 		} else if e := res.GetCreateSandbox().GetSandbox(); e != nil {
 			err = s.applyResultEntry(ctx, conn, e)
@@ -532,7 +544,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 			err = s.applyResultEntry(ctx, conn, e)
 		}
 	case cmdCreateSnapshot:
-		err = s.applySnapshotResult(ctx, info, res)
+		err = s.applySnapshotResult(ctx, conn, info, res)
 	case cmdExportSnapshot:
 		err = s.applyExportResultWithRetry(ctx, conn, info, res)
 	case cmdImportSnapshot:

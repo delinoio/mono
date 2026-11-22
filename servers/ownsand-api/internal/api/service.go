@@ -178,9 +178,10 @@ type Timing struct {
 	// loses its transport write (5 seconds); zero means the default.
 	WriterDrainTimeout time.Duration
 	// ExportApplyRetryWindow bounds how long the channel read loop retries
-	// to apply an export result after a transient database error (15
-	// seconds, below the heartbeat timeout because the loop reads no
-	// heartbeat meanwhile); zero means the default.
+	// to apply an export result or a create-snapshot result after a
+	// transient database error (15 seconds, below the heartbeat timeout
+	// because the loop reads no heartbeat meanwhile); zero means the
+	// default.
 	ExportApplyRetryWindow time.Duration
 	// ExportApplyRetryBackoff is the first wait between two attempts to
 	// apply an export result (250 milliseconds); it doubles up to 2 seconds;
@@ -190,6 +191,13 @@ type Timing struct {
 	// that ends an export attempt whose command send failed (5 seconds);
 	// the retry uses ExportApplyRetryBackoff; zero means the default.
 	ExportFailTimeout time.Duration
+	// CreateFailTimeout bounds how long the end-of-record update of an
+	// unsent or rejected create (a sandbox create, an import before a
+	// create, or CreateSnapshot) is retried after a transient database
+	// error (5 seconds, far below the heartbeat timeout because the channel
+	// read loop also runs the update of an agent-rejected create); the retry
+	// uses ExportApplyRetryBackoff; zero means the default.
+	CreateFailTimeout time.Duration
 	// UnaryBodyReadDeadline bounds the upload of the request body of a unary
 	// RPC, counted from the start of the request (30 seconds); zero means the
 	// default. See UnaryReadDeadline.
@@ -212,6 +220,7 @@ func DefaultTiming() Timing {
 		ExportApplyRetryWindow:  DefaultExportApplyRetryWindow,
 		ExportApplyRetryBackoff: DefaultExportApplyRetryBackoff,
 		ExportFailTimeout:       snapshotFailTimeout,
+		CreateFailTimeout:       DefaultCreateFailTimeout,
 
 		UnaryBodyReadDeadline: DefaultUnaryBodyReadDeadline,
 	}

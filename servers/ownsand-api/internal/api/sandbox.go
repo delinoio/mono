@@ -447,19 +447,17 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: created.proto()}), nil
 }
 
-// createSendFailTimeout bounds the database work that fails a create whose
-// command was not queued. The request context cannot be used for it because
-// its end is a common cause of the send failure.
-const createSendFailTimeout = 5 * time.Second
-
 // failCreateSendNotQueued fails the create whose command send returned an
 // error before the command entered the outbound queue while the device
 // channel stayed connected (the request context ended first, for example
 // while a full outbound queue held the send). It moves the CREATING sandbox
 // to FAILED with CREATE_FAILED through the guarded rejection transition,
-// which releases its reservation, and notifies watchers. It uses a bounded
-// context that does not depend on the request. It returns the reloaded
-// sandbox, or nil when nothing was failed.
+// which releases its reservation, and notifies watchers. It uses the bounded
+// context and the retry of failUnsentCreate (Timing.CreateFailTimeout), which
+// do not depend on the request, and closes conn while it is current when the
+// transition stays unresolved, so the state report of the replacement channel
+// ends the sandbox as LOST_ON_DEVICE. It returns the reloaded sandbox, or nil
+// when nothing was failed; the caller then returns the CREATING record.
 //
 // A send error on a channel that is closed, including a channel that a queue
 // that stayed full closed, keeps reconnect reconciliation as the owner of the
@@ -469,18 +467,21 @@ func (s *Service) failCreateSendNotQueued(ctx context.Context, conn *hub.Conn, i
 	if conn.Context().Err() != nil {
 		return nil
 	}
-	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), createSendFailTimeout)
-	defer cancel()
 	attrs := []any{slog.String("sandbox_id", info.sandboxID), slog.String("channel_id", conn.ID), slog.Any("send_error", sendErr)}
-	if err := s.failCreateRejected(dbCtx, info.sandboxID); err != nil {
-		s.Logger.ErrorContext(dbCtx, "create_send_fail_transition_failed", append(attrs, slog.Any("error", err))...)
+	attempts, channelClosed, err := s.failUnsentCreate(ctx, conn, "create_fail_transition_retry", attrs[:2],
+		func(dbCtx context.Context) error { return s.failCreateRejected(dbCtx, info.sandboxID) })
+	attrs = append(attrs, slog.Int("attempts", attempts))
+	if err != nil {
+		s.Logger.ErrorContext(ctx, "create_send_fail_transition_failed", append(attrs, slog.Bool("channel_closed", channelClosed), slog.Any("error", err))...)
 		return nil
 	}
-	s.Logger.WarnContext(dbCtx, "create_send_failed", attrs...)
+	s.Logger.WarnContext(ctx, "create_send_failed", attrs...)
 	s.watch.fire(info.sandboxID)
+	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.createFailTimeout())
+	defer cancel()
 	row, err := loadSandbox(dbCtx, s.DB.Pool, info.orgID, info.sandboxID, false)
 	if err != nil {
-		s.Logger.ErrorContext(dbCtx, "create_send_fail_reload_failed", append(attrs, slog.Any("error", err))...)
+		s.Logger.ErrorContext(ctx, "create_send_fail_reload_failed", append(attrs, slog.Any("error", err))...)
 		return nil
 	}
 	return row
@@ -525,7 +526,17 @@ func (s *Service) importThenCreate(conn *hub.Conn, info commandInfo, src *resolv
 	case res := <-wait:
 		releaseImport()
 		if res.GetError() != nil {
-			_ = s.failCreateRejected(context.WithoutCancel(ctx), info.sandboxID)
+			// The agent rejected the import, so the create fails. A
+			// transient database error is retried; a failure that remains
+			// closes conn while it is current and is logged, so the state
+			// report of the replacement channel settles the sandbox.
+			attempts, channelClosed, err := s.failUnsentCreate(ctx, conn, "create_fail_transition_retry",
+				[]any{slog.String("sandbox_id", info.sandboxID), slog.String("channel_id", conn.ID)},
+				func(dbCtx context.Context) error { return s.failCreateRejected(dbCtx, info.sandboxID) })
+			if err != nil {
+				s.Logger.ErrorContext(ctx, "import_rejected_fail_create_failed", slog.String("sandbox_id", info.sandboxID), slog.String("channel_id", conn.ID),
+					slog.Int("attempts", attempts), slog.Bool("channel_closed", channelClosed), slog.Any("error", err))
+			}
 			s.watch.fire(info.sandboxID)
 			return
 		}
@@ -556,28 +567,28 @@ func (s *Service) failImportSendDeadline(ctx context.Context, conn *hub.Conn, in
 	}
 }
 
-// importFailTimeout bounds the database update that fails a create whose
-// import wait expired; the expired wait context cannot be used for it.
-const importFailTimeout = 5 * time.Second
-
 // failImportTimeout moves a sandbox whose import wait expired to FAILED with
 // CREATE_FAILED through the guarded rejection transition and notifies
-// watchers. It does not retry the import. A late import success cannot revive
-// the sandbox because the transition only acts on CREATING and the create
-// command is never sent after the import goroutine returned.
+// watchers. It uses the bounded context and the retry of failUnsentCreate
+// (Timing.CreateFailTimeout); the expired wait context cannot be used. A
+// transition that stays unresolved closes conn while it is current, so the
+// state report of the replacement channel settles the sandbox. It does not
+// retry the import. A late import success cannot revive the sandbox because
+// the transition only acts on CREATING and the create command is never sent
+// after the import goroutine returned.
 func (s *Service) failImportTimeout(ctx context.Context, conn *hub.Conn, info commandInfo) {
-	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), importFailTimeout)
-	defer cancel()
-	err := s.failCreateRejected(dbCtx, info.sandboxID)
 	attrs := []any{
 		slog.String("sandbox_id", info.sandboxID),
 		slog.Duration("import_wait", s.Timing.ImportWait),
 	}
+	attempts, channelClosed, err := s.failUnsentCreate(ctx, conn, "create_fail_transition_retry", []any{slog.String("sandbox_id", info.sandboxID), slog.String("channel_id", conn.ID)},
+		func(dbCtx context.Context) error { return s.failCreateRejected(dbCtx, info.sandboxID) })
+	attrs = append(attrs, slog.Int("attempts", attempts))
 	if err != nil {
-		s.Logger.ErrorContext(dbCtx, "import_timeout_fail_create_failed", append(attrs, slog.Any("error", err))...)
+		s.Logger.ErrorContext(ctx, "import_timeout_fail_create_failed", append(attrs, slog.Bool("channel_closed", channelClosed), slog.Any("error", err))...)
 		return
 	}
-	s.Logger.WarnContext(dbCtx, "import_timeout_create_failed", attrs...)
+	s.Logger.WarnContext(ctx, "import_timeout_create_failed", attrs...)
 	s.watch.fire(info.sandboxID)
 }
 

@@ -177,30 +177,59 @@ func TestExportResultAbandonedClosesChannelAndRetries(t *testing.T) {
 }
 
 // TestExportResultPermanentErrorIsNotRetried checks that a permanent
-// database error is applied once and logged, without retries and without
-// closing the channel.
+// database error is applied once without retries, that it ends the
+// application like the end of the retry window (the abandoned log, the owning
+// channel closed), that the replacement channel's state report fails the
+// abandoned attempt with a clean-up job, and that an explicit retry of the
+// export sends a new command and reaches EXPORTED.
 func TestExportResultPermanentErrorIsNotRetried(t *testing.T) {
 	env := testenv.New(t, retryTiming(10*time.Second, 20*time.Millisecond))
 	org := env.NewOrg("alice")
+	c := org.OwnerClient
 	snapID, agent := exportingSnapshot(t, env, org)
 	first := waitExportCommands(t, agent, 1)[0]
 	parts := uploadedParts(t, agent, snapID, "urls")
 
-	newExportFault(t, env).on("23514") // check_violation
+	fault := newExportFault(t, env)
+	fault.on("23514") // check_violation
 	sendExportResult(agent, first, parts)
+	select {
+	case <-agent.Closed():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the channel stayed open after a permanent error")
+	}
+	waitLog(t, env, `"msg":"export_result_apply_abandoned"`)
 	waitLog(t, env, `"msg":"agent_command_result_apply_failed"`)
 	time.Sleep(300 * time.Millisecond) // a wrongly scheduled retry would have logged by now
 	logs := env.Logs.String()
-	for _, unwanted := range []string{`"msg":"export_result_apply_retry"`, `"msg":"export_result_apply_abandoned"`} {
-		if strings.Contains(logs, unwanted) {
-			t.Fatalf("logs contain %s", unwanted)
+	if strings.Contains(logs, `"msg":"export_result_apply_retry"`) {
+		t.Fatal("a permanent error was retried")
+	}
+	for _, want := range []string{`"attempts":1`, `"channel_current":true`} {
+		if !strings.Contains(logs, want) {
+			t.Fatalf("logs lack %s:\n%s", want, logs)
 		}
 	}
-	select {
-	case <-agent.Closed():
-		t.Fatal("the channel closed after a permanent error")
-	default:
+	if got := manifestHashes(t, env, snapID); len(got) != 0 {
+		t.Fatalf("the failed application stored %d parts", len(got))
 	}
+	fault.off()
+
+	agent.Connect()
+	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORT_FAILED)
+	if _, ok := cleanupJobs(t, env)[attemptPrefixOf(org.ID, snapID, first)]; !ok {
+		t.Fatalf("no clean-up job for the abandoned attempt: %v", cleanupJobs(t, env))
+	}
+
+	answerExports(agent)
+	if got := exportSnapshotRPC(t, c, org.ID, snapID); got != ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTING {
+		t.Fatalf("retry state = %v", got)
+	}
+	ids := waitExportCommands(t, agent, 2)
+	if ids[1] == first {
+		t.Fatal("the retry reused the command ID")
+	}
+	waitExportState(t, c, org.ID, snapID, ownsandv1.SnapshotExportState_SNAPSHOT_EXPORT_STATE_EXPORTED)
 }
 
 // TestExportResultRetryStopsWhenSnapshotIsDeleted checks that a retry after

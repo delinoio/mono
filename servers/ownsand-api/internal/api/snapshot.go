@@ -170,24 +170,57 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 		// The send failed before the command was queued, often because the
 		// request context ended, so the failure transition must not use it.
 		// It acts only while the record is still CREATING, so it never
-		// overwrites a state that another writer set.
-		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), snapshotFailTimeout)
-		defer cancel()
-		tag, execErr := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", snap.pb.GetSnapshotId(),
-			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
+		// overwrites a state that another writer set. A transient database
+		// error is retried inside Timing.CreateFailTimeout; a failure that
+		// remains closes conn while it is the current channel, so that the
+		// state report of the replacement channel settles the CREATING
+		// record. The response stays unavailable either way.
+		var applied bool
+		attempts, channelClosed, execErr := h.failUnsentCreate(ctx, conn, "snapshot_create_fail_transition_retry",
+			[]any{slog.String("snapshot_id", snap.pb.GetSnapshotId()), slog.String("channel_id", conn.ID)},
+			func(dbCtx context.Context) error {
+				tag, err := h.DB.Pool.Exec(dbCtx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", snap.pb.GetSnapshotId(),
+					int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
+				applied = err == nil && tag.RowsAffected() > 0
+				return err
+			})
 		attrs := []any{slog.String("snapshot_id", snap.pb.GetSnapshotId()), slog.String("channel_id", conn.ID), slog.Any("send_error", err),
-			slog.Bool("applied", execErr == nil && tag.RowsAffected() > 0)}
+			slog.Bool("applied", applied), slog.Int("attempts", attempts)}
 		if execErr != nil {
-			h.Logger.ErrorContext(dbCtx, "snapshot_create_fail_transition_failed", append(attrs, slog.Any("error", execErr))...)
+			h.Logger.ErrorContext(ctx, "snapshot_create_fail_transition_failed", append(attrs, slog.Bool("channel_closed", channelClosed), slog.Any("error", execErr))...)
 		} else {
-			h.Logger.WarnContext(dbCtx, "snapshot_create_send_failed", attrs...)
+			h.Logger.WarnContext(ctx, "snapshot_create_send_failed", attrs...)
 		}
 		return nil, errUnavailable("the agent channel closed")
 	}
 	return connect.NewResponse(&ownsandv1.CreateSnapshotResponse{Snapshot: snap.pb}), nil
 }
 
-func (s *Service) applySnapshotResult(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+// applySnapshotResult applies the result of a create-snapshot command with
+// applyResultWithRetry. The server removed the command record before it
+// applied the result and the agent sends the result once, so a result that
+// a transient database error loses would leave the snapshot CREATING for as
+// long as the channel lives. Both writes act only on a CREATING row, so a
+// retry after a commit whose outcome is unknown, after the deletion of the
+// snapshot or after another writer settled it changes nothing more. When
+// the application ends without success while conn is still the current
+// channel of its device, the channel is closed: the state report of the
+// replacement channel then applies the agent's report of the snapshot, or
+// fails a snapshot that it does not list.
+func (s *Service) applySnapshotResult(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+	return s.applyResultWithRetry(ctx, conn, resultApplyEvents{
+		retry:     "snapshot_result_apply_retry",
+		recovered: "snapshot_result_apply_recovered",
+		abandoned: "snapshot_result_apply_abandoned",
+	}, errSnapshotResultNotApplied, []any{slog.String("snapshot_id", info.snapshotID), slog.String("command_id", res.GetCommandId())},
+		func(ctx context.Context) error { return s.applySnapshotResultOnce(ctx, info, res) })
+}
+
+// errSnapshotResultNotApplied is the cause that closes a channel whose
+// create-snapshot result could not be applied.
+var errSnapshotResultNotApplied = errors.New("the create-snapshot result could not be applied")
+
+func (s *Service) applySnapshotResultOnce(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
 	if res.GetError() != nil || res.GetCreateSnapshot().GetSnapshot() == nil {
 		_, err := s.DB.Pool.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", info.snapshotID,
 			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
@@ -299,62 +332,28 @@ func (s *Service) exportApplyRetryBackoff() time.Duration {
 	return DefaultExportApplyRetryBackoff
 }
 
-// applyExportResultWithRetry applies an export result and retries after a
-// transient database error (see isTransientDBError) with a doubling backoff
-// until the retry window ends or the channel closes. The server removed the
-// command record before it applied the result, and the row stays EXPORTING
-// with a live owner channel, which neither a repeat ExportSnapshot nor the
-// owner's state report would release, so a result that is lost here would
-// strand the export. A permanent error is returned at once. Every attempt
-// reruns the snapshot row lock and the command ID check of applyExportResult,
-// so a retry after a commit whose outcome is unknown, after a newer attempt
-// or after the deletion of the snapshot changes nothing more. When the
-// window ends while conn is still the current channel of its device, the
-// channel is closed: the state report of the replacement channel then fails
-// the abandoned attempt with a clean-up job, and an explicit retry of the
-// export sends a new command.
+// applyExportResultWithRetry applies an export result with
+// applyResultWithRetry. The server removed the command record before it
+// applied the result, and the row stays EXPORTING with a live owner channel,
+// which neither a repeat ExportSnapshot nor the owner's state report would
+// release, so a result that is lost here would strand the export. Every
+// attempt reruns the snapshot row lock and the command ID check of
+// applyExportResult, so a retry after a commit whose outcome is unknown,
+// after a newer attempt or after the deletion of the snapshot changes
+// nothing more. A transient database error is retried until the window
+// ends. A permanent error is not retried but ends the application the same
+// way (the export_result_apply_abandoned log): while conn is still the
+// current channel of its device, the channel is closed, so the state report
+// of the replacement channel fails the abandoned attempt with a clean-up job
+// and an explicit retry of the export sends a new command.
 func (s *Service) applyExportResultWithRetry(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
 	commandID := res.GetCommandId()
-	retryCtx, cancel := context.WithTimeout(ctx, s.exportApplyRetryWindow())
-	defer cancel()
-	backoff := s.exportApplyRetryBackoff()
-	for attempt := 1; ; attempt++ {
-		err := s.applyExportResult(retryCtx, info, commandID, res)
-		if err == nil {
-			if attempt > 1 {
-				s.Logger.InfoContext(ctx, "export_result_apply_recovered", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("attempts", attempt))
-			}
-			return nil
-		}
-		if ctx.Err() != nil {
-			return err // the channel closed; the replacement channel's state report settles the attempt
-		}
-		if retryCtx.Err() == nil {
-			if !isTransientDBError(err) {
-				return err
-			}
-			s.Logger.WarnContext(ctx, "export_result_apply_retry", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
-				slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
-			timer := time.NewTimer(backoff)
-			select {
-			case <-timer.C:
-			case <-retryCtx.Done():
-				timer.Stop()
-			}
-			if backoff *= 2; backoff > exportApplyRetryBackoffMax {
-				backoff = exportApplyRetryBackoffMax
-			}
-			continue
-		}
-		// The retry window ended.
-		current := s.Hub.Get(info.deviceID) == conn
-		s.Logger.ErrorContext(ctx, "export_result_apply_abandoned", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
-			slog.Int("attempts", attempt), slog.Bool("channel_current", current), slog.Any("error", err))
-		if current {
-			conn.Close(errExportResultNotApplied)
-		}
-		return err
-	}
+	return s.applyResultWithRetry(ctx, conn, resultApplyEvents{
+		retry:     "export_result_apply_retry",
+		recovered: "export_result_apply_recovered",
+		abandoned: "export_result_apply_abandoned",
+	}, errExportResultNotApplied, []any{slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID)},
+		func(ctx context.Context) error { return s.applyExportResult(ctx, info, commandID, res) })
 }
 
 // errExportClaimNotReleased is the cause that closes a channel whose unsent
