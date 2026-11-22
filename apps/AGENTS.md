@@ -8,7 +8,7 @@
 
 - Follow root `AGENTS.md` and project-specific docs before adding or changing app code.
 
-- When you change an app with an e2e suite, run `pnpm exec turbo run test:e2e --filter=<app>` and update its tests in `e2e/`. Follow the [e2e contract](../docs/repository-e2e-contract.md).
+- When you change an app with an e2e suite, run `pnpm exec turbo run test:e2e --filter=./apps/<app>` and update its tests in `e2e/`. Follow the [e2e contract](../docs/repository-e2e-contract.md).
 
 - Each deployed static site declares a `deploy` field in its `package.json`. Follow [the deployment workflow](../docs/repository-workflow-contract.md#deployment-workflow).
 
