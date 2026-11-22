@@ -637,8 +637,10 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (inf
 			r.logger.Error("resume after snapshot failed", "sandbox_id", v.id, "error", rerr)
 			// A VM left paused while the manager reports it running must not
 			// yield a READY snapshot; an earlier capture error takes priority.
+			// The result tells the manager that the source is paused, with
+			// either error.
+			info = vmruntime.SnapshotInfo{SourceState: ownsandv1.SandboxState_SANDBOX_STATE_PAUSED}
 			if err == nil {
-				info = vmruntime.SnapshotInfo{}
 				err = fmt.Errorf("fcrt: resume after snapshot: %w", rerr)
 			}
 		}()

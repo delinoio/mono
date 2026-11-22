@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -65,6 +67,15 @@ type fakeRuntime struct {
 	// snapshotErr, when set, makes Snapshot fail after it wrote its content,
 	// like a runtime whose resume failed after a completed capture.
 	snapshotErr error
+	// snapshotSourceState is the SourceState that Snapshot returns with
+	// snapshotErr, like a runtime that paused the source and could not resume
+	// it (PAUSED); the fake does not pause anything for it.
+	snapshotSourceState ownsandv1.SandboxState
+	// snapshotViaHelper makes Snapshot behave like the macOS and Hyper-V
+	// runtimes: it runs the capture through vmruntime.SnapshotWithPause, with
+	// the Pause and Resume of the fake, so a resumeErr models a rejected
+	// resume that leaves the VM paused.
+	snapshotViaHelper bool
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
@@ -151,20 +162,32 @@ func (r *fakeRuntime) Resume(_ context.Context, vm vmruntime.VM) error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *fakeRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
 	if r.snapStarted != nil {
 		close(r.snapStarted)
 		<-r.snapBlock
 	}
-	os.MkdirAll(dir, 0o700)
-	os.WriteFile(filepath.Join(dir, "disk"), []byte("disk"), 0o600)
-	r.mu.Lock()
-	snapshotErr := r.snapshotErr
-	r.mu.Unlock()
-	if snapshotErr != nil {
-		return vmruntime.SnapshotInfo{}, snapshotErr
+	capture := func() (vmruntime.SnapshotInfo, error) {
+		os.MkdirAll(dir, 0o700)
+		os.WriteFile(filepath.Join(dir, "disk"), []byte("disk"), 0o600)
+		r.mu.Lock()
+		snapshotErr, sourceState := r.snapshotErr, r.snapshotSourceState
+		r.mu.Unlock()
+		if snapshotErr != nil {
+			return vmruntime.SnapshotInfo{SourceState: sourceState}, snapshotErr
+		}
+		return vmruntime.SnapshotInfo{SizeBytes: 4}, nil
 	}
-	return vmruntime.SnapshotInfo{SizeBytes: 4}, nil
+	if !r.snapshotViaHelper {
+		return capture()
+	}
+	r.mu.Lock()
+	wasPaused := r.paused[vm.SandboxID()]
+	r.mu.Unlock()
+	return vmruntime.SnapshotWithPause(slog.New(slog.NewTextHandler(io.Discard, nil)), vm.SandboxID(), wasPaused,
+		func() error { return r.Pause(ctx, vm) },
+		func() error { return r.Resume(ctx, vm) },
+		capture)
 }
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	r.mu.Lock()
@@ -268,14 +291,19 @@ type env struct {
 	m   *Manager
 	out *outbox
 	ex  *execs
+	// logger is the manager logger; nil selects the default logger.
+	logger *slog.Logger
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T) *env { return newEnvWithLogger(t, nil) }
+
+// newEnvWithLogger is newEnv with a manager logger that a test can read.
+func newEnvWithLogger(t *testing.T, logger *slog.Logger) *env {
 	st, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
-	e := &env{t: t, st: st, rt: newFakeRuntime(), clk: &clock{now: time.Now()}, out: &outbox{}, ex: &execs{running: map[string]bool{}, ended: map[string]ownsandv1.SandboxEndReason{}}}
+	e := &env{t: t, st: st, rt: newFakeRuntime(), clk: &clock{now: time.Now()}, out: &outbox{}, ex: &execs{running: map[string]bool{}, ended: map[string]ownsandv1.SandboxEndReason{}}, logger: logger}
 	e.restart()
 	// Registered after t.TempDir, so it runs before the state directory is
 	// removed: Close waits for the background ends that still write records.
@@ -287,7 +315,7 @@ func (e *env) restart() {
 	if e.m != nil {
 		e.m.Close()
 	}
-	m, err := New(context.Background(), Options{Store: e.st, Runtime: e.rt, Now: e.clk.Now, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
+	m, err := New(context.Background(), Options{Store: e.st, Runtime: e.rt, Now: e.clk.Now, Logger: e.logger, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
 	if err != nil {
 		e.t.Fatal(err)
 	}
