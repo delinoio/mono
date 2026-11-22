@@ -156,12 +156,20 @@ func (d *DataPlane) Offer(ctx context.Context, ch agent.Channel, offer *ownsandv
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_INVALID_ARGUMENT, "offer could not be answered: "+msg)
 	}
 	// ended answers an offer whose session ended before the answer was
-	// ready (revoked, closed data plane or lost channel).
+	// ready (revoked, closed data plane or lost channel). A closed data plane
+	// answers unavailable like an offer that arrives after Close; every other
+	// end answers failed_precondition.
 	ended := func() *ownsandv1.SignalingAnswer {
 		s.mu.Lock()
 		reason := s.endReason
 		s.mu.Unlock()
-		logger.Warn("session ended before it was answered", "cancellation_reason", reason.String())
+		d.mu.Lock()
+		closed := d.closed
+		d.mu.Unlock()
+		logger.Warn("session ended before it was answered", "cancellation_reason", reason.String(), "data_plane_closed", closed)
+		if closed {
+			return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
+		}
 		return answerError(offer.GetSessionId(), ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "session ended before it was answered")
 	}
 	// expired answers an offer whose lifetime ran out during setup. It ends

@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
-import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  rs,
+  test,
+} from "@rstest/core";
 import {
   act,
   cleanup,
@@ -14,9 +21,15 @@ import { pendingInvitation } from "./invitation.ts";
 import {
   ACCOUNT_ID,
   ADMIN,
+  addBillingAccounts,
+  addInvitations,
+  addLinkedOrganizations,
+  addMembers,
   createFakeApi,
   INVITATION_TOKEN,
+  numbered,
   OUTSIDER,
+  OWNER,
   VIEWER,
 } from "./testing/fake-api.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
@@ -68,6 +81,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  rs.useRealTimers();
 });
 
 describe("sign-in", () => {
@@ -109,6 +123,57 @@ describe("sign-in", () => {
     expect(
       await screen.findByRole("heading", { name: "Page not found" }),
     ).toBeTruthy();
+  });
+});
+
+describe("ended session", () => {
+  const SESSION_ENDED = "Your session ended. Sign in again.";
+
+  test("an Unauthenticated answer offers the sign-in redirect and no retry", async () => {
+    const api = createFakeApi();
+    api.failNext.set(
+      "ListBillingAccounts",
+      new ConnectError("token expired", Code.Unauthenticated),
+    );
+    const { signIns } = renderApp("/billing", { api });
+    expect(await screen.findByText(SESSION_ENDED)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    expect(signIns).toHaveLength(0);
+    await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("a token source without a token offers the sign-in redirect", async () => {
+    // The Logto SDK keeps isAuthenticated true after a failed refresh, and
+    // the app's own transport then throws Unauthenticated before any request.
+    const { signIns } = renderApp("/billing", {
+      appTransport: true,
+      getAccessToken: async () => undefined,
+    });
+    expect(await screen.findByText(SESSION_ENDED)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("an Unavailable answer keeps the retry button and offers no sign-in", async () => {
+    const api = createFakeApi();
+    api.failNext.set(
+      "ListBillingAccounts",
+      new ConnectError("down", Code.Unavailable),
+    );
+    const { signIns } = renderApp("/billing", { api });
+    expect(
+      await screen.findByText(/Delino Accounts is not available/),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in with Delino" })).toBe(
+      null,
+    );
+    await click(screen.getByRole("button", { name: "Try again" }));
+    expect(
+      await screen.findByRole("link", { name: /Acme Robotics/ }),
+    ).toBeTruthy();
+    expect(signIns).toHaveLength(0);
   });
 });
 
@@ -302,6 +367,204 @@ describe("subscription", () => {
   });
 });
 
+describe("pending subscription polling", () => {
+  /** The subscription poll interval of the overview. */
+  const POLL_MS = 2000;
+  /** Enough fake time for the loading skeleton delay and the first reads. */
+  const SETTLE_MS = 100;
+
+  /** Runs the fake clock forward inside `act`, flushing pending requests. */
+  async function advance(ms: number) {
+    await act(async () => {
+      await rs.advanceTimersByTimeAsync(ms);
+      await new Promise((resolve) =>
+        rs.getRealTimers().setTimeout(resolve, 20),
+      );
+    });
+  }
+
+  /** Renders the overview under fake timers and lets the first reads finish. */
+  async function renderPending(
+    status: SubscriptionStatus,
+    options: {
+      userId?: string;
+      checkout?: ReturnType<typeof fakeCheckout>;
+    } = {},
+  ) {
+    const api = createFakeApi();
+    api.userId = options.userId ?? OWNER;
+    api.accounts.get(ACCOUNT_ID)!.subscription = {
+      status,
+      cancelAtPeriodEnd: false,
+    };
+    rs.useFakeTimers({
+      toFake: [
+        "setTimeout",
+        "clearTimeout",
+        "setInterval",
+        "clearInterval",
+        "Date",
+      ],
+    });
+    renderApp(ACCOUNT_PATH, { api, checkout: options.checkout });
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    return api;
+  }
+
+  /** Confirms the payment on the server like the verified webhook does. */
+  function confirm(api: ReturnType<typeof createFakeApi>) {
+    const account = api.accounts.get(ACCOUNT_ID)!;
+    account.subscription = {
+      status: SubscriptionStatus.ACTIVE,
+      cancelAtPeriodEnd: false,
+      periodEnd: new Date("2026-12-01T00:00:00Z"),
+    };
+    account.balance += 10_000_000n;
+  }
+
+  /** The balance text without `waitFor`, which cannot run on fake timers. */
+  const balanceNow = () =>
+    screen.getByRole("region", { name: "Balance" }).querySelector(".balance")
+      ?.textContent;
+
+  const topUpDisabled = () =>
+    (screen.getByRole("button", { name: "Top up" }) as HTMLButtonElement)
+      .disabled;
+
+  test("a delayed confirmation updates the page without a reload and then stops polling", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+    expect(topUpDisabled()).toBe(true);
+    expect(balanceNow()).toBe("$12.35");
+
+    // Still PENDING: the page reads the subscription every 2 s and nothing else.
+    api.calls.length = 0;
+    await advance(POLL_MS);
+    await advance(POLL_MS);
+    expect(calls(api, "GetSubscription")).toHaveLength(2);
+    // Every read stays on the account of the page.
+    expect(
+      calls(api, "GetSubscription").map((r) => r.billingAccountId),
+    ).toEqual([ACCOUNT_ID, ACCOUNT_ID]);
+    expect(calls(api, "GetBalance")).toHaveLength(0);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+
+    // The webhook confirms the payment between two polls.
+    confirm(api);
+    api.calls.length = 0;
+    await advance(POLL_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+    expect(topUpDisabled()).toBe(false);
+    expect(balanceNow()).toBe("$22.35");
+    expect(calls(api, "GetBalance").length).toBeGreaterThan(0);
+
+    // The transition invalidated the credit reads once; no timer remains.
+    await advance(POLL_MS);
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(api.calls).toEqual([]);
+  });
+
+  test("an admin can top up after the confirmation", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING, {
+      userId: ADMIN,
+    });
+    expect(topUpDisabled()).toBe(true);
+    confirm(api);
+    await advance(POLL_MS);
+    expect(topUpDisabled()).toBe(false);
+  });
+
+  test("a reload while PENDING polls from the initial load", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    expect(calls(api, "GetSubscription")).toHaveLength(1);
+    await advance(POLL_MS);
+    expect(calls(api, "GetSubscription")).toHaveLength(2);
+    confirm(api);
+    await advance(POLL_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+  });
+
+  test("no timer is scheduled for a subscription that is not PENDING", async () => {
+    for (const status of [
+      SubscriptionStatus.ACTIVE,
+      SubscriptionStatus.NONE,
+      SubscriptionStatus.CANCELED,
+    ]) {
+      const api = await renderPending(status);
+      api.calls.length = 0;
+      await advance(POLL_MS * 5);
+      expect(api.calls).toEqual([]);
+      cleanup();
+      rs.useRealTimers();
+    }
+  });
+
+  test("a confirmation before the checkout closes does not poll or refresh twice", async () => {
+    const checkout = fakeCheckout();
+    const api = await renderPending(SubscriptionStatus.NONE, { checkout });
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Start subscription" }),
+      );
+    });
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    expect(checkout.opened).toEqual(["txn_checkout1"]);
+    // The webhook arrives before the poll runs and before the close callback.
+    confirm(api);
+    await act(async () => checkout.close());
+    await advance(SETTLE_MS);
+    await advance(SETTLE_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+    expect(topUpDisabled()).toBe(false);
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(api.calls).toEqual([]);
+  });
+
+  test("an unpaid closed checkout stays pending with reads only", async () => {
+    const checkout = fakeCheckout();
+    const api = await renderPending(SubscriptionStatus.PENDING, { checkout });
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(screen.getByText("Waiting for payment")).toBeTruthy();
+    expect(topUpDisabled()).toBe(true);
+    const methods = new Set(api.calls.map((c) => c.method));
+    expect(methods).toEqual(new Set(["GetSubscription"]));
+    expect(calls(api, "GetSubscription")).toHaveLength(5);
+    expect(calls(api, "StartSubscription")).toHaveLength(0);
+    expect(calls(api, "CreateTopUp")).toHaveLength(0);
+    expect(checkout.opened).toEqual([]);
+  });
+
+  test("unmounting stops the polling", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    await advance(POLL_MS);
+    cleanup();
+    api.calls.length = 0;
+    await advance(POLL_MS * 5);
+    expect(api.calls).toEqual([]);
+  });
+
+  test("a transient Unavailable during polling does not stop it", async () => {
+    const api = await renderPending(SubscriptionStatus.PENDING);
+    api.failNext.set(
+      "GetSubscription",
+      new ConnectError("try again", Code.Unavailable),
+    );
+    await advance(POLL_MS);
+    // The next poll succeeds and sees the confirmation.
+    confirm(api);
+    await advance(POLL_MS);
+    await advance(SETTLE_MS);
+    expect(screen.queryByText("Waiting for payment")).toBeNull();
+    expect(topUpDisabled()).toBe(false);
+    expect(balanceNow()).toBe("$22.35");
+  });
+});
+
 describe("top-up", () => {
   async function openTopUp() {
     await click(await screen.findByRole("button", { name: "Top up" }));
@@ -420,6 +683,63 @@ describe("invoices", () => {
   test("a viewer has no invoices tab", async () => {
     await renderAccount(VIEWER);
     expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
+    expect(
+      screen
+        .getByRole("tab", { name: "Overview" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+  });
+
+  /** Changes the caller's role in the fake API and refetches the account. */
+  async function changeRoleAndRefetch(
+    api: ReturnType<typeof createFakeApi>,
+    userId: string,
+    role: BillingAccountRole,
+  ) {
+    const member = api.accounts
+      .get(ACCOUNT_ID)
+      ?.members.find((m) => m.userId === userId);
+    if (member === undefined) throw new Error("member missing");
+    member.role = role;
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+    });
+    await settle();
+  }
+
+  test("demotion to viewer while Invoices is open selects Overview", async () => {
+    const api = createFakeApi();
+    await renderAccount(ADMIN, { api });
+    await openTab("Invoices");
+    expect(
+      screen
+        .getByRole("tab", { name: "Invoices" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+
+    await changeRoleAndRefetch(api, ADMIN, BillingAccountRole.VIEWER);
+
+    expect(screen.queryByRole("tab", { name: "Invoices" })).toBeNull();
+    const selected = screen
+      .getAllByRole("tab")
+      .filter((t) => t.getAttribute("aria-selected") === "true");
+    expect(selected.map((t) => t.textContent)).toEqual(["Overview"]);
+    expect(screen.getAllByRole("tabpanel")).toHaveLength(1);
+  });
+
+  test("a role change that keeps access keeps the Invoices tab selected", async () => {
+    const api = createFakeApi();
+    await renderAccount(undefined, { api });
+    await openTab("Invoices");
+
+    await changeRoleAndRefetch(api, OWNER, BillingAccountRole.ADMIN);
+
+    expect(screen.getByText("Your role: Admin")).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Invoices" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
   });
 
   test("opens the invoice link that GetInvoiceUrl returns without storing it", async () => {
@@ -469,6 +789,147 @@ describe("invoices", () => {
     } finally {
       window.open = originalOpen;
     }
+  });
+
+  describe("while the link is in flight", () => {
+    const INVOICE_URL = "https://sandbox-invoice.paddle.test/txn_top1.pdf";
+
+    /**
+     * Stands in for the blank tab that the click reserves. `closed` flips
+     * when the test plays the user closing the tab.
+     */
+    function fakeTab() {
+      const tab = {
+        opener: "app" as unknown,
+        closed: false,
+        replaced: [] as string[],
+        closeCalls: 0,
+        location: {
+          replace(url: string) {
+            tab.replaced.push(url);
+          },
+        },
+        close() {
+          tab.closeCalls += 1;
+          tab.closed = true;
+        },
+      };
+      return tab;
+    }
+
+    /**
+     * Opens the invoice with the given `window.open` result and holds the
+     * GetInvoiceUrl answer until `respond` runs. The location assignment
+     * that a blocked pop-up falls back to is recorded and not performed.
+     */
+    async function openInvoiceWith(
+      opened: ReturnType<typeof fakeTab> | null,
+      failure?: ConnectError,
+    ) {
+      const originalOpen = window.open;
+      const originalAssign = window.location.assign;
+      const assigned: string[] = [];
+      window.open = (() => opened) as unknown as typeof window.open;
+      window.location.assign = (url: string | URL) => {
+        assigned.push(String(url));
+      };
+      const api = createFakeApi();
+      if (failure !== undefined) api.failNext.set("GetInvoiceUrl", failure);
+      let respond!: () => void;
+      api.gates.set(
+        "GetInvoiceUrl",
+        new Promise<void>((resolve) => {
+          respond = resolve;
+        }),
+      );
+      await renderAccount(ADMIN, { api });
+      await openTab("Invoices");
+      const list = await screen.findByRole("list", { name: "Invoices" });
+      await click(
+        within(list).getByRole("button", { name: /Open the invoice/ }),
+      );
+      await settle(60);
+      expect(calls(api, "GetInvoiceUrl")).toHaveLength(1);
+      return {
+        api,
+        assigned,
+        respond: async () => {
+          respond();
+          await settle(60);
+        },
+        restore() {
+          window.open = originalOpen;
+          window.location.assign = originalAssign;
+        },
+      };
+    }
+
+    test("a tab the user closed discards the link and leaves the billing page alone", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(tab);
+      try {
+        const pathBefore = window.location.pathname;
+        tab.closed = true;
+        await harness.respond();
+        expect(tab.replaced).toEqual([]);
+        expect(harness.assigned).toEqual([]);
+        expect(window.location.pathname).toBe(pathBefore);
+        expect(
+          screen.getByRole("heading", { name: "Acme Robotics" }),
+        ).toBeTruthy();
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a tab that stays open receives the invoice", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(tab);
+      try {
+        await harness.respond();
+        expect(tab.replaced).toEqual([INVOICE_URL]);
+        expect(tab.opener).toBeNull();
+        expect(harness.assigned).toEqual([]);
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a blocked pop-up opens the invoice in the billing tab", async () => {
+      const harness = await openInvoiceWith(null);
+      try {
+        expect(harness.assigned).toEqual([]);
+        await harness.respond();
+        expect(harness.assigned).toEqual([INVOICE_URL]);
+      } finally {
+        harness.restore();
+      }
+    });
+
+    test("a failed request closes the open tab and shows the error toast", async () => {
+      const tab = fakeTab();
+      const harness = await openInvoiceWith(
+        tab,
+        new ConnectError("unavailable", Code.Unavailable),
+      );
+      try {
+        expect(tab.closeCalls).toBe(1);
+        expect(tab.replaced).toEqual([]);
+        expect(harness.assigned).toEqual([]);
+        expect(
+          await screen.findByText(
+            "Delino Accounts is not available right now. Try again in a moment.",
+          ),
+        ).toBeTruthy();
+        const stored = JSON.stringify({
+          ...window.sessionStorage,
+          ...window.localStorage,
+        });
+        expect(stored).not.toContain("sandbox-invoice");
+      } finally {
+        harness.restore();
+      }
+    });
   });
 });
 
@@ -745,6 +1206,27 @@ describe("invitation acceptance", () => {
     expect(pendingInvitation.read()).toBeUndefined();
   });
 
+  test("an ended session offers sign-in and keeps the token for the redirect", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    const api = createFakeApi();
+    api.userId = OUTSIDER;
+    api.failNext.set(
+      "AcceptInvitation",
+      new ConnectError("token expired", Code.Unauthenticated),
+    );
+    const { signIns } = renderApp("/billing/invitations/accept", { api });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    await settle(60);
+    // The failed attempt deleted the stored token.
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await click(screen.getByRole("button", { name: "Sign in with Delino" }));
+    expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+  });
+
   test("a new link drops the stored token of an earlier link", async () => {
     pendingInvitation.save(EARLIER_INVITATION_TOKEN);
     renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`);
@@ -852,6 +1334,65 @@ describe("settings", () => {
     ]);
   });
 
+  test("a refetch that changes only the read-only counters keeps the unsaved automatic top-up draft", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const amount = await screen.findByRole("textbox", {
+      name: "Top-up amount (USD)",
+    });
+    await type(amount, "75");
+    expect(
+      screen.getByText("Charged this month").nextSibling?.textContent,
+    ).toBe("$0.00");
+    const fake = api.accounts.get(ACCOUNT_ID)!;
+    fake.autoTopUp = {
+      ...fake.autoTopUp,
+      monthToDateUsdMicros: 30_000_000n,
+      consecutiveFailures: 1,
+    };
+    const before = calls(api, "GetAutoTopUpSettings").length;
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+    });
+    await settle(60);
+    expect(calls(api, "GetAutoTopUpSettings").length).toBeGreaterThan(before);
+    expect(
+      screen.getByText("Charged this month").nextSibling?.textContent,
+    ).toBe("$30.00");
+    expect(
+      screen.getByText("Failed top-ups in a row").nextSibling?.textContent,
+    ).toBe("1");
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("75");
+  });
+
+  test("a refetch that changes a saved editable value resets the automatic top-up form", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const amount = await screen.findByRole("textbox", {
+      name: "Top-up amount (USD)",
+    });
+    await type(amount, "75");
+    const fake = api.accounts.get(ACCOUNT_ID)!;
+    fake.autoTopUp = { ...fake.autoTopUp, amountUsdMicros: 40_000_000n };
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+    });
+    await settle(60);
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("40.00");
+  });
+
   test("rejects an enabled automatic top-up amount above $10,000 without a request", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
@@ -881,6 +1422,58 @@ describe("settings", () => {
         }),
       }),
     ]);
+  });
+
+  test("rejects an automatic top-up threshold and monthly cap above the int64 bound without a request", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    await click(
+      await screen.findByRole("switch", { name: "Automatic top-up" }),
+    );
+    const threshold = screen.getByRole("textbox", { name: "Threshold (USD)" });
+    const amount = screen.getByRole("textbox", { name: "Top-up amount (USD)" });
+    const cap = screen.getByRole("textbox", { name: "Monthly cap (USD)" });
+    const save = within(threshold.closest("form")!).getByRole("button", {
+      name: "Save",
+    });
+    await type(threshold, "99999999999999");
+    await type(amount, "25");
+    await type(cap, "99999999999999");
+    await click(save);
+    expect(
+      screen.getAllByText("Enter at most $9,223,372,036,854.77."),
+    ).toHaveLength(2);
+    expect(calls(api, "UpdateAutoTopUpSettings")).toHaveLength(0);
+    await type(threshold, "9223372036854.77");
+    await type(cap, "9223372036854.77");
+    await click(save);
+    await settle(60);
+    expect(calls(api, "UpdateAutoTopUpSettings")).toEqual([
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          thresholdUsdMicros: 9_223_372_036_854_770_000n,
+          monthlyCapUsdMicros: 9_223_372_036_854_770_000n,
+        }),
+      }),
+    ]);
+  });
+
+  test("rejects an alert threshold above the int64 bound without a request", async () => {
+    const api = createFakeApi();
+    await renderAccount(undefined, { api });
+    await openTab("Settings");
+    const input = await screen.findByRole("textbox", {
+      name: "Alert threshold (USD)",
+    });
+    const save = within(input.closest("form")!).getByRole("button", {
+      name: "Save",
+    });
+    await type(input, "9223372036854.78");
+    await click(save);
+    expect(
+      screen.getByText("Enter at most $9,223,372,036,854.77."),
+    ).toBeTruthy();
+    expect(calls(api, "UpdateAlertSettings")).toHaveLength(0);
   });
 
   test("saves the low-balance alert threshold from $0 with the $10 default", async () => {
@@ -930,5 +1523,604 @@ describe("settings", () => {
       screen.getAllByText("Only owners and admins can change these settings.")
         .length,
     ).toBe(3);
+  });
+});
+
+/** The titles of the rows of a list, in order. */
+function rowTitles(list: HTMLElement) {
+  return within(list)
+    .getAllByRole("listitem")
+    .map((row) => row.querySelector(".list-title")?.textContent ?? "");
+}
+
+/** The continuation tokens that the requests of a method sent, in order. */
+function pageTokens(api: ReturnType<typeof createFakeApi>, method: string) {
+  return calls(api, method).map((request) => request.pageToken);
+}
+
+describe("paged lists", () => {
+  describe("billing accounts", () => {
+    test("reads every page in server order", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 200);
+      renderApp("/billing", { api });
+      const list = await screen.findByRole("list", {
+        name: "Billing accounts",
+      });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toBe("Acme Robotics");
+      expect(titles[1]).toBe(`Account ${numbered(1)}`);
+      expect(titles[200]).toBe(`Account ${numbered(200)}`);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1"]);
+      expect(calls(api, "ListBillingAccounts")[1]).toMatchObject({
+        pageSize: 200,
+      });
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 199);
+      renderApp("/billing", { api });
+      const list = await screen.findByRole("list", {
+        name: "Billing accounts",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual([""]);
+    });
+
+    test("no account keeps the empty state and makes one request", async () => {
+      const api = createFakeApi();
+      api.userId = OUTSIDER;
+      renderApp("/billing", { api });
+      expect(await screen.findByText("No billing accounts yet")).toBeTruthy();
+      await settle(100);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual([""]);
+    });
+
+    test("a failed continuation keeps the first page and retries at the failed page", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 200);
+      api.failContinuation.set(
+        "ListBillingAccounts",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      renderApp("/billing", { api });
+      const list = await screen.findByRole("list", {
+        name: "Billing accounts",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(await screen.findByText(/Some items did not load/)).toBeTruthy();
+      // The failure stops the loop: no further request until the retry.
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1"]);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Billing accounts" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(screen.queryByText(/Some items did not load/)).toBeNull();
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1", "p1"]);
+    });
+
+    test("opens the last account of the second page", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 200);
+      renderApp("/billing", { api });
+      const link = await screen.findByRole("link", {
+        name: new RegExp(`Account ${numbered(200)}`),
+      });
+      await settle(100);
+      await click(link);
+      expect(
+        await screen.findByRole("heading", {
+          name: `Account ${numbered(200)}`,
+          level: 1,
+        }),
+      ).toBeTruthy();
+    });
+  });
+
+  describe("members", () => {
+    test("reads every page in server order with the controls of the last member", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toContain("Olivia Owner");
+      expect(titles[200]).toContain(`Member ${numbered(198)}`);
+      expect(calls(api, "ListMembers")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "",
+        }),
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "p1",
+        }),
+      ]);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      expect(
+        within(last).getByRole("button", { name: "Make owner" }),
+      ).toBeTruthy();
+      expect(
+        within(last).getByRole("combobox", {
+          name: `Role of Member ${numbered(198)}`,
+        }),
+      ).toBeTruthy();
+      await click(within(last).getByRole("button", { name: "Remove" }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(
+        within(dialog).getByRole("button", { name: "Remove member" }),
+      );
+      await settle(100);
+      expect(calls(api, "RemoveMember")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          userId: `user-${numbered(198)}`,
+        }),
+      ]);
+    });
+
+    test("the last member can receive ownership", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      await click(within(last).getByRole("button", { name: "Make owner" }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(
+        within(dialog).getByRole("button", { name: "Transfer ownership" }),
+      );
+      await settle(100);
+      expect(calls(api, "TransferOwnership")).toEqual([
+        expect.objectContaining({ userId: `user-${numbered(198)}` }),
+      ]);
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 197);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListMembers")).toEqual([""]);
+    });
+
+    test("a failed continuation retries without duplicates and a viewer stays read-only", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+      api.failContinuation.set(
+        "ListMembers",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      await renderAccount(VIEWER, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Members" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(pageTokens(api, "ListMembers")).toEqual(["", "p1", "p1"]);
+      const members = screen.getByRole("list", { name: "Members" });
+      expect(within(members).queryByRole("button")).toBeNull();
+      expect(within(members).queryByRole("combobox")).toBeNull();
+    });
+  });
+
+  describe("organizations", () => {
+    test("reads every page in server order, including the last row", async () => {
+      const api = createFakeApi();
+      addLinkedOrganizations(api.accounts.get(ACCOUNT_ID)!, 200);
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toBe("Acme sandboxes");
+      expect(titles[200]).toBe(`Org ${numbered(200)}`);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      expect(last.textContent).toContain("OwnSand");
+      expect(last.textContent).toContain("Active");
+      expect(calls(api, "ListLinkedOrganizations")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "",
+        }),
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "p1",
+        }),
+      ]);
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addLinkedOrganizations(api.accounts.get(ACCOUNT_ID)!, 199);
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([""]);
+    });
+
+    test("no organization keeps the empty state", async () => {
+      const api = createFakeApi();
+      api.accounts.get(ACCOUNT_ID)!.linked = [];
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      expect(await screen.findByText("No linked organizations")).toBeTruthy();
+      await settle(100);
+      expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([""]);
+    });
+
+    test("a failed continuation retries without duplicates", async () => {
+      const api = createFakeApi();
+      addLinkedOrganizations(api.accounts.get(ACCOUNT_ID)!, 200);
+      api.failContinuation.set(
+        "ListLinkedOrganizations",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Linked organizations" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([
+        "",
+        "p1",
+        "p1",
+      ]);
+    });
+
+    test("switching to another billing account shows only its organizations", async () => {
+      const api = createFakeApi();
+      const first = api.accounts.get(ACCOUNT_ID)!;
+      addLinkedOrganizations(first, 200, "Alpha");
+      addBillingAccounts(api, 1);
+      const [secondId, second] = [...api.accounts].find(
+        ([, account]) => account.name === `Account ${numbered(1)}`,
+      )!;
+      addLinkedOrganizations(second, 2, "Beta");
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(201);
+      await act(async () => {
+        window.history.pushState(null, "", `/billing/${secondId}`);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await screen.findByRole("heading", {
+        name: `Account ${numbered(1)}`,
+        level: 1,
+      });
+      await openTab("Organizations");
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Linked organizations" }),
+      );
+      expect(titles).toEqual([`Beta ${numbered(1)}`, `Beta ${numbered(2)}`]);
+      expect(calls(api, "ListLinkedOrganizations").at(-1)).toMatchObject({
+        billingAccountId: secondId,
+        pageToken: "",
+      });
+    });
+  });
+
+  describe("invitations", () => {
+    test("reads every page with a Revoke action for the last invitation", async () => {
+      const api = createFakeApi();
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 200);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", {
+        name: "Pending invitations",
+      });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toBe("pending@example.com");
+      expect(titles[200]).toBe(`invitee-${numbered(200)}@example.com`);
+      expect(
+        within(list).getAllByRole("button", { name: "Revoke" }),
+      ).toHaveLength(201);
+      expect(calls(api, "ListInvitations")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "",
+        }),
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "p1",
+        }),
+      ]);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      await click(within(last).getByRole("button", { name: "Revoke" }));
+      await settle(100);
+      expect(calls(api, "RevokeInvitation")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          invitationId: `0193a1b2-0002-7000-8000-${"200".padStart(12, "0")}`,
+        }),
+      ]);
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 199);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", {
+        name: "Pending invitations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListInvitations")).toEqual([""]);
+    });
+
+    test("no pending invitation keeps the empty state", async () => {
+      const api = createFakeApi();
+      api.accounts.get(ACCOUNT_ID)!.invitations = [];
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      expect(await screen.findByText("No pending invitations")).toBeTruthy();
+      await settle(100);
+      expect(pageTokens(api, "ListInvitations")).toEqual([""]);
+    });
+
+    test("a failed continuation retries without duplicates", async () => {
+      const api = createFakeApi();
+      addInvitations(api.accounts.get(ACCOUNT_ID)!, 200);
+      api.failContinuation.set(
+        "ListInvitations",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", {
+        name: "Pending invitations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Pending invitations" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(pageTokens(api, "ListInvitations")).toEqual(["", "p1", "p1"]);
+    });
+  });
+});
+
+/** Triggers the refetch of every stale query, like a return to the tab. */
+async function refocus() {
+  await act(async () => {
+    window.dispatchEvent(new Event("visibilitychange"));
+  });
+  await settle(60);
+}
+
+/** The notice text of a ResourceExhausted failure. */
+const BUSY = "Too many requests. Wait a moment and try again.";
+const BACKGROUND_FAILURE = new ConnectError("busy", Code.ResourceExhausted);
+
+describe("failed background refetches", () => {
+  test("a failed refetch of the account keeps the page, the tab and the typed input", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const amount = await screen.findByRole("textbox", {
+      name: "Top-up amount (USD)",
+    });
+    await type(amount, "75");
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Settings" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("75");
+
+    // Try again reads the account again and clears the notice.
+    const before = calls(api, "GetBillingAccount").length;
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await settle(60);
+    expect(calls(api, "GetBillingAccount").length).toBe(before + 1);
+    expect(screen.queryByText(BUSY)).toBeNull();
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("75");
+  });
+
+  test("a failed refetch of the account keeps an open dialog and its input", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Members");
+    await click(await screen.findByRole("button", { name: "Invite by email" }));
+    await settle(60);
+    await type(
+      screen.getByRole("textbox", { name: "Email" }),
+      "new@example.com",
+    );
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      (screen.getByRole("textbox", { name: "Email" }) as HTMLInputElement)
+        .value,
+    ).toBe("new@example.com");
+  });
+
+  for (const code of [Code.NotFound, Code.PermissionDenied]) {
+    test(`a ${Code[code]} refetch of the account replaces the page`, async () => {
+      const { api } = await renderAccount(ADMIN);
+      api.failNext.set(
+        "GetBillingAccount",
+        new ConnectError("the account is gone", code),
+      );
+      await refocus();
+      expect(
+        screen.getByText(
+          code === Code.NotFound
+            ? "It was not found, or you no longer have access to it."
+            : "the account is gone",
+        ),
+      ).toBeTruthy();
+      expect(
+        screen
+          .getByRole("link", { name: "Go to your billing accounts" })
+          .getAttribute("href"),
+      ).toBe("/billing");
+      expect(screen.queryByRole("tab", { name: "Settings" })).toBeNull();
+    });
+  }
+
+  test("a failed first load shows only the notice", async () => {
+    const api = createFakeApi();
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    renderApp(ACCOUNT_PATH, { api });
+    expect(await screen.findByText(BUSY)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Acme Robotics" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
+  test("a failed refetch of the billing accounts keeps the list", async () => {
+    const api = createFakeApi();
+    renderApp("/billing", { api });
+    const list = await screen.findByRole("list", { name: "Billing accounts" });
+    await settle();
+    api.failNext.set("ListBillingAccounts", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(rowTitles(list)).toEqual(["Acme Robotics"]);
+    expect(
+      rowTitles(screen.getByRole("list", { name: "Billing accounts" })),
+    ).toEqual(["Acme Robotics"]);
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await settle(60);
+    expect(screen.queryByText(BUSY)).toBeNull();
+    expect(
+      rowTitles(screen.getByRole("list", { name: "Billing accounts" })),
+    ).toEqual(["Acme Robotics"]);
+  });
+
+  test("a failed refetch of a list with more than one page keeps every item", async () => {
+    const api = createFakeApi();
+    addBillingAccounts(api, 200);
+    renderApp("/billing", { api });
+    const list = await screen.findByRole("list", { name: "Billing accounts" });
+    await settle(100);
+    expect(rowTitles(list)).toHaveLength(201);
+    api.failNext.set("ListBillingAccounts", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      rowTitles(screen.getByRole("list", { name: "Billing accounts" })),
+    ).toHaveLength(201);
+  });
+
+  test("a failed refetch of the members keeps the members", async () => {
+    const { api } = await renderAccount();
+    await openTab("Members");
+    const list = await screen.findByRole("list", { name: "Members" });
+    await settle();
+    const names = rowTitles(list);
+    expect(names.length).toBeGreaterThan(0);
+    api.failNext.set("ListMembers", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(rowTitles(screen.getByRole("list", { name: "Members" }))).toEqual(
+      names,
+    );
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await settle(60);
+    expect(screen.queryByText(BUSY)).toBeNull();
+    expect(rowTitles(screen.getByRole("list", { name: "Members" }))).toEqual(
+      names,
+    );
+  });
+
+  test("a failed refetch of the balance keeps the balance", async () => {
+    const { api } = await renderAccount();
+    const balanceBefore = document.querySelector(".balance")?.textContent;
+    expect(balanceBefore).toBeTruthy();
+    api.failNext.set("GetBalance", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getAllByText(BUSY).length).toBeGreaterThan(0);
+    expect(document.querySelector(".balance")?.textContent).toBe(balanceBefore);
+  });
+
+  test("a mutation whose follow-up refetch fails keeps the page and its state", async () => {
+    const { api } = await renderAccount(OWNER);
+    await openTab("Members");
+    await screen.findByRole("list", { name: "Members" });
+    await settle();
+    // The role change succeeds; the account refetch that follows it fails.
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    const role = screen.getByRole("combobox", { name: "Role of Vera Viewer" });
+    await click(role);
+    await click(await screen.findByRole("option", { name: "Admin" }));
+    await settle(100);
+    expect(calls(api, "UpdateMemberRole")).toHaveLength(1);
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Members" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
   });
 });

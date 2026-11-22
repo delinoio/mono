@@ -38,9 +38,28 @@ const e2eInputs = new Set([
   "turbo.json",
 ]);
 
-// Paths inside an app package select the app e2e suites.
+// Workspace packages that the apps depend on through `workspace:*` (the shared
+// UI package and the generated TypeScript binding packages). The app e2e
+// suites render these sources in a browser, so a change inside one of them
+// changes the app behavior without touching an `apps/<app>/` path. Keep this
+// list equal to the directories of the workspace dependencies of the apps;
+// plan.test.mjs cross-checks it against `apps/*/package.json`, because the
+// planner runs without installing dependencies and cannot derive it itself.
+// `packages/ownsand-sdk/` is not an app dependency and stays out.
+export const e2eWorkspacePackages = [
+  "packages/delino-ui/",
+  "protos/delino/accounts/",
+  "protos/delino/ownsand/",
+];
+
+// Paths inside an app package or inside a workspace package that an app
+// depends on select the app e2e suites.
 export function isE2eInput(path) {
-  return e2eInputs.has(path) || /^apps\/[^/]+\//.test(path);
+  return (
+    e2eInputs.has(path) ||
+    /^apps\/[^/]+\//.test(path) ||
+    e2eWorkspacePackages.some((prefix) => path.startsWith(prefix))
+  );
 }
 
 // Workspace package roots, as directories that hold one level of packages.
@@ -49,12 +68,25 @@ export function isE2eInput(path) {
 // plan.test.mjs cross-checks them.
 export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 
+// Single workspace packages outside the workspace roots: the release-only Go
+// command packages under `cmds/`. Their manifests declare no package tasks
+// and exist so that Changesets versions them and `deploy.yml` releases them
+// (see the deployment workflow contract), so only the manifest, not the Go
+// source, is a workspace input. plan.test.mjs checks that they declare no
+// scripts and that `pnpm-workspace.yaml` lists exactly these directories.
+export const workspacePackageDirs = ["cmds/ownsand", "cmds/ownsand-agent"];
+
+function isWorkspacePackageFile(path, file) {
+  return workspacePackageDirs.some((dir) => path === `${dir}/${file}`);
+}
+
 // Only the root `turbo.json` and the `turbo.json` placed directly inside a
 // workspace package configure the tasks that the Turbo fixtures inspect. Turbo
 // ignores a `turbo.json` at any other depth, so it does not select fixtures.
 export function isTurboConfigInput(path) {
   return (
     path === "turbo.json" ||
+    isWorkspacePackageFile(path, "turbo.json") ||
     new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/turbo\\.json$`).test(path)
   );
 }
@@ -62,9 +94,12 @@ export function isTurboConfigInput(path) {
 // A package manifest directly inside a workspace package selects the Turbo
 // fixtures, which resolve every workspace package.
 export function isWorkspaceManifest(path) {
-  return new RegExp(
-    `^(${workspaceRoots.join("|")})/[^/]+/package\\.json$`,
-  ).test(path);
+  return (
+    isWorkspacePackageFile(path, "package.json") ||
+    new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/package\\.json$`).test(
+      path,
+    )
+  );
 }
 
 // Root inputs of every workspace package task: the runtime selector, the
@@ -91,6 +126,7 @@ export function isWorkspaceInput(path) {
   return (
     workspaceTaskInputs.has(path) ||
     path === relayDigestVectors ||
+    isWorkspaceManifest(path) ||
     new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/`).test(path)
   );
 }
@@ -158,6 +194,13 @@ const relayDigestVectors =
 // package sources that the `.go` selector would catch).
 const goTestdata = /^(?:go|cmds|internal|servers)\/(?:.+\/)?testdata\//;
 
+// The development launcher of ownsand-api. Its test
+// TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase in
+// `servers/ownsand-api/cmd/ownsand-api` runs the launcher against a Go-built
+// server, so a change to the launcher alone must select the Go checks. The
+// launcher test (`dev.test.mjs`) and the accounts-api launcher run no Go test.
+const ownsandApiLauncher = "servers/ownsand-api/scripts/dev.mjs";
+
 // Go sources, module files, protobuf schema inputs and the inputs of the
 // OwnSand end-to-end suite select the repository Go checks.
 export function isGoInput(path) {
@@ -171,6 +214,7 @@ export function isGoInput(path) {
     path.startsWith(ownsandSdkPackage) ||
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
+    path === ownsandApiLauncher ||
     goTestdata.test(path)
   );
 }
@@ -297,6 +341,7 @@ export function plan(cwd, base, head) {
 export const OutputReason = Object.freeze({
   Diff: "diff",
   MainPush: "main-push",
+  Schedule: "schedule",
 });
 
 // Runner-provided event context that identifies a push to the main branch.
@@ -306,6 +351,16 @@ export const MAIN_REF = "refs/heads/main";
 export function isMainPush(env) {
   return (
     env.GITHUB_EVENT_NAME === MAIN_PUSH_EVENT && env.GITHUB_REF === MAIN_REF
+  );
+}
+
+// Runner-provided event context that identifies the scheduled run. GitHub
+// starts scheduled workflows only on the default branch.
+export const SCHEDULE_EVENT = "schedule";
+
+export function isScheduledMain(env) {
+  return (
+    env.GITHUB_EVENT_NAME === SCHEDULE_EVENT && env.GITHUB_REF === MAIN_REF
   );
 }
 
@@ -328,8 +383,8 @@ export function main(env = process.env, cwd = process.cwd()) {
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
   // Branch-wide cancellation can cancel a main-push run before its Go, Rust,
   // fixtures, e2e, workspace or workflows jobs finish, and the next push then
-  // compares only against its own parent. Every main push therefore runs the Go
-  // checks, the Rust checks, the fixtures, the e2e suites, the workspace package
+  // compares only against its own parent. Every main push therefore runs the
+  // Linux Go checks, the Linux Rust checks, the fixtures, the e2e suites, the workspace package
   // tasks and the workflow lint against its own head so a later documentation-only push cannot hide a
   // cancelled predecessor's range. The fixtures step lives in
   // the `quality` job, so forcing fixtures forces quality too. `format` stays
@@ -338,6 +393,16 @@ export function main(env = process.env, cwd = process.cwd()) {
   // selection.
   const mainPush = isMainPush(env);
   const fixtures = diffPlan.fixtures || mainPush;
+  // The macOS and Windows jobs (`go-platforms` and `rust-platforms`) are the
+  // most expensive CI jobs, and a main push repeats the platform validation
+  // that its pull request already passed. They therefore follow their own
+  // outputs: a pull request or manual comparison selects them with `go` and
+  // `rust`, a main push never selects them, and the scheduled run on main
+  // always selects both. The scheduled run validates each platform against
+  // the main head, so a platform break that two merged pull requests make
+  // together surfaces within a day, and it saves the main-scoped platform
+  // caches that pull requests restore.
+  const scheduled = isScheduledMain(env);
   const result = {
     ...diffPlan,
     fixtures,
@@ -347,9 +412,18 @@ export function main(env = process.env, cwd = process.cwd()) {
     e2e: diffPlan.e2e || mainPush,
     workspace: diffPlan.workspace || mainPush,
     workflows: diffPlan.workflows || mainPush,
+    goPlatforms: scheduled || (diffPlan.go && !mainPush),
+    rustPlatforms: scheduled || (diffPlan.rust && !mainPush),
   };
   const reasonOf = (selectedByDiff) =>
     mainPush && !selectedByDiff ? OutputReason.MainPush : OutputReason.Diff;
+  // `main-push` on a platform output means that the main push deselected it;
+  // `schedule` means that the scheduled run selected it.
+  const platformReasonOf = (selectedByDiff) => {
+    if (scheduled) return OutputReason.Schedule;
+    if (mainPush && selectedByDiff) return OutputReason.MainPush;
+    return OutputReason.Diff;
+  };
   const record = {
     event: "ci_plan",
     validationRevision: execFileSync("git", ["rev-parse", "HEAD"], {
@@ -365,6 +439,8 @@ export function main(env = process.env, cwd = process.cwd()) {
     e2eReason: reasonOf(diffPlan.e2e),
     workspaceReason: reasonOf(diffPlan.workspace),
     workflowsReason: reasonOf(diffPlan.workflows),
+    goPlatformsReason: platformReasonOf(diffPlan.go),
+    rustPlatformsReason: platformReasonOf(diffPlan.rust),
   };
   appendFileSync(
     env.GITHUB_OUTPUT,

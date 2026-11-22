@@ -6,7 +6,11 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
-import { OwnSandConfigError, redactError } from "./errors.ts";
+import {
+  OwnSandConfigError,
+  OwnSandCredentialError,
+  redactError,
+} from "./errors.ts";
 import { type Logger, LogEvent, safeLog } from "./logger.ts";
 
 /** Production origin of the OwnSand control plane. */
@@ -152,13 +156,28 @@ async function currentSecret(
     return credential.apiKey;
   }
   signal.throwIfAborted();
-  // A synchronous throw of the callback stays a rejection of the race.
+  // A synchronous throw of the callback stays a rejection of the race. A
+  // failure of the callback is a terminal credential error that keeps the
+  // callback's message; the abort reason of the race stays unwrapped.
   const token = await raceAbort(
-    new Promise<string>((resolve) => resolve(credential.accessToken())),
+    new Promise<string>((resolve, reject) => {
+      const fail = (error: unknown) =>
+        reject(
+          new OwnSandCredentialError(
+            error instanceof Error ? error.message : String(error),
+            { cause: error },
+          ),
+        );
+      try {
+        Promise.resolve(credential.accessToken()).then(resolve, fail);
+      } catch (error) {
+        fail(error);
+      }
+    }),
     signal,
   );
   if (typeof token !== "string" || token === "") {
-    throw new OwnSandConfigError("accessToken returned no token");
+    throw new OwnSandCredentialError("accessToken returned no token");
   }
   return token;
 }
@@ -192,6 +211,27 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * Sets the Authorization header. A token that cannot be a header value (a
+ * line break or NUL inside it, or a character that no header value can
+ * hold) ends the call with a terminal credential error without a request.
+ * The error never holds the token: the `TypeError` of `Headers.set` quotes
+ * the whole value, so it is neither passed on nor kept as a cause. Only edge
+ * whitespace is allowed; the header normalization drops it.
+ */
+function setAuthorization(headers: Headers, secret: string): void {
+  const invalid = () =>
+    new OwnSandCredentialError("accessToken returned an invalid token");
+  if (/[\r\n\0]/.test(secret.trim())) {
+    throw invalid();
+  }
+  try {
+    headers.set("Authorization", `Bearer ${secret}`);
+  } catch {
+    throw invalid();
+  }
+}
+
 function credentialInterceptor(options: ConnectionOptions): Interceptor {
   return (next) => async (req) => {
     if (new URL(req.url).origin !== options.origin) {
@@ -201,11 +241,12 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
       );
     }
     const secret = await currentSecret(options.credential, req.signal);
-    req.header.set("Authorization", `Bearer ${secret}`);
+    setAuthorization(req.header, secret);
     // Redact with the exact credential of this request. The access token
     // differs per request, so the value lives only in this closure and never
-    // in state that concurrent requests share.
-    return redactCall(next, req, [secret]);
+    // in state that concurrent requests share. A server may echo the value
+    // that the header normalization kept, so that form is redacted too.
+    return redactCall(next, req, [secret, secret.trim()]);
   };
 }
 
@@ -280,31 +321,73 @@ function redactingInterceptor(options: ConnectionOptions): Interceptor {
   return (next) => (req) => redactCall(next, req, secrets());
 }
 
+/**
+ * Logs one `rpc` record per call with its terminal outcome. A unary call is
+ * recorded when the response arrives or the call fails. A server-streaming
+ * call resolves as soon as the stream opens, so its outcome is recorded when
+ * the consumer ends it: `ok` when the stream completes, the Connect code (or
+ * `unknown`) of the error that ends it, or `Canceled` when the consumer or
+ * the caller ends the call before the stream ends. A stream that nobody
+ * iterates records nothing after it opens. The record never carries stream
+ * content.
+ */
 function loggingInterceptor(options: ConnectionOptions): Interceptor {
   return (next) => async (req) => {
-    if (options.logger === undefined) {
+    const logger = options.logger;
+    if (logger === undefined) {
       return next(req);
     }
     const started = options.now();
     const rpc = `${req.service.typeName}/${req.method.name}`;
+    let recorded = false;
+    const record = (code: string): void => {
+      if (recorded) {
+        return;
+      }
+      recorded = true;
+      safeLog(logger, {
+        event: LogEvent.Rpc,
+        rpc,
+        durationMs: options.now() - started,
+        code,
+      });
+    };
+    const codeOf = (error: unknown): string =>
+      error instanceof ConnectError ? Code[error.code] : "unknown";
+    let res;
     try {
-      const res = await next(req);
-      safeLog(options.logger, {
-        event: LogEvent.Rpc,
-        rpc,
-        durationMs: options.now() - started,
-        code: "ok",
-      });
-      return res;
+      res = await next(req);
     } catch (error) {
-      safeLog(options.logger, {
-        event: LogEvent.Rpc,
-        rpc,
-        durationMs: options.now() - started,
-        code: error instanceof ConnectError ? Code[error.code] : "unknown",
-      });
+      record(codeOf(error));
       throw error;
     }
+    if (!res.stream) {
+      record("ok");
+      return res;
+    }
+    const inner = res.message;
+    return {
+      ...res,
+      message: (async function* () {
+        // Connect does not forward return() of an abandoned stream down the
+        // interceptor chain. It ends the call, which aborts the request
+        // signal, and then drains this iterator until it completes. The
+        // signal is still live when the stream ends by itself, because
+        // Connect ends the call only after the last read returns. An
+        // aborted signal at completion therefore means the consumer or the
+        // caller ended the stream first.
+        let outcome = Code[Code.Canceled];
+        try {
+          yield* inner;
+          outcome = req.signal.aborted ? Code[Code.Canceled] : "ok";
+        } catch (error) {
+          outcome = codeOf(error);
+          throw error;
+        } finally {
+          record(outcome);
+        }
+      })(),
+    };
   };
 }
 

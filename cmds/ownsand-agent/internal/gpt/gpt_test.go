@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -271,5 +272,162 @@ func TestReadRejectsCorruptTables(t *testing.T) {
 	}
 	if _, err := Read(f, 1000); err == nil {
 		t.Fatal("a disk size that is not a whole number of sectors was accepted")
+	}
+}
+
+// readSpy is an io.ReaderAt that serves the sectors in content and zeros for
+// every other byte, and records each read. It allocates nothing for the
+// declared entry array, so a test can describe a disk of any layout.
+type readSpy struct {
+	content map[int64][]byte // sector number to sector content
+	reads   []spyRead
+}
+
+type spyRead struct{ off, n int64 }
+
+func (r *readSpy) ReadAt(p []byte, off int64) (int, error) {
+	r.reads = append(r.reads, spyRead{off, int64(len(p))})
+	clear(p)
+	for i := range p {
+		if sec, ok := r.content[(off+int64(i))/SectorSize]; ok {
+			p[i] = sec[(off+int64(i))%SectorSize]
+		}
+	}
+	return len(p), nil
+}
+
+// entryReads returns the reads after the header read at sector 1.
+func (r *readSpy) entryReads() []spyRead {
+	var out []spyRead
+	for _, rd := range r.reads {
+		if rd.off != SectorSize {
+			out = append(out, rd)
+		}
+	}
+	return out
+}
+
+// headerOnlyDisk describes a disk with 16384 sectors (8 MiB) whose only
+// content is a valid primary header that declares the entry array. This is
+// the header of the reported crash, which declared 4096 entries of
+// 0xFFFFFFF8 bytes.
+func headerOnlyDisk(t *testing.T, entriesLBA uint64, numEntries, entrySize, entriesCRC uint32) (*readSpy, int64) {
+	t.Helper()
+	const sectors = 1 << 14
+	h := header{
+		Revision: 0x00010000, HeaderSize: headerSize, CurrentLBA: 1, BackupLBA: sectors - 1,
+		FirstUsableLBA: 34, LastUsableLBA: sectors - 34, EntriesLBA: entriesLBA,
+		NumEntries: numEntries, EntrySize: entrySize, EntriesCRC: entriesCRC,
+	}
+	copy(h.Signature[:], signature)
+	b, err := encodeHeader(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &readSpy{content: map[int64][]byte{1: b}}, sectors * SectorSize
+}
+
+func TestReadBoundsEntryArrayBeforeReading(t *testing.T) {
+	const sectors = 1 << 14
+	// The checksum of the all-zero array that the spy serves; an unsupported
+	// array is never allocated here, and its checksum is never checked.
+	zeros := func(num, size uint32) uint32 {
+		if total := uint64(num) * uint64(size); total <= maxEntryArrayBytes {
+			return crc32.ChecksumIEEE(make([]byte, total))
+		}
+		return 0
+	}
+	cases := []struct {
+		name       string
+		entriesLBA uint64
+		num, size  uint32
+		wantErr    string // substring of the error; empty means Read succeeds
+		wantRead   bool   // whether the entry array is read
+		badCRC     bool   // the header holds a wrong entry array checksum
+	}{
+		{name: "reported crash header", entriesLBA: 2, num: 4096, size: 0xFFFFFFF8, wantErr: "gpt: unsupported entry array (4096 entries of 4294967288 bytes"},
+		{name: "size that overflows 32 bits per entry count", entriesLBA: 2, num: 4096, size: 0x7FFFFFF8, wantErr: "gpt: unsupported entry array"},
+		{name: "one entry size above the cap", entriesLBA: 2, num: 4096, size: 136, wantErr: "gpt: unsupported entry array (4096 entries of 136 bytes"},
+		{name: "one entry above the cap", entriesLBA: 2, num: 4097, size: 128, wantErr: "gpt: unsupported entry array (4097 entries of 128 bytes)"},
+		{name: "exactly the cap is read and parsed", entriesLBA: 2, num: 4096, size: 128, wantRead: true},
+		{name: "exactly the cap keeps the checksum check", entriesLBA: 2, num: 4096, size: 128, badCRC: true, wantErr: "entry array checksum does not match", wantRead: true},
+		{name: "extended entries within the cap", entriesLBA: 2, num: 128, size: 256, wantRead: true},
+		{name: "ends at the disk boundary", entriesLBA: sectors - 64, num: 128, size: 256, wantRead: true},
+		{name: "one sector beyond the disk", entriesLBA: sectors - 63, num: 128, size: 256, wantErr: "lies outside the disk"},
+		{name: "starts at the disk end", entriesLBA: sectors, num: 128, size: 128, wantErr: "lies outside the disk"},
+		{name: "starts far beyond the disk", entriesLBA: 1 << 40, num: 128, size: 128, wantErr: "lies outside the disk"},
+		{name: "offset is representable but beyond the disk", entriesLBA: math.MaxInt64 / SectorSize, num: 128, size: 128, wantErr: "lies outside the disk"},
+		{name: "offset overflows int64", entriesLBA: math.MaxInt64/SectorSize + 1, num: 128, size: 128, wantErr: "not a valid disk offset"},
+		{name: "offset overflows uint64", entriesLBA: math.MaxUint64, num: 128, size: 128, wantErr: "not a valid disk offset"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			crc := zeros(c.num, c.size)
+			if c.badCRC {
+				crc++
+			}
+			spy, size := headerOnlyDisk(t, c.entriesLBA, c.num, c.size, crc)
+			tbl, err := Read(spy, size)
+			if c.wantErr == "" {
+				if err != nil || tbl == nil {
+					t.Fatalf("Read = %v, %v", tbl, err)
+				}
+				if got := len(tbl.Partitions()); got != 0 {
+					t.Fatalf("%d partitions, want 0", got)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), c.wantErr) || !strings.HasPrefix(err.Error(), "gpt:") {
+				t.Fatalf("Read error = %v, want a gpt error containing %q", err, c.wantErr)
+			}
+			reads := spy.entryReads()
+			if !c.wantRead {
+				if len(reads) != 0 {
+					t.Fatalf("a rejected array was read: %v", reads)
+				}
+				return
+			}
+			want := spyRead{int64(c.entriesLBA) * SectorSize, int64(c.num) * int64(c.size)}
+			if len(reads) != 1 || reads[0] != want {
+				t.Fatalf("entry reads = %v, want [%v]", reads, want)
+			}
+		})
+	}
+}
+
+// TestFitAndRemoveTrailingRejectOversizedEntryArray checks that the failure
+// reaches the file based entry points and that nothing is written.
+func TestFitAndRemoveTrailingRejectOversizedEntryArray(t *testing.T) {
+	spy, size := headerOnlyDisk(t, 2, 4096, 0xFFFFFFF8, 0)
+	path := filepath.Join(t.TempDir(), "disk.img")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(size); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(spy.content[1], SectorSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, run := range map[string]func() error{
+		"Fit":            func() error { return Fit(path) },
+		"RemoveTrailing": func() error { _, err := RemoveTrailing(path, AppleAPFSRecovery); return err },
+	} {
+		if err := run(); err == nil || !strings.Contains(err.Error(), "gpt: unsupported entry array") {
+			t.Fatalf("%s error = %v", name, err)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Fatalf("%s changed the disk image", name)
+		}
 	}
 }

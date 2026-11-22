@@ -488,6 +488,134 @@ func TestExportStopsWhenTheContextIsDone(t *testing.T) {
 	})
 }
 
+// stalledResponseTransport answers every request with HTTP 200 headers and
+// a body whose Read blocks until the request context is done. It signals
+// started once the body is being read.
+type stalledResponseTransport struct {
+	started chan struct{}
+	once    sync.Once
+}
+
+func (s *stalledResponseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		req.Body.Close()
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Status:     "200 OK",
+		Header:     http.Header{},
+		Body:       &stalledBody{ctx: req.Context(), started: func() { s.once.Do(func() { close(s.started) }) }},
+		Request:    req,
+	}, nil
+}
+
+type stalledBody struct {
+	ctx     context.Context
+	started func()
+}
+
+func (b *stalledBody) Read([]byte) (int, error) {
+	b.started()
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *stalledBody) Close() error { return nil }
+
+// TestExportReturnsTheContextErrorWhenItIsCancelledDuringTheResponseRead
+// checks that a cancellation that arrives while the upload response body is
+// read is not reported as a successful upload, for the final part too.
+func TestExportReturnsTheContextErrorWhenItIsCancelledDuringTheResponseRead(t *testing.T) {
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "disk"), []byte(strings.Repeat("snapshot-", 100)), 0o600)
+	tempDir := t.TempDir()
+	rt := &stalledResponseTransport{started: make(chan struct{})}
+	tr := &Transfer{
+		HTTP:    &http.Client{Transport: rt},
+		URLs:    fixedURLs{url: "http://upload.invalid/part?sig=secret"},
+		Logger:  quietLogger(),
+		TempDir: tempDir,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-rt.started
+		cancel()
+	}()
+	// One part holds the whole archive, so the stalled upload is the final one.
+	type result struct {
+		parts []*ownsandv1.SnapshotPart
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		parts, _, err := tr.Export(ctx, "snap", src, 1<<30)
+		done <- result{parts, err}
+	}()
+	select {
+	case r := <-done:
+		if !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", r.err)
+		}
+		if r.parts != nil {
+			t.Fatalf("export returned %d parts after cancellation", len(r.parts))
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("export did not stop after the context was cancelled")
+	}
+	if names := listDir(t, tempDir); len(names) != 0 {
+		t.Fatalf("export left %v", names)
+	}
+}
+
+// TestExportFailsWhenTheContextIsDoneAfterTheLastPart checks the checkpoint
+// after the final upload: a context that is done by then must not turn into
+// a successful export.
+func TestExportFailsWhenTheContextIsDoneAfterTheLastPart(t *testing.T) {
+	b := newBucket(t)
+	src := t.TempDir()
+	os.WriteFile(filepath.Join(src, "disk"), []byte(strings.Repeat("snapshot-", 100)), 0o600)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr := &Transfer{
+		HTTP:    &http.Client{Transport: cancelAfterResponse{base: b.srv.Client().Transport, cancel: cancel}},
+		URLs:    b,
+		Logger:  quietLogger(),
+		TempDir: t.TempDir(),
+	}
+	if _, _, err := tr.Export(ctx, "snap", src, 1<<30); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+}
+
+// cancelAfterResponse cancels the context once the server has answered, so
+// the cancellation lands after the upload completed.
+type cancelAfterResponse struct {
+	base   http.RoundTripper
+	cancel context.CancelFunc
+}
+
+func (c cancelAfterResponse) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := c.base.RoundTrip(req)
+	if err == nil {
+		resp.Body = &cancelOnEOF{ReadCloser: resp.Body, cancel: c.cancel}
+	}
+	return resp, err
+}
+
+type cancelOnEOF struct {
+	io.ReadCloser
+	cancel context.CancelFunc
+}
+
+func (c *cancelOnEOF) Read(p []byte) (int, error) {
+	n, err := c.ReadCloser.Read(p)
+	if err == io.EOF {
+		c.cancel()
+	}
+	return n, err
+}
+
 func TestImportStopsWhenTheContextIsDone(t *testing.T) {
 	b, parts := storeSnapshot(t, strings.Repeat("snapshot-", 5000), 4096)
 	cases := []struct {

@@ -5,6 +5,7 @@ package netpolicy
 import (
 	"bufio"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"net"
@@ -34,14 +35,31 @@ const (
 )
 
 // DefaultDNSTCPDeadline is the upper bound of one forwarded TCP connection,
-// counted from its admission: the forwarder ends the connection at this
-// deadline even when both sides stay open.
+// counted from its admission and covering the upstream dial and the copy: the
+// forwarder ends the connection at this deadline even when both sides stay
+// open.
 const DefaultDNSTCPDeadline = 30 * time.Second
 
 // dnsRejectLogInterval is the minimum time between two rejection log records
 // of one transport. Rejections in between only increase the count that the
 // next record reports.
 const dnsRejectLogInterval = 5 * time.Second
+
+// A serve loop that gets an error from its socket waits and tries again
+// instead of ending: the delay starts at dnsServeBackoffMin, doubles with
+// each consecutive error up to dnsServeBackoffMax and starts over after the
+// next success. Once the delay is at the maximum, the loop logs the error at
+// most once per dnsServeBackoffMax.
+const (
+	dnsServeBackoffMin = 5 * time.Millisecond
+	dnsServeBackoffMax = time.Second
+)
+
+// dnsServeRetry is the back-off state of one serve loop.
+type dnsServeRetry struct {
+	delay   time.Duration
+	lastLog time.Time
+}
 
 // dnsLimits holds the concurrency limits of one forwarder.
 type dnsLimits struct {
@@ -50,6 +68,15 @@ type dnsLimits struct {
 	// tcpDeadline bounds one TCP connection (dial and copy). Zero means
 	// DefaultDNSTCPDeadline; tests set a short value.
 	tcpDeadline time.Duration
+	// afterAdmit, when set, runs in serveTCP after a connection took its TCP
+	// slot and before it is registered. It is a test hook that holds the
+	// accept path open at the point where Close can overtake it; production
+	// never sets it.
+	afterAdmit func()
+	// dial, when set, replaces the upstream TCP dial. It is a test hook that
+	// makes a slow dial reproducible; production leaves it nil and dials with
+	// a net.Dialer.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // dnsRejectLog logs rejections of one transport at most once per interval,
@@ -93,6 +120,11 @@ type DNSForwarder struct {
 	logger   *slog.Logger
 	wg       sync.WaitGroup
 	closed   chan struct{}
+	// ctx is the lifetime of the forwarder; Close cancels it first. Upstream
+	// dials derive from it and every upstream connection is closed when it
+	// ends, so Close does not wait for a silent upstream or a slow dial.
+	ctx      context.Context
+	cancel   context.CancelFunc
 	mu       sync.Mutex
 	conns    map[net.Conn]bool
 	udpSlots chan struct{}
@@ -145,7 +177,8 @@ func startDNS(listen netip.AddrPort, upstream string, logger *slog.Logger, limit
 		tcp.Close()
 		return nil, err
 	}
-	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), conns: map[net.Conn]bool{},
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), ctx: ctx, cancel: cancel, conns: map[net.Conn]bool{},
 		udpSlots: make(chan struct{}, limits.maxUDPQueries), tcpSlots: make(chan struct{}, limits.maxTCPConns), limits: limits}
 	f.wg.Add(2)
 	go f.serveUDP()
@@ -166,6 +199,9 @@ func (f *DNSForwarder) Close() {
 	default:
 	}
 	close(f.closed)
+	// End in-progress dials and upstream connections first: they have no
+	// other owner that Close can reach.
+	f.cancel()
 	f.udp.Close()
 	f.tcp.Close()
 	f.mu.Lock()
@@ -176,14 +212,56 @@ func (f *DNSForwarder) Close() {
 	f.wg.Wait()
 }
 
+// retryServe handles an error of a serve loop. It returns false when the loop
+// must end: the forwarder is closing (Close closes the sockets, which is the
+// expected cause of an error), or the socket is closed, which retrying could
+// only turn into a busy loop. Otherwise it logs the error, waits for the
+// back-off delay (or until Close) and returns true.
+func (f *DNSForwarder) retryServe(transport DNSTransport, err error, r *dnsServeRetry) bool {
+	if errors.Is(err, net.ErrClosed) {
+		return false
+	}
+	select {
+	case <-f.closed:
+		return false
+	default:
+	}
+	switch {
+	case r.delay == 0:
+		r.delay = dnsServeBackoffMin
+	case r.delay < dnsServeBackoffMax:
+		r.delay = min(2*r.delay, dnsServeBackoffMax)
+	}
+	if now := time.Now(); r.delay < dnsServeBackoffMax || now.Sub(r.lastLog) >= dnsServeBackoffMax {
+		r.lastLog = now
+		f.logger.Error("dns forwarder socket error; retrying",
+			slog.String("transport", string(transport)),
+			slog.Any("error", err),
+			slog.Duration("retry_in", r.delay))
+	}
+	t := time.NewTimer(r.delay)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-f.closed:
+		return false
+	}
+}
+
 func (f *DNSForwarder) serveUDP() {
 	defer f.wg.Done()
 	buf := make([]byte, 65535)
+	var retry dnsServeRetry
 	for {
 		n, from, err := f.udp.ReadFromUDPAddrPort(buf)
 		if err != nil {
-			return
+			if !f.retryServe(DNSTransportUDP, err, &retry) {
+				return
+			}
+			continue
 		}
+		retry.delay = 0
 		// Admit before copying the query or opening an upstream socket.
 		select {
 		case f.udpSlots <- struct{}{}:
@@ -217,11 +295,16 @@ func (f *DNSForwarder) serveUDP() {
 
 func (f *DNSForwarder) serveTCP() {
 	defer f.wg.Done()
+	var retry dnsServeRetry
 	for {
 		c, err := f.tcp.Accept()
 		if err != nil {
-			return
+			if !f.retryServe(DNSTransportTCP, err, &retry) {
+				return
+			}
+			continue
 		}
+		retry.delay = 0
 		// Admit before dialing the upstream; close the excess connection.
 		select {
 		case f.tcpSlots <- struct{}{}:
@@ -230,10 +313,29 @@ func (f *DNSForwarder) serveTCP() {
 			f.tcpRej.note(f.logger, DNSTransportTCP, f.limits.maxTCPConns)
 			continue
 		}
+		// One absolute deadline bounds the whole connection, dial and copy
+		// together, counted from admission.
+		deadline := time.Now().Add(f.limits.tcpDeadline)
+		if f.limits.afterAdmit != nil {
+			f.limits.afterAdmit()
+		}
+		// Register under the lock that Close holds while it closes the
+		// registered connections, and check closed in the same critical
+		// section: a connection accepted while Close ran is either closed by
+		// Close or refused here, never left open for a handler that Close
+		// would wait for until the TCP deadline.
 		f.mu.Lock()
+		select {
+		case <-f.closed:
+			f.mu.Unlock()
+			c.Close()
+			<-f.tcpSlots
+			return
+		default:
+		}
 		f.conns[c] = true
-		f.mu.Unlock()
 		f.wg.Add(1)
+		f.mu.Unlock()
 		go func() {
 			defer f.wg.Done()
 			defer func() { <-f.tcpSlots }()
@@ -243,15 +345,26 @@ func (f *DNSForwarder) serveTCP() {
 				f.mu.Unlock()
 				c.Close()
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), f.limits.tcpDeadline)
+			ctx, cancel := context.WithDeadline(f.ctx, deadline)
 			defer cancel()
-			var d net.Dialer
-			up, err := d.DialContext(ctx, "tcp", f.upstream)
+			dial := f.limits.dial
+			if dial == nil {
+				var d net.Dialer
+				dial = d.DialContext
+			}
+			up, err := dial(ctx, "tcp", f.upstream)
 			if err != nil {
 				return
 			}
 			defer up.Close()
-			deadline := time.Now().Add(f.limits.tcpDeadline)
+			// Close cancels f.ctx: close the upstream connection then, so the
+			// copy below ends even when the upstream stays silent. AfterFunc
+			// runs at once when f.ctx ended during the dial, so there is no
+			// window between the dial and this registration.
+			stop := context.AfterFunc(f.ctx, func() { up.Close() })
+			defer stop()
+			// The time spent dialing is already gone: both sides get the
+			// remainder of the admission deadline, not a fresh budget.
 			c.SetDeadline(deadline)
 			up.SetDeadline(deadline)
 			done := make(chan struct{})

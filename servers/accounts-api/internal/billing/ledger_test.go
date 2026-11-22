@@ -5,16 +5,20 @@ package billing
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/delinoio/mono/go/uuidv7"
@@ -243,6 +247,27 @@ func (f *fixture) wantLedger(accountID string, want ...wantEntry) {
 	f.checkInvariant(accountID)
 }
 
+// TestLedgerGrantAtMinimumBalance checks that a grant commits at the smallest
+// signed balance, where negating the balance would overflow: the whole grant
+// pays off debt and no credit remains.
+func TestLedgerGrantAtMinimumBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	if _, err := f.db.Pool.Exec(ctx(), `UPDATE billing_accounts SET balance_usd_micros = $2 WHERE billing_account_id = $1`,
+		acct, int64(math.MinInt64)); err != nil {
+		t.Fatal(err)
+	}
+	grantID := f.grant(acct, LedgerManualTopUp, 10*usd)
+	if f.remaining(grantID) != 0 || f.balance(acct) != math.MinInt64+10*usd {
+		t.Fatalf("after the grant: remaining %d, balance %d", f.remaining(grantID), f.balance(acct))
+	}
+	entries := f.ledger(acct)
+	if len(entries) != 1 || entries[0].Kind != LedgerManualTopUp || entries[0].Amount != 10*usd ||
+		entries[0].BalanceAfter != math.MinInt64+10*usd {
+		t.Fatalf("ledger = %+v", entries)
+	}
+}
+
 func TestLedgerFIFOAndDebtPayoff(t *testing.T) {
 	f := newFixture(t)
 	acct := f.account()
@@ -394,6 +419,172 @@ func TestBalanceHidesDueExpiry(t *testing.T) {
 	}
 	if balance != 25*usd || len(grants) != 1 || grants[0].Source != LedgerManualTopUp {
 		t.Fatalf("balance %d, grants %+v", balance, grants)
+	}
+}
+
+// remainders returns the remaining credit of the grants.
+func remainders(grants []CreditGrant) []int64 {
+	out := []int64{}
+	for _, g := range grants {
+		out = append(out, g.Remaining)
+	}
+	return out
+}
+
+// wantBalance checks a Balance result: the effective balance, the remaining
+// credit of the grants in order and the snapshot invariant that a
+// nonnegative balance equals the sum of the remainders and a negative one
+// has no grants.
+func wantBalance(t *testing.T, label string, balance int64, grants []CreditGrant, want int64, wantRemaining ...int64) {
+	t.Helper()
+	if wantRemaining == nil {
+		wantRemaining = []int64{}
+	}
+	got := remainders(grants)
+	if balance != want || !slices.Equal(got, wantRemaining) {
+		t.Fatalf("%s: balance %d with grant remainders %v, want %d with %v", label, balance, got, want, wantRemaining)
+	}
+	var sum int64
+	for _, r := range got {
+		sum += r
+	}
+	if (balance >= 0 && sum != balance) || (balance < 0 && len(grants) != 0) {
+		t.Fatalf("%s: balance %d does not match the grants %v", label, balance, got)
+	}
+}
+
+// A credit-changing commit between the reads of Balance must not pair the
+// balance of one state with the grants of another: both come from one
+// statement and so from one snapshot. The querier commits the change after
+// the first statement of Balance ran, so that a read with several
+// statements would see the old balance and the new grants.
+func TestBalanceIsOneSnapshot(t *testing.T) {
+	tests := []struct {
+		name          string
+		change        func(f *fixture, acct string, first string)
+		wantBalance   int64
+		wantRemaining []int64
+	}{
+		{"deduction of part of a grant", func(f *fixture, acct, _ string) { f.deduct(acct, 4_000_000) }, 11_000_000, []int64{6_000_000, 5_000_000}},
+		{"deduction of a whole grant", func(f *fixture, acct, _ string) { f.deduct(acct, 14_000_000) }, 1_000_000, []int64{1_000_000}},
+		{"new grant", func(f *fixture, acct, _ string) { f.grant(acct, LedgerManualTopUp, 25_000_000) }, 40_000_000,
+			[]int64{10_000_000, 5_000_000, 25_000_000}},
+		{"refund", func(f *fixture, acct, first string) {
+			f.tx(func(tx pgx.Tx) error {
+				a, err := lockAccount(ctx(), tx, acct)
+				if err != nil {
+					return err
+				}
+				_, err = f.s.removeCredit(ctx(), tx, a, first, "txn_refund", 4_000_000, f.s.timestamp())
+				return err
+			})
+		}, 11_000_000, []int64{6_000_000, 5_000_000}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			first := f.grant(acct, LedgerSubscriptionCredit, 10_000_000)
+			f.clock.Advance(time.Hour)
+			f.grant(acct, LedgerManualTopUp, 5_000_000)
+			q := &interleavingQuerier{inner: f.db.Pool, afterFirst: func() { tc.change(f, acct, first) }}
+			balance, grants, err := Balance(ctx(), q, acct, f.clock.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !q.done {
+				t.Fatal("the commit did not run")
+			}
+			// The result is the state before the commit...
+			wantBalance(t, "during the commit", balance, grants, 15_000_000, 10_000_000, 5_000_000)
+			// ...and the next read is the state after it.
+			balance, grants, err = Balance(ctx(), f.db.Pool, acct, f.clock.Now())
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBalance(t, "after the commit", balance, grants, tc.wantBalance, tc.wantRemaining...)
+		})
+	}
+}
+
+func TestBalanceWithoutUsableGrants(t *testing.T) {
+	f := newFixture(t)
+
+	// An account without grants has a zero balance and no grants.
+	empty := f.account()
+	balance, grants, err := Balance(ctx(), f.db.Pool, empty, f.clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBalance(t, "empty account", balance, grants, 0)
+
+	// An account in debt has a negative balance and no grants.
+	debt := f.account()
+	grant := f.grant(debt, LedgerManualTopUp, 10_000_000)
+	f.tx(func(tx pgx.Tx) error {
+		a, err := lockAccount(ctx(), tx, debt)
+		if err != nil {
+			return err
+		}
+		_, err = f.s.removeCredit(ctx(), tx, a, grant, "txn_refund", 25_000_000, f.s.timestamp())
+		return err
+	})
+	balance, grants, err = Balance(ctx(), f.db.Pool, debt, f.clock.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBalance(t, "debt", balance, grants, -15_000_000)
+
+	// Credit that expired but that the expiry job has not removed yet is
+	// left out of the balance and the grants.
+	expired := f.account()
+	f.grant(expired, LedgerSubscriptionCredit, 10_000_000)
+	f.grant(expired, LedgerManualTopUp, 5_000_000)
+	balance, grants, err = Balance(ctx(), f.db.Pool, expired, GrantExpireTime(f.clock.Now()).Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBalance(t, "all expired", balance, grants, 0)
+
+	// An absent account is no row.
+	absent, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := Balance(ctx(), f.db.Pool, absent, f.clock.Now()); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("absent account: error %v, want pgx.ErrNoRows", err)
+	}
+}
+
+// Grants with the same expiry are consumed in ID order, and so listed.
+func TestBalanceOrdersEqualExpiryByID(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	now := f.clock.Now()
+	ids := []string{
+		"00000000-0000-7000-8000-000000000003",
+		"00000000-0000-7000-8000-000000000001",
+		"00000000-0000-7000-8000-000000000002",
+	}
+	for i, id := range ids {
+		if _, err := f.db.Pool.Exec(ctx(), `INSERT INTO credit_grants (credit_grant_id, billing_account_id, source,
+				original_usd_micros, remaining_usd_micros, paddle_transaction_id, create_time, expire_time)
+			VALUES ($1, $2, 'manual_top_up', $3, $3, $4, $5, $6)`,
+			id, acct, int64(i+1)*usd, fmt.Sprintf("txn_order_%d", i), now, GrantExpireTime(now)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, grants, err := Balance(ctx(), f.db.Pool, acct, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	for _, g := range grants {
+		got = append(got, g.ID)
+	}
+	want := []string{ids[1], ids[2], ids[0]}
+	if !slices.Equal(got, want) {
+		t.Fatalf("grant order %v, want %v", got, want)
 	}
 }
 
@@ -959,4 +1150,41 @@ func TestSubmittedAutoTopUpSurvivesSettingsChange(t *testing.T) {
 
 func autoSettings(enabled bool, threshold, amount, limit int64) *accountsv1.AutoTopUpSettings {
 	return &accountsv1.AutoTopUpSettings{Enabled: enabled, ThresholdUsdMicros: threshold, AmountUsdMicros: amount, MonthlyCapUsdMicros: limit}
+}
+
+// A 429 whose body breaks while it is read is still a 429: Paddle did not
+// process the charge, so the manual top-up is removed and the same
+// idempotency key charges again.
+func TestManualTopUpUnreadableRateLimitCanBeRetried(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	authorize := func(pgx.Tx) error { return nil }
+	key, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusTooManyRequests, Truncate: true})
+
+	err = f.s.CreateTopUp(ctx(), acct, "owner-1", key, 25*usd, authorize, nil, nil)
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("CreateTopUp with an unreadable 429 = %v, want unavailable", err)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 0 {
+		t.Fatalf("top-ups after the unreadable 429 = %v, want none", got)
+	}
+	if len(f.paddle.Charges()) != 1 {
+		t.Fatalf("charges = %d, want 1", len(f.paddle.Charges()))
+	}
+
+	f.paddle.FailCharges(nil)
+	if err := f.s.CreateTopUp(ctx(), acct, "owner-1", key, 25*usd, authorize, nil, nil); err != nil {
+		t.Fatalf("retry with the same key = %v", err)
+	}
+	if len(f.paddle.Charges()) != 2 {
+		t.Fatalf("charges after the retry = %d, want 2", len(f.paddle.Charges()))
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "charged" {
+		t.Fatalf("top-ups after the retry = %v", got)
+	}
 }

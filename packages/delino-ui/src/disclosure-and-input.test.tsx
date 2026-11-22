@@ -1181,6 +1181,91 @@ describe("SegmentedControl", () => {
   });
 });
 
+// happy-dom does not compute the cascade or forced colors, so these check the
+// stylesheet text of the single forced-colors block. The block comes after
+// the component rules, because it has the same specificity and wins by order.
+describe("Forced colors", () => {
+  const marker = "@media (forced-colors: active)";
+  const forced = css.slice(css.indexOf(marker));
+
+  test("keeps one forced-colors block after the component rules", () => {
+    expect(css.split(marker)).toHaveLength(2);
+    expect(css.indexOf(marker)).toBeGreaterThan(
+      css.indexOf(".dui-pagination-link[data-current] {"),
+    );
+  });
+
+  test("draws the selected tab with Highlight and hides the idle ones", () => {
+    expect(findRuleBlock(forced, ".dui-tabs-tab")).toContain(
+      "border-bottom-color: Canvas;",
+    );
+    expect(findRuleBlock(forced, ".dui-tabs-tab[data-selected]")).toContain(
+      "border-bottom-color: Highlight;",
+    );
+    expect(
+      findRuleBlock(forced, '.dui-tabs-tab[data-orientation="vertical"]'),
+    ).toContain("border-inline-end-color: Canvas;");
+    expect(
+      findRuleBlock(
+        forced,
+        '.dui-tabs-tab[data-orientation="vertical"][data-selected]',
+      ),
+    ).toContain("border-inline-end-color: Highlight;");
+    // The default selected cue and the 2px border that keeps the size stay.
+    expect(block(".dui-tabs-tab[data-selected]")).toContain(
+      "border-bottom-color: var(--dui-color-text);",
+    );
+    expect(block(".dui-tabs-tab")).toContain("border-bottom: 2px solid");
+  });
+
+  test("outlines the Progress, Meter and Slider tracks and fills them", () => {
+    const track = findRuleBlock(
+      forced,
+      ".dui-progress-track, .dui-slider-track",
+    );
+    expect(track).toContain("box-sizing: border-box;");
+    expect(track).toContain("border: 1px solid CanvasText;");
+    expect(
+      findRuleBlock(
+        forced,
+        ".dui-progress-indicator, .dui-slider-indicator, .dui-radio-indicator",
+      ),
+    ).toContain("background: Highlight;");
+    // The default tracks stay borderless.
+    expect(block(".dui-progress-track")).not.toContain("border:");
+    expect(block(".dui-slider-track")).not.toContain("border:");
+  });
+
+  test("tells the on Switch from the off Switch", () => {
+    const track = findRuleBlock(forced, ".dui-switch");
+    expect(track).toContain("border: 2px solid CanvasText;");
+    // The 2px border plus 1px padding keeps the 3px inset of the default.
+    expect(track).toContain("padding: 1px;");
+    const on = findRuleBlock(forced, ".dui-switch[data-checked]");
+    expect(on).toContain("border-color: Highlight;");
+    expect(on).toContain("background: Highlight;");
+    expect(findRuleBlock(forced, ".dui-switch-thumb")).toContain(
+      "background: CanvasText;",
+    );
+    expect(block(".dui-switch")).toContain("border: 0;");
+  });
+
+  test("fills the pressed Toggle and the current page without a border", () => {
+    const filled = findRuleBlock(
+      forced,
+      ".dui-toggle[data-pressed], .dui-pagination-link[data-current]",
+    );
+    expect(filled).toContain("background: Highlight;");
+    expect(filled).toContain("color: HighlightText;");
+    // A border would widen both controls, so neither gets one.
+    expect(findRuleBlock(forced, ".dui-toggle")).toBeNull();
+    expect(block(".dui-toggle")).toContain("border: 0;");
+    expect(block(".dui-pagination-link, .dui-pagination-step")).toContain(
+      "border: 0;",
+    );
+  });
+});
+
 describe("Toggle", () => {
   test("reports its pressed state", async () => {
     render(<Toggle aria-label="Bold">B</Toggle>);

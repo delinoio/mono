@@ -26,6 +26,23 @@ interface SessionSetup {
 }
 
 /**
+ * Rejects a forced `PEER_TO_PEER` transport without a WebRTC implementation
+ * with an `OwnSandConfigError`. The client runs it before `CreateSandbox`, so
+ * a create that can never produce a usable handle does not start a billable
+ * sandbox; the selector runs it again when it is built.
+ */
+export function assertTransportAvailable(
+  forced: DataPathTransport | undefined,
+  Peer: PeerConnectionConstructor | undefined,
+): void {
+  if (forced === DataPathTransport.PEER_TO_PEER && Peer === undefined) {
+    throw new OwnSandConfigError(
+      "PEER_TO_PEER transport needs a WebRTC implementation",
+    );
+  }
+}
+
+/**
  * Selects the data path of one sandbox handle. With WebRTC available and no
  * forced transport, it opens one peer-to-peer session per handle and moves
  * the handle to the relay after an ICE failure or a session that cannot
@@ -49,11 +66,7 @@ export class DataPathSelector {
     this.#ctx = ctx;
     this.#Peer = Peer;
     this.#forced = forced;
-    if (forced === DataPathTransport.PEER_TO_PEER && Peer === undefined) {
-      throw new OwnSandConfigError(
-        "PEER_TO_PEER transport needs a WebRTC implementation",
-      );
-    }
+    assertTransportAvailable(forced, Peer);
     this.#onRelay = forced === DataPathTransport.RELAY || Peer === undefined;
   }
 
@@ -181,8 +194,19 @@ export class DataPathSelector {
     }
   }
 
-  /** The peer path failed; the handle moves to the relay. */
+  /**
+   * The peer path failed; the handle moves to the relay. A closed handle is
+   * the exception: closing the session ends its streams with the same
+   * `PeerUnavailableError` as a channel failure, but the close is not a peer
+   * failure. An operation in flight at the close therefore ends with
+   * `OwnSandHandleClosedError` (also on a forced `PEER_TO_PEER` transport),
+   * and the handle stays on peer-to-peer so later operations reject with the
+   * same error.
+   */
   peerFailed(cause: unknown): void {
+    if (this.#closed) {
+      throw new OwnSandHandleClosedError();
+    }
     this.#session?.close();
     this.#session = undefined;
     if (this.#forced === DataPathTransport.PEER_TO_PEER) {

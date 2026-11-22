@@ -27,6 +27,12 @@ const (
 	// without the caller's cancellation, so a client that disconnects does
 	// not leave the result unknown.
 	paddleCallTimeout = 20 * time.Second
+	// topUpOutcomeTimeout bounds the transaction that records the outcome
+	// of one Paddle call. It starts after the call returned, so a call that
+	// used its whole budget (a timeout) still leaves this time for the
+	// billing account lock and the write: the unknown result must not be
+	// lost to a deadline that the call already spent.
+	topUpOutcomeTimeout = 10 * time.Second
 )
 
 // topUp is a top-up row.
@@ -122,10 +128,12 @@ func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountSt
 // CreateTopUp runs a manual top-up. authorize runs first in the transaction
 // that records the top-up; it checks the caller's role and locks the billing
 // account. created runs in the same transaction when a new top-up is
-// recorded (not for a repeated key). The Paddle charge runs after that
-// transaction commits, so a concurrent retry with the same key finds the
+// recorded (not for a repeated key). committed, when set, runs once that
+// transaction has committed, before the Paddle charge, so a caller logs the
+// events of created only for a recorded top-up. The Paddle charge runs after
+// that transaction commits, so a concurrent retry with the same key finds the
 // recorded top-up and charges nothing again.
-func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key string, amount int64, authorize func(pgx.Tx) error, created func(pgx.Tx, string) error) error {
+func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key string, amount int64, authorize func(pgx.Tx) error, created func(pgx.Tx, string) error, committed func()) error {
 	if err := ValidateTopUpAmount(amount); err != nil {
 		return err
 	}
@@ -180,6 +188,9 @@ func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key s
 	})
 	if err != nil {
 		return err
+	}
+	if committed != nil {
+		committed()
 	}
 	if existing {
 		s.logger.InfoContext(ctx, "billing_top_up_repeated",
@@ -245,14 +256,16 @@ func outcomeLabel(o paddle.Outcome) string {
 // be retried; an automatic one fails without counting) or unknown (the
 // webhook or the timeout decides).
 func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), paddleCallTimeout)
-	defer cancel()
+	// Two independent deadlines, both without the caller's cancellation:
+	// one for the Paddle call and a fresh one for the outcome transaction.
+	callCtx, cancelCall := context.WithTimeout(context.WithoutCancel(ctx), s.paddleCallTimeout)
+	defer cancelCall()
 	cents, ok := MicrosToCents(t.Amount)
 	if !ok {
 		return paddle.OutcomeNotApplied, fmt.Errorf("top-up %s amount is not whole cents", t.ID)
 	}
 	start := time.Now()
-	_, callErr := s.paddle.CreateOneTimeCharge(ctx, t.PaddleSubscriptionID, paddle.Charge{
+	_, callErr := s.paddle.CreateOneTimeCharge(callCtx, t.PaddleSubscriptionID, paddle.Charge{
 		ProductID:   s.productID,
 		AmountCents: cents,
 		Name:        "Delino credit",
@@ -278,8 +291,12 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 	if callErr != nil {
 		attrs = append(attrs, slog.Any("error", callErr))
 	}
-	s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_top_up_charge", attrs...)
+	s.logger.LogAttrs(callCtx, slog.LevelInfo, "billing_top_up_charge", attrs...)
 
+	// The outcome deadline starts here, after the call returned, so a call
+	// that used its whole budget leaves the full outcome time.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.outcomeTimeout)
+	defer cancel()
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
 		now := s.timestamp()
 		acct, err := lockAccount(ctx, tx, t.BillingAccountID)

@@ -7,18 +7,20 @@
 // contract), so maintainers select dependents explicitly. Only workspace
 // packages with a
 // `deploy` manifest field are deployed. Every release whose version advances
-// is tagged after the deployment, deployable or not. A `none` release (a
+// is tagged after the deployment, deployable or not; binary releases
+// (`github-release`) are published from their tags after that. A `none` release (a
 // dependent through `devDependencies`, or an explicit `none` changeset) is
 // deployed when it is deployable, but keeps its version and gets no tag.
 import { appendFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
-import { workspaceRoots } from "./plan.mjs";
+import { workspacePackageDirs, workspaceRoots } from "./plan.mjs";
 
 // Stable deployment target identifiers of the `deploy.target` manifest field.
 export const DeployTarget = Object.freeze({
   Droplet: "droplet",
   CloudflarePages: "cloudflare-pages",
+  GithubRelease: "github-release",
 });
 
 // Deployable kinds. Each kind maps to exactly one GitHub deployment
@@ -26,12 +28,14 @@ export const DeployTarget = Object.freeze({
 export const DeployKind = Object.freeze({
   Server: "server",
   StaticSite: "static-site",
+  Binary: "binary",
 });
 
 // Kind order of a deployment: servers, then static sites, which call the
-// servers. There is no database stage: each server applies its own embedded
-// migrations at startup (see the deployment workflow contract).
-const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
+// servers, then binaries, which are published from their release tags after
+// the release job. There is no database stage: each server applies its own
+// embedded migrations at startup (see the deployment workflow contract).
+const kindOrder = [DeployKind.Server, DeployKind.StaticSite, DeployKind.Binary];
 
 // A Map, not a plain object: `Map.get` matches by SameValueZero, so inherited
 // `Object.prototype` members (`constructor`, `__proto__`, ...) and arrays that
@@ -39,7 +43,195 @@ const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 const targetRules = new Map([
   [DeployTarget.Droplet, { kind: DeployKind.Server, root: "servers" }],
   [DeployTarget.CloudflarePages, { kind: DeployKind.StaticSite, root: "apps" }],
+  [DeployTarget.GithubRelease, { kind: DeployKind.Binary, root: "cmds" }],
 ]);
+
+// Release platforms (`<GOOS>-<GOARCH>`) of a `github-release` deployable. The
+// release manifest tool (cmds/ownsand-agent/release-manifest) accepts the same
+// set.
+export const ReleasePlatform = Object.freeze({
+  LinuxAmd64: "linux-amd64",
+  LinuxArm64: "linux-arm64",
+  DarwinAmd64: "darwin-amd64",
+  DarwinArm64: "darwin-arm64",
+  WindowsAmd64: "windows-amd64",
+  WindowsArm64: "windows-arm64",
+});
+
+// Platforms that the deploy workflow can build with cgo: only on a native
+// runner, and the macOS runner is arm64.
+const cgoPlatforms = new Set([ReleasePlatform.DarwinArm64]);
+
+// The executable name, which also names the release assets.
+const binaryName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+// The release assets that the workflow adds to every binary release. A
+// license file must not have one of these names.
+const reservedAssetNames = new Set([
+  "SHA256SUMS",
+  "GO-LICENSE",
+  "THIRD-PARTY-LICENSES.txt",
+]);
+
+// A Go symbol for `go build -ldflags -X`: `<import path>.<name>`.
+const goSymbol = /^[A-Za-z0-9_.\/-]+\.[A-Za-z_][A-Za-z0-9_]*$/;
+
+// The release manifest object key inside the releases bucket.
+const manifestObjectKey = /^(?!.*\.\.)(?!.*\/\/)[a-z0-9][a-z0-9._\/-]*\.json$/;
+
+// The agent accepts only MAJOR.MINOR.PATCH as an update target, so a binary
+// release must not have a prefix or a pre-release suffix.
+const binaryReleaseVersion =
+  /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
+
+// Control characters and backslashes break the tab- and line-separated
+// transports of the deploy scripts.
+const transportUnsafe = /[\u0000-\u001f\u007f\\]/;
+
+// Normalizes a relative path and returns it, or undefined when it is empty,
+// absolute, outside its base or unsafe for the deploy scripts.
+function relativePath(raw) {
+  if (typeof raw !== "string" || transportUnsafe.test(raw)) return undefined;
+  const path = posix.normalize(raw).replace(/\/+$/, "");
+  if (
+    path === "" ||
+    path === "." ||
+    path.startsWith("/") ||
+    path === ".." ||
+    path.startsWith("../")
+  ) {
+    return undefined;
+  }
+  return path;
+}
+
+// A nonempty list of different strings, or undefined.
+function stringList(value) {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    !value.every((v) => typeof v === "string" && v !== "") ||
+    new Set(value).size !== value.length
+  ) {
+    return undefined;
+  }
+  return value;
+}
+
+function assetNames(binary, platforms) {
+  return platforms.map((p) =>
+    p.startsWith("windows-") ? `${binary}-${p}.exe` : `${binary}-${p}`,
+  );
+}
+
+// Validates the fields of a `github-release` deployable.
+function binaryFields(name, deploy, dir) {
+  if (typeof deploy.binary !== "string" || !binaryName.test(deploy.binary)) {
+    throw new DeployPlanError(
+      `${name}: deploy.binary must be an executable name matching ${binaryName}`,
+    );
+  }
+  const known = Object.values(ReleasePlatform);
+  const platforms = stringList(deploy.platforms);
+  if (!platforms || !platforms.every((p) => known.includes(p))) {
+    throw new DeployPlanError(
+      `${name}: deploy.platforms must be a nonempty list of different platforms from ${known.join(", ")}`,
+    );
+  }
+  const cgo =
+    deploy.cgoPlatforms === undefined ? [] : stringList(deploy.cgoPlatforms);
+  if (!cgo || !cgo.every((p) => platforms.includes(p) && cgoPlatforms.has(p))) {
+    throw new DeployPlanError(
+      `${name}: deploy.cgoPlatforms must be a nonempty list of different entries of deploy.platforms from ${[...cgoPlatforms].join(", ")}`,
+    );
+  }
+  let versionVariable = "";
+  if (deploy.versionVariable !== undefined) {
+    versionVariable = deploy.versionVariable;
+    if (
+      typeof versionVariable !== "string" ||
+      !goSymbol.test(versionVariable) ||
+      !versionVariable.startsWith(`github.com/delinoio/mono/${dir}/`)
+    ) {
+      throw new DeployPlanError(
+        `${name}: deploy.versionVariable must be a Go variable <import path>.<name> inside github.com/delinoio/mono/${dir}/`,
+      );
+    }
+  }
+  let entitlements = "";
+  if (deploy.entitlements !== undefined) {
+    const path = relativePath(deploy.entitlements);
+    if (!path || !path.endsWith(".plist")) {
+      throw new DeployPlanError(
+        `${name}: deploy.entitlements must be a .plist file inside the package`,
+      );
+    }
+    if (!platforms.some((p) => p.startsWith("darwin-"))) {
+      throw new DeployPlanError(
+        `${name}: deploy.entitlements needs a darwin platform`,
+      );
+    }
+    entitlements = `${dir}/${path}`;
+  }
+  const rawLicenses = stringList(deploy.licenseFiles);
+  const licenseFiles = rawLicenses?.map(relativePath);
+  if (!licenseFiles || licenseFiles.some((p) => p === undefined)) {
+    throw new DeployPlanError(
+      `${name}: deploy.licenseFiles must be a nonempty list of different file paths relative to the repository root`,
+    );
+  }
+  const taken = new Set([
+    ...reservedAssetNames,
+    ...assetNames(deploy.binary, platforms),
+  ]);
+  for (const file of licenseFiles) {
+    const base = posix.basename(file);
+    if (taken.has(base)) {
+      throw new DeployPlanError(
+        `${name}: deploy.licenseFiles has a second release asset named ${base}`,
+      );
+    }
+    taken.add(base);
+  }
+  let manifest = { objectKey: "", publicUrl: "" };
+  if (deploy.updateManifest !== undefined) {
+    const { objectKey, publicUrl } = deploy.updateManifest ?? {};
+    if (typeof objectKey !== "string" || !manifestObjectKey.test(objectKey)) {
+      throw new DeployPlanError(
+        `${name}: deploy.updateManifest.objectKey must be a .json object key matching ${manifestObjectKey}`,
+      );
+    }
+    let url;
+    try {
+      url = new URL(publicUrl);
+    } catch {
+      url = undefined;
+    }
+    if (
+      typeof publicUrl !== "string" ||
+      url?.protocol !== "https:" ||
+      url.href !== publicUrl ||
+      url.pathname !== `/${objectKey}` ||
+      url.search !== "" ||
+      url.hash !== ""
+    ) {
+      throw new DeployPlanError(
+        `${name}: deploy.updateManifest.publicUrl must be https://<host>/${objectKey}`,
+      );
+    }
+    manifest = { objectKey, publicUrl };
+  }
+  return {
+    binary: deploy.binary,
+    platforms,
+    cgoPlatforms: cgo,
+    versionVariable,
+    entitlements,
+    licenseFiles,
+    manifestObjectKey: manifest.objectKey,
+    manifestPublicUrl: manifest.publicUrl,
+  };
+}
 
 const dependencyFields = [
   "dependencies",
@@ -119,6 +311,18 @@ const dropletHostname =
 // other names before any build or upload. It sets no length limit here.
 const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
+// `deploy.buildEnv` maps build-time variables of a static site to GitHub
+// repository variables. The site build runs third-party build plugins without
+// secrets, and only `PUBLIC_` variables are inlined into a public bundle, so
+// the field may set only `PUBLIC_` names; it cannot change `PATH`,
+// `NODE_OPTIONS` or another variable that controls the build tools.
+const buildEnvName = /^PUBLIC_[A-Z0-9_]+$/;
+
+// A GitHub configuration variable name: letters, digits and underscores, not
+// starting with a digit or the reserved `GITHUB_` prefix. GitHub stores the
+// names in upper case, so the manifest uses upper case too.
+const repositoryVariableName = /^(?!GITHUB_)[A-Z_][A-Z0-9_]*$/;
+
 // The container listens on this port inside its own network namespace. Ports
 // below 1024 need privileges that the non-root server images do not have.
 const minimumDropletPort = 1024;
@@ -139,9 +343,18 @@ export const noUdpPorts = "none";
 
 export class DeployPlanError extends Error {}
 
-// Reads every workspace package directly inside a workspace root.
+// Reads every workspace package directly inside a workspace root, and the
+// single workspace packages outside them.
 export function readWorkspacePackages(repoRoot) {
   const packages = [];
+  for (const dir of workspacePackageDirs) {
+    const manifestPath = join(repoRoot, dir, "package.json");
+    if (!existsSync(manifestPath)) continue;
+    packages.push({
+      dir,
+      manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
+    });
+  }
   for (const workspaceRoot of workspaceRoots) {
     const rootPath = join(repoRoot, workspaceRoot);
     if (!existsSync(rootPath)) continue;
@@ -201,6 +414,20 @@ function deployable(pkg) {
     );
   }
   const base = { name, dir: pkg.dir, kind: rule.kind, target: deploy.target };
+  // Only a static site build reads `deploy.buildEnv`: a server reads its
+  // configuration from its env file on the Droplet, and a binary build takes
+  // no repository variables.
+  if (
+    deploy.target !== DeployTarget.CloudflarePages &&
+    deploy.buildEnv !== undefined
+  ) {
+    throw new DeployPlanError(
+      `${name}: deploy.buildEnv is allowed only for the ${DeployTarget.CloudflarePages} target`,
+    );
+  }
+  if (deploy.target === DeployTarget.GithubRelease) {
+    return { ...base, ...binaryFields(name, deploy, pkg.dir) };
+  }
   if (deploy.target === DeployTarget.Droplet) {
     if (!dropletImageName.test(name)) {
       throw new DeployPlanError(
@@ -299,7 +526,41 @@ function deployable(pkg) {
       `${name}: deploy.output must not contain control characters or a backslash`,
     );
   }
-  return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
+  return {
+    ...base,
+    project: deploy.project,
+    output: `${pkg.dir}/${output}`,
+    buildEnv: checkBuildEnv(name, deploy.buildEnv),
+  };
+}
+
+// Returns the `deploy.buildEnv` map of a static site, or an empty map when
+// the field is not set.
+function checkBuildEnv(name, buildEnv) {
+  if (buildEnv === undefined) return {};
+  if (
+    buildEnv === null ||
+    typeof buildEnv !== "object" ||
+    Array.isArray(buildEnv) ||
+    Object.keys(buildEnv).length === 0
+  ) {
+    throw new DeployPlanError(
+      `${name}: deploy.buildEnv must be a nonempty map of build-time variable names to GitHub repository variable names`,
+    );
+  }
+  for (const [variable, source] of Object.entries(buildEnv)) {
+    if (!buildEnvName.test(variable)) {
+      throw new DeployPlanError(
+        `${name}: deploy.buildEnv key ${JSON.stringify(variable)} must match ${buildEnvName}`,
+      );
+    }
+    if (typeof source !== "string" || !repositoryVariableName.test(source)) {
+      throw new DeployPlanError(
+        `${name}: deploy.buildEnv.${variable} must be a GitHub repository variable name matching ${repositoryVariableName}`,
+      );
+    }
+  }
+  return { ...buildEnv };
 }
 
 // Returns the workspace package that a dependency entry links, or undefined
@@ -429,6 +690,17 @@ export function check(repoRoot) {
   for (const id of ids) checkChangesetId(id);
   const packages = readWorkspacePackages(repoRoot);
   plan({ changesets: [], releases: [] }, packages);
+  // The release workflow ships these files, so a missing one would fail a
+  // release only after the version tags exist.
+  for (const pkg of packages) {
+    const d = deployable(pkg);
+    if (d?.target !== DeployTarget.GithubRelease) continue;
+    for (const file of [...d.licenseFiles, d.entitlements].filter(Boolean)) {
+      if (!existsSync(join(repoRoot, file))) {
+        throw new DeployPlanError(`${d.name}: ${file} does not exist`);
+      }
+    }
+  }
   // The plan above has no releases, so it cannot see a release name. Check the
   // name of every workspace package here, so the pull request that adds or
   // renames a package fails before a later release could. A deployable with a
@@ -454,7 +726,9 @@ function rejectSharedDestinations(packages) {
   for (const pkg of packages) {
     const d = deployable(pkg);
     if (!d) continue;
-    const keys = [`${d.target}:${d.service ?? d.project}`];
+    const keys = [`${d.target}:${d.service ?? d.project ?? d.binary}`];
+    if (d.manifestObjectKey)
+      keys.push(`${d.target}-manifest:${d.manifestObjectKey}`);
     if (d.hostname !== undefined)
       keys.push(`${d.target}-hostname:${d.hostname}`);
     if (d.udpPorts !== undefined && d.udpPorts !== noUdpPorts) {
@@ -533,12 +807,27 @@ export function plan(status, packages) {
   const versions = new Map(allReleases.map((r) => [r.name, r.version]));
   rejectSharedDestinations(packages);
   checkNeeds(packages, packagesByName);
+  const types = new Map(allReleases.map((r) => [r.name, r.type]));
   const byName = new Map(
     [...versions.keys()]
       .map((name) => deployable(packagesByName.get(name)))
       .filter(Boolean)
+      // A binary release is published under its version tag, so a `none`
+      // release, which keeps its version and gets no tag, publishes nothing.
+      .filter(
+        (d) =>
+          d.kind !== DeployKind.Binary ||
+          types.get(d.name) !== ReleaseType.None,
+      )
       .map((d) => [d.name, { ...d, version: versions.get(d.name) }]),
   );
+  for (const d of byName.values()) {
+    if (d.kind === DeployKind.Binary && !binaryReleaseVersion.test(d.version)) {
+      throw new DeployPlanError(
+        `${d.name}: a binary release version must be MAJOR.MINOR.PATCH, not ${d.version}`,
+      );
+    }
+  }
   // After the deployable map, so a deployable that fails its own name rule
   // keeps that diagnostic. A `none` release is checked too, because a later
   // run can advance the same package and tag it.
@@ -562,6 +851,7 @@ export function plan(status, packages) {
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
     servers: deployables.filter((d) => d.kind === DeployKind.Server),
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
+    binaries: deployables.filter((d) => d.kind === DeployKind.Binary),
   };
 }
 
@@ -592,6 +882,7 @@ export function main({
       releases: result.releases,
       servers: result.servers.map((d) => d.name),
       staticSites: result.staticSites.map((d) => d.name),
+      binaries: result.binaries.map((d) => d.name),
     }),
   );
   if (env.GITHUB_OUTPUT) {
@@ -601,12 +892,18 @@ export function main({
         `releases=${JSON.stringify(result.releases)}`,
         `servers=${JSON.stringify(result.servers)}`,
         `static_sites=${JSON.stringify(result.staticSites)}`,
+        `binaries=${JSON.stringify(result.binaries)}`,
         // Any pending changeset, including one with only `none` releases,
         // needs the release job to consume it.
         `changesets=${JSON.stringify(result.changesets)}`,
         `has_changesets=${result.changesets.length > 0}`,
         `has_servers=${result.servers.length > 0}`,
         `has_static_sites=${result.staticSites.length > 0}`,
+        `has_binaries=${result.binaries.length > 0}`,
+        // The macOS build job runs only for a cgo platform, and the macOS
+        // signing job only for a darwin platform.
+        `has_cgo_binaries=${result.binaries.some((d) => d.cgoPlatforms.length > 0)}`,
+        `has_darwin_binaries=${result.binaries.some((d) => d.platforms.some((p) => p.startsWith("darwin-")))}`,
         "",
       ].join("\n"),
     );
@@ -618,11 +915,13 @@ export function main({
     } else {
       lines.push("| Order | Package | Version | Kind | Target |");
       lines.push("| --- | --- | --- | --- | --- |");
-      [...result.servers, ...result.staticSites].forEach((d, i) => {
-        lines.push(
-          `| ${i + 1} | ${d.name} | ${d.version} | ${d.kind} | ${d.target} |`,
-        );
-      });
+      [...result.servers, ...result.staticSites, ...result.binaries].forEach(
+        (d, i) => {
+          lines.push(
+            `| ${i + 1} | ${d.name} | ${d.version} | ${d.kind} | ${d.target} |`,
+          );
+        },
+      );
       lines.push("");
       lines.push(
         `Versioned and tagged: ${result.releases.map((r) => `${r.name}@${r.version}`).join(", ") || "none"}`,

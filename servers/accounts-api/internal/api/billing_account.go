@@ -57,17 +57,36 @@ const selectAccess = `SELECT a.billing_account_id::text, a.name, a.create_time, 
 	JOIN billing_account_members m ON m.billing_account_id = a.billing_account_id AND m.user_id = $2
 	WHERE a.billing_account_id = $1 AND a.delete_time IS NULL`
 
+// lockAccountRow locks the live billing account row until the transaction
+// ends.
+const lockAccountRow = `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 AND delete_time IS NULL FOR UPDATE`
+
 // loadAccess returns the billing account and the caller's role. A missing or
 // deleted billing account and a caller without a membership are all
 // not_found, so callers cannot discover other billing accounts.
+//
+// With lockAccount the account row is locked in its own statement before the
+// membership is read. A single statement that joins the membership and
+// appends FOR UPDATE OF the account reads the unlocked membership row in the
+// snapshot taken before the lock wait (READ COMMITTED does not re-read it),
+// so a role changed by the transaction that held the lock would be missed.
+// Every membership change takes the account lock first, so the second
+// statement, which takes its snapshot after the lock is granted, sees the
+// committed membership.
 func loadAccess(ctx context.Context, q db.Querier, accountID, userID string, mode lockMode) (billingAccount, error) {
-	query := selectAccess
 	if mode == lockAccount {
-		query += " FOR UPDATE OF a"
+		var locked int
+		err := q.QueryRow(ctx, lockAccountRow, accountID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return billingAccount{}, notFound("billing account not found")
+		}
+		if err != nil {
+			return billingAccount{}, err
+		}
 	}
 	var a billingAccount
 	var role string
-	err := q.QueryRow(ctx, query, accountID, userID).Scan(&a.ID, &a.Name, &a.CreateTime, &a.Balance, &role)
+	err := q.QueryRow(ctx, selectAccess, accountID, userID).Scan(&a.ID, &a.Name, &a.CreateTime, &a.Balance, &role)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return billingAccount{}, notFound("billing account not found")
 	}
@@ -101,6 +120,7 @@ func (h *BillingAccountHandler) CreateBillingAccount(ctx context.Context, req *c
 		return nil, h.internal(ctx, "create_billing_account", err)
 	}
 	now := h.timestamp()
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time)
 			VALUES ($1, $2, $3, $3)`, id, name, now); err != nil {
@@ -110,7 +130,7 @@ func (h *BillingAccountHandler) CreateBillingAccount(ctx context.Context, req *c
 			VALUES ($1, $2, $3, $4)`, id, userID, string(RoleOwner), now); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: id, Kind: AuditBillingAccountCreated, ActorUserID: userID,
 			Details: map[string]string{"name": name},
 		})
@@ -118,6 +138,7 @@ func (h *BillingAccountHandler) CreateBillingAccount(ctx context.Context, req *c
 	if err != nil {
 		return nil, h.internal(ctx, "create_billing_account", err)
 	}
+	h.flushAudit(ctx, audit)
 	account := billingAccount{ID: id, Name: name, CreateTime: now, CallerRole: RoleOwner}
 	return connect.NewResponse(&accountsv1.CreateBillingAccountResponse{BillingAccount: account.proto()}), nil
 }
@@ -210,6 +231,7 @@ func (h *BillingAccountHandler) UpdateBillingAccount(ctx context.Context, req *c
 	}
 	now := h.timestamp()
 	var account billingAccount
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err = loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -227,7 +249,7 @@ func (h *BillingAccountHandler) UpdateBillingAccount(ctx context.Context, req *c
 		}
 		oldName := account.Name
 		account.Name = name
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditBillingAccountRenamed, ActorUserID: userID,
 			Details: map[string]string{"old_name": oldName, "new_name": name},
 		})
@@ -235,6 +257,7 @@ func (h *BillingAccountHandler) UpdateBillingAccount(ctx context.Context, req *c
 	if err != nil {
 		return nil, h.internal(ctx, "update_billing_account", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.UpdateBillingAccountResponse{BillingAccount: account.proto()}), nil
 }
 
@@ -249,6 +272,7 @@ func (h *BillingAccountHandler) DeleteBillingAccount(ctx context.Context, req *c
 		return nil, err
 	}
 	now := h.timestamp()
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -287,12 +311,13 @@ func (h *BillingAccountHandler) DeleteBillingAccount(ctx context.Context, req *c
 		if _, err := tx.Exec(ctx, `DELETE FROM billing_account_members WHERE billing_account_id = $1`, accountID); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditBillingAccountDeleted, ActorUserID: userID,
 		})
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "delete_billing_account", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.DeleteBillingAccountResponse{}), nil
 }

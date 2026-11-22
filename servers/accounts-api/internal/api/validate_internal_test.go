@@ -3,6 +3,7 @@
 package api
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -62,6 +63,25 @@ func TestPageSizeAndToken(t *testing.T) {
 	if tok, err := decodePageToken(raw, "R", "S"); err != nil || tok.After != "a" || tok.AfterTime != 5 {
 		t.Fatalf("decode = %+v, %v", tok, err)
 	}
+	for _, forged := range []pageToken{
+		{RPC: "R", Scope: "S", After: "a", AfterTime: -1},
+		{RPC: "R", Scope: "S", After: "a", AfterTime: math.MinInt64},
+		{RPC: "R", Scope: "S", After: "\x00"},
+		{RPC: "R", Scope: "S", After: "a\x00b", AfterTime: 5},
+		{RPC: "R", Scope: "S", After: "ownsand\n\x00\nmeter"},
+	} {
+		if _, err := decodePageToken(encodePageToken(forged), "R", "S"); connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Errorf("decodePageToken(%+v) error = %v", forged, err)
+		}
+	}
+	for _, valid := range []pageToken{
+		{RPC: "R", Scope: "S", After: "a"},
+		{RPC: "R", Scope: "S", After: "a\x01b", AfterTime: math.MaxInt64},
+	} {
+		if _, err := decodePageToken(encodePageToken(valid), "R", "S"); err != nil {
+			t.Errorf("decodePageToken(%+v) error = %v", valid, err)
+		}
+	}
 	for _, tc := range [][3]string{{raw, "R", "other"}, {raw, "Other", "S"}, {"%%%", "R", "S"}, {"e30", "R", "S"}} {
 		if _, err := decodePageToken(tc[0], tc[1], tc[2]); connect.CodeOf(err) != connect.CodeInvalidArgument {
 			t.Errorf("decodePageToken(%q, %q, %q) error = %v", tc[0], tc[1], tc[2], err)
@@ -91,5 +111,18 @@ func TestFieldRules(t *testing.T) {
 	}
 	if !RoleAdmin.Allows(PermissionManage) || RoleAdmin.Allows(PermissionOwn) || RoleViewer.Allows(PermissionManage) || !RoleViewer.Allows(PermissionRead) || Role("").Allows(PermissionRead) {
 		t.Error("role permissions do not match the contract table")
+	}
+}
+
+func TestUserIDField(t *testing.T) {
+	for _, ok := range []string{"a", "abc\x01", "user-1", "사용자", strings.Repeat("a", maxUserIDBytes)} {
+		if got, err := userIDField(ok); err != nil || got != ok {
+			t.Errorf("userIDField(%q) = %q, %v", ok, got, err)
+		}
+	}
+	for _, bad := range []string{"", "\x00", "abc\x00", "\x00abc", "ab\x00cd", "\xff", strings.Repeat("a", maxUserIDBytes+1)} {
+		if _, err := userIDField(bad); connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Errorf("userIDField(%q) error = %v", bad, err)
+		}
 	}
 }

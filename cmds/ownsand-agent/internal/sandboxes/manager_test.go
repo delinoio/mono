@@ -67,6 +67,11 @@ type fakeRuntime struct {
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
+	// deleteStarted and deleteBlock, when set, make Delete signal that the
+	// stop started and wait until deleteBlock is closed, like a VM stop that
+	// is still running.
+	deleteStarted chan struct{}
+	deleteBlock   chan struct{}
 	// pauseErr and resumeErr, when set, make Pause and Resume fail.
 	pauseErr  error
 	resumeErr error
@@ -163,6 +168,13 @@ func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (v
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	r.mu.Lock()
 	r.deleteCalls++
+	if r.deleteBlock != nil {
+		started, block := r.deleteStarted, r.deleteBlock
+		r.mu.Unlock()
+		close(started)
+		<-block
+		r.mu.Lock()
+	}
 	if r.deleteFails > 0 {
 		r.deleteFails--
 		r.mu.Unlock()
@@ -1219,6 +1231,128 @@ func TestResendAndIdleReports(t *testing.T) {
 	}
 }
 
+// count returns the number of entries sent so far.
+func (o *outbox) count() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return len(o.entries)
+}
+
+// lastEntry returns the newest outbox entry of the sandbox.
+func (o *outbox) lastEntry(id string) *ownsandv1.SandboxStateEntry {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	for i := len(o.entries) - 1; i >= 0; i-- {
+		if o.entries[i].GetSandboxId() == id {
+			return o.entries[i]
+		}
+	}
+	return nil
+}
+
+// requireTerminalResend checks that every resend Tick sends the unacknowledged
+// terminal entry of the sandbox again, with the given state and end reason.
+func requireTerminalResend(t *testing.T, e *env, id string, state ownsandv1.SandboxState, reason ownsandv1.SandboxEndReason) {
+	t.Helper()
+	// The record turns terminal before the end sends its update.
+	waitFor(t, func() bool { return e.out.lastEntry(id).GetState() == state })
+	for i := 0; i < 3; i++ {
+		n := e.out.count()
+		e.m.Tick(context.Background(), true)
+		if e.out.count() != n+1 {
+			t.Fatalf("resend %d: %d entries, want %d", i, e.out.count(), n+1)
+		}
+		got := e.out.lastEntry(id)
+		if got.GetState() != state || got.GetEndReason() != reason {
+			t.Fatalf("resend %d: state %v end reason %v, want %v %v", i, got.GetState(), got.GetEndReason(), state, reason)
+		}
+	}
+}
+
+// TestResendTerminalUpdateAfterDelete checks that Tick resends the
+// unacknowledged terminal update of a deleted sandbox until the control plane
+// acknowledges it, and then stops.
+func TestResendTerminalUpdateAfterDelete(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResend(t, e, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
+	// The acknowledgement drops the record, so nothing is resent.
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: del.GetRevision()})
+	n := e.out.count()
+	e.m.Tick(context.Background(), true)
+	if e.out.count() != n {
+		t.Fatal("acknowledged terminal update resent")
+	}
+}
+
+func TestResendTerminalUpdateAfterTTL(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	e.clk.Advance(11 * time.Minute)
+	e.m.Tick(context.Background(), false)
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	requireTerminalResend(t, e, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_IDLE_TTL_EXPIRED)
+}
+
+func TestResendTerminalUpdateAfterLostVM(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.vms[id].stop()
+	e.rt.mu.Unlock()
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
+	requireTerminalResend(t, e, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE)
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: e.out.lastEntry(id).GetRevision()})
+	n := e.out.count()
+	e.m.Tick(context.Background(), true)
+	if e.out.count() != n {
+		t.Fatal("acknowledged lost-VM update resent")
+	}
+}
+
+// TestResendSkipsSandboxWhoseEndIsRunning checks that Tick sends no terminal
+// update for a sandbox whose VM stop has not returned, and starts no second
+// end for it.
+func TestResendSkipsSandboxWhoseEndIsRunning(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	e.rt.mu.Lock()
+	e.rt.deleteStarted = make(chan struct{})
+	e.rt.deleteBlock = make(chan struct{})
+	started, block := e.rt.deleteStarted, e.rt.deleteBlock
+	e.rt.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		done <- err
+	}()
+	<-started
+	n := e.out.count()
+	e.clk.Advance(11 * time.Minute)
+	e.m.Tick(context.Background(), true)
+	if e.out.count() != n {
+		t.Fatalf("Tick sent %d entries while the end was running", e.out.count()-n)
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_DELETING {
+		t.Fatalf("state %v, want DELETING", s)
+	}
+	e.rt.mu.Lock()
+	calls := e.rt.deleteCalls
+	e.rt.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("%d runtime Delete calls while the end was running, want 1", calls)
+	}
+	close(block)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	requireTerminalResend(t, e, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER)
+}
+
 func TestPauseResumeAndSnapshot(t *testing.T) {
 	e := newEnv(t)
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
@@ -1705,4 +1839,44 @@ func TestLockSnapshotImportWaitEndsWithItsContext(t *testing.T) {
 		t.Fatal(err)
 	}
 	again()
+}
+
+func TestLockSnapshotImportCanceledContextAbortsWithFreeLock(t *testing.T) {
+	e := newEnv(t)
+	id, _ := uuidv7.NewString()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	// With a free lock and a canceled context both select cases are ready, so
+	// repeat to make a random pick of the lock case practically certain.
+	for i := 0; i < 200; i++ {
+		unlock, err := e.m.LockSnapshotImport(ctx, id)
+		var ce *CommandError
+		if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+			if unlock != nil {
+				unlock()
+			}
+			t.Fatalf("iteration %d: pre-canceled import with a free lock = %v, want ABORTED", i, err)
+		}
+		if unlock != nil {
+			t.Fatalf("iteration %d: aborted import returned an unlock function", i)
+		}
+		e.m.mu.Lock()
+		left := len(e.m.importLocks)
+		e.m.mu.Unlock()
+		if left != 0 {
+			t.Fatalf("iteration %d: %d import locks remain after the aborted import", i, left)
+		}
+	}
+	// The aborted imports left no token behind: a live context takes the lock.
+	again, err := e.m.LockSnapshotImport(context.Background(), id)
+	if err != nil {
+		t.Fatalf("lock after aborted imports = %v", err)
+	}
+	again()
+	e.m.mu.Lock()
+	left := len(e.m.importLocks)
+	e.m.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d import locks remain after every release", left)
+	}
 }

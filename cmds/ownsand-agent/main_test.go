@@ -4,11 +4,16 @@ package main
 
 import (
 	"bytes"
+	"math"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 )
 
@@ -132,5 +137,174 @@ func TestStatusPrintsCapabilities(t *testing.T) {
 	printCapabilities(&out, agent.Status{CapabilitiesAt: at}, colors{})
 	if got := out.String(); !strings.Contains(got, "guest OSes none; base images none") {
 		t.Fatalf("empty report: %q", got)
+	}
+}
+
+// Only a missing identity file or an identity without a device ID means that
+// the device is not enrolled (exit code 3, which service managers do not
+// restart). An identity file that cannot be read or decoded is an error
+// (exit code 1) with the cause in the output, so that the service manager
+// restarts the agent and the operator sees why.
+func TestIdentityReadFailureIsNotNotEnrolled(t *testing.T) {
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	t.Setenv("NO_COLOR", "1")
+	cases := []struct {
+		name      string
+		setup     func(t *testing.T, path string)
+		wantRun   int
+		wantLD    int
+		wantEnrol bool // the status output says "not enrolled"
+	}{
+		{
+			name:      "missing",
+			setup:     func(t *testing.T, path string) {},
+			wantRun:   exitNotEnrolled,
+			wantLD:    exitOK,
+			wantEnrol: true,
+		},
+		{
+			name: "pending identity without a device ID",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte(`{"device_id":"","organization_id":"","private_key_seed":"AAAA"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantRun:   exitNotEnrolled,
+			wantLD:    exitOK,
+			wantEnrol: true,
+		},
+		{
+			name: "corrupt",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte(`{"device_id": "dev`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantRun: exitError,
+			wantLD:  exitError,
+		},
+		{
+			name: "directory",
+			setup: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantRun: exitError,
+			wantLD:  exitError,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+			tc.setup(t, filepath.Join(dir, store.IdentityFile))
+			var out, errb bytes.Buffer
+			if code := run([]string{"status"}, nil, &out, &errb); code != tc.wantRun {
+				t.Fatalf("status: %d, want %d (%q / %q)", code, tc.wantRun, out.String(), errb.String())
+			}
+			if got := strings.Contains(out.String(), "not enrolled"); got != tc.wantEnrol {
+				t.Fatalf("status prints not enrolled = %v, want %v (%q)", got, tc.wantEnrol, out.String())
+			}
+			if !tc.wantEnrol && (!strings.HasPrefix(errb.String(), "ownsand-agent: ") || out.Len() != 0) {
+				t.Fatalf("status error output %q / %q", out.String(), errb.String())
+			}
+			out.Reset()
+			errb.Reset()
+			if code := run([]string{"run"}, nil, &out, &errb); code != tc.wantRun {
+				t.Fatalf("run: %d, want %d", code, tc.wantRun)
+			}
+			if code := run([]string{"run", "--service-manager", "launchd"}, nil, &out, &errb); code != tc.wantLD {
+				t.Fatalf("launchd run: %d, want %d", code, tc.wantLD)
+			}
+		})
+	}
+}
+
+// A valid identity is enrolled: status reports it and exits 0.
+func TestStatusWithValidIdentity(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveIdentity(&store.Identity{DeviceID: "dev-1", OrganizationID: "org-1", PrivateKeySeed: make([]byte, 32)}); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"status", "--no-color"}, nil, &out, &errb); code != exitOK || !strings.Contains(out.String(), "Enrollment: enrolled (device dev-1, organization org-1)") {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+// TestImageBuildResourceRanges runs the real flag parser: a value that does
+// not fit the conversion to bytes or to a 32-bit vCPU count is a usage error
+// that names its flag, for both guest OS values, and no state is created.
+func TestImageBuildResourceRanges(t *testing.T) {
+	big := func(v uint64) string { return strconv.FormatUint(v, 10) }
+	tests := []struct {
+		flag, value string
+	}{
+		{"--disk-gib", big(1 << 33)},
+		{"--disk-gib", big(1 << 34)},
+		{"--disk-gib", big(1<<34 + 64)},
+		{"--disk-gib", big(math.MaxInt64)},
+		{"--cpus", big(math.MaxInt32 + 1)},
+		{"--cpus", big(1 << 32)},
+		{"--cpus", big(1<<32 + 4)},
+		{"--memory-mib", big(1 << 43)},
+		{"--memory-mib", big(1 << 44)},
+		{"--memory-mib", big(math.MaxInt64)},
+	}
+	if strconv.IntSize < 64 {
+		// An int flag cannot hold the 64-bit values, and the flag parser
+		// rejects them before the range check.
+		tests = tests[:4]
+		tests = append(tests, struct{ flag, value string }{"--memory-mib", big(1 << 44)})
+	}
+	for _, guest := range []string{"macos", "windows"} {
+		for _, tc := range tests {
+			stateDir := filepath.Join(t.TempDir(), "state")
+			var out, errb bytes.Buffer
+			args := []string{"image", "build", "--os", guest, "--state-dir", stateDir, tc.flag, tc.value}
+			if code := run(args, nil, &out, &errb); code != exitUsage {
+				t.Fatalf("%v: exit %d, stderr %q", args, code, errb.String())
+			}
+			if !strings.Contains(errb.String(), tc.flag+" "+tc.value) {
+				t.Fatalf("%v: stderr %q does not name the flag and value", args, errb.String())
+			}
+			if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
+				t.Fatalf("%v: the state directory exists (%v)", args, err)
+			}
+		}
+	}
+}
+
+func TestValidateImageResources(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		f    imageBuildFlags
+		want int32
+	}{
+		{"defaults", imageBuildFlags{}, 0},
+		{"four", imageBuildFlags{cpus: 4, diskGiB: 8589934591, memoryMiB: 1<<43 - 1}, 4},
+		{"largest", imageBuildFlags{cpus: math.MaxInt32}, math.MaxInt32},
+	} {
+		if got, err := validateImageResources(tc.f); err != nil || got != tc.want {
+			t.Fatalf("%s: got %d, %v", tc.name, got, err)
+		}
+	}
+	if _, err := validateImageResources(imageBuildFlags{cpus: -1}); err == nil {
+		t.Fatal("negative cpus accepted")
+	}
+	if strconv.IntSize == 64 {
+		for _, cpus := range []int64{1 << 31, 1 << 32, 1<<32 + 4} {
+			_, err := validateImageResources(imageBuildFlags{cpus: int(cpus)})
+			if err == nil || !strings.Contains(err.Error(), "--cpus") {
+				t.Fatalf("cpus %d: %v", cpus, err)
+			}
+		}
 	}
 }

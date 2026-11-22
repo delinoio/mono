@@ -61,13 +61,26 @@ const tokenRefreshMargin = time.Minute
 // maxResponseBytes bounds Logto responses.
 const maxResponseBytes = 1 << 20
 
+// tokenFetchTimeout bounds one token request. The request is detached from
+// the cancellation of the caller that started it, so this timeout is its only
+// bound.
+const tokenFetchTimeout = 10 * time.Second
+
 // Logto is the Management API client.
 type Logto struct {
 	cfg LogtoConfig
 
+	// mu guards accessToken and expiresAt. It is held only for memory
+	// access, never across a network call.
 	mu          sync.Mutex
 	accessToken string
 	expiresAt   time.Time
+
+	// refreshGate admits one token refresh at a time. It is a channel with
+	// capacity one and not a mutex so that a caller waits for it with its
+	// context: a caller that is canceled while another refresh runs returns
+	// at once.
+	refreshGate chan struct{}
 }
 
 // NewLogto returns a Management API client. It fetches no token until the
@@ -83,7 +96,7 @@ func NewLogto(cfg LogtoConfig) *Logto {
 	if cfg.Logger == nil {
 		cfg.Logger = slog.Default()
 	}
-	return &Logto{cfg: cfg}
+	return &Logto{cfg: cfg, refreshGate: make(chan struct{}, 1)}
 }
 
 type tokenResponse struct {
@@ -91,13 +104,68 @@ type tokenResponse struct {
 	ExpiresIn   int64  `json:"expires_in"`
 }
 
-// token returns a cached Management API access token or fetches a new one.
-func (l *Logto) token(ctx context.Context) (string, error) {
+// cachedToken returns the cached access token while it is outside the refresh
+// margin.
+func (l *Logto) cachedToken() (string, bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.accessToken != "" && l.cfg.Now().Before(l.expiresAt.Add(-tokenRefreshMargin)) {
-		return l.accessToken, nil
+		return l.accessToken, true
 	}
+	return "", false
+}
+
+type tokenResult struct {
+	token string
+	err   error
+}
+
+// token returns a cached Management API access token or fetches a new one.
+// Concurrent callers share one refresh. A caller whose context ends while it
+// waits for the refresh returns the context error; the refresh itself keeps
+// running for the other callers.
+func (l *Logto) token(ctx context.Context) (string, error) {
+	if token, ok := l.cachedToken(); ok {
+		return token, nil
+	}
+	select {
+	case l.refreshGate <- struct{}{}:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	// Another caller can have refreshed the token while this one waited.
+	if token, ok := l.cachedToken(); ok {
+		<-l.refreshGate
+		return token, nil
+	}
+	if err := ctx.Err(); err != nil {
+		<-l.refreshGate
+		return "", err
+	}
+	// The goroutine owns the gate until the refresh ends, so that a caller
+	// that stops waiting cannot let a second refresh start in parallel.
+	done := make(chan tokenResult, 1)
+	go func() {
+		defer func() { <-l.refreshGate }()
+		// The refresh serves every waiting caller, so the cancellation of
+		// the caller that started it must not abort it; only the timeout
+		// bounds it.
+		fetchCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), tokenFetchTimeout)
+		defer cancel()
+		token, err := l.fetchToken(fetchCtx)
+		done <- tokenResult{token: token, err: err}
+	}()
+	select {
+	case result := <-done:
+		return result.token, result.err
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+}
+
+// fetchToken requests a new access token and caches it. It holds no lock
+// during the request.
+func (l *Logto) fetchToken(ctx context.Context) (string, error) {
 	form := url.Values{
 		"grant_type": {"client_credentials"},
 		"resource":   {l.cfg.Endpoint + "/api"},
@@ -122,10 +190,12 @@ func (l *Logto) token(ctx context.Context) (string, error) {
 	if err := json.NewDecoder(io.LimitReader(resp.Body, maxResponseBytes)).Decode(&body); err != nil || body.AccessToken == "" {
 		return "", errors.New("logto token response is not valid")
 	}
+	l.mu.Lock()
 	l.accessToken = body.AccessToken
 	l.expiresAt = l.cfg.Now().Add(time.Duration(body.ExpiresIn) * time.Second)
+	l.mu.Unlock()
 	l.cfg.Logger.Info("logto_management_token_loaded", slog.Int64("expires_in_s", body.ExpiresIn))
-	return l.accessToken, nil
+	return body.AccessToken, nil
 }
 
 // invalidate drops a token that Logto rejected.
@@ -200,6 +270,9 @@ type Fake struct {
 	users map[string]User
 	// Err, when set, is returned by every call.
 	Err error
+	// onUser, when set, runs at the start of every User call, outside the
+	// lock. Tests use it to move time or hold locks during a lookup.
+	onUser func()
 }
 
 // NewFake returns an empty fake directory.
@@ -219,8 +292,22 @@ func (f *Fake) SetErr(err error) {
 	f.Err = err
 }
 
+// SetOnUser registers fn to run at the start of every User call; nil removes
+// it. It lets tests change the world while a lookup is in flight.
+func (f *Fake) SetOnUser(fn func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onUser = fn
+}
+
 // User implements Directory.
 func (f *Fake) User(_ context.Context, userID string) (User, error) {
+	f.mu.Lock()
+	hook := f.onUser
+	f.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.Err != nil {

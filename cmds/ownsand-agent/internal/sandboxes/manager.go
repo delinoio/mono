@@ -901,6 +901,13 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 	execs := m.execs
 	for _, sb := range m.sandboxes {
 		if sb.ending {
+			// endLocked leaves ending set after a successful end, so a
+			// terminal record that the control plane has not acknowledged
+			// still needs its resend. A record whose end is in progress is
+			// not terminal yet and stays skipped.
+			if resend && sb.rec.Terminal() && !sb.rec.Acked {
+				unacked = append(unacked, sb.rec.Entry(m.epoch))
+			}
 			continue
 		}
 		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && execs != nil && !now.Before(sb.rec.IdleDeadline) && execs.HasRunningExec(sb.rec.SandboxID) {

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { Button, ButtonVariant } from "delino-ui/button";
 import {
   AlertDialog,
@@ -17,8 +18,17 @@ import {
   DialogTitle,
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
-import { type FormEvent, type ReactNode, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
+import type { AllPages } from "../paging.ts";
 
 export function PageHeader({
   title,
@@ -51,23 +61,109 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-/** A failed request, with a retry button. */
+/**
+ * A failed request. A request that ended with `Code.Unauthenticated` offers
+ * the sign-in redirect, because retrying cannot succeed: the Logto SDK keeps
+ * `isAuthenticated` true after a failed token refresh, so neither the route
+ * guard nor the top bar would offer it. Any other failure offers a retry
+ * when `onRetry` is set.
+ *
+ * `onSignIn` replaces the default `useAuth().signIn()` for a caller that has
+ * to prepare the redirect first.
+ */
 export function ErrorNotice({
   error,
   onRetry,
+  onSignIn,
 }: {
   error: unknown;
   onRetry?: () => void;
+  onSignIn?: () => Promise<void> | void;
 }) {
+  const unauthenticated =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
       <p>{errorMessage(error)}</p>
-      {onRetry ? (
+      {unauthenticated ? (
+        <SignInAgainButton onSignIn={onSignIn} />
+      ) : onRetry ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * A failed background refetch of data that is already on screen (a window
+ * focus refetch, a poll, or the refetch after a mutation). Render it above
+ * the loaded content, and keep that content: the content, its selected tab,
+ * its open dialogs and its typed input must survive a transient failure.
+ * Only a request that failed before it ever returned data replaces the
+ * content with an `ErrorNotice`.
+ *
+ * Pass the error of the failed refetch, or nothing while the last request
+ * succeeded. The retry clears the notice when it succeeds. Keep the notice in
+ * the same position of the tree in every state, so that the content below
+ * does not remount when the notice appears.
+ */
+export function RefetchNotice({
+  error,
+  onRetry,
+}: {
+  error: unknown;
+  onRetry: () => void;
+}) {
+  return error === undefined || error === null ? null : (
+    <ErrorNotice error={error} onRetry={onRetry} />
+  );
+}
+
+/**
+ * The state of the pages after the first one: a short loading line while
+ * later pages load and an error with a retry that resumes at the failed page.
+ * The items of the earlier pages stay visible above it.
+ */
+export function MorePages({ pages }: { pages: AllPages<unknown> }) {
+  if (pages.continuationError !== undefined) {
+    return (
+      <div className="notice notice-error" role="alert">
+        <p>Some items did not load. {errorMessage(pages.continuationError)}</p>
+        <Button
+          variant={ButtonVariant.Secondary}
+          onClick={pages.retryContinuation}
+        >
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  return pages.isLoadingMore ? (
+    <p className="muted" role="status">
+      Loading more
+    </p>
+  ) : null;
+}
+
+/**
+ * Starts the sign-in redirect. It reads the auth context only when it is
+ * rendered, so an `ErrorNotice` for another failure needs no auth provider.
+ */
+function SignInAgainButton({
+  onSignIn,
+}: {
+  onSignIn: (() => Promise<void> | void) | undefined;
+}) {
+  const auth = useAuth();
+  return (
+    <Button
+      variant={ButtonVariant.Secondary}
+      onClick={() => void (onSignIn ? onSignIn() : auth.signIn())}
+    >
+      Sign in with Delino
+    </Button>
   );
 }
 
@@ -84,6 +180,75 @@ export function Empty({
       {children ? <p className="muted">{children}</p> : null}
     </div>
   );
+}
+
+enum SubmissionResult {
+  /** Another submission of this opening is still running. */
+  Skipped = "skipped",
+  Succeeded = "succeeded",
+  Failed = "failed",
+  /** The dialog closed or opened again before the action settled. */
+  Stale = "stale",
+}
+
+/**
+ * The submission state of a dialog. One submission runs at a time, and its
+ * outcome belongs to the opening of the dialog that started it: a request
+ * that settles after the dialog closed or opened again changes no state and
+ * reports `Stale`, so an earlier failure never shows on a later opening and
+ * never keeps its submit button disabled.
+ */
+function useDialogSubmission(open: boolean) {
+  const [error, setError] = useState<unknown>();
+  const [pending, setPending] = useState(false);
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    // Adjust state while rendering: every time the dialog opens again it
+    // starts without the notice and the pending state of an earlier
+    // submission, including a failure that arrived after the dialog closed.
+    setWasOpen(open);
+    if (open) {
+      setError(undefined);
+      setPending(false);
+    }
+  }
+  // The opening counter changes on every open and close edge. The busy ref
+  // stops a second submission in the same tick, before the pending state
+  // renders, and starts again with every opening.
+  const opening = useRef(0);
+  const busy = useRef(false);
+  useEffect(() => {
+    opening.current += 1;
+    busy.current = false;
+  }, [open]);
+  const clearError = useCallback(() => setError(undefined), []);
+  const submit = useCallback(
+    async (action: () => Promise<unknown>): Promise<SubmissionResult> => {
+      if (busy.current) return SubmissionResult.Skipped;
+      busy.current = true;
+      const mine = opening.current;
+      setPending(true);
+      // A retry removes the notice of the previous failure.
+      setError(undefined);
+      try {
+        await action();
+        return mine === opening.current
+          ? SubmissionResult.Succeeded
+          : SubmissionResult.Stale;
+      } catch (e) {
+        if (mine !== opening.current) return SubmissionResult.Stale;
+        setError(e);
+        return SubmissionResult.Failed;
+      } finally {
+        if (mine === opening.current) {
+          busy.current = false;
+          setPending(false);
+        }
+      }
+    },
+    [],
+  );
+  return { error, pending, clearError, submit };
 }
 
 /**
@@ -105,20 +270,12 @@ export function ConfirmDialog({
   onConfirm: () => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [error, setError] = useState<unknown>();
-  const [wasOpen, setWasOpen] = useState(open);
-  if (open !== wasOpen) {
-    // Adjust state while rendering: every time the dialog opens again it
-    // starts without the notice of an earlier failure, including a failure
-    // that arrived after the dialog was already closed.
-    setWasOpen(open);
-    if (open) setError(undefined);
-  }
+  const { error, pending, clearError, submit } = useDialogSubmission(open);
   return (
     <AlertDialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) clearError();
         onOpenChange(next);
       }}
     >
@@ -130,15 +287,10 @@ export function ConfirmDialog({
           <AlertDialogClose>Cancel</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
+            disabled={pending}
             onClick={async () => {
-              // A retry removes the notice of the previous failure.
-              setError(undefined);
-              try {
-                await onConfirm();
-                onOpenChange(false);
-              } catch (e) {
-                setError(e);
-              }
+              const result = await submit(onConfirm);
+              if (result === SubmissionResult.Succeeded) onOpenChange(false);
             }}
           >
             {confirmLabel}
@@ -170,26 +322,16 @@ export function FormDialog({
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
-  const [error, setError] = useState<unknown>();
-  const [pending, setPending] = useState(false);
+  const { error, pending, clearError, submit: run } = useDialogSubmission(open);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (pending) return;
-    setPending(true);
-    setError(undefined);
-    try {
-      await onSubmit();
-    } catch (e) {
-      setError(e);
-    } finally {
-      setPending(false);
-    }
+    await run(onSubmit);
   };
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) clearError();
         onOpenChange(next);
       }}
     >

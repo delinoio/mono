@@ -6,7 +6,12 @@ import { toast } from "delino-ui/toast";
 import { useMemo } from "react";
 import { LIST_PAGE_SIZE } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
-import { Empty, ErrorNotice, Loading } from "../../components/ui.tsx";
+import {
+  Empty,
+  ErrorNotice,
+  Loading,
+  RefetchNotice,
+} from "../../components/ui.tsx";
 import { errorMessage, formatDate, labels } from "../../format.ts";
 import {
   CreditService,
@@ -28,12 +33,15 @@ const invoiceWindow = {
     }
     return {
       navigate(url) {
-        if (opened === null || opened.closed) {
+        if (opened === null) {
           // A blocked pop-up: open the invoice in this tab instead.
           window.location.assign(url);
-        } else {
+        } else if (!opened.closed) {
           opened.location.replace(url);
         }
+        // Otherwise the user closed the blank tab while the link was in
+        // flight. They no longer want the invoice, so discard the link and
+        // leave the billing page where it is.
       },
       close() {
         opened?.close();
@@ -85,9 +93,13 @@ export function InvoicesSection() {
         Paddle is the merchant of record and issues the invoices. Amounts
         exclude tax.
       </p>
+      <RefetchNotice
+        error={invoices.isRefetchError ? invoices.error : undefined}
+        onRetry={() => void invoices.refetch()}
+      />
       {invoices.isPending ? (
         <Loading label="Loading invoices" />
-      ) : invoices.error ? (
+      ) : invoices.isLoadingError ? (
         <ErrorNotice
           error={invoices.error}
           onRetry={() => void invoices.refetch()}

@@ -160,7 +160,7 @@ func New(opts Options) (*App, error) {
 		Timing:                timing,
 	}
 	control := api.NewControl(svc)
-	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Now: opts.Now, Logger: opts.Logger,
+	l := &lease.Lease{DB: opts.DB, InstanceID: opts.InstanceID, Logger: opts.Logger,
 		DeadlineNow: opts.LeaseDeadlineNow, OnAcquire: control.LeaseAcquired, OnLose: control.LeaseLost}
 	svc.Lease = l
 	statuses := billing.NewStatuses(billing.StatusOptions{

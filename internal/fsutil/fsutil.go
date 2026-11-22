@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // CopyTree copies the regular files, directories and symbolic links of src
@@ -174,6 +175,13 @@ func WriteTarContext(ctx context.Context, w io.Writer, dir string) error {
 // operation goes through an os.Root opened on dir, so no entry can read or
 // write outside dir, including through symbolic links that the same archive
 // created earlier; such an entry fails with an error.
+//
+// The lexical link target check cannot see a link that resolves outside dir
+// only because an earlier or later link of the same archive stands for a
+// directory component, such as "a" -> "." followed by "b" -> "a/..". After
+// the last entry, ReadTar therefore resolves every symbolic link that it
+// created through the os.Root again and fails when one leaves dir. A link
+// that resolves to nothing stays allowed.
 func ReadTar(r io.Reader, dir string) error {
 	return ReadTarContext(context.Background(), r, dir)
 }
@@ -188,13 +196,17 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 	}
 	defer root.Close()
 	tr := tar.NewReader(ctxReader{ctx: ctx, r: r})
+	// links holds the names of the symbolic links that the archive created.
+	// A later entry can turn a path component of an earlier link into
+	// another link, so the links are resolved once, after the last entry.
+	var links []string
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return nil
+			return checkLinksConfined(root, links)
 		}
 		if err != nil {
 			return err
@@ -237,10 +249,67 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			if err := root.Symlink(filepath.FromSlash(hdr.Linkname), name); err != nil {
 				return err
 			}
+			links = append(links, name)
 		default:
 			return fmt.Errorf("fsutil: unsupported tar entry type %d", hdr.Typeflag)
 		}
 	}
+}
+
+// checkLinksConfined resolves each symbolic link in links through root and
+// fails when the resolution leaves root or does not finish.
+//
+// confinedLinkTarget cleans ".." elements lexically, as if every component
+// of the target were a real directory. A component can be a link that the
+// same archive created, and the file system then resolves ".." from the
+// link's destination, so a target such as "a/.." with "a" -> "." names the
+// parent of root. os.Root refuses to resolve a path through such a link
+// ("path escapes from parent"), and it reports ELOOP for a chain that is too
+// deep. A link that resolves to nothing, or through a file that is not a
+// directory, is dangling and stays allowed.
+func checkLinksConfined(root *os.Root, links []string) error {
+	for _, name := range links {
+		err := recoverStat(func() (fs.FileInfo, error) { return root.Stat(name) })
+		if err == nil || errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			continue
+		}
+		if errors.Is(err, errRootStatPanic) {
+			return fmt.Errorf("fsutil: tar symbolic link %q cannot be confirmed inside the target directory: %w", name, err)
+		}
+		return fmt.Errorf("fsutil: tar symbolic link %q resolves outside the target directory: %w", name, err)
+	}
+	return nil
+}
+
+// errRootStatPanic marks a panic of os.Root.Stat that recoverStat turned
+// into an error.
+var errRootStatPanic = errors.New("os.Root.Stat panicked")
+
+// recoverStat calls stat, which is os.Root.Stat on one link, and returns a
+// panic of it as an error that wraps errRootStatPanic.
+//
+// Workaround: on Windows, Go 1.26.1 os.Root resolves a symbolic link with
+// rootCleanPath, which cleans the prefix, the link target and the rest of
+// the path lexically. When that result is the path that the walk already
+// opened up to the link, such as "d/x" -> "up/.." or "d/self" -> ".", the new
+// path has no more elements than the walk index, and doInRoot (os/root_openat.go)
+// panics with "index out of range" instead of returning an error. ReadTar
+// must not crash on archive content, so the panic becomes an error, and
+// checkLinksConfined then fails the archive: it fails closed, which also
+// rejects such a link that stays inside the root. The panic happens only on
+// Windows; on other systems recoverStat returns the result of stat
+// unchanged. Remove recoverStat when go.mod requires a Go version in which
+// os.Root.Stat returns a result or an error for such a link on Windows. The
+// doInRoot source of Go 1.27.4 still compares len(newparts) < i without the
+// equal case.
+func recoverStat(stat func() (fs.FileInfo, error)) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", errRootStatPanic, r)
+		}
+	}()
+	_, err = stat()
+	return err
 }
 
 // confinedLinkTarget reports whether the symbolic link target linkname of

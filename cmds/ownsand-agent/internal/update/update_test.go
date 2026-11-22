@@ -157,6 +157,11 @@ func TestUpdateRejectsBadReleases(t *testing.T) {
 	r := newRelease(t, nil)
 	u, _, _ := newUpdater(t, r, "1.0.0", busy, []ed25519.PublicKey{}...)
 	u.opts.Keys = nil
+	// The agent has a built-in release key; remove it for this case, which
+	// covers an agent with neither a built-in nor a configured key.
+	builtin := BuiltinKeys
+	BuiltinKeys = nil
+	t.Cleanup(func() { BuiltinKeys = builtin })
 	if err := update(u, "1.1.0", false); !errors.Is(err, ErrNoKeys) {
 		t.Fatalf("no keys: %v", err)
 	}
@@ -508,6 +513,9 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 		{"same version", "1.0.0", false, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE},
 		{"failed target", "9.9.9", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
 		{"invalid target", "not-semver", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"zero-padded target", "01.1.0", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"signed target", "+1.1.0", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"empty pre-release target", "1.1.0-", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

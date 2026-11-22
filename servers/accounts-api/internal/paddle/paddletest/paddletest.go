@@ -37,6 +37,9 @@ type Failure struct {
 	// Hang makes the fake wait for the client to give up instead of
 	// answering, which a client sees as an unknown outcome.
 	Hang bool
+	// Truncate answers with the status and the first bytes of a body, then
+	// breaks the connection, so a client fails while it reads the body.
+	Truncate bool
 }
 
 // Server is the fake Paddle API.
@@ -132,6 +135,16 @@ func writeError(w http.ResponseWriter, r *http.Request, f *Failure) {
 	if f.Hang {
 		<-r.Context().Done()
 		return
+	}
+	if f.Truncate {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Length", "1024")
+		w.WriteHeader(f.Status)
+		_, _ = w.Write([]byte("{"))
+		w.(http.Flusher).Flush()
+		// Aborting the handler closes the connection before the declared
+		// length is written; net/http recovers this panic without a log.
+		panic(http.ErrAbortHandler)
 	}
 	writeJSON(w, f.Status, map[string]any{
 		"error": map[string]any{"type": "request_error", "code": f.Code, "detail": "fake failure"},

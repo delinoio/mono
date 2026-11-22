@@ -1,23 +1,26 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
 import { useState } from "react";
-import { invalidateServices, LIST_PAGE_SIZE } from "../../api.ts";
+import { invalidateServices } from "../../api.ts";
 import { useAuth } from "../../auth.tsx";
 import { useBillingAccount } from "../../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
   ErrorNotice,
+  RefetchNotice,
   FormDialog,
   Loading,
+  MorePages,
 } from "../../components/ui.tsx";
 import { checkEmail } from "../../forms.ts";
 import { errorMessage, formatDate, labels } from "../../format.ts";
+import { useAllPages } from "../../paging.ts";
 import {
   type BillingAccountMember,
   BillingAccountRole,
@@ -40,10 +43,12 @@ export function MembersSection() {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
-  const members = useQuery(BillingAccountService.method.listMembers, {
-    billingAccountId,
-    pageSize: LIST_PAGE_SIZE,
-  });
+  const members = useAllPages(
+    BillingAccountService.method.listMembers,
+    { billingAccountId },
+    (page) => ({ items: page.members, nextPageToken: page.nextPageToken }),
+    (m) => m.userId,
+  );
   const updateRole = useMutation(
     BillingAccountService.method.updateMemberRole,
     {
@@ -79,79 +84,84 @@ export function MembersSection() {
             </Button>
           ) : null}
         </div>
+        <RefetchNotice error={members.refreshError} onRetry={members.refetch} />
         {members.isPending ? (
           <Loading label="Loading members" />
         ) : members.error ? (
-          <ErrorNotice
-            error={members.error}
-            onRetry={() => void members.refetch()}
-          />
+          <ErrorNotice error={members.error} onRetry={members.refetch} />
         ) : (
-          <ul className="list" aria-label="Members">
-            {members.data.members.map((m) => {
-              const self = m.userId === userId;
-              const manageable = !self && canManageMember(role, m.role);
-              return (
-                <li key={m.userId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {displayName(m)}
-                      {self ? <span className="muted"> (you)</span> : null}
-                    </span>
-                    <span className="muted">
-                      Joined {formatDate(m.createTime)}
-                    </span>
-                  </div>
-                  {manageable ? (
-                    <div className="list-actions">
-                      <Select
-                        label={`Role of ${displayName(m)}`}
-                        value={String(m.role)}
-                        onValueChange={async (v) => {
-                          if (v === null || Number(v) === m.role) return;
-                          try {
-                            await updateRole.mutateAsync({
-                              billingAccountId,
-                              userId: m.userId,
-                              role: Number(v) as BillingAccountRole,
-                            });
-                            toast.success("The role is changed.");
-                          } catch (error) {
-                            toast.error(errorMessage(error));
-                          }
-                        }}
-                      >
-                        <SelectOption value={String(BillingAccountRole.ADMIN)}>
-                          Admin
-                        </SelectOption>
-                        <SelectOption value={String(BillingAccountRole.VIEWER)}>
-                          Viewer
-                        </SelectOption>
-                      </Select>
-                      {can(role, Permission.TransferOwnership) ? (
-                        <Button
-                          variant={ButtonVariant.Secondary}
-                          size={ButtonSize.Small}
-                          onClick={() => setTransferring(m)}
-                        >
-                          Make owner
-                        </Button>
-                      ) : null}
-                      <Button
-                        variant={ButtonVariant.Danger}
-                        size={ButtonSize.Small}
-                        onClick={() => setRemoving(m)}
-                      >
-                        Remove
-                      </Button>
+          <>
+            <ul className="list" aria-label="Members">
+              {members.items.map((m) => {
+                const self = m.userId === userId;
+                const manageable = !self && canManageMember(role, m.role);
+                return (
+                  <li key={m.userId} className="list-row">
+                    <div className="list-main">
+                      <span className="list-title">
+                        {displayName(m)}
+                        {self ? <span className="muted"> (you)</span> : null}
+                      </span>
+                      <span className="muted">
+                        Joined {formatDate(m.createTime)}
+                      </span>
                     </div>
-                  ) : (
-                    <span className="role">{labels.role[m.role]}</span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+                    {manageable ? (
+                      <div className="list-actions">
+                        <Select
+                          label={`Role of ${displayName(m)}`}
+                          value={String(m.role)}
+                          onValueChange={async (v) => {
+                            if (v === null || Number(v) === m.role) return;
+                            try {
+                              await updateRole.mutateAsync({
+                                billingAccountId,
+                                userId: m.userId,
+                                role: Number(v) as BillingAccountRole,
+                              });
+                              toast.success("The role is changed.");
+                            } catch (error) {
+                              toast.error(errorMessage(error));
+                            }
+                          }}
+                        >
+                          <SelectOption
+                            value={String(BillingAccountRole.ADMIN)}
+                          >
+                            Admin
+                          </SelectOption>
+                          <SelectOption
+                            value={String(BillingAccountRole.VIEWER)}
+                          >
+                            Viewer
+                          </SelectOption>
+                        </Select>
+                        {can(role, Permission.TransferOwnership) ? (
+                          <Button
+                            variant={ButtonVariant.Secondary}
+                            size={ButtonSize.Small}
+                            onClick={() => setTransferring(m)}
+                          >
+                            Make owner
+                          </Button>
+                        ) : null}
+                        <Button
+                          variant={ButtonVariant.Danger}
+                          size={ButtonSize.Small}
+                          onClick={() => setRemoving(m)}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ) : (
+                      <span className="role">{labels.role[m.role]}</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+            <MorePages pages={members} />
+          </>
         )}
       </section>
       {can(role, Permission.ManageMembers) ? <Invitations /> : null}
@@ -207,10 +217,12 @@ function Invitations() {
   const { billingAccountId } = useBillingAccount();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
-  const list = useQuery(BillingAccountService.method.listInvitations, {
-    billingAccountId,
-    pageSize: LIST_PAGE_SIZE,
-  });
+  const list = useAllPages(
+    BillingAccountService.method.listInvitations,
+    { billingAccountId },
+    (page) => ({ items: page.invitations, nextPageToken: page.nextPageToken }),
+    (i) => i.invitationId,
+  );
   const create = useMutation(BillingAccountService.method.createInvitation, {
     onSuccess: refresh,
   });
@@ -243,42 +255,46 @@ function Invitations() {
           Invite by email
         </Button>
       </div>
+      <RefetchNotice error={list.refreshError} onRetry={list.refetch} />
       {list.isPending ? (
         <Loading label="Loading invitations" />
       ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : list.data.invitations.length === 0 ? (
+        <ErrorNotice error={list.error} onRetry={list.refetch} />
+      ) : list.items.length === 0 ? (
         <Empty title="No pending invitations" />
       ) : (
-        <ul className="list" aria-label="Pending invitations">
-          {list.data.invitations.map((i) => (
-            <li key={i.invitationId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">{i.email}</span>
-                <span className="muted">
-                  {labels.role[i.role]} · Expires {formatDate(i.expireTime)}
-                </span>
-              </div>
-              <Button
-                variant={ButtonVariant.Secondary}
-                size={ButtonSize.Small}
-                onClick={async () => {
-                  try {
-                    await revoke.mutateAsync({
-                      billingAccountId,
-                      invitationId: i.invitationId,
-                    });
-                    toast.success("The invitation is revoked.");
-                  } catch (error) {
-                    toast.error(errorMessage(error));
-                  }
-                }}
-              >
-                Revoke
-              </Button>
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="list" aria-label="Pending invitations">
+            {list.items.map((i) => (
+              <li key={i.invitationId} className="list-row">
+                <div className="list-main">
+                  <span className="list-title">{i.email}</span>
+                  <span className="muted">
+                    {labels.role[i.role]} · Expires {formatDate(i.expireTime)}
+                  </span>
+                </div>
+                <Button
+                  variant={ButtonVariant.Secondary}
+                  size={ButtonSize.Small}
+                  onClick={async () => {
+                    try {
+                      await revoke.mutateAsync({
+                        billingAccountId,
+                        invitationId: i.invitationId,
+                      });
+                      toast.success("The invitation is revoked.");
+                    } catch (error) {
+                      toast.error(errorMessage(error));
+                    }
+                  }}
+                >
+                  Revoke
+                </Button>
+              </li>
+            ))}
+          </ul>
+          <MorePages pages={list} />
+        </>
       )}
       <FormDialog
         open={creating}

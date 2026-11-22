@@ -44,6 +44,11 @@ func TestPayoffDebt(t *testing.T) {
 		{-3, 10, 3, 7},
 		{-10, 10, 10, 0},
 		{-25, 10, 10, 0},
+		{math.MinInt64, 10, 10, 0},
+		{math.MinInt64, math.MaxInt64, math.MaxInt64, 0},
+		{math.MinInt64 + 1, math.MaxInt64, math.MaxInt64, 0},
+		{math.MinInt64 + 10, 10, 10, 0},
+		{math.MinInt64 + 2, math.MaxInt64, math.MaxInt64 - 1, 1},
 	} {
 		paid, kept := payoff(tc.balance, tc.amount)
 		if paid != tc.paid || kept != tc.kept {
@@ -214,7 +219,7 @@ func TestServiceAndMeterKeys(t *testing.T) {
 			t.Errorf("ServiceKey(%d) is ok", bad)
 		}
 	}
-	for _, bad := range []string{"", "OWNSAND", "unspecified", "tide"} {
+	for _, bad := range []string{"", "OWNSAND", "unspecified", "tide", "ownſand", "ownsand\u00a0", "ownsand "} {
 		if _, ok := ServiceFromKey(bad); ok {
 			t.Errorf("ServiceFromKey(%q) is ok", bad)
 		}
@@ -237,7 +242,7 @@ func TestServiceAndMeterKeys(t *testing.T) {
 	if _, _, ok := MeterKey(accountsv1.Meter_METER_UNSPECIFIED); ok {
 		t.Error("MeterKey(UNSPECIFIED) is ok")
 	}
-	for _, bad := range []string{"", "ownsand", "ownsand.unknown", "OWNSAND.RELAY_EGRESS", "unspecified."} {
+	for _, bad := range []string{"", "ownsand", "ownsand.unknown", "OWNSAND.RELAY_EGRESS", "unspecified.", "ownſand.relay_egress", "ownsand.relay_egreſs", "ownsand.r2_ſtorage", "ownsand.claſſ_a_rpc", "ownsand.relay_egress.x", ".relay_egress", "ownsand."} {
 		if _, ok := MeterFromKey(bad); ok {
 			t.Errorf("MeterFromKey(%q) is ok", bad)
 		}

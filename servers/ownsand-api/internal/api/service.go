@@ -12,7 +12,10 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
@@ -113,6 +116,11 @@ type Service struct {
 	// Billing is the billing status cache that the gated RPCs and
 	// BillingService read; nil turns billing enforcement off.
 	Billing *billing.Statuses
+
+	// afterConfigLimitsRead is a test hook that sendConfiguration calls after
+	// it read the device limits and before it queues the message. It is nil in
+	// production.
+	afterConfigLimitsRead atomic.Pointer[func(deviceID string)]
 
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID
@@ -346,8 +354,13 @@ func canonicalID(value string) string {
 }
 
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without
-// control characters.
+// control characters (C0, DEL and C1). A name may contain the Unicode
+// replacement character U+FFFD as ordinary text; malformed UTF-8 is a
+// separate error.
 func validateName(field, name string) error {
+	if !utf8.ValidString(name) {
+		return errInvalidf("invalid %s: must be valid UTF-8", field)
+	}
 	if strings.TrimSpace(name) == "" {
 		return errInvalidf("invalid %s: is required", field)
 	}
@@ -355,7 +368,7 @@ func validateName(field, name string) error {
 		return errInvalidf("invalid %s: must be at most %d bytes", field, maxNameLength)
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f || r == 0xfffd {
+		if unicode.IsControl(r) {
 			return errInvalidf("invalid %s: must not contain control characters", field)
 		}
 	}
@@ -410,6 +423,31 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 		return p, 0, nil
 	}
 	return p, 0, errPermission("this credential is not accepted here")
+}
+
+// reauthorize repeats authorize for a caller that a data path RPC already
+// registered as a pending session or grant. authorize reads the database only
+// for a user; an API key principal comes from the interceptor, which checked
+// the key before the handler registered the call. A revocation event that the
+// lease holder handled between that check and the registration found nothing
+// to end, so for an API key reauthorize reads the key and its organization
+// again and returns unauthenticated when the key is revoked or the
+// organization is gone. A user is checked as in authorize.
+func (s *Service) reauthorize(ctx context.Context, q db.Querier, orgID string, action authz.Action) (auth.Principal, ownsandv1.Role, error) {
+	p, role, err := s.authorize(ctx, q, orgID, action)
+	if err != nil || !p.IsAPIKey() {
+		return p, role, err
+	}
+	var live bool
+	err = q.QueryRow(ctx, `SELECT true FROM api_keys k JOIN organizations o ON o.organization_id = k.organization_id
+		WHERE k.api_key_id = $1 AND k.organization_id = $2 AND k.revoke_time IS NULL`, p.ID, p.OrganizationID).Scan(&live)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return p, 0, errUnauthenticated("invalid API key")
+	}
+	if err != nil {
+		return p, 0, s.internal(ctx, "reload api key", err)
+	}
+	return p, role, nil
 }
 
 // requireUser returns the principal of an RPC without organization_id,

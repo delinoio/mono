@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -414,6 +415,80 @@ func TestLoadRejectsInvalidBillingValues(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsHostlessURLsAndOrigins(t *testing.T) {
+	for name, tc := range map[string]struct{ env, value string }{
+		"issuer https port only":       {EnvLogtoIssuer, "https://:443/oidc"},
+		"issuer http port only":        {EnvLogtoIssuer, "http://:80"},
+		"management port only":         {EnvLogtoManagementEndpoint, "https://:443"},
+		"cors port only":               {EnvCORSOrigins, "https://:443"},
+		"cors port only in a list":     {EnvCORSOrigins, "https://accounts.delino.io, https://:443"},
+		"web origin port only":         {EnvWebOrigin, "https://:443"},
+		"web origin http port only":    {EnvWebOrigin, "http://:80"},
+		"cors empty bracketed address": {EnvCORSOrigins, "http://[]:80"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load(lookupFrom(map[string]string{tc.env: tc.value}))
+			if err == nil {
+				t.Fatal("Load() error = nil, want an error")
+			}
+			if !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("error %q does not name %s", err, tc.env)
+			}
+			if strings.Contains(err.Error(), ":443") || strings.Contains(err.Error(), ":80") {
+				t.Errorf("error %q contains the value", err)
+			}
+		})
+	}
+}
+
+func TestLoadKeepsLoopbackAndIPv6Hosts(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvCORSOrigins: "http://127.0.0.1:13100,http://[::1]:80",
+		EnvWebOrigin:   "http://[::1]:13100",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if want := []string{"http://127.0.0.1:13100", "http://[::1]"}; !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	if cfg.WebOrigin != "http://[::1]:13100" {
+		t.Errorf("WebOrigin = %q", cfg.WebOrigin)
+	}
+}
+
+func TestLoadCanonicalizesOrigins(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvCORSOrigins: "HTTPS://Accounts.Delino.IO:443, http://Accounts.Delino.Localhost:80, https://accounts.delino.io:8443, http://localhost:443, https://[2001:DB8::1]:443",
+		EnvWebOrigin:   "HTTPS://Accounts.Delino.IO:443",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{
+		"https://accounts.delino.io",
+		"http://accounts.delino.localhost",
+		"https://accounts.delino.io:8443",
+		"http://localhost:443",
+		"https://[2001:db8::1]",
+	}
+	if !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	if cfg.WebOrigin != "https://accounts.delino.io" {
+		t.Errorf("WebOrigin = %q, want %q", cfg.WebOrigin, "https://accounts.delino.io")
+	}
+}
+
+func TestLoadRejectsInvalidOriginPorts(t *testing.T) {
+	for _, value := range []string{"https://accounts.delino.io:99999", "https://accounts.delino.io:port"} {
+		_, err := Load(lookupFrom(map[string]string{EnvCORSOrigins: value}))
+		if err == nil || !strings.Contains(err.Error(), EnvCORSOrigins) {
+			t.Errorf("CORS_ORIGINS=%q: err = %v, want an error that names %s", value, err, EnvCORSOrigins)
+		}
+	}
+}
+
 func TestLoadErrorsDoNotContainSecrets(t *testing.T) {
 	_, err := Load(lookupFrom(map[string]string{EnvLogtoIssuer: "https://user:hunter2@tenant.logto.app/oidc"}))
 	if err == nil {
@@ -486,10 +561,16 @@ func TestUsageServiceClients(t *testing.T) {
 	if got := fmt.Sprint(cfg.UsageServiceClients); got != "map[app1:[SERVICE_ID_OWNSAND] app2:[SERVICE_ID_OWNSAND]]" {
 		t.Errorf("UsageServiceClients = %s", got)
 	}
-	for _, value := range []string{"app1", "=ownsand", "app1=", "app1=OWNSAND", "app1=unspecified", "app1=tide", "app 1=ownsand", "app1=ownsand=x"} {
+	for _, value := range []string{"app1", "=ownsand", "app1=", "app1=OWNSAND", "app1=unspecified", "app1=tide", "app 1=ownsand", "app1=ownsand=x", "app1=ownſand", "app1=ownſAND", "app1=ownsand\u00a0", "app1=ownsand,app2=ownſand"} {
 		if _, err := Load(lookupFrom(map[string]string{EnvUsageServiceClients: value})); err == nil ||
 			!strings.Contains(err.Error(), EnvUsageServiceClients) {
 			t.Errorf("Load(%q) error = %v, want an error that names %s", value, err, EnvUsageServiceClients)
 		}
+	}
+	// U+017F (long s) is folded to "S" by strings.ToUpper and must not
+	// resolve to the ownsand service.
+	_, err = Load(lookupFrom(map[string]string{EnvUsageServiceClients: "app1=ownſand"}))
+	if want := `USAGE_SERVICE_CLIENTS names an unknown service "ownſand"`; err == nil || err.Error() != want {
+		t.Errorf("Load(long s) error = %v, want %q", err, want)
 	}
 }

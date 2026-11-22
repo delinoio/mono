@@ -1,29 +1,38 @@
 // SPDX-License-Identifier: Apache-2.0
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Badge } from "delino-ui/badge";
 import { Button } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
 import { useState } from "react";
-import { invalidateServices, LIST_PAGE_SIZE } from "../api.ts";
+import { invalidateServices } from "../api.ts";
 import { Page } from "../components/shell.tsx";
 import {
   Empty,
   ErrorNotice,
   FormDialog,
   Loading,
+  MorePages,
   PageHeader,
+  RefetchNotice,
 } from "../components/ui.tsx";
 import { checkAccountName } from "../forms.ts";
+import { useAllPages } from "../paging.ts";
 import { labels } from "../format.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /** Route `billing`: the caller's billing accounts and account creation. */
 export function BillingAccountsPage() {
-  const accounts = useQuery(BillingAccountService.method.listBillingAccounts, {
-    pageSize: LIST_PAGE_SIZE,
-  });
+  const accounts = useAllPages(
+    BillingAccountService.method.listBillingAccounts,
+    {},
+    (page) => ({
+      items: page.billingAccounts,
+      nextPageToken: page.nextPageToken,
+    }),
+    (account) => account.billingAccountId,
+  );
   const [creating, setCreating] = useState(false);
   return (
     <Page narrow>
@@ -36,35 +45,36 @@ export function BillingAccountsPage() {
           </Button>
         }
       />
+      <RefetchNotice error={accounts.refreshError} onRetry={accounts.refetch} />
       {accounts.isPending ? (
         <Loading label="Loading billing accounts" />
       ) : accounts.error ? (
-        <ErrorNotice
-          error={accounts.error}
-          onRetry={() => void accounts.refetch()}
-        />
-      ) : accounts.data.billingAccounts.length === 0 ? (
+        <ErrorNotice error={accounts.error} onRetry={accounts.refetch} />
+      ) : accounts.items.length === 0 ? (
         <Empty title="No billing accounts yet">
           Create one to pay for Delino services, or accept an invitation from a
           billing account owner.
         </Empty>
       ) : (
-        <ul className="list" aria-label="Billing accounts">
-          {accounts.data.billingAccounts.map((account) => (
-            <li key={account.billingAccountId} className="list-row">
-              <Link
-                to={routePath({
-                  id: RouteId.BillingAccount,
-                  billingAccountId: account.billingAccountId,
-                })}
-                className="list-link"
-              >
-                <span className="list-title">{account.name}</span>
-                <Badge>{labels.role[account.callerRole]}</Badge>
-              </Link>
-            </li>
-          ))}
-        </ul>
+        <>
+          <ul className="list" aria-label="Billing accounts">
+            {accounts.items.map((account) => (
+              <li key={account.billingAccountId} className="list-row">
+                <Link
+                  to={routePath({
+                    id: RouteId.BillingAccount,
+                    billingAccountId: account.billingAccountId,
+                  })}
+                  className="list-link"
+                >
+                  <span className="list-title">{account.name}</span>
+                  <Badge>{labels.role[account.callerRole]}</Badge>
+                </Link>
+              </li>
+            ))}
+          </ul>
+          <MorePages pages={accounts} />
+        </>
       )}
       <CreateBillingAccountDialog open={creating} onOpenChange={setCreating} />
     </Page>

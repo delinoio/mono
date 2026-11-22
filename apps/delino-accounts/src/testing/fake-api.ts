@@ -49,7 +49,7 @@ export const INVITATION_TOKEN = "bai_valid-token";
 const T0 = new Date("2026-11-01T00:00:00Z");
 const ts = (date: Date = T0) => timestampFromDate(date);
 
-interface FakeAccount {
+export interface FakeAccount {
   id: string;
   name: string;
   deleted: boolean;
@@ -88,9 +88,14 @@ export interface FakeApi {
   /** Fails the next call of a method with the given error once. */
   failNext: Map<string, ConnectError>;
   /**
+   * Fails the next call of a method that carries a `page_token` (a
+   * continuation page, never the first page) with the given error once.
+   */
+  failContinuation: Map<string, ConnectError>;
+  /**
    * Holds every call of a method until the promise settles, so that a test
    * can observe what the page does while a request is still in flight. Only
-   * `GetBillingAccount` honors a gate.
+   * `GetBillingAccount` and `GetInvoiceUrl` honor a gate.
    */
   gates: Map<string, Promise<unknown>>;
   transport: ReturnType<typeof createRouterTransport>;
@@ -262,6 +267,7 @@ export function createFakeApi(): FakeApi {
     ]),
     calls: [] as Call[],
     failNext: new Map<string, ConnectError>(),
+    failContinuation: new Map<string, ConnectError>(),
     gates: new Map<string, Promise<unknown>>(),
   } as FakeApi;
   let nextId = 100;
@@ -270,11 +276,42 @@ export function createFakeApi(): FakeApi {
 
   const record = (method: string, request: object) => {
     api.calls.push({ method, request: { ...request } });
+    const continuation = api.failContinuation.get(method);
+    if (
+      continuation !== undefined &&
+      "pageToken" in request &&
+      request.pageToken !== ""
+    ) {
+      api.failContinuation.delete(method);
+      throw continuation;
+    }
     const failure = api.failNext.get(method);
     if (failure !== undefined) {
       api.failNext.delete(method);
       throw failure;
     }
+  };
+  /**
+   * Serves one page of a list like the server: at most `pageSize` items and
+   * a `next_page_token` that is empty on the last page. A token is `p<n>`,
+   * the index of the page. Only ListBillingAccounts, ListMembers,
+   * ListInvitations and ListLinkedOrganizations page; every other list
+   * returns all of its items.
+   */
+  const paginate = <T>(
+    items: T[],
+    req: { pageSize: number; pageToken: string },
+  ): { page: T[]; nextPageToken: string } => {
+    const size = req.pageSize > 0 ? Math.min(req.pageSize, 200) : 50;
+    const index = req.pageToken === "" ? 0 : Number(req.pageToken.slice(1));
+    if (!/^(|p\d+)$/.test(req.pageToken)) {
+      throw new ConnectError("invalid page token", Code.InvalidArgument);
+    }
+    const start = index * size;
+    return {
+      page: items.slice(start, start + size),
+      nextPageToken: start + size < items.length ? `p${index + 1}` : "",
+    };
   };
   const member = (account: FakeAccount) =>
     account.members.find((m) => m.userId === api.userId);
@@ -345,11 +382,13 @@ export function createFakeApi(): FakeApi {
       },
       listBillingAccounts(req) {
         record("ListBillingAccounts", req);
-        return {
-          billingAccounts: [...api.accounts.values()]
+        const { page, nextPageToken } = paginate(
+          [...api.accounts.values()]
             .filter((a) => !a.deleted && member(a) !== undefined)
             .map(view),
-        };
+          req,
+        );
+        return { billingAccounts: page, nextPageToken };
       },
       updateBillingAccount(req) {
         record("UpdateBillingAccount", req);
@@ -391,11 +430,13 @@ export function createFakeApi(): FakeApi {
       listInvitations(req) {
         record("ListInvitations", req);
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
-        return {
-          invitations: account.invitations.filter(
+        const { page, nextPageToken } = paginate(
+          account.invitations.filter(
             (i) => i.state === InvitationState.PENDING,
           ),
-        };
+          req,
+        );
+        return { invitations: page, nextPageToken };
       },
       revokeInvitation(req) {
         record("RevokeInvitation", req);
@@ -435,7 +476,11 @@ export function createFakeApi(): FakeApi {
       },
       listMembers(req) {
         record("ListMembers", req);
-        return { members: load(req.billingAccountId).account.members };
+        const { page, nextPageToken } = paginate(
+          load(req.billingAccountId).account.members,
+          req,
+        );
+        return { members: page, nextPageToken };
       },
       updateMemberRole(req) {
         record("UpdateMemberRole", req);
@@ -561,8 +606,9 @@ export function createFakeApi(): FakeApi {
           invoices: load(req.billingAccountId, PAYMENT_ROLES).account.invoices,
         };
       },
-      getInvoiceUrl(req) {
+      async getInvoiceUrl(req) {
         record("GetInvoiceUrl", req);
+        await api.gates.get("GetInvoiceUrl");
         load(req.billingAccountId, PAYMENT_ROLES);
         return {
           invoiceUrl: `https://sandbox-invoice.paddle.test/${req.paddleTransactionId}.pdf`,
@@ -572,9 +618,11 @@ export function createFakeApi(): FakeApi {
     service(BillingUsageService, {
       listLinkedOrganizations(req) {
         record("ListLinkedOrganizations", req);
-        return {
-          linkedOrganizations: load(req.billingAccountId).account.linked,
-        };
+        const { page, nextPageToken } = paginate(
+          load(req.billingAccountId).account.linked,
+          req,
+        );
+        return { linkedOrganizations: page, nextPageToken };
       },
       listUsageSummary(req) {
         record("ListUsageSummary", req);
@@ -597,4 +645,87 @@ export function createFakeApi(): FakeApi {
     });
   });
   return api;
+}
+
+/** The numbered id and name that the list helpers below generate. */
+export const numbered = (n: number) => String(n).padStart(4, "0");
+
+/**
+ * Adds billing accounts that the signed-in user owns, named `Account 0001`
+ * and so on, after the seeded account. They hold no members, invitations or
+ * linked organizations beyond their owner.
+ */
+export function addBillingAccounts(api: FakeApi, count: number) {
+  for (let n = 1; n <= count; n++) {
+    const id = `0193a1b2-0001-7000-8000-${String(n).padStart(12, "0")}`;
+    api.accounts.set(id, {
+      ...seedAccount(),
+      id,
+      name: `Account ${numbered(n)}`,
+      members: [
+        {
+          billingAccountId: id,
+          userId: OWNER,
+          role: BillingAccountRole.OWNER,
+          displayName: "Olivia Owner",
+          createTime: ts(),
+        },
+      ],
+      invitations: [],
+      linked: [],
+    });
+  }
+}
+
+/** Adds viewers named `Member 0001` and so on to the account. */
+export function addMembers(account: FakeAccount, count: number) {
+  for (let n = 1; n <= count; n++) {
+    account.members.push({
+      billingAccountId: account.id,
+      userId: `user-${numbered(n)}`,
+      role: BillingAccountRole.VIEWER,
+      displayName: `Member ${numbered(n)}`,
+      createTime: ts(),
+    });
+  }
+}
+
+/** Adds pending invitations for `invitee-0001@example.com` and so on. */
+export function addInvitations(account: FakeAccount, count: number) {
+  for (let n = 1; n <= count; n++) {
+    account.invitations.push({
+      invitationId: `0193a1b2-0002-7000-8000-${String(n).padStart(12, "0")}`,
+      billingAccountId: account.id,
+      email: `invitee-${numbered(n)}@example.com`,
+      role: BillingAccountRole.VIEWER,
+      state: InvitationState.PENDING,
+      inviterUserId: OWNER,
+      createTime: ts(),
+      expireTime: ts(new Date("2026-11-08T00:00:00Z")),
+    });
+  }
+}
+
+/** Adds linked organizations named `<prefix> 0001` and so on. */
+export function addLinkedOrganizations(
+  account: FakeAccount,
+  count: number,
+  prefix = "Org",
+) {
+  for (let n = 1; n <= count; n++) {
+    account.linked.push({
+      service: ServiceId.OWNSAND,
+      organizationId: `${prefix.toLowerCase()}-${numbered(n)}`,
+      organizationName: `${prefix} ${numbered(n)}`,
+      linkTime: ts(),
+      status: create(OrganizationBillingStatusSchema, {
+        service: ServiceId.OWNSAND,
+        organizationId: `${prefix.toLowerCase()}-${numbered(n)}`,
+        billingAccountId: account.id,
+        status: BillingStatus.ALLOWED,
+        reason: BillingStatusReason.NONE,
+        sequence: 1n,
+      }),
+    });
+  }
 }

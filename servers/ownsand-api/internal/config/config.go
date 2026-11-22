@@ -16,6 +16,7 @@ import (
 	pionstun "github.com/pion/stun/v3"
 
 	"github.com/delinoio/mono/servers/internal/listenaddr"
+	"github.com/delinoio/mono/servers/internal/weborigin"
 )
 
 // Environment variable names read by the server.
@@ -66,6 +67,15 @@ const (
 	// per second sustained with a burst of about 100.
 	DefaultSTUNRateBytesPerSecond = 1024
 	DefaultSTUNRateBurstBytes     = 4096
+	// MinSTUNRateBurstBytes is the smallest accepted STUN_RATE_LIMIT_BURST_BYTES.
+	// The limiter drops a response that is larger than the whole burst, so a
+	// smaller burst silently turns the server into one that never answers.
+	// A STUN message is a 20-byte header plus attributes. The 8-byte
+	// FINGERPRINT is always present; the largest success response adds the
+	// 24-byte IPv6 XOR-MAPPED-ADDRESS (52 bytes), and the smallest 420 error
+	// response (one unknown attribute) is 64 bytes. 64 bytes therefore admits
+	// every response that the server can build for a binding request.
+	MinSTUNRateBurstBytes = 64
 	// DefaultAccountsAPIOrigin is the production origin of the delino-accounts
 	// API.
 	DefaultAccountsAPIOrigin = "https://accounts.api.delino.io"
@@ -302,12 +312,20 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		cfg.CORSOrigins = nil
 		for _, origin := range splitList(v) {
 			u, err := url.Parse(origin)
-			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.Path != "" || u.RawQuery != "" ||
+			if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.Path != "" || u.RawQuery != "" ||
+				// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, and user information is not part of an origin.
+				u.ForceQuery || u.User != nil ||
 				// A bare "#" leaves u.Fragment empty, so check the raw value too. Browsers never send a fragment in Origin.
 				u.Fragment != "" || strings.Contains(origin, "#") {
 				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
 			}
-			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)
+			// Store the form that a browser sends in the Origin header (lower-case host, no
+			// default port), because the CORS middleware matches the header exactly.
+			canonical, ok := weborigin.Canonical(u)
+			if !ok {
+				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
+			}
+			cfg.CORSOrigins = append(cfg.CORSOrigins, canonical)
 		}
 	}
 	if v := get(EnvTrustProxyClientAddress); v != "" {
@@ -375,6 +393,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	if cfg.STUNRateBurstBytes, err2 = positiveInt(EnvSTUNRateBurstBytes, get(EnvSTUNRateBurstBytes), DefaultSTUNRateBurstBytes); err2 != nil {
 		return Config{}, err2
 	}
+	if cfg.STUNRateBurstBytes < MinSTUNRateBurstBytes {
+		return Config{}, fmt.Errorf("%s must be at least %d bytes", EnvSTUNRateBurstBytes, MinSTUNRateBurstBytes)
+	}
 
 	cfg.Accounts = Accounts{
 		APIOrigin:     DefaultAccountsAPIOrigin,
@@ -384,7 +405,7 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvAccountsAPIOrigin); v != "" {
 		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
 			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
 			u.ForceQuery || u.Fragment != "" || strings.Contains(v, "#") {
 			return Config{}, fmt.Errorf("%s must be an origin such as https://accounts.api.delino.io", EnvAccountsAPIOrigin)
@@ -446,7 +467,7 @@ func parseKey(name, value string) ([]byte, error) {
 
 func validateURL(name, value string) error {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" {
 		return fmt.Errorf("%s must be an http or https URL", name)
 	}
 	return nil

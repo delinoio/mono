@@ -57,10 +57,30 @@ func TestSendWaitsForADrainingWriter(t *testing.T) {
 	conn := h.Register(context.Background(), "device", "org")
 	const total = outboundQueue*3 + 7
 	got := make(chan uint64, total)
+	// The hub does not close the outbound channel when the connection ends,
+	// so the reader must be stopped and joined explicitly. Otherwise it
+	// outlives the test, on a pass and on an early failure alike. got holds
+	// every envelope, so the reader never blocks on it.
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	t.Cleanup(func() {
+		close(stop)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("the outbound reader did not exit after the test")
+		}
+	})
 	go func() {
-		for env := range conn.Outbound() {
-			time.Sleep(100 * time.Microsecond)
-			got <- env.GetHeartbeatAck().GetSequence()
+		defer close(done)
+		for {
+			select {
+			case <-stop:
+				return
+			case env := <-conn.Outbound():
+				time.Sleep(100 * time.Microsecond)
+				got <- env.GetHeartbeatAck().GetSequence()
+			}
 		}
 	}()
 	for i := 0; i < total; i++ {

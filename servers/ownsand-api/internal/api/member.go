@@ -11,6 +11,7 @@ import (
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/protos/delino/ownsand/v1/ownsandv1connect"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
@@ -241,16 +242,24 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		var invID, orgID, orgName string
 		var role int16
 		var stored []byte
-		var orgCreated time.Time
-		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time
+		var orgCreated, expireTime time.Time
+		err = tx.QueryRow(ctx, `SELECT i.invitation_id::text, i.organization_id::text, i.role, i.secret_sha256, o.name, o.create_time, i.expire_time
 			FROM invitations i JOIN organizations o ON o.organization_id = i.organization_id
 			WHERE i.secret_sha256 = $1 AND i.accept_time IS NULL AND i.revoke_time IS NULL AND i.expire_time > $2
-			FOR UPDATE OF i`, hash, h.now()).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated)
+			FOR UPDATE OF i`, hash, h.now()).Scan(&invID, &orgID, &role, &stored, &orgName, &orgCreated, &expireTime)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !auth.HashEqual(stored, hash)) {
 			return errInvitationInvalid()
 		}
 		if err != nil {
 			return err
+		}
+		// The expiry predicate above binds a timestamp taken before the wait
+		// for the row lock, so an invitation can expire while the statement
+		// waits. Compare again with the time after the lock and before any
+		// write.
+		now := h.now()
+		if !now.Before(expireTime) {
+			return errInvitationInvalid()
 		}
 		setRPCOrganization(ctx, orgID)
 		var exists bool
@@ -260,7 +269,6 @@ func (h MemberHandler) AcceptInvitation(ctx context.Context, req *connect.Reques
 		if exists {
 			return errAlreadyExists("the caller is already a member of the organization")
 		}
-		now := h.now()
 		membershipID := newID()
 		// Two concurrent acceptances by the same user can both pass the
 		// existence check above. ON CONFLICT turns the loser's unique
@@ -375,6 +383,9 @@ func (h MemberHandler) UpdateMemberRole(ctx context.Context, req *connect.Reques
 		if target == "" {
 			return errInvalidf("invalid user_id: is required")
 		}
+		if err := validate.NoNUL("user_id", target); err != nil {
+			return errInvalid(err)
+		}
 		if role != ownsandv1.Role_ROLE_ADMIN && role != ownsandv1.Role_ROLE_MEMBER {
 			return errInvalidf("invalid role: must be ROLE_ADMIN or ROLE_MEMBER; use TransferOwnership for the owner")
 		}
@@ -428,6 +439,9 @@ func (h MemberHandler) RemoveMember(ctx context.Context, req *connect.Request[ow
 		}
 		if target == "" {
 			return errInvalidf("invalid user_id: is required")
+		}
+		if err := validate.NoNUL("user_id", target); err != nil {
+			return errInvalid(err)
 		}
 		membershipID, role, err := loadMembership(ctx, tx, orgID, target)
 		if err != nil {

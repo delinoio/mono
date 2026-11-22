@@ -43,13 +43,12 @@ const (
 type Lease struct {
 	DB         *db.DB
 	InstanceID string
-	// Now stamps the expire_time that the instance writes to the database.
-	Now    func() time.Time
-	Logger *slog.Logger
+	Logger     *slog.Logger
 	// DeadlineNow is the clock of the local ownership deadline; it defaults
-	// to time.Now. It is separate from Now so that a test can move the
-	// database timestamps (for example, to expire other rows) without
-	// expiring the local ownership, and the reverse.
+	// to time.Now. It never reaches the database: the expire_time that an
+	// instance writes and the expiry that it compares against are both
+	// computed with the database clock, so every instance decides takeover
+	// on one shared time reference.
 	DeadlineNow func() time.Time
 	// OnAcquire runs when the instance gains the lease; OnLose runs when it
 	// loses or releases it. The context of OnAcquire ends at the confirmed
@@ -128,29 +127,57 @@ func (l *Lease) WhileHeld(fn func()) bool {
 	return true
 }
 
-// Wait blocks until the instance holds the lease or ctx ends.
+// Wait blocks until the instance holds the lease or ctx ends. It returns nil
+// only while the ownership period is current: the acquisition channel stays
+// closed after the confirmed expiry until the watcher runs the loss
+// transition, so Wait checks the deadline itself and, in that interval, runs
+// the transition (which installs a fresh channel) instead of returning for an
+// expired acquisition or spinning on the closed channel.
 func (l *Lease) Wait(ctx context.Context) error {
 	l.init()
-	l.mu.Lock()
-	ch := l.acquired
-	l.mu.Unlock()
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		l.mu.Lock()
+		if l.heldLocked() {
+			l.mu.Unlock()
+			return nil
+		}
+		if l.held {
+			// Expired, but the loss is not recorded yet. expireIfDue is
+			// idempotent and serialized with the other transitions.
+			l.mu.Unlock()
+			l.expireIfDue()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			continue
+		}
+		ch := l.acquired
+		l.mu.Unlock()
+		select {
+		case <-ch:
+			// An acquisition closed the channel; loop to confirm that the
+			// period is still current.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
 // TryAcquire takes or renews the lease once and reports whether this
 // instance holds it. It does not change the local ownership state; Run does.
+//
+// The statement uses the database clock (now() is the time of the statement's
+// transaction) for the written expire_time and for the expiry check, never an
+// application clock. A wall-clock step of one instance therefore cannot let it
+// take a lease that another instance renewed, or delay its takeover of an
+// abandoned one, and the local ownership deadline (a monotonic reading before
+// the call) stays no later than the expire_time that the database wrote.
 func (l *Lease) TryAcquire(ctx context.Context) (bool, error) {
-	now := l.Now()
 	var holder string
-	err := l.DB.Pool.QueryRow(ctx, `INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, $3)
+	err := l.DB.Pool.QueryRow(ctx, `INSERT INTO instance_leases (lease_name, holder, expire_time) VALUES ($1, $2, now() + make_interval(secs => $3))
 		ON CONFLICT (lease_name) DO UPDATE SET holder = EXCLUDED.holder, expire_time = EXCLUDED.expire_time
-		WHERE instance_leases.holder = EXCLUDED.holder OR instance_leases.expire_time <= $4
-		RETURNING holder`, Name, l.InstanceID, now.Add(TTL), now).Scan(&holder)
+		WHERE instance_leases.holder = EXCLUDED.holder OR instance_leases.expire_time <= now()
+		RETURNING holder`, Name, l.InstanceID, TTL.Seconds()).Scan(&holder)
 	if err != nil {
 		// No row: another instance holds a valid lease.
 		if errors.Is(err, pgx.ErrNoRows) {

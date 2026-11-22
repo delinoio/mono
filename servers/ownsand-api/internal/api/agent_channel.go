@@ -64,8 +64,9 @@ var errDeviceRemoved = errors.New("the device was removed")
 // back the device state. The handler cannot return while the send is
 // active: returning would finish the response writer under the blocked
 // send, which is a data race and a panic in net/http. The handler instead
-// aborts the blocked write (see abortStalledWrite) and then waits for the
-// writer to end.
+// aborts the blocked write (see abortStalledWrite) right after the drain
+// timeout, before the device state update, so a delayed update does not
+// keep the blocked write. It then waits for the writer to end.
 const DefaultWriterDrainTimeout = 5 * time.Second
 
 // streamControlKey is the context key of the response controller of the
@@ -223,9 +224,27 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		// this call (and is marked) or sees the closed channel (and starts
 		// the expiry itself).
 		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.now())
+		stalled := false
 		select {
 		case <-writerDone:
 		case <-time.After(h.writerDrainTimeout()):
+			select {
+			case <-writerDone:
+			default:
+				stalled = true
+			}
+		}
+		if stalled {
+			// Abort the blocked transport write before the device state
+			// changes: markOffline waits on the device row lock without a
+			// bound, and a blocked writer must not stay until it returns.
+			// The send returns an error once the stream is reset. When the
+			// abort is not possible, the wait for the writer below lasts
+			// until the transport ends the stream (the agent disconnects).
+			log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_stalled", slog.String("cause", fmt.Sprint(context.Cause(conn.Context()))))
+			if err := abortStalledWrite(ctx); err != nil {
+				log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_abort_failed", slog.Any("error", err))
+			}
 		}
 		current := h.Hub.Unregister(conn)
 		cause := context.Cause(conn.Context())
@@ -234,17 +253,9 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		if current {
 			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
 		}
-		select {
-		case <-writerDone:
-		default:
-			log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_stalled", slog.String("cause", fmt.Sprint(cause)))
-			// Abort the blocked transport write, then wait: the send returns
-			// an error once the stream is reset, so the wait ends. When the
-			// abort is not possible, the wait lasts until the transport ends
-			// the stream (the agent disconnects).
-			if err := abortStalledWrite(ctx); err != nil {
-				log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_abort_failed", slog.Any("error", err))
-			}
+		if stalled {
+			// The handler cannot return while the send is active: returning
+			// would finish the response writer under the blocked send.
 			<-writerDone
 			log.InfoContext(context.WithoutCancel(ctx), "agent_channel_writer_ended")
 		}
@@ -339,9 +350,17 @@ func (s *Service) deviceLimits(ctx context.Context, deviceID string) (*ownsandv1
 	return &l, err
 }
 
-// sendConfiguration sends the STUN URLs and the device limits.
+// sendConfiguration sends the STUN URLs and the device limits. The channel
+// handler and the control event processor both call it for one channel; the
+// per-channel configuration lock makes the read of the limits and the queueing
+// of the message one step, so the message that is queued last always carries
+// the newest committed limits.
 func (s *Service) sendConfiguration(ctx context.Context, conn *hub.Conn) error {
+	defer conn.LockConfig()()
 	limits, err := s.deviceLimits(ctx, conn.DeviceID)
+	if hook := s.afterConfigLimitsRead.Load(); hook != nil && err == nil {
+		(*hook)(conn.DeviceID)
+	}
 	if err != nil {
 		s.Logger.WarnContext(ctx, "device_limits_load_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
 		conn.Close(err)
@@ -462,7 +481,9 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 		return err
 	}
 	if res.applied {
-		s.watch.fire(e.GetSandboxId())
+		// Watchers are keyed by the lowercase canonical ID, so an agent's
+		// uppercase spelling must not skip them.
+		s.watch.fire(canonicalUUID(e.GetSandboxId()))
 	}
 	// The server acknowledges every update, also a stale retry that it did
 	// not apply, so the agent stops resending it.
@@ -480,13 +501,14 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // handleCommandResult applies the effect of a command result and hands it
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
-	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
+	info, outcome := s.commands.take(res.GetCommandId(), conn.DeviceID, s.now(), s.commandGrace())
 	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
-	if !ok {
+	switch outcome {
+	case takeUnknown:
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
-	}
-	if info.deviceID != conn.DeviceID {
+	case takeWrongDevice:
+		// The record stays for the device that the command was sent to.
 		log.WarnContext(ctx, "agent_command_result_wrong_device")
 		return
 	}
@@ -515,7 +537,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 		err = s.applyExportResultWithRetry(ctx, conn, info, res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
-			_, err = s.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)
+			err = s.registerImportedCopy(ctx, conn, info, log)
 		}
 	}
 	if err != nil {
@@ -524,13 +546,52 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	s.Hub.Commands.Deliver(res.GetCommandId(), res)
 }
 
+// registerImportedCopy records the local copy that a successful import
+// result reports. The parent snapshot row is locked FOR SHARE while the
+// copy row is inserted, which conflicts with the FOR UPDATE lock that every
+// snapshot deletion takes before it lists the holders of the snapshot, so
+// the two orders are consistent: when the result commits first, the
+// deletion reads the copy row and includes the importer in its fanout, and
+// when the deletion commits first, the snapshot is absent here, no row is
+// written and the importer is sent the delete command itself, because the
+// deletion's fanout could not know a device that had not reported its copy
+// yet. The command is sent after the transaction ended, so no database
+// lock is held while the channel is written.
+func (s *Service) registerImportedCopy(ctx context.Context, conn *hub.Conn, info commandInfo, log *slog.Logger) error {
+	present := false
+	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		var one int
+		err := tx.QueryRow(ctx, "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR SHARE", info.snapshotID).Scan(&one)
+		if errors.Is(err, pgx.ErrNoRows) {
+			present = false
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		present = true
+		_, err = tx.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", info.snapshotID, conn.DeviceID)
+		return err
+	})
+	if err != nil {
+		return err
+	}
+	if !present {
+		log.InfoContext(ctx, "snapshot_import_result_late", slog.String("snapshot_id", info.snapshotID))
+		s.sendDeleteSnapshot(ctx, conn, info.orgID, info.snapshotID)
+	}
+	return nil
+}
+
 func (s *Service) applyResultEntry(ctx context.Context, conn *hub.Conn, e *ownsandv1.SandboxStateEntry) error {
 	res, err := s.applySandboxUpdate(ctx, conn.DeviceID, e)
 	if err != nil {
 		return err
 	}
 	if res.applied {
-		s.watch.fire(e.GetSandboxId())
+		// Watchers are keyed by the lowercase canonical ID, so an agent's
+		// uppercase spelling must not skip them.
+		s.watch.fire(canonicalUUID(e.GetSandboxId()))
 	}
 	if res.delete != nil {
 		s.sendDelete(ctx, conn, conn.OrganizationID, *res.delete)
@@ -551,6 +612,11 @@ type updateDecision struct {
 	target string
 	// recovery marks the target as a revocation recovery.
 	recovery bool
+	// pinned marks the target as the version of an organization PIN that is
+	// not a revocation recovery. A pinned target is sent also when it equals
+	// the running version, because the agent may hold a queued update that
+	// the command for the running version drops.
+	pinned bool
 	// withdraw tells the agent to drop a queued update. It is set only under
 	// HOLD when no revocation recovery applies.
 	withdraw bool
@@ -560,9 +626,10 @@ type updateDecision struct {
 // organization policy and the agent releases table. A revoked running or
 // pinned version selects the platform default as a revocation recovery,
 // regardless of HOLD or PIN. A PIN sends the pinned version even when it is
-// lower than the running version. Under FOLLOW_DEFAULT the platform default
-// is a target only when it is strictly newer than the running version, so a
-// default that was rolled back never downgrades a healthy device. HOLD
+// lower than or equal to the running version. Under FOLLOW_DEFAULT the
+// platform default is a target only when it is strictly newer than the
+// running version, so a default that was rolled back never downgrades a
+// healthy device. HOLD
 // sends no target and asks the agent to withdraw an update that it queued
 // earlier.
 func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDecision, error) {
@@ -602,7 +669,7 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 		if pinnedRevoked {
 			return updateDecision{target: def, recovery: true}, nil
 		}
-		return updateDecision{target: policy.GetPinnedVersion()}, nil
+		return updateDecision{target: policy.GetPinnedVersion(), pinned: true}, nil
 	case ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD:
 		return updateDecision{withdraw: true}, nil
 	}
@@ -625,8 +692,11 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 }
 
 // evaluateUpdate sends an update command when the target version differs
-// from the running version and from the last target sent on the channel. It
-// sends the withdrawal of a queued update when the policy is HOLD and no
+// from the last target sent on the channel and, except for a pinned target,
+// from the running version. A pin that equals the running version is sent
+// once per channel and decision, because the agent may hold a queued newer
+// update that the command for its running version drops. The evaluation
+// also sends the withdrawal of a queued update when the policy is HOLD and no
 // revocation recovery applies, once per channel and policy state: also after
 // reconciliation on a new channel, because the agent may still hold an
 // update that an earlier channel queued, and again after a target was sent in
@@ -663,7 +733,7 @@ func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
 	// A revocation recovery is sent even when the same target was sent
 	// before without it, because only a recovery allows a downgrade.
 	sent := fmt.Sprintf("%s/%t", d.target, d.recovery)
-	if d.target == "" || d.target == running || conn.Value(releaseKey{}) == sent {
+	if d.target == "" || (d.target == running && !d.pinned) || conn.Value(releaseKey{}) == sent {
 		return nil
 	}
 	conn.SetValue(releaseKey{}, sent)

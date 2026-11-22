@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -21,9 +22,13 @@ import {
   MAIN_PUSH_EVENT,
   MAIN_REF,
   OutputReason,
+  SCHEDULE_EVENT,
+  e2eWorkspacePackages,
   isMainPush,
+  isScheduledMain,
   main,
   plan,
+  workspacePackageDirs,
   workspaceRoots,
 } from "./plan.mjs";
 
@@ -313,6 +318,10 @@ const WORKSPACE_PACKAGES_KEY = "packages:";
 // selector.
 const WORKSPACE_GLOB_PATTERN =
   /^([^*/\s!.][^*/\s!]*(?:\/[^*/\s!.][^*/\s!]*)*)\/\*$/;
+// A planner-supported single package entry is a plain directory path of one
+// or more segments without a wildcard (such as "cmds/ownsand"). The planner
+// lists these directories in `workspacePackageDirs`.
+const WORKSPACE_DIR_PATTERN = /^([^*/\s!.][^*/\s!]*(?:\/[^*/\s!.][^*/\s!]*)*)$/;
 
 // Returns the workspace roots listed in the `packages:` block of a
 // pnpm-workspace.yaml text. Accepts the valid YAML spellings of a list entry
@@ -320,6 +329,12 @@ const WORKSPACE_GLOB_PATTERN =
 // not a "<root>/*" glob throws instead of being skipped, so the cross-check
 // below cannot pass while the manifest and `workspaceRoots` differ.
 function workspaceGlobRoots(manifest) {
+  return workspaceEntries(manifest).roots;
+}
+
+// Returns the "<root>/*" roots and the single package directories of the
+// `packages:` block.
+function workspaceEntries(manifest) {
   const lines = manifest.split("\n");
   const start = lines.findIndex(
     (line) => line.trimEnd() === WORKSPACE_PACKAGES_KEY,
@@ -330,6 +345,7 @@ function workspaceGlobRoots(manifest) {
     `${WORKSPACE_MANIFEST_NAME} has no packages block`,
   );
   const roots = [];
+  const dirs = [];
   for (const line of lines.slice(start + 1)) {
     // Blank and comment-only lines, at any indentation, do not end the block.
     if (/^\s*(#.*)?$/.test(line)) {
@@ -348,24 +364,27 @@ function workspaceGlobRoots(manifest) {
       entry = quoted[2];
     }
     const globMatch = entry.match(WORKSPACE_GLOB_PATTERN);
-    if (!globMatch) {
+    const dirMatch = entry.match(WORKSPACE_DIR_PATTERN);
+    if (globMatch) {
+      roots.push(globMatch[1]);
+    } else if (dirMatch) {
+      dirs.push(dirMatch[1]);
+    } else {
       throw new Error(
         `unsupported ${WORKSPACE_MANIFEST_NAME} workspace entry: ${entry}`,
       );
     }
-    roots.push(globMatch[1]);
   }
   if (roots.length === 0) {
     throw new Error(`${WORKSPACE_MANIFEST_NAME} packages block has no entries`);
   }
-  return roots;
+  return { roots, dirs };
 }
 
 function sortedWorkspaceRootsMatch(manifest) {
-  assert.deepEqual(
-    [...workspaceRoots].sort(),
-    workspaceGlobRoots(manifest).sort(),
-  );
+  const entries = workspaceEntries(manifest);
+  assert.deepEqual([...workspaceRoots].sort(), entries.roots.sort());
+  assert.deepEqual([...workspacePackageDirs].sort(), entries.dirs.sort());
 }
 
 test("workspace manifest roots match pnpm-workspace.yaml", () => {
@@ -394,8 +413,9 @@ test("workspace glob parser fails closed on unsupported entries", async (t) => {
   for (const entry of [
     "packages/**",
     "'!excluded/*'",
-    "apps/a",
     "./apps/*",
+    "./cmds/a",
+    "cmds/*/a",
     "protos/*/x/*",
     "protos/./x/*",
   ]) {
@@ -437,6 +457,48 @@ test("workspace roots cross-check detects a root after a column-zero comment", (
       ),
     assert.AssertionError,
   );
+});
+
+test("workspace parser reads single package directories", () => {
+  assert.deepEqual(
+    workspaceEntries(
+      "packages:\n  - apps/*\n  - cmds/ownsand\n  - 'cmds/ownsand-agent' # note\n",
+    ),
+    { roots: ["apps"], dirs: ["cmds/ownsand", "cmds/ownsand-agent"] },
+  );
+});
+
+test("workspace cross-check detects an extra single package directory", () => {
+  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  assert.throws(
+    () => sortedWorkspaceRootsMatch(`${current.trimEnd()}\n  - cmds/other\n`),
+    assert.AssertionError,
+  );
+});
+
+test("single workspace packages declare no package tasks", () => {
+  // The planner treats only their manifests as workspace inputs, so a
+  // package task there would not run when its Go source changes.
+  for (const dir of workspacePackageDirs) {
+    const manifest = JSON.parse(
+      readFileSync(join(root, dir, "package.json"), "utf8"),
+    );
+    assert.equal(manifest.private, true, `${dir} must be private`);
+    assert.equal(manifest.scripts, undefined, `${dir} must declare no scripts`);
+  }
+});
+
+test("single workspace package manifests select workspace and fixture checks", (t) => {
+  const f = fixture(t);
+  f.write("cmds/ownsand-agent/package.json");
+  let result = plan(f.cwd, f.base, f.commit());
+  assert.equal(result.workspace, true);
+  assert.equal(result.fixtures, true);
+  f.write("cmds/ownsand-agent/main.go");
+  const base = f.commit();
+  f.write("cmds/ownsand-agent/main.go", "package main // changed\n");
+  result = plan(f.cwd, base, f.commit());
+  assert.equal(result.workspace, false);
 });
 
 test("workspace glob parser rejects an empty packages block", () => {
@@ -492,6 +554,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "servers/ownsand-api/internal/db/migrations/0001_initial.sql",
     "servers/accounts-api/internal/db/migrations/00001_billing_accounts.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
+    "servers/ownsand-api/scripts/dev.mjs",
     "go/example/testdata/case.golden",
     "cmds/example/internal/testdata/input.json",
     "internal/example/testdata/input.txt",
@@ -516,11 +579,24 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("apps/delino-accounts/src/App.tsx");
   f.write("rstest.config.ts");
   f.write("servers/ownsand-api/README.md");
+  // Only the ownsand-api launcher is a Go input: its test runs against a
+  // Go-built server. The launcher test and the accounts-api launcher are not.
+  f.write("servers/ownsand-api/scripts/dev.test.mjs");
+  f.write("servers/accounts-api/scripts/dev.mjs");
   f.write(".github/workflows/deploy.yml");
   f.write("docs/testdata/example.json");
   f.write("go/example/mytestdata/example.json");
   f.write("go/example/testdata.json");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
+});
+
+test("the ownsand-api launcher selects the Go checks and the workspace jobs", (t) => {
+  const f = fixture(t);
+  f.write("servers/ownsand-api/scripts/dev.mjs");
+  const selected = plan(f.cwd, f.base, f.commit());
+  assert.equal(selected.go, true);
+  assert.equal(selected.workspace, true);
+  assert.equal(selected.e2e, false);
 });
 
 test("The relay request digest vectors select Go checks and workspace jobs", (t) => {
@@ -583,6 +659,12 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
     "apps/delino-accounts/src/App.tsx",
     "apps/delino-docs/docs/guide/introduction.md",
     "apps/delino-site/e2e.config.ts",
+    "packages/delino-ui/src/dialog.tsx",
+    "packages/delino-ui/package.json",
+    "protos/delino/ownsand/v1/common_pb.ts",
+    "protos/delino/ownsand/package.json",
+    "protos/delino/accounts/v1/credit_pb.ts",
+    "protos/delino/accounts/package.json",
     ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
@@ -600,7 +682,47 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
   f.write("apps/AGENTS.md");
   f.write("docs/apps-delino-site-foundation.md");
   f.write("servers/accounts-api/main.go");
+  // The OwnSand SDK is not a dependency of an app, and a sibling directory
+  // that only shares a package prefix is not the shared UI package.
+  f.write("packages/ownsand-sdk/src/client.ts");
+  f.write("packages/delino-ui-example/src/button.tsx");
+  f.write("protos/delino/example/v1/example_pb.ts");
+  f.write("protos/buf.yaml");
   assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
+});
+
+test("the e2e workspace packages equal the workspace dependencies of the apps", () => {
+  // The planner runs without installed dependencies, so it lists the packages
+  // that the apps depend on; this test keeps the list in sync with the
+  // manifests.
+  const manifest = (dir) =>
+    JSON.parse(readFileSync(join(root, dir, "package.json"), "utf8"));
+  const packageDirs = new Map();
+  for (const workspaceRoot of workspaceRoots) {
+    for (const entry of readdirSync(join(root, workspaceRoot), {
+      withFileTypes: true,
+    })) {
+      const dir = `${workspaceRoot}/${entry.name}`;
+      if (entry.isDirectory() && existsSync(join(root, dir, "package.json"))) {
+        packageDirs.set(manifest(dir).name, `${dir}/`);
+      }
+    }
+  }
+  const expected = new Set();
+  for (const entry of readdirSync(join(root, "apps"), {
+    withFileTypes: true,
+  })) {
+    if (!entry.isDirectory()) continue;
+    const app = manifest(`apps/${entry.name}`);
+    for (const dependencies of [app.dependencies, app.devDependencies]) {
+      for (const [name, range] of Object.entries(dependencies ?? {})) {
+        if (!String(range).startsWith("workspace:")) continue;
+        assert.ok(packageDirs.has(name), `${name} is not a workspace package`);
+        expected.add(packageDirs.get(name));
+      }
+    }
+  }
+  assert.deepEqual([...e2eWorkspacePackages].sort(), [...expected].sort());
 });
 
 test("workspace package paths and root task inputs select workspace tasks", async (t) => {
@@ -744,7 +866,7 @@ test("planner publishes booleans and records exact comparison and checkout", (t)
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
   const record = JSON.parse(
     readFileSync(summary, "utf8").slice("CI plan: ".length),
@@ -826,7 +948,7 @@ test("planner CLI runs through physical and symlinked script paths", (t) => {
     assert.match(result.stdout, /"event":"ci_plan"/, script);
     assert.equal(
       readFileSync(output, "utf8"),
-      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
       script,
     );
   }
@@ -843,6 +965,17 @@ const eventMatrix = [
   { name: "pull request", event: "pull_request", ref: "refs/pull/1/merge" },
   { name: "manual dispatch", event: "workflow_dispatch", ref: MAIN_REF },
   { name: "main tag-like ref on push", event: "push", ref: "refs/tags/main" },
+  {
+    name: "scheduled main run",
+    event: "schedule",
+    ref: MAIN_REF,
+    schedule: true,
+  },
+  {
+    name: "schedule on another ref",
+    event: "schedule",
+    ref: "refs/heads/dev",
+  },
   { name: "missing event context" },
 ];
 
@@ -853,6 +986,25 @@ test("main-push event constants and detection are exact", () => {
     assert.equal(
       isMainPush({ GITHUB_EVENT_NAME: row.event, GITHUB_REF: row.ref }),
       row.main === true,
+      row.name,
+    );
+  }
+});
+
+// The reason that the planner records for a platform output of an eventMatrix
+// row whose comparison selects (or does not select) the matching Linux output.
+function platformReasonFor(row, selectedByDiff) {
+  if (row.schedule === true) return OutputReason.Schedule;
+  if (row.main === true && selectedByDiff) return OutputReason.MainPush;
+  return OutputReason.Diff;
+}
+
+test("scheduled-run event constant and detection are exact", () => {
+  assert.equal(SCHEDULE_EVENT, "schedule");
+  for (const row of eventMatrix) {
+    assert.equal(
+      isScheduledMain({ GITHUB_EVENT_NAME: row.event, GITHUB_REF: row.ref }),
+      row.schedule === true,
       row.name,
     );
   }
@@ -878,12 +1030,14 @@ for (const row of eventMatrix) {
       },
       f.cwd,
     );
-    // Only a push to main forces fixtures, go and e2e (and so quality); format
-    // still follows the comparison for every event.
+    // Only a push to main forces fixtures, go and e2e (and so quality), and
+    // only the scheduled main run forces the platform jobs; format still
+    // follows the comparison for every event.
     const mainPush = row.main === true;
+    const scheduled = row.schedule === true;
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\nworkspace=${mainPush}\nworkflows=${mainPush}\n`,
+      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\nworkspace=${mainPush}\nworkflows=${mainPush}\ngoPlatforms=${scheduled}\nrustPlatforms=${scheduled}\n`,
     );
     const record = JSON.parse(logged.join(""));
     assert.equal(record.go, mainPush);
@@ -899,6 +1053,11 @@ for (const row of eventMatrix) {
     assert.equal(record.e2eReason, reason);
     assert.equal(record.workspaceReason, reason);
     assert.equal(record.workflowsReason, reason);
+    const platformReason = scheduled
+      ? OutputReason.Schedule
+      : OutputReason.Diff;
+    assert.equal(record.goPlatformsReason, platformReason);
+    assert.equal(record.rustPlatformsReason, platformReason);
     assert.deepEqual(
       JSON.parse(readFileSync(summary, "utf8").slice("CI plan: ".length)),
       record,
@@ -946,11 +1105,11 @@ test("a later documentation-only main push still selects the fixtures and e2e of
   };
   assert.equal(
     run(MAIN_PUSH_EVENT, MAIN_REF),
-    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\n",
+    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\ngoPlatforms=false\nrustPlatforms=false\n",
   );
   assert.equal(
     run("pull_request", "refs/pull/1/merge"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
 });
 
@@ -979,6 +1138,13 @@ test("Go changes select go for every event and keep the diff reason", (t) => {
     assert.match(readFileSync(output, "utf8"), /\ngo=true\n/, row.name);
     const record = JSON.parse(logged.at(-1));
     assert.equal(record.goReason, OutputReason.Diff, row.name);
+    // Every event except a main push runs the Go platform job for Go changes.
+    assert.equal(record.goPlatforms, row.main !== true, row.name);
+    assert.equal(
+      record.goPlatformsReason,
+      platformReasonFor(row, true),
+      row.name,
+    );
     // A Go-only range does not select fixtures or e2e, so only a main push
     // forces them.
     assert.equal(
@@ -1042,8 +1208,60 @@ test("main push selects every whole-suite check for an empty comparison", (t) =>
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\n",
+    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\ngoPlatforms=false\nrustPlatforms=false\n",
   );
+});
+
+test("scheduled main run selects only the platform jobs for an empty comparison", (t) => {
+  const f = fixture(t);
+  const output = join(f.cwd, "output");
+  const logged = [];
+  t.mock.method(console, "log", (line) => logged.push(line));
+  main(
+    {
+      CI_BASE: f.base,
+      CI_HEAD: f.base,
+      GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+      GITHUB_EVENT_NAME: SCHEDULE_EVENT,
+      GITHUB_REF: MAIN_REF,
+    },
+    f.cwd,
+  );
+  assert.equal(
+    readFileSync(output, "utf8"),
+    "quality=false\nformat=false\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=true\nrustPlatforms=true\n",
+  );
+  const record = JSON.parse(logged.at(-1));
+  assert.equal(record.goPlatformsReason, OutputReason.Schedule);
+  assert.equal(record.rustPlatformsReason, OutputReason.Schedule);
+});
+
+test("main push deselects the platform jobs that its Go and Rust changes select", (t) => {
+  const f = fixture(t);
+  f.write("cmds/example/main_windows.go");
+  f.write("crates/example/src/lib.rs");
+  const head = f.commit();
+  const logged = [];
+  t.mock.method(console, "log", (line) => logged.push(line));
+  main(
+    {
+      CI_BASE: f.base,
+      CI_HEAD: head,
+      GITHUB_OUTPUT: join(f.cwd, "output"),
+      GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+      GITHUB_EVENT_NAME: MAIN_PUSH_EVENT,
+      GITHUB_REF: MAIN_REF,
+    },
+    f.cwd,
+  );
+  const record = JSON.parse(logged.at(-1));
+  assert.equal(record.go, true);
+  assert.equal(record.rust, true);
+  assert.equal(record.goPlatforms, false);
+  assert.equal(record.rustPlatforms, false);
+  assert.equal(record.goPlatformsReason, OutputReason.MainPush);
+  assert.equal(record.rustPlatformsReason, OutputReason.MainPush);
 });
 
 test("planner CLI forces whole-suite checks for a main push and keeps pull request selection", (t) => {
@@ -1075,7 +1293,7 @@ test("planner CLI forces whole-suite checks for a main push and keeps pull reque
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\nworkspace=${forced}\nworkflows=${forced}\n`,
+      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\nworkspace=${forced}\nworkflows=${forced}\ngoPlatforms=false\nrustPlatforms=false\n`,
       event,
     );
   }
@@ -1124,7 +1342,7 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
 });
 
@@ -1154,11 +1372,11 @@ const expectedJobOutputs = {
   "go-vet": "go",
   "go-test": "go",
   protos: "go",
-  "go-platforms": "go",
+  "go-platforms": "goPlatforms",
   "rust-fmt": ALWAYS_RUN,
   "rust-clippy": "rust",
   "rust-test": "rust",
-  "rust-platforms": "rust",
+  "rust-platforms": "rustPlatforms",
   e2e: "e2e",
   "workspace-packages": "workspace",
   "workspace-servers": "workspace",
@@ -1370,6 +1588,14 @@ test("Rust changes select rust for every event and keep the diff reason", (t) =>
     assert.match(readFileSync(output, "utf8"), /\nrust=true\n/, row.name);
     const record = JSON.parse(logged.at(-1));
     assert.equal(record.rustReason, OutputReason.Diff, row.name);
+    // Every event except a main push runs the Rust platform job for Rust
+    // changes.
+    assert.equal(record.rustPlatforms, row.main !== true, row.name);
+    assert.equal(
+      record.rustPlatformsReason,
+      platformReasonFor(row, true),
+      row.name,
+    );
     // A Rust-only range does not select Go, so only a main push forces it.
     assert.equal(
       record.goReason,
@@ -1405,7 +1631,7 @@ test("CI workflow runs each Rust check in its own job", () => {
 
 // Read-only text check: each Go check runs in its own job. Only the test job
 // starts Postgres and installs the workspace dependencies that the OwnSand
-// end-to-end suite needs, and only it saves the `go.sum` Go cache.
+// end-to-end suite needs, and only it uses the Linux `go.sum` Go cache.
 test("CI workflow runs each Go check in its own job", () => {
   const jobs = workflowJobs();
   const fmtJob = jobs.get("go-fmt");
@@ -1416,12 +1642,43 @@ test("CI workflow runs each Go check in its own job", () => {
   assert.match(vetJob, /^\s+cache: false$/m);
   const testJob = jobs.get("go-test");
   assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
-  assert.match(testJob, /^\s+cache: true$/m);
+  assert.match(testJob, /^\s+cache: false$/m);
+  assert.match(testJob, /prefix="go-test-\$RUNNER_OS-/);
   assert.match(testJob, /^ {4}services:\n {6}postgres:$/m);
   assert.match(testJob, /^\s+OWNSAND_E2E: "1"$/m);
   assert.match(testJob, /pnpm install --frozen-lockfile --ignore-scripts/);
   for (const job of [fmtJob, vetJob]) {
     assert.doesNotMatch(job, /services:|go test|pnpm install/);
+  }
+});
+
+// Read-only text check: setup-go saves its cache from every ref, so no job
+// enables it. Each job that uses the Go cache restores it in every run and
+// saves it only on main, like the Rust jobs, so pull requests do not save
+// entries that evict the main caches.
+test("CI workflow saves the Go cache only on main", () => {
+  const jobs = workflowJobs();
+  for (const [name, job] of jobs) {
+    if (job.includes("actions/setup-go@")) {
+      assert.doesNotMatch(job, /^\s+cache: true$/m, name);
+    }
+  }
+  for (const name of ["go-test", "protos", "go-platforms"]) {
+    const job = jobs.get(name);
+    assert.match(job, /actions\/cache\/restore@[0-9a-f]{40} # v/, name);
+    assert.match(job, /^\s+go env GOCACHE GOMODCACHE$/m, name);
+    const save = job.indexOf("actions/cache/save@");
+    assert.notEqual(save, -1, name);
+    assert.match(job, /actions\/cache\/save@[0-9a-f]{40} # v/, name);
+    const condition = job
+      .slice(0, save)
+      .match(/^\s+if: (.*)$/gm)
+      .at(-1);
+    assert.match(
+      condition,
+      /if: github\.ref == 'refs\/heads\/main' && steps\.go-cache\.outputs\.cache-hit != 'true'$/,
+      name,
+    );
   }
 });
 
@@ -1819,7 +2076,7 @@ test("planner CLI still exits 0 with one ci_plan record and no error record on s
   assert.match(result.stdout, /"event":"ci_plan"/u);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
 });
 
@@ -1962,7 +2219,7 @@ for (const relative of [true, false]) {
     const fromRoot = run(f.cwd, "root");
     assert.equal(
       fromRoot.output,
-      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\nworkspace=true\nworkflows=false\n",
+      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\nworkspace=true\nworkflows=false\ngoPlatforms=true\nrustPlatforms=false\n",
     );
     for (const directory of startDirectories) {
       assert.deepEqual(

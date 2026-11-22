@@ -362,7 +362,8 @@ type importLock struct {
 // removed, so that a second import of the same ID sees the published copy
 // (and reuses it) or the cleaned destination, and never deletes or rewrites
 // content that another import publishes. The wait ends with an
-// ABORTED error when ctx ends first.
+// ABORTED error when ctx ends first, and a ctx that already ended returns
+// ABORTED even when the lock is free.
 func (m *Manager) LockSnapshotImport(ctx context.Context, id string) (func(), error) {
 	m.mu.Lock()
 	l := m.importLocks[id]
@@ -382,6 +383,14 @@ func (m *Manager) LockSnapshotImport(ctx context.Context, id string) (func(), er
 	}
 	select {
 	case l.held <- struct{}{}:
+		// select picks a ready case at random, so a free lock and a context
+		// that already ended can both be ready and the lock can win. An import
+		// whose context ended must not proceed: give the token back and abort.
+		if ctx.Err() != nil {
+			<-l.held
+			drop()
+			return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot import was canceled before it acquired the snapshot lock")
+		}
 	case <-ctx.Done():
 		drop()
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot import was canceled while it waited for another import of the same snapshot")

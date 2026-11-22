@@ -6,6 +6,7 @@ import { VirtualClock } from "../testing/virtual-clock.ts";
 import type { OperationContext } from "./context.ts";
 import {
   AttemptDeadlineError,
+  ConsumerHold,
   relayCallWithDeadline,
   watchedRelayStream,
 } from "./stream.ts";
@@ -151,6 +152,80 @@ describe("watchedRelayStream caller signal listeners", () => {
     await stream.next();
     expect(count(caller.signal)).toBe(1);
     await stream.return(undefined);
+    expect(count(caller.signal)).toBe(0);
+  });
+});
+
+describe("watchedRelayStream caller abort while an event is held", () => {
+  async function* items(n: number) {
+    for (let i = 0; i < n; i++) yield i;
+  }
+
+  /** Counts activity registrations that are still registered. */
+  function trackRegistrations(ctx: OperationContext) {
+    const state = { live: 0, registered: 0 };
+    const register = ctx.activity.register.bind(ctx.activity);
+    ctx.activity.register = (listener) => {
+      const registration = register(listener);
+      state.live++;
+      state.registered++;
+      let disposed = false;
+      return {
+        id: registration.id,
+        dispose: () => {
+          if (!disposed) {
+            disposed = true;
+            state.live--;
+          }
+          registration.dispose();
+        },
+      };
+    };
+    return state;
+  }
+
+  test("releases the registration and listener without resuming the generator", async () => {
+    const { ctx, clock } = setup();
+    const registrations = trackRegistrations(ctx);
+    const caller = new AbortController();
+    const hold = new ConsumerHold();
+    const stream = watchedRelayStream(
+      ctx,
+      "g",
+      caller.signal,
+      () => items(5),
+      undefined,
+      hold,
+    );
+    // The consumer reads one event and abandons the iteration without
+    // resuming the generator, which stays suspended at its `yield`.
+    expect((await stream.next()).value).toBe(0);
+    hold.release();
+    expect(registrations.live).toBe(1);
+    expect(count(caller.signal)).toBe(1);
+    // Cancel the caller well before the idle deadline.
+    await clock.advance(1000);
+    caller.abort(new Error("caller stop"));
+    await clock.advance(0);
+    expect(registrations.live).toBe(0);
+    expect(count(caller.signal)).toBe(0);
+    // Resuming later still finishes cleanly and repeats the release.
+    await stream.return(undefined);
+    expect(registrations.live).toBe(0);
+    expect(count(caller.signal)).toBe(0);
+  });
+
+  test("a normal completion still releases the registration", async () => {
+    const { ctx } = setup();
+    const registrations = trackRegistrations(ctx);
+    const caller = new AbortController();
+    for await (const _ of watchedRelayStream(ctx, "g", caller.signal, () =>
+      items(2),
+    )) {
+      // drain
+    }
+    expect(registrations.registered).toBe(1);
+    expect(registrations.live).toBe(0);
     expect(count(caller.signal)).toBe(0);
   });
 });

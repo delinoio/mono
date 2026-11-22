@@ -21,7 +21,13 @@ import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { DeviceState, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
-import { type FormEvent, type ReactNode, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { billingReasonOf } from "../api.ts";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
@@ -261,19 +267,53 @@ export function ConfirmDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const [error, setError] = useState<unknown>();
+  const [pending, setPending] = useState(false);
   const [wasOpen, setWasOpen] = useState(open);
   if (open !== wasOpen) {
     // Adjust state while rendering: every time the dialog opens again it
     // starts without the notice of an earlier failure, including a failure
-    // that arrived after the dialog was already closed.
+    // that arrived after the dialog was already closed, and without the
+    // pending state of an earlier request.
     setWasOpen(open);
+    setPending(false);
     if (open) setError(undefined);
   }
+  // The identity of the current opening. Every open, dismissal, controlled
+  // close and unmount ends the opening and starts a new one, so a request
+  // that settles later can tell that its opening is over and must not close
+  // or show an error on the next opening, which can be for another target
+  // or for the same one.
+  const opening = useRef(0);
+  useEffect(
+    () => () => {
+      opening.current += 1;
+    },
+    [open],
+  );
+  const confirm = async () => {
+    if (pending) return;
+    const mine = opening.current;
+    setPending(true);
+    // A retry removes the notice of the previous failure.
+    setError(undefined);
+    try {
+      await onConfirm();
+      if (opening.current === mine) onOpenChange(false);
+    } catch (e) {
+      if (opening.current === mine) setError(e);
+    } finally {
+      if (opening.current === mine) setPending(false);
+    }
+  };
   return (
     <AlertDialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) {
+          opening.current += 1;
+          setPending(false);
+          setError(undefined);
+        }
         onOpenChange(next);
       }}
     >
@@ -285,16 +325,8 @@ export function ConfirmDialog({
           <AlertDialogClose>Cancel</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
-            onClick={async () => {
-              // A retry removes the notice of the previous failure.
-              setError(undefined);
-              try {
-                await onConfirm();
-                onOpenChange(false);
-              } catch (e) {
-                setError(e);
-              }
-            }}
+            disabled={pending}
+            onClick={confirm}
           >
             {confirmLabel}
           </Button>
