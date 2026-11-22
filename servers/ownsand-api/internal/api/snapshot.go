@@ -308,62 +308,28 @@ func (s *Service) exportApplyRetryBackoff() time.Duration {
 	return DefaultExportApplyRetryBackoff
 }
 
-// applyExportResultWithRetry applies an export result and retries after a
-// transient database error (see isTransientDBError) with a doubling backoff
-// until the retry window ends or the channel closes. The server removed the
-// command record before it applied the result, and the row stays EXPORTING
-// with a live owner channel, which neither a repeat ExportSnapshot nor the
-// owner's state report would release, so a result that is lost here would
-// strand the export. A permanent error is returned at once. Every attempt
-// reruns the snapshot row lock and the command ID check of applyExportResult,
-// so a retry after a commit whose outcome is unknown, after a newer attempt
-// or after the deletion of the snapshot changes nothing more. When the
-// window ends while conn is still the current channel of its device, the
-// channel is closed: the state report of the replacement channel then fails
-// the abandoned attempt with a clean-up job, and an explicit retry of the
-// export sends a new command.
+// applyExportResultWithRetry applies an export result with
+// applyResultWithRetry. The server removed the command record before it
+// applied the result, and the row stays EXPORTING with a live owner channel,
+// which neither a repeat ExportSnapshot nor the owner's state report would
+// release, so a result that is lost here would strand the export. Every
+// attempt reruns the snapshot row lock and the command ID check of
+// applyExportResult, so a retry after a commit whose outcome is unknown,
+// after a newer attempt or after the deletion of the snapshot changes
+// nothing more. A transient database error is retried until the window
+// ends. A permanent error is not retried but ends the application the same
+// way (the export_result_apply_abandoned log): while conn is still the
+// current channel of its device, the channel is closed, so the state report
+// of the replacement channel fails the abandoned attempt with a clean-up job
+// and an explicit retry of the export sends a new command.
 func (s *Service) applyExportResultWithRetry(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
 	commandID := res.GetCommandId()
-	retryCtx, cancel := context.WithTimeout(ctx, s.exportApplyRetryWindow())
-	defer cancel()
-	backoff := s.exportApplyRetryBackoff()
-	for attempt := 1; ; attempt++ {
-		err := s.applyExportResult(retryCtx, info, commandID, res)
-		if err == nil {
-			if attempt > 1 {
-				s.Logger.InfoContext(ctx, "export_result_apply_recovered", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID), slog.Int("attempts", attempt))
-			}
-			return nil
-		}
-		if ctx.Err() != nil {
-			return err // the channel closed; the replacement channel's state report settles the attempt
-		}
-		if retryCtx.Err() == nil {
-			if !isTransientDBError(err) {
-				return err
-			}
-			s.Logger.WarnContext(ctx, "export_result_apply_retry", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
-				slog.Int("attempt", attempt), slog.Duration("backoff", backoff), slog.Any("error", err))
-			timer := time.NewTimer(backoff)
-			select {
-			case <-timer.C:
-			case <-retryCtx.Done():
-				timer.Stop()
-			}
-			if backoff *= 2; backoff > exportApplyRetryBackoffMax {
-				backoff = exportApplyRetryBackoffMax
-			}
-			continue
-		}
-		// The retry window ended.
-		current := s.Hub.Get(info.deviceID) == conn
-		s.Logger.ErrorContext(ctx, "export_result_apply_abandoned", slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID),
-			slog.Int("attempts", attempt), slog.Bool("channel_current", current), slog.Any("error", err))
-		if current {
-			conn.Close(errExportResultNotApplied)
-		}
-		return err
-	}
+	return s.applyResultWithRetry(ctx, conn, resultApplyEvents{
+		retry:     "export_result_apply_retry",
+		recovered: "export_result_apply_recovered",
+		abandoned: "export_result_apply_abandoned",
+	}, errExportResultNotApplied, []any{slog.String("snapshot_id", info.snapshotID), slog.String("command_id", commandID)},
+		func(ctx context.Context) error { return s.applyExportResult(ctx, info, commandID, res) })
 }
 
 // errExportClaimNotReleased is the cause that closes a channel whose unsent

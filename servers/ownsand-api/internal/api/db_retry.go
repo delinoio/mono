@@ -86,3 +86,49 @@ func (s *Service) failUnsentCreate(ctx context.Context, conn *hub.Conn, event st
 	}
 	return attempts, channelClosed, err
 }
+
+// resultApplyEvents names the log events of applyResultWithRetry.
+type resultApplyEvents struct {
+	retry, recovered, abandoned string
+}
+
+// applyResultWithRetry applies the result of a command that the server
+// removed from its command records before it applied it, and retries after a
+// transient database error (see isTransientDBError) with a doubling backoff
+// until the retry window (Timing.ExportApplyRetryWindow) ends or the channel
+// closes. A result that is lost here would strand its record in the state
+// that a live owner channel holds (EXPORTING, CREATING), which neither a
+// repeat request nor the owner's state report would release. A permanent
+// error is not retried; it ends the application like the end of the window.
+// Every attempt of apply must be guarded by the state that the record has
+// while the result is pending, so a retry after a commit whose outcome is
+// unknown, after a newer attempt or after the deletion of the record changes
+// nothing more.
+//
+// When the application ends without success while conn is still the current
+// channel of its device, conn is closed with cause: the state report of the
+// replacement channel reconciles the record, and an explicit retry of the
+// operation sends a new command. A channel that was replaced or closed
+// meanwhile is never closed again, and a closed channel's context ends the
+// retry without a close because its replacement's state report settles the
+// record.
+func (s *Service) applyResultWithRetry(ctx context.Context, conn *hub.Conn, ev resultApplyEvents, cause error, attrs []any, apply func(context.Context) error) error {
+	retryCtx, cancel := context.WithTimeout(ctx, s.exportApplyRetryWindow())
+	defer cancel()
+	attempts, err := s.retryTransientDB(retryCtx, ev.retry, attrs, apply)
+	if err == nil {
+		if attempts > 1 {
+			s.Logger.InfoContext(ctx, ev.recovered, append(append([]any(nil), attrs...), slog.Int("attempts", attempts))...)
+		}
+		return nil
+	}
+	if ctx.Err() != nil {
+		return err // the channel closed; the replacement channel's state report settles the record
+	}
+	current := s.Hub.Get(conn.DeviceID) == conn
+	s.Logger.ErrorContext(ctx, ev.abandoned, append(append([]any(nil), attrs...), slog.Int("attempts", attempts), slog.Bool("channel_current", current), slog.Any("error", err))...)
+	if current {
+		conn.Close(cause)
+	}
+	return err
+}
