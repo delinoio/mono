@@ -8,6 +8,7 @@ import (
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
+	"github.com/delinoio/mono/servers/tide-api/internal/db"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 )
@@ -70,6 +71,38 @@ type Adapter interface {
 	// session (cancellation, maximum queue wait, failures, clean-up), for
 	// example to release a Cursor or Devin claim. Errors are logged.
 	ReleaseClaim(ctx context.Context, req *Request) error
+}
+
+// RegistrationRemover is an optional interface of an Adapter whose runners
+// have a registration outside OwnSand (GITHUB_JOB: the GitHub runner
+// registration). The engine calls RemoveRegistration before it deletes the
+// sandbox of a runner of the kind: in DELETING, after a start failure and
+// in the clean-ups. An error keeps the sandbox, and the driver (or the
+// caller of the clean-up) repeats the deletion, so RemoveRegistration
+// returns an error only for a failure that a retry can fix and gives up by
+// itself otherwise. A start failure deletes the sandbox after a logged
+// error.
+type RegistrationRemover interface {
+	RemoveRegistration(ctx context.Context, r *Runner) error
+}
+
+// WarmPooler is an optional interface of an Adapter without
+// BindsAtDispatch. WarmPools lists the runner pools of an organization in
+// which the dispatcher keeps the warm count of each profile of the kind
+// (GITHUB_JOB: the ACTIVE GitHub installations). In a pool, the runners in
+// CREATING, PREPARING or WAITING_FOR_WORK without a request beyond the
+// pool's QUEUED requests count as warm. Without WarmPooler, profiles of the
+// kind get no warm runners.
+type WarmPooler interface {
+	WarmPools(ctx context.Context, orgID string) ([]string, error)
+}
+
+// RequestDecorator is an optional interface of an Adapter that adds
+// kind-specific fields (GITHUB_JOB: the GitHub job) to the API form of its
+// requests. WorkService calls it for every response; an error is logged and
+// the requests stay without the fields.
+type RequestDecorator interface {
+	DecorateRequests(ctx context.Context, q db.Querier, orgID string, reqs []*tidev1.Request) error
 }
 
 // StartResult is the outcome of Adapter.Start.

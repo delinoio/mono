@@ -432,6 +432,10 @@ func (e *Engine) programExited(ctx context.Context, runnerID string, res *ownsan
 
 // stepDeleting deletes the sandbox and ends the runner.
 func (e *Engine) stepDeleting(ctx context.Context, client ownsandclient.Client, r *Runner) {
+	if err := e.removeRegistration(ctx, r); err != nil {
+		// The driver repeats the deletion at its next step.
+		return
+	}
 	if e.removeSandbox(ctx, client, r) {
 		e.finishDelete(ctx, r.ID)
 	}
@@ -545,6 +549,9 @@ func (e *Engine) startFailed(ctx context.Context, runnerID, cause string) {
 		return
 	}
 	e.svc.Logger.WarnContext(ctx, "runner_start_failure", slog.String("runner_id", runnerID), slog.String("organization_id", r.OrganizationID), slog.String("cause", cause))
+	// The registration removal is not repeated for a FAILED runner: its
+	// failure is logged, and the sandbox goes anyway.
+	_ = e.removeRegistration(context.WithoutCancel(ctx), r)
 	if r.SandboxID != "" && !e.deleteEndedSandbox(context.WithoutCancel(ctx), r) {
 		e.ensureDriver(r.ID)
 	}
@@ -701,6 +708,10 @@ func (e *Engine) deleteSandboxNow(ctx context.Context, r *Runner) {
 	if r.State != runDeleting {
 		return
 	}
+	if err := e.removeRegistration(context.WithoutCancel(ctx), r); err != nil {
+		// The driver of the lease holder repeats the deletion.
+		return
+	}
 	client, _, err := e.links.ClientForRemoval(ctx, r.OrganizationID)
 	if err != nil {
 		return
@@ -708,4 +719,19 @@ func (e *Engine) deleteSandboxNow(ctx context.Context, r *Runner) {
 	if e.removeSandbox(context.WithoutCancel(ctx), client, r) {
 		e.finishDelete(ctx, r.ID)
 	}
+}
+
+// removeRegistration runs the adapter's RegistrationRemover, when it has
+// one, and logs its error.
+func (e *Engine) removeRegistration(ctx context.Context, r *Runner) error {
+	rr, ok := e.adapters[r.Kind].(RegistrationRemover)
+	if !ok {
+		return nil
+	}
+	err := rr.RemoveRegistration(ctx, r)
+	if err != nil && ctx.Err() == nil {
+		e.svc.Logger.WarnContext(ctx, "runner_registration_removal_failed", slog.String("organization_id", r.OrganizationID), slog.String("runner_id", r.ID),
+			slog.Any("error", err))
+	}
+	return err
 }

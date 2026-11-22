@@ -125,7 +125,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 				continue
 			}
 		}
-		res := e.createRunner(ctx, client, p, req)
+		res := e.createRunner(ctx, client, p, req, req.PoolKey)
 		if res == createUnavailable && !reclaimed {
 			reclaimed = e.reclaimWarm(ctx, runners, p.ID)
 		}
@@ -145,6 +145,12 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		if a == nil || p.WarmCount == 0 {
 			continue
 		}
+		if !a.BindsAtDispatch() {
+			if !e.fillPoolWarm(ctx, client, a, p, queued, runners) {
+				return nil
+			}
+			continue
+		}
 		idle := 0
 		for _, r := range runners {
 			if r.ProfileID == p.ID && r.RequestID == "" && (r.State == runCreating || r.State == runPrep || r.State == runWarm) {
@@ -152,12 +158,49 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 			}
 		}
 		for ; idle < int(p.WarmCount); idle++ {
-			if e.createRunner(ctx, client, p, nil) != createOK {
+			if e.createRunner(ctx, client, p, nil, "") != createOK {
 				return nil
 			}
 		}
 	}
 	return nil
+}
+
+// fillPoolWarm keeps the warm count of a profile of a kind without
+// BindsAtDispatch in each runner pool that its WarmPooler lists. Every
+// request is covered when it runs, so a pool's runners in CREATING,
+// PREPARING or WAITING_FOR_WORK without a request beyond its QUEUED
+// requests are its warm runners. It reports false when a creation failed,
+// which ends the pass.
+func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, queued []*Request, runners []*Runner) bool {
+	wp, ok := a.(WarmPooler)
+	if !ok {
+		return true
+	}
+	pools, err := wp.WarmPools(ctx, p.OrganizationID)
+	if err != nil {
+		e.svc.Logger.WarnContext(ctx, "dispatch_warm_pools_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
+		return true
+	}
+	for _, pool := range pools {
+		idle := 0
+		for _, r := range runners {
+			if r.ProfileID == p.ID && r.PoolKey == pool && r.RequestID == "" && (r.State == runCreating || r.State == runPrep || r.State == runWaiting) {
+				idle++
+			}
+		}
+		for _, q := range queued {
+			if q.ProfileID == p.ID && q.PoolKey == pool {
+				idle--
+			}
+		}
+		for ; idle < int(p.WarmCount); idle++ {
+			if e.createRunner(ctx, client, p, nil, pool) != createOK {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // expire ends the QUEUED requests whose maximum queue wait ended.
@@ -367,17 +410,14 @@ func sandboxRequest(p *profile.Profile, r *Runner) *ownsandv1.CreateSandboxReque
 
 // createRunner stores a new runner with its idempotency key, binds the
 // request for binding kinds, and calls CreateSandbox. req is nil for a warm
-// runner.
-func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request) createResult {
+// runner; pool is the runner pool of a kind without BindsAtDispatch.
+func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request, pool string) createResult {
 	a := e.adapters[p.Kind]
 	r := &Runner{
 		ID: api.NewID(), OrganizationID: p.OrganizationID, ProfileID: p.ID, Kind: p.Kind, GuestOS: p.GuestOS,
-		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath,
+		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath, PoolKey: pool,
 	}
 	bind := req != nil && a.BindsAtDispatch()
-	if req != nil {
-		r.PoolKey = req.PoolKey
-	}
 	// The request is stored with the runner, so every retry sends the same
 	// parameters with the key.
 	sreq := sandboxRequest(p, r)

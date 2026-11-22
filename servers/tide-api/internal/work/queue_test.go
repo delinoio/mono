@@ -126,3 +126,14 @@ func TestBaseAdapterOutcomes(t *testing.T) {
 		t.Fatal("terminal states")
 	}
 }
+
+func TestRunnerProtoGitHubInstallation(t *testing.T) {
+	r := &Runner{ID: "r1", Kind: tidev1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB, PoolKey: "123456"}
+	if got := r.Proto().GetGithubInstallationId(); got != 123456 {
+		t.Fatalf("github installation = %d", got)
+	}
+	r.Kind = tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION
+	if r.Proto().GetGithubInstallationId() != 0 {
+		t.Fatal("installation on a dev session runner")
+	}
+}

@@ -135,6 +135,10 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 				continue
 			}
 		}
+		if err := e.removeRegistration(ctx, r); err != nil {
+			errs = append(errs, fmt.Errorf("remove the registration of runner %s: %w", r.ID, err))
+			continue
+		}
 		if cerr != nil {
 			errs = append(errs, cerr)
 			continue
