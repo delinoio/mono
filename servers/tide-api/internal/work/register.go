@@ -135,12 +135,21 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 				continue
 			}
 		}
-		if r.SandboxID != "" {
-			if cerr != nil {
-				errs = append(errs, cerr)
+		if cerr != nil {
+			errs = append(errs, cerr)
+			continue
+		}
+		id := r.SandboxID
+		if id == "" {
+			// The CreateSandbox response may be lost or still in flight.
+			var ok bool
+			if id, ok = e.resolveCreate(ctx, client, r); !ok {
+				errs = append(errs, fmt.Errorf("resolve the sandbox creation of runner %s", r.ID))
 				continue
 			}
-			if _, err := client.DeleteSandbox(ctx, r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
+		}
+		if id != "" {
+			if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) && !isCode(err, connect.CodeUnauthenticated) {
 				// A key that OwnSand no longer accepts cannot delete the
 				// sandbox; its idle_ttl ends it.
 				errs = append(errs, fmt.Errorf("delete sandbox of runner %s: %w", r.ID, err))

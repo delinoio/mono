@@ -428,12 +428,64 @@ func (e *Engine) programExited(ctx context.Context, runnerID string, res *ownsan
 
 // stepDeleting deletes the sandbox and ends the runner.
 func (e *Engine) stepDeleting(ctx context.Context, client ownsandclient.Client, r *Runner) {
-	if r.SandboxID != "" {
-		if _, err := client.DeleteSandbox(ctx, r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) {
-			return
+	if e.removeSandbox(ctx, client, r) {
+		e.finishDelete(ctx, r.ID)
+	}
+}
+
+// removeSandbox deletes the sandbox of a DELETING runner and reports
+// whether the runner can end. A runner without a stored sandbox ID first
+// resolves its creation with resolveCreate.
+func (e *Engine) removeSandbox(ctx context.Context, client ownsandclient.Client, r *Runner) bool {
+	id := r.SandboxID
+	if id == "" {
+		var ok bool
+		if id, ok = e.resolveCreate(ctx, client, r); !ok {
+			return false
+		}
+		if id == "" {
+			return true
 		}
 	}
-	e.finishDelete(ctx, r.ID)
+	if _, err := client.DeleteSandbox(ctx, id); err != nil && !isCode(err, connect.CodeNotFound) {
+		e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		return false
+	}
+	return true
+}
+
+// resolveCreate finds the sandbox of a runner that has no stored sandbox ID
+// before its deletion ends: the CreateSandbox response may have been lost,
+// or a call may still be in flight. It repeats CreateSandbox with the
+// stored request and key, which returns the sandbox of the key (OwnSand
+// serializes the calls of one key), or creates it when no call created it;
+// the caller then deletes it. It stores the sandbox ID and returns it, ""
+// when OwnSand created nothing for the key, and ok=false while the result
+// is uncertain (the driver tries again).
+func (e *Engine) resolveCreate(ctx context.Context, client ownsandclient.Client, r *Runner) (sandboxID string, ok bool) {
+	req, err := e.storedCreateRequest(ctx, r.ID)
+	if err != nil {
+		e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		return "", false
+	}
+	sb, err := client.CreateSandbox(ctx, req)
+	switch {
+	case err == nil:
+		if _, err := e.svc.DB.Pool.Exec(ctx, "UPDATE runners SET ownsand_sandbox_id = $2, ownsand_device_id = $3, update_time = $4 WHERE runner_id = $1 AND ownsand_sandbox_id IS NULL",
+			r.ID, sb.GetSandboxId(), sb.GetDeviceId(), e.svc.NowUTC()); err != nil {
+			e.svc.Logger.WarnContext(ctx, "runner_sandbox_store_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
+		}
+		return sb.GetSandboxId(), true
+	case rejected(err, connect.CodeUnavailable), rejected(err, connect.CodeFailedPrecondition), rejected(err, connect.CodeInvalidArgument),
+		rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
+		// OwnSand answered: the key created nothing.
+		return "", true
+	case isCode(err, connect.CodeUnauthenticated):
+		// A key that OwnSand no longer accepts cannot reach the sandbox; its
+		// idle_ttl ends it.
+		return "", true
+	}
+	return "", false
 }
 
 func (e *Engine) finishDelete(ctx context.Context, runnerID string) {
@@ -611,22 +663,14 @@ func (e *Engine) DeleteSandboxOf(ctx context.Context, orgID, runnerID string) {
 }
 
 func (e *Engine) deleteSandboxNow(ctx context.Context, r *Runner) {
-	if r.SandboxID == "" {
-		if r.State == runDeleting {
-			// Without a stored sandbox ID, the driver repeats the creation
-			// with the key first only when the runner is still being
-			// created; a deleted runner without a sandbox ends here.
-			e.finishDelete(ctx, r.ID)
-		}
+	if r.State != runDeleting {
 		return
 	}
 	client, _, err := e.links.ClientForRemoval(ctx, r.OrganizationID)
 	if err != nil {
 		return
 	}
-	if _, err := client.DeleteSandbox(context.WithoutCancel(ctx), r.SandboxID); err != nil && !isCode(err, connect.CodeNotFound) {
-		e.svc.Logger.WarnContext(ctx, "runner_sandbox_delete_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
-		return
+	if e.removeSandbox(context.WithoutCancel(ctx), client, r) {
+		e.finishDelete(ctx, r.ID)
 	}
-	e.finishDelete(ctx, r.ID)
 }

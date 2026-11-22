@@ -383,3 +383,35 @@ func TestLostCreateResponseAsUnavailable(t *testing.T) {
 		t.Fatalf("sandboxes %v", sandboxes)
 	}
 }
+
+// TestDeleteAfterLostCreateResponse: a runner whose CreateSandbox response
+// was lost stays DELETING until tide found its sandbox with the stored key,
+// and the sandbox is deleted.
+func TestDeleteAfterLostCreateResponse(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateResponseError = connect.NewError(connect.CodeDeadlineExceeded, context.DeadlineExceeded)
+	})
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	eventually(t, "a sandbox with a lost response", func() bool { return len(w.fake.Sandboxes(w.osOrg)) == 1 })
+	list, err := w.env.User(w.org.Owner).Work.ListRunners(ctx, connect.NewRequest(&tidev1.ListRunnersRequest{OrganizationId: w.org.ID}))
+	if err != nil || len(list.Msg.GetRunners()) != 1 || list.Msg.GetRunners()[0].GetOwnsandSandboxId() != "" {
+		t.Fatalf("runners %v %v", list, err)
+	}
+	runnerID := list.Msg.GetRunners()[0].GetRunnerId()
+	if _, err := w.env.User(w.org.Member).DevSession.DeleteDevSession(ctx, connect.NewRequest(&tidev1.DeleteDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s.GetDevSessionId()})); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "runner deleting", func() bool { return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETING })
+	stays(t, "runner deleting while the creation is uncertain", func() bool {
+		return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETING
+	})
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateResponseError = nil })
+	eventually(t, "runner deleted", func() bool { return w.runner(t, runnerID).GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED })
+	sandboxes := w.fake.Sandboxes(w.osOrg)
+	if len(sandboxes) != 1 || sandboxes[0].GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED || w.runner(t, runnerID).GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() {
+		t.Fatalf("sandboxes %v", sandboxes)
+	}
+}

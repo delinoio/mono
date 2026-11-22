@@ -449,8 +449,10 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 			}
 			cur, err := e.lockRunner(ctx, tx, r.ID)
 			if err != nil || cur.State != runCreating {
-				// A deleted runner keeps the sandbox ID, so its driver deletes
-				// the sandbox, and starts nothing.
+				// A DELETING runner keeps the sandbox ID, so its driver deletes
+				// the sandbox, and starts nothing. A deletion resolves the key
+				// before the runner ends, so an ended runner gets no sandbox
+				// here.
 				return err
 			}
 			return e.bindStartTx(ctx, tx, cur)
