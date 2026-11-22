@@ -207,7 +207,8 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 	}
 	d.logger.Info("exec accepted", "exec_id", req.GetExecId(), "sandbox_id", req.GetSandboxId())
 	d.sb.Touch(req.GetSandboxId())
-	d.wg.Add(1)
+	// admitExec already counted this worker in d.wg under d.mu, so Close
+	// cannot return before the goroutine below has started and finished.
 	go func() {
 		defer d.wg.Done()
 		// Release the child context from d.ctx once forwarding is over (final
@@ -223,7 +224,10 @@ func (h *handler) exec(ctx context.Context, req *ownsandv1.ExecRequest) (Outcome
 // admitExec registers a new exec or finds the record of a retry. It runs
 // inside Sandboxes.WithRunning, so it takes d.mu below the sandbox manager's
 // lock and must not call the sandbox manager. existing is true when op is the
-// record of an earlier request with the same digest.
+// record of an earlier request with the same digest. A new exec is counted in
+// d.wg here, under d.mu, so that Close, which sets d.closed under d.mu before
+// it waits, either refuses the exec or waits for its worker. The caller
+// starts the worker whenever it gets a new op and no error.
 func (h *handler) admitExec(req *ownsandv1.ExecRequest, digest []byte) (op *execOp, existing bool, err error) {
 	d := h.d
 	d.mu.Lock()
@@ -243,6 +247,9 @@ func (h *handler) admitExec(req *ownsandv1.ExecRequest, digest []byte) (op *exec
 	if err := h.admitLocked(req.GetExecId()); err != nil {
 		return nil, false, err
 	}
+	if d.closed {
+		return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent is shutting down")
+	}
 	execCtx, cancel := context.WithCancel(d.ctx)
 	op = &execOp{
 		sandboxID: req.GetSandboxId(),
@@ -261,6 +268,7 @@ func (h *handler) admitExec(req *ownsandv1.ExecRequest, digest []byte) (op *exec
 		d.logger.Error("persist exec record failed", "exec_id", req.GetExecId(), "error", err)
 		return nil, false, fail(ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE, "agent could not record the exec")
 	}
+	d.wg.Add(1)
 	return op, false, nil
 }
 
