@@ -544,7 +544,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 			err = s.applyResultEntry(ctx, conn, e)
 		}
 	case cmdCreateSnapshot:
-		err = s.applySnapshotResult(ctx, info, res)
+		err = s.applySnapshotResult(ctx, conn, info, res)
 	case cmdExportSnapshot:
 		err = s.applyExportResultWithRetry(ctx, conn, info, res)
 	case cmdImportSnapshot:

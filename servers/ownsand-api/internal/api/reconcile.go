@@ -474,15 +474,19 @@ func unknownSnapshotsTx(ctx context.Context, tx pgx.Tx, entries []*ownsandv1.Sna
 	return unknown, rows.Err()
 }
 
-// applySnapshotEntryTx stores the agent's report of a snapshot.
+// applySnapshotEntryTx stores the agent's report of a snapshot. It acts only
+// while the record is CREATING, which both callers (the create-snapshot
+// result and the state report) require: a repeat of the write after a commit
+// whose outcome is unknown, or a late result for a record that another writer
+// settled or that is being deleted, changes nothing.
 func applySnapshotEntryTx(ctx context.Context, tx pgx.Tx, snapshotID string, e *ownsandv1.SnapshotStateEntry) error {
 	state := e.GetState()
 	if state == ownsandv1.SnapshotState_SNAPSHOT_STATE_UNSPECIFIED {
 		state = ownsandv1.SnapshotState_SNAPSHOT_STATE_READY
 	}
 	_, err := tx.Exec(ctx, `UPDATE snapshots SET state = $2, has_memory_state = $3, size_bytes = $4,
-		macos_hardware_model = COALESCE($5, macos_hardware_model) WHERE snapshot_id = $1`,
-		snapshotID, int16(state), e.GetHasMemoryState(), e.GetSizeBytes(), nilIfEmpty(e.GetMacosHardwareModel()))
+		macos_hardware_model = COALESCE($5, macos_hardware_model) WHERE snapshot_id = $1 AND state = $6`,
+		snapshotID, int16(state), e.GetHasMemoryState(), e.GetSizeBytes(), nilIfEmpty(e.GetMacosHardwareModel()), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
 	return err
 }
 

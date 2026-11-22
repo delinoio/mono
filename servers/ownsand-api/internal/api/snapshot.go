@@ -196,7 +196,31 @@ func (h SnapshotHandler) CreateSnapshot(ctx context.Context, req *connect.Reques
 	return connect.NewResponse(&ownsandv1.CreateSnapshotResponse{Snapshot: snap.pb}), nil
 }
 
-func (s *Service) applySnapshotResult(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+// applySnapshotResult applies the result of a create-snapshot command with
+// applyResultWithRetry. The server removed the command record before it
+// applied the result and the agent sends the result once, so a result that
+// a transient database error loses would leave the snapshot CREATING for as
+// long as the channel lives. Both writes act only on a CREATING row, so a
+// retry after a commit whose outcome is unknown, after the deletion of the
+// snapshot or after another writer settled it changes nothing more. When
+// the application ends without success while conn is still the current
+// channel of its device, the channel is closed: the state report of the
+// replacement channel then applies the agent's report of the snapshot, or
+// fails a snapshot that it does not list.
+func (s *Service) applySnapshotResult(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult) error {
+	return s.applyResultWithRetry(ctx, conn, resultApplyEvents{
+		retry:     "snapshot_result_apply_retry",
+		recovered: "snapshot_result_apply_recovered",
+		abandoned: "snapshot_result_apply_abandoned",
+	}, errSnapshotResultNotApplied, []any{slog.String("snapshot_id", info.snapshotID), slog.String("command_id", res.GetCommandId())},
+		func(ctx context.Context) error { return s.applySnapshotResultOnce(ctx, info, res) })
+}
+
+// errSnapshotResultNotApplied is the cause that closes a channel whose
+// create-snapshot result could not be applied.
+var errSnapshotResultNotApplied = errors.New("the create-snapshot result could not be applied")
+
+func (s *Service) applySnapshotResultOnce(ctx context.Context, info commandInfo, res *ownsandv1.AgentCommandResult) error {
 	if res.GetError() != nil || res.GetCreateSnapshot().GetSnapshot() == nil {
 		_, err := s.DB.Pool.Exec(ctx, "UPDATE snapshots SET state = $2 WHERE snapshot_id = $1 AND state = $3", info.snapshotID,
 			int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_FAILED), int16(ownsandv1.SnapshotState_SNAPSHOT_STATE_CREATING))
