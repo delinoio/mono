@@ -68,6 +68,12 @@ func (h MemberHandler) CreateInvitation(ctx context.Context, req *connect.Reques
 		if role != ownsandv1.Role_ROLE_ADMIN && role != ownsandv1.Role_ROLE_MEMBER {
 			return errInvalidf("invalid role: must be ROLE_ADMIN or ROLE_MEMBER")
 		}
+		// Share the organization row with the insert below, as its foreign
+		// key does, so that a deletion in flight yields not_found instead of
+		// a foreign key violation (internal) once the deletion commits.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		secret, err := auth.NewSecret(auth.SecretInvitation)
 		if err != nil {
 			return err

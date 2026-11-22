@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/delinoio/mono/go/ownsand/validate"
 	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/auth"
@@ -64,6 +65,12 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 	if strings.TrimSpace(name) == "" || len(name) > maxDeviceNameLength {
 		return nil, errInvalidf("invalid name: must be 1 to %d bytes", maxDeviceNameLength)
 	}
+	// PostgreSQL text cannot store U+0000; reject it before the transaction so
+	// that the enrollment token stays usable and the caller gets
+	// invalid_argument instead of an internal error.
+	if err := validate.NoNUL("name", name); err != nil {
+		return nil, errInvalid(err)
+	}
 	if m.GetHostOs() == ownsandv1.HostOs_HOST_OS_UNSPECIFIED || ownsandv1.HostOs_name[int32(m.GetHostOs())] == "" {
 		return nil, errInvalidf("invalid host_os: must be a host OS")
 	}
@@ -72,6 +79,9 @@ func (h AgentHandler) Enroll(ctx context.Context, req *connect.Request[ownsandv1
 	}
 	if v := m.GetAgentVersion(); v == "" || len(v) > maxVersionLength {
 		return nil, errInvalidf("invalid agent_version: is required")
+	}
+	if err := validate.NoNUL("agent_version", m.GetAgentVersion()); err != nil {
+		return nil, errInvalid(err)
 	}
 	if !auth.WellFormed(auth.SecretEnrollmentToken, token) {
 		return nil, errEnrollmentInvalid()
