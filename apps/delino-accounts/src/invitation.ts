@@ -49,6 +49,26 @@ function store(): SessionStore | undefined {
   }
 }
 
+/**
+ * Reads the token of a newly opened invitation link from the address and
+ * drops any token that an earlier link left in `sessionStorage`, so that a
+ * later load with an empty fragment cannot accept the earlier invitation.
+ * The new token stays in memory; only the Sign in button saves it for the
+ * redirect. An address without a token leaves the stored token alone,
+ * because the sign-in return reads it.
+ */
+export function openInvitationFromAddress(
+  location: Pick<Location, "hash" | "pathname" | "search">,
+  history: Pick<History, "replaceState">,
+  storage: SessionStore | undefined = store(),
+): string | undefined {
+  const token = takeTokenFromAddress(location, history);
+  if (token !== undefined) {
+    pendingInvitation.clear(storage);
+  }
+  return token;
+}
+
 /** The token that waits for the sign-in redirect to return. */
 export const pendingInvitation = {
   save(token: string, storage: SessionStore | undefined = store()): void {
