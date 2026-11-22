@@ -206,6 +206,13 @@ func (h *fakeSandbox) GetSandbox(_ context.Context, r *connect.Request[ownsandv1
 	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: &ownsandv1.Sandbox{SandboxId: r.Msg.GetSandboxId(), OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now()}}), nil
 }
 
+func (h *fakeSandbox) ListSandboxes(_ context.Context, r *connect.Request[ownsandv1.ListSandboxesRequest]) (*connect.Response[ownsandv1.ListSandboxesResponse], error) {
+	return connect.NewResponse(&ownsandv1.ListSandboxesResponse{
+		Sandboxes:     []*ownsandv1.Sandbox{{SandboxId: h.f.sb, OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now()}},
+		NextPageToken: "next",
+	}), nil
+}
+
 type fakeDataPath struct {
 	ownsandv1connect.UnimplementedDataPathServiceHandler
 	f *fakeServer

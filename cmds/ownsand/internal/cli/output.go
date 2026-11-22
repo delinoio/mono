@@ -92,9 +92,27 @@ func (a *app) printFields(w io.Writer, m proto.Message) error {
 	flatten("", v, &lines)
 	sort.SliceStable(lines, func(i, j int) bool { return lines[i][0] < lines[j][0] })
 	for _, l := range lines {
-		fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, l[0]), l[1])
+		if _, err := fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, l[0]), l[1]); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// stickyWriter wraps a writer for a sequence of writes whose error is checked
+// once at the end: it remembers the first error and drops every later write.
+type stickyWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (s *stickyWriter) Write(p []byte) (int, error) {
+	if s.err != nil {
+		return 0, s.err
+	}
+	n, err := s.w.Write(p)
+	s.err = err
+	return n, err
 }
 
 func flatten(prefix string, v any, out *[][2]string) {
@@ -171,22 +189,32 @@ func ts(t *timestamppb.Timestamp) string {
 	return t.AsTime().UTC().Format(time.RFC3339)
 }
 
-// printTable prints a table in text mode.
-func (a *app) printTable(headers []string, rows [][]string) {
-	tw := tabwriter.NewWriter(a.env.Stdout, 0, 0, 2, ' ', 0)
+// printTable prints a table in text mode and returns the first error of w.
+// The tabwriter buffers its output, and a write can flush early, so an error
+// can come from a row write as well as from the final flush.
+func (a *app) printTable(w io.Writer, headers []string, rows [][]string) error {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for i, h := range headers {
 		if i > 0 {
-			fmt.Fprint(tw, "\t")
+			if _, err := fmt.Fprint(tw, "\t"); err != nil {
+				return err
+			}
 		}
 		// Color codes would break the column widths, so the header uses
 		// bold only on the whole line below.
-		fmt.Fprint(tw, h)
+		if _, err := fmt.Fprint(tw, h); err != nil {
+			return err
+		}
 	}
-	fmt.Fprintln(tw)
+	if _, err := fmt.Fprintln(tw); err != nil {
+		return err
+	}
 	for _, r := range rows {
-		fmt.Fprintln(tw, strings.Join(r, "\t"))
+		if _, err := fmt.Fprintln(tw, strings.Join(r, "\t")); err != nil {
+			return err
+		}
 	}
-	_ = tw.Flush()
+	return tw.Flush()
 }
 
 // printList prints a list response: JSON as the whole message, text as a
@@ -200,7 +228,9 @@ func (a *app) printList(m proto.Message, next string, headers []string, rows [][
 			headers[i] = strings.ToUpper(headers[i])
 		}
 	}
-	a.printTable(headers, rows)
+	if err := a.printTable(a.env.Stdout, headers, rows); err != nil {
+		return err
+	}
 	if next != "" {
 		fmt.Fprintf(a.env.Stderr, "More results: pass --page-token %s\n", next)
 	}
@@ -219,12 +249,17 @@ func (a *app) printSecret(meta proto.Message, secretField, secret string) error 
 		v[secretField] = secret
 		return writeJSON(a.env.Stdout, v)
 	}
-	if err := a.printFields(a.env.Stderr, meta); err != nil {
+	// The server issued the secret and shows it only once, so a failure to
+	// write the fields on standard error must not stop the secret from
+	// reaching standard output. The first error is returned after both writes.
+	metaErr := a.printFields(a.env.Stderr, meta)
+	if metaErr == nil {
+		_, metaErr = fmt.Fprintln(a.env.Stderr, a.paint(ansiYellow, "The secret is shown once; store it now."))
+	}
+	if _, err := fmt.Fprintln(a.env.Stdout, secret); err != nil {
 		return err
 	}
-	fmt.Fprintln(a.env.Stderr, a.paint(ansiYellow, "The secret is shown once; store it now."))
-	_, err := fmt.Fprintln(a.env.Stdout, secret)
-	return err
+	return metaErr
 }
 
 // logHandler writes --verbose records as colored text lines.

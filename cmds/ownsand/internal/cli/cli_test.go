@@ -51,20 +51,27 @@ func newRunner(t *testing.T) *runner {
 func (r *runner) run(args ...string) result {
 	r.t.Helper()
 	var out, errb bytes.Buffer
+	code := r.runWriters(&out, &errb, args...)
+	return result{code: code, stdout: out.String(), stderr: errb.String()}
+}
+
+// runWriters runs one invocation on the given standard output and error and
+// returns the exit status.
+func (r *runner) runWriters(stdout, stderr io.Writer, args ...string) int {
+	r.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	code := Run(ctx, Env{
+	return Run(ctx, Env{
 		Args:   args,
 		Stdin:  strings.NewReader(r.stdin),
-		Stdout: &out,
-		Stderr: &errb,
+		Stdout: stdout,
+		Stderr: stderr,
 		LookupEnv: func(k string) (string, bool) {
 			v, ok := r.env[k]
 			return v, ok
 		},
 		LoginPollInterval: 10 * time.Millisecond,
 	})
-	return result{code: code, stdout: out.String(), stderr: errb.String()}
 }
 
 func TestUsageErrors(t *testing.T) {
