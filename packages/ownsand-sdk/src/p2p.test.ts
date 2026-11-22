@@ -20,6 +20,7 @@ import {
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
+import type { Sandbox } from "./sandbox.ts";
 import {
   type FakeAgent,
   type FakeAgentPeer,
@@ -32,6 +33,7 @@ import {
   attachMsg,
   ev,
   execMsg,
+  file,
   SANDBOX,
   setup,
   text,
@@ -641,6 +643,149 @@ describe("peer-to-peer data path", () => {
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
     });
   }
+
+  describe("when GetIceServers fails", () => {
+    const relayOperations = {
+      exec: {
+        install(h: ReturnType<typeof p2pSetup>["h"]) {
+          h.api.stream(RelayService, "Exec", function* () {
+            yield execMsg(ev.accepted());
+            yield execMsg(ev.exited(0));
+          });
+        },
+        run: (h: ReturnType<typeof p2pSetup>["h"], sandbox: Sandbox) =>
+          h.clock.run(sandbox.exec({ command: ["x"] }).wait()),
+      },
+      readFile: {
+        install(h: ReturnType<typeof p2pSetup>["h"]) {
+          h.api.stream(RelayService, "ReadFile", function* () {
+            yield file.accepted();
+            yield file.chunk(0, "hi");
+            yield file.end(2);
+          });
+        },
+        run: (h: ReturnType<typeof p2pSetup>["h"], sandbox: Sandbox) =>
+          h.clock.run(sandbox.readFileBytes("/a")),
+      },
+      writeFile: {
+        install(h: ReturnType<typeof p2pSetup>["h"]) {
+          h.api.unary(RelayService, "WriteFile", (req) => ({
+            writeId: req.writeId,
+            offset: req.offset,
+            length: BigInt(req.data.length),
+            finished: true,
+            sizeBytes: req.finish?.sizeBytes ?? 0n,
+          }));
+        },
+        run: (h: ReturnType<typeof p2pSetup>["h"], sandbox: Sandbox) =>
+          h.clock.run(sandbox.writeFile("/b", "hello")),
+      },
+    };
+
+    for (const code of [
+      Code.Unavailable,
+      Code.Internal,
+      Code.DeadlineExceeded,
+      Code.ResourceExhausted,
+    ]) {
+      for (const [name, operation] of Object.entries(relayOperations)) {
+        test(`${name} completes over the relay when GetIceServers fails with ${Code[code]}`, async () => {
+          const { h, rtc } = p2pSetup(() => {});
+          h.api.unary(DataPathService, "GetIceServers", () => {
+            throw new ConnectError("down", code);
+          });
+          operation.install(h);
+          const sandbox = h.client.sandbox(SANDBOX);
+          await operation.run(h, sandbox);
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+          expect(rtc.connections).toHaveLength(0);
+          // The handle stays on the relay: no later operation calls
+          // GetIceServers again.
+          await operation.run(h, sandbox);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        });
+      }
+    }
+
+    for (const code of [
+      Code.Unauthenticated,
+      Code.PermissionDenied,
+      Code.NotFound,
+      Code.InvalidArgument,
+    ]) {
+      test(`ends the operation when GetIceServers fails with ${Code[code]}`, async () => {
+        const { h } = p2pSetup(() => {});
+        h.api.unary(DataPathService, "GetIceServers", () => {
+          throw new ConnectError("rejected", code);
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const error = await h.clock
+          .run(sandbox.exec({ command: ["x"] }).wait())
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(ConnectError);
+        expect(error.code).toBe(code);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+    }
+
+    for (const transport of [undefined, DataPathTransport.PEER_TO_PEER]) {
+      test(`ends the operation without the relay on a billing error (transport ${transport === undefined ? "auto" : DataPathTransport[transport]})`, async () => {
+        const { h } = p2pSetup(() => {}, { transport });
+        h.api.unary(DataPathService, "GetIceServers", () => {
+          throw ownsandError(
+            Code.ResourceExhausted,
+            "suspended; see https://accounts.delino.io",
+            { billingReason: BillingReason.SUSPENDED },
+          );
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const error = await h.clock
+          .run(sandbox.exec({ command: ["x"] }).wait())
+          .catch((e) => e);
+        expect(billingReasonOf(error)).toBe(BillingReason.SUSPENDED);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+    }
+
+    test("an abort while GetIceServers is pending ends with the abort reason and keeps peer-to-peer", async () => {
+      const { h, rtc } = p2pSetup(() => {});
+      h.api.unary(DataPathService, "GetIceServers", async (_req, call) => {
+        await h.clock.sleep(5_000);
+        if (call.signal.aborted) {
+          // A transport reports the abort as Canceled, which must not move the
+          // handle to the relay.
+          throw new ConnectError("canceled", Code.Canceled);
+        }
+        return { iceServers: [{ urls: ["stun:stun.ownsand.api.test:3478"] }] };
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const pending = sandbox
+        .exec({ command: ["x"], signal: controller.signal })
+        .wait()
+        .catch((e) => e);
+      await h.clock.advance(1_000);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+      controller.abort(reason);
+      const error = await h.clock.run(pending);
+      expect(error).toBe(reason);
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(rtc.connections).toHaveLength(0);
+    });
+  });
 
   test("a forced RELAY transport never calls OpenSession", async () => {
     const { h, rtc } = p2pSetup(() => {}, {
