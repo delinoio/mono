@@ -46,6 +46,11 @@ func startShutdownRig(t *testing.T) *shutdownRig {
 			t.Error("Run did not return at cleanup")
 		}
 		srv.execs.wg.Wait()
+		// Release the state directory lock: Windows cannot delete the open
+		// lock file when t.TempDir removes the state directory. This
+		// cleanup runs after the one of t.TempDir was registered, so it
+		// runs before it. Close is safe to call more than once.
+		srv.Close()
 	})
 	var protocols http.Protocols
 	protocols.SetUnencryptedHTTP2(true)
