@@ -11,11 +11,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -955,4 +957,93 @@ func TestTransferReservationAfterFailedInstall(t *testing.T) {
 		t.Fatalf("transfer after the failed installation: %v", err)
 	}
 	end()
+}
+
+// blockingInstaller holds Install until release is closed, so a test can
+// observe the updater while an installation is in progress.
+type blockingInstaller struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingInstaller) Install(string) error {
+	close(b.started)
+	<-b.release
+	return nil
+}
+
+// TestWithdrawDuringInstallLogsTheObservedTarget covers the late withdrawal:
+// it returns ErrInstalling and logs the target that was installing.
+func TestWithdrawDuringInstallLogsTheObservedTarget(t *testing.T) {
+	r := newRelease(t, nil)
+	u, _, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	var logs strings.Builder
+	u.opts.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	inst := &blockingInstaller{started: make(chan struct{}), release: make(chan struct{})}
+	u.opts.Installer = inst
+	if err := update(u, "1.1.0", false); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() { _, err := u.TryInstall(); done <- err }()
+	<-inst.started
+	if err := u.Withdraw(); !errors.Is(err, ErrInstalling) {
+		t.Fatalf("withdrawal during installation: %v", err)
+	}
+	close(inst.release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "agent update withdrawal too late") || !strings.Contains(logs.String(), "target_version=1.1.0") {
+		t.Fatalf("late withdrawal log does not carry the target:\n%s", logs.String())
+	}
+}
+
+// failingInstaller signals that Install started, waits for release and then
+// fails, so the failure path writes the target while withdrawals run.
+type failingInstaller struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (f *failingInstaller) Install(string) error {
+	close(f.started)
+	<-f.release
+	return errors.New("boom")
+}
+
+// TestWithdrawRacesWithInstallFailure runs late withdrawals while a failing
+// installation rewrites the target. Run with -race: the withdrawal must read
+// the target that it logs while it holds the updater lock.
+func TestWithdrawRacesWithInstallFailure(t *testing.T) {
+	r := newRelease(t, nil)
+	u, _, _ := newUpdater(t, r, "1.0.0", &atomic.Bool{})
+	u.opts.Logger = slog.New(slog.NewTextHandler(&strings.Builder{}, nil))
+	for i := 0; i < 50; i++ {
+		inst := &failingInstaller{started: make(chan struct{}), release: make(chan struct{})}
+		u.opts.Installer = inst
+		u.mu.Lock()
+		u.artifact = filepath.Join(t.TempDir(), "agent")
+		u.target = "1.1.0"
+		u.state = ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE
+		u.mu.Unlock()
+		done := make(chan struct{})
+		go func() { u.TryInstall(); close(done) }()
+		<-inst.started
+		// The installation is in progress, so every withdrawal that runs
+		// before the failure returns ErrInstalling and logs the target.
+		var wg sync.WaitGroup
+		for w := 0; w < 4; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := 0; j < 20; j++ {
+					u.WithdrawOrdered(u.NextOrder())
+				}
+			}()
+		}
+		close(inst.release)
+		<-done
+		wg.Wait()
+	}
 }

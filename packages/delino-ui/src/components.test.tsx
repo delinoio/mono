@@ -41,7 +41,7 @@ import { Tabs, TabsList, TabsPanel, TabsTab } from "./tabs.tsx";
 import { TextField } from "./text-field.tsx";
 import { Textarea } from "./textarea.tsx";
 import { createToaster, ToastRegion } from "./toast.tsx";
-import { block, css } from "./stylesheet-source.ts";
+import { block, css, findRuleBlock } from "./stylesheet-source.ts";
 import { Tooltip, TooltipContent, TooltipTrigger } from "./tooltip.tsx";
 
 afterEach(() => {
@@ -1228,72 +1228,68 @@ describe("Tooltip", () => {
   });
 });
 
+// Helpers that read the authored hex tokens from the stylesheet source. The
+// focus ring, error border and field placeholder contrast tests share them.
+const compact = css
+  .replace(/\s+/g, " ")
+  .replace(/\( /g, "(")
+  .replace(/ \)/g, ")");
+
+// Bodies of every `@media (prefers-color-scheme: dark)` block, by brace
+// matching. `block()` returns only the first match of a selector.
+function darkMediaBodies(): string[] {
+  const opener = "@media (prefers-color-scheme: dark) {";
+  const bodies: string[] = [];
+  let from = compact.indexOf(opener);
+  while (from !== -1) {
+    const start = from + opener.length;
+    let depth = 1;
+    let end = start;
+    while (depth > 0 && end < compact.length) {
+      const char = compact[end];
+      if (char === "{") depth += 1;
+      if (char === "}") depth -= 1;
+      end += 1;
+    }
+    bodies.push(compact.slice(start, end - 1));
+    from = compact.indexOf(opener, end);
+  }
+  return bodies;
+}
+
+function darkRule(selector: string): string[] {
+  const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const pattern = new RegExp(`(?:^|[ }])${escaped} \\{([^}]*)\\}`, "g");
+  return darkMediaBodies().flatMap((body) =>
+    [...body.matchAll(pattern)].map((match) => match[1] ?? ""),
+  );
+}
+
+function property(declarations: string[], name: string): string | undefined {
+  const pattern = new RegExp(`(?:^|[ ;])${name}: (#[0-9a-fA-F]{6})`);
+  for (const text of [...declarations].reverse()) {
+    const value = pattern.exec(text)?.[1];
+    if (value) return value;
+  }
+  return undefined;
+}
+
+function luminance(hex: string): number {
+  const channels = [1, 3, 5].map((index) => {
+    const value = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
+    return value <= 0.03928 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4;
+  });
+  return 0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!;
+}
+
+function contrast(first: string, second: string): number {
+  const [high, low] = [luminance(first), luminance(second)].sort(
+    (a, b) => b - a,
+  );
+  return (high! + 0.05) / (low! + 0.05);
+}
+
 describe("ToastRegion", () => {
-  // Helpers that read the authored hex tokens from the stylesheet source. The
-  // focus ring and error border contrast tests below share them.
-  const compact = css
-    .replace(/\s+/g, " ")
-    .replace(/\( /g, "(")
-    .replace(/ \)/g, ")");
-
-  // Bodies of every `@media (prefers-color-scheme: dark)` block, by brace
-  // matching. `block()` returns only the first match of a selector.
-  function darkMediaBodies(): string[] {
-    const opener = "@media (prefers-color-scheme: dark) {";
-    const bodies: string[] = [];
-    let from = compact.indexOf(opener);
-    while (from !== -1) {
-      const start = from + opener.length;
-      let depth = 1;
-      let end = start;
-      while (depth > 0 && end < compact.length) {
-        const char = compact[end];
-        if (char === "{") depth += 1;
-        if (char === "}") depth -= 1;
-        end += 1;
-      }
-      bodies.push(compact.slice(start, end - 1));
-      from = compact.indexOf(opener, end);
-    }
-    return bodies;
-  }
-
-  function darkRule(selector: string): string[] {
-    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const pattern = new RegExp(`(?:^|[ }])${escaped} \\{([^}]*)\\}`, "g");
-    return darkMediaBodies().flatMap((body) =>
-      [...body.matchAll(pattern)].map((match) => match[1] ?? ""),
-    );
-  }
-
-  function property(declarations: string[], name: string): string | undefined {
-    const pattern = new RegExp(`(?:^|[ ;])${name}: (#[0-9a-fA-F]{6})`);
-    for (const text of [...declarations].reverse()) {
-      const value = pattern.exec(text)?.[1];
-      if (value) return value;
-    }
-    return undefined;
-  }
-
-  function luminance(hex: string): number {
-    const channels = [1, 3, 5].map((index) => {
-      const value = Number.parseInt(hex.slice(index, index + 2), 16) / 255;
-      return value <= 0.03928
-        ? value / 12.92
-        : ((value + 0.055) / 1.055) ** 2.4;
-    });
-    return (
-      0.2126 * channels[0]! + 0.7152 * channels[1]! + 0.0722 * channels[2]!
-    );
-  }
-
-  function contrast(first: string, second: string): number {
-    const [high, low] = [luminance(first), luminance(second)].sort(
-      (a, b) => b - a,
-    );
-    return (high! + 0.05) / (low! + 0.05);
-  }
-
   test("shows a toast with its title, description and action", async () => {
     const toaster = createToaster();
     render(<ToastRegion toaster={toaster} aria-label="Notifications" />);
@@ -1708,5 +1704,45 @@ describe("Separator", () => {
     const separator = screen.getByRole("separator");
     expect(separator.className).toBe("dui-separator");
     expect(separator.getAttribute("data-orientation")).toBe("vertical");
+  });
+});
+
+// happy-dom computes no cascade, so these tests check the stylesheet source.
+// Browsers draw `::placeholder` with a built-in color (#757575 in Chromium)
+// that is only 3.60:1 on the dark field surface, so the package sets it.
+describe("Field placeholder", () => {
+  const fieldPlaceholderSelector = [
+    ".dui-text-field-input::placeholder",
+    ".dui-textarea::placeholder",
+    ".dui-number-input-control::placeholder",
+    ".dui-password-input-control::placeholder",
+  ].join(", ");
+
+  test("draws the placeholder of every text entry control with the muted token at full opacity", () => {
+    const rule = findRuleBlock(css, fieldPlaceholderSelector);
+    expect(rule).not.toBeNull();
+    expect(rule).toContain("color: var(--dui-color-text-muted)");
+    // Firefox lowers the placeholder opacity by default.
+    expect(rule).toContain("opacity: 1");
+  });
+
+  test("leaves the Select placeholder on its own rule", () => {
+    expect(findRuleBlock(css, ".dui-select-value[data-placeholder]")).toBe(
+      "color: var(--dui-color-text-muted);",
+    );
+  });
+
+  test("keeps the muted token at 4.5:1 on the field surface in both schemes", () => {
+    const light = [block(":root")];
+    const dark = darkRule(":root");
+    expect(property(light, "--dui-color-text-muted")).toBe("#4e5968");
+    expect(property(light, "--dui-color-surface")).toBe("#ffffff");
+    expect(property(dark, "--dui-color-text-muted")).toBe("#b0b8c1");
+    expect(property(dark, "--dui-color-surface")).toBe("#1e1e24");
+    for (const scheme of [light, dark]) {
+      const muted = property(scheme, "--dui-color-text-muted");
+      const surface = property(scheme, "--dui-color-surface");
+      expect(contrast(muted!, surface!)).toBeGreaterThanOrEqual(4.5);
+    }
   });
 });

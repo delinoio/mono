@@ -118,7 +118,17 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         title="Join the organization"
         description="You join as the signed-in user. The invitation works only once."
       />
-      {accept.error ? <ErrorNotice error={accept.error} /> : null}
+      {accept.error ? (
+        <ErrorNotice
+          error={accept.error}
+          onSignIn={async () => {
+            // The accept handler cleared the stored copy after the failure.
+            // Store the secret again so that it survives the sign-in redirect.
+            pendingInvitation.save(secret);
+            await auth.signIn();
+          }}
+        />
+      ) : null}
       <div className="actions">
         <Button
           onClick={async () => {

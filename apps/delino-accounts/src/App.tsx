@@ -28,6 +28,8 @@ import { HomePage } from "./pages/home.tsx";
 import { InvitationPage } from "./pages/invitation.tsx";
 import {
   Link,
+  isInvitationFlowRoute,
+  parseRoute,
   type Route,
   RouteId,
   routePath,
@@ -40,7 +42,20 @@ import {
  * away from the invitation flow. The sign-in callback is part of the flow.
  */
 export function clearInvitationOnLeave(_from: Route, to: Route): void {
-  if (to.id !== RouteId.BillingInvitation && to.id !== RouteId.Callback) {
+  if (!isInvitationFlowRoute(to)) {
+    pendingInvitation.clear();
+  }
+}
+
+/**
+ * Deletes a pending invitation token when the app starts outside the
+ * invitation flow. Router navigation listeners never see the initial route,
+ * so an abandoned sign-in redirect, a sign-out reload or any other fresh load
+ * of a non-invitation route would otherwise keep the token for the tab's
+ * lifetime.
+ */
+export function clearInvitationOnStart(route: Route): void {
+  if (!isInvitationFlowRoute(route)) {
     pendingInvitation.clear();
   }
 }
@@ -83,6 +98,9 @@ export function Accounts({
     () => queryClient ?? createQueryClient(),
     [queryClient],
   );
+  // Run once before the first render. The clear is idempotent, so a repeated
+  // initializer call under StrictMode is harmless.
+  useState(() => clearInvitationOnStart(parseRoute(window.location.pathname)));
   return (
     <ApiProviders config={config} transport={transport} queryClient={client}>
       <CheckoutProvider checkout={checkout}>
@@ -130,7 +148,11 @@ function Routes({ config }: { config: AccountsConfig }) {
   if (route.id === RouteId.Callback) {
     // Without a Logto registration there is no provider for the Logto
     // callback hook. Show the notice instead.
-    return configured ? <LogtoCallbackPage /> : <SignIn configured={false} />;
+    return config.logto !== undefined ? (
+      <LogtoCallbackPage appId={config.logto.appId} />
+    ) : (
+      <SignIn configured={false} />
+    );
   }
   if (auth.isLoading) {
     return null;

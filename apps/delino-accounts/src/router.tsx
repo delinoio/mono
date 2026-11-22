@@ -28,6 +28,17 @@ export type Route =
   | { id: RouteId.Callback }
   | { id: RouteId.NotFound };
 
+/**
+ * Whether a route belongs to the invitation flow: the invitation page and
+ * the Logto sign-in callback that returns to it. A pending invitation token
+ * may exist only while the app shows one of these routes.
+ */
+export function isInvitationFlowRoute(route: Route): boolean {
+  return (
+    route.id === RouteId.BillingInvitation || route.id === RouteId.Callback
+  );
+}
+
 /** Parses a path into a route. */
 export function parseRoute(pathname: string): Route {
   let parts: string[];

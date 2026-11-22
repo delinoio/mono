@@ -20,7 +20,8 @@
      borders, focus rings and state indicators at least 3:1 (SC 1.4.11).
      Measured values: #ffffff on #1b64da 5.41:1, #ffffff on #d22030 5.26:1,
      #d22030 on #ffffff 5.26:1, #8b95a1 on #ffffff 3.04:1, #3182f6 on
-     #ffffff 3.71:1, #3182f6 on #f9fafb 3.55:1 (the dark toast surface).
+     #ffffff 3.71:1, #3182f6 on #f9fafb 3.55:1 (the dark toast surface),
+     #4e5968 on #ffffff 7.11:1 (muted text and placeholders).
      State indicators (the Progress, Meter and Slider fill
      and the Select option check) use --dui-color-accent-graphic instead of
      --dui-color-accent, because #1b64da is only 2.01:1 against the dark
@@ -184,6 +185,20 @@
     color: var(--dui-color-text);
     font: inherit;
     font-size: 15px;
+  }
+
+  /* Placeholder text. Browsers draw it with a built-in color (#757575 in
+     Chromium) at reduced opacity, which is only 3.60:1 on the dark field
+     surface #1e1e24. Use the muted text token instead, at full opacity
+     (Firefox lowers the opacity of the placeholder by default): #4e5968 on
+     #ffffff 7.11:1 and #b0b8c1 on #1e1e24 8.27:1. The Number and Password
+     input controls are transparent and sit on the surface of their group. */
+  .dui-text-field-input::placeholder,
+  .dui-textarea::placeholder,
+  .dui-number-input-control::placeholder,
+  .dui-password-input-control::placeholder {
+    color: var(--dui-color-text-muted);
+    opacity: 1;
   }
 
   .dui-text-field-input:focus-visible {

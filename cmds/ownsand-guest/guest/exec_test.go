@@ -16,6 +16,9 @@ import (
 
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"connectrpc.com/connect"
+
+	"github.com/delinoio/mono/go/ownsand/datapath"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -356,5 +359,61 @@ func TestCommandEnvOverridesHelperEnv(t *testing.T) {
 	env := strings.Join(commandEnv(map[string]string{"OWNSAND_GUEST_TEST_VAR": "request"}), "\n")
 	if !strings.Contains(env, "OWNSAND_GUEST_TEST_VAR=request") || strings.Contains(env, "=helper") {
 		t.Fatal("request env did not override the helper env")
+	}
+}
+
+// TestServeOversizeFrameEndsStreamWhileExecRuns checks that a frame above the
+// receive limit ends the Serve stream with resource_exhausted at once, also
+// while an exec of that stream still runs, and that the exec keeps running.
+func TestServeOversizeFrameEndsStreamWhileExecRuns(t *testing.T) {
+	h := newHarness(t, nil)
+	release := filepath.Join(t.TempDir(), "release")
+	// The exec ends only after the test creates the release file, so a Serve
+	// that waits for its handlers before it cancels them cannot return
+	// within the deadline below.
+	req := execReq(t, "/bin/sh", "-c", `printf ready; while [ ! -e "$RELEASE" ]; do sleep 0.02; done; printf done`)
+	req.Env = map[string]string{"RELEASE": release}
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s := h.open(ctx)
+	s.send(1, req)
+	if f := s.recv(); f.GetExecEvent().GetStarted() == nil {
+		t.Fatalf("first frame %v", f)
+	}
+
+	// 3 MiB is above the 1 MiB plus 128 KiB receive limit of the handler.
+	oversize := datapath.MustNewFrame(2, testSandbox, &ownsandv1.ReadFileRequest{
+		SandboxId: testSandbox, ReadId: newID(t), Path: strings.Repeat("a", 3<<20),
+	})
+	// The server may reset the stream before the whole frame is written, so
+	// a send error is not a failure; the receive below decides.
+	_ = s.s.Send(&ownsandv1.ServeRequest{Frame: oversize})
+	start := time.Now()
+	var err error
+	for err == nil {
+		_, err = s.s.Receive()
+	}
+	if code := errorCode(err); code != connect.CodeResourceExhausted {
+		t.Fatalf("receive error %v (code %v) after %v", err, code, time.Since(start))
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("stream error arrived only when the deadline ended: %v", err)
+	}
+
+	// The exec outlives the stream: it is still running, and an attach on a
+	// new stream returns the kept output and the result.
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel2()
+	s2 := h.open(ctx2)
+	defer s2.s.CloseRequest()
+	s2.send(3, &ownsandv1.AttachExecRequest{SandboxId: testSandbox, ExecId: req.GetExecId()})
+	evs := s2.collectExec()
+	if stdout, _ := outputs(evs); stdout != "readydone" || evs[len(evs)-1].GetExited().GetExitCode() != 0 {
+		t.Fatalf("attach events %v", evs)
 	}
 }

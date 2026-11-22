@@ -479,6 +479,61 @@ func TestLoginStoresUserOnlyCredentialsAndLogout(t *testing.T) {
 	}
 }
 
+// login and logout take no operands, also none after the "--" terminator. A
+// rejected logout must leave the stored credentials untouched and a rejected
+// login must not send a request to Logto.
+func TestLoginAndLogoutRejectOperands(t *testing.T) {
+	r := newRunner(t)
+	delete(r.env, ownsand.EnvAPIKey)
+	var requests atomic.Int32
+	ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer ls.Close()
+	r.env[EnvLogtoEndpoint] = ls.URL
+	r.env[EnvLogtoAppID] = "app"
+	st := credstore.Store{Dir: r.env[EnvConfigDir]}
+	if err := st.Save(&credstore.Credentials{SessionID: "s", LogtoEndpoint: ls.URL, AppID: "app", RefreshToken: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(r.env[EnvConfigDir], credstore.FileName)
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"logout", "extra"},
+		{"logout", "--", "extra"},
+		{"login", "extra"},
+		{"login", "--", "extra"},
+	} {
+		res := r.run(args...)
+		if res.code != ExitUsage || !strings.Contains(res.stderr, "usage: ownsand "+args[0]) {
+			t.Errorf("%v = %+v, want a usage error", args, res)
+		}
+		after, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(before, after) {
+			t.Errorf("%v changed the credential file: %v", args, err)
+		}
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("a rejected command sent %d request(s) to Logto", n)
+	}
+	for _, name := range []string{"login", "logout"} {
+		if res := r.run(name, "--help"); res.code != ExitOK || !strings.HasPrefix(res.stdout, "Usage: ownsand "+name) {
+			t.Errorf("%s --help = (%d, %q)", name, res.code, res.stdout)
+		}
+	}
+	// A valid logout still works.
+	if res := r.run("logout"); res.code != ExitOK {
+		t.Fatalf("logout: %+v", res)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("logout left the credential file")
+	}
+}
+
 // A device code that expires while the user has not signed in ends the login
 // with the expiry message at the expiry time, not after the polling interval,
 // and without a token request after that point.
