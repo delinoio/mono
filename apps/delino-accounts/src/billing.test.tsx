@@ -522,9 +522,97 @@ describe("members", () => {
     expect(window.location.pathname).toBe("/billing");
   });
 
+  test.each([
+    ["a viewer", VIEWER],
+    ["an admin", ADMIN],
+  ])(
+    "%s who leaves never sees the not-found notice and the account is gone from the list",
+    async (_role, userId) => {
+      const { api } = await renderAccount(userId);
+      await openTab("Members");
+      await screen.findByRole("list", { name: "Members" });
+      // Record the not-found text at every DOM change and at the navigation
+      // itself, so that a flash between the removal and the navigation counts.
+      const notFound = "It was not found, or you no longer have access to it.";
+      const seen: string[] = [];
+      const record = (where: string) => {
+        if (document.body.textContent?.includes(notFound)) seen.push(where);
+      };
+      const observer = new MutationObserver(() => record("mutation"));
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      const pushState = window.history.pushState.bind(window.history);
+      window.history.pushState = (...args) => {
+        record("navigation");
+        pushState(...args);
+      };
+      // Hold the account request that a refresh would send. The page must not
+      // wait for it: the user cannot read the account any more, so the request
+      // can only fail with the not-found notice.
+      let release!: () => void;
+      api.gates.set(
+        "GetBillingAccount",
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
+      try {
+        await click(
+          screen.getByRole("button", { name: "Leave billing account" }),
+        );
+        const dialog = await screen.findByRole("alertdialog");
+        await click(
+          within(dialog).getByRole("button", { name: "Leave billing account" }),
+        );
+        await settle(100);
+        expect(calls(api, "RemoveMember")).toHaveLength(1);
+        expect(window.location.pathname).toBe("/billing");
+        release();
+        await settle(100);
+        expect(await screen.findByText("No billing accounts yet")).toBeTruthy();
+        expect(
+          screen.queryByRole("link", { name: /Acme Robotics/ }),
+        ).toBeNull();
+        expect(seen).toEqual([]);
+      } finally {
+        observer.disconnect();
+        window.history.pushState = pushState;
+      }
+      expect(calls(api, "RemoveMember")).toEqual([
+        expect.objectContaining({ userId }),
+      ]);
+    },
+  );
+
+  test("a failed leave shows its error in the dialog and does not navigate", async () => {
+    const { api } = await renderAccount(VIEWER);
+    await openTab("Members");
+    await screen.findByRole("list", { name: "Members" });
+    api.failNext.set(
+      "RemoveMember",
+      new ConnectError("the owner cannot leave", Code.FailedPrecondition),
+    );
+    await click(screen.getByRole("button", { name: "Leave billing account" }));
+    const dialog = await screen.findByRole("alertdialog");
+    await click(
+      within(dialog).getByRole("button", { name: "Leave billing account" }),
+    );
+    await settle(60);
+    expect(within(dialog).getByRole("alert")).toBeTruthy();
+    expect(window.location.pathname).toBe(ACCOUNT_PATH);
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+    ).toBeTruthy();
+  });
+
   test("changes a role between admin and viewer", async () => {
     const { api } = await renderAccount();
     await openTab("Members");
+    const listed = calls(api, "ListMembers").length;
     await click(
       await screen.findByRole("combobox", { name: "Role of Vera Viewer" }),
     );
@@ -533,12 +621,15 @@ describe("members", () => {
     expect(calls(api, "UpdateMemberRole")).toEqual([
       expect.objectContaining({ userId: VIEWER, role: 2 }),
     ]);
+    expect(calls(api, "ListMembers").length).toBeGreaterThan(listed);
   });
 
   test("removes a member and transfers ownership after confirmation", async () => {
     const { api } = await renderAccount();
     await openTab("Members");
     const list = await screen.findByRole("list", { name: "Members" });
+    const listed = () => calls(api, "ListMembers").length;
+    let before = listed();
     await click(within(list).getAllByRole("button", { name: "Remove" })[1]!);
     let dialog = await screen.findByRole("alertdialog");
     await click(within(dialog).getByRole("button", { name: "Remove member" }));
@@ -546,6 +637,14 @@ describe("members", () => {
     expect(calls(api, "RemoveMember")).toEqual([
       expect.objectContaining({ userId: VIEWER }),
     ]);
+    // The member list is refreshed and no longer shows the removed member.
+    expect(listed()).toBeGreaterThan(before);
+    expect(
+      within(await screen.findByRole("list", { name: "Members" })).queryByText(
+        /Vera Viewer/,
+      ),
+    ).toBeNull();
+    before = listed();
     await click(screen.getByRole("button", { name: "Make owner" }));
     dialog = await screen.findByRole("alertdialog");
     await click(
@@ -555,6 +654,7 @@ describe("members", () => {
     expect(calls(api, "TransferOwnership")).toEqual([
       expect.objectContaining({ userId: ADMIN }),
     ]);
+    expect(listed()).toBeGreaterThan(before);
   });
 
   test("invites by email: focuses the email, checks it and sends the role", async () => {

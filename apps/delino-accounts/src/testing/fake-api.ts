@@ -87,6 +87,12 @@ export interface FakeApi {
   calls: Call[];
   /** Fails the next call of a method with the given error once. */
   failNext: Map<string, ConnectError>;
+  /**
+   * Holds every call of a method until the promise settles, so that a test
+   * can observe what the page does while a request is still in flight. Only
+   * `GetBillingAccount` honors a gate.
+   */
+  gates: Map<string, Promise<unknown>>;
   transport: ReturnType<typeof createRouterTransport>;
 }
 
@@ -256,6 +262,7 @@ export function createFakeApi(): FakeApi {
     ]),
     calls: [] as Call[],
     failNext: new Map<string, ConnectError>(),
+    gates: new Map<string, Promise<unknown>>(),
   } as FakeApi;
   let nextId = 100;
   const newId = () =>
@@ -331,8 +338,9 @@ export function createFakeApi(): FakeApi {
         api.accounts.set(id, account);
         return { billingAccount: view(account) };
       },
-      getBillingAccount(req) {
+      async getBillingAccount(req) {
         record("GetBillingAccount", req);
+        await api.gates.get("GetBillingAccount");
         return { billingAccount: view(load(req.billingAccountId).account) };
       },
       listBillingAccounts(req) {
