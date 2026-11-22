@@ -121,10 +121,12 @@ func newWorld(t *testing.T) *world {
 	})
 	w := &world{t: t, m: m, d: d, sandbox: newID(t)}
 	now := time.Now()
+	// The process runtime runs only guests of the host OS.
+	guestOS, baseImage := processrt.HostGuest()
 	if _, err := m.Create(context.Background(), &ownsandv1.CreateSandboxCommand{
-		SandboxId: w.sandbox, Source: &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
+		SandboxId: w.sandbox, Source: &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: baseImage},
 		Resources: &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 128, DiskGib: 1}, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE,
-		GuestOs: ownsandv1.GuestOs_GUEST_OS_LINUX, IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(time.Hour),
+		GuestOs: guestOS, IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(time.Hour),
 		CreateTime: timestamppb.New(now), MaxDeadline: timestamppb.New(now.Add(time.Hour)),
 		Limits: &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: 4, VcpuOvercommitPercent: 100},
 	}); err != nil {

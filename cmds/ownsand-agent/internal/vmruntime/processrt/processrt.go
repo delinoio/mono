@@ -102,6 +102,18 @@ func findGuestBinary() string {
 	return ""
 }
 
+// HostGuest returns the guest OS and the base image of the sandboxes that
+// the runtime runs on this host: the host OS and its base image, because the
+// guest helper runs as a host process. They are the only guest OS and base
+// image that Capabilities reports, and Create rejects other guest OSes.
+func HostGuest() (ownsandv1.GuestOs, ownsandv1.BaseImage) { return hostGuestOS, hostBaseImage }
+
+// MacOSHardwareModelSupported reports true for every model. The runtime boots
+// no VM, so a macOS snapshot runs on a macOS host whatever hardware model it
+// records. The agent asks only for macOS guests, which this runtime runs only
+// on a macOS host.
+func (r *Runtime) MacOSHardwareModelSupported([]byte) bool { return true }
+
 // Kind returns RuntimeKindProcess.
 func (r *Runtime) Kind() config.RuntimeKind { return config.RuntimeKindProcess }
 
@@ -119,12 +131,16 @@ func (r *Runtime) Capabilities(context.Context) vmruntime.Capabilities {
 }
 
 type vm struct {
-	id      string
-	dir     string
-	socket  string
-	cmd     *exec.Cmd
-	exited  chan struct{}
-	restore ownsandv1.SandboxRestorePath
+	id  string
+	dir string
+	// socket is the listen address of the guest helper, and socketDir is the
+	// directory that holds it outside dir, or "" when the address needs no
+	// directory (see newSocket).
+	socket    string
+	socketDir string
+	cmd       *exec.Cmd
+	exited    chan struct{}
+	restore   ownsandv1.SandboxRestorePath
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -193,7 +209,12 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	} else if err := os.MkdirAll(root, 0o700); err != nil {
 		return nil, err
 	}
-	v := &vm{id: spec.SandboxID, dir: spec.Dir, socket: socketPath(spec.Dir, spec.SandboxID), exited: make(chan struct{}), restore: restore}
+	socket, socketDir, err := newSocket(spec.SandboxID)
+	if err != nil {
+		os.RemoveAll(spec.Dir)
+		return nil, err
+	}
+	v := &vm{id: spec.SandboxID, dir: spec.Dir, socket: socket, socketDir: socketDir, exited: make(chan struct{}), restore: restore}
 	cmd := exec.Command(r.guestBinary,
 		"--listen", "unix://"+v.socket,
 		"--state-dir", filepath.Join(spec.Dir, stateDir),
@@ -206,6 +227,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	procgroup.Set(cmd)
 	if err := launcher.Start(cmd); err != nil {
 		os.RemoveAll(spec.Dir)
+		removeSocketDir(v)
 		return nil, fmt.Errorf("processrt: start guest helper: %w", err)
 	}
 	v.cmd = cmd
@@ -261,6 +283,14 @@ func (r *Runtime) deleteAfterFailedStart(v *vm) {
 	if err := r.removeSandbox(v); err != nil {
 		r.logger.Error("process sandbox cleanup after a failed start failed", "sandbox_id", v.id, "error", err)
 	}
+}
+
+// removeSocketDir removes the socket directory of a sandbox, if it has one.
+func removeSocketDir(v *vm) error {
+	if v.socketDir == "" {
+		return nil
+	}
+	return os.RemoveAll(v.socketDir)
 }
 
 func (r *Runtime) lookup(id string) (*vm, error) {
@@ -447,10 +477,11 @@ func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 	return r.removeSandbox(v)
 }
 
-// removeSandbox removes the files of a sandbox whose helper was reaped and
-// then stops tracking it. A failed removal keeps the sandbox tracked.
+// removeSandbox removes the files of a sandbox whose helper was reaped,
+// including its socket directory, and then stops tracking it. A failed
+// removal keeps the sandbox tracked.
 func (r *Runtime) removeSandbox(v *vm) error {
-	if err := os.RemoveAll(v.dir); err != nil {
+	if err := errors.Join(os.RemoveAll(v.dir), removeSocketDir(v)); err != nil {
 		return err
 	}
 	r.mu.Lock()

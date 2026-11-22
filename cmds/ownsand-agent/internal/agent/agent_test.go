@@ -163,14 +163,17 @@ func (h *harness) command(cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandRe
 
 var limits = &ownsandv1.DeviceLimits{VcpuCount: 4, MemoryMib: 4096, DiskGib: 4, VcpuOvercommitPercent: 100}
 
+// createCommand creates a sandbox of the guest OS that the process runtime
+// runs on this host.
 func createCommand(id string) *ownsandv1.AgentCommand {
 	now := time.Now()
+	guestOS, baseImage := processrt.HostGuest()
 	return &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: &ownsandv1.CreateSandboxCommand{
 		SandboxId:   id,
-		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
+		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: baseImage},
 		Resources:   &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 256, DiskGib: 1},
 		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE,
-		GuestOs:     ownsandv1.GuestOs_GUEST_OS_LINUX,
+		GuestOs:     guestOS,
 		IdleTtl:     durationpb.New(time.Hour),
 		MaxTtl:      durationpb.New(time.Hour),
 		CreateTime:  timestamppb.New(now),
@@ -524,6 +527,12 @@ func (f *importFixture) requireRestorable(t *testing.T, id string) {
 	cmd.GetCreateSandbox().Source = &ownsandv1.CreateSandboxCommand_SnapshotId{SnapshotId: id}
 	if res := f.h.command(cmd); res.GetError() != nil || res.GetCreateSandbox().GetSandbox().GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 		t.Fatalf("create from the imported snapshot %v", res)
+	}
+	// Delete the restored sandbox, so that a test can check several
+	// snapshots: the process runtime runs macOS guests on a macOS host, and
+	// the agent runs at most two macOS guests at a time.
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: fromSnap}}}); res.GetError() != nil {
+		t.Fatalf("delete the sandbox restored from the imported snapshot %v", res)
 	}
 }
 

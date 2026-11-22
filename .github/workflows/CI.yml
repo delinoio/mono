@@ -411,27 +411,13 @@ jobs:
           case "$RUNNER_OS" in
             macOS)
               known_failures=(
-                # The process test runtime runs only guests of the host OS,
-                # but the tests create Linux guests, and the guest helper
-                # socket paths under the macOS TMPDIR exceed the 104-byte unix
-                # socket path limit, so every sandbox create fails.
-                cmds/ownsand-agent
-                cmds/ownsand-agent/internal/agent
-                cmds/ownsand-agent/internal/dataplane
-                cmds/ownsand-agent/internal/ops
               )
               ;;
             Windows)
               known_failures=(
-                # The dangling-symlink and long-destination-name file read
-                # tests expect Linux errors.
-                cmds/ownsand/internal/cli
                 # The read snapshot does not abort when the path is swapped
                 # before open.
                 cmds/ownsand-guest/guest
-                # The HTTP observer receives no response for a request that
-                # starts with CRLF after a POST.
-                servers/accounts-api/internal/server
               )
               ;;
             *)
