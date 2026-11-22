@@ -262,17 +262,24 @@ func (g *gateFixture) openCalls() []gatedCall {
 }
 
 // expectGates checks every gated and open call in the phase: the calls in
-// rejected fail with reason, every other call has no billing error.
+// rejected fail with reason, every other gated call has no billing error
+// (it may still fail for another reason, such as a missing ID), and every
+// open call succeeds.
 func (g *gateFixture) expectGates(t *testing.T, rejected map[string]bool, reason ownsandv1.BillingReason) {
 	t.Helper()
 	ctx := context.Background()
 	all := append(append(g.blockedCalls(), g.suspendedCalls()...), g.openCalls()...)
 	for _, c := range all {
-		if !rejected[c.name] {
+		err := c.call(ctx)
+		got := billingReasonOf(t, c.name, err)
+		if rejected[c.name] {
+			if got != reason {
+				t.Errorf("%s: billing reason = %v, want %v", c.name, got, reason)
+			}
 			continue
 		}
-		if got := billingReasonOf(t, c.name, c.call(ctx)); got != reason {
-			t.Errorf("%s: billing reason = %v, want %v", c.name, got, reason)
+		if got != ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED {
+			t.Errorf("%s: unexpected billing reason %v", c.name, got)
 		}
 	}
 	for _, c := range g.openCalls() {
