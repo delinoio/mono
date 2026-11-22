@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -186,9 +187,29 @@ func waitExit(t *testing.T, h *helperProcess) int {
 	}
 }
 
+// shortSocketDir returns a new directory whose path leaves room for a socket
+// file name within the unix socket path limit (104 bytes on macOS). The
+// directory of t.TempDir contains the test name and sits under the long
+// TMPDIR of macOS, so a socket path built on it exceeds the limit and the bind
+// fails. Windows has a longer limit and no /tmp, so it keeps the default
+// temporary directory.
+func shortSocketDir(t *testing.T) string {
+	t.Helper()
+	base := os.TempDir()
+	if runtime.GOOS != "windows" {
+		base = "/tmp"
+	}
+	dir, err := os.MkdirTemp(base, "ogs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 func TestSecondHelperDoesNotTouchStateOfRunningHelper(t *testing.T) {
 	stateDir := t.TempDir()
-	sockDir := t.TempDir()
+	sockDir := shortSocketDir(t)
 	sock1 := filepath.Join(sockDir, "a.sock")
 	sock2 := filepath.Join(sockDir, "b.sock")
 
