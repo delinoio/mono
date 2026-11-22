@@ -1152,7 +1152,133 @@ test("a workspace dependency cycle fails", () => {
   ];
   assert.throws(
     () => plan(status(["a", "1.0.0"]), cyclic),
-    /workspace dependency cycle/,
+    /dependency cycle: a -> b -> a/,
+  );
+});
+
+test("deploy.needs orders a deployable after the deployables it needs", () => {
+  const servers = [
+    pkg("servers/a-api", {
+      name: "a-api",
+      deploy: droplet("a-api", { needs: ["z-accounts"] }),
+    }),
+    pkg("servers/b-api", { name: "b-api", deploy: droplet("b-api") }),
+    pkg("servers/z-accounts", {
+      name: "z-accounts",
+      deploy: droplet("z-accounts"),
+    }),
+  ];
+  const result = plan(
+    status(["a-api", "1.0.0"], ["b-api", "1.0.0"], ["z-accounts", "1.0.0"]),
+    servers,
+  );
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["b-api", "z-accounts", "a-api"],
+  );
+  // The plan output does not carry the field.
+  assert.equal(result.servers[2].needs, undefined);
+});
+
+test("deploy.needs orders through deployables that the run does not select", () => {
+  const servers = [
+    pkg("servers/a", { name: "a", deploy: droplet("a", { needs: ["m"] }) }),
+    pkg("servers/m", { name: "m", deploy: droplet("m", { needs: ["z"] }) }),
+    pkg("servers/z", { name: "z", deploy: droplet("z") }),
+  ];
+  const result = plan(status(["a", "1.0.0"], ["z", "1.0.0"]), servers);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["z", "a"],
+  );
+});
+
+test("deploy.needs does not select an unreleased deployable", () => {
+  const servers = [
+    pkg("servers/a", { name: "a", deploy: droplet("a", { needs: ["z"] }) }),
+    pkg("servers/z", { name: "z", deploy: droplet("z") }),
+  ];
+  const result = plan(status(["a", "1.0.0"]), servers);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["a"],
+  );
+});
+
+test("a static site can need a server", () => {
+  const mixed = [
+    pkg("servers/z-api", { name: "z-api", deploy: droplet("z-api") }),
+    pkg("apps/a-site", {
+      name: "a-site",
+      deploy: {
+        target: DeployTarget.CloudflarePages,
+        project: "a-site",
+        needs: ["z-api"],
+      },
+    }),
+  ];
+  const result = plan(status(["a-site", "1.0.0"], ["z-api", "1.0.0"]), mixed);
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["z-api"],
+  );
+  assert.deepEqual(
+    result.staticSites.map((d) => d.name),
+    ["a-site"],
+  );
+});
+
+test("invalid deploy.needs fields fail for every deployable", () => {
+  const site = pkg("apps/site", {
+    name: "site",
+    deploy: { target: DeployTarget.CloudflarePages, project: "site" },
+  });
+  const cases = [
+    [{ needs: "z" }, /^a: deploy\.needs must be a nonempty list/],
+    [{ needs: [] }, /^a: deploy\.needs must be a nonempty list/],
+    [{ needs: [""] }, /^a: deploy\.needs must be a nonempty list/],
+    [{ needs: [1] }, /^a: deploy\.needs must be a nonempty list/],
+    [{ needs: ["z", "z"] }, /^a: deploy\.needs must be a nonempty list/],
+    [{ needs: ["a"] }, /^a: deploy\.needs must not name itself$/],
+    [{ needs: ["missing"] }, /^a: deploy\.needs names missing, which is not/],
+    [{ needs: ["ui"] }, /^a: deploy\.needs names ui, which is not/],
+    [
+      { needs: ["site"] },
+      /^a: deploy\.needs names site, a static-site that deploys after every server$/,
+    ],
+  ];
+  for (const [fields, message] of cases) {
+    const packages = [
+      pkg("packages/ui", { name: "ui" }),
+      site,
+      pkg("servers/a", { name: "a", deploy: droplet("a", fields) }),
+      pkg("servers/z", { name: "z", deploy: droplet("z") }),
+    ];
+    // Unselected: the plan checks every deployable of the workspace.
+    assert.throws(
+      () => plan(status(["z", "1.0.0"]), packages),
+      (error) => {
+        assert.ok(error instanceof DeployPlanError);
+        assert.match(error.message, message, JSON.stringify(fields));
+        return true;
+      },
+    );
+  }
+});
+
+test("a deploy.needs cycle fails even when no release selects it", () => {
+  const packages = [
+    pkg("servers/a", { name: "a", deploy: droplet("a", { needs: ["b"] }) }),
+    pkg("servers/b", { name: "b", deploy: droplet("b", { needs: ["a"] }) }),
+    pkg("servers/c", { name: "c", deploy: droplet("c") }),
+  ];
+  assert.throws(
+    () => plan(status(["c", "1.0.0"]), packages),
+    /dependency cycle: a -> b -> a/,
+  );
+  assert.throws(
+    () => plan({ changesets: [], releases: [] }, packages),
+    /dependency cycle: a -> b -> a/,
   );
 });
 
@@ -1362,7 +1488,7 @@ test("real workspace cycles still fail next to unnamed packages", () => {
   ];
   assert.throws(
     () => plan(status(["a", "1.0.1"], ["b", "1.0.1"]), packages),
-    /workspace dependency cycle: a -> b -> a/,
+    /dependency cycle: a -> b -> a/,
   );
 });
 

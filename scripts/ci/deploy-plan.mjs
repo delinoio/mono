@@ -189,6 +189,17 @@ function deployable(pkg) {
       `${name}: deploy.target ${deploy.target} is allowed only under ${rule.root}/`,
     );
   }
+  const needs = deploy.needs ?? [];
+  if (
+    !Array.isArray(needs) ||
+    (deploy.needs !== undefined && needs.length === 0) ||
+    !needs.every((n) => typeof n === "string" && n !== "") ||
+    new Set(needs).size !== needs.length
+  ) {
+    throw new DeployPlanError(
+      `${name}: deploy.needs must be a nonempty list of different deployable package names`,
+    );
+  }
   const base = { name, dir: pkg.dir, kind: rule.kind, target: deploy.target };
   if (deploy.target === DeployTarget.Droplet) {
     if (!dropletImageName.test(name)) {
@@ -320,10 +331,10 @@ function workspaceTarget(
   return key;
 }
 
-// Orders the selected names so that every workspace dependency, direct or
-// through unselected packages, comes before its dependents. Among the
-// packages whose dependencies are already ordered, the alphabetically first
-// one comes next, so the result is stable.
+// Orders the selected names so that every workspace dependency and every
+// deployable in `deploy.needs`, direct or through unselected packages, comes
+// before its dependents. Among the packages whose dependencies are already
+// ordered, the alphabetically first one comes next, so the result is stable.
 function topologicalOrder(selected, packagesByName) {
   const packagesByDir = new Map(
     [...packagesByName.values()].map((pkg) => [pkg.dir, pkg]),
@@ -335,18 +346,20 @@ function topologicalOrder(selected, packagesByName) {
     if (state.get(name) === "done") return reach.get(name);
     if (state.get(name) === "visiting") {
       throw new DeployPlanError(
-        `workspace dependency cycle: ${[...path, name].join(" -> ")}`,
+        `dependency cycle: ${[...path, name].join(" -> ")}`,
       );
     }
     state.set(name, "visiting");
     const { manifest, dir } = packagesByName.get(name);
-    const deps = new Set(
-      dependencyFields.flatMap((field) =>
+    const deps = new Set([
+      ...dependencyFields.flatMap((field) =>
         Object.entries(manifest[field] ?? {}).map(([key, spec]) =>
           workspaceTarget(key, spec, dir, packagesByName, packagesByDir),
         ),
       ),
-    );
+      // `checkNeeds` has validated these names.
+      ...(manifest.deploy?.needs ?? []),
+    ]);
     const reached = new Set();
     for (const dep of [...deps].sort()) {
       if (dep === undefined || !packagesByName.has(dep)) continue;
@@ -460,6 +473,37 @@ function rejectSharedDestinations(packages) {
   }
 }
 
+// `deploy.needs` names the deployables that must deploy before this one when
+// a run deploys both. A deployable that the run does not select is already
+// deployed, so `needs` only orders and never selects. Servers deploy before
+// static sites, so a server cannot need a static site. Checks every
+// deployable of the workspace, selected or not, including cycles.
+function checkNeeds(packages, packagesByName) {
+  const kinds = new Map();
+  for (const pkg of packages) {
+    const d = deployable(pkg);
+    if (d) kinds.set(d.name, d.kind);
+  }
+  for (const [name, kind] of kinds) {
+    for (const need of packagesByName.get(name).manifest.deploy.needs ?? []) {
+      if (need === name) {
+        throw new DeployPlanError(`${name}: deploy.needs must not name itself`);
+      }
+      if (!kinds.has(need)) {
+        throw new DeployPlanError(
+          `${name}: deploy.needs names ${need}, which is not a deployable workspace package`,
+        );
+      }
+      if (kindOrder.indexOf(kinds.get(need)) > kindOrder.indexOf(kind)) {
+        throw new DeployPlanError(
+          `${name}: deploy.needs names ${need}, a ${kinds.get(need)} that deploys after every ${kind}`,
+        );
+      }
+    }
+  }
+  topologicalOrder(new Set(kinds.keys()), packagesByName);
+}
+
 // Builds the deployment plan from the `changeset status` JSON and the
 // workspace packages.
 export function plan(status, packages) {
@@ -488,6 +532,7 @@ export function plan(status, packages) {
     .map(({ name, version }) => ({ name, version }));
   const versions = new Map(allReleases.map((r) => [r.name, r.version]));
   rejectSharedDestinations(packages);
+  checkNeeds(packages, packagesByName);
   const byName = new Map(
     [...versions.keys()]
       .map((name) => deployable(packagesByName.get(name)))
