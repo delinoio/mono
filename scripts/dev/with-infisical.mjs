@@ -233,7 +233,11 @@ export function parseExport(output) {
       "infisical export did not print a JSON array",
     );
   }
-  const variables = {};
+  // Accepted entries stay in a list and become own data properties at the end.
+  // Assigning `variables[entry.key]` on an object literal would invoke the
+  // `Object.prototype.__proto__` setter for the valid name `__proto__` and
+  // silently drop the variable instead of creating an own property.
+  const accepted = [];
   let reserved = 0;
   let invalid = 0;
   for (const entry of entries) {
@@ -256,10 +260,11 @@ export function parseExport(output) {
     } else if (!VariableName.test(entry.key) || entry.value.includes("\0")) {
       invalid += 1;
     } else {
-      variables[entry.key] = entry.value;
+      accepted.push([entry.key, entry.value]);
     }
   }
-  return { variables, reserved, invalid };
+  // A later entry with the same name replaces an earlier one.
+  return { variables: Object.fromEntries(accepted), reserved, invalid };
 }
 
 let received = null;
