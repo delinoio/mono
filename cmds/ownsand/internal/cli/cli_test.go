@@ -946,6 +946,17 @@ func TestListOutputAndColor(t *testing.T) {
 	if strings.Contains(res.stderr, "\x1b[") {
 		t.Fatalf("NO_COLOR: %q", res.stderr)
 	}
+	// An empty NO_COLOR counts as unset, so color stays on.
+	r.env[EnvNoColor] = ""
+	res = r.run("sandbox", "get", "bad")
+	if !strings.Contains(res.stderr, ansiRed) {
+		t.Fatalf("an empty NO_COLOR must keep color: %q", res.stderr)
+	}
+	// --no-color still wins over an empty NO_COLOR.
+	res = r.run("--no-color", "sandbox", "get", "bad")
+	if strings.Contains(res.stderr, "\x1b[") {
+		t.Fatalf("--no-color with an empty NO_COLOR: %q", res.stderr)
+	}
 }
 
 func TestVerboseLogsNeverContainSecretsOrContent(t *testing.T) {
