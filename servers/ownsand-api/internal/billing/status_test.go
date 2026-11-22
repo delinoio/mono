@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -351,6 +352,80 @@ func TestPendingUnlinkRetries(t *testing.T) {
 	}
 	if !strings.Contains(f.logText(), `"msg":"billing_unlink_confirmed"`) {
 		t.Fatal("billing_unlink_confirmed not logged")
+	}
+}
+
+// TestRunRetriesPendingUnlinksEveryTick checks that the status worker of the
+// lease holder retries a due pending unlink at every tick, not only at a
+// poll, and that an instance without the lease never retries.
+func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
+	t0 := time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC)
+	f := newStatusFixture(t, t0)
+	ctx := context.Background()
+	f.addOrg(t, org1)
+	f.link(t, org1, accountA)
+	// The poll interval and the first back-off are far longer than the test,
+	// so only the tick can cause a retry.
+	timing := billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}
+	var mu sync.Mutex
+	isHeld := false
+	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Timing: &timing,
+		Held: func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }})
+	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { statuses.Run(runCtx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	if err := f.db.InTx(ctx, func(tx pgx.Tx) error {
+		_, former, _, err := billing.UnlinkTx(ctx, tx, org1, billing.SourceTransfer, t0)
+		if err != nil {
+			return err
+		}
+		return billing.AddPendingUnlinkTx(ctx, tx, org1, former, t0)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	calls := func() int { return f.fake.Calls(accountstest.MethodUnlinkOrganization) }
+
+	// Without the lease, a due row stays untouched.
+	time.Sleep(300 * time.Millisecond)
+	if n := calls(); n != 0 {
+		t.Fatalf("an instance without the lease retried a pending unlink %d times", n)
+	}
+
+	// With the lease, the next tick retries it although the poll interval has
+	// not elapsed since the poll of the first step.
+	setHeld(true)
+	eventually(t, "the first retry", func() bool { return calls() == 1 })
+	polls := f.fake.Calls(accountstest.MethodListBillingStatusChanges)
+	if polls != 1 {
+		t.Fatalf("polls = %d, want the single poll of the first step", polls)
+	}
+
+	// The failed attempt moved the row an hour ahead; later ticks skip it, and
+	// no further poll runs within the poll interval.
+	time.Sleep(300 * time.Millisecond)
+	if n := calls(); n != 1 {
+		t.Fatalf("a pending unlink that was not due was retried: %d calls", n)
+	}
+	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n != polls {
+		t.Fatalf("polls = %d, want %d: the poll interval has not elapsed", n, polls)
+	}
+
+	// Once the back-off has elapsed, the next tick sends the unlink.
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	f.clock.Advance(time.Hour + time.Second)
+	eventually(t, "the confirmed unlink", func() bool {
+		var n int
+		if err := f.db.Pool.QueryRow(ctx, "SELECT count(*) FROM billing_pending_unlinks WHERE organization_id = $1", org1).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 0
+	})
+	if _, _, linked := f.fake.Link(org1); linked {
+		t.Fatal("delino-accounts still has the link")
 	}
 }
 
