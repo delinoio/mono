@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"google.golang.org/protobuf/proto"
 
@@ -55,6 +56,56 @@ func (s *Sandbox) ReadFileBytes(ctx context.Context, path string) ([]byte, error
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+// FileReadParams describes a read that the caller identifies itself, for a
+// program that serves one read in several calls: for example a server that
+// relays a read to its own clients and continues it from an offset after its
+// client's stream ended. Calls with the same ReadID read the same snapshot of
+// the file (see the file transfer contract).
+type FileReadParams struct {
+	// ReadID is the read_id, a UUID v7 that the caller generated right
+	// before the first call of the read.
+	ReadID string
+	// Path is the absolute guest path. Every call of one ReadID uses the
+	// same path.
+	Path string
+	// BindingSalt is the binding salt of the read (32 bytes). Every call of
+	// one ReadID must use the same salt, because the agent compares the
+	// digest of each call with the digest of the first one. Empty generates
+	// a salt, which suits a read that one call serves to its end.
+	BindingSalt []byte
+	// Offset is the first byte that the call delivers.
+	Offset int64
+}
+
+// ReadFileFrom streams the guest file of p to w from p.Offset and returns
+// the file size when the read reaches the end. On an error it returns the
+// next undelivered offset. Like ReadFile, it continues an interrupted
+// stream with the same read_id and salt, so w never receives a byte twice.
+func (s *Sandbox) ReadFileFrom(ctx context.Context, p FileReadParams, w io.Writer) (int64, error) {
+	salt := p.BindingSalt
+	if len(salt) == 0 {
+		var err error
+		if salt, err = relaybinding.NewSalt(); err != nil {
+			return 0, err
+		}
+	}
+	base := &ownsandv1.ReadFileRequest{OrganizationId: s.org, SandboxId: s.id, ReadId: p.ReadID, Path: p.Path, BindingSalt: salt}
+	check := proto.Clone(base).(*ownsandv1.ReadFileRequest)
+	check.Offset = p.Offset
+	if err := validate.ReadFileRequest(check); err != nil {
+		return 0, err
+	}
+	op := &readOp{
+		s:     s,
+		base:  base,
+		w:     w,
+		next:  p.Offset,
+		rec:   newRecovery(s.c.timing.recoveryWindow),
+		grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE, p.ReadID, relaybinding.ReadFileDigest(base)),
+	}
+	return op.run(ctx)
 }
 
 type readOp struct {
@@ -427,6 +478,105 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 		buf, nextBuf = nextBuf, buf
 		n, rerr = m, nerr
 	}
+}
+
+// FileWriteParams describes a write that the caller identifies itself, for
+// a program that receives the chunks of one file in several calls (for
+// example a server that relays the chunks of its own clients).
+type FileWriteParams struct {
+	// WriteID is the write_id, a UUID v7 that the caller generated right
+	// before the first chunk of the file.
+	WriteID string
+	// Path is the absolute guest target path.
+	Path string
+	// BindingSalt is the binding salt of the write (32 bytes). A program
+	// that can open the same write in another process (for example after a
+	// restart) passes the same salt there, because the agent compares the
+	// digest with the one of the first call. Empty generates a salt.
+	BindingSalt []byte
+}
+
+// FileWrite is one write that the caller feeds with chunks at offsets. The
+// first call through a FileWrite carries the path and the salt; the guest
+// helper records the written ranges, and Finish moves the file into place
+// when the ranges cover exactly [0, size). Each call sends one chunk and
+// retries it after a lost response or a session end with the same request,
+// like WriteFile. A FileWrite is safe for concurrent use; its calls are
+// serialized.
+type FileWrite struct {
+	s     *Sandbox
+	op    *writeOp
+	path  string
+	salt  []byte
+	mu    sync.Mutex
+	first bool
+}
+
+// OpenFileWrite returns a FileWrite. It sends nothing; the first chunk
+// starts the write in the guest.
+func (s *Sandbox) OpenFileWrite(p FileWriteParams) (*FileWrite, error) {
+	salt := p.BindingSalt
+	if len(salt) == 0 {
+		var err error
+		if salt, err = relaybinding.NewSalt(); err != nil {
+			return nil, err
+		}
+	}
+	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: p.WriteID, Path: p.Path, BindingSalt: salt}
+	if err := validate.WriteFileRequest(first, true); err != nil {
+		return nil, err
+	}
+	return &FileWrite{
+		s:     s,
+		path:  p.Path,
+		salt:  salt,
+		first: true,
+		op: &writeOp{
+			s:     s,
+			id:    p.WriteID,
+			grant: newRelayGrant(s, ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE, p.WriteID, relaybinding.WriteFileDigest(first)),
+		},
+	}, nil
+}
+
+// WriteChunk writes data (at most 1 MiB) at offset and returns the result of
+// the guest helper.
+func (fw *FileWrite) WriteChunk(ctx context.Context, offset int64, data []byte) (*ownsandv1.WriteFileResponse, error) {
+	return fw.send(ctx, offset, data, nil)
+}
+
+// Finish writes the last chunk (data may be empty) at offset and finishes
+// the write with the total sizeBytes and the file mode (0 means 0o644).
+func (fw *FileWrite) Finish(ctx context.Context, offset int64, data []byte, sizeBytes int64, mode uint32) (*ownsandv1.WriteFileResponse, error) {
+	if mode == 0 {
+		mode = 0o644
+	}
+	return fw.send(ctx, offset, data, &ownsandv1.WriteFileFinish{SizeBytes: sizeBytes, Mode: mode})
+}
+
+func (fw *FileWrite) send(ctx context.Context, offset int64, data []byte, finish *ownsandv1.WriteFileFinish) (*ownsandv1.WriteFileResponse, error) {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	s := fw.s
+	req := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: fw.op.id, Offset: offset, Data: data, Finish: finish}
+	if fw.first {
+		req.Path, req.BindingSalt = fw.path, fw.salt
+	}
+	if err := validate.WriteFileRequest(req, fw.first); err != nil {
+		return nil, err
+	}
+	res, err := fw.op.send(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	fw.first = false
+	if res.GetOffset() != offset || res.GetLength() != int64(len(data)) {
+		return nil, fw.op.dpErr(fmt.Errorf("ownsand: write result for offset %d length %d, sent offset %d length %d", res.GetOffset(), res.GetLength(), offset, len(data)))
+	}
+	if finish != nil && !res.GetFinished() {
+		return nil, fw.op.dpErr(errors.New("ownsand: the last chunk was acknowledged without finish"))
+	}
+	return res, nil
 }
 
 // readChunk fills buf from r. It returns io.EOF, also together with n > 0,
