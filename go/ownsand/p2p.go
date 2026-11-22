@@ -53,6 +53,16 @@ func (e *errSessionRetired) Error() string {
 	return "ownsand: data path session retired after an interrupted frame"
 }
 
+// errSessionClosedByCaller reports a session that the SDK closed because the
+// caller closed or deleted the handle. It is not a channel failure, so the
+// handle neither moves to the relay nor logs a fall back; every later
+// operation on the closed handle ends with errHandleClosed.
+type errSessionClosedByCaller struct{}
+
+func (e *errSessionClosedByCaller) Error() string {
+	return "ownsand: data path session closed by the caller"
+}
+
 // errP2PFailed reports a data channel that closed without a session-end
 // frame, an ICE failure or an invalid byte stream. The handle moves to the
 // relay.
@@ -77,6 +87,20 @@ func (e *errP2POpen) Error() string {
 }
 
 func (e *errP2POpen) Unwrap() error { return e.cause }
+
+// errOpenSessionFailed marks an error that the OpenSession call returned, so
+// the router can tell it from the error of GetIceServers: only OpenSession
+// reports the state of the sandbox (failed_precondition for a sandbox that is
+// not RUNNING), while GetIceServers has no sandbox state. The wrapper is
+// internal: route unwraps it before it returns or logs an error, so callers
+// and errors.As see the original connect error.
+type errOpenSessionFailed struct {
+	cause error
+}
+
+func (e *errOpenSessionFailed) Error() string { return e.cause.Error() }
+
+func (e *errOpenSessionFailed) Unwrap() error { return e.cause }
 
 // p2pSession is one OpenSession session: one ordered, reliable data channel
 // that carries the concurrent streams of a sandbox handle.
@@ -222,7 +246,14 @@ func openP2PSession(ctx context.Context, c *Client, org, sandboxID string) (*p2p
 	}))
 	if err != nil {
 		closePC()
-		return nil, expired(err)
+		err = expired(err)
+		var openErr *errP2POpen
+		if errors.As(err, &openErr) {
+			// The setup window ended the call: a setup failure and not an
+			// answer of OpenSession.
+			return nil, err
+		}
+		return nil, &errOpenSessionFailed{cause: err}
 	}
 	s.sessionID = res.Msg.GetSessionId()
 	// pion verifies the DTLS fingerprint of the answer, which arrived over
@@ -265,7 +296,7 @@ func (s *p2pSession) isDone() bool {
 }
 
 func (s *p2pSession) close() {
-	s.end(&errP2PFailed{cause: errors.New("session closed by the caller")})
+	s.end(&errSessionClosedByCaller{})
 }
 
 func (s *p2pSession) onMessage(msg webrtc.DataChannelMessage) {

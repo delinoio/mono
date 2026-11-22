@@ -1483,3 +1483,85 @@ func TestDeadlineStatusNearCallerDeadlineIsTheCallerDeadline(t *testing.T) {
 		})
 	}
 }
+
+// retireInstalledSession retires the session that the handle uses, as an
+// interrupted send of another request would.
+func retireInstalledSession(s *Sandbox) func() {
+	return func() {
+		// Let the started event reach the exec before the retirement, as the
+		// frames of a real interrupted send arrive later than the events that
+		// the agent already sent.
+		time.Sleep(20 * time.Millisecond)
+		if sess := s.installedSession(); sess != nil {
+			sess.end(&errSessionRetired{})
+		}
+	}
+}
+
+// TestExecQuietSessionRetirementsDoNotHitFailureCap checks that a silent exec
+// outlives more session retirements than the failure cap of 5 allows when the
+// agent served the continuation of every retired session: a retirement is not
+// a failure, like a session end.
+func TestExecQuietSessionRetirementsDoNotHitFailureCap(t *testing.T) {
+	cp := newFakeCP(t)
+	gate := make(chan struct{})
+	cp.agent.run = func(_ []string, e *fakeExec) {
+		<-gate
+		e.write(0, []byte("line 0\n"))
+		e.write(1, []byte("done\n"))
+		e.finish(exitedEvent(3))
+	}
+	s := cp.handle(t, cp.client(t, TransportAuto))
+	retire := retireInstalledSession(s)
+	cp.p2pScript = func(n int) p2pAction {
+		if n <= quietRotations {
+			return p2pAction{afterStarted: retire}
+		}
+		if n == quietRotations+1 {
+			close(gate)
+		}
+		return p2pAction{}
+	}
+	res, r := runExec(t, s)
+	checkLines(t, res, r, 1)
+	if cp.openSessionCount() != quietRotations+1 {
+		t.Fatalf("%d sessions, want %d", cp.openSessionCount(), quietRotations+1)
+	}
+	if res.Transport != p2pTransport {
+		t.Fatalf("transport %v", res.Transport)
+	}
+	if cp.agent.totalRuns() != 1 {
+		t.Fatalf("command ran %d times", cp.agent.totalRuns())
+	}
+	if len(cp.authRequests()) != 0 {
+		t.Fatal("a retirement moved the exec to the relay")
+	}
+}
+
+// TestExecRepeatedUnservedSessionRetirementsHitFailureCap checks that a
+// retirement before the agent served the continuation still counts as a
+// failure: six of them in a row end the exec with a data path error.
+func TestExecRepeatedUnservedSessionRetirementsHitFailureCap(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.agent.run = lineRun(1, 0)
+	s := cp.handle(t, cp.client(t, TransportAuto))
+	retire := retireInstalledSession(s)
+	cp.p2pScript = func(int) p2pAction { return p2pAction{onRequest: retire} }
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+	var dp *DataPathError
+	if !errors.As(err, &dp) {
+		t.Fatalf("want a DataPathError, got %v", err)
+	}
+	var retired *errSessionRetired
+	if !errors.As(err, &retired) {
+		t.Fatalf("want the retirement as the cause, got %v", err)
+	}
+	if got := cp.openSessionCount(); got != 6 {
+		t.Fatalf("%d sessions, want 6 (the sixth failure ends the exec)", got)
+	}
+	if got := s.Transport(); got != p2pTransport {
+		t.Fatalf("transport %v, want peer-to-peer", got)
+	}
+}

@@ -136,6 +136,14 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		// starts no relay recovery.
 		return nil, cerr
 	}
+	// Only OpenSession reports the state of the sandbox, so the marker of
+	// an OpenSession failure decides the failed_precondition case below. The
+	// router returns and logs the original error.
+	var openSessionErr *errOpenSessionFailed
+	fromOpenSession := errors.As(err, &openSessionErr)
+	if fromOpenSession {
+		err = openSessionErr.cause
+	}
 	if IsBillingError(err) {
 		// Billing enforcement rejected GetIceServers or OpenSession. The
 		// relay is rejected for the same reason, so the error ends the
@@ -151,6 +159,12 @@ func (d *dataPath) route(ctx context.Context) (*p2pSession, error) {
 		case connect.CodeUnauthenticated, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeInvalidArgument, connect.CodeCanceled:
 			return nil, err
 		case connect.CodeFailedPrecondition:
+			if !fromOpenSession {
+				// GetIceServers has no sandbox state, so this is a
+				// control plane failure like any other: the handle moves
+				// to the relay below.
+				break
+			}
 			// The sandbox is not RUNNING (for example PAUSED, where an
 			// AttachExec still works on the relay). Use the relay for this
 			// attempt without moving the handle.
@@ -287,8 +301,8 @@ func (d *dataPath) close() {
 }
 
 // handleSessionError reports whether err ended the session (true) and
-// updates the handle: a session end or retirement only forgets the session,
-// a failure moves the handle to the relay.
+// updates the handle: a session end, retirement or caller close only forgets
+// the session, a failure moves the handle to the relay.
 func (d *dataPath) handleSessionError(sess *p2pSession, err error) bool {
 	var ended *errSessionEnded
 	if errors.As(err, &ended) {
@@ -302,12 +316,30 @@ func (d *dataPath) handleSessionError(sess *p2pSession, err error) bool {
 		d.sessionEnded(sess)
 		return true
 	}
+	var closedByCaller *errSessionClosedByCaller
+	if errors.As(err, &closedByCaller) {
+		// The caller closed the handle, which is not a channel failure: the
+		// handle keeps its transport and the operation continues to
+		// errHandleClosed at its next route call.
+		d.sessionEnded(sess)
+		return true
+	}
 	var failed *errP2PFailed
 	if errors.As(err, &failed) {
 		d.sessionFailed(sess)
 		return true
 	}
 	return false
+}
+
+// isRoutineSessionEnd reports whether err is a session end or a retirement.
+// Neither is a transport failure: the agent ended the session (idle, expiry,
+// revocation) or the SDK retired it after an interrupted send, and the next
+// attempt opens a new session on the same transport.
+func isRoutineSessionEnd(err error) bool {
+	var ended *errSessionEnded
+	var retired *errSessionRetired
+	return errors.As(err, &ended) || errors.As(err, &retired)
 }
 
 // relayGrant is the relay grant of one operation. The SDK uses a grant only

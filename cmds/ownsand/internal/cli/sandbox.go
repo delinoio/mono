@@ -807,8 +807,10 @@ func (a *app) fileWrite(ctx context.Context, name string, args []string) error {
 		return err
 	}
 	m, err := strconv.ParseUint(*mode, 8, 32)
-	if err != nil || m > 0o7777 {
-		return usageErr("--mode must be an octal file mode such as 0644")
+	// The SDK treats a zero mode as "use 0644", so --mode 0 would silently
+	// write a 0644 file; reject it instead of ignoring the requested mode.
+	if err != nil || m == 0 || m > 0o7777 {
+		return usageErr("--mode must be a nonzero octal file mode up to 07777 such as 0644")
 	}
 	org, err := a.orgSetup()
 	if err != nil {

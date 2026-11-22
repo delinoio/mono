@@ -4,7 +4,10 @@ package netpolicy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -521,4 +524,432 @@ func TestDNSForwarderLimitsAreIndependentPerForwarder(t *testing.T) {
 	dnsUDPQuery(t, b, "b1")
 	waitForCount(t, "udp queries of the other forwarder", &g.udpQueries, 2)
 	g.open()
+}
+
+// pauseAfterAdmit returns a dnsLimits hook that blocks the first admitted
+// connection in serveTCP until resume is called, and a channel that reports
+// the pause.
+func pauseAfterAdmit() (hook func(), paused <-chan struct{}, resume func()) {
+	p := make(chan struct{})
+	r := make(chan struct{})
+	var once, rOnce sync.Once
+	hook = func() {
+		once.Do(func() {
+			close(p)
+			<-r
+		})
+	}
+	return hook, p, func() { rOnce.Do(func() { close(r) }) }
+}
+
+// closeInBackground calls f.Close in a goroutine and returns a channel that
+// closes when it returns.
+func closeInBackground(f *DNSForwarder) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.Close()
+	}()
+	return done
+}
+
+func TestDNSForwarderRefusesConnAcceptedDuringClose(t *testing.T) {
+	// A silent upstream would hold a registered connection for the whole
+	// default 30-second deadline.
+	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+	hook, paused, resume := pauseAfterAdmit()
+	defer resume()
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 2, afterAdmit: hook})
+	defer f.Close()
+
+	c, err := net.Dial("tcp", f.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCP did not admit the connection")
+	}
+	// Close runs while the accept path holds an admitted, unregistered
+	// connection. Once Close has closed the listener, let the accept path go on.
+	done := closeInBackground(f)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		select {
+		case <-f.closed:
+		default:
+			if time.Now().After(deadline) {
+				t.Fatal("Close did not start")
+			}
+			time.Sleep(time.Millisecond)
+			continue
+		}
+		break
+	}
+	resume()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for a connection accepted during Close")
+	}
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("connection accepted during Close stayed open: %v", err)
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
+	up := startTCPUpstream(t, func(c net.Conn) { io.Copy(io.Discard, c) })
+	hook, paused, resume := pauseAfterAdmit()
+	defer resume()
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, afterAdmit: hook})
+	defer f.Close()
+
+	// The only slot is held by the paused connection; a second connection is
+	// refused at capacity and does not disturb the paused one.
+	first, err := net.Dial("tcp", f.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	select {
+	case <-paused:
+	case <-time.After(5 * time.Second):
+		t.Fatal("serveTCP did not admit the connection")
+	}
+	// serveTCP is paused, so it does not even accept the second connection;
+	// it waits in the kernel queue until the loop resumes and refuses it.
+	second, err := net.Dial("tcp", f.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	done := closeInBackground(f)
+	time.Sleep(50 * time.Millisecond)
+	resume()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close waited for connections accepted during Close")
+	}
+	for name, c := range map[string]net.Conn{"first": first, "second": second} {
+		c.SetReadDeadline(time.Now().Add(2 * time.Second))
+		if _, err := c.Read(make([]byte, 1)); err == nil {
+			t.Fatalf("%s connection delivered data", name)
+		} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Fatalf("%s connection stayed open after Close: %v", name, err)
+		}
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderSlowDialCountsAgainstDeadline(t *testing.T) {
+	const (
+		deadline  = 600 * time.Millisecond
+		dialDelay = 400 * time.Millisecond
+	)
+	// The upstream reads the query and then stays silent and open.
+	up := startTCPUpstream(t, func(c net.Conn) {
+		readDNSFrame(c)
+		io.Copy(io.Discard, c)
+	})
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		select {
+		case <-time.After(dialDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
+	}
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, tcpDeadline: deadline, dial: dial})
+	defer f.Close()
+
+	start := time.Now()
+	c := dnsTCPConn(t, f, "slow")
+	c.SetReadDeadline(time.Now().Add(deadline + 2*time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("silent connection delivered data")
+	}
+	elapsed := time.Since(start)
+	// Without the shared deadline the copy phase would start a fresh budget
+	// after the dial and end at dialDelay+deadline.
+	if elapsed < deadline-50*time.Millisecond {
+		t.Fatalf("connection ended after %v, before the %v deadline", elapsed, deadline)
+	}
+	if elapsed > deadline+dialDelay/2 {
+		t.Fatalf("connection ended after %v: the dial time did not count against the %v deadline", elapsed, deadline)
+	}
+	requireTCPSlotFreeAfterDial(t, f)
+}
+
+// requireTCPSlotFreeAfterDial waits until the one TCP slot of f is free.
+func requireTCPSlotFreeAfterDial(t *testing.T, f *DNSForwarder) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(f.tcpSlots) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("tcp slot was not released")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDNSForwarderFailedDialReleasesSlot(t *testing.T) {
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		return nil, errors.New("dial refused")
+	}
+	f := startTestDNS(t, "127.0.0.1:1", slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "refused")
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// The forwarder closes with the query unread, so the guest sees a reset or EOF.
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after a failed dial: %v", err)
+	}
+	requireTCPSlotFreeAfterDial(t, f)
+}
+
+// requireClosedWithin fails unless done closes within d.
+func requireClosedWithin(t *testing.T, what string, done <-chan struct{}, d time.Duration) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not finish within %v", what, d)
+	}
+}
+
+func TestDNSForwarderCloseEndsSilentUpstreamConn(t *testing.T) {
+	// The default 30-second deadline stays in place: Close must end the
+	// connection long before it.
+	upstreamEOF := make(chan struct{})
+	up := startTCPUpstream(t, func(c net.Conn) {
+		readDNSFrame(c)
+		// Silent upstream: wait for the forwarder to close its side.
+		io.Copy(io.Discard, c)
+		close(upstreamEOF)
+	})
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "silent")
+	// Let the query reach the upstream, so the handler is in the copy phase.
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	requireClosedWithin(t, "Close", closeInBackground(f), 3*time.Second)
+	t.Logf("Close returned after %v", time.Since(start))
+	requireClosedWithin(t, "upstream EOF", upstreamEOF, 2*time.Second)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderCloseEndsBlockedDial(t *testing.T) {
+	dialing := make(chan struct{})
+	var once sync.Once
+	// The dial blocks until its context ends, like a connect to an address
+	// that never answers.
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		once.Do(func() { close(dialing) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	f := startTestDNS(t, "127.0.0.1:1", slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "blocked")
+	requireClosedWithin(t, "dial start", dialing, 5*time.Second)
+	requireClosedWithin(t, "Close", closeInBackground(f), 3*time.Second)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderCloseDuringDialEndsUpstreamConn(t *testing.T) {
+	// The dial finishes while Close runs: the upstream connection that it
+	// returns must still be closed.
+	upstreamEOF := make(chan struct{})
+	up := startTCPUpstream(t, func(c net.Conn) {
+		io.Copy(io.Discard, c)
+		close(upstreamEOF)
+	})
+	dialing := make(chan struct{})
+	finish := make(chan struct{})
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		close(dialing)
+		<-finish
+		// Ignore ctx on purpose: a dial can succeed just as Close cancels it.
+		var d net.Dialer
+		return d.DialContext(context.Background(), network, address)
+	}
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "late")
+	requireClosedWithin(t, "dial start", dialing, 5*time.Second)
+	done := closeInBackground(f)
+	// Wait until Close has cancelled the forwarder context, then let the dial
+	// return a live connection.
+	deadline := time.Now().Add(5 * time.Second)
+	for f.ctx.Err() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not cancel the forwarder context")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(finish)
+	requireClosedWithin(t, "Close", done, 3*time.Second)
+	requireClosedWithin(t, "upstream EOF", upstreamEOF, 2*time.Second)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+}
+
+// syncBuffer is a log sink that tests read while the forwarder writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// socketErrorRecords returns the retry log records of one transport.
+func (b *syncBuffer) socketErrorRecords(transport DNSTransport) []map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []map[string]any
+	for _, line := range strings.Split(b.buf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["level"] == "ERROR" && rec["transport"] == string(transport) {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// waitForSocketError waits until a retry record of the transport satisfies
+// match (nil matches every record).
+func waitForSocketError(t *testing.T, logs *syncBuffer, transport DNSTransport, timeout time.Duration, match func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, rec := range logs.socketErrorRecords(transport) {
+			if match == nil || match(rec) {
+				return rec
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no matching %s retry record within %v: %v", transport, timeout, logs.socketErrorRecords(transport))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDNSForwarderTCPSurvivesAcceptError(t *testing.T) {
+	up := startGatedUpstream(t)
+	up.open()
+	logs := &syncBuffer{}
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	// An expired deadline makes Accept fail with a timeout error, like a
+	// transient accept failure; the listener itself stays open.
+	if err := f.tcp.SetDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := waitForSocketError(t, logs, DNSTransportTCP, 5*time.Second, nil)
+	if rec["error"] == nil || rec["retry_in"] == nil {
+		t.Fatalf("retry record lacks error or retry_in: %v", rec)
+	}
+	if err := f.tcp.SetDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := dnsTCPConn(t, f, "again")
+	requireDNSAnswer(t, c, "again")
+}
+
+func TestDNSForwarderUDPSurvivesReadError(t *testing.T) {
+	up := startGatedUpstream(t)
+	up.open()
+	logs := &syncBuffer{}
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	if err := f.udp.SetReadDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := waitForSocketError(t, logs, DNSTransportUDP, 5*time.Second, nil)
+	if rec["error"] == nil || rec["retry_in"] == nil {
+		t.Fatalf("retry record lacks error or retry_in: %v", rec)
+	}
+	if err := f.udp.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The loop answers again once its back-off wait ends.
+	c := dnsUDPQuery(t, f, "again")
+	buf := make([]byte, 64)
+	if n, err := c.Read(buf); err != nil || string(buf[:n]) != "ok:again" {
+		t.Fatalf("udp answer after the error %q %v", buf[:n], err)
+	}
+}
+
+func TestDNSForwarderCloseDuringBackoff(t *testing.T) {
+	up := startGatedUpstream(t)
+	up.open()
+	logs := &syncBuffer{}
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	// Both loops fail on every call, so their back-off reaches its maximum.
+	f.tcp.SetDeadline(time.Now())
+	f.udp.SetReadDeadline(time.Now())
+	atCap := func(rec map[string]any) bool {
+		d, _ := rec["retry_in"].(float64)
+		return time.Duration(d) == dnsServeBackoffMax
+	}
+	waitForSocketError(t, logs, DNSTransportTCP, 10*time.Second, atCap)
+	waitForSocketError(t, logs, DNSTransportUDP, 10*time.Second, atCap)
+
+	// Both loops now sleep for about a second. Close must not wait for it.
+	start := time.Now()
+	requireClosedWithin(t, "Close during back-off", closeInBackground(f), 2*time.Second)
+	if elapsed := time.Since(start); elapsed > dnsServeBackoffMax/2 {
+		t.Fatalf("Close waited %v for a loop in back-off", elapsed)
+	}
+	// No retry record after Close, even after a full back-off period.
+	n := len(logs.socketErrorRecords(DNSTransportTCP)) + len(logs.socketErrorRecords(DNSTransportUDP))
+	time.Sleep(dnsServeBackoffMax + 200*time.Millisecond)
+	if m := len(logs.socketErrorRecords(DNSTransportTCP)) + len(logs.socketErrorRecords(DNSTransportUDP)); m != n {
+		t.Fatalf("retry records after Close: %d before, %d after", n, m)
+	}
 }
