@@ -122,6 +122,17 @@ func (st *Store) Get(ctx context.Context, q db.Querier, orgID, id string) (Integ
 	return in, err
 }
 
+// GetByID loads an integration by its ID alone, for an endpoint whose URL
+// names the integration (the OpenAI webhook). Callers authenticate the
+// sender with a credential of the integration before they act on it.
+func (st *Store) GetByID(ctx context.Context, q db.Querier, id string) (Integration, error) {
+	in, err := scanIntegration(q.QueryRow(ctx, "SELECT "+integrationColumns+" FROM agent_integrations WHERE agent_integration_id = $1", id))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Integration{}, api.ErrNotFound("agent integration")
+	}
+	return in, err
+}
+
 func associatedData(integrationID string, cred tidev1.AgentCredential) []byte {
 	return secrets.AssociatedData("agent_integration", integrationID, strconv.Itoa(int(cred)))
 }

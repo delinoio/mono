@@ -56,9 +56,10 @@ type DirectDemand struct {
 	// VendorRequestID identifies the demand at the vendor (Claude Code
 	// order ID, OpenAI session ID).
 	VendorRequestID string
-	// Scope and Endpoint are stored with the claim (Claude Code: the
-	// session ID; OpenAI: the environment ID and the remote URL).
-	Scope, Endpoint string
+	// Scope, Endpoint and WorkspaceDirectory are stored with the claim
+	// (Claude Code: the session ID; OpenAI: the environment ID, the remote
+	// URL and the workspace directory).
+	Scope, Endpoint, WorkspaceDirectory string
 	// Marker is the demand marker of the claim row.
 	Marker string
 	// SourceKey is the request key; empty selects VendorRequestID.
@@ -111,8 +112,8 @@ func (h *Hub) CreateDirectTx(ctx context.Context, tx pgx.Tx, v Vendor, in integr
 	}
 	now := h.svc.NowUTC()
 	if _, err := tx.Exec(ctx, `INSERT INTO agent_claims (request_id, organization_id, agent_integration_id, vendor, vendor_request_id, demand_marker,
-		worker_id, scope, endpoint, state, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $11)`,
-		r.ID, in.OrganizationID, in.ID, int16(in.Vendor), d.VendorRequestID, d.Marker, "tide-"+r.ID, d.Scope, d.Endpoint, int16(ClaimHeld), now); err != nil {
+		worker_id, scope, endpoint, workspace_directory, state, create_time, update_time) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $12)`,
+		r.ID, in.OrganizationID, in.ID, int16(in.Vendor), d.VendorRequestID, d.Marker, "tide-"+r.ID, d.Scope, d.Endpoint, d.WorkspaceDirectory, int16(ClaimHeld), now); err != nil {
 		return nil, false, err
 	}
 	if d.Store != nil {

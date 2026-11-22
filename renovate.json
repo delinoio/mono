@@ -20,6 +20,26 @@
         "// renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+const RunnerVersion = \"(?<currentValue>[^\"]+)\""
       ],
       "extractVersionTemplate": "^v(?<version>.+)$"
+    },
+    {
+      "customType": "regex",
+      "description": "The @openai/codex version that tide-api installs in OPENAI_CODEX guests.",
+      "managerFilePatterns": [
+        "/^servers/tide-api/internal/agent/codex/install\\.go$/"
+      ],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+const CodexVersion = \"(?<currentValue>[^\"]+)\""
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "The Node.js 24 version that tide-api installs in OPENAI_CODEX guests without Node.js.",
+      "managerFilePatterns": [
+        "/^servers/tide-api/internal/agent/codex/install\\.go$/"
+      ],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+const NodeVersion = \"(?<currentValue>[^\"]+)\""
+      ]
     }
   ],
   "packageRules": [
@@ -28,6 +48,23 @@
       "matchPackageNames": ["actions/runner"],
       "prBodyNotes": [
         "Copy the sha256 values of the six release archives into `runnerSHA256` and set `runnerChecksumsVersion` in `servers/tide-api/internal/github/install.go`; `TestRunnerChecksums` fails until then."
+      ]
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["@openai/codex"],
+      "followTag": "alpha",
+      "prBodyNotes": [
+        "The OpenAI self-hosted guide installs `@openai/codex@alpha`, so this pin follows the `alpha` dist-tag. Check that `codex exec-server --help` still lists `--remote` and `--environment-id`."
+      ]
+    },
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["node"],
+      "matchFileNames": ["servers/tide-api/internal/agent/codex/install.go"],
+      "allowedVersions": "<25",
+      "prBodyNotes": [
+        "Copy the sha256 values of the four `.tar.gz` archives (linux-x64, linux-arm64, darwin-x64, darwin-arm64) from the release's `SHASUMS256.txt` into `nodeSHA256` and set `nodeChecksumsVersion` in `servers/tide-api/internal/agent/codex/install.go`; `TestNodeChecksums` fails until then."
       ]
     }
   ]
