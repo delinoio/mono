@@ -2024,5 +2024,55 @@
     .dui-tabs-tab[data-orientation="vertical"][data-selected] {
       border-inline-end-color: Highlight;
     }
+
+    /* Progress, Meter and Slider: the track and the filled part are
+       backgrounds only. Outline the track (border-box keeps the height and
+       width) and fill the indicator with `Highlight`. */
+    .dui-progress-track,
+    .dui-slider-track {
+      box-sizing: border-box;
+      border: 1px solid CanvasText;
+    }
+
+    .dui-progress-indicator,
+    .dui-slider-indicator,
+    .dui-radio-indicator {
+      background: Highlight;
+    }
+
+    /* Switch: the track and thumb are backgrounds only. Border the track (the
+       1px padding keeps the 3px inset, so the sizes and the thumb travel stay
+       the same), fill it with `Highlight` when on, and draw the thumb with
+       `CanvasText` in both states because `HighlightText` is not visible on
+       the on track. */
+    .dui-switch {
+      border: 2px solid CanvasText;
+      padding: 1px;
+    }
+
+    .dui-switch[data-checked] {
+      border-color: Highlight;
+      background: Highlight;
+    }
+
+    .dui-switch-thumb {
+      background: CanvasText;
+    }
+
+    /* Toggle and Pagination: the pressed and the current surface is a
+       background only. Fill it with `Highlight` and `HighlightText`. A border
+       would widen these controls, because their size follows their content
+       and a `min-width` that already includes the border box, while a fill
+       changes no size. The focus ring is an outline, so it stays visible on
+       the fill. Chromium paints a Canvas text backplate behind the label of
+       a filled control, which hides the HighlightText label; opting out of
+       the adjustment removes the backplate, and both colors are already
+       system colors. Remove the opt-out if engines stop painting it. */
+    .dui-toggle[data-pressed],
+    .dui-pagination-link[data-current] {
+      forced-color-adjust: none;
+      background: Highlight;
+      color: HighlightText;
+    }
   }
 }
