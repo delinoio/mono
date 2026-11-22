@@ -239,6 +239,23 @@ export function validateGuestPath(field: string, path: string): void {
   }
 }
 
+/** The largest file mode that a write may set (`07777`, the protobuf rule). */
+const MAX_FILE_MODE = 0o7777;
+
+/**
+ * Checks the mode of a written file. It travels in `finish.mode` of the last
+ * chunk, so without this check a bad mode is only rejected after the upload.
+ * Mirrors the Go validator.
+ */
+export function validateFileMode(mode: number): void {
+  if (!Number.isInteger(mode) || mode < 0 || mode > MAX_FILE_MODE) {
+    throw new OwnSandValidationError(
+      "finish.mode",
+      "must be an integer from 0 to 07777",
+    );
+  }
+}
+
 /**
  * Converts milliseconds to a whole number of nanoseconds, rounding half up to
  * the nearest nanosecond. The integer and fractional millisecond parts are

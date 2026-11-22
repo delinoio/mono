@@ -629,6 +629,40 @@ describe("file write", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  test.each([0o10000, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
+    "rejects write mode %j with finish.mode before any request",
+    async (mode) => {
+      const h = setup();
+      const error = await h.client
+        .sandbox(SANDBOX)
+        .writeFile("/out", "x", { mode })
+        .catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(OwnSandValidationError);
+      expect((error as OwnSandValidationError).field).toBe("finish.mode");
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test.each([
+    [undefined, 0o644],
+    [0, 0],
+    [0o7777, 0o7777],
+  ])("sends write mode %j as finish.mode %j", async (mode, want) => {
+    const h = setup();
+    h.api.unary(RelayService, "WriteFile", (req) => ({
+      writeId: req.writeId,
+      offset: req.offset,
+      length: BigInt(req.data.length),
+      finished: req.finish !== undefined,
+      sizeBytes: req.finish?.sizeBytes ?? 0n,
+    }));
+    await h.clock.run(
+      h.client.sandbox(SANDBOX).writeFile("/out", "x", { mode }),
+    );
+    const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+    expect(writes[writes.length - 1].finish.mode).toBe(want);
+  });
+
   test.each(["\\file.txt", "\\x", "\\", "\\?x"])(
     "rejects root-relative Windows path %j without echoing it",
     async (path) => {

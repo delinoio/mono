@@ -281,8 +281,10 @@ func (op *readOp) relayAttempt(ctx context.Context) readAttempt {
 
 // WriteOptions configures a file write.
 type WriteOptions struct {
-	// Mode is the file mode, for example 0o644. Zero means 0o644. Windows
-	// guests ignore it.
+	// Mode is the file mode, for example 0o644. Zero means 0o644. It must not
+	// exceed 0o7777; a larger value makes WriteFile return a validation error
+	// for the field finish.mode before it sends any request. Windows guests
+	// ignore it.
 	Mode uint32
 	// OnProgress, when set, receives the acknowledged byte count.
 	OnProgress func(written int64)
@@ -308,6 +310,18 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 	}
 	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: writeID, Path: path, BindingSalt: salt}
 	if err := validate.WriteFileRequest(first, true); err != nil {
+		return 0, err
+	}
+	// The first request carries no Finish, so it cannot show a bad mode that
+	// only the last request would send. Check the finish fields on a copy
+	// before any upload; first stays unchanged because its digest binds the
+	// relay grant.
+	check := &ownsandv1.WriteFileRequest{
+		OrganizationId: first.OrganizationId, SandboxId: first.SandboxId, WriteId: first.WriteId,
+		Path: first.Path, BindingSalt: first.BindingSalt,
+		Finish: &ownsandv1.WriteFileFinish{Mode: mode},
+	}
+	if err := validate.WriteFileRequest(check, true); err != nil {
 		return 0, err
 	}
 	op := &writeOp{
