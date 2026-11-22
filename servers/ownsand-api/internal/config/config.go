@@ -16,6 +16,7 @@ import (
 	pionstun "github.com/pion/stun/v3"
 
 	"github.com/delinoio/mono/servers/internal/listenaddr"
+	"github.com/delinoio/mono/servers/internal/weborigin"
 )
 
 // Environment variable names read by the server.
@@ -309,7 +310,13 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 				u.Fragment != "" || strings.Contains(origin, "#") {
 				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
 			}
-			cfg.CORSOrigins = append(cfg.CORSOrigins, origin)
+			// Store the form that a browser sends in the Origin header (lower-case host, no
+			// default port), because the CORS middleware matches the header exactly.
+			canonical, ok := weborigin.Canonical(u)
+			if !ok {
+				return Config{}, fmt.Errorf("%s must list origins such as https://ownsand.delino.io", EnvCORSOrigins)
+			}
+			cfg.CORSOrigins = append(cfg.CORSOrigins, canonical)
 		}
 	}
 	if v := get(EnvTrustProxyClientAddress); v != "" {

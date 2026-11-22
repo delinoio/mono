@@ -4,6 +4,7 @@ package config
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -99,6 +100,7 @@ func TestLoadCORSOrigins(t *testing.T) {
 		{"query", "https://console.example.org?a=b", false},
 		{"fragment", "https://console.example.org#f", false},
 		{"path", "https://console.example.org/p", false},
+		{"port out of range", "https://console.example.org:99999", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := minimal()
@@ -111,6 +113,26 @@ func TestLoadCORSOrigins(t *testing.T) {
 				t.Errorf("error %q does not name %s", err, EnvCORSOrigins)
 			}
 		})
+	}
+}
+
+func TestLoadCanonicalizesCORSOrigins(t *testing.T) {
+	v := minimal()
+	v[EnvCORSOrigins] = "HTTPS://Console.Example.ORG:443, http://Console.Example.org:80, https://console.example.org:8443, http://localhost:443, http://[::1]:80, http://127.0.0.1:13100"
+	cfg, err := Load(env(v))
+	if err != nil {
+		t.Fatalf("Load() err = %v", err)
+	}
+	want := []string{
+		"https://console.example.org",
+		"http://console.example.org",
+		"https://console.example.org:8443",
+		"http://localhost:443",
+		"http://[::1]",
+		"http://127.0.0.1:13100",
+	}
+	if !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
 	}
 }
 
