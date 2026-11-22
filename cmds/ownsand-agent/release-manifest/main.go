@@ -118,7 +118,9 @@ func loadBuiltinKeys() ([]ed25519.PublicKey, error) {
 }
 
 // runKeygen writes a new PKCS#8 PEM private key to a new file with mode 0600
-// and prints the base64 public key for package releasekeys.
+// and prints the base64 public key for package releasekeys. Windows ignores
+// the mode (the file gets the ACL of its directory), so the release process
+// generates the key on Linux or macOS.
 func runKeygen(args []string, stdout io.Writer, logger *slog.Logger) error {
 	if len(args) != 1 || args[0] == "" || strings.HasPrefix(args[0], "-") {
 		return usageError{errors.New("keygen: give the path of the new private key file")}

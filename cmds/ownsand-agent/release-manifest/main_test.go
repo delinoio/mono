@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -44,7 +45,9 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	// Windows has no Unix permission bits: Go reports a writable file as
+	// 0666 there, so only Linux and macOS can check the mode.
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("private key mode %v, want 0600", info.Mode().Perm())
 	}
 	pemBytes, err := os.ReadFile(f.keyFile)
