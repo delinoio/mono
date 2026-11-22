@@ -170,7 +170,15 @@ func (op *readOp) handleEvent(ev *ownsandv1.FileReadEvent, at *readAttempt) bool
 			at.err = fmt.Errorf("%w: chunk at %d, next offset %d", errReadGap, off, op.next)
 			return true
 		}
-		if _, err := op.w.Write(data[op.next-off:]); err != nil {
+		chunk := data[op.next-off:]
+		n, err := op.w.Write(chunk)
+		if err != nil {
+			// The writer accepted n bytes before it failed: count them, so
+			// the returned size matches the bytes that the caller holds.
+			// The error ends the operation, so no retry resumes at op.next.
+			if n > 0 {
+				op.next += int64(min(n, len(chunk)))
+			}
 			at.err = &callbackError{err: err}
 			return true
 		}
