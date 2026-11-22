@@ -423,9 +423,6 @@ jobs:
               ;;
             Windows)
               known_failures=(
-                # The dangling-symlink and long-destination-name file read
-                # tests expect Linux errors.
-                cmds/ownsand/internal/cli
                 # The tar escape checks accept links such as `/etc/passwd`,
                 # which are not absolute paths on Windows.
                 internal/fsutil
