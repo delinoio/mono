@@ -249,13 +249,23 @@ func TestVirtualizationMacOSOutbound(t *testing.T) {
 			"/sbin/ifconfig -a; /usr/sbin/networksetup -listallhardwareports; /usr/sbin/ipconfig getpacket en0; /usr/sbin/scutil --dns | head -20; /usr/bin/curl -sS -m 10 -o /dev/null http://example.com/ 2>&1; /usr/bin/curl -sS -m 10 -o /dev/null http://93.184.215.14/ 2>&1")
 		t.Fatalf("OUTBOUND macOS sandbox cannot reach the internet: %q\n%s", out, diag)
 	}
-	for _, target := range []string{hostLANAddress(), "169.254.169.254", "10.0.0.1"} {
+	lan := hostLANAddress()
+	port := startHostServer(t, lan, "127.0.0.1")
+	for _, target := range []string{lan, "169.254.169.254", "10.0.0.1"} {
 		if target == "" {
 			continue
 		}
 		out, _ := e.exec(ob.GetSandboxId(), "/bin/sh", "-c", "/usr/bin/curl -s -m 3 -o /dev/null http://"+target+"/ && echo REACHED || echo BLOCKED")
 		if !strings.Contains(out, "BLOCKED") {
 			t.Fatalf("OUTBOUND macOS sandbox reached %s: %q", target, out)
+		}
+	}
+	// The host server answers on the host's own addresses: the guest must
+	// not reach it there (127.0.0.1 in the guest is the guest itself).
+	if lan != "" {
+		out, _ := e.exec(ob.GetSandboxId(), "/bin/sh", "-c", "/usr/bin/curl -s -m 3 http://"+lan+":"+port+"/")
+		if strings.Contains(out, hostServerMarker) {
+			t.Fatalf("OUTBOUND macOS sandbox reached the host server at %s:%s: %q", lan, port, out)
 		}
 	}
 	if en, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: ob.GetSandboxId()}); err != nil || en.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
