@@ -229,13 +229,6 @@ func (u *Updater) poke() {
 	}
 }
 
-func (u *Updater) setState(s ownsandv1.AgentUpdateState, target string) {
-	u.mu.Lock()
-	u.state, u.target = s, target
-	u.mu.Unlock()
-	u.opts.Logger.Info("agent update state", "update_state", s.String(), "target_version", target)
-}
-
 // NextOrder returns the order of the next update or withdrawal command. The
 // agent takes it synchronously when it receives the command, before the
 // command runs in its own goroutine, so the order is the receive order.
@@ -316,10 +309,6 @@ func (u *Updater) Handle(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand)
 // HandleOrdered is Handle for a command with an order from NextOrder.
 func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentCommand, order uint64) error {
 	target := cmd.GetTargetVersion()
-	if _, err := semver.Parse(target); err != nil {
-		u.setState(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
-		return err
-	}
 	u.mu.Lock()
 	if u.installing {
 		u.mu.Unlock()
@@ -335,6 +324,14 @@ func (u *Updater) HandleOrdered(ctx context.Context, cmd *ownsandv1.UpdateAgentC
 	u.applied = order
 	u.clearPendingLocked()
 	u.mu.Unlock()
+	// The target is parsed only after the supersession check and the
+	// clearing of the queued artifact, like every other outcome: an invalid
+	// target of a current command must not leave the stale artifact queued,
+	// and one of a superseded command must not touch the newer command's state.
+	if _, err := semver.Parse(target); err != nil {
+		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED, target)
+		return err
+	}
 	if c, _ := semver.CompareStrings(target, u.opts.Running); c == 0 {
 		u.setStateFor(order, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE, "")
 		return nil

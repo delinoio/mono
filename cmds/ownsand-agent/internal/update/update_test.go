@@ -507,6 +507,7 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 	}{
 		{"same version", "1.0.0", false, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE},
 		{"failed target", "9.9.9", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"invalid target", "not-semver", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -658,6 +659,44 @@ func TestOlderUpdateCommandLosesToNewerOrder(t *testing.T) {
 	}
 	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE {
 		t.Fatalf("state %v", s)
+	}
+}
+
+// An update command with an invalid target follows the same supersession rules
+// as every other update command: an older one that runs after a newer valid
+// command must not touch the state, the target or the queued artifact of the
+// newer command.
+func TestOlderInvalidTargetLosesToNewerValidCommand(t *testing.T) {
+	r := newRelease(t, nil)
+	busy := &atomic.Bool{}
+	busy.Store(true)
+	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
+	older, newer := u.NextOrder(), u.NextOrder()
+	if err := u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, newer); err != nil {
+		t.Fatal(err)
+	}
+	err := u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "not-semver"}, older)
+	if !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("late older invalid update: %v", err)
+	}
+	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE || target != "1.1.0" {
+		t.Fatalf("state %v %s", s, target)
+	}
+	busy.Store(false)
+	if ok, err := u.TryInstall(); !ok || err != nil || inst.installed.Load() != 1 || restarts.Load() != 1 {
+		t.Fatalf("the newer artifact was not installed: %v %v", ok, err)
+	}
+	st, err := u.opts.Store.LoadAgent()
+	if err != nil || st == nil || st.PendingUpdate == nil || st.PendingUpdate.TargetVersion != "1.1.0" {
+		t.Fatalf("recorded pending update: %+v %v", st, err)
+	}
+	// The next process confirms the installation of the newer target.
+	u2, err := New(Options{Store: u.opts.Store, Running: "1.1.0"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s, _ := u2.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE {
+		t.Fatalf("after restart: %v", s)
 	}
 }
 
