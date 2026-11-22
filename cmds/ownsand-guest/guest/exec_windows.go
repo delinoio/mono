@@ -3,6 +3,7 @@
 package guest
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -51,10 +52,27 @@ func kill(p *os.Process) {
 // is false; taskkill ends the tree at once.
 func processGroupAlive(*os.Process) bool { return false }
 
-// processExited is not implemented on Windows; the timeout there relies on
-// the waited flag only. Remove this stub once Windows guests detect the
-// direct child's exit before the output pipes drain.
-func processExited(*os.Process) bool { return false }
+// processExited reports whether cmd.Wait already reaped the direct child,
+// which happens before Wait drains the output pipes that a descendant may
+// still hold. The shared timeout code uses it so that a command whose direct
+// child ended before the deadline is not timed out while the pipes drain.
+//
+// It reads the state of the os.Process handle with signal 0, the way the
+// POSIX build does. On Windows, os.Process.Signal returns
+// syscall.EWINDOWS for any signal except Kill while the process handle is
+// open (the child runs, or it ended and nobody waited yet). After
+// os.Process.Wait it returns syscall.EINVAL, because Wait releases the
+// handle, and os.ErrProcessDone when the process was marked done another
+// way. This depends on that behavior of the Go standard library, which is
+// not documented as an API; TestProcessExited pins the outcomes. Replace
+// the probe with a SYNCHRONIZE handle that the exec code opens right after
+// cmd.Start (WaitForSingleObject with a zero timeout) when a Go release
+// changes these results, or when the standard library documents a public
+// way to ask whether a process was waited.
+func processExited(p *os.Process) bool {
+	err := p.Signal(syscall.Signal(0))
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.EINVAL)
+}
 
 // exitStatus keeps the full 32-bit exit code; Windows has no signals.
 func exitStatus(state *os.ProcessState) (code int64, signal int32, signaled bool) {
