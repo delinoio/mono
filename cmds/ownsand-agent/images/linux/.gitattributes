@@ -1,0 +1,5 @@
+# The image scripts and the kernel configuration fragment run in bash and in
+# Linux containers, also from a Windows checkout through WSL. Keep LF line
+# endings in the working tree whatever core.autocrlf is, because bash rejects
+# CRLF scripts and the kernel configuration merge reads CR as part of a value.
+* text eol=lf
