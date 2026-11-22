@@ -379,6 +379,18 @@ func TestWorkerWakeAndStop(t *testing.T) {
 		f.s.RunWorker(runCtx, time.Hour)
 		close(done)
 	}()
+	// An early fatal assertion must stop the worker and wait for it before
+	// the fixture closes the database and the provider, which t.Cleanup runs
+	// in reverse order of registration. Cancel is idempotent, so the normal
+	// path below may stop the worker first.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("RunWorker did not stop during cleanup")
+		}
+	})
 	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
 		t.Fatal("not queued")
 	}
