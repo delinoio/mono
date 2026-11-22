@@ -1428,6 +1428,14 @@ test("CI workflow runs the Go and Rust checks on macOS and Windows", () => {
   );
   assert.match(goJob, /^\s+if go test -count=1 "\$package"; then$/m);
   assert.match(goJob, /does not exist; remove it from the list/);
+  // bash 3.2 on macOS runners fails on an empty array expansion under
+  // `set -u`, so an empty list is expanded with the `+` form and skips the
+  // non-blocking run.
+  assert.match(
+    goJob,
+    /^\s+for package in \$\{known_failures\[@\]\+"\$\{known_failures\[@\]\}"\}; do$/m,
+  );
+  assert.match(goJob, /^\s+if \(\(\$\{#skipped\[@\]\} == 0\)\); then$/m);
   assert.doesNotMatch(goJob, /services:|OWNSAND_E2E: "1"/);
   assert.match(
     rustJob,
