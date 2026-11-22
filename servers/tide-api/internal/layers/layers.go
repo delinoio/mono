@@ -15,6 +15,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/metrics"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
+	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
@@ -49,6 +50,8 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 				return err
 			}
 			out.Metrics = m
+			// Delivery IDs of every webhook sender are kept for 7 days.
+			r.AddDailyJob(webhook.RetentionJob(r.Service.DB))
 			out.Links = link.Register(r, opts.OwnSand, m)
 			out.Integrations = integration.Register(r, opts.PublicOrigin)
 			out.Profiles = profile.Register(r, out.Links, out.Integrations)
