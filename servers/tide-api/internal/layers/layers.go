@@ -13,6 +13,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/link"
 	"github.com/delinoio/mono/servers/tide-api/internal/metrics"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
+	"github.com/delinoio/mono/servers/tide-api/internal/profile"
 )
 
 // Options configures the layers.
@@ -28,6 +29,7 @@ type Layers struct {
 	Metrics      *metrics.Metrics
 	Links        *link.Links
 	Integrations *integration.Store
+	Profiles     *profile.Profiles
 }
 
 // Extensions returns the extensions; New fills out while it wires the app.
@@ -41,6 +43,7 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 			out.Metrics = m
 			out.Links = link.Register(r, opts.OwnSand, m)
 			out.Integrations = integration.Register(r, opts.PublicOrigin)
+			out.Profiles = profile.Register(r, out.Links, out.Integrations)
 			return nil
 		},
 	}
