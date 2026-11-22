@@ -397,6 +397,13 @@ func (h *Handler) ListDevSessions(ctx context.Context, req *connect.Request[tide
 	return connect.NewResponse(resp), nil
 }
 
+// errRebound restarts a DeleteDevSession transaction whose session got a
+// runner after the runner lock.
+var errRebound = errors.New("the dev session got a runner")
+
+// deleteAttempts bounds the restarts of DeleteDevSession after errRebound.
+const deleteAttempts = 3
+
 // DeleteDevSession cancels a queued session (CANCELED_BY_USER) or deletes a
 // starting or running one (ENDED, SESSION_DELETED) with its sandbox. The
 // session owner, an owner or an admin may delete it.
@@ -404,52 +411,88 @@ func (h *Handler) DeleteDevSession(ctx context.Context, req *connect.Request[tid
 	s := h.svc
 	var d *work.Deletion
 	var orgID, sessionID string
-	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
-		c, err := s.Authorize(ctx, tx, req.Msg.GetOrganizationId(), authz.ActionDeleteDevSession)
-		if err != nil {
-			return err
-		}
-		orgID = c.OrganizationID
-		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
-			return err
-		}
-		sess, err := h.load(ctx, tx, c.OrganizationID, req.Msg.GetDevSessionId())
-		if err != nil {
-			return err
-		}
-		sessionID = sess.req.ID
-		if !authz.CanDeleteDevSession(c.Role, c.UserID, sess.req.OwnerUserID) {
-			return api.ErrPermission("a member can delete only their own dev sessions")
-		}
-		if work.RequestTerminal(sess.req.State) {
-			return nil
-		}
-		ended := false
-		if sess.req.RunnerID != "" && sess.req.State != tidev1.RequestState_REQUEST_STATE_QUEUED {
-			d, err = h.e.DeleteRunnerTx(ctx, tx, c.OrganizationID, sess.req.RunnerID, tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteByUser)
+	var err error
+	for attempt := 1; ; attempt++ {
+		d = nil
+		err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
+			c, err := s.Authorize(ctx, tx, req.Msg.GetOrganizationId(), authz.ActionDeleteDevSession)
 			if err != nil {
 				return err
 			}
-			cur, err := h.e.GetRequest(ctx, tx, c.OrganizationID, sessionID)
+			orgID = c.OrganizationID
+			if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
+				return err
+			}
+			sess, err := h.load(ctx, tx, c.OrganizationID, req.Msg.GetDevSessionId())
 			if err != nil {
 				return err
 			}
-			ended = work.RequestTerminal(cur.State)
-		}
-		if !ended {
-			end := work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER}
-			if sess.req.State != tidev1.RequestState_REQUEST_STATE_QUEUED {
-				end = work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_ENDED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED}
+			sessionID = sess.req.ID
+			if !authz.CanDeleteDevSession(c.Role, c.UserID, sess.req.OwnerUserID) {
+				return api.ErrPermission("a member can delete only their own dev sessions")
 			}
-			if _, err := h.e.EndRequestTx(ctx, tx, sessionID, end); err != nil {
+			// Decide on the locked state, so a dispatch that starts the
+			// session meanwhile is seen: lock the open runner of the session,
+			// then the request, in the engine's lock order (runner first).
+			var runnerID string
+			err = tx.QueryRow(ctx, "SELECT runner_id::text FROM runners WHERE request_id = $1 AND state <> ALL($2) FOR UPDATE",
+				sessionID, []int16{int16(tidev1.RunnerState_RUNNER_STATE_DELETED), int16(tidev1.RunnerState_RUNNER_STATE_FAILED)}).Scan(&runnerID)
+			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 				return err
 			}
-		}
-		return s.WriteAudit(ctx, tx, api.AuditEvent{
-			OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_DEV_SESSION_DELETED, Actor: c.Principal,
-			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_DEV_SESSION, TargetID: sessionID, SubjectUserID: sess.req.OwnerUserID,
+			cur, err := work.ScanRequest(tx.QueryRow(ctx, "SELECT "+work.RequestColumns+" FROM requests WHERE request_id = $1 FOR UPDATE", sessionID))
+			if err != nil {
+				return err
+			}
+			if work.RequestTerminal(cur.State) {
+				return nil
+			}
+			queued := cur.State == tidev1.RequestState_REQUEST_STATE_QUEUED
+			ended := false
+			if !queued && cur.RunnerID != "" {
+				if cur.RunnerID != runnerID {
+					r, err := h.e.GetRunner(ctx, tx, c.OrganizationID, cur.RunnerID)
+					if err != nil {
+						return err
+					}
+					if !work.RunnerTerminal(r.State) {
+						// The runner was bound after the runner lock; locking
+						// it now would invert the lock order.
+						return errRebound
+					}
+				}
+				d, err = h.e.DeleteRunnerTx(ctx, tx, c.OrganizationID, cur.RunnerID, tidev1.RunnerEndReason_RUNNER_END_REASON_DELETED_BY_USER, work.DeleteByUser)
+				if err != nil {
+					return err
+				}
+				after, err := h.e.GetRequest(ctx, tx, c.OrganizationID, sessionID)
+				if err != nil {
+					return err
+				}
+				ended = work.RequestTerminal(after.State)
+			}
+			if !ended {
+				end := work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER}
+				if !queued {
+					end = work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_ENDED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_SESSION_DELETED}
+				}
+				if _, err := h.e.EndRequestTx(ctx, tx, sessionID, end); err != nil {
+					return err
+				}
+			}
+			return s.WriteAudit(ctx, tx, api.AuditEvent{
+				OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_DEV_SESSION_DELETED, Actor: c.Principal,
+				TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_DEV_SESSION, TargetID: sessionID, SubjectUserID: sess.req.OwnerUserID,
+			})
 		})
-	})
+		if !errors.Is(err, errRebound) {
+			break
+		}
+		if attempt == deleteAttempts {
+			err = api.ErrUnavailable("the dev session is starting; try again")
+			break
+		}
+	}
 	if err != nil {
 		return nil, s.Internal(ctx, "delete dev session", err)
 	}
