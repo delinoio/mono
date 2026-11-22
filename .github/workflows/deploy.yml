@@ -404,18 +404,32 @@ jobs:
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_changesets == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # Only the release bot credentials of this environment reach this job.
+    environment: releases
     # Job permissions replace the workflow permissions, so repeat
-    # `actions: read` for the stale-plan check.
+    # `actions: read` for the stale-plan check. `GITHUB_TOKEN` pushes
+    # nothing: the `main` rulesets let only the release bot push without a
+    # pull request.
     permissions:
-      contents: write
+      contents: read
       actions: read
     steps:
+      # A token of the `delino-release-bot` GitHub App for this repository
+      # with only `contents: write`. The app is a bypass actor of the `main`
+      # rulesets, so it can push the version commit.
+      - id: release-bot
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ secrets.RELEASE_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+          permission-contents: write
       # The release step pushes the version commit and tags with the
-      # credentials that this checkout persists. The job uploads no artifacts,
-      # so zizmor's artipacked finding does not apply.
+      # release bot token that this checkout persists. The job uploads no
+      # artifacts, so zizmor's artipacked finding does not apply.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
+          token: ${{ steps.release-bot.outputs.token }}
           fetch-depth: 0 # zizmor: ignore[artipacked]
       - name: Check that the plan is still current
         env:
@@ -437,8 +451,8 @@ jobs:
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
           SHA: ${{ needs.plan.outputs.sha }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "delino-release-bot[bot]"
+          git config user.email "331459759+delino-release-bot[bot]@users.noreply.github.com"
           scripts/ci/deploy-release.sh
 
   build-binaries:
