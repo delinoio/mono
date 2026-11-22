@@ -22,11 +22,14 @@ import {
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { createQueryClient } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
+import { shortIdText } from "./components/ui.tsx";
+import { formatTime } from "./format.ts";
 import { pendingInvitation } from "./invitation.ts";
 import { RouteId, RouterProvider, useRouter } from "./router.tsx";
 import {
@@ -920,6 +923,126 @@ describe("sandbox create form resources", () => {
     await settle(60);
     expect(created).toHaveLength(1);
     expect(created[0]?.memoryMib).toBe(1000n);
+  });
+
+  const create = async (dialog: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+  };
+
+  test("rejects a vCPU count above the int32 range without a request", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const vcpu = within(dialog).getByLabelText("vCPUs");
+    for (const value of ["2147483648", "3000000000"]) {
+      await commit(vcpu, value);
+      await create(dialog);
+      expect(vcpu.getAttribute("aria-invalid")).toBe("true");
+      expect(dialog.textContent).toContain(
+        "Enter a whole number of vCPUs from 1 to 2147483647.",
+      );
+      expect(dialog.querySelector(".notice-error")).toBeNull();
+      expect(created).toHaveLength(0);
+    }
+    expect(
+      screen.queryByRole("dialog", { name: "Create a sandbox" }),
+    ).not.toBeNull();
+  });
+
+  test("rejects memory and disk above 2^53 - 1 without a request", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    await commit(
+      within(dialog).getByLabelText("Memory (MiB)"),
+      "9007199254740993",
+    );
+    await commit(
+      within(dialog).getByLabelText("Disk (GiB)"),
+      "10000000000000000000",
+    );
+    await create(dialog);
+    expect(dialog.textContent).toContain("MiB from 1 to 9007199254740991");
+    expect(dialog.textContent).toContain("GiB from 1 to 9007199254740991");
+    expect(dialog.querySelector(".notice-error")).toBeNull();
+    expect(created).toHaveLength(0);
+  });
+
+  test("creates with the largest vCPU count of the int32 range", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    await commit(within(dialog).getByLabelText("vCPUs"), "2147483647");
+    await create(dialog);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.vcpuCount).toBe(2147483647);
+    expect(
+      screen.queryByRole("dialog", { name: "Create a sandbox" }),
+    ).toBeNull();
+  });
+
+  test("labels ready snapshots of the same period with distinct ids and their creation time", async () => {
+    // Snapshots that the mock creates back to back have UUID v7 ids with the
+    // same time prefix; the option label must still tell them apart.
+    const transport = createMockTransport();
+    const snapshots = createClient(SnapshotService, transport);
+    const made = [];
+    for (let i = 0; i < 2; i++) {
+      const res = await snapshots.createSnapshot({
+        organizationId: MOCK_IDS.acme,
+        sandboxId: MOCK_IDS.runningSandbox,
+      });
+      made.push(res.snapshot!);
+    }
+    const dialog = await openForm(transport);
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Source" }));
+    });
+    const options = (await screen.findAllByRole("option")).filter((o) =>
+      (o.textContent ?? "").startsWith("Snapshot "),
+    );
+    const texts = options.map((o) => o.textContent);
+    expect(options).toHaveLength(3);
+    expect(new Set(texts).size).toBe(3);
+    for (const snapshot of made) {
+      expect(texts).toContain(
+        `Snapshot ${shortIdText(snapshot.snapshotId)} · ${formatTime(snapshot.createTime)}`,
+      );
+    }
+  });
+
+  test("creates a sandbox from the chosen snapshot option", async () => {
+    const mock = createMockTransport();
+    const sources: unknown[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          sources.push((rest[3] as { source: unknown }).source);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Source" }));
+    });
+    const option = (await screen.findAllByRole("option")).find((o) =>
+      (o.textContent ?? "").startsWith("Snapshot "),
+    )!;
+    await act(async () => {
+      fireEvent.click(option);
+    });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+    expect(sources).toHaveLength(1);
+    expect(
+      JSON.stringify(sources[0], (_, v) =>
+        typeof v === "bigint" ? String(v) : v,
+      ),
+    ).toContain(MOCK_IDS.snapshot);
   });
 
   test("keeps the minimum of 256 and steps by whole numbers", async () => {
