@@ -17,10 +17,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
+	"github.com/delinoio/mono/cmds/ownsand/internal/logto"
 	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
@@ -400,6 +402,44 @@ func TestLoginStoresUserOnlyCredentialsAndLogout(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatal("logout left the credential file")
+	}
+}
+
+// A device code that expires while the user has not signed in ends the login
+// with the expiry message at the expiry time, not after the polling interval,
+// and without a token request after that point.
+func TestLoginReportsExpiryWithoutLateTokenRequest(t *testing.T) {
+	r := newRunner(t)
+	delete(r.env, ownsand.EnvAPIKey)
+	r.env[EnvLogtoAppID] = "app"
+	var tokenRequests atomic.Int32
+	ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/oidc/device/auth":
+			// A long interval and a lifetime of one second.
+			fmt.Fprint(w, `{"device_code":"dev-secret","user_code":"ABCD-EFGH","verification_uri":"https://login.example/device","expires_in":1,"interval":5}`)
+		case "/oidc/token":
+			tokenRequests.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":"authorization_pending"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ls.Close()
+	r.env[EnvLogtoEndpoint] = ls.URL
+	start := time.Now()
+	res := r.run("login")
+	elapsed := time.Since(start)
+	if res.code != ExitError || !strings.Contains(res.stderr, logto.ErrExpired.Error()) {
+		t.Fatalf("%+v", res)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("login took %v, want about 1s", elapsed)
+	}
+	if n := tokenRequests.Load(); n != 0 {
+		t.Fatalf("%d token requests after the code expired", n)
 	}
 }
 
