@@ -767,24 +767,46 @@ func TestExecPausedBeforeStartedResumesAndSends(t *testing.T) {
 func TestAttachNotFoundAfterStartedIsUnknownOutcome(t *testing.T) {
 	cp := newFakeCP(t)
 	wrote := make(chan struct{})
+	// cleared is closed after the fake agent forgot the exec. The relay holds
+	// the first AttachExec call until then, so the attach lookup always sees
+	// the missing exec and never races with the clearing goroutine.
+	cleared := make(chan struct{})
 	cp.agent.run = func(_ []string, e *fakeExec) {
 		e.write(0, []byte("x"))
 		close(wrote)
 	}
 	cp.relayScript = func(method string, n int) relayAction {
-		if method == "Exec" {
+		switch method {
+		case "Exec":
 			return relayAction{abortAfter: 1}
+		case "AttachExec":
+			if n == 1 {
+				select {
+				case <-cleared:
+				case <-time.After(10 * time.Second):
+					// The fixture failed; let the test fail on its own
+					// deadline instead of holding the relay handler.
+				}
+			}
 		}
 		return relayAction{}
 	}
 	s := cp.handle(t, cp.client(t, TransportRelay))
 	go func() {
-		<-wrote
+		defer close(cleared)
+		select {
+		case <-wrote:
+		case <-time.After(10 * time.Second):
+			return
+		}
 		cp.agent.mu.Lock()
 		cp.agent.execs = map[string]*fakeExec{}
 		cp.agent.mu.Unlock()
 	}()
-	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"x"}})
+	// A failing fixture must end within a test-local deadline.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	_, err := s.Exec(ctx, ExecParams{Command: []string{"x"}})
 	var dp *DataPathError
 	if !errors.As(err, &dp) || !dp.OutcomeUnknown {
 		t.Fatalf("want an unknown outcome, got %v", err)

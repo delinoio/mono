@@ -341,6 +341,12 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 
 	buf := make([]byte, datapath.MaxFileChunkSize)
 	nextBuf := make([]byte, datapath.MaxFileChunkSize)
+	// Observe cancellation before every read of the source, so a canceled
+	// context never enters r.Read. Nothing is acknowledged before the first
+	// chunk, so the offset is 0 here.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	n, rerr := readChunk(r, buf)
 	var offset int64
 	isFirst := true
@@ -352,7 +358,11 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 		var m int
 		var nerr error
 		if !last {
-			// Read ahead to learn whether this chunk is the last one.
+			// Read ahead to learn whether this chunk is the last one. Stop
+			// first when ctx is done and report the acknowledged offset.
+			if err := ctx.Err(); err != nil {
+				return offset, err
+			}
 			m, nerr = readChunk(r, nextBuf)
 			if nerr != nil && nerr != io.EOF {
 				return offset, nerr
