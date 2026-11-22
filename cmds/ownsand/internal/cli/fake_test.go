@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -174,7 +175,15 @@ func (h *fakeDevices) ReplaceDeviceLimits(_ context.Context, r *connect.Request[
 	h.f.mu.Unlock()
 	in := r.Msg.GetLimits()
 	limits := &ownsandv1.DeviceLimits{VcpuCount: in.GetVcpuCount(), MemoryMib: in.GetMemoryMib(), DiskGib: in.GetDiskGib(), VcpuOvercommitPercent: in.GetVcpuOvercommitPercent()}
-	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: &ownsandv1.Device{DeviceId: h.f.dev, Limits: limits}}), nil
+	// The control plane derives the effective limit from the limits and caps
+	// the int32 field at its largest value.
+	exact := int64(limits.GetVcpuCount()) * int64(limits.GetVcpuOvercommitPercent()) / 100
+	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: &ownsandv1.Device{
+		DeviceId:                h.f.dev,
+		Limits:                  limits,
+		EffectiveVcpuLimit:      int32(min(exact, math.MaxInt32)),
+		EffectiveVcpuLimitCount: exact,
+	}}), nil
 }
 
 type fakeSandbox struct {
@@ -195,6 +204,13 @@ func (h *fakeSandbox) CreateSandbox(_ context.Context, r *connect.Request[ownsan
 
 func (h *fakeSandbox) GetSandbox(_ context.Context, r *connect.Request[ownsandv1.GetSandboxRequest]) (*connect.Response[ownsandv1.GetSandboxResponse], error) {
 	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: &ownsandv1.Sandbox{SandboxId: r.Msg.GetSandboxId(), OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now()}}), nil
+}
+
+func (h *fakeSandbox) ListSandboxes(_ context.Context, r *connect.Request[ownsandv1.ListSandboxesRequest]) (*connect.Response[ownsandv1.ListSandboxesResponse], error) {
+	return connect.NewResponse(&ownsandv1.ListSandboxesResponse{
+		Sandboxes:     []*ownsandv1.Sandbox{{SandboxId: h.f.sb, OrganizationId: r.Msg.GetOrganizationId(), State: ownsandv1.SandboxState_SANDBOX_STATE_RUNNING, CreateTime: timestamppb.Now()}},
+		NextPageToken: "next",
+	}), nil
 }
 
 type fakeDataPath struct {

@@ -51,20 +51,27 @@ func newRunner(t *testing.T) *runner {
 func (r *runner) run(args ...string) result {
 	r.t.Helper()
 	var out, errb bytes.Buffer
+	code := r.runWriters(&out, &errb, args...)
+	return result{code: code, stdout: out.String(), stderr: errb.String()}
+}
+
+// runWriters runs one invocation on the given standard output and error and
+// returns the exit status.
+func (r *runner) runWriters(stdout, stderr io.Writer, args ...string) int {
+	r.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	code := Run(ctx, Env{
+	return Run(ctx, Env{
 		Args:   args,
 		Stdin:  strings.NewReader(r.stdin),
-		Stdout: &out,
-		Stderr: &errb,
+		Stdout: stdout,
+		Stderr: stderr,
 		LookupEnv: func(k string) (string, bool) {
 			v, ok := r.env[k]
 			return v, ok
 		},
 		LoginPollInterval: 10 * time.Millisecond,
 	})
-	return result{code: code, stdout: out.String(), stderr: errb.String()}
 }
 
 func TestUsageErrors(t *testing.T) {
@@ -1116,5 +1123,33 @@ func TestParseDurationDayOverflow(t *testing.T) {
 	res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "213504d", "--vcpu", "1", "--memory", "512", "--disk", "5")
 	if res.code != ExitUsage || !strings.Contains(res.stderr, "invalid duration") || len(r.f.callNames()) != 0 {
 		t.Fatalf("%+v %v", res, r.f.callNames())
+	}
+}
+
+// TestDeviceSetLimitsPrintsLargeIntegersInFull checks that text mode prints
+// the largest int32 value in decimal form, and that JSON mode keeps it too.
+func TestDeviceSetLimitsPrintsLargeIntegersInFull(t *testing.T) {
+	r := newRunner(t)
+	args := []string{"device", "set-limits", r.f.dev, "--vcpu", "2147483647", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "100"}
+	res := r.run(append(args, "--no-color")...)
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	for _, want := range []string{"limits.vcpu_count: 2147483647\n", "effective_vcpu_limit: 2147483647\n"} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("stdout misses %q:\n%s", want, res.stdout)
+		}
+	}
+	if strings.Contains(res.stdout, "e+") {
+		t.Errorf("exponent form in stdout:\n%s", res.stdout)
+	}
+	res = r.run(append(args, "--format", "json")...)
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	for _, want := range []string{`"vcpu_count":2147483647`, `"effective_vcpu_limit":2147483647`} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("JSON stdout misses %q:\n%s", want, res.stdout)
+		}
 	}
 }

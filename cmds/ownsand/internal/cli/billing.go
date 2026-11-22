@@ -113,16 +113,21 @@ func (a *app) billingStatus(ctx context.Context, name string, args []string) err
 		if err := writeJSON(a.env.Stdout, out); err != nil {
 			return err
 		}
+		// The JSON result on standard output is complete at this point; the
+		// notes on standard error are advice, so a failed write of them does
+		// not change the exit status.
 		a.billingNotes(a.env.Stderr, org, billing, usageDenied)
 		return nil
 	}
-	a.printBillingText(org, billing, usage)
-	a.billingNotes(a.env.Stdout, org, billing, usageDenied)
-	return nil
+	w := &stickyWriter{w: a.env.Stdout}
+	a.printBillingText(w, org, billing, usage)
+	a.billingNotes(w, org, billing, usageDenied)
+	return w.err
 }
 
-func (a *app) printBillingText(org string, billing *ownsandv1.OrganizationBilling, usage *ownsandv1.GetBillingUsageResponse) {
-	w := a.env.Stdout
+// printBillingText writes the text result to w, a stickyWriter that holds the
+// first write error for the caller.
+func (a *app) printBillingText(w *stickyWriter, org string, billing *ownsandv1.OrganizationBilling, usage *ownsandv1.GetBillingUsageResponse) {
 	line := func(k, v string) { fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, k), v) }
 	line("organization", org)
 	line("status", enumName(billing.GetPhase()))
@@ -164,11 +169,12 @@ func (a *app) printBillingText(org string, billing *ownsandv1.OrganizationBillin
 	for _, m := range usage.GetMeterUsages() {
 		rows = append(rows, []string{meterLabel(m.GetMeter()), meterQuantity(m.GetMeter(), m.GetQuantity()), formatUsageCost(m.GetAmountUsdMicros())})
 	}
-	a.printTable(headers, rows)
+	_ = a.printTable(w, headers, rows) // w keeps the error
 	fmt.Fprintln(w, "Usage of the last 5 to 10 minutes may not be included yet.")
 }
 
-// billingNotes writes what the user can do next.
+// billingNotes writes what the user can do next. Write errors are the
+// caller's to read from w, as for printBillingText.
 func (a *app) billingNotes(w io.Writer, org string, billing *ownsandv1.OrganizationBilling, usageDenied bool) {
 	if !billing.GetLinked() {
 		fmt.Fprintf(w, "No billing account is linked. The organization owner links one on the organization settings page of the console: %s/orgs/%s/settings\n", ConsoleURL, org)
