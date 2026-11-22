@@ -103,7 +103,7 @@ func (st Settings) AlertProto() *accountsv1.AlertSettings {
 
 // ValidateAutoTopUp applies the rules of UpdateAutoTopUpSettings: with
 // enabled true, a threshold of at least $10, an amount of at least $25 and
-// a monthly cap of at least the amount, all whole cents; with enabled false,
+// at most $10,000 and a monthly cap of at least the amount, all whole cents; with enabled false,
 // zero or non-negative whole cents.
 func ValidateAutoTopUp(in *accountsv1.AutoTopUpSettings) error {
 	if in == nil {

@@ -147,6 +147,39 @@ describe("forms", () => {
     }
   });
 
+  test("limits an enabled automatic top-up amount to $10,000", () => {
+    const withAmount = (amount: string, enabled = true) =>
+      checkAutoTopUp({
+        enabled,
+        threshold: "10",
+        amount,
+        monthlyCap: "20000",
+      });
+    expect(withAmount("10000")).toEqual({
+      ok: true,
+      value: {
+        enabled: true,
+        thresholdUsdMicros: 10_000_000n,
+        amountUsdMicros: 10_000_000_000n,
+        monthlyCapUsdMicros: 20_000_000_000n,
+      },
+    });
+    expect(withAmount("10000.01")).toEqual({
+      ok: false,
+      errors: { amount: "Enter at most $10,000.00." },
+    });
+    // A disabled setting keeps any whole-cent amount for a later enable.
+    expect(withAmount("15000", false)).toEqual({
+      ok: true,
+      value: {
+        enabled: false,
+        thresholdUsdMicros: 10_000_000n,
+        amountUsdMicros: 15_000_000_000n,
+        monthlyCapUsdMicros: 20_000_000_000n,
+      },
+    });
+  });
+
   test("keeps disabled automatic top-up values with zero for empty fields", () => {
     expect(
       checkAutoTopUp({

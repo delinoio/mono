@@ -691,6 +691,37 @@ describe("settings", () => {
     ]);
   });
 
+  test("rejects an enabled automatic top-up amount above $10,000 without a request", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    await click(
+      await screen.findByRole("switch", { name: "Automatic top-up" }),
+    );
+    const threshold = screen.getByRole("textbox", { name: "Threshold (USD)" });
+    const amount = screen.getByRole("textbox", { name: "Top-up amount (USD)" });
+    const cap = screen.getByRole("textbox", { name: "Monthly cap (USD)" });
+    const form = threshold.closest("form")!;
+    const save = within(form).getByRole("button", { name: "Save" });
+    await type(threshold, "10");
+    await type(amount, "15000");
+    await type(cap, "20000");
+    await click(save);
+    expect(screen.getByText("Enter at most $10,000.00.")).toBeTruthy();
+    expect(calls(api, "UpdateAutoTopUpSettings")).toHaveLength(0);
+    await type(amount, "10000");
+    await click(save);
+    await settle(60);
+    expect(calls(api, "UpdateAutoTopUpSettings")).toEqual([
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          enabled: true,
+          amountUsdMicros: 10_000_000_000n,
+          monthlyCapUsdMicros: 20_000_000_000n,
+        }),
+      }),
+    ]);
+  });
+
   test("saves the low-balance alert threshold from $0 with the $10 default", async () => {
     const api = createFakeApi();
     await renderAccount(undefined, { api });
