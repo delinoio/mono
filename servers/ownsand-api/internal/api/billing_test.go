@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
@@ -778,5 +779,65 @@ func TestBillingErrorDetailCodecs(t *testing.T) {
 		if got := billingReasonOf(t, name, err); got != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED {
 			t.Fatalf("%s: reason = %v (err %v)", name, got, err)
 		}
+	}
+}
+
+// TestBillingLegacyWriterOrganization creates an organization the way the
+// previous release (before billing) does, with plain inserts and no status
+// row, while the new release serves requests (a rolling deployment). The
+// migration's trigger gives the organization its unlinked status when the
+// creation commits, so its owner can link a billing account with the normal
+// gates, and a non-owner still cannot.
+func TestBillingLegacyWriterOrganization(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	const owner, admin, orgID = "legacy-owner", "legacy-admin", "018f0000-0000-7000-8000-0000000000f1"
+	created := env.Clock.Now().Add(-time.Hour)
+	err := env.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "INSERT INTO organizations (organization_id, name, create_time) VALUES ($1, 'legacy org', $2)", orgID, created); err != nil {
+			return err
+		}
+		for user, role := range map[string]ownsandv1.Role{owner: ownsandv1.Role_ROLE_OWNER, admin: ownsandv1.Role_ROLE_ADMIN} {
+			membership, err := uuidv7.NewString()
+			if err != nil {
+				return err
+			}
+			if _, err := tx.Exec(ctx, "INSERT INTO memberships (membership_id, organization_id, user_id, role, join_time) VALUES ($1, $2, $3, $4, $5)",
+				membership, orgID, user, int16(role), created); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rows int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM organization_billing WHERE organization_id = $1", orgID).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("status rows of the legacy organization = %d, %v, want 1", rows, err)
+	}
+
+	ownerClient := env.User(owner)
+	b := billingStatus(t, ownerClient, orgID)
+	if b.GetPhase() != billing.PhaseBlocked || b.GetLinked() || b.GetReason() != ownsandv1.BillingReason_BILLING_REASON_ACCOUNT_REQUIRED || !b.GetBlockedSince().AsTime().Equal(created) {
+		t.Fatalf("status of the legacy organization = %v", b)
+	}
+
+	// A non-owner cannot link, and the owner can with the normal gates:
+	// delino-accounts checks the billing account role.
+	fake.AddAccount(billingAccountA, "Legacy account", map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER, admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	link := &ownsandv1.LinkBillingAccountRequest{OrganizationId: orgID, BillingAccountId: billingAccountA}
+	if _, err := env.User(admin).Billing.LinkBillingAccount(ctx, connect.NewRequest(link)); testenv.Code(err) != connect.CodePermissionDenied {
+		t.Fatalf("admin link of the legacy organization: %v", err)
+	}
+	resp, err := ownerClient.Billing.LinkBillingAccount(ctx, connect.NewRequest(link))
+	if err != nil {
+		t.Fatalf("owner link of the legacy organization: %v", err)
+	}
+	if resp.Msg.GetBilling().GetPhase() != billing.PhaseAllowed || !resp.Msg.GetBilling().GetLinked() || resp.Msg.GetBillingAccountName() != "Legacy account" {
+		t.Fatalf("link response = %v", resp.Msg)
+	}
+	if account, _, ok := fake.Link(orgID); !ok || account != billingAccountA {
+		t.Fatalf("fake link = %q, %v", account, ok)
 	}
 }
