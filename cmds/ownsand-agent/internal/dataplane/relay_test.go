@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -1307,5 +1308,481 @@ func TestRelayStreamCloseCancelsBlockedRequestAccepted(t *testing.T) {
 	}
 	if f.c.ctx.Err() != nil {
 		t.Fatal("the connection was closed")
+	}
+}
+
+// grantReceived returns the instant at which the relay installed grant g, so
+// a test can drive sweep at exact offsets from the grant's expiry.
+func (e *relayEnv) grantReceived(g *ownsandv1.RelayGrant) time.Time {
+	e.t.Helper()
+	e.dp.relay.mu.Lock()
+	defer e.dp.relay.mu.Unlock()
+	held := e.dp.relay.grants[g.GetGrantId()]
+	if held == nil {
+		e.t.Fatal("the grant is not installed")
+	}
+	return held.received
+}
+
+// waitNoStreams waits until grant g holds no open stream.
+func (e *relayEnv) waitNoStreams(g *ownsandv1.RelayGrant) {
+	e.t.Helper()
+	waitFor(e.t, "the streams of the grant to end", func() bool {
+		e.dp.relay.mu.Lock()
+		defer e.dp.relay.mu.Unlock()
+		held := e.dp.relay.grants[g.GetGrantId()]
+		return held == nil || len(held.streams) == 0
+	})
+}
+
+// TestRelayIdleGrantWaitsForAdmissionToleranceAfterExpiry checks that a
+// grant whose last stream ended before its expiry (or that never admitted a
+// stream) stays admittable for the 30-second admission tolerance after its
+// expiry, as the contract says, and is released only after that. The agent
+// and the control plane then agree on which grants can still admit a first
+// request frame.
+func TestRelayIdleGrantWaitsForAdmissionToleranceAfterExpiry(t *testing.T) {
+	const expiry = 15 * time.Minute
+	for _, tc := range []string{"never_opened", "stream_closed_before_expiry", "request_accepted_then_closed"} {
+		t.Run(tc, func(t *testing.T) {
+			e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 30 * time.Second}, RelayLimits{})
+			req := e.execReq("/bin/sh", "-c", "sleep 30")
+			g, ack := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, req.GetExecId(), relaybinding.ExecDigest(req), expiry, time.Hour, "")
+			if ack.GetResult() != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
+				t.Fatalf("grant ack %v", ack)
+			}
+			if tc != "never_opened" {
+				rc := e.conn()
+				e.openOK(rc, 1, g.GetGrantId())
+				if tc == "request_accepted_then_closed" {
+					rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+					if f := rc.nextOn(1); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+						t.Fatalf("expected the accepted notice, got %v", f)
+					}
+				}
+				rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamClose{}))
+				e.waitNoStreams(g)
+			}
+			received := e.grantReceived(g)
+			// Before the expiry and shortly after it, the grant is held and
+			// admittable.
+			for _, d := range []time.Duration{expiry - time.Second, expiry + time.Second, expiry + 5*time.Second, expiry + 29*time.Second} {
+				e.dp.relay.sweep(received.Add(d))
+				if e.ch.released(g.GetGrantId()) {
+					t.Fatalf("the grant was released %v after its installation, before expiry plus the admission tolerance", d)
+				}
+			}
+			e.dp.relay.mu.Lock()
+			held := e.dp.relay.grants[g.GetGrantId()]
+			admittable := held != nil && held.admittable(received.Add(expiry+5*time.Second), e.dp.timing.AdmissionTolerance)
+			e.dp.relay.mu.Unlock()
+			if !admittable {
+				t.Fatal("the grant is not admittable 5 seconds after its expiry")
+			}
+			e.dp.relay.sweep(received.Add(expiry + 31*time.Second))
+			if !e.ch.released(g.GetGrantId()) {
+				t.Fatal("the grant was not released after its expiry plus the admission tolerance")
+			}
+		})
+	}
+}
+
+// TestRelayGrantWhoseLastStreamEndedAfterExpiryReleasesAtOnce checks that a
+// grant whose last stream ended at or after the grant's expiry is released
+// without waiting for the admission tolerance, and that an open stream keeps
+// the grant.
+func TestRelayGrantWhoseLastStreamEndedAfterExpiryReleasesAtOnce(t *testing.T) {
+	e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 30 * time.Second}, RelayLimits{})
+	g, _ := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, newID(t), nil, 15*time.Minute, time.Hour, "")
+	received := e.grantReceived(g)
+	late := received.Add(15*time.Minute + 2*time.Second)
+	e.dp.relay.mu.Lock()
+	held := e.dp.relay.grants[g.GetGrantId()]
+	held.streams[&rstream{}] = true
+	held.idleSince = late.Add(-time.Hour)
+	e.dp.relay.mu.Unlock()
+	e.dp.relay.sweep(late)
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("a grant with an open stream was released")
+	}
+	// The last stream ends after the expiry, as finishStream records it.
+	e.dp.relay.mu.Lock()
+	clear(held.streams)
+	held.idleSince = late
+	e.dp.relay.mu.Unlock()
+	e.dp.relay.sweep(late)
+	if !e.ch.released(g.GetGrantId()) {
+		t.Fatal("the grant whose last stream ended after its expiry was not released at once")
+	}
+}
+
+// TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime runs the
+// expiry with real time: with an expiry of 1 second and an admission
+// tolerance of 8 seconds, an idle grant still admits a stream and its
+// request 2.2 seconds after its installation, without a release message, and
+// is released as soon as that stream ends after the expiry.
+func TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime(t *testing.T) {
+	e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 8 * time.Second}, RelayLimits{})
+	req := e.execReq("/bin/sh", "-c", "sleep 30")
+	start := time.Now()
+	g, ack := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, req.GetExecId(), relaybinding.ExecDigest(req), time.Second, time.Hour, "")
+	if ack.GetResult() != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
+		t.Fatalf("grant ack %v", ack)
+	}
+	rc := e.conn()
+	time.Sleep(time.Until(start.Add(2200 * time.Millisecond)))
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the idle grant was released at its expiry, before the admission tolerance ended")
+	}
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	if f := rc.nextOn(1); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+		t.Fatalf("a request within the admission tolerance got %v", f)
+	}
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the grant was released while its stream was open")
+	}
+	ended := time.Now()
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamClose{}))
+	waitFor(t, "release after the stream ended past the expiry", func() bool { return e.ch.released(g.GetGrantId()) })
+	if d := time.Since(ended); d > 3*time.Second {
+		t.Fatalf("the grant was released %v after its last stream ended past the expiry", d)
+	}
+}
+
+// TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker checks that
+// the shutdown deadline of a lost channel's connection covers the whole
+// flush, not only the enqueue of the flush marker: when the queue takes the
+// marker but the writer never reaches it (a writer that HTTP/2 flow control
+// blocks), and when the writer took the marker but its request close never
+// returns, the connection is still canceled at the deadline.
+func TestRelayCloseAfterFlushIsBoundedWhenWriterNeverReachesMarker(t *testing.T) {
+	const deadline = 300 * time.Millisecond
+	for _, tc := range []string{"marker_never_dequeued", "marker_taken_close_request_stalls", "queue_full"} {
+		t.Run(tc, func(t *testing.T) {
+			_, c := newManualConn(t, Timing{}, 4)
+			c.flushDeadline = deadline
+			switch tc {
+			case "marker_taken_close_request_stalls":
+				// The writer dequeues the marker and then blocks in the
+				// request close; it never starts its own 2-second timer.
+				go func() { <-c.out; select {} }()
+			case "queue_full":
+				for i := 0; i < cap(c.out); i++ {
+					c.out <- keepaliveFrame(false)
+				}
+			}
+			start := time.Now()
+			go c.closeAfterFlush()
+			select {
+			case <-c.ctx.Done():
+			case <-time.After(5 * time.Second):
+				t.Fatal("the connection was not canceled after the shutdown deadline")
+			}
+			if d := time.Since(start); d < deadline*8/10 || d > deadline+time.Second {
+				t.Fatalf("the connection was canceled after %v, want about %v", d, deadline)
+			}
+		})
+	}
+}
+
+// TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds checks that a
+// connection that ends before the deadline is not canceled again: the timer
+// stops with the connection's context.
+func TestRelayCloseAfterFlushStopsItsTimerWhenTheConnectionEnds(t *testing.T) {
+	_, c := newManualConn(t, Timing{}, 4)
+	c.flushDeadline = 200 * time.Millisecond
+	canceled := make(chan struct{}, 2)
+	inner := c.cancel
+	c.cancel = func() { canceled <- struct{}{}; inner() }
+	go func() { <-c.out; inner() }()
+	c.closeAfterFlush()
+	time.Sleep(600 * time.Millisecond)
+	if len(canceled) != 0 {
+		t.Fatal("the shutdown timer canceled a connection that had ended")
+	}
+}
+
+// TestRelayChannelLossCancelsConnectionWithBlockedWriter runs the lost
+// channel with the real transport: the control plane stops reading the
+// relay stream, so HTTP/2 flow control blocks the agent's writer while the
+// outbound queue still has room and the control plane keeps sending bytes.
+// The queue takes the flush marker, but the writer never reaches it. The
+// agent must still cancel the connection at the shutdown deadline, and the
+// live grant of the new channel must get a new connection after the bounded
+// teardown.
+func TestRelayChannelLossCancelsConnectionWithBlockedWriter(t *testing.T) {
+	const flush = time.Second
+	e := newRelayEnv(t, Timing{FlushDeadline: flush, ReceiveTimeout: time.Hour, KeepaliveInterval: time.Hour, ProbeIdle: time.Hour}, RelayLimits{})
+	var (
+		count   atomic.Int32
+		stalled atomic.Bool
+		sendMu  sync.Mutex
+		release = make(chan struct{})
+	)
+	t.Cleanup(func() { close(release) })
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		rc := &relayConn{t: t, ctx: ctx, frames: make(chan *ownsandv1.DataFrame, 4096), stream: stream}
+		e.conns <- rc
+		if count.Add(1) > 1 {
+			for {
+				req, err := stream.Receive()
+				if err != nil {
+					return nil
+				}
+				rc.frames <- req.GetFrame()
+			}
+		}
+		// First connection: read the startup frames, then stop reading, so
+		// the transport blocks the writer, but keep sending keepalives.
+		for i := 0; i < 2; i++ {
+			if _, err := stream.Receive(); err != nil {
+				return nil
+			}
+		}
+		stalled.Store(true)
+		tick := time.NewTicker(100 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return nil
+			case <-tick.C:
+				sendMu.Lock()
+				_ = stream.Send(&ownsandv1.ConnectResponse{Frame: keepaliveFrame(false)})
+				sendMu.Unlock()
+			}
+		}
+	})
+	req := e.execReq("/bin/sh", "-c", "head -c 3000000 /dev/zero; sleep 30")
+	g := e.execGrant(req)
+	rc := <-e.conns
+	waitFor(t, "stalled relay handler", stalled.Load)
+	sendMu.Lock()
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamOpen{GrantId: g.GetGrantId(), InitialWindowBytes: 64 << 20}))
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	sendMu.Unlock()
+	e.dp.relay.mu.Lock()
+	old := e.dp.relay.conn
+	e.dp.relay.mu.Unlock()
+	// Wait until the writer is blocked: the queue stops draining while it
+	// still has free slots.
+	var queued int
+	waitFor(t, "a blocked writer with a partly filled queue", func() bool {
+		n := len(old.out)
+		blocked := n > 0 && n == queued
+		queued = n
+		time.Sleep(300 * time.Millisecond)
+		return blocked
+	})
+	if len(old.out) >= cap(old.out) {
+		t.Fatalf("the outbound queue is full (%d frames), so the test does not cover a queue with free slots", len(old.out))
+	}
+
+	e.dp.ChannelLost(e.ch)
+	e.ch.Close()
+	lost := time.Now()
+	select {
+	case <-old.ctx.Done():
+	case <-time.After(flush + 3*time.Second):
+		t.Fatalf("the connection was not canceled %v after the channel loss", time.Since(lost))
+	}
+	if d := time.Since(lost); d < flush*8/10 {
+		t.Fatalf("the connection was canceled after %v, before the %v flush deadline", d, flush)
+	}
+	// The grant of the new channel gets a new connection after the bounded
+	// teardown.
+	e.ch = newChannel(2)
+	e.dp.ChannelOpened(e.ch)
+	e.execGrant(e.execReq("/bin/true"))
+	select {
+	case <-e.conns:
+	case <-time.After(teardownGrace + 5*time.Second):
+		t.Fatal("no new relay connection for the live grant of the new channel")
+	}
+	if d := time.Since(lost); d > flush+teardownGrace+4*time.Second {
+		t.Fatalf("the new connection took %v after the channel loss", d)
+	}
+}
+
+// TestRelayChannelLossFlushesSessionEndBeforeClosingRequest checks the
+// unblocked case: with a transport that reads, the queued session-end frame
+// leaves before the request side closes, and the connection ends by that
+// request close, well before the shutdown deadline.
+func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
+	const flush = 10 * time.Second
+	e := newRelayEnv(t, Timing{FlushDeadline: flush}, RelayLimits{})
+	type event struct {
+		frame *ownsandv1.DataFrame
+		err   error
+	}
+	events := make(chan event, 4096)
+	connected := make(chan struct{}, 1)
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, stream *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		rc := &relayConn{t: t, ctx: ctx, frames: make(chan *ownsandv1.DataFrame, 4096), stream: stream}
+		e.conns <- rc
+		connected <- struct{}{}
+		for {
+			req, err := stream.Receive()
+			if err != nil {
+				events <- event{err: err}
+				return nil
+			}
+			rc.frames <- req.GetFrame()
+			events <- event{frame: req.GetFrame()}
+		}
+	})
+	req := e.execReq("/bin/sh", "-c", "sleep 30")
+	g := e.execGrant(req)
+	rc := e.conn()
+	<-connected
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	rc.nextOn(1)
+	lost := time.Now()
+	e.dp.ChannelLost(e.ch)
+	e.ch.Close()
+	var sawSessionEnd bool
+	for {
+		select {
+		case ev := <-events:
+			if ev.err == nil {
+				if ev.frame.GetSessionEnd().GetReason() == ownsandv1.SessionEndReason_SESSION_END_REASON_AGENT_CHANNEL_LOST {
+					sawSessionEnd = true
+				}
+				continue
+			}
+			if !errors.Is(ev.err, io.EOF) {
+				t.Fatalf("the request side ended with %v, want a clean close", ev.err)
+			}
+			if !sawSessionEnd {
+				t.Fatal("the request closed before the session-end frame arrived")
+			}
+			if d := time.Since(lost); d > flush/2 {
+				t.Fatalf("the request closed %v after the channel loss, not at the end of the flush", d)
+			}
+			return
+		case <-time.After(flush):
+			t.Fatal("the request side never closed")
+		}
+	}
+}
+
+// relayAttempt is one relay connection of a scripted control plane.
+type relayAttempt struct {
+	started, ended time.Time
+}
+
+// scriptedRelay makes the control plane keep each relay connection open for
+// the matching duration of lives (the last value repeats) and then fail it
+// with an ordinary error, and records when each attempt started and ended.
+// A negative duration fails the connection at once.
+func scriptedRelay(e *relayEnv, lives ...time.Duration) func() []relayAttempt {
+	var mu sync.Mutex
+	var attempts []relayAttempt
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, _ *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		mu.Lock()
+		n := len(attempts)
+		attempts = append(attempts, relayAttempt{started: time.Now()})
+		mu.Unlock()
+		life := lives[min(n, len(lives)-1)]
+		if life > 0 {
+			select {
+			case <-time.After(life):
+			case <-ctx.Done():
+			}
+		}
+		mu.Lock()
+		attempts[n].ended = time.Now()
+		mu.Unlock()
+		return connect.NewError(connect.CodeUnavailable, errors.New("relay unavailable"))
+	})
+	return func() []relayAttempt {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]relayAttempt(nil), attempts...)
+	}
+}
+
+// waitAttempts waits until the control plane saw n finished attempts.
+func waitAttempts(t *testing.T, get func() []relayAttempt, n int) []relayAttempt {
+	t.Helper()
+	var got []relayAttempt
+	waitFor(t, fmt.Sprintf("%d relay connection attempts", n), func() bool {
+		got = get()
+		return len(got) > n || (len(got) == n && !got[n-1].ended.IsZero())
+	})
+	return got
+}
+
+// TestRelayLongLivedConnectionRestartsBackoff checks that a connection that
+// stayed open for the reset time and then ended with an ordinary error
+// restarts the back-off at its first 200-millisecond step, also when earlier
+// failures had raised it to ReconnectMax, and that the delay of a streak of
+// short connections keeps growing.
+func TestRelayLongLivedConnectionRestartsBackoff(t *testing.T) {
+	// Three connections that fail at once raise the back-off to 800 ms; the
+	// fourth lives longer than the reset time; the fifth is the redial.
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
+	get := scriptedRelay(e, -1, -1, -1, 500*time.Millisecond, -1)
+	e.execGrant(e.execReq("/bin/true"))
+	at := waitAttempts(t, get, 5)
+	gap := func(i int) time.Duration { return at[i+1].started.Sub(at[i].ended) }
+	t.Logf("delays between attempts: %v, %v, %v (short connections), %v (after the long-lived one)", gap(0), gap(1), gap(2), gap(3))
+	if gap(2) < 500*time.Millisecond {
+		t.Fatalf("the delay after the third short connection was %v; the back-off did not grow", gap(2))
+	}
+	if g := gap(3); g > 400*time.Millisecond {
+		t.Fatalf("the delay after a connection that lived 500 ms was %v, want at most the 200 ms first step", g)
+	}
+}
+
+// TestRelayRepeatedLongLivedConnectionsStayAtFirstStep checks that every
+// connection that lives for the reset time starts its own back-off.
+func TestRelayRepeatedLongLivedConnectionsStayAtFirstStep(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
+	get := scriptedRelay(e, 400*time.Millisecond)
+	e.execGrant(e.execReq("/bin/true"))
+	at := waitAttempts(t, get, 4)
+	t.Logf("delays after long-lived connections: %v, %v, %v", at[1].started.Sub(at[0].ended), at[2].started.Sub(at[1].ended), at[3].started.Sub(at[2].ended))
+	for i := 0; i < 3; i++ {
+		if g := at[i+1].started.Sub(at[i].ended); g > 400*time.Millisecond {
+			t.Fatalf("the delay after long-lived connection %d was %v, want at most the 200 ms first step", i+1, g)
+		}
+	}
+}
+
+// TestRelayShortConnectionsKeepBackoffGrowing checks that connections that
+// end before the reset time never restart the back-off, even when each of
+// them lived for a while.
+func TestRelayShortConnectionsKeepBackoffGrowing(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
+	get := scriptedRelay(e, 100*time.Millisecond)
+	e.execGrant(e.execReq("/bin/true"))
+	at := waitAttempts(t, get, 4)
+	gap := func(i int) time.Duration { return at[i+1].started.Sub(at[i].ended) }
+	if gap(2) < 500*time.Millisecond || gap(2) <= gap(0)+200*time.Millisecond {
+		t.Fatalf("delays %v, %v, %v after short connections; the back-off did not keep growing", gap(0), gap(1), gap(2))
+	}
+}
+
+// TestRelayCredentialFailureKeepsBackoffAtShortReset checks that a failure
+// before any connection opened counts as no open time, so even a very short
+// reset time never restarts the back-off of a failing credential request.
+func TestRelayCredentialFailureKeepsBackoffAtShortReset(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 20 * time.Millisecond}, RelayLimits{})
+	var attempts atomic.Int32
+	hook := func(context.Context) error {
+		attempts.Add(1)
+		return errors.New("credential unavailable")
+	}
+	e.beforeAuth.Store(&hook)
+	e.execGrant(e.execReq("/bin/true"))
+	time.Sleep(1500 * time.Millisecond)
+	// Back-off of 200, 400, 800 milliseconds allows about four attempts.
+	if n := attempts.Load(); n < 1 || n > 6 {
+		t.Fatalf("%d credential attempts in 1.5 seconds", n)
 	}
 }

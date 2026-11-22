@@ -327,6 +327,22 @@ func (r *relay) housekeeping() {
 	}
 }
 
+// expiredGrantReleasable reports whether a grant without an open stream is
+// released because of its expiry. A grant whose last stream ended at or after
+// the expiry is released at once, as soon as that stream ends. A grant that
+// never admitted a stream, or whose last stream ended before the expiry, can
+// still admit a first request frame until the expiry plus the admission
+// tolerance (see grant.admittable), so it stays until then; releasing it at
+// the bare expiry would make the control plane's own admittable check accept
+// a stream that the agent no longer knows. The caller holds r.mu.
+func expiredGrantReleasable(g *grant, now time.Time, tolerance time.Duration) bool {
+	expiry := g.received.Add(g.expiresIn)
+	if !now.Before(expiry.Add(tolerance)) {
+		return true
+	}
+	return !now.Before(expiry) && !g.idleSince.Before(expiry)
+}
+
 func (r *relay) sweep(now time.Time) {
 	// An exec keeps running after its caller closed the stream (for example
 	// to attach again later). Its grant is released as soon as the exec
@@ -359,7 +375,7 @@ func (r *relay) sweep(now time.Time) {
 			expired = append(expired, g)
 		case len(g.streams) == 0 && (g.done || (g.opened && g.execGrant() && endedExecs[g.opID]) ||
 			now.Sub(g.idleSince) >= r.d.timing.GrantIdle ||
-			!now.Before(g.received.Add(g.expiresIn))):
+			expiredGrantReleasable(g, now, r.d.timing.AdmissionTolerance)):
 			delete(r.grants, id)
 			released = append(released, g)
 		}
