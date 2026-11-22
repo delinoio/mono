@@ -39,16 +39,16 @@ The project has one hosted server deployable (the control plane on the shared Di
 
 ### Components
 
-| Component ID      | Path                        | Kind                  | Production origin or distribution    |
-| ----------------- | --------------------------- | --------------------- | ------------------------------------ |
-| `ownsand-api`     | `servers/ownsand-api/`      | Droplet server        | `https://ownsand.api.delino.io`      |
-| `ownsand-console` | `apps/ownsand/`             | Cloudflare Pages site | `https://ownsand.delino.io`          |
-| `ownsand-agent`   | `cmds/ownsand-agent/`       | Host service binary   | Signed release, self-updating        |
-| `ownsand-guest`   | `cmds/ownsand-guest/`       | Guest helper binary   | Installed into each guest image      |
-| `ownsand-cli`     | `cmds/ownsand/`             | CLI binary            | Release artifact                     |
-| `ownsand-sdk-ts`  | `packages/ownsand-sdk/`     | TypeScript package    | npm package                          |
-| `ownsand-sdk-go`  | `go/ownsand/`               | Go package            | Root Go module import path           |
-| `ownsand-protos`  | `protos/delino/ownsand/v1/` | Schemas and bindings  | Root Go module and generated TS code |
+| Component ID      | Path                        | Kind                  | Production origin or distribution              |
+| ----------------- | --------------------------- | --------------------- | ---------------------------------------------- |
+| `ownsand-api`     | `servers/ownsand-api/`      | Droplet server        | `https://ownsand.api.delino.io`                |
+| `ownsand-console` | `apps/ownsand/`             | Cloudflare Pages site | `https://ownsand.delino.io`                    |
+| `ownsand-agent`   | `cmds/ownsand-agent/`       | Host service binary   | GitHub Release, signed manifest, self-updating |
+| `ownsand-guest`   | `cmds/ownsand-guest/`       | Guest helper binary   | Installed into each guest image                |
+| `ownsand-cli`     | `cmds/ownsand/`             | CLI binary            | GitHub Release                                 |
+| `ownsand-sdk-ts`  | `packages/ownsand-sdk/`     | TypeScript package    | npm package                                    |
+| `ownsand-sdk-go`  | `go/ownsand/`               | Go package            | Root Go module import path                     |
+| `ownsand-protos`  | `protos/delino/ownsand/v1/` | Schemas and bindings  | Root Go module and generated TS code           |
 
 ### Protocol and API
 
@@ -138,7 +138,7 @@ Status: recorded decisions. Metering, usage reporting, the status sync, enforcem
 
 Record each decision in the owning domain contract before the implementation that depends on it. The domain contracts also own narrower open decisions (for example, the production Linux base image, the network access of Windows guests (a TUN driver for `OUTBOUND`), the CLI keychain storage, the verification of the client address header and the stalled relay reader timeout (the header rule and the relay buffer and concurrency limits are recorded), and the WebSocket transport for devices behind HTTP/1.1-only proxies); each is recorded where it applies. The cross-domain ones are:
 
-- The release signing tool and the key custody process ([agent contract](cmds-ownsand-agent-foundation.md#agent-updates)).
+- The release signing tool and the key custody process are recorded in the [agent contract](cmds-ownsand-agent-foundation.md#agent-updates), and the release of the agent and the CLI in the [workflow contract](repository-workflow-contract.md#binary-releases). The release of the signed `LINUX` base image and the revocation of a released agent version remain open.
 - The microVM implementation for Linux hosts (Firecracker class) ([agent contract](cmds-ownsand-agent-foundation.md#isolation)): recorded as Firecracker `v1.17.0` without the jailer; the jailer, the production Linux base image and its signed publication remain open.
 - The WebSocket fallback of the agent channel and the relay connection for devices behind HTTP/1.1-only proxies. The primary transport is recorded: a Connect bidirectional stream over HTTP/2 ([control plane contract](servers-ownsand-api-foundation.md#agent-channel)).
 - The npm package name and publication workflow of the TypeScript SDK. The workspace package `ownsand-sdk` is private and unpublished; the repository publishes no packages to a registry today, so the [workflow contract](repository-workflow-contract.md) must change before the first publication.
