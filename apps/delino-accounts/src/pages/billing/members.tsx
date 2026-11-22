@@ -15,9 +15,11 @@ import {
   ErrorNotice,
   FormDialog,
   Loading,
+  MorePages,
 } from "../../components/ui.tsx";
 import { checkEmail } from "../../forms.ts";
 import { errorMessage, formatDate, labels } from "../../format.ts";
+import { useAllPages } from "../../paging.ts";
 import {
   type BillingAccountMember,
   BillingAccountRole,
@@ -40,10 +42,12 @@ export function MembersSection() {
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
   const refresh = () => invalidateServices(queryClient, BillingAccountService);
-  const members = useQuery(BillingAccountService.method.listMembers, {
-    billingAccountId,
-    pageSize: LIST_PAGE_SIZE,
-  });
+  const members = useAllPages(
+    BillingAccountService.method.listMembers,
+    { billingAccountId },
+    (page) => ({ items: page.members, nextPageToken: page.nextPageToken }),
+    (m) => m.userId,
+  );
   const updateRole = useMutation(
     BillingAccountService.method.updateMemberRole,
     {
@@ -82,76 +86,80 @@ export function MembersSection() {
         {members.isPending ? (
           <Loading label="Loading members" />
         ) : members.error ? (
-          <ErrorNotice
-            error={members.error}
-            onRetry={() => void members.refetch()}
-          />
+          <ErrorNotice error={members.error} onRetry={members.refetch} />
         ) : (
-          <ul className="list" aria-label="Members">
-            {members.data.members.map((m) => {
-              const self = m.userId === userId;
-              const manageable = !self && canManageMember(role, m.role);
-              return (
-                <li key={m.userId} className="list-row">
-                  <div className="list-main">
-                    <span className="list-title">
-                      {displayName(m)}
-                      {self ? <span className="muted"> (you)</span> : null}
-                    </span>
-                    <span className="muted">
-                      Joined {formatDate(m.createTime)}
-                    </span>
-                  </div>
-                  {manageable ? (
-                    <div className="list-actions">
-                      <Select
-                        label={`Role of ${displayName(m)}`}
-                        value={String(m.role)}
-                        onValueChange={async (v) => {
-                          if (v === null || Number(v) === m.role) return;
-                          try {
-                            await updateRole.mutateAsync({
-                              billingAccountId,
-                              userId: m.userId,
-                              role: Number(v) as BillingAccountRole,
-                            });
-                            toast.success("The role is changed.");
-                          } catch (error) {
-                            toast.error(errorMessage(error));
-                          }
-                        }}
-                      >
-                        <SelectOption value={String(BillingAccountRole.ADMIN)}>
-                          Admin
-                        </SelectOption>
-                        <SelectOption value={String(BillingAccountRole.VIEWER)}>
-                          Viewer
-                        </SelectOption>
-                      </Select>
-                      {can(role, Permission.TransferOwnership) ? (
-                        <Button
-                          variant={ButtonVariant.Secondary}
-                          size={ButtonSize.Small}
-                          onClick={() => setTransferring(m)}
-                        >
-                          Make owner
-                        </Button>
-                      ) : null}
-                      <Button
-                        variant={ButtonVariant.Danger}
-                        size={ButtonSize.Small}
-                        onClick={() => setRemoving(m)}
-                      >
-                        Remove
-                      </Button>
+          <>
+            <ul className="list" aria-label="Members">
+              {members.items.map((m) => {
+                const self = m.userId === userId;
+                const manageable = !self && canManageMember(role, m.role);
+                return (
+                  <li key={m.userId} className="list-row">
+                    <div className="list-main">
+                      <span className="list-title">
+                        {displayName(m)}
+                        {self ? <span className="muted"> (you)</span> : null}
+                      </span>
+                      <span className="muted">
+                        Joined {formatDate(m.createTime)}
+                      </span>
                     </div>
-                  ) : (
-                    <span className="role">{labels.role[m.role]}</span>
-                  )}
-                </li>
-              );
-            })}
-          </ul>
+                    {manageable ? (
+                      <div className="list-actions">
+                        <Select
+                          label={`Role of ${displayName(m)}`}
+                          value={String(m.role)}
+                          onValueChange={async (v) => {
+                            if (v === null || Number(v) === m.role) return;
+                            try {
+                              await updateRole.mutateAsync({
+                                billingAccountId,
+                                userId: m.userId,
+                                role: Number(v) as BillingAccountRole,
+                              });
+                              toast.success("The role is changed.");
+                            } catch (error) {
+                              toast.error(errorMessage(error));
+                            }
+                          }}
+                        >
+                          <SelectOption
+                            value={String(BillingAccountRole.ADMIN)}
+                          >
+                            Admin
+                          </SelectOption>
+                          <SelectOption
+                            value={String(BillingAccountRole.VIEWER)}
+                          >
+                            Viewer
+                          </SelectOption>
+                        </Select>
+                        {can(role, Permission.TransferOwnership) ? (
+                          <Button
+                            variant={ButtonVariant.Secondary}
+                            size={ButtonSize.Small}
+                            onClick={() => setTransferring(m)}
+                          >
+                            Make owner
+                          </Button>
+                        ) : null}
+                        <Button
+                          variant={ButtonVariant.Danger}
+                          size={ButtonSize.Small}
+                          onClick={() => setRemoving(m)}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ) : (
+                      <span className="role">{labels.role[m.role]}</span>
+                    )}
+                  </li>
+                );
+              })}
+            </ul>
+            <MorePages pages={members} />
+          </>
         )}
       </section>
       {can(role, Permission.ManageMembers) ? <Invitations /> : null}

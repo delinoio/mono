@@ -15,6 +15,7 @@ import {
   ACCOUNT_ID,
   ADMIN,
   addBillingAccounts,
+  addMembers,
   createFakeApi,
   INVITATION_TOKEN,
   numbered,
@@ -1031,6 +1032,107 @@ describe("paged lists", () => {
           level: 1,
         }),
       ).toBeTruthy();
+    });
+  });
+
+  describe("members", () => {
+    test("reads every page in server order with the controls of the last member", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toContain("Olivia Owner");
+      expect(titles[200]).toContain(`Member ${numbered(198)}`);
+      expect(calls(api, "ListMembers")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "",
+        }),
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "p1",
+        }),
+      ]);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      expect(
+        within(last).getByRole("button", { name: "Make owner" }),
+      ).toBeTruthy();
+      expect(
+        within(last).getByRole("combobox", {
+          name: `Role of Member ${numbered(198)}`,
+        }),
+      ).toBeTruthy();
+      await click(within(last).getByRole("button", { name: "Remove" }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(
+        within(dialog).getByRole("button", { name: "Remove member" }),
+      );
+      await settle(100);
+      expect(calls(api, "RemoveMember")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          userId: `user-${numbered(198)}`,
+        }),
+      ]);
+    });
+
+    test("the last member can receive ownership", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      await click(within(last).getByRole("button", { name: "Make owner" }));
+      const dialog = await screen.findByRole("alertdialog");
+      await click(
+        within(dialog).getByRole("button", { name: "Transfer ownership" }),
+      );
+      await settle(100);
+      expect(calls(api, "TransferOwnership")).toEqual([
+        expect.objectContaining({ userId: `user-${numbered(198)}` }),
+      ]);
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 197);
+      await renderAccount(undefined, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListMembers")).toEqual([""]);
+    });
+
+    test("a failed continuation retries without duplicates and a viewer stays read-only", async () => {
+      const api = createFakeApi();
+      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+      api.failContinuation.set(
+        "ListMembers",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      await renderAccount(VIEWER, { api });
+      await openTab("Members");
+      const list = await screen.findByRole("list", { name: "Members" });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Members" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(pageTokens(api, "ListMembers")).toEqual(["", "p1", "p1"]);
+      const members = screen.getByRole("list", { name: "Members" });
+      expect(within(members).queryByRole("button")).toBeNull();
+      expect(within(members).queryByRole("combobox")).toBeNull();
     });
   });
 });
