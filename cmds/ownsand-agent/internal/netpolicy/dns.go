@@ -103,6 +103,11 @@ type DNSForwarder struct {
 	logger   *slog.Logger
 	wg       sync.WaitGroup
 	closed   chan struct{}
+	// ctx is the lifetime of the forwarder; Close cancels it first. Upstream
+	// dials derive from it and every upstream connection is closed when it
+	// ends, so Close does not wait for a silent upstream or a slow dial.
+	ctx      context.Context
+	cancel   context.CancelFunc
 	mu       sync.Mutex
 	conns    map[net.Conn]bool
 	udpSlots chan struct{}
@@ -155,7 +160,8 @@ func startDNS(listen netip.AddrPort, upstream string, logger *slog.Logger, limit
 		tcp.Close()
 		return nil, err
 	}
-	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), conns: map[net.Conn]bool{},
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &DNSForwarder{udp: udp, tcp: tcp, upstream: upstream, logger: logger, closed: make(chan struct{}), ctx: ctx, cancel: cancel, conns: map[net.Conn]bool{},
 		udpSlots: make(chan struct{}, limits.maxUDPQueries), tcpSlots: make(chan struct{}, limits.maxTCPConns), limits: limits}
 	f.wg.Add(2)
 	go f.serveUDP()
@@ -176,6 +182,9 @@ func (f *DNSForwarder) Close() {
 	default:
 	}
 	close(f.closed)
+	// End in-progress dials and upstream connections first: they have no
+	// other owner that Close can reach.
+	f.cancel()
 	f.udp.Close()
 	f.tcp.Close()
 	f.mu.Lock()
@@ -272,7 +281,7 @@ func (f *DNSForwarder) serveTCP() {
 				f.mu.Unlock()
 				c.Close()
 			}()
-			ctx, cancel := context.WithDeadline(context.Background(), deadline)
+			ctx, cancel := context.WithDeadline(f.ctx, deadline)
 			defer cancel()
 			dial := f.limits.dial
 			if dial == nil {
@@ -284,6 +293,12 @@ func (f *DNSForwarder) serveTCP() {
 				return
 			}
 			defer up.Close()
+			// Close cancels f.ctx: close the upstream connection then, so the
+			// copy below ends even when the upstream stays silent. AfterFunc
+			// runs at once when f.ctx ended during the dial, so there is no
+			// window between the dial and this registration.
+			stop := context.AfterFunc(f.ctx, func() { up.Close() })
+			defer stop()
 			// The time spent dialing is already gone: both sides get the
 			// remainder of the admission deadline, not a fresh budget.
 			c.SetDeadline(deadline)

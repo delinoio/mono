@@ -716,3 +716,108 @@ func TestDNSForwarderFailedDialReleasesSlot(t *testing.T) {
 	}
 	requireTCPSlotFreeAfterDial(t, f)
 }
+
+// requireClosedWithin fails unless done closes within d.
+func requireClosedWithin(t *testing.T, what string, done <-chan struct{}, d time.Duration) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(d):
+		t.Fatalf("%s did not finish within %v", what, d)
+	}
+}
+
+func TestDNSForwarderCloseEndsSilentUpstreamConn(t *testing.T) {
+	// The default 30-second deadline stays in place: Close must end the
+	// connection long before it.
+	upstreamEOF := make(chan struct{})
+	up := startTCPUpstream(t, func(c net.Conn) {
+		readDNSFrame(c)
+		// Silent upstream: wait for the forwarder to close its side.
+		io.Copy(io.Discard, c)
+		close(upstreamEOF)
+	})
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "silent")
+	// Let the query reach the upstream, so the handler is in the copy phase.
+	time.Sleep(200 * time.Millisecond)
+	start := time.Now()
+	requireClosedWithin(t, "Close", closeInBackground(f), 3*time.Second)
+	t.Logf("Close returned after %v", time.Since(start))
+	requireClosedWithin(t, "upstream EOF", upstreamEOF, 2*time.Second)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderCloseEndsBlockedDial(t *testing.T) {
+	dialing := make(chan struct{})
+	var once sync.Once
+	// The dial blocks until its context ends, like a connect to an address
+	// that never answers.
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		once.Do(func() { close(dialing) })
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	f := startTestDNS(t, "127.0.0.1:1", slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "blocked")
+	requireClosedWithin(t, "dial start", dialing, 5*time.Second)
+	requireClosedWithin(t, "Close", closeInBackground(f), 3*time.Second)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+	if n := len(f.tcpSlots); n != 0 {
+		t.Fatalf("tcp slots in use after Close: %d", n)
+	}
+}
+
+func TestDNSForwarderCloseDuringDialEndsUpstreamConn(t *testing.T) {
+	// The dial finishes while Close runs: the upstream connection that it
+	// returns must still be closed.
+	upstreamEOF := make(chan struct{})
+	up := startTCPUpstream(t, func(c net.Conn) {
+		io.Copy(io.Discard, c)
+		close(upstreamEOF)
+	})
+	dialing := make(chan struct{})
+	finish := make(chan struct{})
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		close(dialing)
+		<-finish
+		// Ignore ctx on purpose: a dial can succeed just as Close cancels it.
+		var d net.Dialer
+		return d.DialContext(context.Background(), network, address)
+	}
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "late")
+	requireClosedWithin(t, "dial start", dialing, 5*time.Second)
+	done := closeInBackground(f)
+	// Wait until Close has cancelled the forwarder context, then let the dial
+	// return a live connection.
+	deadline := time.Now().Add(5 * time.Second)
+	for f.ctx.Err() == nil {
+		if time.Now().After(deadline) {
+			t.Fatal("Close did not cancel the forwarder context")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(finish)
+	requireClosedWithin(t, "Close", done, 3*time.Second)
+	requireClosedWithin(t, "upstream EOF", upstreamEOF, 2*time.Second)
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+}
