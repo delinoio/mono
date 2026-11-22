@@ -4,6 +4,8 @@ package api
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -73,6 +75,27 @@ func (e *BillingEnforcer) Run(ctx context.Context) {
 	}
 }
 
+// errBillingStale is returned by the send hook of a pause or resume that an
+// organization's billing phase made obsolete between the selection of the
+// target and the moment the command is sent. The worker drops such work
+// quietly.
+var errBillingStale = errors.New("the billing phase no longer qualifies the sandbox")
+
+// pausingPhaseSQL returns the SQL condition that an organization_billing row
+// (alias b) is in a pausing phase: SUSPENDED, or BLOCKED for at least
+// billing.SuspendAfter (the cutoff placeholder holds now minus SuspendAfter).
+// The target query of a pass and the recheck right before a pause use this
+// one condition, so they cannot disagree. The phase values are constants, not
+// input.
+func pausingPhaseSQL(cutoffPlaceholder string) string {
+	return fmt.Sprintf("(b.phase = %d OR (b.phase = %d AND b.blocked_since <= %s))",
+		int16(billing.PhaseSuspended), int16(billing.PhaseBlocked), cutoffPlaceholder)
+}
+
+// allowedPhaseSQL is the condition that an organization_billing row (alias
+// b) is ALLOWED, shared by the resume target query and the rechecks.
+var allowedPhaseSQL = fmt.Sprintf("b.phase = %d", int16(billing.PhaseAllowed))
+
 // billingTarget is a sandbox that a pass pauses or resumes.
 type billingTarget struct {
 	orgID, sandboxID, deviceID string
@@ -93,17 +116,17 @@ func (e *BillingEnforcer) Pass(ctx context.Context) error {
 	pause, err := e.targets(ctx, `SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending
 		FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
 		WHERE s.agent_state = $1 AND NOT s.delete_pending
-		AND (b.phase = $2 OR (b.phase = $3 AND b.blocked_since <= $4))
+		AND `+pausingPhaseSQL("$2")+`
 		ORDER BY s.organization_id, s.sandbox_id`,
-		int16(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING), int16(billing.PhaseSuspended), int16(billing.PhaseBlocked), suspendedSince)
+		int16(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING), suspendedSince)
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_enforcement_failed", slog.Any("error", err))
 		return err
 	}
 	resume, err := e.targets(ctx, `SELECT s.organization_id::text, s.sandbox_id::text, s.device_id::text, s.agent_state, s.delete_pending
 		FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
-		WHERE s.paused_by_billing AND b.phase = $1
-		ORDER BY s.organization_id, s.sandbox_id`, int16(billing.PhaseAllowed))
+		WHERE s.paused_by_billing AND `+allowedPhaseSQL+`
+		ORDER BY s.organization_id, s.sandbox_id`)
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_enforcement_failed", slog.Any("error", err))
 		return err
@@ -152,15 +175,37 @@ func (e *BillingEnforcer) targets(ctx context.Context, sql string, args ...any) 
 // written first, so a pause that the agent applied is never left without
 // its mark (a crash between the two would leave the sandbox paused after the
 // recovery).
+//
+// The selection of the targets ran before this call, and the call can wait
+// for a slot while the organization's status changes. The mark therefore
+// applies only while the organization is still in a pausing phase, and the
+// pause command is sent only after a second check of that phase (see
+// pausingPhaseSQL). A recovery that commits after the last check is not
+// suppressed; the next pass finds the sandbox marked, RUNNING and ALLOWED and
+// only removes the mark, and a pause that already ran is resumed by the
+// next pass.
 func (e *BillingEnforcer) pause(ctx context.Context, t billingTarget) {
 	s := e.s
-	tag, err := s.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = true WHERE sandbox_id = $1 AND agent_state = $2 AND NOT paused_by_billing",
-		t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING))
+	cutoff := s.now().Add(-billing.SuspendAfter)
+	var eligible, marked bool
+	err := s.DB.Pool.QueryRow(ctx, `WITH eligible AS (
+			SELECT 1 FROM organization_billing b WHERE b.organization_id = $1 AND `+pausingPhaseSQL("$4")+`
+		), upd AS (
+			UPDATE sandboxes SET paused_by_billing = true
+			WHERE sandbox_id = $2 AND agent_state = $3 AND NOT paused_by_billing AND EXISTS (SELECT 1 FROM eligible)
+			RETURNING 1
+		)
+		SELECT EXISTS (SELECT 1 FROM eligible), EXISTS (SELECT 1 FROM upd)`,
+		t.orgID, t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_RUNNING), cutoff).Scan(&eligible, &marked)
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_sandbox_pause_failed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.Any("error", err))
 		return
 	}
-	if tag.RowsAffected() > 0 {
+	if !eligible {
+		s.Logger.DebugContext(ctx, "billing_sandbox_pause_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
+		return
+	}
+	if marked {
 		s.Logger.InfoContext(ctx, "billing_sandbox_marked", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 	}
 	if s.Hub.Live(t.deviceID) == nil {
@@ -169,7 +214,14 @@ func (e *BillingEnforcer) pause(ctx context.Context, t billingTarget) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_pause_deferred", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
 	}
-	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, true, func() error { return nil })
+	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, true, func() error {
+		return e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM organization_billing b WHERE b.organization_id = $1 AND `+pausingPhaseSQL("$2")+`)`,
+			t.orgID, s.now().Add(-billing.SuspendAfter))
+	})
+	if errors.Is(err, errBillingStale) {
+		s.Logger.DebugContext(ctx, "billing_sandbox_pause_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
+		return
+	}
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_sandbox_pause_failed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID),
 			slog.String("device_id", t.deviceID), slog.String("code", connect.CodeOf(err).String()), slog.String("error", err.Error()))
@@ -180,9 +232,27 @@ func (e *BillingEnforcer) pause(ctx context.Context, t billingTarget) {
 		slog.String("device_id", t.deviceID), slog.String("state", state.String()))
 }
 
+// recheck runs a one-row EXISTS query right before a command is sent and
+// returns errBillingStale when it is false.
+func (e *BillingEnforcer) recheck(ctx context.Context, sql string, args ...any) error {
+	var ok bool
+	if err := e.s.DB.Pool.QueryRow(ctx, sql, args...).Scan(&ok); err != nil {
+		return err
+	}
+	if !ok {
+		return errBillingStale
+	}
+	return nil
+}
+
 // resume resumes a sandbox that billing paused, after a confirmed recovery,
 // and clears its mark. A marked sandbox that is not PAUSED any more (it
 // ended, or a pause never happened) only loses its mark.
+//
+// Like pause, it rechecks right before the command is sent (and before the
+// mark is cleared) that the organization is still ALLOWED, because the
+// target list can be older than a new suspension. The recheck also requires
+// that the sandbox is still marked and PAUSED and has no pending delete.
 func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 	s := e.s
 	if t.state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED || t.deletePending {
@@ -190,9 +260,18 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 			// A pending delete ends the sandbox; keep the mark until then.
 			return
 		}
-		if _, err := s.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1 AND paused_by_billing AND agent_state <> $2",
-			t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED)); err != nil {
+		tag, err := s.DB.Pool.Exec(ctx, `UPDATE sandboxes SET paused_by_billing = false
+			WHERE sandbox_id = $1 AND paused_by_billing AND agent_state <> $2
+			AND EXISTS (SELECT 1 FROM organization_billing b WHERE b.organization_id = sandboxes.organization_id AND `+allowedPhaseSQL+`)`,
+			t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED))
+		if err != nil {
 			s.Logger.WarnContext(ctx, "billing_sandbox_resume_failed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.Any("error", err))
+			return
+		}
+		if tag.RowsAffected() == 0 {
+			// The organization was suspended again, or the sandbox changed,
+			// after the target selection.
+			s.Logger.DebugContext(ctx, "billing_sandbox_resume_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID))
 			return
 		}
 		s.Logger.InfoContext(ctx, "billing_sandbox_unmarked", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID),
@@ -203,7 +282,15 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_resume_deferred", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
 	}
-	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, func() error { return nil })
+	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, func() error {
+		return e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
+			WHERE s.sandbox_id = $1 AND s.paused_by_billing AND s.agent_state = $2 AND NOT s.delete_pending AND `+allowedPhaseSQL+`)`,
+			t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED))
+	})
+	if errors.Is(err, errBillingStale) {
+		s.Logger.DebugContext(ctx, "billing_sandbox_resume_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
+		return
+	}
 	if err != nil {
 		s.Logger.WarnContext(ctx, "billing_sandbox_resume_failed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID),
 			slog.String("device_id", t.deviceID), slog.String("code", connect.CodeOf(err).String()), slog.String("error", err.Error()))
