@@ -21,6 +21,8 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/auth"
 	"github.com/delinoio/mono/servers/tide-api/internal/config"
 	"github.com/delinoio/mono/servers/tide-api/internal/db"
+	"github.com/delinoio/mono/servers/tide-api/internal/github"
+	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 )
@@ -84,6 +86,15 @@ func run() error {
 		}
 	}
 
+	var gh github.Options
+	if g := cfg.GitHub; g != nil {
+		gh = github.Options{
+			Client: githubapi.New(githubapi.Config{AppID: g.AppID, ClientID: g.ClientID, ClientSecret: g.ClientSecret, PrivateKey: g.PrivateKey, Slug: g.Slug,
+				APIOrigin: g.APIOrigin, WebOrigin: g.WebOrigin}, nil, logger, nil),
+			WebhookSecret: g.WebhookSecret,
+		}
+	}
+
 	a, err := app.New(app.Options{
 		DB:     database,
 		Logger: logger,
@@ -101,6 +112,7 @@ func run() error {
 		Extensions: layers.Extensions(layers.Options{
 			OwnSand:      ownsandclient.SDKFactory{BaseURL: cfg.OwnSandAPIOrigin, Logger: logger},
 			PublicOrigin: cfg.PublicOrigin,
+			GitHub:       gh,
 		}, &layers.Layers{}),
 	})
 	if err != nil {
@@ -149,7 +161,7 @@ func run() error {
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)),
 		slog.String("client_address_mode", string(cfg.ClientAddressMode)), slog.String("metrics_addr", metricsAddr),
-		slog.String("secret_primary_key_id", cfg.SecretKeys.PrimaryKeyID()),
+		slog.String("secret_primary_key_id", cfg.SecretKeys.PrimaryKeyID()), slog.Bool("github_app", cfg.GitHub != nil),
 		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
 	err = serve(ctx, stop, srv, listener, logger, shutdownTimeout, stopAndWait)
 	if metricsSrv != nil {

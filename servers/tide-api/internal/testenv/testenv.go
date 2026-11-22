@@ -211,6 +211,7 @@ type Clients struct {
 	Integration  tidev1connect.AgentIntegrationServiceClient
 	Profile      tidev1connect.RunnerProfileServiceClient
 	Work         tidev1connect.WorkServiceClient
+	GitHub       tidev1connect.GitHubServiceClient
 	// HTTP sends plain requests with the same credential.
 	HTTP *http.Client
 }
@@ -243,6 +244,7 @@ func (e *Env) Bearer(token string) *Clients {
 		Integration:  tidev1connect.NewAgentIntegrationServiceClient(hc, url),
 		Profile:      tidev1connect.NewRunnerProfileServiceClient(hc, url),
 		Work:         tidev1connect.NewWorkServiceClient(hc, url),
+		GitHub:       tidev1connect.NewGitHubServiceClient(hc, url),
 		HTTP:         hc,
 	}
 }

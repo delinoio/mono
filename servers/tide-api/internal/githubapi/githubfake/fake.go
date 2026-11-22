@@ -176,6 +176,18 @@ func (f *Fake) SetBusy(name string, busy bool) {
 	})
 }
 
+// MarkFailed records the deliveries of a GUID as failed, as GitHub does
+// when the receiver answered too late.
+func (f *Fake) MarkFailed(guid string) {
+	f.Update(func() {
+		for _, d := range f.deliveries {
+			if d.GUID == guid {
+				d.StatusCode, d.Status = http.StatusGatewayTimeout, "timed out"
+			}
+		}
+	})
+}
+
 // Deliveries returns copies of the recorded deliveries, newest first.
 func (f *Fake) Deliveries() []githubapi.Delivery {
 	f.mu.Lock()
