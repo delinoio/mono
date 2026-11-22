@@ -115,6 +115,8 @@ const expectedPassThroughEnv = {
     "LOG_LEVEL",
     "METRICS_ADDR",
     "OTEL_*",
+    "OWNSAND_API_ORIGIN",
+    "PUBLIC_ORIGIN",
     "RUN_MIGRATIONS",
     "TIDE_SECRET_KEYS",
     "TRUST_PROXY_CLIENT_ADDRESS",

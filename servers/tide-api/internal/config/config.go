@@ -32,6 +32,8 @@ const (
 	EnvAllowDirectClientAddress = "ALLOW_DIRECT_CLIENT_ADDRESS"
 	EnvSecretKeys               = "TIDE_SECRET_KEYS"
 	EnvMetricsAddr              = "METRICS_ADDR"
+	EnvOwnSandAPIOrigin         = "OWNSAND_API_ORIGIN"
+	EnvPublicOrigin             = "PUBLIC_ORIGIN"
 )
 
 // Defaults.
@@ -45,6 +47,11 @@ const (
 	DefaultAudience = "https://tide.api.delino.io"
 	// DefaultCORSOrigin is the production console origin.
 	DefaultCORSOrigin = "https://tide.delino.io"
+	// DefaultOwnSandAPIOrigin is the production origin of ownsand-api.
+	DefaultOwnSandAPIOrigin = "https://ownsand.api.delino.io"
+	// DefaultPublicOrigin is the public origin of tide-api, which the
+	// webhook URLs that tide shows to admins use.
+	DefaultPublicOrigin = "https://tide.api.delino.io"
 )
 
 // ClientAddressMode selects where the client address of a request comes
@@ -131,6 +138,12 @@ type Config struct {
 	// MetricsAddr is the listen address of the internal Prometheus
 	// listener; empty turns it off.
 	MetricsAddr string
+
+	// OwnSandAPIOrigin is the origin of the OwnSand API that tide calls with
+	// the OwnSand API key of each organization.
+	OwnSandAPIOrigin string
+	// PublicOrigin is the public origin of this server, for webhook URLs.
+	PublicOrigin string
 }
 
 // Load reads the configuration through lookup, which has the signature of
@@ -142,6 +155,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		RunMigrations: true,
 		LogtoAudience: DefaultAudience,
 		CORSOrigins:   []string{DefaultCORSOrigin},
+
+		OwnSandAPIOrigin: DefaultOwnSandAPIOrigin,
+		PublicOrigin:     DefaultPublicOrigin,
 	}
 	get := func(name string) string {
 		value, _ := lookup(name)
@@ -227,7 +243,28 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 		}
 		cfg.MetricsAddr = v
 	}
+	if v := get(EnvOwnSandAPIOrigin); v != "" {
+		if cfg.OwnSandAPIOrigin, err = parseOrigin(EnvOwnSandAPIOrigin, v, "https://ownsand.api.delino.io"); err != nil {
+			return Config{}, err
+		}
+	}
+	if v := get(EnvPublicOrigin); v != "" {
+		if cfg.PublicOrigin, err = parseOrigin(EnvPublicOrigin, v, "https://tide.api.delino.io"); err != nil {
+			return Config{}, err
+		}
+	}
 	return cfg, nil
+}
+
+// parseOrigin accepts an http or https origin without path (a trailing "/"
+// is removed), query, fragment or user info.
+func parseOrigin(name, value, example string) (string, error) {
+	u, err := url.Parse(value)
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+		u.ForceQuery || u.Fragment != "" || u.User != nil || strings.Contains(value, "#") {
+		return "", fmt.Errorf("%s must be an origin such as %s", name, example)
+	}
+	return strings.TrimSuffix(value, "/"), nil
 }
 
 func parseBool(name, value string, def bool) (bool, error) {

@@ -17,6 +17,8 @@
         "TRUST_PROXY_CLIENT_ADDRESS",
         "TIDE_SECRET_KEYS",
         "METRICS_ADDR",
+        "OWNSAND_API_ORIGIN",
+        "PUBLIC_ORIGIN",
         "OTEL_*"
       ]
     },

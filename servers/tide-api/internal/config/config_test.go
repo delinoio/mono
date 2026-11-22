@@ -55,6 +55,9 @@ func TestDefaults(t *testing.T) {
 	if cfg.SecretKeys == nil || cfg.SecretKeys.PrimaryKeyID() != "k1" {
 		t.Fatal("secret keys not parsed")
 	}
+	if cfg.OwnSandAPIOrigin != "https://ownsand.api.delino.io" || cfg.PublicOrigin != "https://tide.api.delino.io" {
+		t.Fatalf("origins = %q %q", cfg.OwnSandAPIOrigin, cfg.PublicOrigin)
+	}
 }
 
 func TestOverrides(t *testing.T) {
@@ -69,6 +72,8 @@ func TestOverrides(t *testing.T) {
 	env[EnvAllowDirectClientAddress] = "true"
 	env[EnvMetricsAddr] = "0.0.0.0:9400"
 	env[EnvSecretKeys] = "new:" + testKey(t) + ",old:" + testKey(t)
+	env[EnvOwnSandAPIOrigin] = "http://127.0.0.1:18300/"
+	env[EnvPublicOrigin] = "https://tide.example"
 	cfg, err := Load(lookup(env))
 	if err != nil {
 		t.Fatal(err)
@@ -78,6 +83,9 @@ func TestOverrides(t *testing.T) {
 	}
 	if cfg.LogtoAudience != "https://tide.example" || len(cfg.CORSOrigins) != 2 || cfg.MetricsAddr != "0.0.0.0:9400" {
 		t.Fatalf("cfg = %+v", cfg)
+	}
+	if cfg.OwnSandAPIOrigin != "http://127.0.0.1:18300" || cfg.PublicOrigin != "https://tide.example" {
+		t.Fatalf("origins = %q %q", cfg.OwnSandAPIOrigin, cfg.PublicOrigin)
 	}
 	if cfg.ClientAddressMode != ClientAddressVerifiedProxy {
 		t.Fatalf("mode = %q", cfg.ClientAddressMode)
@@ -109,6 +117,10 @@ func TestInvalid(t *testing.T) {
 		{EnvCORSOrigins, "https://tide.delino.io/path", EnvCORSOrigins},
 		{EnvCORSOrigins, "https://tide.delino.io#", EnvCORSOrigins},
 		{EnvSecretKeys, "", EnvSecretKeys},
+		{EnvOwnSandAPIOrigin, "https://ownsand.example/api", EnvOwnSandAPIOrigin},
+		{EnvOwnSandAPIOrigin, "ftp://x", EnvOwnSandAPIOrigin},
+		{EnvPublicOrigin, "https://tide.example?", EnvPublicOrigin},
+		{EnvPublicOrigin, "https://u@tide.example", EnvPublicOrigin},
 		{EnvSecretKeys, "k1", EnvSecretKeys},
 		{EnvSecretKeys, "k1:" + secretKey[:20], EnvSecretKeys},
 		{EnvSecretKeys, "k1:" + secretKey + ",k1:" + secretKey, EnvSecretKeys},
