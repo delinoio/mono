@@ -102,6 +102,12 @@ func findGuestBinary() string {
 	return ""
 }
 
+// HostGuest returns the guest OS and the base image of the sandboxes that
+// the runtime runs on this host: the host OS and its base image, because the
+// guest helper runs as a host process. They are the only guest OS and base
+// image that Capabilities reports, and Create rejects other guest OSes.
+func HostGuest() (ownsandv1.GuestOs, ownsandv1.BaseImage) { return hostGuestOS, hostBaseImage }
+
 // Kind returns RuntimeKindProcess.
 func (r *Runtime) Kind() config.RuntimeKind { return config.RuntimeKindProcess }
 
