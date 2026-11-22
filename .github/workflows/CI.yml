@@ -434,9 +434,6 @@ jobs:
                 # The peer-to-peer data channel never opens, so the
                 # peer-to-peer tests time out.
                 go/ownsand
-                # The tar escape checks accept links such as `/etc/passwd`,
-                # which are not absolute paths on Windows.
-                internal/fsutil
                 # The HTTP observer receives no response for a request that
                 # starts with CRLF after a POST.
                 servers/accounts-api/internal/server
