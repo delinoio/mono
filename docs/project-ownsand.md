@@ -168,7 +168,7 @@ The cross-component suite in `servers/ownsand-api/e2e/` (package `e2e`, licensed
 - Update [Billing](#billing), the [control plane contract](servers-ownsand-api-foundation.md#billing) and the [protos contract](protos-ownsand-api-contract.md#billing) together when a price, a meter, the RPC classification or the enforcement changes. A meter change also updates the [`delino-accounts` protos contract](protos-delino-accounts-api-contract.md#enums).
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
 - Update the [control plane contract](servers-ownsand-api-foundation.md) and this index together when the traffic placement or the deployment target changes.
-- Update `apps/AGENTS.md`, `cmds/AGENTS.md`, `servers/AGENTS.md`, `packages/AGENTS.md` and `protos/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `apps/AGENTS.md`, `cmds/AGENTS.md`, `servers/AGENTS.md`, `packages/AGENTS.md` and `protos/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts. Distinguish fixture, build and packaging checks from acceptance on real Linux, macOS and Windows devices.
 
 ## References

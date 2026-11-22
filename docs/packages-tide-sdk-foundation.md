@@ -57,7 +57,7 @@ The Go SDK logs retries and reconnects at debug level through the caller's logge
 ## Change Triggers
 
 - Update this contract when the SDK surface or its helpers change.
-- Update `packages/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `packages/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
 ## References
 

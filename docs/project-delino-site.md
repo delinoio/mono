@@ -30,7 +30,7 @@ The project has one deployable. It has no `cmds`, `servers`, `crates`, `protos` 
 - Update [apps-delino-site-foundation.md](apps-delino-site-foundation.md) and this index together when routes, the production origin, the toolchain or the deployment target change.
 - Update [project-delino-docs.md](project-delino-docs.md) when the cross-site link contract changes.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
-- Update `apps/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `apps/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts.
 
 ## References

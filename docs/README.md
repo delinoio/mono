@@ -71,4 +71,4 @@ Before implementing a new project, add `project-<id>.md`, at least one `<domain>
 
 ## Instruction update policy
 
-Keep feature behavior in its owning contract. Update `AGENTS.md` only when development procedures, directory ownership or development rules change. Keep validation evidence and issue or pull request traceability in pull requests, Linear issues and CI logs, rather than instruction files or documentation. See [root instructions](../AGENTS.md).
+Keep feature behavior in its owning contract. Update `AGENTS.md` only when development procedures, directory ownership or repository/domain development rules change. Keep validation evidence and issue or pull request traceability in pull requests, Linear issues and CI logs, rather than instruction files or documentation. See [root instructions](../AGENTS.md).

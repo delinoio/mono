@@ -68,7 +68,7 @@ The project is a library, not a deployable. It has no `apps`, `cmds`, `servers`,
 - Update [packages-delino-ui-foundation.md](packages-delino-ui-foundation.md) and this index together when exports, component IDs, the UI SDK version or the styling contract change.
 - Update the owning app contract when an app starts or stops using the package.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
-- Update `packages/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `packages/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts.
 
 ## References

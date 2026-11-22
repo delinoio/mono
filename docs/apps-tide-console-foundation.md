@@ -78,7 +78,7 @@ The console sends no logs to a service in this version. Browser console messages
 
 - Update this contract with route, role or flow changes.
 - Update the [protos contract](protos-tide-api-contract.md) first when the console needs a new RPC.
-- Update `apps/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `apps/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
 ## References
 

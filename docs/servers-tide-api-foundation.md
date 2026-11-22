@@ -411,7 +411,7 @@ The server records audit events for: organization creation and deletion, ownersh
 - Update the console, CLI and SDK contracts when their surface changes.
 - Update the OwnSand contracts first when tide needs a new OwnSand capability.
 - Update the [authentication contract](repository-auth-contract.md) when the webhook endpoints or their verification change.
-- Update `servers/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `servers/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
 ## References
 

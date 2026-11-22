@@ -61,7 +61,7 @@ Document upstream/downstream dependencies and cross-domain dependencies.
 
 ## Change Triggers
 
-Declare which related contracts must be updated when this contract changes. Update `AGENTS.md` only when development procedures, directory ownership or repository/domain development rules change; follow the [instruction-update policy](README.md#instruction-update-policy). Ordinary feature, bug-fix, test and behavior-contract changes update their owning contracts without duplicating requirements in instructions.
+Declare which related contracts must be updated when this contract changes. Update `AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy). Ordinary feature, bug-fix, test and behavior-contract changes update their owning contracts without duplicating requirements in instructions.
 
 ## References
 

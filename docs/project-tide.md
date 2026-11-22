@@ -157,7 +157,7 @@ Record each decision in the owning domain contract before the implementation tha
 - Update the OwnSand contracts first when tide needs a new OwnSand capability, and keep that capability general.
 - Update [repository-auth-contract.md](repository-auth-contract.md) when the personal API key or webhook signature exceptions change.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
-- Update `apps/AGENTS.md`, `cmds/AGENTS.md`, `servers/AGENTS.md`, `packages/AGENTS.md` and `protos/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `apps/AGENTS.md`, `cmds/AGENTS.md`, `servers/AGENTS.md`, `packages/AGENTS.md` and `protos/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts. Distinguish fixture, build and packaging checks from acceptance with real GitHub organizations, real vendor accounts and real Linux, macOS and Windows devices.
 
 ## References

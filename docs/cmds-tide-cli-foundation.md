@@ -103,7 +103,7 @@ Only the stored Logto tokens and the selected organization in the user configura
 ## Change Triggers
 
 - Update this contract with command or flag changes.
-- Update `cmds/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `cmds/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
 ## References
 

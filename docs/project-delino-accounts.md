@@ -57,7 +57,7 @@ The project has two deployables. The web app is a static single-page application
 - Update the [protos contract](protos-delino-accounts-api-contract.md) and the protos path above when the schema package or its path changes.
 - Update [repository-auth-contract.md](repository-auth-contract.md) when the Paddle webhook signature exception changes.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
-- Update `apps/AGENTS.md` and `servers/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `apps/AGENTS.md` and `servers/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts.
 
 ## References

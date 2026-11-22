@@ -50,7 +50,7 @@ The Chromium Embedded Framework (CEF) has no Android or iOS port, so mobile targ
 - Update [apps-delidev-foundation.md](apps-delidev-foundation.md) and this index together when paths, component IDs, the runtime per target or the bundle identifier change.
 - Update the [workflow contract](repository-workflow-contract.md) when the Rust validation, Linux build packages or the Tauri toolchain change.
 - Update the [documentation catalog](README.md) when contracts are added, renamed or removed.
-- Update `apps/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `apps/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 - Record implementation status, validation results and unresolved limits in pull requests, Linear issues and CI logs/artifacts.
 
 ## References

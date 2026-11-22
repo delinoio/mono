@@ -165,7 +165,7 @@ Generated code does not log. Components never log credential fields of request m
 
 - Update the [project index](project-tide.md) and the [control plane contract](servers-tide-api-foundation.md) when a service, message or enum changes behavior.
 - Update the console, CLI and SDK contracts when their surface changes.
-- Update `protos/AGENTS.md` only when development procedures, directory ownership or development rules change; follow the [instruction-update policy](README.md#instruction-update-policy).
+- Update `protos/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
 ## References
 
