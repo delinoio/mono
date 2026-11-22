@@ -6,10 +6,11 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -66,8 +67,8 @@ function fixture(
   return { root, record: join(root, "record.json") };
 }
 
-function run({ root, record }, args = [], env = {}) {
-  const result = spawnSync(process.execPath, [launcher, ...args], {
+function run({ root, record }, args = [], env = {}, script = launcher) {
+  const result = spawnSync(process.execPath, [script, ...args], {
     cwd: root,
     encoding: "utf8",
     env: {
@@ -162,6 +163,27 @@ test("the launcher starts `rspress preview` without PORT and HOST", (t) => {
   assert.equal(record.event, "rspress_preview_env");
   assert.deepEqual(record.removed.sort(), ["HOST", "PORT"]);
   assert.doesNotMatch(result.stderr, /5000|0\.0\.0\.0/);
+});
+
+test("a symlinked launcher path behaves like the real path", posixOnly, (t) => {
+  // Node.js keeps the symlink spelling in process.argv[1] and resolves
+  // import.meta.url to the real path, so a guard that compares the two would
+  // skip the launcher silently with status 0.
+  const f = fixture(t);
+  const fileLink = join(f.root, "linked-file", "rspress-preview.mjs");
+  mkdirSync(dirname(fileLink));
+  symlinkSync(launcher, fileLink);
+  const directoryLink = join(f.root, "linked-directory");
+  symlinkSync(dirname(launcher), directoryLink, "dir");
+  for (const script of [fileLink, join(directoryLink, "rspress-preview.mjs")]) {
+    rmSync(f.record, { force: true });
+    const result = run(f, ["--open"], { PORT: "5000", KEEP: "kept" }, script);
+    assert.equal(result.status, 0, `${script}: ${result.stderr}`);
+    assert.deepEqual(result.recorded?.args, ["preview", "--open"], script);
+    assert.equal(result.recorded.PORT, null, script);
+    assert.equal(result.recorded.KEEP, "kept", script);
+    assert.equal(JSON.parse(result.stderr.trim()).event, "rspress_preview_env");
+  }
 });
 
 test("the launcher logs nothing when PORT and HOST are unset", (t) => {
