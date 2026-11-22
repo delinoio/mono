@@ -123,6 +123,42 @@ func TestRunnerProfiles(t *testing.T) {
 	}
 }
 
+// Two updates of different masked fields of one profile that overlap both
+// stay applied.
+func TestRunnerProfileConcurrentUpdates(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	admin := w.env.User(w.org.Admin)
+	resp, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{OrganizationId: w.org.ID, Profile: &tidev1.RunnerProfile{
+		Name: "dev", WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, WorkspacePath: "/work",
+		GuestOs: tidev1.GuestOs_GUEST_OS_LINUX, Source: &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+		Resources: &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 32}, NetworkMode: tidev1.NetworkMode_NETWORK_MODE_OUTBOUND,
+		IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(8 * time.Hour), MaxQueueWait: durationpb.New(30 * time.Minute), WarmCount: 1,
+	}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := resp.Msg.GetProfile().GetRunnerProfileId()
+	// The held update stands in for another admin's warm_count update that
+	// commits after this name update read the profile.
+	commit := holdTx(t, w.env, "UPDATE runner_profiles SET warm_count = 3 WHERE runner_profile_id = $1", id)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: id,
+			Profile: &tidev1.RunnerProfile{Name: "renamed"}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"name"}}}))
+		errc <- err
+	}()
+	waitForLockWaiter(t, w.env)
+	commit()
+	if err := <-errc; err != nil {
+		t.Fatalf("name update: %v", err)
+	}
+	got, err := admin.Profile.GetRunnerProfile(ctx, connect.NewRequest(&tidev1.GetRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: id}))
+	if err != nil || got.Msg.GetProfile().GetName() != "renamed" || got.Msg.GetProfile().GetWarmCount() != 3 {
+		t.Fatalf("profile after both updates: %v %v", got, err)
+	}
+}
+
 // TestIntegrationDeleteBlockedByProfile checks that an integration cannot be
 // deleted while a runner profile names it.
 func TestIntegrationDeleteBlockedByProfile(t *testing.T) {

@@ -444,14 +444,60 @@ func (h *Handler) UpdateRunnerProfile(ctx context.Context, req *connect.Request[
 	if len(paths) == 0 {
 		return nil, api.ErrInvalidf("invalid update_mask: must name at least one path")
 	}
-	p, err := ps.Get(ctx, s.DB.Pool, c.OrganizationID, id)
-	if err != nil {
-		return nil, s.Internal(ctx, "update runner profile", err)
-	}
 	in := req.Msg.GetProfile()
 	if in == nil {
 		in = &tidev1.RunnerProfile{}
 	}
+	// The mask is applied to a snapshot outside the transaction, because the
+	// template check may call OwnSand. The transaction locks the row and
+	// writes only when the row still equals the snapshot; otherwise a
+	// concurrent update changed it, and the mask is applied again to the
+	// new row, so the update does not undo the other one.
+	var p *Profile
+	for attempt := 1; ; attempt++ {
+		p, err = ps.applyUpdate(ctx, c, id, in, paths)
+		if !errors.Is(err, errProfileChanged) {
+			break
+		}
+		if attempt == maxUpdateAttempts {
+			return nil, api.ErrPrecondition("the runner profile changed meanwhile; try again")
+		}
+	}
+	if err != nil {
+		return nil, s.Internal(ctx, "update runner profile", err)
+	}
+	ps.changed(ctx, c.OrganizationID)
+	return connect.NewResponse(&tidev1.UpdateRunnerProfileResponse{Profile: p.Proto()}), nil
+}
+
+// maxUpdateAttempts bounds the retries of UpdateRunnerProfile after
+// concurrent updates of the same profile.
+const maxUpdateAttempts = 3
+
+// errProfileChanged tells UpdateRunnerProfile that the row changed after it
+// read its snapshot.
+var errProfileChanged = errors.New("the runner profile changed meanwhile")
+
+// sameRow reports whether two reads of a profile row are equal.
+func sameRow(a, b *Profile) bool {
+	x, y := *a, *b
+	if !x.CreateTime.Equal(y.CreateTime) || !x.UpdateTime.Equal(y.UpdateTime) {
+		return false
+	}
+	x.CreateTime, x.UpdateTime, y.CreateTime, y.UpdateTime = time.Time{}, time.Time{}, time.Time{}, time.Time{}
+	return x == y
+}
+
+// applyUpdate reads the profile, applies the mask, validates the result and
+// writes it. It returns errProfileChanged when the row changed between the
+// read and the write.
+func (ps *Profiles) applyUpdate(ctx context.Context, c api.Caller, id string, in *tidev1.RunnerProfile, paths []string) (*Profile, error) {
+	s := ps.svc
+	p, err := ps.Get(ctx, s.DB.Pool, c.OrganizationID, id)
+	if err != nil {
+		return nil, err
+	}
+	snapshot := *p
 	oldTemplate := p.TemplateID
 	for _, path := range paths {
 		if err := applyField(p, in, path); err != nil {
@@ -460,7 +506,7 @@ func (h *Handler) UpdateRunnerProfile(ctx context.Context, req *connect.Request[
 	}
 	vendor, err := ps.vendorOf(ctx, s.DB.Pool, p)
 	if err != nil {
-		return nil, s.Internal(ctx, "update runner profile", err)
+		return nil, err
 	}
 	if err := Validate(p, vendor); err != nil {
 		return nil, err
@@ -470,7 +516,7 @@ func (h *Handler) UpdateRunnerProfile(ctx context.Context, req *connect.Request[
 	}
 	if p.TemplateID != oldTemplate || contains(paths, "guest_os") {
 		if err := ps.checkTemplate(ctx, p); err != nil {
-			return nil, s.Internal(ctx, "update runner profile", err)
+			return nil, err
 		}
 	}
 	p.UpdateTime = s.NowUTC()
@@ -478,7 +524,17 @@ func (h *Handler) UpdateRunnerProfile(ctx context.Context, req *connect.Request[
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
-		tag, err := tx.Exec(ctx, `UPDATE runner_profiles SET name = $3, workspace_path = $4, guest_os = $5, base_image = $6, ownsand_template_id = $7,
+		current, err := Scan(tx.QueryRow(ctx, "SELECT "+profileColumns+" FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR UPDATE", c.OrganizationID, id))
+		if errors.Is(err, pgx.ErrNoRows) {
+			return api.ErrNotFound("runner profile")
+		}
+		if err != nil {
+			return err
+		}
+		if !sameRow(current, &snapshot) {
+			return errProfileChanged
+		}
+		_, err = tx.Exec(ctx, `UPDATE runner_profiles SET name = $3, workspace_path = $4, guest_os = $5, base_image = $6, ownsand_template_id = $7,
 			vcpu_count = $8, memory_mib = $9, disk_gib = $10, network_mode = $11, idle_ttl_ms = $12, max_ttl_ms = $13, priority = $14,
 			max_queue_wait_ms = $15, warm_count = $16, update_time = $17 WHERE organization_id = $1 AND runner_profile_id = $2`,
 			c.OrganizationID, id, p.Name, p.WorkspacePath, int16(p.GuestOS), nullable(int16(p.BaseImage)), nullable(p.TemplateID),
@@ -490,19 +546,15 @@ func (h *Handler) UpdateRunnerProfile(ctx context.Context, req *connect.Request[
 		if err != nil {
 			return err
 		}
-		if tag.RowsAffected() == 0 {
-			return api.ErrNotFound("runner profile")
-		}
 		return s.WriteAudit(ctx, tx, api.AuditEvent{
 			OrganizationID: c.OrganizationID, Action: tidev1.AuditAction_AUDIT_ACTION_RUNNER_PROFILE_UPDATED, Actor: c.Principal,
 			TargetKind: tidev1.AuditTargetKind_AUDIT_TARGET_KIND_RUNNER_PROFILE, TargetID: id,
 		})
 	})
 	if err != nil {
-		return nil, s.Internal(ctx, "update runner profile", err)
+		return nil, err
 	}
-	ps.changed(ctx, c.OrganizationID)
-	return connect.NewResponse(&tidev1.UpdateRunnerProfileResponse{Profile: p.Proto()}), nil
+	return p, nil
 }
 
 func contains(list []string, v string) bool {
