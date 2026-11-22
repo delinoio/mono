@@ -14,7 +14,7 @@
 
 - Keep repository and domain rules in the appropriate `AGENTS.md` files.
 
-- Web app development servers run through portless: the `dev` script is `portless run --prefix=`, so the URL does not depend on the checkout, the real server command is the `dev:app` script, and the app's Turbo `dev` task passes `PORTLESS` and `PORTLESS_*` through. Follow [Frontend development URLs](../docs/repository-environment-contract.md#frontend-development-urls).
+- The web app development servers of `delino-accounts`, `ownsand-console`, `delino-docs` and `delino-site` run through portless: the `dev` script runs `portless run --prefix=` (behind `scripts/dev/with-infisical.mjs` for `delino-accounts` and `ownsand-console`), so the URL does not depend on the checkout, the real server command is the `dev:app` script, and the app's Turbo `dev` task passes `PORTLESS` and `PORTLESS_*` through. The `delidev` frontend `dev` script runs `rsbuild dev` directly. Follow [Frontend development URLs](../docs/repository-environment-contract.md#frontend-development-urls).
 
 - Write all source and comments in English.
 
