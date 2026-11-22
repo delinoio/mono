@@ -242,6 +242,12 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	if _, e, ok := a.Sandboxes.SnapshotContent(snapshotID); ok {
 		return e, nil
 	}
+	// A copy that a delete marked, or whose removal failed, is removed before
+	// the import writes into its directory.
+	if err := a.Sandboxes.PrepareSnapshotImport(snapshotID); err != nil {
+		a.logger.Warn("snapshot import refused while an earlier copy is being deleted", "snapshot_id", snapshotID, "error", err)
+		return nil, err
+	}
 	if entry.GetGuestOs() == ownsandv1.GuestOs_GUEST_OS_MACOS {
 		// A macOS snapshot boots only on a Mac that supports its hardware
 		// model; check it again before the download.
