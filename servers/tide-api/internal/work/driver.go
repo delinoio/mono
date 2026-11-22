@@ -297,7 +297,16 @@ func (e *Engine) stepStart(ctx context.Context, client ownsandclient.Client, r *
 			}
 			return e.startRequestTx(ctx, tx, n.RequestID, n.ID, []tidev1.RequestState{reqStarting}, reqRunning)
 		}
-		_, err := e.setRunnerTx(ctx, tx, r.ID, from, runWaiting, "program_exec_id = $4", nullable(res.ProgramExecID))
+		n, err := e.setRunnerTx(ctx, tx, r.ID, from, runWaiting, "program_exec_id = $4", nullable(res.ProgramExecID))
+		if err != nil || n != nil || res.ProgramExecID == "" {
+			return err
+		}
+		// A source that binds work later (GITHUB_JOB: an early in_progress
+		// webhook, MarkBusy) can mark the runner BUSY before Start returns.
+		// The runner keeps the exec ID, so its driver follows the program
+		// and deletes the sandbox when the program exits.
+		_, err = tx.Exec(ctx, "UPDATE runners SET program_exec_id = $2, update_time = $3 WHERE runner_id = $1 AND state = $4 AND program_exec_id IS NULL",
+			r.ID, res.ProgramExecID, e.svc.NowUTC(), int16(runBusy))
 		return err
 	})
 	if err != nil {

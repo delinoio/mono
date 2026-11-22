@@ -345,6 +345,49 @@ func TestSurplusWhileStarting(t *testing.T) {
 	})
 }
 
+// TestInProgressBeforeStartReturns: an in_progress event that marks the
+// runner BUSY before Start returned keeps the program exec ID, so tide
+// follows the program and deletes the sandbox when it exits.
+func TestInProgressBeforeStartReturns(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.link(t, 501, "acme")
+	w.createProfile(t, ghProfile("linux", 0))
+	gate, entered := make(chan struct{}), make(chan string, 1)
+	w.progs.hold(gate, entered)
+	released := false
+	defer func() {
+		if !released {
+			close(gate)
+		}
+	}()
+	w.send(t, "workflow_job", job("queued", 501, 1, tideLinux, ""))
+	select {
+	case <-entered:
+	case <-time.After(15 * time.Second):
+		t.Fatal("timed out waiting for the start exec")
+	}
+	starting := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_PREPARING)
+	if len(starting) != 1 {
+		t.Fatalf("%d starting runners", len(starting))
+	}
+	r := starting[0]
+	w.send(t, "workflow_job", job("in_progress", 501, 1, tideLinux, "tide-"+r.GetRunnerId()))
+	if got := w.runner(t, r.GetRunnerId()); got.GetState() != tidev1.RunnerState_RUNNER_STATE_BUSY {
+		t.Fatalf("runner %v", got)
+	}
+	close(gate)
+	released = true
+	w.progs.exit(r.GetOwnsandSandboxId())
+	eventually(t, "the busy runner deleted after its program exit", func() bool {
+		got := w.runner(t, r.GetRunnerId())
+		if got.GetState() == tidev1.RunnerState_RUNNER_STATE_BUSY {
+			// The program may have exited before the follower attached.
+			w.progs.exit(r.GetOwnsandSandboxId())
+		}
+		return got.GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED && got.GetEndReason() == tidev1.RunnerEndReason_RUNNER_END_REASON_WORK_DONE
+	})
+}
+
 // TestWarmRunnerPerPool: a warm count keeps idle runners per ACTIVE
 // installation, and the surplus rule keeps them.
 func TestWarmRunnerPerPool(t *testing.T) {
