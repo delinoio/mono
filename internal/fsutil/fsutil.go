@@ -167,8 +167,10 @@ func WriteTarContext(ctx context.Context, w io.Writer, dir string) error {
 	return tw.Close()
 }
 
-// ReadTar extracts a tar stream into dir. It rejects names that leave dir
-// and link targets that are absolute or leave dir. Every file system
+// ReadTar extracts a tar stream into dir. It rejects names that are not
+// local paths under the host rules and link targets that are absolute,
+// start at a root (such as "/etc" on Windows), have a volume name or leave
+// dir. Every file system
 // operation goes through an os.Root opened on dir, so no entry can read or
 // write outside dir, including through symbolic links that the same archive
 // created earlier; such an entry fails with an error.
@@ -223,14 +225,48 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 				return err
 			}
 		case tar.TypeSymlink:
-			if filepath.IsAbs(hdr.Linkname) || !filepath.IsLocal(filepath.Join(filepath.Dir(name), hdr.Linkname)) || strings.Contains(hdr.Linkname, "\x00") {
+			if !confinedLinkTarget(name, hdr.Linkname) {
 				return fmt.Errorf("fsutil: tar symbolic link leaves the target directory")
 			}
-			if err := root.Symlink(hdr.Linkname, name); err != nil {
+			// Workaround: on Windows, os.Root.Symlink in Go 1.26 writes the
+			// target unchanged, and Windows does not resolve `/` in link
+			// contents, so a tar target such as `../real/f` does not resolve.
+			// os.Symlink converts the separators, and Root.Symlink does too
+			// from Go 1.27. FromSlash changes nothing on Linux and macOS.
+			// Remove the conversion when go.mod requires Go 1.27 or later.
+			if err := root.Symlink(filepath.FromSlash(hdr.Linkname), name); err != nil {
 				return err
 			}
 		default:
 			return fmt.Errorf("fsutil: unsupported tar entry type %d", hdr.Typeflag)
 		}
 	}
+}
+
+// confinedLinkTarget reports whether the symbolic link target linkname of
+// the entry name, which is a local path in host form, stays inside the
+// extraction root.
+//
+// The target must be relative under the host path rules. A joined path
+// cannot be used for this check alone: filepath.Join drops the leading
+// separator of a root-relative target such as "/etc" or `\etc` on
+// Windows, where filepath.IsAbs reports false for it because it has no
+// volume name, and Windows resolves it against the root of the current
+// drive. A volume name ("C:x", `C:\x`, `\\server\share`) also makes the
+// target leave the root. After these checks, the target joined with the
+// directory of the entry must be local, so ".." elements cannot climb out
+// of the root.
+//
+// The rules are the host rules: on Linux and macOS, a backslash and a colon
+// are ordinary file name characters, so a target such as `\x` or "C:x"
+// names a file in the directory of the link there.
+func confinedLinkTarget(name, linkname string) bool {
+	if linkname == "" || strings.Contains(linkname, "\x00") {
+		return false
+	}
+	target := filepath.FromSlash(linkname)
+	if filepath.IsAbs(target) || filepath.VolumeName(target) != "" || os.IsPathSeparator(target[0]) {
+		return false
+	}
+	return filepath.IsLocal(filepath.Join(filepath.Dir(name), target))
 }
