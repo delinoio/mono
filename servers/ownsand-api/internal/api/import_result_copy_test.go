@@ -166,16 +166,15 @@ func TestImportResultWaitsForInFlightSnapshotDeletion(t *testing.T) {
 }
 
 // TestImportResultRecordsOneCopy checks that an ordinary import of an
-// existing snapshot records one copy row and creates the sandbox, that an
-// existing copy row stays one row, and that no delete command is sent.
+// existing snapshot records one copy row, creates the sandbox and sends no
+// delete command.
 func TestImportResultRecordsOneCopy(t *testing.T) {
 	env := testenv.New(t)
-	ctx := context.Background()
 	org := env.NewOrg("alice")
 	c := org.OwnerClient
 	snapID, devB, agentB := importFixture(t, env, org)
 
-	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	created, err := c.Sandbox.CreateSandbox(context.Background(), connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,18 +182,38 @@ func TestImportResultRecordsOneCopy(t *testing.T) {
 	if n := copyRowCount(t, env, snapID, devB.ID); n != 1 {
 		t.Fatalf("copy rows after the import = %d, want 1", n)
 	}
+	if n := deleteSnapshotCommands(agentB, snapID); n != 0 {
+		t.Fatalf("delete commands for an existing snapshot = %d, want 0", n)
+	}
+}
 
-	// A second import result for a device that already has the row.
+// TestImportResultKeepsExistingCopyRow checks that an import result for a
+// device that already has a copy row (for example one that a state report
+// recovered while the import ran) leaves one row, creates the sandbox and
+// sends no delete command. The row is inserted while the import command is
+// in flight; a row that exists before the create would skip the import, so
+// the result would never reach the registration path.
+func TestImportResultKeepsExistingCopyRow(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	c := org.OwnerClient
+	snapID, devB, agentB := importFixture(t, env, org)
 	importID := withholdImportResult(agentB)
-	if _, err := env.DB.Pool.Exec(ctx, "DELETE FROM snapshot_copies WHERE snapshot_id = $1", snapID); err != nil {
+
+	created, err := c.Sandbox.CreateSandbox(ctx, connect.NewRequest(importCreateReq(org.ID, snapID, devB.ID)))
+	if err != nil {
 		t.Fatal(err)
 	}
+	agentB.WaitFor("import command", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCommand().GetImportSnapshot() != nil })
+	agentB.AddSnapshot(readySnapshotEntry(snapID))
+	cmdID := importID()
 	if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO snapshot_copies (snapshot_id, device_id) VALUES ($1, $2)", snapID, devB.ID); err != nil {
 		t.Fatal(err)
 	}
-	cmdID := startWithheldImport(t, org, snapID, devB.ID, agentB, importID)
+
 	sendImportResult(agentB, cmdID)
-	time.Sleep(300 * time.Millisecond)
+	waitState(t, c, org.ID, created.Msg.GetSandbox().GetSandboxId(), ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 	if n := copyRowCount(t, env, snapID, devB.ID); n != 1 {
 		t.Fatalf("copy rows with an existing row = %d, want 1", n)
 	}
