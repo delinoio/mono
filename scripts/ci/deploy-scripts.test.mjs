@@ -2791,7 +2791,9 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 //                 as for a missing container.
 //   STUB_FAIL     the `docker` subcommand that prints a daemon error and
 //                 fails (for example `start`).
-function runCaddy(t, { inspect, fail, args } = {}) {
+//   STUB_NO_IMAGE set when the pinned image is not local: `docker image
+//                 inspect` fails, as for an image that was never pulled.
+function runCaddy(t, { inspect, fail, noImage, args } = {}) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -2805,12 +2807,16 @@ function runCaddy(t, { inspect, fail, args } = {}) {
 fi
 case "$1" in
   inspect) [[ -n "\${STUB_INSPECT:-}" ]] && echo "$STUB_INSPECT" || exit 1 ;;
+  image)
+    if [[ "$2" == "inspect" && -n "\${STUB_NO_IMAGE:-}" ]]; then exit 1; fi
+    ;;
 esac`,
   );
   const env = { ...baseEnv, PATH: `${bin}${delimiter}${baseEnv.PATH}` };
   env.STUB_DIR = dir;
   if (inspect !== undefined) env.STUB_INSPECT = inspect;
   if (fail !== undefined) env.STUB_FAIL = fail;
+  if (noImage) env.STUB_NO_IMAGE = "1";
   const result = spawnSync(
     "bash",
     [startCaddy, ...(args ?? [caddyImage, "/srv/delino", "delino"])],
@@ -2828,6 +2834,8 @@ esac`,
 const caddyRun = `docker run --detach --name caddy --network delino --restart unless-stopped --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
 const caddyInspect =
   "docker inspect --format {{.Config.Image}} {{.State.Running}} caddy";
+const caddyImageInspect = `docker image inspect ${caddyImage}`;
+const caddyPull = `docker pull ${caddyImage}`;
 const caddyReload =
   "docker exec caddy caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile";
 
@@ -2836,6 +2844,7 @@ test("start-caddy creates a missing container", { skip }, (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.deepEqual(result.calls, [
     caddyInspect,
+    caddyImageInspect,
     "docker rm --force caddy",
     caddyRun,
   ]);
@@ -2861,9 +2870,73 @@ test("start-caddy recreates a container with another image", { skip }, (t) => {
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(
       result.calls,
-      [caddyInspect, "docker rm --force caddy", caddyRun],
+      [caddyInspect, caddyImageInspect, "docker rm --force caddy", caddyRun],
       running,
     );
+  }
+});
+
+test(
+  "start-caddy pulls a missing image before it removes the container",
+  {
+    skip,
+  },
+  (t) => {
+    for (const inspect of [
+      undefined,
+      `caddy:2.10.0@sha256:${"a".repeat(64)} true`,
+    ]) {
+      const result = runCaddy(t, { inspect, noImage: true });
+      assert.equal(result.status, 0, result.stderr);
+      assert.deepEqual(
+        result.calls,
+        [
+          caddyInspect,
+          caddyImageInspect,
+          caddyPull,
+          "docker rm --force caddy",
+          caddyRun,
+        ],
+        String(inspect),
+      );
+    }
+  },
+);
+
+test(
+  "start-caddy keeps the old container when the pull fails",
+  { skip },
+  (t) => {
+    for (const inspect of [
+      undefined,
+      `caddy:2.10.0@sha256:${"a".repeat(64)} true`,
+    ]) {
+      const result = runCaddy(t, { inspect, noImage: true, fail: "pull" });
+      const label = String(inspect);
+      assert.notEqual(result.status, 0, label);
+      assert.match(
+        result.stderr,
+        /Error response from daemon: stub pull failed/,
+        label,
+      );
+      assert.deepEqual(
+        result.calls,
+        [caddyInspect, caddyImageInspect, caddyPull],
+        label,
+      );
+    }
+  },
+);
+
+test("start-caddy needs no pull for a same-image container", { skip }, (t) => {
+  for (const running of ["true", "false"]) {
+    const result = runCaddy(t, {
+      inspect: `${caddyImage} ${running}`,
+      noImage: true,
+      fail: "pull",
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(!result.calls.some((call) => call.startsWith("docker pull")));
   }
 });
 
