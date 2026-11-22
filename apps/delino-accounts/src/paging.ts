@@ -28,10 +28,15 @@ export interface AllPages<Item> {
   /** The first page is still loading. */
   isPending: boolean;
   /**
-   * The first request or a refresh failed. Retrying it reads the list again
-   * from the first page.
+   * The first request failed, so no item has loaded. Retrying it reads the
+   * list again from the first page.
    */
   error: unknown;
+  /**
+   * A refresh of a list that has loaded failed. The items stay and `refetch`
+   * reads the list again from the first page.
+   */
+  refreshError: unknown;
   /** The list continues, so a later page is loading or has not loaded. */
   isLoadingMore: boolean;
   /**
@@ -90,17 +95,29 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
     hasNextPage,
     isFetching,
     isFetchNextPageError,
+    isRefetchError,
     fetchNextPage,
     refetch,
   } = query;
   // Read the next page as soon as the previous one has loaded. A failed page
   // stops the loop until the user retries it, so a failing server is not
-  // called in a tight loop.
+  // called in a tight loop. A failed refresh stops it too until the retry.
   useEffect(() => {
-    if (hasNextPage && !isFetching && !isFetchNextPageError) {
+    if (
+      hasNextPage &&
+      !isFetching &&
+      !isFetchNextPageError &&
+      !isRefetchError
+    ) {
       void fetchNextPage();
     }
-  }, [hasNextPage, isFetching, isFetchNextPageError, fetchNextPage]);
+  }, [
+    hasNextPage,
+    isFetching,
+    isFetchNextPageError,
+    isRefetchError,
+    fetchNextPage,
+  ]);
 
   const seen = new Set<string>();
   const items: Item[] = [];
@@ -116,7 +133,11 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
   return {
     items,
     isPending: query.isPending,
-    error: isFetchNextPageError ? undefined : query.error,
+    error: query.isLoadingError ? query.error : undefined,
+    // A failed next page also has `isRefetchError`; it is the continuation
+    // error below, not a failed refresh.
+    refreshError:
+      isRefetchError && !isFetchNextPageError ? query.error : undefined,
     isLoadingMore: hasNextPage && !isFetchNextPageError,
     continuationError: isFetchNextPageError ? query.error : undefined,
     refetch: () => void refetch(),

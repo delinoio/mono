@@ -14,6 +14,7 @@ import {
   Loading,
   MorePages,
   PageHeader,
+  RefetchNotice,
 } from "../components/ui.tsx";
 import { checkAccountName } from "../forms.ts";
 import { useAllPages } from "../paging.ts";
@@ -44,6 +45,7 @@ export function BillingAccountsPage() {
           </Button>
         }
       />
+      <RefetchNotice error={accounts.refreshError} onRetry={accounts.refetch} />
       {accounts.isPending ? (
         <Loading label="Loading billing accounts" />
       ) : accounts.error ? (
