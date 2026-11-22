@@ -52,7 +52,7 @@ The Go SDK logs retries and reconnects at debug level through the caller's logge
 ## Dependencies and Integrations
 
 - Upstream: the generated code of `delino.tide.v1`, Connect-ES and connect-go.
-- Publication: the npm package name and the publication workflow of the TypeScript SDK are open decisions, together with the same decision of OwnSand.
+- Publication (recorded decision): the workspace package is named `tide-sdk` and is `private`, so neither pnpm nor Changesets publishes it, like `ownsand-sdk`. The npm package name and the publication workflow of the TypeScript SDK stay an [open decision](project-tide.md#open-decisions), together with the same decision of OwnSand.
 
 ## Change Triggers
 
