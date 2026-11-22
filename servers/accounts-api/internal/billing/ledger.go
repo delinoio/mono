@@ -225,6 +225,9 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, err
 	}
+	// The balance before the inline expiry is the baseline of the low-balance
+	// check: an expiry that the new grant does not make up for is a decrease.
+	before := acct.Balance
 	if err := s.expireDue(ctx, tx, acct, now); err != nil {
 		return "", false, err
 	}
@@ -243,7 +246,13 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	}, now); err != nil {
 		return "", false, err
 	}
+	// afterIncrease runs first so that a grant that reaches the threshold
+	// re-arms the alert before afterDecrease reads the settings. A purchase
+	// never queues an automatic top-up (usage is false).
 	if err := s.afterIncrease(ctx, tx, acct, now); err != nil {
+		return "", false, err
+	}
+	if _, err := s.afterDecrease(ctx, tx, acct, before, now, false); err != nil {
 		return "", false, err
 	}
 	s.metrics.CreditGrant(string(in.Kind))
@@ -326,10 +335,12 @@ func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, d Deduction) (Deduction
 	if err != nil {
 		return DeductionResult{}, err
 	}
+	// before precedes the inline expiry so that a due expiry counts as a
+	// decrease, also for a zero-amount deduction.
+	before := acct.Balance
 	if err := s.expireDue(ctx, tx, acct, now); err != nil {
 		return DeductionResult{}, err
 	}
-	before := acct.Balance
 	if err := consumeGrants(ctx, tx, acct.ID, d.AmountUSDMicros, now, ""); err != nil {
 		return DeductionResult{}, err
 	}
