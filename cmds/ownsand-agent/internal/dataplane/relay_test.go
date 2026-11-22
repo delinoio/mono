@@ -1669,3 +1669,120 @@ func TestRelayChannelLossFlushesSessionEndBeforeClosingRequest(t *testing.T) {
 		}
 	}
 }
+
+// relayAttempt is one relay connection of a scripted control plane.
+type relayAttempt struct {
+	started, ended time.Time
+}
+
+// scriptedRelay makes the control plane keep each relay connection open for
+// the matching duration of lives (the last value repeats) and then fail it
+// with an ordinary error, and records when each attempt started and ended.
+// A negative duration fails the connection at once.
+func scriptedRelay(e *relayEnv, lives ...time.Duration) func() []relayAttempt {
+	var mu sync.Mutex
+	var attempts []relayAttempt
+	e.cp.SetRelayHandler(func(ctx context.Context, _ string, _ *connect.BidiStream[ownsandv1.ConnectRequest, ownsandv1.ConnectResponse]) error {
+		mu.Lock()
+		n := len(attempts)
+		attempts = append(attempts, relayAttempt{started: time.Now()})
+		mu.Unlock()
+		life := lives[min(n, len(lives)-1)]
+		if life > 0 {
+			select {
+			case <-time.After(life):
+			case <-ctx.Done():
+			}
+		}
+		mu.Lock()
+		attempts[n].ended = time.Now()
+		mu.Unlock()
+		return connect.NewError(connect.CodeUnavailable, errors.New("relay unavailable"))
+	})
+	return func() []relayAttempt {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]relayAttempt(nil), attempts...)
+	}
+}
+
+// waitAttempts waits until the control plane saw n finished attempts.
+func waitAttempts(t *testing.T, get func() []relayAttempt, n int) []relayAttempt {
+	t.Helper()
+	var got []relayAttempt
+	waitFor(t, fmt.Sprintf("%d relay connection attempts", n), func() bool {
+		got = get()
+		return len(got) > n || (len(got) == n && !got[n-1].ended.IsZero())
+	})
+	return got
+}
+
+// TestRelayLongLivedConnectionRestartsBackoff checks that a connection that
+// stayed open for the reset time and then ended with an ordinary error
+// restarts the back-off at its first 200-millisecond step, also when earlier
+// failures had raised it to ReconnectMax, and that the delay of a streak of
+// short connections keeps growing.
+func TestRelayLongLivedConnectionRestartsBackoff(t *testing.T) {
+	// Three connections that fail at once raise the back-off to 800 ms; the
+	// fourth lives longer than the reset time; the fifth is the redial.
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
+	get := scriptedRelay(e, -1, -1, -1, 500*time.Millisecond, -1)
+	e.execGrant(e.execReq("/bin/true"))
+	at := waitAttempts(t, get, 5)
+	gap := func(i int) time.Duration { return at[i+1].started.Sub(at[i].ended) }
+	t.Logf("delays between attempts: %v, %v, %v (short connections), %v (after the long-lived one)", gap(0), gap(1), gap(2), gap(3))
+	if gap(2) < 500*time.Millisecond {
+		t.Fatalf("the delay after the third short connection was %v; the back-off did not grow", gap(2))
+	}
+	if g := gap(3); g > 400*time.Millisecond {
+		t.Fatalf("the delay after a connection that lived 500 ms was %v, want at most the 200 ms first step", g)
+	}
+}
+
+// TestRelayRepeatedLongLivedConnectionsStayAtFirstStep checks that every
+// connection that lives for the reset time starts its own back-off.
+func TestRelayRepeatedLongLivedConnectionsStayAtFirstStep(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
+	get := scriptedRelay(e, 400*time.Millisecond)
+	e.execGrant(e.execReq("/bin/true"))
+	at := waitAttempts(t, get, 4)
+	t.Logf("delays after long-lived connections: %v, %v, %v", at[1].started.Sub(at[0].ended), at[2].started.Sub(at[1].ended), at[3].started.Sub(at[2].ended))
+	for i := 0; i < 3; i++ {
+		if g := at[i+1].started.Sub(at[i].ended); g > 400*time.Millisecond {
+			t.Fatalf("the delay after long-lived connection %d was %v, want at most the 200 ms first step", i+1, g)
+		}
+	}
+}
+
+// TestRelayShortConnectionsKeepBackoffGrowing checks that connections that
+// end before the reset time never restart the back-off, even when each of
+// them lived for a while.
+func TestRelayShortConnectionsKeepBackoffGrowing(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 300 * time.Millisecond}, RelayLimits{})
+	get := scriptedRelay(e, 100*time.Millisecond)
+	e.execGrant(e.execReq("/bin/true"))
+	at := waitAttempts(t, get, 4)
+	gap := func(i int) time.Duration { return at[i+1].started.Sub(at[i].ended) }
+	if gap(2) < 500*time.Millisecond || gap(2) <= gap(0)+200*time.Millisecond {
+		t.Fatalf("delays %v, %v, %v after short connections; the back-off did not keep growing", gap(0), gap(1), gap(2))
+	}
+}
+
+// TestRelayCredentialFailureKeepsBackoffAtShortReset checks that a failure
+// before any connection opened counts as no open time, so even a very short
+// reset time never restarts the back-off of a failing credential request.
+func TestRelayCredentialFailureKeepsBackoffAtShortReset(t *testing.T) {
+	e := newRelayEnv(t, Timing{ReconnectMax: time.Second, ReconnectReset: 20 * time.Millisecond}, RelayLimits{})
+	var attempts atomic.Int32
+	hook := func(context.Context) error {
+		attempts.Add(1)
+		return errors.New("credential unavailable")
+	}
+	e.beforeAuth.Store(&hook)
+	e.execGrant(e.execReq("/bin/true"))
+	time.Sleep(1500 * time.Millisecond)
+	// Back-off of 200, 400, 800 milliseconds allows about four attempts.
+	if n := attempts.Load(); n < 1 || n > 6 {
+		t.Fatalf("%d credential attempts in 1.5 seconds", n)
+	}
+}

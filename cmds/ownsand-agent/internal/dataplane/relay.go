@@ -407,20 +407,35 @@ func (r *relay) loop(ch agent.Channel) {
 			ch = cur
 			b.Reset()
 		}
-		probeLost, err := r.connectOnce(ch)
+		var openedAt time.Time
+		probeLost, err := r.connectOnce(ch, &openedAt)
+		// A connection that stayed open for ReconnectReset was healthy, so
+		// the failures before it say nothing about the next dial: the
+		// back-off starts again at its first step. A failure before the
+		// connection opened (the credential request, a dropped credential)
+		// has no open time and keeps the back-off.
+		var lived time.Duration
+		if !openedAt.IsZero() {
+			lived = time.Since(openedAt)
+			if lived >= r.d.timing.ReconnectReset {
+				b.Reset()
+			}
+		}
 		switch {
 		case errors.Is(err, errIdle), errors.Is(err, errChannelChanged), errors.Is(err, errNoLiveGrant):
 			continue
 		case err != nil && !probeLost:
-			r.d.logger.Warn("relay connection ended", "error", err)
-			if backoff.Sleep(r.ctx, b.Next()) != nil {
+			delay := b.Next()
+			r.d.logger.Warn("relay connection ended", "error", err,
+				"open_ms", lived.Milliseconds(), "retry_in_ms", delay.Milliseconds())
+			if backoff.Sleep(r.ctx, delay) != nil {
 				r.mu.Lock()
 				r.running = false
 				r.mu.Unlock()
 				return
 			}
 		case probeLost:
-			r.d.logger.Warn("relay connection lost; dialing again", "error", err)
+			r.d.logger.Warn("relay connection lost; dialing again", "error", err, "open_ms", lived.Milliseconds())
 			b.Reset()
 		}
 	}
@@ -477,8 +492,10 @@ func (r *relay) acquireCredential(ch agent.Channel) (string, error) {
 }
 
 // connectOnce runs one relay connection until it ends. It reports whether
-// the echo probe ended it.
-func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
+// the echo probe ended it, and it stores in *openedAt the instant at which
+// it installed the connection (it leaves it zero when the connection never
+// opened), so the loop can tell how long the connection lived.
+func (r *relay) connectOnce(ch agent.Channel, openedAt *time.Time) (bool, error) {
 	if r.client == nil {
 		return false, errors.New("dataplane: no relay client")
 	}
@@ -520,6 +537,7 @@ func (r *relay) connectOnce(ch agent.Channel) (bool, error) {
 	}
 	r.conn = c
 	r.idleFrom = time.Now()
+	*openedAt = r.idleFrom
 	r.mu.Unlock()
 	defer r.connClosed(c)
 	stream := r.client.Connect(ctx)
