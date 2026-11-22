@@ -117,7 +117,7 @@ func WithLayers(fake *ownsandfake.Fake, out *layers.Layers) Option {
 // FastWorkTiming returns engine intervals for tests.
 func FastWorkTiming() work.Timing {
 	return work.Timing{PassInterval: 200 * time.Millisecond, ReconcileInterval: 100 * time.Millisecond, SandboxPoll: 50 * time.Millisecond,
-		StartTimeout: time.Minute, GaugeInterval: 100 * time.Millisecond}
+		StartTimeout: time.Minute, GaugeInterval: 100 * time.Millisecond, CreateTimeout: time.Second}
 }
 
 // WithLayerOptions is WithLayers with explicit layer options; empty fields

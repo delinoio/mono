@@ -129,6 +129,12 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		if res == createUnavailable && !reclaimed {
 			reclaimed = e.reclaimWarm(ctx, runners, p.ID)
 		}
+		if res == createStalled {
+			// OwnSand did not answer in time: end this organization's pass,
+			// so one stalled organization delays the others at most by one
+			// CreateTimeout per pass. The driver repeats the call.
+			return nil
+		}
 	}
 	if len(uncovered) > 0 {
 		return nil
@@ -324,7 +330,17 @@ const (
 	createUnavailable
 	createFailed
 	createSkipped
+	// createStalled: the call reached CreateTimeout (an uncertain result).
+	createStalled
 )
+
+// createSandbox calls CreateSandbox bounded by CreateTimeout, so a stalled
+// OwnSand call cannot block the dispatcher, a driver or a deletion.
+func (e *Engine) createSandbox(ctx context.Context, client ownsandclient.Client, req *ownsandv1.CreateSandboxRequest) (*ownsandv1.Sandbox, error) {
+	ctx, cancel := context.WithTimeout(ctx, e.timing.createTimeout())
+	defer cancel()
+	return client.CreateSandbox(ctx, req)
+}
 
 // sandboxRequest builds the CreateSandbox request of a runner: no device
 // ID, the profile's source, resources, network and TTLs, and the tide
@@ -417,8 +433,12 @@ func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, 
 		e.svc.Logger.WarnContext(ctx, "dispatch_create_runner_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
 		return createFailed
 	}
-	sb, err := client.CreateSandbox(ctx, sreq)
-	return e.applyCreate(ctx, r, sb, err)
+	sb, err := e.createSandbox(ctx, client, sreq)
+	res := e.applyCreate(ctx, r, sb, err)
+	if res == createFailed && ctx.Err() == nil && (errors.Is(err, context.DeadlineExceeded) || isCode(err, connect.CodeDeadlineExceeded)) {
+		return createStalled
+	}
+	return res
 }
 
 // storedCreateRequest returns the CreateSandbox request that the runner was

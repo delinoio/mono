@@ -204,7 +204,7 @@ func (e *Engine) stepCreating(ctx context.Context, client ownsandclient.Client, 
 			e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 			return e.timing.SandboxPoll
 		}
-		sb, err := client.CreateSandbox(ctx, req)
+		sb, err := e.createSandbox(ctx, client, req)
 		switch e.applyCreate(ctx, r, sb, err) {
 		case createOK:
 			return 0
@@ -472,7 +472,7 @@ func (e *Engine) resolveCreate(ctx context.Context, client ownsandclient.Client,
 		e.svc.Logger.WarnContext(ctx, "runner_create_request_load_failed", slog.String("runner_id", r.ID), slog.Any("error", err))
 		return "", false
 	}
-	sb, err := client.CreateSandbox(ctx, req)
+	sb, err := e.createSandbox(ctx, client, req)
 	switch {
 	case err == nil:
 		if _, err := e.svc.DB.Pool.Exec(ctx, "UPDATE runners SET ownsand_sandbox_id = $2, ownsand_device_id = $3, update_time = $4 WHERE runner_id = $1 AND ownsand_sandbox_id IS NULL",

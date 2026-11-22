@@ -5,6 +5,7 @@ package layers_test
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -439,5 +440,31 @@ func TestStartFailureCleanupRetry(t *testing.T) {
 	var pending int
 	if err := w.env.DB.Pool.QueryRow(context.Background(), "SELECT count(*) FROM runners WHERE organization_id = $1 AND sandbox_cleanup", w.org.ID).Scan(&pending); err != nil || pending != 0 {
 		t.Fatalf("%d runners still marked (%v)", pending, err)
+	}
+}
+
+// TestStalledCreateSandbox: a CreateSandbox call that OwnSand never
+// answers ends at CreateTimeout, so the dispatcher goes on; the runner keeps
+// its key and its driver creates the sandbox.
+func TestStalledCreateSandbox(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	var stalled sync.Once
+	w.fake.SetCreateHook(func(ctx context.Context) error {
+		first := false
+		stalled.Do(func() { first = true })
+		if !first {
+			return nil
+		}
+		<-ctx.Done()
+		return connect.NewError(connect.CodeDeadlineExceeded, ctx.Err())
+	})
+	a := w.createSession(t, w.env.User(w.org.Member), profileID)
+	eventually(t, "the stalled call", func() bool { return w.fake.Calls("CreateSandbox") >= 1 })
+	b := w.createSession(t, w.env.User(w.org.Admin), profileID)
+	w.waitState(t, b.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	w.waitState(t, a.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	if n := len(w.fake.Sandboxes(w.osOrg)); n != 2 {
+		t.Fatalf("%d sandboxes", n)
 	}
 }

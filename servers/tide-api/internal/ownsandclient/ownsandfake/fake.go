@@ -47,6 +47,10 @@ type Fake struct {
 	// no output.
 	Exec   ExecFunc
 	Attach AttachFunc
+	// createHook runs before each CreateSandbox call without the fake lock
+	// (for example to stall a call until its context ends); its error is
+	// the call's error.
+	createHook func(ctx context.Context) error
 }
 
 // Org is one fake OwnSand organization.
@@ -255,7 +259,23 @@ func (c *client) TemplateGuestOS(ctx context.Context, templateID string) (ownsan
 	return g, nil
 }
 
+// SetCreateHook sets the hook that runs before each CreateSandbox call; nil
+// removes it.
+func (f *Fake) SetCreateHook(fn func(ctx context.Context) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.createHook = fn
+}
+
 func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandboxRequest) (*ownsandv1.Sandbox, error) {
+	c.f.mu.Lock()
+	hook := c.f.createHook
+	c.f.mu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return nil, err
+		}
+	}
 	o, err := c.begin("CreateSandbox")
 	if err != nil {
 		return nil, err

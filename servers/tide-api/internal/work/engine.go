@@ -50,6 +50,20 @@ type Timing struct {
 	StartTimeout time.Duration
 	// GaugeInterval is the interval of the gauge collector.
 	GaugeInterval time.Duration
+	// CreateTimeout bounds one CreateSandbox call (15 seconds when zero). A
+	// call that reaches it is an uncertain result: the runner keeps its key
+	// and its driver repeats the call.
+	CreateTimeout time.Duration
+}
+
+// defaultCreateTimeout is the CreateTimeout of a zero Timing field.
+const defaultCreateTimeout = 15 * time.Second
+
+func (t Timing) createTimeout() time.Duration {
+	if t.CreateTimeout > 0 {
+		return t.CreateTimeout
+	}
+	return defaultCreateTimeout
 }
 
 // DefaultTiming returns the production intervals.
@@ -60,6 +74,7 @@ func DefaultTiming() Timing {
 		SandboxPoll:       10 * time.Second,
 		StartTimeout:      30 * time.Minute,
 		GaugeInterval:     15 * time.Second,
+		CreateTimeout:     defaultCreateTimeout,
 	}
 }
 
