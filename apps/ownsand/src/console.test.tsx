@@ -54,6 +54,8 @@ function renderConsole(
     transport?: Transport;
     config?: ConsoleConfig;
     queryClient?: QueryClient;
+    /** The signed-in user; the mock user by default. */
+    userId?: string;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -62,7 +64,7 @@ function renderConsole(
   const auth: Auth = {
     isLoading: false,
     isAuthenticated: signedIn,
-    userId: signedIn ? MOCK_USER : undefined,
+    userId: signedIn ? (options.userId ?? MOCK_USER) : undefined,
     signIn: async () => {
       signIns.push(1);
     },
@@ -1871,5 +1873,171 @@ describe("billing settings", () => {
     });
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain("removes the billing link");
+  });
+});
+
+describe("leaving and deleting an organization", () => {
+  const NOT_FOUND_NOTICE =
+    "It was not found, or you no longer have access to it.";
+
+  /**
+   * A transport with the latency of a real control plane: ListOrganizations
+   * answers slowly, so a refetch of it is still running when the others
+   * have settled.
+   */
+  function slowTransport(fail: string[] = [], userId?: string) {
+    const mock = createMockTransport({ userId });
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, method.name === "ListOrganizations" ? 80 : 20),
+        );
+        if (fail.includes(method.name)) {
+          throw new ConnectError("the request failed", Code.Unavailable);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return transport;
+  }
+
+  /** Records whether the not-found notice was ever in the document. */
+  function watchNotice() {
+    const seen = { notice: false };
+    const check = () => {
+      if (document.body.textContent?.includes(NOT_FOUND_NOTICE)) {
+        seen.notice = true;
+      }
+    };
+    const observer = new MutationObserver(check);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return { seen, stop: () => observer.disconnect() };
+  }
+
+  const confirmIn = async (label: string) => {
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: label }));
+    });
+    return dialog;
+  };
+
+  test("leaving as a member never shows the not-found notice and ends at /", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.northwind}/members`, {
+      transport: slowTransport(),
+      queryClient: createQueryClient(),
+    });
+    const watcher = watchNotice();
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Leave organization" }),
+      );
+    });
+    await confirmIn("Leave organization");
+    await settle(400);
+    watcher.stop();
+    expect(watcher.seen.notice).toBe(false);
+    expect(window.location.pathname).toBe("/");
+    expect(
+      await screen.findByRole("link", { name: /Acme Robotics/ }),
+    ).toBeTruthy();
+    // The organization list was refetched after the navigation.
+    expect(screen.queryByRole("link", { name: /Northwind Labs/ })).toBeNull();
+  });
+
+  test("leaving as an admin never shows the not-found notice and ends at /", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, {
+      transport: slowTransport([], "user-admin-jun"),
+      userId: "user-admin-jun",
+      queryClient: createQueryClient(),
+    });
+    const watcher = watchNotice();
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Leave organization" }),
+      );
+    });
+    await confirmIn("Leave organization");
+    await settle(400);
+    watcher.stop();
+    expect(watcher.seen.notice).toBe(false);
+    expect(window.location.pathname).toBe("/");
+  });
+
+  test("deleting as the owner never shows the not-found notice and ends at /", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: slowTransport(),
+      queryClient: createQueryClient(),
+    });
+    const watcher = watchNotice();
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Delete organization" }),
+      );
+    });
+    await confirmIn("Delete organization");
+    await settle(400);
+    watcher.stop();
+    expect(watcher.seen.notice).toBe(false);
+    expect(window.location.pathname).toBe("/");
+    expect(
+      await screen.findByRole("link", { name: /Northwind Labs/ }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Acme Robotics/ })).toBeNull();
+  });
+
+  test("a failed leave shows the error in the dialog and keeps the path", async () => {
+    const path = `/orgs/${MOCK_IDS.northwind}/members`;
+    renderConsole(path, {
+      transport: slowTransport(["RemoveMember"]),
+      queryClient: createQueryClient(),
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Leave organization" }),
+      );
+    });
+    const dialog = await confirmIn("Leave organization");
+    await settle(200);
+    expect(dialog.querySelector(".notice-error")).not.toBeNull();
+    expect(window.location.pathname).toBe(path);
+  });
+
+  test("a failed delete shows the error in the dialog and keeps the path", async () => {
+    const path = `/orgs/${MOCK_IDS.acme}/settings`;
+    renderConsole(path, {
+      transport: slowTransport(["DeleteOrganization"]),
+      queryClient: createQueryClient(),
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Delete organization" }),
+      );
+    });
+    const dialog = await confirmIn("Delete organization");
+    await settle(200);
+    expect(dialog.querySelector(".notice-error")).not.toBeNull();
+    expect(window.location.pathname).toBe(path);
+  });
+
+  test("removing another member refreshes the members list", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, {
+      transport: slowTransport(),
+      queryClient: createQueryClient(),
+    });
+    const row = (await screen.findByText("user-member-ada")).closest("li")!;
+    await act(async () => {
+      fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+    });
+    await confirmIn("Remove member");
+    await settle(300);
+    expect(screen.queryByText("user-member-ada")).toBeNull();
+    expect(screen.getByText("Jun Park")).toBeTruthy();
+    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/members`);
   });
 });
