@@ -10,7 +10,9 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -134,6 +136,48 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// hostServerMarker is the response body of the host server of the
+// OUTBOUND checks.
+const hostServerMarker = "OWNSAND-HOST-SERVER-MARKER"
+
+// startHostServer serves hostServerMarker on every IPv4 address of the host
+// on a free port until the test ends and returns the port. The OUTBOUND
+// checks fetch it from the guest at the host's own addresses, so they fail
+// when the guest reaches a host service; a fetch of port 80, where usually
+// nothing listens on a host, is refused whether the policy holds or not. It
+// first checks that the host itself reaches the server at each of addrs
+// (empty addresses are skipped).
+func startHostServer(t *testing.T, addrs ...string) string {
+	t.Helper()
+	l, err := net.Listen("tcp4", "0.0.0.0:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &http.Server{
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { io.WriteString(w, hostServerMarker) }),
+		ReadHeaderTimeout: 5 * time.Second,
+	}
+	go srv.Serve(l)
+	t.Cleanup(func() { srv.Close() })
+	port := strconv.Itoa(l.Addr().(*net.TCPAddr).Port)
+	client := &http.Client{Timeout: 3 * time.Second}
+	for _, a := range addrs {
+		if a == "" {
+			continue
+		}
+		resp, err := client.Get("http://" + net.JoinHostPort(a, port) + "/")
+		if err != nil {
+			t.Fatalf("the host cannot reach its own test server at %s: %v", a, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(body) != hostServerMarker {
+			t.Fatalf("the host test server at %s answered %q", a, body)
+		}
+	}
+	return port
 }
 
 // hostLANAddress returns an IPv4 address of a host interface that is not
@@ -272,13 +316,28 @@ func TestVirtualizationIntegration(t *testing.T) {
 		if !strings.Contains(out, "INTERNET_OK") {
 			t.Fatalf("OUTBOUND sandbox cannot reach the internet: %q %v", out, ex)
 		}
-		for _, target := range []string{hostLANAddress(), "127.0.0.1", "169.254.169.254", "10.0.0.1"} {
+		lan := hostLANAddress()
+		port := startHostServer(t, lan, "127.0.0.1")
+		for _, target := range []string{lan, "127.0.0.1", "169.254.169.254", "10.0.0.1"} {
 			if target == "" {
 				continue
 			}
 			out, _ := e.exec(ob.GetSandboxId(), "/bin/sh", "-c", "wget -q -T 3 -O /dev/null http://"+target+"/ && echo REACHED || echo BLOCKED")
 			if !strings.Contains(out, "BLOCKED") {
 				t.Fatalf("OUTBOUND sandbox reached %s: %q", target, out)
+			}
+		}
+		// The host server answers on the host's own addresses and on no
+		// other: the guest must not reach it there, nor through its
+		// gateway, which serves only DNS.
+		for _, target := range []string{lan, "127.0.0.1", "$gw"} {
+			if target == "" {
+				continue
+			}
+			out, _ := e.exec(ob.GetSandboxId(), "/bin/sh", "-c",
+				"gw=$(ip route | awk '/^default/ {print $3}'); wget -q -T 3 -O - http://"+target+":"+port+"/ 2>&1; echo gateway=$gw")
+			if strings.Contains(out, hostServerMarker) || !strings.Contains(out, "gateway=172.") {
+				t.Fatalf("OUTBOUND sandbox reached the host server at %s:%s (or has no gateway): %q", target, port, out)
 			}
 		}
 	}

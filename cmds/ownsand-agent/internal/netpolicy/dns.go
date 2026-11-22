@@ -133,11 +133,9 @@ func startDNS(listen netip.AddrPort, upstream string, logger *slog.Logger, limit
 		limits.tcpDeadline = DefaultDNSTCPDeadline
 	}
 	// TCP is bound first, and UDP takes the port number of the TCP listener.
-	// For a fixed port (the agent uses 53) the order does not matter. For
-	// port 0 (the tests), the kernel then chooses the TCP port: Windows
-	// reserves blocks of TCP port numbers inside its dynamic range (Hyper-V
-	// and WinNAT exclusions) and never chooses one of them for TCP, but it can
-	// choose a UDP port whose number is reserved for TCP.
+	// For a fixed port (the agent uses 53) the order does not matter; for port
+	// 0, the kernel chooses the TCP port. The tests pass random fixed ports,
+	// because a kernel-chosen port can be excluded for UDP on Windows.
 	tcp, err := net.ListenTCP("tcp", net.TCPAddrFromAddrPort(listen))
 	if err != nil {
 		return nil, err

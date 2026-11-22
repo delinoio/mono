@@ -42,16 +42,23 @@ type Manager struct {
 	// the sandbox and removes it when the attachment fails or ends.
 	gateways map[string]TapGateway
 	rules    string
+	// cleanups counts the host clean-ups of CleanupHost. Refresh reads the
+	// host routes outside the mutex and applies its ruleset only when no
+	// clean-up ran meanwhile, so that a refresh in flight cannot apply the
+	// table again after the device removal deleted it.
+	cleanups uint64
 	// interval and refresh are RefreshInterval and Refresh; tests replace
 	// them.
 	interval time.Duration
 	refresh  func() error
-	// run, startDNS, setForwarding, tapExists, hostRoutes and applyRules are
-	// the host operations of the manager: the `ip` command, the DNS
+	// run, listTaps, startDNS, setForwarding, tapExists, hostRoutes and
+	// applyRules are the host operations of the manager: the `ip` and `nft`
+	// commands, the tap device listing, the DNS
 	// forwarder, the IPv4 forwarding switch, the tap device probe, the
 	// routing table read and the `nft` script replacement. Tests replace
 	// them so that the manager runs without root.
 	run           func(name string, args ...string) error
+	listTaps      func() ([]string, error)
 	startDNS      func(listen netip.AddrPort, upstream string, logger *slog.Logger) (dnsCloser, error)
 	setForwarding func() error
 	tapExists     func(tap string) bool
@@ -68,6 +75,7 @@ func NewManager(logger *slog.Logger) *Manager {
 		gateways:      map[string]TapGateway{},
 		interval:      RefreshInterval,
 		run:           run,
+		listTaps:      listTapDevices,
 		startDNS:      startDNSForwarder,
 		setForwarding: enableIPv4Forwarding,
 		tapExists:     tapDeviceExists,
@@ -178,6 +186,9 @@ func HostRoutes() ([]Route, []netip.Prefix, error) {
 // Refresh recomputes the ruleset from the host routes and the current DNS
 // assignments of the attached sandboxes and applies it when it changed.
 func (m *Manager) Refresh() error {
+	m.mu.Lock()
+	cleanups := m.cleanups
+	m.mu.Unlock()
 	routes, onLink, err := m.hostRoutes()
 	if err != nil {
 		return err
@@ -185,6 +196,13 @@ func (m *Manager) Refresh() error {
 	v4, v6 := Blocked(routes, onLink)
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.cleanups != cleanups {
+		// CleanupHost deleted the table while this refresh read the routes.
+		// It runs only without attached sandboxes, and the next Attach
+		// applies the table with its own refresh.
+		m.logger.Debug("network policy refresh skipped after host clean-up")
+		return nil
+	}
 	assignments := make([]TapGateway, 0, len(m.gateways))
 	for _, g := range m.gateways {
 		assignments = append(assignments, g)
@@ -384,8 +402,9 @@ func isNftTableAbsent(err error) bool {
 }
 
 // CleanupHost deletes every sandbox tap device and the agent's nftables
-// table, for an agent start (the VMs ended with the previous process) and
-// for `ownsand-agent reset`. It attempts every resource even when an earlier
+// table, for an agent start (the VMs ended with the previous process), for
+// the device removal (see Manager.CleanupHost) and for `ownsand-agent
+// reset`. It attempts every resource even when an earlier
 // one fails, logs each failure with its operation and resource, and returns
 // the failures joined (nil when every resource is deleted or was already
 // absent, so a retry after a partial failure succeeds once the remaining
@@ -393,6 +412,29 @@ func isNftTableAbsent(err error) bool {
 // reset reports it.
 func CleanupHost(logger *slog.Logger) error {
 	return cleanupHost(logger, hostCleanupOps{listTaps: listTapDevices, run: run, tapExists: tapDeviceExists})
+}
+
+// errAttached reports a host clean-up while sandboxes are attached.
+var errAttached = errors.New("netpolicy: sandboxes are still attached")
+
+// CleanupHost is the package CleanupHost through the host operations of the
+// manager, for a manager without attached sandboxes: the agent start and the
+// device removal after it deleted every sandbox. A removed agent exits for
+// good, so the clean-up of the next agent start would never run. It also
+// forgets the applied ruleset, so that a later Attach applies the table
+// again, and makes a refresh that is in flight apply nothing (see
+// Manager.cleanups). With attached sandboxes it changes nothing and returns
+// an error.
+func (m *Manager) CleanupHost() error {
+	m.mu.Lock()
+	if len(m.attached) > 0 {
+		m.mu.Unlock()
+		return errAttached
+	}
+	m.rules = ""
+	m.cleanups++
+	m.mu.Unlock()
+	return cleanupHost(m.logger, hostCleanupOps{listTaps: m.listTaps, run: m.run, tapExists: m.tapExists})
 }
 
 func cleanupHost(logger *slog.Logger, ops hostCleanupOps) error {

@@ -5,7 +5,8 @@ package e2e
 import (
 	"bytes"
 	"context"
-	"strings"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -81,23 +82,20 @@ func retryAndImport(ctx context.Context, t *testing.T, s *stack, c *ownsand.Clie
 		t.Fatalf("retry ExportSnapshot: %v", err)
 	}
 	waitExported(ctx, t, c, snapID)
-	keys := s.objects.keys("organizations/" + s.orgID + "/snapshots/" + snapID + "/attempts/")
-	attempts := map[string]int{}
-	for _, k := range keys {
-		_, rest, _ := strings.Cut(k, "/attempts/")
-		attempt, _, _ := strings.Cut(rest, "/")
-		attempts[attempt]++
-	}
 	// A stale upload of the abandoned attempt may have stored objects under
 	// its own prefix; the exported manifest points at exactly one attempt.
+	attempts := s.exportAttempts(snapID)
 	complete := 0
-	for _, n := range attempts {
-		if n == 3 {
-			complete++
+	var errs []error
+	for id, parts := range attempts {
+		if err := checkExportParts(parts, e2ePartSize, s.wantExportParts()); err != nil {
+			errs = append(errs, fmt.Errorf("attempt %s: %w", id, err))
+			continue
 		}
+		complete++
 	}
 	if complete < 1 {
-		t.Fatalf("exported objects %v, want one attempt with 3 parts", keys)
+		t.Fatalf("no complete export attempt: %v", errors.Join(errs...))
 	}
 
 	p := createParams()

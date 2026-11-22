@@ -5,6 +5,7 @@ package e2e
 import (
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,4 +176,29 @@ func TestLogSinkScanErrorDoesNotBlockWriter(t *testing.T) {
 		t.Fatal("write blocked after the scan error")
 	}
 	_ = w.Close()
+}
+
+// TestDefaultLinuxGuestRuntime checks the runtime of the stacks that create
+// LINUX sandboxes without selecting a runtime: the process runtime runs only
+// guests of the host OS, so a macOS host uses the Virtualization.framework
+// runtime when the base image is set and skips the test without it, instead
+// of failing every create with failed_precondition.
+func TestDefaultLinuxGuestRuntime(t *testing.T) {
+	for _, tc := range []struct {
+		goos, kernel, rootfs string
+		want                 linuxGuestRuntime
+		reason               string
+	}{
+		{goos: "linux", want: linuxGuestRuntimeProcess},
+		{goos: "linux", kernel: "k", rootfs: "r", want: linuxGuestRuntimeProcess},
+		{goos: "darwin", kernel: "k", rootfs: "r", want: linuxGuestRuntimeVirtualization},
+		{goos: "darwin", want: linuxGuestRuntimeUnavailable, reason: envVZKernel},
+		{goos: "darwin", kernel: "k", want: linuxGuestRuntimeUnavailable, reason: envVZRootfs},
+		{goos: "windows", kernel: "k", rootfs: "r", want: linuxGuestRuntimeUnavailable, reason: "windows host"},
+	} {
+		got, reason := defaultLinuxGuestRuntime(tc.goos, tc.kernel, tc.rootfs)
+		if got != tc.want || (tc.reason == "") != (reason == "") || !strings.Contains(reason, tc.reason) {
+			t.Errorf("defaultLinuxGuestRuntime(%q, %q, %q) = (%v, %q), want (%v, containing %q)", tc.goos, tc.kernel, tc.rootfs, got, reason, tc.want, tc.reason)
+		}
+	}
 }

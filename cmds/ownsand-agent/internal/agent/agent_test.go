@@ -346,6 +346,43 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	requireEmptyStateDir(t, st)
 }
 
+// TestStatusRecordsCapabilities checks that the status file holds the
+// capabilities of the capability report that the agent sent, so that
+// `ownsand-agent status` can print the hypervisor checks.
+func TestStatusRecordsCapabilities(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	h := start(t, cp, st, id)
+	env, _ := h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+	caps := env.GetCapabilityReport().GetCapabilities()
+	var status Status
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status = Status{}
+		if err := st.LoadStatus(&status); err == nil && !status.CapabilitiesAt.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the status file has no capabilities: %+v", status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(status.Checks) == 0 || len(status.Checks) != len(caps.GetHypervisorChecks()) {
+		t.Fatalf("status checks %+v, report %v", status.Checks, caps.GetHypervisorChecks())
+	}
+	for i, ch := range caps.GetHypervisorChecks() {
+		if got := status.Checks[i]; got.ID != ch.GetCheckId() || got.Passed != ch.GetPassed() || got.Detail != ch.GetDetail() {
+			t.Errorf("status check %d = %+v, want %v", i, got, ch)
+		}
+	}
+	if len(status.GuestOSes) != len(caps.GetGuestOses()) || status.GuestOSes[0] != caps.GetGuestOses()[0].String() {
+		t.Errorf("status guest OSes %v, report %v", status.GuestOSes, caps.GetGuestOses())
+	}
+	if len(status.BaseImages) != len(caps.GetBuiltBaseImages()) {
+		t.Errorf("status base images %v, report %v", status.BaseImages, caps.GetBuiltBaseImages())
+	}
+}
+
 // TestFailedRemovalResumesStatusWrites checks that a removal that fails
 // keeps the agent enrolled and lifts the status fence, so the status file
 // renews while the removal retries.
@@ -390,6 +427,78 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 		t.Fatal("removal not confirmed")
 	}
 	requireEmptyStateDir(t, st)
+}
+
+// hostCleanerRuntime is a runtime with host resources outside the state
+// directory, like the Linux Firecracker runtime: it records the CleanupHost
+// calls and the sandboxes that still ran at each call.
+type hostCleanerRuntime struct {
+	vmruntime.Runtime
+	mu      sync.Mutex
+	calls   int
+	running []string
+	err     error
+}
+
+func (r *hostCleanerRuntime) CleanupHost() error {
+	ids, _ := r.Runtime.Running(context.Background())
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls++
+	r.running = append(r.running, ids...)
+	return r.err
+}
+
+// TestRemovalCleansUpHostNetwork checks that the device removal deletes the
+// host network resources of the runtime after it deleted every sandbox: a
+// removed agent exits for good and never runs the clean-up of the next
+// start. A failed host clean-up is logged and does not stop the removal.
+func TestRemovalCleansUpHostNetwork(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{{"success", nil}, {"failure", errors.New("delete nftables table inet ownsand: simulated")}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := testcp.New(t)
+			st, id := enrollDevice(t, cp)
+			var rt *hostCleanerRuntime
+			h := startWith(t, cp, st, id, func(o *Options) {
+				rt = &hostCleanerRuntime{Runtime: o.Runtime, err: tc.err}
+				o.Runtime = rt
+			})
+			h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+			cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+			sandboxID, _ := uuidv7.NewString()
+			if res := h.command(createCommand(sandboxID)); res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+				t.Fatalf("create result %v", res)
+			}
+			cp.MarkRemoved(id.DeviceID)
+			cmdID, _ := uuidv7.NewString()
+			cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CleanUp{CleanUp: &ownsandv1.CleanUpCommand{}}}}})
+			select {
+			case err := <-h.errc:
+				if !errors.Is(err, ErrRemoved) {
+					t.Fatalf("run returned %v", err)
+				}
+				h.errc <- err
+			case <-time.After(20 * time.Second):
+				t.Fatal("agent did not finish the removal")
+			}
+			rt.mu.Lock()
+			calls, running := rt.calls, rt.running
+			rt.mu.Unlock()
+			if calls != 1 {
+				t.Fatalf("CleanupHost calls = %d, want 1", calls)
+			}
+			if len(running) != 0 {
+				t.Fatalf("CleanupHost ran while sandboxes ran: %v", running)
+			}
+			if cp.Confirms() != 1 {
+				t.Fatal("removal not confirmed")
+			}
+			requireEmptyStateDir(t, st)
+		})
+	}
 }
 
 func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {

@@ -6,7 +6,9 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 )
 
@@ -80,5 +82,55 @@ func TestCLIMisc(t *testing.T) {
 	}
 	if code := run([]string{"run", "--service-manager", "bogus"}, nil, &out, &errb); code != exitUsage {
 		t.Fatalf("unknown service manager: %d", code)
+	}
+}
+
+// A configuration that does not parse ends `run` with the usage exit code
+// and the error on standard error; the test process is no Windows service,
+// so the Windows build does not connect to the service control manager.
+func TestRunWithInvalidConfiguration(t *testing.T) {
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", t.TempDir())
+	t.Setenv("OWNSAND_AGENT_LOG_LEVEL", "bogus")
+	var out, errb bytes.Buffer
+	if code := run([]string{"run"}, nil, &out, &errb); code != exitUsage {
+		t.Fatalf("run = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(errb.String(), "invalid OWNSAND_AGENT_LOG_LEVEL") {
+		t.Fatalf("stderr = %q", errb.String())
+	}
+}
+
+// TestStatusPrintsCapabilities checks the capability lines of `status`:
+// every hypervisor check of the last capability report with its result and
+// detail, and an unknown state before the first report.
+func TestStatusPrintsCapabilities(t *testing.T) {
+	var out bytes.Buffer
+	printCapabilities(&out, agent.Status{}, colors{})
+	if got := out.String(); got != "Capabilities: unknown (no capability report yet)\n" {
+		t.Fatalf("before a report: %q", got)
+	}
+	out.Reset()
+	at := time.Date(2026, 11, 22, 14, 25, 28, 0, time.Local)
+	printCapabilities(&out, agent.Status{
+		GuestOSes:  []string{"GUEST_OS_LINUX", "GUEST_OS_MACOS"},
+		BaseImages: []string{"BASE_IMAGE_LINUX"},
+		Checks: []agent.StatusCheck{
+			{ID: "virtualization-entitlement", Passed: true, Detail: "the agent executable has the entitlement"},
+			{ID: "macos-base-image", Detail: "the macOS base image is not built"},
+			{ID: "outbound-network", Passed: true},
+		},
+		CapabilitiesAt: at,
+	}, colors{})
+	want := "Capabilities: guest OSes GUEST_OS_LINUX, GUEST_OS_MACOS; base images BASE_IMAGE_LINUX (report of 2026-11-22 14:25:28)\n" +
+		"  virtualization-entitlement: passed (the agent executable has the entitlement)\n" +
+		"  macos-base-image: failed (the macOS base image is not built)\n" +
+		"  outbound-network: passed\n"
+	if got := out.String(); got != want {
+		t.Fatalf("status capabilities:\n%s\nwant:\n%s", got, want)
+	}
+	out.Reset()
+	printCapabilities(&out, agent.Status{CapabilitiesAt: at}, colors{})
+	if got := out.String(); !strings.Contains(got, "guest OSes none; base images none") {
+		t.Fatalf("empty report: %q", got)
 	}
 }

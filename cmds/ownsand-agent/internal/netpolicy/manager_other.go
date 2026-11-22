@@ -24,6 +24,9 @@ func NewManager(*slog.Logger) *Manager { return &Manager{} }
 // Attach fails on this host OS.
 func (m *Manager) Attach(string) (Link, string, error) { return Link{}, "", errUnsupported }
 
+// CleanupHost does nothing on this host OS and reports no error.
+func (m *Manager) CleanupHost() error { return nil }
+
 // Detach does nothing on this host OS.
 func (m *Manager) Detach(string) {}
 

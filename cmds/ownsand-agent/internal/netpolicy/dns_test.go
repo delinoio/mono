@@ -7,6 +7,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/netip"
 	"os"
@@ -20,8 +21,8 @@ import (
 
 func TestDNSForwarder(t *testing.T) {
 	// Upstream: UDP and TCP echo with a marker, answering at once. The helpers
-	// retry when the UDP port with the number of the kernel-chosen TCP port is
-	// taken already.
+	// retry with another candidate port when one of the two listeners cannot
+	// bind it.
 	up := startGatedUpstream(t)
 	up.open()
 	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: DefaultDNSMaxUDPQueries, maxTCPConns: DefaultDNSMaxTCPConns})
@@ -81,23 +82,19 @@ type gatedUpstream struct {
 
 func startGatedUpstream(t *testing.T) *gatedUpstream {
 	t.Helper()
-	// The kernel picks the TCP port, and the UDP port with the same number can
-	// be taken already: retry with another TCP port. TCP goes first because
-	// Windows reserves blocks of TCP port numbers in its dynamic range and
-	// hands out UDP ports one after another, so all retries of a UDP-first
-	// order can land in one reserved TCP block.
+	// The UDP and TCP listeners need the same port number, which can be taken
+	// or excluded for one of them: retry with another candidate port.
 	var up *net.UDPConn
 	var upTCP net.Listener
 	for attempt := 0; ; attempt++ {
 		var err error
-		upTCP, err = net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			t.Fatal(err)
+		upTCP, err = net.Listen("tcp", candidateAddr().String())
+		if err == nil {
+			if up, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(upTCP.Addr().(*net.TCPAddr).AddrPort())); err == nil {
+				break
+			}
+			upTCP.Close()
 		}
-		if up, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(upTCP.Addr().(*net.TCPAddr).AddrPort())); err == nil {
-			break
-		}
-		upTCP.Close()
 		if attempt == 20 {
 			t.Fatal(err)
 		}
@@ -149,12 +146,12 @@ func startGatedUpstream(t *testing.T) *gatedUpstream {
 }
 
 // startTestDNS is startDNS with retries: the forwarder listens on one port
-// number for UDP and TCP, and the UDP side of a kernel-chosen TCP port can be
-// taken already.
+// number for UDP and TCP, and a candidate port can be taken or excluded for
+// one of them.
 func startTestDNS(t *testing.T, upstream string, logger *slog.Logger, limits dnsLimits) *DNSForwarder {
 	t.Helper()
 	for attempt := 0; ; attempt++ {
-		f, err := startDNS(netip.MustParseAddrPort("127.0.0.1:0"), upstream, logger, limits)
+		f, err := startDNS(candidateAddr(), upstream, logger, limits)
 		if err == nil {
 			return f
 		}
@@ -162,6 +159,18 @@ func startTestDNS(t *testing.T, upstream string, logger *slog.Logger, limits dns
 			t.Fatal(err)
 		}
 	}
+}
+
+// candidateAddr returns a loopback address with a random port of the dynamic
+// range (49152-65535) for a test listener that needs the same port number for
+// UDP and TCP. A kernel-chosen port is no good candidate on Windows: Windows
+// hands out ephemeral ports in sequence, and Hyper-V, WSL and WinNAT exclude
+// blocks of port numbers from that range (netsh int ipv4 show
+// excludedportrange protocol=tcp, and protocol=udp), so once one candidate
+// falls into such a block, every following kernel-chosen candidate fails with
+// an access error in the same block.
+func candidateAddr() netip.AddrPort {
+	return netip.AddrPortFrom(netip.AddrFrom4([4]byte{127, 0, 0, 1}), uint16(49152+rand.IntN(65536-49152)))
 }
 
 func (g *gatedUpstream) open() { g.once.Do(func() { close(g.release) }) }

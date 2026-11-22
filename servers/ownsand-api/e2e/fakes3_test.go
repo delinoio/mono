@@ -73,6 +73,19 @@ func newFakeS3(t *testing.T) *fakeS3 {
 	return f
 }
 
+// sizes returns the size of every object whose key starts with prefix.
+func (f *fakeS3) sizes(prefix string) map[string]int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string]int{}
+	for k, v := range f.objects {
+		if strings.HasPrefix(k, prefix) {
+			out[k] = len(v)
+		}
+	}
+	return out
+}
+
 func (f *fakeS3) keys(prefix string) []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()

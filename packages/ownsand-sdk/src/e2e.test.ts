@@ -177,10 +177,12 @@ async function expectSuspended(
           }
 
           // The process runtime's guest paths are host paths below the
-          // sandbox root, which is the exec working directory.
+          // sandbox root, which is the exec working directory. In a VM
+          // guest the working directory is "/", so root is empty there.
           const pwd = await sandbox.run({ command: ["/bin/pwd"] });
-          const root = decoder.decode(pwd.stdout).trim().replace(/\/$/, "");
-          expect(root.startsWith("/")).toBe(true);
+          const dir = decoder.decode(pwd.stdout).trim();
+          expect(dir.startsWith("/")).toBe(true);
+          const root = dir.replace(/\/$/, "");
 
           const data = randomBytes(2 * 1024 * 1024 + 4321);
           await sandbox.writeFile(`${root}/ts.bin`, data);

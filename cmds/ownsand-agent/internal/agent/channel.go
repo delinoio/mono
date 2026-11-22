@@ -221,7 +221,7 @@ func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityRepor
 	caps := a.rt.Capabilities(ctx)
 	caps.MacOSHardwareModels = a.macOSHardwareModels(caps.MacOSHardwareModels)
 	free, _ := sysinfo.FreeDiskBytes(a.st.Dir())
-	return &ownsandv1.CapabilityReport{
+	report := &ownsandv1.CapabilityReport{
 		HostOs:       sysinfo.HostOS(),
 		Arch:         sysinfo.Arch(),
 		AgentVersion: version.Version,
@@ -236,6 +236,8 @@ func (a *Agent) capabilityReport(ctx context.Context) *ownsandv1.CapabilityRepor
 			HypervisorChecks:     caps.Checks,
 		},
 	}
+	a.setCapabilities(report.GetCapabilities())
+	return report
 }
 
 // macOSHardwareModels adds the hardware models of the local macOS

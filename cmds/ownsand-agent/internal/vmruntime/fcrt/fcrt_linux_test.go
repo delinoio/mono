@@ -252,8 +252,9 @@ func TestCreateFailureReleasesVM(t *testing.T) {
 // tap devices and the nftables table of the host.
 func TestRuntimeRunsNetworkRefresh(t *testing.T) {
 	cleanups := 0
-	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()}, func() {
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()}, func() error {
 		cleanups++
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -279,18 +280,47 @@ func TestRuntimeRunsNetworkRefresh(t *testing.T) {
 	}
 }
 
+// CleanupHost, which the device removal calls, runs the host network
+// clean-up of the runtime again and returns its error. The test passes an
+// in-memory clean-up and never reaches the live host network.
+func TestRuntimeCleanupHostRunsHostCleanup(t *testing.T) {
+	cleanups := 0
+	fail := errors.New("delete nftables table inet ownsand: simulated")
+	var result error
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Network: netpolicy.NewManager(quiet()), Logger: quiet()}, func() error {
+		cleanups++
+		return result
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { r.Close() })
+	var _ vmruntime.HostCleaner = r
+	if err := r.CleanupHost(); err != nil || cleanups != 2 {
+		t.Fatalf("CleanupHost = %v after %d clean-ups, want nil after 2 (startup and removal)", err, cleanups)
+	}
+	result = fail
+	if err := r.CleanupHost(); !errors.Is(err, fail) {
+		t.Fatalf("CleanupHost = %v, want the clean-up failure", err)
+	}
+}
+
 // Without a network manager the startup skips the clean-up and the refresh
 // loop.
 func TestRuntimeWithoutNetworkSkipsCleanupAndRefresh(t *testing.T) {
 	cleanups := 0
-	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Logger: quiet()}, func() {
+	r, err := newRuntime(Options{Binary: filepath.Join(t.TempDir(), "missing"), Logger: quiet()}, func() error {
 		cleanups++
+		return nil
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if cleanups != 0 {
 		t.Fatalf("startup clean-up ran %d times without a network manager, want 0", cleanups)
+	}
+	if err := r.CleanupHost(); err != nil || cleanups != 0 {
+		t.Fatalf("CleanupHost without a network manager = %v after %d clean-ups, want nil after 0", err, cleanups)
 	}
 	if r.refreshDone != nil || r.stopRefresh != nil {
 		t.Fatal("refresh loop started without a network manager")
