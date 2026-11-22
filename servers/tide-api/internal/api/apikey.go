@@ -79,6 +79,18 @@ func (h APIKeyHandler) CreateApiKey(ctx context.Context, req *connect.Request[ti
 		if err := LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
+		// Lock the caller's membership after the organization, the lock
+		// order of RemoveMember. A removal that committed after Authorize
+		// deleted the row, so the key is not created; a removal that starts
+		// later waits for this commit and then revokes the new key too.
+		var locked int
+		err = tx.QueryRow(ctx, "SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR KEY SHARE", c.OrganizationID, c.UserID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound("organization")
+		}
+		if err != nil {
+			return err
+		}
 		secret, err := auth.NewSecret(auth.SecretAPIKey)
 		if err != nil {
 			return err

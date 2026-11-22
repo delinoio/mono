@@ -166,3 +166,26 @@ func TestPersonalAPIKeyFollowsMembership(t *testing.T) {
 	}
 	wantCode(t, "key without membership", listProfiles(env.Bearer(secret2), org.ID), connect.CodeNotFound)
 }
+
+// A key creation that passed Authorize before a membership removal committed
+// must not leave an unrevoked key behind.
+func TestCreateApiKeyAfterConcurrentRemoval(t *testing.T) {
+	env := testenv.New(t)
+	ctx := context.Background()
+	org := env.NewOrg("alice")
+	// The held deletion stands in for a RemoveMember that commits while the
+	// creation runs.
+	commit := holdTx(t, env, "DELETE FROM memberships WHERE organization_id = $1 AND user_id = $2", org.ID, org.Member)
+	errc := make(chan error, 1)
+	go func() {
+		_, err := env.User(org.Member).APIKey.CreateApiKey(ctx, connect.NewRequest(&tidev1.CreateApiKeyRequest{OrganizationId: org.ID, Name: "late"}))
+		errc <- err
+	}()
+	waitForLockWaiter(t, env)
+	commit()
+	wantCode(t, "create after removal", <-errc, connect.CodeNotFound)
+	var keys int
+	if err := env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM api_keys WHERE organization_id = $1 AND user_id = $2", org.ID, org.Member).Scan(&keys); err != nil || keys != 0 {
+		t.Fatalf("keys of the removed user = %d, %v", keys, err)
+	}
+}
