@@ -3,6 +3,7 @@
 package api
 
 import (
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -61,6 +62,25 @@ func TestPageSizeAndToken(t *testing.T) {
 	raw := encodePageToken(pageToken{RPC: "R", Scope: "S", After: "a", AfterTime: 5})
 	if tok, err := decodePageToken(raw, "R", "S"); err != nil || tok.After != "a" || tok.AfterTime != 5 {
 		t.Fatalf("decode = %+v, %v", tok, err)
+	}
+	for _, forged := range []pageToken{
+		{RPC: "R", Scope: "S", After: "a", AfterTime: -1},
+		{RPC: "R", Scope: "S", After: "a", AfterTime: math.MinInt64},
+		{RPC: "R", Scope: "S", After: "\x00"},
+		{RPC: "R", Scope: "S", After: "a\x00b", AfterTime: 5},
+		{RPC: "R", Scope: "S", After: "ownsand\n\x00\nmeter"},
+	} {
+		if _, err := decodePageToken(encodePageToken(forged), "R", "S"); connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Errorf("decodePageToken(%+v) error = %v", forged, err)
+		}
+	}
+	for _, valid := range []pageToken{
+		{RPC: "R", Scope: "S", After: "a"},
+		{RPC: "R", Scope: "S", After: "a\x01b", AfterTime: math.MaxInt64},
+	} {
+		if _, err := decodePageToken(encodePageToken(valid), "R", "S"); err != nil {
+			t.Errorf("decodePageToken(%+v) error = %v", valid, err)
+		}
 	}
 	for _, tc := range [][3]string{{raw, "R", "other"}, {raw, "Other", "S"}, {"%%%", "R", "S"}, {"e30", "R", "S"}} {
 		if _, err := decodePageToken(tc[0], tc[1], tc[2]); connect.CodeOf(err) != connect.CodeInvalidArgument {
