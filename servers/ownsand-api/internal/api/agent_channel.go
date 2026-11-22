@@ -64,8 +64,9 @@ var errDeviceRemoved = errors.New("the device was removed")
 // back the device state. The handler cannot return while the send is
 // active: returning would finish the response writer under the blocked
 // send, which is a data race and a panic in net/http. The handler instead
-// aborts the blocked write (see abortStalledWrite) and then waits for the
-// writer to end.
+// aborts the blocked write (see abortStalledWrite) right after the drain
+// timeout, before the device state update, so a delayed update does not
+// keep the blocked write. It then waits for the writer to end.
 const DefaultWriterDrainTimeout = 5 * time.Second
 
 // streamControlKey is the context key of the response controller of the
@@ -223,9 +224,27 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		// this call (and is marked) or sees the closed channel (and starts
 		// the expiry itself).
 		expiring := h.commands.markClosed(conn.DeviceID, conn.Generation, h.now())
+		stalled := false
 		select {
 		case <-writerDone:
 		case <-time.After(h.writerDrainTimeout()):
+			select {
+			case <-writerDone:
+			default:
+				stalled = true
+			}
+		}
+		if stalled {
+			// Abort the blocked transport write before the device state
+			// changes: markOffline waits on the device row lock without a
+			// bound, and a blocked writer must not stay until it returns.
+			// The send returns an error once the stream is reset. When the
+			// abort is not possible, the wait for the writer below lasts
+			// until the transport ends the stream (the agent disconnects).
+			log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_stalled", slog.String("cause", fmt.Sprint(context.Cause(conn.Context()))))
+			if err := abortStalledWrite(ctx); err != nil {
+				log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_abort_failed", slog.Any("error", err))
+			}
 		}
 		current := h.Hub.Unregister(conn)
 		cause := context.Cause(conn.Context())
@@ -234,17 +253,9 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 		if current {
 			h.markOffline(context.WithoutCancel(ctx), conn.DeviceID)
 		}
-		select {
-		case <-writerDone:
-		default:
-			log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_stalled", slog.String("cause", fmt.Sprint(cause)))
-			// Abort the blocked transport write, then wait: the send returns
-			// an error once the stream is reset, so the wait ends. When the
-			// abort is not possible, the wait lasts until the transport ends
-			// the stream (the agent disconnects).
-			if err := abortStalledWrite(ctx); err != nil {
-				log.WarnContext(context.WithoutCancel(ctx), "agent_channel_writer_abort_failed", slog.Any("error", err))
-			}
+		if stalled {
+			// The handler cannot return while the send is active: returning
+			// would finish the response writer under the blocked send.
 			<-writerDone
 			log.InfoContext(context.WithoutCancel(ctx), "agent_channel_writer_ended")
 		}
