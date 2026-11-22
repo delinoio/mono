@@ -153,11 +153,18 @@ func (c *Client) CreateSandbox(ctx context.Context, p CreateSandboxParams) (*San
 }
 
 // Sandbox returns a handle for an existing sandbox. org may be "" for the
-// client default.
+// client default. A valid sandbox UUID in either hex case is stored in its
+// lowercase canonical text form, so the handle spells the identifier the same
+// way in Connect requests, relay request digests and peer-to-peer frames, as
+// the control plane and the agent do. A value that is not a valid UUID v7 is
+// kept as given, so request validation still reports it.
 func (c *Client) Sandbox(org, sandboxID string) (*Sandbox, error) {
 	o, err := c.organization(org)
 	if err != nil {
 		return nil, err
+	}
+	if u, perr := uuidv7.Parse(sandboxID); perr == nil {
+		sandboxID = u.String()
 	}
 	return c.handle(o, &ownsandv1.Sandbox{SandboxId: sandboxID, OrganizationId: o}), nil
 }

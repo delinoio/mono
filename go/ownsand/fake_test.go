@@ -33,6 +33,18 @@ import (
 
 const testAPIKey = "osk_test-secret-key-value"
 
+// canonicalFakeID returns the lowercase text form of a valid UUID v7 and any
+// other value unchanged. The real control plane rewrites validated sandbox
+// identifiers this way before it forwards a request to an agent or compares a
+// request with a relay grant; the fakes do the same, so a test that opens a
+// handle with an uppercase spelling reproduces that behavior.
+func canonicalFakeID(s string) string {
+	if u, err := uuidv7.Parse(s); err == nil {
+		return u.String()
+	}
+	return s
+}
+
 func mustID(t testing.TB) string {
 	t.Helper()
 	id, err := uuidv7.NewString()
@@ -445,12 +457,12 @@ func (f *fakeSandboxes) GetSandbox(_ context.Context, req *connect.Request[ownsa
 	cp.mu.Lock()
 	defer cp.mu.Unlock()
 	for _, sb := range cp.created {
-		if sb.GetSandboxId() == req.Msg.GetSandboxId() {
+		if sb.GetSandboxId() == canonicalFakeID(req.Msg.GetSandboxId()) {
 			sb.State = ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
 			return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: sb}), nil
 		}
 	}
-	if req.Msg.GetSandboxId() != cp.sandboxID {
+	if canonicalFakeID(req.Msg.GetSandboxId()) != cp.sandboxID {
 		return nil, connect.NewError(connect.CodeNotFound, errors.New("sandbox not found"))
 	}
 	return connect.NewResponse(&ownsandv1.GetSandboxResponse{Sandbox: f.record()}), nil
@@ -569,7 +581,7 @@ func (f *fakeDataPath) OpenSession(ctx context.Context, req *connect.Request[own
 			cp.t.Errorf("data channel %q does not follow the wire agreement", dc.Label())
 			return
 		}
-		newFakeAgentSession(cp, pc, dc, req.Msg.GetSandboxId())
+		newFakeAgentSession(cp, pc, dc, canonicalFakeID(req.Msg.GetSandboxId()))
 	})
 	if err := pc.SetRemoteDescription(webrtc.SessionDescription{Type: webrtc.SDPTypeOffer, SDP: req.Msg.GetSdpOffer()}); err != nil {
 		return nil, connect.NewError(connect.CodeInvalidArgument, err)
@@ -850,18 +862,21 @@ func (f *fakeRelay) execLike(ctx context.Context, method string, h http.Header, 
 }
 
 func (f *fakeRelay) Exec(ctx context.Context, req *connect.Request[ownsandv1.ExecRequest], stream *connect.ServerStream[ownsandv1.ExecResponse]) error {
+	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	return f.execLike(ctx, "Exec", req.Header(), nil, req.Msg, func(ev *ownsandv1.ExecEvent) error {
 		return stream.Send(&ownsandv1.ExecResponse{Event: ev})
 	})
 }
 
 func (f *fakeRelay) AttachExec(ctx context.Context, req *connect.Request[ownsandv1.AttachExecRequest], stream *connect.ServerStream[ownsandv1.AttachExecResponse]) error {
+	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	return f.execLike(ctx, "AttachExec", req.Header(), req.Msg, nil, func(ev *ownsandv1.ExecEvent) error {
 		return stream.Send(&ownsandv1.AttachExecResponse{Event: ev})
 	})
 }
 
 func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1.ReadFileRequest], stream *connect.ServerStream[ownsandv1.ReadFileResponse]) error {
+	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	g, act, err := f.begin("ReadFile", req.Header(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_READ_FILE)
 	if err != nil {
 		return err
@@ -916,6 +931,7 @@ func (f *fakeRelay) ReadFile(ctx context.Context, req *connect.Request[ownsandv1
 }
 
 func (f *fakeRelay) WriteFile(_ context.Context, req *connect.Request[ownsandv1.WriteFileRequest]) (*connect.Response[ownsandv1.WriteFileResponse], error) {
+	req.Msg.SandboxId = canonicalFakeID(req.Msg.GetSandboxId())
 	g, act, err := f.begin("WriteFile", req.Header(), ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_WRITE_FILE)
 	if err != nil {
 		return nil, err
