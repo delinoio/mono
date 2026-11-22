@@ -53,6 +53,11 @@ export function MembersSection() {
   const removeMember = useMutation(BillingAccountService.method.removeMember, {
     onSuccess: refresh,
   });
+  // Leaving has no `onSuccess` refresh: the leaving user can no longer read
+  // the account, so refetching its queries would render the not-found notice
+  // before the page navigates away. A per-call `onSuccess` would not replace
+  // the hook-level one, so leaving uses its own mutation.
+  const leave = useMutation(BillingAccountService.method.removeMember);
   const transfer = useMutation(BillingAccountService.method.transferOwnership, {
     onSuccess: refresh,
   });
@@ -184,11 +189,14 @@ export function MembersSection() {
         description="You lose access to its balance, usage and settings. An owner or admin can invite you again."
         confirmLabel="Leave billing account"
         onConfirm={async () => {
-          await removeMember.mutateAsync({
+          await leave.mutateAsync({
             billingAccountId,
             userId: userId ?? "",
           });
+          // Leave the account first, so that the invalidation does not
+          // refetch its queries (they are now `not_found` for this user).
           navigate(routePath({ id: RouteId.Billing }));
+          await refresh();
         }}
       />
     </div>
