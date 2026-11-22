@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -164,6 +165,204 @@ func TestReadTarRejectsDirectoryBelowEscapingLink(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(parent, "created")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("directory created outside the restore root: %v", err)
+	}
+}
+
+// restoreBelowSecret returns a restore directory below a parent that holds
+// secret.txt, so a link that escapes the restore root has something to reach.
+func restoreBelowSecret(t *testing.T) (parent, dir string) {
+	t.Helper()
+	parent = t.TempDir()
+	if err := os.WriteFile(filepath.Join(parent, "secret.txt"), []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir = filepath.Join(parent, "restore")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return parent, dir
+}
+
+// requireNothingOutside fails when the parent directory holds anything but
+// secret.txt and the restore directory.
+func requireNothingOutside(t *testing.T, parent string) {
+	t.Helper()
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if e.Name() != "secret.txt" && e.Name() != "restore" {
+			t.Errorf("entry created outside the restore root: %s", e.Name())
+		}
+	}
+}
+
+// requireLinkInside fails when the symbolic link name below dir resolves to
+// a path outside dir. A link that resolves to nothing passes.
+func requireLinkInside(t *testing.T, dir, name string) {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(filepath.Join(dir, name))
+	if errors.Is(err, os.ErrNotExist) {
+		return
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	realDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(realDir, resolved)
+	if err != nil || !filepath.IsLocal(rel) && rel != "." {
+		t.Fatalf("link %s resolves outside the root: %s", name, resolved)
+	}
+}
+
+func TestReadTarRejectsChainedLinkWithNothingWrittenThroughIt(t *testing.T) {
+	requireSymlinks(t)
+	parent, dir := restoreBelowSecret(t)
+	// "b" passes the lexical check, because "a/.." cleans to ".", but "a"
+	// is a link to the root, so the file system resolves "a/.." to the
+	// parent of the root.
+	buf := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "."}},
+		{hdr: tar.Header{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "a/.."}},
+	})
+	err := ReadTar(buf, dir)
+	if runtime.GOOS == "windows" {
+		// Windows removes ".." elements lexically before it follows a
+		// link, so "a/.." is the root. ReadTar may accept the archive, but
+		// then "b" must resolve inside the root.
+		if err == nil {
+			requireLinkInside(t, dir, "b")
+		}
+	} else if err == nil {
+		t.Fatal("accepted a symbolic link that resolves outside the root through an earlier link")
+	}
+	requireNothingOutside(t, parent)
+}
+
+func TestReadTarRejectsChainedLinkVariants(t *testing.T) {
+	deep := strings.Repeat("a/", 25) + strings.Repeat("../", 25)
+	tests := []struct {
+		name    string
+		entries []tarEntry
+		links   []string
+	}{
+		{
+			name: "link to a directory with a dot-dot suffix",
+			entries: []tarEntry{
+				{hdr: tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0o755}},
+				{hdr: tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "sub/.."}},
+				{hdr: tar.Header{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "a/.."}},
+			},
+			links: []string{"a", "b"},
+		},
+		{
+			name: "link below a directory that climbs",
+			entries: []tarEntry{
+				{hdr: tar.Header{Name: "d", Typeflag: tar.TypeDir, Mode: 0o755}},
+				{hdr: tar.Header{Name: "d/up", Typeflag: tar.TypeSymlink, Linkname: ".."}},
+				{hdr: tar.Header{Name: "d/x", Typeflag: tar.TypeSymlink, Linkname: "up/.."}},
+			},
+			links: []string{"d/up", "d/x"},
+		},
+		{
+			name: "dot-dot after a repeated link",
+			entries: []tarEntry{
+				{hdr: tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "."}},
+				{hdr: tar.Header{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "a/a/../.."}},
+			},
+			links: []string{"a", "b"},
+		},
+		{
+			name: "deep chain that reaches the parent",
+			entries: []tarEntry{
+				{hdr: tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "."}},
+				{hdr: tar.Header{Name: "disk.ext4", Typeflag: tar.TypeSymlink, Linkname: deep + "secret.txt"}},
+			},
+			links: []string{"a", "disk.ext4"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			requireSymlinks(t)
+			parent, dir := restoreBelowSecret(t)
+			err := ReadTar(buildTar(t, tt.entries), dir)
+			if runtime.GOOS == "windows" {
+				// Windows cleans ".." lexically, so these links stay in
+				// the root. ReadTar may accept the archive, but then no
+				// link may resolve outside the root.
+				if err == nil {
+					for _, name := range tt.links {
+						requireLinkInside(t, dir, filepath.FromSlash(name))
+					}
+				}
+			} else if err == nil {
+				t.Fatal("accepted a symbolic link that resolves outside the root")
+			}
+			requireNothingOutside(t, parent)
+		})
+	}
+}
+
+func TestReadTarRejectsLinkThatLaterBecomesChained(t *testing.T) {
+	requireSymlinks(t)
+	parent, dir := restoreBelowSecret(t)
+	// "missing" does not exist when "b" is created, so a check at creation
+	// time accepts "b". The next entry turns "missing" into a link to the
+	// root, and then "b" resolves to the parent of the root.
+	buf := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "missing/.."}},
+		{hdr: tar.Header{Name: "missing", Typeflag: tar.TypeSymlink, Linkname: "."}},
+	})
+	err := ReadTar(buf, dir)
+	if runtime.GOOS == "windows" {
+		// Windows cleans ".." lexically, so "missing/.." is the root.
+		if err == nil {
+			requireLinkInside(t, dir, "b")
+		}
+	} else if err == nil {
+		t.Fatal("accepted a link that resolves outside the root after a later entry")
+	}
+	requireNothingOutside(t, parent)
+}
+
+func TestReadTarAcceptsChainedLinkInsideTheRoot(t *testing.T) {
+	requireSymlinks(t)
+	parent, dir := restoreBelowSecret(t)
+	// "a/.." is the root here, because "a" is a link to the directory "sub"
+	// below the root.
+	buf := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "sub", Typeflag: tar.TypeDir, Mode: 0o755}},
+		{hdr: tar.Header{Name: "a", Typeflag: tar.TypeSymlink, Linkname: "sub"}},
+		{hdr: tar.Header{Name: "b", Typeflag: tar.TypeSymlink, Linkname: "a/.."}},
+	})
+	if err := ReadTar(buf, dir); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]string{"a": "sub", "b": "a/.."} {
+		got, err := os.Readlink(filepath.Join(dir, name))
+		if err != nil || filepath.ToSlash(got) != want {
+			t.Errorf("Readlink(%s) = %q, %v; want %q", name, got, err, want)
+		}
+	}
+	requireLinkInside(t, dir, "b")
+	requireNothingOutside(t, parent)
+}
+
+func TestReadTarAcceptsLinkThroughARegularFile(t *testing.T) {
+	requireSymlinks(t)
+	dir := t.TempDir()
+	// A link below a regular file resolves to nothing and stays allowed
+	// like a dangling link.
+	buf := buildTar(t, []tarEntry{
+		{hdr: tar.Header{Name: "f", Typeflag: tar.TypeReg, Mode: 0o644}, data: "x"},
+		{hdr: tar.Header{Name: "l", Typeflag: tar.TypeSymlink, Linkname: "f/x"}},
+	})
+	if err := ReadTar(buf, dir); err != nil {
+		t.Fatal(err)
 	}
 }
 
