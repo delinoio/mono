@@ -35,6 +35,7 @@ const (
 	guestEnvWorkspace = "TIDE_SYNC_WORKSPACE"
 	guestEnvArchive   = "TIDE_SYNC_ARCHIVE"
 	guestEnvDeletes   = "TIDE_SYNC_DELETE_LIST"
+	guestEnvPrunes    = "TIDE_SYNC_PRUNE_LIST"
 	guestEnvLinks     = "TIDE_SYNC_LINK_LIST"
 	guestEnvPath      = "TIDE_DOWNLOAD_PATH"
 	guestEnvDLArchive = "TIDE_DOWNLOAD_ARCHIVE"
@@ -60,8 +61,9 @@ exit 1`,
 mkdir -p "$TIDE_SYNC_WORKSPACE"
 cd "$TIDE_SYNC_WORKSPACE"
 if [ -n "$TIDE_SYNC_DELETE_LIST" ]; then xargs -0 rm -f -- < "$TIDE_SYNC_DELETE_LIST"; fi
+if [ -n "$TIDE_SYNC_PRUNE_LIST" ]; then xargs -0 sh -c 'for d do if [ -d "$d" ] && [ ! -L "$d" ]; then rmdir -- "$d" || exit 1; fi; done' tide < "$TIDE_SYNC_PRUNE_LIST"; fi
 if [ -n "$TIDE_SYNC_ARCHIVE" ]; then tar -x -m -o -f "$TIDE_SYNC_ARCHIVE"; fi`,
-	opCleanup: `for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST"; do if [ -n "$f" ]; then rm -f "$f"; fi; done
+	opCleanup: `for f in "$TIDE_SYNC_ARCHIVE" "$TIDE_SYNC_DELETE_LIST" "$TIDE_SYNC_PRUNE_LIST"; do if [ -n "$f" ]; then rm -f "$f"; fi; done
 if [ -n "$TIDE_SYNC_LOCK" ]; then rm -rf "$TIDE_SYNC_LOCK"; fi`,
 	opProbe: `p="$TIDE_DOWNLOAD_PATH"
 if [ -d "$p" ]; then
@@ -99,6 +101,13 @@ if ($env:TIDE_SYNC_DELETE_LIST) {
     if (Test-Path -LiteralPath $t) { Remove-Item -LiteralPath $t -Force }
   }
 }
+if ($env:TIDE_SYNC_PRUNE_LIST) {
+  foreach ($p in [System.IO.File]::ReadAllLines($env:TIDE_SYNC_PRUNE_LIST, [System.Text.Encoding]::UTF8)) {
+    if ($p -eq '') { continue }
+    $t = Join-Path $ws $p
+    if (Test-Path -LiteralPath $t -PathType Container) { [System.IO.Directory]::Delete($t) }
+  }
+}
 if ($env:TIDE_SYNC_ARCHIVE) {
   & "$env:SystemRoot\System32\tar.exe" -x -m -f $env:TIDE_SYNC_ARCHIVE -C $ws
   if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -119,7 +128,7 @@ if ($env:TIDE_SYNC_LINK_LIST) {
 }
 exit 0`,
 	opCleanup: `$ProgressPreference = 'SilentlyContinue'
-foreach ($f in @($env:TIDE_SYNC_ARCHIVE, $env:TIDE_SYNC_DELETE_LIST, $env:TIDE_SYNC_LINK_LIST)) {
+foreach ($f in @($env:TIDE_SYNC_ARCHIVE, $env:TIDE_SYNC_DELETE_LIST, $env:TIDE_SYNC_PRUNE_LIST, $env:TIDE_SYNC_LINK_LIST)) {
   if ($f -and (Test-Path -LiteralPath $f)) { Remove-Item -LiteralPath $f -Force }
 }
 if ($env:TIDE_SYNC_LOCK -and (Test-Path -LiteralPath $env:TIDE_SYNC_LOCK)) { Remove-Item -LiteralPath $env:TIDE_SYNC_LOCK -Recurse -Force }

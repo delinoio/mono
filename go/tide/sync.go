@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"path"
 	"sort"
 	"strings"
 	"time"
@@ -92,9 +93,10 @@ type SyncResult struct {
 //     written and the archive and the lock are removed.
 //
 // The deleted files are removed before the archive is extracted, so that a
-// path can change between a file and a directory. A sync that stops before
-// the new manifest is written leaves the old manifest, so the next sync
-// sends the same files again.
+// path can change between a file and a directory; the directories that
+// held deleted files under the path of a new file are removed when they are
+// empty. A sync that stops before the new manifest is written leaves the
+// old manifest, so the next sync sends the same files again.
 func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 	report := func(tp TransferProgress) {
 		if p.Progress != nil {
@@ -225,7 +227,7 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		}
 	}()
 	windows := osys == tidev1.GuestOs_GUEST_OS_WINDOWS
-	applyEnv := map[string]string{guestEnvWorkspace: s.GetWorkspacePath(), guestEnvArchive: "", guestEnvDeletes: "", guestEnvLinks: ""}
+	applyEnv := map[string]string{guestEnvWorkspace: s.GetWorkspacePath(), guestEnvArchive: "", guestEnvDeletes: "", guestEnvPrunes: "", guestEnvLinks: ""}
 
 	var links []localFile
 	var archived int
@@ -258,17 +260,17 @@ func (c *Client) Sync(ctx context.Context, p SyncParams) (*SyncResult, error) {
 		list := guestSibling(s, ".tide-sync-"+syncID+".delete")
 		applyEnv[guestEnvDeletes] = list
 		cleanupEnv[guestEnvDeletes] = list
-		var b bytes.Buffer
-		for _, d := range deleted {
-			if windows {
-				b.WriteString(strings.ReplaceAll(d, "/", `\`))
-				b.WriteByte('\n')
-			} else {
-				b.WriteString(d)
-				b.WriteByte(0)
-			}
+		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(pathList(deleted, windows)), nil)
+		res.BytesSent += n
+		if err != nil {
+			return nil, err
 		}
-		n, err := c.writeGuestFile(ctx, s, list, 0o644, &b, nil)
+	}
+	if prunes := pruneDirs(deleted, changed); len(prunes) > 0 {
+		list := guestSibling(s, ".tide-sync-"+syncID+".prune")
+		applyEnv[guestEnvPrunes] = list
+		cleanupEnv[guestEnvPrunes] = list
+		n, err := c.writeGuestFile(ctx, s, list, 0o644, bytes.NewReader(pathList(prunes, windows)), nil)
 		res.BytesSent += n
 		if err != nil {
 			return nil, err
@@ -356,6 +358,63 @@ func (c *Client) readManifest(ctx context.Context, s *tidev1.DevSession) (manife
 		return parseManifest(nil), nil
 	}
 	return parseManifest(b.Bytes()), nil
+}
+
+// pathList returns the guest list file of relative paths: NUL-separated
+// for Linux and macOS guests, newline-separated with backslashes for
+// Windows guests.
+func pathList(paths []string, windows bool) []byte {
+	var b bytes.Buffer
+	for _, p := range paths {
+		if windows {
+			b.WriteString(strings.ReplaceAll(p, "/", `\`))
+			b.WriteByte('\n')
+		} else {
+			b.WriteString(p)
+			b.WriteByte(0)
+		}
+	}
+	return b.Bytes()
+}
+
+// pruneDirs returns the guest directories that the apply command removes
+// after the deletions and before the extraction. The deletions remove only
+// files, so a deleted entry a/b/old leaves the directories a/b and a, and
+// the guest tar cannot then extract a new file or link at a. For each
+// deleted path below the path of a changed file or link, the result holds
+// the directories from the parent of the deleted path up to that path.
+// The guest removes only empty directories, so files that the guest created
+// there stay and make the apply fail. Deeper directories come first.
+func pruneDirs(deleted []string, changed []localFile) []string {
+	incoming := map[string]bool{}
+	for _, f := range changed {
+		incoming[f.rel] = true
+	}
+	dirs := map[string]bool{}
+	for _, d := range deleted {
+		var chain []string
+		for dir := path.Dir(d); dir != "."; dir = path.Dir(dir) {
+			chain = append(chain, dir)
+			if incoming[dir] {
+				for _, c := range chain {
+					dirs[c] = true
+				}
+				break
+			}
+		}
+	}
+	out := make([]string, 0, len(dirs))
+	for d := range dirs {
+		out = append(out, d)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		di, dj := strings.Count(out[i], "/"), strings.Count(out[j], "/")
+		if di != dj {
+			return di > dj
+		}
+		return out[i] < out[j]
+	})
+	return out
 }
 
 // largest returns the n largest regular files of files.

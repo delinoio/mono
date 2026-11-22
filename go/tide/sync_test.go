@@ -288,6 +288,61 @@ func TestInvalidWindowsPath(t *testing.T) {
 	}
 }
 
+// TestSyncReplacesDirectoryWithFile checks that a synced directory that
+// became a file locally is replaced in the guest: the deletions leave empty
+// directories, which the apply command removes before the extraction, but
+// it keeps a directory that holds files that the guest created.
+func TestSyncReplacesDirectoryWithFile(t *testing.T) {
+	needPOSIX(t)
+	c, srv, org := newTestClient(t, "")
+	ctx := context.Background()
+	for _, guestFile := range []bool{false, true} {
+		ds := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_LINUX)
+		dir := newRepo(t, map[string]string{"a/b/old": "old", "a/c": "c", "keep.txt": "k"}, nil, "")
+		if _, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir}); err != nil {
+			t.Fatal(err)
+		}
+		if guestFile {
+			if err := os.WriteFile(filepath.Join(ds.GetWorkspacePath(), "a/b/guest.txt"), []byte("guest"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		git(t, dir, "rm", "-q", "-r", "a")
+		if err := os.WriteFile(filepath.Join(dir, "a"), []byte("now a file"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git(t, dir, "add", "a")
+		res, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: ds.GetDevSessionId(), LocalDir: dir})
+		if guestFile {
+			if err == nil {
+				t.Fatal("the sync removed a directory that holds a guest file")
+			}
+			if readGuest(t, ds, "a/b/guest.txt") != "guest" {
+				t.Fatal("the guest file is gone")
+			}
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Uploaded != 1 || res.Deleted != 2 || readGuest(t, ds, "a") != "now a file" {
+			t.Fatalf("sync = %+v", res)
+		}
+		if matches, _ := filepath.Glob(ds.GetWorkspacePath() + ".tide-sync-*"); len(matches) != 0 {
+			t.Fatalf("temporary files left: %v", matches)
+		}
+	}
+}
+
+func TestPruneDirs(t *testing.T) {
+	changed := []localFile{{rel: "a"}, {rel: "x/y"}}
+	got := pruneDirs([]string{"a/b/c/old", "a/d", "x/y/z", "other/dir/f", "a"}, changed)
+	want := []string{"a/b/c", "a/b", "x/y", "a"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pruneDirs = %v, want %v", got, want)
+	}
+}
+
 func TestSyncLockAndRestartAfterStoppedSync(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
