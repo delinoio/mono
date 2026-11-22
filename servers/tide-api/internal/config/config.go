@@ -6,6 +6,10 @@
 package config
 
 import (
+	"crypto/rsa"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/url"
@@ -34,6 +38,17 @@ const (
 	EnvMetricsAddr              = "METRICS_ADDR"
 	EnvOwnSandAPIOrigin         = "OWNSAND_API_ORIGIN"
 	EnvPublicOrigin             = "PUBLIC_ORIGIN"
+
+	// The tide GitHub App. Set all six or none: without them the GitHub
+	// layer is off (see GitHubApp).
+	EnvGitHubAppID            = "GITHUB_APP_ID"
+	EnvGitHubAppClientID      = "GITHUB_APP_CLIENT_ID"
+	EnvGitHubAppClientSecret  = "GITHUB_APP_CLIENT_SECRET"
+	EnvGitHubAppPrivateKey    = "GITHUB_APP_PRIVATE_KEY"
+	EnvGitHubAppWebhookSecret = "GITHUB_APP_WEBHOOK_SECRET"
+	EnvGitHubAppSlug          = "GITHUB_APP_SLUG"
+	EnvGitHubAPIOrigin        = "GITHUB_API_ORIGIN"
+	EnvGitHubWebOrigin        = "GITHUB_WEB_ORIGIN"
 )
 
 // Defaults.
@@ -52,6 +67,11 @@ const (
 	// DefaultPublicOrigin is the public origin of tide-api, which the
 	// webhook URLs that tide shows to admins use.
 	DefaultPublicOrigin = "https://tide.api.delino.io"
+	// DefaultGitHubAPIOrigin is the GitHub REST API of github.com.
+	DefaultGitHubAPIOrigin = "https://api.github.com"
+	// DefaultGitHubWebOrigin is github.com, which serves the app
+	// installation page and the OAuth code exchange.
+	DefaultGitHubWebOrigin = "https://github.com"
 )
 
 // ClientAddressMode selects where the client address of a request comes
@@ -144,6 +164,30 @@ type Config struct {
 	OwnSandAPIOrigin string
 	// PublicOrigin is the public origin of this server, for webhook URLs.
 	PublicOrigin string
+
+	// GitHub is the tide GitHub App, or nil when no GITHUB_APP_* variable
+	// is set (the GitHub layer is then off).
+	GitHub *GitHubApp
+}
+
+// GitHubApp holds the settings and service secrets of the tide GitHub App.
+// It holds secrets; never log it.
+type GitHubApp struct {
+	// AppID is the numeric app ID. The app JWT uses the client ID as its
+	// issuer, as GitHub recommends; the app ID checks the installations
+	// that GitHub lists.
+	AppID        int64
+	ClientID     string
+	ClientSecret string
+	// PrivateKey signs the app JWT (RS256).
+	PrivateKey    *rsa.PrivateKey
+	WebhookSecret string
+	// Slug is the app's URL name (https://github.com/apps/<slug>).
+	Slug string
+	// APIOrigin and WebOrigin are the GitHub REST API and web origins; tests
+	// point them at a fake.
+	APIOrigin string
+	WebOrigin string
 }
 
 // Load reads the configuration through lookup, which has the signature of
@@ -253,7 +297,121 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 			return Config{}, err
 		}
 	}
+	if cfg.GitHub, err = loadGitHubApp(get); err != nil {
+		return Config{}, err
+	}
 	return cfg, nil
+}
+
+// loadGitHubApp reads the GitHub App settings. With none of the six app
+// variables set it returns nil, so development setups without a GitHub App
+// still start; with some but not all of them it fails.
+func loadGitHubApp(get func(string) string) (*GitHubApp, error) {
+	names := []string{EnvGitHubAppID, EnvGitHubAppClientID, EnvGitHubAppClientSecret, EnvGitHubAppPrivateKey, EnvGitHubAppWebhookSecret, EnvGitHubAppSlug}
+	var missing []string
+	for _, n := range names {
+		if get(n) == "" {
+			missing = append(missing, n)
+		}
+	}
+	if len(missing) == len(names) {
+		return nil, nil
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("the GitHub App needs all of %s; missing: %s", strings.Join(names, ", "), strings.Join(missing, ", "))
+	}
+	app := &GitHubApp{
+		ClientID: get(EnvGitHubAppClientID), ClientSecret: get(EnvGitHubAppClientSecret), WebhookSecret: get(EnvGitHubAppWebhookSecret),
+		Slug: get(EnvGitHubAppSlug), APIOrigin: DefaultGitHubAPIOrigin, WebOrigin: DefaultGitHubWebOrigin,
+	}
+	id, err := strconv.ParseInt(get(EnvGitHubAppID), 10, 64)
+	if err != nil || id <= 0 {
+		return nil, fmt.Errorf("%s must be a positive integer", EnvGitHubAppID)
+	}
+	app.AppID = id
+	if !printableToken(app.ClientID) {
+		return nil, fmt.Errorf("%s must be the app client ID (printable ASCII without spaces)", EnvGitHubAppClientID)
+	}
+	if !printableToken(app.ClientSecret) {
+		return nil, fmt.Errorf("%s must be printable ASCII without spaces", EnvGitHubAppClientSecret)
+	}
+	if len(app.WebhookSecret) < 16 {
+		return nil, fmt.Errorf("%s must have at least 16 characters", EnvGitHubAppWebhookSecret)
+	}
+	if !validSlug(app.Slug) {
+		return nil, fmt.Errorf("%s must be the app slug (lowercase letters, digits and '-')", EnvGitHubAppSlug)
+	}
+	if app.PrivateKey, err = ParseRSAPrivateKey(get(EnvGitHubAppPrivateKey)); err != nil {
+		return nil, fmt.Errorf("%s: %w", EnvGitHubAppPrivateKey, err)
+	}
+	if v := get(EnvGitHubAPIOrigin); v != "" {
+		if app.APIOrigin, err = parseOrigin(EnvGitHubAPIOrigin, v, DefaultGitHubAPIOrigin); err != nil {
+			return nil, err
+		}
+	}
+	if v := get(EnvGitHubWebOrigin); v != "" {
+		if app.WebOrigin, err = parseOrigin(EnvGitHubWebOrigin, v, DefaultGitHubWebOrigin); err != nil {
+			return nil, err
+		}
+	}
+	return app, nil
+}
+
+// ParseRSAPrivateKey parses the PEM of the GitHub App private key: the
+// PKCS #1 block ("RSA PRIVATE KEY") that GitHub generates or a PKCS #8
+// block ("PRIVATE KEY"). A value with literal "\n" sequences instead of line
+// breaks is accepted, because many secret stores keep one line. Errors never
+// contain key material.
+func ParseRSAPrivateKey(value string) (*rsa.PrivateKey, error) {
+	value = strings.ReplaceAll(value, `\n`, "\n")
+	block, _ := pem.Decode([]byte(value))
+	if block == nil {
+		return nil, errors.New("must be a PEM private key")
+	}
+	switch block.Type {
+	case "RSA PRIVATE KEY":
+		key, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, errors.New("invalid PKCS #1 RSA private key")
+		}
+		return key, nil
+	case "PRIVATE KEY":
+		key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+		if err != nil {
+			return nil, errors.New("invalid PKCS #8 private key")
+		}
+		rsaKey, ok := key.(*rsa.PrivateKey)
+		if !ok {
+			return nil, errors.New("must be an RSA private key")
+		}
+		return rsaKey, nil
+	}
+	return nil, errors.New("must be an RSA PRIVATE KEY or PRIVATE KEY PEM block")
+}
+
+func printableToken(v string) bool {
+	if v == "" || len(v) > 256 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] <= ' ' || v[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validSlug(v string) bool {
+	if v == "" || len(v) > 100 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !('a' <= c && c <= 'z' || '0' <= c && c <= '9' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // parseOrigin accepts an http or https origin without path (a trailing "/"

@@ -411,8 +411,17 @@ The server reads these environment variables without a service prefix. Empty val
 | `OTEL_*`                      | no       | empty (no OTLP export)          | Standard OpenTelemetry variables, read by the SDK through the shared telemetry package, as for `accounts-api`. |
 | `OWNSAND_API_ORIGIN`          | no       | `https://ownsand.api.delino.io` | Origin of the OwnSand API, for example `http://127.0.0.1:18300` for a local `ownsand-api`.                     |
 | `PUBLIC_ORIGIN`               | no       | `https://tide.api.delino.io`    | Public origin of `tide-api` in the webhook URLs that admins register.                                          |
+| `GITHUB_APP_ID`               | no       | empty (GitHub layer off)        | Numeric ID of the tide GitHub App. Service secret group: set all six `GITHUB_APP_*` variables or none.         |
+| `GITHUB_APP_CLIENT_ID`        | no       | empty                           | Client ID of the app: the issuer of the app JWT and the OAuth client of the code exchange.                     |
+| `GITHUB_APP_CLIENT_SECRET`    | no       | empty                           | Service secret: the client secret of the app, for the OAuth code exchange.                                     |
+| `GITHUB_APP_PRIVATE_KEY`      | no       | empty                           | Service secret: the app private key in PEM (PKCS #1 or PKCS #8). Literal `\n` sequences count as line breaks.  |
+| `GITHUB_APP_WEBHOOK_SECRET`   | no       | empty                           | Service secret: the app webhook secret, at least 16 characters.                                                |
+| `GITHUB_APP_SLUG`             | no       | empty                           | URL name of the app; the installation URL is `<GITHUB_WEB_ORIGIN>/apps/<slug>/installations/new`.              |
+| `GITHUB_API_ORIGIN`           | no       | `https://api.github.com`        | Origin of the GitHub REST API. Only tests change it (a fake GitHub API).                                       |
+| `GITHUB_WEB_ORIGIN`           | no       | `https://github.com`            | Origin of the installation page and of `POST /login/oauth/access_token`. Only tests change it.                 |
 
-- Later layers add the GitHub App and vendor settings to this table with their implementation.
+- When none of the six `GITHUB_APP_*` variables is set, the GitHub layer is off, so development setups without a GitHub App still start: the `GitHubService` RPCs fail with `failed_precondition` after authorization, `POST /webhooks/github` answers `503`, and no GitHub job is matched. Some but not all of the six variables stop the server at startup.
+- Later layers add the vendor settings to this table with their implementation.
 - Member display names: `ListMembers` reads them through an optional display name source. The `delino-accounts` API has no display name RPC yet, as the [OwnSand contract](servers-ownsand-api-foundation.md#dependencies-and-integrations) records, so tide-api has no client or configuration for it and returns empty display names until that RPC exists.
 
 ## Security

@@ -19,6 +19,14 @@
         "METRICS_ADDR",
         "OWNSAND_API_ORIGIN",
         "PUBLIC_ORIGIN",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_CLIENT_ID",
+        "GITHUB_APP_CLIENT_SECRET",
+        "GITHUB_APP_PRIVATE_KEY",
+        "GITHUB_APP_WEBHOOK_SECRET",
+        "GITHUB_APP_SLUG",
+        "GITHUB_API_ORIGIN",
+        "GITHUB_WEB_ORIGIN",
         "OTEL_*"
       ]
     },
