@@ -309,6 +309,72 @@ func TestReportUsageIdempotency(t *testing.T) {
 	}
 }
 
+// TestReportUsageReplaySuspendsMoreThanOneBatchOfAccounts replays the
+// reports of 101 organizations on 101 distinct unpaid billing accounts after
+// every suspension time passed. The test server runs no worker, so the
+// replay itself records the suspensions, in more than one batch of accounts.
+func TestReportUsageReplaySuspendsMoreThanOneBatchOfAccounts(t *testing.T) {
+	const n = 101
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accounts := make([]string, n)
+	orgs := make([]string, n)
+	for i := range orgs {
+		accounts[i] = createAccount(t, owner, fmt.Sprintf("Unpaid %d", i)).GetBillingAccountId()
+		orgs[i] = newOrg(t)
+		// An account without a subscription blocks its link at once.
+		if st := link(t, env, accounts[i], orgs[i], owner.ID, fmt.Sprintf("Org %d", i)).GetStatus(); st.GetStatus() != blocked {
+			t.Fatalf("status of organization %d = %v, want BLOCKED", i, st)
+		}
+	}
+	env.Clock.Advance(15 * time.Minute)
+	w := window(env.Clock.Now()).Add(-billing.WindowLength)
+	reports := make([]*accountsv1.UsageReport, n)
+	for i, org := range orgs {
+		reports[i] = report(org, meterEgress, w, 1, usd)
+	}
+	first := reportUsage(t, env.Service(), reports...)
+	if len(first.GetStatuses()) != n {
+		t.Fatalf("first report returned %d statuses, want %d", len(first.GetStatuses()), n)
+	}
+	for _, res := range first.GetResults() {
+		if res.GetDuplicate() || res.GetUnattributed() {
+			t.Fatalf("first result = %v", res)
+		}
+	}
+	for _, st := range first.GetStatuses() {
+		if st.GetStatus() != blocked {
+			t.Fatalf("status before the suspension time = %v, want BLOCKED", st)
+		}
+	}
+
+	env.Clock.Advance(billing.SuspendAfter)
+	again := reportUsage(t, env.Service(), reports...)
+	for i, res := range again.GetResults() {
+		if !res.GetDuplicate() || res.GetLedgerEntryId() != first.GetResults()[i].GetLedgerEntryId() {
+			t.Fatalf("replayed result %d = %v, want the first result as duplicate", i, res)
+		}
+	}
+	if len(again.GetStatuses()) != n {
+		t.Fatalf("replay returned %d statuses, want %d", len(again.GetStatuses()), n)
+	}
+	for _, st := range again.GetStatuses() {
+		if st.GetStatus() != accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED {
+			t.Fatalf("status after the suspension time = %v, want SUSPENDED", st)
+		}
+	}
+	// The replay deducted no credit again: each account has its one usage entry.
+	for _, acct := range accounts {
+		if b := balanceOf(t, env, owner.ID, acct).GetBalanceUsdMicros(); b != -usd {
+			t.Fatalf("balance of %s = %d, want one deduction", acct, b)
+		}
+	}
+	var blockedLinks int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM organization_links WHERE billing_status = 'blocked'`).Scan(&blockedLinks); err != nil || blockedLinks != 0 {
+		t.Fatalf("%d links stay blocked after the replay, %v", blockedLinks, err)
+	}
+}
+
 func TestReportUsageConcurrentForOneBillingAccount(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)
