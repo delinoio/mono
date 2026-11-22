@@ -145,6 +145,22 @@ export function validateLabels(
         `values must be at most ${MAX_LABEL_VALUE_SIZE} bytes`,
       );
     }
+    // U+0000 is valid UTF-8 and passes protobuf, but PostgreSQL text and jsonb
+    // values cannot store it, so the control plane would fail the request
+    // after the round trip. Mirrors the Go validator, in the same order; the
+    // message names the rule and never the label.
+    if (key.includes("\0")) {
+      throw new OwnSandValidationError(
+        "labels",
+        "keys must not contain a NUL byte",
+      );
+    }
+    if (value.includes("\0")) {
+      throw new OwnSandValidationError(
+        "labels",
+        "values must not contain a NUL byte",
+      );
+    }
   }
 }
 

@@ -596,6 +596,44 @@ describe("createSandbox", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  test.each([
+    ["a label key", { "a\0b": "v" }, "keys must not contain a NUL byte"],
+    ["a label value", { k: "a\0b" }, "values must not contain a NUL byte"],
+    [
+      "a NUL key and a NUL value",
+      { "a\0b": "c\0d" },
+      "keys must not contain a NUL byte",
+    ],
+  ])(
+    "rejects a NUL byte in %s before the request",
+    async (_n, labels, rule) => {
+      const h = setup();
+      const error = await h.client
+        .createSandbox({ ...validCreate, labels })
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(OwnSandValidationError);
+      expect(error.field).toBe("labels");
+      expect(error.message).toContain(rule);
+      // The message names the rule and never the label.
+      expect(error.message).not.toContain("a\0b");
+      expect(error.message).not.toContain("c\0d");
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test("accepts other control characters in labels", async () => {
+    const h = setup();
+    h.api.unary(SandboxService, "CreateSandbox", () => ({
+      sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+    }));
+    await h.client.createSandbox({
+      ...validCreate,
+      labels: { "k\u0001": "a\u0001b\n" },
+    });
+    const req = h.api.callsOf("CreateSandbox")[0]!.request as any;
+    expect(req.labels).toEqual({ "k\u0001": "a\u0001b\n" });
+  });
+
   const MAX_INT64 = 2n ** 63n - 1n;
   const goodResources = { vcpuCount: 2, memoryMib: 2048, diskGib: 10 };
   test.each([
