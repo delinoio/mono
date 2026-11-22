@@ -1609,6 +1609,83 @@ describe("peer-to-peer data path", () => {
       expect(readOffsets(p.rtc)).toEqual([0n]);
     });
 
+    test("a read cancelled while the consumer is paused delivers no buffered chunk and no success", async () => {
+      // Three chunks and the end frame arrive while the consumer holds the
+      // first chunk: the queue then holds a buffered terminal frame.
+      const file = source(3 << 10);
+      const p = p2pSetup(readAgent(file, 1 << 10));
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const chunks: Uint8Array[] = [];
+      const wait = gate();
+      const done = (async () => {
+        for await (const chunk of p.h.client
+          .sandbox(SANDBOX)
+          .readFile("/big", { signal: controller.signal })) {
+          chunks.push(chunk);
+          if (chunks.length === 1) await wait.promise;
+        }
+        return "completed";
+      })().catch((e: unknown) => e);
+      await p.h.clock.advance(1000);
+      expect(chunks).toHaveLength(1);
+      controller.abort(reason);
+      wait.open();
+      expect(await p.h.clock.run(done)).toBe(reason);
+      // Only the chunk that was delivered before the abort.
+      expect(chunks).toHaveLength(1);
+    });
+
+    test("a transport failure still lets the consumer drain the buffered chunks", async () => {
+      const file = source(3 << 10);
+      let peerRef: FakeAgentPeer | undefined;
+      const p = p2pSetup((frame, peer) => {
+        if (frame.payload.case !== "fileReadRequest") return;
+        peerRef = peer;
+        for (let at = 0; at < file.length; at += 1 << 10) {
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_READ_EVENT,
+            payload: {
+              case: "fileReadEvent",
+              value: {
+                event: {
+                  case: "chunk",
+                  value: {
+                    offset: BigInt(at),
+                    data: file.subarray(at, at + (1 << 10)),
+                  },
+                },
+              },
+            },
+          });
+        }
+      });
+      const chunks: Uint8Array[] = [];
+      const wait = gate();
+      const done = (async () => {
+        for await (const chunk of p.h.client
+          .sandbox(SANDBOX)
+          .readFile("/big")) {
+          chunks.push(chunk);
+          if (chunks.length === 1) await wait.promise;
+        }
+      })().catch((e: unknown) => e);
+      await p.h.clock.advance(1000);
+      expect(chunks).toHaveLength(1);
+      // The channel fails while two chunks are still buffered.
+      peerRef!.fail();
+      await p.h.clock.settle();
+      wait.open();
+      await p.h.clock.run(done);
+      // The buffered chunks were delivered before the failure took effect;
+      // the read then continued from the delivered offset.
+      expect(chunks.length).toBeGreaterThanOrEqual(3);
+      expect(chunks[1]!.length).toBe(1 << 10);
+      expect(readOffsets(p.rtc)[0]).toBe(0n);
+    });
+
     test("a burst below both limits is queued without failing the stream", async () => {
       // 64 frames of 1 KiB: the chunks and the end frame reach 64 frames at
       // the most, below 8 MiB.
@@ -1778,6 +1855,125 @@ describe("peer-to-peer data path", () => {
       expect(
         rtc.frames.some((frame) => frame.kind === DataFrameKind.EXEC_REQUEST),
       ).toBe(false);
+    });
+
+    test("a caller aborted while its frame waits for the send turn returns before the turn is released", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => messages++;
+      // The first write holds the send turn while it waits for the buffer.
+      const holder = sandbox.writeFile("/a", new Uint8Array(40 << 10).fill(7));
+      await h.clock.settle();
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      let outcome: unknown = "pending";
+      const cancelled = sandbox
+        .run({ command: ["rm", "-rf", "/data"], signal: controller.signal })
+        .then(
+          () => (outcome = "completed"),
+          (error: unknown) => (outcome = error),
+        );
+      // A later request queues behind the cancelled one.
+      const later = sandbox.writeFile("/c", new Uint8Array(40 << 10).fill(9));
+      await h.clock.settle();
+      expect(outcome).toBe("pending");
+      controller.abort(reason);
+      await h.clock.settle();
+      // The caller is released with its reason although the buffer is still
+      // full and the active sender still holds the turn.
+      expect(outcome).toBe(reason);
+      expect(messages).toBe(0);
+      await cancelled;
+      // The active sender and the session are still usable; the later frame
+      // keeps its place after the active one.
+      for (let i = 0; i < 10 && messages < 6; i++) {
+        channel.drain(0);
+        await h.clock.settle();
+      }
+      const [heldWrite, laterWrite] = await h.clock.run(
+        Promise.all([holder, later]),
+      );
+      expect(heldWrite.sizeBytes).toBe(BigInt(40 << 10));
+      expect(laterWrite.sizeBytes).toBe(BigInt(40 << 10));
+      expect(messages).toBe(6);
+      expect(
+        rtc.frames.map((frame) =>
+          frame.payload.case === "fileWriteChunk"
+            ? frame.payload.value.path
+            : frame.kind,
+        ),
+      ).toEqual(["/warm", "/a", "/c"]);
+      expect(rtc.channels).toHaveLength(1);
+      expect(channel.readyState).toBe("open");
+    });
+
+    test("an abort during a frame in progress returns at once and still lets that frame finish", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      channel.bufferedAmount = FULL;
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        channel.bufferedAmount = FULL;
+      };
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      let outcome: unknown = "pending";
+      const write = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10).fill(7), {
+          signal: controller.signal,
+        })
+        .then(
+          () => (outcome = "completed"),
+          (error: unknown) => (outcome = error),
+        );
+      await h.clock.settle();
+      channel.drain();
+      await h.clock.settle();
+      expect(messages).toBe(1);
+      controller.abort(reason);
+      await h.clock.settle();
+      expect(outcome).toBe(reason);
+      for (let i = 0; i < 10 && messages < 3; i++) {
+        channel.drain();
+        await h.clock.settle();
+      }
+      expect(messages).toBe(3);
+      expect(rtc.frames).toHaveLength(2);
+      await write;
+    });
+
+    test("a send that throws in the middle of a frame retires the session and no later frame follows", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        if (messages === 2) {
+          // The channel took the first message of the frame and fails on the
+          // second, as an RTCDataChannel does with an OperationError.
+          throw new Error("OperationError: send queue is full");
+        }
+      };
+      const partial = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10).fill(7))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10).fill(8))
+        .catch((e) => e);
+      await h.clock.settle();
+      // Only two messages of the first frame were written; the queued frame
+      // never followed them on the dead byte stream.
+      expect(messages).toBe(2);
+      expect(channel.readyState).toBe("closed");
+      await h.clock.run(Promise.all([partial, queued]));
+      expect(messages).toBe(2);
+      expect(rtc.frames).toHaveLength(1);
     });
 
     test("a caller aborted while its first message waits for the buffer sends nothing", async () => {
