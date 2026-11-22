@@ -27,6 +27,17 @@ type imageBuildFlags struct {
 	guestBinary string
 }
 
+// validateImageResources checks --disk-gib, --cpus and --memory-mib before the
+// build creates any state, so that a value that would overflow the conversion
+// to bytes or to a 32-bit vCPU count is a usage error and never wraps into a
+// smaller image or VM. It returns the vCPU count for the build options.
+func validateImageResources(f imageBuildFlags) (int32, error) {
+	if err := imagebuild.ValidateResources(f.diskGiB, int64(f.cpus), f.memoryMiB); err != nil {
+		return 0, err
+	}
+	return int32(f.cpus), nil
+}
+
 // imageBuild runs `ownsand-agent image build`. The running agent sees the
 // new image at its next capability report.
 func imageBuild(cfg config.Config, f imageBuildFlags, stdout, stderr io.Writer, c colors) int {
@@ -35,8 +46,9 @@ func imageBuild(cfg config.Config, f imageBuildFlags, stdout, stderr io.Writer, 
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitUsage
 	}
-	if f.diskGiB < 0 || f.cpus < 0 || f.memoryMiB < 0 {
-		fmt.Fprintln(stderr, "ownsand-agent: --disk-gib, --cpus and --memory-mib must not be negative")
+	cpus, err := validateImageResources(f)
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitUsage
 	}
 	st, err := store.Open(cfg.StateDir)
@@ -53,7 +65,7 @@ func imageBuild(cfg config.Config, f imageBuildFlags, stdout, stderr io.Writer, 
 		ISO:         f.iso,
 		Edition:     f.edition,
 		DiskGiB:     f.diskGiB,
-		CPUCount:    int32(f.cpus),
+		CPUCount:    cpus,
 		MemoryMiB:   f.memoryMiB,
 		GuestBinary: f.guestBinary,
 		Logger:      newLogger(cfg),
