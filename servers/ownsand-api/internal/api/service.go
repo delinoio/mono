@@ -178,6 +178,10 @@ type Timing struct {
 	// apply an export result (250 milliseconds); it doubles up to 2 seconds;
 	// zero means the default.
 	ExportApplyRetryBackoff time.Duration
+	// ExportFailTimeout bounds how long ExportSnapshot retries the update
+	// that ends an export attempt whose command send failed (5 seconds);
+	// the retry uses ExportApplyRetryBackoff; zero means the default.
+	ExportFailTimeout time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -195,6 +199,7 @@ func DefaultTiming() Timing {
 
 		ExportApplyRetryWindow:  DefaultExportApplyRetryWindow,
 		ExportApplyRetryBackoff: DefaultExportApplyRetryBackoff,
+		ExportFailTimeout:       snapshotFailTimeout,
 	}
 }
 
