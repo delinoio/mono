@@ -211,6 +211,27 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * Sets the Authorization header. A token that cannot be a header value (a
+ * line break or NUL inside it, or a character that no header value can
+ * hold) ends the call with a terminal credential error without a request.
+ * The error never holds the token: the `TypeError` of `Headers.set` quotes
+ * the whole value, so it is neither passed on nor kept as a cause. Only edge
+ * whitespace is allowed; the header normalization drops it.
+ */
+function setAuthorization(headers: Headers, secret: string): void {
+  const invalid = () =>
+    new OwnSandCredentialError("accessToken returned an invalid token");
+  if (/[\r\n\0]/.test(secret.trim())) {
+    throw invalid();
+  }
+  try {
+    headers.set("Authorization", `Bearer ${secret}`);
+  } catch {
+    throw invalid();
+  }
+}
+
 function credentialInterceptor(options: ConnectionOptions): Interceptor {
   return (next) => async (req) => {
     if (new URL(req.url).origin !== options.origin) {
@@ -220,11 +241,12 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
       );
     }
     const secret = await currentSecret(options.credential, req.signal);
-    req.header.set("Authorization", `Bearer ${secret}`);
+    setAuthorization(req.header, secret);
     // Redact with the exact credential of this request. The access token
     // differs per request, so the value lives only in this closure and never
-    // in state that concurrent requests share.
-    return redactCall(next, req, [secret]);
+    // in state that concurrent requests share. A server may echo the value
+    // that the header normalization kept, so that form is redacted too.
+    return redactCall(next, req, [secret, secret.trim()]);
   };
 }
 
