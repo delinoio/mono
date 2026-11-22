@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-//go:build linux || darwin
+//go:build darwin
 
 package sysinfo
 
@@ -11,5 +11,7 @@ func freeDiskBytes(dir string) (int64, error) {
 	if err := unix.Statfs(dir, &st); err != nil {
 		return 0, err
 	}
-	return int64(st.Bavail) * int64(st.Bsize), nil
+	// statfs(2) block counts are in units of f_bsize on macOS, which has no
+	// fragment size field, so pass zero.
+	return availBytes(st.Bavail, int64(st.Bsize), 0), nil
 }
