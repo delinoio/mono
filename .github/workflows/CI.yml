@@ -401,8 +401,9 @@ jobs:
         # The blocking run leaves them out so that every other package blocks
         # CI. A second, non-blocking run still tests them and reports each one
         # that passes. Remove a package from the list in the change that fixes
-        # its failures on this platform; remove the list when it is empty. The
-        # run fails when a listed package no longer exists.
+        # its failures on this platform; a list can be empty. Remove the
+        # workaround when both lists are empty. The run fails when a listed
+        # package no longer exists.
         shell: bash
         run: |
           set -euo pipefail
@@ -418,9 +419,6 @@ jobs:
                 cmds/ownsand-agent/internal/agent
                 cmds/ownsand-agent/internal/dataplane
                 cmds/ownsand-agent/internal/ops
-                # The exec test compares the working directory with the
-                # TMPDIR path, which macOS reports as `/private/var/...`.
-                cmds/ownsand-guest/guest
               )
               ;;
             Windows)
@@ -431,15 +429,9 @@ jobs:
                 # The read snapshot does not abort when the path is swapped
                 # before open.
                 cmds/ownsand-guest/guest
-                # The peer-to-peer data channel never opens, so the
-                # peer-to-peer tests time out.
-                go/ownsand
                 # The tar escape checks accept links such as `/etc/passwd`,
                 # which are not absolute paths on Windows.
                 internal/fsutil
-                # The relay test that blocks socket writes ends with
-                # `context canceled` before the idle timeout.
-                servers/ownsand-api/internal/api
               )
               ;;
             *)
@@ -454,8 +446,13 @@ jobs:
           while IFS= read -r package; do
             all_packages+=("$package")
           done <<< "$package_list"
+          # Under `set -u`, bash 3.2 on macOS runners reports the expansion of
+          # an empty array as an unbound variable. `${arr[@]+"${arr[@]}"}`
+          # expands to nothing for an empty array, so every expansion of an
+          # array that can be empty uses this form. `tested` is never empty:
+          # it has every package of the module that is not listed.
           skipped=()
-          for package in "${known_failures[@]}"; do
+          for package in ${known_failures[@]+"${known_failures[@]}"}; do
             if [[ ! " ${all_packages[*]} " == *" $module/$package "* ]]; then
               echo "::error::Known failing package $module/$package does not exist; remove it from the list"
               exit 1
@@ -464,16 +461,22 @@ jobs:
           done
           tested=()
           for package in "${all_packages[@]}"; do
-            if [[ ! " ${skipped[*]} " == *" $package "* ]]; then
+            if [[ ! " ${skipped[*]+"${skipped[*]}"} " == *" $package "* ]]; then
               tested+=("$package")
             fi
           done
           {
             echo "Packages left out of the blocking run: ${#skipped[@]}"
-            printf -- '- %s\n' "${skipped[@]}"
+            if ((${#skipped[@]} > 0)); then
+              printf -- '- %s\n' "${skipped[@]}"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
           status=0
           go test -count=1 "${tested[@]}" || status=$?
+          if ((${#skipped[@]} == 0)); then
+            echo "No known failing packages on $RUNNER_OS; the non-blocking run is skipped."
+            exit "$status"
+          fi
           echo "::group::Known failing packages (non-blocking)"
           for package in "${skipped[@]}"; do
             if go test -count=1 "$package"; then
