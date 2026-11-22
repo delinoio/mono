@@ -5,6 +5,7 @@ package billing
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -328,6 +329,105 @@ func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
 	f.webhook("subscription.created", map[string]any{"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": f.clock.Now()})
 	sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
 	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub {
+		t.Fatalf("subscription = %+v", sub)
+	}
+}
+
+// TestLateActiveEventDoesNotReplaceNewCheckout checks that a late event of an
+// earlier subscription, in any status, leaves the row of a new open checkout
+// PENDING, also when its updated_at is after the cancellation, and that the
+// subscription of the checkout transaction still completes it. A PENDING row
+// without a checkout transaction accepts the first entity.
+func TestLateActiveEventDoesNotReplaceNewCheckout(t *testing.T) {
+	for _, status := range []string{
+		paddle.SubscriptionStatusActive, paddle.SubscriptionStatusTrialing,
+		paddle.SubscriptionStatusPastDue, paddle.SubscriptionStatusPaused,
+	} {
+		for _, afterCancel := range []bool{false, true} {
+			name := status
+			if afterCancel {
+				name += " after the cancellation"
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newFixture(t)
+				acct := f.account()
+				f.credit(acct, 1000)
+				oldSub := f.activate(acct)
+				cancelTime := f.clock.Now()
+				f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": cancelTime})
+				txnID := f.checkout(acct)
+				org := f.link(acct, "Acme")
+				logs := f.captureLogs()
+
+				updatedAt := cancelTime.Add(-time.Hour)
+				if afterCancel {
+					updatedAt = cancelTime.Add(time.Hour)
+				}
+				f.webhook("subscription.updated", map[string]any{"id": oldSub, "status": status, "updated_at": updatedAt})
+				sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+				if sub.Status != SubscriptionPending || sub.CheckoutTransactionID != txnID || sub.PaddleSubscriptionID != "" {
+					t.Fatalf("subscription after the late %s event = %+v", status, sub)
+				}
+				if got := f.status(org).Status; got == StatusAllowed {
+					t.Fatalf("organization status = %s after the late event", got)
+				}
+				if !strings.Contains(logs.String(), "billing_subscription_entity_ignored") ||
+					!strings.Contains(logs.String(), `"billing_account_id":"`+acct+`"`) ||
+					!strings.Contains(logs.String(), `"paddle_subscription_id":"`+oldSub+`"`) {
+					t.Fatalf("logs do not name the ignored entity: %s", logs)
+				}
+				// The open checkout is still returned, not already_exists.
+				if again := f.checkout(acct); again != txnID {
+					t.Fatalf("second StartSubscription = %s, want %s", again, txnID)
+				}
+				// The subscription of the checkout transaction completes it.
+				newSub := f.paddle.NewID("sub")
+				f.webhook("subscription.created", map[string]any{"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": f.clock.Now()})
+				sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+				if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub || sub.CheckoutTransactionID != "" {
+					t.Fatalf("subscription after subscription.created = %+v", sub)
+				}
+			})
+		}
+	}
+}
+
+// TestUpdateBeforeCreatedActivatesNewCheckout checks that an update of the
+// new subscription that arrives before its subscription.created is accepted,
+// because its ID was not recorded before.
+func TestUpdateBeforeCreatedActivatesNewCheckout(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	oldSub := f.activate(acct)
+	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now()})
+	f.checkout(acct)
+	newSub := f.paddle.NewID("sub")
+	f.webhook("subscription.updated", map[string]any{
+		"id": newSub, "status": "active", "updated_at": f.clock.Now().Add(time.Minute),
+		"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
+	})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != newSub {
+		t.Fatalf("subscription = %+v", sub)
+	}
+}
+
+// TestPendingWithoutCheckoutAcceptsFirstEntity checks that a PENDING row
+// without a checkout transaction accepts the first entity of an earlier
+// subscription.
+func TestPendingWithoutCheckoutAcceptsFirstEntity(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.tx(func(tx pgx.Tx) error {
+		return saveSubscription(ctx(), tx, acct, Subscription{Status: SubscriptionPending}, "", f.s.timestamp())
+	})
+	first := f.paddle.NewID("sub")
+	f.webhook("subscription.updated", map[string]any{
+		"id": first, "status": "active", "updated_at": f.clock.Now(),
+		"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
+	})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != first {
 		t.Fatalf("subscription = %+v", sub)
 	}
 }

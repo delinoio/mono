@@ -119,6 +119,14 @@ func (s *Service) applyPaddleSubscription(ctx context.Context, tx pgx.Tx, acct *
 	if !ok || entity.ID == "" {
 		return false, nil
 	}
+	// Look the ID up before it is recorded: whether an earlier event or
+	// payment already named this subscription decides how a pending checkout
+	// treats the entity.
+	var knownEarlier bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM paddle_subscriptions
+		WHERE paddle_subscription_id = $1 AND billing_account_id = $2)`, entity.ID, acct.ID).Scan(&knownEarlier); err != nil {
+		return false, err
+	}
 	if err := recordPaddleSubscription(ctx, tx, entity.ID, acct.ID, now); err != nil {
 		return false, err
 	}
@@ -136,10 +144,25 @@ func (s *Service) applyPaddleSubscription(ctx context.Context, tx pgx.Tx, acct *
 	} else if current.PaddleUpdateTime != nil && !entity.UpdatedAt.IsZero() && entity.UpdatedAt.Before(*current.PaddleUpdateTime) {
 		return false, nil
 	}
-	if current.Status == SubscriptionPending && current.PaddleSubscriptionID == "" && status == SubscriptionCanceled {
-		// A late event of an earlier subscription while a new checkout is
-		// open. It must not replace the pending checkout.
-		return false, nil
+	if current.Status == SubscriptionPending && current.PaddleSubscriptionID == "" {
+		if status == SubscriptionCanceled {
+			// A canceled entity never replaces the pending checkout.
+			return false, nil
+		}
+		if current.CheckoutTransactionID != "" && entity.TransactionID != current.CheckoutTransactionID && knownEarlier {
+			// A late event of an earlier subscription, in any status, while
+			// a new checkout is open. Only the subscription of the checkout
+			// transaction completes it. The entity names its transaction on
+			// subscription.created only, so a subscription whose ID was not
+			// recorded before (for example an update that precedes
+			// subscription.created of the new subscription) is accepted. It
+			// must not replace the pending checkout.
+			s.logger.InfoContext(ctx, "billing_subscription_entity_ignored",
+				slog.String("billing_account_id", acct.ID),
+				slog.String("paddle_subscription_id", entity.ID),
+				slog.String("checkout_transaction_id", current.CheckoutTransactionID))
+			return false, nil
+		}
 	}
 	next := Subscription{
 		Status:               status,
