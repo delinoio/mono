@@ -482,13 +482,14 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 // handleCommandResult applies the effect of a command result and hands it
 // to a waiting RPC.
 func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *ownsandv1.AgentCommandResult) {
-	info, ok := s.commands.take(res.GetCommandId(), s.now(), s.commandGrace())
+	info, outcome := s.commands.take(res.GetCommandId(), conn.DeviceID, s.now(), s.commandGrace())
 	log := s.Logger.With(slog.String("device_id", conn.DeviceID), slog.String("command_id", res.GetCommandId()), slog.String("channel_id", conn.ID))
-	if !ok {
+	switch outcome {
+	case takeUnknown:
 		log.InfoContext(ctx, "agent_command_result_unknown")
 		return
-	}
-	if info.deviceID != conn.DeviceID {
+	case takeWrongDevice:
+		// The record stays for the device that the command was sent to.
 		log.WarnContext(ctx, "agent_command_result_wrong_device")
 		return
 	}
