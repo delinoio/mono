@@ -94,6 +94,9 @@ func Build(ctx context.Context, opts Options) error {
 	if opts.ImagesDir == "" {
 		return errors.New("imagebuild: the images directory is required")
 	}
+	if err := ValidateResources(opts.DiskGiB, int64(opts.CPUCount), opts.MemoryMiB); err != nil {
+		return err
+	}
 	dir, err := images.Dir(opts.ImagesDir, opts.GuestOS)
 	if err != nil {
 		return err
