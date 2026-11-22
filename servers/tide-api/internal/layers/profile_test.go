@@ -159,6 +159,39 @@ func TestRunnerProfileConcurrentUpdates(t *testing.T) {
 	}
 }
 
+// Durations are stored in milliseconds, so a value with a smaller part is
+// rejected instead of being truncated.
+func TestRunnerProfileSubMillisecondDurations(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	admin := w.env.User(w.org.Admin)
+	base := func() *tidev1.RunnerProfile {
+		return &tidev1.RunnerProfile{
+			Name: "dev", WorkloadKind: tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION, WorkspacePath: "/work",
+			GuestOs: tidev1.GuestOs_GUEST_OS_LINUX, Source: &tidev1.RunnerProfile_BaseImage{BaseImage: tidev1.GuestOs_GUEST_OS_LINUX},
+			Resources: &tidev1.Resources{VcpuCount: 2, MemoryMib: 4096, DiskGib: 32}, NetworkMode: tidev1.NetworkMode_NETWORK_MODE_OUTBOUND,
+			IdleTtl: durationpb.New(time.Hour), MaxTtl: durationpb.New(8 * time.Hour), MaxQueueWait: durationpb.New(30 * time.Minute),
+		}
+	}
+	for name, change := range map[string]func(*tidev1.RunnerProfile){
+		"idle_ttl":       func(p *tidev1.RunnerProfile) { p.IdleTtl = durationpb.New(500 * time.Microsecond) },
+		"max_ttl":        func(p *tidev1.RunnerProfile) { p.MaxTtl = durationpb.New(time.Hour + time.Nanosecond) },
+		"max_queue_wait": func(p *tidev1.RunnerProfile) { p.MaxQueueWait = durationpb.New(1500 * time.Microsecond) },
+	} {
+		in := base()
+		change(in)
+		_, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{OrganizationId: w.org.ID, Profile: in}))
+		wantCode(t, "create with sub-millisecond "+name, err, connect.CodeInvalidArgument)
+	}
+	resp, err := admin.Profile.CreateRunnerProfile(ctx, connect.NewRequest(&tidev1.CreateRunnerProfileRequest{OrganizationId: w.org.ID, Profile: base()}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = admin.Profile.UpdateRunnerProfile(ctx, connect.NewRequest(&tidev1.UpdateRunnerProfileRequest{OrganizationId: w.org.ID, RunnerProfileId: resp.Msg.GetProfile().GetRunnerProfileId(),
+		Profile: &tidev1.RunnerProfile{MaxQueueWait: durationpb.New(500 * time.Microsecond)}, UpdateMask: &fieldmaskpb.FieldMask{Paths: []string{"max_queue_wait"}}}))
+	wantCode(t, "update with sub-millisecond max_queue_wait", err, connect.CodeInvalidArgument)
+}
+
 // TestIntegrationDeleteBlockedByProfile checks that an integration cannot be
 // deleted while a runner profile names it.
 func TestIntegrationDeleteBlockedByProfile(t *testing.T) {

@@ -190,6 +190,11 @@ func durationField(field string, d interface {
 	if err := d.CheckValid(); err != nil {
 		return 0, api.ErrInvalidf("invalid %s: %v", field, err)
 	}
+	// The durations are stored in milliseconds, so a value with a smaller
+	// part would read back as another value.
+	if d.AsDuration()%time.Millisecond != 0 {
+		return 0, api.ErrInvalidf("invalid %s: must be a whole number of milliseconds", field)
+	}
 	return d.AsDuration(), nil
 }
 
