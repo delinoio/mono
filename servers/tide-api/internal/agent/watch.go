@@ -266,7 +266,7 @@ func (h *Hub) poll(ctx context.Context) {
 		return
 	}
 	for _, hc := range ended {
-		if err := h.releaseClaim(ctx, hc.claim, hc.req); err != nil && ctx.Err() == nil {
+		if _, err := h.releaseClaim(ctx, hc.claim, hc.req); err != nil && ctx.Err() == nil {
 			h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", hc.claim.OrganizationID), slog.String("request_id", hc.claim.RequestID),
 				slog.Any("error", err))
 		}

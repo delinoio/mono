@@ -109,6 +109,11 @@ type Hub struct {
 	vendors  map[tidev1.AgentVendor]Vendor
 	bySource map[work.Source]Vendor
 
+	// claimLocks serializes the claim and release calls of one vendor
+	// request; see lockVendorRequest.
+	claimLocksMu sync.Mutex
+	claimLocks   map[string]*claimLock
+
 	mu       sync.Mutex
 	watchers map[string]*watcher
 	// stopped holds the organizations whose deletion runs: no watcher runs
@@ -126,7 +131,7 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 	}
 	h := &Hub{svc: r.Service, engine: engine, integrations: integrations, timing: timing, log: r.Service.Logger,
 		vendors: map[tidev1.AgentVendor]Vendor{}, bySource: map[work.Source]Vendor{},
-		watchers: map[string]*watcher{}, stopped: map[string]bool{}, syncNow: make(chan struct{}, 1)}
+		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, stopped: map[string]bool{}, syncNow: make(chan struct{}, 1)}
 	engine.RegisterAdapter(&Adapter{h: h})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_watchers", RunFunc: h.runWatchers})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_claims", RunFunc: h.runPoller})
@@ -268,29 +273,87 @@ func (h *Hub) releaseRequest(ctx context.Context, req *work.Request) error {
 	if c.State != ClaimHeld {
 		return nil
 	}
-	return h.releaseClaim(ctx, c, req)
+	_, err = h.releaseClaim(ctx, c, req)
+	return err
+}
+
+// claimLock is one entry of Hub.claimLocks.
+type claimLock struct {
+	mu    sync.Mutex
+	users int
+}
+
+// lockVendorRequest locks the claim and release calls of one vendor request
+// and returns the unlock function. The vendor APIs identify a claim only by
+// the vendor request ID (Cursor `claims/{id}/release`, Devin
+// `devins/{session_id}/release`), so a release of an earlier claim that
+// runs after the claim of a follow-up would end the follow-up's claim.
+// admit releases the earlier claim first, and the lock keeps the claim
+// poller from releasing it at the same time. The lock is per process: the
+// watchers and the claim poller run on the lease holder. Other instances
+// release only claims of requests that they ended before a runner took the
+// session, and the vendor queues the follow-up of such a request only after
+// that release took effect.
+func (h *Hub) lockVendorRequest(orgID string, vendor tidev1.AgentVendor, vendorRequestID string) func() {
+	key := orgID + "/" + VendorLabel(vendor) + "/" + vendorRequestID
+	h.claimLocksMu.Lock()
+	l := h.claimLocks[key]
+	if l == nil {
+		l = &claimLock{}
+		h.claimLocks[key] = l
+	}
+	l.users++
+	h.claimLocksMu.Unlock()
+	l.mu.Lock()
+	return func() {
+		l.mu.Unlock()
+		h.claimLocksMu.Lock()
+		if l.users--; l.users == 0 {
+			delete(h.claimLocks, key)
+		}
+		h.claimLocksMu.Unlock()
+	}
 }
 
 // releaseClaim asks the vendor to release c and marks it released when the
-// vendor confirms.
-func (h *Hub) releaseClaim(ctx context.Context, c *Claim, req *work.Request) error {
-	v := h.vendors[c.Vendor]
-	if v == nil {
-		return nil
+// vendor confirms. It returns whether the claim is released.
+func (h *Hub) releaseClaim(ctx context.Context, c *Claim, req *work.Request) (bool, error) {
+	unlock := h.lockVendorRequest(c.OrganizationID, c.Vendor, c.VendorRequestID)
+	defer unlock()
+	return h.releaseClaimLocked(ctx, c, req)
+}
+
+// releaseClaimLocked is releaseClaim for a caller that holds the lock of
+// the vendor request. It reads the claim again, because another caller
+// may have released it meanwhile.
+func (h *Hub) releaseClaimLocked(ctx context.Context, c *Claim, req *work.Request) (bool, error) {
+	cur, err := h.claim(ctx, h.svc.DB.Pool, c.RequestID)
+	if errors.Is(err, errNoClaim) {
+		return true, nil
 	}
-	in, err := h.integrations.Get(ctx, h.svc.DB.Pool, c.OrganizationID, c.IntegrationID)
 	if err != nil {
-		return fmt.Errorf("load agent integration: %w", err)
+		return false, err
 	}
-	done, err := v.Release(ctx, in, c, req)
+	if cur.State != ClaimHeld {
+		return true, nil
+	}
+	v := h.vendors[cur.Vendor]
+	if v == nil {
+		return false, nil
+	}
+	in, err := h.integrations.Get(ctx, h.svc.DB.Pool, cur.OrganizationID, cur.IntegrationID)
+	if err != nil {
+		return false, fmt.Errorf("load agent integration: %w", err)
+	}
+	done, err := v.Release(ctx, in, cur, req)
 	if done {
-		if err := h.setClaimState(ctx, h.svc.DB.Pool, c.RequestID, ClaimHeld, ClaimReleased); err != nil {
-			return err
+		if err := h.setClaimState(ctx, h.svc.DB.Pool, cur.RequestID, ClaimHeld, ClaimReleased); err != nil {
+			return false, err
 		}
-		h.log.InfoContext(ctx, "agent_claim_released", slog.String("organization_id", c.OrganizationID), slog.String("request_id", c.RequestID),
-			slog.String("vendor", VendorLabel(c.Vendor)), slog.String("vendor_request_id", c.VendorRequestID))
+		h.log.InfoContext(ctx, "agent_claim_released", slog.String("organization_id", cur.OrganizationID), slog.String("request_id", cur.RequestID),
+			slog.String("vendor", VendorLabel(cur.Vendor)), slog.String("vendor_request_id", cur.VendorRequestID))
 	}
-	return err
+	return done, err
 }
 
 // prepareOrgDeletion stops the watchers of the organization and releases
@@ -316,7 +379,7 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 		return err
 	}
 	for _, hc := range claims {
-		if err := h.releaseClaim(ctx, hc.claim, hc.req); err != nil {
+		if _, err := h.releaseClaim(ctx, hc.claim, hc.req); err != nil {
 			h.log.WarnContext(ctx, "agent_claim_release_failed", slog.String("organization_id", d.OrganizationID), slog.String("request_id", hc.claim.RequestID), slog.Any("error", err))
 		}
 	}

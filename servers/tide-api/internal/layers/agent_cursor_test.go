@@ -31,8 +31,15 @@ type cursorWorld struct {
 
 func newCursorWorld(t *testing.T, guest tidev1.GuestOs) *cursorWorld {
 	t.Helper()
+	return newCursorWorldTiming(t, guest, agent.Timing{})
+}
+
+// newCursorWorldTiming is newCursorWorld with agent timing (zero: the fast
+// test timing).
+func newCursorWorldTiming(t *testing.T, guest tidev1.GuestOs, timing agent.Timing) *cursorWorld {
+	t.Helper()
 	fake := cursorfake.New(t, cursorKey, "tide-pool")
-	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}})
+	w := newAgentWorld(t, layers.Options{Cursor: cursor.Options{BaseURL: fake.Server.URL, RelistInterval: time.Hour}, AgentTiming: timing})
 	cw := &cursorWorld{agentWorld: w, cursor: fake}
 	cw.integrationID = w.createIntegration(t, &tidev1.CreateAgentIntegrationRequest{
 		Vendor: tidev1.AgentVendor_AGENT_VENDOR_CURSOR, Name: "cursor",
@@ -119,6 +126,53 @@ func TestCursorRequestLifecycle(t *testing.T) {
 	}
 	if strings.Contains(w.env.Logs.String(), cursorKey) {
 		t.Fatal("the API key reached the log")
+	}
+}
+
+// TestCursorFollowUpBeforeRelease: when a follow-up of a request arrives
+// before the claim poller released the claim of the ended request, tide
+// releases the earlier claim before it claims the follow-up, so that a
+// later poll does not release the follow-up's claim (Cursor identifies a
+// claim only by the request ID).
+func TestCursorFollowUpBeforeRelease(t *testing.T) {
+	timing := fastAgentTiming()
+	timing.PollInterval = time.Hour // the test runs the poller with Poll
+	w := newCursorWorldTiming(t, tidev1.GuestOs_GUEST_OS_LINUX, timing)
+	ctx := context.Background()
+	w.cursor.AddRequest("bc-follow", true)
+	first := w.requestBySource(t, "bc-follow")
+	workerID := "tide-" + first.GetRequestId()
+	var runner *tidev1.Runner
+	eventually(t, "runner waits for work", func() bool {
+		r := w.request(t, first.GetRequestId())
+		if r.GetRunnerId() == "" {
+			return false
+		}
+		runner = w.runner(t, r.GetRunnerId())
+		return runner.GetState() == tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	})
+	w.cursor.Connect(workerID)
+	w.l.Agents.Poll(ctx)
+	w.waitRequest(t, first.GetRequestId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	// The worker exits after its idle release timeout; Cursor frees its
+	// claim, and tide's claim row stays held until the next poll.
+	w.cursor.Disconnect(workerID)
+	w.guest.exitProgram(runner.GetOwnsandSandboxId(), 0)
+	w.waitRequest(t, first.GetRequestId(), tidev1.RequestState_REQUEST_STATE_ENDED)
+	if c, err := w.l.Agents.Claim(ctx, first.GetRequestId()); err != nil || c.State != agent.ClaimHeld {
+		t.Fatalf("claim %+v %v", c, err)
+	}
+	w.cursor.AddRequest("bc-follow", true)
+	second := w.requestBySource(t, "bc-follow#2")
+	if c, err := w.l.Agents.Claim(ctx, first.GetRequestId()); err != nil || c.State != agent.ClaimReleased {
+		t.Fatalf("earlier claim %+v %v", c, err)
+	}
+	w.l.Agents.Poll(ctx)
+	if got, ok := w.cursor.Claim("bc-follow"); !ok || got != "tide-"+second.GetRequestId() {
+		t.Fatalf("live claim %q %v", got, ok)
+	}
+	if n := w.cursor.Released("bc-follow"); n != 0 {
+		t.Fatalf("%d releases of the follow-up's claim", n)
 	}
 }
 

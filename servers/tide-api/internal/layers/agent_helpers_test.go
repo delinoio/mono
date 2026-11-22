@@ -121,7 +121,9 @@ func newAgentWorld(t *testing.T, opts layers.Options) *agentWorld {
 	t.Helper()
 	w := &world{fake: ownsandfake.New(), l: &layers.Layers{}}
 	opts.OwnSand = w.fake
-	opts.AgentTiming = fastAgentTiming()
+	if opts.AgentTiming == (agent.Timing{}) {
+		opts.AgentTiming = fastAgentTiming()
+	}
 	w.env = testenv.New(t, testenv.WithLayerOptions(opts, w.l))
 	w.org = w.env.NewOrg("alice")
 	ww := &workWorld{world: w, osOrg: api.NewID()}

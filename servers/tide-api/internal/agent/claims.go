@@ -222,6 +222,9 @@ func (h *Hub) profileFor(ctx context.Context, q db.Querier, in integration.Integ
 //     repeated event, or tide's claim lapsed (for example, at a Devin claim
 //     deadline). tide claims it again with the same worker ID; a conflict
 //     changes nothing, because the claim can still be tide's.
+//   - When the newest request of the vendor request ended and tide still
+//     holds its claim, tide releases that claim first; while the vendor
+//     does not confirm the release, tide claims nothing.
 //   - When the newest request of the vendor request ended because a user
 //     canceled it in tide, the same pending entry (same marker) is not
 //     claimed again.
@@ -233,6 +236,8 @@ func (h *Hub) profileFor(ctx context.Context, q db.Querier, in integration.Integ
 func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d Demand) error {
 	logAttrs := []slog.Attr{slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID),
 		slog.String("vendor", VendorLabel(in.Vendor)), slog.String("vendor_request_id", d.VendorRequestID)}
+	unlock := h.lockVendorRequest(in.OrganizationID, in.Vendor, d.VendorRequestID)
+	defer unlock()
 	c, req, err := h.latestClaim(ctx, h.svc.DB.Pool, in.OrganizationID, in.Vendor, d.VendorRequestID)
 	if err != nil {
 		return err
@@ -258,6 +263,20 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		}
 		h.log.LogAttrs(ctx, slog.LevelInfo, "agent_claim_renewed", append(logAttrs, slog.String("request_id", c.RequestID))...)
 		return nil
+	}
+	if c != nil && c.State == ClaimHeld {
+		// The earlier request ended, but tide did not release its claim
+		// yet. Release it before the new claim, because a later release
+		// would end the new claim (see lockVendorRequest).
+		done, err := h.releaseClaimLocked(ctx, c, req)
+		if err != nil {
+			return fmt.Errorf("release the earlier claim: %w", err)
+		}
+		if !done {
+			// The next list or event admits the entry.
+			h.log.LogAttrs(ctx, slog.LevelInfo, "agent_demand_deferred", append(logAttrs, slog.String("request_id", c.RequestID), slog.String("cause", "earlier_claim_held"))...)
+			return nil
+		}
 	}
 	if c != nil && canceledBeforeStart(req) && c.DemandMarker == d.Marker {
 		return nil
