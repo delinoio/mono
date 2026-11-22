@@ -185,7 +185,7 @@ func (a *app) registerGlobals(fs *flag.FlagSet) {
 	fs.StringVar(&a.g.apiURL, "api-url", a.g.apiURL, "API origin (env "+EnvAPIURL+")")
 	fs.StringVar(&a.g.org, "org", a.g.org, "organization ID (env "+ownsand.EnvOrganization+")")
 	fs.StringVar(&a.g.format, "format", a.g.format, "output format: text or json")
-	fs.BoolVar(&a.g.noColor, "no-color", a.g.noColor, "disable ANSI color (env "+EnvNoColor+")")
+	fs.BoolVar(&a.g.noColor, "no-color", a.g.noColor, "disable ANSI color (env "+EnvNoColor+" set to a non-empty value)")
 	fs.BoolVar(&a.g.verbose, "verbose", a.g.verbose, "write structured logs to standard error")
 	fs.StringVar(&a.g.transport, "transport", a.g.transport, "data path transport: auto, peer-to-peer or relay (env "+EnvTransport+")")
 }
@@ -282,8 +282,10 @@ func (a *app) applyGlobals() error {
 		return usageErr("%v", err)
 	}
 	a.fmt = f
-	_, noColorEnv := a.env.LookupEnv(EnvNoColor)
-	a.color = !a.g.noColor && !noColorEnv
+	// NO_COLOR turns color off only when it is set to a non-empty value, as
+	// the no-color.org convention says; an empty value counts as unset.
+	noColorEnv, _ := a.env.LookupEnv(EnvNoColor)
+	a.color = !a.g.noColor && noColorEnv == ""
 	if a.g.verbose {
 		a.logger = slog.New(newLogHandler(a.env.Stderr, a.color))
 	} else {
