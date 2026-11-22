@@ -484,6 +484,62 @@ func TestDeviceSetLimitsKeepsCurrentOvercommit(t *testing.T) {
 	}
 }
 
+// TestDeviceSetLimitsOvercommitFlag checks that only an absent
+// --vcpu-overcommit falls back to the device's current value, that every
+// explicit value is validated before any RPC, and that an explicit valid value
+// is sent without a preceding GetDevice.
+func TestDeviceSetLimitsOvercommitFlag(t *testing.T) {
+	base := []string{"--vcpu", "8", "--memory", "16384", "--disk", "200"}
+	for _, tc := range []struct {
+		name      string
+		flag      []string
+		wantCode  int
+		wantCalls []string
+		wantPct   int32
+	}{
+		{name: "absent keeps the current value", wantCalls: []string{"GetDevice", "ReplaceDeviceLimits"}, wantPct: 150},
+		{name: "explicit 100", flag: []string{"--vcpu-overcommit", "100"}, wantCalls: []string{"ReplaceDeviceLimits"}, wantPct: 100},
+		{name: "explicit 400", flag: []string{"--vcpu-overcommit=400"}, wantCalls: []string{"ReplaceDeviceLimits"}, wantPct: 400},
+		{name: "explicit 110", flag: []string{"--vcpu-overcommit", "110"}, wantCode: ExitUsage},
+		{name: "explicit -1", flag: []string{"--vcpu-overcommit", "-1"}, wantCode: ExitUsage},
+		{name: "explicit -25", flag: []string{"--vcpu-overcommit=-25"}, wantCode: ExitUsage},
+		{name: "explicit minimum int32", flag: []string{"--vcpu-overcommit", "-2147483648"}, wantCode: ExitUsage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			args := append([]string{"device", "set-limits", r.f.dev}, base...)
+			res := r.run(append(args, tc.flag...)...)
+			if res.code != tc.wantCode {
+				t.Fatalf("exit code %d, want %d: %+v", res.code, tc.wantCode, res)
+			}
+			calls := r.f.callNames()
+			if len(calls) != len(tc.wantCalls) {
+				t.Fatalf("calls %v, want %v", calls, tc.wantCalls)
+			}
+			for i := range calls {
+				if calls[i] != tc.wantCalls[i] {
+					t.Fatalf("calls %v, want %v", calls, tc.wantCalls)
+				}
+			}
+			r.f.mu.Lock()
+			l := r.f.limit
+			r.f.mu.Unlock()
+			if tc.wantCode != 0 {
+				if !strings.Contains(res.stderr, "limits.vcpu_overcommit_percent") || !strings.Contains(res.stderr, "100 to 400 in steps of 25") {
+					t.Fatalf("stderr does not name the field and the allowed range: %q", res.stderr)
+				}
+				if l != nil {
+					t.Fatalf("limits were sent: %v", l)
+				}
+				return
+			}
+			if l.GetVcpuCount() != 8 || l.GetMemoryMib() != 16384 || l.GetDiskGib() != 200 || l.VcpuOvercommitPercent == nil || l.GetVcpuOvercommitPercent() != tc.wantPct {
+				t.Fatalf("limits %v, want overcommit %d", l, tc.wantPct)
+			}
+		})
+	}
+}
+
 // TestDeviceSetLimitsSendsExplicitZero checks that a zero flag value is sent
 // as a present zero, which the strict RPC accepts, and that every field of
 // the request is present.
