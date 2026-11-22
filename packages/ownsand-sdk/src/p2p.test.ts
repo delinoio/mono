@@ -24,6 +24,8 @@ import {
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
+import { PeerUnavailableError } from "./p2p/session.ts";
+import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
 import type { Sandbox } from "./sandbox.ts";
 import {
   type FakeAgent,
@@ -652,6 +654,103 @@ describe("peer-to-peer data path", () => {
     expect(sandbox.transport).toBe(DataPathTransport.RELAY);
     await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
     expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+  });
+
+  describe("when the WebRTC constructor throws", () => {
+    /** A peer connection constructor that throws, with the throw recorded. */
+    function throwingWebRtc(
+      error: Error,
+      onConstruct: () => void = () => {},
+    ): { RTCPeerConnection: PeerConnectionConstructor; constructed: number[] } {
+      const constructed: number[] = [];
+      return {
+        constructed,
+        RTCPeerConnection: class {
+          constructor() {
+            constructed.push(constructed.length);
+            onConstruct();
+            throw error;
+          }
+        } as unknown as PeerConnectionConstructor,
+      };
+    }
+
+    function throwingSetup(
+      webrtc: { RTCPeerConnection: PeerConnectionConstructor },
+      transport?: DataPathTransport,
+    ) {
+      const h = setup({ webrtc, transport });
+      h.api.unary(DataPathService, "GetIceServers", () => ({
+        iceServers: [{ urls: ["stun:stun.ownsand.api.test:3478"] }],
+      }));
+      h.api.unary(DataPathService, "OpenSession", () => ({
+        sessionId: "session-1",
+        sdpAnswer: "v=0 fake-answer",
+        expiresIn: { seconds: 3600n },
+      }));
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      return h;
+    }
+
+    test("an automatic transport uses the relay and keeps the handle on it", async () => {
+      const webrtc = throwingWebRtc(new Error("native webrtc unavailable"));
+      const h = throwingSetup(webrtc);
+      const sandbox = h.client.sandbox(SANDBOX);
+      const result = await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+      expect(result.kind).toBe(ExecResultKind.Exited);
+      expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+      expect(webrtc.constructed).toHaveLength(1);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+      // The handle stays on the relay: no later operation builds a peer.
+      await h.clock.run(sandbox.exec({ command: ["x"] }).wait());
+      expect(webrtc.constructed).toHaveLength(1);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+    });
+
+    test("a forced PEER_TO_PEER transport returns a data path error with the original cause", async () => {
+      const original = new Error("native webrtc unavailable");
+      const webrtc = throwingWebRtc(original);
+      const h = throwingSetup(webrtc, DataPathTransport.PEER_TO_PEER);
+      const error = await h.clock
+        .run(
+          h.client
+            .sandbox(SANDBOX)
+            .exec({ command: ["x"] })
+            .wait(),
+        )
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(error.cause).toBeInstanceOf(PeerUnavailableError);
+      expect(error.cause.message).toBe("peer-to-peer setup failed");
+      expect(error.cause.cause).toBe(original);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("a caller abort ends with the abort reason and starts no relay", async () => {
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const webrtc = throwingWebRtc(
+        new Error("native webrtc unavailable"),
+        () => controller.abort(reason),
+      );
+      const h = throwingSetup(webrtc);
+      const sandbox = h.client.sandbox(SANDBOX);
+      const error = await h.clock
+        .run(sandbox.exec({ command: ["x"], signal: controller.signal }).wait())
+        .catch((e) => e);
+      expect(error).toBe(reason);
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
   });
 
   for (const code of [
