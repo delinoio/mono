@@ -339,6 +339,15 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			}
 			continue
 		}
+		// The caller's context stays authoritative. It can end while the
+		// attempt fails, so the attempt can report a status that the server
+		// answered for the caller's deadline (Connect sends the deadline as a
+		// timeout header, and the server's timer can fire first) or the
+		// stream reset of the cancellation. classify would take such an
+		// error for a terminal failure of the operation.
+		if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
+			return nil, cerr
+		}
 		if at.authErr {
 			if connect.CodeOf(err) == connect.CodeFailedPrecondition {
 				if ended := s.endedState(ctx); ended != nil {
@@ -385,10 +394,8 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			// Only WriteFile retries deadline_exceeded, because its retry
 			// is idempotent by write_id. For an exec, the status is the
 			// control plane's final answer; unless the caller's own
-			// deadline caused it, the operation ends with it.
-			if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
-				return nil, cerr
-			}
+			// deadline caused it (handled above), the operation ends with
+			// it.
 			return nil, op.dpErr(err, false)
 		}
 		op.rec.fail(err)
