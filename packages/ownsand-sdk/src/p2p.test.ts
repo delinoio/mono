@@ -12,6 +12,7 @@ import { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 import {
   BillingReason,
   DataPathTransport,
+  ErrorCode,
   SessionEndReason,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
@@ -885,6 +886,39 @@ describe("peer-to-peer data path", () => {
       .catch((e) => e);
     expect(error.code).toBe(Code.FailedPrecondition);
   });
+
+  for (const [name, message, expected] of [
+    [
+      "a missing file keeps the guest message",
+      "read: file does not exist",
+      "read: file does not exist",
+    ],
+    ["an expired read_id", "read expired", "the file read expired"],
+  ] as const) {
+    test(`a file read error frame with not_found: ${name}`, async () => {
+      const { h } = p2pSetup((frame, peer) => {
+        peer.send({
+          streamId: frame.streamId,
+          sandboxId: SANDBOX,
+          kind: DataFrameKind.ERROR,
+          payload: {
+            case: "error",
+            value: { code: ErrorCode.NOT_FOUND, message },
+          },
+        });
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const error = await h.clock
+        .run(sandbox.readFileBytes("/missing"))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.NotFound);
+      expect(error.message).toBe(expected);
+      expect(error.cause).toBeInstanceOf(ConnectError);
+      expect(error.cause.rawMessage).toBe(message);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+  }
 
   describe("invalid frames", () => {
     const UNKNOWN_KIND = 99 as DataFrameKind;

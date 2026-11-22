@@ -15,7 +15,7 @@ import { type OperationContext, throwIfAborted } from "../relay/context.ts";
 import { GrantKeeper, RelayCallKind } from "../relay/grant.ts";
 import { RecoveryWindow } from "../relay/recovery.ts";
 import { watchedRelayStream } from "../relay/stream.ts";
-import { isNotFound, recoverOrThrow } from "./common.ts";
+import { isExpiredRead, isNotFound, recoverOrThrow } from "./common.ts";
 
 /** A relay stream that ended with OK before `accepted`: not a rotation. */
 class UnacceptedStreamEnd extends OwnSandError {
@@ -26,7 +26,8 @@ class UnacceptedStreamEnd extends OwnSandError {
  * Reads a guest file in chunks. It generates the `read_id` and salt right
  * before the first call, continues every interrupted or rotated stream from
  * the next undelivered offset with the same `read_id`, and never delivers a
- * byte twice. A `read_id` that expired (`not_found`) is a visible error.
+ * byte twice. A `read_id` that expired and a path that does not exist are
+ * visible `not_found` errors with their own messages.
  */
 export async function* runReadFile(
   ctx: OperationContext,
@@ -155,8 +156,16 @@ export async function* runReadFile(
       window.fail();
       continue;
     }
-    if (isNotFound(failure)) {
+    if (isExpiredRead(failure)) {
       throw new DataPathError("the file read expired", {
+        code: Code.NotFound,
+        cause: failure,
+      });
+    }
+    if (isNotFound(failure)) {
+      // A missing path: keep the guest's message ("file does not exist") and
+      // the original error as the cause.
+      throw new DataPathError(failure.rawMessage, {
         code: Code.NotFound,
         cause: failure,
       });

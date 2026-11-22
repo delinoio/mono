@@ -88,16 +88,52 @@ describe("file read", () => {
     expect(text(bytes)).toBe("abcd");
   });
 
-  test("an expired read_id is a visible error", async () => {
+  for (const guestMessage of [
+    "read expired",
+    "operation expired, or the caller's clock may be behind",
+  ]) {
+    test(`an expired read_id is a visible error ("${guestMessage}")`, async () => {
+      const h = setup();
+      h.api.stream(RelayService, "ReadFile", function* () {
+        throw new ConnectError(guestMessage, Code.NotFound);
+      });
+      const error = await h.clock
+        .run(h.client.sandbox(SANDBOX).readFileBytes("/data"))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.NotFound);
+      expect(error.message).toBe("the file read expired");
+      expect(error.cause).toBeInstanceOf(ConnectError);
+      expect(error.cause.rawMessage).toBe(guestMessage);
+    });
+  }
+
+  test("a missing file is a not_found error that keeps the guest message", async () => {
     const h = setup();
     h.api.stream(RelayService, "ReadFile", function* () {
-      throw new ConnectError("read expired", Code.NotFound);
+      throw new ConnectError("read: file does not exist", Code.NotFound);
     });
-    const error = await h.clock
-      .run(h.client.sandbox(SANDBOX).readFileBytes("/data"))
-      .catch((e) => e);
-    expect(error).toBeInstanceOf(DataPathError);
-    expect(error.code).toBe(Code.NotFound);
+    const reads: Array<() => Promise<unknown>> = [
+      () => h.client.sandbox(SANDBOX).readFileBytes("/missing"),
+      async () => {
+        for await (const _ of h.client.sandbox(SANDBOX).readFile("/missing")) {
+          // No chunk arrives.
+        }
+      },
+    ];
+    for (const read of reads) {
+      const error: any = await h.clock
+        .run(read() as Promise<void>)
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.NotFound);
+      expect(error.message).toContain("file does not exist");
+      expect(error.message).not.toContain("expired");
+      expect(error.cause).toBeInstanceOf(ConnectError);
+      expect(error.cause.rawMessage).toBe("read: file does not exist");
+    }
+    // A missing file is terminal: no recovery attempt.
+    expect(h.api.callsOf("ReadFile")).toHaveLength(2);
   });
 
   test("repeated accepted continuations without data at the same offset end within the window", async () => {
