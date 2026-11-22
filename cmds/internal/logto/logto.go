@@ -2,9 +2,9 @@
 
 // Package logto implements the OAuth 2.0 device authorization flow
 // (RFC 8628) and the refresh token grant against a Logto tenant, as the
-// ownsand CLI uses them: the CLI is a Logto native application with device
-// flow, asks for offline_access in the device authorization and exchanges
-// the refresh token for an access token of the OwnSand API resource.
+// ownsand and tide CLIs use them: each CLI is a Logto native application with
+// device flow, asks for offline_access in the device authorization and
+// exchanges the refresh token for an access token of its API resource.
 // See https://docs.logto.io/quick-starts/device-flow.
 //
 // Tokens and device codes are secrets: errors never contain them.
@@ -28,7 +28,7 @@ type Config struct {
 	Endpoint string
 	// AppID is the ID of the native application with device flow.
 	AppID string
-	// Resource is the API resource indicator of the OwnSand API.
+	// Resource is the API resource indicator of the API.
 	Resource string
 	// Scopes are requested in the device authorization; openid and
 	// offline_access are always included.
@@ -69,6 +69,10 @@ func (e *Error) Error() string {
 	}
 	return "logto: " + e.Code
 }
+
+// ErrMissingConfig reports a configuration without a tenant endpoint or an
+// application ID. Callers name their own configuration variables with it.
+var ErrMissingConfig = errors.New("logto: the tenant endpoint and the application ID are required")
 
 // ErrAccessDenied and ErrExpired end the device flow.
 var (
@@ -131,7 +135,7 @@ func (c Config) post(ctx context.Context, path string, form url.Values, out any)
 // Validate checks that the configuration names a tenant and an application.
 func (c Config) Validate() error {
 	if c.Endpoint == "" || c.AppID == "" {
-		return errors.New("logto: the tenant endpoint and the application ID are required (OWNSAND_LOGTO_ENDPOINT and OWNSAND_LOGTO_APP_ID)")
+		return ErrMissingConfig
 	}
 	u, err := url.Parse(c.Endpoint)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {

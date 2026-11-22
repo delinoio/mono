@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
-	"github.com/delinoio/mono/cmds/ownsand/internal/logto"
+	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/cmds/internal/logto"
 	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
@@ -63,6 +63,9 @@ func (a *app) login(ctx context.Context, args []string) error {
 	}
 	cfg := a.logtoConfig()
 	if err := cfg.Validate(); err != nil {
+		if errors.Is(err, logto.ErrMissingConfig) {
+			return fmt.Errorf("%w (%s and %s)", err, EnvLogtoEndpoint, EnvLogtoAppID)
+		}
 		return err
 	}
 	da, err := cfg.StartDeviceAuthorization(ctx)

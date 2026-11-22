@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
-	"github.com/delinoio/mono/cmds/ownsand/internal/logto"
+	"github.com/delinoio/mono/cmds/internal/credstore"
+	"github.com/delinoio/mono/cmds/internal/logto"
 	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
