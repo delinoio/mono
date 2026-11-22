@@ -199,9 +199,26 @@ export class PeerSession {
       // the handle moves to the relay.
       throw new PeerUnavailableError("GetIceServers failed", { cause: error });
     }
-    const pc = new Peer({
-      iceServers: ice.iceServers.map((server) => ({ urls: [...server.urls] })),
-    });
+    let pc: PeerConnectionLike;
+    try {
+      pc = new Peer({
+        iceServers: ice.iceServers.map((server) => ({
+          urls: [...server.urls],
+        })),
+      });
+    } catch (error) {
+      // The WebRTC constructor can throw synchronously (an invalid ICE server
+      // URL, or a native stack that cannot start). Nothing was opened, so
+      // there is nothing to close. Without this guard the raw error would
+      // skip the relay fallback that every other peer setup failure uses.
+      // A caller abort still ends the operation with the abort reason.
+      if (signal?.aborted) {
+        throw error;
+      }
+      throw new PeerUnavailableError("peer-to-peer setup failed", {
+        cause: error,
+      });
+    }
     try {
       const channel = pc.createDataChannel(DATA_CHANNEL_LABEL, {
         ordered: true,
@@ -371,6 +388,12 @@ export class PeerSession {
         signal,
       );
       for await (const frame of queue) {
+        // The queue hands out its buffered frames before it reports a stored
+        // failure, which is right for a transport failure but not for the
+        // caller's own cancellation: a cancelled caller gets the abort reason
+        // before any more output, and a buffered final frame cannot turn the
+        // cancellation into a success.
+        throwIfAborted(signal);
         if (frame.payload.case === "error") {
           throw connectErrorFromDetail(frame.payload.value);
         }
@@ -381,6 +404,8 @@ export class PeerSession {
           continue;
         }
         yield accepted.value;
+        // The consumer can abort while it handles the yielded value.
+        throwIfAborted(signal);
         if (accepted.final) {
           return;
         }
@@ -403,7 +428,8 @@ export class PeerSession {
    * its frame waits for the turn, so the turn re-checks the signal before it
    * sends the first message and skips a cancelled frame; a frame that is
    * already in progress always completes, because a partial frame would
-   * corrupt the byte stream.
+   * corrupt the byte stream. The caller itself returns as soon as its signal
+   * aborts, whether its frame waits for the turn or is in progress.
    */
   async #send(
     frame: DataFrame,
@@ -419,7 +445,11 @@ export class PeerSession {
     // The next sender waits for this turn to finish, whether it failed or
     // not; the failure itself reaches only the caller of this frame.
     this.#sendTail = turn.catch(() => {});
-    await turn;
+    // The caller does not wait for the turn longer than its signal allows:
+    // an abort returns the abort reason at once, even while a frame of
+    // another request holds the turn. The queued turn stays in the chain and
+    // re-checks the signal when it starts, so it writes nothing.
+    await rejectOnAbort(turn, signal);
   }
 
   async #writeMessages(
@@ -441,7 +471,26 @@ export class PeerSession {
         throw this.#ended;
       }
       throwIfAborted(cancellable);
-      this.#channel.send(message);
+      try {
+        this.#channel.send(message);
+      } catch (error) {
+        if (index === 0) {
+          // Nothing of this frame is on the byte stream, so the session
+          // stays usable and the caller sees the send failure.
+          throw error;
+        }
+        // A prefix of the frame is already queued, so no later frame can
+        // follow it: the decoder of the agent would read the next frame as
+        // the rest of this one. Retire the session; the waiting calls see it
+        // ended and recover as they do for any other peer failure.
+        this.#terminate(
+          new PeerUnavailableError(
+            "data channel send failed in the middle of a frame",
+            { cause: error },
+          ),
+        );
+        throw this.#ended;
+      }
     }
   }
 
@@ -665,6 +714,38 @@ async function waitForGathering(
           }
         },
       );
+  });
+}
+
+/**
+ * Settles with `promise`, or rejects with the abort reason as soon as the
+ * signal aborts. `promise` keeps running; a later failure of it is handled
+ * by this race, so it never becomes an unhandled rejection.
+ */
+function rejectOnAbort<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (signal === undefined) {
+    return promise;
+  }
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    if (signal.aborted) {
+      onAbort();
+    } else {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
   });
 }
 

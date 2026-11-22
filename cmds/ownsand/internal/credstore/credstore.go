@@ -48,6 +48,11 @@ var ErrNotFound = errors.New("credstore: no stored credentials")
 // than the caller expected, for example because the user signed in again.
 var ErrReplaced = errors.New("credstore: the stored credentials belong to another session")
 
+// ErrRotated reports that the stored refresh token is not the one the caller
+// refreshed, because another process refreshed the same session first and
+// stored its own rotation.
+var ErrRotated = errors.New("credstore: the stored refresh token was rotated by another process")
+
 // NewSessionID returns a random identifier for a new sign-in.
 func NewSessionID() (string, error) {
 	var b [16]byte
@@ -121,6 +126,36 @@ func (s Store) SaveIfSession(sessionID string, c *Credentials) error {
 	}
 	if cur.SessionID != sessionID {
 		return ErrReplaced
+	}
+	return s.write(c)
+}
+
+// SaveIfCurrent writes c only when the stored credentials are still the
+// generation that the caller refreshed: they belong to the session sessionID
+// and hold the refresh token refreshToken, which the caller sent to the token
+// endpoint. It is the compare-and-swap of a token refresh: Logto rotates the
+// refresh token, so a result derived from an older refresh token must never
+// replace the newer rotation that another process stored meanwhile. It
+// returns ErrNotFound when the credentials were removed, ErrReplaced when
+// another session replaced them and ErrRotated when the same session holds a
+// different refresh token; in every case it writes nothing and the caller
+// reloads the stored credentials with Load. The comparison and the write
+// happen under the store lock.
+func (s Store) SaveIfCurrent(sessionID, refreshToken string, c *Credentials) error {
+	unlock, err := s.lockDir()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	cur, err := s.Load()
+	if err != nil {
+		return err
+	}
+	if cur.SessionID != sessionID {
+		return ErrReplaced
+	}
+	if cur.RefreshToken != refreshToken {
+		return ErrRotated
 	}
 	return s.write(c)
 }

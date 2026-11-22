@@ -66,6 +66,187 @@ func TestVsockHandshake(t *testing.T) {
 	}
 }
 
+// delayedAckPeer listens on the vsock socket of a new vm. Each accepted
+// connection reads the CONNECT line, reports it on accepted, and then waits on
+// release before it answers "OK". closed receives the result of the peer's
+// read: io.EOF when the dialer closes its end, or a timeout error when it
+// never does.
+func delayedAckPeer(t *testing.T) (v *vm, accepted chan struct{}, release chan struct{}, closed chan error) {
+	t.Helper()
+	dir := t.TempDir()
+	f, _ := os.Open(dir)
+	t.Cleanup(func() { f.Close() })
+	v = &vm{dir: dir, dirFile: f}
+	l, err := net.Listen("unix", v.path(vsockSocket))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	accepted = make(chan struct{}, 1)
+	release = make(chan struct{})
+	closed = make(chan error, 1)
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		r := bufio.NewReader(c)
+		if _, err := r.ReadString('\n'); err != nil {
+			return
+		}
+		accepted <- struct{}{}
+		// Watch for the dialer closing its end while the acknowledgement is
+		// delayed; the dialer sends nothing after the CONNECT line.
+		read := make(chan error, 1)
+		go func() {
+			c.SetReadDeadline(time.Now().Add(5 * time.Second))
+			_, err := r.ReadByte()
+			read <- err
+		}()
+		select {
+		case err := <-read:
+			closed <- err
+		case <-release:
+			c.Write([]byte("OK 1073741824\n"))
+			closed <- <-read
+		}
+	}()
+	return v, accepted, release, closed
+}
+
+func TestVsockHandshakeCancelDuringAck(t *testing.T) {
+	v, accepted, _, closed := delayedAckPeer(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	type result struct {
+		c   net.Conn
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		c, err := v.Dial(ctx)
+		done <- result{c, err}
+	}()
+	select {
+	case <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer never saw the CONNECT line")
+	}
+	start := time.Now()
+	cancel()
+	select {
+	case r := <-done:
+		if r.c != nil {
+			r.c.Close()
+			t.Fatal("a canceled dial returned a connection")
+		}
+		if !errors.Is(r.err, context.Canceled) {
+			t.Fatalf("Dial error %v, want context.Canceled", r.err)
+		}
+		if elapsed := time.Since(start); elapsed > 2*time.Second {
+			t.Fatalf("Dial took %v to notice the cancellation", elapsed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Dial did not return after the cancellation")
+	}
+	select {
+	case err := <-closed:
+		if err != io.EOF {
+			t.Fatalf("peer read %v, want io.EOF after the dialer closed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("peer did not see the connection close")
+	}
+}
+
+func TestVsockHandshakeDeadlineDuringAck(t *testing.T) {
+	v, accepted, _, _ := delayedAckPeer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	c, err := v.Dial(ctx)
+	if c != nil {
+		c.Close()
+		t.Fatal("a timed-out dial returned a connection")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Dial error %v, want context.DeadlineExceeded", err)
+	}
+	select {
+	case <-accepted:
+	default:
+		t.Fatal("peer never saw the CONNECT line")
+	}
+}
+
+func TestVsockHandshakeCanceledBeforeDial(t *testing.T) {
+	v, _, release, _ := delayedAckPeer(t)
+	close(release)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	c, err := v.Dial(ctx)
+	if c != nil {
+		c.Close()
+		t.Fatal("a canceled dial returned a connection")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Dial error %v, want context.Canceled", err)
+	}
+}
+
+func TestVsockHandshakeRefused(t *testing.T) {
+	dir := t.TempDir()
+	f, _ := os.Open(dir)
+	defer f.Close()
+	v := &vm{dir: dir, dirFile: f}
+	l, err := net.Listen("unix", v.path(vsockSocket))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	go func() {
+		c, err := l.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		bufio.NewReader(c).ReadString('\n')
+		c.Write([]byte("NO\n"))
+	}()
+	c, err := v.Dial(context.Background())
+	if c != nil {
+		c.Close()
+		t.Fatal("a refused handshake returned a connection")
+	}
+	if err == nil || !strings.Contains(err.Error(), "refused") {
+		t.Fatalf("Dial error %v, want a refusal", err)
+	}
+}
+
+func TestVsockHandshakeClearsDeadline(t *testing.T) {
+	v, accepted, release, _ := delayedAckPeer(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	go func() {
+		<-accepted
+		close(release)
+	}()
+	c, err := v.Dial(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	// Outlive the context deadline: a leftover socket deadline would make the
+	// read fail with a timeout instead of waiting for the idle peer.
+	time.Sleep(500 * time.Millisecond)
+	c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_, err = c.Read(make([]byte, 1))
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("read error %v, want the new read deadline", err)
+	}
+}
+
 func TestAPIClientErrors(t *testing.T) {
 	dir := t.TempDir()
 	f, _ := os.Open(dir)

@@ -68,7 +68,7 @@ function fakeGo(t, script) {
 // received and exits.
 function fakeGoBuildingEnvPrinter(t) {
   const program = `#!${process.execPath}
-console.log(JSON.stringify({ event: "env", cors: process.env.CORS_ORIGINS, direct: process.env.ALLOW_DIRECT_CLIENT_ADDRESS }));
+console.log(JSON.stringify({ event: "env", cors: process.env.CORS_ORIGINS, direct: process.env.ALLOW_DIRECT_CLIENT_ADDRESS, database: process.env.DATABASE_URL }));
 `;
   return fakeGo(
     t,
@@ -139,6 +139,52 @@ for (const [label, value] of [
         event: "env",
         cors: DefaultCorsOrigins,
         direct: "true",
+        database: "postgres://launcher-test",
+      });
+    },
+  );
+}
+
+// The server removes only ASCII white space, so Unicode white space is a value,
+// not an unset variable. The launcher must neither skip nor replace it.
+for (const [label, value] of [
+  ["U+00A0", "\u00a0"],
+  ["U+3000", "\u3000"],
+]) {
+  test(
+    `DATABASE_URL that is only ${label} is set and starts the build`,
+    { skip, timeout: Timeout },
+    async (t) => {
+      const { code, output } = await runLauncher(t, {
+        env: { DATABASE_URL: value },
+        goDir: fakeGoBuildingEnvPrinter(t),
+      });
+
+      assert.equal(code, 0, output);
+      assert.doesNotMatch(output, /ownsand_api_dev_skipped/);
+      assert.equal(envRecord(output).database, value);
+    },
+  );
+
+  test(
+    `CORS_ORIGINS and ALLOW_DIRECT_CLIENT_ADDRESS that are only ${label} pass through unchanged`,
+    { skip, timeout: Timeout },
+    async (t) => {
+      const { code, output } = await runLauncher(t, {
+        env: {
+          DATABASE_URL: "postgres://launcher-test",
+          CORS_ORIGINS: value,
+          ALLOW_DIRECT_CLIENT_ADDRESS: value,
+        },
+        goDir: fakeGoBuildingEnvPrinter(t),
+      });
+
+      assert.equal(code, 0, output);
+      assert.deepEqual(envRecord(output), {
+        event: "env",
+        cors: value,
+        direct: value,
+        database: "postgres://launcher-test",
       });
     },
   );
@@ -158,6 +204,7 @@ test(
       event: "env",
       cors: DefaultCorsOrigins,
       direct: "true",
+      database: "postgres://launcher-test",
     });
   },
 );
@@ -180,6 +227,7 @@ test(
       event: "env",
       cors: "https://a.example",
       direct: "false",
+      database: "postgres://launcher-test",
     });
   },
 );

@@ -16,7 +16,9 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	"github.com/delinoio/mono/go/ownsand/validate"
+	"github.com/delinoio/mono/go/uuidv7"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -723,3 +725,145 @@ func TestWriteFileContinuesOnRelayAfterChannelFailure(t *testing.T) {
 }
 
 func must(b []byte, _ bool) []byte { return b }
+
+// lateEOFReader returns one full chunk at once and then waits before it
+// reports the end of input, so the lookahead of WriteFile delays the first
+// send by that long.
+type lateEOFReader struct {
+	data  []byte
+	off   int
+	delay time.Duration
+}
+
+func (r *lateEOFReader) Read(p []byte) (int, error) {
+	if r.off >= len(r.data) {
+		time.Sleep(r.delay)
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+// firstByteDelayReader waits before it returns its first byte.
+type firstByteDelayReader struct {
+	data  []byte
+	off   int
+	delay time.Duration
+	slept bool
+}
+
+func (r *firstByteDelayReader) Read(p []byte) (int, error) {
+	if !r.slept {
+		r.slept = true
+		time.Sleep(r.delay)
+	}
+	if r.off >= len(r.data) {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data[r.off:])
+	r.off += n
+	return n, nil
+}
+
+// TestWriteFileGeneratesWriteIDWhenFirstRequestIsReady checks that the
+// write_id is created after chunk 1 and its lookahead are read, so a slow
+// source does not age the UUID v7 timestamp before the first send.
+func TestWriteFileGeneratesWriteIDWhenFirstRequestIsReady(t *testing.T) {
+	const delay = 1500 * time.Millisecond
+	const maxAge = 500 * time.Millisecond
+	cases := map[string]func() io.Reader{
+		"slow first byte": func() io.Reader {
+			return &firstByteDelayReader{data: []byte("hello"), delay: delay}
+		},
+		"full chunk then late end of input": func() io.Reader {
+			return &lateEOFReader{data: make([]byte, datapath.MaxFileChunkSize), delay: delay}
+		},
+	}
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		for name, newReader := range cases {
+			t.Run(tr.String()+"/"+name, func(t *testing.T) {
+				cp := newFakeCP(t)
+				s := cp.handle(t, cp.client(t, tr))
+				if _, err := s.WriteFile(context.Background(), "/slow", newReader(), WriteOptions{}); err != nil {
+					t.Fatal(err)
+				}
+				reqs := cp.agent.writeRequests()
+				if len(reqs) == 0 {
+					t.Fatal("no write request reached the agent")
+				}
+				sentAt := time.Now()
+				id := reqs[0].GetWriteId()
+				created, err := uuidv7.TimeOf(id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The agent saw the first request after the delay; its write_id
+				// must be newer than the delay, not from before the read.
+				if age := sentAt.Sub(created); age > maxAge {
+					t.Fatalf("write_id %s is %v old after the upload; the delayed read must not age it (limit %v)", id, age, maxAge)
+				}
+				for _, r := range reqs {
+					if r.GetWriteId() != id {
+						t.Fatal("later chunks must keep the write_id")
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestWriteFileRetryKeepsOperationIdentity checks that the write_id, the
+// binding salt and the grant digest are fixed once the first request is ready
+// and that a retry after a failure reuses them, also for a slow source.
+func TestWriteFileRetryKeepsOperationIdentity(t *testing.T) {
+	cp := newFakeCP(t)
+	cp.relayScript = func(_ string, n int) relayAction {
+		if n == 1 {
+			return relayAction{abortAfter: 1}
+		}
+		if n == 2 {
+			return relayAction{err: connect.NewError(connect.CodeDeadlineExceeded, errors.New("call limit"))}
+		}
+		return relayAction{}
+	}
+	want := randomBytes(t, datapath.MaxFileChunkSize+10)
+	r := &firstByteDelayReader{data: want, delay: 300 * time.Millisecond}
+	s := cp.handle(t, cp.client(t, TransportRelay))
+	if _, err := s.WriteFile(context.Background(), "/w", r, WriteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(must(cp.agent.file("/w")), want) {
+		t.Fatal("content differs")
+	}
+	reqs := cp.agent.writeRequests()
+	ids := map[string]bool{}
+	for _, req := range reqs {
+		ids[req.GetWriteId()] = true
+	}
+	if len(ids) != 1 {
+		t.Fatalf("%d write_ids across retries, want 1", len(ids))
+	}
+	first := reqs[0]
+	if first.GetPath() == "" || len(first.GetBindingSalt()) == 0 {
+		t.Fatal("first request carries no path and salt")
+	}
+	wantDigest := relaybinding.WriteFileDigest(first)
+	auths := cp.authRequests()
+	if len(auths) == 0 {
+		t.Fatal("no relay authorization")
+	}
+	for _, a := range auths {
+		if a.GetOperationId() != first.GetWriteId() {
+			t.Fatalf("authorization for %s, want %s", a.GetOperationId(), first.GetWriteId())
+		}
+		if !bytes.Equal(a.GetRequestDigest(), wantDigest) {
+			t.Fatal("grant digest differs from the digest of the first request")
+		}
+	}
+	for _, req := range reqs {
+		if req.GetPath() != "" && !bytes.Equal(req.GetBindingSalt(), first.GetBindingSalt()) {
+			t.Fatal("a resent first request must keep the salt")
+		}
+	}
+}

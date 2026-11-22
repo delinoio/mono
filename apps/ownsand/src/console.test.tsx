@@ -1766,3 +1766,88 @@ describe("billing settings", () => {
     expect(dialog.textContent).toContain("removes the billing link");
   });
 });
+
+describe("ended session", () => {
+  /** A transport that fails one method with the given code. */
+  function failing(methodName: string, code: Code): Transport {
+    const mock = createMockTransport();
+    return {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === methodName) {
+          throw new ConnectError("x", code);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+  }
+
+  test("offers sign-in instead of Try again when listing organizations fails with unauthenticated", async () => {
+    const { signIns } = renderConsole("/", {
+      transport: failing("ListOrganizations", Code.Unauthenticated),
+    });
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("offers sign-in instead of Try again when loading an organization fails with unauthenticated", async () => {
+    const { signIns } = renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+      transport: failing("GetOrganization", Code.Unauthenticated),
+    });
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("keeps Try again and offers no sign-in when the failure is unavailable", async () => {
+    renderConsole("/", {
+      transport: failing("ListOrganizations", Code.Unavailable),
+    });
+    expect(
+      await screen.findByRole("button", { name: "Try again" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Sign in with Delino" }),
+    ).toBeNull();
+  });
+
+  test("keeps the invitation secret across the sign-in after the accept request fails with unauthenticated", async () => {
+    const { signIns } = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      { transport: failing("AcceptInvitation", Code.Unauthenticated) },
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await settle(60);
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    // The accept handler deleted the stored copy.
+    expect(pendingInvitation.read()).toBeUndefined();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+  });
+});

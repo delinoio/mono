@@ -8,9 +8,9 @@
 // waits for it to exit and removes the build output. A signal before the
 // server starts stops the launcher without starting the server.
 //
-// The server needs Postgres. An empty value (empty or only whitespace) counts
-// as unset for DATABASE_URL, CORS_ORIGINS and ALLOW_DIRECT_CLIENT_ADDRESS, as
-// it does for the server. When DATABASE_URL is unset, the
+// The server needs Postgres. An empty value (empty or only ASCII white space)
+// counts as unset for DATABASE_URL, CORS_ORIGINS and ALLOW_DIRECT_CLIENT_ADDRESS,
+// as it does for the server. When DATABASE_URL is unset, the
 // launcher prints an `ownsand_api_dev_skipped` record and exits with status 0
 // instead of failing, so the root `pnpm dev` keeps running the other
 // development servers on machines without a database. When
@@ -47,6 +47,14 @@ const DevelopmentConsoleOrigins = Object.freeze([
   "http://ownsand.delino.localhost",
 ]);
 const ProductionConsoleOrigin = "https://ownsand.delino.io";
+
+// The server removes only ASCII white space (space, tab, LF, VT, FF, CR) from
+// configuration values, so the launcher must use the same rule to decide that a
+// value is unset. JavaScript's trim() and \s also remove Unicode white space
+// such as U+00A0 and U+3000, which would hide a value the server rejects.
+const AsciiWhiteSpaceOnly = /^[\t\n\v\f\r ]*$/;
+const isUnset = (value) =>
+  value === undefined || AsciiWhiteSpaceOnly.test(value);
 
 const packageDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const binaryName =
@@ -89,7 +97,7 @@ const stoppedStatus = () => signalExitCode(received);
 
 async function main() {
   // An empty value counts as unset, as it does for the server.
-  if (!process.env.DATABASE_URL?.trim()) {
+  if (isUnset(process.env.DATABASE_URL)) {
     console.error(
       JSON.stringify({
         event: "ownsand_api_dev_skipped",
@@ -99,10 +107,10 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
-  if (!env.ALLOW_DIRECT_CLIENT_ADDRESS?.trim()) {
+  if (isUnset(env.ALLOW_DIRECT_CLIENT_ADDRESS)) {
     env.ALLOW_DIRECT_CLIENT_ADDRESS = "true";
   }
-  if (!env.CORS_ORIGINS?.trim()) {
+  if (isUnset(env.CORS_ORIGINS)) {
     env.CORS_ORIGINS = [
       ProductionConsoleOrigin,
       ...DevelopmentConsoleOrigins,
