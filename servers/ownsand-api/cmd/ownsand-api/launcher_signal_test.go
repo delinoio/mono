@@ -187,7 +187,7 @@ func (p *launcherProc) waitHealthy(t *testing.T, port int) {
 }
 
 // adminSnapshot lists the user tables of the administration database and the
-// row count of schema_migrations when it exists.
+// row count of goose_db_version when it exists.
 type adminSnapshot struct {
 	tables         []string
 	migrationsRows int64
@@ -222,12 +222,12 @@ func takeAdminSnapshot(t *testing.T, admin string) adminSnapshot {
 	}
 	snap.migrationsRows = -1
 	var exists bool
-	if err := conn.QueryRow(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL").Scan(&exists); err != nil {
-		t.Fatalf("check schema_migrations: %v", err)
+	if err := conn.QueryRow(ctx, "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&exists); err != nil {
+		t.Fatalf("check goose_db_version: %v", err)
 	}
 	if exists {
-		if err := conn.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&snap.migrationsRows); err != nil {
-			t.Fatalf("count schema_migrations: %v", err)
+		if err := conn.QueryRow(ctx, "SELECT count(*) FROM goose_db_version").Scan(&snap.migrationsRows); err != nil {
+			t.Fatalf("count goose_db_version: %v", err)
 		}
 	}
 	return snap
@@ -274,7 +274,7 @@ func TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase(t *testing.T) {
 
 	after := takeAdminSnapshot(t, admin)
 	if !slices.Equal(before.tables, after.tables) || before.migrationsRows != after.migrationsRows {
-		t.Fatalf("the administration database changed: tables %v -> %v, schema_migrations rows %d -> %d",
+		t.Fatalf("the administration database changed: tables %v -> %v, goose_db_version rows %d -> %d",
 			before.tables, after.tables, before.migrationsRows, after.migrationsRows)
 	}
 }

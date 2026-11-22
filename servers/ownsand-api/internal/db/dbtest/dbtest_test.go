@@ -73,10 +73,10 @@ func TestNewTargetsGeneratedDatabase(t *testing.T) {
 		t.Fatalf("current_database = %q, want a generated database", current)
 	}
 	var migrated bool
-	if err := conn.QueryRow(ctx, "SELECT to_regclass('schema_migrations') IS NOT NULL").Scan(&migrated); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT to_regclass('goose_db_version') IS NOT NULL").Scan(&migrated); err != nil {
 		t.Fatal(err)
 	}
 	if !migrated {
-		t.Fatal("generated database has no schema_migrations table")
+		t.Fatal("generated database has no goose_db_version table")
 	}
 }

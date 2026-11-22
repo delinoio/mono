@@ -12,9 +12,12 @@
 -- (the empty string, 0, or 100 for vcpu_overcommit_percent); nullable
 -- columns get NULL.
 
+-- +goose Up
+
 -- 3 is DEVICE_STATE_REMOVED in protos/delino/ownsand/v1/common.proto. The
 -- value is hard-coded because migrations are immutable and independent of
 -- the generated Go code; a renumbered enum value would need a new migration.
+-- +goose StatementBegin
 CREATE FUNCTION scrub_removed_device() RETURNS trigger AS $$
 BEGIN
     NEW.name := '';
@@ -34,6 +37,7 @@ BEGIN
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
+-- +goose StatementEnd
 
 CREATE TRIGGER devices_scrub_removed
     BEFORE INSERT OR UPDATE ON devices

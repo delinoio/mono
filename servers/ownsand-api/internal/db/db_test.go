@@ -4,7 +4,11 @@ package db_test
 
 import (
 	"context"
+	"io/fs"
 	"reflect"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -147,24 +151,64 @@ func TestScrubRemovedDevicesMigration(t *testing.T) {
 	}
 }
 
+// appliedVersions returns the applied versions in the goose version table,
+// including the zero version, in insertion order.
+func appliedVersions(t *testing.T, ctx context.Context, d *db.DB) []int64 {
+	t.Helper()
+	rows, err := d.Pool.Query(ctx, "SELECT version_id FROM goose_db_version WHERE is_applied ORDER BY id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	versions, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return versions
+}
+
+// embeddedVersions returns 0 followed by the version of every embedded
+// migration file, in order.
+func embeddedVersions(t *testing.T) []int64 {
+	t.Helper()
+	files, err := fs.Glob(db.Migrations(), "*.sql")
+	if err != nil || len(files) == 0 {
+		t.Fatalf("embedded migrations = %v, %v", files, err)
+	}
+	versions := []int64{0}
+	for _, f := range files {
+		prefix, _, _ := strings.Cut(f, "_")
+		v, err := strconv.ParseInt(prefix, 10, 64)
+		if err != nil {
+			t.Fatalf("migration %s: %v", f, err)
+		}
+		versions = append(versions, v)
+	}
+	return versions
+}
+
 // TestMigrateIsIdempotent applies the migrations to a migrated database
-// again and checks that every embedded migration is recorded once.
+// again and checks that goose records every embedded migration once.
 func TestMigrateIsIdempotent(t *testing.T) {
 	d := dbtest.New(t)
 	ctx := context.Background()
 	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
 		t.Fatal(err)
 	}
-	var n int
-	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM schema_migrations").Scan(&n); err != nil || n == 0 {
-		t.Fatalf("schema_migrations rows = %d, %v", n, err)
+	if got, want := appliedVersions(t, ctx, d), embeddedVersions(t); !slices.Equal(got, want) {
+		t.Fatalf("goose_db_version versions = %v, want %v", got, want)
 	}
-	// A changed migration is refused.
-	if _, err := d.Pool.Exec(ctx, "UPDATE schema_migrations SET sha256 = '\\x00' WHERE version = 1"); err != nil {
+}
+
+// setDatabaseTimeZone sets the default time zone of new sessions of the test
+// database.
+func setDatabaseTimeZone(t *testing.T, ctx context.Context, d *db.DB, zone string) {
+	t.Helper()
+	var name string
+	if err := d.Pool.QueryRow(ctx, "SELECT current_database()").Scan(&name); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.Migrate(ctx, testenv.Discard()); err == nil {
-		t.Fatal("a changed migration was accepted")
+	if _, err := d.Pool.Exec(ctx, "ALTER DATABASE "+pgx.Identifier{name}.Sanitize()+" SET timezone = "+pgx.Identifier{zone}.Sanitize()); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -299,11 +343,13 @@ func wantBlocked(t *testing.T, r billingRow, start time.Time) {
 	}
 }
 
-// appliedAt returns the time at which the runner recorded the migration.
-func appliedAt(t *testing.T, ctx context.Context, d *db.DB, version int) time.Time {
+// appliedAt returns the time at which goose recorded the migration. goose
+// stores it as UTC without a time zone (see db.MigrateUpTo).
+func appliedAt(t *testing.T, ctx context.Context, d *db.DB, version int64) time.Time {
 	t.Helper()
 	var at time.Time
-	if err := d.Pool.QueryRow(ctx, "SELECT applied_at FROM schema_migrations WHERE version = $1", version).Scan(&at); err != nil {
+	if err := d.Pool.QueryRow(ctx, `SELECT tstamp AT TIME ZONE 'UTC' FROM goose_db_version
+		WHERE version_id = $1 AND is_applied ORDER BY id DESC LIMIT 1`, version).Scan(&at); err != nil {
 		t.Fatal(err)
 	}
 	return at
@@ -327,10 +373,19 @@ func TestLegacyWriterMigrationBackfill(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// goose records the application time from now() of the session; the
+	// migration sessions must store it as UTC whatever the database time
+	// zone is.
+	setDatabaseTimeZone(t, ctx, d, "Pacific/Kiritimati")
 	if err := d.MigrateUpTo(ctx, testenv.Discard(), billingStatusMigration); err != nil {
 		t.Fatal(err)
 	}
 	applied := appliedAt(t, ctx, d, billingStatusMigration)
+	// Migration 0008 started the block of the existing organizations at its
+	// own now(), the time that goose recorded for it.
+	if got := readBilling(t, ctx, d.Pool, old); got.blockedSince == nil || !got.blockedSince.Equal(applied) {
+		t.Fatalf("blocked_since after migration %d = %v, want its recorded application time %v", billingStatusMigration, got.blockedSince, applied)
+	}
 	// Migration 0008 backfilled the two organizations; one of them links.
 	linkedAt := time.Date(2031, 1, 2, 3, 4, 5, 0, time.UTC)
 	if _, err := d.Pool.Exec(ctx, `UPDATE organization_billing SET billing_account_id = '01900000-0000-7000-8000-00000000b111', phase = 1, reason = 0,

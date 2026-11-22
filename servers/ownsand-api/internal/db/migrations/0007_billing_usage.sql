@@ -10,6 +10,8 @@
 -- BillingMeter value; window_start is the start of an aligned 5-minute UTC
 -- window.
 
+-- +goose Up
+
 -- Usage of the open (not yet sealed) windows. Every instance adds its
 -- in-memory counts here at least every 30 seconds and at a graceful
 -- shutdown.

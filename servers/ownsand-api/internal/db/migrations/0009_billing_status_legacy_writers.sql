@@ -38,8 +38,11 @@
 -- migration 0008 can run against the database. That migration drops
 -- organizations_billing_status_insert and create_organization_billing_status.
 
+-- +goose Up
+
 LOCK TABLE organizations IN SHARE ROW EXCLUSIVE MODE;
 
+-- +goose StatementBegin
 CREATE FUNCTION create_organization_billing_status() RETURNS trigger AS $$
 BEGIN
     -- The organization can be gone at commit (inserted and deleted in one
@@ -51,6 +54,7 @@ BEGIN
     RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
+-- +goose StatementEnd
 
 CREATE CONSTRAINT TRIGGER organizations_billing_status_insert
     AFTER INSERT ON organizations
@@ -62,10 +66,17 @@ CREATE CONSTRAINT TRIGGER organizations_billing_status_insert
 -- migration 0008. The block starts at the later of the creation and
 -- migration 0008, because billing was not enforced before it; existing rows
 -- keep their links and timestamps.
+--
+-- goose records the application time of migration 0008 in the tstamp column
+-- (timestamp without time zone) of goose_db_version. The migration runner in
+-- internal/db opens its sessions with TimeZone=UTC, so the column holds UTC.
 INSERT INTO organization_billing (organization_id, billing_account_id, phase, reason, blocked_since, suspend_time, update_time)
 SELECT o.organization_id, NULL, 2, 1, s.blocked_since, s.blocked_since + interval '72 hours', now()
 FROM organizations o
 CROSS JOIN LATERAL (
-    SELECT greatest(o.create_time, (SELECT applied_at FROM schema_migrations WHERE version = 8)) AS blocked_since
+    SELECT greatest(o.create_time, (
+        SELECT tstamp AT TIME ZONE 'UTC' FROM goose_db_version
+        WHERE version_id = 8 AND is_applied ORDER BY id DESC LIMIT 1
+    )) AS blocked_since
 ) s
 WHERE NOT EXISTS (SELECT 1 FROM organization_billing b WHERE b.organization_id = o.organization_id);
