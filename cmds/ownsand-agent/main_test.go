@@ -82,3 +82,18 @@ func TestCLIMisc(t *testing.T) {
 		t.Fatalf("unknown service manager: %d", code)
 	}
 }
+
+// A configuration that does not parse ends `run` with the usage exit code
+// and the error on standard error; the test process is no Windows service,
+// so the Windows build does not connect to the service control manager.
+func TestRunWithInvalidConfiguration(t *testing.T) {
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", t.TempDir())
+	t.Setenv("OWNSAND_AGENT_LOG_LEVEL", "bogus")
+	var out, errb bytes.Buffer
+	if code := run([]string{"run"}, nil, &out, &errb); code != exitUsage {
+		t.Fatalf("run = %d, want %d", code, exitUsage)
+	}
+	if !strings.Contains(errb.String(), "invalid OWNSAND_AGENT_LOG_LEVEL") {
+		t.Fatalf("stderr = %q", errb.String())
+	}
+}

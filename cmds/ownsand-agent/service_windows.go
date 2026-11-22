@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows/registry"
@@ -26,6 +27,51 @@ func runService(cfg config.Config) int {
 	if err != nil || !isService {
 		return runInteractive(cfg)
 	}
+	return runUnderServiceManager(cfg, runAgentOutcome)
+}
+
+// runConfigError ends `run` when its configuration does not parse. Under the
+// service control manager the process still connects to the manager and
+// reports the usage exit code as a service-specific error, like every other
+// nonzero exit of run: a service process that exits before it connects is
+// reported only as a start timeout (error 1053, event 7009), its error text
+// is lost because a service has no standard error, and the failure actions
+// do not apply. The error goes to agent.log in the state directory that the
+// environment names, or the default one, because the configuration that would
+// name it did not parse.
+func runConfigError(cfgErr error, stderr io.Writer) int {
+	fmt.Fprintln(stderr, "ownsand-agent:", cfgErr)
+	isService, err := svc.IsWindowsService()
+	if err != nil || !isService {
+		return exitUsage
+	}
+	return runUnderServiceManager(config.Config{StateDir: configErrorStateDir(os.LookupEnv)}, configErrorRun(cfgErr))
+}
+
+// configErrorStateDir returns the state directory for the log of a
+// configuration error: the value of OWNSAND_AGENT_STATE_DIR when it is set,
+// otherwise the default state directory of the host OS.
+func configErrorStateDir(lookup config.Lookup) string {
+	if v, ok := lookup(config.EnvStateDir); ok {
+		if v = strings.TrimSpace(v); v != "" {
+			return v
+		}
+	}
+	return config.DefaultStateDir()
+}
+
+// configErrorRun returns the agent run of a service whose configuration did
+// not parse: it logs the error and ends with the usage exit code.
+func configErrorRun(cfgErr error) func(context.Context, config.Config) (int, bool) {
+	return func(context.Context, config.Config) (int, bool) {
+		slog.New(slog.NewJSONHandler(os.Stderr, nil)).With("component", "ownsand-agent").Error("invalid configuration", "error", cfgErr.Error())
+		return exitUsage, false
+	}
+}
+
+// runUnderServiceManager runs the agent with run under the Windows service
+// control manager.
+func runUnderServiceManager(cfg config.Config, run func(context.Context, config.Config) (int, bool)) int {
 	// A Windows service has no standard error; the agent writes its JSON
 	// log to agent.log in the state directory. The file is opened with
 	// delete sharing (see openServiceLog) so that a device removal can delete
@@ -40,7 +86,7 @@ func runService(cfg config.Config) int {
 			}()
 		}
 	}
-	h := &handler{cfg: cfg, run: runAgentOutcome}
+	h := &handler{cfg: cfg, run: run}
 	if err := svc.Run(service.Name, h); err != nil {
 		return exitError
 	}

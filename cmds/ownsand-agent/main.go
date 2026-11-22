@@ -92,6 +92,11 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	cfg, err := config.FromEnv(os.LookupEnv)
 	if err != nil {
+		if cmd == "run" {
+			// The Windows service must report the error to the service
+			// control manager (see runConfigError).
+			return runConfigError(err, stderr)
+		}
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitUsage
 	}
