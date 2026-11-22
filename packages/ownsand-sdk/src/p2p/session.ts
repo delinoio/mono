@@ -199,9 +199,26 @@ export class PeerSession {
       // the handle moves to the relay.
       throw new PeerUnavailableError("GetIceServers failed", { cause: error });
     }
-    const pc = new Peer({
-      iceServers: ice.iceServers.map((server) => ({ urls: [...server.urls] })),
-    });
+    let pc: PeerConnectionLike;
+    try {
+      pc = new Peer({
+        iceServers: ice.iceServers.map((server) => ({
+          urls: [...server.urls],
+        })),
+      });
+    } catch (error) {
+      // The WebRTC constructor can throw synchronously (an invalid ICE server
+      // URL, or a native stack that cannot start). Nothing was opened, so
+      // there is nothing to close. Without this guard the raw error would
+      // skip the relay fallback that every other peer setup failure uses.
+      // A caller abort still ends the operation with the abort reason.
+      if (signal?.aborted) {
+        throw error;
+      }
+      throw new PeerUnavailableError("peer-to-peer setup failed", {
+        cause: error,
+      });
+    }
     try {
       const channel = pc.createDataChannel(DATA_CHANNEL_LABEL, {
         ordered: true,
