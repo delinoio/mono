@@ -417,6 +417,12 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
   readonly #hold: ConsumerHold | undefined;
   #iterated = false;
   #result: ExecResult | undefined;
+  /**
+   * The first rejection of the generator. It is boxed because an abort reason
+   * can be any value, including `undefined`, so the box tells "failed" apart
+   * from "not failed".
+   */
+  #failure: { readonly error: unknown } | undefined;
   #draining: Promise<void> | undefined;
 
   constructor(
@@ -443,7 +449,7 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     this.#iterated = true;
     try {
       for (;;) {
-        const next = await this.#generator.next();
+        const next = await this.#read();
         if (next.done) {
           // Keep a result that a concurrent wait() already stored.
           this.#result ??= next.value;
@@ -468,6 +474,9 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     // leaves the generator suspended with its stream open and no result yet.
     this.#iterated = true;
     if (this.#result === undefined) {
+      // A terminal failure is final: every later wait() reports the same
+      // rejection, because the closed generator has nothing more to say.
+      if (this.#failure !== undefined) throw this.#failure.error;
       // Overlapping wait() calls share one drain. A second reader of the
       // generator would see its exhausted `{ done: true }` and must never be
       // able to erase the terminal result that the first reader stored.
@@ -484,7 +493,7 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
 
   async #drain(): Promise<void> {
     while (this.#result === undefined) {
-      const next = await this.#generator.next();
+      const next = await this.#read();
       if (next.done) {
         // Keep a result that a concurrent reader already stored.
         this.#result ??= next.value;
@@ -492,6 +501,36 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
       }
       // Discard events.
     }
+  }
+
+  /**
+   * The one place that reads the generator, for iteration and for draining.
+   *
+   * A generator that rejects closes. A read that was queued behind the
+   * rejecting read then resolves with `{ done: true }` and no result, which
+   * would hide the failure from its consumer. The first rejection is recorded
+   * and every read that ends without a result after it, and every later
+   * read, rethrows the same rejection.
+   */
+  async #read(): Promise<IteratorResult<ExecStreamEvent, ExecResult>> {
+    if (this.#failure !== undefined && this.#result === undefined) {
+      throw this.#failure.error;
+    }
+    let next: IteratorResult<ExecStreamEvent, ExecResult>;
+    try {
+      next = await this.#generator.next();
+    } catch (error) {
+      this.#failure ??= { error };
+      throw this.#failure.error;
+    }
+    if (
+      next.done &&
+      this.#failure !== undefined &&
+      this.#result === undefined
+    ) {
+      throw this.#failure.error;
+    }
+    return next;
   }
 }
 
