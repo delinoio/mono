@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
@@ -346,8 +348,13 @@ func canonicalID(value string) string {
 }
 
 // validateName checks a display name: 1 to 100 bytes of valid UTF-8 without
-// control characters.
+// control characters (C0, DEL and C1). A name may contain the Unicode
+// replacement character U+FFFD as ordinary text; malformed UTF-8 is a
+// separate error.
 func validateName(field, name string) error {
+	if !utf8.ValidString(name) {
+		return errInvalidf("invalid %s: must be valid UTF-8", field)
+	}
 	if strings.TrimSpace(name) == "" {
 		return errInvalidf("invalid %s: is required", field)
 	}
@@ -355,7 +362,7 @@ func validateName(field, name string) error {
 		return errInvalidf("invalid %s: must be at most %d bytes", field, maxNameLength)
 	}
 	for _, r := range name {
-		if r < 0x20 || r == 0x7f || r == 0xfffd {
+		if unicode.IsControl(r) {
 			return errInvalidf("invalid %s: must not contain control characters", field)
 		}
 	}
