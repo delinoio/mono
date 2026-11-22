@@ -66,19 +66,39 @@ func requireDenied(t *testing.T, grant *ownsandv1.SignedUrlGrant) {
 
 // withholdImportResult makes the fake agent keep the import result back and
 // returns a function that returns the import command ID.
+//
+// The fake agent runs its command hook on its own goroutine after the read
+// loop recorded the envelope, so a test that observed the command through
+// WaitFor can call the returned function before the hook stored the ID. The
+// returned function therefore waits until the hook ran, and fails the test
+// when no import command arrives. Reading the ID without this wait returned
+// an empty ID under load, and the server then dropped the result as an
+// unknown command, which made the tests that send it time out.
 func withholdImportResult(agent *testenv.FakeAgent) (importCommandID func() string) {
 	var mu sync.Mutex
 	var id string
+	seen := make(chan struct{})
 	agent.SetOnCommand(func(fa *testenv.FakeAgent, cmd *ownsandv1.AgentCommand) *ownsandv1.AgentCommandResult {
 		if cmd.GetImportSnapshot() != nil {
 			mu.Lock()
 			id = cmd.GetCommandId()
 			mu.Unlock()
+			select {
+			case <-seen:
+			default:
+				close(seen)
+			}
 			return nil
 		}
 		return fa.DefaultAnswer(cmd)
 	})
 	return func() string {
+		agent.T.Helper()
+		select {
+		case <-seen:
+		case <-time.After(10 * time.Second):
+			agent.T.Fatal("timed out waiting for the import command to reach the agent hook")
+		}
 		mu.Lock()
 		defer mu.Unlock()
 		return id
