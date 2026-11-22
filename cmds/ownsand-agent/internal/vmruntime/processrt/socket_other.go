@@ -28,6 +28,14 @@ func newSocket(string) (address, dir string, err error) {
 	if err != nil {
 		return "", "", fmt.Errorf("processrt: create guest helper socket directory: %w", err)
 	}
+	// A relative TMPDIR would make the address resolve against the working
+	// directory of the caller, while the helper starts in the sandbox root.
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		_ = os.Remove(dir)
+		return "", "", fmt.Errorf("processrt: resolve guest helper socket directory: %w", err)
+	}
+	dir = abs
 	address = filepath.Join(dir, "g.sock")
 	if len(address) > maxSocketPath {
 		_ = os.Remove(dir)

@@ -321,6 +321,54 @@ func TestDeleteRunningSandboxKillsExecWorkers(t *testing.T) {
 	}
 }
 
+// TestDeleteNeverContinuesHelperBeforeKill checks the order of the signals
+// that Delete sends to the helper of a running and of a paused sandbox: the
+// helper is stopped and then killed, and never continued in between. A
+// continued helper can handle a request that it received before the stop and
+// start an exec worker after Delete enumerated the workers, and nothing kills
+// that worker. The race is too short to hit reliably with a real exec, so the
+// test asserts the order of the signals, and still checks that the workers
+// that already run die.
+func TestDeleteNeverContinuesHelperBeforeKill(t *testing.T) {
+	for _, paused := range []bool{false, true} {
+		name := "running"
+		if paused {
+			name = "paused"
+		}
+		t.Run(name, func(t *testing.T) {
+			rt := newRuntime(t)
+			m := createSandbox(t, rt)
+			shell, sleeper := startWorker(t, m)
+			h, err := rt.lookup(m.SandboxID())
+			if err != nil {
+				t.Fatal(err)
+			}
+			helperPID := h.cmd.Process.Pid
+			if paused {
+				if err := rt.Pause(context.Background(), m); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var signals []syscall.Signal
+			h.onSignal = func(sig syscall.Signal) { signals = append(signals, sig) }
+			if err := rt.Delete(context.Background(), m.SandboxID()); err != nil {
+				t.Fatal(err)
+			}
+			if len(signals) == 0 || signals[len(signals)-1] != syscall.SIGKILL {
+				t.Fatalf("signals to the helper during Delete = %v; want them to end with SIGKILL", signals)
+			}
+			for _, sig := range signals {
+				if sig == syscall.SIGCONT {
+					t.Fatalf("signals to the helper during Delete = %v; want no SIGCONT before the SIGKILL", signals)
+				}
+			}
+			for _, pid := range []int{shell, sleeper, helperPID} {
+				waitState(t, "process after Delete", pid, "")
+			}
+		})
+	}
+}
+
 // TestPauseFailureContinuesHelper checks that a Pause that fails while it
 // lists the exec process groups (a canceled context fails the `ps` command)
 // continues the helper again. The sandbox manager keeps the sandbox in the
@@ -606,6 +654,93 @@ func TestFailedStartCleanupDoesNotNeedProcessListing(t *testing.T) {
 	}
 	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
 		t.Errorf("TMPDIR entries after the failed Create: %v, %v; want none", entries, err)
+	}
+}
+
+// TestRelativeSandboxDirectoryKeepsHelperRecordsOutsideRoot checks that a
+// sandbox directory given as a relative path (a relative agent state
+// directory) gives the helper records (guest-state) the same place as an
+// absolute one: next to the sandbox root, not inside it. The helper starts
+// with the sandbox root as its working directory, so a relative --state-dir
+// would resolve a second time below the root, where Snapshot copies the
+// records into the snapshot disk.
+func TestRelativeSandboxDirectoryKeepsHelperRecordsOutsideRoot(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(base)
+	rt := newRuntime(t)
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relDir := filepath.Join("state", "vms", id)
+	m, err := rt.Create(context.Background(), vmruntime.Spec{
+		SandboxID: id,
+		Dir:       relDir,
+		GuestOS:   hostGuestOS,
+		BaseImage: hostBaseImage,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Create answered a readiness probe on the socket that Dial uses, so the
+	// helper listens where the agent dials.
+	c, err := m.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	h, err := rt.lookup(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absDir := filepath.Join(base, relDir)
+	if h.dir != absDir {
+		t.Fatalf("sandbox directory of the runtime = %q; want the absolute %q", h.dir, absDir)
+	}
+	root := filepath.Join(absDir, rootDir)
+	if cwd, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", h.cmd.Process.Pid)); err == nil && cwd != root {
+		t.Errorf("helper working directory = %q; want the sandbox root %q", cwd, root)
+	}
+	// The helper keeps its records beside the root, and nothing named like
+	// them exists inside the root.
+	records := filepath.Join(absDir, stateDir)
+	if st, err := os.Stat(records); err != nil || !st.IsDir() {
+		t.Fatalf("helper records %s: %v, %v; want a directory", records, st, err)
+	}
+	assertNoGuestState := func(what, tree string) {
+		t.Helper()
+		err := filepath.WalkDir(tree, func(path string, d os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.Name() == stateDir {
+				t.Errorf("%s contains %s", what, path)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	assertNoGuestState("the sandbox root", root)
+
+	snapshotDir := t.TempDir()
+	if _, err := rt.Snapshot(context.Background(), m, snapshotDir); err != nil {
+		t.Fatal(err)
+	}
+	assertNoGuestState("the snapshot disk", filepath.Join(snapshotDir, diskDir))
+
+	if err := rt.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(absDir); !os.IsNotExist(err) {
+		t.Errorf("sandbox directory after Delete: %v; want it removed", err)
+	}
+	if _, err := os.Stat(filepath.Join("state")); err != nil {
+		t.Errorf("parent state directory after Delete: %v; want it kept", err)
 	}
 }
 
