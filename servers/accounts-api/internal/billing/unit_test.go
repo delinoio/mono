@@ -44,6 +44,11 @@ func TestPayoffDebt(t *testing.T) {
 		{-3, 10, 3, 7},
 		{-10, 10, 10, 0},
 		{-25, 10, 10, 0},
+		{math.MinInt64, 10, 10, 0},
+		{math.MinInt64, math.MaxInt64, math.MaxInt64, 0},
+		{math.MinInt64 + 1, math.MaxInt64, math.MaxInt64, 0},
+		{math.MinInt64 + 10, 10, 10, 0},
+		{math.MinInt64 + 2, math.MaxInt64, math.MaxInt64 - 1, 1},
 	} {
 		paid, kept := payoff(tc.balance, tc.amount)
 		if paid != tc.paid || kept != tc.kept {
