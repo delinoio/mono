@@ -157,6 +157,11 @@ func TestUpdateRejectsBadReleases(t *testing.T) {
 	r := newRelease(t, nil)
 	u, _, _ := newUpdater(t, r, "1.0.0", busy, []ed25519.PublicKey{}...)
 	u.opts.Keys = nil
+	// The agent has a built-in release key; remove it for this case, which
+	// covers an agent with neither a built-in nor a configured key.
+	builtin := BuiltinKeys
+	BuiltinKeys = nil
+	t.Cleanup(func() { BuiltinKeys = builtin })
 	if err := update(u, "1.1.0", false); !errors.Is(err, ErrNoKeys) {
 		t.Fatalf("no keys: %v", err)
 	}
