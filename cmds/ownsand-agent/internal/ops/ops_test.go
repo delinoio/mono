@@ -11,11 +11,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/ops"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
@@ -850,4 +853,226 @@ func TestExecContextCanceledWhenForwardingEnds(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-rdone
+}
+
+// faultySandboxes gives the dispatcher a guest client whose dialer a test
+// controls. It keeps one client for the sandbox, so the failure counters
+// of the dialer span the retries of one exec.
+type faultySandboxes struct {
+	*sandboxes.Manager
+	wrap func(guestclient.Dialer) guestclient.Dialer
+
+	mu     sync.Mutex
+	client *guestclient.Client
+}
+
+func (f *faultySandboxes) Guest(id string) (*guestclient.Client, bool) {
+	real, ok := f.Manager.Guest(id)
+	if !ok {
+		return nil, false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.client == nil {
+		f.client = real.WithDialer(f.wrap)
+	}
+	return f.client, true
+}
+
+// cutConn is a connection that a test can close from outside.
+type cutConn struct {
+	net.Conn
+}
+
+// readCount returns the number of lines that commands appended to path.
+func readCount(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Count(string(data), "\n")
+}
+
+func waitForCount(t *testing.T, path string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for readCount(t, path) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%s has %d lines after 10 seconds, want %d", path, readCount(t, path), want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// TestExecStartsOnceWhenTheFirstDialFails checks that an exec whose first
+// connection to the guest helper fails before any request was sent starts the
+// command once on the next connection and reports its result, instead of
+// attaching to an exec that the helper never saw.
+func TestExecStartsOnceWhenTheFirstDialFails(t *testing.T) {
+	var dials atomic.Int32
+	e := newEnvWith(t, envOptions{wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+		return &faultySandboxes{Manager: m, wrap: func(real guestclient.Dialer) guestclient.Dialer {
+			return func(ctx context.Context) (net.Conn, error) {
+				if dials.Add(1) == 1 {
+					return nil, fmt.Errorf("injected dial failure")
+				}
+				return real(ctx)
+			}
+		}}
+	}})
+	count := filepath.Join(t.TempDir(), "count")
+	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; echo done")
+	out, frames, accepted := e.handle(req, nil)
+	if !out.Finished || !accepted {
+		t.Fatalf("outcome %+v accepted %v", out, accepted)
+	}
+	if got := frames[len(frames)-1].GetExecEvent().GetFailed(); got != nil {
+		t.Fatalf("exec failed: %v", got)
+	}
+	requireCleanExit(t, frames)
+	if stdout(frames) != "done\n" {
+		t.Fatalf("stdout %q", stdout(frames))
+	}
+	if n := dials.Load(); n < 2 {
+		t.Fatalf("dials %d, want the failed dial and a retry", n)
+	}
+	if n := readCount(t, count); n != 1 {
+		t.Fatalf("command ran %d times, want 1", n)
+	}
+}
+
+// TestExecAttachesAfterTheStartWasDelivered checks that a guest stream that is
+// cut after the guest started the command makes the next attempt attach from
+// the kept offsets, so the command runs once and its output is complete.
+func TestExecAttachesAfterTheStartWasDelivered(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		first *cutConn
+		dials int
+	)
+	e := newEnvWith(t, envOptions{wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+		return &faultySandboxes{Manager: m, wrap: func(real guestclient.Dialer) guestclient.Dialer {
+			return func(ctx context.Context) (net.Conn, error) {
+				conn, err := real(ctx)
+				if err != nil {
+					return nil, err
+				}
+				mu.Lock()
+				defer mu.Unlock()
+				dials++
+				if dials > 1 {
+					return conn, nil
+				}
+				first = &cutConn{Conn: conn}
+				return first, nil
+			}
+		}}
+	}})
+	count := filepath.Join(t.TempDir(), "count")
+	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; echo before; sleep 2; echo after")
+	go func() {
+		// Cut the connection of the start request after the command started.
+		deadline := time.Now().Add(10 * time.Second)
+		for readCount(t, count) < 1 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if first != nil {
+			first.Close()
+		}
+	}()
+	out, frames, _ := e.handle(req, nil)
+	if !out.Finished {
+		t.Fatalf("outcome %+v", out)
+	}
+	requireCleanExit(t, frames)
+	if stdout(frames) != "before\nafter\n" {
+		t.Fatalf("stdout %q, want the complete output once", stdout(frames))
+	}
+	mu.Lock()
+	n := dials
+	mu.Unlock()
+	if n < 2 {
+		t.Fatalf("dials %d, want a second connection after the cut", n)
+	}
+	if n := readCount(t, count); n != 1 {
+		t.Fatalf("command ran %d times, want 1", n)
+	}
+}
+
+// TestExecDoesNotRestartWhenTheHelperHasNoRecord checks that a guest helper
+// that lost its record of the exec (a restarted helper) is only asked to
+// attach: the exec ends with the failure of the guest and the command does not
+// run again. The second sandbox stands for the restarted helper: it never saw
+// the exec ID.
+func TestExecDoesNotRestartWhenTheHelperHasNoRecord(t *testing.T) {
+	fresh := newEnv(t)
+	freshClient, ok := fresh.m.Guest(fresh.sandbox)
+	if !ok {
+		t.Fatal("no guest client for the second sandbox")
+	}
+	var freshDial guestclient.Dialer
+	freshClient.WithDialer(func(d guestclient.Dialer) guestclient.Dialer { freshDial = d; return d }).Close()
+
+	var (
+		mu    sync.Mutex
+		first *cutConn
+		dials int
+	)
+	e := newEnvWith(t, envOptions{wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+		return &faultySandboxes{Manager: m, wrap: func(real guestclient.Dialer) guestclient.Dialer {
+			return func(ctx context.Context) (net.Conn, error) {
+				mu.Lock()
+				defer mu.Unlock()
+				dials++
+				if dials > 1 {
+					// Every later connection reaches the helper without a record.
+					return freshDial(ctx)
+				}
+				conn, err := real(ctx)
+				if err != nil {
+					return nil, err
+				}
+				first = &cutConn{Conn: conn}
+				return first, nil
+			}
+		}}
+	}})
+	count := filepath.Join(t.TempDir(), "count")
+	req := e.execReq("/bin/sh", "-c", "echo run >> "+count+"; sleep 5")
+	go func() {
+		deadline := time.Now().Add(10 * time.Second)
+		for readCount(t, count) < 1 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if first != nil {
+			first.Close()
+		}
+	}()
+	out, frames, _ := e.handle(req, nil)
+	if !out.Finished {
+		t.Fatalf("outcome %+v", out)
+	}
+	failed := last(frames).GetExecEvent().GetFailed()
+	if failed == nil || !strings.Contains(failed.GetMessage(), "guest helper") {
+		t.Fatalf("last frame %v, want the failure of the guest helper for an unknown exec", last(frames))
+	}
+	mu.Lock()
+	n := dials
+	mu.Unlock()
+	if n < 2 {
+		t.Fatalf("dials %d, want the attach on a second connection", n)
+	}
+	// Neither helper started the command a second time.
+	time.Sleep(500 * time.Millisecond)
+	if n := readCount(t, count); n != 1 {
+		t.Fatalf("command ran %d times, want 1", n)
+	}
 }
