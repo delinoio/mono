@@ -462,7 +462,9 @@ func (s *Service) handleSandboxUpdate(ctx context.Context, conn *hub.Conn, e *ow
 		return err
 	}
 	if res.applied {
-		s.watch.fire(e.GetSandboxId())
+		// Watchers are keyed by the lowercase canonical ID, so an agent's
+		// uppercase spelling must not skip them.
+		s.watch.fire(canonicalUUID(e.GetSandboxId()))
 	}
 	// The server acknowledges every update, also a stale retry that it did
 	// not apply, so the agent stops resending it.
@@ -530,7 +532,9 @@ func (s *Service) applyResultEntry(ctx context.Context, conn *hub.Conn, e *ownsa
 		return err
 	}
 	if res.applied {
-		s.watch.fire(e.GetSandboxId())
+		// Watchers are keyed by the lowercase canonical ID, so an agent's
+		// uppercase spelling must not skip them.
+		s.watch.fire(canonicalUUID(e.GetSandboxId()))
 	}
 	if res.delete != nil {
 		s.sendDelete(ctx, conn, conn.OrganizationID, *res.delete)
