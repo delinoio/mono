@@ -12,7 +12,12 @@ import {
   resolveApiOrigin,
 } from "./connection.ts";
 import { OwnSandConfigError, OwnSandValidationError } from "./errors.ts";
-import { BaseImage, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  BaseImage,
+  BillingReason,
+  DataPathTransport,
+  SandboxState,
+} from "@delino/ownsand-protos/v1/common_pb";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
@@ -20,7 +25,7 @@ import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { isUuidV7 } from "./uuidv7.ts";
-import { LostResponse } from "./testing/fake-api.ts";
+import { LostResponse, ownsandError } from "./testing/fake-api.ts";
 import {
   API_KEY,
   ev,
@@ -603,6 +608,251 @@ describe("createSandbox", () => {
       .callsOf("CreateSandbox")
       .map((c) => (c.request as any).idempotencyKey);
     expect(new Set(all).size).toBe(2);
+  });
+
+  describe("a forced PEER_TO_PEER transport without WebRTC", () => {
+    const answer = () => ({
+      sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+    });
+
+    test.each([
+      ["webrtc: false", { webrtc: false as const }],
+      // The Node.js test runtime has no RTCPeerConnection of its own.
+      ["no runtime RTCPeerConnection", { webrtc: undefined }],
+    ])(
+      "rejects createSandbox with a config error before CreateSandbox (%s)",
+      async (_name, webrtc) => {
+        const h = setup({
+          transport: DataPathTransport.PEER_TO_PEER,
+          ...webrtc,
+        });
+        h.api.unary(SandboxService, "CreateSandbox", answer);
+        const error = await h.clock
+          .run(h.client.createSandbox(validCreate))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(OwnSandConfigError);
+        expect(error.message).toBe(
+          "PEER_TO_PEER transport needs a WebRTC implementation",
+        );
+        expect(h.api.callsOf("CreateSandbox")).toHaveLength(0);
+        expect(h.api.calls).toHaveLength(0);
+      },
+    );
+
+    test("still throws from sandbox(id)", () => {
+      const h = setup({ transport: DataPathTransport.PEER_TO_PEER });
+      expect(() => h.client.sandbox(SANDBOX)).toThrow(OwnSandConfigError);
+      expect(h.api.calls).toHaveLength(0);
+    });
+
+    test.each([
+      ["the default transport", undefined],
+      ["the RELAY transport", DataPathTransport.RELAY],
+    ])("still creates a sandbox with %s", async (_name, transport) => {
+      const h = setup({ transport });
+      h.api.unary(SandboxService, "CreateSandbox", answer);
+      const sandbox = await h.clock.run(h.client.createSandbox(validCreate));
+      expect(sandbox.sandboxId).toBe(SANDBOX);
+      expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+      expect(h.api.callsOf("CreateSandbox")).toHaveLength(1);
+    });
+  });
+
+  describe("the 60-second retry window", () => {
+    const created = {
+      sandbox: { sandboxId: SANDBOX, state: SandboxState.CREATING },
+    };
+    const never = () => new Promise<never>(() => {});
+
+    /** Registers a CreateSandbox fake and records the virtual time of each call. */
+    function recorded(
+      h: ReturnType<typeof setup>,
+      handler: (call: { index: number }) => unknown,
+    ): number[] {
+      const times: number[] = [];
+      h.api.unary(SandboxService, "CreateSandbox", (_req, call) => {
+        times.push(h.clock.now());
+        return handler(call) as never;
+      });
+      return times;
+    }
+    const gaps = (times: number[]) =>
+      times.slice(1).map((t, i) => t - times[i]!);
+    const keysOf = (h: ReturnType<typeof setup>) =>
+      new Set(
+        h.api
+          .callsOf("CreateSandbox")
+          .map((c) => (c.request as any).idempotencyKey),
+      );
+
+    test("retries more than four lost responses with one key and the back-off schedule", async () => {
+      const h = setup();
+      const times = recorded(h, (call) => {
+        if (call.index >= 6) return created;
+        if (call.index % 2 === 0) throw new LostResponse();
+        throw new ConnectError("restart", Code.Unavailable);
+      });
+      const sandbox = await h.clock.run(h.client.createSandbox(validCreate));
+      expect(sandbox.sandboxId).toBe(SANDBOX);
+      expect(times).toHaveLength(7);
+      expect(gaps(times)).toEqual([500, 1000, 2000, 4000, 5000, 5000]);
+      expect(keysOf(h).size).toBe(1);
+    });
+
+    test("retries a deadline_exceeded with the same key", async () => {
+      const h = setup();
+      recorded(h, (call) => {
+        if (call.index === 0) {
+          throw new ConnectError("too slow", Code.DeadlineExceeded);
+        }
+        return created;
+      });
+      await h.clock.run(h.client.createSandbox(validCreate));
+      expect(h.api.callsOf("CreateSandbox")).toHaveLength(2);
+      expect(keysOf(h).size).toBe(1);
+    });
+
+    test("waits at least the retry_after of a rate limit", async () => {
+      const h = setup();
+      const times = recorded(h, (call) => {
+        if (call.index === 0) {
+          throw ownsandError(Code.ResourceExhausted, "rate limited", {
+            retryAfterMs: 10_000,
+          });
+        }
+        return created;
+      });
+      await h.clock.run(h.client.createSandbox(validCreate));
+      expect(gaps(times)).toEqual([10_000]);
+    });
+
+    test("returns the failure at once when the retry_after is longer than the window", async () => {
+      const h = setup();
+      const times = recorded(h, () => {
+        throw ownsandError(Code.ResourceExhausted, "rate limited", {
+          retryAfterMs: 120_000,
+        });
+      });
+      const error = await h.clock
+        .run(h.client.createSandbox(validCreate))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.ResourceExhausted);
+      expect(times).toEqual([0]);
+    });
+
+    test("ends with the last failure within 60 seconds when every attempt is unavailable", async () => {
+      const h = setup();
+      const times = recorded(h, (call) => {
+        throw new ConnectError(`down ${call.index}`, Code.Unavailable);
+      });
+      const error = await h.clock
+        .run(h.client.createSandbox(validCreate))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(error.rawMessage).toBe(`down ${times.length - 1}`);
+      expect(h.clock.now()).toBeLessThanOrEqual(60_000);
+      expect(times.length).toBeGreaterThan(4);
+      expect(keysOf(h).size).toBe(1);
+    });
+
+    test("cancels a retry that never answers at the window end and returns the last failure", async () => {
+      const h = setup();
+      const times = recorded(h, (call) => {
+        if (call.index === 0) {
+          throw new ConnectError("first failure", Code.Unavailable);
+        }
+        return never();
+      });
+      const error = await h.clock
+        .run(h.client.createSandbox(validCreate))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Unavailable);
+      expect(error.rawMessage).toBe("first failure");
+      // The window starts with the first failure, at virtual time 0.
+      expect(h.clock.now()).toBe(60_000);
+      expect(times).toEqual([0, 500]);
+    });
+
+    test("does not set a Connect timeout on the retry", async () => {
+      const h = setup();
+      recorded(h, (call) => {
+        if (call.index === 0) throw new LostResponse();
+        return created;
+      });
+      await h.clock.run(h.client.createSandbox(validCreate));
+      for (const call of h.api.callsOf("CreateSandbox")) {
+        expect(call.headers.get("connect-timeout-ms")).toBeNull();
+      }
+    });
+
+    test("ends a billing resource_exhausted after one call", async () => {
+      const h = setup();
+      const times = recorded(h, () => {
+        throw ownsandError(Code.ResourceExhausted, "suspended", {
+          billingReason: BillingReason.SUSPENDED,
+        });
+      });
+      const error = await h.clock
+        .run(h.client.createSandbox(validCreate))
+        .catch((e) => e);
+      expect(error.code).toBe(Code.ResourceExhausted);
+      expect(times).toHaveLength(1);
+    });
+
+    test("a caller abort during the back-off rejects with the caller's reason and sends no further call", async () => {
+      const h = setup();
+      const times = recorded(h, () => {
+        throw new ConnectError("down", Code.Unavailable);
+      });
+      const abort = new AbortController();
+      const reason = new Error("caller gave up");
+      const outcome = h.client
+        .createSandbox({ ...validCreate, signal: abort.signal })
+        .catch((e) => e);
+      await h.clock.advance(700);
+      expect(times).toEqual([0, 500]);
+      abort.abort(reason);
+      await h.clock.advance(60_000);
+      expect(await outcome).toBe(reason);
+      expect(times).toEqual([0, 500]);
+    });
+
+    test("a caller abort during a stalled retry rejects with the caller's reason", async () => {
+      const h = setup();
+      const times = recorded(h, (call) => {
+        if (call.index === 0) throw new ConnectError("down", Code.Unavailable);
+        return never();
+      });
+      const abort = new AbortController();
+      const reason = new Error("caller gave up");
+      const outcome = h.client
+        .createSandbox({ ...validCreate, signal: abort.signal })
+        .catch((e) => e);
+      await h.clock.advance(10_000);
+      abort.abort(reason);
+      await h.clock.advance(120_000);
+      expect(await outcome).toBe(reason);
+      expect(times).toEqual([0, 500]);
+    });
+
+    test("leaves no listener on the caller's signal and no timer after the create", async () => {
+      const h = setup();
+      recorded(h, (call) => {
+        if (call.index === 0) throw new LostResponse();
+        return created;
+      });
+      const abort = new AbortController();
+      const before = getEventListeners(abort.signal, "abort").length;
+      await h.clock.run(
+        h.client.createSandbox({ ...validCreate, signal: abort.signal }),
+      );
+      expect(getEventListeners(abort.signal, "abort")).toHaveLength(before);
+      // A pending window timer would make this advance fire it.
+      await h.clock.advance(120_000);
+    });
   });
 
   test("waits until the sandbox is stable", async () => {
