@@ -309,6 +309,14 @@ export function FormDialog({
 }) {
   const [error, setError] = useState<unknown>();
   const [pending, setPending] = useState(false);
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    // Adjust state while rendering: every time the dialog opens again it
+    // starts without the notice of an earlier failure, including a failure
+    // that arrived after the dialog was already closed.
+    setWasOpen(open);
+    if (open) setError(undefined);
+  }
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (pending || submitDisabled) return;

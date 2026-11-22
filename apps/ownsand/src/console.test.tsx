@@ -308,6 +308,125 @@ describe("confirmation dialog errors", () => {
   });
 });
 
+describe("form dialog errors", () => {
+  /**
+   * A transport whose CreateApiKey waits for `release()` and then fails for
+   * the first `failures` calls; without a `gate`, it fails at once.
+   */
+  function createKeyTransport(failures: number, gate = false) {
+    const mock = createMockTransport();
+    const state = {
+      calls: 0,
+      release: undefined as (() => void) | undefined,
+    };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "CreateApiKey") {
+          state.calls += 1;
+          if (gate) {
+            await new Promise<void>((resolve) => {
+              state.release = resolve;
+            });
+          }
+          if (state.calls <= failures) {
+            throw new ConnectError("create failed", Code.Unavailable);
+          }
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  /** The error notice inside a dialog; the live-region announcer also has the alert role. */
+  const noticeIn = (dialog: HTMLElement) =>
+    dialog.querySelector(".notice-error");
+
+  async function openCreate() {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
+    });
+    await settle(60);
+    return screen.findByRole("dialog", { name: "Create an API key" });
+  }
+
+  async function submitCreate(dialog: HTMLElement, name = "deploy-bot") {
+    await act(async () => {
+      fireEvent.input(within(dialog).getByRole("textbox", { name: "Name" }), {
+        target: { value: name },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create key" }),
+      );
+    });
+  }
+
+  test("a failure while the dialog is open shows its notice and a retry removes it", async () => {
+    const { transport, state } = createKeyTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openCreate();
+    await submitCreate(dialog);
+    await settle(60);
+    expect(noticeIn(dialog)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create key" }),
+      );
+    });
+    await settle(60);
+    expect(state.calls).toBe(2);
+    expect(noticeIn(dialog)).toBeNull();
+    expect(
+      await screen.findByRole("dialog", { name: "Your new API key" }),
+    ).toBeTruthy();
+  });
+
+  test("a notice does not survive Cancel and reopening", async () => {
+    const { transport } = createKeyTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openCreate();
+    await submitCreate(dialog);
+    await settle(60);
+    expect(noticeIn(dialog)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    });
+    await settle(60);
+    expect(
+      screen.queryByRole("dialog", { name: "Create an API key" }),
+    ).toBeNull();
+    const reopened = await openCreate();
+    expect(noticeIn(reopened)).toBeNull();
+  });
+
+  test("a failure that arrives after Escape does not show on the next opening", async () => {
+    const { transport, state } = createKeyTransport(1, true);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openCreate();
+    await submitCreate(dialog);
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    await settle(60);
+    expect(
+      screen.queryByRole("dialog", { name: "Create an API key" }),
+    ).toBeNull();
+    // The request fails only now, while the dialog is closed.
+    await act(async () => {
+      state.release?.();
+    });
+    await settle(60);
+    const reopened = await openCreate();
+    expect(noticeIn(reopened)).toBeNull();
+  });
+});
+
 describe("devices", () => {
   test("shows the overcommitted and effective vCPU limit", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices`);
