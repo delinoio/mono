@@ -54,6 +54,10 @@ type fakeServer struct {
 	// fields keep the presence that the CLI sent.
 	limit *ownsandv1.DeviceLimitsInput
 	creat []*ownsandv1.CreateSandboxRequest
+	// writeModes are the modes of the relay WriteFile finish requests, in
+	// order; writes counts every relay WriteFile request.
+	writeModes []uint32
+	writes     int
 	// execIDs are the exec IDs of the relay Exec requests, in order.
 	execIDs []string
 	// billing and usage are the BillingService state; usage is served only
@@ -322,6 +326,7 @@ func (h *fakeRelay) ReadFile(_ context.Context, r *connect.Request[ownsandv1.Rea
 func (h *fakeRelay) WriteFile(_ context.Context, r *connect.Request[ownsandv1.WriteFileRequest]) (*connect.Response[ownsandv1.WriteFileResponse], error) {
 	h.f.mu.Lock()
 	defer h.f.mu.Unlock()
+	h.f.writes++
 	key := "write:" + r.Msg.GetWriteId()
 	if r.Msg.GetPath() != "" {
 		h.f.files[key+":path"] = []byte(r.Msg.GetPath())
@@ -329,6 +334,7 @@ func (h *fakeRelay) WriteFile(_ context.Context, r *connect.Request[ownsandv1.Wr
 	h.f.files[key] = append(h.f.files[key], r.Msg.GetData()...)
 	res := &ownsandv1.WriteFileResponse{WriteId: r.Msg.GetWriteId(), Offset: r.Msg.GetOffset(), Length: int64(len(r.Msg.GetData()))}
 	if fin := r.Msg.GetFinish(); fin != nil {
+		h.f.writeModes = append(h.f.writeModes, fin.GetMode())
 		h.f.files[string(h.f.files[key+":path"])] = bytes.Clone(h.f.files[key])
 		res.Finished, res.SizeBytes = true, fin.GetSizeBytes()
 	}

@@ -16,6 +16,20 @@ export class OwnSandConfigError extends OwnSandError {
   override name = "OwnSandConfigError";
 }
 
+/**
+ * The credential of the client failed locally, before any request left the
+ * SDK: the `accessToken` callback threw, or it returned no token or a value
+ * that cannot be an HTTP header value. It is deterministic for the call, so
+ * `classifyFailure` treats it as terminal, also when Connect wraps it as the
+ * `cause` of a `ConnectError`; a retry or a relay recovery window would only
+ * call the failing callback again. It is an `OwnSandConfigError`, so callers
+ * that handled the former empty-token error keep working. Its message never
+ * contains the token.
+ */
+export class OwnSandCredentialError extends OwnSandConfigError {
+  override name = "OwnSandCredentialError";
+}
+
 /** A request failed validation before the SDK sent it. */
 export class OwnSandValidationError extends OwnSandError {
   override name = "OwnSandValidationError";
@@ -160,12 +174,22 @@ export enum FailureClass {
  * error as `cause`), a server stream that ended without its end-of-stream
  * message, and an `aborted` status without an OwnSand ErrorDetail. An
  * `aborted` status with an ErrorDetail is an explicit, terminal result (for
- * example from the guest helper for a file that changed during a read).
+ * example from the guest helper for a file that changed during a read). A
+ * local credential failure (`OwnSandCredentialError`) is terminal.
  */
 export function classifyFailure(error: unknown): FailureClass {
   // Every other DataPathError is an interruption (the write path relies on
   // that for its deadline retry), so this terminal subclass is checked first.
   if (error instanceof InvalidFrameError) {
+    return FailureClass.Terminal;
+  }
+  // A local credential failure is deterministic and is no transport
+  // interruption, also when Connect wrapped it (code unknown, cause set).
+  if (
+    error instanceof OwnSandCredentialError ||
+    (error instanceof ConnectError &&
+      error.cause instanceof OwnSandCredentialError)
+  ) {
     return FailureClass.Terminal;
   }
   if (!(error instanceof ConnectError)) {
@@ -217,9 +241,41 @@ export function connectErrorFromDetail(detail: ErrorDetail): ConnectError {
 }
 
 /**
+ * Returns the `cause` for a Connect error that `redactError` rebuilds. The
+ * original cause can hold a secret in its message, stack or own causes, so it
+ * is never kept, but `classifyFailure` reads it: a Connect error with a
+ * defined cause that is not a Connect error is a transport interruption, and
+ * a credential error as cause is terminal. The replacement keeps exactly that
+ * signal, so redaction never changes how the relay recovery rules and the
+ * `createSandbox` retry treat the error:
+ *
+ * - no cause, or a Connect error as cause (`classifyFailure` ignores it and
+ *   decides by the code): no cause;
+ * - an `OwnSandCredentialError`: a new one with the redacted message;
+ * - any other cause: a generic `Error` with a fixed message.
+ */
+function replacementCause(
+  cause: unknown,
+  secrets: readonly string[],
+): Error | undefined {
+  if (cause === undefined || cause instanceof ConnectError) {
+    return undefined;
+  }
+  if (cause instanceof OwnSandCredentialError) {
+    const redacted = redactError(cause, secrets) as OwnSandCredentialError;
+    return redacted === cause
+      ? new OwnSandCredentialError(cause.message)
+      : redacted;
+  }
+  return new Error("transport failure");
+}
+
+/**
  * Replaces every occurrence of each secret in the error message. Connect
  * errors never contain request headers, but this keeps a credential out of
- * an error even when a lower layer echoed it.
+ * an error even when a lower layer echoed it. A rebuilt Connect error keeps
+ * its code, metadata and details and never its original cause, but it keeps
+ * the classification of the original (see `replacementCause`).
  */
 export function redactError(
   error: unknown,
@@ -245,7 +301,13 @@ export function redactError(
     if (!changed) {
       return error;
     }
-    const copy = new ConnectError(raw, error.code, error.metadata);
+    const copy = new ConnectError(
+      raw,
+      error.code,
+      error.metadata,
+      undefined,
+      replacementCause(error.cause, secrets),
+    );
     copy.details = error.details;
     return copy;
   }
@@ -253,7 +315,12 @@ export function redactError(
   if (!changed) {
     return error;
   }
-  const copy = new OwnSandError(message);
+  // A credential error stays a credential error, so that redaction never
+  // turns a terminal failure into a retryable one.
+  const copy =
+    error instanceof OwnSandCredentialError
+      ? new OwnSandCredentialError(message)
+      : new OwnSandError(message);
   copy.name = error.name;
   return copy;
 }

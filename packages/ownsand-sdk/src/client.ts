@@ -2,6 +2,7 @@
 import { create } from "@bufbuild/protobuf";
 import {
   type Client,
+  Code,
   ConnectError,
   createClient,
   type Transport,
@@ -21,7 +22,9 @@ import {
   classifyFailure,
   FailureClass,
   OwnSandConfigError,
+  OwnSandCredentialError,
   OwnSandError,
+  retryAfterMs,
 } from "./errors.ts";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { BillingService } from "@delino/ownsand-protos/v1/billing_pb";
@@ -46,13 +49,14 @@ import {
   SnapshotService,
   type Template,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
+import { assertTransportAvailable } from "./datapath.ts";
 import type { Logger } from "./logger.ts";
 import {
   type PeerConnectionConstructor,
   runtimePeerConnection,
 } from "./p2p/webrtc.ts";
 import { type OperationContext } from "./relay/context.ts";
-import { backoffMs } from "./relay/recovery.ts";
+import { backoffMs, FixedBudget } from "./relay/recovery.ts";
 import { Sandbox } from "./sandbox.ts";
 import { UuidV7Generator } from "./uuidv7.ts";
 import {
@@ -105,9 +109,6 @@ export interface CreateSandboxInput {
   organizationId?: string;
   signal?: AbortSignal;
 }
-
-/** Retries of one logical create after a lost response. */
-const CREATE_ATTEMPTS = 4;
 
 /**
  * The OwnSand client: the public services with idiomatic names and sandbox
@@ -206,6 +207,7 @@ export class OwnSandClient {
     organizationId: string,
     info: Sandbox["info"],
   ): Sandbox {
+    assertTransportAvailable(this.#forced, this.#Peer);
     const ctx: OperationContext = {
       clock: this.#clock,
       ids: this.#ids,
@@ -224,9 +226,12 @@ export class OwnSandClient {
    * Creates a sandbox. It validates the TTLs and resources before the
    * request, generates one idempotency key for this create and reuses it for
    * every retry after a lost response. The sandbox starts in `CREATING`;
-   * use `waitUntilStable` on the handle.
+   * use `waitUntilStable` on the handle. A forced `PEER_TO_PEER` transport
+   * without a WebRTC implementation fails with an `OwnSandConfigError`
+   * before any request, because the handle could not be built after it.
    */
   async createSandbox(input: CreateSandboxInput): Promise<Sandbox> {
+    assertTransportAvailable(this.#forced, this.#Peer);
     validateTtl(input.idleTtl, input.maxTtl);
     validateResources(input.resources);
     validateLabels(input.labels);
@@ -255,27 +260,64 @@ export class OwnSandClient {
         input.network === undefined ? undefined : { mode: input.network },
       labels: { ...input.labels },
     });
+    // The retry window of the contract: it starts with the first retried
+    // failure, lasts 60 seconds (`FixedBudget`) and also bounds each retry in
+    // flight. `lastFailure` is what the create returns when the
+    // window ends.
+    let budget: FixedBudget | undefined;
+    let lastFailure: unknown;
     for (let attempt = 0; ; attempt++) {
+      // A caller abort stays terminal and sends no further call.
+      input.signal?.throwIfAborted();
+      const bound = new AbortController();
+      const stopBound = new AbortController();
+      let signal = input.signal;
+      if (budget !== undefined) {
+        // Cancel the retry with a timer, not with a Connect request timeout.
+        this.#clock
+          .sleep(Math.max(0, budget.remainingMs()), stopBound.signal)
+          .then(
+            () => bound.abort(),
+            () => {},
+          );
+        signal =
+          input.signal === undefined
+            ? bound.signal
+            : AbortSignal.any([input.signal, bound.signal]);
+      }
       try {
-        const res = await this.sandboxes.createSandbox(request, {
-          signal: input.signal,
-        });
+        const res = await this.sandboxes.createSandbox(request, { signal });
+        stopBound.abort();
         if (res.sandbox === undefined) {
           throw new OwnSandError("CreateSandbox returned no sandbox");
         }
         return this.#handle(res.sandbox.sandboxId, organizationId, res.sandbox);
       } catch (error) {
-        if (
-          input.signal?.aborted ||
-          attempt + 1 >= CREATE_ATTEMPTS ||
-          !(
-            error instanceof ConnectError || !(error instanceof OwnSandError)
-          ) ||
-          classifyFailure(error) === FailureClass.Terminal
-        ) {
+        // The timer of this attempt is no longer needed, also not while the
+        // back-off sleeps.
+        stopBound.abort();
+        if (input.signal?.aborted) {
+          throw input.signal.reason;
+        }
+        if (bound.signal.aborted) {
+          // The window ended while the retry was in flight.
+          throw lastFailure;
+        }
+        const failure = createFailureOf(error);
+        if (failure === undefined) {
           throw error;
         }
-        await this.#clock.sleep(backoffMs(attempt), input.signal);
+        budget ??= new FixedBudget(this.#clock);
+        // A rate limit waits at least as long as the server asks.
+        const delay =
+          failure === FailureClass.ResourceExhausted
+            ? Math.max(backoffMs(attempt), retryAfterMs(error))
+            : backoffMs(attempt);
+        if (delay >= budget.remainingMs()) {
+          throw error;
+        }
+        lastFailure = error;
+        await this.#clock.sleep(delay, input.signal);
       }
     }
   }
@@ -335,6 +377,30 @@ export class OwnSandClient {
       templateId,
     });
   }
+}
+
+/**
+ * Classifies a failed `CreateSandbox` call: the class of a failure that a
+ * retry with the same idempotency key can resolve, or `undefined` for a
+ * failure that ends the create. A bare `OwnSandError` (a local failure such
+ * as an empty response) and a terminal class, including a billing error and a
+ * local credential failure, end it. `deadline_exceeded` is a lost response of
+ * a create, so it is retried here although the shared relay classification
+ * treats it as terminal.
+ */
+function createFailureOf(error: unknown): FailureClass | undefined {
+  if (error instanceof OwnSandError && !(error instanceof ConnectError)) {
+    return undefined;
+  }
+  const failure = classifyFailure(error);
+  if (failure !== FailureClass.Terminal) {
+    return failure;
+  }
+  return error instanceof ConnectError &&
+    error.code === Code.DeadlineExceeded &&
+    !(error.cause instanceof OwnSandCredentialError)
+    ? FailureClass.Interruption
+    : undefined;
 }
 
 function required<T>(value: T | undefined, name: string): T {

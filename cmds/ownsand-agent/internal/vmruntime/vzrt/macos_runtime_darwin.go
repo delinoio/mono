@@ -131,11 +131,7 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	r.vms[spec.SandboxID] = v
 	r.mu.Unlock()
 
-	memoryRestore := spec.Snapshot != nil && spec.Snapshot.HasMemoryState && spec.MemoryRestoreAllowed &&
-		memoryStateSupported &&
-		spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_NONE &&
-		spec.Snapshot.Resources.GetVcpuCount() == spec.Resources.GetVcpuCount() &&
-		spec.Snapshot.Resources.GetMemoryMib() == spec.Resources.GetMemoryMib()
+	memoryRestore := vmruntime.MemoryRestoreEligible(spec, memoryStateSupported)
 	if memoryRestore {
 		err := r.restoreMacOS(ctx, v, spec)
 		if err == nil {

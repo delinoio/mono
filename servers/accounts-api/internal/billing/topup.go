@@ -122,10 +122,12 @@ func (s *Service) queueAutoTopUp(ctx context.Context, tx pgx.Tx, acct *accountSt
 // CreateTopUp runs a manual top-up. authorize runs first in the transaction
 // that records the top-up; it checks the caller's role and locks the billing
 // account. created runs in the same transaction when a new top-up is
-// recorded (not for a repeated key). The Paddle charge runs after that
-// transaction commits, so a concurrent retry with the same key finds the
+// recorded (not for a repeated key). committed, when set, runs once that
+// transaction has committed, before the Paddle charge, so a caller logs the
+// events of created only for a recorded top-up. The Paddle charge runs after
+// that transaction commits, so a concurrent retry with the same key finds the
 // recorded top-up and charges nothing again.
-func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key string, amount int64, authorize func(pgx.Tx) error, created func(pgx.Tx, string) error) error {
+func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key string, amount int64, authorize func(pgx.Tx) error, created func(pgx.Tx, string) error, committed func()) error {
 	if err := ValidateTopUpAmount(amount); err != nil {
 		return err
 	}
@@ -180,6 +182,9 @@ func (s *Service) CreateTopUp(ctx context.Context, accountID, actorUserID, key s
 	})
 	if err != nil {
 		return err
+	}
+	if committed != nil {
+		committed()
 	}
 	if existing {
 		s.logger.InfoContext(ctx, "billing_top_up_repeated",

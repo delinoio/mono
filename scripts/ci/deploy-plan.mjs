@@ -119,6 +119,18 @@ const dropletHostname =
 // other names before any build or upload. It sets no length limit here.
 const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
+// `deploy.buildEnv` maps build-time variables of a static site to GitHub
+// repository variables. The site build runs third-party build plugins without
+// secrets, and only `PUBLIC_` variables are inlined into a public bundle, so
+// the field may set only `PUBLIC_` names; it cannot change `PATH`,
+// `NODE_OPTIONS` or another variable that controls the build tools.
+const buildEnvName = /^PUBLIC_[A-Z0-9_]+$/;
+
+// A GitHub configuration variable name: letters, digits and underscores, not
+// starting with a digit or the reserved `GITHUB_` prefix. GitHub stores the
+// names in upper case, so the manifest uses upper case too.
+const repositoryVariableName = /^(?!GITHUB_)[A-Z_][A-Z0-9_]*$/;
+
 // The container listens on this port inside its own network namespace. Ports
 // below 1024 need privileges that the non-root server images do not have.
 const minimumDropletPort = 1024;
@@ -202,6 +214,12 @@ function deployable(pkg) {
   }
   const base = { name, dir: pkg.dir, kind: rule.kind, target: deploy.target };
   if (deploy.target === DeployTarget.Droplet) {
+    // A server reads its configuration from its env file on the Droplet.
+    if (deploy.buildEnv !== undefined) {
+      throw new DeployPlanError(
+        `${name}: deploy.buildEnv is allowed only for the ${DeployTarget.CloudflarePages} target`,
+      );
+    }
     if (!dropletImageName.test(name)) {
       throw new DeployPlanError(
         `${name}: a droplet deployable package name must be a container image repository name matching ${dropletImageName}`,
@@ -299,7 +317,41 @@ function deployable(pkg) {
       `${name}: deploy.output must not contain control characters or a backslash`,
     );
   }
-  return { ...base, project: deploy.project, output: `${pkg.dir}/${output}` };
+  return {
+    ...base,
+    project: deploy.project,
+    output: `${pkg.dir}/${output}`,
+    buildEnv: checkBuildEnv(name, deploy.buildEnv),
+  };
+}
+
+// Returns the `deploy.buildEnv` map of a static site, or an empty map when
+// the field is not set.
+function checkBuildEnv(name, buildEnv) {
+  if (buildEnv === undefined) return {};
+  if (
+    buildEnv === null ||
+    typeof buildEnv !== "object" ||
+    Array.isArray(buildEnv) ||
+    Object.keys(buildEnv).length === 0
+  ) {
+    throw new DeployPlanError(
+      `${name}: deploy.buildEnv must be a nonempty map of build-time variable names to GitHub repository variable names`,
+    );
+  }
+  for (const [variable, source] of Object.entries(buildEnv)) {
+    if (!buildEnvName.test(variable)) {
+      throw new DeployPlanError(
+        `${name}: deploy.buildEnv key ${JSON.stringify(variable)} must match ${buildEnvName}`,
+      );
+    }
+    if (typeof source !== "string" || !repositoryVariableName.test(source)) {
+      throw new DeployPlanError(
+        `${name}: deploy.buildEnv.${variable} must be a GitHub repository variable name matching ${repositoryVariableName}`,
+      );
+    }
+  }
+  return { ...buildEnv };
 }
 
 // Returns the workspace package that a dependency entry links, or undefined

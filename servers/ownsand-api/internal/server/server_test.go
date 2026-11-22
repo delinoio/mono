@@ -38,3 +38,30 @@ func TestCORS(t *testing.T) {
 		t.Fatalf("foreign preflight = %d %v", rec.Code, rec.Header())
 	}
 }
+
+// TestCORSMatchesBrowserSerializedOrigin checks that the middleware, which
+// compares the Origin header by exact string match, accepts the form that a
+// browser sends for an origin that config.Load canonicalized (lower-case host,
+// no default port), keeps other ports distinct and sends Vary: Origin.
+func TestCORSMatchesBrowserSerializedOrigin(t *testing.T) {
+	h := NewHandler(Options{CORSOrigins: []string{"https://ownsand.delino.io", "http://ownsand.delino.localhost:8080"}})
+	for origin, want := range map[string]int{
+		"https://ownsand.delino.io":            http.StatusNoContent,
+		"http://ownsand.delino.localhost:8080": http.StatusNoContent,
+		"https://ownsand.delino.io:8443":       http.StatusForbidden,
+		"http://ownsand.delino.localhost":      http.StatusForbidden,
+		"http://ownsand.delino.io":             http.StatusForbidden,
+	} {
+		req := httptest.NewRequest(http.MethodOptions, "/x/y", nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "POST")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != want {
+			t.Errorf("preflight from %s: status = %d, want %d", origin, rec.Code, want)
+		}
+		if want == http.StatusNoContent && (rec.Header().Get("Access-Control-Allow-Origin") != origin || rec.Header().Get("Vary") != "Origin") {
+			t.Errorf("preflight from %s: headers = %v", origin, rec.Header())
+		}
+	}
+}

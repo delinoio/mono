@@ -378,6 +378,11 @@ h2 {
   margin: 0;
 }
 
+/* A notice above loaded content (a failed refetch) keeps a gap to it. */
+.notice:not(:last-child) {
+  margin-bottom: 12px;
+}
+
 .notice-error {
   color: var(--dui-color-danger-text);
 }

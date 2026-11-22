@@ -6,7 +6,12 @@ import { toast } from "delino-ui/toast";
 import { useMemo } from "react";
 import { LIST_PAGE_SIZE } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
-import { Empty, ErrorNotice, Loading } from "../../components/ui.tsx";
+import {
+  Empty,
+  ErrorNotice,
+  Loading,
+  RefetchNotice,
+} from "../../components/ui.tsx";
 import { errorMessage, formatDate, labels } from "../../format.ts";
 import {
   CreditService,
@@ -85,9 +90,13 @@ export function InvoicesSection() {
         Paddle is the merchant of record and issues the invoices. Amounts
         exclude tax.
       </p>
+      <RefetchNotice
+        error={invoices.isRefetchError ? invoices.error : undefined}
+        onRetry={() => void invoices.refetch()}
+      />
       {invoices.isPending ? (
         <Loading label="Loading invoices" />
-      ) : invoices.error ? (
+      ) : invoices.isLoadingError ? (
         <ErrorNotice
           error={invoices.error}
           onRetry={() => void invoices.refetch()}

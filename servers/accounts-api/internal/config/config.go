@@ -17,6 +17,7 @@ import (
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/internal/listenaddr"
+	"github.com/delinoio/mono/servers/internal/weborigin"
 )
 
 // Environment variable names read by the server.
@@ -392,11 +393,12 @@ func stableKey(key string) bool {
 	return true
 }
 
-// httpURL checks that value is an absolute http or https URL without a query
+// httpURL checks that value is an absolute http or https URL with a host name
+// (a port alone such as https://:443 has none), without a query
 // or fragment and returns it without a trailing slash.
 func httpURL(name, value string) (string, error) {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
 		u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
 		return "", fmt.Errorf("%s must be an http or https URL", name)
 	}
@@ -404,14 +406,21 @@ func httpURL(name, value string) (string, error) {
 }
 
 // parseOrigin checks that value is a browser origin: an http or https scheme
-// and a host with an optional port, without a path, query or fragment.
+// and a host name with an optional port, without a path, query or fragment.
+// It returns the origin in the form that a browser sends in the Origin header
+// (lower-case host, no default port), so the CORS middleware can match the
+// header by exact string comparison.
 func parseOrigin(name, value string) (string, error) {
 	u, err := url.Parse(value)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Hostname() == "" || u.User != nil ||
 		u.Path != "" || u.RawQuery != "" || u.Fragment != "" || strings.Contains(value, "#") || strings.Contains(value, "?") {
 		return "", fmt.Errorf("%s must hold origins such as https://accounts.delino.io", name)
 	}
-	return value, nil
+	origin, ok := weborigin.Canonical(u)
+	if !ok {
+		return "", fmt.Errorf("%s must hold origins such as https://accounts.delino.io", name)
+	}
+	return origin, nil
 }
 
 // asciiWhiteSpace is the set of ASCII white space characters that are removed

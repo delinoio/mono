@@ -4,7 +4,12 @@ import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { useState } from "react";
 import { LIST_PAGE_SIZE } from "../../api.ts";
 import { useBillingAccount } from "../../components/shell.tsx";
-import { Empty, ErrorNotice, Loading } from "../../components/ui.tsx";
+import {
+  Empty,
+  ErrorNotice,
+  Loading,
+  RefetchNotice,
+} from "../../components/ui.tsx";
 import {
   addMonths,
   formatMonth,
@@ -87,9 +92,13 @@ function UsageSummary() {
           </Button>
         </div>
       </div>
+      <RefetchNotice
+        error={summary.isRefetchError ? summary.error : undefined}
+        onRetry={() => void summary.refetch()}
+      />
       {summary.isPending ? (
         <Loading label="Loading usage" />
-      ) : summary.error ? (
+      ) : summary.isLoadingError ? (
         <ErrorNotice
           error={summary.error}
           onRetry={() => void summary.refetch()}
@@ -199,9 +208,13 @@ function Ledger() {
     <section className="section" aria-labelledby="ledger-title">
       <h2 id="ledger-title">Ledger</h2>
       <p className="muted">Every change of the balance, newest first.</p>
+      <RefetchNotice
+        error={ledger.isRefetchError ? ledger.error : undefined}
+        onRetry={() => void ledger.refetch()}
+      />
       {ledger.isPending ? (
         <Loading label="Loading the ledger" />
-      ) : ledger.error ? (
+      ) : ledger.isLoadingError ? (
         <ErrorNotice
           error={ledger.error}
           onRetry={() => void ledger.refetch()}

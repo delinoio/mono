@@ -354,10 +354,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		os.RemoveAll(spec.Dir)
 	}
 
-	memoryRestore := spec.Snapshot != nil && spec.Snapshot.HasMemoryState && spec.MemoryRestoreAllowed &&
-		spec.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_NONE &&
-		spec.Snapshot.Resources.GetVcpuCount() == spec.Resources.GetVcpuCount() &&
-		spec.Snapshot.Resources.GetMemoryMib() == spec.Resources.GetMemoryMib()
+	memoryRestore := vmruntime.MemoryRestoreEligible(spec, true)
 	src := r.opts.Rootfs
 	if spec.Snapshot != nil {
 		src = filepath.Join(spec.Snapshot.Dir, snapDisk)

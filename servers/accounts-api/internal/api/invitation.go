@@ -108,14 +108,33 @@ func scanInvitation(row pgx.Row) (invitation, error) {
 	return i, err
 }
 
+// Why an undelivered invitation is revoked. The value is stored in the
+// details of the invitation_revoked audit event.
+const (
+	revokeReasonDeliveryFailed = "delivery_failed"
+	revokeReasonAuditFailed    = "audit_failed"
+)
+
+// invitationFollowUpTimeout bounds the transactions that run after the email
+// was sent or failed. They run detached from the request context, so a client
+// that disconnects during the send does not leave an undelivered invitation
+// pending.
+const invitationFollowUpTimeout = 10 * time.Second
+
 // CreateInvitation invites an email address and sends the invitation email.
 // Owner and admin only.
 //
-// The email is sent inside the transaction that creates the invitation, so an
-// invitation exists only when Resend accepted its email; a failed delivery
-// fails the RPC with unavailable and leaves nothing behind. The Resend
-// idempotency key `invitation/<invitation_id>` keeps a retried send of the
-// same invitation to one email.
+// The email is sent only after the transaction that inserts the invitation has
+// committed, so a rolled-back transaction never sends an email for an
+// invitation that does not exist. A second transaction then either records the
+// invitation_created audit event (the email was accepted) or revokes the
+// invitation under the account lock (the send failed) and the RPC fails with
+// unavailable. A failed send therefore leaves a revoked invitation, which no
+// longer blocks a new invitation for the address, and no invitation_created
+// audit event. The Resend idempotency key `invitation/<invitation_id>` keeps a
+// retried send of the same invitation to one email. A crash between the commit
+// and the send leaves a pending invitation without an email; an owner or admin
+// revokes it and invites again.
 func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *connect.Request[accountsv1.CreateInvitationRequest]) (*connect.Response[accountsv1.CreateInvitationResponse], error) {
 	userID, err := callerUserID(ctx)
 	if err != nil {
@@ -146,6 +165,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		ID: id, BillingAccountID: accountID, Email: addr, Role: role, InviterUserID: userID,
 		CreateTime: now, ExpireTime: now.Add(InvitationLifetime),
 	}
+	var msg email.Message
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -169,13 +189,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 			id, accountID, hash, addr, emailKey(addr), string(role), userID, inv.CreateTime, inv.ExpireTime); err != nil {
 			return err
 		}
-		if err := h.recordAudit(ctx, tx, now, auditEvent{
-			BillingAccountID: accountID, Kind: AuditInvitationCreated, ActorUserID: userID, InvitationID: id,
-			Details: map[string]string{"role": string(role)},
-		}); err != nil {
-			return err
-		}
-		msg, err := email.InvitationMessage(email.Invitation{
+		msg, err = email.InvitationMessage(email.Invitation{
 			InvitationID:       id,
 			BillingAccountID:   accountID,
 			BillingAccountName: account.Name,
@@ -184,20 +198,87 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 			Link:               email.InvitationLink(h.webOrigin, token),
 			ExpireTime:         inv.ExpireTime,
 		})
-		if err != nil {
-			return err
-		}
-		if err := h.email.Send(ctx, msg); err != nil {
-			h.logger.WarnContext(ctx, "invitation_email_failed",
-				slog.String("billing_account_id", accountID), slog.String("invitation_id", id))
-			return unavailable("the invitation email could not be sent; try again later")
-		}
-		return nil
+		return err
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "create_invitation", err)
 	}
+
+	// The invitation is committed. Send the email outside any transaction.
+	if err := h.email.Send(ctx, msg); err != nil {
+		h.logger.WarnContext(ctx, "invitation_email_failed",
+			slog.String("billing_account_id", accountID), slog.String("invitation_id", id))
+		h.revokeUndelivered(ctx, inv, userID, revokeReasonDeliveryFailed)
+		return nil, unavailable("the invitation email could not be sent; try again later")
+	}
+
+	// The email was accepted: record the creation. If that fails, the
+	// invitation is revoked so that every pending invitation has its
+	// invitation_created audit event.
+	followUp, cancel := invitationFollowUpContext(ctx)
+	defer cancel()
+	audit := &auditLog{}
+	if err := h.db.InTx(followUp, func(tx pgx.Tx) error {
+		return h.recordAudit(followUp, tx, audit, now, auditEvent{
+			BillingAccountID: accountID, Kind: AuditInvitationCreated, ActorUserID: userID, InvitationID: id,
+			Details: map[string]string{"role": string(role)},
+		})
+	}); err != nil {
+		h.revokeUndelivered(ctx, inv, userID, revokeReasonAuditFailed)
+		return nil, h.internal(ctx, "create_invitation", err)
+	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.CreateInvitationResponse{Invitation: inv.proto(now)}), nil
+}
+
+// invitationFollowUpContext returns a bounded context that keeps the values of
+// ctx but ignores its cancellation.
+func invitationFollowUpContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), invitationFollowUpTimeout)
+}
+
+// revokeUndelivered revokes the invitation that CreateInvitation committed but
+// could not deliver, under the billing account lock, and records the
+// invitation_revoked audit event with the reason. Nothing happens when the
+// invitation is no longer pending, for example because an owner revoked it or
+// the billing account was deleted meanwhile. A failure is logged and not
+// returned: the invitation then stays pending until an owner or admin revokes
+// it.
+func (h *BillingAccountHandler) revokeUndelivered(ctx context.Context, inv invitation, actorUserID, reason string) {
+	followUp, cancel := invitationFollowUpContext(ctx)
+	defer cancel()
+	now := h.timestamp()
+	audit := &auditLog{}
+	err := h.db.InTx(followUp, func(tx pgx.Tx) error {
+		var locked bool
+		err := tx.QueryRow(followUp, `SELECT true FROM billing_accounts
+			WHERE billing_account_id = $1 AND delete_time IS NULL FOR UPDATE`, inv.BillingAccountID).Scan(&locked)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		tag, err := tx.Exec(followUp, `UPDATE billing_account_invitations SET revoke_time = $2
+			WHERE invitation_id = $1 AND accept_time IS NULL AND revoke_time IS NULL`, inv.ID, now)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() == 0 {
+			return nil
+		}
+		return h.recordAudit(followUp, tx, audit, now, auditEvent{
+			BillingAccountID: inv.BillingAccountID, Kind: AuditInvitationRevoked, ActorUserID: actorUserID,
+			InvitationID: inv.ID, Details: map[string]string{"reason": reason},
+		})
+	})
+	if err != nil {
+		h.logger.ErrorContext(ctx, "invitation_revoke_failed",
+			slog.String("billing_account_id", inv.BillingAccountID), slog.String("invitation_id", inv.ID),
+			slog.String("reason", reason), slog.Any("error", err))
+		return
+	}
+	h.flushAudit(ctx, audit)
 }
 
 // ListInvitations lists the pending invitations, newest first. Owner and
@@ -273,6 +354,7 @@ func (h *BillingAccountHandler) RevokeInvitation(ctx context.Context, req *conne
 	}
 	now := h.timestamp()
 	var inv invitation
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -297,13 +379,14 @@ func (h *BillingAccountHandler) RevokeInvitation(ctx context.Context, req *conne
 			return err
 		}
 		inv.RevokeTime = &now
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditInvitationRevoked, ActorUserID: userID, InvitationID: invitationID,
 		})
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "revoke_invitation", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.RevokeInvitationResponse{Invitation: inv.proto(now)}), nil
 }
 
@@ -352,6 +435,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 	}
 
 	var account billingAccount
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		// Lock the billing account first, as every other change does, then
 		// read the invitation again under that lock.
@@ -391,7 +475,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 			return err
 		}
 		account = billingAccount{ID: inv.BillingAccountID, Name: name, CreateTime: createTime, CallerRole: inv.Role}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: inv.BillingAccountID, Kind: AuditInvitationAccepted, ActorUserID: userID,
 			TargetUserID: userID, InvitationID: inv.ID, Details: map[string]string{"role": string(inv.Role)},
 		})
@@ -399,6 +483,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, h.internal(ctx, "accept_invitation", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.AcceptInvitationResponse{
 		BillingAccount: account.proto(),
 		Member: &accountsv1.BillingAccountMember{
