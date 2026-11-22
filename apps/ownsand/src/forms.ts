@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * Client-side checks of the create sandbox form. They mirror the rules of
- * the protos contract so that the user sees the problem before the request;
- * the control plane checks them again.
+ * Client-side checks of the create sandbox form (the TTLs and the resource
+ * ranges). They mirror the rules of the protos contract so that the user sees
+ * the problem before the request; the control plane checks them again.
  */
 
 import { create } from "@bufbuild/protobuf";
@@ -11,6 +11,7 @@ import {
   type DeviceLimitsInput,
   DeviceLimitsInputSchema,
 } from "@delino/ownsand-protos/v1/common_pb";
+import { MAX_INT32 } from "./format.ts";
 
 export const MAX_TTL_SECONDS = 7 * 24 * 3600;
 export const MAX_LABELS = 32;
@@ -37,6 +38,52 @@ export function ttlErrors(input: TtlInput): { idle?: string; max?: string } {
     input.idleMinutes! * 60 > input.maxHours! * 3600
   ) {
     errors.idle = "The idle TTL must not be longer than the maximum TTL.";
+  }
+  return errors;
+}
+
+export interface ResourceInput {
+  vcpu: number | null;
+  memory: number | null;
+  disk: number | null;
+}
+
+/**
+ * The largest memory or disk value that the form sends. The form holds a
+ * `number`, and a value above 2^53 - 1 would be rounded when it becomes the
+ * `int64` of the request.
+ */
+export const MAX_RESOURCE_INT64 = Number.MAX_SAFE_INTEGER;
+
+/**
+ * Returns field errors of the resource inputs, or an empty object. The vCPU
+ * count is an `int32` and memory and disk are `int64` values in the request;
+ * a value outside the range would fail in the protobuf serializer, or be
+ * rounded, so the form reports it before the request.
+ */
+export function resourceErrors(input: ResourceInput): {
+  vcpu?: string;
+  memory?: string;
+  disk?: string;
+} {
+  const errors: { vcpu?: string; memory?: string; disk?: string } = {};
+  if (input.vcpu === null || !(input.vcpu > 0)) {
+    errors.vcpu = "Enter at least 1 vCPU.";
+  } else if (!Number.isInteger(input.vcpu) || input.vcpu > MAX_INT32) {
+    errors.vcpu = `Enter a whole number of vCPUs from 1 to ${MAX_INT32}.`;
+  }
+  if (input.memory === null || !(input.memory > 0)) {
+    errors.memory = "Enter the memory in MiB.";
+  } else if (
+    !Number.isInteger(input.memory) ||
+    input.memory > MAX_RESOURCE_INT64
+  ) {
+    errors.memory = `Enter a whole number of MiB from 1 to ${MAX_RESOURCE_INT64}.`;
+  }
+  if (input.disk === null || !(input.disk > 0)) {
+    errors.disk = "Enter the disk size in GiB.";
+  } else if (!Number.isInteger(input.disk) || input.disk > MAX_RESOURCE_INT64) {
+    errors.disk = `Enter a whole number of GiB from 1 to ${MAX_RESOURCE_INT64}.`;
   }
   return errors;
 }

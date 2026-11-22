@@ -34,6 +34,7 @@ import {
   deviceLimitsInput,
   parseInt64Limit,
   parseLabels,
+  resourceErrors,
   ttlErrors,
 } from "./forms.ts";
 import {
@@ -417,6 +418,42 @@ describe("formatting and form rules", () => {
       "7 days",
     );
     expect(ttlErrors({ idleMinutes: 60, maxHours: 168 })).toEqual({});
+  });
+
+  test("keeps the resources of the create form within the request ranges", () => {
+    expect(resourceErrors({ vcpu: 2, memory: 4096, disk: 20 })).toEqual({});
+    expect(
+      resourceErrors({ vcpu: 2147483647, memory: 9007199254740991, disk: 1 }),
+    ).toEqual({});
+    // Empty and non-positive values keep their messages.
+    expect(resourceErrors({ vcpu: null, memory: null, disk: null })).toEqual({
+      vcpu: "Enter at least 1 vCPU.",
+      memory: "Enter the memory in MiB.",
+      disk: "Enter the disk size in GiB.",
+    });
+    expect(resourceErrors({ vcpu: 0, memory: -1, disk: 0 })).toEqual({
+      vcpu: "Enter at least 1 vCPU.",
+      memory: "Enter the memory in MiB.",
+      disk: "Enter the disk size in GiB.",
+    });
+    // The vCPU count is an int32; memory and disk stay exact below 2^53.
+    expect(resourceErrors({ vcpu: 2147483648, memory: 1, disk: 1 }).vcpu).toBe(
+      "Enter a whole number of vCPUs from 1 to 2147483647.",
+    );
+    expect(
+      resourceErrors({ vcpu: 3000000000, memory: 1, disk: 1 }).vcpu,
+    ).toContain("1 to 2147483647");
+    expect(
+      resourceErrors({ vcpu: 1, memory: 9007199254740992, disk: 1 }).memory,
+    ).toContain("1 to 9007199254740991");
+    expect(resourceErrors({ vcpu: 1, memory: 1, disk: 1e19 }).disk).toContain(
+      "1 to 9007199254740991",
+    );
+    expect(resourceErrors({ vcpu: 1.5, memory: 1.5, disk: 1.5 })).toEqual({
+      vcpu: "Enter a whole number of vCPUs from 1 to 2147483647.",
+      memory: "Enter a whole number of MiB from 1 to 9007199254740991.",
+      disk: "Enter a whole number of GiB from 1 to 9007199254740991.",
+    });
   });
 
   test("parses labels and enforces their limits", () => {

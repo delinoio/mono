@@ -40,7 +40,7 @@ import {
   ShortId,
 } from "../components/ui.tsx";
 import { formatMib, formatTime, labels } from "../format.ts";
-import { parseLabels, ttlErrors } from "../forms.ts";
+import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { uuidV7 } from "../uuid.ts";
 
@@ -309,11 +309,7 @@ function CreateSandboxDialog({
         const ttl = ttlErrors({ idleMinutes, maxHours });
         if (ttl.idle) next.idle = ttl.idle;
         if (ttl.max) next.max = ttl.max;
-        if (!(vcpu !== null && vcpu > 0)) next.vcpu = "Enter at least 1 vCPU.";
-        if (!(memory !== null && memory > 0))
-          next.memory = "Enter the memory in MiB.";
-        if (!(disk !== null && disk > 0))
-          next.disk = "Enter the disk size in GiB.";
+        Object.assign(next, resourceErrors({ vcpu, memory, disk }));
         const parsed = parseLabels(labelText);
         if ("error" in parsed) next.labels = parsed.error;
         setErrors(next);

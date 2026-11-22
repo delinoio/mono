@@ -922,6 +922,62 @@ describe("sandbox create form resources", () => {
     expect(created[0]?.memoryMib).toBe(1000n);
   });
 
+  const create = async (dialog: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+  };
+
+  test("rejects a vCPU count above the int32 range without a request", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const vcpu = within(dialog).getByLabelText("vCPUs");
+    for (const value of ["2147483648", "3000000000"]) {
+      await commit(vcpu, value);
+      await create(dialog);
+      expect(vcpu.getAttribute("aria-invalid")).toBe("true");
+      expect(dialog.textContent).toContain(
+        "Enter a whole number of vCPUs from 1 to 2147483647.",
+      );
+      expect(dialog.querySelector(".notice-error")).toBeNull();
+      expect(created).toHaveLength(0);
+    }
+    expect(
+      screen.queryByRole("dialog", { name: "Create a sandbox" }),
+    ).not.toBeNull();
+  });
+
+  test("rejects memory and disk above 2^53 - 1 without a request", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    await commit(
+      within(dialog).getByLabelText("Memory (MiB)"),
+      "9007199254740993",
+    );
+    await commit(
+      within(dialog).getByLabelText("Disk (GiB)"),
+      "10000000000000000000",
+    );
+    await create(dialog);
+    expect(dialog.textContent).toContain("MiB from 1 to 9007199254740991");
+    expect(dialog.textContent).toContain("GiB from 1 to 9007199254740991");
+    expect(dialog.querySelector(".notice-error")).toBeNull();
+    expect(created).toHaveLength(0);
+  });
+
+  test("creates with the largest vCPU count of the int32 range", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    await commit(within(dialog).getByLabelText("vCPUs"), "2147483647");
+    await create(dialog);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.vcpuCount).toBe(2147483647);
+    expect(
+      screen.queryByRole("dialog", { name: "Create a sandbox" }),
+    ).toBeNull();
+  });
+
   test("keeps the minimum of 256 and steps by whole numbers", async () => {
     const { transport } = recordingTransport();
     const dialog = await openForm(transport);
