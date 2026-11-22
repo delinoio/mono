@@ -2,7 +2,7 @@
 
 //go:build windows
 
-package imagebuild
+package images
 
 import (
 	"errors"
