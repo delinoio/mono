@@ -15,6 +15,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -104,7 +105,9 @@ type extractStats struct {
 // extractArchive extracts the tar archive r into the directory dir, which
 // must exist and be empty. It rejects entries with absolute paths, entries
 // that resolve outside dir, symbolic links whose targets point outside dir
-// and hard links to paths outside the archive. Each regular file may hold at
+// and hard links to paths outside the archive. After the last entry, it
+// checks every symbolic link again with the other links of the tree
+// resolved (verifyLinks). Each regular file may hold at
 // most fileLimit bytes and all files together at most totalLimit bytes.
 // Entry types other than directories, regular files, symbolic links and
 // hard links are skipped with a warning.
@@ -123,7 +126,7 @@ func extractArchive(ctx context.Context, r io.Reader, dir string, fileLimit, tot
 		}
 		hdr, err := tr.Next()
 		if errors.Is(err, io.EOF) {
-			return st, nil
+			return st, verifyLinks(ctx, dir)
 		}
 		if err != nil {
 			return st, err
@@ -257,4 +260,103 @@ func confinedLinkTarget(name, linkname string) bool {
 		return false
 	}
 	return filepath.IsLocal(filepath.Join(filepath.Dir(name), target))
+}
+
+// maxLinkHops bounds the symbolic links that verifyLinks follows for one
+// path. A longer chain is rejected; operating systems stop much earlier
+// (Linux after 40 links).
+const maxLinkHops = 255
+
+// verifyLinks checks every symbolic link in the extracted tree dir: its
+// target, resolved from the directory where the link really is and through
+// the other links of the tree, must stay inside dir. confinedLinkTarget
+// checks a target only as text, and an entry name or a target that passes
+// through another link can point elsewhere: with a/b -> .., the link
+// a/b/l -> ../x is the link l in dir, whose target leaves dir.
+func verifyLinks(ctx context.Context, dir string) error {
+	return filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if d.Type()&fs.ModeSymlink == 0 {
+			return nil
+		}
+		rel, err := filepath.Rel(dir, p)
+		if err != nil {
+			return err
+		}
+		ok, err := resolvesInside(dir, rel)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("tide: the archive entry %s is a symbolic link that resolves outside the destination", filepath.ToSlash(rel))
+		}
+		return nil
+	})
+}
+
+// resolvesInside resolves the local path rel inside dir like the operating
+// system does: element by element, following each symbolic link. It reports
+// whether every step stays inside dir. After an element that does not
+// exist, the rest of the path is checked as text.
+func resolvesInside(dir, rel string) (bool, error) {
+	pending := splitPath(rel)
+	var cur []string
+	missing := false
+	hops := 0
+	for len(pending) > 0 {
+		el := pending[0]
+		pending = pending[1:]
+		switch el {
+		case "", ".":
+			continue
+		case "..":
+			if len(cur) == 0 {
+				return false, nil
+			}
+			cur = cur[:len(cur)-1]
+			continue
+		}
+		cur = append(cur, el)
+		if missing {
+			continue
+		}
+		full := filepath.Join(append([]string{dir}, cur...)...)
+		info, err := os.Lstat(full)
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ENOTDIR) {
+			missing = true
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			continue
+		}
+		if hops++; hops > maxLinkHops {
+			return false, nil
+		}
+		target, err := os.Readlink(full)
+		if err != nil {
+			return false, err
+		}
+		if target == "" || filepath.IsAbs(target) || filepath.VolumeName(target) != "" || os.IsPathSeparator(target[0]) {
+			return false, nil
+		}
+		// The target replaces the link, relative to the link's directory.
+		// It is not cleaned: a ".." after a link leaves the link's target,
+		// not the link.
+		cur = cur[:len(cur)-1]
+		pending = append(splitPath(target), pending...)
+	}
+	return true, nil
+}
+
+// splitPath splits a local path at every separator of the local system.
+func splitPath(p string) []string {
+	return strings.FieldsFunc(p, func(r rune) bool { return r < 0x80 && os.IsPathSeparator(uint8(r)) })
 }

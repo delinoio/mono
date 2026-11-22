@@ -655,6 +655,42 @@ func TestExtractRejectsPathTraversal(t *testing.T) {
 		}
 	}
 
+	// Links that pass the text check but leave the destination once the
+	// other links of the archive are resolved.
+	for name, entries := range map[string][]*tar.Header{
+		"link in a linked directory": {
+			{Typeflag: tar.TypeDir, Name: "a/", Mode: 0o755},
+			{Typeflag: tar.TypeSymlink, Name: "a/b", Linkname: ".."},
+			{Typeflag: tar.TypeSymlink, Name: "a/b/l", Linkname: "../x"},
+		},
+		"target through a link": {
+			{Typeflag: tar.TypeDir, Name: "a/", Mode: 0o755},
+			{Typeflag: tar.TypeSymlink, Name: "a/b", Linkname: ".."},
+			{Typeflag: tar.TypeSymlink, Name: "l", Linkname: "a/b/../../x"},
+		},
+		"two links in one directory": {
+			{Typeflag: tar.TypeDir, Name: "a/", Mode: 0o755},
+			{Typeflag: tar.TypeSymlink, Name: "a/p", Linkname: ".."},
+			{Typeflag: tar.TypeSymlink, Name: "a/q", Linkname: "p/.."},
+		},
+	} {
+		dir := filepath.Join(t.TempDir(), "dest")
+		_ = os.Mkdir(dir, 0o755)
+		if _, err := extractArchive(ctx, tarOf(t, entries...), dir, 100, 1000); err == nil || !strings.Contains(err.Error(), "resolves outside") {
+			t.Errorf("%s: extraction = %v", name, err)
+		}
+	}
+	// Chained links that stay inside are kept.
+	inside := t.TempDir()
+	if _, err := extractArchive(ctx, tarOf(t,
+		&tar.Header{Typeflag: tar.TypeReg, Name: "d/e/f", Size: 1, Mode: 0o644},
+		&tar.Header{Typeflag: tar.TypeSymlink, Name: "l1", Linkname: "d/e"},
+		&tar.Header{Typeflag: tar.TypeSymlink, Name: "l2", Linkname: "l1/../e/f"},
+		&tar.Header{Typeflag: tar.TypeSymlink, Name: "dangling", Linkname: "l1/missing/x"},
+	), inside, 100, 1000); err != nil {
+		t.Fatalf("links inside: %v", err)
+	}
+
 	dir := t.TempDir()
 	st, err := extractArchive(ctx, tarOf(t,
 		&tar.Header{Typeflag: tar.TypeDir, Name: "./", Mode: 0o755},
