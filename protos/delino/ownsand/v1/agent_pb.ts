@@ -1160,11 +1160,17 @@ export const ImportSnapshotCommandSchema: GenMessage<ImportSnapshotCommand> = /*
 
 /**
  * Delete the local copy of a snapshot whose record the control plane
- * deleted. The agent succeeds also when it holds no copy. It fails with
- * FAILED_PRECONDITION while a create or an export uses the copy; the
- * control plane sends the command again for each snapshot that a later
- * state report lists and that it does not know. An agent that does not
- * know this command answers UNIMPLEMENTED and keeps the copy.
+ * deleted. The agent succeeds also when it holds no copy. While a create
+ * or an export reads the copy, the agent also succeeds at once, takes no
+ * new create or export from the snapshot and deletes the copy when the
+ * last of those readers ends; a delete that arrives while the agent
+ * captures the snapshot also succeeds at once, and the capture then
+ * publishes nothing and its create_snapshot fails with ABORTED. The control
+ * plane sends the command only once while the agent channel stays
+ * connected, and sends it again for each snapshot that a later state report
+ * lists and that it does not know (for example a copy that remained after
+ * an agent restart). An agent that does not know this command answers
+ * UNIMPLEMENTED and keeps the copy.
  *
  * @generated from message delino.ownsand.v1.DeleteSnapshotCommand
  */
