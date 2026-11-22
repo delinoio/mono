@@ -414,8 +414,15 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// shutdownGrace is how long Run lets open requests finish after ctx ends
+// before it closes their connections. Tests shorten it.
+var shutdownGrace = 5 * time.Second
+
 // Run serves the GuestService on l with HTTP/2 without TLS (prior
-// knowledge) until ctx ends, and removes expired operations meanwhile.
+// knowledge) until ctx ends, and removes expired operations meanwhile. After
+// ctx ends it stops accepting requests, waits for the open ones for at most
+// shutdownGrace (an open stream still sends its final message), closes the
+// remaining connections and then returns nil.
 func (s *Server) Run(ctx context.Context, l net.Listener) error {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
@@ -439,14 +446,19 @@ func (s *Server) Run(ctx context.Context, l net.Listener) error {
 			}
 		}
 	}()
+	// shutdownDone closes after Shutdown or Close returned. Serve returns
+	// http.ErrServerClosed as soon as Shutdown starts, not when the open
+	// requests ended, so Run waits for this channel before it returns.
+	shutdownDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 			defer cancel()
 			if err := srv.Shutdown(shutdownCtx); err != nil {
 				srv.Close()
 			}
+			close(shutdownDone)
 		case <-done:
 		}
 	}()
@@ -454,6 +466,9 @@ func (s *Server) Run(ctx context.Context, l net.Listener) error {
 	err := srv.Serve(l)
 	close(done)
 	if errors.Is(err, http.ErrServerClosed) {
+		// Only the shutdown goroutine closes the server, so it closes
+		// shutdownDone.
+		<-shutdownDone
 		return nil
 	}
 	return fmt.Errorf("guest: serve: %w", err)
