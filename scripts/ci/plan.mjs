@@ -26,6 +26,9 @@ const fixtureInputs = new Set([
   // `scripts/ci/protos-generate.test.mjs` runs this script against a fake `go`
   // in `test:tooling`. It is also a protobuf input (see `protoInputs`).
   "scripts/protos.sh",
+  // `scripts/ci/imported-skills.test.mjs` checks the imported skill copies
+  // against this lock file and `scripts/ci/imported-skills.manifest.json`.
+  "skills-lock.json",
 ]);
 
 // Shared runtime and workspace inputs that change every app e2e suite.
@@ -314,6 +317,10 @@ export function plan(cwd, base, head) {
       // The development scripts (the root `dev` portless preflight and the
       // Infisical launcher) have fixtures in `test:tooling`.
       path.startsWith("scripts/dev/") ||
+      // The imported skill copies are verified against their lock entries by
+      // `scripts/ci/imported-skills.test.mjs`, so a change to a skill file
+      // must run it.
+      path.startsWith(".agents/skills/") ||
       // A pending changeset is validated in the quality job, so that an
       // invalid one cannot reach main and stop every deployment.
       path.startsWith(".changeset/") ||
