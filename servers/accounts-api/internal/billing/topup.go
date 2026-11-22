@@ -27,6 +27,12 @@ const (
 	// without the caller's cancellation, so a client that disconnects does
 	// not leave the result unknown.
 	paddleCallTimeout = 20 * time.Second
+	// topUpOutcomeTimeout bounds the transaction that records the outcome
+	// of one Paddle call. It starts after the call returned, so a call that
+	// used its whole budget (a timeout) still leaves this time for the
+	// billing account lock and the write: the unknown result must not be
+	// lost to a deadline that the call already spent.
+	topUpOutcomeTimeout = 10 * time.Second
 )
 
 // topUp is a top-up row.
@@ -250,14 +256,16 @@ func outcomeLabel(o paddle.Outcome) string {
 // be retried; an automatic one fails without counting) or unknown (the
 // webhook or the timeout decides).
 func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), paddleCallTimeout)
-	defer cancel()
+	// Two independent deadlines, both without the caller's cancellation:
+	// one for the Paddle call and a fresh one for the outcome transaction.
+	callCtx, cancelCall := context.WithTimeout(context.WithoutCancel(ctx), s.paddleCallTimeout)
+	defer cancelCall()
 	cents, ok := MicrosToCents(t.Amount)
 	if !ok {
 		return paddle.OutcomeNotApplied, fmt.Errorf("top-up %s amount is not whole cents", t.ID)
 	}
 	start := time.Now()
-	_, callErr := s.paddle.CreateOneTimeCharge(ctx, t.PaddleSubscriptionID, paddle.Charge{
+	_, callErr := s.paddle.CreateOneTimeCharge(callCtx, t.PaddleSubscriptionID, paddle.Charge{
 		ProductID:   s.productID,
 		AmountCents: cents,
 		Name:        "Delino credit",
@@ -283,8 +291,12 @@ func (s *Service) charge(ctx context.Context, t topUp) (paddle.Outcome, error) {
 	if callErr != nil {
 		attrs = append(attrs, slog.Any("error", callErr))
 	}
-	s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_top_up_charge", attrs...)
+	s.logger.LogAttrs(callCtx, slog.LevelInfo, "billing_top_up_charge", attrs...)
 
+	// The outcome deadline starts here, after the call returned, so a call
+	// that used its whole budget leaves the full outcome time.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.outcomeTimeout)
+	defer cancel()
 	err := s.db.InTx(ctx, func(tx pgx.Tx) error {
 		now := s.timestamp()
 		acct, err := lockAccount(ctx, tx, t.BillingAccountID)
