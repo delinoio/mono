@@ -113,6 +113,8 @@ type LogtoConfig struct {
 type LogtoValidator struct {
 	cfg LogtoConfig
 
+	// mu guards keys, fetchedAt and attemptedAt. It is held only for memory
+	// access, never across the key set request.
 	mu        sync.Mutex
 	keys      jose.JSONWebKeySet
 	fetchedAt time.Time
@@ -120,6 +122,12 @@ type LogtoValidator struct {
 	// or not. It gates both refresh paths so that a failing key set endpoint
 	// is not fetched again within jwksMinRefresh.
 	attemptedAt time.Time
+
+	// refreshGate admits one key set refresh at a time. It is a channel with
+	// capacity one and not a mutex so that a request waits for it with its
+	// context: a request that is canceled while another refresh runs
+	// returns at once.
+	refreshGate chan struct{}
 }
 
 // NewLogtoValidator returns a validator. It does not fetch keys until the
@@ -137,7 +145,7 @@ func NewLogtoValidator(cfg LogtoConfig) *LogtoValidator {
 	if cfg.JWKSURL == "" {
 		cfg.JWKSURL = strings.TrimRight(cfg.Issuer, "/") + "/jwks"
 	}
-	return &LogtoValidator{cfg: cfg}
+	return &LogtoValidator{cfg: cfg, refreshGate: make(chan struct{}, 1)}
 }
 
 type logtoClaims struct {
@@ -178,33 +186,65 @@ func (v *LogtoValidator) Validate(ctx context.Context, raw string) (Token, error
 	return Token{Subject: claims.Subject, ClientID: claims.ClientID, Scopes: strings.Fields(claims.Scope)}, nil
 }
 
+// key returns the signing key with the key ID. A cached key that needs no
+// refresh is returned without waiting for a refresh that another request runs.
+// Requests that need a refresh share it: one runs it and the others wait for
+// it, each ending its wait when its own context ends.
 func (v *LogtoValidator) key(ctx context.Context, kid string) (*jose.JSONWebKey, error) {
+	k, due := v.lookup(kid)
+	if k != nil && !due {
+		return k, nil
+	}
+	// A request that finds no key waits for a refresh that is already
+	// running before it decides: that refresh can load the key, and during
+	// the cooldown it is the reason why no new refresh starts.
+	select {
+	case v.refreshGate <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	// Another request can have refreshed, or armed the cooldown, while this
+	// one waited.
+	if k, due = v.lookup(kid); !due {
+		<-v.refreshGate
+		return keyOrUnknown(k)
+	}
+	err := v.refresh(ctx)
+	if err != nil && (ctx.Err() != nil || !v.hasKeys()) {
+		return nil, err
+	}
+	// The refresh armed the cooldown, so an unknown key ID is not fetched
+	// again for jwksMinRefresh, even when the refresh failed.
+	k, _ = v.lookup(kid)
+	return keyOrUnknown(k)
+}
+
+func keyOrUnknown(k *jose.JSONWebKey) (*jose.JSONWebKey, error) {
+	if k == nil {
+		return nil, errors.New("unknown key id")
+	}
+	return k, nil
+}
+
+// lookup returns the cached key with the key ID and whether a refresh is due.
+// A refresh is due outside the cooldown when the key set is missing or older
+// than jwksRefreshInterval, or when the key ID is unknown. An unknown key ID
+// refreshes the key set at most once per jwksMinRefresh, counted from the last
+// attempt even when it failed.
+func (v *LogtoValidator) lookup(kid string) (key *jose.JSONWebKey, due bool) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	now := v.cfg.Now()
-	cooling := func() bool {
-		return !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
-	}
-	if (v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval) && !cooling() {
-		if err := v.refreshLocked(ctx); err != nil && v.fetchedAt.IsZero() {
-			return nil, err
-		}
-	}
-	if k := v.findLocked(kid); k != nil {
-		return k, nil
-	}
-	// An unknown key ID refreshes the key set at most once per
-	// jwksMinRefresh, counted from the last attempt even when it failed.
-	if cooling() {
-		return nil, errors.New("unknown key id")
-	}
-	if err := v.refreshLocked(ctx); err != nil {
-		return nil, err
-	}
-	if k := v.findLocked(kid); k != nil {
-		return k, nil
-	}
-	return nil, errors.New("unknown key id")
+	cooling := !v.attemptedAt.IsZero() && now.Sub(v.attemptedAt) < jwksMinRefresh
+	stale := v.fetchedAt.IsZero() || now.Sub(v.fetchedAt) > jwksRefreshInterval
+	key = v.findLocked(kid)
+	return key, !cooling && (stale || key == nil)
+}
+
+func (v *LogtoValidator) hasKeys() bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return !v.fetchedAt.IsZero()
 }
 
 func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
@@ -217,13 +257,36 @@ func (v *LogtoValidator) findLocked(kid string) *jose.JSONWebKey {
 	return nil
 }
 
-func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
+// refresh loads the key set. The caller holds refreshGate; refresh releases
+// it when the load ends. The load runs in its own goroutine, so a caller that
+// is canceled while it waits returns at once and the load still completes for
+// the other callers.
+func (v *LogtoValidator) refresh(ctx context.Context) error {
 	// A caller that is already gone must not arm the process-wide cooldown
 	// for later live callers.
 	if err := ctx.Err(); err != nil {
+		<-v.refreshGate
 		return err
 	}
+	v.mu.Lock()
 	v.attemptedAt = v.cfg.Now()
+	v.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		defer func() { <-v.refreshGate }()
+		done <- v.load(ctx)
+	}()
+	select {
+	case err := <-done:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// load fetches the key set and replaces the cached one. It holds no lock
+// during the request.
+func (v *LogtoValidator) load(ctx context.Context) error {
 	body, err := v.fetch(ctx)
 	if err != nil {
 		v.cfg.Logger.Warn("logto_jwks_fetch_failed", slog.Any("error", err))
@@ -234,8 +297,10 @@ func (v *LogtoValidator) refreshLocked(ctx context.Context) error {
 		v.cfg.Logger.Warn("logto_jwks_parse_failed", slog.Any("error", err))
 		return err
 	}
+	v.mu.Lock()
 	v.keys = set
 	v.fetchedAt = v.cfg.Now()
+	v.mu.Unlock()
 	v.cfg.Logger.Info("logto_jwks_loaded", slog.Int("keys", len(set.Keys)))
 	return nil
 }
