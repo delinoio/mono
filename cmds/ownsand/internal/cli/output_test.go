@@ -296,3 +296,129 @@ func TestStickyWriterKeepsFirstError(t *testing.T) {
 		t.Fatalf("err %v, wrote %q", w.err, under.buf.String())
 	}
 }
+
+func TestSafeText(t *testing.T) {
+	for _, tc := range []struct{ name, in, want string }{
+		{"empty", "", ""},
+		{"ascii and space", "a b~", "a b~"},
+		{"printable non-ASCII", "한국어 café 日本語　x 😀", "한국어 café 日本語　x 😀"},
+		{"escape", "a\x1b[31mred\x1b[0m", `a\x1b[31mred\x1b[0m`},
+		{"bell", "a\x07b", `a\x07b`},
+		{"carriage return", "a\rb", `a\rb`},
+		{"newline", "a\nb", `a\nb`},
+		{"tab", "a\tb", `a\tb`},
+		{"nul and delete", "\x00\x7f", `\x00\x7f`},
+		{"C1 control", "a\u009bb", `a\x9bb`},
+		{"line separator", "a\u2028b", "a\\u2028b"},
+		{"bidi override", "a\u202eb", "a\\u202eb"},
+		{"non-BMP unassigned", "a\U000e0001b", `a\U000e0001b`},
+		{"invalid UTF-8", "a\xffb\xc3", `a\xffb\xc3`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := safeText(tc.in); got != tc.want {
+				t.Fatalf("safeText(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// hostileLabels are labels whose keys and values carry a terminal escape, a
+// bell, a carriage return, a forged record line and a tab.
+var hostileLabels = map[string]string{
+	"evil\x1b[2Jkey": "v\x07al\rue\nforged: line\tx",
+	"plain":          "한국어",
+}
+
+func TestPrintFieldsEscapesControlCharacters(t *testing.T) {
+	var buf bytes.Buffer
+	a := &app{}
+	if err := a.printFields(&buf, &ownsandv1.Sandbox{SandboxId: "id", Labels: hostileLabels}); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	assertNoControlBytes(t, out)
+	if !strings.Contains(out, `labels.evil\x1b[2Jkey: v\x07al\rue\nforged: line\tx`) || !strings.Contains(out, "labels.plain: 한국어\n") {
+		t.Fatalf("output %q", out)
+	}
+	for _, l := range strings.Split(strings.TrimSuffix(out, "\n"), "\n") {
+		if !strings.HasPrefix(l, "labels.") && !strings.HasPrefix(l, "sandbox_id: ") {
+			t.Fatalf("line %q does not start with a real field key", l)
+		}
+	}
+}
+
+func TestPrintTableEscapesCells(t *testing.T) {
+	var buf bytes.Buffer
+	a := &app{}
+	rows := [][]string{{"1", "a\nb\tc\x1b[0m", "x"}, {"2", "plain 한국어", "y"}}
+	if err := a.printTable(&buf, []string{"ID", "NAME", "Z"}, rows); err != nil {
+		t.Fatal(err)
+	}
+	out := buf.String()
+	assertNoControlBytes(t, out)
+	lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want header and two rows, got %q", out)
+	}
+	if !strings.Contains(lines[1], `a\nb\tc\x1b[0m`) || !strings.Contains(lines[2], "plain 한국어") {
+		t.Fatalf("output %q", out)
+	}
+}
+
+// assertNoControlBytes fails when s has a control byte other than the
+// newline that ends a line.
+func assertNoControlBytes(t *testing.T, s string) {
+	t.Helper()
+	for i := 0; i < len(s); i++ {
+		if c := s[i]; (c < 0x20 && c != '\n') || c == 0x7f {
+			t.Fatalf("output has control byte %#x at %d: %q", c, i, s)
+		}
+	}
+}
+
+// TestTextOutputEscapesServerStrings runs real commands against the fake
+// control plane with hostile strings: text mode shows only escapes, and
+// --format json keeps the exact values.
+func TestTextOutputEscapesServerStrings(t *testing.T) {
+	r := newRunner(t)
+	r.f.labels = hostileLabels
+	for _, args := range [][]string{{"sandbox", "get", r.f.sb}, {"sandbox", "list"}} {
+		res := r.run(append(args, "--no-color")...)
+		if res.code != ExitOK {
+			t.Fatalf("%v: %+v", args, res)
+		}
+		if args[1] == "get" {
+			assertNoControlBytes(t, res.stdout)
+			if !strings.Contains(res.stdout, `labels.evil\x1b[2Jkey: v\x07al\rue\nforged: line\tx`) {
+				t.Fatalf("stdout %q", res.stdout)
+			}
+		}
+	}
+	res := r.run("sandbox", "get", r.f.sb, "--format", "json")
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	var got struct {
+		Labels map[string]string `json:"labels"`
+	}
+	if err := json.Unmarshal([]byte(res.stdout), &got); err != nil {
+		t.Fatal(err)
+	}
+	for k, v := range hostileLabels {
+		if got.Labels[k] != v {
+			t.Fatalf("json label %q = %q, want %q", k, got.Labels[k], v)
+		}
+	}
+
+	r.signInAs("owner")
+	r.f.billing, r.f.usage = linkedAllowed(), billingUsage()
+	r.f.usage.BillingAccountName = "Ac\x1b[2Jme\nstatus: forged"
+	res = r.run("billing", "status", "--no-color")
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	assertNoControlBytes(t, res.stdout)
+	if !strings.Contains(res.stdout, `billing account: Ac\x1b[2Jme\nstatus: forged (`) {
+		t.Fatalf("stdout %q", res.stdout)
+	}
+}
