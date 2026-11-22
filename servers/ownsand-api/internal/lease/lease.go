@@ -128,17 +128,39 @@ func (l *Lease) WhileHeld(fn func()) bool {
 	return true
 }
 
-// Wait blocks until the instance holds the lease or ctx ends.
+// Wait blocks until the instance holds the lease or ctx ends. It returns nil
+// only while the ownership period is current: the acquisition channel stays
+// closed after the confirmed expiry until the watcher runs the loss
+// transition, so Wait checks the deadline itself and, in that interval, runs
+// the transition (which installs a fresh channel) instead of returning for an
+// expired acquisition or spinning on the closed channel.
 func (l *Lease) Wait(ctx context.Context) error {
 	l.init()
-	l.mu.Lock()
-	ch := l.acquired
-	l.mu.Unlock()
-	select {
-	case <-ch:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	for {
+		l.mu.Lock()
+		if l.heldLocked() {
+			l.mu.Unlock()
+			return nil
+		}
+		if l.held {
+			// Expired, but the loss is not recorded yet. expireIfDue is
+			// idempotent and serialized with the other transitions.
+			l.mu.Unlock()
+			l.expireIfDue()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			continue
+		}
+		ch := l.acquired
+		l.mu.Unlock()
+		select {
+		case <-ch:
+			// An acquisition closed the channel; loop to confirm that the
+			// period is still current.
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 }
 
