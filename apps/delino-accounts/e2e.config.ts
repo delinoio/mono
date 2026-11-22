@@ -15,7 +15,12 @@ export default {
         url: "http://127.0.0.1:0",
         command: {
           executable: "rsbuild",
-          args: ["dev", "--host", "127.0.0.1", "--port", "{port}"],
+          // `--no-env` stops Rsbuild from loading `.env` and `.env.local` from the
+          // app root, so a developer's local values (for example an invalid
+          // `PUBLIC_LOGTO_ENDPOINT` or a configured Logto registration) cannot
+          // break the suite. `rsbuild.config.ts` inlines the `PUBLIC_*` values
+          // from `process.env` itself, because the dotenv step no longer does.
+          args: ["dev", "--no-env", "--host", "127.0.0.1", "--port", "{port}"],
           // The runner passes only PATH, HOME and temporary-directory variables
           // to the app command. Pass a nondefault API origin explicitly so
           // `e2e/home.e2e.ts` can observe that the build-time variable reaches
