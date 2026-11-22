@@ -59,6 +59,9 @@ type Fake struct {
 	FailDelete int
 	// FailJIT makes generate-jitconfig answer this status once.
 	FailJIT int
+	// JITGate, when set, runs before a generate-jitconfig call is served,
+	// without the fake lock, so a test can hold a runner start there.
+	JITGate func()
 }
 
 // Installation is a fake installation.
@@ -238,6 +241,14 @@ func (f *Fake) verifyJWT(r *http.Request) bool {
 }
 
 func (f *Fake) serve(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/generate-jitconfig") {
+		f.mu.Lock()
+		gate := f.JITGate
+		f.mu.Unlock()
+		if gate != nil {
+			gate()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p := r.URL.Path

@@ -254,6 +254,95 @@ func TestCanceledJobSurplus(t *testing.T) {
 	}
 }
 
+// TestSurplusWhileStarting: the surplus removal decides on the current
+// state of a runner that was still starting in its snapshot. A runner with
+// a recorded registration keeps it while GitHub refuses the removal (it
+// took a job), and a runner deleted before its registration was recorded
+// removes the registration and never starts the runner program.
+func TestSurplusWhileStarting(t *testing.T) {
+	waitFor := func(t *testing.T, what string, ch <-chan string) {
+		t.Helper()
+		select {
+		case <-ch:
+		case <-time.After(15 * time.Second):
+			t.Fatalf("timed out waiting for %s", what)
+		}
+	}
+	t.Run("registered", func(t *testing.T) {
+		w := newGHWorld(t, worldOpts{})
+		w.link(t, 501, "acme")
+		w.createProfile(t, ghProfile("linux", 0))
+		gate, entered := make(chan struct{}), make(chan string, 1)
+		w.progs.hold(gate, entered)
+		defer close(gate)
+		w.send(t, "workflow_job", job("queued", 501, 1, tideLinux, ""))
+		waitFor(t, "the start exec", entered)
+		starting := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_PREPARING)
+		if len(starting) != 1 {
+			t.Fatalf("%d starting runners", len(starting))
+		}
+		id := starting[0].GetRunnerId()
+		// GitHub gave the runner a job; its in_progress event has not come.
+		w.gh.SetBusy("tide-"+id, true)
+		w.send(t, "workflow_job", job("completed", 501, 1, tideLinux, ""))
+		w.l.GitHub.Wait()
+		if got := w.runner(t, id).GetState(); got != tidev1.RunnerState_RUNNER_STATE_PREPARING {
+			t.Fatalf("the busy runner changed to %v", got)
+		}
+		if _, ok := w.gh.RunnerByName("tide-" + id); !ok {
+			t.Fatal("the busy registration was removed")
+		}
+	})
+	t.Run("not registered", func(t *testing.T) {
+		w := newGHWorld(t, worldOpts{})
+		w.link(t, 501, "acme")
+		w.createProfile(t, ghProfile("linux", 0))
+		release, entered := make(chan struct{}), make(chan string, 1)
+		w.gh.Update(func() {
+			w.gh.JITGate = func() {
+				select {
+				case entered <- "":
+				default:
+				}
+				<-release
+			}
+		})
+		released := false
+		defer func() {
+			if !released {
+				close(release)
+			}
+		}()
+		w.send(t, "workflow_job", job("queued", 501, 1, tideLinux, ""))
+		waitFor(t, "the JIT configuration call", entered)
+		starting := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_PREPARING)
+		if len(starting) != 1 {
+			t.Fatalf("%d starting runners", len(starting))
+		}
+		id := starting[0].GetRunnerId()
+		w.send(t, "workflow_job", job("completed", 501, 1, tideLinux, ""))
+		w.l.GitHub.Wait()
+		if r := w.runner(t, id); r.GetState() != tidev1.RunnerState_RUNNER_STATE_DELETED || r.GetEndReason() != tidev1.RunnerEndReason_RUNNER_END_REASON_SURPLUS {
+			t.Fatalf("surplus runner %v", r)
+		}
+		w.gh.Update(func() { w.gh.JITGate = nil })
+		close(release)
+		released = true
+		eventually(t, "the late registration removed", func() bool {
+			_, ok := w.gh.RunnerByName("tide-" + id)
+			return w.gh.Calls("generate_jitconfig") == 1 && !ok
+		})
+		stays(t, "no runner program", func() bool {
+			for _, cmd := range w.progs.all() {
+				if strings.Contains(strings.Join(cmd, " "), "--jitconfig") {
+					return false
+				}
+			}
+			return true
+		})
+	})
+}
+
 // TestWarmRunnerPerPool: a warm count keeps idle runners per ACTIVE
 // installation, and the surplus rule keeps them.
 func TestWarmRunnerPerPool(t *testing.T) {

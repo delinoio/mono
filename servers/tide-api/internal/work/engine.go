@@ -471,27 +471,12 @@ func (e *Engine) PoolSurplus(ctx context.Context, orgID, profileID, poolKey stri
 	return nil, nil
 }
 
-// DeleteIdleRunner deletes a runner with reason only while it is still in
-// CREATING, PREPARING or WAITING_FOR_WORK without a request (a surplus or
-// clean-up of a runner pool). It returns nil when the runner changed
-// meanwhile, for example because it took work.
-func (e *Engine) DeleteIdleRunner(ctx context.Context, orgID, runnerID string, reason tidev1.RunnerEndReason) (*Runner, error) {
-	var out *Runner
-	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-		r, err := e.DeleteIdleRunnerTx(ctx, tx, orgID, runnerID, reason)
-		out = r
-		return err
-	})
-	if err != nil || out == nil {
-		return nil, err
-	}
-	e.kickRunner(out.ID)
-	e.Kick(orgID)
-	return out, nil
-}
-
-// DeleteIdleRunnerTx is DeleteIdleRunner in the caller's transaction. After
-// the commit, call RunnerChanged (or DeleteSandboxOf) for the runner.
+// DeleteIdleRunnerTx deletes a runner with reason in the caller's
+// transaction only while it is still in CREATING, PREPARING or
+// WAITING_FOR_WORK without a request (a surplus or clean-up of a runner
+// pool). It returns nil when the runner changed meanwhile, for example
+// because it took work. After the commit, call RunnerChanged (or
+// DeleteSandboxOf) for the runner.
 func (e *Engine) DeleteIdleRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason tidev1.RunnerEndReason) (*Runner, error) {
 	if _, err := e.GetRunner(ctx, tx, orgID, runnerID); err != nil {
 		return nil, err

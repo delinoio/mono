@@ -35,6 +35,18 @@ type programs struct {
 	mu       sync.Mutex
 	commands [][]string
 	running  map[string]chan struct{} // sandbox ID -> exit signal
+	// gate, when set, holds each start exec (the registration is recorded
+	// and the runner is still PREPARING) until it is closed; entered gets
+	// the sandbox ID of a held start.
+	gate    chan struct{}
+	entered chan string
+}
+
+// hold holds the start execs until gate is closed.
+func (p *programs) hold(gate chan struct{}, entered chan string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gate, p.entered = gate, entered
 }
 
 func (p *programs) exec(ctx context.Context, sandboxID string, e ownsand.ExecParams) (*ownsand.ExecResult, error) {
@@ -43,6 +55,20 @@ func (p *programs) exec(ctx context.Context, sandboxID string, e ownsand.ExecPar
 	p.mu.Unlock()
 	joined := strings.Join(e.Command, " ")
 	if strings.Contains(joined, "--jitconfig") {
+		p.mu.Lock()
+		gate, entered := p.gate, p.entered
+		p.mu.Unlock()
+		if gate != nil {
+			select {
+			case entered <- sandboxID:
+			default:
+			}
+			select {
+			case <-gate:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
 		p.mu.Lock()
 		if p.running[sandboxID] == nil {
 			p.running[sandboxID] = make(chan struct{})

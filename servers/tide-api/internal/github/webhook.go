@@ -453,10 +453,9 @@ func (l *Layer) jobCompleted(ctx context.Context, tx pgx.Tx, inst *Installation,
 
 // removeSurplus compares the pool's runners in CREATING, PREPARING or
 // WAITING_FOR_WORK with all of its remaining QUEUED requests and removes
-// the newest surplus runners: first the GitHub registration, then the
-// sandbox. A runner whose removal GitHub refuses took a job and stays. The
-// profile's warm count is kept as a reserve (recorded decision), so the
-// rule does not delete the warm runners that the dispatcher keeps.
+// the newest surplus runners with removeIdleRunner. The profile's warm
+// count is kept as a reserve (recorded decision), so the rule does not
+// delete the warm runners that the dispatcher keeps.
 func (l *Layer) removeSurplus(ctx context.Context, orgID, profileID, pool string) {
 	reserve := 0
 	if p, err := l.profiles.Get(ctx, l.svc.DB.Pool, orgID, profileID); err == nil {
@@ -476,28 +475,85 @@ func (l *Layer) removeSurplus(ctx context.Context, orgID, profileID, pool string
 		return
 	}
 	for _, r := range surplus {
-		if r.State == tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK && inst != nil && inst.Active() {
-			refused, err := l.removeRegistration(ctx, inst, r.ID)
-			if err != nil {
-				// Without a removed registration the runner may still take a
-				// job, so it stays; the next completed event tries again.
-				l.svc.Logger.WarnContext(ctx, "github_surplus_registration_failed", slog.String("organization_id", orgID), slog.String("runner_id", r.ID), slog.Any("error", err))
-				continue
-			}
-			if refused {
-				continue
-			}
-		}
-		d, err := l.engine.DeleteIdleRunner(ctx, orgID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_SURPLUS)
+		deleted, err := l.removeIdleRunner(ctx, inst, orgID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_SURPLUS)
 		if err != nil {
+			// Without a removed registration the runner may still take a
+			// job, so it stays; the next completed event tries again.
 			l.svc.Logger.WarnContext(ctx, "github_surplus_delete_failed", slog.String("organization_id", orgID), slog.String("runner_id", r.ID), slog.Any("error", err))
 			continue
 		}
-		if d != nil {
-			l.engine.DeleteSandboxOf(ctx, orgID, d.ID)
+		if deleted {
 			l.svc.Logger.InfoContext(ctx, "github_surplus_runner_removed", slog.String("organization_id", orgID), slog.String("runner_id", r.ID))
 		}
 	}
+}
+
+// removeIdleRunner deletes a GITHUB_JOB runner of inst's pool with reason
+// while it is in CREATING, PREPARING or WAITING_FOR_WORK without a request,
+// and reports whether it did. It decides on the current state, not on an
+// earlier snapshot: under the runner row lock that recordRegistration also
+// takes, a runner with a recorded registration keeps it until GitHub
+// accepted its removal (a refusal means that the runner took a job, and it
+// stays), and a runner without one changes to DELETING, so its start
+// records the registration later, removes it and does not start the runner
+// program. Without an ACTIVE installation, a registered runner stays.
+func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID, runnerID string, reason tidev1.RunnerEndReason) (bool, error) {
+	// Two rounds: the registration removal, then the deletion.
+	for range 2 {
+		registered := false
+		var d *work.Runner
+		err := l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+			registered, d = false, nil
+			var state int16
+			var bound bool
+			err := tx.QueryRow(ctx, "SELECT state, request_id IS NOT NULL FROM runners WHERE organization_id = $1 AND runner_id = $2 FOR UPDATE", orgID, runnerID).
+				Scan(&state, &bound)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			switch tidev1.RunnerState(state) {
+			case tidev1.RunnerState_RUNNER_STATE_CREATING, tidev1.RunnerState_RUNNER_STATE_PREPARING, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK:
+			default:
+				return nil
+			}
+			if bound {
+				return nil
+			}
+			reg, err := l.registration(ctx, tx, runnerID)
+			if err != nil {
+				return err
+			}
+			if reg != nil && !reg.removed && reg.githubRunnerID != 0 {
+				registered = true
+				return nil
+			}
+			d, err = l.engine.DeleteIdleRunnerTx(ctx, tx, orgID, runnerID, reason)
+			return err
+		})
+		if err != nil {
+			return false, err
+		}
+		if !registered {
+			if d == nil {
+				return false, nil
+			}
+			l.engine.RunnerChanged(d.ID)
+			l.engine.DeleteSandboxOf(ctx, orgID, d.ID)
+			l.svc.WorkChanged(orgID)
+			return true, nil
+		}
+		if inst == nil || !inst.Active() {
+			return false, nil
+		}
+		refused, err := l.removeRegistration(ctx, inst, runnerID)
+		if err != nil || refused {
+			return false, err
+		}
+	}
+	return false, nil
 }
 
 // installationEvent applies deleted, suspend and unsuspend. deleted and

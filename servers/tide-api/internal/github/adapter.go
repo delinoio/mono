@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/jackc/pgx/v5"
+
 	"github.com/delinoio/mono/go/ownsand"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -123,7 +125,7 @@ func (a *Adapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, e
 	if err != nil {
 		return work.StartResult{}, err
 	}
-	if _, err := l.svc.DB.Pool.Exec(ctx, "UPDATE github_runners SET github_runner_id = $2 WHERE runner_id = $1", r.ID, jit.Runner.ID); err != nil {
+	if err := l.recordRegistration(ctx, inst, r.ID, jit.Runner.ID); err != nil {
 		return work.StartResult{}, err
 	}
 	l.svc.Logger.InfoContext(ctx, "github_runner_registered", slog.String("organization_id", r.OrganizationID), slog.String("runner_id", r.ID),
@@ -156,6 +158,40 @@ func (a *Adapter) Start(ctx context.Context, g *work.Guest) (work.StartResult, e
 	// An exec that already exited is followed too: AttachExec returns its
 	// result, and the engine deletes the runner.
 	return work.StartResult{ProgramExecID: execID}, nil
+}
+
+// errDeletedWhileStarting fails a start whose runner was deleted (for
+// example as a surplus runner) before its registration was recorded.
+var errDeletedWhileStarting = errors.New("the runner was deleted while it started")
+
+// recordRegistration stores the GitHub runner ID of a new registration. It
+// locks the runner row, like removeIdleRunner, so a deletion of a waiting
+// runner either sees the registration (and removes it at GitHub first) or
+// comes first: then the runner is no longer PREPARING, the registration is
+// removed here, and the start fails before the runner program starts.
+func (l *Layer) recordRegistration(ctx context.Context, inst *Installation, runnerID string, githubRunnerID int64) error {
+	starting := false
+	err := l.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
+		var state int16
+		if err := tx.QueryRow(ctx, "SELECT state FROM runners WHERE runner_id = $1 FOR UPDATE", runnerID).Scan(&state); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, "UPDATE github_runners SET github_runner_id = $2 WHERE runner_id = $1", runnerID, githubRunnerID); err != nil {
+			return err
+		}
+		s := tidev1.RunnerState(state)
+		starting = s == tidev1.RunnerState_RUNNER_STATE_PREPARING || s == tidev1.RunnerState_RUNNER_STATE_WARM
+		return nil
+	})
+	if err != nil || starting {
+		return err
+	}
+	// The runner never connected, so GitHub accepts the removal. When it
+	// fails, the deletion of the runner (a DELETING runner) repeats it.
+	if _, err := l.removeRegistration(context.WithoutCancel(ctx), inst, runnerID); err != nil {
+		l.svc.Logger.WarnContext(ctx, "github_runner_removal_failed", slog.String("organization_id", inst.OrganizationID), slog.String("runner_id", runnerID), slog.Any("error", err))
+	}
+	return errDeletedWhileStarting
 }
 
 // ProgramExited keeps the request: GitHub ends it with the completed event.
