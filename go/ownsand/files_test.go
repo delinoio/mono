@@ -9,12 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
+	"github.com/delinoio/mono/go/ownsand/validate"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -401,6 +403,55 @@ func TestWriteFileChunkedBothTransports(t *testing.T) {
 				if (i == 2) != (r.GetFinish() != nil) {
 					t.Fatal("only the last chunk finishes")
 				}
+			}
+		})
+	}
+}
+
+func TestWriteFileRejectsOutOfRangeModeBeforeUpload(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, tr))
+			for _, call := range []func() error{
+				func() error {
+					_, err := s.WriteFile(context.Background(), "/out", bytes.NewReader([]byte("x")), WriteOptions{Mode: 0o10000})
+					return err
+				},
+				func() error {
+					return s.WriteFileBytes(context.Background(), "/out", nil, WriteOptions{Mode: 0o10000})
+				},
+			} {
+				err := call()
+				if !validate.IsValidationError(err) || !strings.Contains(err.Error(), "finish.mode") {
+					t.Fatalf("got %v, want a validation error for finish.mode", err)
+				}
+			}
+			if n := len(cp.agent.writeRequests()); n != 0 {
+				t.Fatalf("%d write requests reached the agent", n)
+			}
+			if n := cp.relayCount("WriteFile") + len(cp.authRequests()); n != 0 {
+				t.Fatalf("%d relay calls or grants for a rejected write", n)
+			}
+		})
+	}
+}
+
+func TestWriteFileModeLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode uint32
+		want uint32
+	}{{"default", 0, 0o644}, {"maximum", 0o7777, 0o7777}} {
+		t.Run(tc.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, TransportRelay))
+			if err := s.WriteFileBytes(context.Background(), "/m", []byte("x"), WriteOptions{Mode: tc.mode}); err != nil {
+				t.Fatal(err)
+			}
+			reqs := cp.agent.writeRequests()
+			if got := reqs[len(reqs)-1].GetFinish().GetMode(); got != tc.want {
+				t.Fatalf("finish mode %#o, want %#o", got, tc.want)
 			}
 		})
 	}
