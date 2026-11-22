@@ -196,6 +196,13 @@ type fakeCP struct {
 	gateErr error
 	// openErr, when set, is the error of every OpenSession request.
 	openErr error
+	// agentGate, when set, holds every peer-to-peer file read and write
+	// chunk request at the agent until the gate closes or the data channel
+	// closes. The agent reports "read" or "write" on agentHits (when set)
+	// when a request reaches the gate. The channels are created by the test
+	// before the first request and never replaced.
+	agentGate chan struct{}
+	agentHits chan string
 	// iceServers are the ICE server URLs that GetIceServers returns.
 	iceServers []string
 	iceCalls   int // GetIceServers requests
@@ -526,6 +533,33 @@ func (f *fakeDataPath) hold(ctx context.Context, gate chan struct{}, kind string
 		f.cp.gateCanceled++
 		f.cp.mu.Unlock()
 		return ctx.Err()
+	}
+}
+
+// holdAgent blocks a peer-to-peer file request of kind at the agent gate. It
+// reports false when the data channel closed first, and then the request is
+// not served. A nil gate never blocks.
+func (cp *fakeCP) holdAgent(ctx context.Context, kind string) bool {
+	gate := cp.agentGate
+	if gate == nil {
+		return true
+	}
+	select {
+	case <-gate:
+		return true
+	default:
+	}
+	if cp.agentHits != nil {
+		select {
+		case cp.agentHits <- kind:
+		default:
+		}
+	}
+	select {
+	case <-gate:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -1322,6 +1356,9 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			errFrame(err)
 		}
 	case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_READ_REQUEST:
+		if !cp.holdAgent(s.ctx, "read") {
+			return
+		}
 		chunks := 0
 		err := cp.agent.serveRead(f.GetFileReadRequest(), func(ev *ownsandv1.FileReadEvent) error {
 			if err := s.send(frame(ev)); err != nil {
@@ -1346,6 +1383,9 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			errFrame(err)
 		}
 	case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_WRITE_CHUNK:
+		if !cp.holdAgent(s.ctx, "write") {
+			return
+		}
 		if act.failAfter > 0 {
 			_ = s.pc.Close()
 			return

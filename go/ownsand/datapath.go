@@ -287,8 +287,8 @@ func (d *dataPath) close() {
 }
 
 // handleSessionError reports whether err ended the session (true) and
-// updates the handle: a session end or retirement only forgets the session,
-// a failure moves the handle to the relay.
+// updates the handle: a session end, retirement or caller close only forgets
+// the session, a failure moves the handle to the relay.
 func (d *dataPath) handleSessionError(sess *p2pSession, err error) bool {
 	var ended *errSessionEnded
 	if errors.As(err, &ended) {
@@ -299,6 +299,14 @@ func (d *dataPath) handleSessionError(sess *p2pSession, err error) bool {
 	var retired *errSessionRetired
 	if errors.As(err, &retired) {
 		d.s.c.logger.Debug("ownsand data path session retired after an interrupted frame", "sandbox_id", d.s.id)
+		d.sessionEnded(sess)
+		return true
+	}
+	var closedByCaller *errSessionClosedByCaller
+	if errors.As(err, &closedByCaller) {
+		// The caller closed the handle, which is not a channel failure: the
+		// handle keeps its transport and the operation continues to
+		// errHandleClosed at its next route call.
 		d.sessionEnded(sess)
 		return true
 	}

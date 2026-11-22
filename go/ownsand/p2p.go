@@ -53,6 +53,16 @@ func (e *errSessionRetired) Error() string {
 	return "ownsand: data path session retired after an interrupted frame"
 }
 
+// errSessionClosedByCaller reports a session that the SDK closed because the
+// caller closed or deleted the handle. It is not a channel failure, so the
+// handle neither moves to the relay nor logs a fall back; every later
+// operation on the closed handle ends with errHandleClosed.
+type errSessionClosedByCaller struct{}
+
+func (e *errSessionClosedByCaller) Error() string {
+	return "ownsand: data path session closed by the caller"
+}
+
 // errP2PFailed reports a data channel that closed without a session-end
 // frame, an ICE failure or an invalid byte stream. The handle moves to the
 // relay.
@@ -265,7 +275,7 @@ func (s *p2pSession) isDone() bool {
 }
 
 func (s *p2pSession) close() {
-	s.end(&errP2PFailed{cause: errors.New("session closed by the caller")})
+	s.end(&errSessionClosedByCaller{})
 }
 
 func (s *p2pSession) onMessage(msg webrtc.DataChannelMessage) {

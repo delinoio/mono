@@ -5,7 +5,10 @@ package ownsand
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -463,5 +466,194 @@ func TestControlPlaneDeadlineStatusWithoutCallerDeadlineFallsBackToRelay(t *test
 	}
 	if r.res.Transport != relayTransport || len(cp.authRequests()) == 0 {
 		t.Fatalf("transport %v", r.res.Transport)
+	}
+}
+
+// logBuffer is a goroutine-safe log sink for the logger of a test client.
+type logBuffer struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
+}
+
+// captureLogs makes the client write its debug logs to the returned buffer.
+func captureLogs(c *Client) *logBuffer {
+	buf := &logBuffer{}
+	c.logger = slog.New(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return buf
+}
+
+// heldOp is one operation that is in flight on the peer-to-peer session
+// while the agent holds its request.
+type heldOp struct {
+	name string
+	// start begins the operation in the background and returns when the
+	// agent holds the request, with the channel of the operation's error.
+	start func(t *testing.T, cp *fakeCP, s *Sandbox) <-chan error
+}
+
+var heldOps = []heldOp{
+	{"exec", func(t *testing.T, cp *fakeCP, s *Sandbox) <-chan error {
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		cp.agent.run = func(_ []string, e *fakeExec) {
+			<-release
+			e.finish(exitedEvent(0))
+		}
+		out := make(chan error, 1)
+		go func() {
+			_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+			out <- err
+		}()
+		waitFor(t, "the exec to run on the agent", func() bool { return cp.agent.totalRuns() == 1 })
+		return out
+	}},
+	{"read", func(t *testing.T, cp *fakeCP, s *Sandbox) <-chan error {
+		cp.agent.setFile("/f", []byte("data"))
+		cp.agentGate = make(chan struct{})
+		cp.agentHits = make(chan string, 4)
+		out := make(chan error, 1)
+		go func() {
+			_, err := s.ReadFileBytes(context.Background(), "/f")
+			out <- err
+		}()
+		if got := <-cp.agentHits; got != "read" {
+			t.Fatalf("agent gate %q", got)
+		}
+		return out
+	}},
+	{"write", func(t *testing.T, cp *fakeCP, s *Sandbox) <-chan error {
+		cp.agentGate = make(chan struct{})
+		cp.agentHits = make(chan string, 4)
+		out := make(chan error, 1)
+		go func() { out <- s.WriteFileBytes(context.Background(), "/f", []byte("data"), WriteOptions{}) }()
+		if got := <-cp.agentHits; got != "write" {
+			t.Fatalf("agent gate %q", got)
+		}
+		return out
+	}},
+}
+
+func waitOpErr(t *testing.T, ch <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-ch:
+		return err
+	case <-time.After(20 * time.Second):
+		t.Fatal("operation did not return")
+		return nil
+	}
+}
+
+// closeCases lists the ways that the caller ends a handle: Close and a
+// successful Delete both close the data path.
+var closeCases = []struct {
+	name  string
+	close func(t *testing.T, s *Sandbox)
+}{
+	{"Close", func(t *testing.T, s *Sandbox) {
+		if err := s.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}},
+	{"Delete", func(t *testing.T, s *Sandbox) {
+		if _, err := s.Delete(context.Background()); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	}},
+}
+
+// TestCloseDuringOperationKeepsThePeerToPeerTransport checks that a close
+// that the caller starts while an operation runs on the session ends the
+// operation with errHandleClosed. The close is not a channel failure, so the
+// handle stays on peer-to-peer, asks for no relay grant and logs no fall back.
+func TestCloseDuringOperationKeepsThePeerToPeerTransport(t *testing.T) {
+	for _, op := range heldOps {
+		for _, cc := range closeCases {
+			t.Run(op.name+"/"+cc.name, func(t *testing.T) {
+				cp := newFakeCP(t)
+				c := cp.client(t, TransportAuto)
+				logs := captureLogs(c)
+				s := cp.handle(t, c)
+				ch := op.start(t, cp, s)
+				if s.Transport() != p2pTransport {
+					t.Fatalf("transport %v before the close, want peer-to-peer", s.Transport())
+				}
+				cc.close(t, s)
+				if err := waitOpErr(t, ch); !errors.Is(err, errHandleClosed) {
+					t.Fatalf("operation after the close: %v, want errHandleClosed", err)
+				}
+				if n := len(cp.authRequests()); n != 0 {
+					t.Fatalf("%d AuthorizeRelay calls after the close, want 0", n)
+				}
+				if got := s.Transport(); got != p2pTransport {
+					t.Fatalf("transport %v after the close, want peer-to-peer", got)
+				}
+				s.dp.mu.Lock()
+				relay := s.dp.relay
+				s.dp.mu.Unlock()
+				if relay {
+					t.Fatal("the handle moved to the relay after a caller close")
+				}
+				if got := logs.String(); strings.Contains(got, "falls back to the relay") {
+					t.Fatalf("a caller close logged a relay fall back:\n%s", got)
+				}
+
+				// Later operations fail with errHandleClosed and call no control
+				// plane method.
+				ice, open := cp.iceCallCount(), cp.openSessionCount()
+				_, err := s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+				if !errors.Is(err, errHandleClosed) {
+					t.Fatalf("exec after the close: %v", err)
+				}
+				if _, err := s.ReadFileBytes(context.Background(), "/f"); !errors.Is(err, errHandleClosed) {
+					t.Fatalf("read after the close: %v", err)
+				}
+				if err := s.WriteFileBytes(context.Background(), "/g", []byte("x"), WriteOptions{}); !errors.Is(err, errHandleClosed) {
+					t.Fatalf("write after the close: %v", err)
+				}
+				if cp.iceCallCount() != ice || cp.openSessionCount() != open {
+					t.Fatal("an operation on a closed handle called the control plane")
+				}
+				if n := len(cp.authRequests()); n != 0 {
+					t.Fatalf("%d AuthorizeRelay calls by later operations, want 0", n)
+				}
+			})
+		}
+	}
+}
+
+// TestCloseDuringOperationOnForcedPeerToPeer checks that forced
+// peer-to-peer ends the operation with errHandleClosed too.
+func TestCloseDuringOperationOnForcedPeerToPeer(t *testing.T) {
+	for _, op := range heldOps {
+		t.Run(op.name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			ch := op.start(t, cp, s)
+			if err := s.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := waitOpErr(t, ch); !errors.Is(err, errHandleClosed) {
+				t.Fatalf("operation after the close: %v, want errHandleClosed", err)
+			}
+			if n := len(cp.authRequests()); n != 0 {
+				t.Fatalf("%d AuthorizeRelay calls, want 0", n)
+			}
+			if got := s.Transport(); got != p2pTransport {
+				t.Fatalf("transport %v, want peer-to-peer", got)
+			}
+		})
 	}
 }
