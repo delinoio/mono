@@ -172,6 +172,13 @@
 - `<scope>` must use a stable lowercase project, component, domain, or tooling identifier from repository contracts when one applies (for example: `tooling`, `docs`, `ci`).
 - Do not create unscoped pull request titles or use bracket-style project prefixes like `[project]`.
 
+## GitHub Mention Quoting Rules
+
+- GitHub treats a bare `@name` in pull request titles and descriptions, commit messages, issues, and comments as a mention, and notifies the user or organization with that name. A squash merge copies the pull request title and description into the commit message, so a bare `@name` there also mentions on the default branch.
+- When pull request or commit text must contain `@` for something that is not a mention, wrap that text in backticks. This includes npm scopes and package names (`@delino`, `@delino/ownsand-protos`), decorators and annotations, roles and placeholders (`@me`, `@reviewer`), and code. Quote the `@` text in titles too, for example ``refactor(protos): move TypeScript bindings into `@delino` binding packages``.
+- Write a bare `@name` only for a real GitHub login that you intend to notify.
+- Email addresses in Git trailers such as `Co-Authored-By:` stay unquoted, because GitHub reads the trailer address as written.
+
 ## Runtime Baselines
 
 - Root `.nvmrc` is the canonical Node.js runtime selector for local development workflows.
