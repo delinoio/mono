@@ -130,3 +130,20 @@ func TestOwnSandLinkValidationRateLimit(t *testing.T) {
 		t.Fatalf("%d validations reached OwnSand", n)
 	}
 }
+
+// The production clock has sub-microsecond precision, and PostgreSQL stores
+// microseconds; setting and replacing the key must still succeed.
+func TestOwnSandLinkWithSubMicrosecondClock(t *testing.T) {
+	w := newWorld(t)
+	osOrg := api.NewID()
+	w.fake.AddOrg(osOrg, ownsandKey('a'))
+	w.env.Clock.Advance(1500 * time.Nanosecond)
+	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('a')); err != nil {
+		t.Fatalf("set: %v", err)
+	}
+	w.fake.AddOrg(osOrg, ownsandKey('b'))
+	w.env.Clock.Advance(time.Second + 700*time.Nanosecond)
+	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('b')); err != nil {
+		t.Fatalf("replace: %v", err)
+	}
+}

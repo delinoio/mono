@@ -317,7 +317,10 @@ func (h *Handler) SetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 	if err != nil {
 		return nil, s.Internal(ctx, "encrypt ownsand api key", err)
 	}
-	now := s.NowUTC()
+	// PostgreSQL stores timestamptz with microsecond precision. The
+	// transaction compares the stored credential_set_time with now, so now
+	// has the same precision.
+	now := s.NowUTC().Truncate(time.Microsecond)
 	var out Link
 	err = s.DB.InTx(ctx, func(tx pgx.Tx) error {
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
