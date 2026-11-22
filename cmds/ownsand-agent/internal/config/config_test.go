@@ -86,7 +86,11 @@ func TestFromEnv(t *testing.T) {
 		t.Fatal("bad key accepted")
 	}
 	cfg, _ = FromEnv(env(nil))
-	if cfg.StateDir != DefaultStateDir() || cfg.Runtime != DefaultRuntime() {
+	if cfg.StateDir != DefaultStateDir() || cfg.Runtime != DefaultRuntime() || cfg.ReleaseManifestURL != DefaultReleaseManifestURL {
 		t.Fatalf("defaults %+v", cfg)
+	}
+	cfg, _ = FromEnv(env(map[string]string{EnvReleaseManifestURL: " https://example.test/manifest.json "}))
+	if cfg.ReleaseManifestURL != "https://example.test/manifest.json" {
+		t.Fatalf("manifest URL override %q", cfg.ReleaseManifestURL)
 	}
 }
