@@ -418,9 +418,6 @@ jobs:
                 cmds/ownsand-agent/internal/agent
                 cmds/ownsand-agent/internal/dataplane
                 cmds/ownsand-agent/internal/ops
-                # The exec test compares the working directory with the
-                # TMPDIR path, which macOS reports as `/private/var/...`.
-                cmds/ownsand-guest/guest
               )
               ;;
             Windows)

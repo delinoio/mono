@@ -33,7 +33,15 @@ func TestExecOutputAndExitCode(t *testing.T) {
 		t.Fatalf("first event %v", evs[0])
 	}
 	stdout, stderr := outputs(evs)
-	if stdout != "outbar\n"+req.GetWorkingDirectory()+"\n" || stderr != "err" {
+	// `pwd` prints the physical path: the helper passes its own PWD, which
+	// does not name the working directory, so the shell does not use it. On
+	// macOS the TempDir path starts with /var, a symbolic link to
+	// /private/var, so compare with the resolved path.
+	wantDir, err := filepath.EvalSymlinks(req.GetWorkingDirectory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdout != "outbar\n"+wantDir+"\n" || stderr != "err" {
 		t.Fatalf("stdout %q stderr %q", stdout, stderr)
 	}
 	last := evs[len(evs)-1].GetExited()
