@@ -15,16 +15,20 @@
 # The script handles the state of the `caddy` container in one of three ways,
 # so the certificates in the `caddy-data` volume and the open connections stay
 # whenever the image did not change:
-#   - The container is missing, or it uses another image: remove it (if
-#     present) and create it with the pinned image.
+#   - The container is missing, or it uses another image: obtain the pinned
+#     image first (a `docker pull`, only when the image is not already
+#     local), then remove the old container (if present) and create it with
+#     the pinned image. A failing pull fails the script before the old
+#     container is touched, so the proxy keeps serving; a local image needs no
+#     registry connection.
 #   - The container uses the pinned image and is not running (for example
 #     after `docker stop`, which `--restart unless-stopped` does not undo):
 #     start it. `docker exec` cannot reload a stopped container, and the
 #     started container reads the Caddyfile that `provision.sh` just wrote.
 #   - The container uses the pinned image and is running: reload the
 #     configuration without recreating it.
-# A failing `docker run`, `docker start` or `docker exec` fails the script
-# with the Docker diagnostic on standard error.
+# A failing `docker pull`, `docker run`, `docker start` or `docker exec` fails
+# the script with the Docker diagnostic on standard error.
 set -euo pipefail
 
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
@@ -49,6 +53,12 @@ read -r current_image running < <(
 ) || true
 
 if [[ "$current_image" != "$caddy_image" ]]; then
+  # Obtain the pinned image before the old container goes away. `docker run`
+  # would pull it implicitly, but only after the removal, so an unreachable
+  # registry would leave the Droplet without a proxy. When the pull fails,
+  # `set -e` ends the script here with the pull diagnostic and the old
+  # container keeps running.
+  docker image inspect "$caddy_image" > /dev/null 2>&1 || docker pull "$caddy_image"
   docker rm --force caddy > /dev/null 2>&1 || true
   docker run --detach --name caddy \
     --network "$network" \
