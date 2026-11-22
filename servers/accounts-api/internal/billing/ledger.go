@@ -439,23 +439,58 @@ func (g CreditGrant) Proto() *accountsv1.CreditGrant {
 // Balance returns the balance and the unexpired grants with remaining credit
 // in consumption order. Credit of grants that expired but that the expiry
 // job has not removed yet is left out of both.
+//
+// One statement reads the balance, the credit that is due and the grants, so
+// they come from one snapshot even when q is a pool: separate statements
+// would each take their own snapshot, and a credit-changing commit between
+// them could pair an earlier balance with later grants. The account row is
+// the root of a LEFT JOIN, so an account without usable grants still returns
+// one row with NULL grant columns, and an absent account returns no row.
 func Balance(ctx context.Context, q db.Querier, accountID string, now time.Time) (int64, []CreditGrant, error) {
-	var balance, due int64
-	if err := q.QueryRow(ctx, `SELECT a.balance_usd_micros, COALESCE((SELECT SUM(remaining_usd_micros) FROM credit_grants g
-			WHERE g.billing_account_id = a.billing_account_id AND g.remaining_usd_micros > 0 AND g.expire_time <= $2), 0)
-		FROM billing_accounts a WHERE a.billing_account_id = $1`, accountID, now).Scan(&balance, &due); err != nil {
-		return 0, nil, err
-	}
-	rows, err := q.Query(ctx, `SELECT credit_grant_id::text, source, original_usd_micros, remaining_usd_micros,
-			paddle_transaction_id, create_time, expire_time
-		FROM credit_grants WHERE billing_account_id = $1 AND remaining_usd_micros > 0 AND expire_time > $2
-		ORDER BY expire_time, credit_grant_id`, accountID, now)
+	rows, err := q.Query(ctx, `SELECT a.balance_usd_micros,
+			COALESCE((SELECT SUM(d.remaining_usd_micros) FROM credit_grants d
+				WHERE d.billing_account_id = a.billing_account_id AND d.remaining_usd_micros > 0 AND d.expire_time <= $2), 0)::bigint,
+			g.credit_grant_id::text, g.source, g.original_usd_micros, g.remaining_usd_micros,
+			g.paddle_transaction_id, g.create_time, g.expire_time
+		FROM billing_accounts a
+		LEFT JOIN credit_grants g ON g.billing_account_id = a.billing_account_id
+			AND g.remaining_usd_micros > 0 AND g.expire_time > $2
+		WHERE a.billing_account_id = $1
+		ORDER BY g.expire_time, g.credit_grant_id`, accountID, now)
 	if err != nil {
 		return 0, nil, err
 	}
-	grants, err := pgx.CollectRows(rows, pgx.RowToStructByPos[CreditGrant])
-	if err != nil {
+	defer rows.Close()
+	var (
+		balance, due int64
+		found        bool
+		grants       = []CreditGrant{}
+	)
+	for rows.Next() {
+		var (
+			id, source, paddleTxn  *string
+			original, remaining    *int64
+			createTime, expireTime *time.Time
+		)
+		if err := rows.Scan(&balance, &due, &id, &source, &original, &remaining, &paddleTxn, &createTime, &expireTime); err != nil {
+			return 0, nil, err
+		}
+		found = true
+		if id == nil {
+			// The account has no usable grant: this row only carries the
+			// balance.
+			continue
+		}
+		grants = append(grants, CreditGrant{
+			ID: *id, Source: LedgerKind(*source), Original: *original, Remaining: *remaining,
+			PaddleTransactionID: *paddleTxn, CreateTime: *createTime, ExpireTime: *expireTime,
+		})
+	}
+	if err := rows.Err(); err != nil {
 		return 0, nil, err
+	}
+	if !found {
+		return 0, nil, pgx.ErrNoRows
 	}
 	return balance - due, grants, nil
 }
