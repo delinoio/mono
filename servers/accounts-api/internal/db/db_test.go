@@ -5,11 +5,16 @@ package db_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/delinoio/mono/servers/accounts-api/internal/db"
 	"github.com/delinoio/mono/servers/accounts-api/internal/db/dbtest"
@@ -107,5 +112,116 @@ func TestSchemaKeepsOneOwnerPerAccount(t *testing.T) {
 	}
 	if err := d.Migrate(ctx, discard()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// insertLink inserts a link row of the account with the given status columns;
+// a nil value is stored as NULL.
+func insertLink(ctx context.Context, d *db.DB, id, account string, status, reason, sequence, blockedSince, suspendTime any) error {
+	_, err := d.Pool.Exec(ctx, `INSERT INTO organization_links
+		(organization_link_id, service, organization_id, billing_account_id, link_time,
+		 billing_status, status_reason, status_sequence, blocked_since, suspend_time)
+		VALUES ($1, 'ownsand', $2, $3, now(), $4, $5, $6, $7, $8)`,
+		id, id, account, status, reason, sequence, blockedSince, suspendTime)
+	return err
+}
+
+// isStatusCompleteViolation reports whether err is a violation of the
+// organization_links_status_complete check constraint.
+func isStatusCompleteViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23514" &&
+		pgErr.ConstraintName == "organization_links_status_complete"
+}
+
+func TestOrganizationLinkStatusMustBeComplete(t *testing.T) {
+	d := dbtest.New(t)
+	ctx := context.Background()
+	const account = "01900000-0000-7000-8000-000000000001"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time) VALUES ($1, 'a', now(), now())`, account); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	rejected := []struct {
+		name                                                string
+		status, reason, sequence, blockedSince, suspendTime any
+	}{
+		{"blocked with a NULL reason", "blocked", nil, int64(1), now, now},
+		{"suspended with a NULL reason", "suspended", nil, int64(1), now, now},
+		{"allowed with a NULL reason", "allowed", nil, int64(1), nil, nil},
+		{"NULL status with reason none and a sequence", nil, "none", int64(1), nil, nil},
+		{"NULL status with a reason and both timestamps", nil, "no_active_subscription", int64(1), now, now},
+		{"NULL status with only a sequence", nil, nil, int64(1), nil, nil},
+		{"NULL status with only blocked_since", nil, nil, nil, now, nil},
+		{"NULL status with only suspend_time", nil, nil, nil, nil, now},
+		{"blocked without a sequence", "blocked", "non_positive_balance", nil, now, now},
+		{"blocked without timestamps", "blocked", "non_positive_balance", int64(1), nil, nil},
+		{"allowed with a timestamp", "allowed", "none", int64(1), now, nil},
+		{"blocked with reason none", "blocked", "none", int64(1), now, now},
+	}
+	for i, c := range rejected {
+		id := fmt.Sprintf("01900000-0000-7000-8000-0000000001%02d", i)
+		if err := insertLink(ctx, d, id, account, c.status, c.reason, c.sequence, c.blockedSince, c.suspendTime); !isStatusCompleteViolation(err) {
+			t.Errorf("insert %s: error = %v, want a violation of organization_links_status_complete", c.name, err)
+		}
+	}
+	accepted := []struct {
+		name                                                string
+		status, reason, sequence, blockedSince, suspendTime any
+	}{
+		{"no status", nil, nil, nil, nil, nil},
+		{"allowed", "allowed", "none", int64(2), nil, nil},
+		{"blocked", "blocked", "no_active_subscription", int64(3), now, now},
+		{"suspended", "suspended", "non_positive_balance", int64(4), now, now},
+	}
+	for i, c := range accepted {
+		id := fmt.Sprintf("01900000-0000-7000-8000-0000000002%02d", i)
+		if err := insertLink(ctx, d, id, account, c.status, c.reason, c.sequence, c.blockedSince, c.suspendTime); err != nil {
+			t.Errorf("insert %s: %v", c.name, err)
+		}
+	}
+	// An UPDATE that leaves a complete row incomplete is rejected as well.
+	_, err := d.Pool.Exec(ctx, `UPDATE organization_links SET status_reason = NULL WHERE organization_link_id = '01900000-0000-7000-8000-000000000201'`)
+	if !isStatusCompleteViolation(err) {
+		t.Errorf("update to a NULL reason: error = %v, want a violation of organization_links_status_complete", err)
+	}
+	_, err = d.Pool.Exec(ctx, `UPDATE organization_links SET billing_status = NULL WHERE organization_link_id = '01900000-0000-7000-8000-000000000201'`)
+	if !isStatusCompleteViolation(err) {
+		t.Errorf("update to a NULL status: error = %v, want a violation of organization_links_status_complete", err)
+	}
+}
+
+func TestOrganizationLinkStatusMigrationKeepsCompleteRows(t *testing.T) {
+	ctx := context.Background()
+	// Migration 00004 is the last one before the stricter constraint.
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, 4))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const account = "01900000-0000-7000-8000-000000000001"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time) VALUES ($1, 'a', now(), now())`, account); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().UTC()
+	// The constraint of migration 00003 accepts a blocked link without a reason.
+	const incomplete = "01900000-0000-7000-8000-000000000301"
+	if err := insertLink(ctx, d, incomplete, account, "blocked", nil, int64(1), now, now); err != nil {
+		t.Fatalf("insert an incomplete row before migration 00005: %v", err)
+	}
+	if _, err := d.Pool.Exec(ctx, `DELETE FROM organization_links WHERE organization_link_id = $1`, incomplete); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertLink(ctx, d, "01900000-0000-7000-8000-000000000302", account, "blocked", "no_active_subscription", int64(2), now, now); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertLink(ctx, d, "01900000-0000-7000-8000-000000000303", account, nil, nil, nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, discard()); err != nil {
+		t.Fatalf("migrate with complete rows: %v", err)
+	}
+	if err := insertLink(ctx, d, incomplete, account, "blocked", nil, int64(1), now, now); !isStatusCompleteViolation(err) {
+		t.Fatalf("insert an incomplete row after migration 00005: error = %v, want a violation of organization_links_status_complete", err)
 	}
 }
