@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/version"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 // Status is the status file of the running agent, which
@@ -22,6 +23,42 @@ type Status struct {
 	UpdateTarget  string    `json:"update_target,omitempty"`
 	Sandboxes     int       `json:"sandboxes"`
 	UpdatedAt     time.Time `json:"updated_at"`
+	// GuestOSes, BaseImages and Checks are the capabilities of the last
+	// capability report of this agent process and CapabilitiesAt is its
+	// time; all are empty until the agent built its first report.
+	GuestOSes      []string      `json:"guest_oses,omitempty"`
+	BaseImages     []string      `json:"base_images,omitempty"`
+	Checks         []StatusCheck `json:"checks,omitempty"`
+	CapabilitiesAt time.Time     `json:"capabilities_at,omitzero"`
+}
+
+// StatusCheck is one hypervisor check of a capability report.
+type StatusCheck struct {
+	ID     string `json:"id"`
+	Passed bool   `json:"passed"`
+	Detail string `json:"detail,omitempty"`
+}
+
+// setCapabilities records the capabilities of a capability report in the
+// status and writes the status file, so that `ownsand-agent status` shows
+// the checks that decide which sandboxes the device can run.
+func (a *Agent) setCapabilities(c *ownsandv1.DeviceCapabilities) {
+	var guests, images []string
+	for _, g := range c.GetGuestOses() {
+		guests = append(guests, g.String())
+	}
+	for _, b := range c.GetBuiltBaseImages() {
+		images = append(images, b.String())
+	}
+	checks := make([]StatusCheck, 0, len(c.GetHypervisorChecks()))
+	for _, ch := range c.GetHypervisorChecks() {
+		checks = append(checks, StatusCheck{ID: ch.GetCheckId(), Passed: ch.GetPassed(), Detail: ch.GetDetail()})
+	}
+	a.mu.Lock()
+	a.status.GuestOSes, a.status.BaseImages, a.status.Checks = guests, images, checks
+	a.status.CapabilitiesAt = time.Now()
+	a.mu.Unlock()
+	a.writeStatus()
 }
 
 func (a *Agent) setConnected(connected bool) {

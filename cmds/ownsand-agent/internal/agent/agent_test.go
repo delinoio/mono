@@ -346,6 +346,43 @@ func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
 	requireEmptyStateDir(t, st)
 }
 
+// TestStatusRecordsCapabilities checks that the status file holds the
+// capabilities of the capability report that the agent sent, so that
+// `ownsand-agent status` can print the hypervisor checks.
+func TestStatusRecordsCapabilities(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	h := start(t, cp, st, id)
+	env, _ := h.wait(0, "capability report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+	caps := env.GetCapabilityReport().GetCapabilities()
+	var status Status
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		status = Status{}
+		if err := st.LoadStatus(&status); err == nil && !status.CapabilitiesAt.IsZero() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("the status file has no capabilities: %+v", status)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if len(status.Checks) == 0 || len(status.Checks) != len(caps.GetHypervisorChecks()) {
+		t.Fatalf("status checks %+v, report %v", status.Checks, caps.GetHypervisorChecks())
+	}
+	for i, ch := range caps.GetHypervisorChecks() {
+		if got := status.Checks[i]; got.ID != ch.GetCheckId() || got.Passed != ch.GetPassed() || got.Detail != ch.GetDetail() {
+			t.Errorf("status check %d = %+v, want %v", i, got, ch)
+		}
+	}
+	if len(status.GuestOSes) != len(caps.GetGuestOses()) || status.GuestOSes[0] != caps.GetGuestOses()[0].String() {
+		t.Errorf("status guest OSes %v, report %v", status.GuestOSes, caps.GetGuestOses())
+	}
+	if len(status.BaseImages) != len(caps.GetBuiltBaseImages()) {
+		t.Errorf("status base images %v, report %v", status.BaseImages, caps.GetBuiltBaseImages())
+	}
+}
+
 // TestFailedRemovalResumesStatusWrites checks that a removal that fails
 // keeps the agent enrolled and lifts the status fence, so the status file
 // renews while the removal retries.

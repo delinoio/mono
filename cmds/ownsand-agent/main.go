@@ -329,6 +329,7 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		fmt.Fprintf(stdout, "%s %s (status of %s)\n", c.bold("Connection:"), conn, s.UpdatedAt.Format("2006-01-02 15:04:05"))
 		fmt.Fprintf(stdout, "%s %s, runtime %s\n", c.bold("Agent:"), s.AgentVersion, s.Runtime)
 		fmt.Fprintf(stdout, "%s %s %s\n", c.bold("Update:"), s.UpdateState, s.UpdateTarget)
+		printCapabilities(stdout, s, c)
 	}
 	var sandboxes []string
 	_ = st.LoadSandboxes(func(b []byte) error {
@@ -346,6 +347,35 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 	sort.Strings(snaps)
 	fmt.Fprintf(stdout, "%s %d\n", c.bold("Snapshots:"), len(snaps))
 	return exitOK
+}
+
+// printCapabilities prints the capabilities of the last capability report
+// in the status file: the guest OSes, the built base images and every
+// hypervisor check with its result and detail.
+func printCapabilities(stdout io.Writer, s agent.Status, c colors) {
+	if s.CapabilitiesAt.IsZero() {
+		fmt.Fprintf(stdout, "%s unknown (no capability report yet)\n", c.bold("Capabilities:"))
+		return
+	}
+	none := func(v []string) string {
+		if len(v) == 0 {
+			return "none"
+		}
+		return strings.Join(v, ", ")
+	}
+	fmt.Fprintf(stdout, "%s guest OSes %s; base images %s (report of %s)\n", c.bold("Capabilities:"),
+		none(s.GuestOSes), none(s.BaseImages), s.CapabilitiesAt.Format("2006-01-02 15:04:05"))
+	for _, ch := range s.Checks {
+		result := c.ok("passed")
+		if !ch.Passed {
+			result = c.bad("failed")
+		}
+		fmt.Fprintf(stdout, "  %s: %s", ch.ID, result)
+		if ch.Detail != "" {
+			fmt.Fprintf(stdout, " (%s)", ch.Detail)
+		}
+		fmt.Fprintln(stdout)
+	}
 }
 
 func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
