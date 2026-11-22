@@ -20,6 +20,10 @@ import (
 // DefaultLogtoResource is the API resource indicator of the tide API.
 const DefaultLogtoResource = "https://tide.api.delino.io"
 
+// DefaultLogtoScope is the scope that the tide control plane requires in user
+// access tokens. The CLI always requests it.
+const DefaultLogtoScope = "tide:use"
+
 // refreshMargin renews an access token this long before it expires.
 const refreshMargin = time.Minute
 
@@ -35,7 +39,7 @@ func (a *app) logtoConfig() logto.Config {
 		Endpoint:   a.getenv(EnvLogtoEndpoint),
 		AppID:      a.getenv(EnvLogtoAppID),
 		Resource:   resource,
-		Scopes:     strings.Fields(a.getenv(EnvLogtoScopes)),
+		Scopes:     append([]string{DefaultLogtoScope}, strings.Fields(a.getenv(EnvLogtoScopes))...),
 		HTTPClient: a.env.HTTPClient,
 	}
 }
