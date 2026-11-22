@@ -37,6 +37,13 @@ const (
 	ResendInterval = 10 * time.Second
 	// MaxMacOSGuests is the Virtualization.framework limit.
 	MaxMacOSGuests = 2
+	// DefaultRunningAttempts is the number of commits that a create tries
+	// to publish the RUNNING record after the VM started, before it stops
+	// the VM again.
+	DefaultRunningAttempts = 3
+	// DefaultRunningBackoff is the wait after the first failed RUNNING
+	// commit; the wait grows linearly with the attempt number.
+	DefaultRunningBackoff = 200 * time.Millisecond
 )
 
 // Outbox sends sandbox updates on the current agent channel. It returns
@@ -128,6 +135,13 @@ type Manager struct {
 	execs       ExecTracker
 	gate        CreateGate
 	closed      bool
+	// runningAttempts and runningBackoff bound the retries of the first
+	// RUNNING commit of a create; see publishRunning. Tests override them.
+	runningAttempts int
+	runningBackoff  time.Duration
+	// onRunningCommitFailed is a test hook that publishRunning calls after
+	// a failed RUNNING commit, before it waits for the next attempt.
+	onRunningCommitFailed func(attempt int, willRetry bool)
 	// beforeIdleReports is a test hook that Tick calls after it collected the
 	// pending idle reports and released mu, before it publishes them.
 	beforeIdleReports func()
@@ -164,6 +178,7 @@ func New(ctx context.Context, opts Options) (*Manager, error) {
 	}
 	m := &Manager{
 		st: opts.Store, rt: opts.Runtime, logger: opts.Logger, now: opts.Now, freeDisk: opts.FreeDisk,
+		runningAttempts: DefaultRunningAttempts, runningBackoff: DefaultRunningBackoff,
 		sandboxes: map[string]*sandbox{}, snapshots: map[string]*snapshot{}, pending: map[string]*pendingSnapshot{}, importLocks: map[string]*importLock{}, reports: map[uint64]map[string]uint64{},
 	}
 	agentState, err := m.st.UpdateAgent(func(a *store.AgentState) error {
@@ -664,16 +679,80 @@ func (m *Manager) Create(ctx context.Context, cmd *ownsandv1.CreateSandboxComman
 	// Supervise the VM before the fallible running save: when the save fails,
 	// the VM still runs, and its later exit must end the record.
 	go m.watchVM(sb, vm)
-	entry, err = m.update(sb, func(r *Record) {
-		r.State = ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
-		r.RestorePath = vm.RestorePath()
-		r.IdleDeadline = m.now().Add(r.IdleTTL)
-	})
+	return m.publishRunning(ctx, sb, vm)
+}
+
+// publishRunning records and reports RUNNING for a sandbox whose VM started.
+// The caller holds sb.cmdMu. A failed commit is recoverable, because the VM
+// runs and a repeated create command would only get the existing creating
+// record: it tries the commit up to m.runningAttempts times with a growing
+// wait. A revision failure leaves the record unchanged (CREATING), while a
+// failed record save leaves the new state in memory and unsaved; the next
+// attempt commits either again with a new revision.
+//
+// A delete or a TTL end that took over (sb.ending, or a record that left
+// CREATING and RUNNING) keeps control of the teardown: publishRunning commits
+// nothing more and returns ABORTED, and that end stops the VM after the create
+// released sb.cmdMu. When the attempts are used up, the create does not report
+// success: it ends the sandbox as CREATE_FAILED, which stops the VM. When
+// that end fails too, the sandbox stays tracked with its VM, ending cleared,
+// so that a TTL tick, a delete or the VM exit ends it later.
+func (m *Manager) publishRunning(ctx context.Context, sb *sandbox, vm vmruntime.VM) (*ownsandv1.SandboxStateEntry, error) {
+	id := sb.rec.SandboxID
+	attempts := max(m.runningAttempts, 1)
+	live := func() bool {
+		if m.sandboxes[id] != sb || sb.ending {
+			return false
+		}
+		return sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_CREATING || sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		entry, err := m.updateIf(sb, live, func(r *Record) {
+			r.State = ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+			r.RestorePath = vm.RestorePath()
+			r.IdleDeadline = m.now().Add(r.IdleTTL)
+		})
+		if err == nil {
+			return entry, nil
+		}
+		if errors.Is(err, errSandboxGone) {
+			m.logger.Warn("sandbox ended during its create; the end stops the VM", "sandbox_id", id)
+			m.mu.Lock()
+			entry := sb.rec.Entry(m.epoch)
+			m.mu.Unlock()
+			return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "sandbox was deleted during its create")
+		}
+		lastErr = err
+		// The record state after the error tells the failures apart: a
+		// revision failure did not change the record, a save failure did.
+		m.mu.Lock()
+		stage := "revision"
+		if sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			stage = "save"
+		}
+		m.mu.Unlock()
+		willRetry := attempt < attempts && ctx.Err() == nil
+		m.logger.Error("sandbox running record failed", "sandbox_id", id, "failed_stage", stage, "attempt", attempt, "max_attempts", attempts, "will_retry", willRetry, "error", err)
+		if m.onRunningCommitFailed != nil {
+			m.onRunningCommitFailed(attempt, willRetry)
+		}
+		if !willRetry {
+			break
+		}
+		select {
+		case <-time.After(m.runningBackoff * time.Duration(attempt)):
+		case <-ctx.Done():
+		}
+	}
+	m.logger.Error("sandbox running record could not be published; ending the sandbox", "sandbox_id", id, "error", lastErr)
+	entry, err := m.endLocked(context.Background(), sb, ownsandv1.SandboxState_SANDBOX_STATE_FAILED, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED)
 	if err != nil {
-		m.logger.Error("sandbox running record failed", "sandbox_id", id, "error", err)
+		// endLocked cleared sb.ending: the sandbox and its VM stay tracked.
+		m.logger.Error("end of the sandbox after a failed running record failed; the sandbox stays tracked for a retry", "sandbox_id", id, "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "agent could not record the sandbox")
 	}
-	return entry, nil
+	return entry, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "agent could not record the sandbox; the sandbox was stopped")
 }
 
 // watchVM ends a sandbox whose VM ended without a command.

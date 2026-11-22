@@ -4,6 +4,7 @@ package sandboxes
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"os"
@@ -1159,6 +1160,7 @@ func TestCreateFirstRecordFailureRollsBack(t *testing.T) {
 
 func TestCreateRunningRecordFailureStillWatchesVM(t *testing.T) {
 	e := newEnv(t)
+	e.m.runningBackoff = time.Millisecond
 	cmd := e.createCmd(1, time.Hour, time.Hour)
 	id := cmd.GetSandboxId()
 	// The first save works; the running save fails.
@@ -1179,6 +1181,282 @@ func TestCreateRunningRecordFailureStillWatchesVM(t *testing.T) {
 	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_FAILED)
 	if endReason(e.m, id) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
 		t.Fatal("lost VM reason")
+	}
+}
+
+// failRevisions makes every later revision write fail, and returns the
+// function that repairs the store. A directory in place of agent.json makes
+// the store unable to read the file that holds the revision counter; the
+// fault does not depend on directory permissions, and the sandbox record
+// directory stays writable, so only the revision persistence fails. The
+// repair is idempotent, and the cleanup also covers a failed assertion.
+func failRevisions(t *testing.T, st *store.Store) (restore func()) {
+	t.Helper()
+	agentFile := st.Path(store.AgentFile)
+	saved := agentFile + ".saved"
+	if err := os.Rename(agentFile, saved); err != nil {
+		t.Error(err)
+		return func() {}
+	}
+	if err := os.Mkdir(agentFile, 0o700); err != nil {
+		t.Error(err)
+		return func() {}
+	}
+	restore = func() {
+		if _, err := os.Stat(saved); err != nil {
+			return
+		}
+		if err := os.Remove(agentFile); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Rename(saved, agentFile); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(restore)
+	return restore
+}
+
+// persistedState returns the state of the saved record of a sandbox.
+func persistedState(t *testing.T, st *store.Store, id string) ownsandv1.SandboxState {
+	t.Helper()
+	var state ownsandv1.SandboxState
+	found := false
+	if err := st.LoadSandboxes(func(data []byte) error {
+		var rec Record
+		if err := json.Unmarshal(data, &rec); err != nil {
+			return err
+		}
+		if rec.SandboxID == id {
+			state, found = rec.State, true
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatalf("no saved record of %s", id)
+	}
+	return state
+}
+
+func requireStates(t *testing.T, got, want []ownsandv1.SandboxState) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("reported states %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("reported states %v, want %v", got, want)
+		}
+	}
+}
+
+// TestCreateRecoversFromOneRevisionFailure checks that one failed revision
+// write after the VM started does not fail the create: the next attempt
+// publishes RUNNING, with the one VM that already runs.
+func TestCreateRecoversFromOneRevisionFailure(t *testing.T) {
+	e := newEnv(t)
+	e.m.runningBackoff = time.Millisecond
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	var restore func()
+	e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
+	attempts := 0
+	e.m.onRunningCommitFailed = func(attempt int, willRetry bool) {
+		attempts++
+		if !willRetry {
+			t.Error("the first failure did not schedule a retry")
+		}
+		if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_CREATING {
+			t.Errorf("a revision failure changed the record to %v", state)
+		}
+		restore()
+	}
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("create %v %v", entry, err)
+	}
+	if attempts != 1 || e.rt.startCount() != 1 {
+		t.Fatalf("failed attempts %d, VM starts %d, want 1 and 1", attempts, e.rt.startCount())
+	}
+	if got := persistedState(t, e.st, id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("saved record state %v, want RUNNING", got)
+	}
+	requireStates(t, e.out.states(id), []ownsandv1.SandboxState{ownsandv1.SandboxState_SANDBOX_STATE_CREATING, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING})
+	if ids, _ := e.rt.Running(context.Background()); len(ids) != 1 {
+		t.Fatalf("running VMs %v, want one", ids)
+	}
+}
+
+// TestCreateRecoversFromOneRecordSaveFailure checks the same recovery for a
+// failed record save. Unlike a revision failure, a save failure leaves the new
+// state in the record, and the retry still publishes it.
+func TestCreateRecoversFromOneRecordSaveFailure(t *testing.T) {
+	e := newEnv(t)
+	e.m.runningBackoff = time.Millisecond
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	e.rt.onCreate = func(vmruntime.Spec) { blockRecord(t, e.st, id) }
+	e.m.onRunningCommitFailed = func(int, bool) {
+		if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Errorf("a save failure left the record in %v, want the new RUNNING state", state)
+		}
+		unblockRecord(t, e.st, id)
+	}
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err != nil || entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("create %v %v", entry, err)
+	}
+	if got := persistedState(t, e.st, id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("saved record state %v, want RUNNING", got)
+	}
+	if e.rt.startCount() != 1 {
+		t.Fatalf("VM starts %d, want 1", e.rt.startCount())
+	}
+}
+
+// TestCreateStopsVMWhenRunningRecordCannotBePublished checks that a create
+// whose RUNNING record fails every attempt does not report success with a VM
+// that nobody tracks: it ends the sandbox as CREATE_FAILED and stops the VM.
+func TestCreateStopsVMWhenRunningRecordCannotBePublished(t *testing.T) {
+	e := newEnv(t)
+	e.m.runningBackoff = time.Millisecond
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	var restore func()
+	e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
+	attempts := 0
+	e.m.onRunningCommitFailed = func(attempt int, willRetry bool) {
+		attempts++
+		if attempt != attempts || willRetry != (attempt < DefaultRunningAttempts) {
+			t.Errorf("attempt %d willRetry %v after %d failures", attempt, willRetry, attempts)
+		}
+		if !willRetry {
+			// The store works again for the teardown.
+			restore()
+		}
+	}
+	entry, err := e.m.Create(context.Background(), cmd)
+	requireInternal(t, err)
+	if attempts != DefaultRunningAttempts {
+		t.Fatalf("failed attempts %d, want %d", attempts, DefaultRunningAttempts)
+	}
+	if entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("entry %v", entry)
+	}
+	if ids, _ := e.rt.Running(context.Background()); len(ids) != 0 || e.rt.hasFiles(id) {
+		t.Fatalf("VM %v or its files remain", ids)
+	}
+	if got := persistedState(t, e.st, id); got != ownsandv1.SandboxState_SANDBOX_STATE_FAILED {
+		t.Fatalf("saved record state %v, want FAILED", got)
+	}
+	if e.ex.ended[id] != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatal("execs not ended with the sandbox")
+	}
+	for _, state := range e.out.states(id) {
+		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Fatal("RUNNING reported for a sandbox that did not publish it")
+		}
+	}
+	if e.rt.startCount() != 1 {
+		t.Fatalf("VM starts %d, want 1", e.rt.startCount())
+	}
+}
+
+// TestCreateKeepsSandboxTrackedWhenTheEndFails checks that, when neither the
+// RUNNING record nor the end of the sandbox can be recorded, the sandbox and
+// its VM stay tracked, and that a delete or a TTL tick ends them later.
+func TestCreateKeepsSandboxTrackedWhenTheEndFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  func(e *env, id string)
+		want ownsandv1.SandboxEndReason
+	}{
+		{"delete", func(e *env, id string) {
+			if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id}); err != nil {
+				t.Fatal(err)
+			}
+		}, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER},
+		{"ttl", func(e *env, id string) {
+			e.clk.Advance(2 * time.Hour)
+			e.m.Tick(context.Background(), false)
+			waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+		}, ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newEnv(t)
+			e.m.runningBackoff = time.Millisecond
+			cmd := e.createCmd(1, time.Hour, time.Hour)
+			id := cmd.GetSandboxId()
+			var restore func()
+			e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
+			_, err := e.m.Create(context.Background(), cmd)
+			requireInternal(t, err)
+			if _, ok := e.m.State(id); !ok {
+				t.Fatal("sandbox with a running VM is not tracked")
+			}
+			if ids, _ := e.rt.Running(context.Background()); len(ids) != 1 {
+				t.Fatalf("running VMs %v, want the one that started", ids)
+			}
+			e.m.mu.Lock()
+			ending := e.m.sandboxes[id].ending
+			e.m.mu.Unlock()
+			if ending {
+				t.Fatal("the failed end left the sandbox ending, so no later end could retry")
+			}
+			restore()
+			tc.end(e, id)
+			if state, _ := e.m.State(id); state != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+				t.Fatalf("state %v, want DELETED", state)
+			}
+			if got := endReason(e.m, id); got != tc.want {
+				t.Fatalf("end reason %v, want %v", got, tc.want)
+			}
+			if ids, _ := e.rt.Running(context.Background()); len(ids) != 0 || e.rt.hasFiles(id) {
+				t.Fatalf("VM %v or its files remain", ids)
+			}
+		})
+	}
+}
+
+// TestCreateYieldsToConcurrentTTLEnd checks that a TTL end that started while
+// the create retries its RUNNING record keeps control of the teardown: the
+// create commits no RUNNING record afterwards, and the TTL end stops the VM.
+func TestCreateYieldsToConcurrentTTLEnd(t *testing.T) {
+	e := newEnv(t)
+	e.m.runningBackoff = time.Millisecond
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	var restore func()
+	e.rt.onCreate = func(vmruntime.Spec) { restore = failRevisions(t, e.st) }
+	e.m.onRunningCommitFailed = func(int, bool) {
+		// The TTL passed while the create waits; the end goroutine blocks on
+		// the command lock that the create holds.
+		e.clk.Advance(2 * time.Hour)
+		e.m.Tick(context.Background(), false)
+		restore()
+	}
+	entry, err := e.m.Create(context.Background(), cmd)
+	var ce *CommandError
+	if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+		t.Fatalf("create %v %v, want an aborted error", entry, err)
+	}
+	waitState(t, e.m, id, ownsandv1.SandboxState_SANDBOX_STATE_DELETED)
+	if got := endReason(e.m, id); got != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_MAX_TTL_EXPIRED {
+		t.Fatalf("end reason %v, want MAX_TTL_EXPIRED", got)
+	}
+	for _, state := range e.out.states(id) {
+		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Fatal("a RUNNING update overwrote the TTL end")
+		}
+	}
+	if ids, _ := e.rt.Running(context.Background()); len(ids) != 0 || e.rt.hasFiles(id) {
+		t.Fatalf("VM %v or its files remain", ids)
+	}
+	if e.rt.startCount() != 1 {
+		t.Fatalf("VM starts %d, want 1", e.rt.startCount())
 	}
 }
 
