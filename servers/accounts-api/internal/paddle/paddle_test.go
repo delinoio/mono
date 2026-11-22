@@ -5,6 +5,7 @@ package paddle_test
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -159,6 +160,70 @@ func TestClientInvoiceAndAuth(t *testing.T) {
 	unreachable := paddle.New(paddle.Config{BaseURL: "http://127.0.0.1:1", APIKey: "k"})
 	if _, err := unreachable.GetSubscription(ctx, "sub"); paddle.Classify(err) != paddle.OutcomeUnknown {
 		t.Fatalf("unreachable = %v", err)
+	}
+}
+
+// brokenBody yields a partial body and then fails, as a connection that
+// breaks while Paddle answers.
+type brokenBody struct{ sent bool }
+
+func (b *brokenBody) Read(p []byte) (int, error) {
+	if b.sent {
+		return 0, io.ErrUnexpectedEOF
+	}
+	b.sent = true
+	return copy(p, `{"error":{"code":"leaked_partial`), nil
+}
+
+func (b *brokenBody) Close() error { return nil }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestClientUnreadableResponse(t *testing.T) {
+	for _, tc := range []struct {
+		status  int
+		want    paddle.Outcome
+		wantAPI bool
+	}{
+		{http.StatusTooManyRequests, paddle.OutcomeNotApplied, true},
+		{http.StatusUnauthorized, paddle.OutcomeNotApplied, true},
+		{http.StatusForbidden, paddle.OutcomeNotApplied, true},
+		{http.StatusNotFound, paddle.OutcomeNotFound, true},
+		{http.StatusBadRequest, paddle.OutcomeRejected, true},
+		{http.StatusInternalServerError, paddle.OutcomeUnknown, true},
+		// A 2xx whose body cannot be read keeps the read error: Paddle may
+		// have applied the request.
+		{http.StatusOK, paddle.OutcomeUnknown, false},
+	} {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			client := paddle.New(paddle.Config{BaseURL: "http://paddle.example.test", APIKey: "k", Client: &http.Client{
+				Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+					return &http.Response{StatusCode: tc.status, Header: http.Header{}, Body: &brokenBody{}, Request: r}, nil
+				}),
+			}})
+			_, err := client.GetSubscription(context.Background(), "sub_1")
+			if err == nil {
+				t.Fatal("GetSubscription succeeded")
+			}
+			if got := paddle.Classify(err); got != tc.want {
+				t.Fatalf("Classify = %v, want %v (%v)", got, tc.want, err)
+			}
+			var apiErr *paddle.APIError
+			if errors.As(err, &apiErr) != tc.wantAPI {
+				t.Fatalf("APIError = %v, want %v (%v)", errors.As(err, &apiErr), tc.wantAPI, err)
+			}
+			if tc.wantAPI && (apiErr.Status != tc.status || apiErr.Code != "" || apiErr.Type != "" || apiErr.RequestID != "") {
+				t.Fatalf("APIError = %+v", apiErr)
+			}
+			if !tc.wantAPI && !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("2xx error = %v, want the read error", err)
+			}
+			if strings.Contains(err.Error(), "leaked_partial") || paddle.ErrorCode(err) != "" {
+				t.Fatalf("error carries the partial body: %v", err)
+			}
+		})
 	}
 }
 
