@@ -1651,6 +1651,9 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_PS_EXIT exit code of `docker ps` (default 0).
 //   STUB_RELOAD   exit code of `docker exec <proxy> caddy reload` (default 0).
 //   STUB_LOGS     exit code of `docker logs` (default 0).
+//   STUB_STOP_FAIL  space-separated container IDs that `docker stop` fails for.
+//   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
+//                 (`docker rm --force` of a replacement still succeeds).
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function runDroplet(
@@ -1662,6 +1665,7 @@ function runDroplet(
     envFile = "LOG_LEVEL=info\n",
     route,
     state,
+    previous,
     stubs = {},
     prepare,
   } = {},
@@ -1677,9 +1681,14 @@ function runDroplet(
   if (envFile !== null) {
     writeFileSync(join(deployRoot, "env", `${args[0]}.env`), envFile);
   }
-  if (state !== undefined) {
+  if (state !== undefined || previous !== undefined) {
     mkdirSync(join(deployRoot, "state"));
+  }
+  if (state !== undefined) {
     writeFileSync(join(deployRoot, "state", "api.current"), state);
+  }
+  if (previous !== undefined) {
+    writeFileSync(join(deployRoot, "state", "api.previous"), previous);
   }
   if (route !== undefined) {
     writeFileSync(join(deployRoot, "caddy", "sites", "api.caddy"), route);
@@ -1697,6 +1706,8 @@ function runDroplet(
       *) echo 172.18.0.5 ;;
     esac ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
+  stop) [[ " \${STUB_STOP_FAIL:-} " != *" \$4 "* ]] || exit 1 ;;
+  rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
   logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
 esac`,
   );
@@ -1855,6 +1866,118 @@ test(
       result.read("state/api.previous"),
       `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}\n`,
     );
+  },
+);
+
+const olderImage = `registry.digitalocean.com/delino/api@sha256:${"0".repeat(64)}`;
+const oldestImage = `registry.digitalocean.com/delino/api@sha256:${"1".repeat(64)}`;
+
+test(
+  "droplet deploy records the image and fails when the cleanup of an old container fails",
+  { skip },
+  (t) => {
+    const cases = [
+      {
+        name: "stop",
+        env: { STUB_STOP_FAIL: "old1" },
+        failed: "docker stop old1",
+        message: /docker stop failed for the previous container old1/,
+      },
+      {
+        name: "rm",
+        env: { STUB_RM_FAIL: "old1" },
+        failed: "docker rm old1",
+        message: /docker rm failed for the previous container old1/,
+      },
+    ];
+    for (const { name, env, failed, message } of cases) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1", "old2"],
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env,
+      });
+      assert.equal(result.status, 1, `${name}: ${result.stderr}`);
+      assert.match(result.stderr, message, name);
+      assert.ok(result.stderr.includes(`(${failed})`), result.stderr);
+      assert.match(
+        result.stderr,
+        /replacement api-\S+ already serves api/,
+        name,
+      );
+      // The route serves the replacement, so the state names it, and the
+      // image that served before it is the one to roll back to.
+      assert.equal(result.read("state/api.current"), `${dropletImage}\n`, name);
+      assert.equal(result.read("state/api.previous"), `${olderImage}\n`, name);
+      assert.match(result.read("caddy/sites/api.caddy"), /reverse_proxy api-/);
+      // The failure of one container does not skip the next one.
+      assert.ok(
+        result.calls.some((call) =>
+          call.startsWith("docker stop --time 30 old2"),
+        ),
+        name,
+      );
+      assert.ok(
+        result.calls.some((call) => call === "docker rm old2"),
+        name,
+      );
+      assert.equal(
+        result.calls.some((call) => call === "docker rm old1"),
+        name === "rm",
+        name,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy keeps the previous image when a retry finishes a failed cleanup",
+  { skip },
+  (t) => {
+    // The first attempt switched the route and recorded the image, but could
+    // not stop the old container. The retry deploys the same image again.
+    const result = runDroplet(t, undefined, {
+      old: ["old1", "old2"],
+      state: `${dropletImage}\n`,
+      previous: `${olderImage}\n`,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(result.read("state/api.previous"), `${olderImage}\n`);
+    for (const id of ["old1", "old2"]) {
+      assert.ok(
+        result.calls.some((call) => call === `docker stop --time 30 ${id}`),
+        id,
+      );
+      assert.ok(
+        result.calls.some((call) => call === `docker rm ${id}`),
+        id,
+      );
+    }
+  },
+);
+
+test(
+  "droplet deploy keeps both state files when the health check or the proxy reload fails",
+  { skip },
+  (t) => {
+    for (const env of [{ STUB_HEALTHY: "0" }, { STUB_RELOAD: "1" }]) {
+      const result = runDroplet(t, undefined, {
+        old: ["old1"],
+        state: `${olderImage}\n`,
+        previous: `${oldestImage}\n`,
+        env,
+      });
+      const label = JSON.stringify(env);
+      assert.equal(result.status, 1, label);
+      assert.equal(result.read("state/api.current"), `${olderImage}\n`, label);
+      assert.equal(
+        result.read("state/api.previous"),
+        `${oldestImage}\n`,
+        label,
+      );
+      assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
+    }
   },
 );
 

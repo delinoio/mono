@@ -16,9 +16,12 @@
 # reverse proxy route to the new alias and reload the proxy, and only then
 # stop the old container. The proxy route selects the old container until the
 # reload succeeds, so a container that is starting or unhealthy never receives
-# a request. A failure before the old container stops removes the new
-# container, so the old one keeps serving. The exit code is the deployment
-# verdict.
+# a request. A failure before the proxy reload removes the new container, so
+# the old one keeps serving. After the reload the replacement is the deployed
+# image: the script records it in the state files first, and then stops and
+# removes the old containers. A failed stop or removal makes the script exit
+# non-zero and name the container, but the state files already name the
+# replacement. The exit code is the deployment verdict.
 #
 # Arguments:
 #   service   Droplet service name: container name prefix, label value and
@@ -133,27 +136,52 @@ main() {
     fail "the route of $service was not switched; the previous container keeps serving."
   fi
 
+  # The proxy routes to the replacement now, so it is the deployed image.
+  # Record it before the cleanup: a failed cleanup must not leave the state
+  # files naming the image that the route no longer serves.
+  record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
+
+  local -a failed=()
   local id
   for id in "${old[@]}"; do
     echo "Stop the previous container $id"
-    docker stop --time "$stop_timeout" "$id" > /dev/null
-    docker rm "$id" > /dev/null
+    if ! docker stop --time "$stop_timeout" "$id" > /dev/null; then
+      echo "::error::docker stop failed for the previous container $id." >&2
+      failed+=("docker stop $id")
+      continue
+    fi
+    if ! docker rm "$id" > /dev/null; then
+      echo "::error::docker rm failed for the previous container $id." >&2
+      failed+=("docker rm $id")
+    fi
   done
-
-  mkdir -p "$root/state"
-  if [[ -f "$state.current" ]] && [[ "$(< "$state.current")" != "$image" ]]; then
-    mv "$state.current" "$state.previous"
-  fi
-  echo "$image" > "$state.current"
   # Removes images that no container uses any more. A rollback pulls the
   # previous image from the registry again.
   docker image prune --force > /dev/null || true
+  if (( ${#failed[@]} > 0 )); then
+    fail "the replacement $new already serves $service as $image, but the cleanup of the previous containers failed (${failed[*]}). Remove them by hand, or deploy the same image again to retry."
+  fi
   echo "$service runs $image behind https://$hostname"
 }
 
 fail() {
   echo "::error::$1" >&2
   exit 1
+}
+
+# Records the image that the route serves: `<state>.current` becomes the image
+# and `<state>.previous` the image that `<state>.current` held. A retry with
+# the same image keeps `<state>.previous`, so a rollback still finds the image
+# that served before the first attempt. The caller evaluates this function as
+# an `if` or `||` operand, which disables `set -e` inside it, so every step
+# checks its own status.
+record_state() {
+  local state="$1" image="$2"
+  mkdir -p "$(dirname "$state")" || return 1
+  if [[ -f "$state.current" ]] && [[ "$(< "$state.current")" != "$image" ]]; then
+    mv -f "$state.current" "$state.previous" || return 1
+  fi
+  echo "$image" > "$state.current"
 }
 
 # Prints the unique network alias of a replacement container. The alias is a
