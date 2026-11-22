@@ -19,6 +19,14 @@ func newBufferLogger() (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewTextHandler(&buf, nil)), &buf
 }
 
+// settledReadEntry returns an entry whose snapshot preparation has ended,
+// because sweep never removes an entry that is still being prepared.
+func settledReadEntry(snapshot string, lastEnd time.Time) *readEntry {
+	ready := make(chan struct{})
+	close(ready)
+	return &readEntry{snapshot: snapshot, ready: ready, lastEnd: lastEnd}
+}
+
 func TestReadSweepFailureLogsNoPath(t *testing.T) {
 	logger, buf := newBufferLogger()
 	dir := filepath.Join(t.TempDir(), "secret-reads")
@@ -35,7 +43,7 @@ func TestReadSweepFailureLogsNoPath(t *testing.T) {
 		t.Fatal(err)
 	}
 	end := time.Now()
-	m.entries["read-1"] = &readEntry{snapshot: snap, lastEnd: end}
+	m.entries["read-1"] = settledReadEntry(snap, end)
 	m.sweep(end.Add(m.retention))
 
 	out := buf.String()
@@ -61,8 +69,8 @@ func TestReadSweepSuccessAndMissingLogNoWarning(t *testing.T) {
 		t.Fatal(err)
 	}
 	end := time.Now()
-	m.entries["a"] = &readEntry{snapshot: present, lastEnd: end}
-	m.entries["b"] = &readEntry{snapshot: filepath.Join(dir, "missing"), lastEnd: end}
+	m.entries["a"] = settledReadEntry(present, end)
+	m.entries["b"] = settledReadEntry(filepath.Join(dir, "missing"), end)
 	m.sweep(end.Add(m.retention))
 	if strings.Contains(buf.String(), "level=WARN") {
 		t.Fatalf("unexpected warning: %q", buf.String())
