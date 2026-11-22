@@ -476,11 +476,17 @@ func (s *Statuses) Run(ctx context.Context) {
 	var lastPoll time.Time
 	for {
 		if s.held() {
-			if s.client != nil && time.Since(lastPoll) >= s.timing.Poll {
-				// A failed poll is retried at the next poll interval, not at
-				// every tick; Poll logs the failure.
-				_ = s.Poll(ctx)
-				lastPoll = time.Now()
+			if s.client != nil {
+				if time.Since(lastPoll) >= s.timing.Poll {
+					// A failed poll is retried at the next poll interval, not
+					// at every tick; Poll logs the failure.
+					_ = s.Poll(ctx)
+					lastPoll = time.Now()
+				}
+				// Due pending unlinks are retried at every tick, not only at
+				// a poll: the back-off bounds (1 second to 5 minutes) are
+				// shorter than the poll interval, and an attempt that is not
+				// due yet is skipped by the query.
 				_ = s.RetryPendingUnlinks(ctx)
 			}
 			_ = s.Advance(ctx)
