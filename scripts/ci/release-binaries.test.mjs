@@ -105,6 +105,11 @@ case "$1" in
       esac
       shift
     done
+    # The release manifest tool: a copy of its stub, so later steps can run it.
+    if [[ "$out" == */tools/release-manifest ]]; then
+      cp "$STUB_DIR/bin/release-manifest" "$out"
+      exit 0
+    fi
     printf 'binary %s %s %s\\n' "$GOOS-$GOARCH" "$CGO_ENABLED" "$ldflags" > "$out" ;;
   list) cat "$STUB_DIR/go-list.tsv" ;;
   *) echo "unexpected go $*" >&2; exit 1 ;;
@@ -289,10 +294,25 @@ test(
   (t) => {
     const f = fixture(t);
     const out = join(f.dir, "out");
-    const result = f.run(["build", "cross", out]);
+    // The build job builds the manifest tool itself and checks the keys with
+    // that copy, not with a tool from the environment.
+    const result = f.run(["build", "cross", out], {
+      RELEASE_MANIFEST_TOOL: "",
+    });
     assert.equal(result.status, 0, result.stderr);
+    assert.match(
+      result.log,
+      new RegExp(
+        `^go build -trimpath -buildvcs=false -o ${out}/tools/release-manifest \\./cmds/ownsand-agent/release-manifest CGO_ENABLED=0 `,
+        "m",
+      ),
+    );
     // The agent has an update manifest, so the build checks the built-in keys.
     assert.match(result.log, /^release-manifest check-keys$/m);
+    assert.ok(
+      result.log.indexOf("release-manifest check-keys") >
+        result.log.indexOf("/tools/release-manifest"),
+    );
     assert.equal(
       readFileSync(
         join(out, "release/ownsand-agent/ownsand-agent-linux-amd64"),
@@ -366,7 +386,9 @@ test(
       STUB_NO_KEYS: "1",
     });
     assert.notEqual(result.status, 0);
-    assert.doesNotMatch(result.log, /go build/);
+    // Only the manifest tool was built, no release binary.
+    assert.equal(result.log.match(/^go build/gm).length, 1);
+    assert.doesNotMatch(result.log, /go build .*-ldflags/);
   },
 );
 
@@ -382,6 +404,8 @@ test(
     );
     assert.equal(result.status, 0, result.stderr);
     assert.doesNotMatch(result.log, /check-keys/);
+    // The publish job downloads the tool for every binary release.
+    assert.match(result.log, /go build .*-o \S+\/tools\/release-manifest /);
   },
 );
 
@@ -888,6 +912,51 @@ test(
       /--current \S+\/current\.json --current-signature \S+\/current\.json\.sig$/m,
     );
     assert.equal(result.log.match(/add-release/g).length, 2);
+  },
+);
+
+test(
+  "the manifest steps use only the prebuilt tool and never compile",
+  { skip },
+  async (t) => {
+    const steps = (dir) => [
+      [["prepare-manifests", dir, join(dir, "assets")], {}],
+      [["sign-manifests", dir], { OWNSAND_AGENT_RELEASE_SIGNING_KEY: "key" }],
+    ];
+    for (const tool of ["", "missing", "directory", "symlink"]) {
+      await t.test(tool || "unset", (t) => {
+        const f = fixture(t);
+        const dir = join(f.dir, "manifests");
+        write(join(dir, "ownsand-agent/manifest.json"), "{}\n");
+        let path = tool === "" ? "" : join(f.dir, `tool-${tool}`);
+        if (tool === "directory") mkdirSync(path);
+        if (tool === "symlink") {
+          symlinkSync(join(f.dir, "bin/release-manifest"), path);
+        }
+        for (const [args, env] of steps(dir)) {
+          const result = f.run(args, { ...env, RELEASE_MANIFEST_TOOL: path });
+          assert.notEqual(result.status, 0, args[0]);
+          assert.match(
+            result.stderr,
+            /RELEASE_MANIFEST_TOOL is not the release manifest tool that build cross built/,
+          );
+          assert.doesNotMatch(result.log, /^go /m);
+        }
+      });
+    }
+    await t.test("downloaded without its executable bit", (t) => {
+      const f = fixture(t);
+      const dir = join(f.dir, "manifests");
+      const tool = join(f.dir, "artifacts/tools/release-manifest");
+      write(tool, readFileSync(join(f.dir, "bin/release-manifest"), "utf8"));
+      chmodSync(tool, 0o644);
+      const result = f.run(["prepare-manifests", dir, join(f.dir, "assets")], {
+        RELEASE_MANIFEST_TOOL: tool,
+      });
+      assert.equal(result.status, 0, result.stderr);
+      assert.match(result.log, /^release-manifest add-release /m);
+      assert.doesNotMatch(result.log, /^go /m);
+    });
   },
 );
 

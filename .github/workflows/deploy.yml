@@ -461,10 +461,18 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Build every platform without cgo and the license notices
+      - name: Build every platform without cgo, the license notices and the manifest tool
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
         run: scripts/ci/release-binaries.sh build cross "$RUNNER_TEMP/binaries"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # `publish-binaries` has secrets and therefore runs no build; it
+        # signs the manifests with this tool.
+        with:
+          name: release-manifest-tool
+          path: ${{ runner.temp }}/binaries/tools
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: binaries-release
@@ -564,17 +572,17 @@ jobs:
     permissions:
       contents: write
     steps:
-      # No build runs in this job. The release manifest tool is built from
-      # the checkout with the standard library only, in a step without
-      # secrets, and each secret reaches only the step that needs it.
+      # No build runs in this job: it has secrets, so it receives only build
+      # artifacts, including the release manifest tool that `build-binaries`
+      # built. Each secret reaches only the step that needs it.
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ needs.plan.outputs.sha }}
           persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
-          go-version-file: go.mod
-          cache: false
+          name: release-manifest-tool
+          path: ${{ runner.temp }}/artifacts/tools
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: binaries-release
@@ -610,10 +618,12 @@ jobs:
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
           REPOSITORY: ${{ github.repository }}
+          RELEASE_MANIFEST_TOOL: ${{ runner.temp }}/artifacts/tools/release-manifest
         run: scripts/ci/release-binaries.sh prepare-manifests "$RUNNER_TEMP/manifests" "$RUNNER_TEMP/assets"
       - name: Sign the manifests
         env:
           BINARIES: ${{ needs.plan.outputs.binaries }}
+          RELEASE_MANIFEST_TOOL: ${{ runner.temp }}/artifacts/tools/release-manifest
           OWNSAND_AGENT_RELEASE_SIGNING_KEY: ${{ secrets.OWNSAND_AGENT_RELEASE_SIGNING_KEY }}
         run: scripts/ci/release-binaries.sh sign-manifests "$RUNNER_TEMP/manifests"
       - name: Upload the manifests

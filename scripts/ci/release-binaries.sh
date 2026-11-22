@@ -6,9 +6,12 @@
 # one workflow step, so that each secret reaches only the step that needs it:
 #
 #   build <cross|cgo> <out-dir>   build jobs, no secrets. `cross` builds every
-#                                 platform without cgo and writes the license
-#                                 notices; `cgo` builds the cgo platforms on a
-#                                 native runner. Darwin executables go to
+#                                 platform without cgo, writes the license
+#                                 notices and builds the release manifest
+#                                 tool for the publish job into
+#                                 <out-dir>/tools/release-manifest; `cgo`
+#                                 builds the cgo platforms on a native runner.
+#                                 Darwin executables go to
 #                                 <out-dir>/darwin/<name>/, all other files to
 #                                 <out-dir>/release/<name>/.
 #   sign-macos <in-dir> <out-dir> macOS signing job: Developer ID signature
@@ -22,8 +25,8 @@
 #                                 creates or completes its GitHub Release.
 #   fetch-manifests <dir>         publish job, RELEASES_R2_*: downloads the
 #                                 current manifest and signature.
-#   prepare-manifests <dir> <assets>  publish job, no secrets: builds the
-#                                 release manifest tool and adds the releases.
+#   prepare-manifests <dir> <assets>  publish job, no secrets: adds the
+#                                 releases with the prebuilt manifest tool.
 #   sign-manifests <dir>          publish job, the signing key only.
 #   upload-manifests <dir>        publish job, RELEASES_R2_*: uploads the
 #                                 manifest and its signature.
@@ -35,7 +38,10 @@
 #                        commit whose parent is this revision.
 #   RUNNER_TEMP          scratch directory.
 #   GITHUB_STEP_SUMMARY  optional summary file.
-#   RELEASE_MANIFEST_TOOL  optional prebuilt release manifest tool (tests).
+#   RELEASE_MANIFEST_TOOL  release manifest tool that `build cross` built,
+#                        for `prepare-manifests` and `sign-manifests`. A job
+#                        with a secret runs no build, so these steps never
+#                        compile the tool themselves.
 #   APPLE_DEVELOPER_ID_CERTIFICATE_P12       base64 PKCS#12 Developer ID
 #                                            Application certificate and key.
 #   APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD  its password.
@@ -190,10 +196,18 @@ build() {
     # shellcheck disable=SC2016
     filter='$is_cgo'
   fi
-  # An update-manifest release must not fail after the tags exist because
-  # the agent has no built-in key.
-  if [[ "$mode" == cross ]] && has_manifests > /dev/null; then
-    run_manifest_tool check-keys
+  if [[ "$mode" == cross ]]; then
+    # The publish job has secrets and therefore runs no build, so it gets the
+    # release manifest tool from this job. Build it for this runner, which
+    # has the platform of the publish runner, from the standard library only.
+    mkdir -p "$out/tools"
+    CGO_ENABLED=0 go build -trimpath -buildvcs=false -o "$out/tools/release-manifest" \
+      ./cmds/ownsand-agent/release-manifest < /dev/null
+    # An update-manifest release must not fail after the tags exist because
+    # the agent has no built-in key.
+    if has_manifests > /dev/null; then
+      RELEASE_MANIFEST_TOOL="$out/tools/release-manifest" run_manifest_tool check-keys
+    fi
   fi
   echo "## Binary builds ($mode)" >> "$summary"
   while IFS=$'\t' read -r -u 3 name version dir binary; do
@@ -238,12 +252,17 @@ build() {
   done 3< <(binary_rows)
 }
 
+# Runs the prebuilt release manifest tool. It never falls back to `go run`,
+# because the steps that call it run in a job with secrets.
 run_manifest_tool() {
-  if [[ -n "${RELEASE_MANIFEST_TOOL:-}" ]]; then
-    "$RELEASE_MANIFEST_TOOL" "$@" < /dev/null
-  else
-    (cd "$repo_root" && go run ./cmds/ownsand-agent/release-manifest "$@" < /dev/null)
+  local tool="${RELEASE_MANIFEST_TOOL:-}"
+  if [[ -z "$tool" || -L "$tool" || ! -f "$tool" ]]; then
+    echo "::error::RELEASE_MANIFEST_TOOL is not the release manifest tool that build cross built: ${tool:-<empty>}" >&2
+    exit 1
   fi
+  # A downloaded artifact loses its executable bit.
+  [[ -x "$tool" ]] || chmod -- u+x "$tool"
+  "$tool" "$@" < /dev/null
 }
 
 keychain=""
@@ -540,13 +559,6 @@ prepare_manifests() {
   require_binaries
   has_manifests || return 0
   require_env REPOSITORY
-  if [[ -z "${RELEASE_MANIFEST_TOOL:-}" ]]; then
-    # Build the tool here, without secrets, so that the signing step runs no
-    # compiler.
-    (cd "$repo_root" && go build -trimpath -buildvcs=false -o "$RUNNER_TEMP/release-manifest" ./cmds/ownsand-agent/release-manifest < /dev/null)
-    echo "RELEASE_MANIFEST_TOOL=$RUNNER_TEMP/release-manifest" >> "${GITHUB_ENV:-/dev/null}"
-    RELEASE_MANIFEST_TOOL="$RUNNER_TEMP/release-manifest"
-  fi
   local name version binary key url args
   while IFS=$'\t' read -r -u 3 name version binary key url; do
     mkdir -p "$dir/$name"
@@ -564,7 +576,7 @@ sign_manifests() {
   local dir="$1"
   require_binaries
   has_manifests || return 0
-  require_env OWNSAND_AGENT_RELEASE_SIGNING_KEY RELEASE_MANIFEST_TOOL
+  require_env OWNSAND_AGENT_RELEASE_SIGNING_KEY
   local name version binary key url
   while IFS=$'\t' read -r -u 3 name version binary key url; do
     run_manifest_tool sign --manifest "$dir/$name/manifest.json" --out "$dir/$name/manifest.json.sig"
