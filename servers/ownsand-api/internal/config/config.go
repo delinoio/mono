@@ -384,7 +384,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if v := get(EnvAccountsAPIOrigin); v != "" {
 		u, err := url.Parse(v)
-		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" || strings.Contains(v, "#") {
+		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || (u.Path != "" && u.Path != "/") || u.RawQuery != "" ||
+			// A bare "?" leaves u.RawQuery empty and only sets u.ForceQuery, so check it too. The origin has no query, empty or not.
+			u.ForceQuery || u.Fragment != "" || strings.Contains(v, "#") {
 			return Config{}, fmt.Errorf("%s must be an origin such as https://accounts.api.delino.io", EnvAccountsAPIOrigin)
 		}
 		cfg.Accounts.APIOrigin = strings.TrimSuffix(v, "/")

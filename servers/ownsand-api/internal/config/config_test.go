@@ -256,13 +256,19 @@ func TestLoadAccountsAndMetrics(t *testing.T) {
 		t.Fatalf("cfg = %+v %q", cfg.Accounts, cfg.MetricsAddr)
 	}
 	for name, mutate := range map[string]func(map[string]string){
-		"missing client id":     func(v map[string]string) { delete(v, EnvAccountsM2MClientID) },
-		"missing client secret": func(v map[string]string) { delete(v, EnvAccountsM2MClientSecret) },
-		"missing endpoint":      func(v map[string]string) { delete(v, EnvLogtoTokenEndpoint) },
-		"bad endpoint":          func(v map[string]string) { v[EnvLogtoTokenEndpoint] = "tenant/oidc/token" },
-		"origin with path":      func(v map[string]string) { v[EnvAccountsAPIOrigin] = "https://accounts.api.delino.io/v1" },
-		"origin without scheme": func(v map[string]string) { v[EnvAccountsAPIOrigin] = "accounts.api.delino.io" },
-		"bad metrics addr":      func(v map[string]string) { v[EnvMetricsAddr] = "9090" },
+		"missing client id":      func(v map[string]string) { delete(v, EnvAccountsM2MClientID) },
+		"missing client secret":  func(v map[string]string) { delete(v, EnvAccountsM2MClientSecret) },
+		"missing endpoint":       func(v map[string]string) { delete(v, EnvLogtoTokenEndpoint) },
+		"bad endpoint":           func(v map[string]string) { v[EnvLogtoTokenEndpoint] = "tenant/oidc/token" },
+		"origin with path":       func(v map[string]string) { v[EnvAccountsAPIOrigin] = "https://accounts.api.delino.io/v1" },
+		"origin without scheme":  func(v map[string]string) { v[EnvAccountsAPIOrigin] = "accounts.api.delino.io" },
+		"origin with bare query": func(v map[string]string) { v[EnvAccountsAPIOrigin] = "http://127.0.0.1:18100?" },
+		"origin with slash and bare query": func(v map[string]string) {
+			v[EnvAccountsAPIOrigin] = "http://127.0.0.1:18100/?"
+		},
+		"origin with query":         func(v map[string]string) { v[EnvAccountsAPIOrigin] = "http://127.0.0.1:18100/?a=b" },
+		"origin with bare fragment": func(v map[string]string) { v[EnvAccountsAPIOrigin] = "http://127.0.0.1:18100#" },
+		"bad metrics addr":          func(v map[string]string) { v[EnvMetricsAddr] = "9090" },
 	} {
 		w := map[string]string{}
 		for k, val := range v {
@@ -271,6 +277,36 @@ func TestLoadAccountsAndMetrics(t *testing.T) {
 		mutate(w)
 		if _, err := Load(env(w)); err == nil {
 			t.Errorf("%s: accepted", name)
+		}
+	}
+}
+
+func TestLoadAccountsAPIOriginQuery(t *testing.T) {
+	for _, origin := range []string{
+		"http://127.0.0.1:18100?",
+		"http://127.0.0.1:18100/?",
+		"https://accounts.api.delino.io?",
+		"https://accounts.api.delino.io/?",
+		"https://accounts.api.delino.io/?a=b",
+	} {
+		v := minimal()
+		v[EnvAccountsAPIOrigin] = origin
+		_, err := Load(env(v))
+		if err == nil || !strings.Contains(err.Error(), EnvAccountsAPIOrigin) {
+			t.Errorf("%q: err = %v, want an error that names %s", origin, err, EnvAccountsAPIOrigin)
+		}
+	}
+	for origin, want := range map[string]string{
+		"https://accounts.api.delino.io":  "https://accounts.api.delino.io",
+		"https://accounts.api.delino.io/": "https://accounts.api.delino.io",
+		"http://127.0.0.1:18100":          "http://127.0.0.1:18100",
+		"http://127.0.0.1:18100/":         "http://127.0.0.1:18100",
+	} {
+		v := minimal()
+		v[EnvAccountsAPIOrigin] = origin
+		cfg, err := Load(env(v))
+		if err != nil || cfg.Accounts.APIOrigin != want {
+			t.Errorf("%q: origin = %q, err = %v, want %q", origin, cfg.Accounts.APIOrigin, err, want)
 		}
 	}
 }
