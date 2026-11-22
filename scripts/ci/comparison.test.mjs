@@ -133,6 +133,26 @@ test("a pull request compares the first parent of its test merge commit", (t) =>
   });
 });
 
+test("the planner rejects a base branch revision that the pull request head does not contain", (t) => {
+  const f = staleBaseFixture(t);
+  // A two-dot diff from the base branch tip to the pull request head lists the
+  // Go file that only the base branch changed, so it would select Go.
+  assert.match(
+    f.git("diff", "--name-only", f.mainTip, f.prHead),
+    /cmds\/tool\/main\.go/u,
+  );
+  assert.throws(
+    () => plan(f.cwd, f.mainTip, f.prHead),
+    /is not an ancestor of head/u,
+  );
+  // The fork point stays a valid comparison.
+  assert.deepEqual(plan(f.cwd, f.fork, f.prHead), {
+    ...noChecks,
+    quality: true,
+    format: true,
+  });
+});
+
 test("a pull request checkout must be the test merge commit of the event head", (t) => {
   const f = staleBaseFixture(t);
   const env = { GITHUB_EVENT_NAME: ComparisonEvent.PullRequest };
@@ -207,6 +227,18 @@ test("a push without a prior commit compares a local empty-tree commit", (t) => 
   assert.equal(f.git("ls-tree", comparison.base), "");
   // The planner accepts the empty-tree commit although it is not an ancestor.
   assert.equal(plan(f.cwd, comparison.base, comparison.head).go, true);
+});
+
+test("the planner accepts no other unrelated base", (t) => {
+  const f = fixture(t);
+  const head = f.commit("docs/guide.md");
+  // A parentless commit of a nonempty tree.
+  const tree = f.git("rev-parse", `${head}^{tree}`);
+  const unrelated = f.git("commit-tree", tree, "-m", "unrelated");
+  assert.throws(
+    () => plan(f.cwd, unrelated, head),
+    /is not an ancestor of head/u,
+  );
 });
 
 test("a push rejects an invalid or unknown prior commit", (t) => {
