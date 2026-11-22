@@ -168,6 +168,7 @@ type Fake struct {
 	err      error
 	// errFor holds the per-recipient errors, keyed by the To address.
 	errFor map[string]error
+	onSend func(Message)
 }
 
 // NewFake returns an empty fake sender.
@@ -182,6 +183,9 @@ func (f *Fake) Send(_ context.Context, msg Message) error {
 	}
 	if err := f.errFor[msg.To]; err != nil {
 		return err
+	}
+	if f.onSend != nil {
+		f.onSend(msg)
 	}
 	f.messages = append(f.messages, msg)
 	return nil
@@ -209,6 +213,16 @@ func (f *Fake) SetErrFor(to string, err error) {
 		f.errFor = map[string]error{}
 	}
 	f.errFor[to] = err
+}
+
+// SetOnSend registers fn to run for every message that is about to be
+// delivered, before it is recorded, so a test can observe what the sender sees
+// at the time of the call. fn runs while the fake holds its lock and must not
+// call the fake. nil removes it.
+func (f *Fake) SetOnSend(fn func(Message)) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.onSend = fn
 }
 
 // Messages returns a copy of the recorded messages in send order.
