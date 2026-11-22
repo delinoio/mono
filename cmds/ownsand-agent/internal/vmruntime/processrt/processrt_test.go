@@ -776,3 +776,199 @@ func TestSocketOutsideLongSandboxDirectory(t *testing.T) {
 		}
 	}
 }
+
+// newRuntimeWithVMsDir returns a runtime that knows vmsDir, as the agent
+// builds it, and does not close the helpers on cleanup, so that a test can
+// model an earlier agent process whose helpers outlived it.
+func newRuntimeWithVMsDir(t *testing.T, vmsDir string) *Runtime {
+	t.Helper()
+	rt, err := NewWithOptions(Options{GuestBinary: guestBinary, VMsDir: vmsDir, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rt
+}
+
+// writeSandboxFiles writes the layout of a sandbox directory that a process
+// runtime leaves behind: root with a user file and guest-state.
+func writeSandboxFiles(t *testing.T, vmsDir, id string) string {
+	t.Helper()
+	dir := filepath.Join(vmsDir, id)
+	for _, sub := range []string{rootDir, stateDir} {
+		if err := os.MkdirAll(filepath.Join(dir, sub), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(dir, rootDir, "user-file.txt"), []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return dir
+}
+
+func mustExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("%s: %v; want it kept", path, err)
+	}
+}
+
+func mustNotExist(t *testing.T, path string) {
+	t.Helper()
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("%s: %v; want it removed", path, err)
+	}
+}
+
+// TestDeleteUntrackedRemovesSandboxFiles checks that a runtime that did not
+// create a sandbox (a restarted agent) removes its directory, that a second
+// Delete and a Delete of an ID without a directory succeed, and that sibling
+// sandboxes stay.
+func TestDeleteUntrackedRemovesSandboxFiles(t *testing.T) {
+	vmsDir := t.TempDir()
+	// The earlier agent process created the sandbox with a real helper.
+	earlier := newRuntimeWithVMsDir(t, vmsDir)
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := earlier.Create(context.Background(), vmruntime.Spec{SandboxID: id, Dir: filepath.Join(vmsDir, id), GuestOS: hostGuestOS, BaseImage: hostBaseImage}); err != nil {
+		t.Fatal(err)
+	}
+	// The helper of an earlier agent process ends with that process; this
+	// test stops it with the earlier runtime after the restarted runtime
+	// removed the files.
+	t.Cleanup(func() { _ = earlier.Close() })
+	userFile := filepath.Join(vmsDir, id, rootDir, "user-file.txt")
+	if err := os.WriteFile(userFile, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sibling := writeSandboxFiles(t, vmsDir, "0192f4b6-7c3a-7def-8abc-000000000002")
+
+	restarted := newRuntimeWithVMsDir(t, vmsDir)
+	ctx := context.Background()
+	if err := restarted.Delete(ctx, id); err != nil {
+		t.Fatalf("Delete of an untracked sandbox: %v", err)
+	}
+	mustNotExist(t, filepath.Join(vmsDir, id))
+	if err := restarted.Delete(ctx, id); err != nil {
+		t.Fatalf("second Delete: %v", err)
+	}
+	if err := restarted.Delete(ctx, "0192f4b6-7c3a-7def-8abc-000000000003"); err != nil {
+		t.Fatalf("Delete of an ID without a directory: %v", err)
+	}
+	mustExist(t, filepath.Join(sibling, rootDir, "user-file.txt"))
+	mustExist(t, filepath.Join(sibling, stateDir))
+}
+
+// TestDeleteUntrackedWithoutVMsDirKeepsFiles checks that a runtime that does
+// not know the sandbox directories keeps the earlier no-op for an untracked
+// sandbox.
+func TestDeleteUntrackedWithoutVMsDirKeepsFiles(t *testing.T) {
+	vmsDir := t.TempDir()
+	id := "0192f4b6-7c3a-7def-8abc-000000000001"
+	dir := writeSandboxFiles(t, vmsDir, id)
+	rt := newRuntime(t)
+	if err := rt.Delete(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	mustExist(t, dir)
+}
+
+// TestDeleteUntrackedRejectsPathLikeIDs checks that an ID with more than one
+// path element cannot address a directory outside the sandbox directories.
+func TestDeleteUntrackedRejectsPathLikeIDs(t *testing.T) {
+	base := t.TempDir()
+	vmsDir := filepath.Join(base, "vms")
+	if err := os.Mkdir(vmsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(outside, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	for _, id := range []string{"", ".", "..", "../outside", "a/b", `a\b`, outside} {
+		if err := rt.Delete(context.Background(), id); err == nil {
+			t.Errorf("Delete(%q) succeeded; want an error", id)
+		}
+	}
+	mustExist(t, outside)
+	mustExist(t, vmsDir)
+}
+
+// TestDeleteUntrackedRemovesRecordedSocketDirectory checks that Delete of an
+// untracked sandbox removes the socket directory that the sandbox directory
+// records (macOS keeps the socket outside the sandbox directory), and ignores
+// a record that does not name a socket directory.
+func TestDeleteUntrackedRemovesRecordedSocketDirectory(t *testing.T) {
+	vmsDir := t.TempDir()
+	socketDir, err := os.MkdirTemp(t.TempDir(), socketDirPrefix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(socketDir, "g.sock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	unrelated := t.TempDir()
+	id := "0192f4b6-7c3a-7def-8abc-000000000001"
+	dir := writeSandboxFiles(t, vmsDir, id)
+	if err := recordSocketDir(dir, socketDir); err != nil {
+		t.Fatal(err)
+	}
+	otherID := "0192f4b6-7c3a-7def-8abc-000000000002"
+	otherDir := writeSandboxFiles(t, vmsDir, otherID)
+	// A record without the socket directory prefix is not removed.
+	if err := recordSocketDir(otherDir, unrelated); err != nil {
+		t.Fatal(err)
+	}
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	for _, sandboxID := range []string{id, otherID} {
+		if err := rt.Delete(context.Background(), sandboxID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mustNotExist(t, dir)
+	mustNotExist(t, socketDir)
+	mustNotExist(t, otherDir)
+	mustExist(t, unrelated)
+}
+
+// TestRecordSocketDirNoopWithoutSocketDirectory checks that a sandbox with an
+// abstract socket (Linux) gets no record file.
+func TestRecordSocketDirNoopWithoutSocketDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "sb")
+	if err := recordSocketDir(dir, ""); err != nil {
+		t.Fatal(err)
+	}
+	mustNotExist(t, dir)
+}
+
+// TestCloseRemovesSandboxWhoseHelperExited checks that Close removes every
+// tracked sandbox, including one whose helper exited, so that its files do
+// not outlive the agent process.
+func TestCloseRemovesSandboxWhoseHelperExited(t *testing.T) {
+	vmsDir := t.TempDir()
+	rt := newRuntimeWithVMsDir(t, vmsDir)
+	id, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	v, err := rt.Create(context.Background(), vmruntime.Spec{SandboxID: id, Dir: filepath.Join(vmsDir, id), GuestOS: hostGuestOS, BaseImage: hostBaseImage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := killHelperAndWait(t, rt, v)
+	if err := rt.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mustNotExist(t, filepath.Join(vmsDir, id))
+	if h.socketDir != "" {
+		mustNotExist(t, h.socketDir)
+	}
+	rt.mu.Lock()
+	tracked := len(rt.vms)
+	rt.mu.Unlock()
+	if tracked != 0 {
+		t.Fatalf("%d sandboxes tracked after Close; want none", tracked)
+	}
+}

@@ -21,7 +21,7 @@ import (
 func New(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Runtime, error) {
 	switch cfg.Runtime {
 	case config.RuntimeKindProcess:
-		return processrt.New(cfg.GuestBinary, logger)
+		return processrt.NewWithOptions(processrt.Options{GuestBinary: cfg.GuestBinary, VMsDir: st.Path(store.VMsDir), Logger: logger})
 	case config.RuntimeKindFirecracker:
 		return newFirecracker(cfg, st, logger)
 	case config.RuntimeKindVirtualization:

@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -55,9 +56,27 @@ var errHelperExited = errors.New("processrt: guest helper has exited")
 // Runtime is the process test runtime.
 type Runtime struct {
 	guestBinary string
-	logger      *slog.Logger
-	mu          sync.Mutex
-	vms         map[string]*vm
+	// vmsDir holds the sandbox directories (<state>/vms), or "" when the
+	// runtime does not know it. Delete uses it to remove the files of a
+	// sandbox that the runtime does not track, for example one that an
+	// earlier agent process created.
+	vmsDir string
+	logger *slog.Logger
+	mu     sync.Mutex
+	vms    map[string]*vm
+}
+
+// Options configures a process runtime.
+type Options struct {
+	// GuestBinary is the guest helper binary; see New.
+	GuestBinary string
+	// VMsDir holds the sandbox directories (<state>/vms). When it is set,
+	// Delete removes the directory of a sandbox that the runtime does not
+	// track, so the files of a sandbox that an earlier agent process left
+	// behind are removed. An empty VMsDir keeps Delete a no-op for an
+	// untracked sandbox.
+	VMsDir string
+	Logger *slog.Logger
 }
 
 var _ vmruntime.Runtime = (*Runtime)(nil)
@@ -67,7 +86,18 @@ var _ vmruntime.Runtime = (*Runtime)(nil)
 // PATH. A relative guestBinary resolves against the working directory of the
 // agent at this call; the runtime stores the absolute path because Create
 // starts the helper with the sandbox root as its working directory.
+//
+// A runtime that New returns does not know the sandbox directories, so its
+// Delete cannot remove the files of an untracked sandbox; use NewWithOptions
+// with VMsDir for that.
 func New(guestBinary string, logger *slog.Logger) (*Runtime, error) {
+	return NewWithOptions(Options{GuestBinary: guestBinary, Logger: logger})
+}
+
+// NewWithOptions returns a process runtime that opts configure; see New for
+// the guest binary rules.
+func NewWithOptions(opts Options) (*Runtime, error) {
+	guestBinary, logger := opts.GuestBinary, opts.Logger
 	if !supported {
 		return nil, fmt.Errorf("%w: the process test runtime needs a Linux or macOS host", vmruntime.ErrUnsupported)
 	}
@@ -86,7 +116,15 @@ func New(guestBinary string, logger *slog.Logger) (*Runtime, error) {
 		return nil, fmt.Errorf("processrt: guest helper binary %s is not a file", guestBinary)
 	}
 	logger.Warn("process test runtime selected: sandboxes run as host processes without isolation")
-	return &Runtime{guestBinary: guestBinary, logger: logger, vms: map[string]*vm{}}, nil
+	vmsDir := opts.VMsDir
+	if vmsDir != "" {
+		absVMs, err := filepath.Abs(vmsDir)
+		if err != nil {
+			return nil, fmt.Errorf("processrt: resolve sandbox directories %s: %w", vmsDir, err)
+		}
+		vmsDir = absVMs
+	}
+	return &Runtime{guestBinary: guestBinary, vmsDir: vmsDir, logger: logger, vms: map[string]*vm{}}, nil
 }
 
 func findGuestBinary() string {
@@ -232,6 +270,11 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		return nil, err
 	}
 	v := &vm{id: spec.SandboxID, dir: dir, socket: socket, socketDir: socketDir, exited: make(chan struct{}), restore: restore}
+	if err := recordSocketDir(dir, socketDir); err != nil {
+		os.RemoveAll(dir)
+		removeSocketDir(v)
+		return nil, err
+	}
 	cmd := exec.Command(r.guestBinary,
 		"--listen", "unix://"+v.socket,
 		"--state-dir", filepath.Join(dir, stateDir),
@@ -483,7 +526,7 @@ func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 	v, ok := r.vms[sandboxID]
 	r.mu.Unlock()
 	if !ok {
-		return nil
+		return r.removeUntracked(sandboxID)
 	}
 	if !v.hasExited() {
 		if err := r.stopHelper(ctx, v); err != nil {
@@ -492,6 +535,77 @@ func (r *Runtime) Delete(ctx context.Context, sandboxID string) error {
 		r.logger.Info("process sandbox stopped", "sandbox_id", sandboxID)
 	}
 	return r.removeSandbox(v)
+}
+
+// socketDirFile is the file in a sandbox directory that records the socket
+// directory of the sandbox when that directory lies outside the sandbox
+// directory (macOS; see newSocket). A later agent process reads it to remove
+// the socket directory of a sandbox that it does not track.
+const socketDirFile = "socket-dir"
+
+// socketDirPrefix is the name prefix of the socket directories that newSocket
+// creates. removeUntracked refuses to remove a recorded directory without it,
+// so a damaged record cannot make Delete remove an unrelated directory.
+const socketDirPrefix = "osb-"
+
+// recordSocketDir records socketDir in the sandbox directory dir. It does
+// nothing when socketDir is empty.
+func recordSocketDir(dir, socketDir string) error {
+	if socketDir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("processrt: create sandbox directory: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, socketDirFile), []byte(socketDir), 0o600); err != nil {
+		return fmt.Errorf("processrt: record guest helper socket directory: %w", err)
+	}
+	return nil
+}
+
+// recordedSocketDir returns the socket directory that dir records, or "" when
+// dir records none or an unexpected path.
+func recordedSocketDir(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, socketDirFile))
+	if err != nil {
+		return ""
+	}
+	socketDir := filepath.Clean(string(data))
+	if !filepath.IsAbs(socketDir) || !strings.HasPrefix(filepath.Base(socketDir), socketDirPrefix) {
+		return ""
+	}
+	return socketDir
+}
+
+// removeUntracked removes the files of a sandbox that the runtime does not
+// track: one that an earlier agent process created, or one that was deleted
+// already. The helper of such a sandbox is not reachable through the runtime.
+// Delete is idempotent, so a sandbox without files is not an error. It does
+// nothing when the runtime does not know the sandbox directories.
+//
+// The socket directory goes first and the sandbox directory, which records
+// it, last, so that a failed removal can be retried.
+func (r *Runtime) removeUntracked(sandboxID string) error {
+	if r.vmsDir == "" {
+		return nil
+	}
+	// A sandbox ID is one path element: an ID that is empty, "." or ".." or
+	// that holds a separator would address a directory outside vmsDir.
+	if sandboxID == "" || sandboxID == "." || sandboxID == ".." ||
+		strings.ContainsAny(sandboxID, `/\`) || filepath.Base(sandboxID) != sandboxID {
+		return fmt.Errorf("processrt: sandbox ID %q is not a single path element", sandboxID)
+	}
+	dir := filepath.Join(r.vmsDir, sandboxID)
+	if socketDir := recordedSocketDir(dir); socketDir != "" {
+		if err := os.RemoveAll(socketDir); err != nil {
+			return err
+		}
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	r.logger.Info("process sandbox files removed", "sandbox_id", sandboxID)
+	return nil
 }
 
 // removeSandbox removes the files of a sandbox whose helper was reaped,
@@ -551,9 +665,16 @@ func (r *Runtime) Running(context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// Close stops every helper.
+// Close stops every helper and removes every tracked sandbox, including a
+// sandbox whose helper exited already, so that its files do not outlive the
+// agent process.
 func (r *Runtime) Close() error {
-	ids, _ := r.Running(context.Background())
+	r.mu.Lock()
+	ids := make([]string, 0, len(r.vms))
+	for id := range r.vms {
+		ids = append(ids, id)
+	}
+	r.mu.Unlock()
 	var errs []error
 	for _, id := range ids {
 		errs = append(errs, r.Delete(context.Background(), id))
