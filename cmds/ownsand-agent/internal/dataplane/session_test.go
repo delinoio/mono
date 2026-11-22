@@ -353,14 +353,18 @@ func requireNoSession(t *testing.T, dp *DataPlane) {
 	}
 }
 
-// requireEndedAnswer fails unless the offer returns an error answer without
-// an SDP body before the silent STUN server times out its gathering.
-func requireEndedAnswer(t *testing.T, answers <-chan *ownsandv1.SignalingAnswer) {
+// requireEndedAnswer fails unless the offer returns an error answer with the
+// given code and without an SDP body before the silent STUN server times out
+// its gathering.
+func requireEndedAnswer(t *testing.T, answers <-chan *ownsandv1.SignalingAnswer, code ownsandv1.ErrorCode) {
 	t.Helper()
 	select {
 	case a := <-answers:
 		if a.GetError() == nil || a.GetSdp() != "" {
 			t.Fatalf("answer %v, want an error answer without an SDP body", a)
+		}
+		if got := a.GetError().GetCode(); got != code {
+			t.Fatalf("answer error code %v, want %v", got, code)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("offer did not end before the gathering timeout")
@@ -377,7 +381,7 @@ func TestRevokeDuringOfferGathering(t *testing.T) {
 	_, id, answers := w.startOffer(t, dp, ch)
 	s := waitGathering(t, dp, id)
 	dp.Revoke(ch, &ownsandv1.SessionRevocation{RevocationId: "r", Target: &ownsandv1.SessionRevocation_SessionId{SessionId: id}})
-	requireEndedAnswer(t, answers)
+	requireEndedAnswer(t, answers, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION)
 	requireNoSession(t, dp)
 	s.mu.Lock()
 	reason := s.endReason
@@ -401,7 +405,7 @@ func TestCloseDuringOfferGathering(t *testing.T) {
 	waitGathering(t, dp, id)
 	dp.Close()
 	requireNoSession(t, dp)
-	requireEndedAnswer(t, answers)
+	requireEndedAnswer(t, answers, ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE)
 	requireNoSession(t, dp)
 }
 
@@ -419,7 +423,7 @@ func TestChannelLostDuringOfferGathering(t *testing.T) {
 	waitGathering(t, dp, liveID)
 	lost.Close()
 	dp.ChannelLost(lost)
-	requireEndedAnswer(t, lostAnswers)
+	requireEndedAnswer(t, lostAnswers, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION)
 	dp.mu.Lock()
 	_, lostKept := dp.sessions[lostID]
 	_, liveKept := dp.sessions[liveID]
@@ -447,7 +451,7 @@ func TestChannelDoneDuringOfferGathering(t *testing.T) {
 	_, id, answers := w.startOffer(t, dp, ch)
 	waitGathering(t, dp, id)
 	ch.Close()
-	requireEndedAnswer(t, answers)
+	requireEndedAnswer(t, answers, ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION)
 	requireNoSession(t, dp)
 }
 

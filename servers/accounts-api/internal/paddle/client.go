@@ -215,6 +215,13 @@ func (c *Client) do(ctx context.Context, method, path string, body any, out any)
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes))
 	if err != nil {
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			// The status line already decides the outcome (for example a 429
+			// is never applied and a 5xx stays unknown), so keep it and
+			// discard the partial body: it never reaches the error, the
+			// code, the type or the request ID.
+			return &APIError{Status: resp.StatusCode}
+		}
 		return fmt.Errorf("read paddle response: %w", err)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {

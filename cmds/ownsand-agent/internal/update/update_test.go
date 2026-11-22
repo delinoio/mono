@@ -508,6 +508,9 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 		{"same version", "1.0.0", false, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE},
 		{"failed target", "9.9.9", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
 		{"invalid target", "not-semver", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"zero-padded target", "01.1.0", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"signed target", "+1.1.0", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
+		{"empty pre-release target", "1.1.0-", true, ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_FAILED},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

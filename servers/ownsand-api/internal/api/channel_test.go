@@ -909,10 +909,17 @@ func TestAgentUpdateTargetOrdering(t *testing.T) {
 		{name: "equal default with a v prefix", running: "1.9.0", releases: []release{{"v1.9.0", true, false}}, mode: follow},
 		{name: "a release is newer than its pre-release", running: "1.9.0-rc.1", releases: []release{{"1.9.0", true, false}}, mode: follow, wantTarget: "1.9.0"},
 		{name: "a pre-release default is older than the release", running: "1.9.0", releases: []release{{"1.9.0-rc.1", true, false}}, mode: follow},
+		{name: "a higher numeric pre-release identifier is not a downgrade", running: "1.9.0-rc.10", releases: []release{{"1.9.0-rc.2", true, false}}, mode: follow},
+		{name: "a higher numeric pre-release identifier is newer", running: "1.9.0-rc.2", releases: []release{{"1.9.0-rc.10", true, false}}, mode: follow, wantTarget: "1.9.0-rc.10"},
 		{name: "unrecognized running version", running: "dev-build", releases: []release{{"1.9.0", true, false}}, mode: follow, wantWarning: true},
 		{name: "unrecognized default version", running: "1.9.0", releases: []release{{"latest", true, false}}, mode: follow, wantWarning: true},
+		{name: "zero-padded running version", running: "01.0.0", releases: []release{{"1.1.0", true, false}}, mode: follow, wantWarning: true},
+		{name: "zero-padded default version", running: "1.0.0", releases: []release{{"01.1.0", true, false}}, mode: follow, wantWarning: true},
+		{name: "signed default version", running: "1.0.0", releases: []release{{"+1.1.0", true, false}}, mode: follow, wantWarning: true},
 		{name: "no default release", running: "1.9.0", releases: []release{{"1.8.0", false, false}}, mode: follow},
 		{name: "lower pin is sent without recovery", running: "1.10.0", releases: []release{{"1.10.0", true, false}, {"1.9.0", false, false}}, mode: pin, pinned: "1.9.0", wantTarget: "1.9.0"},
+		{name: "a pin equal to the running version is sent without recovery", running: "1.9.0", releases: []release{{"1.10.0", true, false}, {"1.9.0", false, false}}, mode: pin, pinned: "1.9.0", wantTarget: "1.9.0"},
+		{name: "a pin equal to the running version with a v prefix is sent as pinned", running: "1.9.0", releases: []release{{"1.10.0", true, false}}, mode: pin, pinned: "v1.9.0", wantTarget: "v1.9.0"},
 		{name: "healthy hold sends nothing", running: "1.0.0", releases: []release{{"1.1.0", true, false}}, mode: hold},
 		{name: "revoked running version recovers to a lower default", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, true}}, mode: follow, wantTarget: "1.9.0", wantRecovery: true},
 		{name: "revoked running version recovers under hold", running: "1.10.0", releases: []release{{"1.9.0", true, false}, {"1.10.0", false, true}}, mode: hold, wantTarget: "1.9.0", wantRecovery: true},
@@ -967,6 +974,148 @@ func TestAgentUpdateTargetOrdering(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPinEqualToRunningVersionDropsQueuedUpdate checks that a PIN whose
+// version equals the running version is still sent, once per channel and
+// decision: the agent may hold a queued newer update, and a command for the
+// version that it already runs makes it drop that update. FOLLOW_DEFAULT with
+// an equal default sends nothing.
+func TestPinEqualToRunningVersionDropsQueuedUpdate(t *testing.T) {
+	const (
+		follow = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_FOLLOW_DEFAULT
+		pin    = ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_PIN
+	)
+	setPolicy := func(t *testing.T, org *testenv.Org, mode ownsandv1.AgentVersionPolicyMode, pinned string) {
+		t.Helper()
+		if _, err := org.OwnerClient.Device.UpdateAgentVersionPolicy(context.Background(), connect.NewRequest(&ownsandv1.UpdateAgentVersionPolicyRequest{OrganizationId: org.ID, Mode: mode, PinnedVersion: pinned})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// settle waits until the lease holder evaluated every earlier policy
+	// event (it processes control events in order, so the configuration of a
+	// later limits change shows it) and the channel handled the earlier
+	// envelopes.
+	var settleN int32
+	settle := func(t *testing.T, org *testenv.Org, dev *testenv.Device, agent *testenv.FakeAgent) {
+		t.Helper()
+		settleN++
+		if _, err := org.OwnerClient.Device.UpdateDeviceLimits(context.Background(), connect.NewRequest(&ownsandv1.UpdateDeviceLimitsRequest{OrganizationId: org.ID, DeviceId: dev.ID,
+			Limits: &ownsandv1.DeviceLimits{VcpuCount: 10 + settleN, MemoryMib: 8192, DiskGib: 100, VcpuOvercommitPercent: 200}})); err != nil {
+			t.Fatal(err)
+		}
+		agent.WaitFor("new configuration", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetConfiguration().GetLimits().GetVcpuCount() == 10+settleN
+		})
+		agent.Heartbeat(uint64(100 + settleN))
+		agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == uint64(100+settleN) })
+	}
+	updates := func(agent *testenv.FakeAgent) (out []*ownsandv1.UpdateAgentCommand) {
+		for _, c := range agent.Commands() {
+			if u := c.GetUpdateAgent(); u != nil {
+				out = append(out, u)
+			}
+		}
+		return out
+	}
+	wantUpdates := func(t *testing.T, agent *testenv.FakeAgent, want ...string) {
+		t.Helper()
+		got := updates(agent)
+		if len(got) != len(want) {
+			t.Fatalf("update commands = %v, want targets %v", got, want)
+		}
+		for i, u := range got {
+			if u.GetTargetVersion() != want[i] || u.GetRevocationRecovery() {
+				t.Fatalf("update %d = %v, want target %q without recovery", i, u, want[i])
+			}
+		}
+	}
+
+	t.Run("a pin to the running version drops a queued update", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.1.0', 1, 1, true, false), ('1.0.0', 1, 1, false, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev, agent := setupAgent(t, env, org, nil)
+		agent.WaitFor("queued update target", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetCommand().GetUpdateAgent().GetTargetVersion() == "1.1.0"
+		})
+		// The agent verified the target and holds it until it is idle.
+		agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{Sequence: 1, UpdateState: ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_PENDING_IDLE, UpdateTargetVersion: "1.1.0"}}})
+		agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 1 })
+
+		setPolicy(t, org, pin, "1.0.0")
+		agent.Eventually("the pin command", func() bool { return len(updates(agent)) == 2 })
+		wantUpdates(t, agent, "1.1.0", "1.0.0")
+
+		// The agent drops the queued update and reports it.
+		agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Heartbeat{Heartbeat: &ownsandv1.Heartbeat{Sequence: 2, UpdateState: ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE}}})
+		agent.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 2 })
+		testenv.Eventually(t, "up to date stored", func() bool {
+			var state int16
+			var since *time.Time
+			if err := env.DB.Pool.QueryRow(ctx, "SELECT update_state, pending_idle_since FROM devices WHERE device_id = $1", dev.ID).Scan(&state, &since); err != nil {
+				t.Fatal(err)
+			}
+			return state == int16(ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE) && since == nil
+		})
+
+		// The same decision on the same channel sends nothing again.
+		setPolicy(t, org, pin, "1.0.0")
+		settle(t, org, dev, agent)
+		wantUpdates(t, agent, "1.1.0", "1.0.0")
+
+		// A change back to FOLLOW_DEFAULT sends the newer default again.
+		setPolicy(t, org, follow, "")
+		agent.Eventually("the default again", func() bool { return len(updates(agent)) == 3 })
+		wantUpdates(t, agent, "1.1.0", "1.0.0", "1.1.0")
+	})
+
+	t.Run("a pin to the running version is sent once per channel", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.0.0', 1, 1, true, false)"); err != nil {
+			t.Fatal(err)
+		}
+		setPolicy(t, org, pin, "1.0.0")
+		dev, agent := setupAgent(t, env, org, nil)
+		agent.WaitFor("pin command", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetCommand().GetUpdateAgent().GetTargetVersion() == "1.0.0"
+		})
+		// Repeated evaluations on the same channel send no second command.
+		setPolicy(t, org, pin, "1.0.0")
+		settle(t, org, dev, agent)
+		agent.SendStateReport()
+		settle(t, org, dev, agent)
+		wantUpdates(t, agent, "1.0.0")
+
+		// A new channel may meet an agent that still holds a queued update,
+		// so it gets the command once more.
+		agent.Close()
+		again := env.NewFakeAgent(dev)
+		again.Connect()
+		again.WaitFor("pin command on the new channel", func(e *ownsandv1.AgentEnvelope) bool {
+			return e.GetCommand().GetUpdateAgent().GetTargetVersion() == "1.0.0"
+		})
+		again.Heartbeat(1)
+		again.WaitFor("heartbeat ack", func(e *ownsandv1.AgentEnvelope) bool { return e.GetHeartbeatAck().GetSequence() == 1 })
+		wantUpdates(t, again, "1.0.0")
+	})
+
+	t.Run("an equal default under FOLLOW_DEFAULT sends nothing", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.0.0', 1, 1, true, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev, agent := setupAgent(t, env, org, nil)
+		settle(t, org, dev, agent)
+		wantUpdates(t, agent)
+	})
 }
 
 func TestDeviceRemovalOverTheChannel(t *testing.T) {

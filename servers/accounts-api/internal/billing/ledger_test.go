@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -17,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/delinoio/mono/go/uuidv7"
@@ -243,6 +245,27 @@ func (f *fixture) wantLedger(accountID string, want ...wantEntry) {
 		}
 	}
 	f.checkInvariant(accountID)
+}
+
+// TestLedgerGrantAtMinimumBalance checks that a grant commits at the smallest
+// signed balance, where negating the balance would overflow: the whole grant
+// pays off debt and no credit remains.
+func TestLedgerGrantAtMinimumBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	if _, err := f.db.Pool.Exec(ctx(), `UPDATE billing_accounts SET balance_usd_micros = $2 WHERE billing_account_id = $1`,
+		acct, int64(math.MinInt64)); err != nil {
+		t.Fatal(err)
+	}
+	grantID := f.grant(acct, LedgerManualTopUp, 10*usd)
+	if f.remaining(grantID) != 0 || f.balance(acct) != math.MinInt64+10*usd {
+		t.Fatalf("after the grant: remaining %d, balance %d", f.remaining(grantID), f.balance(acct))
+	}
+	entries := f.ledger(acct)
+	if len(entries) != 1 || entries[0].Kind != LedgerManualTopUp || entries[0].Amount != 10*usd ||
+		entries[0].BalanceAfter != math.MinInt64+10*usd {
+		t.Fatalf("ledger = %+v", entries)
+	}
 }
 
 func TestLedgerFIFOAndDebtPayoff(t *testing.T) {
@@ -1127,4 +1150,41 @@ func TestSubmittedAutoTopUpSurvivesSettingsChange(t *testing.T) {
 
 func autoSettings(enabled bool, threshold, amount, limit int64) *accountsv1.AutoTopUpSettings {
 	return &accountsv1.AutoTopUpSettings{Enabled: enabled, ThresholdUsdMicros: threshold, AmountUsdMicros: amount, MonthlyCapUsdMicros: limit}
+}
+
+// A 429 whose body breaks while it is read is still a 429: Paddle did not
+// process the charge, so the manual top-up is removed and the same
+// idempotency key charges again.
+func TestManualTopUpUnreadableRateLimitCanBeRetried(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	authorize := func(pgx.Tx) error { return nil }
+	key, err := uuidv7.NewString()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusTooManyRequests, Truncate: true})
+
+	err = f.s.CreateTopUp(ctx(), acct, "owner-1", key, 25*usd, authorize, nil, nil)
+	if connect.CodeOf(err) != connect.CodeUnavailable {
+		t.Fatalf("CreateTopUp with an unreadable 429 = %v, want unavailable", err)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 0 {
+		t.Fatalf("top-ups after the unreadable 429 = %v, want none", got)
+	}
+	if len(f.paddle.Charges()) != 1 {
+		t.Fatalf("charges = %d, want 1", len(f.paddle.Charges()))
+	}
+
+	f.paddle.FailCharges(nil)
+	if err := f.s.CreateTopUp(ctx(), acct, "owner-1", key, 25*usd, authorize, nil, nil); err != nil {
+		t.Fatalf("retry with the same key = %v", err)
+	}
+	if len(f.paddle.Charges()) != 2 {
+		t.Fatalf("charges after the retry = %d, want 2", len(f.paddle.Charges()))
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "charged" {
+		t.Fatalf("top-ups after the retry = %v", got)
+	}
 }
