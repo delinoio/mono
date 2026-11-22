@@ -10,7 +10,7 @@ import {
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { toast } from "delino-ui/toast";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   invalidateServices,
   POLL_INTERVAL_MS,
@@ -71,13 +71,36 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
   const resume = useMutation(SandboxService.method.resumeSandbox, {
     onSuccess: refresh,
   });
+  // Deleting a sandbox frees its allocation on the device. DeleteSandbox
+  // can return while the sandbox is still `DELETING`, so the effect below
+  // invalidates the device queries again once the polled state settles.
   const remove = useMutation(SandboxService.method.deleteSandbox, {
-    onSuccess: refresh,
+    onSuccess: () => {
+      void invalidateServices(queryClient, DeviceService);
+      return refresh();
+    },
   });
   const snapshot = useMutation(SnapshotService.method.createSnapshot, {
     onSuccess: refresh,
   });
   const [confirmDelete, setConfirmDelete] = useState(false);
+
+  // A sandbox that leaves `CREATING` or `DELETING` changes the allocation of
+  // its device, so the device queries are stale from that moment.
+  const polledState = query.data?.sandbox?.state;
+  const previousState = useRef(polledState);
+  useEffect(() => {
+    const before = previousState.current;
+    previousState.current = polledState;
+    if (
+      before !== undefined &&
+      polledState !== undefined &&
+      sandboxSettling({ state: before }) &&
+      !sandboxSettling({ state: polledState })
+    ) {
+      void invalidateServices(queryClient, DeviceService);
+    }
+  }, [polledState, queryClient]);
 
   if (query.isPending) return <Loading label="Loading the sandbox" />;
   if (query.error)

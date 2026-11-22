@@ -1038,6 +1038,24 @@ export function createMockTransport(
             s.endReason = SandboxEndReason.DEVICE_REMOVED;
           }
         }
+        // Like the real control plane, delete the records of snapshots that
+        // exist only on the removed device, and the templates that reference
+        // them. An exported snapshot is organization data: it stays, without
+        // a local copy.
+        const dropped = new Set(
+          org.snapshots
+            .filter(
+              (s) =>
+                s.deviceId === device.deviceId &&
+                s.exportState !== SnapshotExportState.EXPORTED,
+            )
+            .map((s) => s.snapshotId),
+        );
+        org.snapshots = org.snapshots.filter((s) => !dropped.has(s.snapshotId));
+        org.templates = org.templates.filter((t) => !dropped.has(t.snapshotId));
+        for (const s of org.snapshots) {
+          if (s.deviceId === device.deviceId) s.deviceId = "";
+        }
         return { device };
       },
       getAgentVersionPolicy(req) {

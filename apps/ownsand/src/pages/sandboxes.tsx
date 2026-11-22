@@ -333,6 +333,9 @@ function CreateSandboxDialog({
           network: { mode: Number(network) as NetworkMode },
           labels: parsed.labels,
         });
+        // A new sandbox changes the allocation of its device. The device
+        // queries are marked stale for their next view and not awaited.
+        void invalidateServices(queryClient, DeviceService);
         await invalidateServices(queryClient, SandboxService);
         onOpenChange(false);
         reset();

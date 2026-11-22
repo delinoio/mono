@@ -17,9 +17,11 @@ import {
 import {
   type DeviceLimitsInput,
   type Resources,
+  SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
@@ -680,6 +682,168 @@ describe("devices", () => {
     await settle(100);
     expect(await screen.findByText("studio-mac")).toBeTruthy();
     expect(screen.queryByText("build-box-1")).toBeNull();
+  });
+});
+
+describe("cached lists after a mutation that changes another service", () => {
+  /** The console with the production query client, whose staleTime is 10 s. */
+  function renderCounting(
+    path: string,
+    mock: Transport = createMockTransport(),
+  ) {
+    const counted = countingTransport(mock);
+    renderConsole(path, {
+      transport: counted.transport,
+      queryClient: createQueryClient(),
+    });
+    return counted;
+  }
+
+  const open = async (name: string | RegExp) => {
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("link", { name }));
+    });
+    await settle(60);
+  };
+
+  const confirmRemoveDevice = async () => {
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Remove device" }),
+      );
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Remove device" }),
+      );
+    });
+    await settle(100);
+  };
+
+  test("a removed device's sandboxes, snapshots and templates leave the fresh cached lists", async () => {
+    const { calls } = renderCounting(`/orgs/${MOCK_IDS.acme}/snapshots`);
+    expect(await screen.findByText("node-24-toolchain")).toBeTruthy();
+    await open("Sandboxes");
+    await open("Devices");
+    const before = { ...calls };
+    await open("build-box-1");
+    await confirmRemoveDevice();
+    // The device list is the page that the removal returns to.
+    expect(await screen.findByText("studio-mac")).toBeTruthy();
+    // The cached lists are inactive here and refetch when a page shows them
+    // again, although their 10 s staleTime has not passed.
+    await open("Snapshots");
+    expect(await screen.findByText("No snapshots")).toBeTruthy();
+    expect(screen.queryByText("node-24-toolchain")).toBeNull();
+    expect(calls.ListSnapshots).toBeGreaterThan(before.ListSnapshots ?? 0);
+    expect(calls.ListTemplates).toBeGreaterThan(before.ListTemplates ?? 0);
+    await open("Sandboxes");
+    expect(calls.ListSandboxes).toBeGreaterThan(before.ListSandboxes ?? 0);
+    expect(screen.queryByText("Running")).toBeNull();
+  });
+
+  test("a created sandbox invalidates the device queries", async () => {
+    const { calls } = renderCounting(`/orgs/${MOCK_IDS.acme}/sandboxes`);
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Create sandbox" }),
+      );
+    });
+    await settle(60);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create a sandbox",
+    });
+    const before = calls.ListDevices ?? 0;
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(100);
+    expect(calls.CreateSandbox).toBe(1);
+    expect(calls.ListDevices).toBeGreaterThan(before);
+  });
+
+  test("a deleted sandbox invalidates the device queries", async () => {
+    const { calls } = renderCounting(
+      `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await settle(60);
+    const before = calls.ListDevices ?? 0;
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Delete sandbox" }),
+      );
+    });
+    await settle(100);
+    expect(calls.DeleteSandbox).toBe(1);
+    expect(calls.ListDevices).toBeGreaterThan(before);
+  });
+
+  test("a sandbox that is still deleting invalidates the device queries once its state settles", async () => {
+    const mock = createMockTransport();
+    let polls = 0;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        const response = await mock.unary(method, ...rest);
+        // DeleteSandbox and the first read after it report DELETING, as the
+        // control plane does when the agent has not finished. The response
+        // is a copy, so the mock's own state stays DELETED.
+        const { sandbox } = response.message as { sandbox?: Sandbox };
+        if (
+          (method.name === "DeleteSandbox" ||
+            (method.name === "GetSandbox" && polls++ === 1)) &&
+          sandbox
+        ) {
+          sandbox.state = SandboxState.DELETING;
+        }
+        return response;
+      },
+    };
+    const { calls } = renderCounting(
+      `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+      transport,
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Delete sandbox" }),
+      );
+    });
+    await settle(100);
+    const afterDelete = calls.ListDevices ?? 0;
+    // The page polls every 3 s while the sandbox is DELETING.
+    await settle(3_500);
+    expect(calls.ListDevices).toBeGreaterThan(afterDelete);
+  }, 15_000);
+
+  test("pause, resume and snapshot do not refetch the device queries", async () => {
+    const { calls } = renderCounting(
+      `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+    );
+    const press = async (name: string) => {
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", { name }));
+      });
+      await settle(100);
+    };
+    await screen.findByRole("button", { name: "Pause" });
+    await settle(60);
+    const before = calls.ListDevices;
+    await press("Pause");
+    await press("Resume");
+    await press("Take snapshot");
+    expect(calls.PauseSandbox).toBe(1);
+    expect(calls.ResumeSandbox).toBe(1);
+    expect(calls.CreateSnapshot).toBe(1);
+    expect(calls.ListDevices).toBe(before);
   });
 });
 
