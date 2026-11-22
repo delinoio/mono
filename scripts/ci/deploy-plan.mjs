@@ -28,9 +28,9 @@ export const DeployKind = Object.freeze({
   StaticSite: "static-site",
 });
 
-// Kind order of a deployment: the database stage (not implemented yet; see
-// the deployment workflow contract) comes first, then servers, then static
-// sites, which call the servers.
+// Kind order of a deployment: servers, then static sites, which call the
+// servers. There is no database stage: each server applies its own embedded
+// migrations at startup (see the deployment workflow contract).
 const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 
 // A Map, not a plain object: `Map.get` matches by SameValueZero, so inherited
@@ -124,6 +124,19 @@ const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 const minimumDropletPort = 1024;
 const maximumDropletPort = 65535;
 
+// Stable identifiers of the `deploy.upstreamProtocol` manifest field: the
+// protocol that the reverse proxy uses toward the container. `h2c` (HTTP/2
+// without TLS) is for servers whose bidirectional streams need HTTP/2 from end
+// to end; every other server keeps the default `http1`.
+export const UpstreamProtocol = Object.freeze({
+  Http1: "http1",
+  H2c: "h2c",
+});
+
+// `droplet-deploy.sh` receives the UDP host ports of a server as one argument:
+// a comma-separated list, or this value when the server publishes none.
+export const noUdpPorts = "none";
+
 export class DeployPlanError extends Error {}
 
 // Reads every workspace package directly inside a workspace root.
@@ -208,12 +221,39 @@ function deployable(pkg) {
         `${name}: deploy.port must be an integer from ${minimumDropletPort} to ${maximumDropletPort}`,
       );
     }
+    const upstreamProtocol = deploy.upstreamProtocol ?? UpstreamProtocol.Http1;
+    if (!Object.values(UpstreamProtocol).includes(upstreamProtocol)) {
+      throw new DeployPlanError(
+        `${name}: deploy.upstreamProtocol must be one of ${Object.values(UpstreamProtocol).join(", ")}`,
+      );
+    }
+    const udpPorts = deploy.udpPorts ?? [];
+    // The Droplet publishes each UDP port on the same host port, so ports
+    // below 1024 are excluded like the container port (UDP 443 belongs to
+    // the reverse proxy).
+    if (
+      !Array.isArray(udpPorts) ||
+      (deploy.udpPorts !== undefined && udpPorts.length === 0) ||
+      !udpPorts.every(
+        (p) =>
+          Number.isInteger(p) &&
+          p >= minimumDropletPort &&
+          p <= maximumDropletPort,
+      ) ||
+      new Set(udpPorts).size !== udpPorts.length
+    ) {
+      throw new DeployPlanError(
+        `${name}: deploy.udpPorts must be a nonempty list of different integers from ${minimumDropletPort} to ${maximumDropletPort}`,
+      );
+    }
     return {
       ...base,
       service: deploy.service,
       hostname: deploy.hostname,
-      // A string, so that the deploy loop can require nonempty string fields.
+      // Strings, so that the deploy loop can require nonempty string fields.
       port: String(deploy.port),
+      upstreamProtocol,
+      udpPorts: udpPorts.length > 0 ? udpPorts.join(",") : noUdpPorts,
     };
   }
   if (typeof deploy.project !== "string" || deploy.project === "") {
@@ -393,7 +433,8 @@ export function check(repoRoot) {
 
 // Two deployables that name the same Droplet service or Pages project would
 // overwrite each other, while both get a release tag. Two Droplet services
-// with the same host name would replace each other's reverse proxy route.
+// with the same host name would replace each other's reverse proxy route, and
+// two that publish the same UDP port could not run at the same time.
 // Checks every deployable of the workspace, selected or not.
 function rejectSharedDestinations(packages) {
   const owners = new Map();
@@ -403,6 +444,10 @@ function rejectSharedDestinations(packages) {
     const keys = [`${d.target}:${d.service ?? d.project}`];
     if (d.hostname !== undefined)
       keys.push(`${d.target}-hostname:${d.hostname}`);
+    if (d.udpPorts !== undefined && d.udpPorts !== noUdpPorts) {
+      for (const port of d.udpPorts.split(","))
+        keys.push(`${d.target}-udp:${port}`);
+    }
     for (const key of keys) {
       const owner = owners.get(key);
       if (owner) {
