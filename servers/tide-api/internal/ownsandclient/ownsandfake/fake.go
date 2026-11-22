@@ -6,6 +6,9 @@
 // capacity limit, the idempotency of CreateSandbox, guest files and execs.
 // It is not a model of the OwnSand scheduler: a test sets the capacity
 // (MaxSandboxes), scripts CreateSandbox errors and ends sandboxes itself.
+// Its own errors are wire errors (connect.NewWireError), as OwnSand sends
+// them; a scripted error made with connect.NewError models a transport
+// failure or an intermediary's answer.
 package ownsandfake
 
 import (
@@ -217,13 +220,13 @@ func (c *client) begin(rpc string) (*Org, error) {
 		if o.APIKey != "" && o.APIKey == c.key {
 			if o.ID != c.org {
 				c.f.mu.Unlock()
-				return nil, connect.NewError(connect.CodeNotFound, errors.New("organization not found"))
+				return nil, connect.NewWireError(connect.CodeNotFound, errors.New("organization not found"))
 			}
 			return o, nil
 		}
 	}
 	c.f.mu.Unlock()
-	return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid API key"))
+	return nil, connect.NewWireError(connect.CodeUnauthenticated, errors.New("invalid API key"))
 }
 
 func (c *client) ListDevices(ctx context.Context) ([]*ownsandv1.Device, error) {
@@ -247,7 +250,7 @@ func (c *client) TemplateGuestOS(ctx context.Context, templateID string) (ownsan
 	defer c.f.mu.Unlock()
 	g, ok := o.Templates[templateID]
 	if !ok {
-		return 0, connect.NewError(connect.CodeNotFound, errors.New("template not found"))
+		return 0, connect.NewWireError(connect.CodeNotFound, errors.New("template not found"))
 	}
 	return g, nil
 }
@@ -259,7 +262,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 	}
 	defer c.f.mu.Unlock()
 	if req.GetIdempotencyKey() == "" || req.GetPlacement().GetDeviceId() != "" {
-		return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("tide sends an idempotency key and no device ID"))
+		return nil, connect.NewWireError(connect.CodeInvalidArgument, errors.New("tide sends an idempotency key and no device ID"))
 	}
 	encoded, err := proto.MarshalOptions{Deterministic: true}.Marshal(req)
 	if err != nil {
@@ -267,7 +270,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 	}
 	if id, ok := o.keys[req.GetIdempotencyKey()]; ok {
 		if !bytes.Equal(o.requests[req.GetIdempotencyKey()], encoded) {
-			return nil, connect.NewError(connect.CodeAlreadyExists, errors.New("the idempotency_key was used with other parameters"))
+			return nil, connect.NewWireError(connect.CodeAlreadyExists, errors.New("the idempotency_key was used with other parameters"))
 		}
 		if o.CreateResponseError != nil {
 			return nil, o.CreateResponseError
@@ -278,7 +281,7 @@ func (c *client) CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandbox
 		return nil, o.CreateError
 	}
 	if o.MaxSandboxes > 0 && o.active() >= o.MaxSandboxes {
-		return nil, connect.NewError(connect.CodeUnavailable, errors.New("no device has free capacity"))
+		return nil, connect.NewWireError(connect.CodeUnavailable, errors.New("no device has free capacity"))
 	}
 	id, _ := uuidv7.NewString()
 	state := ownsandv1.SandboxState_SANDBOX_STATE_CREATING
@@ -306,7 +309,7 @@ func (c *client) sandbox(rpc, id string) (*Org, *fakeSandbox, error) {
 	s, ok := o.sandboxes[id]
 	if !ok {
 		c.f.mu.Unlock()
-		return nil, nil, connect.NewError(connect.CodeNotFound, errors.New("sandbox not found"))
+		return nil, nil, connect.NewWireError(connect.CodeNotFound, errors.New("sandbox not found"))
 	}
 	return o, s, nil
 }
@@ -344,7 +347,7 @@ func (c *client) running(rpc, id string) error {
 	}
 	defer c.f.mu.Unlock()
 	if s.sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		return connect.NewError(connect.CodeFailedPrecondition, errors.New("sandbox is not running"))
+		return connect.NewWireError(connect.CodeFailedPrecondition, errors.New("sandbox is not running"))
 	}
 	return nil
 }
@@ -370,7 +373,7 @@ func (c *client) AttachExec(ctx context.Context, sandboxID, execID string, p own
 	if fn != nil {
 		return fn(ctx, sandboxID, execID, p)
 	}
-	return nil, connect.NewError(connect.CodeNotFound, errors.New("exec not found"))
+	return nil, connect.NewWireError(connect.CodeNotFound, errors.New("exec not found"))
 }
 
 func (f *Fake) execFunc() ExecFunc {
@@ -400,7 +403,7 @@ func (c *client) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileR
 		src, exists := s.files[p.Path]
 		if !exists {
 			c.f.mu.Unlock()
-			return 0, connect.NewError(connect.CodeNotFound, errors.New("no such file"))
+			return 0, connect.NewWireError(connect.CodeNotFound, errors.New("no such file"))
 		}
 		snap = append([]byte(nil), src...)
 		s.reads[p.ReadID] = snap
@@ -450,7 +453,7 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 		s.writes[w.p.WriteID] = fw
 	}
 	if old, ok := fw.ranges[offset]; ok && !bytes.Equal(old, data) {
-		return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
+		return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("chunk overlaps written bytes with different content"))
 	}
 	fw.ranges[offset] = append([]byte(nil), data...)
 	res := &ownsandv1.WriteFileResponse{WriteId: w.p.WriteID, Offset: offset, Length: int64(len(data))}
@@ -463,12 +466,12 @@ func (w *fileWrite) send(offset int64, data []byte, size *int64) (*ownsandv1.Wri
 		sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
 		for _, off := range offsets {
 			if off != int64(buf.Len()) {
-				return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the file"))
+				return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the file"))
 			}
 			buf.Write(fw.ranges[off])
 		}
 		if int64(buf.Len()) != *size {
-			return nil, connect.NewError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the size"))
+			return nil, connect.NewWireError(connect.CodeFailedPrecondition, errors.New("the written ranges do not cover the size"))
 		}
 		s.files[fw.path] = buf.Bytes()
 		res.Finished, res.SizeBytes = true, *size

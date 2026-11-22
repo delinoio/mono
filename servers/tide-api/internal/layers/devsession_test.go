@@ -101,7 +101,7 @@ func TestDevSessionQueueAndDeletion(t *testing.T) {
 	s3 := w.createSession(t, memberByKey, profileID)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
 		o.MaxSandboxes = 0
-		o.CreateError = connect.NewError(connect.CodeUnavailable, errors.New("full"))
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	del, err = memberByKey.DevSession.DeleteDevSession(ctx, connect.NewRequest(&tidev1.DeleteDevSessionRequest{OrganizationId: w.org.ID, DevSessionId: s3.GetDevSessionId()}))
 	if err != nil {
@@ -202,7 +202,7 @@ func TestDevSessionEnds(t *testing.T) {
 
 	// No device can run the profile.
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.CreateError = connect.NewError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
+		o.CreateError = connect.NewWireError(connect.CodeFailedPrecondition, errors.New("no eligible device"))
 	})
 	s = w.createSession(t, member, profileID)
 	s = w.waitState(t, s.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_FAILED)
@@ -239,7 +239,7 @@ func TestDevSessionEnds(t *testing.T) {
 
 	// The maximum queue wait ends a session that never got capacity.
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.CreateError = connect.NewError(connect.CodeUnavailable, errors.New("full"))
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	s = w.createSession(t, member, profileID)
 	stays(t, "queued", func() bool {

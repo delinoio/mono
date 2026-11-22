@@ -109,7 +109,7 @@ func TestWorkService(t *testing.T) {
 	running := w.createSession(t, w.env.User(w.org.Member), lowID)
 	running = w.waitState(t, running.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.CreateError = connect.NewError(connect.CodeUnavailable, errors.New("full"))
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	low := w.createSession(t, w.env.User(w.org.Member), lowID)
 	w.env.Clock.Advance(time.Second)
@@ -222,7 +222,7 @@ func TestCleanUps(t *testing.T) {
 	running = w.waitState(t, running.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 	eventually(t, "warm runner of b", func() bool { return w.fake.Active(w.osOrg) == 2 })
 	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
-		o.CreateError = connect.NewError(connect.CodeUnavailable, errors.New("full"))
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
 	})
 	queuedA := w.createSession(t, w.env.User(w.org.Member), aID)
 
@@ -359,6 +359,27 @@ func TestCreateRetryAfterProfileChange(t *testing.T) {
 	s = w.waitState(t, s.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
 	sandboxes := w.fake.Sandboxes(w.osOrg)
 	if len(sandboxes) != 1 || w.runner(t, s.GetRunnerId()).GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() || sandboxes[0].GetResources().GetVcpuCount() != 2 {
+		t.Fatalf("sandboxes %v", sandboxes)
+	}
+}
+
+// TestLostCreateResponseAsUnavailable: an unavailable error that OwnSand did
+// not send (a transport failure or an intermediary's 503) may hide a
+// created sandbox. The runner keeps its key and recovers that sandbox; no
+// second sandbox is created.
+func TestLostCreateResponseAsUnavailable(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateResponseError = connect.NewError(connect.CodeUnavailable, errors.New("503 Service Unavailable"))
+	})
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	eventually(t, "a sandbox with a lost response", func() bool { return len(w.fake.Sandboxes(w.osOrg)) == 1 })
+	stays(t, "one sandbox", func() bool { return len(w.fake.Sandboxes(w.osOrg)) == 1 })
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.CreateResponseError = nil })
+	s = w.waitState(t, s.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	sandboxes := w.fake.Sandboxes(w.osOrg)
+	if len(sandboxes) != 1 || w.runner(t, s.GetRunnerId()).GetOwnsandSandboxId() != sandboxes[0].GetSandboxId() {
 		t.Fatalf("sandboxes %v", sandboxes)
 	}
 }

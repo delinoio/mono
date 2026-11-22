@@ -463,16 +463,16 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 		e.ensureDriver(r.ID)
 		e.kickRunner(r.ID)
 		return createOK
-	case isCode(err, connect.CodeUnavailable):
+	case rejected(err, connect.CodeUnavailable):
 		// No device has free capacity: the sandbox does not exist, so the
 		// runner is removed and its request returns to the queue.
 		e.dropRunner(ctx, r, false)
 		return createUnavailable
-	case isCode(err, connect.CodeFailedPrecondition):
+	case rejected(err, connect.CodeFailedPrecondition):
 		// No device of the OwnSand organization can ever run the profile.
 		e.dropRunner(ctx, r, true)
 		return createFailed
-	case isCode(err, connect.CodeInvalidArgument), isCode(err, connect.CodeNotFound), isCode(err, connect.CodePermissionDenied):
+	case rejected(err, connect.CodeInvalidArgument), rejected(err, connect.CodeNotFound), rejected(err, connect.CodePermissionDenied):
 		// OwnSand rejected the request (for example, an unknown template):
 		// a start failure that counts as an attempt.
 		if berr := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error { return e.bindStartTx(ctx, tx, r) }); berr != nil {
@@ -486,6 +486,16 @@ func (e *Engine) applyCreate(ctx context.Context, r *Runner, sb *ownsandv1.Sandb
 		e.ensureDriver(r.ID)
 		return createFailed
 	}
+}
+
+// rejected reports whether OwnSand itself answered CreateSandbox with the
+// code. OwnSand answers an error only before it commits a sandbox, so such
+// an answer proves that the key created nothing. An error that the client
+// made from a transport failure or from the HTTP status of an intermediary
+// (for example a proxy's 503, which the client reads as unavailable) is not
+// such an answer: the sandbox may exist, so the result is uncertain.
+func rejected(err error, code connect.Code) bool {
+	return isCode(err, code) && connect.IsWireError(err)
 }
 
 // dropRunner removes a runner whose sandbox was never created. noDevice
