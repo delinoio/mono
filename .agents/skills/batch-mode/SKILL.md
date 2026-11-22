@@ -1,6 +1,7 @@
 ---
 name: batch-mode
 description: Use when a human explicitly invokes $batch-mode or requests Batch Mode, in which many issues are fixed in one batch run. List the Linear issues that the batch must fix and apply the batch CI constraints. Do not activate automatically for batch work or CI tasks.
+disable-model-invocation: true
 ---
 
 # Batch Mode
