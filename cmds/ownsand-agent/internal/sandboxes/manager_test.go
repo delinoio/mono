@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -70,6 +71,11 @@ type fakeRuntime struct {
 	// snapshotErr, like a runtime that paused the source and could not resume
 	// it (PAUSED); the fake does not pause anything for it.
 	snapshotSourceState ownsandv1.SandboxState
+	// snapshotViaHelper makes Snapshot behave like the macOS and Hyper-V
+	// runtimes: it runs the capture through vmruntime.SnapshotWithPause, with
+	// the Pause and Resume of the fake, so a resumeErr models a rejected
+	// resume that leaves the VM paused.
+	snapshotViaHelper bool
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
@@ -156,7 +162,7 @@ func (r *fakeRuntime) Resume(_ context.Context, vm vmruntime.VM) error {
 	r.mu.Unlock()
 	return nil
 }
-func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
+func (r *fakeRuntime) Snapshot(ctx context.Context, vm vmruntime.VM, dir string) (vmruntime.SnapshotInfo, error) {
 	if r.snapStarted != nil {
 		close(r.snapStarted)
 		<-r.snapBlock
@@ -172,7 +178,16 @@ func (r *fakeRuntime) Snapshot(_ context.Context, _ vmruntime.VM, dir string) (v
 		}
 		return vmruntime.SnapshotInfo{SizeBytes: 4}, nil
 	}
-	return capture()
+	if !r.snapshotViaHelper {
+		return capture()
+	}
+	r.mu.Lock()
+	wasPaused := r.paused[vm.SandboxID()]
+	r.mu.Unlock()
+	return vmruntime.SnapshotWithPause(slog.New(slog.NewTextHandler(io.Discard, nil)), vm.SandboxID(), wasPaused,
+		func() error { return r.Pause(ctx, vm) },
+		func() error { return r.Resume(ctx, vm) },
+		capture)
 }
 func (r *fakeRuntime) Delete(_ context.Context, id string) error {
 	r.mu.Lock()

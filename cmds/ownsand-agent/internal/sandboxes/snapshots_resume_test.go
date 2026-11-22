@@ -93,6 +93,66 @@ func requireResumeReachesRuntime(t *testing.T, e *env, id string) {
 	}
 }
 
+// TestSnapshotResumeFailureRecordsSourcePaused checks that a snapshot whose
+// runtime paused the running source and could not resume it fails, publishes
+// no capture, publishes the source as PAUSED with a newer revision, and that
+// one explicit resume then reaches the runtime. The fake runtime runs the
+// capture through the shared vmruntime.SnapshotWithPause helper, like the
+// macOS and Hyper-V runtimes.
+func TestSnapshotResumeFailureRecordsSourcePaused(t *testing.T) {
+	e := newEnv(t)
+	e.rt.snapshotViaHelper = true
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	before := e.out.lastEntry(id)
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: before.GetRevision()})
+	snapID, _ := uuidv7.NewString()
+
+	e.rt.mu.Lock()
+	e.rt.resumeErr = errors.New("hcs: resume rejected")
+	e.rt.mu.Unlock()
+	entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+	requireSnapshotFailedClean(t, e, snapID, entry, err)
+	if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("source state %v, want PAUSED", got)
+	}
+	last := e.out.lastEntry(id)
+	if last.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED || last.GetRevision().GetCounter() <= before.GetRevision().GetCounter() {
+		t.Fatalf("published %v, want PAUSED with a revision newer than %d", last, before.GetRevision().GetCounter())
+	}
+	if got := e.m.StateReport(2, nil).GetSandboxes()[0].GetState(); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("state report %v, want PAUSED", got)
+	}
+
+	// The runtime accepts a resume again; one explicit resume reaches it.
+	e.rt.mu.Lock()
+	e.rt.resumeErr = nil
+	e.rt.mu.Unlock()
+	requireResumeReachesRuntime(t, e, id)
+}
+
+// TestSnapshotCaptureAndResumeFailureRecordsSourcePaused checks that a
+// capture error stays the command result while the paused source is still
+// recorded.
+func TestSnapshotCaptureAndResumeFailureRecordsSourcePaused(t *testing.T) {
+	e := newEnv(t)
+	e.rt.snapshotViaHelper = true
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	snapID, _ := uuidv7.NewString()
+	e.rt.mu.Lock()
+	e.rt.snapshotErr = errors.New("disk copy failed")
+	e.rt.resumeErr = errors.New("hcs: resume rejected")
+	e.rt.mu.Unlock()
+	entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+	requireSnapshotFailedClean(t, e, snapID, entry, err)
+	if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("source state %v, want PAUSED", got)
+	}
+	e.rt.mu.Lock()
+	e.rt.resumeErr = nil
+	e.rt.mu.Unlock()
+	requireResumeReachesRuntime(t, e, id)
+}
+
 // TestSnapshotRuntimeReportedPausedSourceIsRecorded checks the outcome that a
 // runtime returns directly with its error, like the Firecracker runtime.
 func TestSnapshotRuntimeReportedPausedSourceIsRecorded(t *testing.T) {
@@ -132,6 +192,66 @@ func TestSnapshotErrorsThatKeepTheSourceState(t *testing.T) {
 			t.Fatalf("a state update %v was published, want none", last)
 		}
 	})
+	t.Run("capture error with successful resume", func(t *testing.T) {
+		e := newEnv(t)
+		e.rt.snapshotViaHelper = true
+		id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+		snapID, _ := uuidv7.NewString()
+		e.rt.mu.Lock()
+		e.rt.snapshotErr = errors.New("disk copy failed")
+		e.rt.mu.Unlock()
+		entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		requireSnapshotFailedClean(t, e, snapID, entry, err)
+		if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Fatalf("source state %v, want RUNNING", got)
+		}
+	})
+	t.Run("successful snapshot", func(t *testing.T) {
+		e := newEnv(t)
+		e.rt.snapshotViaHelper = true
+		id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+		snapID, _ := uuidv7.NewString()
+		en, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		if err != nil || en.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+			t.Fatalf("snapshot %v %v", en, err)
+		}
+		if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			t.Fatalf("source state %v, want RUNNING", got)
+		}
+	})
+	t.Run("already paused source is not resumed", func(t *testing.T) {
+		e := newEnv(t)
+		e.rt.snapshotViaHelper = true
+		id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+		if _, err := e.m.Pause(context.Background(), &ownsandv1.PauseSandboxCommand{SandboxId: id}); err != nil {
+			t.Fatal(err)
+		}
+		// A resume of this fake would fail; the capture must not call it.
+		e.rt.mu.Lock()
+		e.rt.resumeErr = errors.New("must not run")
+		e.rt.snapshotErr = errors.New("disk copy failed")
+		e.rt.mu.Unlock()
+		snapID, _ := uuidv7.NewString()
+		entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		requireSnapshotFailedClean(t, e, snapID, entry, err)
+		if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+			t.Fatalf("source state %v, want PAUSED", got)
+		}
+		if got := e.resumeCalls(); got != 0 {
+			t.Fatalf("%d runtime Resume calls for a source that was already paused", got)
+		}
+		e.rt.mu.Lock()
+		e.rt.snapshotErr = nil
+		e.rt.mu.Unlock()
+		snapID, _ = uuidv7.NewString()
+		en, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
+		if err != nil || en.GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+			t.Fatalf("snapshot of the paused source %v %v", en, err)
+		}
+		if got := e.sandboxState(id); got != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED || e.resumeCalls() != 0 {
+			t.Fatalf("source state %v after %d resumes, want PAUSED and none", got, e.resumeCalls())
+		}
+	})
 }
 
 // TestSnapshotPausedSourcePublicationFailureIsLogged checks that a source
@@ -140,6 +260,7 @@ func TestSnapshotErrorsThatKeepTheSourceState(t *testing.T) {
 func TestSnapshotPausedSourcePublicationFailureIsLogged(t *testing.T) {
 	logs := &lockedBuffer{}
 	e := newEnvWithLogger(t, slog.New(slog.NewJSONHandler(logs, nil)))
+	e.rt.snapshotViaHelper = true
 	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
 	n := e.out.count()
 	snapID, _ := uuidv7.NewString()
@@ -169,8 +290,7 @@ func TestSnapshotPausedSourcePublicationFailureIsLogged(t *testing.T) {
 	t.Cleanup(restoreAgentFile)
 
 	e.rt.mu.Lock()
-	e.rt.snapshotErr = errors.New("fcrt: resume after snapshot: rejected")
-	e.rt.snapshotSourceState = ownsandv1.SandboxState_SANDBOX_STATE_PAUSED
+	e.rt.resumeErr = errors.New("hcs: resume rejected")
 	e.rt.mu.Unlock()
 	entry, err := e.m.CreateSnapshot(context.Background(), &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: id})
 	requireSnapshotFailedClean(t, e, snapID, entry, err)
