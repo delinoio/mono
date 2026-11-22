@@ -128,7 +128,7 @@ func (a *app) billingStatus(ctx context.Context, name string, args []string) err
 // printBillingText writes the text result to w, a stickyWriter that holds the
 // first write error for the caller.
 func (a *app) printBillingText(w *stickyWriter, org string, billing *ownsandv1.OrganizationBilling, usage *ownsandv1.GetBillingUsageResponse) {
-	line := func(k, v string) { fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, k), v) }
+	line := func(k, v string) { fmt.Fprintf(w, "%s: %s\n", a.paint(ansiCyan, safeText(k)), safeText(v)) }
 	line("organization", org)
 	line("status", enumName(billing.GetPhase()))
 	if r := billing.GetReason(); r != ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED {
