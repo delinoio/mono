@@ -12,7 +12,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -78,7 +78,7 @@ type statusFixture struct {
 	*fixture
 	fake     *accountstest.Server
 	statuses *billing.Statuses
-	registry *prometheus.Registry
+	registry *testMeter
 }
 
 func newStatusFixture(t *testing.T, start time.Time) *statusFixture {
@@ -86,7 +86,7 @@ func newStatusFixture(t *testing.T, start time.Time) *statusFixture {
 	f.fake = accountstest.New(t, f.clock.Now)
 	f.fake.AddAccount(accountA, "Account A", map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
 	f.fake.AddAccount(accountB, "Account B", map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN})
-	f.registry = prometheus.NewRegistry()
+	f.registry = newTestMeter(t)
 	f.statuses = billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Metrics: f.registry})
 	return f
 }
@@ -442,24 +442,13 @@ func TestStatusMetrics(t *testing.T) {
 	}
 	expect := func(phase string, want float64) {
 		t.Helper()
-		g, err := f.registry.Gather()
-		if err != nil {
-			t.Fatal(err)
+		got, ok := f.registry.gauge(t, "ownsand_billing_organizations", attribute.String("phase", phase))
+		if !ok {
+			t.Fatalf("no %s sample", phase)
 		}
-		for _, mf := range g {
-			if mf.GetName() != "ownsand_billing_organizations" {
-				continue
-			}
-			for _, m := range mf.GetMetric() {
-				if m.GetLabel()[0].GetValue() == phase {
-					if got := m.GetGauge().GetValue(); got != want {
-						t.Fatalf("%s = %v, want %v", phase, got, want)
-					}
-					return
-				}
-			}
+		if got != want {
+			t.Fatalf("%s = %v, want %v", phase, got, want)
 		}
-		t.Fatalf("no %s sample", phase)
 	}
 	expect("allowed", 1)
 	expect("blocked", 1)
@@ -472,15 +461,7 @@ func TestStatusMetrics(t *testing.T) {
 	}
 	expect("blocked", 0)
 	expect("suspended", 1)
-	g, err := f.registry.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, mf := range g {
-		found = found || mf.GetName() == "ownsand_billing_pending_unlinks"
-	}
-	if !found {
-		t.Fatal("ownsand_billing_pending_unlinks is not registered")
+	if _, ok := f.registry.gauge(t, "ownsand_billing_pending_unlinks"); !ok {
+		t.Fatal("ownsand_billing_pending_unlinks is not recorded")
 	}
 }

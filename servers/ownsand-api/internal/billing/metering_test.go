@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/prometheus/client_golang/prometheus"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
@@ -242,7 +241,7 @@ func TestFlushSealAndReport(t *testing.T) {
 	accounts.statuses = []*accountsv1.OrganizationBillingStatus{{Service: accountsv1.ServiceId_SERVICE_ID_OWNSAND, OrganizationId: org1, Status: accountsv1.BillingStatus_BILLING_STATUS_ALLOWED, Sequence: 7}}
 	accounts.unattributed[org2] = true
 	sink := &statusRecorder{}
-	reg := prometheus.NewRegistry()
+	reg := newTestMeter(t)
 	m := f.metering(client, func(o *billing.Options) { o.Statuses = sink; o.Metrics = reg })
 	ctx := context.Background()
 
@@ -315,7 +314,7 @@ func TestFlushSealAndReport(t *testing.T) {
 	if got := gauge(t, reg, "ownsand_billing_usage_outbox_depth"); got != 3 {
 		t.Fatalf("outbox depth = %v", got)
 	}
-	if got := gauge(t, reg, "ownsand_billing_usage_report_lag_seconds"); got != 60 {
+	if got := gauge(t, reg, "ownsand_billing_usage_report_lag"); got != 60 {
 		t.Fatalf("report lag = %v", got)
 	}
 
@@ -363,19 +362,13 @@ func TestFlushSealAndReport(t *testing.T) {
 	}
 }
 
-func gauge(t *testing.T, reg *prometheus.Registry, name string) float64 {
+func gauge(t *testing.T, reg *testMeter, name string) float64 {
 	t.Helper()
-	mfs, err := reg.Gather()
-	if err != nil {
-		t.Fatal(err)
+	v, ok := reg.gauge(t, name)
+	if !ok {
+		t.Fatalf("metric %s not recorded", name)
 	}
-	for _, mf := range mfs {
-		if mf.GetName() == name {
-			return mf.GetMetric()[0].GetGauge().GetValue()
-		}
-	}
-	t.Fatalf("metric %s not registered", name)
-	return 0
+	return v
 }
 
 // TestReportSurvivesOutageAndRestart covers the outbox across an accounts-api

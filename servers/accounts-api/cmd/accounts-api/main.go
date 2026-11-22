@@ -24,6 +24,7 @@ import (
 	"github.com/delinoio/mono/servers/accounts-api/internal/metrics"
 	"github.com/delinoio/mono/servers/accounts-api/internal/paddle"
 	"github.com/delinoio/mono/servers/accounts-api/internal/server"
+	"github.com/delinoio/mono/servers/internal/telemetry"
 )
 
 const shutdownTimeout = 10 * time.Second
@@ -63,7 +64,20 @@ func run() error {
 		return err
 	}
 
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: cfg.LogLevel.SlogLevel()}))
+	tel, err := telemetry.New(context.Background(), telemetry.Options{ServiceName: "accounts-api", Level: cfg.LogLevel.SlogLevel()})
+	if err != nil {
+		return err
+	}
+	// This deferred call runs last, so the OTLP export flushes the records of
+	// the shutdown.
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), telemetry.ShutdownTimeout)
+		defer cancel()
+		if err := tel.Shutdown(ctx); err != nil {
+			slog.Error("telemetry_shutdown_failed", slog.Any("error", err))
+		}
+	}()
+	logger := tel.Logger
 	slog.SetDefault(logger)
 
 	ctx, stop := shutdownContext()
@@ -84,7 +98,10 @@ func run() error {
 
 	// The metrics exist also without METRICS_ADDR, so the code that records
 	// them never checks whether the listener runs.
-	appMetrics := metrics.New()
+	appMetrics, err := metrics.New(tel.MeterProvider)
+	if err != nil {
+		return err
+	}
 	handler, billingService, err := newHandler(cfg, database, logger, appMetrics)
 	if err != nil {
 		return err
@@ -119,13 +136,14 @@ func run() error {
 	})}
 	if metricsListener != nil {
 		backgroundErrs = append(backgroundErrs, runAsync(func() error {
-			return metrics.Serve(background, metricsListener, appMetrics, logger)
+			return metrics.Serve(background, metricsListener, tel.MetricsHandler(slog.NewLogLogger(logger.Handler(), slog.LevelError)), logger)
 		}))
 	}
 
 	srv := newServer(handler, logger)
 
-	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)))
+	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)),
+		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
 	serveErr := serve(ctx, stop, srv, listener, logger, shutdownTimeout)
 	stopBackground()
 	errs := []error{serveErr}

@@ -30,7 +30,8 @@
         "LOGTO_TOKEN_ENDPOINT",
         "ACCOUNTS_M2M_CLIENT_ID",
         "ACCOUNTS_M2M_CLIENT_SECRET",
-        "METRICS_ADDR"
+        "METRICS_ADDR",
+        "OTEL_*"
       ]
     },
     "build": {

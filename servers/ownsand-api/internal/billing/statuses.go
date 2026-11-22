@@ -11,7 +11,8 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
@@ -58,8 +59,8 @@ type StatusOptions struct {
 	// poll and the pending unlinks stay idle, and the RPCs that need
 	// delino-accounts fail with unavailable.
 	Client accountsv1connect.UsageServiceClient
-	// Metrics registers the status metrics; nil registers none.
-	Metrics prometheus.Registerer
+	// Metrics provides the meter of the status metrics; nil records none.
+	Metrics metric.MeterProvider
 	// Timing overrides DefaultStatusTiming.
 	Timing *StatusTiming
 }
@@ -245,7 +246,7 @@ func (s *Statuses) Poll(ctx context.Context) error {
 				return err
 			}
 			code := connect.CodeOf(err).String()
-			s.metrics.pollFailures.WithLabelValues(code).Inc()
+			add(s.metrics.pollFailures, attribute.String("code", code))
 			s.logger.WarnContext(ctx, "billing_status_poll_failed", slog.String("code", code), slog.Int64("after_sequence", after), slog.Any("error", err))
 			return err
 		}
@@ -438,7 +439,7 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	counts := map[ownsandv1.BillingPhase]float64{}
+	counts := map[ownsandv1.BillingPhase]int64{}
 	for rows.Next() {
 		var phase int16
 		var n int64
@@ -446,20 +447,20 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		counts[ownsandv1.BillingPhase(phase)] += float64(n)
+		counts[ownsandv1.BillingPhase(phase)] += n
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}
 	for _, p := range []ownsandv1.BillingPhase{PhaseAllowed, PhaseBlocked, PhaseSuspended} {
-		s.metrics.organizations.WithLabelValues(PhaseName(p)).Set(counts[p])
+		s.metrics.organizations.Record(ctx, counts[p], metric.WithAttributes(attribute.String("phase", PhaseName(p))))
 	}
 	var pending int64
 	if err := s.db.Pool.QueryRow(ctx, "SELECT count(*) FROM billing_pending_unlinks").Scan(&pending); err != nil {
 		return err
 	}
-	s.metrics.pendingUnlinks.Set(float64(pending))
+	s.metrics.pendingUnlinks.Record(ctx, pending)
 	return nil
 }
 
@@ -511,31 +512,19 @@ func (s *Statuses) KickPoll() {
 	}
 }
 
-// statusMetrics are the Prometheus metrics of the status cache. Their
+// statusMetrics are the OpenTelemetry metrics of the status cache. Their
 // labels never contain organization, user or billing account IDs.
 type statusMetrics struct {
-	organizations  *prometheus.GaugeVec
-	pollFailures   *prometheus.CounterVec
-	pendingUnlinks prometheus.Gauge
+	organizations  metric.Int64Gauge
+	pollFailures   metric.Int64Counter
+	pendingUnlinks metric.Int64Gauge
 }
 
-func newStatusMetrics(reg prometheus.Registerer) *statusMetrics {
-	m := &statusMetrics{
-		organizations: prometheus.NewGaugeVec(prometheus.GaugeOpts{
-			Name: "ownsand_billing_organizations",
-			Help: "Organizations in each confirmed billing phase (allowed, blocked or suspended).",
-		}, []string{"phase"}),
-		pollFailures: prometheus.NewCounterVec(prometheus.CounterOpts{
-			Name: "ownsand_billing_status_poll_failures_total",
-			Help: "Failed ListBillingStatusChanges requests, by Connect code.",
-		}, []string{"code"}),
-		pendingUnlinks: prometheus.NewGauge(prometheus.GaugeOpts{
-			Name: "ownsand_billing_pending_unlinks",
-			Help: "Billing links that were removed locally and that delino-accounts has not confirmed yet.",
-		}),
+func newStatusMetrics(provider metric.MeterProvider) *statusMetrics {
+	m := meter(provider)
+	return &statusMetrics{
+		organizations:  int64Gauge(m, "ownsand_billing_organizations", "Organizations in each confirmed billing phase (allowed, blocked or suspended)."),
+		pollFailures:   int64Counter(m, "ownsand_billing_status_poll_failures", "Failed ListBillingStatusChanges requests, by Connect code."),
+		pendingUnlinks: int64Gauge(m, "ownsand_billing_pending_unlinks", "Billing links that were removed locally and that delino-accounts has not confirmed yet."),
 	}
-	if reg != nil {
-		reg.MustRegister(m.organizations, m.pollFailures, m.pendingUnlinks)
-	}
-	return m
 }

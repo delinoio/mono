@@ -52,9 +52,10 @@ Current packages:
 
 Current `servers/internal/` packages:
 
-| Import path                                            | Content                                                                                                  | Users                         |
-| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- | ----------------------------- |
-| `github.com/delinoio/mono/servers/internal/listenaddr` | `host:port` listen address validation: a port from 0 to 65535 and an empty, IP address or RFC 1123 host. | `accounts-api`, `ownsand-api` |
+| Import path                                            | Content                                                                                                                                                                                                                                                                                                         | Users                         |
+| ------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------- |
+| `github.com/delinoio/mono/servers/internal/listenaddr` | `host:port` listen address validation: a port from 0 to 65535 and an empty, IP address or RFC 1123 host.                                                                                                                                                                                                        | `accounts-api`, `ownsand-api` |
+| `github.com/delinoio/mono/servers/internal/telemetry`  | OpenTelemetry SDK setup: the meter provider with the Go runtime metrics, the Prometheus exposition handler of the internal metrics listener, the `log/slog` logger with the `otelslog` log bridge, and OTLP/HTTP export of metrics and logs when the standard `OTEL_EXPORTER_OTLP_*` variables set an endpoint. | `accounts-api`, `ownsand-api` |
 
 ## Task orchestration
 
