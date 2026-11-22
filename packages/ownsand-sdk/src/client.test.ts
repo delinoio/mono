@@ -25,7 +25,7 @@ import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
 import { isUuidV7 } from "./uuidv7.ts";
-import { LostResponse, ownsandError } from "./testing/fake-api.ts";
+import { Hang, LostResponse, ownsandError } from "./testing/fake-api.ts";
 import {
   API_KEY,
   ev,
@@ -407,6 +407,164 @@ describe("credentials", () => {
       }),
     ]);
     expect(JSON.stringify(records)).not.toContain(API_KEY);
+  });
+
+  describe("streaming RPC outcomes", () => {
+    const EXEC = "delino.ownsand.v1.RelayService/Exec";
+
+    function streamHarness() {
+      const records: LogRecord[] = [];
+      const clock = { now: 0 };
+      const h = setup();
+      const transport = createApiTransport({
+        origin: h.api.origin,
+        credential: { apiKey: API_KEY },
+        organizationId: ORG,
+        fetch: h.api.fetch,
+        logger: (r) => records.push(r),
+        activity: new ActivityRegistry(),
+        now: () => clock.now,
+      });
+      const open = async (signal?: AbortSignal) =>
+        transport.stream(
+          RelayService.method.exec,
+          signal,
+          undefined,
+          undefined,
+          (async function* () {
+            yield create(RelayService.method.exec.input, {});
+          })(),
+        );
+      return { h, records, open, clock };
+    }
+
+    test("logs nothing until the stream ends and then logs ok once", async () => {
+      const { h, records, open, clock } = streamHarness();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      clock.now = 1_000;
+      const res = await open();
+      expect(records).toEqual([]);
+      clock.now = 1_250;
+      const seen: unknown[] = [];
+      for await (const m of res.message) {
+        seen.push(m);
+      }
+      expect(seen).toHaveLength(2);
+      expect(records).toEqual([
+        { event: "rpc", rpc: EXEC, durationMs: 250, code: "ok" },
+      ]);
+      expect(JSON.stringify(records)).not.toContain(API_KEY);
+    });
+
+    test("logs the Connect code of the error that ends the stream", async () => {
+      const { h, records, open, clock } = streamHarness();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        throw new ConnectError(`rejected ${API_KEY}`, Code.Unavailable);
+      });
+      const res = await open();
+      clock.now = 400;
+      const error = await (async () => {
+        try {
+          for await (const _ of res.message) {
+            // Drain until the stream error.
+          }
+        } catch (e) {
+          return e as Error;
+        }
+        return undefined;
+      })();
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(records).toEqual([
+        expect.objectContaining({ rpc: EXEC, code: "Unavailable" }),
+      ]);
+      expect(records[0]!.durationMs).toBe(400);
+      expect(JSON.stringify(records)).not.toContain(API_KEY);
+    });
+
+    test("logs unknown when opening a stream fails with an error that is not a Connect error", async () => {
+      const { records } = streamHarness();
+      const failing = createApiTransport({
+        origin: "https://ownsand.api.test",
+        credential: { apiKey: API_KEY },
+        organizationId: ORG,
+        fetch: async () => {
+          throw new TypeError("network down");
+        },
+        logger: (r) => records.push(r),
+        activity: new ActivityRegistry(),
+        now: () => 0,
+      });
+      await failing
+        .stream(
+          RelayService.method.exec,
+          undefined,
+          undefined,
+          undefined,
+          (async function* () {
+            yield create(RelayService.method.exec.input, {});
+          })(),
+        )
+        .catch(() => undefined);
+      expect(records).toHaveLength(1);
+      expect(records[0]!.rpc).toBe(EXEC);
+      expect(records[0]!.code).toBe("unknown");
+    });
+
+    test("logs Canceled once when the consumer abandons the stream", async () => {
+      const { h, records, open } = streamHarness();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.exited(0));
+      });
+      const res = await open();
+      for await (const _ of res.message) {
+        break;
+      }
+      expect(records).toEqual([
+        expect.objectContaining({ rpc: EXEC, code: "Canceled" }),
+      ]);
+      // A second return of the iterator must not log again.
+      await res.message[Symbol.asyncIterator]().return?.();
+      expect(records).toHaveLength(1);
+    });
+
+    test("logs the cancellation code when the caller aborts the stream", async () => {
+      const { h, records, open } = streamHarness();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield new Hang();
+      });
+      const controller = new AbortController();
+      const res = await open(controller.signal);
+      const iterator = res.message[Symbol.asyncIterator]();
+      await iterator.next();
+      controller.abort();
+      await iterator.next().catch(() => undefined);
+      expect(records).toHaveLength(1);
+      expect(records[0]).toEqual(
+        expect.objectContaining({ rpc: EXEC, code: "Canceled" }),
+      );
+    });
+
+    test("logs a failure that happens before the stream opens once", async () => {
+      const { h, records, open } = streamHarness();
+      h.api.stream(RelayService, "Exec", () => {
+        throw new ConnectError("denied", Code.PermissionDenied);
+      });
+      const res = await open();
+      await (async () => {
+        for await (const _ of res.message) {
+          // Drain until the stream error.
+        }
+      })().catch(() => undefined);
+      expect(records).toEqual([
+        expect.objectContaining({ rpc: EXEC, code: "PermissionDenied" }),
+      ]);
+    });
   });
 });
 

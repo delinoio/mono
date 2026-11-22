@@ -118,7 +118,7 @@ The SDKs persist nothing. They keep sessions and credentials in memory only.
 
 ## Logging
 
-The SDKs log nothing by default. An optional logger receives RPC names, sandbox IDs, transport selection, durations and Connect codes, never credentials, exec content or file content.
+The SDKs log nothing by default. An optional logger receives RPC names, sandbox IDs, transport selection, durations and Connect codes, never credentials, exec content or file content. The TypeScript SDK logs one `rpc` record per call with its terminal outcome: a unary call when the response arrives or fails, and a server-streaming call when its stream ends (`ok` on completion, the Connect code of the error that ends it, or `Canceled` when the consumer or the caller ends the call first), with the duration measured at that point.
 
 ## Build and Test
 
