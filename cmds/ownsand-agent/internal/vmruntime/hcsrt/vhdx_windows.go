@@ -63,9 +63,12 @@ func vhdxSize(h syscall.Handle) (uint64, error) {
 }
 
 // growVHDX grows the virtual disk at path to at least size bytes (rounded
-// up to 1 MiB) and returns its virtual size. A smaller size keeps the disk:
-// a VHDX cannot shrink below its partitions, and the guest grows its
-// Windows partition into the new space at boot.
+// up to 1 MiB) and returns its virtual size; the guest grows its Windows
+// partition into the new space at boot. A size below the virtual size of
+// the disk fails with an error that wraps vmruntime.ErrUnsupported (see
+// checkWindowsDiskSize) before the disk changes: a VHDX cannot shrink below
+// its partitions, and keeping the larger disk would give the guest more
+// capacity than the sandbox reserves.
 func growVHDX(path string, size int64) (int64, error) {
 	h, err := openVHDX(path)
 	if err != nil {
@@ -76,8 +79,11 @@ func growVHDX(path string, size int64) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	if err := checkWindowsDiskSize(size, int64(cur)); err != nil {
+		return 0, err
+	}
 	want := (uint64(size) + vhdAlign - 1) / vhdAlign * vhdAlign
-	if want <= cur {
+	if want == cur {
 		return int64(cur), nil
 	}
 	params := resizeVirtualDiskParameters{Version: 1, NewSize: want}
