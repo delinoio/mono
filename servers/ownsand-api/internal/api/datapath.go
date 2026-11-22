@@ -403,7 +403,7 @@ func (h DataPathHandler) OpenSession(ctx context.Context, req *connect.Request[o
 		return nil, err
 	}
 	// Authorize again after registering, as the contract requires.
-	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+	if _, _, err := h.S.reauthorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		return fail(err)
 	}
 	key := conn.DeviceID + "/" + sess.id
@@ -552,7 +552,7 @@ func (h DataPathHandler) AuthorizeRelay(ctx context.Context, req *connect.Reques
 	}
 	// The caller's authorization is checked again after the grant is
 	// registered, so a revocation in between reaches the pending grant.
-	if _, _, err := h.S.authorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
+	if _, _, err := h.S.reauthorize(ctx, h.S.DB.Pool, orgID, authz.ActionUseSandboxes); err != nil {
 		if !existing {
 			h.Grants.RemoveMatching(func(x *grants.Grant) bool { return x.ID == g.ID })
 		}
