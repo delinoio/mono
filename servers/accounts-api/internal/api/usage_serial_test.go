@@ -231,3 +231,86 @@ func TestReportUsageWithoutLinkStaysUnattributed(t *testing.T) {
 		t.Fatalf("%d usage reports, want 1", n)
 	}
 }
+
+// TestFirstLinkTimeFollowsCommittedUnattributedReport pauses an unattributed
+// report of a window that is about to end after it holds the organization
+// lock, and starts a first link of the organization, which waits for the
+// lock. The clock moves past the end of the window before the report
+// commits. The link then takes its time after the report: it must not reach
+// back into the window of the stored unattributed report, which a retry
+// replays.
+func TestFirstLinkTimeFollowsCommittedUnattributedReport(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subscribe(t, env, f)
+	org := newOrg(t)
+	start := alignToWindowEnd(env)
+	end := start.Add(billing.WindowLength)
+	pauseInsert(t, env, "usage_reports", pauseReportKey, false)
+	release := holdKey(t, env, pauseReportKey)
+
+	reported := reportAsync(env, report(org, meterEgress, start, 1000, usd))
+	waitAdvisoryWaiters(t, env, 1) // the report holds the organization lock and waits in its insert
+	linked := linkAsync(env, f.AccountID, org, f.Owner.ID)
+	waitAdvisoryWaiters(t, env, 2) // the link, whose time was read already, waits for the organization lock
+	env.Clock.Advance(10 * time.Minute)
+	release()
+
+	res := waitUsage(t, reported).GetResults()[0]
+	if res.GetDuplicate() || !res.GetUnattributed() {
+		t.Fatalf("result = %v, want unattributed", res)
+	}
+	waitLink(t, linked, false)
+	var linkTime time.Time
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT link_time FROM organization_links WHERE service = 'ownsand' AND organization_id = $1`,
+		org).Scan(&linkTime); err != nil {
+		t.Fatal(err)
+	}
+	if linkTime.Before(end) {
+		t.Fatalf("link_time %s is before the end of the reported window %s", linkTime, end)
+	}
+	// The retry returns the stored row and does not charge the new link.
+	again := reportUsage(t, env.Service(), report(org, meterEgress, start, 1000, usd)).GetResults()[0]
+	if !again.GetDuplicate() || !again.GetUnattributed() {
+		t.Fatalf("retry = %v, want the unattributed row as duplicate", again)
+	}
+	if got := usageLedgerEntries(t, env, f.AccountID); got != 0 {
+		t.Fatalf("%d usage ledger entries, want none", got)
+	}
+}
+
+// TestReportUsageIgnoresFirstLinkThatRollsBack starts a first link that
+// holds the organization lock and then fails. The report that waited for the
+// lock finds no link and is stored as unattributed.
+func TestReportUsageIgnoresFirstLinkThatRollsBack(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subscribe(t, env, f)
+	org := newOrg(t)
+	start := alignToWindowEnd(env)
+	pauseInsert(t, env, "organization_links", pauseLinkKey, true)
+	release := holdKey(t, env, pauseLinkKey)
+
+	linked := linkAsync(env, f.AccountID, org, f.Owner.ID)
+	waitAdvisoryWaiters(t, env, 1)
+	reported := reportAsync(env, report(org, meterEgress, start, 1000, usd))
+	waitAdvisoryWaiters(t, env, 2)
+	release()
+
+	waitLink(t, linked, true)
+	res := waitUsage(t, reported).GetResults()[0]
+	if res.GetDuplicate() || !res.GetUnattributed() {
+		t.Fatalf("result = %v, want unattributed", res)
+	}
+	var links int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM organization_links WHERE organization_id = $1`, org).Scan(&links); err != nil || links != 0 {
+		t.Fatalf("%d links after the failed link, %v", links, err)
+	}
+	if got := usageLedgerEntries(t, env, f.AccountID); got != 0 {
+		t.Fatalf("%d usage ledger entries, want none", got)
+	}
+	again := reportUsage(t, env.Service(), report(org, meterEgress, start, 1000, usd)).GetResults()[0]
+	if !again.GetDuplicate() || !again.GetUnattributed() {
+		t.Fatalf("retry = %v, want the unattributed row as duplicate", again)
+	}
+}

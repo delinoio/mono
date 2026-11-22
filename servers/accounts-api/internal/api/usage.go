@@ -302,7 +302,8 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 
 // link creates the link of the organization to the billing account, which
 // tx holds locked, or changes the name of an existing link to it. A link to
-// another billing account is already_exists.
+// another billing account is already_exists. now is the time of a rename; a
+// new link takes its time after it holds the organization lock.
 func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, service, orgID, accountID, userID, name string, now time.Time) error {
 	var linkID, linkedAccount, oldName string
 	err := tx.QueryRow(ctx, `SELECT organization_link_id::text, billing_account_id::text, organization_name
@@ -335,6 +336,13 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, service, orgID, acco
 	if err := billing.LockOrganization(ctx, tx, service, orgID); err != nil {
 		return err
 	}
+	// A new link takes effect when it holds both locks: read the clock
+	// again, because the caller read it before it waited for the billing
+	// account lock and for the organization lock. A report that committed
+	// as unattributed while this transaction waited then ends before the
+	// link time, and the link cannot reach back into the window of such a
+	// report. The audit event of the link uses the same time.
+	now = h.timestamp()
 	if _, err := tx.Exec(ctx, `INSERT INTO organization_links (organization_link_id, service, organization_id,
 			billing_account_id, organization_name, link_time) VALUES ($1, $2, $3, $4, $5, $6)`,
 		linkID, service, orgID, accountID, name, now); err != nil {
