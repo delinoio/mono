@@ -5,7 +5,9 @@ import { defineConfig } from "@rspress/core";
 // `pnpm dev` runs this server through portless (`dev` script), which assigns
 // a free loopback port in `PORT` and sets `PORTLESS_URL`. Read `PORT` only in
 // that case, so a `PORT` exported by the shell does not move the fixed port of
-// `dev:app` and `preview`.
+// `dev:app`. `rspress preview` reads `PORT` and `HOST` itself, before this
+// configuration, so the `preview` script runs through
+// `scripts/dev/rspress-preview.mjs`, which removes both variables.
 const devPort =
   process.env.PORTLESS_URL && process.env.PORT
     ? Number(process.env.PORT)
