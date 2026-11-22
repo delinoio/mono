@@ -419,10 +419,9 @@ async function main() {
 }
 
 // The module also exports its pure helpers for tests; run only as a script.
-if (
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+// import.meta.main needs Node 24.2+; unlike comparing process.argv[1] with the
+// module URL, it also holds when a symlinked path starts the script.
+if (import.meta.main) {
   const removeSignalRecording = installSignalRecording();
   try {
     process.exitCode = await main();

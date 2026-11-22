@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -586,6 +587,114 @@ test(
           (record) => record.event === "dev_env_failed",
         );
         assert.equal(failure?.reason, reason, result.stderr);
+      });
+    }
+  },
+);
+
+// Spellings of the launcher path that reach it through a symlink. Node.js
+// keeps the symlink spelling in process.argv[1] and resolves import.meta.url to
+// the real path, so a guard that compares the two skips main() silently.
+function symlinkedLaunchers(f) {
+  const fileLink = join(f.root, "linked-file", "with-infisical.mjs");
+  mkdirSync(dirname(fileLink));
+  symlinkSync(f.launcher, fileLink);
+  const directoryLink = join(f.root, "linked-directory");
+  symlinkSync(join(f.root, "scripts"), directoryLink, "dir");
+  return [
+    ["symlinked file", fileLink],
+    ["symlinked directory", join(directoryLink, "dev", "with-infisical.mjs")],
+  ];
+}
+
+test(
+  "a symlinked launcher path runs the command directly like the real path",
+  posixOnly,
+  async (t) => {
+    const reference = fixture(t);
+    const expected = await startLauncher(reference, [
+      "--path=/api",
+      ...commandArgs(7),
+    ]).exited;
+    assert.equal(expected.code, 7, expected.stderr);
+    const base = fixture(t);
+    for (const [name, launcher] of symlinkedLaunchers(base)) {
+      await t.test(name, async () => {
+        rmSync(`${base.out}.start`, { force: true });
+        const result = await startLauncher({ ...base, launcher }, [
+          "--path=/api",
+          ...commandArgs(7),
+        ]).exited;
+        assert.equal(result.code, 7, result.stderr);
+        assert.equal(existsSync(base.infisicalArgs), false);
+        assert.deepEqual(started(base).args, ["7"]);
+        assert.deepEqual(records(result.stderr), records(expected.stderr));
+      });
+    }
+  },
+);
+
+test(
+  "a symlinked launcher path stops before the command when the CLI is missing",
+  posixOnly,
+  async (t) => {
+    // The counterfactual of the old guard: it exited with status 0, no record
+    // and no fetch attempt, so only a launcher that runs main() reports the
+    // failure.
+    const base = fixture(t, { config: ProjectConfigFile.Yaml, cli: false });
+    for (const [name, launcher] of symlinkedLaunchers(base)) {
+      await t.test(name, async () => {
+        const result = await startLauncher({ ...base, launcher }, [
+          "--path=/api",
+          ...commandArgs(0),
+        ]).exited;
+        assert.equal(result.code, 1, result.stderr);
+        assert.equal(existsSync(`${base.out}.start`), false);
+        const failure = records(result.stderr).find(
+          (record) => record.event === "dev_env_failed",
+        );
+        assert.equal(failure?.reason, FailureReason.CliMissing, result.stderr);
+      });
+    }
+  },
+);
+
+test(
+  "a symlinked launcher path injects the exported variables",
+  posixOnly,
+  async (t) => {
+    const base = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: {
+        FAKE_INFISICAL_OUTPUT: exported([
+          { key: "DEV_VALUE", value: secretValue },
+        ]),
+      },
+    });
+    for (const [name, launcher] of symlinkedLaunchers(base)) {
+      await t.test(name, async () => {
+        rmSync(`${base.out}.start`, { force: true });
+        const result = await startLauncher({ ...base, launcher }, [
+          "--path=/api",
+          ...commandArgs(3),
+        ]).exited;
+        assert.equal(result.code, 3, result.stderr);
+        assert.equal(started(base).DEV_VALUE, secretValue);
+        assert.deepEqual(
+          records(result.stderr).map(({ event, folder, config }) => ({
+            event,
+            folder,
+            config,
+          })),
+          [
+            {
+              event: "dev_env_infisical",
+              folder: "/api",
+              config: ProjectConfigFile.Yaml,
+            },
+          ],
+        );
+        assert.equal(result.stderr.includes(secretValue), false);
       });
     }
   },

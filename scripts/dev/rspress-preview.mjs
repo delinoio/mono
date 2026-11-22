@@ -43,7 +43,6 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { constants } from "node:os";
 import { dirname, resolve } from "node:path";
-import { fileURLToPath } from "node:url";
 
 // The package whose CLI the launcher starts and the bin entry it reads.
 export const RspressPackage = "@rspress/core";
@@ -176,10 +175,9 @@ async function main() {
 }
 
 // The module also exports its pure helpers for tests; run only as a script.
-if (
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+// import.meta.main needs Node 24.2+; unlike comparing process.argv[1] with the
+// module URL, it also holds when a symlinked path starts the script.
+if (import.meta.main) {
   const removeSignalRecording = installSignalRecording();
   try {
     process.exitCode = await main();
