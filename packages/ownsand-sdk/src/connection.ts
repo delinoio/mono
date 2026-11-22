@@ -6,7 +6,11 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
-import { OwnSandConfigError, redactError } from "./errors.ts";
+import {
+  OwnSandConfigError,
+  OwnSandCredentialError,
+  redactError,
+} from "./errors.ts";
 import { type Logger, LogEvent, safeLog } from "./logger.ts";
 
 /** Production origin of the OwnSand control plane. */
@@ -152,13 +156,28 @@ async function currentSecret(
     return credential.apiKey;
   }
   signal.throwIfAborted();
-  // A synchronous throw of the callback stays a rejection of the race.
+  // A synchronous throw of the callback stays a rejection of the race. A
+  // failure of the callback is a terminal credential error that keeps the
+  // callback's message; the abort reason of the race stays unwrapped.
   const token = await raceAbort(
-    new Promise<string>((resolve) => resolve(credential.accessToken())),
+    new Promise<string>((resolve, reject) => {
+      const fail = (error: unknown) =>
+        reject(
+          new OwnSandCredentialError(
+            error instanceof Error ? error.message : String(error),
+            { cause: error },
+          ),
+        );
+      try {
+        Promise.resolve(credential.accessToken()).then(resolve, fail);
+      } catch (error) {
+        fail(error);
+      }
+    }),
     signal,
   );
   if (typeof token !== "string" || token === "") {
-    throw new OwnSandConfigError("accessToken returned no token");
+    throw new OwnSandCredentialError("accessToken returned no token");
   }
   return token;
 }
@@ -192,6 +211,27 @@ function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
   });
 }
 
+/**
+ * Sets the Authorization header. A token that cannot be a header value (a
+ * line break or NUL inside it, or a character that no header value can
+ * hold) ends the call with a terminal credential error without a request.
+ * The error never holds the token: the `TypeError` of `Headers.set` quotes
+ * the whole value, so it is neither passed on nor kept as a cause. Only edge
+ * whitespace is allowed; the header normalization drops it.
+ */
+function setAuthorization(headers: Headers, secret: string): void {
+  const invalid = () =>
+    new OwnSandCredentialError("accessToken returned an invalid token");
+  if (/[\r\n\0]/.test(secret.trim())) {
+    throw invalid();
+  }
+  try {
+    headers.set("Authorization", `Bearer ${secret}`);
+  } catch {
+    throw invalid();
+  }
+}
+
 function credentialInterceptor(options: ConnectionOptions): Interceptor {
   return (next) => async (req) => {
     if (new URL(req.url).origin !== options.origin) {
@@ -201,11 +241,12 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
       );
     }
     const secret = await currentSecret(options.credential, req.signal);
-    req.header.set("Authorization", `Bearer ${secret}`);
+    setAuthorization(req.header, secret);
     // Redact with the exact credential of this request. The access token
     // differs per request, so the value lives only in this closure and never
-    // in state that concurrent requests share.
-    return redactCall(next, req, [secret]);
+    // in state that concurrent requests share. A server may echo the value
+    // that the header normalization kept, so that form is redacted too.
+    return redactCall(next, req, [secret, secret.trim()]);
   };
 }
 
