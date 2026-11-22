@@ -178,6 +178,10 @@ type Timing struct {
 	// apply an export result (250 milliseconds); it doubles up to 2 seconds;
 	// zero means the default.
 	ExportApplyRetryBackoff time.Duration
+	// UnaryBodyReadDeadline bounds the upload of the request body of a unary
+	// RPC, counted from the start of the request (30 seconds); zero means the
+	// default. See UnaryReadDeadline.
+	UnaryBodyReadDeadline time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -195,6 +199,8 @@ func DefaultTiming() Timing {
 
 		ExportApplyRetryWindow:  DefaultExportApplyRetryWindow,
 		ExportApplyRetryBackoff: DefaultExportApplyRetryBackoff,
+
+		UnaryBodyReadDeadline: DefaultUnaryBodyReadDeadline,
 	}
 }
 

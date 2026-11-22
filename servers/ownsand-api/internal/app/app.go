@@ -184,20 +184,35 @@ func New(opts Options) (*App, error) {
 	}
 	plane := api.NewDataPlane(svc, relayLimits, relayTiming)
 	authn := &api.Authenticator{Service: svc, Logto: opts.Logto}
-	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.ClientAddressMode)...)}
+	// WithReadMaxBytes runs before the interceptor chain, so an oversized or
+	// inflated request ends with resource_exhausted before authentication
+	// and before any rate limit token is taken.
+	handlerOpts := []connect.HandlerOption{
+		connect.WithInterceptors(svc.Interceptors(authn, opts.ClientAddressMode)...),
+		connect.WithReadMaxBytes(api.MaxRequestBytes),
+	}
 
 	var mounts []server.Mount
 	add := func(path string, h http.Handler) { mounts = append(mounts, server.Mount{Path: path, Handler: h}) }
-	add(ownsandv1connect.NewOrganizationServiceHandler(api.OrganizationHandler{Service: svc}, handlerOpts...))
-	add(ownsandv1connect.NewMemberServiceHandler(api.MemberHandler{Service: svc}, handlerOpts...))
-	add(ownsandv1connect.NewApiKeyServiceHandler(api.APIKeyHandler{Service: svc}, handlerOpts...))
-	add(ownsandv1connect.NewDeviceServiceHandler(api.DeviceHandler{Service: svc}, handlerOpts...))
+	// unary bounds the upload of the request body of the unary procedures of
+	// a service. The RelayService request gate arms its own deadline and
+	// RelayAgentService serves only a stream, so neither goes through it;
+	// AgentService serves the Channel stream beside its unary RPCs, so the
+	// stream is exempt by path.
+	unary := func(path string, h http.Handler, streaming ...string) (string, http.Handler) {
+		return path, api.UnaryReadDeadline(h, timing.UnaryBodyDeadline(), opts.Logger, streaming...)
+	}
+	add(unary(ownsandv1connect.NewOrganizationServiceHandler(api.OrganizationHandler{Service: svc}, handlerOpts...)))
+	add(unary(ownsandv1connect.NewMemberServiceHandler(api.MemberHandler{Service: svc}, handlerOpts...)))
+	add(unary(ownsandv1connect.NewApiKeyServiceHandler(api.APIKeyHandler{Service: svc}, handlerOpts...)))
+	add(unary(ownsandv1connect.NewDeviceServiceHandler(api.DeviceHandler{Service: svc}, handlerOpts...)))
 	agentPath, agentHandler := ownsandv1connect.NewAgentServiceHandler(api.AgentHandler{Service: svc}, handlerOpts...)
+	_, agentHandler = unary(agentPath, agentHandler, ownsandv1connect.AgentServiceChannelProcedure)
 	add(agentPath, api.WithStreamControl(agentHandler))
-	add(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...))
-	add(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...))
-	add(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...))
-	add(ownsandv1connect.NewBillingServiceHandler(api.BillingHandler{Service: svc}, handlerOpts...))
+	add(unary(ownsandv1connect.NewSandboxServiceHandler(api.SandboxHandler{Service: svc}, handlerOpts...)))
+	add(unary(ownsandv1connect.NewSnapshotServiceHandler(api.SnapshotHandler{Service: svc}, handlerOpts...)))
+	add(unary(ownsandv1connect.NewDataPathServiceHandler(api.DataPathHandler{DataPlane: plane}, handlerOpts...)))
+	add(unary(ownsandv1connect.NewBillingServiceHandler(api.BillingHandler{Service: svc}, handlerOpts...)))
 	// The relay gate opens the relay stream and arms the request deadline
 	// before Connect reads the request body; RelayReadDeadlines gives it the
 	// means to interrupt a body read that blocks.

@@ -27,6 +27,25 @@ import (
 // RelayGrantHeader carries the grant ID of a RelayService request.
 const RelayGrantHeader = "Ownsand-Relay-Grant-Id"
 
+// MaxRequestBytes is the largest request message that any handler reads, in
+// bytes after decompression. connect-go reads a request message before the
+// interceptor chain runs and, without a limit, buffers and inflates it
+// without bound, so the server sets the limit on every handler. It applies to
+// each message of a stream, not to the stream as a whole.
+//
+// The value is 2 MiB. The largest legitimate message is a relay WriteFile
+// request that carries 1 MiB of file data: protojson encodes the bytes field
+// as base64, which is about 1.4 MB, and the binary codec needs 1 MiB plus the
+// identifiers. The largest relay frame, datapath.MaxFrameSize (1 MiB plus
+// 64 KiB, 1,179,648 bytes), travels inside a RelayAgentService.Connect
+// message, and a full agent state report is far smaller than both. 2 MiB
+// leaves headroom above all of them.
+const MaxRequestBytes = 2 << 20
+
+// Compile-time check that the limit holds the largest relay frame with room
+// to spare; it fails to build when MaxFrameSize grows past the limit.
+const _ = uint(MaxRequestBytes - datapath.MaxFrameSize - 1)
+
 // RelayAgentHandler serves RelayAgentService.
 type RelayAgentHandler struct{ *DataPlane }
 
