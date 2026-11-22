@@ -228,7 +228,13 @@ func ReadTarContext(ctx context.Context, r io.Reader, dir string) error {
 			if !confinedLinkTarget(name, hdr.Linkname) {
 				return fmt.Errorf("fsutil: tar symbolic link leaves the target directory")
 			}
-			if err := root.Symlink(hdr.Linkname, name); err != nil {
+			// Workaround: on Windows, os.Root.Symlink in Go 1.26 writes the
+			// target unchanged, and Windows does not resolve `/` in link
+			// contents, so a tar target such as `../real/f` does not resolve.
+			// os.Symlink converts the separators, and Root.Symlink does too
+			// from Go 1.27. FromSlash changes nothing on Linux and macOS.
+			// Remove the conversion when go.mod requires Go 1.27 or later.
+			if err := root.Symlink(filepath.FromSlash(hdr.Linkname), name); err != nil {
 				return err
 			}
 		default:
