@@ -127,7 +127,24 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	if err := run.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer run.Process.Kill()
+	// One goroutine reaps the child as soon as it exits, so the child is
+	// reaped on every path: the normal SIGTERM shutdown below and any early
+	// t.Fatalf. exitErr is valid once exited is closed.
+	exited := make(chan struct{})
+	var exitErr error
+	go func() {
+		exitErr = run.Wait()
+		close(exited)
+	}()
+	t.Cleanup(func() {
+		// Killing an already exited child is a harmless no-op.
+		_ = run.Process.Kill()
+		select {
+		case <-exited:
+		case <-time.After(20 * time.Second):
+			t.Error("agent child was not reaped after kill")
+		}
+	})
 	if env, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil }); env == nil {
 		t.Fatalf("no state report\n%s", logs.String())
 	}
@@ -197,12 +214,10 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	}
 
 	run.Process.Signal(syscall.SIGTERM)
-	done := make(chan error, 1)
-	go func() { done <- run.Wait() }()
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("agent exit: %v\n%s", err, logs.String())
+	case <-exited:
+		if exitErr != nil {
+			t.Fatalf("agent exit: %v\n%s", exitErr, logs.String())
 		}
 	case <-time.After(20 * time.Second):
 		t.Fatal("agent did not stop on SIGTERM")
