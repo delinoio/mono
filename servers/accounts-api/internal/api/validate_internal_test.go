@@ -93,3 +93,16 @@ func TestFieldRules(t *testing.T) {
 		t.Error("role permissions do not match the contract table")
 	}
 }
+
+func TestUserIDField(t *testing.T) {
+	for _, ok := range []string{"a", "abc\x01", "user-1", "사용자", strings.Repeat("a", maxUserIDBytes)} {
+		if got, err := userIDField(ok); err != nil || got != ok {
+			t.Errorf("userIDField(%q) = %q, %v", ok, got, err)
+		}
+	}
+	for _, bad := range []string{"", "\x00", "abc\x00", "\x00abc", "ab\x00cd", "\xff", strings.Repeat("a", maxUserIDBytes+1)} {
+		if _, err := userIDField(bad); connect.CodeOf(err) != connect.CodeInvalidArgument {
+			t.Errorf("userIDField(%q) error = %v", bad, err)
+		}
+	}
+}
