@@ -27,6 +27,9 @@
 #   DEPLOY_GUARD         stale-plan check command
 #                        (default scripts/ci/check-pending-changesets.sh).
 #   DEPLOY_PROVIDER      provider helper (default scripts/ci/deploy-provider.sh).
+#   BUILD_VARIABLES      JSON object of the GitHub repository variables
+#                        (`toJSON(vars)`) for `build-static-sites`. Each site
+#                        gets the variables that its `deploy.buildEnv` maps.
 #   SITES_ROOT           directory that holds the site outputs for
 #                        `static-sites` (default: the working directory). The
 #                        workflow unpacks the build artifact outside the
@@ -98,14 +101,54 @@ deploy_servers() {
   done 3< <(jq -r '.[] | [.name, .version, .service, .hostname, .port, .upstreamProtocol, .udpPorts] | @tsv' <<< "$SERVERS")
 }
 
+# Prints the build environment of one site as NUL-terminated `NAME=value`
+# entries: each `deploy.buildEnv` entry with the value of the repository
+# variable that it names. Fails with one error that names every missing or
+# empty variable, so a production site is never built without, for example,
+# its sign-in configuration. GitHub variable names are case-insensitive.
+site_build_env() {
+  local name="$1" variables="$2" missing
+  missing="$(jq -r --arg name "$name" --argjson vars "$variables" '
+    ($vars | with_entries(.key |= ascii_upcase)) as $v
+    | .[] | select(.name == $name) | (.buildEnv // {}) | to_entries[]
+    | select(($v[.value | ascii_upcase] | type) != "string"
+        or $v[.value | ascii_upcase] == ""
+        or ($v[.value | ascii_upcase] | contains("\u0000")))
+    | "\(.key) (repository variable \(.value))"' <<< "$SITES" | paste -sd, -)"
+  if [[ -n "$missing" ]]; then
+    echo "::error::The build of $name needs repository variables that are not set, are empty or contain NUL: ${missing//,/, }" >&2
+    return 1
+  fi
+  jq -j --arg name "$name" --argjson vars "$variables" '
+    ($vars | with_entries(.key |= ascii_upcase)) as $v
+    | .[] | select(.name == $name) | (.buildEnv // {}) | to_entries[]
+    | "\(.key)=\($v[.value | ascii_upcase])\u0000"' <<< "$SITES"
+}
+
 # Builds every site in plan order. The workflow runs this in a step without
 # deploy secrets, because the build runs third-party plugins.
 build_static_sites() {
   require_targets SITES "${SITES:-}" name version project output
-  local name version project output
+  local variables="${BUILD_VARIABLES:-}"
+  [[ -n "$variables" ]] || variables='{}'
+  if ! jq -e 'type == "object" and all(.[]; type == "string")' <<< "$variables" > /dev/null 2>&1; then
+    echo "::error::BUILD_VARIABLES is not a JSON object of strings." >&2
+    exit 1
+  fi
+  local name version project output build_env
+  local -a env_args
   while IFS=$'\t' read -r -u 3 name version project output; do
     echo "::group::Build $name@$version"
-    pnpm exec turbo run build --filter="$name" < /dev/null
+    build_env="$RUNNER_TEMP/build-env-$name"
+    site_build_env "$name" "$variables" > "$build_env"
+    mapfile -d '' -t env_args < "$build_env"
+    rm -f -- "$build_env"
+    if (( ${#env_args[@]} > 0 )); then
+      echo "Build variables: $(printf '%s\n' "${env_args[@]%%=*}" | paste -sd, -)"
+    fi
+    # Every name starts with `PUBLIC_` (the planner checks it), so `env`
+    # never reads an entry as an option or a command.
+    env "${env_args[@]}" pnpm exec turbo run build --filter="$name" < /dev/null
     if [[ ! -d "$output" ]]; then
       echo "::error::The build of $name produced no $output directory."
       exit 1

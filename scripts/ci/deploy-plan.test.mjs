@@ -1137,6 +1137,91 @@ test("a static site output outside the package fails", () => {
   assert.throws(() => plan(status(["web", "1.0.0"]), site), /deploy.output/);
 });
 
+test("a static site carries its deploy.buildEnv map", () => {
+  const buildEnv = {
+    PUBLIC_LOGTO_ENDPOINT: "LOGTO_ENDPOINT",
+    PUBLIC_LOGTO_APP_ID: "WEB_LOGTO_APP_ID",
+  };
+  const site = [
+    pkg("apps/web", {
+      name: "web",
+      deploy: {
+        target: DeployTarget.CloudflarePages,
+        project: "web",
+        buildEnv,
+      },
+    }),
+  ];
+  assert.deepEqual(
+    plan(status(["web", "1.0.0"]), site).staticSites[0].buildEnv,
+    buildEnv,
+  );
+  assert.deepEqual(
+    plan(status(["web", "1.0.0"]), workspace).staticSites[0].buildEnv,
+    {},
+  );
+});
+
+test("an invalid deploy.buildEnv fails the plan and the check", () => {
+  const cases = [
+    [null, /nonempty map/],
+    [[], /nonempty map/],
+    [{}, /nonempty map/],
+    ["PUBLIC_A", /nonempty map/],
+    [{ NODE_OPTIONS: "OPTIONS" }, /key "NODE_OPTIONS" must match/],
+    [{ PUBLIC_: "A" }, /key "PUBLIC_" must match/],
+    [{ public_a: "A" }, /key "public_a" must match/],
+    [{ PUBLIC_A: "" }, /PUBLIC_A must be a GitHub repository variable name/],
+    [{ PUBLIC_A: 1 }, /PUBLIC_A must be a GitHub repository variable name/],
+    [{ PUBLIC_A: "lower" }, /PUBLIC_A must be a GitHub repository variable/],
+    [{ PUBLIC_A: "1ST" }, /PUBLIC_A must be a GitHub repository variable/],
+    [{ PUBLIC_A: "GITHUB_TOKEN" }, /PUBLIC_A must be a GitHub repository/],
+    [{ PUBLIC_A: "A-B" }, /PUBLIC_A must be a GitHub repository variable/],
+  ];
+  for (const [buildEnv, message] of cases) {
+    const site = [
+      pkg("apps/web", {
+        name: "web",
+        deploy: {
+          target: DeployTarget.CloudflarePages,
+          project: "web",
+          buildEnv,
+        },
+      }),
+    ];
+    assert.throws(
+      () => plan(status(["web", "1.0.0"]), site),
+      message,
+      JSON.stringify(buildEnv),
+    );
+    const dir = mkdtempSync(join(tmpdir(), "deploy-plan-build-env-"));
+    try {
+      mkdirSync(join(dir, ".changeset"));
+      mkdirSync(join(dir, "apps", "web"), { recursive: true });
+      writeFileSync(
+        join(dir, "apps", "web", "package.json"),
+        JSON.stringify(site[0].manifest),
+      );
+      assert.throws(() => check(dir), message, JSON.stringify(buildEnv));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+});
+
+test("a server with deploy.buildEnv fails", () => {
+  const servers = [
+    pkg("servers/api", {
+      name: "api",
+      deploy: droplet("api", { buildEnv: { PUBLIC_A: "A" } }),
+    }),
+  ];
+  assert.throws(
+    () => plan(status(["api", "1.0.0"]), servers),
+    /deploy.buildEnv is allowed only for the cloudflare-pages target/,
+  );
+});
+
 test("a workspace dependency cycle fails", () => {
   const cyclic = [
     pkg("servers/a", {

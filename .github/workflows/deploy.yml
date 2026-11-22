@@ -272,6 +272,11 @@ jobs:
       - name: Build in dependency order
         env:
           SITES: ${{ needs.plan.outputs.static_sites }}
+          # Public build-time values (for example the Logto application IDs)
+          # come from repository variables, not secrets: they end up in the
+          # public bundle. Each site gets only the variables that its
+          # `deploy.buildEnv` maps.
+          BUILD_VARIABLES: ${{ toJSON(vars) }}
         run: scripts/ci/deploy-targets.sh build-static-sites
       - name: Pack the build output
         env:
