@@ -390,7 +390,11 @@ function CreateSandboxDialog({
           value={memory}
           onValueChange={setMemory}
           min={256}
-          step={256}
+          // `step` is also the grid that Enter and blur snap the typed value
+          // to, so 256 here would turn 1000 into 1,024. The arrow keys and
+          // buttons move by 1 and Shift moves by 256.
+          step={1}
+          largeStep={256}
           error={errors.memory}
         />
         <NumberInput

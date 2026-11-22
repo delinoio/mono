@@ -525,7 +525,7 @@ describe("device limits", () => {
 
   /**
    * A mock transport whose build box has the given limits and that records
-   * the ReplaceDeviceLimits and CreateSandbox requests.
+   * the ReplaceDeviceLimits requests.
    */
   async function recordingTransport(limits: {
     vcpuCount: number;
@@ -539,22 +539,16 @@ describe("device limits", () => {
       limits: { ...limits, vcpuOvercommitPercent: 150 },
     });
     const replaced: DeviceLimitsInput[] = [];
-    const created: Resources[] = [];
     const transport: Transport = {
       ...mock,
       unary(method, ...rest) {
-        const request = rest[3] as {
-          limits?: DeviceLimitsInput;
-          resources?: Resources;
-        };
         if (method.name === "ReplaceDeviceLimits") {
-          replaced.push(request.limits!);
+          replaced.push((rest[3] as { limits: DeviceLimitsInput }).limits);
         }
-        if (method.name === "CreateSandbox") created.push(request.resources!);
         return mock.unary(method, ...rest);
       },
     };
-    return { transport, replaced, created };
+    return { transport, replaced };
   }
 
   const commit = async (input: HTMLElement, value: string) => {
@@ -689,6 +683,90 @@ describe("device limits", () => {
     expect(replaced[0]?.memoryMib).toBe(0n);
     expect(replaced[0]?.vcpuCount).toBe(16);
     expect(replaced[0]?.diskGib).toBe(500n);
+  });
+});
+
+describe("sandbox create form resources", () => {
+  /** A mock transport that records the resources of every CreateSandbox. */
+  function recordingTransport() {
+    const mock = createMockTransport();
+    const created: Resources[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          created.push((rest[3] as { resources: Resources }).resources);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, created };
+  }
+
+  async function openForm(transport: Transport) {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Create sandbox" }),
+      );
+    });
+    await settle(60);
+    return screen.findByRole("dialog", { name: "Create a sandbox" });
+  }
+
+  const commit = async (input: HTMLElement, value: string) => {
+    await act(async () => {
+      fireEvent.input(input, { target: { value } });
+      fireEvent.blur(input);
+    });
+    await settle();
+  };
+
+  test("keeps a Memory of 1000 and sends it", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const memory = within(dialog).getByLabelText("Memory (MiB)");
+    await commit(memory, "1000");
+    // The field formats its value with a thousands separator.
+    expect((memory as HTMLInputElement).value).toBe("1,000");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.memoryMib).toBe(1000n);
+  });
+
+  test("keeps the minimum of 256 and steps by whole numbers", async () => {
+    const { transport } = recordingTransport();
+    const dialog = await openForm(transport);
+    const memory = within(dialog).getByLabelText(
+      "Memory (MiB)",
+    ) as HTMLInputElement;
+    await commit(memory, "100");
+    expect(memory.value).toBe("256");
+    await commit(memory, "1000");
+    await act(async () => {
+      fireEvent.keyDown(memory, { key: "ArrowUp" });
+    });
+    await settle();
+    expect(memory.value).toBe("1,001");
+    await act(async () => {
+      fireEvent.keyDown(memory, { key: "ArrowUp", shiftKey: true });
+    });
+    await settle();
+    expect(memory.value).toBe("1,257");
+    // The plus button of the Memory field adds one more whole number.
+    const plus = memory
+      .closest('[data-slot="number-input-group"]')!
+      .querySelector('[data-slot="number-input-increment"]')!;
+    await act(async () => {
+      fireEvent.pointerDown(plus, { button: 0 });
+      fireEvent.pointerUp(plus, { button: 0 });
+      fireEvent.click(plus);
+    });
+    await settle();
+    expect(memory.value).toMatch(/^1,25[89]$/);
   });
 });
 
