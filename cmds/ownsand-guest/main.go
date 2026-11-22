@@ -102,11 +102,24 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (io.W
 		fmt.Fprintf(os.Stderr, "ownsand-guest: invalid clock mode %q\n", *clock)
 		return 2
 	}
+	// Take the listener before the state directory: a helper that cannot
+	// own its address must not touch the state of the one that does. The
+	// state directory lock in guest.New then keeps a second helper on
+	// another listener from cleaning the snapshots of a running one.
+	l, err := guestlisten.Listen(*listen)
+	if err != nil {
+		logger.Error("listen failed", "error", err)
+		return 1
+	}
 	srv, err := guest.New(guest.Config{StateDir: *stateDir, Version: version, Clock: mode, Logger: logger})
 	if err != nil {
+		_ = l.Close()
 		logger.Error("start failed", "error", err)
 		return 1
 	}
+	// Release the state directory lock when the helper ends, so that a
+	// replacement in the same process (tests) can start.
+	defer srv.Close()
 	// The network tunnel of the Hyper-V runtime lives in the helper that
 	// the init process of a Linux guest restarts, so a failed relay comes
 	// back with the helper: a terminal tunnel error ends the helper with
@@ -121,11 +134,6 @@ func run(ctx context.Context, args []string, openLog func(stateDir string) (io.W
 	}
 	if *growDisk {
 		go growSystemDisk(logger)
-	}
-	l, err := guestlisten.Listen(*listen)
-	if err != nil {
-		logger.Error("listen failed", "error", err)
-		return 1
 	}
 	return serve(ctx, logger, tunnelFatal, func(ctx context.Context) error { return srv.Run(ctx, l) })
 }

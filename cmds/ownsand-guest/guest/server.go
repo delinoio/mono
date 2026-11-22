@@ -77,13 +77,19 @@ type Server struct {
 	execs  *execManager
 	reads  *readManager
 	writes *writeManager
+	// lock is the exclusive ownership of the state directory; Close
+	// releases it.
+	lock *stateLock
 }
 
 var _ ownsandv1connect.GuestServiceHandler = (*Server)(nil)
 
-// New returns a server. It clears read snapshots of an earlier process and
-// registers the unfinished writes that an earlier process recorded, so that
-// the sweep removes their staging files.
+// New returns a server. It first takes the exclusive lock of the state
+// directory and fails with ErrStateDirInUse when another helper holds it, so
+// that a second helper never deletes the snapshots of a running one. Then it
+// clears read snapshots of an earlier process and registers the unfinished
+// writes that an earlier process recorded, so that the sweep removes their
+// staging files. The caller must call Close to release the lock.
 func New(cfg Config) (*Server, error) {
 	if cfg.StateDir == "" {
 		return nil, errors.New("guest: state directory is required")
@@ -106,12 +112,18 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Clock == ClockModeUnspecified {
 		cfg.Clock = ClockModeSet
 	}
+	lock, err := lockStateDir(cfg.StateDir)
+	if err != nil {
+		return nil, err
+	}
 	reads, err := newReadManager(filepath.Join(cfg.StateDir, "reads"), cfg.Now, cfg.Logger)
 	if err != nil {
+		lock.release()
 		return nil, err
 	}
 	writes, err := newWriteManager(filepath.Join(cfg.StateDir, "writes"), cfg.Now, cfg.Logger)
 	if err != nil {
+		lock.release()
 		return nil, err
 	}
 	return &Server{
@@ -121,7 +133,16 @@ func New(cfg Config) (*Server, error) {
 		execs:  newExecManager(cfg.Now, cfg.Logger),
 		reads:  reads,
 		writes: writes,
+		lock:   lock,
 	}, nil
+}
+
+// Close releases the lock of the state directory. Call it after Run
+// returned; a replacement server on the same directory then starts. It is
+// safe to call more than once. The lock also ends with the process.
+func (s *Server) Close() error {
+	s.lock.release()
+	return nil
 }
 
 // GuestOS returns the GuestOs of the running operating system.

@@ -43,11 +43,12 @@ func releaseOnCleanup(t *testing.T, h *harness) {
 }
 
 // restart simulates a helper restart on the same state directory and clock:
-// it closes the files that the old server holds open (the process exit does
-// that) and starts a new server.
+// it closes the files that the old server holds open and releases its state
+// directory lock (the process exit does both) and starts a new server.
 func restart(t *testing.T, h *harness, mutate func(*Config)) *harness {
 	t.Helper()
 	releaseWriteFiles(h)
+	h.srv.Close()
 	stateDir, now := h.srv.cfg.StateDir, h.clock.Now
 	h2 := newHarness(t, func(c *Config) {
 		c.StateDir = stateDir

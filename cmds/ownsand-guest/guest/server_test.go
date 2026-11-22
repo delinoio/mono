@@ -78,6 +78,7 @@ func newHarness(t *testing.T, mutate func(*Config)) *harness {
 		cancel()
 		<-done
 		srv.execs.wg.Wait()
+		srv.Close()
 	})
 	var protocols http.Protocols
 	protocols.SetUnencryptedHTTP2(true)
