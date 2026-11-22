@@ -528,6 +528,12 @@ func (f *importFixture) requireRestorable(t *testing.T, id string) {
 	if res := f.h.command(cmd); res.GetError() != nil || res.GetCreateSandbox().GetSandbox().GetRestorePath() != ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT {
 		t.Fatalf("create from the imported snapshot %v", res)
 	}
+	// Delete the restored sandbox, so that a test can check several
+	// snapshots: the process runtime runs macOS guests on a macOS host, and
+	// the agent runs at most two macOS guests at a time.
+	if res := f.h.command(&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSandbox{DeleteSandbox: &ownsandv1.DeleteSandboxCommand{SandboxId: fromSnap}}}); res.GetError() != nil {
+		t.Fatalf("delete the sandbox restored from the imported snapshot %v", res)
+	}
 }
 
 // getGate counts the part downloads of one snapshot ID and blocks the first
