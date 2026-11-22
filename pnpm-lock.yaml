@@ -291,6 +291,8 @@ importers:
 
   cmds/ownsand-agent: {}
 
+  cmds/tide: {}
+
   packages/delino-ui:
     dependencies:
       '@ui-sdk/core':

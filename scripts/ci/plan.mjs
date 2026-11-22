@@ -77,7 +77,11 @@ export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 // (see the deployment workflow contract), so only the manifest, not the Go
 // source, is a workspace input. plan.test.mjs checks that they declare no
 // scripts and that `pnpm-workspace.yaml` lists exactly these directories.
-export const workspacePackageDirs = ["cmds/ownsand", "cmds/ownsand-agent"];
+export const workspacePackageDirs = [
+  "cmds/ownsand",
+  "cmds/ownsand-agent",
+  "cmds/tide",
+];
 
 function isWorkspacePackageFile(path, file) {
   return workspacePackageDirs.some((dir) => path === `${dir}/${file}`);
