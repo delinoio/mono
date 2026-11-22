@@ -418,6 +418,31 @@ func (s *Service) authorize(ctx context.Context, q db.Querier, orgID string, act
 	return p, 0, errPermission("this credential is not accepted here")
 }
 
+// reauthorize repeats authorize for a caller that a data path RPC already
+// registered as a pending session or grant. authorize reads the database only
+// for a user; an API key principal comes from the interceptor, which checked
+// the key before the handler registered the call. A revocation event that the
+// lease holder handled between that check and the registration found nothing
+// to end, so for an API key reauthorize reads the key and its organization
+// again and returns unauthenticated when the key is revoked or the
+// organization is gone. A user is checked as in authorize.
+func (s *Service) reauthorize(ctx context.Context, q db.Querier, orgID string, action authz.Action) (auth.Principal, ownsandv1.Role, error) {
+	p, role, err := s.authorize(ctx, q, orgID, action)
+	if err != nil || !p.IsAPIKey() {
+		return p, role, err
+	}
+	var live bool
+	err = q.QueryRow(ctx, `SELECT true FROM api_keys k JOIN organizations o ON o.organization_id = k.organization_id
+		WHERE k.api_key_id = $1 AND k.organization_id = $2 AND k.revoke_time IS NULL`, p.ID, p.OrganizationID).Scan(&live)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return p, 0, errUnauthenticated("invalid API key")
+	}
+	if err != nil {
+		return p, 0, s.internal(ctx, "reload api key", err)
+	}
+	return p, role, nil
+}
+
 // requireUser returns the principal of an RPC without organization_id,
 // which accepts only Logto users.
 func requireUser(ctx context.Context) (auth.Principal, error) {

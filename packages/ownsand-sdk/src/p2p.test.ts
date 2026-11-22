@@ -1999,6 +1999,175 @@ describe("peer-to-peer data path", () => {
       }
     });
 
+    describe("an operation in flight at the close", () => {
+      /** Accepts every request and never finishes it. */
+      const hanging: FakeAgent = (frame, peer) => {
+        if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+          execEvent(peer, frame.streamId, ev.started());
+        }
+        if (frame.payload.case === "fileReadRequest") {
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_READ_EVENT,
+            payload: {
+              case: "fileReadEvent",
+              value: {
+                event: {
+                  case: "chunk",
+                  value: { offset: 0n, data: new TextEncoder().encode("hi") },
+                },
+              },
+            },
+          });
+        }
+        if (
+          frame.payload.case === "fileWriteChunk" &&
+          frame.payload.value.offset === 0n
+        ) {
+          // Answers the first chunk only: the close arrives between chunks.
+          const req = frame.payload.value;
+          peer.send({
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.FILE_WRITE_RESULT,
+            payload: {
+              case: "fileWriteResult",
+              value: {
+                writeId: req.writeId,
+                offset: req.offset,
+                length: BigInt(req.data.length),
+                finished: false,
+                sizeBytes: 0n,
+              },
+            },
+          });
+        }
+      };
+
+      const operations: Record<string, (sandbox: Sandbox) => Promise<unknown>> =
+        {
+          exec: (sandbox) => sandbox.exec({ command: ["x"] }).wait(),
+          readFile: async (sandbox) => {
+            for await (const chunk of sandbox.readFile("/a")) {
+              void chunk;
+            }
+          },
+          writeFile: (sandbox) =>
+            // Two chunks: the agent answers the first and the close arrives
+            // while the second is in flight.
+            sandbox.writeFile("/a", new Uint8Array((1 << 20) + 1).fill(7)),
+        };
+
+      /** Fails the test when a later operation reaches the relay. */
+      function expectNoRelay(h: ReturnType<typeof p2pSetup>["h"]) {
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(h.api.callsOf("Exec")).toHaveLength(0);
+        expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+        expect(h.api.callsOf("ReadFile")).toHaveLength(0);
+        expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+      }
+
+      async function expectLaterOperationsRejected(sandbox: Sandbox) {
+        const { h } = current!;
+        await expect(
+          h.clock.run(sandbox.run({ command: ["y"] })),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        await expect(
+          h.clock.run(sandbox.exec({ command: ["y"] }).wait()),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        await expect(
+          h.clock.run(sandbox.readFileBytes("/b")),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        await expect(
+          h.clock.run(sandbox.writeFile("/b", "x")),
+        ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expectNoRelay(h);
+      }
+
+      let current: ReturnType<typeof p2pSetup> | undefined;
+
+      for (const name of Object.keys(operations)) {
+        for (const close of ["close", "delete"] as const) {
+          test(`${name} ends with the closed error after ${close}, without a relay fall back`, async () => {
+            current = p2pSetup(hanging);
+            const { h, rtc } = current;
+            h.api.unary(SandboxService, "DeleteSandbox", (req) => ({
+              sandbox: { sandboxId: req.sandboxId },
+            }));
+            const sandbox = h.client.sandbox(SANDBOX);
+            const pending = operations[name]!(sandbox).catch((e) => e);
+            // The session is open and the request is on the channel.
+            await h.clock.advance(1_000);
+            expect(rtc.frames.length).toBeGreaterThan(0);
+            if (close === "close") {
+              sandbox.close();
+            } else {
+              await h.clock.run(sandbox.delete());
+            }
+            const error = await h.clock.run(pending);
+            expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+            expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+            expectNoRelay(h);
+            await expectLaterOperationsRejected(sandbox);
+          });
+        }
+      }
+
+      test("a forced PEER_TO_PEER handle ends with the closed error, not a data path error", async () => {
+        current = p2pSetup(hanging, {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h, rtc } = current;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const pending = sandbox
+          .exec({ command: ["x"] })
+          .wait()
+          .catch((e) => e);
+        await h.clock.advance(1_000);
+        expect(rtc.frames).toHaveLength(1);
+        sandbox.close();
+        const error = await h.clock.run(pending);
+        expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+        expect(error).not.toBeInstanceOf(DataPathError);
+        await expectLaterOperationsRejected(sandbox);
+      });
+
+      test("a channel failure on an open handle still moves it to the relay", async () => {
+        const { h, rtc } = p2pSetup((frame, peer) => {
+          if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+            execEvent(peer, frame.streamId, ev.started());
+            queueMicrotask(() => queueMicrotask(() => peer.fail()));
+          }
+        });
+        h.api.stream(RelayService, "AttachExec", function* () {
+          yield attachMsg(ev.accepted());
+          yield attachMsg(ev.started());
+          yield attachMsg(ev.exited(0));
+        });
+        h.api.stream(RelayService, "Exec", function* () {
+          yield execMsg(ev.accepted());
+          yield execMsg(ev.exited(0));
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const result = await h.clock.run(
+          sandbox.exec({ command: ["x"] }).wait(),
+        );
+        expect(result.kind).toBe(ExecResultKind.Exited);
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        expect(rtc.channels[0]!.readyState).toBe("closed");
+        expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+        // The relay handle keeps serving after a later close.
+        sandbox.close();
+        const again = await h.clock.run(
+          sandbox.exec({ command: ["y"] }).wait(),
+        );
+        expect(again.kind).toBe(ExecResultKind.Exited);
+      });
+    });
+
     test("delete closes the handle only after DeleteSandbox succeeded", async () => {
       const { h, rtc } = p2pSetup(exiting);
       let fail = true;

@@ -18,7 +18,14 @@ import {
   DialogTitle,
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
-import { type FormEvent, type ReactNode, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
 import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
 import type { AllPages } from "../paging.ts";
@@ -175,6 +182,75 @@ export function Empty({
   );
 }
 
+enum SubmissionResult {
+  /** Another submission of this opening is still running. */
+  Skipped = "skipped",
+  Succeeded = "succeeded",
+  Failed = "failed",
+  /** The dialog closed or opened again before the action settled. */
+  Stale = "stale",
+}
+
+/**
+ * The submission state of a dialog. One submission runs at a time, and its
+ * outcome belongs to the opening of the dialog that started it: a request
+ * that settles after the dialog closed or opened again changes no state and
+ * reports `Stale`, so an earlier failure never shows on a later opening and
+ * never keeps its submit button disabled.
+ */
+function useDialogSubmission(open: boolean) {
+  const [error, setError] = useState<unknown>();
+  const [pending, setPending] = useState(false);
+  const [wasOpen, setWasOpen] = useState(open);
+  if (open !== wasOpen) {
+    // Adjust state while rendering: every time the dialog opens again it
+    // starts without the notice and the pending state of an earlier
+    // submission, including a failure that arrived after the dialog closed.
+    setWasOpen(open);
+    if (open) {
+      setError(undefined);
+      setPending(false);
+    }
+  }
+  // The opening counter changes on every open and close edge. The busy ref
+  // stops a second submission in the same tick, before the pending state
+  // renders, and starts again with every opening.
+  const opening = useRef(0);
+  const busy = useRef(false);
+  useEffect(() => {
+    opening.current += 1;
+    busy.current = false;
+  }, [open]);
+  const clearError = useCallback(() => setError(undefined), []);
+  const submit = useCallback(
+    async (action: () => Promise<unknown>): Promise<SubmissionResult> => {
+      if (busy.current) return SubmissionResult.Skipped;
+      busy.current = true;
+      const mine = opening.current;
+      setPending(true);
+      // A retry removes the notice of the previous failure.
+      setError(undefined);
+      try {
+        await action();
+        return mine === opening.current
+          ? SubmissionResult.Succeeded
+          : SubmissionResult.Stale;
+      } catch (e) {
+        if (mine !== opening.current) return SubmissionResult.Stale;
+        setError(e);
+        return SubmissionResult.Failed;
+      } finally {
+        if (mine === opening.current) {
+          busy.current = false;
+          setPending(false);
+        }
+      }
+    },
+    [],
+  );
+  return { error, pending, clearError, submit };
+}
+
 /**
  * An explicit confirmation step for a destructive action. The cancel
  * button comes first and gets the focus; Escape closes the dialog.
@@ -194,20 +270,12 @@ export function ConfirmDialog({
   onConfirm: () => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
 }) {
-  const [error, setError] = useState<unknown>();
-  const [wasOpen, setWasOpen] = useState(open);
-  if (open !== wasOpen) {
-    // Adjust state while rendering: every time the dialog opens again it
-    // starts without the notice of an earlier failure, including a failure
-    // that arrived after the dialog was already closed.
-    setWasOpen(open);
-    if (open) setError(undefined);
-  }
+  const { error, pending, clearError, submit } = useDialogSubmission(open);
   return (
     <AlertDialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) clearError();
         onOpenChange(next);
       }}
     >
@@ -219,15 +287,10 @@ export function ConfirmDialog({
           <AlertDialogClose>Cancel</AlertDialogClose>
           <Button
             variant={ButtonVariant.Danger}
+            disabled={pending}
             onClick={async () => {
-              // A retry removes the notice of the previous failure.
-              setError(undefined);
-              try {
-                await onConfirm();
-                onOpenChange(false);
-              } catch (e) {
-                setError(e);
-              }
+              const result = await submit(onConfirm);
+              if (result === SubmissionResult.Succeeded) onOpenChange(false);
             }}
           >
             {confirmLabel}
@@ -259,26 +322,16 @@ export function FormDialog({
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
-  const [error, setError] = useState<unknown>();
-  const [pending, setPending] = useState(false);
+  const { error, pending, clearError, submit: run } = useDialogSubmission(open);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (pending) return;
-    setPending(true);
-    setError(undefined);
-    try {
-      await onSubmit();
-    } catch (e) {
-      setError(e);
-    } finally {
-      setPending(false);
-    }
+    await run(onSubmit);
   };
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) clearError();
         onOpenChange(next);
       }}
     >

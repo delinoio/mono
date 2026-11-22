@@ -70,12 +70,24 @@ type Request struct {
 	Kind            ownsandv1.RelayOperationKind
 	OperationID     string
 	Digest          []byte
-	ReplacesID      string
+	// ReplacesID is the predecessor that the caller requested. It stays on
+	// the stored request even when no predecessor was resolved, so a retry
+	// of the same authorization ID can be compared with it. Grant.Replaces
+	// is the resolved link, which the grant lifecycle changes.
+	ReplacesID string
 }
 
 func (r Request) sameOperation(g *Grant) bool {
 	return g.Principal == r.Principal && g.SandboxID == r.SandboxID && g.OrgID == r.OrgID && g.Kind == r.Kind &&
 		g.OperationID == r.OperationID && bytes.Equal(g.Digest, r.Digest)
+}
+
+// sameRequest reports whether r repeats the request that created g: the same
+// operation, the same device and the same requested predecessor. Only the
+// existing-grant branch of Reserve uses it. The predecessor check uses
+// sameOperation, because the predecessor's own ReplacesID differs.
+func (r Request) sameRequest(g *Grant) bool {
+	return r.sameOperation(g) && g.DeviceID == r.DeviceID && g.Request.ReplacesID == r.ReplacesID
 }
 
 // Grant is one relay grant.
@@ -222,7 +234,7 @@ func (r *Registry) Reserve(req Request, newID func() string) (g *Grant, existing
 		delete(r.byAuth, req.AuthorizationID)
 	}
 	if old := r.byAuth[req.AuthorizationID]; old != nil {
-		if !req.sameOperation(old) || old.DeviceID != req.DeviceID {
+		if !req.sameRequest(old) {
 			return nil, false, ErrReuse
 		}
 		return old, true, nil
@@ -250,8 +262,6 @@ func (r *Registry) Reserve(req Request, newID func() string) (g *Grant, existing
 	if predecessor != nil {
 		g.Replaces = predecessor.ID
 		predecessor.Successor = g.ID
-	} else {
-		g.Request.ReplacesID = ""
 	}
 	r.byID[g.ID] = g
 	r.byAuth[req.AuthorizationID] = g

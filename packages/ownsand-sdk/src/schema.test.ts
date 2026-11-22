@@ -4,6 +4,7 @@ import { describe, expect, test } from "@rstest/core";
 import { file_delino_ownsand_v1_agent } from "@delino/ownsand-protos/v1/agent_pb";
 import { file_delino_ownsand_v1_api_key } from "@delino/ownsand-protos/v1/api_key_pb";
 import { file_delino_ownsand_v1_audit } from "@delino/ownsand-protos/v1/audit_pb";
+import { file_delino_ownsand_v1_billing } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   ErrorCode,
   file_delino_ownsand_v1_common,
@@ -26,6 +27,7 @@ const files: DescFile[] = [
   file_delino_ownsand_v1_agent,
   file_delino_ownsand_v1_api_key,
   file_delino_ownsand_v1_audit,
+  file_delino_ownsand_v1_billing,
   file_delino_ownsand_v1_common,
   file_delino_ownsand_v1_data_frame,
   file_delino_ownsand_v1_data_path,
@@ -57,6 +59,7 @@ describe("generated TypeScript bindings", () => {
         "agent",
         "api_key",
         "audit",
+        "billing",
         "common",
         "data_frame",
         "data_path",

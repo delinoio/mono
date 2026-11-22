@@ -515,6 +515,25 @@ func TestAuthorizeRelayRules(t *testing.T) {
 		t.Fatalf("replacement grant = %v", g)
 	}
 	testenv.Eventually(t, "predecessor removed", func() bool { return env.App.Plane.Grants.Get(prev) == nil })
+	// An exact retry of the replacement returns its grant, also after the
+	// predecessor was removed. A retry that drops or changes the predecessor
+	// reuses the authorization_id for another request.
+	if again, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(rep)); err != nil || again.Msg.GetGrantId() != repl.Msg.GetGrantId() {
+		t.Fatalf("exact retry of a replacement: %v %v", again, err)
+	}
+	dropped := proto.Clone(rep).(*ownsandv1.AuthorizeRelayRequest)
+	dropped.ReplacesGrantId = nil
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(dropped)); testenv.Code(err) != connect.CodeInvalidArgument {
+		t.Fatalf("retry without the predecessor: %v", err)
+	}
+	changedPrev := repl.Msg.GetGrantId()
+	changed := proto.Clone(rep).(*ownsandv1.AuthorizeRelayRequest)
+	changed.ReplacesGrantId = &changedPrev
+	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(changed)); testenv.Code(err) != connect.CodeInvalidArgument {
+		t.Fatalf("retry with another predecessor: %v", err)
+	}
+	// The three calls above used part of the per-principal rate budget.
+	env.Clock.Advance(2 * time.Second)
 	// The agent's grant limit rejection.
 	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck {
 		return &ownsandv1.RelayGrantAck{GrantId: g.GetGrantId(), Result: ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_REJECTED_GRANT_LIMIT}
