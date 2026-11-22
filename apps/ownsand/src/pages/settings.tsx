@@ -9,11 +9,14 @@ import {
 import { Select, SelectOption } from "delino-ui/select";
 import { TextField } from "delino-ui/text-field";
 import { toast } from "delino-ui/toast";
-import { BillingService } from "ownsand-sdk/gen/billing_pb";
-import { AgentVersionPolicyMode, Role } from "ownsand-sdk/gen/common_pb";
-import { DeviceService } from "ownsand-sdk/gen/device_pb";
-import { MemberService } from "ownsand-sdk/gen/member_pb";
-import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
+import { BillingService } from "@delino/ownsand-protos/v1/billing_pb";
+import {
+  AgentVersionPolicyMode,
+  Role,
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { type FormEvent, useEffect, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";

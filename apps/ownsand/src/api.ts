@@ -9,14 +9,14 @@ import {
 } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
 import { QueryClient } from "@tanstack/react-query";
-import { BillingService } from "ownsand-sdk/gen/billing_pb";
+import { BillingService } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   BillingReason,
   ErrorDetailSchema,
   SandboxState,
   SnapshotExportState,
   SnapshotState,
-} from "ownsand-sdk/gen/common_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
 
 /**
  * The ListOrganizations request of the console. The control plane returns 50

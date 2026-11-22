@@ -2,14 +2,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { billingReasonOf, DataPathError, isBillingError } from "./errors.ts";
-import { BillingService } from "./gen/delino/ownsand/v1/billing_pb.ts";
+import { BillingService } from "@delino/ownsand-protos/v1/billing_pb";
 import {
   BillingReason,
   SandboxState,
-} from "./gen/delino/ownsand/v1/common_pb.ts";
-import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
-import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
-import { SandboxService } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
+import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { Disconnect, ownsandError } from "./testing/fake-api.ts";
 import {
   attachMsg,

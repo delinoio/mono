@@ -9,14 +9,14 @@ import {
   RelayOperationKind,
   SandboxEndReason,
   SandboxState,
-} from "../gen/delino/ownsand/v1/common_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
 import {
   type AttachExecRequest,
   AttachExecRequestSchema,
   type ExecEvent,
   ExecFailureReason,
   type ExecRequest,
-} from "../gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 import { PeerUnavailableError, SessionEndedError } from "../p2p/session.ts";
 import {
   type OperationContext,

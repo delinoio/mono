@@ -5,8 +5,11 @@ import { Button, ButtonVariant } from "delino-ui/button";
 import { NumberInput } from "delino-ui/number-input";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
-import { DeviceState } from "ownsand-sdk/gen/common_pb";
-import { type Device, DeviceService } from "ownsand-sdk/gen/device_pb";
+import { DeviceState } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  type Device,
+  DeviceService,
+} from "@delino/ownsand-protos/v1/device_pb";
 import { type FormEvent, useEffect, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";

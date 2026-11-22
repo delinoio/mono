@@ -4,9 +4,9 @@ import { describe, expect, test } from "@rstest/core";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
 import { DataPathError, OwnSandValidationError } from "./errors.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
-import { RelayOperationKind } from "./gen/delino/ownsand/v1/common_pb.ts";
-import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
-import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
+import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
+import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
+import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { chunkSource } from "./operations/write.ts";
 import {
   Disconnect,

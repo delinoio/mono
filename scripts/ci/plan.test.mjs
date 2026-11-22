@@ -257,6 +257,7 @@ test("workspace package manifests select fixtures", async (t) => {
     "apps/delino-site/package.json",
     "servers/accounts-api/package.json",
     "packages/new-lib/package.json",
+    "protos/delino/ownsand/package.json",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);
@@ -296,17 +297,21 @@ test("only direct workspace package manifests select fixtures", (t) => {
   f.write("apps/delino-accounts/package.json.example");
   f.write("cmds/example/package.json");
   f.write("docs/package.json");
+  f.write("protos/delino/package.json");
+  f.write("protos/delino/ownsand/v1/package.json");
   const result = plan(f.cwd, f.base, f.commit());
   assert.equal(result.fixtures, false);
 });
 
 const WORKSPACE_MANIFEST_NAME = "pnpm-workspace.yaml";
 const WORKSPACE_PACKAGES_KEY = "packages:";
-// A planner-supported workspace glob is exactly "<root>/*": one plain
-// directory name followed by a single-level wildcard. Anything else (negation,
-// "**", nested roots, relative prefixes, bare directories) is not understood by
-// the planner's workspace manifest selector.
-const WORKSPACE_GLOB_PATTERN = /^([^*/\s!]+)\/\*$/;
+// A planner-supported workspace glob is exactly "<root>/*": a plain directory
+// path of one or more segments (such as "apps" or "protos/delino") followed by
+// a single-level wildcard. Anything else (negation, "**", relative prefixes,
+// bare directories) is not understood by the planner's workspace manifest
+// selector.
+const WORKSPACE_GLOB_PATTERN =
+  /^([^*/\s!.][^*/\s!]*(?:\/[^*/\s!.][^*/\s!]*)*)\/\*$/;
 
 // Returns the workspace roots listed in the `packages:` block of a
 // pnpm-workspace.yaml text. Accepts the valid YAML spellings of a list entry
@@ -377,8 +382,22 @@ test("workspace glob parser accepts quotes and trailing comments", () => {
   );
 });
 
+test("workspace glob parser accepts nested roots", () => {
+  assert.deepEqual(
+    workspaceGlobRoots("packages:\n  - apps/*\n  - protos/delino/*\n"),
+    ["apps", "protos/delino"],
+  );
+});
+
 test("workspace glob parser fails closed on unsupported entries", async (t) => {
-  for (const entry of ["packages/**", "'!excluded/*'", "apps/a", "./apps/*"]) {
+  for (const entry of [
+    "packages/**",
+    "'!excluded/*'",
+    "apps/a",
+    "./apps/*",
+    "protos/*/x/*",
+    "protos/./x/*",
+  ]) {
     await t.test(entry, () => {
       assert.throws(
         () => workspaceGlobRoots(`packages:\n  - apps/*\n  - ${entry}\n`),
@@ -451,16 +470,19 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "protos/buf.gen.yaml",
     "protos/buf.lock",
     "scripts/protos.sh",
-    "packages/ownsand-sdk/buf.gen.yaml",
+    "protos/delino/ownsand/buf.gen.yaml",
+    "protos/delino/ownsand/package.json",
+    "protos/delino/ownsand/tsconfig.json",
+    "protos/delino/ownsand/tsconfig.build.json",
+    "protos/delino/ownsand/v1/common_pb.ts",
     "packages/ownsand-sdk/package.json",
-    "packages/ownsand-sdk/src/gen/delino/ownsand/v1/common_pb.ts",
     "packages/ownsand-sdk/src/client.ts",
     "packages/ownsand-sdk/src/e2e.test.ts",
     "packages/ownsand-sdk/rstest.config.ts",
     "packages/ownsand-sdk/tsconfig.json",
-    "apps/delino-accounts/buf.gen.yaml",
-    "apps/delino-accounts/package.json",
-    "apps/delino-accounts/src/gen/delino/accounts/v1/credit_pb.ts",
+    "protos/delino/accounts/buf.gen.yaml",
+    "protos/delino/accounts/package.json",
+    "protos/delino/accounts/v1/credit_pb.ts",
     ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
@@ -484,6 +506,9 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("servers/example/README.md");
   f.write("servers/example/go.mod.example");
   f.write("protos/AGENTS.md");
+  f.write("protos/delino/ownsand/README.md");
+  f.write("protos/delino/ownsand/v1/notes_pb.md");
+  f.write("apps/delino-accounts/package.json");
   f.write("docs/buf.yaml");
   f.write("packages/ownsand-sdk-example/src/client.ts");
   f.write("packages/delino-ui/package.json");

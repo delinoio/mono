@@ -16,10 +16,13 @@ import {
   NetworkMode,
   SandboxState,
   SnapshotState,
-} from "ownsand-sdk/gen/common_pb";
-import { DeviceService } from "ownsand-sdk/gen/device_pb";
-import { type Sandbox, SandboxService } from "ownsand-sdk/gen/sandbox_pb";
-import { SnapshotService } from "ownsand-sdk/gen/snapshot_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import {
+  type Sandbox,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { useMemo, useState } from "react";
 import {
   invalidateServices,

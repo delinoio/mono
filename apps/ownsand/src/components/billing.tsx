@@ -4,8 +4,8 @@ import {
   BillingPhase,
   BillingService,
   type OrganizationBilling,
-} from "ownsand-sdk/gen/billing_pb";
-import { BillingReason, Role } from "ownsand-sdk/gen/common_pb";
+} from "@delino/ownsand-protos/v1/billing_pb";
+import { BillingReason, Role } from "@delino/ownsand-protos/v1/common_pb";
 import { ACCOUNTS_URL } from "../config.ts";
 import { formatTime } from "../format.ts";
 import { Link, RouteId, routePath } from "../router.tsx";

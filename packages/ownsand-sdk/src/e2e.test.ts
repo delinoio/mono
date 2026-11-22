@@ -6,8 +6,8 @@
 // OWNSAND_E2E_* variables below; otherwise it is skipped.
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
-import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
-import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
+import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
+import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import {
   BaseImage,
   BillingReason,

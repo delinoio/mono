@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create, toBinary } from "@bufbuild/protobuf";
 import { OwnSandValidationError } from "./errors.ts";
-import { ExecRequestSchema } from "./gen/delino/ownsand/v1/data_frame_pb.ts";
+import { ExecRequestSchema } from "@delino/ownsand-protos/v1/data_frame_pb";
 
 /**
  * Request rules that the SDK checks before it sends a request. They equal

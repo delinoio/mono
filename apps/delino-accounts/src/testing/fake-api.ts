@@ -15,7 +15,7 @@ import {
   BillingAccountRole,
   BillingAccountService,
   InvitationState,
-} from "../gen/delino/accounts/v1/billing_account_pb.ts";
+} from "@delino/accounts-protos/v1/billing_account_pb";
 import {
   type AutoTopUpSettings,
   type CreditGrant,
@@ -24,7 +24,7 @@ import {
   type LedgerEntry,
   LedgerEntryKind,
   SubscriptionStatus,
-} from "../gen/delino/accounts/v1/credit_pb.ts";
+} from "@delino/accounts-protos/v1/credit_pb";
 import {
   BillingStatus,
   BillingStatusReason,
@@ -34,7 +34,7 @@ import {
   OrganizationBillingStatusSchema,
   ServiceId,
   type UsageSummaryRow,
-} from "../gen/delino/accounts/v1/usage_pb.ts";
+} from "@delino/accounts-protos/v1/usage_pb";
 
 type Init<T> = Omit<T, "$typeName" | "$unknown">;
 

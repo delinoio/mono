@@ -25,7 +25,7 @@ import {
   CreditService,
   type Subscription,
   SubscriptionStatus,
-} from "../../gen/delino/accounts/v1/credit_pb.ts";
+} from "@delino/accounts-protos/v1/credit_pb";
 import { formatUsd, usd } from "../../money.ts";
 import { useCheckout } from "../../paddle.tsx";
 import { can, Permission } from "../../roles.ts";

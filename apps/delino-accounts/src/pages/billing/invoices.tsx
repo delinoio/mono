@@ -11,7 +11,7 @@ import { errorMessage, formatDate, labels } from "../../format.ts";
 import {
   CreditService,
   type Invoice,
-} from "../../gen/delino/accounts/v1/credit_pb.ts";
+} from "@delino/accounts-protos/v1/credit_pb";
 import { formatUsd } from "../../money.ts";
 
 /**

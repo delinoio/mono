@@ -12,13 +12,13 @@ import {
   requestDigest,
   writeFileBinding,
 } from "./digest.ts";
-import { RelayOperationKind } from "./gen/delino/ownsand/v1/common_pb.ts";
+import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import {
   ExecRequestSchema,
   ReadFileRequestSchema,
   RelayRequestBindingSchema,
   WriteFileRequestSchema,
-} from "./gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 
 interface Vector {
   name: string;

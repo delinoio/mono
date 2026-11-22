@@ -16,7 +16,7 @@ import {
 } from "../components/ui.tsx";
 import { checkAccountName } from "../forms.ts";
 import { labels } from "../format.ts";
-import { BillingAccountService } from "../gen/delino/accounts/v1/billing_account_pb.ts";
+import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /** Route `billing`: the caller's billing accounts and account creation. */

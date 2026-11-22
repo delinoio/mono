@@ -8,16 +8,16 @@ import {
   toBinary,
 } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
-import { ErrorDetailSchema } from "../gen/delino/ownsand/v1/common_pb.ts";
-import { ApiKeyService } from "../gen/delino/ownsand/v1/api_key_pb.ts";
-import { BillingService } from "../gen/delino/ownsand/v1/billing_pb.ts";
-import { DataPathService } from "../gen/delino/ownsand/v1/data_path_pb.ts";
-import { DeviceService } from "../gen/delino/ownsand/v1/device_pb.ts";
-import { MemberService } from "../gen/delino/ownsand/v1/member_pb.ts";
-import { OrganizationService } from "../gen/delino/ownsand/v1/organization_pb.ts";
-import { RelayService } from "../gen/delino/ownsand/v1/relay_pb.ts";
-import { SandboxService } from "../gen/delino/ownsand/v1/sandbox_pb.ts";
-import { SnapshotService } from "../gen/delino/ownsand/v1/snapshot_pb.ts";
+import { ErrorDetailSchema } from "@delino/ownsand-protos/v1/common_pb";
+import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
+import { BillingService } from "@delino/ownsand-protos/v1/billing_pb";
+import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import type { VirtualClock } from "./virtual-clock.ts";
 
 /** Waits in virtual time inside a stream script. */

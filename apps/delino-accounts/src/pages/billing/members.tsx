@@ -22,7 +22,7 @@ import {
   type BillingAccountMember,
   BillingAccountRole,
   BillingAccountService,
-} from "../../gen/delino/accounts/v1/billing_account_pb.ts";
+} from "@delino/accounts-protos/v1/billing_account_pb";
 import { can, canManageMember, Permission } from "../../roles.ts";
 import { RouteId, routePath, useRouter } from "../../router.tsx";
 

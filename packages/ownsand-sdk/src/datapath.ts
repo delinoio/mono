@@ -2,7 +2,7 @@
 
 import { Code } from "@connectrpc/connect";
 import { DataPathError, OwnSandConfigError } from "./errors.ts";
-import { DataPathTransport } from "./gen/delino/ownsand/v1/common_pb.ts";
+import { DataPathTransport } from "@delino/ownsand-protos/v1/common_pb";
 import { LogEvent, safeLog } from "./logger.ts";
 import {
   PeerSession,

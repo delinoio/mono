@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# TypeScript code generation for the delino-accounts schemas, the bindings
+# of the workspace package @delino/accounts-protos. scripts/protos.sh runs
+# this template from protos/ with `--path delino/accounts` and `--output` set
+# to a temporary directory, then copies the generated `*_pb.ts` files next to
+# the schemas. It puts this package's node_modules/.bin first on PATH, so
+# `protoc-gen-es` is the exact version pinned in package.json. Keep it equal
+# to the @bufbuild/protobuf runtime version.
+version: v2
+clean: false
+plugins:
+  - local: protoc-gen-es
+    out: .
+    include_imports: false
+    opt:
+      - target=ts
+      - import_extension=ts

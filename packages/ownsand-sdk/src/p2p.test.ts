@@ -12,13 +12,13 @@ import {
   BillingReason,
   DataPathTransport,
   SessionEndReason,
-} from "./gen/delino/ownsand/v1/common_pb.ts";
-import { DataPathService } from "./gen/delino/ownsand/v1/data_path_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import {
   type DataFrame,
   DataFrameKind,
-} from "./gen/delino/ownsand/v1/data_frame_pb.ts";
-import { RelayService } from "./gen/delino/ownsand/v1/relay_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
+import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
 import {
   type FakeAgent,

@@ -9,7 +9,7 @@ import {
   BillingMeter,
   type BillingMeterUsage,
   BillingService,
-} from "ownsand-sdk/gen/billing_pb";
+} from "@delino/ownsand-protos/v1/billing_pb";
 import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";

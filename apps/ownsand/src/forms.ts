@@ -10,7 +10,7 @@ import { create } from "@bufbuild/protobuf";
 import {
   type DeviceLimitsInput,
   DeviceLimitsInputSchema,
-} from "ownsand-sdk/gen/common_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
 
 export const MAX_TTL_SECONDS = 7 * 24 * 3600;
 export const MAX_LABELS = 32;

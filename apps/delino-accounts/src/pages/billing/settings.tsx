@@ -22,13 +22,13 @@ import {
   DEFAULT_ALERT_THRESHOLD_USD_MICROS,
 } from "../../forms.ts";
 import { formatCount } from "../../format.ts";
-import { BillingAccountService } from "../../gen/delino/accounts/v1/billing_account_pb.ts";
+import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import {
   type AlertSettings,
   type AutoTopUpSettings,
   CreditService,
-} from "../../gen/delino/accounts/v1/credit_pb.ts";
-import { BillingUsageService } from "../../gen/delino/accounts/v1/usage_pb.ts";
+} from "@delino/accounts-protos/v1/credit_pb";
+import { BillingUsageService } from "@delino/accounts-protos/v1/usage_pb";
 import { formatUsd, toAmountInput } from "../../money.ts";
 import { can, Permission } from "../../roles.ts";
 import { RouteId, routePath, useRouter } from "../../router.tsx";

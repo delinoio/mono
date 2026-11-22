@@ -2,9 +2,9 @@
 import type { Client } from "@connectrpc/connect";
 import type { Clock } from "../clock.ts";
 import type { ActivityRegistry } from "../connection.ts";
-import type { DataPathService } from "../gen/delino/ownsand/v1/data_path_pb.ts";
-import type { RelayService } from "../gen/delino/ownsand/v1/relay_pb.ts";
-import type { SandboxService } from "../gen/delino/ownsand/v1/sandbox_pb.ts";
+import type { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
+import type { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import type { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import type { Logger } from "../logger.ts";
 import type { UuidV7Generator } from "../uuidv7.ts";
 

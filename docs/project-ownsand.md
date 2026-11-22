@@ -19,8 +19,9 @@ Paths marked `planned` do not exist yet. Create each path, its workspace members
 - `cmds/ownsand-guest/`: Go helper that runs inside each sandbox guest and serves exec and file requests from the device agent.
 - `cmds/ownsand/`: Go command-line interface for people and programs.
 - `apps/ownsand/`: Rsbuild React web console (workspace package `ownsand-console`) served at `https://ownsand.delino.io`.
-- `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go bindings.
-- `packages/ownsand-sdk/`: TypeScript SDK (workspace package `ownsand-sdk`, not published) and the generated TypeScript bindings of the schemas.
+- `protos/delino/ownsand/v1/`: Connect RPC schemas and the committed Go and TypeScript bindings.
+- `protos/delino/ownsand/`: TypeScript binding package (workspace package `@delino/ownsand-protos`, not published) that the TypeScript SDK and the web console depend on.
+- `packages/ownsand-sdk/`: TypeScript SDK (workspace package `ownsand-sdk`, not published).
 - `go/ownsand/`: Go SDK: the client in the package root and the shared data path packages in its subpackages. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
 
 The project has one hosted server deployable (the control plane on the shared DigitalOcean Droplet), one static site (the web console) and three distributed programs (the device agent, the guest helper and the CLI). The project has no `crates` paths.

@@ -2,10 +2,13 @@
 import { useMutation, useQuery } from "@connectrpc/connect-query";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonVariant } from "delino-ui/button";
-import { SandboxState } from "ownsand-sdk/gen/common_pb";
-import { DeviceService } from "ownsand-sdk/gen/device_pb";
-import { type Sandbox, SandboxService } from "ownsand-sdk/gen/sandbox_pb";
-import { SnapshotService } from "ownsand-sdk/gen/snapshot_pb";
+import { SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import {
+  type Sandbox,
+  SandboxService,
+} from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { toast } from "delino-ui/toast";
 import { useState } from "react";
 import {

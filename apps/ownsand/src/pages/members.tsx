@@ -4,9 +4,12 @@ import { useQueryClient } from "@tanstack/react-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
 import { toast } from "delino-ui/toast";
-import { InvitationState, Role } from "ownsand-sdk/gen/common_pb";
-import { type Member, MemberService } from "ownsand-sdk/gen/member_pb";
-import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
+import { InvitationState, Role } from "@delino/ownsand-protos/v1/common_pb";
+import {
+  type Member,
+  MemberService,
+} from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useAuth } from "../auth.tsx";

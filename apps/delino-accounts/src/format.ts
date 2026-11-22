@@ -4,17 +4,17 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import {
   BillingAccountRole,
   InvitationState,
-} from "./gen/delino/accounts/v1/billing_account_pb.ts";
+} from "@delino/accounts-protos/v1/billing_account_pb";
 import {
   LedgerEntryKind,
   SubscriptionStatus,
-} from "./gen/delino/accounts/v1/credit_pb.ts";
+} from "@delino/accounts-protos/v1/credit_pb";
 import {
   BillingStatus,
   BillingStatusReason,
   Meter,
   ServiceId,
-} from "./gen/delino/accounts/v1/usage_pb.ts";
+} from "@delino/accounts-protos/v1/usage_pb";
 
 /** Display labels of the enums the pages show. */
 export const labels = {

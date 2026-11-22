@@ -2,7 +2,10 @@
 import type { Duration, Timestamp } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { billingReasonOf } from "./api.ts";
-import { BillingAccountRole, BillingMeter } from "ownsand-sdk/gen/billing_pb";
+import {
+  BillingAccountRole,
+  BillingMeter,
+} from "@delino/ownsand-protos/v1/billing_pb";
 import {
   AgentUpdateState,
   AgentVersionPolicyMode,
@@ -20,7 +23,7 @@ import {
   SandboxState,
   SnapshotExportState,
   SnapshotState,
-} from "ownsand-sdk/gen/common_pb";
+} from "@delino/ownsand-protos/v1/common_pb";
 import { ACCOUNTS_URL } from "./config.ts";
 
 /** Display labels of the enums the console shows. */

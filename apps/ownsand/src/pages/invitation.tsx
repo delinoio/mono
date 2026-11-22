@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useMutation } from "@connectrpc/connect-query";
 import { Button } from "delino-ui/button";
-import { MemberService } from "ownsand-sdk/gen/member_pb";
+import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";

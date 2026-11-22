@@ -9,8 +9,7 @@
     "node": ">=24"
   },
   "exports": {
-    ".": "./src/index.ts",
-    "./gen/*": "./src/gen/delino/ownsand/v1/*.ts"
+    ".": "./src/index.ts"
   },
   "files": [
     "dist"
@@ -24,10 +23,10 @@
   "dependencies": {
     "@bufbuild/protobuf": "2.16.0",
     "@connectrpc/connect": "2.3.0",
-    "@connectrpc/connect-web": "2.3.0"
+    "@connectrpc/connect-web": "2.3.0",
+    "@delino/ownsand-protos": "workspace:*"
   },
   "devDependencies": {
-    "@bufbuild/protoc-gen-es": "2.16.0",
     "@rstest/core": "0.12.6",
     "@types/node": "24.19.2",
     "typescript": "6.0.3"
@@ -37,10 +36,6 @@
       ".": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
-      },
-      "./gen/*": {
-        "types": "./dist/gen/delino/ownsand/v1/*.d.ts",
-        "default": "./dist/gen/delino/ownsand/v1/*.js"
       }
     }
   }

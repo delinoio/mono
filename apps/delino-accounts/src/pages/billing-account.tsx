@@ -9,7 +9,7 @@ import {
 } from "../components/shell.tsx";
 import { ErrorNotice, Loading, PageHeader } from "../components/ui.tsx";
 import { labels } from "../format.ts";
-import { BillingAccountService } from "../gen/delino/accounts/v1/billing_account_pb.ts";
+import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
 import { InvoicesSection } from "./billing/invoices.tsx";

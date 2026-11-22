@@ -4,7 +4,7 @@ import {
   BillingReason,
   type ErrorDetail,
   ErrorDetailSchema,
-} from "./gen/delino/ownsand/v1/common_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
 
 /** Base class of the errors that the SDK itself raises. */
 export class OwnSandError extends Error {

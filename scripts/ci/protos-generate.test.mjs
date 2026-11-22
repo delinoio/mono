@@ -65,8 +65,8 @@ if [[ "$ts" -eq 1 ]]; then
     echo "fake go: TypeScript generator failure for $schemas" >&2
     exit 1
   fi
-  mkdir -p "$out/src/gen/$schemas/v1"
-  echo "new ts $schemas" > "$out/src/gen/$schemas/v1/new_pb.ts"
+  mkdir -p "$out/$schemas/v1"
+  echo "new ts $schemas" > "$out/$schemas/v1/new_pb.ts"
 else
   if [[ "\${FAKE_GO_FAIL:-}" == "go" ]]; then
     echo "fake go: Go generator failure" >&2
@@ -83,11 +83,9 @@ function write(file, content) {
   writeFileSync(file, content);
 }
 
-// TypeScript targets of the script: package directory and its schema path.
-const tsPackages = [
-  ["packages", "ownsand-sdk"],
-  ["apps", "delino-accounts"],
-];
+// TypeScript targets of the script: the schema directories under protos/,
+// which are also the binding package directories.
+const tsPackages = ["ownsand", "accounts"];
 
 // Creates a repository with the real script, committed (old) bindings of both
 // languages and every TypeScript target, and the fake go in a bin directory.
@@ -129,23 +127,16 @@ function fixture({ plugin = true } = {}) {
     "old go connect\n",
   );
   for (const pkg of tsPackages) {
-    write(join(repo, ...pkg, "buf.gen.yaml"), "version: v2\n");
-    write(
-      join(repo, ...pkg, "src", "gen", "delino", "a_pb.ts"),
-      `old ts a ${pkg[1]}\n`,
-    );
-    write(
-      join(repo, ...pkg, "src", "gen", "stale_pb.ts"),
-      `old ts stale ${pkg[1]}\n`,
-    );
-    if (plugin === true || plugin === pkg[1]) {
-      const pluginFile = join(
-        repo,
-        ...pkg,
-        "node_modules",
-        ".bin",
-        "protoc-gen-es",
-      );
+    const dir = join(repo, "protos", "delino", pkg);
+    write(join(dir, "buf.gen.yaml"), "version: v2\n");
+    write(join(dir, "package.json"), "{}\n");
+    write(join(dir, "v1", "a_pb.ts"), `old ts a ${pkg}\n`);
+    write(join(dir, "v1", "stale_pb.ts"), `old ts stale ${pkg}\n`);
+    // Files that are not bindings: generation must keep them.
+    write(join(dir, "v1", "a.proto"), "x\n");
+    write(join(dir, "dist", "v1", "a_pb.ts"), `built ${pkg}\n`);
+    if (plugin === true || plugin === pkg) {
+      const pluginFile = join(dir, "node_modules", ".bin", "protoc-gen-es");
       write(pluginFile, "#!/bin/sh\n");
       chmodSync(pluginFile, 0o755);
     }
@@ -183,7 +174,10 @@ function bindings(repo) {
   };
   add(join(repo, "protos"), (f) => /\.(pb|connect)\.go$/.test(f));
   for (const pkg of tsPackages) {
-    add(join(repo, ...pkg, "src", "gen"), () => true);
+    add(
+      join(repo, "protos", "delino", pkg),
+      (f) => !f.includes("node_modules"),
+    );
   }
   return result;
 }
@@ -202,7 +196,7 @@ function assertPreserved(f, result, diagnostic) {
   assert.notEqual(run.status, 0, run.stdout);
   assert.match(run.stderr, diagnostic);
   assert.deepEqual(bindings(f.repo), before);
-  assert.equal(before.size, 7);
+  assert.equal(before.size, 15);
   assert.deepEqual(readdirSync(f.scratch), []);
 }
 
@@ -263,15 +257,15 @@ test(
 );
 
 test(
-  "a missing protoc-gen-es of the web app preserves every binding",
+  "a missing protoc-gen-es of the accounts package preserves every binding",
   { skip },
   (t) => {
-    const f = fixture({ plugin: "ownsand-sdk" });
+    const f = fixture({ plugin: "ownsand" });
     t.after(() => rmSync(f.dir, { recursive: true, force: true }));
     assertPreserved(
       f,
       () => generate(f),
-      /delino-accounts\/node_modules\/\.bin\/protoc-gen-es is missing/,
+      /delino\/accounts\/node_modules\/\.bin\/protoc-gen-es is missing/,
     );
   },
 );
@@ -284,33 +278,25 @@ test(
     t.after(() => rmSync(f.dir, { recursive: true, force: true }));
     const run = generate(f);
     assert.equal(run.status, 0, run.stderr);
+    const kept = tsPackages.flatMap((pkg) => {
+      const dir = join("protos", "delino", pkg);
+      return [
+        [join(dir, "buf.gen.yaml"), "version: v2\n"],
+        [join(dir, "package.json"), "{}\n"],
+        [join(dir, "v1", "a.proto"), "x\n"],
+        [join(dir, "dist", "v1", "a_pb.ts"), `built ${pkg}\n`],
+      ];
+    });
     assert.deepEqual(
       [...bindings(f.repo)].sort(),
       [
+        ...kept,
         [
-          join(
-            "packages",
-            "ownsand-sdk",
-            "src",
-            "gen",
-            "delino",
-            "ownsand",
-            "v1",
-            "new_pb.ts",
-          ),
+          join("protos", "delino", "ownsand", "v1", "new_pb.ts"),
           "new ts delino/ownsand\n",
         ],
         [
-          join(
-            "apps",
-            "delino-accounts",
-            "src",
-            "gen",
-            "delino",
-            "accounts",
-            "v1",
-            "new_pb.ts",
-          ),
+          join("protos", "delino", "accounts", "v1", "new_pb.ts"),
           "new ts delino/accounts\n",
         ],
         [join("protos", "delino", "ownsand", "v1", "new.pb.go"), "new go\n"],

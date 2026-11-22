@@ -1705,8 +1705,8 @@ test("CLI --all reports one candidate per distinct path after a conflicted merge
 test("Rstack owns exclusions and retains Markdown prose and embedded code", async (t) => {
   const f = fixture(t);
   const ignored = [
-    "packages/example/src/gen/client.ts",
-    "apps/delino-accounts/src/gen/delino/accounts/v1/credit_pb.ts",
+    "protos/delino/example/v1/example_pb.ts",
+    "protos/delino/accounts/v1/credit_pb.ts",
     "vendor/code.ts",
     "data/fixtures/input.json",
     "data/testdata/input.json",

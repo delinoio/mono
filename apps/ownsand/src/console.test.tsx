@@ -14,7 +14,7 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
-import { OrganizationService } from "ownsand-sdk/gen/organization_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { type Auth, AuthContextProvider } from "./auth.tsx";

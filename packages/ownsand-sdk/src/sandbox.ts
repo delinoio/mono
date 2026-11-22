@@ -5,12 +5,12 @@ import { newBindingSalt } from "./digest.ts";
 import {
   DataPathTransport,
   SandboxState,
-} from "./gen/delino/ownsand/v1/common_pb.ts";
-import { ExecRequestSchema } from "./gen/delino/ownsand/v1/data_frame_pb.ts";
-import type { Sandbox as SandboxMessage } from "./gen/delino/ownsand/v1/sandbox_pb.ts";
-import type { Snapshot } from "./gen/delino/ownsand/v1/snapshot_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
+import { ExecRequestSchema } from "@delino/ownsand-protos/v1/data_frame_pb";
+import type { Sandbox as SandboxMessage } from "@delino/ownsand-protos/v1/sandbox_pb";
+import type { Snapshot } from "@delino/ownsand-protos/v1/snapshot_pb";
 import type { Client } from "@connectrpc/connect";
-import type { SnapshotService } from "./gen/delino/ownsand/v1/snapshot_pb.ts";
+import type { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import {
   ExecHandle,
   type ExecResult,

@@ -8,6 +8,6 @@ pnpm --filter delino-accounts build
 pnpm --filter delino-accounts test
 ```
 
-Build-time configuration: [`.env.example`](.env.example). TypeScript bindings in `src/gen/` come from `scripts/protos.sh generate`.
+Build-time configuration: [`.env.example`](.env.example). TypeScript bindings come from the workspace package `@delino/accounts-protos`.
 
 Contract: [`docs/apps-delino-accounts-foundation.md`](../../docs/apps-delino-accounts-foundation.md).

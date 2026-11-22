@@ -290,7 +290,7 @@ jobs:
             scripts/protos.sh
             protos/buf.gen.yaml
       # scripts/protos.sh check also generates the TypeScript bindings with the
-      # protoc-gen-es versions that packages/ownsand-sdk and apps/delino-accounts
+      # protoc-gen-es versions that the binding packages in protos/delino/
       # pin.
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6

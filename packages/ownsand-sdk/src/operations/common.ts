@@ -4,7 +4,7 @@ import { classifyFailure, FailureClass, retryAfterMs } from "../errors.ts";
 import {
   SandboxEndReason,
   SandboxState,
-} from "../gen/delino/ownsand/v1/common_pb.ts";
+} from "@delino/ownsand-protos/v1/common_pb";
 import { LogEvent, safeLog } from "../logger.ts";
 import type { OperationContext } from "../relay/context.ts";
 import { Timing } from "../relay/context.ts";

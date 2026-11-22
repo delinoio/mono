@@ -5,12 +5,12 @@ import {
   type MessageInitShape,
 } from "@bufbuild/protobuf";
 import { OwnSandClient, type OwnSandClientOptions } from "../client.ts";
-import { SandboxState } from "../gen/delino/ownsand/v1/common_pb.ts";
-import { DataPathService } from "../gen/delino/ownsand/v1/data_path_pb.ts";
+import { SandboxState } from "@delino/ownsand-protos/v1/common_pb";
+import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import type {
   ExecEventSchema,
   FileReadEventSchema,
-} from "../gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 
 type ExecEventInit = NonNullable<
   MessageInitShape<typeof ExecEventSchema>["event"]
@@ -22,8 +22,8 @@ import {
   AttachExecResponseSchema,
   ExecResponseSchema,
   ReadFileResponseSchema,
-} from "../gen/delino/ownsand/v1/relay_pb.ts";
-import { SandboxService } from "../gen/delino/ownsand/v1/sandbox_pb.ts";
+} from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { FakeApi } from "./fake-api.ts";
 import { VirtualClock } from "./virtual-clock.ts";
 

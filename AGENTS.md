@@ -59,7 +59,7 @@
 - `crates/`: Rust crates and Rust-based tooling.
 - `cmds/`: Go command-line tools and device-side programs. The device agent and guest helper are licensed under FSL-1.1-ALv2; the other commands use Apache-2.0.
 - `servers/`: Backend services, licensed under FSL-1.1-ALv2.
-- `protos/`: Versioned protocol schemas and committed Go bindings.
+- `protos/`: Versioned protocol schemas, committed Go bindings and the TypeScript binding packages (`@delino/<name>-protos` in `protos/delino/<name>/`).
 - `go/`: Go packages that external users import, in the root Go module.
 - `internal/`: Generic Go packages that only this repository imports, shared across projects.
 - `packages/`: Shared generated and runtime packages.

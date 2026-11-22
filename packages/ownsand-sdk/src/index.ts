@@ -44,10 +44,10 @@ export type {
 } from "./p2p/webrtc.ts";
 export { type ExecOptions, type RunResult, Sandbox } from "./sandbox.ts";
 export { isUuidV7, UuidV7Generator } from "./uuidv7.ts";
-export * from "./gen/delino/ownsand/v1/common_pb.ts";
-export { ExecFailureReason } from "./gen/delino/ownsand/v1/data_frame_pb.ts";
+export * from "@delino/ownsand-protos/v1/common_pb";
+export { ExecFailureReason } from "@delino/ownsand-protos/v1/data_frame_pb";
 export {
   BillingAccountRole,
   BillingMeter,
   BillingPhase,
-} from "./gen/delino/ownsand/v1/billing_pb.ts";
+} from "@delino/ownsand-protos/v1/billing_pb";

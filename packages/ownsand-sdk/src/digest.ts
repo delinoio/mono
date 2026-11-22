@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash, randomBytes } from "node:crypto";
 import type { Duration } from "@bufbuild/protobuf/wkt";
-import { RelayOperationKind } from "./gen/delino/ownsand/v1/common_pb.ts";
+import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import type {
   ExecRequest,
   ReadFileRequest,
   WriteFileRequest,
-} from "./gen/delino/ownsand/v1/data_frame_pb.ts";
+} from "@delino/ownsand-protos/v1/data_frame_pb";
 
 /** Size of a binding salt: 32 random bytes per operation. */
 export const BINDING_SALT_SIZE = 32;
