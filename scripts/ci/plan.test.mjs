@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
   renameSync,
   rmSync,
   symlinkSync,
@@ -22,6 +23,7 @@ import {
   MAIN_REF,
   OutputReason,
   SCHEDULE_EVENT,
+  e2eWorkspacePackages,
   isMainPush,
   isScheduledMain,
   main,
@@ -552,6 +554,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "servers/ownsand-api/internal/db/migrations/0001_initial.sql",
     "servers/accounts-api/internal/db/migrations/00001_billing_accounts.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
+    "servers/ownsand-api/scripts/dev.mjs",
     "go/example/testdata/case.golden",
     "cmds/example/internal/testdata/input.json",
     "internal/example/testdata/input.txt",
@@ -576,11 +579,24 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   f.write("apps/delino-accounts/src/App.tsx");
   f.write("rstest.config.ts");
   f.write("servers/ownsand-api/README.md");
+  // Only the ownsand-api launcher is a Go input: its test runs against a
+  // Go-built server. The launcher test and the accounts-api launcher are not.
+  f.write("servers/ownsand-api/scripts/dev.test.mjs");
+  f.write("servers/accounts-api/scripts/dev.mjs");
   f.write(".github/workflows/deploy.yml");
   f.write("docs/testdata/example.json");
   f.write("go/example/mytestdata/example.json");
   f.write("go/example/testdata.json");
   assert.equal(plan(f.cwd, f.base, f.commit()).go, false);
+});
+
+test("the ownsand-api launcher selects the Go checks and the workspace jobs", (t) => {
+  const f = fixture(t);
+  f.write("servers/ownsand-api/scripts/dev.mjs");
+  const selected = plan(f.cwd, f.base, f.commit());
+  assert.equal(selected.go, true);
+  assert.equal(selected.workspace, true);
+  assert.equal(selected.e2e, false);
 });
 
 test("The relay request digest vectors select Go checks and workspace jobs", (t) => {
@@ -643,6 +659,12 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
     "apps/delino-accounts/src/App.tsx",
     "apps/delino-docs/docs/guide/introduction.md",
     "apps/delino-site/e2e.config.ts",
+    "packages/delino-ui/src/dialog.tsx",
+    "packages/delino-ui/package.json",
+    "protos/delino/ownsand/v1/common_pb.ts",
+    "protos/delino/ownsand/package.json",
+    "protos/delino/accounts/v1/credit_pb.ts",
+    "protos/delino/accounts/package.json",
     ".github/workflows/CI.yml",
     ".nvmrc",
     "package.json",
@@ -660,7 +682,47 @@ test("app paths and shared workspace inputs select e2e suites", async (t) => {
   f.write("apps/AGENTS.md");
   f.write("docs/apps-delino-site-foundation.md");
   f.write("servers/accounts-api/main.go");
+  // The OwnSand SDK is not a dependency of an app, and a sibling directory
+  // that only shares a package prefix is not the shared UI package.
+  f.write("packages/ownsand-sdk/src/client.ts");
+  f.write("packages/delino-ui-example/src/button.tsx");
+  f.write("protos/delino/example/v1/example_pb.ts");
+  f.write("protos/buf.yaml");
   assert.equal(plan(f.cwd, f.base, f.commit()).e2e, false);
+});
+
+test("the e2e workspace packages equal the workspace dependencies of the apps", () => {
+  // The planner runs without installed dependencies, so it lists the packages
+  // that the apps depend on; this test keeps the list in sync with the
+  // manifests.
+  const manifest = (dir) =>
+    JSON.parse(readFileSync(join(root, dir, "package.json"), "utf8"));
+  const packageDirs = new Map();
+  for (const workspaceRoot of workspaceRoots) {
+    for (const entry of readdirSync(join(root, workspaceRoot), {
+      withFileTypes: true,
+    })) {
+      const dir = `${workspaceRoot}/${entry.name}`;
+      if (entry.isDirectory() && existsSync(join(root, dir, "package.json"))) {
+        packageDirs.set(manifest(dir).name, `${dir}/`);
+      }
+    }
+  }
+  const expected = new Set();
+  for (const entry of readdirSync(join(root, "apps"), {
+    withFileTypes: true,
+  })) {
+    if (!entry.isDirectory()) continue;
+    const app = manifest(`apps/${entry.name}`);
+    for (const dependencies of [app.dependencies, app.devDependencies]) {
+      for (const [name, range] of Object.entries(dependencies ?? {})) {
+        if (!String(range).startsWith("workspace:")) continue;
+        assert.ok(packageDirs.has(name), `${name} is not a workspace package`);
+        expected.add(packageDirs.get(name));
+      }
+    }
+  }
+  assert.deepEqual([...e2eWorkspacePackages].sort(), [...expected].sort());
 });
 
 test("workspace package paths and root task inputs select workspace tasks", async (t) => {

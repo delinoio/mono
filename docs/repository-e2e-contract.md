@@ -67,7 +67,7 @@ The root `test:e2e` Turbo task is uncached because results depend on a browser, 
 
 ## CI
 
-- The CI planner selects the `e2e` job when a path inside an `apps/<app>/` package changes, or when `.github/workflows/CI.yml`, `.nvmrc`, `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` or `turbo.json` changes. The planner also selects it for every push to `refs/heads/main`, regardless of the comparison, so a cancelled main-push run cannot leave its e2e validation unrun. The job runs every app suite on Ubuntu.
+- The CI planner selects the `e2e` job when a path inside an `apps/<app>/` package changes, when a path inside a workspace package that the apps depend on (`packages/delino-ui/`, `protos/delino/accounts/` or `protos/delino/ownsand/`) changes, because the app suites render their sources, or when `.github/workflows/CI.yml`, `.nvmrc`, `package.json`, `pnpm-lock.yaml`, `pnpm-workspace.yaml` or `turbo.json` changes. A planner test keeps the list of those packages equal to the workspace dependencies of the apps. The planner also selects it for every push to `refs/heads/main`, regardless of the comparison, so a cancelled main-push run cannot leave its e2e validation unrun. The job runs every app suite on Ubuntu.
 - The job installs Chromium with system dependencies and runs `pnpm test:e2e -- --reporter list,junit`.
 - The model key comes from the `AI_GATEWAY_API_KEY` repository secret. Pull requests from forks do not receive secrets; when the key is empty, the job excludes tests tagged `agent` and records that in the job summary.
 - The job uploads `apps/*/.e2e/` reports, results and logs as the `e2e-results` artifact for seven days. The upload sets `include-hidden-files: true`, because `.e2e/` is a hidden directory. The replay cache is not uploaded.

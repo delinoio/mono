@@ -38,9 +38,28 @@ const e2eInputs = new Set([
   "turbo.json",
 ]);
 
-// Paths inside an app package select the app e2e suites.
+// Workspace packages that the apps depend on through `workspace:*` (the shared
+// UI package and the generated TypeScript binding packages). The app e2e
+// suites render these sources in a browser, so a change inside one of them
+// changes the app behavior without touching an `apps/<app>/` path. Keep this
+// list equal to the directories of the workspace dependencies of the apps;
+// plan.test.mjs cross-checks it against `apps/*/package.json`, because the
+// planner runs without installing dependencies and cannot derive it itself.
+// `packages/ownsand-sdk/` is not an app dependency and stays out.
+export const e2eWorkspacePackages = [
+  "packages/delino-ui/",
+  "protos/delino/accounts/",
+  "protos/delino/ownsand/",
+];
+
+// Paths inside an app package or inside a workspace package that an app
+// depends on select the app e2e suites.
 export function isE2eInput(path) {
-  return e2eInputs.has(path) || /^apps\/[^/]+\//.test(path);
+  return (
+    e2eInputs.has(path) ||
+    /^apps\/[^/]+\//.test(path) ||
+    e2eWorkspacePackages.some((prefix) => path.startsWith(prefix))
+  );
 }
 
 // Workspace package roots, as directories that hold one level of packages.
@@ -175,6 +194,13 @@ const relayDigestVectors =
 // package sources that the `.go` selector would catch).
 const goTestdata = /^(?:go|cmds|internal|servers)\/(?:.+\/)?testdata\//;
 
+// The development launcher of ownsand-api. Its test
+// TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase in
+// `servers/ownsand-api/cmd/ownsand-api` runs the launcher against a Go-built
+// server, so a change to the launcher alone must select the Go checks. The
+// launcher test (`dev.test.mjs`) and the accounts-api launcher run no Go test.
+const ownsandApiLauncher = "servers/ownsand-api/scripts/dev.mjs";
+
 // Go sources, module files, protobuf schema inputs and the inputs of the
 // OwnSand end-to-end suite select the repository Go checks.
 export function isGoInput(path) {
@@ -188,6 +214,7 @@ export function isGoInput(path) {
     path.startsWith(ownsandSdkPackage) ||
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
+    path === ownsandApiLauncher ||
     goTestdata.test(path)
   );
 }
