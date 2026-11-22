@@ -909,6 +909,8 @@ func TestAgentUpdateTargetOrdering(t *testing.T) {
 		{name: "equal default with a v prefix", running: "1.9.0", releases: []release{{"v1.9.0", true, false}}, mode: follow},
 		{name: "a release is newer than its pre-release", running: "1.9.0-rc.1", releases: []release{{"1.9.0", true, false}}, mode: follow, wantTarget: "1.9.0"},
 		{name: "a pre-release default is older than the release", running: "1.9.0", releases: []release{{"1.9.0-rc.1", true, false}}, mode: follow},
+		{name: "a higher numeric pre-release identifier is not a downgrade", running: "1.9.0-rc.10", releases: []release{{"1.9.0-rc.2", true, false}}, mode: follow},
+		{name: "a higher numeric pre-release identifier is newer", running: "1.9.0-rc.2", releases: []release{{"1.9.0-rc.10", true, false}}, mode: follow, wantTarget: "1.9.0-rc.10"},
 		{name: "unrecognized running version", running: "dev-build", releases: []release{{"1.9.0", true, false}}, mode: follow, wantWarning: true},
 		{name: "unrecognized default version", running: "1.9.0", releases: []release{{"latest", true, false}}, mode: follow, wantWarning: true},
 		{name: "zero-padded running version", running: "01.0.0", releases: []release{{"1.1.0", true, false}}, mode: follow, wantWarning: true},
