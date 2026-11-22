@@ -59,6 +59,9 @@ type Org struct {
 	MaxSandboxes int
 	// CreateError, when set, is the error of the next CreateSandbox calls.
 	CreateError error
+	// DeleteError, when set, is the error of the next DeleteSandbox calls
+	// (for example a transient OwnSand failure).
+	DeleteError error
 	// StartRunning makes new sandboxes RUNNING at once (the default);
 	// false keeps them CREATING until the test calls SetRunning.
 	StartRunning bool
@@ -297,11 +300,14 @@ func (c *client) GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.S
 }
 
 func (c *client) DeleteSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error) {
-	_, s, err := c.sandbox("DeleteSandbox", sandboxID)
+	o, s, err := c.sandbox("DeleteSandbox", sandboxID)
 	if err != nil {
 		return nil, err
 	}
 	defer c.f.mu.Unlock()
+	if o.DeleteError != nil {
+		return nil, o.DeleteError
+	}
 	if !ownsand.IsTerminal(s.sb.GetState()) {
 		reason := ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER
 		s.sb.State, s.sb.EndReason = ownsandv1.SandboxState_SANDBOX_STATE_DELETED, &reason

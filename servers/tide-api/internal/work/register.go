@@ -67,6 +67,11 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 		},
 		AfterCommit: func(ctx context.Context, orgID, profileID string) { e.releasePending(ctx, "profile/"+profileID) },
 	})
+	unmark := func(ctx context.Context, orgID string) {
+		if _, err := r.Service.DB.Pool.Exec(context.WithoutCancel(ctx), "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", orgID); err != nil {
+			r.Service.Logger.WarnContext(ctx, "ownsand_link_unmark_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+		}
+	}
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
 		Name: "work",
 		Prepare: func(ctx context.Context, d api.OrganizationDeletion) error {
@@ -76,13 +81,16 @@ func Register(r *app.Registry, links *link.Links, profiles *profile.Profiles, m 
 			if _, err := r.Service.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = true WHERE organization_id = $1", d.OrganizationID); err != nil {
 				return err
 			}
-			return e.cleanUpRunners(ctx, d.OrganizationID, func(*Runner) bool { return true })
-		},
-		Abort: func(ctx context.Context, d api.OrganizationDeletion) {
-			if _, err := r.Service.DB.Pool.Exec(ctx, "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", d.OrganizationID); err != nil {
-				r.Service.Logger.WarnContext(ctx, "ownsand_link_unmark_failed", slog.String("organization_id", d.OrganizationID), slog.Any("error", err))
+			if err := e.cleanUpRunners(ctx, d.OrganizationID, func(*Runner) bool { return true }); err != nil {
+				// The core runs Abort only for the hooks before the one that
+				// failed, so this hook clears its own mark: the organization
+				// stays and its dispatch continues.
+				unmark(ctx, d.OrganizationID)
+				return err
 			}
+			return nil
 		},
+		Abort: func(ctx context.Context, d api.OrganizationDeletion) { unmark(ctx, d.OrganizationID) },
 		InTx: func(ctx context.Context, tx pgx.Tx, d api.OrganizationDeletion) error {
 			ended, err := e.endOpenTx(ctx, tx, d.OrganizationID, "", RequestEnd{State: reqCanceled, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
 			e.pendingReleases.Store("org/"+d.OrganizationID, ended)

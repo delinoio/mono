@@ -275,3 +275,27 @@ func TestCleanUps(t *testing.T) {
 func isEnded(s tidev1.RequestState) bool {
 	return s == tidev1.RequestState_REQUEST_STATE_ENDED || s == tidev1.RequestState_REQUEST_STATE_FAILED || s == tidev1.RequestState_REQUEST_STATE_CANCELED
 }
+
+// TestOrganizationDeletionFailureKeepsDispatch: when OwnSand cannot delete a
+// sandbox, DeleteOrganization fails, the organization stays and its
+// dispatcher still starts new work.
+func TestOrganizationDeletionFailureKeepsDispatch(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	s := w.createSession(t, w.env.User(w.org.Member), profileID)
+	w.waitState(t, s.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.DeleteError = connect.NewWireError(connect.CodeUnavailable, errors.New("device busy"))
+	})
+	if _, err := w.env.User(w.org.Owner).Organization.DeleteOrganization(ctx, connect.NewRequest(&tidev1.DeleteOrganizationRequest{OrganizationId: w.org.ID})); err == nil {
+		t.Fatal("the organization deletion succeeded without the sandbox deletion")
+	}
+	var removing bool
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT removing FROM ownsand_links WHERE organization_id = $1", w.org.ID).Scan(&removing); err != nil || removing {
+		t.Fatalf("link still marked as being removed: %v %v", removing, err)
+	}
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) { o.DeleteError = nil })
+	next := w.createSession(t, w.env.User(w.org.Member), profileID)
+	w.waitState(t, next.GetDevSessionId(), tidev1.RequestState_REQUEST_STATE_RUNNING)
+}
