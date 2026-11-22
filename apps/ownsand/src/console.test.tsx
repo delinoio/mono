@@ -18,15 +18,20 @@ import {
 import {
   type DeviceLimitsInput,
   type Resources,
+  SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
+import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
 import { createQueryClient } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
+import { shortIdText } from "./components/ui.tsx";
+import { formatTime } from "./format.ts";
 import { pendingInvitation } from "./invitation.ts";
 import { RouteId, RouterProvider, useRouter } from "./router.tsx";
 import {
@@ -53,6 +58,8 @@ function renderConsole(
     transport?: Transport;
     config?: ConsoleConfig;
     queryClient?: QueryClient;
+    /** The signed-in user; the mock user by default. */
+    userId?: string;
     strict?: boolean;
   } = {},
 ) {
@@ -62,7 +69,7 @@ function renderConsole(
   const auth: Auth = {
     isLoading: false,
     isAuthenticated: signedIn,
-    userId: signedIn ? MOCK_USER : undefined,
+    userId: signedIn ? (options.userId ?? MOCK_USER) : undefined,
     signIn: async () => {
       signIns.push(1);
     },
@@ -686,6 +693,168 @@ describe("devices", () => {
   });
 });
 
+describe("cached lists after a mutation that changes another service", () => {
+  /** The console with the production query client, whose staleTime is 10 s. */
+  function renderCounting(
+    path: string,
+    mock: Transport = createMockTransport(),
+  ) {
+    const counted = countingTransport(mock);
+    renderConsole(path, {
+      transport: counted.transport,
+      queryClient: createQueryClient(),
+    });
+    return counted;
+  }
+
+  const open = async (name: string | RegExp) => {
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("link", { name }));
+    });
+    await settle(60);
+  };
+
+  const confirmRemoveDevice = async () => {
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Remove device" }),
+      );
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Remove device" }),
+      );
+    });
+    await settle(100);
+  };
+
+  test("a removed device's sandboxes, snapshots and templates leave the fresh cached lists", async () => {
+    const { calls } = renderCounting(`/orgs/${MOCK_IDS.acme}/snapshots`);
+    expect(await screen.findByText("node-24-toolchain")).toBeTruthy();
+    await open("Sandboxes");
+    await open("Devices");
+    const before = { ...calls };
+    await open("build-box-1");
+    await confirmRemoveDevice();
+    // The device list is the page that the removal returns to.
+    expect(await screen.findByText("studio-mac")).toBeTruthy();
+    // The cached lists are inactive here and refetch when a page shows them
+    // again, although their 10 s staleTime has not passed.
+    await open("Snapshots");
+    expect(await screen.findByText("No snapshots")).toBeTruthy();
+    expect(screen.queryByText("node-24-toolchain")).toBeNull();
+    expect(calls.ListSnapshots).toBeGreaterThan(before.ListSnapshots ?? 0);
+    expect(calls.ListTemplates).toBeGreaterThan(before.ListTemplates ?? 0);
+    await open("Sandboxes");
+    expect(calls.ListSandboxes).toBeGreaterThan(before.ListSandboxes ?? 0);
+    expect(screen.queryByText("Running")).toBeNull();
+  });
+
+  test("a created sandbox invalidates the device queries", async () => {
+    const { calls } = renderCounting(`/orgs/${MOCK_IDS.acme}/sandboxes`);
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Create sandbox" }),
+      );
+    });
+    await settle(60);
+    const dialog = await screen.findByRole("dialog", {
+      name: "Create a sandbox",
+    });
+    const before = calls.ListDevices ?? 0;
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(100);
+    expect(calls.CreateSandbox).toBe(1);
+    expect(calls.ListDevices).toBeGreaterThan(before);
+  });
+
+  test("a deleted sandbox invalidates the device queries", async () => {
+    const { calls } = renderCounting(
+      `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await settle(60);
+    const before = calls.ListDevices ?? 0;
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Delete sandbox" }),
+      );
+    });
+    await settle(100);
+    expect(calls.DeleteSandbox).toBe(1);
+    expect(calls.ListDevices).toBeGreaterThan(before);
+  });
+
+  test("a sandbox that is still deleting invalidates the device queries once its state settles", async () => {
+    const mock = createMockTransport();
+    let polls = 0;
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        const response = await mock.unary(method, ...rest);
+        // DeleteSandbox and the first read after it report DELETING, as the
+        // control plane does when the agent has not finished. The response
+        // is a copy, so the mock's own state stays DELETED.
+        const { sandbox } = response.message as { sandbox?: Sandbox };
+        if (
+          (method.name === "DeleteSandbox" ||
+            (method.name === "GetSandbox" && polls++ === 1)) &&
+          sandbox
+        ) {
+          sandbox.state = SandboxState.DELETING;
+        }
+        return response;
+      },
+    };
+    const { calls } = renderCounting(
+      `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+      transport,
+    );
+    await act(async () => {
+      fireEvent.click(await screen.findByRole("button", { name: "Delete" }));
+    });
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Delete sandbox" }),
+      );
+    });
+    await settle(100);
+    const afterDelete = calls.ListDevices ?? 0;
+    // The page polls every 3 s while the sandbox is DELETING.
+    await settle(3_500);
+    expect(calls.ListDevices).toBeGreaterThan(afterDelete);
+  }, 15_000);
+
+  test("pause, resume and snapshot do not refetch the device queries", async () => {
+    const { calls } = renderCounting(
+      `/orgs/${MOCK_IDS.acme}/sandboxes/${MOCK_IDS.runningSandbox}`,
+    );
+    const press = async (name: string) => {
+      await act(async () => {
+        fireEvent.click(await screen.findByRole("button", { name }));
+      });
+      await settle(100);
+    };
+    await screen.findByRole("button", { name: "Pause" });
+    await settle(60);
+    const before = calls.ListDevices;
+    await press("Pause");
+    await press("Resume");
+    await press("Take snapshot");
+    expect(calls.PauseSandbox).toBe(1);
+    expect(calls.ResumeSandbox).toBe(1);
+    expect(calls.CreateSnapshot).toBe(1);
+    expect(calls.ListDevices).toBe(before);
+  });
+});
+
 describe("device limits", () => {
   test("saves an explicit zero with the strict RPC", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`);
@@ -920,6 +1089,126 @@ describe("sandbox create form resources", () => {
     await settle(60);
     expect(created).toHaveLength(1);
     expect(created[0]?.memoryMib).toBe(1000n);
+  });
+
+  const create = async (dialog: HTMLElement) => {
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+  };
+
+  test("rejects a vCPU count above the int32 range without a request", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const vcpu = within(dialog).getByLabelText("vCPUs");
+    for (const value of ["2147483648", "3000000000"]) {
+      await commit(vcpu, value);
+      await create(dialog);
+      expect(vcpu.getAttribute("aria-invalid")).toBe("true");
+      expect(dialog.textContent).toContain(
+        "Enter a whole number of vCPUs from 1 to 2147483647.",
+      );
+      expect(dialog.querySelector(".notice-error")).toBeNull();
+      expect(created).toHaveLength(0);
+    }
+    expect(
+      screen.queryByRole("dialog", { name: "Create a sandbox" }),
+    ).not.toBeNull();
+  });
+
+  test("rejects memory and disk above 2^53 - 1 without a request", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    await commit(
+      within(dialog).getByLabelText("Memory (MiB)"),
+      "9007199254740993",
+    );
+    await commit(
+      within(dialog).getByLabelText("Disk (GiB)"),
+      "10000000000000000000",
+    );
+    await create(dialog);
+    expect(dialog.textContent).toContain("MiB from 1 to 9007199254740991");
+    expect(dialog.textContent).toContain("GiB from 1 to 9007199254740991");
+    expect(dialog.querySelector(".notice-error")).toBeNull();
+    expect(created).toHaveLength(0);
+  });
+
+  test("creates with the largest vCPU count of the int32 range", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    await commit(within(dialog).getByLabelText("vCPUs"), "2147483647");
+    await create(dialog);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.vcpuCount).toBe(2147483647);
+    expect(
+      screen.queryByRole("dialog", { name: "Create a sandbox" }),
+    ).toBeNull();
+  });
+
+  test("labels ready snapshots of the same period with distinct ids and their creation time", async () => {
+    // Snapshots that the mock creates back to back have UUID v7 ids with the
+    // same time prefix; the option label must still tell them apart.
+    const transport = createMockTransport();
+    const snapshots = createClient(SnapshotService, transport);
+    const made = [];
+    for (let i = 0; i < 2; i++) {
+      const res = await snapshots.createSnapshot({
+        organizationId: MOCK_IDS.acme,
+        sandboxId: MOCK_IDS.runningSandbox,
+      });
+      made.push(res.snapshot!);
+    }
+    const dialog = await openForm(transport);
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Source" }));
+    });
+    const options = (await screen.findAllByRole("option")).filter((o) =>
+      (o.textContent ?? "").startsWith("Snapshot "),
+    );
+    const texts = options.map((o) => o.textContent);
+    expect(options).toHaveLength(3);
+    expect(new Set(texts).size).toBe(3);
+    for (const snapshot of made) {
+      expect(texts).toContain(
+        `Snapshot ${shortIdText(snapshot.snapshotId)} · ${formatTime(snapshot.createTime)}`,
+      );
+    }
+  });
+
+  test("creates a sandbox from the chosen snapshot option", async () => {
+    const mock = createMockTransport();
+    const sources: unknown[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          sources.push((rest[3] as { source: unknown }).source);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("combobox", { name: "Source" }));
+    });
+    const option = (await screen.findAllByRole("option")).find((o) =>
+      (o.textContent ?? "").startsWith("Snapshot "),
+    )!;
+    await act(async () => {
+      fireEvent.click(option);
+    });
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+    expect(sources).toHaveLength(1);
+    expect(
+      JSON.stringify(sources[0], (_, v) =>
+        typeof v === "bigint" ? String(v) : v,
+      ),
+    ).toContain(MOCK_IDS.snapshot);
   });
 
   test("keeps the minimum of 256 and steps by whole numbers", async () => {
@@ -1764,5 +2053,256 @@ describe("billing settings", () => {
     });
     const dialog = await screen.findByRole("alertdialog");
     expect(dialog.textContent).toContain("removes the billing link");
+  });
+});
+
+describe("leaving and deleting an organization", () => {
+  const NOT_FOUND_NOTICE =
+    "It was not found, or you no longer have access to it.";
+
+  /**
+   * A transport with the latency of a real control plane: ListOrganizations
+   * answers slowly, so a refetch of it is still running when the others
+   * have settled.
+   */
+  function slowTransport(fail: string[] = [], userId?: string) {
+    const mock = createMockTransport({ userId });
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, method.name === "ListOrganizations" ? 80 : 20),
+        );
+        if (fail.includes(method.name)) {
+          throw new ConnectError("the request failed", Code.Unavailable);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return transport;
+  }
+
+  /** Records whether the not-found notice was ever in the document. */
+  function watchNotice() {
+    const seen = { notice: false };
+    const check = () => {
+      if (document.body.textContent?.includes(NOT_FOUND_NOTICE)) {
+        seen.notice = true;
+      }
+    };
+    const observer = new MutationObserver(check);
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+    });
+    return { seen, stop: () => observer.disconnect() };
+  }
+
+  const confirmIn = async (label: string) => {
+    const dialog = await screen.findByRole("alertdialog");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: label }));
+    });
+    return dialog;
+  };
+
+  test("leaving as a member never shows the not-found notice and ends at /", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.northwind}/members`, {
+      transport: slowTransport(),
+      queryClient: createQueryClient(),
+    });
+    const watcher = watchNotice();
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Leave organization" }),
+      );
+    });
+    await confirmIn("Leave organization");
+    await settle(400);
+    watcher.stop();
+    expect(watcher.seen.notice).toBe(false);
+    expect(window.location.pathname).toBe("/");
+    expect(
+      await screen.findByRole("link", { name: /Acme Robotics/ }),
+    ).toBeTruthy();
+    // The organization list was refetched after the navigation.
+    expect(screen.queryByRole("link", { name: /Northwind Labs/ })).toBeNull();
+  });
+
+  test("leaving as an admin never shows the not-found notice and ends at /", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, {
+      transport: slowTransport([], "user-admin-jun"),
+      userId: "user-admin-jun",
+      queryClient: createQueryClient(),
+    });
+    const watcher = watchNotice();
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Leave organization" }),
+      );
+    });
+    await confirmIn("Leave organization");
+    await settle(400);
+    watcher.stop();
+    expect(watcher.seen.notice).toBe(false);
+    expect(window.location.pathname).toBe("/");
+  });
+
+  test("deleting as the owner never shows the not-found notice and ends at /", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/settings`, {
+      transport: slowTransport(),
+      queryClient: createQueryClient(),
+    });
+    const watcher = watchNotice();
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Delete organization" }),
+      );
+    });
+    await confirmIn("Delete organization");
+    await settle(400);
+    watcher.stop();
+    expect(watcher.seen.notice).toBe(false);
+    expect(window.location.pathname).toBe("/");
+    expect(
+      await screen.findByRole("link", { name: /Northwind Labs/ }),
+    ).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Acme Robotics/ })).toBeNull();
+  });
+
+  test("a failed leave shows the error in the dialog and keeps the path", async () => {
+    const path = `/orgs/${MOCK_IDS.northwind}/members`;
+    renderConsole(path, {
+      transport: slowTransport(["RemoveMember"]),
+      queryClient: createQueryClient(),
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Leave organization" }),
+      );
+    });
+    const dialog = await confirmIn("Leave organization");
+    await settle(200);
+    expect(dialog.querySelector(".notice-error")).not.toBeNull();
+    expect(window.location.pathname).toBe(path);
+  });
+
+  test("a failed delete shows the error in the dialog and keeps the path", async () => {
+    const path = `/orgs/${MOCK_IDS.acme}/settings`;
+    renderConsole(path, {
+      transport: slowTransport(["DeleteOrganization"]),
+      queryClient: createQueryClient(),
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Delete organization" }),
+      );
+    });
+    const dialog = await confirmIn("Delete organization");
+    await settle(200);
+    expect(dialog.querySelector(".notice-error")).not.toBeNull();
+    expect(window.location.pathname).toBe(path);
+  });
+
+  test("removing another member refreshes the members list", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/members`, {
+      transport: slowTransport(),
+      queryClient: createQueryClient(),
+    });
+    const row = (await screen.findByText("user-member-ada")).closest("li")!;
+    await act(async () => {
+      fireEvent.click(within(row).getByRole("button", { name: "Remove" }));
+    });
+    await confirmIn("Remove member");
+    await settle(300);
+    expect(screen.queryByText("user-member-ada")).toBeNull();
+    expect(screen.getByText("Jun Park")).toBeTruthy();
+    expect(window.location.pathname).toBe(`/orgs/${MOCK_IDS.acme}/members`);
+  });
+});
+
+describe("ended session", () => {
+  /** A transport that fails one method with the given code. */
+  function failing(methodName: string, code: Code): Transport {
+    const mock = createMockTransport();
+    return {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === methodName) {
+          throw new ConnectError("x", code);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+  }
+
+  test("offers sign-in instead of Try again when listing organizations fails with unauthenticated", async () => {
+    const { signIns } = renderConsole("/", {
+      transport: failing("ListOrganizations", Code.Unauthenticated),
+    });
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("offers sign-in instead of Try again when loading an organization fails with unauthenticated", async () => {
+    const { signIns } = renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, {
+      transport: failing("GetOrganization", Code.Unauthenticated),
+    });
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("keeps Try again and offers no sign-in when the failure is unavailable", async () => {
+    renderConsole("/", {
+      transport: failing("ListOrganizations", Code.Unavailable),
+    });
+    expect(
+      await screen.findByRole("button", { name: "Try again" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("button", { name: "Sign in with Delino" }),
+    ).toBeNull();
+  });
+
+  test("keeps the invitation secret across the sign-in after the accept request fails with unauthenticated", async () => {
+    const { signIns } = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      { transport: failing("AcceptInvitation", Code.Unauthenticated) },
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await settle(60);
+    expect(
+      await screen.findByText("Your session ended. Sign in again."),
+    ).toBeTruthy();
+    // The accept handler deleted the stored copy.
+    expect(pendingInvitation.read()).toBeUndefined();
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
   });
 });

@@ -11,6 +11,8 @@ import {
   type Device,
   DeviceService,
 } from "@delino/ownsand-protos/v1/device_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
+import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { type FormEvent, useEffect, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { useOrg } from "../components/shell.tsx";
@@ -148,7 +150,14 @@ export function DevicePage({ deviceId }: { deviceId: string }) {
     onSuccess: () => invalidateServices(queryClient, DeviceService),
   });
   const remove = useMutation(DeviceService.method.removeDevice, {
-    onSuccess: () => invalidateServices(queryClient, DeviceService),
+    onSuccess: () => {
+      // Removing a device ends its sandboxes and deletes the snapshots and
+      // templates that exist only on it, so their cached lists are stale
+      // too. They are not awaited: no page needs them before it navigates,
+      // and a refetch that is still running must not delay the navigation.
+      void invalidateServices(queryClient, SandboxService, SnapshotService);
+      return invalidateServices(queryClient, DeviceService);
+    },
   });
   const [vcpu, setVcpu] = useState<number | null>(null);
   // Memory and disk are the digits of the stored int64 limits: a number

@@ -51,6 +51,10 @@ export function MembersPage() {
   const removeMember = useMutation(MemberService.method.removeMember, {
     onSuccess: refresh,
   });
+  // Leaving has no awaited refetch: the caller no longer has access to the
+  // organization, so a refetch of its member and organization queries would
+  // fail with `not_found` and render that error before the navigation.
+  const leave = useMutation(MemberService.method.removeMember);
   const [removing, setRemoving] = useState<Member>();
   const [leaving, setLeaving] = useState(false);
 
@@ -152,11 +156,14 @@ export function MembersPage() {
         description="You lose access to its devices and sandboxes. An admin can invite you again."
         confirmLabel="Leave organization"
         onConfirm={async () => {
-          await removeMember.mutateAsync({
+          await leave.mutateAsync({
             organizationId,
             userId: userId ?? "",
           });
           navigate("/");
+          // After the navigation, so only the organization list at `/`
+          // refetches, and it is not awaited.
+          void refresh();
         }}
       />
     </>

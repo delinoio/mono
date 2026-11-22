@@ -407,8 +407,11 @@ func (u *Updater) Withdraw() error {
 func (u *Updater) WithdrawOrdered(order uint64) error {
 	u.mu.Lock()
 	if u.installing {
+		// u.target is written under u.mu (HandleOrdered, fail), so read it
+		// before the unlock and log the captured value.
+		target := u.target
 		u.mu.Unlock()
-		u.opts.Logger.Warn("agent update withdrawal too late", "reason", "installing", "target_version", u.target)
+		u.opts.Logger.Warn("agent update withdrawal too late", "reason", "installing", "target_version", target)
 		return ErrInstalling
 	}
 	if u.revokedRunning {

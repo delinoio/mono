@@ -284,7 +284,7 @@ Billing errors:
 
 - `CheckReady` returns the guest OS and the guest helper version.
 - `SetClock` sets the guest clock from the host clock after a memory-state restore and after a resume, as [expired operation IDs](#file-transfer) require.
-- `Serve` is a bidirectional stream of `ServeRequest` and `ServeResponse` messages, each with one `DataFrame`. The agent sends request frames and the guest helper answers with the frames of the same `stream_id`.
+- `Serve` is a bidirectional stream of `ServeRequest` and `ServeResponse` messages, each with one `DataFrame`. The agent sends request frames and the guest helper answers with the frames of the same `stream_id`. A client half-close lets the handlers of the requests that already arrived finish their responses before the stream ends. A receive error (for example a frame above the receive limit, which is `resource_exhausted`) cancels these handlers and ends the stream with that error at once; an exec keeps running without the stream, and a later `ExecAttachRequest` returns its kept output and result.
 
 ### Enums
 

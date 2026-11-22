@@ -21,6 +21,10 @@ const DefaultLogtoResource = "https://ownsand.api.delino.io"
 // refreshMargin renews an access token this long before it expires.
 const refreshMargin = time.Minute
 
+// maxRefreshAttempts bounds the refresh requests of one token request when
+// other processes keep rotating the stored refresh token meanwhile.
+const maxRefreshAttempts = 3
+
 func (a *app) logtoConfig() logto.Config {
 	resource := a.getenv(EnvLogtoResource)
 	if resource == "" {
@@ -50,7 +54,8 @@ func logtoScopes(extra string) []string {
 // login runs the Logto device authorization flow and stores the tokens.
 func (a *app) login(ctx context.Context, args []string) error {
 	fs := a.newFlags("login")
-	if _, err := a.parse(fs, args); err != nil {
+	// login takes no operands: reject any before the sign-in starts.
+	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
 	if a.getenv(ownsand.EnvAPIKey) != "" {
@@ -110,7 +115,8 @@ func (a *app) login(ctx context.Context, args []string) error {
 
 func (a *app) logout(args []string) error {
 	fs := a.newFlags("logout")
-	if _, err := a.parse(fs, args); err != nil {
+	// logout takes no operands: reject any before the store is touched.
+	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
 	st, err := a.store()
@@ -135,6 +141,9 @@ func firstNonEmpty(vs ...string) string {
 
 // tokenSource returns the Logto access token of the stored credentials and
 // refreshes it shortly before it expires, storing the rotated refresh token.
+// Before it refreshes, it reloads the stored credentials, so a refresh that
+// another process finished is used instead of repeated; it publishes the result
+// only over the refresh token it sent.
 func (a *app) tokenSource() (ownsand.TokenSource, error) {
 	st, err := a.store()
 	if err != nil {
@@ -163,45 +172,114 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 	// staleErr is set once the stored session was cleared or replaced; the
 	// source then refuses to use or publish the tokens it holds.
 	var staleErr error
+	// fresh reports whether the access token needs no refresh yet.
+	fresh := func() bool {
+		return creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin
+	}
+	// adopt replaces the cached credentials with the stored ones of the same
+	// session, which another process may have refreshed. It reports whether
+	// the stored refresh token differs from the cached one. A removed or
+	// replaced session makes the source stale.
+	adopt := func() (bool, error) {
+		stored, err := st.Load()
+		switch {
+		case errors.Is(err, credstore.ErrNotFound):
+			a.logger.Debug("ownsand found the stored credentials removed before a Logto token refresh")
+			staleErr = errors.New("the stored credentials were removed (signed out); run 'ownsand login' to sign in again")
+			return false, staleErr
+		case err != nil:
+			return false, err
+		case stored.SessionID != creds.SessionID:
+			a.logger.Debug("ownsand found the stored credentials replaced before a Logto token refresh")
+			staleErr = errors.New("the stored credentials were replaced (signed in again); run the command again to load them")
+			return false, staleErr
+		}
+		rotated := stored.RefreshToken != creds.RefreshToken
+		*creds = *stored
+		return rotated, nil
+	}
 	return func(ctx context.Context) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
 		if staleErr != nil {
 			return "", staleErr
 		}
-		if creds.AccessToken != "" && time.Until(creds.AccessTokenExpiry) > refreshMargin {
+		for attempt := 1; ; attempt++ {
+			if fresh() {
+				return creds.AccessToken, nil
+			}
+			// Another process may have refreshed the tokens since this
+			// source loaded them. Logto rotates the refresh token, so the
+			// cached one may be spent: use the stored generation first.
+			if _, err := adopt(); err != nil {
+				return "", err
+			}
+			if fresh() {
+				a.logger.Debug("ownsand adopted the Logto access token that another process refreshed")
+				return creds.AccessToken, nil
+			}
+			// The network request runs without the store lock. The stored
+			// generation is compared under the lock when the result is
+			// published.
+			sent := creds.RefreshToken
+			tok, err := cfg.Refresh(ctx, sent)
+			if err != nil {
+				// A refresh token that another process rotated while this
+				// request was in flight is rejected as spent: retry once
+				// with the stored generation instead of failing.
+				var oe *logto.Error
+				if attempt < maxRefreshAttempts && errors.As(err, &oe) && oe.Code == "invalid_grant" {
+					rotated, aerr := adopt()
+					if aerr != nil {
+						return "", aerr
+					}
+					if rotated {
+						a.logger.Debug("ownsand retries the Logto token refresh with the token that another process stored")
+						continue
+					}
+				}
+				return "", fmt.Errorf("refresh the Logto token (run 'ownsand login' again if it was revoked): %w", err)
+			}
+			next := *creds
+			next.AccessToken = tok.AccessToken
+			next.AccessTokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
+			if tok.RefreshToken != "" {
+				next.RefreshToken = tok.RefreshToken
+			}
+			switch err := st.SaveIfCurrent(creds.SessionID, sent, &next); {
+			case err == nil:
+			case errors.Is(err, credstore.ErrNotFound):
+				// Do not recreate the file: the user signed out while the
+				// refresh was in flight.
+				a.logger.Debug("ownsand discarded a refreshed Logto token: the stored credentials were removed")
+				staleErr = errors.New("the stored credentials were removed while the Logto token refreshed (signed out); run 'ownsand login' to sign in again")
+				return "", staleErr
+			case errors.Is(err, credstore.ErrReplaced):
+				a.logger.Debug("ownsand discarded a refreshed Logto token: the stored credentials were replaced")
+				staleErr = errors.New("the stored credentials were replaced while the Logto token refreshed (signed in again); run the command again to load them")
+				return "", staleErr
+			case errors.Is(err, credstore.ErrRotated):
+				// Another process stored a newer rotation of the same
+				// session. Keep it: this result derives from an older
+				// refresh token and must not replace it.
+				a.logger.Debug("ownsand discarded a refreshed Logto token: another process stored a newer one")
+				if _, aerr := adopt(); aerr != nil {
+					return "", aerr
+				}
+				if fresh() {
+					return creds.AccessToken, nil
+				}
+				if attempt >= maxRefreshAttempts {
+					return "", errors.New("the Logto token was refreshed by another process too often while this command refreshed it; run the command again")
+				}
+				continue
+			default:
+				return "", err
+			}
+			*creds = next
+			a.logger.Debug("ownsand refreshed the Logto access token")
 			return creds.AccessToken, nil
 		}
-		// The network request runs without the store lock. The stored
-		// session is compared under the lock when the result is published.
-		tok, err := cfg.Refresh(ctx, creds.RefreshToken)
-		if err != nil {
-			return "", fmt.Errorf("refresh the Logto token (run 'ownsand login' again if it was revoked): %w", err)
-		}
-		next := *creds
-		next.AccessToken = tok.AccessToken
-		next.AccessTokenExpiry = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second)
-		if tok.RefreshToken != "" {
-			next.RefreshToken = tok.RefreshToken
-		}
-		switch err := st.SaveIfSession(creds.SessionID, &next); {
-		case err == nil:
-		case errors.Is(err, credstore.ErrNotFound):
-			// Do not recreate the file: the user signed out while the
-			// refresh was in flight.
-			a.logger.Debug("ownsand discarded a refreshed Logto token: the stored credentials were removed")
-			staleErr = errors.New("the stored credentials were removed while the Logto token refreshed (signed out); run 'ownsand login' to sign in again")
-			return "", staleErr
-		case errors.Is(err, credstore.ErrReplaced):
-			a.logger.Debug("ownsand discarded a refreshed Logto token: the stored credentials were replaced")
-			staleErr = errors.New("the stored credentials were replaced while the Logto token refreshed (signed in again); run the command again to load them")
-			return "", staleErr
-		default:
-			return "", err
-		}
-		*creds = next
-		a.logger.Debug("ownsand refreshed the Logto access token")
-		return creds.AccessToken, nil
 	}, nil
 }
 

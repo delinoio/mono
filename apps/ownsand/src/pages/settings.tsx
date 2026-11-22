@@ -179,9 +179,10 @@ function OwnerActions() {
         BillingService,
       ),
   });
-  const remove = useMutation(OrganizationService.method.deleteOrganization, {
-    onSuccess: () => invalidateServices(queryClient, OrganizationService),
-  });
+  // No `onSuccess` refetch: a refetch of the deleted organization's queries
+  // fails with `not_found` and would render that error before the
+  // navigation. The confirmation refreshes the cache after it navigates.
+  const remove = useMutation(OrganizationService.method.deleteOrganization);
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -252,6 +253,7 @@ function OwnerActions() {
         onConfirm={async () => {
           await remove.mutateAsync({ organizationId });
           navigate("/");
+          void invalidateServices(queryClient, OrganizationService);
         }}
       />
     </>

@@ -19,6 +19,7 @@ import {
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { DeviceState, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
 import {
   type FormEvent,
@@ -28,6 +29,7 @@ import {
   useState,
 } from "react";
 import { billingReasonOf } from "../api.ts";
+import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import { errorMessage, labels } from "../format.ts";
 
@@ -99,23 +101,54 @@ export function TextWithAccountsLink({ text }: { text: string }) {
 }
 
 /**
+ * The sign-in button of an `unauthenticated` notice. It reads the auth context
+ * here and not in `ErrorNotice`, so that a notice for any other error (for
+ * example the callback page's, which a test or a caller may mount without an
+ * auth provider) does not need one.
+ */
+function SignInButton({ onSignIn }: { onSignIn?: () => void | Promise<void> }) {
+  const auth = useAuth();
+  return (
+    <Button
+      variant={ButtonVariant.Secondary}
+      onClick={() => {
+        void (onSignIn ?? auth.signIn)();
+      }}
+    >
+      Sign in with Delino
+    </Button>
+  );
+}
+
+/**
  * A failed request, with a retry button. A billing error shows the server
  * message with its link and never offers a retry, because it is terminal.
+ * An `unauthenticated` error, from the server or from a token request that
+ * failed, cannot succeed on a retry: the notice offers the sign-in instead.
+ * The Logto SDK keeps reporting the user as signed in after a failed token
+ * refresh, so the signed-out view never shows. `onSignIn` replaces the
+ * default `auth.signIn()` for a page that must prepare the redirect first.
  */
 export function ErrorNotice({
   error,
   onRetry,
+  onSignIn,
 }: {
   error: unknown;
   onRetry?: () => void;
+  onSignIn?: () => void | Promise<void>;
 }) {
   const billing = billingReasonOf(error) !== undefined;
+  const unauthenticated =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
       <p>
         <TextWithAccountsLink text={errorMessage(error)} />
       </p>
-      {onRetry && !billing ? (
+      {unauthenticated ? (
+        <SignInButton onSignIn={onSignIn} />
+      ) : onRetry && !billing ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
@@ -406,11 +439,20 @@ export function Detail({
   );
 }
 
+/**
+ * Shortens a UUID to its first 8 and last 4 characters. A UUID v7 starts with
+ * a timestamp, so the first 8 characters alone repeat for about 65 seconds;
+ * the last 4 characters tell ids from the same period apart.
+ */
+export function shortIdText(id: string): string {
+  return id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
 /** Shortens a UUID for display; the full value stays in the title. */
 export function ShortId({ id }: { id: string }) {
   return (
     <code className="id" title={id}>
-      {id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id}
+      {shortIdText(id)}
     </code>
   );
 }
