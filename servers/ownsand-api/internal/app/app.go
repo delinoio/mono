@@ -184,7 +184,13 @@ func New(opts Options) (*App, error) {
 	}
 	plane := api.NewDataPlane(svc, relayLimits, relayTiming)
 	authn := &api.Authenticator{Service: svc, Logto: opts.Logto}
-	handlerOpts := []connect.HandlerOption{connect.WithInterceptors(svc.Interceptors(authn, opts.ClientAddressMode)...)}
+	// WithReadMaxBytes runs before the interceptor chain, so an oversized or
+	// inflated request ends with resource_exhausted before authentication
+	// and before any rate limit token is taken.
+	handlerOpts := []connect.HandlerOption{
+		connect.WithInterceptors(svc.Interceptors(authn, opts.ClientAddressMode)...),
+		connect.WithReadMaxBytes(api.MaxRequestBytes),
+	}
 
 	var mounts []server.Mount
 	add := func(path string, h http.Handler) { mounts = append(mounts, server.Mount{Path: path, Handler: h}) }

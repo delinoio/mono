@@ -272,9 +272,21 @@ func (h AgentHandler) Channel(ctx context.Context, stream *connect.BidiStream[ow
 			log.InfoContext(ctx, "agent_channel_heartbeat_timeout")
 			conn.Close(errors.New("no heartbeat for the heartbeat timeout"))
 		case <-conn.Done():
-			return nil
+			return channelReadLimitError(context.Cause(conn.Context()))
 		}
 	}
+}
+
+// channelReadLimitError returns the error that ends the channel handler when
+// the inbound reader stopped because a message exceeded MaxRequestBytes, so
+// that the agent sees resource_exhausted and not a clean end of stream. Every
+// other cause ends the handler without an error, as before.
+func channelReadLimitError(cause error) error {
+	var ce *connect.Error
+	if errors.As(cause, &ce) && ce.Code() == connect.CodeResourceExhausted {
+		return ce
+	}
+	return nil
 }
 
 // markOffline sets the device offline after its current channel closed.

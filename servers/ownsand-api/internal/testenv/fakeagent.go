@@ -121,6 +121,14 @@ func (a *FakeAgent) Close() {
 // Closed is closed when the server ends the channel.
 func (a *FakeAgent) Closed() <-chan struct{} { return a.closed }
 
+// CloseErr returns the error that ended the channel, or nil while the channel
+// is open or when it ended without an error. Read it after Closed is closed.
+func (a *FakeAgent) CloseErr() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.closeErr
+}
+
 // Send sends one envelope.
 func (a *FakeAgent) Send(env *ownsandv1.AgentEnvelope) {
 	a.sendMu.Lock()
