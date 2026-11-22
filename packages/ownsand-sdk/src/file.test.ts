@@ -16,6 +16,7 @@ import {
   Trickle,
 } from "./testing/fake-api.ts";
 import { file, SANDBOX, setup, text } from "./testing/harness.ts";
+import { uuidV7TimestampMs } from "./uuidv7.ts";
 import { validateGuestPath } from "./validate.ts";
 
 const MIN = 60_000;
@@ -467,6 +468,170 @@ describe("file write", () => {
     const [write] = h.api.callsOf("WriteFile").map((c) => c.request as any);
     expect(write.finish.sizeBytes).toBe(0n);
     expect(write.path).toBe("/empty");
+  });
+
+  describe("write_id allocation while the source is slow", () => {
+    // The agent admits an operation ID only while its UUID v7 timestamp is at
+    // most 15 minutes old, so a write_id that is allocated before a slow
+    // source delivers its first sendable chunk is rejected as expired.
+    const ID_WINDOW_MS = 15 * MIN;
+
+    function admittingHandler(h: ReturnType<typeof setup>) {
+      h.api.unary(RelayService, "WriteFile", (req) => {
+        const age = h.clock.wallNow() - uuidV7TimestampMs(req.writeId);
+        if (age >= ID_WINDOW_MS) {
+          throw ownsandError(Code.NotFound, "the operation ID has expired");
+        }
+        return {
+          writeId: req.writeId,
+          offset: req.offset,
+          length: BigInt(req.data.length),
+          finished: req.finish !== undefined,
+          sizeBytes: req.finish?.sizeBytes ?? 0n,
+        };
+      });
+    }
+
+    function expectFreshFirstRequest(
+      h: ReturnType<typeof setup>,
+      bytes: number,
+    ) {
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      const auths = h.api
+        .callsOf("AuthorizeRelay")
+        .map((c) => c.request as any);
+      expect(writes).toHaveLength(1);
+      expect(writes[0].offset).toBe(0n);
+      expect(writes[0].data).toHaveLength(bytes);
+      expect(writes[0].finish.sizeBytes).toBe(BigInt(bytes));
+      expect(
+        h.clock.wallNow() - uuidV7TimestampMs(writes[0].writeId),
+      ).toBeLessThan(1000);
+      expect(auths).toHaveLength(1);
+      expect(auths[0].operationKind).toBe(RelayOperationKind.WRITE_FILE);
+      expect(auths[0].operationId).toBe(writes[0].writeId);
+      expect(Buffer.from(auths[0].requestDigest)).toEqual(
+        Buffer.from(requestDigest(writeFileBinding(writes[0]))),
+      );
+    }
+
+    test("an async iterable that waits 15 minutes for its first byte still gets a fresh write_id", async () => {
+      const h = setup();
+      admittingHandler(h);
+      async function* source() {
+        await h.clock.sleep(ID_WINDOW_MS);
+        yield new TextEncoder().encode("hello");
+      }
+      const result = await h.clock.run(
+        h.client.sandbox(SANDBOX).writeFile("/f", source()),
+      );
+      expectFreshFirstRequest(h, 5);
+      expect(result.sizeBytes).toBe(5n);
+      const [write] = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      expect(result.writeId).toBe(write.writeId);
+    });
+
+    test("a source that waits 15 minutes for its end after a full chunk still gets a fresh write_id", async () => {
+      const h = setup();
+      admittingHandler(h);
+      async function* source() {
+        yield new Uint8Array(1 << 20);
+        await h.clock.sleep(ID_WINDOW_MS);
+      }
+      await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", source()));
+      expectFreshFirstRequest(h, 1 << 20);
+    });
+
+    test("a ReadableStream that closes after 15 minutes still gets a fresh write_id", async () => {
+      const h = setup();
+      admittingHandler(h);
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await h.clock.sleep(ID_WINDOW_MS);
+          controller.enqueue(new TextEncoder().encode("hello"));
+          controller.close();
+        },
+      });
+      await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", stream));
+      expectFreshFirstRequest(h, 5);
+    });
+
+    test("a retry of the first unacknowledged request keeps its identity and later chunks keep the write_id", async () => {
+      const h = setup();
+      h.api.unary(RelayService, "WriteFile", (req, call) => {
+        if (call.index === 0) {
+          throw new ConnectError("relay call limit", Code.DeadlineExceeded);
+        }
+        return {
+          writeId: req.writeId,
+          offset: req.offset,
+          length: BigInt(req.data.length),
+          finished: req.finish !== undefined,
+          sizeBytes: req.finish?.sizeBytes ?? 0n,
+        };
+      });
+      async function* source() {
+        await h.clock.sleep(ID_WINDOW_MS);
+        yield new Uint8Array(1 << 20);
+        yield new Uint8Array(1 << 20);
+        yield new Uint8Array(10);
+      }
+      const result = await h.clock.run(
+        h.client.sandbox(SANDBOX).writeFile("/f", source()),
+      );
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      expect(writes).toHaveLength(4);
+      expect(
+        h.clock.wallNow() - uuidV7TimestampMs(writes[0].writeId),
+      ).toBeLessThan(MIN);
+      expect(writes[1].writeId).toBe(writes[0].writeId);
+      expect(writes[1].path).toBe("/f");
+      expect(writes[1].path).toBe(writes[0].path);
+      expect(writes[0].bindingSalt).toHaveLength(32);
+      expect(Buffer.from(writes[1].bindingSalt)).toEqual(
+        Buffer.from(writes[0].bindingSalt),
+      );
+      expect(writes[1].offset).toBe(writes[0].offset);
+      expect(Buffer.from(writes[1].data)).toEqual(Buffer.from(writes[0].data));
+      expect(writes[1].finish).toEqual(writes[0].finish);
+      expect(writes.map((w) => w.offset)).toEqual([
+        0n,
+        0n,
+        BigInt(1 << 20),
+        BigInt(2 << 20),
+      ]);
+      for (const write of writes) {
+        expect(write.writeId).toBe(writes[0].writeId);
+      }
+      expect(writes[3].finish.sizeBytes).toBe(BigInt((2 << 20) + 10));
+      expect(result.writeId).toBe(writes[0].writeId);
+      for (const auth of h.api.callsOf("AuthorizeRelay")) {
+        expect((auth.request as any).operationId).toBe(writes[0].writeId);
+      }
+    });
+
+    test("an abort while the source waits rejects with the reason and sends no request", async () => {
+      const h = setup();
+      admittingHandler(h);
+      const REASON = new Error("caller gave up");
+      const controller = new AbortController();
+      async function* source() {
+        await h.clock.sleep(ID_WINDOW_MS);
+        yield new Uint8Array(1);
+      }
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .writeFile("/f", source(), { signal: controller.signal })
+        .then(
+          () => "resolved",
+          (error) => error,
+        );
+      await h.clock.advance(5 * MIN);
+      controller.abort(REASON);
+      expect(await outcome).toBe(REASON);
+      expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
   });
 
   describe("cancellation while the source is waiting", () => {

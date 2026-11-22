@@ -228,13 +228,19 @@ export async function runWriteFile(
   mode: number,
   signal: AbortSignal | undefined,
 ): Promise<WriteFileResult> {
-  const writeId = ctx.ids.next();
   const salt = newBindingSalt();
+  // The agent admits an operation ID only while its UUID v7 timestamp is
+  // within 15 minutes, so the ID is allocated when the first chunk is ready
+  // to send and not before the source is read: a source that needs that long
+  // for its first chunk (or for the end of the stream after a full chunk)
+  // must not use up the admission window.
+  let writeId: string | undefined;
   let grants: GrantKeeper | undefined;
   let offset = 0n;
   let first = true;
   throwIfAborted(signal);
   for await (const chunk of chunkSource(source, MAX_FILE_CHUNK_SIZE, signal)) {
+    writeId ??= ctx.ids.next();
     const request = create(WriteFileRequestSchema, {
       organizationId: ctx.organizationId,
       sandboxId: ctx.sandboxId,
