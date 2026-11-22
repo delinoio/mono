@@ -19,6 +19,7 @@ import {
 import { Skeleton } from "delino-ui/skeleton";
 import { type FormEvent, type ReactNode, useState } from "react";
 import { errorMessage } from "../format.ts";
+import type { AllPages } from "../paging.ts";
 
 export function PageHeader({
   title,
@@ -69,6 +70,32 @@ export function ErrorNotice({
       ) : null}
     </div>
   );
+}
+
+/**
+ * The state of the pages after the first one: a short loading line while
+ * later pages load and an error with a retry that resumes at the failed page.
+ * The items of the earlier pages stay visible above it.
+ */
+export function MorePages({ pages }: { pages: AllPages<unknown> }) {
+  if (pages.continuationError !== undefined) {
+    return (
+      <div className="notice notice-error" role="alert">
+        <p>Some items did not load. {errorMessage(pages.continuationError)}</p>
+        <Button
+          variant={ButtonVariant.Secondary}
+          onClick={pages.retryContinuation}
+        >
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  return pages.isLoadingMore ? (
+    <p className="muted" role="status">
+      Loading more
+    </p>
+  ) : null;
 }
 
 export function Empty({
