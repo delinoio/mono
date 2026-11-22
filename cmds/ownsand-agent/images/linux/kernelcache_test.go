@@ -4,7 +4,8 @@
 // run without Docker. The kernel source cache helper runs against a stub
 // curl on PATH, so no test uses the network. The tests need bash and GNU
 // sha256sum and skip without them (macOS has shasum only) and on Windows;
-// the helper itself runs inside the Debian build container.
+// the helper itself runs inside the Debian build container. The root file
+// system script runs against a stub busybox in build-rootfs_test.go.
 package linux
 
 import (

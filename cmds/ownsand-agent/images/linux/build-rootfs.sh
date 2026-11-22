@@ -46,12 +46,27 @@ else
 fi
 ln -s ownsand-guest "$rootfs/sbin/init"
 cp "$busybox" "$rootfs/bin/busybox"
-for applet in $("$busybox" --list); do
+# Capture the applet list in an assignment: a failing command substitution in
+# the word list of a for loop does not stop a set -e script, so a busybox
+# that cannot list its applets would otherwise produce an image without them.
+if ! applets="$("$busybox" --list)"; then
+  echo "busybox --list failed: $busybox" >&2
+  exit 1
+fi
+if [ -z "$applets" ]; then
+  echo "busybox --list printed no applets: $busybox" >&2
+  exit 1
+fi
+while IFS= read -r applet; do
   case "$applet" in
-    busybox | init) ;;
+    busybox | init | '') ;;
     *) ln -sf busybox "$rootfs/bin/$applet" ;;
   esac
-done
+done <<< "$applets"
+if [ ! -L "$rootfs/bin/sh" ]; then
+  echo "busybox does not provide the sh applet: $busybox" >&2
+  exit 1
+fi
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$rootfs/etc/passwd"
 printf 'root:x:0:\n' > "$rootfs/etc/group"
 printf 'sandbox\n' > "$rootfs/etc/hostname"
