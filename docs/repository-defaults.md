@@ -18,6 +18,8 @@ Repository-owned source, package metadata and future release artifacts use Apach
 - Backend services under `servers/` should deploy to the shared DigitalOcean Droplet by default, as containers behind its Caddy reverse proxy. Any exception must be documented in its project contract.
 - Persistent relational databases should use PlanetScale Postgres by default. Any exception must be documented in its project contract.
 - File handling should use Cloudflare R2 for object storage plus signed URLs for upload and download access by default. Use another storage or access pattern only when the project contract documents the reason, trust boundary, and migration considerations.
+- Product analytics should use PostHog Cloud by default. Use another product analytics service only when the project contract documents the reason.
+- Observability data (metrics, logs and traces), dashboards and alerts should use Grafana Cloud by default. Use another observability backend only when the project contract documents the reason.
 
 ## Repository-Wide Rules
 

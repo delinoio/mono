@@ -98,6 +98,8 @@
 - Static sites under `apps/` should use Rsbuild/Rspress-style toolchains and deploy to Cloudflare Pages by default. Existing documented exceptions remain valid until their project contract changes.
 - Backend services under `servers/` should deploy to the shared DigitalOcean Droplet, and persistent relational databases should use PlanetScale Postgres, unless a project contract documents an exception.
 - File handling should default to Cloudflare R2 object storage plus signed URLs for upload and download access unless a project contract documents another storage or access pattern.
+- Product analytics should default to PostHog Cloud unless a project contract documents another product analytics service.
+- Observability data (metrics, logs and traces), dashboards and alerts should default to Grafana Cloud unless a project contract documents another observability backend.
 
 ## Documentation-First Policy
 
