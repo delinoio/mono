@@ -13,7 +13,7 @@
 import { appendFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
 import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
-import { workspaceRoots } from "./plan.mjs";
+import { workspacePackageDirs, workspaceRoots } from "./plan.mjs";
 
 // Stable deployment target identifiers of the `deploy.target` manifest field.
 export const DeployTarget = Object.freeze({
@@ -139,9 +139,18 @@ export const noUdpPorts = "none";
 
 export class DeployPlanError extends Error {}
 
-// Reads every workspace package directly inside a workspace root.
+// Reads every workspace package directly inside a workspace root, and the
+// single workspace packages outside them.
 export function readWorkspacePackages(repoRoot) {
   const packages = [];
+  for (const dir of workspacePackageDirs) {
+    const manifestPath = join(repoRoot, dir, "package.json");
+    if (!existsSync(manifestPath)) continue;
+    packages.push({
+      dir,
+      manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
+    });
+  }
   for (const workspaceRoot of workspaceRoots) {
     const rootPath = join(repoRoot, workspaceRoot);
     if (!existsSync(rootPath)) continue;

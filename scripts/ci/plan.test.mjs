@@ -24,6 +24,7 @@ import {
   isMainPush,
   main,
   plan,
+  workspacePackageDirs,
   workspaceRoots,
 } from "./plan.mjs";
 
@@ -313,6 +314,10 @@ const WORKSPACE_PACKAGES_KEY = "packages:";
 // selector.
 const WORKSPACE_GLOB_PATTERN =
   /^([^*/\s!.][^*/\s!]*(?:\/[^*/\s!.][^*/\s!]*)*)\/\*$/;
+// A planner-supported single package entry is a plain directory path of one
+// or more segments without a wildcard (such as "cmds/ownsand"). The planner
+// lists these directories in `workspacePackageDirs`.
+const WORKSPACE_DIR_PATTERN = /^([^*/\s!.][^*/\s!]*(?:\/[^*/\s!.][^*/\s!]*)*)$/;
 
 // Returns the workspace roots listed in the `packages:` block of a
 // pnpm-workspace.yaml text. Accepts the valid YAML spellings of a list entry
@@ -320,6 +325,12 @@ const WORKSPACE_GLOB_PATTERN =
 // not a "<root>/*" glob throws instead of being skipped, so the cross-check
 // below cannot pass while the manifest and `workspaceRoots` differ.
 function workspaceGlobRoots(manifest) {
+  return workspaceEntries(manifest).roots;
+}
+
+// Returns the "<root>/*" roots and the single package directories of the
+// `packages:` block.
+function workspaceEntries(manifest) {
   const lines = manifest.split("\n");
   const start = lines.findIndex(
     (line) => line.trimEnd() === WORKSPACE_PACKAGES_KEY,
@@ -330,6 +341,7 @@ function workspaceGlobRoots(manifest) {
     `${WORKSPACE_MANIFEST_NAME} has no packages block`,
   );
   const roots = [];
+  const dirs = [];
   for (const line of lines.slice(start + 1)) {
     // Blank and comment-only lines, at any indentation, do not end the block.
     if (/^\s*(#.*)?$/.test(line)) {
@@ -348,24 +360,27 @@ function workspaceGlobRoots(manifest) {
       entry = quoted[2];
     }
     const globMatch = entry.match(WORKSPACE_GLOB_PATTERN);
-    if (!globMatch) {
+    const dirMatch = entry.match(WORKSPACE_DIR_PATTERN);
+    if (globMatch) {
+      roots.push(globMatch[1]);
+    } else if (dirMatch) {
+      dirs.push(dirMatch[1]);
+    } else {
       throw new Error(
         `unsupported ${WORKSPACE_MANIFEST_NAME} workspace entry: ${entry}`,
       );
     }
-    roots.push(globMatch[1]);
   }
   if (roots.length === 0) {
     throw new Error(`${WORKSPACE_MANIFEST_NAME} packages block has no entries`);
   }
-  return roots;
+  return { roots, dirs };
 }
 
 function sortedWorkspaceRootsMatch(manifest) {
-  assert.deepEqual(
-    [...workspaceRoots].sort(),
-    workspaceGlobRoots(manifest).sort(),
-  );
+  const entries = workspaceEntries(manifest);
+  assert.deepEqual([...workspaceRoots].sort(), entries.roots.sort());
+  assert.deepEqual([...workspacePackageDirs].sort(), entries.dirs.sort());
 }
 
 test("workspace manifest roots match pnpm-workspace.yaml", () => {
@@ -394,8 +409,9 @@ test("workspace glob parser fails closed on unsupported entries", async (t) => {
   for (const entry of [
     "packages/**",
     "'!excluded/*'",
-    "apps/a",
     "./apps/*",
+    "./cmds/a",
+    "cmds/*/a",
     "protos/*/x/*",
     "protos/./x/*",
   ]) {
@@ -437,6 +453,48 @@ test("workspace roots cross-check detects a root after a column-zero comment", (
       ),
     assert.AssertionError,
   );
+});
+
+test("workspace parser reads single package directories", () => {
+  assert.deepEqual(
+    workspaceEntries(
+      "packages:\n  - apps/*\n  - cmds/ownsand\n  - 'cmds/ownsand-agent' # note\n",
+    ),
+    { roots: ["apps"], dirs: ["cmds/ownsand", "cmds/ownsand-agent"] },
+  );
+});
+
+test("workspace cross-check detects an extra single package directory", () => {
+  const current = readFileSync(join(root, WORKSPACE_MANIFEST_NAME), "utf8");
+  assert.throws(
+    () => sortedWorkspaceRootsMatch(`${current.trimEnd()}\n  - cmds/other\n`),
+    assert.AssertionError,
+  );
+});
+
+test("single workspace packages declare no package tasks", () => {
+  // The planner treats only their manifests as workspace inputs, so a
+  // package task there would not run when its Go source changes.
+  for (const dir of workspacePackageDirs) {
+    const manifest = JSON.parse(
+      readFileSync(join(root, dir, "package.json"), "utf8"),
+    );
+    assert.equal(manifest.private, true, `${dir} must be private`);
+    assert.equal(manifest.scripts, undefined, `${dir} must declare no scripts`);
+  }
+});
+
+test("single workspace package manifests select workspace and fixture checks", (t) => {
+  const f = fixture(t);
+  f.write("cmds/ownsand-agent/package.json");
+  let result = plan(f.cwd, f.base, f.commit());
+  assert.equal(result.workspace, true);
+  assert.equal(result.fixtures, true);
+  f.write("cmds/ownsand-agent/main.go");
+  const base = f.commit();
+  f.write("cmds/ownsand-agent/main.go", "package main // changed\n");
+  result = plan(f.cwd, base, f.commit());
+  assert.equal(result.workspace, false);
 });
 
 test("workspace glob parser rejects an empty packages block", () => {

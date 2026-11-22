@@ -3,3 +3,7 @@ packages:
   - packages/*
   - protos/delino/*
   - servers/*
+  # Release-only Go command packages. Their manifests declare no tasks and
+  # exist so that Changesets versions them (docs/repository-workflow-contract.md).
+  - cmds/ownsand
+  - cmds/ownsand-agent
