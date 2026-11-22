@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/rand"
 	"errors"
+	"fmt"
 	"io"
 	"testing"
 	"time"
@@ -258,6 +259,85 @@ func TestReadFileResumesOnNewSession(t *testing.T) {
 	}
 	if cp.openSessionCount() != 2 {
 		t.Fatalf("%d sessions", cp.openSessionCount())
+	}
+}
+
+// prefixWriter accepts at most accept bytes on its failing call, then returns
+// err with the accepted count, as an io.Writer may (a short write with an
+// error). Earlier calls accept everything.
+type prefixWriter struct {
+	buf         bytes.Buffer
+	failOnCall  int
+	accept      int
+	err         error
+	calls       int
+	acceptedSum int
+}
+
+func (w *prefixWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls == w.failOnCall {
+		n := min(w.accept, len(p))
+		w.buf.Write(p[:n])
+		w.acceptedSum += n
+		return n, w.err
+	}
+	w.buf.Write(p)
+	w.acceptedSum += len(p)
+	return len(p), nil
+}
+
+func TestReadFileCallbackErrorCountsAcceptedPrefix(t *testing.T) {
+	writeErr := errors.New("writer full")
+	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
+		for _, accept := range []int{0, 3} {
+			t.Run(fmt.Sprintf("%s/accept-%d", tr, accept), func(t *testing.T) {
+				cp := newFakeCP(t)
+				cp.agent.readChunk = 10
+				want := randomBytes(t, 95)
+				cp.agent.setFile("/f", want)
+				s := cp.handle(t, cp.client(t, tr))
+				// The writer takes the first chunk (10 bytes) and a strict
+				// prefix of the second.
+				w := &prefixWriter{failOnCall: 2, accept: accept, err: writeErr}
+				size, err := s.ReadFile(context.Background(), "/f", w)
+				if !errors.Is(err, writeErr) {
+					t.Fatalf("want the writer's error, got %v", err)
+				}
+				var dp *DataPathError
+				if errors.As(err, &dp) {
+					t.Fatalf("callback error must not be wrapped: %v", err)
+				}
+				if wantSize := int64(10 + accept); size != wantSize || size != int64(w.acceptedSum) {
+					t.Fatalf("returned %d bytes, writer accepted %d, want %d", size, w.acceptedSum, wantSize)
+				}
+				if !bytes.Equal(w.buf.Bytes(), want[:size]) {
+					t.Fatal("writer content is not a prefix of the file")
+				}
+				if tr == TransportRelay {
+					if n := cp.relayCount("ReadFile"); n != 1 {
+						t.Fatalf("%d ReadFile calls, want 1: a callback error is not retried", n)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestReadFileCompleteChunksCountOnce(t *testing.T) {
+	for _, tr := range []Transport{TransportRelay, TransportPeerToPeer} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.readChunk = 10
+			want := randomBytes(t, 95)
+			cp.agent.setFile("/f", want)
+			s := cp.handle(t, cp.client(t, tr))
+			w := &prefixWriter{failOnCall: -1}
+			size, err := s.ReadFile(context.Background(), "/f", w)
+			if err != nil || size != int64(len(want)) || !bytes.Equal(w.buf.Bytes(), want) {
+				t.Fatalf("read %d bytes: %v", size, err)
+			}
+		})
 	}
 }
 

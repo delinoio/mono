@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -1317,5 +1318,163 @@ func TestExecCallerCancellationEndsHeldContinuationEarlier(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("cancellation took %v", time.Since(start))
+	}
+}
+
+// deadlineStatus is a deadline_exceeded status that the control plane (relay)
+// or the agent (p2p error frame) answers for a read or an exec.
+func deadlineStatus() error {
+	return detailErr(connect.CodeDeadlineExceeded, "server deadline", &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, Message: "server deadline"})
+}
+
+// deadlineOperations lists the operations that must end at once on a
+// deadline_exceeded status. WriteFile is not among them: it retries.
+func deadlineOperations(t *testing.T) map[string]struct {
+	method string
+	run    func(ctx context.Context, s *Sandbox) error
+} {
+	type op = struct {
+		method string
+		run    func(ctx context.Context, s *Sandbox) error
+	}
+	return map[string]op{
+		"Exec": {"Exec", func(ctx context.Context, s *Sandbox) error {
+			_, err := s.Exec(ctx, ExecParams{Command: []string{"run"}})
+			return err
+		}},
+		"AttachExec": {"AttachExec", func(ctx context.Context, s *Sandbox) error {
+			_, err := s.AttachExec(ctx, mustID(t), AttachParams{})
+			return err
+		}},
+		"ReadFile": {"ReadFile", func(ctx context.Context, s *Sandbox) error {
+			_, err := s.ReadFile(ctx, "/f", io.Discard)
+			return err
+		}},
+		"ReadFileBytes": {"ReadFile", func(ctx context.Context, s *Sandbox) error {
+			_, err := s.ReadFileBytes(ctx, "/f")
+			return err
+		}},
+	}
+}
+
+// TestDeadlineStatusEndsExecAndReadAtOnce checks that a deadline_exceeded
+// status ends an exec or a read at once with a DataPathError, on the relay,
+// without a new AuthorizeRelay, and that the exec never runs.
+func TestDeadlineStatusEndsExecAndReadAtOnce(t *testing.T) {
+	for name, tt := range deadlineOperations(t) {
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			cp.agent.setFile("/f", []byte("data"))
+			cp.relayScript = func(method string, _ int) relayAction {
+				if method == tt.method {
+					return relayAction{err: deadlineStatus()}
+				}
+				return relayAction{}
+			}
+			s := cp.handle(t, cp.client(t, TransportRelay))
+			// A caller deadline far beyond the skew: the status is the
+			// control plane's own.
+			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
+			start := time.Now()
+			err := tt.run(ctx, s)
+			var dp *DataPathError
+			if !errors.As(err, &dp) || connect.CodeOf(err) != connect.CodeDeadlineExceeded {
+				t.Fatalf("want a DataPathError with deadline_exceeded, got %v", err)
+			}
+			if dp.OutcomeUnknown {
+				t.Fatal("a pre-start failure must not report an unknown outcome")
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatal("a server status must not look like the caller's deadline")
+			}
+			if n := cp.relayCount(tt.method); n != 1 {
+				t.Fatalf("%d %s calls, want 1: no retry", n, tt.method)
+			}
+			if n := len(cp.authRequests()); n != 1 {
+				t.Fatalf("%d AuthorizeRelay calls, want 1: no recovery window", n)
+			}
+			if n := cp.agent.totalRuns(); n != 0 {
+				t.Fatalf("%d runs, want 0", n)
+			}
+			if d := time.Since(start); d > testTiming().recoveryWindow {
+				t.Fatalf("ended after %v, want at once (recovery window %v)", d, testTiming().recoveryWindow)
+			}
+		})
+	}
+}
+
+// TestDeadlineStatusEndsExecAndReadAtOnceOnP2P covers the error frames of the
+// peer-to-peer path.
+func TestDeadlineStatusEndsExecAndReadAtOnceOnP2P(t *testing.T) {
+	for name, tt := range deadlineOperations(t) {
+		if name == "AttachExec" || name == "ReadFileBytes" {
+			// The same loops serve these on the relay test above; one
+			// exec and one read cover the shared p2p frame handling.
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			cp.agent.setFile("/f", []byte("data"))
+			cp.p2pScript = func(int) p2pAction {
+				return p2pAction{raw: func(id uint64, sb string) *ownsandv1.DataFrame {
+					return datapath.MustNewFrame(id, sb, &ownsandv1.ErrorDetail{Code: ownsandv1.ErrorCode_ERROR_CODE_DEADLINE_EXCEEDED, Message: "server deadline"})
+				}}
+			}
+			s := cp.handle(t, cp.client(t, TransportPeerToPeer))
+			ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+			defer cancel()
+			start := time.Now()
+			err := tt.run(ctx, s)
+			var dp *DataPathError
+			if !errors.As(err, &dp) || connect.CodeOf(err) != connect.CodeDeadlineExceeded || dp.OutcomeUnknown {
+				t.Fatalf("want a DataPathError with deadline_exceeded, got %v", err)
+			}
+			if d := time.Since(start); d > testTiming().recoveryWindow {
+				t.Fatalf("ended after %v, want at once", d)
+			}
+			if n := cp.agent.totalRuns(); n != 0 {
+				t.Fatalf("%d runs, want 0", n)
+			}
+		})
+	}
+}
+
+// TestDeadlineStatusNearCallerDeadlineIsTheCallerDeadline checks the race
+// rule: a deadline_exceeded status that arrives within the skew of the
+// caller's own deadline is the caller's deadline, so the caller's context
+// error is authoritative. The skew is far larger than the caller's timeout,
+// so the order does not depend on the speed of the machine.
+func TestDeadlineStatusNearCallerDeadlineIsTheCallerDeadline(t *testing.T) {
+	for name, tt := range deadlineOperations(t) {
+		t.Run(name, func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			cp.agent.setFile("/f", []byte("data"))
+			cp.relayScript = func(method string, _ int) relayAction {
+				if method == tt.method {
+					return relayAction{err: deadlineStatus()}
+				}
+				return relayAction{}
+			}
+			c := cp.client(t, TransportRelay)
+			c.timing.callerDeadlineSkew = 30 * time.Second
+			s := cp.handle(t, c)
+			ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			defer cancel()
+			err := tt.run(ctx, s)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("want the caller's deadline error, got %v", err)
+			}
+			var dp *DataPathError
+			if errors.As(err, &dp) {
+				t.Fatalf("the caller's deadline must not be wrapped: %v", err)
+			}
+			if n := cp.relayCount(tt.method); n != 1 {
+				t.Fatalf("%d %s calls, want 1", n, tt.method)
+			}
+		})
 	}
 }

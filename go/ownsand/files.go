@@ -143,6 +143,16 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 			// guest helper means that the file changed during the copy.
 			return op.next, op.dpErr(err)
 		}
+		if kind == failDeadline {
+			// Only WriteFile retries deadline_exceeded, because its retry
+			// is idempotent by write_id. For a read, the status is the
+			// control plane's final answer; unless the caller's own
+			// deadline caused it, the operation ends with it.
+			if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
+				return op.next, cerr
+			}
+			return op.next, op.dpErr(err)
+		}
 		op.rec.fail(err)
 		if sess == nil && kind != failExhausted {
 			op.grant.discard()
@@ -170,7 +180,15 @@ func (op *readOp) handleEvent(ev *ownsandv1.FileReadEvent, at *readAttempt) bool
 			at.err = fmt.Errorf("%w: chunk at %d, next offset %d", errReadGap, off, op.next)
 			return true
 		}
-		if _, err := op.w.Write(data[op.next-off:]); err != nil {
+		chunk := data[op.next-off:]
+		n, err := op.w.Write(chunk)
+		if err != nil {
+			// The writer accepted n bytes before it failed: count them, so
+			// the returned size matches the bytes that the caller holds.
+			// The error ends the operation, so no retry resumes at op.next.
+			if n > 0 {
+				op.next += int64(min(n, len(chunk)))
+			}
 			at.err = &callbackError{err: err}
 			return true
 		}
