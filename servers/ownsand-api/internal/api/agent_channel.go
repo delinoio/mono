@@ -551,6 +551,11 @@ type updateDecision struct {
 	target string
 	// recovery marks the target as a revocation recovery.
 	recovery bool
+	// pinned marks the target as the version of an organization PIN that is
+	// not a revocation recovery. A pinned target is sent also when it equals
+	// the running version, because the agent may hold a queued update that
+	// the command for the running version drops.
+	pinned bool
 	// withdraw tells the agent to drop a queued update. It is set only under
 	// HOLD when no revocation recovery applies.
 	withdraw bool
@@ -560,9 +565,10 @@ type updateDecision struct {
 // organization policy and the agent releases table. A revoked running or
 // pinned version selects the platform default as a revocation recovery,
 // regardless of HOLD or PIN. A PIN sends the pinned version even when it is
-// lower than the running version. Under FOLLOW_DEFAULT the platform default
-// is a target only when it is strictly newer than the running version, so a
-// default that was rolled back never downgrades a healthy device. HOLD
+// lower than or equal to the running version. Under FOLLOW_DEFAULT the
+// platform default is a target only when it is strictly newer than the
+// running version, so a default that was rolled back never downgrades a
+// healthy device. HOLD
 // sends no target and asks the agent to withdraw an update that it queued
 // earlier.
 func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDecision, error) {
@@ -602,7 +608,7 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 		if pinnedRevoked {
 			return updateDecision{target: def, recovery: true}, nil
 		}
-		return updateDecision{target: policy.GetPinnedVersion()}, nil
+		return updateDecision{target: policy.GetPinnedVersion(), pinned: true}, nil
 	case ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD:
 		return updateDecision{withdraw: true}, nil
 	}
@@ -625,8 +631,11 @@ func (s *Service) updateTarget(ctx context.Context, deviceID string) (updateDeci
 }
 
 // evaluateUpdate sends an update command when the target version differs
-// from the running version and from the last target sent on the channel. It
-// sends the withdrawal of a queued update when the policy is HOLD and no
+// from the last target sent on the channel and, except for a pinned target,
+// from the running version. A pin that equals the running version is sent
+// once per channel and decision, because the agent may hold a queued newer
+// update that the command for its running version drops. The evaluation
+// also sends the withdrawal of a queued update when the policy is HOLD and no
 // revocation recovery applies, once per channel and policy state: also after
 // reconciliation on a new channel, because the agent may still hold an
 // update that an earlier channel queued, and again after a target was sent in
@@ -663,7 +672,7 @@ func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
 	// A revocation recovery is sent even when the same target was sent
 	// before without it, because only a recovery allows a downgrade.
 	sent := fmt.Sprintf("%s/%t", d.target, d.recovery)
-	if d.target == "" || d.target == running || conn.Value(releaseKey{}) == sent {
+	if d.target == "" || (d.target == running && !d.pinned) || conn.Value(releaseKey{}) == sent {
 		return nil
 	}
 	conn.SetValue(releaseKey{}, sent)
