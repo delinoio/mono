@@ -485,9 +485,26 @@ func dnsRuleLines(rules string) []string {
 func dnsRulesFor(l Link) []string {
 	tap := TapName(l.Index)
 	return []string{
-		`iifname "` + tap + `" ip daddr ` + l.Gateway.String() + ` udp dport 53 accept`,
-		`iifname "` + tap + `" ip daddr ` + l.Gateway.String() + ` tcp dport 53 accept`,
+		`iifname "` + tap + `" ip saddr ` + l.Guest.String() + ` ip daddr ` + l.Gateway.String() + ` udp dport 53 accept`,
+		`iifname "` + tap + `" ip saddr ` + l.Guest.String() + ` ip daddr ` + l.Gateway.String() + ` tcp dport 53 accept`,
 	}
+}
+
+// sourceGuardLinesFor returns the forward chain rule that drops packets
+// from the tap of l whose source is not its guest address.
+func sourceGuardLinesFor(l Link) []string {
+	return []string{`iifname "` + TapName(l.Index) + `" ip saddr != ` + l.Guest.String() + ` drop`}
+}
+
+// sourceGuardLines returns the per-tap source guard lines of a ruleset.
+func sourceGuardLines(rules string) []string {
+	var out []string
+	for _, l := range strings.Split(rules, "\n") {
+		if l = strings.TrimSpace(l); strings.Contains(l, " ip saddr != ") {
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 // Attach and Detach change only the DNS rules of their own tap, and a
@@ -506,17 +523,29 @@ func TestAttachDetachChangeOnlyOwnDNSRules(t *testing.T) {
 	if got, want := dnsRuleLines(last()), dnsRulesFor(a); !slices.Equal(got, want) {
 		t.Fatalf("after attach a: %q, want %q", got, want)
 	}
+	if got, want := sourceGuardLines(last()), sourceGuardLinesFor(a); !slices.Equal(got, want) {
+		t.Fatalf("after attach a: source guards %q, want %q", got, want)
+	}
 	b := mustAttach(t, m, "sandbox-b")
 	if got, want := dnsRuleLines(last()), append(dnsRulesFor(a), dnsRulesFor(b)...); !slices.Equal(got, want) {
 		t.Fatalf("after attach b: %q, want %q", got, want)
+	}
+	if got, want := sourceGuardLines(last()), append(sourceGuardLinesFor(a), sourceGuardLinesFor(b)...); !slices.Equal(got, want) {
+		t.Fatalf("after attach b: source guards %q, want %q", got, want)
 	}
 	m.Detach("sandbox-a")
 	if got, want := dnsRuleLines(last()), dnsRulesFor(b); !slices.Equal(got, want) {
 		t.Fatalf("after detach a: %q, want only the rules of b %q", got, want)
 	}
+	if got, want := sourceGuardLines(last()), sourceGuardLinesFor(b); !slices.Equal(got, want) {
+		t.Fatalf("after detach a: source guards %q, want only the guard of b %q", got, want)
+	}
 	m.Detach("sandbox-b")
 	if got := dnsRuleLines(last()); len(got) != 0 {
 		t.Fatalf("after detach b: DNS rules remain: %q", got)
+	}
+	if got := sourceGuardLines(last()); len(got) != 0 {
+		t.Fatalf("after detach b: source guards remain: %q", got)
 	}
 	// A reused tap name gets exactly its own gateway.
 	c := mustAttach(t, m, "sandbox-c")
@@ -525,6 +554,9 @@ func TestAttachDetachChangeOnlyOwnDNSRules(t *testing.T) {
 	}
 	if got, want := dnsRuleLines(last()), dnsRulesFor(c); !slices.Equal(got, want) {
 		t.Fatalf("after reuse: %q, want %q", got, want)
+	}
+	if got, want := sourceGuardLines(last()), sourceGuardLinesFor(c); !slices.Equal(got, want) {
+		t.Fatalf("after reuse: source guards %q, want %q", got, want)
 	}
 }
 
