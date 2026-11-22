@@ -5,15 +5,18 @@ package layers_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
+	"github.com/delinoio/mono/servers/tide-api/internal/link"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/tide-api/internal/testenv"
@@ -145,5 +148,29 @@ func TestOwnSandLinkWithSubMicrosecondClock(t *testing.T) {
 	w.env.Clock.Advance(time.Second + 700*time.Nanosecond)
 	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('b')); err != nil {
 		t.Fatalf("replace: %v", err)
+	}
+}
+
+// A removal whose deletion transaction fails keeps the link and clears the
+// removal mark, so the link stays dispatchable and accepts a new key.
+func TestOwnSandLinkRemovalFailureClearsMark(t *testing.T) {
+	w := newWorld(t)
+	ctx := context.Background()
+	osOrg := api.NewID()
+	w.fake.AddOrg(osOrg, ownsandKey('a'))
+	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('a')); err != nil {
+		t.Fatal(err)
+	}
+	w.l.Links.OnRemoval(link.RemovalHook{Name: "fail", InTx: func(context.Context, pgx.Tx, string) error { return errors.New("deletion failed") }})
+	_, err := w.env.User(w.org.Admin).OwnSandLink.RemoveOwnSandLink(ctx, connect.NewRequest(&tidev1.RemoveOwnSandLinkRequest{OrganizationId: w.org.ID}))
+	wantCode(t, "failed removal", err, connect.CodeInternal)
+	lk, ok, err := w.l.Links.Get(ctx, w.env.DB.Pool, w.org.ID)
+	if err != nil || !ok || lk.Removing || !lk.Dispatchable() {
+		t.Fatalf("link after failed removal: %+v %v %v", lk, ok, err)
+	}
+	w.fake.AddOrg(osOrg, ownsandKey('b'))
+	w.env.Clock.Advance(time.Second)
+	if _, err := w.setLink(w.org.Admin, osOrg, ownsandKey('b')); err != nil {
+		t.Fatalf("new key after failed removal: %v", err)
 	}
 }

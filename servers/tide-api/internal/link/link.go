@@ -380,8 +380,8 @@ func (h *Handler) GetOwnSandLink(ctx context.Context, req *connect.Request[tidev
 // RemoveOwnSandLink marks the link as being removed (dispatch stops), runs
 // the Prepare hooks (the work layer deletes the runners), then deletes the
 // link and its key in a transaction that also runs the InTx hooks (the work
-// layer ends the queued requests with CANCELED). A failed Prepare clears the
-// mark and keeps the link.
+// layer ends the queued requests with CANCELED). A failed Prepare or a failed
+// deletion transaction clears the mark and keeps the link.
 func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[tidev1.RemoveOwnSandLinkRequest]) (*connect.Response[tidev1.RemoveOwnSandLinkResponse], error) {
 	l := h.links
 	s := l.svc
@@ -402,9 +402,7 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		}
 		if err := hook.Prepare(ctx, c.OrganizationID); err != nil {
 			s.Logger.WarnContext(ctx, "ownsand_link_removal_prepare_failed", slog.String("hook", hook.Name), slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
-			if _, uerr := s.DB.Pool.Exec(context.WithoutCancel(ctx), "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", c.OrganizationID); uerr != nil {
-				s.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", c.OrganizationID), slog.Any("error", uerr))
-			}
+			l.unmarkRemoval(ctx, c.OrganizationID)
 			return nil, s.Internal(ctx, "prepare ownsand link removal", err)
 		}
 	}
@@ -436,9 +434,26 @@ func (h *Handler) RemoveOwnSandLink(ctx context.Context, req *connect.Request[ti
 		})
 	})
 	if err != nil {
+		// The deletion rolled back (for example, the request was canceled
+		// while it waited for the organization lock), so the link stays and
+		// must not stay marked.
+		s.Logger.WarnContext(ctx, "ownsand_link_removal_failed", slog.String("organization_id", c.OrganizationID), slog.Any("error", err))
+		l.unmarkRemoval(ctx, c.OrganizationID)
 		return nil, s.Internal(ctx, "remove ownsand link", err)
 	}
 	l.forget(c.OrganizationID)
 	s.Logger.InfoContext(ctx, "ownsand_link_removed", slog.String("organization_id", c.OrganizationID))
 	return connect.NewResponse(&tidev1.RemoveOwnSandLinkResponse{}), nil
+}
+
+// unmarkRemoval clears the removal mark of a removal that failed, so the
+// kept link is dispatchable again and accepts a new key. It does not use the
+// cancellation of ctx, because a canceled request is one cause of the
+// failure, and it has its own time limit.
+func (l *Links) unmarkRemoval(ctx context.Context, orgID string) {
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	if _, err := l.svc.DB.Pool.Exec(uctx, "UPDATE ownsand_links SET removing = false WHERE organization_id = $1", orgID); err != nil {
+		l.svc.Logger.WarnContext(ctx, "ownsand_link_removal_unmark_failed", slog.String("organization_id", orgID), slog.Any("error", err))
+	}
 }
