@@ -50,6 +50,10 @@ type Runtime struct {
 	host        procHost
 	signalGroup func(pid int) error
 	stopTimeout time.Duration
+	// waitExit observes the exit of a tracked child without reaping it, and
+	// observeRetry paces its retries after a failure (see launch).
+	waitExit     func(pid int) error
+	observeRetry time.Duration
 	// stopRefresh ends the network policy refresh loop; refreshDone
 	// closes when it returned. Both are nil without a network manager.
 	stopRefresh context.CancelFunc
@@ -108,6 +112,7 @@ func newRuntime(opts Options, hostCleanup func() error) (*Runtime, error) {
 		host:        newLinuxProcs(),
 		signalGroup: func(pid int) error { return syscall.Kill(-pid, syscall.SIGKILL) },
 		stopTimeout: exitTimeout,
+		waitExit:    waitExitNoReap, observeRetry: observeRetryDelay,
 	}
 	if opts.Network != nil {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -236,6 +241,7 @@ type vm struct {
 	dir      string
 	dirFile  *os.File
 	cmd      *exec.Cmd
+	launch   *launch
 	exited   chan struct{}
 	api      *apiClient
 	restore  ownsandv1.SandboxRestorePath
@@ -438,14 +444,15 @@ func (r *Runtime) startProcess(ctx context.Context, v *vm) error {
 		return fmt.Errorf("fcrt: start firecracker: %w", err)
 	}
 	exited := make(chan struct{})
-	go func() {
-		cmd.Wait()
-		logf.Close()
-		close(exited)
-	}()
+	l := &launch{
+		pid: cmd.Process.Pid, exited: exited, observe: r.waitExit,
+		wait:   func() { cmd.Wait() },
+		finish: func() { logf.Close() },
+	}
 	v.mu.Lock()
-	v.cmd, v.exited = cmd, exited
+	v.cmd, v.launch, v.exited = cmd, l, exited
 	v.mu.Unlock()
+	go l.supervise(r.logger, v.id, r.observeRetry)
 	// Without the record a later agent process cannot prove that it owns the
 	// process, so a failed write fails the start; the caller stops the
 	// process.
@@ -646,16 +653,24 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (inf
 // v then keeps its process reference, so that a later stop tries again.
 func (r *Runtime) stop(v *vm) error {
 	v.mu.Lock()
-	cmd, exited := v.cmd, v.exited
+	cmd, l := v.cmd, v.launch
 	v.mu.Unlock()
 	var err error
 	if cmd != nil && cmd.Process != nil {
+		exited := l.exited
 		select {
 		case <-exited:
 		default:
-			// Signal only a process that this agent has not reaped yet: after
-			// the wait goroutine reaped it, its PID may name another process.
-			if kerr := r.signalGroup(cmd.Process.Pid); kerr != nil && !errors.Is(kerr, syscall.ESRCH) {
+			// Signal only while this launch still owns the PID: the launch
+			// gate refuses the signal once its reaper committed to reap the
+			// child (the exited channel stays open until the output drained
+			// and the log closed), and the reaper waits for a signal in
+			// flight before it reaps. The signal is the group signal, so
+			// same-group descendants end with the leader.
+			state, kerr := l.signal(r.signalGroup)
+			if state != signalAllowed {
+				r.logger.Warn("firecracker group signal skipped", "sandbox_id", v.id, "pid", cmd.Process.Pid, "reason", string(state))
+			} else if kerr != nil && !errors.Is(kerr, syscall.ESRCH) {
 				r.logger.Error("signal firecracker failed", "sandbox_id", v.id, "pid", cmd.Process.Pid, "error", kerr)
 			}
 			timer := time.NewTimer(r.stopTimeout)
