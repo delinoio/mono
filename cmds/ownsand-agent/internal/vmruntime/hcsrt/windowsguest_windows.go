@@ -94,8 +94,10 @@ func checkWindowsResources(res *ownsandv1.Resources, m images.Metadata) error {
 }
 
 // prepareWindowsDisk copies the Windows disk into the VM directory and
-// grows it to the requested size; the guest helper extends C: at boot. The
-// copy is a full, self-contained VHDX (no differencing parent), so a
+// grows it to the requested size; the guest helper extends C: at boot. A
+// request below the virtual size of the copy (the source disk, also of a
+// snapshot) fails as unsupported before any compute system exists, and the
+// create removes the VM directory. The copy is a full, self-contained VHDX (no differencing parent), so a
 // snapshot never depends on the base image, which a rebuild replaces.
 func (r *Runtime) prepareWindowsDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
 	src, metaDir := r.windowsSource(spec)

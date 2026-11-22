@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -206,26 +205,11 @@ func (b *BuildVM) copyConsole(pipe, path string) {
 		return
 	}
 	defer out.Close()
-	for {
+	dial := func() (net.Conn, error) {
 		timeout := time.Second
-		conn, err := winio.DialPipe(pipe, &timeout)
-		if err == nil {
-			go func() {
-				select {
-				case <-b.stop:
-				case <-b.sys.exited:
-				}
-				conn.Close()
-			}()
-			_, _ = io.Copy(out, conn)
-			conn.Close()
-		}
-		select {
-		case <-b.stop:
-			return
-		case <-b.sys.exited:
-			return
-		case <-time.After(100 * time.Millisecond):
-		}
+		return winio.DialPipe(pipe, &timeout)
 	}
+	// The shared loop ends each closer goroutine with its copy, so a console
+	// pipe that ends while the VM runs leaves no goroutine behind.
+	copyConsoleLoop(dial, out, b.stop, b.sys.exited)
 }
