@@ -362,11 +362,34 @@ func parseUsageServiceClients(value string) (map[string][]accountsv1.ServiceId, 
 
 // serviceFromKey returns the ServiceId of a stable lowercase identifier.
 func serviceFromKey(key string) (accountsv1.ServiceId, bool) {
+	// Reject anything outside a-z, 0-9 and "_" before the lookup:
+	// strings.ToUpper is Unicode-aware and folds characters such as U+017F
+	// (long s) to ASCII letters, so the lookup alone would accept "ownſand".
+	// billing.ServiceFromKey applies the same rule; the packages keep
+	// separate copies because config cannot import billing.
+	if !stableKey(key) {
+		return accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED, false
+	}
 	v, ok := accountsv1.ServiceId_value["SERVICE_ID_"+strings.ToUpper(key)]
-	if !ok || v == 0 || asciiLower(key) != key {
+	if !ok || v == 0 {
 		return accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED, false
 	}
 	return accountsv1.ServiceId(v), true
+}
+
+// stableKey reports whether key is non-empty and holds only the bytes a-z,
+// 0-9 and "_" that stable identifiers use.
+func stableKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 // httpURL checks that value is an absolute http or https URL without a query
