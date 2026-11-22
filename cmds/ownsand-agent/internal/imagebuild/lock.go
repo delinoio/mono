@@ -6,9 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
 )
 
 // ErrBuildInProgress reports that another process builds the image of the
@@ -36,47 +37,34 @@ func (e *BuildInProgressError) Is(target error) bool { return target == ErrBuild
 
 // buildLock is an exclusive cross-process lock on the image destination. The
 // operating system releases it when the holder closes the file or ends for
-// any reason, so a crashed build never blocks a later one.
+// any reason, so a crashed build never blocks a later one. The lock is the
+// one that images.Recover takes, so a reader never restores a backup while
+// Install exchanges the directories.
 type buildLock struct {
-	f *os.File
+	l *images.Lock
 }
 
 // buildLockPath returns the lock file of an image directory: the sibling
 // `<dir>.build.lock` (for example images/windows.build.lock), next to the
 // staging directory `<dir>.build` that it protects. Install and the
 // platform builders never remove it, so every process locks the same file.
-func buildLockPath(dir string) string { return dir + ".build.lock" }
+func buildLockPath(dir string) string { return images.LockPath(dir) }
 
 // acquireBuildLock takes the build lock of the image directory dir without
 // waiting. It returns *BuildInProgressError when another process holds it.
 func acquireBuildLock(dir string, logger *slog.Logger) (*buildLock, error) {
 	path := buildLockPath(dir)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return nil, fmt.Errorf("imagebuild: create the images directory: %w", err)
-	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
-	if err != nil {
-		return nil, fmt.Errorf("imagebuild: open the build lock: %w", err)
-	}
-	ok, err := tryLockFile(f)
-	if err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("imagebuild: lock %s: %w", path, err)
-	}
-	if !ok {
-		_ = f.Close()
+	l, err := images.TryLock(dir)
+	if errors.Is(err, images.ErrLocked) {
 		image := strings.TrimSuffix(filepath.Base(path), ".build.lock")
 		logger.Warn("image build refused: another build holds the lock", "image", image, "lock_path", path)
 		return nil, &BuildInProgressError{Image: image, LockPath: path}
 	}
-	return &buildLock{f: f}, nil
+	if err != nil {
+		return nil, fmt.Errorf("imagebuild: %w", err)
+	}
+	return &buildLock{l: l}, nil
 }
 
-// release unlocks and closes the lock file. It leaves the file in place:
-// removing it would let a waiting process lock an unlinked file while a third
-// process creates and locks a new one.
-func (l *buildLock) release() error {
-	unlockErr := unlockFile(l.f)
-	closeErr := l.f.Close()
-	return errors.Join(unlockErr, closeErr)
-}
+// release unlocks and closes the lock file. It leaves the file in place.
+func (l *buildLock) release() error { return l.l.Release() }

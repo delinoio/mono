@@ -45,7 +45,9 @@ func (r *Runtime) macOSImage() ([]byte, string) {
 	if dir == "" {
 		return nil, "no macOS image directory is configured"
 	}
-	if _, err := images.ReadMetadata(dir); err != nil {
+	// Resolve first restores the previous image when an image build ended
+	// between the two renames of its install.
+	if _, err := images.Resolve(dir); err != nil {
 		return nil, "the macOS base image is not built; run `ownsand-agent image build`"
 	}
 	for _, name := range []string{images.MacOSDisk, images.MacOSAuxStorage} {
@@ -99,7 +101,7 @@ func (r *Runtime) createMacOS(ctx context.Context, spec vmruntime.Spec) (vmrunti
 	if !macOSHardwareModelSupported(model) {
 		return nil, fmt.Errorf("%w: this Mac does not support the hardware model of the macOS guest", vmruntime.ErrUnsupported)
 	}
-	if meta, err := images.ReadMetadata(r.opts.MacOSImage); err == nil {
+	if meta, err := images.Resolve(r.opts.MacOSImage); err == nil {
 		if spec.Resources.GetVcpuCount() < meta.MinimumCPUCount || spec.Resources.GetMemoryMib() < meta.MinimumMemoryMiB {
 			return nil, fmt.Errorf("%w: macOS guests need at least %d vCPUs and %d MiB of memory", vmruntime.ErrUnsupported, meta.MinimumCPUCount, meta.MinimumMemoryMiB)
 		}
