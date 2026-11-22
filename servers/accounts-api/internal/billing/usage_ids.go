@@ -28,8 +28,16 @@ func ServiceKey(s accountsv1.ServiceId) (string, bool) {
 
 // ServiceFromKey returns the service of a stable identifier.
 func ServiceFromKey(key string) (accountsv1.ServiceId, bool) {
+	// Reject anything outside a-z, 0-9 and "_" before the lookup:
+	// strings.ToUpper is Unicode-aware and folds characters such as U+017F
+	// (long s) to ASCII letters. config.serviceFromKey applies the same
+	// rule; the packages keep separate copies because config cannot import
+	// billing.
+	if !stableKey(key) {
+		return accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED, false
+	}
 	v, ok := accountsv1.ServiceId_value["SERVICE_ID_"+strings.ToUpper(key)]
-	if !ok || v == 0 || strings.ToLower(key) != key {
+	if !ok || v == 0 {
 		return accountsv1.ServiceId_SERVICE_ID_UNSPECIFIED, false
 	}
 	return accountsv1.ServiceId(v), true
@@ -66,10 +74,28 @@ func MeterKey(m accountsv1.Meter) (key string, service accountsv1.ServiceId, ok 
 	return svc + "." + strings.ToLower(strings.TrimPrefix(rest, best)), service, true
 }
 
+// stableKey reports whether key is non-empty and holds only the bytes a-z,
+// 0-9 and "_" that stable identifiers use.
+func stableKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		c := key[i]
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	return true
+}
+
 // MeterFromKey returns the meter of a stable identifier.
 func MeterFromKey(key string) (accountsv1.Meter, bool) {
 	service, meter, ok := strings.Cut(key, ".")
-	if !ok || strings.ToLower(key) != key {
+	// Exactly one ".", and both parts hold only a-z, 0-9 and "_": the
+	// Unicode-aware strings.ToUpper below would otherwise fold characters
+	// such as U+017F (long s) to ASCII letters.
+	if !ok || strings.Contains(meter, ".") || !stableKey(service) || !stableKey(meter) {
 		return accountsv1.Meter_METER_UNSPECIFIED, false
 	}
 	v, ok := accountsv1.Meter_value["METER_"+strings.ToUpper(service)+"_"+strings.ToUpper(meter)]

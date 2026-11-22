@@ -161,7 +161,7 @@ The server is the Logto API resource `https://accounts.api.delino.io`. Each serv
 | `ServiceId`           | `OWNSAND`                                                                                  |
 | `Meter`               | `OWNSAND_RELAY_EGRESS`, `OWNSAND_R2_STORAGE`, `OWNSAND_CLASS_A_RPC`, `OWNSAND_CLASS_B_RPC` |
 
-- Stable identifiers: the stable identifier of a `ServiceId` value is its name without the prefix, in lowercase (`ownsand`); `LedgerEntry.service` and the database store it. The stable identifier of a meter is `<service>.<meter>` in lowercase: `ownsand.relay_egress`, `ownsand.r2_storage`, `ownsand.class_a_rpc` and `ownsand.class_b_rpc`; `LedgerEntry.meter` and the database store it. Each `Meter` value starts with the name of its `ServiceId` value.
+- Stable identifiers: the stable identifier of a `ServiceId` value is its name without the prefix, in lowercase (`ownsand`); `LedgerEntry.service` and the database store it. The stable identifier of a meter is `<service>.<meter>` in lowercase: `ownsand.relay_egress`, `ownsand.r2_storage`, `ownsand.class_a_rpc` and `ownsand.class_b_rpc`; `LedgerEntry.meter` and the database store it. Each `Meter` value starts with the name of its `ServiceId` value. A stable identifier holds only the bytes `a-z`, `0-9` and `_` (a meter identifier has exactly one `.` between two such parts); the parsers match it exactly and reject any other byte, including non-ASCII characters that Unicode case mapping would fold to ASCII letters, such as `ſ` (U+017F) for `s`.
 - Quantity units: bytes for relay egress, byte-seconds for R2 storage and calls for the RPC meters. The [OwnSand project index](project-ownsand.md#billing) owns the prices.
 - A new consuming service adds its `ServiceId` value and its meters.
 
