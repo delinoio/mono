@@ -647,6 +647,11 @@ func TestRelayConnectionRules(t *testing.T) {
 	// stop is idempotent; the deferred call stops the keepalive when the
 	// fixture fails before the explicit stop below.
 	defer stop()
+	// ConnectRelay does not wait for the server. The server registers a
+	// connection before it serves its frames, so the echo proves that r1 is
+	// registered; without it, r2 can register first and r1 replaces r2.
+	r1.SendFrame(&ownsandv1.DataFrame{Kind: ownsandv1.DataFrameKind_DATA_FRAME_KIND_RELAY_KEEPALIVE, Payload: &ownsandv1.DataFrame_RelayKeepalive{RelayKeepalive: &ownsandv1.RelayKeepalive{EchoRequested: true}}})
+	r1.WaitFrame("keepalive on the first connection", func(f *ownsandv1.DataFrame) bool { return f.GetRelayKeepalive() != nil })
 	r2 := agent.ConnectRelay(serveExec)
 	stop2 := keepAlive(r2)
 	defer stop2()
