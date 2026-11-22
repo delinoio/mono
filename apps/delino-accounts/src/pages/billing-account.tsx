@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useQuery } from "@connectrpc/connect-query";
 import { Tabs, TabsList, TabsPanel, TabsTab } from "delino-ui/tabs";
 import { useState } from "react";
@@ -7,7 +8,12 @@ import {
   Page,
   useBillingAccount,
 } from "../components/shell.tsx";
-import { ErrorNotice, Loading, PageHeader } from "../components/ui.tsx";
+import {
+  ErrorNotice,
+  Loading,
+  PageHeader,
+  RefetchNotice,
+} from "../components/ui.tsx";
 import { labels } from "../format.ts";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { can, Permission } from "../roles.ts";
@@ -61,7 +67,14 @@ export function BillingAccountPage({
       </Page>
     );
   }
-  if (account.error) {
+  // A failed refetch of an account that has loaded keeps the page, its tab and
+  // its dialogs, and shows a retryable notice above it. Only a first-load
+  // failure, or a refetch that says the account is gone or no longer readable
+  // for the caller, replaces the page.
+  if (
+    account.isLoadingError ||
+    (account.isRefetchError && accountGone(account.error))
+  ) {
     return (
       <Page>
         <ErrorNotice
@@ -84,9 +97,25 @@ export function BillingAccountPage({
       }}
     >
       <Page>
+        <RefetchNotice
+          error={account.isRefetchError ? account.error : undefined}
+          onRetry={() => void account.refetch()}
+        />
         <BillingAccountBody />
       </Page>
     </BillingAccountProvider>
+  );
+}
+
+/**
+ * Whether a failed refetch means that the caller cannot use the account any
+ * more: it was deleted, or the caller was removed from it. Showing its stale
+ * data would be wrong then. Any other failure is transient.
+ */
+function accountGone(error: unknown): boolean {
+  return (
+    error instanceof ConnectError &&
+    (error.code === Code.NotFound || error.code === Code.PermissionDenied)
   );
 }
 

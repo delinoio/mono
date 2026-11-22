@@ -90,6 +90,31 @@ export function ErrorNotice({
 }
 
 /**
+ * A failed background refetch of data that is already on screen (a window
+ * focus refetch, a poll, or the refetch after a mutation). Render it above
+ * the loaded content, and keep that content: the content, its selected tab,
+ * its open dialogs and its typed input must survive a transient failure.
+ * Only a request that failed before it ever returned data replaces the
+ * content with an `ErrorNotice`.
+ *
+ * Pass the error of the failed refetch, or nothing while the last request
+ * succeeded. The retry clears the notice when it succeeds. Keep the notice in
+ * the same position of the tree in every state, so that the content below
+ * does not remount when the notice appears.
+ */
+export function RefetchNotice({
+  error,
+  onRetry,
+}: {
+  error: unknown;
+  onRetry: () => void;
+}) {
+  return error === undefined || error === null ? null : (
+    <ErrorNotice error={error} onRetry={onRetry} />
+  );
+}
+
+/**
  * The state of the pages after the first one: a short loading line while
  * later pages load and an error with a retry that resumes at the failed page.
  * The items of the earlier pages stay visible above it.

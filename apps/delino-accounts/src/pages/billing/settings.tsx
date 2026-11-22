@@ -12,6 +12,7 @@ import {
   ConfirmDialog,
   Detail,
   ErrorNotice,
+  RefetchNotice,
   Loading,
 } from "../../components/ui.tsx";
 import {
@@ -145,7 +146,7 @@ function AutoTopUpSection() {
     <section className="section" aria-label="Automatic top-up">
       <Loading label="Loading automatic top-up" />
     </section>
-  ) : settings.error ? (
+  ) : settings.isLoadingError ? (
     <section className="section" aria-label="Automatic top-up">
       <ErrorNotice
         error={settings.error}
@@ -153,14 +154,23 @@ function AutoTopUpSection() {
       />
     </section>
   ) : (
-    <AutoTopUpForm
-      // Start again from the server values after each save. Only the four
-      // editable values identify the form: the read-only counters change
-      // without any user action, and a refetch that changes only them must
-      // not discard the draft in the inputs.
-      key={autoTopUpFormKey(settings.data.settings)}
-      settings={settings.data.settings}
-    />
+    // The notice and the form are siblings in a fragment in every loaded
+    // state, so that a failed refetch does not remount the form and discard
+    // its draft.
+    <>
+      <RefetchNotice
+        error={settings.isRefetchError ? settings.error : undefined}
+        onRetry={() => void settings.refetch()}
+      />
+      <AutoTopUpForm
+        // Start again from the server values after each save. Only the four
+        // editable values identify the form: the read-only counters change
+        // without any user action, and a refetch that changes only them must
+        // not discard the draft in the inputs.
+        key={autoTopUpFormKey(settings.data.settings)}
+        settings={settings.data.settings}
+      />
+    </>
   );
 }
 
@@ -280,7 +290,7 @@ function AlertSection() {
     <section className="section" aria-label="Low-balance alert">
       <Loading label="Loading the low-balance alert" />
     </section>
-  ) : settings.error ? (
+  ) : settings.isLoadingError ? (
     <section className="section" aria-label="Low-balance alert">
       <ErrorNotice
         error={settings.error}
@@ -288,10 +298,17 @@ function AlertSection() {
       />
     </section>
   ) : (
-    <AlertForm
-      key={String(settings.data.settings?.lowBalanceThresholdUsdMicros)}
-      settings={settings.data.settings}
-    />
+    // A fragment in every loaded state; see AutoTopUpSection.
+    <>
+      <RefetchNotice
+        error={settings.isRefetchError ? settings.error : undefined}
+        onRetry={() => void settings.refetch()}
+      />
+      <AlertForm
+        key={String(settings.data.settings?.lowBalanceThresholdUsdMicros)}
+        settings={settings.data.settings}
+      />
+    </>
   );
 }
 

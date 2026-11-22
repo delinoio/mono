@@ -1736,3 +1736,198 @@ describe("paged lists", () => {
     });
   });
 });
+
+/** Triggers the refetch of every stale query, like a return to the tab. */
+async function refocus() {
+  await act(async () => {
+    window.dispatchEvent(new Event("visibilitychange"));
+  });
+  await settle(60);
+}
+
+/** The notice text of a ResourceExhausted failure. */
+const BUSY = "Too many requests. Wait a moment and try again.";
+const BACKGROUND_FAILURE = new ConnectError("busy", Code.ResourceExhausted);
+
+describe("failed background refetches", () => {
+  test("a failed refetch of the account keeps the page, the tab and the typed input", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const amount = await screen.findByRole("textbox", {
+      name: "Top-up amount (USD)",
+    });
+    await type(amount, "75");
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Settings" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("75");
+
+    // Try again reads the account again and clears the notice.
+    const before = calls(api, "GetBillingAccount").length;
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await settle(60);
+    expect(calls(api, "GetBillingAccount").length).toBe(before + 1);
+    expect(screen.queryByText(BUSY)).toBeNull();
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("75");
+  });
+
+  test("a failed refetch of the account keeps an open dialog and its input", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Members");
+    await click(await screen.findByRole("button", { name: "Invite by email" }));
+    await settle(60);
+    await type(
+      screen.getByRole("textbox", { name: "Email" }),
+      "new@example.com",
+    );
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      (screen.getByRole("textbox", { name: "Email" }) as HTMLInputElement)
+        .value,
+    ).toBe("new@example.com");
+  });
+
+  for (const code of [Code.NotFound, Code.PermissionDenied]) {
+    test(`a ${Code[code]} refetch of the account replaces the page`, async () => {
+      const { api } = await renderAccount(ADMIN);
+      api.failNext.set(
+        "GetBillingAccount",
+        new ConnectError("the account is gone", code),
+      );
+      await refocus();
+      expect(
+        screen.getByText(
+          code === Code.NotFound
+            ? "It was not found, or you no longer have access to it."
+            : "the account is gone",
+        ),
+      ).toBeTruthy();
+      expect(
+        screen
+          .getByRole("link", { name: "Go to your billing accounts" })
+          .getAttribute("href"),
+      ).toBe("/billing");
+      expect(screen.queryByRole("tab", { name: "Settings" })).toBeNull();
+    });
+  }
+
+  test("a failed first load shows only the notice", async () => {
+    const api = createFakeApi();
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    renderApp(ACCOUNT_PATH, { api });
+    expect(await screen.findByText(BUSY)).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: "Acme Robotics" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+  });
+
+  test("a failed refetch of the billing accounts keeps the list", async () => {
+    const api = createFakeApi();
+    renderApp("/billing", { api });
+    const list = await screen.findByRole("list", { name: "Billing accounts" });
+    await settle();
+    api.failNext.set("ListBillingAccounts", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(rowTitles(list)).toEqual(["Acme Robotics"]);
+    expect(
+      rowTitles(screen.getByRole("list", { name: "Billing accounts" })),
+    ).toEqual(["Acme Robotics"]);
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await settle(60);
+    expect(screen.queryByText(BUSY)).toBeNull();
+    expect(
+      rowTitles(screen.getByRole("list", { name: "Billing accounts" })),
+    ).toEqual(["Acme Robotics"]);
+  });
+
+  test("a failed refetch of a list with more than one page keeps every item", async () => {
+    const api = createFakeApi();
+    addBillingAccounts(api, 200);
+    renderApp("/billing", { api });
+    const list = await screen.findByRole("list", { name: "Billing accounts" });
+    await settle(100);
+    expect(rowTitles(list)).toHaveLength(201);
+    api.failNext.set("ListBillingAccounts", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      rowTitles(screen.getByRole("list", { name: "Billing accounts" })),
+    ).toHaveLength(201);
+  });
+
+  test("a failed refetch of the members keeps the members", async () => {
+    const { api } = await renderAccount();
+    await openTab("Members");
+    const list = await screen.findByRole("list", { name: "Members" });
+    await settle();
+    const names = rowTitles(list);
+    expect(names.length).toBeGreaterThan(0);
+    api.failNext.set("ListMembers", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(rowTitles(screen.getByRole("list", { name: "Members" }))).toEqual(
+      names,
+    );
+    await click(screen.getByRole("button", { name: "Try again" }));
+    await settle(60);
+    expect(screen.queryByText(BUSY)).toBeNull();
+    expect(rowTitles(screen.getByRole("list", { name: "Members" }))).toEqual(
+      names,
+    );
+  });
+
+  test("a failed refetch of the balance keeps the balance", async () => {
+    const { api } = await renderAccount();
+    const balanceBefore = document.querySelector(".balance")?.textContent;
+    expect(balanceBefore).toBeTruthy();
+    api.failNext.set("GetBalance", BACKGROUND_FAILURE);
+    await refocus();
+    expect(screen.getAllByText(BUSY).length).toBeGreaterThan(0);
+    expect(document.querySelector(".balance")?.textContent).toBe(balanceBefore);
+  });
+
+  test("a mutation whose follow-up refetch fails keeps the page and its state", async () => {
+    const { api } = await renderAccount(OWNER);
+    await openTab("Members");
+    await screen.findByRole("list", { name: "Members" });
+    await settle();
+    // The role change succeeds; the account refetch that follows it fails.
+    api.failNext.set("GetBillingAccount", BACKGROUND_FAILURE);
+    const role = screen.getByRole("combobox", { name: "Role of Vera Viewer" });
+    await click(role);
+    await click(await screen.findByRole("option", { name: "Admin" }));
+    await settle(100);
+    expect(calls(api, "UpdateMemberRole")).toHaveLength(1);
+    expect(screen.getByText(BUSY)).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+    ).toBeTruthy();
+    expect(
+      screen
+        .getByRole("tab", { name: "Members" })
+        .getAttribute("aria-selected"),
+    ).toBe("true");
+  });
+});

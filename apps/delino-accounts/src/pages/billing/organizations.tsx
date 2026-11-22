@@ -4,6 +4,7 @@ import { useBillingAccount } from "../../components/shell.tsx";
 import {
   Empty,
   ErrorNotice,
+  RefetchNotice,
   Loading,
   MorePages,
 } from "../../components/ui.tsx";
@@ -58,6 +59,7 @@ export function OrganizationsSection() {
         This billing account pays for these organizations. Link or unlink an
         organization in its service, for example in the OwnSand console.
       </p>
+      <RefetchNotice error={orgs.refreshError} onRetry={orgs.refetch} />
       {orgs.isPending ? (
         <Loading label="Loading linked organizations" />
       ) : orgs.error ? (

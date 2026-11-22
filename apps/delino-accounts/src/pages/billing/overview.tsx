@@ -12,6 +12,7 @@ import {
   ConfirmDialog,
   Empty,
   ErrorNotice,
+  RefetchNotice,
   FormDialog,
   Loading,
 } from "../../components/ui.tsx";
@@ -81,9 +82,13 @@ function BalanceCard() {
   return (
     <section className="section" aria-labelledby="balance-title">
       <h2 id="balance-title">Balance</h2>
+      <RefetchNotice
+        error={balance.isRefetchError ? balance.error : undefined}
+        onRetry={() => void balance.refetch()}
+      />
       {balance.isPending ? (
         <Loading label="Loading the balance" />
-      ) : balance.error ? (
+      ) : balance.isLoadingError ? (
         <ErrorNotice
           error={balance.error}
           onRetry={() => void balance.refetch()}
@@ -272,7 +277,7 @@ function SubscriptionCard() {
       </section>
     );
   }
-  if (subscription.error) {
+  if (subscription.isLoadingError) {
     return (
       <section className="section" aria-label="Subscription">
         <ErrorNotice
@@ -299,6 +304,10 @@ function SubscriptionCard() {
 
   return (
     <section className="section" aria-labelledby="subscription-title">
+      <RefetchNotice
+        error={subscription.isRefetchError ? subscription.error : undefined}
+        onRetry={() => void subscription.refetch()}
+      />
       <div className="section-header">
         <h2 id="subscription-title">Subscription</h2>
         {sub !== undefined ? subscriptionBadge(sub) : null}
@@ -393,9 +402,13 @@ function CreditGrants() {
         Credit expires 12 months after purchase. Usage takes the credit that
         expires first.
       </p>
+      <RefetchNotice
+        error={balance.isRefetchError ? balance.error : undefined}
+        onRetry={() => void balance.refetch()}
+      />
       {balance.isPending ? (
         <Loading label="Loading credit" />
-      ) : balance.error ? (
+      ) : balance.isLoadingError ? (
         <ErrorNotice
           error={balance.error}
           onRetry={() => void balance.refetch()}

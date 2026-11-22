@@ -13,6 +13,7 @@ import {
   ConfirmDialog,
   Empty,
   ErrorNotice,
+  RefetchNotice,
   FormDialog,
   Loading,
   MorePages,
@@ -83,6 +84,7 @@ export function MembersSection() {
             </Button>
           ) : null}
         </div>
+        <RefetchNotice error={members.refreshError} onRetry={members.refetch} />
         {members.isPending ? (
           <Loading label="Loading members" />
         ) : members.error ? (
@@ -253,6 +255,7 @@ function Invitations() {
           Invite by email
         </Button>
       </div>
+      <RefetchNotice error={list.refreshError} onRetry={list.refetch} />
       {list.isPending ? (
         <Loading label="Loading invitations" />
       ) : list.error ? (
