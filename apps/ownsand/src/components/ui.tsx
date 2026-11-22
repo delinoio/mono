@@ -19,9 +19,11 @@ import {
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
 import { toast } from "delino-ui/toast";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { DeviceState, SandboxState } from "@delino/ownsand-protos/v1/common_pb";
 import { type FormEvent, type ReactNode, useState } from "react";
 import { billingReasonOf } from "../api.ts";
+import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import { errorMessage, labels } from "../format.ts";
 
@@ -95,21 +97,40 @@ export function TextWithAccountsLink({ text }: { text: string }) {
 /**
  * A failed request, with a retry button. A billing error shows the server
  * message with its link and never offers a retry, because it is terminal.
+ * An `unauthenticated` error, from the server or from a token request that
+ * failed, cannot succeed on a retry: the notice offers the sign-in instead.
+ * The Logto SDK keeps reporting the user as signed in after a failed token
+ * refresh, so the signed-out view never shows. `onSignIn` replaces the
+ * default `auth.signIn()` for a page that must prepare the redirect first.
  */
 export function ErrorNotice({
   error,
   onRetry,
+  onSignIn,
 }: {
   error: unknown;
   onRetry?: () => void;
+  onSignIn?: () => void | Promise<void>;
 }) {
+  const auth = useAuth();
   const billing = billingReasonOf(error) !== undefined;
+  const unauthenticated =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
       <p>
         <TextWithAccountsLink text={errorMessage(error)} />
       </p>
-      {onRetry && !billing ? (
+      {unauthenticated ? (
+        <Button
+          variant={ButtonVariant.Secondary}
+          onClick={() => {
+            void (onSignIn ?? auth.signIn)();
+          }}
+        >
+          Sign in with Delino
+        </Button>
+      ) : onRetry && !billing ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
