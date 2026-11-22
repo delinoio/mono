@@ -7,6 +7,7 @@ import {
   InvalidFrameError,
   OwnSandConfigError,
   OwnSandHandleClosedError,
+  OwnSandValidationError,
 } from "./errors.ts";
 import { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 import {
@@ -508,6 +509,41 @@ describe("peer-to-peer data path", () => {
     expect(h.api.callsOf("OpenSession")).toHaveLength(2);
     expect(rtc.connections).toHaveLength(2);
     expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+  });
+
+  test("rejects a negative file offset and a bad attach exec request before any session or relay call", () => {
+    const { h, rtc } = p2pSetup(exitingAgent);
+    const sandbox = h.client.sandbox(SANDBOX);
+    const attempts: [() => unknown, string][] = [
+      [() => sandbox.readFile("/f", { offset: -1n }), "offset"],
+      [() => sandbox.attachExec("", {}), "exec_id"],
+      [
+        () =>
+          sandbox.attachExec("0192f4b6-8000-7000-8000-000000000001", {
+            stdoutOffset: -1n,
+          }),
+        "stdout_offset",
+      ],
+      [
+        () =>
+          sandbox.attachExec("0192f4b6-8000-7000-8000-000000000001", {
+            stderrOffset: -1n,
+          }),
+        "stderr_offset",
+      ],
+    ];
+    for (const [attempt, field] of attempts) {
+      let error: unknown;
+      try {
+        attempt();
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(OwnSandValidationError);
+      expect((error as OwnSandValidationError).field).toBe(field);
+    }
+    expect(h.api.calls).toHaveLength(0);
+    expect(rtc.connections).toHaveLength(0);
   });
 
   test("ends the operation when a new session cannot be authorized", async () => {

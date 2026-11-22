@@ -31,7 +31,9 @@ import {
   durationFromMs,
   validateExec,
   validateFileMode,
+  validateExecId,
   validateGuestPath,
+  validateOffset,
 } from "./validate.ts";
 import { OwnSandError } from "./errors.ts";
 
@@ -196,6 +198,13 @@ export class Sandbox {
       signal?: AbortSignal;
     } = {},
   ): ExecHandle {
+    // Check before any request, in the order of the Go validator, so a bad
+    // exec ID or offset throws here and not as an error of the first event.
+    const stdoutOffset = options.stdoutOffset ?? 0n;
+    const stderrOffset = options.stderrOffset ?? 0n;
+    validateExecId("exec_id", execId);
+    validateOffset("stdout_offset", stdoutOffset);
+    validateOffset("stderr_offset", stderrOffset);
     const hold = new ConsumerHold();
     return new ExecHandle(
       execId,
@@ -205,8 +214,8 @@ export class Sandbox {
         {
           execId,
           request: undefined,
-          stdoutOffset: options.stdoutOffset ?? 0n,
-          stderrOffset: options.stderrOffset ?? 0n,
+          stdoutOffset,
+          stderrOffset,
         },
         options.signal,
         hold,
@@ -238,11 +247,13 @@ export class Sandbox {
     options: { offset?: bigint; signal?: AbortSignal } = {},
   ): AsyncIterable<Uint8Array> {
     validateGuestPath("path", path);
+    const offset = options.offset ?? 0n;
+    validateOffset("offset", offset);
     const ctx = this.#ctx;
     const selector = this.#selector;
     return {
       [Symbol.asyncIterator]: () =>
-        runReadFile(ctx, selector, path, options.offset ?? 0n, options.signal),
+        runReadFile(ctx, selector, path, offset, options.signal),
     };
   }
 

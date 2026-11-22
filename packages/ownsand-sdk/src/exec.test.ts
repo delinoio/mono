@@ -4,7 +4,7 @@ import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import type { Clock } from "./clock.ts";
 import { execBinding, requestDigest } from "./digest.ts";
-import { DataPathError } from "./errors.ts";
+import { DataPathError, OwnSandValidationError } from "./errors.ts";
 import { Timing } from "./relay/context.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import {
@@ -1266,6 +1266,95 @@ describe("exec over the relay", () => {
     expect(auth.operationKind).toBe(RelayOperationKind.ATTACH_EXEC);
     expect(auth.operationId).toBe(execId);
     expect(auth.requestDigest).toHaveLength(0);
+  });
+
+  test.each([
+    ["an empty exec ID", "", {}, "exec_id", "is required"],
+    [
+      "a malformed exec ID",
+      "not-a-uuid",
+      {},
+      "exec_id",
+      "must be a canonical UUID v7",
+    ],
+    [
+      "a UUID v4",
+      "0192f4b6-8000-4000-8000-000000000001",
+      {},
+      "exec_id",
+      "must be a canonical UUID v7",
+    ],
+    [
+      "an uppercase exec ID",
+      "0192F4B6-8000-7000-8000-00000000000A",
+      {},
+      "exec_id",
+      "must be a canonical lowercase UUID v7",
+    ],
+    [
+      "a negative stdout offset",
+      "0192f4b6-8000-7000-8000-000000000001",
+      { stdoutOffset: -1n },
+      "stdout_offset",
+      "must not be negative",
+    ],
+    [
+      "a negative stderr offset",
+      "0192f4b6-8000-7000-8000-000000000001",
+      { stderrOffset: -1n },
+      "stderr_offset",
+      "must not be negative",
+    ],
+    [
+      "two negative offsets (stdout is reported first)",
+      "0192f4b6-8000-7000-8000-000000000001",
+      { stdoutOffset: -1n, stderrOffset: -1n },
+      "stdout_offset",
+      "must not be negative",
+    ],
+    [
+      "a bad exec ID and a negative offset (the exec ID is reported first)",
+      "x",
+      { stdoutOffset: -1n },
+      "exec_id",
+      "must be a canonical UUID v7",
+    ],
+  ])(
+    "rejects %s in attachExec synchronously before any request",
+    (_name, execId, options, field, rule) => {
+      const h = setup();
+      let error: unknown;
+      try {
+        h.client.sandbox(SANDBOX).attachExec(execId, options);
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(OwnSandValidationError);
+      expect((error as OwnSandValidationError).field).toBe(field);
+      expect((error as OwnSandValidationError).message).toContain(rule);
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test("attaches with offset zero explicitly and with large offsets", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "AttachExec", async function* () {
+      yield attachMsg(ev.accepted());
+      yield attachMsg(ev.exited(0));
+    });
+    await h.clock.run(
+      collect(
+        h.client
+          .sandbox(SANDBOX)
+          .attachExec("0192f4b6-8000-7000-8000-000000000001", {
+            stdoutOffset: 0n,
+            stderrOffset: 2n ** 40n,
+          }),
+      ),
+    );
+    const req = h.api.callsOf("AttachExec")[0]!.request as any;
+    expect(req.stdoutOffset).toBe(0n);
+    expect(req.stderrOffset).toBe(2n ** 40n);
   });
 
   test("recovers 11 interrupted operations of one principal at once", async () => {

@@ -98,7 +98,16 @@ export type SandboxSourceInput =
 
 export interface CreateSandboxInput {
   source: SandboxSourceInput;
-  resources: { vcpuCount: number; memoryMib: number; diskGib: number };
+  /**
+   * Resources of the sandbox. `memoryMib` and `diskGib` are `int64` fields on
+   * the wire, so each accepts a `number` (a safe integer) or a `bigint` (up to
+   * the `int64` maximum); `vcpuCount` is an `int32` and stays a `number`.
+   */
+  resources: {
+    vcpuCount: number;
+    memoryMib: number | bigint;
+    diskGib: number | bigint;
+  };
   /** Idle TTL in milliseconds. Required; there is no default. */
   idleTtl: number;
   /** Maximum TTL in milliseconds, at most 7 days. Required. */
