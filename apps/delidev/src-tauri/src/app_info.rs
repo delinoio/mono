@@ -63,12 +63,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reports_crate_version() {
+        assert_eq!(AppInfo::current().version, env!("CARGO_PKG_VERSION"));
+    }
+
+    // The `mobile` cfg is emitted by tauri-build, so the expected runtime and
+    // platform depend on the target the test binary is compiled for.
+    #[cfg(not(mobile))]
+    #[test]
     fn desktop_build_reports_cef() {
         let info = AppInfo::current();
 
         assert_eq!(info.runtime, WebviewRuntime::Cef);
         assert_eq!(info.platform, PlatformFamily::Desktop);
-        assert_eq!(info.version, env!("CARGO_PKG_VERSION"));
+    }
+
+    #[cfg(mobile)]
+    #[test]
+    fn mobile_build_reports_wry() {
+        let info = AppInfo::current();
+
+        assert_eq!(info.runtime, WebviewRuntime::Wry);
+        assert_eq!(info.platform, PlatformFamily::Mobile);
     }
 
     #[test]
