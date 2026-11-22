@@ -40,6 +40,13 @@ export function renderApp(
     signedIn?: boolean;
     checkout?: Checkout;
     config?: AccountsConfig;
+    /** Replaces the access token source of the signed-in user. */
+    getAccessToken?: () => Promise<string | undefined>;
+    /**
+     * Uses the app's own API transport, which reads `getAccessToken`, instead
+     * of the fake API transport.
+     */
+    appTransport?: boolean;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -54,7 +61,7 @@ export function renderApp(
       signIns.push(1);
     },
     signOut: async () => {},
-    getAccessToken: async () => "token",
+    getAccessToken: options.getAccessToken ?? (async () => "token"),
   };
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -63,7 +70,7 @@ export function renderApp(
     <AuthContextProvider value={auth}>
       <Accounts
         config={options.config ?? TEST_CONFIG}
-        transport={api.transport}
+        transport={options.appTransport ? undefined : api.transport}
         queryClient={queryClient}
         checkout={options.checkout}
       />

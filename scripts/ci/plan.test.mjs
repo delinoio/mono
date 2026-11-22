@@ -21,7 +21,9 @@ import {
   MAIN_PUSH_EVENT,
   MAIN_REF,
   OutputReason,
+  SCHEDULE_EVENT,
   isMainPush,
+  isScheduledMain,
   main,
   plan,
   workspacePackageDirs,
@@ -802,7 +804,7 @@ test("planner publishes booleans and records exact comparison and checkout", (t)
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
   const record = JSON.parse(
     readFileSync(summary, "utf8").slice("CI plan: ".length),
@@ -884,7 +886,7 @@ test("planner CLI runs through physical and symlinked script paths", (t) => {
     assert.match(result.stdout, /"event":"ci_plan"/, script);
     assert.equal(
       readFileSync(output, "utf8"),
-      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+      "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
       script,
     );
   }
@@ -901,6 +903,17 @@ const eventMatrix = [
   { name: "pull request", event: "pull_request", ref: "refs/pull/1/merge" },
   { name: "manual dispatch", event: "workflow_dispatch", ref: MAIN_REF },
   { name: "main tag-like ref on push", event: "push", ref: "refs/tags/main" },
+  {
+    name: "scheduled main run",
+    event: "schedule",
+    ref: MAIN_REF,
+    schedule: true,
+  },
+  {
+    name: "schedule on another ref",
+    event: "schedule",
+    ref: "refs/heads/dev",
+  },
   { name: "missing event context" },
 ];
 
@@ -911,6 +924,25 @@ test("main-push event constants and detection are exact", () => {
     assert.equal(
       isMainPush({ GITHUB_EVENT_NAME: row.event, GITHUB_REF: row.ref }),
       row.main === true,
+      row.name,
+    );
+  }
+});
+
+// The reason that the planner records for a platform output of an eventMatrix
+// row whose comparison selects (or does not select) the matching Linux output.
+function platformReasonFor(row, selectedByDiff) {
+  if (row.schedule === true) return OutputReason.Schedule;
+  if (row.main === true && selectedByDiff) return OutputReason.MainPush;
+  return OutputReason.Diff;
+}
+
+test("scheduled-run event constant and detection are exact", () => {
+  assert.equal(SCHEDULE_EVENT, "schedule");
+  for (const row of eventMatrix) {
+    assert.equal(
+      isScheduledMain({ GITHUB_EVENT_NAME: row.event, GITHUB_REF: row.ref }),
+      row.schedule === true,
       row.name,
     );
   }
@@ -936,12 +968,14 @@ for (const row of eventMatrix) {
       },
       f.cwd,
     );
-    // Only a push to main forces fixtures, go and e2e (and so quality); format
-    // still follows the comparison for every event.
+    // Only a push to main forces fixtures, go and e2e (and so quality), and
+    // only the scheduled main run forces the platform jobs; format still
+    // follows the comparison for every event.
     const mainPush = row.main === true;
+    const scheduled = row.schedule === true;
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\nworkspace=${mainPush}\nworkflows=${mainPush}\n`,
+      `quality=true\nformat=true\nfixtures=${mainPush}\ngo=${mainPush}\nrust=${mainPush}\ne2e=${mainPush}\nworkspace=${mainPush}\nworkflows=${mainPush}\ngoPlatforms=${scheduled}\nrustPlatforms=${scheduled}\n`,
     );
     const record = JSON.parse(logged.join(""));
     assert.equal(record.go, mainPush);
@@ -957,6 +991,11 @@ for (const row of eventMatrix) {
     assert.equal(record.e2eReason, reason);
     assert.equal(record.workspaceReason, reason);
     assert.equal(record.workflowsReason, reason);
+    const platformReason = scheduled
+      ? OutputReason.Schedule
+      : OutputReason.Diff;
+    assert.equal(record.goPlatformsReason, platformReason);
+    assert.equal(record.rustPlatformsReason, platformReason);
     assert.deepEqual(
       JSON.parse(readFileSync(summary, "utf8").slice("CI plan: ".length)),
       record,
@@ -1004,11 +1043,11 @@ test("a later documentation-only main push still selects the fixtures and e2e of
   };
   assert.equal(
     run(MAIN_PUSH_EVENT, MAIN_REF),
-    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\n",
+    "quality=true\nformat=true\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\ngoPlatforms=false\nrustPlatforms=false\n",
   );
   assert.equal(
     run("pull_request", "refs/pull/1/merge"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
 });
 
@@ -1037,6 +1076,13 @@ test("Go changes select go for every event and keep the diff reason", (t) => {
     assert.match(readFileSync(output, "utf8"), /\ngo=true\n/, row.name);
     const record = JSON.parse(logged.at(-1));
     assert.equal(record.goReason, OutputReason.Diff, row.name);
+    // Every event except a main push runs the Go platform job for Go changes.
+    assert.equal(record.goPlatforms, row.main !== true, row.name);
+    assert.equal(
+      record.goPlatformsReason,
+      platformReasonFor(row, true),
+      row.name,
+    );
     // A Go-only range does not select fixtures or e2e, so only a main push
     // forces them.
     assert.equal(
@@ -1100,8 +1146,60 @@ test("main push selects every whole-suite check for an empty comparison", (t) =>
   );
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\n",
+    "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=true\ne2e=true\nworkspace=true\nworkflows=true\ngoPlatforms=false\nrustPlatforms=false\n",
   );
+});
+
+test("scheduled main run selects only the platform jobs for an empty comparison", (t) => {
+  const f = fixture(t);
+  const output = join(f.cwd, "output");
+  const logged = [];
+  t.mock.method(console, "log", (line) => logged.push(line));
+  main(
+    {
+      CI_BASE: f.base,
+      CI_HEAD: f.base,
+      GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+      GITHUB_EVENT_NAME: SCHEDULE_EVENT,
+      GITHUB_REF: MAIN_REF,
+    },
+    f.cwd,
+  );
+  assert.equal(
+    readFileSync(output, "utf8"),
+    "quality=false\nformat=false\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=true\nrustPlatforms=true\n",
+  );
+  const record = JSON.parse(logged.at(-1));
+  assert.equal(record.goPlatformsReason, OutputReason.Schedule);
+  assert.equal(record.rustPlatformsReason, OutputReason.Schedule);
+});
+
+test("main push deselects the platform jobs that its Go and Rust changes select", (t) => {
+  const f = fixture(t);
+  f.write("cmds/example/main_windows.go");
+  f.write("crates/example/src/lib.rs");
+  const head = f.commit();
+  const logged = [];
+  t.mock.method(console, "log", (line) => logged.push(line));
+  main(
+    {
+      CI_BASE: f.base,
+      CI_HEAD: head,
+      GITHUB_OUTPUT: join(f.cwd, "output"),
+      GITHUB_STEP_SUMMARY: join(f.cwd, "summary"),
+      GITHUB_EVENT_NAME: MAIN_PUSH_EVENT,
+      GITHUB_REF: MAIN_REF,
+    },
+    f.cwd,
+  );
+  const record = JSON.parse(logged.at(-1));
+  assert.equal(record.go, true);
+  assert.equal(record.rust, true);
+  assert.equal(record.goPlatforms, false);
+  assert.equal(record.rustPlatforms, false);
+  assert.equal(record.goPlatformsReason, OutputReason.MainPush);
+  assert.equal(record.rustPlatformsReason, OutputReason.MainPush);
 });
 
 test("planner CLI forces whole-suite checks for a main push and keeps pull request selection", (t) => {
@@ -1133,7 +1231,7 @@ test("planner CLI forces whole-suite checks for a main push and keeps pull reque
     assert.equal(result.status, 0, result.stderr);
     assert.equal(
       readFileSync(output, "utf8"),
-      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\nworkspace=${forced}\nworkflows=${forced}\n`,
+      `quality=true\nformat=true\nfixtures=${forced}\ngo=${forced}\nrust=${forced}\ne2e=${forced}\nworkspace=${forced}\nworkflows=${forced}\ngoPlatforms=false\nrustPlatforms=false\n`,
       event,
     );
   }
@@ -1182,7 +1280,7 @@ test("planner CLI ignores GIT_* variables set after the suite loaded", (t) => {
   assert.equal(result.status, 0, result.stderr);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
 });
 
@@ -1212,11 +1310,11 @@ const expectedJobOutputs = {
   "go-vet": "go",
   "go-test": "go",
   protos: "go",
-  "go-platforms": "go",
+  "go-platforms": "goPlatforms",
   "rust-fmt": ALWAYS_RUN,
   "rust-clippy": "rust",
   "rust-test": "rust",
-  "rust-platforms": "rust",
+  "rust-platforms": "rustPlatforms",
   e2e: "e2e",
   "workspace-packages": "workspace",
   "workspace-servers": "workspace",
@@ -1428,6 +1526,14 @@ test("Rust changes select rust for every event and keep the diff reason", (t) =>
     assert.match(readFileSync(output, "utf8"), /\nrust=true\n/, row.name);
     const record = JSON.parse(logged.at(-1));
     assert.equal(record.rustReason, OutputReason.Diff, row.name);
+    // Every event except a main push runs the Rust platform job for Rust
+    // changes.
+    assert.equal(record.rustPlatforms, row.main !== true, row.name);
+    assert.equal(
+      record.rustPlatformsReason,
+      platformReasonFor(row, true),
+      row.name,
+    );
     // A Rust-only range does not select Go, so only a main push forces it.
     assert.equal(
       record.goReason,
@@ -1463,7 +1569,7 @@ test("CI workflow runs each Rust check in its own job", () => {
 
 // Read-only text check: each Go check runs in its own job. Only the test job
 // starts Postgres and installs the workspace dependencies that the OwnSand
-// end-to-end suite needs, and only it saves the `go.sum` Go cache.
+// end-to-end suite needs, and only it uses the Linux `go.sum` Go cache.
 test("CI workflow runs each Go check in its own job", () => {
   const jobs = workflowJobs();
   const fmtJob = jobs.get("go-fmt");
@@ -1474,12 +1580,43 @@ test("CI workflow runs each Go check in its own job", () => {
   assert.match(vetJob, /^\s+cache: false$/m);
   const testJob = jobs.get("go-test");
   assert.match(testJob, /^\s+run: go test -count=1 \.\/\.\.\.$/m);
-  assert.match(testJob, /^\s+cache: true$/m);
+  assert.match(testJob, /^\s+cache: false$/m);
+  assert.match(testJob, /prefix="go-test-\$RUNNER_OS-/);
   assert.match(testJob, /^ {4}services:\n {6}postgres:$/m);
   assert.match(testJob, /^\s+OWNSAND_E2E: "1"$/m);
   assert.match(testJob, /pnpm install --frozen-lockfile --ignore-scripts/);
   for (const job of [fmtJob, vetJob]) {
     assert.doesNotMatch(job, /services:|go test|pnpm install/);
+  }
+});
+
+// Read-only text check: setup-go saves its cache from every ref, so no job
+// enables it. Each job that uses the Go cache restores it in every run and
+// saves it only on main, like the Rust jobs, so pull requests do not save
+// entries that evict the main caches.
+test("CI workflow saves the Go cache only on main", () => {
+  const jobs = workflowJobs();
+  for (const [name, job] of jobs) {
+    if (job.includes("actions/setup-go@")) {
+      assert.doesNotMatch(job, /^\s+cache: true$/m, name);
+    }
+  }
+  for (const name of ["go-test", "protos", "go-platforms"]) {
+    const job = jobs.get(name);
+    assert.match(job, /actions\/cache\/restore@[0-9a-f]{40} # v/, name);
+    assert.match(job, /^\s+go env GOCACHE GOMODCACHE$/m, name);
+    const save = job.indexOf("actions/cache/save@");
+    assert.notEqual(save, -1, name);
+    assert.match(job, /actions\/cache\/save@[0-9a-f]{40} # v/, name);
+    const condition = job
+      .slice(0, save)
+      .match(/^\s+if: (.*)$/gm)
+      .at(-1);
+    assert.match(
+      condition,
+      /if: github\.ref == 'refs\/heads\/main' && steps\.go-cache\.outputs\.cache-hit != 'true'$/,
+      name,
+    );
   }
 });
 
@@ -1877,7 +2014,7 @@ test("planner CLI still exits 0 with one ci_plan record and no error record on s
   assert.match(result.stdout, /"event":"ci_plan"/u);
   assert.equal(
     readFileSync(output, "utf8"),
-    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\n",
+    "quality=true\nformat=true\nfixtures=false\ngo=false\nrust=false\ne2e=false\nworkspace=false\nworkflows=false\ngoPlatforms=false\nrustPlatforms=false\n",
   );
 });
 
@@ -2020,7 +2157,7 @@ for (const relative of [true, false]) {
     const fromRoot = run(f.cwd, "root");
     assert.equal(
       fromRoot.output,
-      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\nworkspace=true\nworkflows=false\n",
+      "quality=true\nformat=false\nfixtures=true\ngo=true\nrust=false\ne2e=true\nworkspace=true\nworkflows=false\ngoPlatforms=true\nrustPlatforms=false\n",
     );
     for (const directory of startDirectories) {
       assert.deepEqual(

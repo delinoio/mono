@@ -9,10 +9,17 @@ on:
         description: Optional base revision for affected validation
         required: false
         type: string
+  # The scheduled run validates the main head on the macOS and Windows runners
+  # only, because main pushes do not run those jobs; it also saves their
+  # main-scoped caches. It runs daily at 18:00 UTC.
+  schedule:
+    - cron: "0 18 * * *"
 permissions:
   contents: read
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # The scheduled run has its own group: it shares `refs/heads/main` with the
+  # main pushes, which would otherwise cancel it.
+  group: ci-${{ github.workflow }}-${{ github.event_name == 'schedule' && 'schedule' || github.ref }}
   cancel-in-progress: true
 jobs:
   # Each job timeout is at least three times the longest observed run without
@@ -33,6 +40,8 @@ jobs:
       e2e: ${{ steps.plan.outputs.e2e }}
       workspace: ${{ steps.plan.outputs.workspace }}
       workflows: ${{ steps.plan.outputs.workflows }}
+      goPlatforms: ${{ steps.plan.outputs.goPlatforms }}
+      rustPlatforms: ${{ steps.plan.outputs.rustPlatforms }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -160,9 +169,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # The go-test job owns the cache under the `go.sum` key. setup-go
-          # cannot restore without saving, and both jobs would save different
-          # caches under one key.
+          # The go-test job owns the Go cache under the `go.sum` key. setup-go
+          # cannot restore without saving, so its cache would save an entry
+          # from every pull request under a key of its own.
           cache: false
       - name: Vet Go module
         run: go vet ./...
@@ -207,11 +216,38 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # Caches the Go module and build caches, keyed by the `go.sum` hash.
-          # Only this job saves them under that key; the go-vet and workspace
-          # jobs do not use them, and the protos job keys its cache by other
-          # files, so no two jobs race to save different caches under one key.
-          cache: true
+          # setup-go cannot restore without saving, and it saves a new entry
+          # from every ref that misses the key, also from pull requests. The
+          # steps below restore the Go cache in every run and save it only on
+          # main.
+          cache: false
+      - name: Resolve Go cache paths and key
+        id: go-cache-key
+        shell: bash
+        env:
+          CACHE_INPUTS_HASH: ${{ hashFiles('go.sum') }}
+        run: |
+          set -euo pipefail
+          # Only this job uses the `go-test-` prefix, so no other job saves a
+          # different cache under its keys. The key names the runner OS,
+          # image and architecture, the Go version and the `go.sum` hash.
+          prefix="go-test-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-unknown}-$(go env GOVERSION)-"
+          {
+            echo "prefix=$prefix"
+            echo "key=$prefix$CACHE_INPUTS_HASH"
+            echo 'paths<<EOF'
+            go env GOCACHE GOMODCACHE
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore Go module and build caches
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
+          # A run whose `go.sum` differs from main restores the newest main
+          # entry of the same platform and Go version.
+          restore-keys: ${{ steps.go-cache-key.outputs.prefix }}
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
@@ -229,6 +265,15 @@ jobs:
         # -count=1 bypasses cached test results, so every run executes the
         # tests; the restored build cache only skips recompilation.
         run: go test -count=1 ./...
+      - name: Save Go module and build caches
+        # Only main runs save the cache. Pull requests restore the main cache
+        # and do not use the repository cache quota for their builds. An
+        # exact key hit has nothing new to save.
+        if: github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
       - name: Record validation result
         if: always()
         env:
@@ -258,14 +303,38 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
+          # setup-go cannot restore without saving. The steps below restore
+          # the Go cache in every run and save it only on main.
+          cache: false
+      - name: Resolve Go cache paths and key
+        id: go-cache-key
+        shell: bash
+        env:
+          # The files that pin the buf CLI and protoc plugin versions.
+          CACHE_INPUTS_HASH: ${{ hashFiles('scripts/protos.sh', 'protos/buf.gen.yaml') }}
+        run: |
+          set -euo pipefail
           # Caches the buf CLI and protoc plugin builds that `go run` makes.
-          # The key hashes the files that pin their versions, not `go.sum`,
-          # so this cache and the go-test job cache have different keys and the
-          # two jobs never race to save one key.
-          cache: true
-          cache-dependency-path: |
-            scripts/protos.sh
-            protos/buf.gen.yaml
+          # Only this job uses the `go-protos-` prefix, so this cache and the
+          # go-test job cache have different keys and the two jobs never race
+          # to save one key.
+          prefix="go-protos-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-unknown}-$(go env GOVERSION)-"
+          {
+            echo "prefix=$prefix"
+            echo "key=$prefix$CACHE_INPUTS_HASH"
+            echo 'paths<<EOF'
+            go env GOCACHE GOMODCACHE
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore Go module and build caches
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
+          # A run that changes a pinned tool version restores the newest main
+          # entry of the same platform and Go version.
+          restore-keys: ${{ steps.go-cache-key.outputs.prefix }}
       # scripts/protos.sh check also generates the TypeScript bindings with the
       # protoc-gen-es versions that the binding packages in protos/delino/
       # pin.
@@ -291,6 +360,15 @@ jobs:
             echo "Comparison base $COMPARISON_BASE is not in this checkout; breaking-change check skipped."
             echo "Protobuf breaking-change check: skipped, comparison base not in checkout" >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Save Go module and build caches
+        # Only main runs save the cache. Pull requests restore the main cache
+        # and do not use the repository cache quota for their builds. An
+        # exact key hit has nothing new to save.
+        if: github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
       - name: Record validation result
         if: always()
         env:
@@ -309,8 +387,10 @@ jobs:
     # code (build tags and `_darwin`/`_windows` files), and the macOS
     # Virtualization.framework runtime builds only with cgo on a macOS host.
     # The Linux go-vet and go-test jobs do not compile or run that code.
+    # Pull requests, manual dispatches and the scheduled main run select it;
+    # main pushes do not.
     needs: changes
-    if: needs.changes.outputs.go == 'true'
+    if: needs.changes.outputs.goPlatforms == 'true'
     strategy:
       # Report the failures of every platform in one run.
       fail-fast: false
@@ -335,10 +415,36 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version-file: go.mod
-          # Caches the Go module and build caches. The setup-go key includes
-          # the runner OS and architecture, so these entries never share a key
-          # with the Linux go-test job.
-          cache: true
+          # setup-go cannot restore without saving. The steps below restore
+          # the Go cache in every run and save it only on main.
+          cache: false
+      - name: Resolve Go cache paths and key
+        id: go-cache-key
+        shell: bash
+        env:
+          CACHE_INPUTS_HASH: ${{ hashFiles('go.sum') }}
+        run: |
+          set -euo pipefail
+          # Only this job uses the `go-platforms-` prefix, and the key names
+          # the runner OS and architecture, so the macOS and Windows entries
+          # never share a key with each other or with the Linux go-test job.
+          prefix="go-platforms-$RUNNER_OS-$RUNNER_ARCH-${ImageOS:-unknown}-$(go env GOVERSION)-"
+          {
+            echo "prefix=$prefix"
+            echo "key=$prefix$CACHE_INPUTS_HASH"
+            echo 'paths<<EOF'
+            go env GOCACHE GOMODCACHE
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Restore Go module and build caches
+        id: go-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
+          # A run whose `go.sum` differs from main restores the newest main
+          # entry of the same platform and Go version.
+          restore-keys: ${{ steps.go-cache-key.outputs.prefix }}
       - name: Vet Go module
         run: go vet ./...
       - name: Vet the other build configurations of the host OS
@@ -446,6 +552,15 @@ jobs:
           done
           echo "::endgroup::"
           exit "$status"
+      - name: Save Go module and build caches
+        # Only main runs save the cache. Pull requests restore the main cache
+        # and do not use the repository cache quota for their builds. An
+        # exact key hit has nothing new to save.
+        if: github.ref == 'refs/heads/main' && steps.go-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.go-cache-key.outputs.paths }}
+          key: ${{ steps.go-cache-key.outputs.key }}
       - name: Record validation result
         if: always()
         shell: bash
@@ -603,8 +718,10 @@ jobs:
     # The delidev desktop app links CEF on macOS and Windows differently from
     # Linux (a framework on macOS, import libraries and runtime DLLs on
     # Windows), so the Linux rust-clippy and rust-test jobs do not cover them.
+    # Pull requests, manual dispatches and the scheduled main run select it;
+    # main pushes do not.
     needs: changes
-    if: needs.changes.outputs.rust == 'true'
+    if: needs.changes.outputs.rustPlatforms == 'true'
     strategy:
       # Report the failures of every platform in one run.
       fail-fast: false
@@ -652,7 +769,8 @@ jobs:
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # The job ID is the same for every matrix entry, so add the runner
-          # to the key. Only main pushes save the cache.
+          # to the key. Only runs on main save the cache; for this job that is
+          # the scheduled run.
           key: ${{ matrix.runner }}
           cache-directories: ~/.cache/cef
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -760,7 +878,8 @@ jobs:
         with:
           go-version-file: go.mod
           # The go-test job owns the Go cache. setup-go cannot restore without
-          # saving, and both jobs would save different caches under one key.
+          # saving, so its cache would save an entry from every pull request
+          # under a key of its own.
           cache: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -805,7 +924,8 @@ jobs:
         with:
           go-version-file: go.mod
           # The go-test job owns the Go cache. setup-go cannot restore without
-          # saving, and both jobs would save different caches under one key.
+          # saving, so its cache would save an entry from every pull request
+          # under a key of its own.
           cache: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -914,11 +1034,11 @@ jobs:
             "go-vet": "go",
             "go-test": "go",
             "protos": "go",
-            "go-platforms": "go",
+            "go-platforms": "goPlatforms",
             "rust-fmt": "always",
             "rust-clippy": "rust",
             "rust-test": "rust",
-            "rust-platforms": "rust",
+            "rust-platforms": "rustPlatforms",
             "e2e": "e2e",
             "workspace-packages": "workspace",
             "workspace-servers": "workspace",

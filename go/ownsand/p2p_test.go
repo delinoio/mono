@@ -385,8 +385,8 @@ func TestSendWaitingForSendTurnObservesSessionEnd(t *testing.T) {
 	sess.close()
 	select {
 	case err := <-errc:
-		var failed *errP2PFailed
-		if !errors.As(err, &failed) {
+		var closed *errSessionClosedByCaller
+		if !errors.As(err, &closed) {
 			t.Fatalf("want the session end error, got %v", err)
 		}
 	case <-time.After(15 * time.Second):

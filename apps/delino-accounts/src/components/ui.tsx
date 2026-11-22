@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { Code, ConnectError } from "@connectrpc/connect";
 import { Button, ButtonVariant } from "delino-ui/button";
 import {
   AlertDialog,
@@ -18,7 +19,9 @@ import {
 } from "delino-ui/dialog";
 import { Skeleton } from "delino-ui/skeleton";
 import { type FormEvent, type ReactNode, useState } from "react";
+import { useAuth } from "../auth.tsx";
 import { errorMessage } from "../format.ts";
+import type { AllPages } from "../paging.ts";
 
 export function PageHeader({
   title,
@@ -51,23 +54,109 @@ export function Loading({ label = "Loading" }: { label?: string }) {
   );
 }
 
-/** A failed request, with a retry button. */
+/**
+ * A failed request. A request that ended with `Code.Unauthenticated` offers
+ * the sign-in redirect, because retrying cannot succeed: the Logto SDK keeps
+ * `isAuthenticated` true after a failed token refresh, so neither the route
+ * guard nor the top bar would offer it. Any other failure offers a retry
+ * when `onRetry` is set.
+ *
+ * `onSignIn` replaces the default `useAuth().signIn()` for a caller that has
+ * to prepare the redirect first.
+ */
 export function ErrorNotice({
   error,
   onRetry,
+  onSignIn,
 }: {
   error: unknown;
   onRetry?: () => void;
+  onSignIn?: () => Promise<void> | void;
 }) {
+  const unauthenticated =
+    error instanceof ConnectError && error.code === Code.Unauthenticated;
   return (
     <div className="notice notice-error" role="alert">
       <p>{errorMessage(error)}</p>
-      {onRetry ? (
+      {unauthenticated ? (
+        <SignInAgainButton onSignIn={onSignIn} />
+      ) : onRetry ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
         </Button>
       ) : null}
     </div>
+  );
+}
+
+/**
+ * A failed background refetch of data that is already on screen (a window
+ * focus refetch, a poll, or the refetch after a mutation). Render it above
+ * the loaded content, and keep that content: the content, its selected tab,
+ * its open dialogs and its typed input must survive a transient failure.
+ * Only a request that failed before it ever returned data replaces the
+ * content with an `ErrorNotice`.
+ *
+ * Pass the error of the failed refetch, or nothing while the last request
+ * succeeded. The retry clears the notice when it succeeds. Keep the notice in
+ * the same position of the tree in every state, so that the content below
+ * does not remount when the notice appears.
+ */
+export function RefetchNotice({
+  error,
+  onRetry,
+}: {
+  error: unknown;
+  onRetry: () => void;
+}) {
+  return error === undefined || error === null ? null : (
+    <ErrorNotice error={error} onRetry={onRetry} />
+  );
+}
+
+/**
+ * The state of the pages after the first one: a short loading line while
+ * later pages load and an error with a retry that resumes at the failed page.
+ * The items of the earlier pages stay visible above it.
+ */
+export function MorePages({ pages }: { pages: AllPages<unknown> }) {
+  if (pages.continuationError !== undefined) {
+    return (
+      <div className="notice notice-error" role="alert">
+        <p>Some items did not load. {errorMessage(pages.continuationError)}</p>
+        <Button
+          variant={ButtonVariant.Secondary}
+          onClick={pages.retryContinuation}
+        >
+          Try again
+        </Button>
+      </div>
+    );
+  }
+  return pages.isLoadingMore ? (
+    <p className="muted" role="status">
+      Loading more
+    </p>
+  ) : null;
+}
+
+/**
+ * Starts the sign-in redirect. It reads the auth context only when it is
+ * rendered, so an `ErrorNotice` for another failure needs no auth provider.
+ */
+function SignInAgainButton({
+  onSignIn,
+}: {
+  onSignIn: (() => Promise<void> | void) | undefined;
+}) {
+  const auth = useAuth();
+  return (
+    <Button
+      variant={ButtonVariant.Secondary}
+      onClick={() => void (onSignIn ? onSignIn() : auth.signIn())}
+    >
+      Sign in with Delino
+    </Button>
   );
 }
 

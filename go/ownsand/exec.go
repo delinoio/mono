@@ -322,14 +322,15 @@ func (op *execOp) run(ctx context.Context) (*ExecResult, error) {
 			err = errNotAccepted
 		}
 		if sess != nil && s.dp.handleSessionError(sess, err) {
-			var ended *errSessionEnded
-			if (at.accepted || at.served) && errors.As(err, &ended) {
-				// A routine session end (idle, the 1-hour expiry) of a
-				// continuation that the agent accepted shows that the
-				// operation recovered on its new session. It is not a
-				// failure, so a quiet exec can outlive any number of
-				// session expiries. Only failed sessions (a data channel
-				// failure, an end before the agent accepted) count.
+			if (at.accepted || at.served) && isRoutineSessionEnd(err) {
+				// A routine session end (idle, the 1-hour expiry) or a
+				// retirement (another request's interrupted send tore a
+				// frame) of a continuation that the agent accepted shows
+				// that the operation recovered on its new session. It is
+				// not a failure, so a quiet exec can outlive any number of
+				// session expiries and retirements. Only failed sessions
+				// (a data channel failure, an end or retirement before the
+				// agent accepted) count.
 				sessionErrors = 0
 				continue
 			}

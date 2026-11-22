@@ -99,6 +99,7 @@ test("comparison events are the CI.yml triggers", () => {
     "pull_request",
     "push",
     "workflow_dispatch",
+    "schedule",
   ]);
   const workflow = readFileSync(join(root, ".github/workflows/CI.yml"), "utf8");
   const triggers = workflow.slice(
@@ -274,6 +275,20 @@ test("a manual dispatch compares the merge base with origin/main by default", (t
   );
 });
 
+test("a scheduled run compares the checkout with itself", (t) => {
+  const f = staleBaseFixture(t);
+  f.git("switch", "--quiet", "--detach", f.mainTip);
+  assert.deepEqual(
+    resolveComparison({ GITHUB_EVENT_NAME: ComparisonEvent.Schedule }, f.cwd),
+    {
+      base: f.mainTip,
+      head: f.mainTip,
+      requestedBase: f.mainTip,
+      baseSource: BaseSource.Checkout,
+    },
+  );
+});
+
 test("a manual base input compares its merge base with the checkout", (t) => {
   const f = staleBaseFixture(t);
   f.git("branch", "base-branch", f.mainTip);
@@ -328,7 +343,7 @@ test("a revision without a common ancestor fails", (t) => {
 
 test("an unsupported event fails", (t) => {
   const f = fixture(t);
-  for (const event of [undefined, "", "pull_request_target", "schedule"]) {
+  for (const event of [undefined, "", "pull_request_target", "merge_group"]) {
     assert.throws(
       () => resolveComparison({ GITHUB_EVENT_NAME: event }, f.cwd),
       /Unsupported comparison event/u,

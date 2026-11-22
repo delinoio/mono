@@ -314,6 +314,7 @@ export function plan(cwd, base, head) {
 export const OutputReason = Object.freeze({
   Diff: "diff",
   MainPush: "main-push",
+  Schedule: "schedule",
 });
 
 // Runner-provided event context that identifies a push to the main branch.
@@ -323,6 +324,16 @@ export const MAIN_REF = "refs/heads/main";
 export function isMainPush(env) {
   return (
     env.GITHUB_EVENT_NAME === MAIN_PUSH_EVENT && env.GITHUB_REF === MAIN_REF
+  );
+}
+
+// Runner-provided event context that identifies the scheduled run. GitHub
+// starts scheduled workflows only on the default branch.
+export const SCHEDULE_EVENT = "schedule";
+
+export function isScheduledMain(env) {
+  return (
+    env.GITHUB_EVENT_NAME === SCHEDULE_EVENT && env.GITHUB_REF === MAIN_REF
   );
 }
 
@@ -345,8 +356,8 @@ export function main(env = process.env, cwd = process.cwd()) {
   const diffPlan = plan(cwd, env.CI_BASE, env.CI_HEAD);
   // Branch-wide cancellation can cancel a main-push run before its Go, Rust,
   // fixtures, e2e, workspace or workflows jobs finish, and the next push then
-  // compares only against its own parent. Every main push therefore runs the Go
-  // checks, the Rust checks, the fixtures, the e2e suites, the workspace package
+  // compares only against its own parent. Every main push therefore runs the
+  // Linux Go checks, the Linux Rust checks, the fixtures, the e2e suites, the workspace package
   // tasks and the workflow lint against its own head so a later documentation-only push cannot hide a
   // cancelled predecessor's range. The fixtures step lives in
   // the `quality` job, so forcing fixtures forces quality too. `format` stays
@@ -355,6 +366,16 @@ export function main(env = process.env, cwd = process.cwd()) {
   // selection.
   const mainPush = isMainPush(env);
   const fixtures = diffPlan.fixtures || mainPush;
+  // The macOS and Windows jobs (`go-platforms` and `rust-platforms`) are the
+  // most expensive CI jobs, and a main push repeats the platform validation
+  // that its pull request already passed. They therefore follow their own
+  // outputs: a pull request or manual comparison selects them with `go` and
+  // `rust`, a main push never selects them, and the scheduled run on main
+  // always selects both. The scheduled run validates each platform against
+  // the main head, so a platform break that two merged pull requests make
+  // together surfaces within a day, and it saves the main-scoped platform
+  // caches that pull requests restore.
+  const scheduled = isScheduledMain(env);
   const result = {
     ...diffPlan,
     fixtures,
@@ -364,9 +385,18 @@ export function main(env = process.env, cwd = process.cwd()) {
     e2e: diffPlan.e2e || mainPush,
     workspace: diffPlan.workspace || mainPush,
     workflows: diffPlan.workflows || mainPush,
+    goPlatforms: scheduled || (diffPlan.go && !mainPush),
+    rustPlatforms: scheduled || (diffPlan.rust && !mainPush),
   };
   const reasonOf = (selectedByDiff) =>
     mainPush && !selectedByDiff ? OutputReason.MainPush : OutputReason.Diff;
+  // `main-push` on a platform output means that the main push deselected it;
+  // `schedule` means that the scheduled run selected it.
+  const platformReasonOf = (selectedByDiff) => {
+    if (scheduled) return OutputReason.Schedule;
+    if (mainPush && selectedByDiff) return OutputReason.MainPush;
+    return OutputReason.Diff;
+  };
   const record = {
     event: "ci_plan",
     validationRevision: execFileSync("git", ["rev-parse", "HEAD"], {
@@ -382,6 +412,8 @@ export function main(env = process.env, cwd = process.cwd()) {
     e2eReason: reasonOf(diffPlan.e2e),
     workspaceReason: reasonOf(diffPlan.workspace),
     workflowsReason: reasonOf(diffPlan.workflows),
+    goPlatformsReason: platformReasonOf(diffPlan.go),
+    rustPlatformsReason: platformReasonOf(diffPlan.rust),
   };
   appendFileSync(
     env.GITHUB_OUTPUT,

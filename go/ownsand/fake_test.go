@@ -128,6 +128,15 @@ type p2pAction struct {
 	// event of an exec, with no output: a quiet exec whose session expires
 	// after the agent accepted the continuation.
 	endAfterStarted bool
+	// onRequest, when set, runs once the agent has the exec (started for an
+	// exec request, looked up for an attach) and before it serves any
+	// frame; the request then gets no frame. A test uses it to end or retire
+	// the session before the agent served the request.
+	onRequest func()
+	// afterStarted, when set, runs after the agent sent the started event
+	// of an exec, so a test can end or retire the session after the agent
+	// served the continuation.
+	afterStarted func()
 	// raw, when set, answers the request with this frame only.
 	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
@@ -196,6 +205,13 @@ type fakeCP struct {
 	gateErr error
 	// openErr, when set, is the error of every OpenSession request.
 	openErr error
+	// agentGate, when set, holds every peer-to-peer file read and write
+	// chunk request at the agent until the gate closes or the data channel
+	// closes. The agent reports "read" or "write" on agentHits (when set)
+	// when a request reaches the gate. The channels are created by the test
+	// before the first request and never replaced.
+	agentGate chan struct{}
+	agentHits chan string
 	// iceServers are the ICE server URLs that GetIceServers returns.
 	iceServers []string
 	iceCalls   int // GetIceServers requests
@@ -526,6 +542,33 @@ func (f *fakeDataPath) hold(ctx context.Context, gate chan struct{}, kind string
 		f.cp.gateCanceled++
 		f.cp.mu.Unlock()
 		return ctx.Err()
+	}
+}
+
+// holdAgent blocks a peer-to-peer file request of kind at the agent gate. It
+// reports false when the data channel closed first, and then the request is
+// not served. A nil gate never blocks.
+func (cp *fakeCP) holdAgent(ctx context.Context, kind string) bool {
+	gate := cp.agentGate
+	if gate == nil {
+		return true
+	}
+	select {
+	case <-gate:
+		return true
+	default:
+	}
+	if cp.agentHits != nil {
+		select {
+		case cp.agentHits <- kind:
+		default:
+		}
+	}
+	select {
+	case <-gate:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -1279,6 +1322,9 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 		}
 		switch ev.GetEvent().(type) {
 		case *ownsandv1.ExecEvent_Started:
+			if act.afterStarted != nil {
+				act.afterStarted()
+			}
 			if act.endAfterStarted {
 				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
 				time.Sleep(20 * time.Millisecond)
@@ -1308,6 +1354,10 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			return
 		}
 		e := cp.agent.startExec(cp, req)
+		if act.onRequest != nil {
+			act.onRequest()
+			return
+		}
 		if err := cp.agent.serveExec(s.ctx, cp, e, 0, 0, sendExec); err != nil && !errors.Is(err, errSessionGone) && s.ctx.Err() == nil {
 			errFrame(err)
 		}
@@ -1318,10 +1368,17 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			errFrame(connect.NewError(connect.CodeNotFound, errors.New("exec not found")))
 			return
 		}
+		if act.onRequest != nil {
+			act.onRequest()
+			return
+		}
 		if err := cp.agent.serveExec(s.ctx, cp, e, req.GetStdoutOffset(), req.GetStderrOffset(), sendExec); err != nil && !errors.Is(err, errSessionGone) && s.ctx.Err() == nil {
 			errFrame(err)
 		}
 	case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_READ_REQUEST:
+		if !cp.holdAgent(s.ctx, "read") {
+			return
+		}
 		chunks := 0
 		err := cp.agent.serveRead(f.GetFileReadRequest(), func(ev *ownsandv1.FileReadEvent) error {
 			if err := s.send(frame(ev)); err != nil {
@@ -1346,6 +1403,9 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			errFrame(err)
 		}
 	case ownsandv1.DataFrameKind_DATA_FRAME_KIND_FILE_WRITE_CHUNK:
+		if !cp.holdAgent(s.ctx, "write") {
+			return
+		}
 		if act.failAfter > 0 {
 			_ = s.pc.Close()
 			return
