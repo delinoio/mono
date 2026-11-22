@@ -67,6 +67,15 @@ const (
 	// per second sustained with a burst of about 100.
 	DefaultSTUNRateBytesPerSecond = 1024
 	DefaultSTUNRateBurstBytes     = 4096
+	// MinSTUNRateBurstBytes is the smallest accepted STUN_RATE_LIMIT_BURST_BYTES.
+	// The limiter drops a response that is larger than the whole burst, so a
+	// smaller burst silently turns the server into one that never answers.
+	// A STUN message is a 20-byte header plus attributes. The 8-byte
+	// FINGERPRINT is always present; the largest success response adds the
+	// 24-byte IPv6 XOR-MAPPED-ADDRESS (52 bytes), and the smallest 420 error
+	// response (one unknown attribute) is 64 bytes. 64 bytes therefore admits
+	// every response that the server can build for a binding request.
+	MinSTUNRateBurstBytes = 64
 	// DefaultAccountsAPIOrigin is the production origin of the delino-accounts
 	// API.
 	DefaultAccountsAPIOrigin = "https://accounts.api.delino.io"
@@ -383,6 +392,9 @@ func Load(lookup func(string) (string, bool)) (Config, error) {
 	}
 	if cfg.STUNRateBurstBytes, err2 = positiveInt(EnvSTUNRateBurstBytes, get(EnvSTUNRateBurstBytes), DefaultSTUNRateBurstBytes); err2 != nil {
 		return Config{}, err2
+	}
+	if cfg.STUNRateBurstBytes < MinSTUNRateBurstBytes {
+		return Config{}, fmt.Errorf("%s must be at least %d bytes", EnvSTUNRateBurstBytes, MinSTUNRateBurstBytes)
 	}
 
 	cfg.Accounts = Accounts{

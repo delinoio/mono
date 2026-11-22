@@ -11,7 +11,34 @@ import (
 	"time"
 
 	pionstun "github.com/pion/stun/v3"
+
+	"github.com/delinoio/mono/servers/ownsand-api/internal/config"
 )
+
+// The smallest accepted burst must admit every response the server builds:
+// the limiter drops a response larger than the whole burst.
+func TestResponsesFitMinimumBurst(t *testing.T) {
+	plain := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest, pionstun.Fingerprint)
+	unknown := pionstun.MustBuild(pionstun.TransactionID, pionstun.BindingRequest,
+		pionstun.RawAttribute{Type: 0x0030, Value: []byte{1, 2, 3, 4}}, pionstun.Fingerprint)
+	for name, tc := range map[string]struct {
+		req *pionstun.Message
+		src *net.UDPAddr
+	}{
+		"ipv4 success": {plain, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4000}},
+		"ipv6 success": {plain, &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4000}},
+		"ipv4 420":     {unknown, &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 4000}},
+		"ipv6 420":     {unknown, &net.UDPAddr{IP: net.ParseIP("2001:db8::1"), Port: 4000}},
+	} {
+		resp, err := Respond(tc.req.Raw, tc.src)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if len(resp) > config.MinSTUNRateBurstBytes {
+			t.Errorf("%s: response of %d bytes exceeds the %d-byte minimum burst", name, len(resp), config.MinSTUNRateBurstBytes)
+		}
+	}
+}
 
 func TestBindingResponseCarriesSourceAddress(t *testing.T) {
 	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
