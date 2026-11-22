@@ -91,6 +91,40 @@ func TestSaveIfSession(t *testing.T) {
 	}
 }
 
+func TestSaveIfCurrent(t *testing.T) {
+	s := Store{Dir: t.TempDir()}
+	if err := s.SaveIfCurrent("one", "r1", &Credentials{SessionID: "one", RefreshToken: "r2"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a missing file must report ErrNotFound, got %v", err)
+	}
+	if _, err := s.Load(); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("SaveIfCurrent recreated the file: %v", err)
+	}
+	if err := s.Save(&Credentials{SessionID: "one", RefreshToken: "r1"}); err != nil {
+		t.Fatal(err)
+	}
+	// The generation the caller refreshed stores its rotation.
+	if err := s.SaveIfCurrent("one", "r1", &Credentials{SessionID: "one", RefreshToken: "r2"}); err != nil {
+		t.Fatal(err)
+	}
+	// A second result derived from r1 is stale: r2 was stored meanwhile.
+	if err := s.SaveIfCurrent("one", "r1", &Credentials{SessionID: "one", RefreshToken: "r2-late"}); !errors.Is(err, ErrRotated) {
+		t.Fatalf("want ErrRotated, got %v", err)
+	}
+	if got, _ := s.Load(); got.RefreshToken != "r2" {
+		t.Fatalf("a stale result overwrote the newer rotation: %+v", got)
+	}
+	// Another session replaced it.
+	if err := s.Save(&Credentials{SessionID: "two", RefreshToken: "r1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SaveIfCurrent("one", "r1", &Credentials{SessionID: "one", RefreshToken: "r3"}); !errors.Is(err, ErrReplaced) {
+		t.Fatalf("want ErrReplaced, got %v", err)
+	}
+	if got, _ := s.Load(); got.SessionID != "two" {
+		t.Fatalf("an older session overwrote the new one: %+v", got)
+	}
+}
+
 func TestFileWithoutSessionIDStillLoads(t *testing.T) {
 	s := Store{Dir: t.TempDir()}
 	legacy := `{"logto_endpoint":"https://auth.example","app_id":"app","resource":"r","refresh_token":"old","access_token":"a"}`
