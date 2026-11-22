@@ -15,6 +15,7 @@ import {
   ACCOUNT_ID,
   ADMIN,
   addBillingAccounts,
+  addLinkedOrganizations,
   addMembers,
   createFakeApi,
   INVITATION_TOKEN,
@@ -1133,6 +1134,123 @@ describe("paged lists", () => {
       const members = screen.getByRole("list", { name: "Members" });
       expect(within(members).queryByRole("button")).toBeNull();
       expect(within(members).queryByRole("combobox")).toBeNull();
+    });
+  });
+
+  describe("organizations", () => {
+    test("reads every page in server order, including the last row", async () => {
+      const api = createFakeApi();
+      addLinkedOrganizations(api.accounts.get(ACCOUNT_ID)!, 200);
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toBe("Acme sandboxes");
+      expect(titles[200]).toBe(`Org ${numbered(200)}`);
+      const last = within(list).getAllByRole("listitem")[200]!;
+      expect(last.textContent).toContain("OwnSand");
+      expect(last.textContent).toContain("Active");
+      expect(calls(api, "ListLinkedOrganizations")).toEqual([
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "",
+        }),
+        expect.objectContaining({
+          billingAccountId: ACCOUNT_ID,
+          pageToken: "p1",
+        }),
+      ]);
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addLinkedOrganizations(api.accounts.get(ACCOUNT_ID)!, 199);
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([""]);
+    });
+
+    test("no organization keeps the empty state", async () => {
+      const api = createFakeApi();
+      api.accounts.get(ACCOUNT_ID)!.linked = [];
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      expect(await screen.findByText("No linked organizations")).toBeTruthy();
+      await settle(100);
+      expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([""]);
+    });
+
+    test("a failed continuation retries without duplicates", async () => {
+      const api = createFakeApi();
+      addLinkedOrganizations(api.accounts.get(ACCOUNT_ID)!, 200);
+      api.failContinuation.set(
+        "ListLinkedOrganizations",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Linked organizations" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(pageTokens(api, "ListLinkedOrganizations")).toEqual([
+        "",
+        "p1",
+        "p1",
+      ]);
+    });
+
+    test("switching to another billing account shows only its organizations", async () => {
+      const api = createFakeApi();
+      const first = api.accounts.get(ACCOUNT_ID)!;
+      addLinkedOrganizations(first, 200, "Alpha");
+      addBillingAccounts(api, 1);
+      const [secondId, second] = [...api.accounts].find(
+        ([, account]) => account.name === `Account ${numbered(1)}`,
+      )!;
+      addLinkedOrganizations(second, 2, "Beta");
+      await renderAccount(undefined, { api });
+      await openTab("Organizations");
+      const list = await screen.findByRole("list", {
+        name: "Linked organizations",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(201);
+      await act(async () => {
+        window.history.pushState(null, "", `/billing/${secondId}`);
+        window.dispatchEvent(new PopStateEvent("popstate"));
+      });
+      await screen.findByRole("heading", {
+        name: `Account ${numbered(1)}`,
+        level: 1,
+      });
+      await openTab("Organizations");
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Linked organizations" }),
+      );
+      expect(titles).toEqual([`Beta ${numbered(1)}`, `Beta ${numbered(2)}`]);
+      expect(calls(api, "ListLinkedOrganizations").at(-1)).toMatchObject({
+        billingAccountId: secondId,
+        pageToken: "",
+      });
     });
   });
 });
