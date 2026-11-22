@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -552,20 +553,70 @@ func TestSupersedingCommandClearsQueuedArtifact(t *testing.T) {
 	}
 }
 
-// gateTransport holds the artifact download until release is closed, and
-// signals started when that download begins.
+// gateTimeout bounds every wait on a gated download, so a regression or an
+// earlier failure reports a diagnostic instead of hanging the test binary.
+const gateTimeout = 10 * time.Second
+
+// gateTransport holds the artifact download until open is called or the
+// request context ends, and signals started when that download begins.
 type gateTransport struct {
 	base    http.RoundTripper
 	started chan struct{}
 	release chan struct{}
+	once    sync.Once
 }
 
-func (g gateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+// newGateTransport returns a gate that is opened when the test ends, so a
+// fatal assertion cannot leave a download blocked.
+func newGateTransport(t *testing.T, base http.RoundTripper) *gateTransport {
+	t.Helper()
+	g := &gateTransport{base: base, started: make(chan struct{}, 1), release: make(chan struct{})}
+	t.Cleanup(g.open)
+	return g
+}
+
+// open releases the held download. It is safe to call more than once.
+func (g *gateTransport) open() {
+	g.once.Do(func() { close(g.release) })
+}
+
+func (g *gateTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if req.URL.Path == "/agent" {
-		g.started <- struct{}{}
-		<-g.release
+		select {
+		case g.started <- struct{}{}:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
+		select {
+		case <-g.release:
+		case <-req.Context().Done():
+			return nil, req.Context().Err()
+		}
 	}
 	return g.base.RoundTrip(req)
+}
+
+// awaitStarted fails the test when the gated download does not begin in time.
+func (g *gateTransport) awaitStarted(t *testing.T) {
+	t.Helper()
+	select {
+	case <-g.started:
+	case <-time.After(gateTimeout):
+		t.Fatalf("download did not start within %v", gateTimeout)
+	}
+}
+
+// awaitDone returns the result of the command goroutine, and fails the test
+// when it does not finish in time.
+func awaitDone(t *testing.T, done <-chan error) error {
+	t.Helper()
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(gateTimeout):
+		t.Fatalf("download did not finish within %v", gateTimeout)
+		return nil
+	}
 }
 
 func TestWithdrawWhilePendingIdleNeverInstalls(t *testing.T) {
@@ -618,24 +669,28 @@ func TestWithdrawDuringDownloadNeverInstalls(t *testing.T) {
 	r := newRelease(t, nil)
 	busy := &atomic.Bool{}
 	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
-	gate := gateTransport{base: r.srv.Client().Transport, started: make(chan struct{}, 1), release: make(chan struct{})}
+	gate := newGateTransport(t, r.srv.Client().Transport)
 	u.opts.HTTP = &http.Client{Transport: gate}
 
 	// The commands take their orders in receive order, as the agent does.
 	updateOrder := u.NextOrder()
+	// Cancelling the context when the test ends stops a download that an early
+	// failure left running.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() {
-		done <- u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, updateOrder)
+		done <- u.HandleOrdered(ctx, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0"}, updateOrder)
 	}()
-	<-gate.started
+	gate.awaitStarted(t)
 	if s, _ := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_DOWNLOADING {
 		t.Fatalf("state %v", s)
 	}
 	if err := u.WithdrawOrdered(u.NextOrder()); err != nil {
 		t.Fatal(err)
 	}
-	close(gate.release)
-	if err := <-done; !errors.Is(err, ErrSuperseded) {
+	gate.open()
+	if err := awaitDone(t, done); !errors.Is(err, ErrSuperseded) {
 		t.Fatalf("download finished with %v, want ErrSuperseded", err)
 	}
 	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_UP_TO_DATE || target != "" {
@@ -760,23 +815,27 @@ func TestWithdrawDuringDownloadKeepsSignedRevocation(t *testing.T) {
 	busy := &atomic.Bool{}
 	busy.Store(true)
 	u, inst, restarts := newUpdater(t, r, "1.0.0", busy)
-	gate := gateTransport{base: r.srv.Client().Transport, started: make(chan struct{}, 1), release: make(chan struct{})}
+	gate := newGateTransport(t, r.srv.Client().Transport)
 	u.opts.HTTP = &http.Client{Transport: gate}
 
 	updateOrder := u.NextOrder()
+	// Cancelling the context when the test ends stops a download that an early
+	// failure left running.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan error, 1)
 	go func() {
-		done <- u.HandleOrdered(context.Background(), &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0", RevocationRecovery: true}, updateOrder)
+		done <- u.HandleOrdered(ctx, &ownsandv1.UpdateAgentCommand{TargetVersion: "1.1.0", RevocationRecovery: true}, updateOrder)
 	}()
-	<-gate.started
+	gate.awaitStarted(t)
 	if err := u.WithdrawOrdered(u.NextOrder()); !errors.Is(err, ErrRunningRevoked) {
 		t.Fatalf("withdrawal during the download of a revocation recovery: %v", err)
 	}
 	if _, err := u.BeginCreate(); !errors.Is(err, ErrRunningRevoked) {
 		t.Fatalf("create while the manifest revokes the running version: %v", err)
 	}
-	close(gate.release)
-	if err := <-done; err != nil {
+	gate.open()
+	if err := awaitDone(t, done); err != nil {
 		t.Fatalf("the recovery download finished with %v", err)
 	}
 	if s, target := u.State(); s != ownsandv1.AgentUpdateState_AGENT_UPDATE_STATE_REVOKED_PENDING_IDLE || target != "1.1.0" {
@@ -991,7 +1050,7 @@ func TestWithdrawDuringInstallLogsTheObservedTarget(t *testing.T) {
 		t.Fatalf("withdrawal during installation: %v", err)
 	}
 	close(inst.release)
-	if err := <-done; err != nil {
+	if err := awaitDone(t, done); err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(logs.String(), "agent update withdrawal too late") || !strings.Contains(logs.String(), "target_version=1.1.0") {
