@@ -150,16 +150,15 @@ function Routes({ config }: { config: ConsoleConfig }) {
   const configured =
     config.authMode === AuthMode.Mock || config.logto !== undefined;
   if (route.id === RouteId.Callback) {
+    if (config.authMode === AuthMode.Mock) {
+      return <MockCallbackPage />;
+    }
     // Without a Logto registration there is no provider for the Logto
     // callback hook, which would render nothing. Show the notice instead.
-    if (!configured) {
+    if (config.logto === undefined) {
       return <SignIn configured={false} />;
     }
-    return config.authMode === AuthMode.Mock ? (
-      <MockCallbackPage />
-    ) : (
-      <LogtoCallbackPage />
-    );
+    return <LogtoCallbackPage appId={config.logto.appId} />;
   }
   if (auth.isLoading) {
     return null;
