@@ -153,20 +153,38 @@ func (c *Client) logRPC(ctx context.Context, procedure string, start time.Time, 
 // activity records the time of the last received response byte of one
 // request, so that the relay can detect a stream that receives nothing for
 // 90 seconds, also while one large frame is still in transit.
+//
+// It stores the elapsed time since base, not a Unix timestamp. base keeps the
+// monotonic clock reading of time.Now, so time.Since(base) ignores a step of
+// the wall clock (for example an NTP correction or a manual change): the step
+// alone neither expires a live stream nor extends the limit of a stalled one.
+// Do not rebuild base from a Unix time or call Round(0), Truncate(0) or
+// UTC/Local conversions that strip the monotonic reading.
 type activity struct {
-	last atomic.Int64
+	base time.Time
+	// elapsed returns the monotonic time since base. Tests replace it with a
+	// controlled clock; production code leaves it nil and uses time.Since.
+	elapsed func() time.Duration
+	last    atomic.Int64 // nanoseconds since base of the last received byte
 }
 
 func newActivity() *activity {
-	a := &activity{}
+	a := &activity{base: time.Now()}
 	a.touch()
 	return a
 }
 
-func (a *activity) touch() { a.last.Store(time.Now().UnixNano()) }
+func (a *activity) now() time.Duration {
+	if a.elapsed != nil {
+		return a.elapsed()
+	}
+	return time.Since(a.base)
+}
+
+func (a *activity) touch() { a.last.Store(int64(a.now())) }
 
 func (a *activity) idle() time.Duration {
-	return time.Since(time.Unix(0, a.last.Load()))
+	return max(a.now()-time.Duration(a.last.Load()), 0)
 }
 
 type activityKey struct{}
