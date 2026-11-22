@@ -12,12 +12,14 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	"github.com/delinoio/mono/servers/accounts-api/internal/api"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth"
 	"github.com/delinoio/mono/servers/accounts-api/internal/auth/authtest"
+	"github.com/delinoio/mono/servers/accounts-api/internal/email"
 	"github.com/delinoio/mono/servers/accounts-api/internal/testenv"
 )
 
@@ -458,7 +460,9 @@ func TestInvitationRules(t *testing.T) {
 		t.Fatalf("%d emails, want 1", n)
 	}
 
-	// A failed delivery creates no invitation.
+	// A failed delivery leaves no pending invitation: the invitation is
+	// revoked, so the list below does not show it and the address can be
+	// invited again.
 	env.Email.SetErr(errors.New("resend down"))
 	_, err = owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
 		BillingAccountId: accountID, Email: "undelivered@example.com", Role: roleViewer,
@@ -524,9 +528,29 @@ func auditRowCount(t *testing.T, env *testenv.Env, accountID string, kind api.Au
 	return n
 }
 
-// An audit event is logged only after its transaction committed, so a failed
-// invitation email, which rolls the transaction back, leaves neither a row nor
-// a log record.
+// invitationRows returns the stored invitations of the billing account as
+// "<email>=<state>" in creation order, where the state is pending, revoked or
+// accepted.
+func invitationRows(t *testing.T, env *testenv.Env, accountID string) []string {
+	t.Helper()
+	rows, err := env.DB.Pool.Query(ctx(), `SELECT email || '=' || CASE
+			WHEN accept_time IS NOT NULL THEN 'accepted'
+			WHEN revoke_time IS NOT NULL THEN 'revoked' ELSE 'pending' END
+		FROM billing_account_invitations WHERE billing_account_id = $1 ORDER BY invitation_id`, accountID)
+	if err != nil {
+		t.Fatalf("read invitations: %v", err)
+	}
+	got, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		t.Fatalf("read invitations: %v", err)
+	}
+	return got
+}
+
+// An audit event is logged only after its transaction committed. The
+// invitation_created event is recorded only after the email was accepted, so a
+// failed send, which revokes the invitation, leaves neither an
+// invitation_created row nor a log record, only the revocation with its reason.
 func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")
@@ -549,8 +573,26 @@ func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
 	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 0 {
 		t.Errorf("%d invitation_created audit rows after a failed send, want 0", n)
 	}
+	if n := auditRecordCount(logs, api.AuditInvitationRevoked); n != 1 {
+		t.Errorf("%d invitation_revoked audit records after a failed send, want 1", n)
+	}
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationRevoked); n != 1 {
+		t.Errorf("%d invitation_revoked audit rows after a failed send, want 1", n)
+	}
+	var reason string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT details->>'reason' FROM billing_audit_events
+		WHERE billing_account_id = $1 AND kind = $2`, accountID, string(api.AuditInvitationRevoked)).Scan(&reason); err != nil || reason != "delivery_failed" {
+		t.Errorf("revocation reason = %q, %v, want delivery_failed", reason, err)
+	}
+	if got := invitationRows(t, env, accountID); strings.Join(got, ",") != "undelivered@example.com=revoked" {
+		t.Errorf("invitations after a failed send = %v, want one revoked", got)
+	}
+	if n := len(env.Email.Messages()); n != 0 {
+		t.Errorf("%d emails after a failed send, want 0", n)
+	}
 
-	// The retry succeeds and logs exactly one record, with the new invitation.
+	// The retry succeeds and logs exactly one creation record, with the new
+	// invitation.
 	inv := invite(t, owner, accountID, "undelivered@example.com", roleViewer)
 	logs = env.Logs.String()
 	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 1 {
@@ -561,6 +603,103 @@ func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
 	}
 	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
 		t.Errorf("%d invitation_created audit rows, want 1", n)
+	}
+}
+
+// The email is sent after the invitation committed, a transient send failure is
+// recovered by inviting again, each invitation ID gets one email, and the
+// recipient of the delivered invitation can accept it.
+func TestInvitationDeliveryAfterCommit(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+	guest := newPerson(env, "guest")
+	env.Directory.Set(guest.ID, directoryUser("guest@example.com"))
+
+	// At the time of the send, the invitation is committed and visible from
+	// another connection, and its creation is not audited yet.
+	var seenAtSend []string
+	var createdAtSend int
+	env.Email.SetOnSend(func(email.Message) {
+		seenAtSend = invitationRows(t, env, accountID)
+		createdAtSend = auditRowCount(t, env, accountID, api.AuditInvitationCreated)
+	})
+	env.Email.SetErr(errors.New("resend down"))
+	_, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
+		BillingAccountId: accountID, Email: "guest@example.com", Role: roleViewer,
+	}))
+	wantCode(t, err, connect.CodeUnavailable)
+	if len(seenAtSend) != 0 {
+		t.Fatalf("the sender ran although the send was set to fail: %v", seenAtSend)
+	}
+	env.Email.SetErr(nil)
+
+	// Transient failure, then recovery: the address can be invited again.
+	invite(t, owner, accountID, "guest@example.com", roleViewer)
+	if got := strings.Join(seenAtSend, ","); got != "guest@example.com=revoked,guest@example.com=pending" {
+		t.Errorf("invitations visible at the send = %v, want the revoked one and the committed pending one", seenAtSend)
+	}
+	if createdAtSend != 0 {
+		t.Errorf("%d invitation_created rows at the send, want 0", createdAtSend)
+	}
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
+		t.Errorf("%d invitation_created rows after the send, want 1", n)
+	}
+
+	// One email for one invitation ID, with that ID in the idempotency key.
+	msgs := env.Email.Messages()
+	if len(msgs) != 1 {
+		t.Fatalf("%d emails, want 1", len(msgs))
+	}
+	var pendingID string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT invitation_id::text FROM billing_account_invitations
+		WHERE billing_account_id = $1 AND revoke_time IS NULL`, accountID).Scan(&pendingID); err != nil {
+		t.Fatalf("read the pending invitation: %v", err)
+	}
+	if msgs[0].IdempotencyKey != "invitation/"+pendingID {
+		t.Errorf("idempotency key = %q, want invitation/%s", msgs[0].IdempotencyKey, pendingID)
+	}
+
+	// The recipient accepts the delivered invitation.
+	if _, err := accept(guest, env.InvitationToken("guest@example.com")); err != nil {
+		t.Fatalf("AcceptInvitation of the delivered invitation: %v", err)
+	}
+	if got := invitationRows(t, env, accountID); strings.Join(got, ",") != "guest@example.com=revoked,guest@example.com=accepted" {
+		t.Errorf("invitations = %v, want the revoked one and the accepted one", got)
+	}
+}
+
+// A transaction that fails to commit the invitation sends no email and creates
+// nothing.
+func TestInvitationCommitFailureSendsNoEmail(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+
+	// A constraint trigger that fires at commit fails the transaction after
+	// every statement of the handler succeeded, like a failed commit.
+	for _, stmt := range []string{
+		`CREATE FUNCTION fail_invitation_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN RAISE EXCEPTION 'forced commit failure'; END $$`,
+		`CREATE CONSTRAINT TRIGGER fail_invitation_commit AFTER INSERT ON billing_account_invitations
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION fail_invitation_commit()`,
+	} {
+		if _, err := env.DB.Pool.Exec(ctx(), stmt); err != nil {
+			t.Fatalf("install the failing trigger: %v", err)
+		}
+	}
+	_, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
+		BillingAccountId: accountID, Email: "rolledback@example.com", Role: roleViewer,
+	}))
+	wantCode(t, err, connect.CodeInternal)
+	if n := len(env.Email.Messages()); n != 0 {
+		t.Errorf("%d emails after a failed commit, want 0", n)
+	}
+	if got := invitationRows(t, env, accountID); len(got) != 0 {
+		t.Errorf("invitations after a failed commit = %v, want none", got)
+	}
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 0 {
+		t.Errorf("%d invitation_created rows after a failed commit, want 0", n)
 	}
 }
 
