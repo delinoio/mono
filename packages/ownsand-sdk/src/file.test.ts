@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { runInNewContext } from "node:vm";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
@@ -7,7 +8,7 @@ import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
-import { chunkSource } from "./operations/write.ts";
+import { chunkSource, type WriteSource } from "./operations/write.ts";
 import {
   Disconnect,
   Hang,
@@ -16,6 +17,7 @@ import {
   Trickle,
 } from "./testing/fake-api.ts";
 import { file, SANDBOX, setup, text } from "./testing/harness.ts";
+import { uuidV7TimestampMs } from "./uuidv7.ts";
 import { validateGuestPath } from "./validate.ts";
 
 const MIN = 60_000;
@@ -503,6 +505,296 @@ describe("file write", () => {
     const [write] = h.api.callsOf("WriteFile").map((c) => c.request as any);
     expect(write.finish.sizeBytes).toBe(0n);
     expect(write.path).toBe("/empty");
+  });
+
+  describe("binary sources from another realm", () => {
+    // A `node:vm` context has its own Uint8Array and ArrayBuffer constructors,
+    // so `instanceof` does not recognize its values.
+    const foreign = <T>(code: string): T => runInNewContext(code) as T;
+
+    function uploaded(h: ReturnType<typeof setup>): Uint8Array {
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      return Buffer.concat(writes.map((w) => Buffer.from(w.data)));
+    }
+
+    async function upload(source: WriteSource): Promise<{
+      bytes: Uint8Array;
+      sizes: number[];
+      finish: any;
+    }> {
+      const h = setup();
+      h.api.unary(RelayService, "WriteFile", (req) => ({
+        writeId: req.writeId,
+        offset: req.offset,
+        length: BigInt(req.data.length),
+        finished: req.finish !== undefined,
+        sizeBytes: req.finish?.sizeBytes ?? 0n,
+      }));
+      await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", source));
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      return {
+        bytes: uploaded(h),
+        sizes: writes.map((w) => w.data.length),
+        finish: writes.at(-1).finish,
+      };
+    }
+
+    test("a foreign realm is not recognized by instanceof", () => {
+      expect(foreign<unknown>("new Uint8Array(1)") instanceof Uint8Array).toBe(
+        false,
+      );
+      expect(
+        foreign<unknown>("new ArrayBuffer(1)") instanceof ArrayBuffer,
+      ).toBe(false);
+    });
+
+    test("uploads the same bytes for a foreign and a local Uint8Array", async () => {
+      const code = "Uint8Array.from([1, 2, 3, 4, 5, 255])";
+      const local = await upload(Uint8Array.from([1, 2, 3, 4, 5, 255]));
+      const remote = await upload(foreign<Uint8Array>(code));
+      expect([...remote.bytes]).toEqual([1, 2, 3, 4, 5, 255]);
+      expect([...remote.bytes]).toEqual([...local.bytes]);
+      expect(remote.finish.sizeBytes).toBe(6n);
+    });
+
+    test("keeps the byteOffset and length of a foreign typed-array slice", async () => {
+      const code =
+        "const b = Uint8Array.from([9, 9, 1, 2, 3, 9, 9]); b.subarray(2, 5)";
+      const slice = foreign<Uint8Array>(code);
+      expect(slice.byteOffset).toBe(2);
+      expect(slice.buffer.byteLength).toBe(7);
+      const local = await upload(
+        Uint8Array.from([9, 9, 1, 2, 3, 9, 9]).subarray(2, 5),
+      );
+      const remote = await upload(slice);
+      expect([...remote.bytes]).toEqual([1, 2, 3]);
+      expect([...remote.bytes]).toEqual([...local.bytes]);
+      expect(remote.finish.sizeBytes).toBe(3n);
+    });
+
+    test("uploads the same bytes for a foreign and a local ArrayBuffer", async () => {
+      const code = "Uint8Array.from([7, 8, 9]).buffer";
+      const local = await upload(Uint8Array.from([7, 8, 9]).buffer);
+      const remote = await upload(foreign<ArrayBuffer>(code));
+      expect([...remote.bytes]).toEqual([7, 8, 9]);
+      expect([...remote.bytes]).toEqual([...local.bytes]);
+    });
+
+    test("chunks a large foreign Uint8Array at 1 MiB like a local one", async () => {
+      const size = (2 << 20) + 3;
+      const remoteSource = foreign<Uint8Array>(
+        `const b = new Uint8Array(${size}); for (let i = 0; i < b.length; i++) b[i] = i % 251; b`,
+      );
+      const localSource = new Uint8Array(size);
+      for (let i = 0; i < size; i++) localSource[i] = i % 251;
+      const local = await upload(localSource);
+      const remote = await upload(remoteSource);
+      expect(remote.sizes).toEqual([1 << 20, 1 << 20, 3]);
+      expect(remote.sizes).toEqual(local.sizes);
+      expect(Buffer.from(remote.bytes).equals(Buffer.from(local.bytes))).toBe(
+        true,
+      );
+    });
+
+    test("an iterable of foreign pieces uploads the same bytes as local pieces", async () => {
+      const pieces = foreign<Uint8Array[]>(
+        "[Uint8Array.from([1, 2]), Uint8Array.from([3, 4, 5, 6]).subarray(1, 3)]",
+      );
+      const remote = await upload(pieces);
+      const buffer = foreign<unknown>("Uint8Array.from([8, 9]).buffer");
+      const remoteBuffer = await upload([buffer] as any);
+      expect([...remote.bytes]).toEqual([1, 2, 4, 5]);
+      expect([...remoteBuffer.bytes]).toEqual([8, 9]);
+    });
+
+    test("an object that only fakes the type tag is not read as a binary source", async () => {
+      const h = setup();
+      const fake = { [Symbol.toStringTag]: "Uint8Array", length: 2 };
+      await expect(
+        h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", fake as any)),
+      ).rejects.toBeDefined();
+      expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+    });
+
+    test("existing local sources keep their chunking", async () => {
+      const text = await upload("héllo");
+      expect(Buffer.from(text.bytes).toString()).toBe("héllo");
+      const stream = await upload(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(Uint8Array.from([1, 2]));
+            controller.enqueue(Uint8Array.from([3]));
+            controller.close();
+          },
+        }),
+      );
+      expect([...stream.bytes]).toEqual([1, 2, 3]);
+      expect(stream.sizes).toEqual([3]);
+    });
+  });
+
+  describe("write_id allocation while the source is slow", () => {
+    // The agent admits an operation ID only while its UUID v7 timestamp is at
+    // most 15 minutes old, so a write_id that is allocated before a slow
+    // source delivers its first sendable chunk is rejected as expired.
+    const ID_WINDOW_MS = 15 * MIN;
+
+    function admittingHandler(h: ReturnType<typeof setup>) {
+      h.api.unary(RelayService, "WriteFile", (req) => {
+        const age = h.clock.wallNow() - uuidV7TimestampMs(req.writeId);
+        if (age >= ID_WINDOW_MS) {
+          throw ownsandError(Code.NotFound, "the operation ID has expired");
+        }
+        return {
+          writeId: req.writeId,
+          offset: req.offset,
+          length: BigInt(req.data.length),
+          finished: req.finish !== undefined,
+          sizeBytes: req.finish?.sizeBytes ?? 0n,
+        };
+      });
+    }
+
+    function expectFreshFirstRequest(
+      h: ReturnType<typeof setup>,
+      bytes: number,
+    ) {
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      const auths = h.api
+        .callsOf("AuthorizeRelay")
+        .map((c) => c.request as any);
+      expect(writes).toHaveLength(1);
+      expect(writes[0].offset).toBe(0n);
+      expect(writes[0].data).toHaveLength(bytes);
+      expect(writes[0].finish.sizeBytes).toBe(BigInt(bytes));
+      expect(
+        h.clock.wallNow() - uuidV7TimestampMs(writes[0].writeId),
+      ).toBeLessThan(1000);
+      expect(auths).toHaveLength(1);
+      expect(auths[0].operationKind).toBe(RelayOperationKind.WRITE_FILE);
+      expect(auths[0].operationId).toBe(writes[0].writeId);
+      expect(Buffer.from(auths[0].requestDigest)).toEqual(
+        Buffer.from(requestDigest(writeFileBinding(writes[0]))),
+      );
+    }
+
+    test("an async iterable that waits 15 minutes for its first byte still gets a fresh write_id", async () => {
+      const h = setup();
+      admittingHandler(h);
+      async function* source() {
+        await h.clock.sleep(ID_WINDOW_MS);
+        yield new TextEncoder().encode("hello");
+      }
+      const result = await h.clock.run(
+        h.client.sandbox(SANDBOX).writeFile("/f", source()),
+      );
+      expectFreshFirstRequest(h, 5);
+      expect(result.sizeBytes).toBe(5n);
+      const [write] = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      expect(result.writeId).toBe(write.writeId);
+    });
+
+    test("a source that waits 15 minutes for its end after a full chunk still gets a fresh write_id", async () => {
+      const h = setup();
+      admittingHandler(h);
+      async function* source() {
+        yield new Uint8Array(1 << 20);
+        await h.clock.sleep(ID_WINDOW_MS);
+      }
+      await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", source()));
+      expectFreshFirstRequest(h, 1 << 20);
+    });
+
+    test("a ReadableStream that closes after 15 minutes still gets a fresh write_id", async () => {
+      const h = setup();
+      admittingHandler(h);
+      const stream = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+          await h.clock.sleep(ID_WINDOW_MS);
+          controller.enqueue(new TextEncoder().encode("hello"));
+          controller.close();
+        },
+      });
+      await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", stream));
+      expectFreshFirstRequest(h, 5);
+    });
+
+    test("a retry of the first unacknowledged request keeps its identity and later chunks keep the write_id", async () => {
+      const h = setup();
+      h.api.unary(RelayService, "WriteFile", (req, call) => {
+        if (call.index === 0) {
+          throw new ConnectError("relay call limit", Code.DeadlineExceeded);
+        }
+        return {
+          writeId: req.writeId,
+          offset: req.offset,
+          length: BigInt(req.data.length),
+          finished: req.finish !== undefined,
+          sizeBytes: req.finish?.sizeBytes ?? 0n,
+        };
+      });
+      async function* source() {
+        await h.clock.sleep(ID_WINDOW_MS);
+        yield new Uint8Array(1 << 20);
+        yield new Uint8Array(1 << 20);
+        yield new Uint8Array(10);
+      }
+      const result = await h.clock.run(
+        h.client.sandbox(SANDBOX).writeFile("/f", source()),
+      );
+      const writes = h.api.callsOf("WriteFile").map((c) => c.request as any);
+      expect(writes).toHaveLength(4);
+      expect(
+        h.clock.wallNow() - uuidV7TimestampMs(writes[0].writeId),
+      ).toBeLessThan(MIN);
+      expect(writes[1].writeId).toBe(writes[0].writeId);
+      expect(writes[1].path).toBe("/f");
+      expect(writes[1].path).toBe(writes[0].path);
+      expect(writes[0].bindingSalt).toHaveLength(32);
+      expect(Buffer.from(writes[1].bindingSalt)).toEqual(
+        Buffer.from(writes[0].bindingSalt),
+      );
+      expect(writes[1].offset).toBe(writes[0].offset);
+      expect(Buffer.from(writes[1].data)).toEqual(Buffer.from(writes[0].data));
+      expect(writes[1].finish).toEqual(writes[0].finish);
+      expect(writes.map((w) => w.offset)).toEqual([
+        0n,
+        0n,
+        BigInt(1 << 20),
+        BigInt(2 << 20),
+      ]);
+      for (const write of writes) {
+        expect(write.writeId).toBe(writes[0].writeId);
+      }
+      expect(writes[3].finish.sizeBytes).toBe(BigInt((2 << 20) + 10));
+      expect(result.writeId).toBe(writes[0].writeId);
+      for (const auth of h.api.callsOf("AuthorizeRelay")) {
+        expect((auth.request as any).operationId).toBe(writes[0].writeId);
+      }
+    });
+
+    test("an abort while the source waits rejects with the reason and sends no request", async () => {
+      const h = setup();
+      admittingHandler(h);
+      const REASON = new Error("caller gave up");
+      const controller = new AbortController();
+      async function* source() {
+        await h.clock.sleep(ID_WINDOW_MS);
+        yield new Uint8Array(1);
+      }
+      const outcome = h.client
+        .sandbox(SANDBOX)
+        .writeFile("/f", source(), { signal: controller.signal })
+        .then(
+          () => "resolved",
+          (error) => error,
+        );
+      await h.clock.advance(5 * MIN);
+      controller.abort(REASON);
+      expect(await outcome).toBe(REASON);
+      expect(h.api.callsOf("WriteFile")).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
   });
 
   describe("cancellation while the source is waiting", () => {

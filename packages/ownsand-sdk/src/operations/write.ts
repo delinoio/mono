@@ -135,6 +135,45 @@ function abortable<T>(
 
 function ignoreFailure(): void {}
 
+// `instanceof` compares constructor identity, so it misses a Uint8Array or an
+// ArrayBuffer from another realm (a `node:vm` context, an iframe or a worker
+// boundary): such a value would fall through to the generic iterable branch
+// and upload its elements or fail. These checks read the internal slots with
+// the intrinsic accessors of this realm instead, which accept an object of
+// any realm and reject every other object, including one that only fakes
+// `Symbol.toStringTag`. They use no Node.js module, so the SDK stays
+// runtime-neutral.
+const typedArrayTagOf = Object.getOwnPropertyDescriptor(
+  Object.getPrototypeOf(Uint8Array.prototype),
+  Symbol.toStringTag,
+)?.get as (this: unknown) => string | undefined;
+const arrayBufferByteLengthOf = Object.getOwnPropertyDescriptor(
+  ArrayBuffer.prototype,
+  "byteLength",
+)?.get as (this: unknown) => number;
+
+/** Reports whether `value` is a Uint8Array of any realm (a Buffer included). */
+function isUint8Array(value: unknown): value is Uint8Array {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    typedArrayTagOf.call(value) === "Uint8Array"
+  );
+}
+
+/** Reports whether `value` is an ArrayBuffer of any realm. */
+function isArrayBuffer(value: unknown): value is ArrayBuffer {
+  if (typeof value !== "object" || value === null) return false;
+  try {
+    // Throws a TypeError for anything that has no ArrayBuffer slot, and a
+    // SharedArrayBuffer has its own accessor, so it also throws here.
+    arrayBufferByteLengthOf.call(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Yields the pieces of a source. The signal is observed while the source is
  * idle: an abort rejects with the signal's reason at once, even when a pending
@@ -148,9 +187,9 @@ async function* iterateSource(
   throwIfAborted(signal);
   if (typeof source === "string") {
     yield new TextEncoder().encode(source);
-  } else if (source instanceof Uint8Array) {
+  } else if (isUint8Array(source)) {
     yield source;
-  } else if (source instanceof ArrayBuffer) {
+  } else if (isArrayBuffer(source)) {
     yield new Uint8Array(source);
   } else if (source instanceof ReadableStream) {
     const reader = source.getReader();
@@ -198,7 +237,7 @@ async function* iterateSource(
           return;
         }
         const piece = await abortable(Promise.resolve(result.value), signal);
-        yield piece instanceof Uint8Array ? piece : new Uint8Array(piece);
+        yield isUint8Array(piece) ? piece : new Uint8Array(piece);
       }
     } finally {
       if (!finished) {
@@ -228,13 +267,19 @@ export async function runWriteFile(
   mode: number,
   signal: AbortSignal | undefined,
 ): Promise<WriteFileResult> {
-  const writeId = ctx.ids.next();
   const salt = newBindingSalt();
+  // The agent admits an operation ID only while its UUID v7 timestamp is
+  // within 15 minutes, so the ID is allocated when the first chunk is ready
+  // to send and not before the source is read: a source that needs that long
+  // for its first chunk (or for the end of the stream after a full chunk)
+  // must not use up the admission window.
+  let writeId: string | undefined;
   let grants: GrantKeeper | undefined;
   let offset = 0n;
   let first = true;
   throwIfAborted(signal);
   for await (const chunk of chunkSource(source, MAX_FILE_CHUNK_SIZE, signal)) {
+    writeId ??= ctx.ids.next();
     const request = create(WriteFileRequestSchema, {
       organizationId: ctx.organizationId,
       sandboxId: ctx.sandboxId,
