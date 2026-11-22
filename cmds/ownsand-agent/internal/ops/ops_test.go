@@ -116,12 +116,14 @@ func newEnvWith(t *testing.T, o envOptions) *env {
 	})
 	e.sandbox = newID(t)
 	now := time.Now()
+	// The process runtime runs only guests of the host OS.
+	guestOS, baseImage := processrt.HostGuest()
 	if _, err := m.Create(context.Background(), &ownsandv1.CreateSandboxCommand{
 		SandboxId:   e.sandbox,
-		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: ownsandv1.BaseImage_BASE_IMAGE_LINUX},
+		Source:      &ownsandv1.CreateSandboxCommand_BaseImage{BaseImage: baseImage},
 		Resources:   &ownsandv1.Resources{VcpuCount: 1, MemoryMib: 256, DiskGib: 1},
 		NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE,
-		GuestOs:     hostGuestOS(),
+		GuestOs:     guestOS,
 		IdleTtl:     durationpb.New(time.Hour),
 		MaxTtl:      durationpb.New(time.Hour),
 		CreateTime:  timestamppb.New(now),
@@ -131,16 +133,6 @@ func newEnvWith(t *testing.T, o envOptions) *env {
 		t.Fatal(err)
 	}
 	return e
-}
-
-func hostGuestOS() ownsandv1.GuestOs {
-	if strings.Contains(strings.ToLower(os.Getenv("GOOS")), "darwin") {
-		return ownsandv1.GuestOs_GUEST_OS_MACOS
-	}
-	if _, err := os.Stat("/System/Library"); err == nil {
-		return ownsandv1.GuestOs_GUEST_OS_MACOS
-	}
-	return ownsandv1.GuestOs_GUEST_OS_LINUX
 }
 
 func newID(t *testing.T) string {

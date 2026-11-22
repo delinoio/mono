@@ -164,6 +164,21 @@ func startWorker(t *testing.T, v vmruntime.VM) (shell, sleeper int) {
 	}
 }
 
+// longSandboxDir returns a sandbox directory whose path alone exceeds the
+// 104-byte unix socket path limit of macOS, so that a socket inside it could
+// not be bound there.
+func longSandboxDir(t *testing.T) string {
+	t.Helper()
+	dir := filepath.Join(t.TempDir(), strings.Repeat("d", maxTestSocketPath), "sb")
+	if len(dir) <= maxTestSocketPath {
+		t.Fatalf("sandbox directory %s is not longer than %d bytes", dir, maxTestSocketPath)
+	}
+	return dir
+}
+
+// maxTestSocketPath is the longest unix socket path that macOS accepts.
+const maxTestSocketPath = 103
+
 func newRuntime(t *testing.T) *Runtime {
 	t.Helper()
 	rt, err := New(guestBinary, slog.New(slog.NewJSONHandler(io.Discard, nil)))
@@ -211,15 +226,9 @@ func createSandbox(t *testing.T, rt *Runtime) vmruntime.VM {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A short directory keeps the unix socket path below the macOS limit.
-	dir, err := os.MkdirTemp("", "pr")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
 	v, err := rt.Create(context.Background(), vmruntime.Spec{
 		SandboxID: id,
-		Dir:       filepath.Join(dir, "sb"),
+		Dir:       longSandboxDir(t),
 		GuestOS:   hostGuestOS,
 		BaseImage: hostBaseImage,
 	})
@@ -560,12 +569,16 @@ func TestFailedStartCleanupDoesNotNeedProcessListing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	dir, err := os.MkdirTemp("", "pr")
+	spec := vmruntime.Spec{SandboxID: id, Dir: longSandboxDir(t), GuestOS: hostGuestOS, BaseImage: hostBaseImage}
+	// A private, short TMPDIR receives the socket directory, so that the
+	// check below does not see the socket directories of other test packages
+	// that run at the same time.
+	tmp, err := os.MkdirTemp("", "pt")
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { os.RemoveAll(dir) })
-	spec := vmruntime.Spec{SandboxID: id, Dir: filepath.Join(dir, "sb"), GuestOS: hostGuestOS, BaseImage: hostBaseImage}
+	t.Cleanup(func() { os.RemoveAll(tmp) })
+	t.Setenv("TMPDIR", tmp)
 
 	// A canceled context fails the readiness wait; an empty PATH makes the
 	// `ps` command of the process listing fail.
@@ -590,5 +603,41 @@ func TestFailedStartCleanupDoesNotNeedProcessListing(t *testing.T) {
 	}
 	if _, err := os.Stat(spec.Dir); !os.IsNotExist(err) {
 		t.Errorf("sandbox directory after the failed Create: %v; want it removed", err)
+	}
+	if entries, err := os.ReadDir(tmp); err != nil || len(entries) != 0 {
+		t.Errorf("TMPDIR entries after the failed Create: %v, %v; want none", entries, err)
+	}
+}
+
+// TestSocketOutsideLongSandboxDirectory checks that the guest helper serves a
+// sandbox whose directory is too long for a unix socket path inside it, and
+// that Delete removes the socket directory with the sandbox.
+func TestSocketOutsideLongSandboxDirectory(t *testing.T) {
+	rt := newRuntime(t)
+	m := createSandbox(t, rt)
+	v, err := rt.lookup(m.SandboxID())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(v.socket) > maxTestSocketPath {
+		t.Fatalf("socket address has %d bytes; want at most %d", len(v.socket), maxTestSocketPath)
+	}
+	if v.socketDir != "" {
+		if st, err := os.Stat(v.socketDir); err != nil || st.Mode().Perm() != 0o700 {
+			t.Fatalf("socket directory: %v, %v; want a private directory", st, err)
+		}
+	}
+	c, err := m.Dial(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Close()
+	if err := rt.Delete(context.Background(), m.SandboxID()); err != nil {
+		t.Fatal(err)
+	}
+	if v.socketDir != "" {
+		if _, err := os.Stat(v.socketDir); !os.IsNotExist(err) {
+			t.Errorf("socket directory after Delete: %v; want it removed", err)
+		}
 	}
 }
