@@ -465,7 +465,7 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 }
 
 // Run runs the status worker until ctx ends: on the lease holder it polls
-// every Poll interval and, every Tick, records time-based suspensions and
+// every Poll interval (measured between poll starts) and, every Tick, records time-based suspensions and
 // retries due pending unlinks; every instance refreshes the metrics.
 func (s *Statuses) Run(ctx context.Context) {
 	if s.client == nil {
@@ -478,11 +478,17 @@ func (s *Statuses) Run(ctx context.Context) {
 	for {
 		if s.held() {
 			if s.client != nil {
-				if time.Since(lastPoll) >= s.timing.Poll {
+				// The poll interval runs from the start of the previous poll,
+				// not from its end, and a step may run up to half a tick
+				// early: the step is sampled only at a tick, and a step that
+				// runs a few milliseconds before the interval has elapsed
+				// would otherwise wait for the next tick, which stretches
+				// every interval by one Tick.
+				if lastPoll.IsZero() || time.Since(lastPoll) >= s.timing.Poll-s.timing.Tick/2 {
 					// A failed poll is retried at the next poll interval, not
 					// at every tick; Poll logs the failure.
-					_ = s.Poll(ctx)
 					lastPoll = time.Now()
+					_ = s.Poll(ctx)
 				}
 				// Due pending unlinks are retried at every tick, not only at
 				// a poll: the back-off bounds (1 second to 5 minutes) are

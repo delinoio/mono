@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
+	"github.com/delinoio/mono/protos/delino/accounts/v1/accountsv1connect"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
@@ -529,6 +530,128 @@ func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
 	})
 	if _, _, linked := f.fake.Link(org1); linked {
 		t.Fatal("delino-accounts still has the link")
+	}
+}
+
+// pollRecorder wraps a UsageService client and records the start time of
+// every ListBillingStatusChanges call, after which it takes delay to answer.
+type pollRecorder struct {
+	accountsv1connect.UsageServiceClient
+	delay time.Duration
+
+	mu     sync.Mutex
+	starts []time.Time
+}
+
+func (p *pollRecorder) ListBillingStatusChanges(ctx context.Context, req *connect.Request[accountsv1.ListBillingStatusChangesRequest]) (*connect.Response[accountsv1.ListBillingStatusChangesResponse], error) {
+	p.mu.Lock()
+	p.starts = append(p.starts, time.Now())
+	p.mu.Unlock()
+	time.Sleep(p.delay)
+	return p.UsageServiceClient.ListBillingStatusChanges(ctx, req)
+}
+
+func (p *pollRecorder) startTimes() []time.Time {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]time.Time(nil), p.starts...)
+}
+
+// runStatuses runs the status worker of a lease holder with the timing and
+// the client until the returned stop function is called.
+func (f *statusFixture) runStatuses(timing billing.StatusTiming, client accountsv1connect.UsageServiceClient, held func() bool) (*billing.Statuses, func()) {
+	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: client, Timing: &timing, Held: held})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { statuses.Run(ctx); close(done) }()
+	return statuses, func() { cancel(); <-done }
+}
+
+// TestRunPollCadence checks that consecutive polls start one Poll interval
+// apart when a poll takes up to one Tick: the interval runs between poll
+// starts, and the step that polls is not delayed by one more Tick when it
+// runs a few milliseconds before the interval has elapsed. The wall-clock
+// bounds are generous: the old behavior (an interval of Poll plus Tick)
+// averages 250 ms for the 200 ms interval, the expected one 200 ms.
+func TestRunPollCadence(t *testing.T) {
+	const (
+		poll = 200 * time.Millisecond
+		tick = 50 * time.Millisecond
+	)
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration
+	}{
+		{"fast poll", 5 * time.Millisecond},
+		// A poll that takes longer than two ticks makes the ticker drop ticks.
+		{"slow poll", 120 * time.Millisecond},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
+			rec := &pollRecorder{UsageServiceClient: f.fake.Client(), delay: tc.delay}
+			_, stop := f.runStatuses(billing.StatusTiming{Poll: poll, Tick: tick, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, rec, nil)
+			defer stop()
+			eventually(t, "ten polls", func() bool { return len(rec.startTimes()) >= 10 })
+			starts := rec.startTimes()
+			for i := 1; i < len(starts); i++ {
+				if gap := starts[i].Sub(starts[i-1]); gap < poll-tick {
+					t.Fatalf("poll %d started %v after the previous one, want about %v", i, gap, poll)
+				}
+			}
+			avg := starts[len(starts)-1].Sub(starts[0]) / time.Duration(len(starts)-1)
+			if avg < poll-20*time.Millisecond || avg > poll+25*time.Millisecond {
+				t.Fatalf("average poll interval = %v over %d polls, want about %v (not %v)", avg, len(starts), poll, poll+tick)
+			}
+		})
+	}
+}
+
+// TestRunPollTriggers checks the cases that the poll cadence keeps: the first
+// step polls, a failed poll is retried at the next interval and not at every
+// tick, KickPoll makes the next step poll, and an instance without the lease
+// never polls.
+func TestRunPollTriggers(t *testing.T) {
+	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
+	var mu sync.Mutex
+	isHeld := false
+	held := func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }
+	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
+	polls := func() int { return f.fake.Calls(accountstest.MethodListBillingStatusChanges) }
+
+	// The poll interval is far longer than the test: only the first step and
+	// a kick poll.
+	statuses, stop := f.runStatuses(billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), held)
+	defer stop()
+	time.Sleep(200 * time.Millisecond)
+	if n := polls(); n != 0 {
+		t.Fatalf("an instance without the lease polled %d times", n)
+	}
+	setHeld(true)
+	eventually(t, "the poll of the first held step", func() bool { return polls() == 1 })
+	time.Sleep(200 * time.Millisecond)
+	if n := polls(); n != 1 {
+		t.Fatalf("polls = %d, want 1 within the poll interval", n)
+	}
+	statuses.KickPoll()
+	eventually(t, "the poll after a kick", func() bool { return polls() == 2 })
+	time.Sleep(200 * time.Millisecond)
+	if n := polls(); n != 2 {
+		t.Fatalf("polls = %d, want 2 after the kick", n)
+	}
+}
+
+// TestRunFailedPollRetriesAtNextInterval checks that a failed poll is retried
+// at the next poll interval, not at every tick.
+func TestRunFailedPollRetriesAtNextInterval(t *testing.T) {
+	f := newStatusFixture(t, time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC))
+	f.fake.Fail(accountstest.MethodListBillingStatusChanges, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	_, stop := f.runStatuses(billing.StatusTiming{Poll: 300 * time.Millisecond, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}, f.fake.Client(), nil)
+	defer stop()
+	time.Sleep(time.Second)
+	// One poll at the first step and one every 300 ms: 4 within a second. A
+	// retry at every tick would make about 50.
+	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n < 3 || n > 6 {
+		t.Fatalf("polls = %d within 1s of a 300 ms poll interval, want about 4", n)
 	}
 }
 
