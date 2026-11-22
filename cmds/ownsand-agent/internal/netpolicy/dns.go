@@ -34,8 +34,9 @@ const (
 )
 
 // DefaultDNSTCPDeadline is the upper bound of one forwarded TCP connection,
-// counted from its admission: the forwarder ends the connection at this
-// deadline even when both sides stay open.
+// counted from its admission and covering the upstream dial and the copy: the
+// forwarder ends the connection at this deadline even when both sides stay
+// open.
 const DefaultDNSTCPDeadline = 30 * time.Second
 
 // dnsRejectLogInterval is the minimum time between two rejection log records
@@ -55,6 +56,10 @@ type dnsLimits struct {
 	// accept path open at the point where Close can overtake it; production
 	// never sets it.
 	afterAdmit func()
+	// dial, when set, replaces the upstream TCP dial. It is a test hook that
+	// makes a slow dial reproducible; production leaves it nil and dials with
+	// a net.Dialer.
+	dial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // dnsRejectLog logs rejections of one transport at most once per interval,
@@ -235,6 +240,9 @@ func (f *DNSForwarder) serveTCP() {
 			f.tcpRej.note(f.logger, DNSTransportTCP, f.limits.maxTCPConns)
 			continue
 		}
+		// One absolute deadline bounds the whole connection, dial and copy
+		// together, counted from admission.
+		deadline := time.Now().Add(f.limits.tcpDeadline)
 		if f.limits.afterAdmit != nil {
 			f.limits.afterAdmit()
 		}
@@ -264,15 +272,20 @@ func (f *DNSForwarder) serveTCP() {
 				f.mu.Unlock()
 				c.Close()
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), f.limits.tcpDeadline)
+			ctx, cancel := context.WithDeadline(context.Background(), deadline)
 			defer cancel()
-			var d net.Dialer
-			up, err := d.DialContext(ctx, "tcp", f.upstream)
+			dial := f.limits.dial
+			if dial == nil {
+				var d net.Dialer
+				dial = d.DialContext
+			}
+			up, err := dial(ctx, "tcp", f.upstream)
 			if err != nil {
 				return
 			}
 			defer up.Close()
-			deadline := time.Now().Add(f.limits.tcpDeadline)
+			// The time spent dialing is already gone: both sides get the
+			// remainder of the admission deadline, not a fresh budget.
 			c.SetDeadline(deadline)
 			up.SetDeadline(deadline)
 			done := make(chan struct{})

@@ -4,7 +4,9 @@ package netpolicy
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"log/slog"
 	"math/rand/v2"
@@ -645,4 +647,72 @@ func TestDNSForwarderRefusesConnAcceptedDuringCloseAtCapacity(t *testing.T) {
 	if n := len(f.tcpSlots); n != 0 {
 		t.Fatalf("tcp slots in use after Close: %d", n)
 	}
+}
+
+func TestDNSForwarderSlowDialCountsAgainstDeadline(t *testing.T) {
+	const (
+		deadline  = 600 * time.Millisecond
+		dialDelay = 400 * time.Millisecond
+	)
+	// The upstream reads the query and then stays silent and open.
+	up := startTCPUpstream(t, func(c net.Conn) {
+		readDNSFrame(c)
+		io.Copy(io.Discard, c)
+	})
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		select {
+		case <-time.After(dialDelay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		var d net.Dialer
+		return d.DialContext(ctx, network, address)
+	}
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, tcpDeadline: deadline, dial: dial})
+	defer f.Close()
+
+	start := time.Now()
+	c := dnsTCPConn(t, f, "slow")
+	c.SetReadDeadline(time.Now().Add(deadline + 2*time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("silent connection delivered data")
+	}
+	elapsed := time.Since(start)
+	// Without the shared deadline the copy phase would start a fresh budget
+	// after the dial and end at dialDelay+deadline.
+	if elapsed < deadline-50*time.Millisecond {
+		t.Fatalf("connection ended after %v, before the %v deadline", elapsed, deadline)
+	}
+	if elapsed > deadline+dialDelay/2 {
+		t.Fatalf("connection ended after %v: the dial time did not count against the %v deadline", elapsed, deadline)
+	}
+	requireTCPSlotFreeAfterDial(t, f)
+}
+
+// requireTCPSlotFreeAfterDial waits until the one TCP slot of f is free.
+func requireTCPSlotFreeAfterDial(t *testing.T, f *DNSForwarder) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for len(f.tcpSlots) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("tcp slot was not released")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDNSForwarderFailedDialReleasesSlot(t *testing.T) {
+	dial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		return nil, errors.New("dial refused")
+	}
+	f := startTestDNS(t, "127.0.0.1:1", slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, dial: dial})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "refused")
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	// The forwarder closes with the query unread, so the guest sees a reset or EOF.
+	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("guest connection stayed open after a failed dial: %v", err)
+	}
+	requireTCPSlotFreeAfterDial(t, f)
 }
