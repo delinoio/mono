@@ -11,6 +11,7 @@ import type { Sandbox as SandboxMessage } from "@delino/ownsand-protos/v1/sandbo
 import type { Snapshot } from "@delino/ownsand-protos/v1/snapshot_pb";
 import type { Client } from "@connectrpc/connect";
 import type { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
+import { ConsumerHold } from "./relay/stream.ts";
 import {
   ExecHandle,
   type ExecResult,
@@ -161,6 +162,7 @@ export class Sandbox {
           : durationFromMs(options.timeoutMs),
       bindingSalt: newBindingSalt(),
     });
+    const hold = new ConsumerHold();
     return new ExecHandle(
       execId,
       runExec(
@@ -168,8 +170,10 @@ export class Sandbox {
         this.#selector,
         { execId, request, stdoutOffset: 0n, stderrOffset: 0n },
         options.signal,
+        hold,
       ),
       this.#selector,
+      hold,
     );
   }
 
@@ -185,6 +189,7 @@ export class Sandbox {
       signal?: AbortSignal;
     } = {},
   ): ExecHandle {
+    const hold = new ConsumerHold();
     return new ExecHandle(
       execId,
       runExec(
@@ -197,8 +202,10 @@ export class Sandbox {
           stderrOffset: options.stderrOffset ?? 0n,
         },
         options.signal,
+        hold,
       ),
       this.#selector,
+      hold,
     );
   }
 

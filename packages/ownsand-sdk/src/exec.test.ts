@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
+import { getEventListeners } from "node:events";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
+import type { Clock } from "./clock.ts";
 import { execBinding, requestDigest } from "./digest.ts";
 import { DataPathError } from "./errors.ts";
+import { Timing } from "./relay/context.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import {
   DataPathTransport,
@@ -18,6 +21,7 @@ import {
   ExecResultKind,
   type ExecStreamEvent,
 } from "./operations/exec.ts";
+import type { VirtualClock } from "./testing/virtual-clock.ts";
 import {
   Disconnect,
   Eof,
@@ -1354,6 +1358,178 @@ describe("exec over the relay", () => {
     const timeout = (h.api.callsOf("Exec")[0]!.request as any).timeout;
     expect(timeout.seconds).toBe(1n);
     expect(timeout.nanos).toBe(500_000_000 + 500_000);
+  });
+});
+
+/** Wraps a clock and counts the sleeps that have not settled yet. */
+function countingClock(inner: VirtualClock): Clock & { pending: () => number } {
+  let pending = 0;
+  return {
+    now: () => inner.now(),
+    wallNow: () => inner.wallNow(),
+    pending: () => pending,
+    sleep(ms, signal) {
+      pending++;
+      return inner.sleep(ms, signal).finally(() => {
+        pending--;
+      });
+    },
+  };
+}
+
+describe("exec handle iteration that ends early", () => {
+  /** Yields one stdout chunk and then hangs, like an agent that went silent. */
+  function silentAfterFirstChunk(h: ReturnType<typeof setup>) {
+    const seen: { signal?: AbortSignal } = {};
+    h.api.stream(RelayService, "Exec", async function* (req, call) {
+      seen.signal = call.signal;
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.stdout(0, "a"));
+      yield new Hang();
+    });
+    h.api.stream(RelayService, "AttachExec", async function* () {
+      yield attachMsg(ev.accepted());
+      yield attachMsg(ev.stdout(1, "b"));
+      yield attachMsg(ev.exited(0));
+    });
+    return seen;
+  }
+
+  for (const how of ["break", "throw"] as const) {
+    test(`aborts the call after the idle limit and leaves no timer or listener after a ${how} in the loop`, async () => {
+      let counted: ReturnType<typeof countingClock> | undefined;
+      const h = setup((clock) => {
+        counted = countingClock(clock);
+        return { clock: counted };
+      });
+      const seen = silentAfterFirstChunk(h);
+      const caller = new AbortController();
+      const listenersBefore = getEventListeners(caller.signal, "abort").length;
+      const handle = h.client
+        .sandbox(SANDBOX)
+        .exec({ command: ["x"], signal: caller.signal });
+      await h.clock.run(
+        (async () => {
+          try {
+            for await (const e of handle) {
+              if (e.type !== ExecEventType.Stdout) continue;
+              if (how === "break") break;
+              throw new Error("boom");
+            }
+          } catch (error) {
+            expect((error as Error).message).toBe("boom");
+          }
+        })(),
+      );
+      // Not idle yet: the event was released at 0 ms.
+      await h.clock.advance(Timing.streamIdleMs - 1_000);
+      expect(seen.signal?.aborted).toBe(false);
+      await h.clock.advance(2_000);
+      expect(seen.signal?.aborted).toBe(true);
+      expect(counted!.pending()).toBe(0);
+      expect(getEventListeners(caller.signal, "abort")).toHaveLength(
+        listenersBefore,
+      );
+    });
+  }
+
+  test("break followed by an immediate wait() resumes the same stream", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", async function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.stdout(0, "a"));
+      yield execMsg(ev.stdout(1, "b"));
+      yield execMsg(ev.exited(0));
+    });
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["x"] });
+    await h.clock.run(
+      (async () => {
+        for await (const e of handle) {
+          if (e.type === ExecEventType.Stdout) break;
+        }
+      })(),
+    );
+    const result = await h.clock.run(handle.wait());
+    expect(result).toMatchObject({ kind: ExecResultKind.Exited, exitCode: 0n });
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(0);
+  });
+
+  test("wait() after the idle limit released the stream continues with AttachExec from the delivered offsets", async () => {
+    const h = setup();
+    const seen = silentAfterFirstChunk(h);
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["x"] });
+    await h.clock.run(
+      (async () => {
+        for await (const e of handle) {
+          if (e.type === ExecEventType.Stdout) break;
+        }
+      })(),
+    );
+    await h.clock.advance(Timing.streamIdleMs + 1_000);
+    expect(seen.signal?.aborted).toBe(true);
+    const result = await h.clock.run(handle.wait());
+    expect(result).toMatchObject({
+      kind: ExecResultKind.Exited,
+      exitCode: 0n,
+      complete: true,
+    });
+    expect(h.api.callsOf("Exec")).toHaveLength(1);
+    expect(h.api.callsOf("AttachExec")).toHaveLength(1);
+    const attach = h.api.callsOf("AttachExec")[0]!.request as any;
+    expect(attach.stdoutOffset).toBe(1n);
+    expect(attach.stderrOffset).toBe(0n);
+  });
+
+  test("the caller aborting its own signal after a break ends the watcher and leaves no timer", async () => {
+    let counted: ReturnType<typeof countingClock> | undefined;
+    const h = setup((clock) => {
+      counted = countingClock(clock);
+      return { clock: counted };
+    });
+    const seen = silentAfterFirstChunk(h);
+    const caller = new AbortController();
+    const listenersBefore = getEventListeners(caller.signal, "abort").length;
+    const handle = h.client
+      .sandbox(SANDBOX)
+      .exec({ command: ["x"], signal: caller.signal });
+    await h.clock.run(
+      (async () => {
+        for await (const e of handle) {
+          if (e.type === ExecEventType.Stdout) break;
+        }
+      })(),
+    );
+    expect(counted!.pending()).toBeGreaterThan(0);
+    caller.abort(new Error("caller stop"));
+    await h.clock.settle();
+    expect(seen.signal?.aborted).toBe(true);
+    expect(counted!.pending()).toBe(0);
+    expect(getEventListeners(caller.signal, "abort")).toHaveLength(
+      listenersBefore,
+    );
+  });
+
+  test("a consumer that still holds an event keeps the idle clock paused", async () => {
+    const h = setup();
+    const seen = silentAfterFirstChunk(h);
+    const handle = h.client.sandbox(SANDBOX).exec({ command: ["x"] });
+    const iterator = handle[Symbol.asyncIterator]();
+    await h.clock.run(
+      (async () => {
+        for (;;) {
+          const next = await iterator.next();
+          if (next.value?.type === ExecEventType.Stdout) return;
+        }
+      })(),
+    );
+    await h.clock.advance(10 * Timing.streamIdleMs);
+    expect(seen.signal?.aborted).toBe(false);
+    await iterator.return(undefined);
+    await h.clock.advance(Timing.streamIdleMs + 1_000);
+    expect(seen.signal?.aborted).toBe(true);
   });
 });
 
