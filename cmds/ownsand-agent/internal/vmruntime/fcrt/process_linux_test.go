@@ -647,8 +647,23 @@ func startHelper(t *testing.T, bin, dir, id string) *exec.Cmd {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	go cmd.Wait()
-	t.Cleanup(func() { syscall.Kill(cmd.Process.Pid, syscall.SIGKILL) })
+	done := make(chan struct{})
+	go func() {
+		cmd.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		// os.Process.Kill returns os.ErrProcessDone once Wait reaped the
+		// child, so a PID that the kernel may have reused is never signalled.
+		if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			t.Errorf("kill helper %d: %v", cmd.Process.Pid, err)
+		}
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("helper %d was not reaped within 10s of the kill", cmd.Process.Pid)
+		}
+	})
 	return cmd
 }
 
