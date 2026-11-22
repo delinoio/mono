@@ -77,13 +77,19 @@ type Server struct {
 	execs  *execManager
 	reads  *readManager
 	writes *writeManager
+	// lock is the exclusive ownership of the state directory; Close
+	// releases it.
+	lock *stateLock
 }
 
 var _ ownsandv1connect.GuestServiceHandler = (*Server)(nil)
 
-// New returns a server. It clears read snapshots of an earlier process and
-// registers the unfinished writes that an earlier process recorded, so that
-// the sweep removes their staging files.
+// New returns a server. It first takes the exclusive lock of the state
+// directory and fails with ErrStateDirInUse when another helper holds it, so
+// that a second helper never deletes the snapshots of a running one. Then it
+// clears read snapshots of an earlier process and registers the unfinished
+// writes that an earlier process recorded, so that the sweep removes their
+// staging files. The caller must call Close to release the lock.
 func New(cfg Config) (*Server, error) {
 	if cfg.StateDir == "" {
 		return nil, errors.New("guest: state directory is required")
@@ -106,12 +112,18 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Clock == ClockModeUnspecified {
 		cfg.Clock = ClockModeSet
 	}
+	lock, err := lockStateDir(cfg.StateDir)
+	if err != nil {
+		return nil, err
+	}
 	reads, err := newReadManager(filepath.Join(cfg.StateDir, "reads"), cfg.Now, cfg.Logger)
 	if err != nil {
+		lock.release()
 		return nil, err
 	}
 	writes, err := newWriteManager(filepath.Join(cfg.StateDir, "writes"), cfg.Now, cfg.Logger)
 	if err != nil {
+		lock.release()
 		return nil, err
 	}
 	return &Server{
@@ -121,7 +133,16 @@ func New(cfg Config) (*Server, error) {
 		execs:  newExecManager(cfg.Now, cfg.Logger),
 		reads:  reads,
 		writes: writes,
+		lock:   lock,
 	}, nil
+}
+
+// Close releases the lock of the state directory. Call it after Run
+// returned; a replacement server on the same directory then starts. It is
+// safe to call more than once. The lock also ends with the process.
+func (s *Server) Close() error {
+	s.lock.release()
+	return nil
 }
 
 // GuestOS returns the GuestOs of the running operating system.
@@ -414,8 +435,15 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
+// shutdownGrace is how long Run lets open requests finish after ctx ends
+// before it closes their connections. Tests shorten it.
+var shutdownGrace = 5 * time.Second
+
 // Run serves the GuestService on l with HTTP/2 without TLS (prior
-// knowledge) until ctx ends, and removes expired operations meanwhile.
+// knowledge) until ctx ends, and removes expired operations meanwhile. After
+// ctx ends it stops accepting requests, waits for the open ones for at most
+// shutdownGrace (an open stream still sends its final message), closes the
+// remaining connections and then returns nil.
 func (s *Server) Run(ctx context.Context, l net.Listener) error {
 	var protocols http.Protocols
 	protocols.SetHTTP1(true)
@@ -439,14 +467,19 @@ func (s *Server) Run(ctx context.Context, l net.Listener) error {
 			}
 		}
 	}()
+	// shutdownDone closes after Shutdown or Close returned. Serve returns
+	// http.ErrServerClosed as soon as Shutdown starts, not when the open
+	// requests ended, so Run waits for this channel before it returns.
+	shutdownDone := make(chan struct{})
 	go func() {
 		select {
 		case <-ctx.Done():
-			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 			defer cancel()
 			if err := srv.Shutdown(shutdownCtx); err != nil {
 				srv.Close()
 			}
+			close(shutdownDone)
 		case <-done:
 		}
 	}()
@@ -454,6 +487,9 @@ func (s *Server) Run(ctx context.Context, l net.Listener) error {
 	err := srv.Serve(l)
 	close(done)
 	if errors.Is(err, http.ErrServerClosed) {
+		// Only the shutdown goroutine closes the server, so it closes
+		// shutdownDone.
+		<-shutdownDone
 		return nil
 	}
 	return fmt.Errorf("guest: serve: %w", err)
