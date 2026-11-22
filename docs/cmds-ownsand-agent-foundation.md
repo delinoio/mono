@@ -64,7 +64,7 @@ Both components use `FSL-1.1-ALv2` according to the [license contract](repositor
 
 ### Capabilities
 
-The agent reports its capabilities after each authentication, again when its built images or hypervisor checks change, and its free disk at least every 60 seconds and whenever it changes by more than 1 GiB: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory, available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), the supported macOS hardware models, and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
+The agent reports its capabilities after each authentication, again when its built images or hypervisor checks change, and its free disk at least every 60 seconds and whenever it changes by more than 1 GiB: host OS, architecture, agent version, logical CPU count, memory, free disk in the state directory (the free blocks that an unprivileged user can use times the file system unit of the platform: the fragment size `f_frsize` on Linux, which can be smaller than the block size `f_bsize` on some file systems, and `f_bsize` on macOS), available guest OSes, built base images, whether macOS guests are supported (Apple silicon only), the supported macOS hardware models, and the hypervisor checks below. The control plane uses them for [scheduling](servers-ownsand-api-foundation.md#scheduler).
 
 ### Isolation
 
