@@ -22,6 +22,7 @@ import {
   deviceAllocatedVcpu,
   effectiveVcpuLimit,
   formatByteCount,
+  formatBytes,
   formatCount,
   formatDuration,
   formatGibMonths,
@@ -580,6 +581,59 @@ describe("router", () => {
       id: RouteId.Sandboxes,
       organizationId: "o 1",
     });
+  });
+});
+
+describe("formatBytes", () => {
+  const KIB = 1024;
+  const MIB = KIB * 1024;
+  const GIB = MIB * 1024;
+  const TIB = GIB * 1024;
+
+  test("keeps the outputs that need no promotion", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1)).toBe("1 B");
+    expect(formatBytes(1023)).toBe("1023 B");
+    expect(formatBytes(KIB)).toBe("1.0 KiB");
+    expect(formatBytes(1.5 * KIB)).toBe("1.5 KiB");
+    expect(formatBytes(MIB)).toBe("1.0 MiB");
+    expect(formatBytes(GIB)).toBe("1.0 GiB");
+    expect(formatBytes(TIB)).toBe("1.0 TiB");
+    expect(formatBytes(2.5 * TIB)).toBe("2.5 TiB");
+  });
+
+  test("promotes a value that rounds to 1024.0 at one decimal", () => {
+    expect(formatBytes(MIB - 1)).toBe("1.0 MiB");
+    expect(formatBytes(GIB - 1)).toBe("1.0 GiB");
+    expect(formatBytes(TIB - 1)).toBe("1.0 TiB");
+  });
+
+  test("promotes at the smallest value that rounds up and not below it", () => {
+    // 1023.95 KiB is the first size that shows as 1024.0 KiB.
+    const smallestKib = Math.ceil(1023.95 * KIB);
+    expect(formatBytes(smallestKib)).toBe("1.0 MiB");
+    expect(formatBytes(smallestKib - 1)).toBe("1023.9 KiB");
+    const smallestMib = Math.ceil(1023.95 * MIB);
+    expect(formatBytes(smallestMib)).toBe("1.0 GiB");
+    expect(formatBytes(smallestMib - 1)).toBe("1023.9 MiB");
+    const smallestGib = Math.ceil(1023.95 * GIB);
+    expect(formatBytes(smallestGib)).toBe("1.0 TiB");
+    expect(formatBytes(smallestGib - 1)).toBe("1023.9 GiB");
+  });
+
+  test("never starts with 1024.0 below 1 TiB", () => {
+    for (const unit of [KIB, MIB, GIB]) {
+      for (const offset of [-2, -1, 0, 1, 2, 100, 1000]) {
+        const bytes = Math.round(1023.95 * unit) + offset;
+        expect(formatBytes(bytes).startsWith("1024.0")).toBe(false);
+      }
+    }
+  });
+
+  test("formats a bigint like the same number", () => {
+    for (const bytes of [0, 1023, KIB, MIB - 1, GIB - 1, TIB - 1, 5 * GIB]) {
+      expect(formatBytes(BigInt(bytes))).toBe(formatBytes(bytes));
+    }
   });
 });
 

@@ -200,13 +200,23 @@ export function formatMib(mib: bigint | number): string {
   return `${n} MiB`;
 }
 
-/** Formats a byte count. */
+/**
+ * Formats a byte count with one decimal in the largest binary unit that
+ * keeps the shown number below 1024. A value that rounds to 1024.0 at one
+ * decimal (for example, 1,048,575 bytes) moves to the next unit, so the
+ * text never starts with "1024.0" below 1 TiB.
+ */
 export function formatBytes(bytes: bigint | number): string {
   const n = Number(bytes);
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let value = n;
   let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
+  // Bytes show as an integer, so they promote at exactly 1024. The other
+  // units show one decimal, so they promote when that decimal text reaches
+  // 1024.0.
+  const reachesNextUnit = (v: number, u: number): boolean =>
+    u === 0 ? v >= 1024 : Number(v.toFixed(1)) >= 1024;
+  while (unit < units.length - 1 && reachesNextUnit(value, unit)) {
     value /= 1024;
     unit++;
   }
