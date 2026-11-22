@@ -11,6 +11,9 @@
     "upstreamProtocol": "h2c",
     "udpPorts": [
       3478
+    ],
+    "needs": [
+      "accounts-api"
     ]
   },
   "scripts": {
