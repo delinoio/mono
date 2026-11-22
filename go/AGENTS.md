@@ -10,7 +10,6 @@
 - Put only Go packages that external users import in this directory. Keep repository-only Go code in its owning project directory, and keep generated protobuf Go bindings under `protos/`.
 - Treat import paths and exported identifiers as a public interface. Mark a change that moves, renames or removes them as breaking.
 - Write all source and comments in English.
-- When Go code in this directory changes, run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` from the repository root and confirm that it prints no path, then run `go vet ./...` and `go test ./...` from the repository root before finishing.
 
 ## Owning contracts
 

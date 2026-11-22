@@ -26,8 +26,6 @@
 
 - Avoid undocumented cross-domain coupling.
 
-- When Go code in this domain changes, run `git ls-files -z -- '*.go' | xargs -0 --no-run-if-empty gofmt -l` from the repository root and confirm that it prints no path, then run `go vet ./...` and `go test ./...` from the repository root before finishing.
-
 ## Licensing
 
 - `cmds/ownsand-agent/` and `cmds/ownsand-guest/` are licensed under FSL-1.1-ALv2 (their `LICENSE` files), not the repository-wide Apache-2.0 license. Use `SPDX-License-Identifier: FSL-1.1-ALv2` in their source headers.
