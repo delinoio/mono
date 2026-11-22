@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { QueryClient } from "@tanstack/react-query";
+import { StrictMode } from "react";
 import { act, render } from "@testing-library/react";
 import { Accounts } from "../App.tsx";
 import { type Auth, AuthContextProvider } from "../auth.tsx";
@@ -47,6 +48,8 @@ export function renderApp(
      * of the fake API transport.
      */
     appTransport?: boolean;
+    /** Renders inside `StrictMode`, as `index.tsx` does. */
+    strict?: boolean;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -66,7 +69,7 @@ export function renderApp(
   const queryClient = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   });
-  render(
+  const app = (
     <AuthContextProvider value={auth}>
       <Accounts
         config={options.config ?? TEST_CONFIG}
@@ -74,8 +77,9 @@ export function renderApp(
         queryClient={queryClient}
         checkout={options.checkout}
       />
-    </AuthContextProvider>,
+    </AuthContextProvider>
   );
+  render(options.strict ? <StrictMode>{app}</StrictMode> : app);
   return { api, signIns };
 }
 

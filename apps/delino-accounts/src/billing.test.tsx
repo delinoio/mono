@@ -1150,6 +1150,38 @@ describe("invitation acceptance", () => {
     await click(await screen.findByRole("link", { name: "Not now" }));
     expect(pendingInvitation.read()).toBeUndefined();
   });
+
+  test.each(["/billing", "/", ACCOUNT_PATH, "/unknown"])(
+    "a fresh load of %s deletes the stored token of an abandoned redirect",
+    async (path) => {
+      pendingInvitation.save(INVITATION_TOKEN);
+      renderApp(path, { signedIn: false });
+      expect(pendingInvitation.read()).toBeUndefined();
+      await settle();
+      expect(pendingInvitation.read()).toBeUndefined();
+    },
+  );
+
+  test("a fresh load of the invitation page keeps the stored token", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    renderApp("/billing/invitations/accept", { signedIn: false });
+    await settle();
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+  });
+
+  test("a fresh load of the invitation page under StrictMode keeps the stored token", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    renderApp("/billing/invitations/accept", { signedIn: false, strict: true });
+    await settle();
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+  });
+
+  test("a fresh load outside the flow under StrictMode deletes the stored token", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    renderApp("/billing", { signedIn: false, strict: true });
+    await settle();
+    expect(pendingInvitation.read()).toBeUndefined();
+  });
 });
 
 describe("settings", () => {

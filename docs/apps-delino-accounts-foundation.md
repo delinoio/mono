@@ -65,7 +65,7 @@ This contract owns the `delino-accounts-web` component of [`delino-accounts`](pr
 
 ## Storage
 
-The app has no server-side storage. All account and billing state belongs to the [API server](servers-accounts-api-foundation.md). Browser storage is limited to the Logto SDK session data, per-user display preferences and, only during the sign-in redirect of the invitation flow, the billing account invitation token in `sessionStorage`. The app deletes the token when `AcceptInvitation` returns, also after a failure, and when the user leaves the invitation flow. Static assets of at least 512 KiB require Git LFS according to the repository workflow contract.
+The app has no server-side storage. All account and billing state belongs to the [API server](servers-accounts-api-foundation.md). Browser storage is limited to the Logto SDK session data, per-user display preferences and, only during the sign-in redirect of the invitation flow, the billing account invitation token in `sessionStorage`. The app deletes the token when `AcceptInvitation` returns, also after a failure, and when the user leaves the invitation flow. The invitation flow is the `billing-invitation` and `callback` routes. Leaving the flow includes an in-app navigation to another route, a fresh page load whose route is outside the flow (an abandoned sign-in redirect, or the reload after sign-out), and a failed sign-in callback; a successful callback keeps the token until it opens the invitation page. Static assets of at least 512 KiB require Git LFS according to the repository workflow contract.
 
 ## Security
 
