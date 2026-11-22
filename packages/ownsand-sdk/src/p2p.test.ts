@@ -1870,6 +1870,35 @@ describe("peer-to-peer data path", () => {
       await write;
     });
 
+    test("a send that throws in the middle of a frame retires the session and no later frame follows", async () => {
+      const p = p2pSetup(writeAgent());
+      const { h, rtc } = p;
+      const { sandbox, channel } = await warmUp(p);
+      let messages = 0;
+      channel.afterSend = () => {
+        messages++;
+        if (messages === 2) {
+          // The channel took the first message of the frame and fails on the
+          // second, as an RTCDataChannel does with an OperationError.
+          throw new Error("OperationError: send queue is full");
+        }
+      };
+      const partial = sandbox
+        .writeFile("/a", new Uint8Array(40 << 10).fill(7))
+        .catch((e) => e);
+      const queued = sandbox
+        .writeFile("/b", new Uint8Array(40 << 10).fill(8))
+        .catch((e) => e);
+      await h.clock.settle();
+      // Only two messages of the first frame were written; the queued frame
+      // never followed them on the dead byte stream.
+      expect(messages).toBe(2);
+      expect(channel.readyState).toBe("closed");
+      await h.clock.run(Promise.all([partial, queued]));
+      expect(messages).toBe(2);
+      expect(rtc.frames).toHaveLength(1);
+    });
+
     test("a caller aborted while its first message waits for the buffer sends nothing", async () => {
       const p = p2pSetup(writeAgent());
       const { h, rtc } = p;

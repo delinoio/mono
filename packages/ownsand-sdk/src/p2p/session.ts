@@ -446,7 +446,26 @@ export class PeerSession {
         throw this.#ended;
       }
       throwIfAborted(cancellable);
-      this.#channel.send(message);
+      try {
+        this.#channel.send(message);
+      } catch (error) {
+        if (index === 0) {
+          // Nothing of this frame is on the byte stream, so the session
+          // stays usable and the caller sees the send failure.
+          throw error;
+        }
+        // A prefix of the frame is already queued, so no later frame can
+        // follow it: the decoder of the agent would read the next frame as
+        // the rest of this one. Retire the session; the waiting calls see it
+        // ended and recover as they do for any other peer failure.
+        this.#terminate(
+          new PeerUnavailableError(
+            "data channel send failed in the middle of a frame",
+            { cause: error },
+          ),
+        );
+        throw this.#ended;
+      }
     }
   }
 
