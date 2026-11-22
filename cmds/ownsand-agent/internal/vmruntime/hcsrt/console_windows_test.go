@@ -143,3 +143,153 @@ func TestCopyConsoleEndsCloserWhenPipeEnds(t *testing.T) {
 		t.Fatalf("console.log = %q, want every connection appended: %q", got, want)
 	}
 }
+
+// newTestBuildVM returns a BuildVM that has no compute system: copyConsole
+// uses only its stop channel, its exited channel, its console channel and
+// its logger.
+func newTestBuildVM() *BuildVM {
+	return &BuildVM{
+		sys:     &system{exited: make(chan struct{})},
+		logger:  slog.New(slog.NewJSONHandler(io.Discard, nil)),
+		stop:    make(chan struct{}),
+		console: make(chan struct{}),
+	}
+}
+
+func waitBuildVMConsole(t *testing.T, b *BuildVM) {
+	t.Helper()
+	select {
+	case <-b.console:
+	case <-time.After(30 * time.Second):
+		t.Fatal("BuildVM.copyConsole did not return")
+	}
+}
+
+// A pipe that ends while the build VM still runs leaves no closer goroutine
+// behind, on a real named pipe: BuildVM.copyConsole re-dials after each end,
+// and once the pipe is gone no closer from an earlier connection is alive.
+// Closing stop then ends copyConsole and closes b.console.
+func TestBuildVMConsoleEndsCloserWhenPipeEnds(t *testing.T) {
+	pipe := `\\.\pipe\ownsand-buildvm-closer-test-com1`
+	l, err := winio.ListenPipe(pipe, nil)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", pipe, err)
+	}
+	defer l.Close()
+
+	path := filepath.Join(t.TempDir(), consoleFile)
+	b := newTestBuildVM()
+	go b.copyConsole(pipe, path)
+
+	var want []byte
+	for _, msg := range []string{"one;", "two;", "three;"} {
+		conn, err := l.Accept()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := conn.Write([]byte(msg)); err != nil {
+			t.Fatalf("guest write: %v", err)
+		}
+		conn.Close()
+		want = append(want, msg...)
+	}
+	l.Close()
+	waitConsoleClosers(t, 0)
+	select {
+	case <-b.console:
+		t.Fatal("copyConsole returned while the build VM still runs")
+	default:
+	}
+
+	close(b.stop)
+	waitBuildVMConsole(t, b)
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("console.log = %q, want every connection appended: %q", got, want)
+	}
+}
+
+// Closing stop, or the exit of the compute system, closes a live console
+// connection that blocks, ends copyConsole and then closes b.console.
+func TestBuildVMConsoleStopClosesLiveConnection(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(b *BuildVM)
+	}{
+		{"stop", func(b *BuildVM) { close(b.stop) }},
+		{"exited", func(b *BuildVM) { close(b.sys.exited) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pipe := `\\.\pipe\ownsand-buildvm-live-` + tc.name + `-test-com1`
+			l, err := winio.ListenPipe(pipe, nil)
+			if err != nil {
+				t.Fatalf("listen on %s: %v", pipe, err)
+			}
+			defer l.Close()
+
+			path := filepath.Join(t.TempDir(), consoleFile)
+			b := newTestBuildVM()
+			go b.copyConsole(pipe, path)
+
+			// The guest side stays open and writes once, so the copy
+			// blocks in Read on a live connection.
+			conn, err := l.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conn.Close()
+			if _, err := conn.Write([]byte("boot;")); err != nil {
+				t.Fatalf("guest write: %v", err)
+			}
+			waitConsoleClosers(t, 1)
+			select {
+			case <-b.console:
+				t.Fatal("copyConsole returned before the build VM stopped")
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			tc.stop(b)
+			waitBuildVMConsole(t, b)
+			waitConsoleClosers(t, 0)
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "boot;" {
+				t.Fatalf("console.log = %q, want boot;", got)
+			}
+		})
+	}
+}
+
+// A console log that cannot open ends copyConsole at once, without a dial,
+// and still closes b.console.
+func TestBuildVMConsoleLogOpenFailureReturnsWithoutDial(t *testing.T) {
+	pipe := `\\.\pipe\ownsand-buildvm-openfail-test-com1`
+	l, err := winio.ListenPipe(pipe, nil)
+	if err != nil {
+		t.Fatalf("listen on %s: %v", pipe, err)
+	}
+	defer l.Close()
+	accepted := make(chan struct{})
+	go func() {
+		if conn, err := l.Accept(); err == nil {
+			conn.Close()
+			close(accepted)
+		}
+	}()
+
+	b := newTestBuildVM()
+	// The parent directory does not exist, so OpenFile fails.
+	go b.copyConsole(pipe, filepath.Join(t.TempDir(), "missing", consoleFile))
+	waitBuildVMConsole(t, b)
+	select {
+	case <-accepted:
+		t.Fatal("copyConsole dialed the pipe after the log open failed")
+	case <-time.After(300 * time.Millisecond):
+	}
+	waitConsoleClosers(t, 0)
+}
