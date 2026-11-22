@@ -32,10 +32,10 @@ import {
 import { useOrg } from "../components/shell.tsx";
 import {
   Empty,
-  ErrorNotice,
   FormDialog,
   Loading,
   PageHeader,
+  QueryBoundary,
   SandboxStateBadge,
   ShortId,
   shortIdText,
@@ -126,41 +126,41 @@ export function SandboxesPage() {
           onCheckedChange={(checked) => setIncludeEnded(checked === true)}
         />
       </div>
-      {list.isPending ? (
-        <Loading label="Loading sandboxes" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : sandboxes.length === 0 ? (
-        <Empty title="No sandboxes match">
-          Create a sandbox, or change the filters.
-        </Empty>
-      ) : (
-        <div className="table-wrap">
-          <table className="table">
-            <thead>
-              <tr>
-                <th scope="col">Sandbox</th>
-                <th scope="col">State</th>
-                <th scope="col">Device</th>
-                <th scope="col">Resources</th>
-                <th scope="col">Idle deadline</th>
-                <th scope="col">Max deadline</th>
-                <th scope="col">Labels</th>
-              </tr>
-            </thead>
-            <tbody>
-              {sandboxes.map((s) => (
-                <SandboxRow
-                  key={s.sandboxId}
-                  sandbox={s}
-                  organizationId={organizationId}
-                  deviceName={deviceNames.get(s.deviceId)}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+      <QueryBoundary query={list} loading="Loading sandboxes">
+        {() =>
+          sandboxes.length === 0 ? (
+            <Empty title="No sandboxes match">
+              Create a sandbox, or change the filters.
+            </Empty>
+          ) : (
+            <div className="table-wrap">
+              <table className="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Sandbox</th>
+                    <th scope="col">State</th>
+                    <th scope="col">Device</th>
+                    <th scope="col">Resources</th>
+                    <th scope="col">Idle deadline</th>
+                    <th scope="col">Max deadline</th>
+                    <th scope="col">Labels</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sandboxes.map((s) => (
+                    <SandboxRow
+                      key={s.sandboxId}
+                      sandbox={s}
+                      organizationId={organizationId}
+                      deviceName={deviceNames.get(s.deviceId)}
+                    />
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )
+        }
+      </QueryBoundary>
       {list.hasNextPage ? (
         <Button
           variant={ButtonVariant.Secondary}

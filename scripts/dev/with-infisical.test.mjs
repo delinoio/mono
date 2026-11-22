@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -43,7 +44,9 @@ const secretValue = "s3cr3t-value-that-must-not-be-logged";
 // A fake `infisical` CLI. For `export` it records its arguments and working
 // directory, optionally waits, and then prints FAKE_INFISICAL_OUTPUT on
 // standard output and exits with FAKE_INFISICAL_EXIT. The file has no
-// extension, so Node.js runs it as CommonJS.
+// extension, so Node.js picks its module type from the nearest enclosing
+// package.json; fixture() writes a CommonJS one next to it, because the file
+// uses require().
 const fakeInfisical = `#!/usr/bin/env node
 const { writeFileSync } = require("node:fs");
 writeFileSync(
@@ -95,13 +98,27 @@ if (process.argv[3] === "wait") {
 // fixture as its repository root.
 function fixture(t, { config = null, cli = true, env = {} } = {}) {
   const root = mkdtempSync(join(tmpdir(), "with-infisical-"));
-  t.after(() => rmSync(root, { recursive: true, force: true }));
+  // Launchers started from this fixture register their teardown here. It runs
+  // before the directory is removed, because the teardown reads the command's
+  // start record from that directory and `t.after` hooks run in order.
+  const teardowns = [];
+  t.after(async () => {
+    try {
+      for (const teardown of teardowns.reverse()) await teardown();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
   mkdirSync(join(root, "scripts", "dev"), { recursive: true });
   const launcher = join(root, "scripts", "dev", "with-infisical.mjs");
   copyFileSync(launcherSource, launcher);
   if (config) writeFileSync(join(root, config), "version: 1\n");
   const bin = join(root, "bin");
   mkdirSync(bin);
+  // The fake CLI uses require(); keep it CommonJS even when the temporary
+  // directory sits inside a package with "type": "module" (for example when
+  // TMPDIR points into the repository checkout).
+  writeFileSync(join(bin, "package.json"), '{"type":"commonjs"}\n');
   if (cli) {
     writeFileSync(join(bin, "infisical"), fakeInfisical);
     chmodSync(join(bin, "infisical"), 0o755);
@@ -116,6 +133,7 @@ function fixture(t, { config = null, cli = true, env = {} } = {}) {
     packageDir,
     launcher,
     out,
+    teardowns,
     infisicalArgs: join(root, "infisical-args.json"),
     env: {
       // Only the fake CLI directory and Node.js: a real `infisical` on the
@@ -129,8 +147,22 @@ function fixture(t, { config = null, cli = true, env = {} } = {}) {
   };
 }
 
+// Sends SIGKILL to a process or, for a negative ID, to a process group, and
+// ignores a target that is already gone.
+function forceKill(id) {
+  try {
+    process.kill(id, "SIGKILL");
+  } catch (error) {
+    if (error.code !== "ESRCH") throw error;
+  }
+}
+
 // Starts the launcher in its own process group, as a terminal or Turborepo
-// starts a job, and collects its output.
+// starts a job, and collects its output. The fixture's teardown force-stops
+// the group, a command that left it, and the output pipes when the test ends
+// for any reason, for example when a readiness wait fails before the test
+// signals the launcher. Without it, the detached group and its pipes outlive
+// the failed test and keep the test runner from exiting.
 function startLauncher(f, args) {
   const child = spawn(process.execPath, [f.launcher, ...args], {
     cwd: f.packageDir,
@@ -148,6 +180,34 @@ function startLauncher(f, args) {
     child.once("close", (code, signal) =>
       resolve({ code, signal, stdout, stderr }),
     );
+  });
+  f.teardowns.push(async () => {
+    if (child.pid === undefined) return;
+    let commandPid = null;
+    try {
+      commandPid = JSON.parse(readFileSync(`${f.out}.start`, "utf8")).pid;
+    } catch {
+      // The command did not start, or its record is unreadable.
+    }
+    forceKill(-child.pid);
+    if (commandPid !== null) forceKill(commandPid);
+    // A survivor would keep the pipes open, so close them from this side.
+    child.stdout.destroy();
+    child.stderr.destroy();
+    let timer;
+    try {
+      await Promise.race([
+        exited,
+        new Promise((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error("the launcher did not exit after SIGKILL")),
+            10_000,
+          );
+        }),
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
   });
   return { child, exited, output: () => stdout };
 }
@@ -532,6 +592,114 @@ test(
   },
 );
 
+// Spellings of the launcher path that reach it through a symlink. Node.js
+// keeps the symlink spelling in process.argv[1] and resolves import.meta.url to
+// the real path, so a guard that compares the two skips main() silently.
+function symlinkedLaunchers(f) {
+  const fileLink = join(f.root, "linked-file", "with-infisical.mjs");
+  mkdirSync(dirname(fileLink));
+  symlinkSync(f.launcher, fileLink);
+  const directoryLink = join(f.root, "linked-directory");
+  symlinkSync(join(f.root, "scripts"), directoryLink, "dir");
+  return [
+    ["symlinked file", fileLink],
+    ["symlinked directory", join(directoryLink, "dev", "with-infisical.mjs")],
+  ];
+}
+
+test(
+  "a symlinked launcher path runs the command directly like the real path",
+  posixOnly,
+  async (t) => {
+    const reference = fixture(t);
+    const expected = await startLauncher(reference, [
+      "--path=/api",
+      ...commandArgs(7),
+    ]).exited;
+    assert.equal(expected.code, 7, expected.stderr);
+    const base = fixture(t);
+    for (const [name, launcher] of symlinkedLaunchers(base)) {
+      await t.test(name, async () => {
+        rmSync(`${base.out}.start`, { force: true });
+        const result = await startLauncher({ ...base, launcher }, [
+          "--path=/api",
+          ...commandArgs(7),
+        ]).exited;
+        assert.equal(result.code, 7, result.stderr);
+        assert.equal(existsSync(base.infisicalArgs), false);
+        assert.deepEqual(started(base).args, ["7"]);
+        assert.deepEqual(records(result.stderr), records(expected.stderr));
+      });
+    }
+  },
+);
+
+test(
+  "a symlinked launcher path stops before the command when the CLI is missing",
+  posixOnly,
+  async (t) => {
+    // The counterfactual of the old guard: it exited with status 0, no record
+    // and no fetch attempt, so only a launcher that runs main() reports the
+    // failure.
+    const base = fixture(t, { config: ProjectConfigFile.Yaml, cli: false });
+    for (const [name, launcher] of symlinkedLaunchers(base)) {
+      await t.test(name, async () => {
+        const result = await startLauncher({ ...base, launcher }, [
+          "--path=/api",
+          ...commandArgs(0),
+        ]).exited;
+        assert.equal(result.code, 1, result.stderr);
+        assert.equal(existsSync(`${base.out}.start`), false);
+        const failure = records(result.stderr).find(
+          (record) => record.event === "dev_env_failed",
+        );
+        assert.equal(failure?.reason, FailureReason.CliMissing, result.stderr);
+      });
+    }
+  },
+);
+
+test(
+  "a symlinked launcher path injects the exported variables",
+  posixOnly,
+  async (t) => {
+    const base = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: {
+        FAKE_INFISICAL_OUTPUT: exported([
+          { key: "DEV_VALUE", value: secretValue },
+        ]),
+      },
+    });
+    for (const [name, launcher] of symlinkedLaunchers(base)) {
+      await t.test(name, async () => {
+        rmSync(`${base.out}.start`, { force: true });
+        const result = await startLauncher({ ...base, launcher }, [
+          "--path=/api",
+          ...commandArgs(3),
+        ]).exited;
+        assert.equal(result.code, 3, result.stderr);
+        assert.equal(started(base).DEV_VALUE, secretValue);
+        assert.deepEqual(
+          records(result.stderr).map(({ event, folder, config }) => ({
+            event,
+            folder,
+            config,
+          })),
+          [
+            {
+              event: "dev_env_infisical",
+              folder: "/api",
+              config: ProjectConfigFile.Yaml,
+            },
+          ],
+        );
+        assert.equal(result.stderr.includes(secretValue), false);
+      });
+    }
+  },
+);
+
 test("invalid launcher arguments exit with status 2", posixOnly, async (t) => {
   const f = fixture(t);
   const result = await startLauncher(f, ["--path=api", ...commandArgs(0)])
@@ -606,5 +774,102 @@ test(
     const result = await launcher.exited;
     assert.equal(result.code, 130, result.stderr);
     assert.equal(existsSync(`${f.out}.start`), false);
+  },
+);
+
+test(
+  "the teardown removes a launcher group whose test failed before it signalled",
+  posixOnly,
+  async () => {
+    // A fake `t` collects the fixture hooks, so that the test runs the
+    // teardown itself, as it runs after a failed readiness wait.
+    const hooks = [];
+    const fakeT = { after: (hook) => hooks.push(hook) };
+    let hooksRan = false;
+    const runHooks = async () => {
+      hooksRan = true;
+      for (const hook of hooks) await hook();
+    };
+    const waiting = (config) => ({
+      config,
+      args: commandArgs(0, "wait"),
+      ready: (launcher) => launcher.output().includes("ready"),
+    });
+    const scenarios = [
+      ["direct", waiting(null)],
+      ["configured", waiting(ProjectConfigFile.Yaml)],
+      [
+        "fetching",
+        {
+          config: ProjectConfigFile.Yaml,
+          env: { FAKE_INFISICAL_DELAY_MS: "30000" },
+          args: commandArgs(0),
+          ready: (_launcher, f) => existsSync(f.infisicalArgs),
+        },
+      ],
+    ];
+    for (const [name, scenario] of scenarios) {
+      hooks.length = 0;
+      hooksRan = false;
+      const f = fixture(fakeT, scenario);
+      const launcher = startLauncher(f, ["--path=/api", ...scenario.args]);
+      const groupId = launcher.child.pid;
+      let commandPid = null;
+      try {
+        await waitFor(() => scenario.ready(launcher, f), name);
+        if (name !== "fetching") commandPid = started(f).pid;
+        assert.equal(alive(-groupId), true, `${name}: the group is running`);
+      } finally {
+        await runHooks();
+      }
+      assert.equal(hooksRan, true);
+      await waitFor(() => !alive(-groupId), `${name}: the group to stop`);
+      if (commandPid !== null) {
+        await waitFor(() => !alive(commandPid), `${name}: the command to stop`);
+      }
+      assert.equal(launcher.child.stdout.destroyed, true, name);
+      assert.equal(launcher.child.stderr.destroyed, true, name);
+      assert.equal(existsSync(f.root), false, `${name}: fixture removed`);
+    }
+  },
+);
+
+test("the fixture pins its fake CLI to CommonJS", (t) => {
+  const f = fixture(t);
+  assert.deepEqual(
+    JSON.parse(readFileSync(join(f.root, "bin", "package.json"), "utf8")),
+    { type: "commonjs" },
+  );
+});
+
+test(
+  "the fake CLI runs when the temporary directory is inside the repository",
+  posixOnly,
+  async (t) => {
+    // The repository root package.json has "type": "module", so an
+    // unpinned extensionless fake CLI would fail with "require is not
+    // defined" whenever TMPDIR points into the checkout.
+    const repositoryRoot = join(dirname(launcherSource), "..", "..");
+    const inside = mkdtempSync(join(repositoryRoot, "with-infisical-tmp-"));
+    const previous = process.env.TMPDIR;
+    t.after(() => {
+      if (previous === undefined) delete process.env.TMPDIR;
+      else process.env.TMPDIR = previous;
+      rmSync(inside, { recursive: true, force: true });
+    });
+    process.env.TMPDIR = inside;
+    const f = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: {
+        FAKE_INFISICAL_OUTPUT: exported([
+          { key: "DEV_VALUE", value: secretValue },
+        ]),
+      },
+    });
+    assert.ok(f.root.startsWith(inside), "the fixture must be inside TMPDIR");
+    const result = await startLauncher(f, ["--path=/api", ...commandArgs(0)])
+      .exited;
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(started(f).DEV_VALUE, secretValue);
   },
 );

@@ -21,9 +21,13 @@ import {
 /**
  * The ListOrganizations request of the console. The control plane returns 50
  * organizations for an empty request, so every surface sends this one input
- * to read the documented first 200 and to share one React Query key.
+ * to read pages of the documented maximum of 200 and to share one React
+ * Query key. `useOrganizations` follows the continuation tokens.
  */
-export const LIST_ORGANIZATIONS_REQUEST = { pageSize: 200 } as const;
+export const LIST_ORGANIZATIONS_REQUEST = {
+  pageSize: 200,
+  pageToken: "",
+} as const;
 
 /**
  * The Connect transport of the console: binary Connect protocol to the

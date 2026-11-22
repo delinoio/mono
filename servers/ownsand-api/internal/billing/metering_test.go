@@ -85,6 +85,12 @@ func (f *fakeAccounts) ReportUsage(_ context.Context, req *connect.Request[accou
 	if n < 1 || n > billing.MaxReportBatch {
 		return nil, connect.NewError(connect.CodeInvalidArgument, fmt.Errorf("%d reports", n))
 	}
+	// accounts-api rejects the whole request when one report has no meter.
+	for _, r := range req.Msg.GetReports() {
+		if r.GetMeter() == accountsv1.Meter_METER_UNSPECIFIED {
+			return nil, connect.NewError(connect.CodeInvalidArgument, errors.New("meter is required"))
+		}
+	}
 	resp := &accountsv1.ReportUsageResponse{Statuses: f.statuses}
 	for _, r := range req.Msg.GetReports() {
 		ws := r.GetWindowStart().AsTime()
@@ -491,6 +497,147 @@ func TestReportBatchesAndRejectsMismatchedResults(t *testing.T) {
 	depth, _, err := m.OutboxStats(ctx)
 	if err != nil || depth != 0 {
 		t.Fatalf("depth = %d %v", depth, err)
+	}
+}
+
+// unknownMeter is a persisted meter value that is not an OwnSand meter, for
+// example one that a newer release wrote before a rollback.
+const unknownMeter = ownsandv1.BillingMeter(99)
+
+// seedOutbox inserts n unreported rows of one organization and meter, one per
+// window from first, due at the fixture time.
+func (f *fixture) seedOutbox(t *testing.T, org string, meter ownsandv1.BillingMeter, first time.Time, n int) {
+	t.Helper()
+	if _, err := f.db.Pool.Exec(context.Background(), `INSERT INTO usage_outbox (organization_id, meter, window_start, quantity, amount_usd_micros, seal_time, next_attempt_time)
+		SELECT $1, $2, $3::timestamptz + make_interval(mins => 5 * i), 1, 1, $4, $4 FROM generate_series(0, $5 - 1) AS i`,
+		org, int16(meter), first, f.clock.Now(), n); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReportSkipsUnknownMeterRows covers an outbox row whose meter value is
+// not an OwnSand meter: it must not fail the supported rows of its batch,
+// and it must stay unchanged and unreported.
+func TestReportSkipsUnknownMeterRows(t *testing.T) {
+	f := newFixture(t, t0.Add(time.Hour))
+	accounts, client := newFakeAccounts(t)
+	reg := newTestMeter(t)
+	m := f.metering(client, func(o *billing.Options) { o.Metrics = reg })
+	ctx := context.Background()
+	// The unknown row has the oldest window, so it would sort first in a batch.
+	f.seedOutbox(t, org1, unknownMeter, t0.Add(-time.Hour), 1)
+	f.seedOutbox(t, org1, relay, t0, 2)
+	f.seedOutbox(t, org2, classA, t0, 1)
+	before, ok := f.outbox(t, org1, unknownMeter, t0.Add(-time.Hour))
+	if !ok {
+		t.Fatal("unknown row not seeded")
+	}
+
+	for pass := 0; pass < 2; pass++ {
+		f.clock.Advance(time.Minute)
+		if err := m.Report(ctx); err != nil {
+			t.Fatalf("pass %d: report: %v", pass, err)
+		}
+		if _, reports := accounts.count(); reports != 3 {
+			t.Fatalf("pass %d: reported %d rows, want the 3 supported rows", pass, reports)
+		}
+		after, ok := f.outbox(t, org1, unknownMeter, t0.Add(-time.Hour))
+		if !ok || after.reported || after.attempts != before.attempts || !after.next.Equal(before.next) {
+			t.Fatalf("pass %d: unknown row changed: %+v -> %+v (present %v)", pass, before, after, ok)
+		}
+	}
+	// Supported rows are reported once; the second pass had nothing due.
+	if requests, _ := accounts.count(); requests != 1 {
+		t.Fatalf("requests = %d, want 1", requests)
+	}
+	for _, c := range []struct {
+		org   string
+		meter ownsandv1.BillingMeter
+		w     time.Time
+	}{{org1, relay, t0}, {org1, relay, t0.Add(5 * time.Minute)}, {org2, classA, t0}} {
+		if s, _ := f.outbox(t, c.org, c.meter, c.w); !s.reported || s.attempts != 1 {
+			t.Fatalf("supported row %v %v = %+v", c.org, c.meter, s)
+		}
+	}
+	if err := m.RefreshMetrics(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gauge(t, reg, "ownsand_billing_usage_outbox_depth"); got != 0 {
+		t.Fatalf("outbox depth = %v, want 0 for the supported meters", got)
+	}
+	if got := gauge(t, reg, "ownsand_billing_usage_report_lag"); got != 0 {
+		t.Fatalf("report lag = %v, want 0", got)
+	}
+	if got := gauge(t, reg, "ownsand_billing_usage_outbox_unsupported_depth"); got != 1 {
+		t.Fatalf("unsupported depth = %v, want 1", got)
+	}
+	if n := strings.Count(f.logText(), `"msg":"billing_usage_unknown_meter_unsent"`); n != 2 {
+		t.Fatalf("billing_usage_unknown_meter_unsent logged %d times, want once per pass (2)", n)
+	}
+	if strings.Contains(f.logText(), `"msg":"billing_usage_report_failed"`) {
+		t.Fatal("a report failed")
+	}
+}
+
+// TestReportUnknownMeterRowsDoNotStarveSupportedRows covers a full batch of
+// unknown-meter rows that sort before a supported row: the supported row is
+// still reported, and the idle reporter does not spin on the unknown rows.
+func TestReportUnknownMeterRowsDoNotStarveSupportedRows(t *testing.T) {
+	f := newFixture(t, t0.Add(time.Hour))
+	accounts, client := newFakeAccounts(t)
+	m := f.metering(client)
+	ctx := context.Background()
+	f.seedOutbox(t, org1, unknownMeter, t0.Add(-48*time.Hour), billing.MaxReportBatch+1)
+	f.seedOutbox(t, org2, relay, t0, 1)
+
+	if err := m.Report(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if requests, reports := accounts.count(); requests != 1 || reports != 1 {
+		t.Fatalf("requests = %d, reports = %d, want 1 and 1", requests, reports)
+	}
+	if s, _ := f.outbox(t, org2, relay, t0); !s.reported {
+		t.Fatalf("supported row not reported: %+v", s)
+	}
+	var untouched int
+	if err := f.db.Pool.QueryRow(ctx, `SELECT count(*) FROM usage_outbox WHERE meter = $1 AND report_time IS NULL AND attempts = 0 AND next_attempt_time = $2`,
+		int16(unknownMeter), f.clock.Now()).Scan(&untouched); err != nil {
+		t.Fatal(err)
+	}
+	if untouched != billing.MaxReportBatch+1 {
+		t.Fatalf("%d unknown rows untouched, want %d", untouched, billing.MaxReportBatch+1)
+	}
+	// Only unknown rows are left: nothing is due and nothing is sent.
+	f.clock.Advance(time.Hour)
+	if err := m.Report(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if requests, _ := accounts.count(); requests != 1 {
+		t.Fatalf("requests = %d after only unknown rows were left, want 1", requests)
+	}
+}
+
+// TestRunDoesNotSpinOnUnknownMeterRows checks that the report worker does not
+// wake up at every back-off interval for an unknown-meter row that is due but
+// is never reported.
+func TestRunDoesNotSpinOnUnknownMeterRows(t *testing.T) {
+	f := newFixture(t, t0.Add(time.Hour))
+	_, client := newFakeAccounts(t)
+	timing := billing.Timing{Flush: time.Hour, Tick: 10 * time.Millisecond, Report: time.Hour, BackoffMin: 10 * time.Millisecond, BackoffMax: time.Hour}
+	m := f.metering(client, func(o *billing.Options) { o.Timing = &timing })
+	f.seedOutbox(t, org1, unknownMeter, t0.Add(-time.Hour), 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	eventually(t, "the first report pass", func() bool {
+		return strings.Contains(f.logText(), `"msg":"billing_usage_unknown_meter_unsent"`)
+	})
+	time.Sleep(300 * time.Millisecond)
+	cancel()
+	<-done
+	// One pass at the start; a spin would add one per BackoffMin.
+	if n := strings.Count(f.logText(), `"msg":"billing_usage_unknown_meter_unsent"`); n > 2 {
+		t.Fatalf("the reporter ran %d passes for a row it never reports", n)
 	}
 }
 

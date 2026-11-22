@@ -14,10 +14,9 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Empty,
-  ErrorNotice,
   FormDialog,
-  Loading,
   PageHeader,
+  QueryBoundary,
   SecretDialog,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
@@ -52,38 +51,38 @@ export function ApiKeysPage() {
           <Button onClick={() => setCreating(true)}>Create API key</Button>
         }
       />
-      {list.isPending ? (
-        <Loading label="Loading API keys" />
-      ) : list.error ? (
-        <ErrorNotice error={list.error} onRetry={() => void list.refetch()} />
-      ) : list.data.apiKeys.length === 0 ? (
-        <Empty title="No API keys" />
-      ) : (
-        <ul className="list" aria-label="API keys">
-          {list.data.apiKeys.map((k) => (
-            <li key={k.apiKeyId} className="list-row">
-              <div className="list-main">
-                <span className="list-title">
-                  {k.name} · {labels.apiKeyState[k.state]}
-                </span>
-                <span className="muted">
-                  <code>{k.keyPrefix}…</code> · created{" "}
-                  {formatTime(k.createTime)}
-                </span>
-              </div>
-              {k.state === ApiKeyState.ACTIVE ? (
-                <Button
-                  variant={ButtonVariant.Danger}
-                  size={ButtonSize.Small}
-                  onClick={() => setRevoking(k)}
-                >
-                  Revoke
-                </Button>
-              ) : null}
-            </li>
-          ))}
-        </ul>
-      )}
+      <QueryBoundary query={list} loading="Loading API keys">
+        {(data) =>
+          data.apiKeys.length === 0 ? (
+            <Empty title="No API keys" />
+          ) : (
+            <ul className="list" aria-label="API keys">
+              {data.apiKeys.map((k) => (
+                <li key={k.apiKeyId} className="list-row">
+                  <div className="list-main">
+                    <span className="list-title">
+                      {k.name} · {labels.apiKeyState[k.state]}
+                    </span>
+                    <span className="muted">
+                      <code>{k.keyPrefix}…</code> · created{" "}
+                      {formatTime(k.createTime)}
+                    </span>
+                  </div>
+                  {k.state === ApiKeyState.ACTIVE ? (
+                    <Button
+                      variant={ButtonVariant.Danger}
+                      size={ButtonSize.Small}
+                      onClick={() => setRevoking(k)}
+                    >
+                      Revoke
+                    </Button>
+                  ) : null}
+                </li>
+              ))}
+            </ul>
+          )
+        }
+      </QueryBoundary>
       <FormDialog
         open={creating}
         onOpenChange={(open) => {

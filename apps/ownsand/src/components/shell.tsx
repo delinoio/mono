@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-import { LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
 import { useQuery } from "@connectrpc/connect-query";
 import { Button, ButtonSize, ButtonVariant } from "delino-ui/button";
 import { Select, SelectOption } from "delino-ui/select";
@@ -9,10 +8,16 @@ import { createContext, type ReactNode, useContext } from "react";
 import { useAuth } from "../auth.tsx";
 import { ACCOUNTS_URL } from "../config.ts";
 import { labels } from "../format.ts";
+import { useOrganizations } from "../organizations.ts";
 import { can, Permission } from "../roles.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { BillingBanner } from "./billing.tsx";
-import { ErrorNotice, Loading } from "./ui.tsx";
+import {
+  ErrorNotice,
+  Loading,
+  RefreshFailedNotice,
+  showsFullError,
+} from "./ui.tsx";
 
 interface OrgContextValue {
   organizationId: string;
@@ -87,14 +92,17 @@ export function canOpenSection(role: Role | undefined, id: RouteId): boolean {
   return section === undefined || can(role, section.permission);
 }
 
+/**
+ * The value of the switcher entry that reports an incomplete organization
+ * list. It is not an organization ID, so it never navigates.
+ */
+const RETRY_ORGANIZATIONS = "retry-organizations";
+
 /** The top bar: product name, organization switcher and account links. */
 export function TopBar({ organizationId }: { organizationId?: string }) {
   const auth = useAuth();
   const { route, navigate } = useRouter();
-  const orgs = useQuery(
-    OrganizationService.method.listOrganizations,
-    LIST_ORGANIZATIONS_REQUEST,
-  );
+  const orgs = useOrganizations();
   const section =
     "organizationId" in route &&
     route.id !== RouteId.Sandbox &&
@@ -108,13 +116,17 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
       <Link to="/" className="brand">
         OwnSand
       </Link>
-      {organizationId !== undefined && orgs.data !== undefined ? (
+      {organizationId !== undefined && orgs.isLoaded ? (
         <div className="org-switcher">
           <Select
             label="Organization"
             value={organizationId}
             onValueChange={(value) => {
               if (value === null) return;
+              if (value === RETRY_ORGANIZATIONS) {
+                orgs.retryLoadMore();
+                return;
+              }
               navigate(
                 routePath({ id: section, organizationId: value } as Parameters<
                   typeof routePath
@@ -122,11 +134,20 @@ export function TopBar({ organizationId }: { organizationId?: string }) {
               );
             }}
           >
-            {orgs.data.organizations.map((org) => (
+            {orgs.organizations.map((org) => (
               <SelectOption key={org.organizationId} value={org.organizationId}>
                 {org.name}
               </SelectOption>
             ))}
+            {orgs.loadMoreError ? (
+              <SelectOption value={RETRY_ORGANIZATIONS}>
+                Some organizations did not load. Try again
+              </SelectOption>
+            ) : orgs.isIncomplete ? (
+              <SelectOption value={RETRY_ORGANIZATIONS} disabled>
+                Loading more organizations
+              </SelectOption>
+            ) : null}
           </Select>
         </div>
       ) : null}
@@ -161,7 +182,11 @@ export function OrgShell({
   let body: ReactNode;
   if (org.isPending) {
     body = <Loading label="Loading the organization" />;
-  } else if (org.error) {
+  } else if (org.data === undefined || showsFullError(org)) {
+    // No loaded organization, or an error that a retry cannot fix
+    // (`not_found`, `permission_denied`, `unauthenticated`): replace the
+    // layout. A transient failure of a refetch keeps the layout mounted, so
+    // open dialogs and typed values survive; the notice below reports it.
     body = <ErrorNotice error={org.error} onRetry={() => void org.refetch()} />;
   } else {
     const organization = org.data.organization!;
@@ -198,6 +223,7 @@ export function OrgShell({
             </ul>
           </nav>
           <main className="content">
+            {org.error ? <RefreshFailedNotice query={org} /> : null}
             <BillingBanner organizationId={organizationId} role={role} />
             {canOpenSection(role, current) ? (
               children

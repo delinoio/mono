@@ -11,7 +11,7 @@ tags: postgres, schema, primary-keys, data-types, foreign-keys, naming
 Prefer `BIGINT GENERATED ALWAYS AS IDENTITY`. Avoid random UUIDs (UUIDv4) as primary keys; use `uuidv7()` when you need UUIDs.
 
 ```sql
-CREATE TABLE user (
+CREATE TABLE app_user (
   id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
   email TEXT NOT NULL UNIQUE
 );

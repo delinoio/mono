@@ -286,16 +286,17 @@ export async function GET(request: Request) {
 
 ```typescript
 export async function GET(request: Request) {
-  const sessionPromise = auth()
   const configPromise = fetchConfig()
-  const session = await sessionPromise
-  const [config, data] = await Promise.all([
-    configPromise,
-    fetchData(session.user.id)
-  ])
+  const dataPromise = (async () => {
+    const session = await auth()
+    return fetchData(session.user.id)
+  })()
+  const [config, data] = await Promise.all([configPromise, dataPromise])
   return Response.json({ data, config })
 }
 ```
+
+Attach `Promise.all` before any other `await`, so a rejection of any started promise is observed immediately instead of surfacing as an unhandled rejection. Wrapping the session-dependent step in an async function also turns a synchronous throw into a rejection of that promise.
 
 For operations with more complex dependency chains, use `better-all` to automatically maximize parallelism (see Dependency-Based Parallelization).
 
@@ -451,6 +452,15 @@ import { Button, TextField } from '@mui/material'
 ```
 
 **Correct - Next.js 13.5+ (recommended):**
+
+```js
+// next.config.js - automatically optimizes barrel imports at build time
+module.exports = {
+  experimental: {
+    optimizePackageImports: ['lucide-react', '@mui/material']
+  }
+}
+```
 
 ```tsx
 // Keep the standard imports - Next.js transforms them to direct imports
@@ -1279,12 +1289,22 @@ getUser({ uid: 1 })  // Cache miss, runs query again
 **Correct: cache hit**
 
 ```typescript
+const getUser = cache(async (uid: number) => {
+  return await db.user.findUnique({ where: { id: uid } })
+})
+
+// Primitive args use value equality
+getUser(1)
+getUser(1)  // Cache hit, returns cached result
+```
+
+If you must pass objects, pass the same reference:
+
+```typescript
 const params = { uid: 1 }
 getUser(params)  // Query runs
 getUser(params)  // Cache hit (same reference)
 ```
-
-If you must pass objects, pass the same reference:
 
 **Next.js-Specific Note:**
 
@@ -1346,7 +1366,7 @@ export async function POST(request: Request) {
     const userAgent = (await headers()).get('user-agent') || 'unknown'
     const sessionCookie = (await cookies()).get('session-id')?.value || 'anonymous'
     
-    logUserAction({ sessionCookie, userAgent })
+    await logUserAction({ sessionCookie, userAgent })
   })
   
   return new Response(JSON.stringify({ status: 'success' }), {
@@ -1356,7 +1376,7 @@ export async function POST(request: Request) {
 }
 ```
 
-The response is sent immediately while logging happens in the background.
+The response is sent immediately while logging happens in the background. Await async side effects inside the `after` callback, or return them from it, so the callback tracks their completion and failures.
 
 **Common use cases:**
 
@@ -1542,7 +1562,7 @@ function StaticContent() {
 **For mutations:**
 
 ```tsx
-import { useSWRMutation } from 'swr/mutation'
+import useSWRMutation from 'swr/mutation'
 
 function UpdateButton() {
   const { trigger } = useSWRMutation('/api/user', updateUser)
@@ -2673,6 +2693,24 @@ export default function Document() {
 **Correct: non-blocking**
 
 ```tsx
+export default function Document() {
+  return (
+    <html>
+      <head>
+        {/* Independent script - use async */}
+        <script src="https://example.com/analytics.js" async />
+        {/* DOM-dependent script - use defer */}
+        <script src="/scripts/utils.js" defer />
+      </head>
+      <body>{/* content */}</body>
+    </html>
+  )
+}
+```
+
+**Note:** In Next.js, prefer the `next/script` component with `strategy` prop instead of raw script tags:
+
+```tsx
 import Script from 'next/script'
 
 export default function Page() {
@@ -2684,8 +2722,6 @@ export default function Page() {
   )
 }
 ```
-
-**Note:** In Next.js, prefer the `next/script` component with `strategy` prop instead of raw script tags:
 
 Reference: [https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script#defer](https://developer.mozilla.org/en-US/docs/Web/HTML/Element/script#defer)
 
@@ -2949,14 +2985,36 @@ function updateElementStyles(element: HTMLElement) {
 **Correct: batch reads, then writes**
 
 ```typescript
+function avoidThrashing(element: HTMLElement) {
+  // Read phase - all layout queries first
+  const rect1 = element.getBoundingClientRect()
+  const offsetWidth = element.offsetWidth
+  const offsetHeight = element.offsetHeight
+  
+  // Write phase - all style changes after
+  element.style.width = '100px'
+  element.style.height = '200px'
+}
+```
+
+**Better: use CSS classes**
+
+```css
+.highlighted-box {
+  width: 100px;
+  height: 200px;
+  background-color: blue;
+  border: 1px solid black;
+}
+```
+
+```typescript
 function updateElementStyles(element: HTMLElement) {
   element.classList.add('highlighted-box')
   
   const { width, height } = element.getBoundingClientRect()
 }
 ```
-
-**Better: use CSS classes**
 
 **React example:**
 
@@ -3162,19 +3220,37 @@ Use a Map (not a hook) so it works everywhere: utilities, event handlers, not ju
 **Cookie caching:**
 
 ```typescript
-let cookieCache: Record<string, string> | null = null
+let cookieCache: Map<string, string> | null = null
+
+function parseCookies(cookieString: string) {
+  const cookies = new Map<string, string>()
+  if (cookieString === '') return cookies
+  for (const pair of cookieString.split('; ')) {
+    // Split at the first '=' only: a value may contain '=' (for example base64 padding)
+    const separator = pair.indexOf('=')
+    if (separator === -1) cookies.set('', pair)  // a cookie sent without a name
+    else cookies.set(pair.slice(0, separator), pair.slice(separator + 1))
+  }
+  return cookies
+}
 
 function getCookie(name: string) {
-  if (!cookieCache) {
-    cookieCache = Object.fromEntries(
-      document.cookie.split('; ').map(c => c.split('='))
-    )
-  }
-  return cookieCache[name]
+  cookieCache ??= parseCookies(document.cookie)
+  return cookieCache.get(name)
+}
+
+// Call after your own code writes document.cookie, so the next read sees the change
+export function invalidateCookieCache() {
+  cookieCache = null
 }
 ```
 
+Values stay raw: the cache does not decode them.
+
 **Important: invalidate on external changes**
+
+If storage can change externally (another tab, server-set cookies), invalidate cache.
+Cookie changes fire no `storage` event, so the cookie cache can only be reset on a known mutation (`invalidateCookieCache()`) or when the page becomes visible again:
 
 ```typescript
 window.addEventListener('storage', (e) => {
@@ -3187,11 +3263,10 @@ window.addEventListener('storage', (e) => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible') {
     storageCache.clear()
+    invalidateCookieCache()  // the next getCookie() call parses document.cookie again
   }
 })
 ```
-
-If storage can change externally (another tab, server-set cookies), invalidate cache:
 
 ### 7.6 Combine Multiple Array Iterations
 
@@ -3792,6 +3867,23 @@ function useWindowEvent(event: string, handler: (e) => void) {
 **Correct: stable subscription**
 
 ```tsx
+function useWindowEvent(event: string, handler: (e) => void) {
+  const handlerRef = useRef(handler)
+  useEffect(() => {
+    handlerRef.current = handler
+  }, [handler])
+
+  useEffect(() => {
+    const listener = (e) => handlerRef.current(e)
+    window.addEventListener(event, listener)
+    return () => window.removeEventListener(event, listener)
+  }, [event])
+}
+```
+
+**Alternative: use `useEffectEvent` if you're on latest React:**
+
+```tsx
 import { useEffectEvent } from 'react'
 
 function useWindowEvent(event: string, handler: (e) => void) {
@@ -3803,8 +3895,6 @@ function useWindowEvent(event: string, handler: (e) => void) {
   }, [event])
 }
 ```
-
-**Alternative: use `useEffectEvent` if you're on latest React:**
 
 `useEffectEvent` provides a cleaner API for the same pattern: the effect keeps its registered listener until `event` changes, and that listener always calls the latest version of the handler. The function returned by `useEffectEvent` changes identity on every render, so call it only from inside the effect and do not add it to the dependency array.
 

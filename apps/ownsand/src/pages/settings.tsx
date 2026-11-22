@@ -23,9 +23,8 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Detail,
-  ErrorNotice,
-  Loading,
   PageHeader,
+  QueryBoundary,
   toastError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
@@ -111,53 +110,50 @@ function AgentPolicy() {
       <p className="muted">
         Decides which agent version the devices of this organization install.
       </p>
-      {policy.isPending ? (
-        <Loading label="Loading the agent version policy" />
-      ) : policy.error ? (
-        <ErrorNotice
-          error={policy.error}
-          onRetry={() => void policy.refetch()}
-        />
-      ) : (
-        <form className="form" onSubmit={save}>
-          <SegmentedControl
-            aria-label="Update mode"
-            value={mode}
-            onValueChange={(v: unknown) => typeof v === "string" && setMode(v)}
-            disabled={!editable}
-          >
-            {MODES.map((m) => (
-              <SegmentedControlItem key={m} value={String(m)}>
-                {labels.policyMode[m]}
-              </SegmentedControlItem>
-            ))}
-          </SegmentedControl>
-          {Number(mode) === AgentVersionPolicyMode.PIN ? (
-            <TextField
-              label="Pinned version"
-              value={version}
-              onValueChange={(v) => {
-                setVersion(v);
-                setVersionError(undefined);
-              }}
-              error={versionError}
+      <QueryBoundary query={policy} loading="Loading the agent version policy">
+        {() => (
+          <form className="form" onSubmit={save}>
+            <SegmentedControl
+              aria-label="Update mode"
+              value={mode}
+              onValueChange={(v: unknown) =>
+                typeof v === "string" && setMode(v)
+              }
               disabled={!editable}
-            />
-          ) : null}
-          {current?.updateTime ? (
-            <p className="muted">
-              Last changed {formatTime(current.updateTime)}
-            </p>
-          ) : null}
-          {editable ? (
-            <div className="actions">
-              <Button type="submit">Save policy</Button>
-            </div>
-          ) : (
-            <p className="muted">Only admins can change the policy.</p>
-          )}
-        </form>
-      )}
+            >
+              {MODES.map((m) => (
+                <SegmentedControlItem key={m} value={String(m)}>
+                  {labels.policyMode[m]}
+                </SegmentedControlItem>
+              ))}
+            </SegmentedControl>
+            {Number(mode) === AgentVersionPolicyMode.PIN ? (
+              <TextField
+                label="Pinned version"
+                value={version}
+                onValueChange={(v) => {
+                  setVersion(v);
+                  setVersionError(undefined);
+                }}
+                error={versionError}
+                disabled={!editable}
+              />
+            ) : null}
+            {current?.updateTime ? (
+              <p className="muted">
+                Last changed {formatTime(current.updateTime)}
+              </p>
+            ) : null}
+            {editable ? (
+              <div className="actions">
+                <Button type="submit">Save policy</Button>
+              </div>
+            ) : (
+              <p className="muted">Only admins can change the policy.</p>
+            )}
+          </form>
+        )}
+      </QueryBoundary>
     </section>
   );
 }

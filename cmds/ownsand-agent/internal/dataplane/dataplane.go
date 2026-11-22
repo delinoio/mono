@@ -71,6 +71,14 @@ type Timing struct {
 	ConnectionIdle     time.Duration
 	GrantIdle          time.Duration
 	AdmissionTolerance time.Duration
+	// FlushDeadline bounds how long a relay connection of a lost agent
+	// channel may stay open while it flushes its queued session-end frames
+	// and closes its request side (see rconn.closeAfterFlush).
+	FlushDeadline time.Duration
+	// ReconnectReset is the time an open relay connection must have lived
+	// before the reconnect back-off restarts at its first step after the
+	// connection ended with an error.
+	ReconnectReset time.Duration
 }
 
 // DefaultTiming returns the contract values.
@@ -85,6 +93,8 @@ func DefaultTiming() Timing {
 		ConnectionIdle:     60 * time.Second,
 		GrantIdle:          60 * time.Second,
 		AdmissionTolerance: 30 * time.Second,
+		FlushDeadline:      5 * time.Second,
+		ReconnectReset:     60 * time.Second,
 	}
 }
 
@@ -104,6 +114,8 @@ func (t Timing) withDefaults() Timing {
 	set(&t.ConnectionIdle, d.ConnectionIdle)
 	set(&t.GrantIdle, d.GrantIdle)
 	set(&t.AdmissionTolerance, d.AdmissionTolerance)
+	set(&t.FlushDeadline, d.FlushDeadline)
+	set(&t.ReconnectReset, d.ReconnectReset)
 	return t
 }
 

@@ -24,15 +24,16 @@ export async function GET(request: Request) {
 
 ```typescript
 export async function GET(request: Request) {
-  const sessionPromise = auth()
   const configPromise = fetchConfig()
-  const session = await sessionPromise
-  const [config, data] = await Promise.all([
-    configPromise,
-    fetchData(session.user.id)
-  ])
+  const dataPromise = (async () => {
+    const session = await auth()
+    return fetchData(session.user.id)
+  })()
+  const [config, data] = await Promise.all([configPromise, dataPromise])
   return Response.json({ data, config })
 }
 ```
+
+Attach `Promise.all` before any other `await`, so a rejection of any started promise is observed immediately instead of surfacing as an unhandled rejection. Wrapping the session-dependent step in an async function also turns a synchronous throw into a rejection of that promise.
 
 For operations with more complex dependency chains, use `better-all` to automatically maximize parallelism (see Dependency-Based Parallelization).

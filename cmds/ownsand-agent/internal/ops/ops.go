@@ -137,6 +137,10 @@ type Dispatcher struct {
 	wg     sync.WaitGroup
 
 	mu sync.Mutex
+	// closed is set by Close; no exec is admitted afterwards. It is
+	// guarded by mu so that it orders admission (and its wg.Add) before or
+	// after Close's wg.Wait.
+	closed bool
 	// execs are the execs with an in-memory log.
 	execs map[string]*execOp
 	// lost are exec_ids accepted by an earlier agent process; their
@@ -200,8 +204,12 @@ func (d *Dispatcher) persistLocked() error {
 	return d.st.SaveExecs(records)
 }
 
-// Close stops the guest forwarding of every exec.
+// Close refuses new execs, stops the guest forwarding of every exec and
+// waits for every admitted forwarding goroutine to finish.
 func (d *Dispatcher) Close() {
+	d.mu.Lock()
+	d.closed = true
+	d.mu.Unlock()
 	d.cancel()
 	d.wg.Wait()
 }

@@ -23,7 +23,9 @@ import {
   ErrorNotice,
   Loading,
   PageHeader,
+  RefreshFailedNotice,
   SandboxStateBadge,
+  showsFullError,
   ShortId,
   toastError,
 } from "../components/ui.tsx";
@@ -103,7 +105,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
   }, [polledState, queryClient]);
 
   if (query.isPending) return <Loading label="Loading the sandbox" />;
-  if (query.error)
+  if (query.data === undefined || showsFullError(query))
     return (
       <ErrorNotice error={query.error} onRetry={() => void query.refetch()} />
     );
@@ -123,6 +125,7 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
 
   return (
     <>
+      {query.error ? <RefreshFailedNotice query={query} /> : null}
       <PageHeader
         title="Sandbox"
         description={<ShortId id={s.sandboxId} />}
