@@ -167,6 +167,29 @@ func TestDevinClaimRelease(t *testing.T) {
 	}
 }
 
+// TestDevinSourceKeyAfterRetention: when the retention job deleted the
+// first request of a session, the next request of the session still gets
+// an unused source key.
+func TestDevinSourceKeyAfterRetention(t *testing.T) {
+	w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.full()
+	w.devin.AddSession("ses-keep", true)
+	first := w.requestBySource(t, "ses-keep")
+	w.env.Clock.Advance(2 * time.Hour)
+	w.waitRequest(t, first.GetRequestId(), tidev1.RequestState_REQUEST_STATE_EXPIRED)
+	second := w.requestBySource(t, "ses-keep#2")
+	// The retention job deletes the first request (and its claim).
+	if _, err := w.env.DB.Pool.Exec(context.Background(), "DELETE FROM requests WHERE request_id = $1", first.GetRequestId()); err != nil {
+		t.Fatal(err)
+	}
+	w.env.Clock.Advance(2 * time.Hour)
+	w.waitRequest(t, second.GetRequestId(), tidev1.RequestState_REQUEST_STATE_EXPIRED)
+	third := w.requestBySource(t, "ses-keep#3")
+	if third.GetState() != tidev1.RequestState_REQUEST_STATE_QUEUED {
+		t.Fatalf("third request %v", third)
+	}
+}
+
 // TestDevinCancelReleasedByPoller: when the claim poller releases the claim
 // of a canceled request (as after a restart between the cancellation commit
 // and its release step), the session that returns to the queue is still

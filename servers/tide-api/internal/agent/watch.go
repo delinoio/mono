@@ -36,7 +36,7 @@ func (w *Watch) Admit(ctx context.Context, d Demand) error { return w.h.admit(ct
 // the vendor queue: a QUEUED tide request of it ends with CANCELED and
 // CANCELED_BY_SOURCE.
 func (w *Watch) Lost(ctx context.Context, vendorRequestID string) error {
-	c, req, _, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
+	c, req, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
 	if err != nil || c == nil || work.RequestTerminal(req.State) {
 		return err
 	}
@@ -46,14 +46,14 @@ func (w *Watch) Lost(ctx context.Context, vendorRequestID string) error {
 // Claim returns the newest claim of a vendor request and its request, or
 // nil.
 func (w *Watch) Claim(ctx context.Context, vendorRequestID string) (*Claim, *work.Request, error) {
-	c, req, _, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
+	c, req, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
 	return c, req, err
 }
 
 // Taken reports that the runner program with workerID took the session of
 // a vendor request: the runner becomes BUSY and the request RUNNING.
 func (w *Watch) Taken(ctx context.Context, vendorRequestID, workerID string) error {
-	c, req, _, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
+	c, req, err := w.h.latestClaim(ctx, w.h.svc.DB.Pool, w.In.OrganizationID, w.In.Vendor, vendorRequestID)
 	if err != nil || c == nil || c.WorkerID != workerID || req.State != tidev1.RequestState_REQUEST_STATE_STARTING {
 		return err
 	}

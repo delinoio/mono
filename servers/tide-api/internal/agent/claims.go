@@ -147,29 +147,55 @@ type Demand struct {
 var ErrClaimTaken = errors.New("another worker holds the vendor request")
 
 // latestClaim returns the newest claim of a vendor request of the
-// organization with the state of its request, and the number of claims.
-func (h *Hub) latestClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, *work.Request, int, error) {
-	var n int
-	if err := q.QueryRow(ctx, "SELECT count(*) FROM agent_claims WHERE organization_id = $1 AND vendor = $2 AND vendor_request_id = $3",
-		orgID, int16(vendor), vendorRequestID).Scan(&n); err != nil {
-		return nil, nil, 0, err
-	}
-	if n == 0 {
-		return nil, nil, 0, nil
-	}
+// organization with the state of its request, or nil.
+func (h *Hub) latestClaim(ctx context.Context, q db.Querier, orgID string, vendor tidev1.AgentVendor, vendorRequestID string) (*Claim, *work.Request, error) {
 	c, err := scanClaim(q.QueryRow(ctx, `SELECT `+claimColumns+` FROM agent_claims c WHERE c.organization_id = $1 AND c.vendor = $2 AND c.vendor_request_id = $3
 		ORDER BY c.create_time DESC, c.request_id DESC LIMIT 1`, orgID, int16(vendor), vendorRequestID))
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil, n, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, err
 	}
 	req, err := h.engine.GetRequest(ctx, q, orgID, c.RequestID)
 	if err != nil {
-		return nil, nil, 0, err
+		return nil, nil, err
 	}
-	return c, req, n, nil
+	return c, req, nil
+}
+
+// nextSourceKey returns the source key of a new request of a vendor
+// request: the vendor request ID when no request of the source has it, and
+// otherwise `<vendor request ID>#<n>` with n one more than the highest
+// suffix of the stored requests (the first request counts as 1). The
+// retention job deletes old ended requests with their claims, so a count of
+// the stored claims could select a key that a newer request still has.
+func (h *Hub) nextSourceKey(ctx context.Context, q db.Querier, orgID string, source work.Source, vendorRequestID string) (string, error) {
+	rows, err := q.Query(ctx, `SELECT source_key FROM requests WHERE organization_id = $1 AND source = $2
+		AND (source_key = $3 OR left(source_key, length($3) + 1) = $3 || '#')`, orgID, int16(source), vendorRequestID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	high := 0
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return "", err
+		}
+		if key == vendorRequestID {
+			high = max(high, 1)
+		} else if n, err := strconv.Atoi(key[len(vendorRequestID)+1:]); err == nil && n > 0 {
+			high = max(high, n)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if high == 0 {
+		return vendorRequestID, nil
+	}
+	return vendorRequestID + "#" + strconv.Itoa(high+1), nil
 }
 
 // profileFor returns the runner profile that receives the requests of an
@@ -201,12 +227,13 @@ func (h *Hub) profileFor(ctx context.Context, q db.Querier, in integration.Integ
 //     claimed again.
 //   - Otherwise tide claims it with a new worker ID and creates a request
 //     with the oldest profile that names the integration. The source key is
-//     the vendor request ID, with `#<n>` for the n-th request of the same
-//     vendor request (a Cursor follow-up or a Devin resume reuses the ID).
+//     the vendor request ID, with `#<n>` for a later request of the same
+//     vendor request (a Cursor follow-up or a Devin resume reuses the ID);
+//     see nextSourceKey.
 func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d Demand) error {
 	logAttrs := []slog.Attr{slog.String("organization_id", in.OrganizationID), slog.String("agent_integration_id", in.ID),
 		slog.String("vendor", VendorLabel(in.Vendor)), slog.String("vendor_request_id", d.VendorRequestID)}
-	c, req, n, err := h.latestClaim(ctx, h.svc.DB.Pool, in.OrganizationID, in.Vendor, d.VendorRequestID)
+	c, req, err := h.latestClaim(ctx, h.svc.DB.Pool, in.OrganizationID, in.Vendor, d.VendorRequestID)
 	if err != nil {
 		return err
 	}
@@ -243,6 +270,10 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		h.log.LogAttrs(ctx, slog.LevelDebug, "agent_demand_ignored", append(logAttrs, slog.String("cause", "no_profile"))...)
 		return nil
 	}
+	key, err := h.nextSourceKey(ctx, h.svc.DB.Pool, in.OrganizationID, v.Source(), d.VendorRequestID)
+	if err != nil {
+		return err
+	}
 	requestID := api.NewID()
 	workerID := "tide-" + requestID
 	if err := d.Claim(ctx, workerID); err != nil {
@@ -251,10 +282,6 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 			return nil
 		}
 		return err
-	}
-	key := d.VendorRequestID
-	if n > 0 {
-		key += "#" + strconv.Itoa(n+1)
 	}
 	claim := &Claim{RequestID: requestID, OrganizationID: in.OrganizationID, IntegrationID: in.ID, Vendor: in.Vendor, VendorRequestID: d.VendorRequestID,
 		DemandMarker: d.Marker, WorkerID: workerID, Scope: d.Scope, State: ClaimHeld}
