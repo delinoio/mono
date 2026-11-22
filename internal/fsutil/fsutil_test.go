@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -46,6 +47,8 @@ func TestReadTarRejectsEscapes(t *testing.T) {
 		{Name: "../evil", Typeflag: tar.TypeReg, Mode: 0o644},
 		{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "/etc/passwd"},
 		{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "../../x"},
+		{Name: "link", Typeflag: tar.TypeSymlink, Linkname: "//server/share"},
+		{Name: "link", Typeflag: tar.TypeSymlink, Linkname: ""},
 	} {
 		var buf bytes.Buffer
 		tw := tar.NewWriter(&buf)
@@ -130,7 +133,20 @@ func TestReadTarRejectsDirectoryBelowEscapingLink(t *testing.T) {
 		{hdr: tar.Header{Name: "l2", Typeflag: tar.TypeSymlink, Linkname: "a/b/.."}},
 		{hdr: tar.Header{Name: "l2/created", Typeflag: tar.TypeDir, Mode: 0o755}},
 	})
-	if err := ReadTar(buf, dir); err == nil {
+	err := ReadTar(buf, dir)
+	if runtime.GOOS == "windows" {
+		// Windows removes ".." elements lexically before it follows a link,
+		// and os.Root does the same there, so "a/b/.." is "a" and the
+		// directory is "a/created" inside the root. ReadTar may accept the
+		// archive, but then the directory must be inside the root.
+		if err == nil {
+			if info, err := os.Lstat(filepath.Join(dir, "a", "created")); err != nil || !info.IsDir() {
+				t.Fatalf("accepted the archive, but a/created is not a directory in the root: %v", err)
+			}
+		}
+	} else if err == nil {
+		// On other systems the link "a/b" is resolved first, so "a/b/.."
+		// is the parent of the root.
 		t.Fatal("accepted a directory below an escaping symbolic link")
 	}
 	if _, err := os.Lstat(filepath.Join(parent, "created")); !errors.Is(err, os.ErrNotExist) {
@@ -154,11 +170,11 @@ func TestReadTarAcceptsConfinedLinks(t *testing.T) {
 	if err := ReadTar(buf, dir); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dir, "dirlink", "f")); string(b) != "hello" {
-		t.Fatalf("dirlink: %q", b)
+	if b, err := os.ReadFile(filepath.Join(dir, "dirlink", "f")); err != nil || string(b) != "hello" {
+		t.Fatalf("dirlink: %q, %v", b, err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dir, "real", "up")); string(b) != "hello" {
-		t.Fatalf("up: %q", b)
+	if b, err := os.ReadFile(filepath.Join(dir, "real", "up")); err != nil || string(b) != "hello" {
+		t.Fatalf("up: %q, %v", b, err)
 	}
 	if got, err := os.Readlink(filepath.Join(dir, "dangling")); err != nil || got != "missing" {
 		t.Fatalf("dangling: %q, %v", got, err)
@@ -166,12 +182,118 @@ func TestReadTarAcceptsConfinedLinks(t *testing.T) {
 }
 
 func TestReadTarRejectsAbsoluteLookingLink(t *testing.T) {
-	for _, link := range []string{"/etc", "a/../../x"} {
+	for _, link := range []string{"/etc", "/etc/passwd", "a/../../x", "//server/share/x"} {
 		buf := buildTar(t, []tarEntry{
 			{hdr: tar.Header{Name: "l", Typeflag: tar.TypeSymlink, Linkname: link}},
 		})
 		if err := ReadTar(buf, t.TempDir()); err == nil {
 			t.Errorf("accepted link %q", link)
+		}
+	}
+}
+
+// windowsPathForms are tar names and link targets that are not local paths
+// on Windows. On other systems a backslash and a colon are ordinary file
+// name characters, so the same strings are local names there.
+var windowsPathForms = []string{
+	`\x`,
+	`\etc\passwd`,
+	`C:\x`,
+	`C:x`,
+	`C:/x`,
+	`\\server\share`,
+	`\\server\share\x`,
+	`\\?\C:\x`,
+	`a\..\..\x`,
+}
+
+func TestReadTarWindowsPathFormLinks(t *testing.T) {
+	for _, link := range windowsPathForms {
+		t.Run(link, func(t *testing.T) {
+			buf := buildTar(t, []tarEntry{
+				{hdr: tar.Header{Name: "l", Typeflag: tar.TypeSymlink, Linkname: link}},
+			})
+			dir := t.TempDir()
+			err := ReadTar(buf, dir)
+			if runtime.GOOS == "windows" {
+				// The check runs before the link is created, so this part
+				// does not need the symbolic link privilege.
+				if err == nil {
+					t.Fatalf("accepted link %q", link)
+				}
+				return
+			}
+			requireSymlinks(t)
+			if err != nil {
+				t.Fatalf("rejected link %q, which is a local name on %s: %v", link, runtime.GOOS, err)
+			}
+			if got, err := os.Readlink(filepath.Join(dir, "l")); err != nil || got != link {
+				t.Fatalf("link target %q, %v; want %q", got, err, link)
+			}
+		})
+	}
+}
+
+func TestReadTarWindowsPathFormNames(t *testing.T) {
+	for _, name := range windowsPathForms {
+		t.Run(name, func(t *testing.T) {
+			buf := buildTar(t, []tarEntry{
+				{hdr: tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644}, data: "x"},
+			})
+			parent := t.TempDir()
+			dir := filepath.Join(parent, "restore")
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			err := ReadTar(buf, dir)
+			if runtime.GOOS == "windows" {
+				if err == nil {
+					t.Fatalf("accepted entry name %q", name)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("rejected entry name %q, which is a local name on %s: %v", name, runtime.GOOS, err)
+			}
+			if b, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(b) != "x" {
+				t.Fatalf("entry %q: %q, %v", name, b, err)
+			}
+		})
+	}
+}
+
+func TestConfinedLinkTarget(t *testing.T) {
+	windows := runtime.GOOS == "windows"
+	for _, tc := range []struct {
+		name, link string
+		want       bool
+	}{
+		{"l", "f", true},
+		{"l", "a/b", true},
+		{"a/l", "../f", true},
+		{"a/b/l", "../../f", true},
+		{"l", ".", true},
+		{"l", "", false},
+		{"l", "f\x00", false},
+		{"l", "/etc", false},
+		{"l", "/etc/passwd", false},
+		{"l", "//server/share", false},
+		{"l", "..", false},
+		{"l", "../x", false},
+		{"a/l", "../../x", false},
+		{"l", "a/../../x", false},
+		{"l", `\x`, !windows},
+		{"l", `\etc\passwd`, !windows},
+		{"l", `C:\x`, !windows},
+		{"l", `C:x`, !windows},
+		{"l", `C:/x`, !windows},
+		{"l", `\\server\share`, !windows},
+		{"l", `\\?\C:\x`, !windows},
+		{"a/l", `..\..\x`, !windows},
+		{"l", "NUL", !windows},
+	} {
+		if got := confinedLinkTarget(filepath.FromSlash(tc.name), tc.link); got != tc.want {
+			t.Errorf("confinedLinkTarget(%q, %q) = %v, want %v", tc.name, tc.link, got, tc.want)
 		}
 	}
 }
