@@ -50,11 +50,59 @@ type principals struct {
 	system   *windows.SID
 	admins   *windows.SID
 	vmGroup  *windows.SID
-	trusted  []*windows.SID // SYSTEM and Administrators
+	trusted  []*windows.SID // SYSTEM and Administrators: the entries of the DACL
 	retained []*windows.SID // SIDs whose explicit ACEs may stay on a child
+	// rootOwners and childOwners are the SIDs that may own the state
+	// directory and an entry below it. They add the user of an elevated
+	// administrator process to trusted and retained (see processIdentity).
+	// They never widen a DACL: only trusted and retained select ACEs.
+	rootOwners  []*windows.SID
+	childOwners []*windows.SID
+}
+
+// processIdentity returns the user SID of the process token and whether the
+// process is an elevated administrator (or SYSTEM). CheckTokenMembership
+// reports a member of Administrators only for an elevated token, because the
+// group is deny-only in the filtered token of a non-elevated administrator.
+func processIdentity() (user *windows.SID, elevated bool, err error) {
+	token := windows.GetCurrentProcessToken()
+	tokenUser, err := token.GetTokenUser()
+	if err != nil {
+		return nil, false, fmt.Errorf("read the user of the process token: %w", err)
+	}
+	user, err = tokenUser.User.Sid.Copy()
+	if err != nil {
+		return nil, false, fmt.Errorf("copy the user of the process token: %w", err)
+	}
+	admins, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid)
+	if err != nil {
+		return nil, false, fmt.Errorf("resolve the Administrators SID: %w", err)
+	}
+	member, err := windows.Token(0).IsMember(admins)
+	if err != nil {
+		return nil, false, fmt.Errorf("check the Administrators membership: %w", err)
+	}
+	return user, member && token.IsElevated(), nil
 }
 
 func loadPrincipals() (*principals, error) {
+	user, elevated, err := processIdentity()
+	if err != nil {
+		return nil, err
+	}
+	return newPrincipals(user, elevated)
+}
+
+// newPrincipals builds the principals for a process whose token user is user.
+// An elevated administrator may also own the state directory and its
+// entries: it can take ownership of any object anyway, so refusing its own
+// objects protects nothing, and it is the account that creates them (the
+// owner of an object that an elevated administrator creates is usually the
+// Administrators group, but a directory that was made before, such as the
+// temporary directory of the account, is owned by the user). A process that
+// is not elevated gets no extra owner, so a directory of a standard user, or
+// of an administrator whose token is filtered, still fails closed.
+func newPrincipals(user *windows.SID, elevated bool) (*principals, error) {
 	system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid)
 	if err != nil {
 		return nil, fmt.Errorf("resolve the SYSTEM SID: %w", err)
@@ -67,13 +115,20 @@ func loadPrincipals() (*principals, error) {
 	if err != nil {
 		return nil, fmt.Errorf("resolve the Virtual Machines SID: %w", err)
 	}
-	return &principals{
+	p := &principals{
 		system:   system,
 		admins:   admins,
 		vmGroup:  vm,
 		trusted:  []*windows.SID{system, admins},
 		retained: []*windows.SID{system, admins, vm},
-	}, nil
+	}
+	p.rootOwners = append([]*windows.SID{}, p.trusted...)
+	p.childOwners = append([]*windows.SID{}, p.retained...)
+	if elevated && user != nil {
+		p.rootOwners = append(p.rootOwners, user)
+		p.childOwners = append(p.childOwners, user)
+	}
+	return p, nil
 }
 
 func sidIn(sid *windows.SID, set []*windows.SID) bool {
@@ -87,14 +142,16 @@ func sidIn(sid *windows.SID, set []*windows.SID) bool {
 
 // restrictStateDir protects the state directory root, corrects the ACLs of
 // the entries that already exist and fails closed when an entry belongs to
-// an untrusted owner. An owner can always change the DACL of its own object,
-// so a directory that a standard user created cannot be made private.
+// an untrusted owner (anyone except SYSTEM, Administrators and the user of an
+// elevated administrator process). An owner can always change the DACL of its
+// own object, so a directory that a standard user created cannot be made
+// private.
 func restrictStateDir(dir string) error {
 	p, err := loadPrincipals()
 	if err != nil {
 		return err
 	}
-	if err := checkOwner(dir, p, p.trusted); err != nil {
+	if err := checkOwner(dir, p, p.rootOwners); err != nil {
 		return err
 	}
 	if err := protectRoot(dir, p); err != nil {
@@ -119,7 +176,7 @@ func checkOwner(path string, p *principals, allowed []*windows.SID) error {
 		return fmt.Errorf("read the owner of %s: %w", path, err)
 	}
 	if !ownerAllowed(owner, allowed) {
-		return fmt.Errorf("%s is owned by %s, but the state directory and its content must be owned by NT AUTHORITY\\SYSTEM or BUILTIN\\Administrators; delete it or take its ownership as an administrator", path, describeSID(owner))
+		return fmt.Errorf("%s is owned by %s, but the state directory and its content must be owned by NT AUTHORITY\\SYSTEM, BUILTIN\\Administrators or, in an elevated administrator process, that process's own user; delete it or take its ownership as an administrator", path, describeSID(owner))
 	}
 	return nil
 }
@@ -269,7 +326,7 @@ func protectRoot(dir string, p *principals) error {
 func resetChildren(root string, p *principals) error {
 	// An owner of a child may be the Virtual Machines group too: the group
 	// has no logon, but Hyper-V can create files for a VM in its name.
-	childOwners := append([]*windows.SID{}, p.retained...)
+	childOwners := p.childOwners
 	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			// An entry that disappears during the walk (a VM file that a

@@ -320,6 +320,98 @@ func TestOwnerAllowed(t *testing.T) {
 	}
 }
 
+// The user of an elevated administrator process may own the state directory
+// and its entries (the account that the hosted Windows CI runner uses owns
+// its temporary directories), and no process gets that allowance for another
+// account or without elevation.
+func TestPrincipalsProcessUserOwner(t *testing.T) {
+	user := wellKnown(t, windows.WinBuiltinGuestsSid) // stands for the process user
+	other := wellKnown(t, windows.WinBuiltinUsersSid) // stands for another account
+	for _, tc := range []struct {
+		name     string
+		elevated bool
+		owner    *windows.SID
+		child    bool
+		want     bool
+	}{
+		{"elevated, root owned by the process user", true, user, false, true},
+		{"elevated, child owned by the process user", true, user, true, true},
+		{"not elevated, root owned by the process user", false, user, false, false},
+		{"not elevated, child owned by the process user", false, user, true, false},
+		{"elevated, root owned by another account", true, other, false, false},
+		{"elevated, child owned by another account", true, other, true, false},
+		{"not elevated, root owned by another account", false, other, false, false},
+	} {
+		p, err := newPrincipals(user, tc.elevated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		allowed := p.rootOwners
+		if tc.child {
+			allowed = p.childOwners
+		}
+		if got := ownerAllowed(tc.owner, allowed); got != tc.want {
+			t.Errorf("%s: ownerAllowed = %v, want %v", tc.name, got, tc.want)
+		}
+		// The owner allowance never adds an entry to a DACL or keeps an
+		// explicit entry of the process user on a child.
+		if sidIn(user, p.trusted) || sidIn(user, p.retained) {
+			t.Errorf("%s: the process user is a trusted or retained principal", tc.name)
+		}
+	}
+	// SYSTEM and Administrators stay accepted without elevation.
+	p, err := newPrincipals(user, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ownerAllowed(p.system, p.rootOwners) || !ownerAllowed(p.admins, p.rootOwners) {
+		t.Error("SYSTEM or Administrators is not an allowed root owner")
+	}
+}
+
+// A directory that the test process owns passes the owner check only when
+// the process is treated as elevated: the check reads the real owner of a
+// real directory with the real process user.
+func TestCheckOwnerProcessUser(t *testing.T) {
+	user, _, err := processIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	sd, err := windows.GetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.OWNER_SECURITY_INFORMATION)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner, _, err := sd.Owner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base, err := newPrincipals(user, false); err != nil {
+		t.Fatal(err)
+	} else if sidIn(user, base.trusted) {
+		t.Skipf("the process user %s is SYSTEM or Administrators, which are always trusted", user)
+	}
+	if !owner.Equals(user) {
+		// An elevated administrator usually creates objects that the
+		// Administrators group owns; only a user-owned directory proves
+		// the process-user rule.
+		t.Skipf("the temporary directory is owned by %s, not by the process user %s", owner, user)
+	}
+	for _, elevated := range []bool{true, false} {
+		p, err := newPrincipals(user, elevated)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = checkOwner(dir, p, p.rootOwners)
+		if elevated && err != nil {
+			t.Errorf("elevated: owner %s rejected: %v", owner, err)
+		}
+		if !elevated && err == nil {
+			t.Errorf("not elevated: owner %s accepted", owner)
+		}
+	}
+}
+
 // Open fails closed, with a message that names the owner, when the owner of
 // the state directory is not trusted.
 func TestCheckOwnerRejectsUntrustedOwner(t *testing.T) {
