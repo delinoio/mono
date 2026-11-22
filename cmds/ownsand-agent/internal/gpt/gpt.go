@@ -75,6 +75,24 @@ func guidString(b []byte) string {
 		binary.LittleEndian.Uint16(b[6:8]), b[8:10], b[10:16]))
 }
 
+// parseHeader decodes and checks the GPT header in the sector buf: the
+// signature, the header size and the header checksum.
+func parseHeader(buf []byte) (header, error) {
+	var h header
+	if err := binary.Read(bytes.NewReader(buf[:headerSize]), binary.LittleEndian, &h); err != nil {
+		return header{}, err
+	}
+	if string(h.Signature[:]) != signature || h.HeaderSize < headerSize || h.HeaderSize > SectorSize {
+		return header{}, errors.New("gpt: the disk has no GUID partition table")
+	}
+	check := append([]byte(nil), buf[:h.HeaderSize]...)
+	binary.LittleEndian.PutUint32(check[16:20], 0)
+	if crc32.ChecksumIEEE(check) != h.HeaderCRC {
+		return header{}, errors.New("gpt: the header checksum does not match")
+	}
+	return h, nil
+}
+
 // Read parses the primary partition table of the disk image f.
 func Read(f io.ReaderAt, size int64) (*Table, error) {
 	if size%SectorSize != 0 || size < 34*SectorSize*2 {
@@ -84,17 +102,9 @@ func Read(f io.ReaderAt, size int64) (*Table, error) {
 	if _, err := f.ReadAt(buf, SectorSize); err != nil {
 		return nil, fmt.Errorf("gpt: read the header: %w", err)
 	}
-	var h header
-	if err := binary.Read(bytes.NewReader(buf[:headerSize]), binary.LittleEndian, &h); err != nil {
+	h, err := parseHeader(buf)
+	if err != nil {
 		return nil, err
-	}
-	if string(h.Signature[:]) != signature || h.HeaderSize < headerSize || h.HeaderSize > SectorSize {
-		return nil, errors.New("gpt: the disk has no GUID partition table")
-	}
-	check := append([]byte(nil), buf[:h.HeaderSize]...)
-	binary.LittleEndian.PutUint32(check[16:20], 0)
-	if crc32.ChecksumIEEE(check) != h.HeaderCRC {
-		return nil, errors.New("gpt: the header checksum does not match")
 	}
 	if h.EntrySize < 128 || h.EntrySize%8 != 0 || h.NumEntries == 0 || h.NumEntries > 4096 {
 		return nil, fmt.Errorf("gpt: unsupported entry array (%d entries of %d bytes)", h.NumEntries, h.EntrySize)
@@ -214,6 +224,60 @@ func writeProtectiveMBR(f io.WriterAt, sectors uint64) error {
 	return nil
 }
 
+// verify reads the primary and the backup table back from the disk and
+// checks that each header is valid, that each entry array matches the
+// checksum of its header and that both arrays hold exactly the entries of t,
+// so a write that damaged an entry array fails instead of leaving a table
+// that a tool or the guest rejects.
+func (t *Table) verify(r io.ReaderAt) error {
+	last := t.sectors - 1
+	for _, c := range []struct {
+		name      string
+		headerLBA uint64
+	}{{"primary", 1}, {"backup", last}} {
+		buf := make([]byte, SectorSize)
+		if _, err := r.ReadAt(buf, int64(c.headerLBA)*SectorSize); err != nil {
+			return fmt.Errorf("gpt: verify the %s header: %w", c.name, err)
+		}
+		h, err := parseHeader(buf)
+		if err != nil {
+			return fmt.Errorf("gpt: verify the %s header: %w", c.name, err)
+		}
+		if h.CurrentLBA != c.headerLBA {
+			return fmt.Errorf("gpt: the %s header is at sector %d but claims sector %d", c.name, c.headerLBA, h.CurrentLBA)
+		}
+		entries := make([]byte, len(t.entries))
+		if _, err := r.ReadAt(entries, int64(h.EntriesLBA)*SectorSize); err != nil {
+			return fmt.Errorf("gpt: verify the %s entries: %w", c.name, err)
+		}
+		if crc32.ChecksumIEEE(entries) != h.EntriesCRC {
+			return fmt.Errorf("gpt: the %s entry array on the disk does not match the checksum of its header", c.name)
+		}
+		if !bytes.Equal(entries, t.entries) {
+			return fmt.Errorf("gpt: the %s entry array on the disk differs from the partition table", c.name)
+		}
+	}
+	return nil
+}
+
+// overlapsLayout reports whether sector lba holds a structure of the layout
+// that Write produces: the protective MBR, the primary header and entries,
+// the backup entries and header, or a sector of a used partition.
+func (t *Table) overlapsLayout(lba uint64) bool {
+	last := t.sectors - 1
+	primaryEntries := t.hdr.EntriesLBA
+	if lba <= 1 || lba >= last-t.entrySectors() ||
+		(lba >= primaryEntries && lba < primaryEntries+t.entrySectors()) {
+		return true
+	}
+	for _, p := range t.Partitions() {
+		if lba >= p.FirstLBA && lba <= p.LastLBA {
+			return true
+		}
+	}
+	return false
+}
+
 // RemoveTrailing removes the partitions of the type typeGUID that follow the
 // last partition of another type, so that partition can grow, and returns
 // how many it removed.
@@ -250,6 +314,9 @@ func RemoveTrailing(path, typeGUID string) (int, error) {
 	if err := t.Write(f); err != nil {
 		return 0, err
 	}
+	if err := t.verify(f); err != nil {
+		return 0, err
+	}
 	return removed, f.Sync()
 }
 
@@ -278,11 +345,16 @@ func Fit(path string) error {
 		return err
 	}
 	// Clear the old backup header, which now lies in the free space, so no
-	// tool mistakes it for a table.
-	if oldBackup > 1 && oldBackup < t.sectors-1 {
+	// tool mistakes it for a table. When the disk grew by no more than the
+	// entry array, that sector lies inside the new backup entry array, which
+	// Write has just filled; clearing it would corrupt the array.
+	if !t.overlapsLayout(oldBackup) {
 		if _, err := f.WriteAt(make([]byte, SectorSize), int64(oldBackup)*SectorSize); err != nil {
 			return err
 		}
+	}
+	if err := t.verify(f); err != nil {
+		return err
 	}
 	return f.Sync()
 }
