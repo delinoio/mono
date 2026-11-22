@@ -31,6 +31,15 @@ func TestRunRefreshesWhileAttached(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
+	// Stop the refresh worker even when an assertion below fails first.
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Run did not return after the test ended")
+		}
+	})
 
 	time.Sleep(20 * time.Millisecond)
 	if got := n.Load(); got != 0 {
@@ -207,6 +216,65 @@ func waitFor(t *testing.T, ch <-chan struct{}, what string) {
 	}
 }
 
+// attachResult is the outcome of an Attach call made off the test goroutine.
+type attachResult struct {
+	link Link
+	tap  string
+	err  error
+}
+
+// attachAsync runs Attach in a goroutine, so that a competing operation that
+// blocks on the manager lock fails the test within a bound instead of hanging
+// it. The goroutine must not call t.Fatal, so it reports through the channel.
+func attachAsync(m *Manager, id string) <-chan attachResult {
+	res := make(chan attachResult, 1)
+	go func() {
+		link, tap, err := m.Attach(id)
+		res <- attachResult{link: link, tap: tap, err: err}
+	}()
+	return res
+}
+
+// awaitAttach waits for an Attach started by attachAsync within the test bound
+// and checks its tap name, as mustAttach does.
+func awaitAttach(t *testing.T, res <-chan attachResult, id, what string) Link {
+	t.Helper()
+	select {
+	case r := <-res:
+		if r.err != nil {
+			t.Fatalf("Attach(%s): %v", id, r.err)
+		}
+		if r.tap != TapName(r.link.Index) {
+			t.Fatalf("Attach(%s) tap = %q, want %q", id, r.tap, TapName(r.link.Index))
+		}
+		return r.link
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout waiting for %s", what)
+		return Link{}
+	}
+}
+
+// onceFunc returns a function that closes ch the first time it is called.
+func onceFunc(ch chan struct{}) func() {
+	var once sync.Once
+	return func() { once.Do(func() { close(ch) }) }
+}
+
+// releaseOnCleanup opens a held fixture gate and then waits for the Detach
+// that it blocks when the test ends, so an assertion that fails first cannot
+// leave the worker blocked.
+func releaseOnCleanup(t *testing.T, open func(), done <-chan struct{}) {
+	t.Helper()
+	t.Cleanup(func() {
+		open()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Error("Detach did not return after the held fixture was released")
+		}
+	})
+}
+
 // A normal attach configures the tap and serves DNS on the gateway of the
 // lowest free link.
 func TestAttachConfiguresTapAndDNS(t *testing.T) {
@@ -262,10 +330,12 @@ func TestDetachReservesLinkUntilDNSClosed(t *testing.T) {
 	m, h := newFakeManager(t)
 	mustAttach(t, m, "sandbox-a")
 	closing, release := make(chan struct{}, 1), make(chan struct{})
+	openRelease := onceFunc(release)
 	h.mu.Lock()
 	h.dnsClosing, h.dnsRelease = closing, release
 	h.mu.Unlock()
 	done := detachAsync(m, "sandbox-a")
+	releaseOnCleanup(t, openRelease, done)
 	waitFor(t, closing, "DNS close to start")
 	// Later DNS forwarders must not block.
 	h.mu.Lock()
@@ -273,10 +343,10 @@ func TestDetachReservesLinkUntilDNSClosed(t *testing.T) {
 	h.mu.Unlock()
 
 	// Another sandbox gets link 2 (and Attach is not blocked by the mutex).
-	if link := mustAttach(t, m, "sandbox-b"); link.Index != 2 {
+	if link := awaitAttach(t, attachAsync(m, "sandbox-b"), "sandbox-b", "Attach while DNS closes"); link.Index != 2 {
 		t.Fatalf("second attach index = %d, want 2 while link 1 is being torn down", link.Index)
 	}
-	close(release)
+	openRelease()
 	waitFor(t, done, "Detach")
 	// After the teardown, link 1 is the lowest free index again.
 	if link := mustAttach(t, m, "sandbox-c"); link.Index != 1 {
@@ -289,20 +359,22 @@ func TestDetachReservesLinkUntilTapDeleted(t *testing.T) {
 	m, h := newFakeManager(t)
 	mustAttach(t, m, "sandbox-a")
 	started, release := make(chan struct{}, 1), make(chan struct{})
+	openRelease := onceFunc(release)
 	h.mu.Lock()
 	h.delStarted, h.delRelease = started, release
 	h.mu.Unlock()
 	done := detachAsync(m, "sandbox-a")
+	releaseOnCleanup(t, openRelease, done)
 	waitFor(t, started, "tap deletion to start")
 	// Later deletions must not block.
 	h.mu.Lock()
 	h.delStarted, h.delRelease = nil, nil
 	h.mu.Unlock()
 
-	if link := mustAttach(t, m, "sandbox-b"); link.Index != 2 {
+	if link := awaitAttach(t, attachAsync(m, "sandbox-b"), "sandbox-b", "Attach while the tap deletion runs"); link.Index != 2 {
 		t.Fatalf("second attach index = %d, want 2 while the tap of link 1 exists", link.Index)
 	}
-	close(release)
+	openRelease()
 	waitFor(t, done, "Detach")
 	if link := mustAttach(t, m, "sandbox-c"); link.Index != 1 {
 		t.Fatalf("third attach index = %d, want 1 after the teardown", link.Index)
