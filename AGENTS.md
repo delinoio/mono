@@ -217,6 +217,7 @@
 - Prefer structured logging over ad-hoc plain text logs for business and system events.
 - Go code should use `log/slog` (or a compatible structured logger built on it).
 - Rust code should use `tracing` (or a compatible structured logging facade).
+- Instrument metrics, logs and traces with the OpenTelemetry SDK. Keep `log/slog` (Go) and `tracing` (Rust) as the logging APIs and send their log records to the OpenTelemetry SDK through its log bridge. Follow `docs/repository-defaults.md#repository-wide-rules`.
 - CLI and operator-facing logs should enable ANSI color by default; allow opt-out with documented flags or environment variables.
 
 ## Contract navigation

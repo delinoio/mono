@@ -28,6 +28,7 @@ These rules are not defaults; project and domain contracts must not deviate from
 - Authentication uses one shared Logto tenant for all services. A project may accept another credential for programs, devices or short-lived capabilities that it issues after validating another accepted credential only when the documented exceptions in `docs/repository-auth-contract.md` list it. See `docs/repository-auth-contract.md`.
 - User charges use USD with 0.000001 USD precision. See `docs/repository-billing-contract.md`.
 - Account management and billing for every service use `delino-accounts`. See `docs/repository-auth-contract.md`, `docs/repository-billing-contract.md` and `docs/project-delino-accounts.md`.
+- Metrics, logs and traces are instrumented with the OpenTelemetry SDK. Go code keeps `log/slog` and Rust code keeps `tracing` as the logging API, and sends the log records to the OpenTelemetry SDK through its log bridge. The observability backend that receives this data is a default; see [Default Technology Choices](#default-technology-choices).
 
 ## Documentation Requirements
 
