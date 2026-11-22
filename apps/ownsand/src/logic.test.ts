@@ -9,6 +9,7 @@ import {
 import { create, toBinary, fromBinary } from "@bufbuild/protobuf";
 import { CreateSandboxRequestSchema } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { sandboxSettling, snapshotSettling } from "./api.ts";
+import { shortIdText } from "./components/ui.tsx";
 import { clearInvitationOnLeave, clearInvitationOutsideFlow } from "./App.tsx";
 import {
   AuthMode,
@@ -54,6 +55,26 @@ import {
   RouteId,
   routePath,
 } from "./router.tsx";
+
+describe("shortIdText", () => {
+  test("keeps the first 8 and the last 4 characters of a long id", () => {
+    expect(shortIdText("0192f4a0-7c1e-7d3b-9a4f-3b8e5c6d7e8f")).toBe(
+      "0192f4a0…7e8f",
+    );
+  });
+
+  test("tells apart UUID v7 ids that share the time prefix", () => {
+    const first = "0192f4a0-7c1e-7d3b-9a4f-3b8e5c6d7e8f";
+    const second = "0192f4a0-7c20-7a11-8b22-112233441234";
+    expect(first.slice(0, 8)).toBe(second.slice(0, 8));
+    expect(shortIdText(first)).not.toBe(shortIdText(second));
+  });
+
+  test("keeps an id of 13 characters or fewer unchanged", () => {
+    expect(shortIdText("abc")).toBe("abc");
+    expect(shortIdText("0123456789abc")).toBe("0123456789abc");
+  });
+});
 
 describe("deviceAllocatedVcpu", () => {
   test("prefers the exact 64-bit total above the int32 range", () => {

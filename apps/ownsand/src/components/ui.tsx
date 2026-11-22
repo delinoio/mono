@@ -406,11 +406,20 @@ export function Detail({
   );
 }
 
+/**
+ * Shortens a UUID to its first 8 and last 4 characters. A UUID v7 starts with
+ * a timestamp, so the first 8 characters alone repeat for about 65 seconds;
+ * the last 4 characters tell ids from the same period apart.
+ */
+export function shortIdText(id: string): string {
+  return id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
+}
+
 /** Shortens a UUID for display; the full value stays in the title. */
 export function ShortId({ id }: { id: string }) {
   return (
     <code className="id" title={id}>
-      {id.length > 13 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id}
+      {shortIdText(id)}
     </code>
   );
 }

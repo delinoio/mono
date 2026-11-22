@@ -38,6 +38,7 @@ import {
   PageHeader,
   SandboxStateBadge,
   ShortId,
+  shortIdText,
 } from "../components/ui.tsx";
 import { formatMib, formatTime, labels } from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
@@ -368,7 +369,7 @@ function CreateSandboxDialog({
                 key={s.snapshotId}
                 value={`snapshot:${s.snapshotId}`}
               >
-                Snapshot {s.snapshotId.slice(0, 8)}
+                {`Snapshot ${shortIdText(s.snapshotId)} · ${formatTime(s.createTime)}`}
               </SelectOption>
             ))}
         </Select>
