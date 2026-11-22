@@ -1345,6 +1345,33 @@ describe("exec over the relay", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  test("rejects a timeout above the protobuf Duration maximum before sending", async () => {
+    const h = setup();
+    const sandbox = h.client.sandbox(SANDBOX);
+    // 315576000000 seconds is the longest protobuf Duration.
+    for (const timeoutMs of [315_576_000_001_000, 3.2e14, 1e300]) {
+      expect(() => sandbox.exec({ command: ["x"], timeoutMs })).toThrow(
+        "is not a valid duration",
+      );
+    }
+    expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("accepts a timeout of exactly the protobuf Duration maximum", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield execMsg(ev.started());
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(SANDBOX);
+    await h.clock.run(
+      sandbox.exec({ command: ["x"], timeoutMs: 315_576_000_000_000 }).wait(),
+    );
+    const timeout = (h.api.callsOf("Exec")[0]!.request as any).timeout;
+    expect(timeout.seconds).toBe(315_576_000_000n);
+    expect(timeout.nanos).toBe(0);
+  });
+
   test("sends a fractional millisecond timeout at nanosecond precision", async () => {
     const h = setup();
     h.api.stream(RelayService, "Exec", function* () {
