@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package cli implements the tide command-line interface on the tide Go
-// SDK. The owning contract is
+// Package cli implements the tide command-line interface and starts the
+// tide mcp MCP server, on the tide Go SDK. The owning contract is
 // docs/cmds-tide-cli-foundation.md.
 package cli
 
@@ -347,6 +347,7 @@ func init() {
 		"login":  (*app).login,
 		"logout": (*app).logout,
 		"status": (*app).status,
+		"mcp":    (*app).mcp,
 	}
 	commandTable = map[string]map[string]commandFunc{
 		"org": {
@@ -400,6 +401,7 @@ Commands:
   login                      sign in with the Logto device flow
   logout                     delete the stored tokens
   status                     show the queue, the runners and the device pool
+  mcp                        serve the MCP server on standard input and output
   version                    print the version
 `)
 	groups := make([]string, 0, len(commandTable))

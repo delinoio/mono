@@ -147,7 +147,7 @@ Record each decision in the owning domain contract before the implementation tha
 
 - The exact install commands per guest OS of each runner program. The runner implementation records them with the guest OSes on which it verified them ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
 - The npm package name and publication workflow of the TypeScript SDK, together with the same open decision of OwnSand.
-- Every new third-party dependency. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it. Recorded owner approval: the official MCP Go SDK `github.com/modelcontextprotocol/go-sdk` for the `tide mcp` server. Its pinned version and its dependency security review are part of the change that adds it.
+- Every new third-party dependency. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it. Recorded owner approval: the official MCP Go SDK `github.com/modelcontextprotocol/go-sdk` for the `tide mcp` server. Recorded decision: the root `go.mod` pins v1.8.0, the latest stable release when it was added. The change that adds it records the dependency security review (the Go vulnerability database and the GitHub advisories of the module). The module is licensed under MIT and Apache-2.0, and its new indirect modules are licensed under MIT, MIT-0 or BSD-3-Clause.
 
 ## Change Policy
 
