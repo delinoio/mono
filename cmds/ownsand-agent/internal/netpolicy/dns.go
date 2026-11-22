@@ -33,6 +33,11 @@ const (
 	DefaultDNSMaxTCPConns   = 32
 )
 
+// DefaultDNSTCPDeadline is the upper bound of one forwarded TCP connection,
+// counted from its admission: the forwarder ends the connection at this
+// deadline even when both sides stay open.
+const DefaultDNSTCPDeadline = 30 * time.Second
+
 // dnsRejectLogInterval is the minimum time between two rejection log records
 // of one transport. Rejections in between only increase the count that the
 // next record reports.
@@ -42,6 +47,9 @@ const dnsRejectLogInterval = 5 * time.Second
 type dnsLimits struct {
 	maxUDPQueries int
 	maxTCPConns   int
+	// tcpDeadline bounds one TCP connection (dial and copy). Zero means
+	// DefaultDNSTCPDeadline; tests set a short value.
+	tcpDeadline time.Duration
 }
 
 // dnsRejectLog logs rejections of one transport at most once per interval,
@@ -121,6 +129,9 @@ func StartDNS(listen netip.AddrPort, upstream string, logger *slog.Logger) (*DNS
 
 // startDNS is StartDNS with explicit concurrency limits (tests set small ones).
 func startDNS(listen netip.AddrPort, upstream string, logger *slog.Logger, limits dnsLimits) (*DNSForwarder, error) {
+	if limits.tcpDeadline <= 0 {
+		limits.tcpDeadline = DefaultDNSTCPDeadline
+	}
 	udp, err := net.ListenUDP("udp", net.UDPAddrFromAddrPort(listen))
 	if err != nil {
 		return nil, err
@@ -228,7 +239,7 @@ func (f *DNSForwarder) serveTCP() {
 				f.mu.Unlock()
 				c.Close()
 			}()
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			ctx, cancel := context.WithTimeout(context.Background(), f.limits.tcpDeadline)
 			defer cancel()
 			var d net.Dialer
 			up, err := d.DialContext(ctx, "tcp", f.upstream)
@@ -236,7 +247,7 @@ func (f *DNSForwarder) serveTCP() {
 				return
 			}
 			defer up.Close()
-			deadline := time.Now().Add(30 * time.Second)
+			deadline := time.Now().Add(f.limits.tcpDeadline)
 			c.SetDeadline(deadline)
 			up.SetDeadline(deadline)
 			done := make(chan struct{})
@@ -248,6 +259,14 @@ func (f *DNSForwarder) serveTCP() {
 				close(done)
 			}()
 			io.Copy(c, up)
+			// The upstream ended its answer direction (it closed, or the
+			// deadline passed). Close the guest connection now: the guest
+			// observes EOF, the guest-to-upstream copy above stops reading
+			// and the TCP slot is released, instead of waiting for the guest
+			// to close or for the deadline. A guest that closes first keeps
+			// the path above: CloseWrite on the upstream lets a pending
+			// answer still reach the guest.
+			c.Close()
 			<-done
 		}()
 	}
