@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -819,5 +820,136 @@ func TestDNSForwarderCloseDuringDialEndsUpstreamConn(t *testing.T) {
 	c.SetReadDeadline(time.Now().Add(2 * time.Second))
 	if _, err := c.Read(make([]byte, 1)); err == nil || errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("guest connection stayed open after Close: %v", err)
+	}
+}
+
+// syncBuffer is a log sink that tests read while the forwarder writes.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// socketErrorRecords returns the retry log records of one transport.
+func (b *syncBuffer) socketErrorRecords(transport DNSTransport) []map[string]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []map[string]any
+	for _, line := range strings.Split(b.buf.String(), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["level"] == "ERROR" && rec["transport"] == string(transport) {
+			out = append(out, rec)
+		}
+	}
+	return out
+}
+
+// waitForSocketError waits until a retry record of the transport satisfies
+// match (nil matches every record).
+func waitForSocketError(t *testing.T, logs *syncBuffer, transport DNSTransport, timeout time.Duration, match func(map[string]any) bool) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, rec := range logs.socketErrorRecords(transport) {
+			if match == nil || match(rec) {
+				return rec
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no matching %s retry record within %v: %v", transport, timeout, logs.socketErrorRecords(transport))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDNSForwarderTCPSurvivesAcceptError(t *testing.T) {
+	up := startGatedUpstream(t)
+	up.open()
+	logs := &syncBuffer{}
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	// An expired deadline makes Accept fail with a timeout error, like a
+	// transient accept failure; the listener itself stays open.
+	if err := f.tcp.SetDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := waitForSocketError(t, logs, DNSTransportTCP, 5*time.Second, nil)
+	if rec["error"] == nil || rec["retry_in"] == nil {
+		t.Fatalf("retry record lacks error or retry_in: %v", rec)
+	}
+	if err := f.tcp.SetDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	c := dnsTCPConn(t, f, "again")
+	requireDNSAnswer(t, c, "again")
+}
+
+func TestDNSForwarderUDPSurvivesReadError(t *testing.T) {
+	up := startGatedUpstream(t)
+	up.open()
+	logs := &syncBuffer{}
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	if err := f.udp.SetReadDeadline(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	rec := waitForSocketError(t, logs, DNSTransportUDP, 5*time.Second, nil)
+	if rec["error"] == nil || rec["retry_in"] == nil {
+		t.Fatalf("retry record lacks error or retry_in: %v", rec)
+	}
+	if err := f.udp.SetReadDeadline(time.Time{}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The loop answers again once its back-off wait ends.
+	c := dnsUDPQuery(t, f, "again")
+	buf := make([]byte, 64)
+	if n, err := c.Read(buf); err != nil || string(buf[:n]) != "ok:again" {
+		t.Fatalf("udp answer after the error %q %v", buf[:n], err)
+	}
+}
+
+func TestDNSForwarderCloseDuringBackoff(t *testing.T) {
+	up := startGatedUpstream(t)
+	up.open()
+	logs := &syncBuffer{}
+	f := startTestDNS(t, up.addr, slog.New(slog.NewJSONHandler(logs, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	// Both loops fail on every call, so their back-off reaches its maximum.
+	f.tcp.SetDeadline(time.Now())
+	f.udp.SetReadDeadline(time.Now())
+	atCap := func(rec map[string]any) bool {
+		d, _ := rec["retry_in"].(float64)
+		return time.Duration(d) == dnsServeBackoffMax
+	}
+	waitForSocketError(t, logs, DNSTransportTCP, 10*time.Second, atCap)
+	waitForSocketError(t, logs, DNSTransportUDP, 10*time.Second, atCap)
+
+	// Both loops now sleep for about a second. Close must not wait for it.
+	start := time.Now()
+	requireClosedWithin(t, "Close during back-off", closeInBackground(f), 2*time.Second)
+	if elapsed := time.Since(start); elapsed > dnsServeBackoffMax/2 {
+		t.Fatalf("Close waited %v for a loop in back-off", elapsed)
+	}
+	// No retry record after Close, even after a full back-off period.
+	n := len(logs.socketErrorRecords(DNSTransportTCP)) + len(logs.socketErrorRecords(DNSTransportUDP))
+	time.Sleep(dnsServeBackoffMax + 200*time.Millisecond)
+	if m := len(logs.socketErrorRecords(DNSTransportTCP)) + len(logs.socketErrorRecords(DNSTransportUDP)); m != n {
+		t.Fatalf("retry records after Close: %d before, %d after", n, m)
 	}
 }
