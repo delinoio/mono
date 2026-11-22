@@ -8,9 +8,11 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,34 +24,96 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/relay"
 )
 
-// stalledConn is a client connection that stops reading after limit bytes,
-// like a peer whose network path stopped draining: the server's socket
-// writes then block once the kernel buffers are full.
-type stalledConn struct {
-	net.Conn
-	mu     sync.Mutex
-	read   int
-	limit  int
-	closed chan struct{}
-	once   sync.Once
+// stalledListener accepts connections whose writes stall after limit bytes,
+// like a server socket whose peer stopped draining its network path once the
+// kernel buffers filled. The test blocks the writes itself instead of filling
+// the kernel buffers: how a blocked socket write progresses depends on the
+// platform. Linux lets it advance a little at a time, so a write deadline
+// often ends a write with partial progress; Windows lets it make none.
+type stalledListener struct {
+	net.Listener
+	limit int
+	// blocked counts the writes that stalled.
+	blocked atomic.Int64
 }
 
-func (c *stalledConn) Read(p []byte) (int, error) {
-	c.mu.Lock()
-	left := c.limit - c.read
-	c.mu.Unlock()
-	if left <= 0 {
-		<-c.closed
-		return 0, net.ErrClosed
+func (l *stalledListener) Accept() (net.Conn, error) {
+	c, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
 	}
-	if len(p) > left {
-		p = p[:left]
-	}
-	n, err := c.Conn.Read(p)
+	return &stalledConn{Conn: c, l: l, left: l.limit, changed: make(chan struct{}), closed: make(chan struct{})}, nil
+}
+
+// stalledConn passes its writes until they reach limit bytes and then blocks
+// every later write without progress until the write deadline passes or the
+// connection closes, as a socket write does when the kernel buffers are full.
+// The HTTP/2 write byte timeout ends such a write through the write deadline.
+type stalledConn struct {
+	net.Conn
+	l        *stalledListener
+	mu       sync.Mutex
+	left     int
+	deadline time.Time
+	// changed is closed and replaced when the write deadline changes, so
+	// that a blocked write reads the new deadline.
+	changed chan struct{}
+	closed  chan struct{}
+	once    sync.Once
+}
+
+func (c *stalledConn) Write(p []byte) (int, error) {
 	c.mu.Lock()
-	c.read += n
+	pass := c.left > 0
+	c.left -= len(p)
 	c.mu.Unlock()
-	return n, err
+	if pass {
+		return c.Conn.Write(p)
+	}
+	c.l.blocked.Add(1)
+	for {
+		c.mu.Lock()
+		deadline, changed := c.deadline, c.changed
+		c.mu.Unlock()
+		var expired <-chan time.Time
+		var timer *time.Timer
+		if !deadline.IsZero() {
+			wait := time.Until(deadline)
+			if wait <= 0 {
+				return 0, os.ErrDeadlineExceeded
+			}
+			timer = time.NewTimer(wait)
+			expired = timer.C
+		}
+		select {
+		case <-expired:
+			return 0, os.ErrDeadlineExceeded
+		case <-changed:
+			if timer != nil {
+				timer.Stop()
+			}
+		case <-c.closed:
+			return 0, net.ErrClosed
+		}
+	}
+}
+
+func (c *stalledConn) setWriteDeadline(t time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deadline = t
+	close(c.changed)
+	c.changed = make(chan struct{})
+}
+
+func (c *stalledConn) SetWriteDeadline(t time.Time) error {
+	c.setWriteDeadline(t)
+	return c.Conn.SetWriteDeadline(t)
+}
+
+func (c *stalledConn) SetDeadline(t time.Time) error {
+	c.setWriteDeadline(t)
+	return c.Conn.SetDeadline(t)
 }
 
 func (c *stalledConn) Close() error {
@@ -81,10 +145,10 @@ func sendInFlight() bool {
 func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 	for _, tc := range []struct {
 		name string
-		// stallSocket stops the client from reading its socket, so the
-		// server's socket writes block; otherwise the client reads the
-		// socket but never receives the stream, so that the stream's flow
-		// control window closes.
+		// stallSocket blocks the server's socket writes, as when the
+		// client stops draining its network path; otherwise the client
+		// reads the socket but never receives the stream, so that the
+		// stream's flow control window closes.
 		stallSocket bool
 	}{
 		{name: "flow control window closed", stallSocket: false},
@@ -132,36 +196,31 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 			// A write interrupt cannot end a socket write that the kernel
 			// buffers block; the HTTP/2 write byte timeout does, and the
 			// production server sets it (see newServer in cmd/ownsand-api).
+			// Here it is longer than the idle timeout, so that the idle
+			// timeout closes the relay connection while the socket write
+			// is still blocked. In production that happens when a socket
+			// that drains slowly keeps restarting the write byte timeout.
+			// A shorter one closes the HTTP/2 connection first, and Run
+			// then ends with the canceled request context instead.
 			srv := &http.Server{Handler: RelayAgentWriteInterrupt(handler), Protocols: &protocols,
-				HTTP2: &http.HTTP2Config{WriteByteTimeout: 500 * time.Millisecond}}
-			listener, err := net.Listen("tcp", "127.0.0.1:0")
+				HTTP2: &http.HTTP2Config{WriteByteTimeout: 2 * time.Second}}
+			tcpListener, err := net.Listen("tcp", "127.0.0.1:0")
 			if err != nil {
 				t.Fatal(err)
+			}
+			var listener net.Listener = tcpListener
+			var stalled *stalledListener
+			if tc.stallSocket {
+				stalled = &stalledListener{Listener: tcpListener, limit: 64 << 10}
+				listener = stalled
 			}
 			go func() { _ = srv.Serve(listener) }()
 			t.Cleanup(func() { _ = srv.Close() })
 
-			var clientConn *stalledConn
 			var clientProtocols http.Protocols
 			clientProtocols.SetUnencryptedHTTP2(true)
 			transport := &http.Transport{Protocols: &clientProtocols}
-			if tc.stallSocket {
-				transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-					var d net.Dialer
-					c, err := d.DialContext(ctx, network, addr)
-					if err != nil {
-						return nil, err
-					}
-					clientConn = &stalledConn{Conn: c, limit: 4096, closed: make(chan struct{})}
-					return clientConn, nil
-				}
-			}
-			t.Cleanup(func() {
-				transport.CloseIdleConnections()
-				if clientConn != nil {
-					_ = clientConn.Close()
-				}
-			})
+			t.Cleanup(transport.CloseIdleConnections)
 			client := ownsandv1connect.NewRelayAgentServiceClient(&http.Client{Transport: transport}, "http://"+listener.Addr().String())
 			cs := client.Connect(context.Background())
 			// The first request frame grants the credit for stream 1, so that the
@@ -181,6 +240,9 @@ func TestRelayAgentConnectEndsBlockedSendBeforeReturning(t *testing.T) {
 				}
 				if r.elapsed > 10*time.Second {
 					t.Fatalf("the connection closed after %v", r.elapsed)
+				}
+				if stalled != nil && stalled.blocked.Load() == 0 {
+					t.Fatal("no server socket write blocked")
 				}
 			case <-time.After(15 * time.Second):
 				t.Fatal("the handler did not return for an idle connection with a blocked send")

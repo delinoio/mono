@@ -10,9 +10,9 @@ package ownsand
 import (
 	"context"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -62,11 +62,14 @@ func testTiming() timing {
 }
 
 // loopbackSettingEngine restricts ICE to loopback host candidates, so the
-// tests need no network and no STUN server.
+// tests need no network and no STUN server. It selects candidates by their
+// loopback IP address, not by the interface name: the loopback interface is
+// "lo" on Linux and "lo0" on macOS, but on Windows Go reports its friendly
+// name "Loopback Pseudo-Interface 1", which a name filter does not match.
 func loopbackSettingEngine() *webrtc.SettingEngine {
 	se := &webrtc.SettingEngine{}
 	se.SetIncludeLoopbackCandidate(true)
-	se.SetInterfaceFilter(func(name string) bool { return name == "lo" || strings.HasPrefix(name, "lo") })
+	se.SetIPFilter(func(ip net.IP) bool { return ip.IsLoopback() })
 	se.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
 	se.SetICEMulticastDNSMode(ice.MulticastDNSModeDisabled)
 	return se
