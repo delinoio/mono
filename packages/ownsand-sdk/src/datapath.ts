@@ -194,8 +194,19 @@ export class DataPathSelector {
     }
   }
 
-  /** The peer path failed; the handle moves to the relay. */
+  /**
+   * The peer path failed; the handle moves to the relay. A closed handle is
+   * the exception: closing the session ends its streams with the same
+   * `PeerUnavailableError` as a channel failure, but the close is not a peer
+   * failure. An operation in flight at the close therefore ends with
+   * `OwnSandHandleClosedError` (also on a forced `PEER_TO_PEER` transport),
+   * and the handle stays on peer-to-peer so later operations reject with the
+   * same error.
+   */
   peerFailed(cause: unknown): void {
+    if (this.#closed) {
+      throw new OwnSandHandleClosedError();
+    }
     this.#session?.close();
     this.#session = undefined;
     if (this.#forced === DataPathTransport.PEER_TO_PEER) {
