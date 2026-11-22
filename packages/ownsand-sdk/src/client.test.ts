@@ -24,12 +24,14 @@ import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecResultKind } from "./operations/exec.ts";
 import { type LogRecord } from "./logger.ts";
+import { execBinding, requestDigest } from "./digest.ts";
 import { isUuidV7 } from "./uuidv7.ts";
 import { Hang, LostResponse, ownsandError } from "./testing/fake-api.ts";
 import {
   API_KEY,
   ev,
   execMsg,
+  file,
   ORG,
   SANDBOX,
   setup,
@@ -1102,5 +1104,99 @@ describe("createSandbox", () => {
     const stable = await h.clock.run(sandbox.waitUntilStable());
     expect(stable.state).toBe(SandboxState.RUNNING);
     expect(sandbox.info?.state).toBe(SandboxState.RUNNING);
+  });
+});
+
+describe("sandbox ID canonicalization", () => {
+  const UPPER = SANDBOX.toUpperCase();
+
+  test("stores a UUID v7 in either hex case in lowercase", () => {
+    const h = setup();
+    expect(UPPER).not.toBe(SANDBOX);
+    expect(h.client.sandbox(UPPER).sandboxId).toBe(SANDBOX);
+    expect(h.client.sandbox(SANDBOX).sandboxId).toBe(SANDBOX);
+    const mixed = `${SANDBOX.slice(0, 18)}${SANDBOX.slice(18).toUpperCase()}`;
+    expect(h.client.sandbox(mixed).sandboxId).toBe(SANDBOX);
+  });
+
+  test("keeps a value that is not a UUID v7 unchanged", () => {
+    const h = setup();
+    for (const value of [
+      "My-Sandbox",
+      "",
+      // A UUID v4 is not a UUID v7.
+      "0192F4B6-7C3A-4DEF-8ABC-0123456789AB",
+      // A trailing character is not part of a UUID.
+      `${UPPER}\n`,
+    ]) {
+      expect(h.client.sandbox(value).sandboxId).toBe(value);
+    }
+  });
+
+  test("sends the lowercase ID in unary requests, relay RPCs and the request digest", async () => {
+    const h = setup();
+    h.api.unary(SandboxService, "GetSandbox", (req) => ({
+      sandbox: { sandboxId: req.sandboxId, state: SandboxState.RUNNING },
+    }));
+    h.api.stream(RelayService, "Exec", function* (req) {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.started(req.execId));
+      yield execMsg(ev.exited(0));
+    });
+    const sandbox = h.client.sandbox(UPPER);
+    await sandbox.get();
+    const handle = sandbox.exec({ command: ["/bin/true"] });
+    await h.clock.run(handle.wait());
+
+    expect((h.api.callsOf("GetSandbox")[0]!.request as any).sandboxId).toBe(
+      SANDBOX,
+    );
+    const auth = h.api.callsOf("AuthorizeRelay")[0]!.request as any;
+    const exec = h.api.callsOf("Exec")[0]!.request as any;
+    expect(auth.sandboxId).toBe(SANDBOX);
+    expect(exec.sandboxId).toBe(SANDBOX);
+    // The digest equals the digest of the same request with the lowercase ID.
+    expect(Buffer.from(auth.requestDigest)).toEqual(
+      Buffer.from(requestDigest(execBinding(exec))),
+    );
+    expect(Buffer.from(auth.requestDigest)).toEqual(
+      Buffer.from(requestDigest(execBinding({ ...exec, sandboxId: SANDBOX }))),
+    );
+  });
+
+  test("sends the lowercase ID in file transfer relay requests", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "ReadFile", function* () {
+      yield file.accepted();
+      yield file.chunk(0, "x");
+      yield file.end(1);
+    });
+    h.api.unary(RelayService, "WriteFile", (req) => ({
+      writeId: req.writeId,
+      offset: req.offset,
+      length: BigInt(req.data.length),
+      finished: true,
+      sizeBytes: req.finish?.sizeBytes ?? 0n,
+    }));
+    const sandbox = h.client.sandbox(UPPER);
+    await h.clock.run(sandbox.readFileBytes("/f"));
+    await h.clock.run(sandbox.writeFile("/f", "hello"));
+    for (const name of ["ReadFile", "WriteFile"]) {
+      expect((h.api.callsOf(name)[0]!.request as any).sandboxId).toBe(SANDBOX);
+    }
+    for (const call of h.api.callsOf("AuthorizeRelay")) {
+      expect((call.request as any).sandboxId).toBe(SANDBOX);
+    }
+  });
+
+  test("sends a value that is not a UUID v7 as given", async () => {
+    const h = setup();
+    h.api.unary(SandboxService, "GetSandbox", (req) => ({
+      sandbox: { sandboxId: req.sandboxId, state: SandboxState.RUNNING },
+    }));
+    await h.client.sandbox("My-Sandbox").get();
+    expect((h.api.callsOf("GetSandbox")[0]!.request as any).sandboxId).toBe(
+      "My-Sandbox",
+    );
   });
 });

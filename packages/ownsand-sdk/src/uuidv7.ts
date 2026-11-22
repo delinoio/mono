@@ -51,6 +51,20 @@ export function isUuidV7(value: string): boolean {
   return UUID_V7_PATTERN.test(value);
 }
 
+const UUID_V7_ANY_CASE_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+/**
+ * Returns the canonical lowercase text form of a UUID v7 that is spelled in
+ * either hex case, and the value unchanged when it is not a UUID v7. The
+ * control plane and the agent spell every UUID in lowercase, so a caller
+ * named identifier must be lowercased before it reaches a request, a relay
+ * request digest or a data channel frame.
+ */
+export function canonicalizeUuidV7(value: string): string {
+  return UUID_V7_ANY_CASE_PATTERN.test(value) ? value.toLowerCase() : value;
+}
+
 /** Returns the Unix millisecond timestamp of a UUID v7. */
 export function uuidV7TimestampMs(value: string): number {
   if (!isUuidV7(value)) {

@@ -126,6 +126,24 @@ describe("peer-to-peer data path", () => {
     expect(rtc.frames[1]!.streamId).toBe(2n);
   });
 
+  test("sends the lowercase sandbox ID in frames and OpenSession for an uppercase handle", async () => {
+    const { h, rtc } = p2pSetup((frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    });
+    const sandbox = h.client.sandbox(SANDBOX.toUpperCase());
+    expect(sandbox.sandboxId).toBe(SANDBOX);
+    await h.clock.run(sandbox.run({ command: ["true"] }));
+    const open = h.api.callsOf("OpenSession")[0]!.request as any;
+    expect(open.sandboxId).toBe(SANDBOX);
+    expect(rtc.frames).not.toHaveLength(0);
+    for (const frame of rtc.frames) {
+      expect(frame.sandboxId).toBe(SANDBOX);
+    }
+  });
+
   test("a caller aborted while the shared session setup is pending sends no frame", async () => {
     const { h, rtc } = p2pSetup((frame, peer) => {
       if (frame.kind === DataFrameKind.EXEC_REQUEST) {

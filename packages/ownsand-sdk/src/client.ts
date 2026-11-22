@@ -58,7 +58,7 @@ import {
 import { type OperationContext } from "./relay/context.ts";
 import { backoffMs, FixedBudget } from "./relay/recovery.ts";
 import { Sandbox } from "./sandbox.ts";
-import { UuidV7Generator } from "./uuidv7.ts";
+import { canonicalizeUuidV7, UuidV7Generator } from "./uuidv7.ts";
 import {
   durationFromMs,
   validateLabels,
@@ -226,7 +226,10 @@ export class OwnSandClient {
       activity: this.#activity,
       logger: this.#logger,
       organizationId,
-      sandboxId,
+      // A UUID v7 in either hex case is stored in lowercase, the spelling of
+      // the control plane and the agent; any other value is kept as given
+      // and request validation reports it.
+      sandboxId: canonicalizeUuidV7(sandboxId),
     };
     return new Sandbox(ctx, this.snapshots, this.#Peer, this.#forced, info);
   }
