@@ -50,7 +50,8 @@ func logtoScopes(extra string) []string {
 // login runs the Logto device authorization flow and stores the tokens.
 func (a *app) login(ctx context.Context, args []string) error {
 	fs := a.newFlags("login")
-	if _, err := a.parse(fs, args); err != nil {
+	// login takes no operands: reject any before the sign-in starts.
+	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
 	if a.getenv(ownsand.EnvAPIKey) != "" {
@@ -110,7 +111,8 @@ func (a *app) login(ctx context.Context, args []string) error {
 
 func (a *app) logout(args []string) error {
 	fs := a.newFlags("logout")
-	if _, err := a.parse(fs, args); err != nil {
+	// logout takes no operands: reject any before the store is touched.
+	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
 	st, err := a.store()
