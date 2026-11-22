@@ -158,6 +158,13 @@ const relayDigestVectors =
 // package sources that the `.go` selector would catch).
 const goTestdata = /^(?:go|cmds|internal|servers)\/(?:.+\/)?testdata\//;
 
+// The development launcher of ownsand-api. Its test
+// TestLauncherForwardsSIGTERMToServerOnGeneratedDatabase in
+// `servers/ownsand-api/cmd/ownsand-api` runs the launcher against a Go-built
+// server, so a change to the launcher alone must select the Go checks. The
+// launcher test (`dev.test.mjs`) and the accounts-api launcher run no Go test.
+const ownsandApiLauncher = "servers/ownsand-api/scripts/dev.mjs";
+
 // Go sources, module files, protobuf schema inputs and the inputs of the
 // OwnSand end-to-end suite select the repository Go checks.
 export function isGoInput(path) {
@@ -171,6 +178,7 @@ export function isGoInput(path) {
     path.startsWith(ownsandSdkPackage) ||
     goMigrations.some((prefix) => path.startsWith(prefix)) ||
     path === relayDigestVectors ||
+    path === ownsandApiLauncher ||
     goTestdata.test(path)
   );
 }
