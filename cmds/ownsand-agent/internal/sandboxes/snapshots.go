@@ -173,6 +173,12 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 		m.logger.Error("snapshot failed", "snapshot_id", id, "error", err)
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
 	}
+	// A runtime can return success after ctx ended, for example when it
+	// ignores the cancellation of its disk copy. The command result can no
+	// longer reach the control plane, so the capture is not published.
+	if err := ctx.Err(); err != nil {
+		return nil, m.abortCanceledSnapshotCreate(id, dir, err)
+	}
 	if m.snapshotDeletedDuringCreate(pending) {
 		return nil, m.abortSnapshotCreate(id, dir)
 	}
@@ -205,6 +211,17 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 		_ = m.st.DeleteSnapshot(id)
 		return nil, m.abortedSnapshotError(id)
 	}
+	// The same critical section checks the cancellation, so that a capture
+	// whose context ended while the record was saved is never published.
+	if err := ctx.Err(); err != nil {
+		delete(m.pending, id)
+		m.mu.Unlock()
+		published = true // The pending entry is already removed.
+		if derr := m.st.DeleteSnapshot(id); derr != nil {
+			m.logger.Error("canceled snapshot could not be removed", "snapshot_id", id, "error", derr)
+		}
+		return nil, m.canceledSnapshotError(id, err)
+	}
 	m.snapshots[snap.rec.SnapshotID] = snap
 	delete(m.pending, id)
 	m.mu.Unlock()
@@ -229,6 +246,21 @@ func (m *Manager) abortSnapshotCreate(id, dir string) error {
 		m.logger.Error("aborted snapshot content could not be removed", "snapshot_id", id, "error", err)
 	}
 	return m.abortedSnapshotError(id)
+}
+
+// abortCanceledSnapshotCreate removes the record and content of a capture
+// whose context ended before publication and returns the error of the
+// create. The pending entry is removed by the caller's deferred cleanup.
+func (m *Manager) abortCanceledSnapshotCreate(id, dir string, cause error) error {
+	if err := removeDirIfExists(dir); err != nil {
+		m.logger.Error("canceled snapshot content could not be removed", "snapshot_id", id, "error", err)
+	}
+	return m.canceledSnapshotError(id, cause)
+}
+
+func (m *Manager) canceledSnapshotError(id string, cause error) error {
+	m.logger.Info("snapshot create aborted by a canceled command", "snapshot_id", id, "error", cause)
+	return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot create was canceled")
 }
 
 func (m *Manager) abortedSnapshotError(id string) error {

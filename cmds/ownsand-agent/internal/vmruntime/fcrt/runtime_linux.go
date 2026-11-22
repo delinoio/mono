@@ -379,7 +379,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if spec.Snapshot != nil {
 		src = filepath.Join(spec.Snapshot.Dir, snapDisk)
 	}
-	if err := copyDisk(src, filepath.Join(spec.Dir, diskFile)); err != nil {
+	if err := copyDisk(ctx, src, filepath.Join(spec.Dir, diskFile)); err != nil {
 		cleanup()
 		return nil, fmt.Errorf("fcrt: prepare disk: %w", err)
 	}
@@ -654,7 +654,7 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (inf
 		}
 		info.HasMemoryState = true
 	}
-	if err := copyDisk(filepath.Join(v.dir, diskFile), filepath.Join(dir, snapDisk)); err != nil {
+	if err := copyDisk(ctx, filepath.Join(v.dir, diskFile), filepath.Join(dir, snapDisk)); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
 	for _, name := range []string{snapState, snapMemory, snapDisk} {
@@ -914,8 +914,13 @@ func (r *Runtime) Close() error {
 }
 
 // copyDisk copies a disk image, with a reflink where the file system
-// supports it.
-func copyDisk(src, dst string) error {
+// supports it. A copy that is not a reflink runs in chunks and ends at the
+// next chunk boundary once ctx ends. A failed or canceled copy removes its
+// partial destination file.
+func copyDisk(ctx context.Context, src, dst string) (err error) {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -925,14 +930,39 @@ func copyDisk(src, dst string) error {
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if err != nil {
+			os.Remove(dst)
+		}
+	}()
 	if unix.IoctlFileClone(int(out.Fd()), int(in.Fd())) == nil {
 		return out.Close()
 	}
-	if _, err := io.Copy(out, in); err != nil {
+	if _, err := io.Copy(out, &ctxReader{ctx: ctx, r: in}); err != nil {
 		out.Close()
 		return err
 	}
 	return out.Close()
+}
+
+// diskCopyChunk bounds the work between two cancellation checks of copyDisk.
+const diskCopyChunk = 4 << 20
+
+// ctxReader reads from r in chunks of at most diskCopyChunk bytes and fails
+// with the context error once ctx ends.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	if len(p) > diskCopyChunk {
+		p = p[:diskCopyChunk]
+	}
+	return c.r.Read(p)
 }
 
 func tool(name string) string {

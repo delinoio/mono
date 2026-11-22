@@ -10,8 +10,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -192,11 +194,21 @@ func (r *Runtime) vmDir(id string) string { return filepath.Join(r.opts.VMsDir, 
 
 func systemID(sandboxID string) string { return systemIDPrefix + sandboxID }
 
-var procCopyFileW = windows.NewLazySystemDLL("kernel32.dll").NewProc("CopyFileW")
+var procCopyFileExW = windows.NewLazySystemDLL("kernel32.dll").NewProc("CopyFileExW")
 
-// copyFile copies src to dst with CopyFileW, which clones blocks on ReFS
-// volumes, and makes dst writable.
-func copyFile(src, dst string) error {
+// copyFileFailIfExists is COPY_FILE_FAIL_IF_EXISTS of CopyFileExW.
+const copyFileFailIfExists = 0x1
+
+// copyFile copies src to dst with CopyFileExW, which clones blocks on ReFS
+// volumes, and makes dst writable. The copy ends early with the error of ctx
+// once ctx ends: CopyFileExW polls a cancel flag that a goroutine sets when
+// ctx ends, and the system deletes the partial destination file when the
+// copy is canceled. A caller whose copy must not be interrupted passes
+// context.Background().
+func copyFile(ctx context.Context, src, dst string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	_ = os.Remove(dst)
 	s, err := windows.UTF16PtrFromString(src)
 	if err != nil {
@@ -206,9 +218,34 @@ func copyFile(src, dst string) error {
 	if err != nil {
 		return err
 	}
-	if ok, _, e := procCopyFileW.Call(uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(d)), 1); ok == 0 {
+	// cancel is the BOOL that CopyFileExW polls. It lives on the heap, because
+	// the goroutine below writes it while the call runs.
+	cancel := new(int32)
+	copying := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-ctx.Done():
+			atomic.StoreInt32(cancel, 1)
+		case <-copying:
+		}
+	}()
+	ok, _, e := procCopyFileExW.Call(uintptr(unsafe.Pointer(s)), uintptr(unsafe.Pointer(d)), 0, 0, uintptr(unsafe.Pointer(cancel)), copyFileFailIfExists)
+	close(copying)
+	<-watcherDone
+	runtime.KeepAlive(cancel)
+	if ok == 0 {
+		if errors.Is(e, windows.ERROR_REQUEST_ABORTED) && ctx.Err() != nil {
+			// The system removes the partial file; remove it again in case
+			// the abort left it behind.
+			_ = os.Remove(dst)
+			return ctx.Err()
+		}
 		return fmt.Errorf("hcsrt: copy %s: %w", src, e)
 	}
+	// A copy that completed after ctx ended is kept: the caller checks ctx
+	// at its own publication boundary.
 	return os.Chmod(dst, 0o600)
 }
 
@@ -379,7 +416,9 @@ func (r *Runtime) prepareLinuxDisk(spec vmruntime.Spec) (vmSpec, int64, error) {
 		src, hasFooter = filepath.Join(spec.Snapshot.Dir, snapDisk), true
 	}
 	disk := filepath.Join(spec.Dir, diskFile)
-	if err := copyFile(src, disk); err != nil {
+	// A create is bound to the agent lifetime, not to a channel, so its copy
+	// is not interrupted.
+	if err := copyFile(context.Background(), src, disk); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
 	size, err := makeFixedVHD(disk, spec.Resources.GetDiskGib()<<30, hasFooter)
@@ -607,20 +646,21 @@ func (r *Runtime) Snapshot(ctx context.Context, m vmruntime.VM, dir string) (vmr
 	return vmruntime.SnapshotWithPause(r.logger, v.id, wasPaused,
 		func() error { return r.Pause(ctx, m) },
 		func() error { return r.Resume(context.Background(), m) },
-		func() (vmruntime.SnapshotInfo, error) { return r.captureDisk(v, dir) })
+		func() (vmruntime.SnapshotInfo, error) { return r.captureDisk(ctx, v, dir) })
 }
 
-// captureDisk copies the disk of the paused VM v into dir.
-func (r *Runtime) captureDisk(v *vm, dir string) (vmruntime.SnapshotInfo, error) {
+// captureDisk copies the disk of the paused VM v into dir. The copy ends
+// early when ctx ends; the resume of the VM does not depend on ctx.
+func (r *Runtime) captureDisk(ctx context.Context, v *vm, dir string) (vmruntime.SnapshotInfo, error) {
 	start := time.Now()
 	src, dst := filepath.Join(v.dir, diskFile), filepath.Join(dir, snapDisk)
 	if v.guestOS == ownsandv1.GuestOs_GUEST_OS_WINDOWS {
 		src, dst = filepath.Join(v.dir, windowsDiskFile), filepath.Join(dir, snapWindowsDisk)
-		if err := copyFile(filepath.Join(v.dir, images.MetadataFile), filepath.Join(dir, images.MetadataFile)); err != nil {
+		if err := copyFile(ctx, filepath.Join(v.dir, images.MetadataFile), filepath.Join(dir, images.MetadataFile)); err != nil {
 			return vmruntime.SnapshotInfo{}, err
 		}
 	}
-	if err := copyFile(src, dst); err != nil {
+	if err := copyFile(ctx, src, dst); err != nil {
 		return vmruntime.SnapshotInfo{}, err
 	}
 	st, err := os.Stat(dst)
