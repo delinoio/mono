@@ -176,7 +176,9 @@ func (s *Service) applyPaddleSubscription(ctx context.Context, tx pgx.Tx, acct *
 
 // activateFromPayment marks the subscription ACTIVE after a verified
 // subscription payment, in case the transaction webhook arrives before the
-// subscription webhook. It does not replace another current subscription.
+// subscription webhook. It does not replace another current subscription,
+// and while a new checkout is open it ignores the payment of any transaction
+// but the checkout transaction.
 func (s *Service) activateFromPayment(ctx context.Context, tx pgx.Tx, acct *accountState, txn paddle.Transaction, now time.Time) error {
 	if txn.SubscriptionID == "" {
 		return nil
@@ -187,6 +189,18 @@ func (s *Service) activateFromPayment(ctx context.Context, tx pgx.Tx, acct *acco
 	current, err := LoadSubscription(ctx, tx, acct.ID, true)
 	if err != nil {
 		return err
+	}
+	if current.Status == SubscriptionPending && current.PaddleSubscriptionID == "" &&
+		current.CheckoutTransactionID != "" && txn.ID != current.CheckoutTransactionID {
+		// A late payment of an earlier subscription while a new checkout is
+		// open. Only the payment of the open checkout transaction completes
+		// it. The credit grant and the recorded subscription stay.
+		s.logger.InfoContext(ctx, "billing_subscription_payment_ignored",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", txn.SubscriptionID),
+			slog.String("paddle_transaction_id", txn.ID),
+			slog.String("checkout_transaction_id", current.CheckoutTransactionID))
+		return nil
 	}
 	if current.PaddleSubscriptionID != "" && current.PaddleSubscriptionID != txn.SubscriptionID && current.Manageable() {
 		return nil
