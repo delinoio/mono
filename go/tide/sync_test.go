@@ -470,6 +470,36 @@ func TestDownloadResumeKeepsReadID(t *testing.T) {
 	}
 }
 
+// TestSyncArchiveRejectsChangedFiles checks that the archive fails when a
+// file changed after it was hashed: same size with other bytes, or more
+// bytes.
+func TestSyncArchiveRejectsChangedFiles(t *testing.T) {
+	needPOSIX(t)
+	for name, content := range map[string]string{"same size": "bbbb", "grown": "aaaaa", "shrunk": "aaa"} {
+		dir := newRepo(t, map[string]string{"f.txt": "aaaa"}, nil, "")
+		local, err := listLocalFiles(context.Background(), dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "f.txt"), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		var b bytes.Buffer
+		if err := writeSyncArchive(context.Background(), &b, dir, local.files, false); err == nil || !strings.Contains(err.Error(), "changed during the sync") {
+			t.Errorf("%s: archive of a changed file = %v", name, err)
+		}
+	}
+	dir := newRepo(t, map[string]string{"f.txt": "aaaa"}, nil, "")
+	local, err := listLocalFiles(context.Background(), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b bytes.Buffer
+	if err := writeSyncArchive(context.Background(), &b, dir, local.files, false); err != nil {
+		t.Fatalf("archive of an unchanged file = %v", err)
+	}
+}
+
 // tarOf builds an archive from headers; regular entries get body content.
 func tarOf(t *testing.T, entries ...*tar.Header) *bytes.Reader {
 	t.Helper()

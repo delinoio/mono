@@ -5,6 +5,8 @@ package tide
 import (
 	"archive/tar"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,7 +22,9 @@ import (
 // slash-separated relative names, owner 0). Regular files carry their mode
 // (0644 or 0755); symbolic links are link entries unless skipLinks is set.
 // The content of each file is read again and must still have the hashed
-// size, so that the manifest describes what the guest receives.
+// size and SHA-256, so that the manifest describes what the guest
+// receives. A file that changed since it was hashed fails the archive, and
+// so the upload, before the guest can extract it.
 func writeSyncArchive(ctx context.Context, w io.Writer, root string, files []localFile, skipLinks bool) error {
 	tw := tar.NewWriter(w)
 	dirs := map[string]bool{}
@@ -63,11 +67,22 @@ func writeSyncArchive(ctx context.Context, w io.Writer, root string, files []loc
 			if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: f.rel, Size: f.entry.Size, Mode: mode, ModTime: now, Format: tar.FormatPAX}); err != nil {
 				return err
 			}
-			n, err := io.Copy(tw, io.LimitReader(file, f.entry.Size))
+			h := sha256.New()
+			n, err := io.Copy(io.MultiWriter(tw, h), io.LimitReader(file, f.entry.Size))
 			if err != nil {
 				return err
 			}
-			if n != f.entry.Size {
+			changed := n != f.entry.Size || hex.EncodeToString(h.Sum(nil)) != f.entry.SHA256
+			if !changed {
+				// A file that grew has more bytes after the hashed size.
+				var extra [1]byte
+				m, err := file.Read(extra[:])
+				if err != nil && !errors.Is(err, io.EOF) {
+					return err
+				}
+				changed = m > 0
+			}
+			if changed {
 				return fmt.Errorf("tide: %s changed during the sync; sync again", f.rel)
 			}
 			return nil
