@@ -12,7 +12,7 @@
     "build": "rspress build",
     "dev": "portless run --prefix=",
     "dev:app": "rspress dev",
-    "preview": "rspress preview",
+    "preview": "node ../../scripts/dev/rspress-preview.mjs",
     "typecheck": "tsc --noEmit",
     "test:e2e": "e2e run"
   },
