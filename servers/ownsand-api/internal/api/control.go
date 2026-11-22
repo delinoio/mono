@@ -81,6 +81,32 @@ func (c *Control) LeaseAcquired(ctx context.Context) {
 	c.mu.Unlock()
 }
 
+// initCursor sets an unset cursor to the newest event for the event processor
+// batch that copied generation gen. Unlike LeaseAcquired it is not a lease
+// transition: it reads the newest event ID before it takes the lock and
+// stores it only when no transition ran since the batch copied gen and the
+// cursor is still unset, and it never increments cursorGen. A read that
+// started in an earlier lease period therefore cannot replace the cursor that
+// a later LeaseAcquired stored, or set a cursor that a later LeaseLost
+// cleared. A failed read leaves the cursor and the generation unchanged and
+// the event processor repeats it while the lease is held.
+func (c *Control) initCursor(ctx context.Context, gen uint64) {
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	id, err := c.latestID(ctx)
+	if err != nil {
+		c.S.Logger.Warn("control_event_cursor_failed", slog.Any("error", err))
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cursorGen != gen || c.cursor >= 0 {
+		c.S.Logger.Info("control_event_batch_superseded", slog.Int64("cursor", c.cursor))
+		return
+	}
+	c.cursor = id
+}
+
 // LeaseLost closes every agent channel; agents reconnect to the new holder.
 func (c *Control) LeaseLost() {
 	c.S.Hub.CloseAll(errLeaseLost)
@@ -124,7 +150,8 @@ func (c *Control) runEvents(ctx context.Context) {
 	}
 }
 
-// processEvents delivers the events after the cursor. The cursor belongs to
+// processEvents delivers the events after the cursor; an unset cursor is
+// first initialized by initCursor. The cursor belongs to
 // the lease period in which the batch started: when LeaseLost or
 // LeaseAcquired runs while the batch is in flight, the batch stops before
 // its next read, its next delivery and its cursor store, so it neither
@@ -135,7 +162,7 @@ func (c *Control) processEvents(ctx context.Context) {
 	cursor, gen := c.cursor, c.cursorGen
 	c.mu.Unlock()
 	if cursor < 0 {
-		c.LeaseAcquired(ctx)
+		c.initCursor(ctx, gen)
 		return
 	}
 	for {
