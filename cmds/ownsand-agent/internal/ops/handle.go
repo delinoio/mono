@@ -13,6 +13,7 @@ import (
 	"connectrpc.com/connect"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-guest/execlog"
 	"github.com/delinoio/mono/go/ownsand/datapath"
 	"github.com/delinoio/mono/go/ownsand/relaybinding"
@@ -346,9 +347,19 @@ func (h *handler) streamExec(ctx context.Context, op *execOp, stdoutOff, stderrO
 // forwardExec runs the exec in the guest helper and applies its events to
 // the exec log. It attaches again from the kept offsets after a guest
 // connection loss.
+//
+// The command starts at most once. The start request is the only request that
+// can start the command, so the next attempt sends it again only when the
+// previous attempt provably delivered nothing: the dial to the guest helper
+// failed (guestclient.DialError), or the sandbox had no guest client. Any
+// other failure after the start request may have been written (an error after
+// a successful send, a lost response, a restarted helper) makes every later
+// attempt an attach. An attach to an exec that the helper does not know ends
+// the exec with a failure and never starts the command.
 func (d *Dispatcher) forwardExec(ctx context.Context, op *execOp, req *ownsandv1.ExecRequest) {
 	defer d.sb.Touch(op.sandboxID)
 	logger := d.logger.With("exec_id", req.GetExecId(), "sandbox_id", op.sandboxID)
+	startMaybeSent := false
 	for attempt := 0; ; attempt++ {
 		if op.log.Final() != nil || ctx.Err() != nil {
 			return
@@ -365,7 +376,7 @@ func (d *Dispatcher) forwardExec(ctx context.Context, op *execOp, req *ownsandv1
 			continue
 		}
 		var first *ownsandv1.DataFrame
-		if attempt == 0 {
+		if !startMaybeSent {
 			first = datapath.MustNewFrame(guestStreamID, op.sandboxID, req)
 		} else {
 			so, se := op.log.Offsets()
@@ -379,8 +390,17 @@ func (d *Dispatcher) forwardExec(ctx context.Context, op *execOp, req *ownsandv1
 			logger.Info("exec ended in the guest")
 			return
 		}
+		var dialErr *guestclient.DialError
+		notDelivered := errors.As(err, &dialErr)
+		if !startMaybeSent && !notDelivered {
+			startMaybeSent = true
+		}
 		if err != nil && ctx.Err() == nil {
-			logger.Warn("guest exec stream lost; attaching again", "error", err, "attempt", attempt)
+			if notDelivered {
+				logger.Warn("guest connection failed before the request was sent; sending it again", "error", err, "attempt", attempt)
+			} else {
+				logger.Warn("guest exec stream lost; attaching again", "error", err, "attempt", attempt, "start_maybe_sent", startMaybeSent)
+			}
 		}
 	}
 }
@@ -395,7 +415,13 @@ type guestStream interface {
 func (d *Dispatcher) runGuestExec(ctx context.Context, s guestStream, first *ownsandv1.DataFrame, op *execOp) (bool, error) {
 	defer s.CloseResponse()
 	if err := s.Send(&ownsandv1.ServeRequest{Frame: first}); err != nil {
-		return false, err
+		if !errors.Is(err, io.EOF) {
+			return false, err
+		}
+		// Connect reports a failed call as io.EOF from Send and keeps the
+		// real error for Receive, so the caller can tell a failed dial from
+		// a lost response. Receive below returns that error, or a response
+		// that still arrived.
 	}
 	for {
 		resp, err := s.Receive()
