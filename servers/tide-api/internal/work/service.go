@@ -13,6 +13,7 @@ import (
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
+	"google.golang.org/protobuf/proto"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -379,7 +380,11 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 		return stream.Send(m)
 	}
 	sent := map[string]int64{}
-	var cursor int64
+	// removable holds the sent runners that the dispatcher may still remove
+	// without a terminal state: a CREATING runner without a sandbox, whose
+	// CreateSandbox OwnSand rejected for capacity (dropRunner).
+	removable := map[string]*tidev1.Runner{}
+	var cursor, removed int64
 	emit := func(rows []watchRow) error {
 		for _, r := range rows {
 			if sent[r.id] >= r.seq {
@@ -387,7 +392,56 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 			}
 			sent[r.id] = r.seq
 			cursor = max(cursor, r.seq)
+			if run := r.msg.GetRunner(); run != nil {
+				if run.GetState() == runCreating && run.GetOwnsandSandboxId() == "" {
+					removable[run.GetRunnerId()] = run
+				} else {
+					delete(removable, run.GetRunnerId())
+				}
+			}
 			if err := send(r.msg); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// emitRemoved sends a sent runner whose row is gone once more as
+	// DELETED with CLEAN_UP, so a client drops it: the stream has no
+	// removal event.
+	emitRemoved := func() error {
+		if len(removable) == 0 {
+			return nil
+		}
+		ids := make([]string, 0, len(removable))
+		for id := range removable {
+			ids = append(ids, id)
+		}
+		rows, err := s.DB.Pool.Query(ctx, "SELECT runner_id::text FROM runners WHERE runner_id = ANY($1::uuid[])", ids)
+		if err != nil {
+			return err
+		}
+		exists := map[string]bool{}
+		for rows.Next() {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return err
+			}
+			exists[id] = true
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, id := range ids {
+			if exists[id] {
+				continue
+			}
+			gone := proto.Clone(removable[id]).(*tidev1.Runner)
+			gone.State, gone.EndReason, gone.EndedAt = runDeleted, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, api.Timestamp(s.NowUTC())
+			delete(removable, id)
+			removed++
+			if err := send(&tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Runner{Runner: gone}}); err != nil {
 				return err
 			}
 		}
@@ -431,12 +485,18 @@ func (h *Handler) WatchQueue(ctx context.Context, req *connect.Request[tidev1.Wa
 			}
 			return s.Internal(ctx, "watch queue", err)
 		}
-		before := len(sent)
+		before, beforeRemoved := len(sent), removed
 		prevCursor := cursor
 		if err := emit(rows); err != nil {
 			return err
 		}
-		if cursor != prevCursor || len(sent) != before {
+		if err := emitRemoved(); err != nil {
+			if ctx.Err() != nil {
+				continue
+			}
+			return s.Internal(ctx, "watch queue", err)
+		}
+		if cursor != prevCursor || len(sent) != before || removed != beforeRemoved {
 			lastSend = time.Now()
 		}
 		for id, seq := range sent {

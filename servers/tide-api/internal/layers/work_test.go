@@ -468,3 +468,46 @@ func TestStalledCreateSandbox(t *testing.T) {
 		t.Fatalf("%d sandboxes", n)
 	}
 }
+
+// TestWatchQueueRemovedRunner: a CREATING runner that the dispatcher removes
+// after OwnSand had no capacity is sent once more as DELETED, so a watch
+// does not keep it.
+func TestWatchQueueRemovedRunner(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	// OwnSand answers only after the watch sent the runner (not at
+	// CreateTimeout, which could come before the watch reads the change).
+	release := make(chan struct{})
+	w.fake.SetCreateHook(func(context.Context) error {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return connect.NewWireError(connect.CodeUnavailable, errors.New("no device has free capacity"))
+	})
+	watch, err := w.env.User(w.org.Member).Work.WatchQueue(ctx, connect.NewRequest(&tidev1.WatchQueueRequest{OrganizationId: w.org.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for watch.Receive() && watch.Msg().GetSnapshotComplete() == nil {
+	}
+	w.createSession(t, w.env.User(w.org.Member), profileID)
+	runnerID := ""
+	for runnerID == "" && watch.Receive() {
+		if r := watch.Msg().GetRunner(); r != nil && r.GetState() == tidev1.RunnerState_RUNNER_STATE_CREATING {
+			runnerID = r.GetRunnerId()
+		}
+	}
+	if runnerID == "" {
+		t.Fatalf("no CREATING runner: %v", watch.Err())
+	}
+	close(release)
+	for watch.Receive() {
+		if r := watch.Msg().GetRunner(); r != nil && r.GetRunnerId() == runnerID && r.GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED {
+			return
+		}
+	}
+	t.Fatalf("the removed runner was not sent as DELETED: %v", watch.Err())
+}
