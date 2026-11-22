@@ -103,7 +103,7 @@ func (r *Resend) Send(ctx context.Context, msg Message) error {
 			slog.String("kind", string(msg.Kind)),
 			slog.String("billing_account_id", msg.BillingAccountID),
 			slog.Int64("duration_ms", time.Since(start).Milliseconds()),
-			slog.String("error_kind", errorKind(err)))
+			slog.String("error_kind", errorKind(ctx, err)))
 		return fmt.Errorf("send %s email: %w", msg.Kind, errSendFailed)
 	}
 	r.logger.InfoContext(ctx, "billing_email_sent",
@@ -119,18 +119,27 @@ func (r *Resend) Send(ctx context.Context, msg Message) error {
 var errSendFailed = errors.New("email delivery failed")
 
 // errorKind classifies a Resend error for the log. The log never carries the
-// provider message, because a validation message can quote the recipient
-// address.
-func errorKind(err error) string {
+// provider message, because a validation message can quote the address.
+//
+// The canceled kind follows the caller's context, not the error type:
+// http.Client.Do wraps every failure, including a context cancellation, in
+// *url.Error, and an http.Client.Timeout expiry also satisfies
+// errors.Is(err, context.DeadlineExceeded). Only a done send context means
+// that the caller canceled the send; a client timeout with a live context is a
+// network failure. A context that ends just after a genuine network failure
+// is reported as canceled.
+func errorKind(ctx context.Context, err error) string {
 	var rateLimit *resend.RateLimitError
 	var netErr *url.Error
 	switch {
 	case errors.As(err, &rateLimit):
+		// A received 429 is a provider answer, even when the context ended
+		// afterwards.
 		return "rate_limited"
+	case ctx.Err() != nil:
+		return "canceled"
 	case errors.As(err, &netErr):
 		return "network"
-	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
-		return "canceled"
 	default:
 		// A rejected request or a provider failure; Resend returns its
 		// message as plain error text.
@@ -157,6 +166,8 @@ type Fake struct {
 	mu       sync.Mutex
 	messages []Message
 	err      error
+	// errFor holds the per-recipient errors, keyed by the To address.
+	errFor map[string]error
 }
 
 // NewFake returns an empty fake sender.
@@ -169,6 +180,9 @@ func (f *Fake) Send(_ context.Context, msg Message) error {
 	if f.err != nil {
 		return f.err
 	}
+	if err := f.errFor[msg.To]; err != nil {
+		return err
+	}
 	f.messages = append(f.messages, msg)
 	return nil
 }
@@ -179,6 +193,22 @@ func (f *Fake) SetErr(err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.err = err
+}
+
+// SetErrFor makes every Send to the address to fail with err without
+// recording the message, while other recipients still succeed; nil restores
+// normal delivery for that address. SetErr takes precedence.
+func (f *Fake) SetErrFor(to string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err == nil {
+		delete(f.errFor, to)
+		return
+	}
+	if f.errFor == nil {
+		f.errFor = map[string]error{}
+	}
+	f.errFor[to] = err
 }
 
 // Messages returns a copy of the recorded messages in send order.

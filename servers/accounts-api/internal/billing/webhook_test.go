@@ -243,6 +243,93 @@ func TestEmailDeliveryRetry(t *testing.T) {
 	}
 }
 
+// emailsTo counts the recorded emails of one recipient address.
+func emailsTo(f *fixture, addr string) int {
+	n := 0
+	for _, m := range f.email.Messages() {
+		if m.To == addr {
+			n++
+		}
+	}
+	return n
+}
+
+// TestEmailDeliveryContinuesAfterRecipientFailure pins that one recipient
+// that keeps failing does not keep a later recipient from getting the
+// email, and that the notification is still abandoned after the retry
+// budget.
+func TestEmailDeliveryContinuesAfterRecipientFailure(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	// Recipients sort by user ID: "admin-N" comes before "owner-N".
+	var adminID, ownerID string
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT
+		(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'admin'),
+		(SELECT user_id FROM billing_account_members WHERE billing_account_id = $1 AND role = 'owner')`,
+		acct).Scan(&adminID, &ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if adminID >= ownerID {
+		t.Fatalf("admin %q must sort before owner %q", adminID, ownerID)
+	}
+	adminAddr, ownerAddr := adminID+"@example.com", ownerID+"@example.com"
+	f.grant(acct, LedgerManualTopUp, 25*usd)
+	f.deduct(acct, 20*usd)
+
+	// The first sorted recipient always fails, the second succeeds.
+	f.email.SetErrFor(adminAddr, errSendTest)
+	for i := 0; i < notificationMaxAttempts+2; i++ {
+		if err := f.s.DeliverNotifications(ctx()); err != nil {
+			t.Fatal(err)
+		}
+		f.clock.Advance(time.Hour)
+	}
+	if got := emailsTo(f, ownerAddr); got != 1 {
+		t.Fatalf("emails to the second recipient = %d, want exactly 1", got)
+	}
+	if got := emailsTo(f, adminAddr); got != 0 {
+		t.Fatalf("emails to the failing recipient = %d", got)
+	}
+	var attempts int
+	var abandoned bool
+	var delivered int
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT n.attempts, n.abandon_time IS NOT NULL,
+			(SELECT count(*) FROM billing_notification_deliveries d WHERE d.notification_id = n.notification_id)
+		FROM billing_notifications n WHERE n.billing_account_id = $1 AND n.kind = $2`,
+		acct, string(NotifyLowBalance)).Scan(&attempts, &abandoned, &delivered); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != notificationMaxAttempts || !abandoned || delivered != 1 {
+		t.Fatalf("attempts %d abandoned %v deliveries %d", attempts, abandoned, delivered)
+	}
+
+	// A transient failure of the first recipient delivers to both after the
+	// retry, and the second recipient is not emailed twice.
+	acct2 := f.account()
+	var admin2 string
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT user_id FROM billing_account_members
+		WHERE billing_account_id = $1 AND role = 'admin'`, acct2).Scan(&admin2); err != nil {
+		t.Fatal(err)
+	}
+	f.grant(acct2, LedgerManualTopUp, 25*usd)
+	f.deduct(acct2, 20*usd)
+	f.email.SetErrFor(admin2+"@example.com", errSendTest)
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	f.email.SetErrFor(admin2+"@example.com", nil)
+	f.clock.Advance(2 * time.Minute)
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := emailsTo(f, admin2+"@example.com"); got != 1 {
+		t.Fatalf("emails to the recovered recipient = %d, want 1", got)
+	}
+}
+
 type sendError struct{}
 
 func (sendError) Error() string { return "send failed" }
