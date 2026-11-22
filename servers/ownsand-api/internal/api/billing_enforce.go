@@ -184,7 +184,23 @@ func (e *BillingEnforcer) targets(ctx context.Context, sql string, args ...any) 
 // suppressed; the next pass finds the sandbox marked, RUNNING and ALLOWED and
 // only removes the mark, and a pause that already ran is resumed by the
 // next pass.
+//
+// The mark and the command run under the sandbox ordering lock, so a caller's
+// pause of the same sandbox is ordered before the mark or after the command:
+// a caller pause that completed first leaves no stale mark on its sandbox
+// (the mark applies only to a RUNNING sandbox), and one that runs later
+// removes the mark.
 func (e *BillingEnforcer) pause(ctx context.Context, t billingTarget) {
+	err := e.s.withSandboxOrder(ctx, t.sandboxID, func() error {
+		e.pauseOrdered(ctx, t)
+		return nil
+	})
+	if err != nil {
+		e.s.Logger.WarnContext(ctx, "billing_sandbox_pause_failed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.Any("error", err))
+	}
+}
+
+func (e *BillingEnforcer) pauseOrdered(ctx context.Context, t billingTarget) {
 	s := e.s
 	cutoff := s.now().Add(-billing.SuspendAfter)
 	var eligible, marked bool
@@ -217,7 +233,7 @@ func (e *BillingEnforcer) pause(ctx context.Context, t billingTarget) {
 	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, true, func() error {
 		return e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM organization_billing b WHERE b.organization_id = $1 AND `+pausingPhaseSQL("$2")+`)`,
 			t.orgID, s.now().Add(-billing.SuspendAfter))
-	})
+	}, nil)
 	if errors.Is(err, errBillingStale) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_pause_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
@@ -253,6 +269,8 @@ func (e *BillingEnforcer) recheck(ctx context.Context, sql string, args ...any) 
 // mark is cleared) that the organization is still ALLOWED, because the
 // target list can be older than a new suspension. The recheck also requires
 // that the sandbox is still marked and PAUSED and has no pending delete.
+// A caller's PauseSandbox removes the mark of its sandbox, so a target that a
+// caller paused after the selection is dropped by that recheck.
 func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 	s := e.s
 	if t.state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED || t.deletePending {
@@ -282,10 +300,31 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_resume_deferred", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 		return
 	}
-	sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, func() error {
-		return e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
+	// The recheck, the command, the reconciliation of the agent's result and
+	// the clearing of the mark run under the sandbox ordering lock. A caller's
+	// PauseSandbox of the same sandbox, on any instance, waits for them, and
+	// it cancels this resume when it ran first: it removes the mark, which the
+	// recheck requires.
+	var resumed bool
+	err := s.withSandboxOrder(ctx, t.sandboxID, func() error {
+		sb, err := s.pauseOrResumeSandbox(ctx, t.orgID, t.sandboxID, false, func() error {
+			return e.recheck(ctx, `SELECT EXISTS (SELECT 1 FROM sandboxes s JOIN organization_billing b ON b.organization_id = s.organization_id
 			WHERE s.sandbox_id = $1 AND s.paused_by_billing AND s.agent_state = $2 AND NOT s.delete_pending AND `+allowedPhaseSQL+`)`,
-			t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED))
+				t.sandboxID, int16(ownsandv1.SandboxState_SANDBOX_STATE_PAUSED))
+		}, nil)
+		if err != nil {
+			return err
+		}
+		if sb.AgentState != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+			// The agent has not reported the resume yet; a later pass checks
+			// again and clears the mark then.
+			return nil
+		}
+		if _, err := s.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1", t.sandboxID); err != nil {
+			return err
+		}
+		resumed = true
+		return nil
 	})
 	if errors.Is(err, errBillingStale) {
 		s.Logger.DebugContext(ctx, "billing_sandbox_resume_stale", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
@@ -296,14 +335,7 @@ func (e *BillingEnforcer) resume(ctx context.Context, t billingTarget) {
 			slog.String("device_id", t.deviceID), slog.String("code", connect.CodeOf(err).String()), slog.String("error", err.Error()))
 		return
 	}
-	if sb.AgentState != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
-		// The agent has not reported the resume yet; a later pass checks
-		// again and clears the mark then.
-		return
+	if resumed {
+		s.Logger.InfoContext(ctx, "billing_sandbox_resumed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 	}
-	if _, err := s.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1", t.sandboxID); err != nil {
-		s.Logger.WarnContext(ctx, "billing_sandbox_resume_failed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.Any("error", err))
-		return
-	}
-	s.Logger.InfoContext(ctx, "billing_sandbox_resumed", slog.String("organization_id", t.orgID), slog.String("sandbox_id", t.sandboxID), slog.String("device_id", t.deviceID))
 }
