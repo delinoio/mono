@@ -72,15 +72,7 @@ var macOSProvisionCommands = [][]string{
 }
 
 // runTool runs a host tool and returns its standard output.
-func runTool(ctx context.Context, name string, args ...string) ([]byte, error) {
-	var stdout, stderr bytes.Buffer
-	cmd := exec.CommandContext(ctx, name, args...)
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("%s %s: %w: %s", filepath.Base(name), strings.Join(args, " "), err, strings.TrimSpace(stderr.String()))
-	}
-	return stdout.Bytes(), nil
-}
+var runTool hostRunner = runHostTool
 
 // plistJSON runs a tool that prints a property list and decodes it as JSON.
 func plistJSON(ctx context.Context, v any, name string, args ...string) error {
@@ -95,13 +87,6 @@ func plistJSON(ctx context.Context, v any, name string, args ...string) error {
 		return fmt.Errorf("plutil: %w", err)
 	}
 	return json.Unmarshal(js, v)
-}
-
-type hdiutilAttach struct {
-	SystemEntities []struct {
-		DevEntry    string `json:"dev-entry"`
-		ContentHint string `json:"content-hint"`
-	} `json:"system-entities"`
 }
 
 type apfsList struct {
@@ -149,28 +134,15 @@ func dataVolume(ctx context.Context, wholeDisk string) (string, error) {
 // provisionMacOSDisk installs the guest helper as a launchd daemon on the
 // Data volume of the installed disk and marks the Setup Assistant as done,
 // so the guest boots without interaction.
-func provisionMacOSDisk(ctx context.Context, build, disk, guestBinary string, logger *slog.Logger) (err error) {
-	var attach hdiutilAttach
-	if err := plistJSON(ctx, &attach, "/usr/bin/hdiutil", "attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", "-plist", disk); err != nil {
-		return fmt.Errorf("imagebuild: attach the guest disk: %w", err)
-	}
-	whole := ""
-	for _, e := range attach.SystemEntities {
-		if e.ContentHint == "GUID_partition_scheme" {
-			whole = strings.TrimPrefix(e.DevEntry, "/dev/")
-		}
-	}
-	if whole == "" {
-		return errors.New("imagebuild: the attached guest disk has no GUID partition table")
-	}
-	defer func() {
-		if _, derr := runTool(context.Background(), "/usr/bin/hdiutil", "detach", "/dev/"+whole); derr != nil {
-			logger.Warn("detach the guest disk failed; forcing", "error", derr)
-			if _, derr := runTool(context.Background(), "/usr/bin/hdiutil", "detach", "-force", "/dev/"+whole); derr != nil && err == nil {
-				err = derr
-			}
-		}
-	}()
+func provisionMacOSDisk(ctx context.Context, build, disk, guestBinary string, logger *slog.Logger) error {
+	return withAttachedDisk(ctx, runTool, disk, logger, func(whole string) error {
+		return installGuestHelper(ctx, build, whole, guestBinary, logger)
+	})
+}
+
+// installGuestHelper installs the guest helper on the Data volume of the
+// attached whole disk device (for example disk8).
+func installGuestHelper(ctx context.Context, build, whole, guestBinary string, logger *slog.Logger) (err error) {
 	data, err := dataVolume(ctx, whole)
 	if err != nil {
 		return err
