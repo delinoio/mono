@@ -226,9 +226,16 @@ func runAgentOutcome(ctx context.Context, cfg config.Config) (code int, updated 
 		return exitError, false
 	}
 	id, err := st.LoadIdentity()
-	if err != nil || id.DeviceID == "" {
+	switch {
+	case errors.Is(err, store.ErrNotFound) || (err == nil && id.DeviceID == ""):
 		logger.Error("the device is not enrolled; run `ownsand-agent enroll`")
 		return exitNotEnrolled, false
+	case err != nil:
+		// An unreadable or undecodable identity file is an error, not a
+		// missing enrollment: exit code 3 would stop the service manager
+		// from restarting the agent.
+		logger.Error("read device identity failed", "error", err)
+		return exitError, false
 	}
 	agentState, err := st.LoadAgent()
 	if err != nil {
@@ -307,9 +314,13 @@ func status(cfg config.Config, stdout, stderr io.Writer, c colors) int {
 		return exitError
 	}
 	id, err := st.LoadIdentity()
-	if err != nil || id.DeviceID == "" {
+	switch {
+	case errors.Is(err, store.ErrNotFound) || (err == nil && id.DeviceID == ""):
 		fmt.Fprintf(stdout, "%s %s\n", c.bold("Enrollment:"), c.bad("not enrolled"))
 		return exitNotEnrolled
+	case err != nil:
+		fmt.Fprintln(stderr, "ownsand-agent:", err)
+		return exitError
 	}
 	fmt.Fprintf(stdout, "%s %s (device %s, organization %s)\n", c.bold("Enrollment:"), c.ok("enrolled"), id.DeviceID, id.OrganizationID)
 	if a, err := st.LoadAgent(); err == nil {
