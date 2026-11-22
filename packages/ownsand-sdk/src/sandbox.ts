@@ -27,7 +27,12 @@ import {
 } from "./operations/write.ts";
 import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
 import type { OperationContext } from "./relay/context.ts";
-import { durationFromMs, validateExec, validateGuestPath } from "./validate.ts";
+import {
+  durationFromMs,
+  validateExec,
+  validateFileMode,
+  validateGuestPath,
+} from "./validate.ts";
 import { OwnSandError } from "./errors.ts";
 
 /** Options of one exec. */
@@ -260,12 +265,14 @@ export class Sandbox {
     options: { mode?: number; signal?: AbortSignal } = {},
   ): Promise<WriteFileResult> {
     validateGuestPath("path", path);
+    const mode = options.mode ?? DEFAULT_FILE_MODE;
+    validateFileMode(mode);
     return runWriteFile(
       this.#ctx,
       this.#selector,
       path,
       source,
-      options.mode ?? DEFAULT_FILE_MODE,
+      mode,
       options.signal,
     );
   }
