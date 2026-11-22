@@ -142,6 +142,18 @@ h2 {
   max-width: 60ch;
 }
 
+/* The title and description are one flex item. A long name without break
+   opportunities, such as a 100-character billing account name, would keep the
+   item at its content width and push the page into horizontal scroll, so let
+   the item shrink and break the title anywhere. */
+.page-header > :first-child {
+  min-width: 0;
+}
+
+.page-header h1 {
+  overflow-wrap: anywhere;
+}
+
 /* WebKit drops list semantics from a list with `list-style: none`, so the
    element in pages/home.tsx keeps an explicit role="list". Keep both
    together. */
@@ -251,7 +263,14 @@ h2 {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  /* Let the link shrink below the width of an unbroken name so that the list,
+     which clips its overflow, never hides the badge. */
+  min-width: 0;
   color: var(--dui-color-text);
+}
+
+.list-link > :not(.list-title) {
+  flex-shrink: 0;
 }
 
 .list-main {
@@ -261,8 +280,16 @@ h2 {
   min-width: 0;
 }
 
+.content .dui-tabs-list {
+  /* The billing account sections do not fit the width of a phone: scroll the
+     tab list instead of the whole page. */
+  overflow-x: auto;
+}
+
 .list-title {
+  min-width: 0;
   font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
 .list-actions {
