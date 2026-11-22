@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -51,14 +52,18 @@ func writeJSON(w io.Writer, v any) error {
 	return err
 }
 
-// protoValue returns m as a generic JSON value.
+// protoValue returns m as a generic JSON value. Numbers stay json.Number so
+// that they keep the exact decimal text of the protobuf JSON mapping: a
+// float64 would print as an exponent (for example 1e+06) in text mode.
 func protoValue(m proto.Message) (map[string]any, error) {
 	b, err := jsonOpts.Marshal(m)
 	if err != nil {
 		return nil, err
 	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
 	out := map[string]any{}
-	if err := json.Unmarshal(b, &out); err != nil {
+	if err := dec.Decode(&out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -110,7 +115,7 @@ func flatten(prefix string, v any, out *[][2]string) {
 			case map[string]any, []any:
 				simple = false
 			}
-			parts = append(parts, fmt.Sprint(x))
+			parts = append(parts, scalarText(x))
 		}
 		if simple {
 			*out = append(*out, [2]string{prefix, strings.Join(parts, ", ")})
@@ -119,11 +124,21 @@ func flatten(prefix string, v any, out *[][2]string) {
 		for i, x := range t {
 			flatten(fmt.Sprintf("%s[%d]", prefix, i), x, out)
 		}
-	case string:
-		*out = append(*out, [2]string{prefix, t})
 	default:
-		*out = append(*out, [2]string{prefix, fmt.Sprint(t)})
+		*out = append(*out, [2]string{prefix, scalarText(t)})
 	}
+}
+
+// scalarText formats a JSON scalar of protoValue for text mode. A json.Number
+// prints its literal, so an integer never takes the exponent form.
+func scalarText(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case json.Number:
+		return t.String()
+	}
+	return fmt.Sprint(v)
 }
 
 // enumName returns the lowercase value name of an enum without its prefix.

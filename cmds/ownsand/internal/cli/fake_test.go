@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -174,7 +175,15 @@ func (h *fakeDevices) ReplaceDeviceLimits(_ context.Context, r *connect.Request[
 	h.f.mu.Unlock()
 	in := r.Msg.GetLimits()
 	limits := &ownsandv1.DeviceLimits{VcpuCount: in.GetVcpuCount(), MemoryMib: in.GetMemoryMib(), DiskGib: in.GetDiskGib(), VcpuOvercommitPercent: in.GetVcpuOvercommitPercent()}
-	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: &ownsandv1.Device{DeviceId: h.f.dev, Limits: limits}}), nil
+	// The control plane derives the effective limit from the limits and caps
+	// the int32 field at its largest value.
+	exact := int64(limits.GetVcpuCount()) * int64(limits.GetVcpuOvercommitPercent()) / 100
+	return connect.NewResponse(&ownsandv1.ReplaceDeviceLimitsResponse{Device: &ownsandv1.Device{
+		DeviceId:                h.f.dev,
+		Limits:                  limits,
+		EffectiveVcpuLimit:      int32(min(exact, math.MaxInt32)),
+		EffectiveVcpuLimitCount: exact,
+	}}), nil
 }
 
 type fakeSandbox struct {

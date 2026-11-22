@@ -1062,3 +1062,31 @@ func TestParseDurationDayOverflow(t *testing.T) {
 		t.Fatalf("%+v %v", res, r.f.callNames())
 	}
 }
+
+// TestDeviceSetLimitsPrintsLargeIntegersInFull checks that text mode prints
+// the largest int32 value in decimal form, and that JSON mode keeps it too.
+func TestDeviceSetLimitsPrintsLargeIntegersInFull(t *testing.T) {
+	r := newRunner(t)
+	args := []string{"device", "set-limits", r.f.dev, "--vcpu", "2147483647", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "100"}
+	res := r.run(append(args, "--no-color")...)
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	for _, want := range []string{"limits.vcpu_count: 2147483647\n", "effective_vcpu_limit: 2147483647\n"} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("stdout misses %q:\n%s", want, res.stdout)
+		}
+	}
+	if strings.Contains(res.stdout, "e+") {
+		t.Errorf("exponent form in stdout:\n%s", res.stdout)
+	}
+	res = r.run(append(args, "--format", "json")...)
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	for _, want := range []string{`"vcpu_count":2147483647`, `"effective_vcpu_limit":2147483647`} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("JSON stdout misses %q:\n%s", want, res.stdout)
+		}
+	}
+}
