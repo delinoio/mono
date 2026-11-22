@@ -41,7 +41,7 @@ func fsError(what string, err error) *opError {
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "%s: file does not exist", what)
 	case errors.Is(err, fs.ErrPermission):
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_PERMISSION_DENIED, "%s: permission denied", what)
-	case errors.Is(err, syscall.ENOSPC):
+	case isDiskFull(err):
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, "%s: no space left on the guest disk", what)
 	case errors.Is(err, syscall.EISDIR), errors.Is(err, syscall.ENOTDIR):
 		return errorf(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "%s: path is a directory or has a non-directory parent", what)
