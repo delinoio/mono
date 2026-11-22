@@ -13,6 +13,7 @@ package ownsandclient
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"time"
 
@@ -38,6 +39,20 @@ type Client interface {
 	CreateSandbox(ctx context.Context, req *ownsandv1.CreateSandboxRequest) (*ownsandv1.Sandbox, error)
 	GetSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error)
 	DeleteSandbox(ctx context.Context, sandboxID string) (*ownsandv1.Sandbox, error)
+
+	// Data path operations (OwnSand relay). They block until the operation
+	// ends or ctx ends; the SDK continues an interrupted relay stream.
+	Exec(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error)
+	AttachExec(ctx context.Context, sandboxID, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error)
+	ReadFile(ctx context.Context, sandboxID string, p ownsand.FileReadParams, w io.Writer) (int64, error)
+	// OpenFileWrite returns a write that takes its chunks in separate calls.
+	OpenFileWrite(sandboxID string, p ownsand.FileWriteParams) (FileWrite, error)
+}
+
+// FileWrite is one file write of ownsand.FileWrite.
+type FileWrite interface {
+	WriteChunk(ctx context.Context, offset int64, data []byte) (*ownsandv1.WriteFileResponse, error)
+	Finish(ctx context.Context, offset int64, data []byte, sizeBytes int64, mode uint32) (*ownsandv1.WriteFileResponse, error)
 }
 
 // Factory returns a client for an OwnSand organization and its API key.
@@ -140,6 +155,44 @@ func (s *sdkClient) DeleteSandbox(ctx context.Context, sandboxID string) (*ownsa
 	return res.GetSandbox(), nil
 }
 
+func (s *sdkClient) sandbox(id string) (*ownsand.Sandbox, error) { return s.c.Sandbox(s.org, id) }
+
+func (s *sdkClient) Exec(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+	sb, err := s.sandbox(sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sb.Close() }()
+	return sb.Exec(ctx, p)
+}
+
+func (s *sdkClient) AttachExec(ctx context.Context, sandboxID, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+	sb, err := s.sandbox(sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = sb.Close() }()
+	return sb.AttachExec(ctx, execID, p)
+}
+
+func (s *sdkClient) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileReadParams, w io.Writer) (int64, error) {
+	sb, err := s.sandbox(sandboxID)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = sb.Close() }()
+	return sb.ReadFileFrom(ctx, p, w)
+}
+
+func (s *sdkClient) OpenFileWrite(sandboxID string, p ownsand.FileWriteParams) (FileWrite, error) {
+	sb, err := s.sandbox(sandboxID)
+	if err != nil {
+		return nil, err
+	}
+	// The relay transport keeps no session, so the handle needs no Close.
+	return sb.OpenFileWrite(p)
+}
+
 // Code returns the Connect code of an OwnSand call result as the metric and
 // log value ("ok" for nil).
 func Code(err error) string {
@@ -218,6 +271,55 @@ func (c *Instrumented) DeleteSandbox(ctx context.Context, sandboxID string) (*ow
 	sb, err := c.Inner.DeleteSandbox(ctx, sandboxID)
 	c.Observe(ctx, "DeleteSandbox", start, err, slog.String("sandbox_id", sandboxID))
 	return sb, err
+}
+
+func (c *Instrumented) Exec(ctx context.Context, sandboxID string, p ownsand.ExecParams) (*ownsand.ExecResult, error) {
+	start := time.Now()
+	res, err := c.Inner.Exec(ctx, sandboxID, p)
+	c.Observe(ctx, "Exec", start, err, slog.String("sandbox_id", sandboxID), slog.String("exec_id", p.ExecID))
+	return res, err
+}
+
+func (c *Instrumented) AttachExec(ctx context.Context, sandboxID, execID string, p ownsand.AttachParams) (*ownsand.ExecResult, error) {
+	start := time.Now()
+	res, err := c.Inner.AttachExec(ctx, sandboxID, execID, p)
+	c.Observe(ctx, "AttachExec", start, err, slog.String("sandbox_id", sandboxID), slog.String("exec_id", execID))
+	return res, err
+}
+
+func (c *Instrumented) ReadFile(ctx context.Context, sandboxID string, p ownsand.FileReadParams, w io.Writer) (int64, error) {
+	start := time.Now()
+	n, err := c.Inner.ReadFile(ctx, sandboxID, p, w)
+	c.Observe(ctx, "ReadFile", start, err, slog.String("sandbox_id", sandboxID), slog.String("read_id", p.ReadID))
+	return n, err
+}
+
+func (c *Instrumented) OpenFileWrite(sandboxID string, p ownsand.FileWriteParams) (FileWrite, error) {
+	inner, err := c.Inner.OpenFileWrite(sandboxID, p)
+	if err != nil {
+		return nil, err
+	}
+	return &instrumentedWrite{c: c, inner: inner, sandboxID: sandboxID, writeID: p.WriteID}, nil
+}
+
+type instrumentedWrite struct {
+	c                  *Instrumented
+	inner              FileWrite
+	sandboxID, writeID string
+}
+
+func (w *instrumentedWrite) WriteChunk(ctx context.Context, offset int64, data []byte) (*ownsandv1.WriteFileResponse, error) {
+	start := time.Now()
+	res, err := w.inner.WriteChunk(ctx, offset, data)
+	w.c.Observe(ctx, "WriteFile", start, err, slog.String("sandbox_id", w.sandboxID), slog.String("write_id", w.writeID), slog.Int("size", len(data)))
+	return res, err
+}
+
+func (w *instrumentedWrite) Finish(ctx context.Context, offset int64, data []byte, sizeBytes int64, mode uint32) (*ownsandv1.WriteFileResponse, error) {
+	start := time.Now()
+	res, err := w.inner.Finish(ctx, offset, data, sizeBytes, mode)
+	w.c.Observe(ctx, "WriteFile", start, err, slog.String("sandbox_id", w.sandboxID), slog.String("write_id", w.writeID), slog.Int("size", len(data)), slog.Bool("finish", true))
+	return res, err
 }
 
 // OwnSand labels of tide sandboxes. Labels hold no secrets.
