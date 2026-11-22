@@ -44,12 +44,12 @@ func NewURL(t testing.TB) string {
 // NewURLAtVersion is like NewURL but applies only the migrations up to and
 // including maxVersion, so an upgrade test can insert legacy data and then
 // apply the later migrations with db.MigrateUpTo or db.Migrate.
-func NewURLAtVersion(t testing.TB, maxVersion int) string {
+func NewURLAtVersion(t testing.TB, maxVersion int64) string {
 	t.Helper()
 	return newURL(t, maxVersion)
 }
 
-func newURL(t testing.TB, maxVersion int) string {
+func newURL(t testing.TB, maxVersion int64) string {
 	t.Helper()
 	admin := URL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

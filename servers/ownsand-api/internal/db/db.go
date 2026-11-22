@@ -1,41 +1,60 @@
 // SPDX-License-Identifier: FSL-1.1-ALv2
 
-// Package db opens the Postgres pool, applies the embedded migrations and
-// runs transactions.
+// Package db opens the Postgres pool, applies the embedded goose migrations
+// and runs transactions.
 //
 // Migration tool (recorded decision in docs/servers-ownsand-api-foundation.md
-// Storage): an embedded, forward-only runner in this package. Each file in
-// migrations/ is named `<version>_<name>.sql` with a zero-padded version and
-// runs once, in version order, inside its own transaction while the runner
-// holds a Postgres advisory lock, so two instances that start together
-// apply each migration exactly once. The `schema_migrations` table records
-// the applied versions with the SHA-256 of each file, and the runner refuses
-// to start when an applied file changed. Migrations are never edited after
+// Storage): goose SQL migrations embedded from migrations/. Each file is
+// named `<version>_<name>.sql` with a zero-padded version and has a
+// `-- +goose Up` section and no down section. goose applies each pending
+// file once, in version order, inside its own transaction while it holds a
+// Postgres session advisory lock, so two instances that start together
+// apply each migration exactly once. goose records the applied versions in
+// `goose_db_version`. Migrations are forward-only and never edited after
 // they reach `main`; a later change adds a new file.
+//
+// Databases that the earlier embedded runner migrated record their history
+// in `schema_migrations`. Before goose runs, Migrate copies that history into
+// `goose_db_version` once, so goose does not apply those migrations again.
 package db
 
 import (
 	"context"
-	"crypto/sha256"
+	"database/sql"
 	"embed"
 	"errors"
 	"fmt"
 	"io/fs"
 	"log/slog"
-	"sort"
-	"strconv"
-	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
+	"github.com/pressly/goose/v3/database"
+	"github.com/pressly/goose/v3/lock"
 )
 
 //go:embed migrations/*.sql
 var migrationFiles embed.FS
 
-// migrationLockID is the advisory lock key of the migration runner.
+// migrationLockID is the Postgres advisory lock key that serializes
+// migration runs of several instances. It is the key of the earlier embedded
+// runner too, so a previous release that starts during a rolling deployment
+// waits for goose and goose waits for it. It differs from the goose default
+// so that another goose user of the same database cannot block ownsand-api.
 const migrationLockID int64 = 0x6f776e73616e64 // "ownsand"
+
+// gooseVersionTable is the goose version table (the goose default name).
+const gooseVersionTable = "goose_db_version"
+
+// migrationTimeZone is the session time zone of the migration connections.
+// goose stores the application time in a `timestamp` column without a time
+// zone, from now() in the session time zone. Migration 0009 reads the time
+// of migration 0008 from that column as UTC, so every session that writes it
+// must use UTC.
+const migrationTimeZone = "UTC"
 
 // DB is the Postgres pool of the control plane.
 type DB struct {
@@ -75,45 +94,15 @@ func (d *DB) InTx(ctx context.Context, fn func(tx pgx.Tx) error) error {
 	return pgx.BeginTxFunc(ctx, d.Pool, pgx.TxOptions{}, fn)
 }
 
-type migration struct {
-	version int
-	name    string
-	sql     string
-	sum     [32]byte
-}
-
-func loadMigrations() ([]migration, error) {
-	entries, err := fs.ReadDir(migrationFiles, "migrations")
+// Migrations returns the embedded migration files, rooted at the migrations
+// directory.
+func Migrations() fs.FS {
+	sub, err := fs.Sub(migrationFiles, "migrations")
 	if err != nil {
-		return nil, err
+		// The directory is embedded at build time, so this cannot happen.
+		panic(err)
 	}
-	var out []migration
-	seen := map[int]bool{}
-	for _, e := range entries {
-		name := e.Name()
-		if !strings.HasSuffix(name, ".sql") {
-			continue
-		}
-		prefix, _, ok := strings.Cut(name, "_")
-		if !ok {
-			return nil, fmt.Errorf("migration %s: name must be <version>_<name>.sql", name)
-		}
-		version, err := strconv.Atoi(prefix)
-		if err != nil || version <= 0 {
-			return nil, fmt.Errorf("migration %s: invalid version", name)
-		}
-		if seen[version] {
-			return nil, fmt.Errorf("migration %s: duplicate version %d", name, version)
-		}
-		seen[version] = true
-		body, err := fs.ReadFile(migrationFiles, "migrations/"+name)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, migration{version: version, name: name, sql: string(body), sum: sha256.Sum256(body)})
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].version < out[j].version })
-	return out, nil
+	return sub
 }
 
 // Migrate applies every embedded migration that the database has not
@@ -126,70 +115,102 @@ func (d *DB) Migrate(ctx context.Context, logger *slog.Logger) error {
 // applied yet, up to and including maxVersion; 0 means all of them. Upgrade
 // tests use it to build a database at an older schema version and then
 // apply the later migrations through the normal runner.
-func (d *DB) MigrateUpTo(ctx context.Context, logger *slog.Logger, maxVersion int) error {
-	migrations, err := loadMigrations()
+func (d *DB) MigrateUpTo(ctx context.Context, logger *slog.Logger, maxVersion int64) error {
+	// The migration connections are separate from the pool, so the session
+	// time zone does not change the sessions that serve requests.
+	connConfig := d.Pool.Config().ConnConfig.Copy()
+	connConfig.RuntimeParams["timezone"] = migrationTimeZone
+	sqlDB := stdlib.OpenDB(*connConfig)
+	defer func() { _ = sqlDB.Close() }()
+
+	if err := adoptLegacyHistory(ctx, logger, sqlDB); err != nil {
+		return err
+	}
+
+	locker, err := lock.NewPostgresSessionLocker(lock.WithLockID(migrationLockID))
 	if err != nil {
-		return err
+		return fmt.Errorf("migration lock: %w", err)
 	}
-	conn, err := d.Pool.Acquire(ctx)
+	provider, err := goose.NewProvider(goose.DialectPostgres, sqlDB, Migrations(),
+		goose.WithSessionLocker(locker),
+		goose.WithDisableGlobalRegistry(true),
+	)
 	if err != nil {
-		return err
+		return fmt.Errorf("load migrations: %w", err)
 	}
-	defer conn.Release()
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID); err != nil {
-		return fmt.Errorf("lock migrations: %w", err)
+	var results []*goose.MigrationResult
+	if maxVersion == 0 {
+		results, err = provider.Up(ctx)
+	} else {
+		results, err = provider.UpTo(ctx, maxVersion)
 	}
-	defer func() {
-		_, _ = conn.Exec(context.WithoutCancel(ctx), "SELECT pg_advisory_unlock($1)", migrationLockID)
-	}()
-	if _, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version integer PRIMARY KEY,
-		name text NOT NULL,
-		sha256 bytea NOT NULL,
-		applied_at timestamptz NOT NULL DEFAULT now()
-	)`); err != nil {
-		return fmt.Errorf("create schema_migrations: %w", err)
-	}
-	applied := map[int][]byte{}
-	rows, err := conn.Query(ctx, "SELECT version, sha256 FROM schema_migrations")
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var v int
-		var sum []byte
-		if err := rows.Scan(&v, &sum); err != nil {
-			rows.Close()
-			return err
-		}
-		applied[v] = sum
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, m := range migrations {
-		if maxVersion > 0 && m.version > maxVersion {
-			break
-		}
-		if sum, ok := applied[m.version]; ok {
-			if string(sum) != string(m.sum[:]) {
-				return fmt.Errorf("migration %s changed after it was applied", m.name)
-			}
+	for _, r := range results {
+		if r.Error != nil {
 			continue
 		}
-		err := pgx.BeginTxFunc(ctx, conn, pgx.TxOptions{}, func(tx pgx.Tx) error {
-			if _, err := tx.Exec(ctx, m.sql); err != nil {
-				return err
-			}
-			_, err := tx.Exec(ctx, "INSERT INTO schema_migrations (version, name, sha256) VALUES ($1, $2, $3)", m.version, m.name, m.sum[:])
-			return err
-		})
-		if err != nil {
-			return fmt.Errorf("apply migration %s: %w", m.name, err)
-		}
-		logger.Info("db_migration_applied", slog.Int("version", m.version), slog.String("name", m.name))
+		logger.Info("db_migration_applied",
+			slog.Int64("version", r.Source.Version),
+			slog.String("name", r.Source.Path),
+			slog.Int64("duration_ms", r.Duration.Milliseconds()))
 	}
+	if err != nil {
+		return fmt.Errorf("apply migrations: %w", err)
+	}
+	return nil
+}
+
+// adoptLegacyHistory copies the history of the earlier embedded runner from
+// schema_migrations into a new goose version table, so that goose does not
+// apply those migrations again. It does nothing when the goose version table
+// exists or when schema_migrations does not. A transaction-scoped advisory
+// lock on the migration lock key serializes it with goose and with the
+// earlier runner of a previous release.
+//
+// schema_migrations stays unchanged, so a previous release still starts
+// against the database. Remove the table and this function together, in a
+// later change, once no database and no running release predates goose.
+func adoptLegacyHistory(ctx context.Context, logger *slog.Logger, sqlDB *sql.DB) error {
+	store, err := database.NewStore(database.DialectPostgres, gooseVersionTable)
+	if err != nil {
+		return fmt.Errorf("goose store: %w", err)
+	}
+	tx, err := sqlDB.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("adopt migration history: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, "SELECT pg_advisory_xact_lock($1)", migrationLockID); err != nil {
+		return fmt.Errorf("lock migrations: %w", err)
+	}
+	var gooseExists, legacyExists bool
+	if err := tx.QueryRowContext(ctx,
+		"SELECT to_regclass($1) IS NOT NULL, to_regclass('schema_migrations') IS NOT NULL", gooseVersionTable,
+	).Scan(&gooseExists, &legacyExists); err != nil {
+		return fmt.Errorf("adopt migration history: %w", err)
+	}
+	if gooseExists || !legacyExists {
+		return nil
+	}
+	// The same table and zero version row as goose creates itself.
+	if err := store.CreateVersionTable(ctx, tx); err != nil {
+		return fmt.Errorf("create goose version table: %w", err)
+	}
+	if err := store.Insert(ctx, tx, database.InsertRequest{Version: 0}); err != nil {
+		return fmt.Errorf("insert goose zero version: %w", err)
+	}
+	res, err := tx.ExecContext(ctx, `INSERT INTO `+gooseVersionTable+` (version_id, is_applied, tstamp)
+		SELECT version, true, applied_at AT TIME ZONE 'UTC' FROM schema_migrations ORDER BY version`)
+	if err != nil {
+		return fmt.Errorf("copy migration history: %w", err)
+	}
+	copied, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("copy migration history: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("adopt migration history: %w", err)
+	}
+	logger.Info("db_migration_history_adopted", slog.Int64("versions", copied))
 	return nil
 }
 

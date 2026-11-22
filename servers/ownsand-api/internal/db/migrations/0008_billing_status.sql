@@ -11,6 +11,8 @@
 -- linked organization, or that the control plane decided for an
 -- organization without a link.
 
+-- +goose Up
+
 CREATE TABLE organization_billing (
     organization_id uuid PRIMARY KEY REFERENCES organizations ON DELETE CASCADE,
     -- Linked delino-accounts billing account; NULL without a link.

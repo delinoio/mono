@@ -10,5 +10,7 @@
 -- use the legacy object keys, and an EXPORTING row without an owner counts
 -- as orphaned).
 
+-- +goose Up
+
 ALTER TABLE snapshots ADD COLUMN export_command_id uuid;
 ALTER TABLE snapshots ADD COLUMN export_channel_id uuid;

@@ -5,6 +5,8 @@
 -- organization_id column that every query filters on. Secret columns hold
 -- only SHA-256 hashes.
 
+-- +goose Up
+
 CREATE TABLE organizations (
     organization_id uuid PRIMARY KEY,
     name text NOT NULL,

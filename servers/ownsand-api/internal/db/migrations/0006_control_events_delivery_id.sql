@@ -26,6 +26,8 @@
 -- The advisory lock key must differ from the migration runner's lock key
 -- (0x6f776e73616e64) because both use the bigint advisory lock namespace.
 
+-- +goose Up
+
 ALTER TABLE control_events ADD COLUMN delivery_id bigint;
 
 UPDATE control_events SET delivery_id = event_id;
@@ -36,6 +38,7 @@ SELECT setval('control_events_delivery_id_seq', COALESCE(max(delivery_id), 0) + 
 
 CREATE UNIQUE INDEX control_events_delivery_id_idx ON control_events (delivery_id);
 
+-- +goose StatementBegin
 CREATE FUNCTION control_events_assign_delivery_id() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -45,6 +48,7 @@ BEGIN
     RETURN NULL;
 END;
 $$;
+-- +goose StatementEnd
 
 CREATE CONSTRAINT TRIGGER control_events_assign_delivery_id
     AFTER INSERT ON control_events

@@ -3,6 +3,8 @@
 -- Agent channel support: the instance lease. Only the lease holder accepts
 -- agent channels and runs heartbeat timers and state transitions.
 
+-- +goose Up
+
 CREATE TABLE instance_leases (
     lease_name text PRIMARY KEY,
     holder text NOT NULL,
