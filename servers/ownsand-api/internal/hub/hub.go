@@ -72,6 +72,9 @@ type Conn struct {
 	// updateMu serializes the update decisions of the channel, from reading
 	// the policy to queueing the command; see LockUpdates.
 	updateMu sync.Mutex
+	// configMu serializes the configuration sends of the channel, from
+	// reading the device limits to queueing the message; see LockConfig.
+	configMu sync.Mutex
 }
 
 // Context ends when the channel closes.
@@ -159,6 +162,19 @@ func (c *Conn) SetValue(key, value any) {
 func (c *Conn) LockUpdates() (unlock func()) {
 	c.updateMu.Lock()
 	return c.updateMu.Unlock
+}
+
+// LockConfig takes the per-channel configuration lock and returns its release
+// function. The channel handler (when the channel opens) and the control event
+// processor (after a change of device limits) both read the limits and queue
+// a configuration message for the same channel. Without one lock, a send that
+// read older limits can queue its message after the message of a newer
+// send, and the agent then keeps the older limits. Hold the lock from reading
+// the limits until the message is queued, so the sender that runs later also
+// reads the newer committed limits.
+func (c *Conn) LockConfig() (unlock func()) {
+	c.configMu.Lock()
+	return c.configMu.Unlock
 }
 
 // Hub is the registry of agent channels.

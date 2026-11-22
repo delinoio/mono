@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -113,6 +114,11 @@ type Service struct {
 	// Billing is the billing status cache that the gated RPCs and
 	// BillingService read; nil turns billing enforcement off.
 	Billing *billing.Statuses
+
+	// afterConfigLimitsRead is a test hook that sendConfiguration calls after
+	// it read the device limits and before it queues the message. It is nil in
+	// production.
+	afterConfigLimitsRead atomic.Pointer[func(deviceID string)]
 
 	watch    sandboxWatch
 	commands commandStore // pending commands by command ID

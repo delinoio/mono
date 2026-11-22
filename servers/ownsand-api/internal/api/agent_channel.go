@@ -350,9 +350,17 @@ func (s *Service) deviceLimits(ctx context.Context, deviceID string) (*ownsandv1
 	return &l, err
 }
 
-// sendConfiguration sends the STUN URLs and the device limits.
+// sendConfiguration sends the STUN URLs and the device limits. The channel
+// handler and the control event processor both call it for one channel; the
+// per-channel configuration lock makes the read of the limits and the queueing
+// of the message one step, so the message that is queued last always carries
+// the newest committed limits.
 func (s *Service) sendConfiguration(ctx context.Context, conn *hub.Conn) error {
+	defer conn.LockConfig()()
 	limits, err := s.deviceLimits(ctx, conn.DeviceID)
+	if hook := s.afterConfigLimitsRead.Load(); hook != nil && err == nil {
+		(*hook)(conn.DeviceID)
+	}
 	if err != nil {
 		s.Logger.WarnContext(ctx, "device_limits_load_failed", slog.String("device_id", conn.DeviceID), slog.Any("error", err))
 		conn.Close(err)
