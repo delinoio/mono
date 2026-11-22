@@ -133,6 +133,59 @@ describe("console configuration", () => {
     ).toThrow("PUBLIC_API_ORIGIN");
   });
 
+  test.each([
+    "https://api.example.test\\tenant\\..",
+    "https://api.example.test\\",
+    "https://api.example.test/tenant/..",
+  ])("rejects a hidden path in the API origin %s", (value) => {
+    expect(() =>
+      readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false }),
+    ).toThrow(
+      "PUBLIC_API_ORIGIN must be an origin without a path, query or fragment",
+    );
+  });
+
+  test.each([
+    "https://api.example.test\\tenant\\..",
+    "https://api.example.test\\",
+    "https://api.example.test/tenant/..",
+  ])("rejects a hidden path in the Logto endpoint %s", (value) => {
+    expect(() =>
+      readConsoleConfig(
+        { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: "app123" },
+        { production: true },
+      ),
+    ).toThrow(
+      "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
+    );
+  });
+
+  test("omits the rejected value from the origin error", () => {
+    expect(() =>
+      readConsoleConfig(
+        { PUBLIC_API_ORIGIN: "https://secret.example.test\\tenant\\.." },
+        { production: false },
+      ),
+    ).not.toThrow(/secret/);
+  });
+
+  test.each([
+    ["https://api.example.test", "https://api.example.test"],
+    ["https://api.example.test/", "https://api.example.test"],
+    ["http://127.0.0.1:18300/", "http://127.0.0.1:18300"],
+  ])("accepts the origin %s", (value, origin) => {
+    expect(
+      readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false })
+        .apiOrigin,
+    ).toBe(origin);
+    expect(
+      readConsoleConfig(
+        { PUBLIC_LOGTO_ENDPOINT: value, PUBLIC_LOGTO_APP_ID: "app123" },
+        { production: true },
+      ).logto?.endpoint,
+    ).toBe(origin);
+  });
+
   test("enables the mock API only outside production", () => {
     expect(
       readConsoleConfig(
