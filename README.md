@@ -1,6 +1,22 @@
 # Delino
 
-Monorepo for Delino services. It currently contains the `delino-site`, `delino-docs`, `delino-accounts` and `ownsand` web apps, the `delidev` desktop and mobile app, the `accounts-api` and `ownsand-api` Go servers in `servers/`, the shared React UI component package `delino-ui` and the TypeScript SDK `ownsand-sdk` in `packages/`, the Go SDK `ownsand-sdk-go` in the public Go package tree `go/ownsand`, the Go command tools `cmds/ownsand`, `cmds/ownsand-agent` and `cmds/ownsand-guest`, the OwnSand and `delino-accounts` Connect RPC schemas in `protos/delino/ownsand/v1` and `protos/delino/accounts/v1` with committed Go bindings and TypeScript bindings (the workspace packages `@delino/ownsand-protos` and `@delino/accounts-protos`), and shared instructions, skills, documentation and formatting tooling. The root Cargo workspace has one member, `apps/delidev/src-tauri`. Only the `crates/` directory is still reserved: it holds only its scoped `AGENTS.md` instructions today.
+Delino is the monorepo for Delino services. It contains web apps, a desktop and mobile app, Go servers, SDKs, command-line tools, Connect RPC schemas and shared tooling.
+
+## Repository contents
+
+| Path             | Contents                                                                                                                                                                                                                                   |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `apps/`          | The `delino-site`, `delino-docs`, `delino-accounts` and `ownsand` web apps, and the `delidev` desktop and mobile app                                                                                                                       |
+| `servers/`       | The `accounts-api` and `ownsand-api` Go servers                                                                                                                                                                                            |
+| `packages/`      | The shared React UI component package `delino-ui` and the TypeScript SDK `ownsand-sdk`                                                                                                                                                     |
+| `go/`            | The public Go package tree, including the Go SDK `ownsand-sdk-go` in `go/ownsand`                                                                                                                                                          |
+| `cmds/`          | The Go command tools `cmds/ownsand`, `cmds/ownsand-agent` and `cmds/ownsand-guest`                                                                                                                                                         |
+| `protos/delino/` | The OwnSand and `delino-accounts` Connect RPC schemas in `protos/delino/ownsand/v1` and `protos/delino/accounts/v1`, with committed Go bindings and the TypeScript binding packages `@delino/ownsand-protos` and `@delino/accounts-protos` |
+| `crates/`        | Reserved. It holds only its scoped `AGENTS.md` instructions today.                                                                                                                                                                         |
+
+The repository also contains shared instructions, skills, documentation and formatting tooling.
+
+The root Cargo workspace has one member: `apps/delidev/src-tauri`.
 
 ## License
 
@@ -13,15 +29,30 @@ This repository uses two licenses. The license depends on the directory.
 | `cmds/ownsand-guest/`        | [Functional Source License 1.1, ALv2 Future License](cmds/ownsand-guest/LICENSE) (`FSL-1.1-ALv2`) |
 | All other repository content | [Apache License 2.0](LICENSE) (`Apache-2.0`)                                                      |
 
-The backend services in `servers/`, the OwnSand device agent in `cmds/ownsand-agent/` and the OwnSand guest helper in `cmds/ownsand-guest/` are source-available, not Apache-2.0. You can use, change and redistribute them for any purpose other than a Competing Use, as defined in [servers/LICENSE](servers/LICENSE). Each version becomes available under Apache-2.0 two years after its release. The OwnSand CLI in `cmds/ownsand/`, the SDKs and the Connect RPC schemas use Apache-2.0.
+The `FSL-1.1-ALv2` directories contain the backend services (`servers/`), the OwnSand device agent (`cmds/ownsand-agent/`) and the OwnSand guest helper (`cmds/ownsand-guest/`). This code is source-available, not Apache-2.0:
 
-[LICENSE-FSL](LICENSE-FSL) is a root copy of the FSL-1.1-ALv2 license files. It is there so that the GitHub license summary shows both licenses. Its terms apply only to `servers/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/`.
+- You can use, change and redistribute it for any purpose other than a Competing Use, as defined in [servers/LICENSE](servers/LICENSE).
+- Each version becomes available under Apache-2.0 two years after its release.
 
-Imported skills retain their original licenses and notices. See [NOTICE](NOTICE).
+The OwnSand CLI in `cmds/ownsand/`, the SDKs and the Connect RPC schemas use Apache-2.0.
+
+[LICENSE-FSL](LICENSE-FSL) is a root copy of the FSL-1.1-ALv2 license files. It exists so that the GitHub license summary shows both licenses. Its terms apply only to `servers/`, `cmds/ownsand-agent/` and `cmds/ownsand-guest/`.
+
+Imported skills keep their original licenses and notices. See [NOTICE](NOTICE).
 
 ## Setup
 
-Use Node.js 24, pnpm 10.26.2 and the Go toolchain selected by the root `go.mod` (Go 1.26.1 or later). The root `pnpm build`, `pnpm dev`, `pnpm lint` and `pnpm test` tasks run the Go servers `servers/accounts-api` and `servers/ownsand-api`, whose scripts call `go`.
+### Requirements
+
+- Node.js 24
+- pnpm 10.26.2
+- The Go toolchain that the root `go.mod` selects (Go 1.26.1 or later)
+
+The root `pnpm build`, `pnpm dev`, `pnpm lint` and `pnpm test` tasks also run the Go servers `servers/accounts-api` and `servers/ownsand-api`. The scripts of these servers call `go`.
+
+### Install and check
+
+Install the dependencies, run the tests and check the formatting:
 
 ```sh
 pnpm install --frozen-lockfile
@@ -29,8 +60,19 @@ pnpm test
 pnpm format:check --all
 ```
 
-`pnpm dev` works without any secret provider. Maintainers with access to the team's Infisical development project can run `infisical login` and then `infisical init` in the repository root; the development servers then receive their development variables from Infisical. See [the environment contract](docs/repository-environment-contract.md#local-development-injection).
+### Development variables (optional)
+
+`pnpm dev` works without a secret provider.
+
+Maintainers with access to the team's Infisical development project can get the development variables from Infisical:
+
+1. Run `infisical login`.
+2. Run `infisical init` in the repository root.
+
+The development servers then receive their development variables from Infisical. See [the environment contract](docs/repository-environment-contract.md#local-development-injection).
 
 ## Add a project
 
-Start with [the documentation catalog](docs/README.md) and [repository instructions](AGENTS.md). Create a project index and at least one domain contract before runtime implementation. Add language workspaces and build, test and release workflows when their first owning project is introduced.
+1. Read [the documentation catalog](docs/README.md) and [the repository instructions](AGENTS.md).
+2. Before runtime implementation, create a project index and at least one domain contract.
+3. Add language workspaces and build, test and release workflows when the first project that owns them is introduced.
