@@ -96,6 +96,55 @@ describe("forms", () => {
     expect(checkAccountName("a\u0007b").ok).toBe(false);
   });
 
+  test("trims the white space of Go's strings.TrimSpace from account names", () => {
+    // U+0085 is white space for Go but not for String.prototype.trim.
+    expect(checkAccountName("\u0085Acme")).toEqual({
+      ok: true,
+      value: "Acme",
+    });
+    expect(checkAccountName("Acme\u0085")).toEqual({
+      ok: true,
+      value: "Acme",
+    });
+    expect(checkAccountName("\u0085").ok).toBe(false);
+    expect(checkAccountName("\u0085")).toEqual({
+      ok: false,
+      error: "Enter a name.",
+    });
+    // Every other member of unicode.IsSpace.
+    const spaces =
+      "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000";
+    expect(checkAccountName(`${spaces}Acme${spaces}`)).toEqual({
+      ok: true,
+      value: "Acme",
+    });
+    expect(checkAccountName(spaces)).toEqual({
+      ok: false,
+      error: "Enter a name.",
+    });
+    // Inside the name, U+0085 is a control character and still rejected.
+    expect(checkAccountName("A\u0085c")).toEqual({
+      ok: false,
+      error: "Remove control characters from the name.",
+    });
+    expect(checkAccountName("A\u00a0c")).toEqual({
+      ok: true,
+      value: "A\u00a0c",
+    });
+    // U+FEFF is not white space for Go: it is kept, counted, and (as a
+    // format character, not a control character) accepted.
+    expect(checkAccountName("\ufeffAcme\ufeff")).toEqual({
+      ok: true,
+      value: "\ufeffAcme\ufeff",
+    });
+    expect(checkAccountName("\ufeff".repeat(100)).ok).toBe(true);
+    expect(checkAccountName("\ufeff".repeat(101)).ok).toBe(false);
+    expect(checkAccountName("\ufeff")).toEqual({
+      ok: true,
+      value: "\ufeff",
+    });
+  });
+
   test("checks invitation email addresses", () => {
     expect(checkEmail(" a@example.com ")).toEqual({
       ok: true,

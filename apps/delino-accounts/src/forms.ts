@@ -14,12 +14,33 @@ export type Checked<T> = { ok: true; value: T } | { ok: false; error: string };
 export const MAX_ACCOUNT_NAME_LENGTH = 100;
 
 /**
+ * The white space that Go's `strings.TrimSpace` removes (`unicode.IsSpace`):
+ * U+0009 to U+000D, U+0020, U+0085, U+00A0, U+1680, U+2000 to U+200A,
+ * U+2028, U+2029, U+202F, U+205F and U+3000. The API server trims the
+ * billing account name with it. `String.prototype.trim` differs: it also
+ * removes U+FEFF and does not remove U+0085, so the app cannot use it for
+ * a value that the server trims. Keep this set equal to `unicode.IsSpace`.
+ */
+const GO_SPACE_CLASS =
+  "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const GO_SPACE_EDGES = new RegExp(
+  `^[${GO_SPACE_CLASS}]+|[${GO_SPACE_CLASS}]+$`,
+  "g",
+);
+
+/** Removes the white space at the start and the end like `strings.TrimSpace`. */
+function trimGoSpace(input: string): string {
+  return input.replace(GO_SPACE_EDGES, "");
+}
+
+/**
  * Checks a billing account name like the server: 1 to 100 Unicode code
- * points after white space at the start and the end is removed, and no
- * control characters.
+ * points after the white space at the start and the end is removed (the set
+ * of Go's `strings.TrimSpace`, see `trimGoSpace`), and no control
+ * characters.
  */
 export function checkAccountName(input: string): Checked<string> {
-  const name = input.trim();
+  const name = trimGoSpace(input);
   if (name === "") {
     return { ok: false, error: "Enter a name." };
   }
