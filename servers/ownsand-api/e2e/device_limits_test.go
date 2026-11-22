@@ -23,7 +23,7 @@ import (
 // Connect JSON, and checks that a missing value is rejected without a write,
 // that an explicit zero is stored and that an API key is denied.
 func TestReplaceDeviceLimitsAgainstTheRealControlPlane(t *testing.T) {
-	s := newStack(t)
+	s := newStack(t, stackOptions{noSandboxes: true})
 	ctx := s.ctx(2 * time.Minute)
 	user := s.userClient(ownsand.TransportAuto)
 	stored := func() *ownsandv1.DeviceLimits {

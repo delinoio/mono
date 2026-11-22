@@ -18,7 +18,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,6 +74,9 @@ type stack struct {
 	api    *proc
 	// work is the directory of the agent state directories.
 	work string
+	// processRuntime is true when the agents use the process runtime, whose
+	// snapshots hold only the files of the sandbox root.
+	processRuntime bool
 	// accounts is the fake delino-accounts API of usage reporting and
 	// billing, and billingAccountID the billing account that the
 	// organization is linked to, in which the user is the billing owner.
@@ -88,6 +93,43 @@ func requireE2E(t *testing.T) {
 	dbtest.URL(t)
 	if testing.Short() {
 		t.Skip("skipping the end-to-end suite in -short mode")
+	}
+}
+
+// linuxGuestRuntime is the agent runtime that runs the LINUX sandboxes of a
+// stack that does not select its own runtime.
+type linuxGuestRuntime int
+
+const (
+	// linuxGuestRuntimeProcess is the process runtime, on a Linux host.
+	linuxGuestRuntimeProcess linuxGuestRuntime = iota
+	// linuxGuestRuntimeVirtualization is the Virtualization.framework
+	// runtime with the base image of TestLifecycleVirtualization, on a
+	// macOS host.
+	linuxGuestRuntimeVirtualization
+	// linuxGuestRuntimeUnavailable means that the host cannot run the
+	// LINUX sandboxes of the suite, so the test is skipped.
+	linuxGuestRuntimeUnavailable
+)
+
+// defaultLinuxGuestRuntime selects the runtime of the LINUX sandboxes for a
+// host of goos, and returns the skip reason when there is none. The process
+// runtime runs the guest helper as a host process, so it runs only guests of
+// the host OS (MACOS on a macOS host) and runs the suite's LINUX sandboxes
+// only on Linux. On a macOS host, the Virtualization.framework runtime runs
+// them when vzKernel and vzRootfs (OWNSAND_VZ_TEST_KERNEL and
+// OWNSAND_VZ_TEST_ROOTFS) name the base image.
+func defaultLinuxGuestRuntime(goos, vzKernel, vzRootfs string) (linuxGuestRuntime, string) {
+	switch {
+	case goos == "linux":
+		return linuxGuestRuntimeProcess, ""
+	case goos == "darwin" && vzKernel != "" && vzRootfs != "":
+		return linuxGuestRuntimeVirtualization, ""
+	case goos == "darwin":
+		return linuxGuestRuntimeUnavailable, "the process runtime runs only guests of the host OS and the suite creates LINUX sandboxes; set " +
+			envVZKernel + " and " + envVZRootfs + " to run them with the Virtualization.framework runtime on this macOS host"
+	default:
+		return linuxGuestRuntimeUnavailable, "the process runtime runs only guests of the host OS and the suite creates LINUX sandboxes; run it on a Linux or macOS host (" + goos + " host)"
 	}
 }
 
@@ -387,8 +429,12 @@ type stackOptions struct {
 	agents int
 	// objects runs the fake S3 store and configures snapshot export.
 	objects bool
-	// agentEnv selects the agent runtime; nil means the process runtime.
+	// agentEnv selects the agent runtime; nil means the runtime that
+	// defaultLinuxGuestRuntime selects for the host.
 	agentEnv []string
+	// noSandboxes marks a test that creates no sandbox, so it runs with the
+	// process runtime on every host.
+	noSandboxes bool
 }
 
 // agentProc is one enrolled agent process.
@@ -402,8 +448,10 @@ type agentProc struct {
 }
 
 // newStack starts the control plane, creates an organization with a user
-// token, enrolls and starts the agents with the process runtime, sets
-// device limits and creates an API key.
+// token, enrolls and starts the agents with the runtime of the options (by
+// default the process runtime on Linux and the Virtualization.framework
+// runtime on macOS, see defaultLinuxGuestRuntime), sets device limits and
+// creates an API key.
 func newStack(t *testing.T, opts ...stackOptions) *stack {
 	t.Helper()
 	requireE2E(t)
@@ -413,6 +461,16 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	}
 	if o.agents == 0 {
 		o.agents = 1
+	}
+	runtimeEnv := o.agentEnv
+	if runtimeEnv == nil && !o.noSandboxes {
+		kernel, rootfs := os.Getenv(envVZKernel), os.Getenv(envVZRootfs)
+		switch kind, reason := defaultLinuxGuestRuntime(runtime.GOOS, kernel, rootfs); kind {
+		case linuxGuestRuntimeVirtualization:
+			runtimeEnv = virtualizationAgentEnv(t, kernel, rootfs)
+		case linuxGuestRuntimeUnavailable:
+			t.Skip(reason)
+		}
 	}
 	bins := buildBinaries(t)
 	logs := &logSink{}
@@ -452,7 +510,7 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 			"R2_SECRET_ACCESS_KEY=e2e-secret-key",
 			// The minimum part size, so a snapshot of a few MiB has
 			// several parts.
-			"SNAPSHOT_PART_SIZE_BYTES=5242880",
+			"SNAPSHOT_PART_SIZE_BYTES="+strconv.Itoa(e2ePartSize),
 		)
 	}
 	// Billing: the control plane reports usage to, polls statuses from and
@@ -478,9 +536,9 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	}
 	user = s.userClient(ownsand.TransportAuto)
 
-	runtimeEnv := o.agentEnv
 	if runtimeEnv == nil {
 		runtimeEnv = []string{"OWNSAND_AGENT_RUNTIME=process", "OWNSAND_AGENT_GUEST_BINARY=" + filepath.Join(bins, "ownsand-guest")}
+		s.processRuntime = true
 	}
 	for i := range o.agents {
 		s.agents = append(s.agents, s.startAgent(ctx, user, work, i, runtimeEnv))
@@ -493,6 +551,10 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	s.apiKey = k.GetApiKeySecret()
 	return s
 }
+
+// e2ePartSize is the export part size of the suite: the minimum, so a
+// snapshot of a few MiB has several parts.
+const e2ePartSize = 5 << 20
 
 // e2eBillingAccountID is the billing account of the suite's organization.
 const e2eBillingAccountID = "01900000-0000-7000-8000-0000000e2e01"
