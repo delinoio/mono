@@ -46,6 +46,7 @@ import {
   SnapshotService,
   type Template,
 } from "@delino/ownsand-protos/v1/snapshot_pb";
+import { assertTransportAvailable } from "./datapath.ts";
 import type { Logger } from "./logger.ts";
 import {
   type PeerConnectionConstructor,
@@ -206,6 +207,7 @@ export class OwnSandClient {
     organizationId: string,
     info: Sandbox["info"],
   ): Sandbox {
+    assertTransportAvailable(this.#forced, this.#Peer);
     const ctx: OperationContext = {
       clock: this.#clock,
       ids: this.#ids,
@@ -224,9 +226,12 @@ export class OwnSandClient {
    * Creates a sandbox. It validates the TTLs and resources before the
    * request, generates one idempotency key for this create and reuses it for
    * every retry after a lost response. The sandbox starts in `CREATING`;
-   * use `waitUntilStable` on the handle.
+   * use `waitUntilStable` on the handle. A forced `PEER_TO_PEER` transport
+   * without a WebRTC implementation fails with an `OwnSandConfigError`
+   * before any request, because the handle could not be built after it.
    */
   async createSandbox(input: CreateSandboxInput): Promise<Sandbox> {
+    assertTransportAvailable(this.#forced, this.#Peer);
     validateTtl(input.idleTtl, input.maxTtl);
     validateResources(input.resources);
     validateLabels(input.labels);
