@@ -54,16 +54,21 @@ func TestLoadValues(t *testing.T) {
 
 func TestLoadRejects(t *testing.T) {
 	for name, mutate := range map[string]func(map[string]string){
-		"missing database":   func(v map[string]string) { delete(v, EnvDatabaseURL) },
-		"missing issuer":     func(v map[string]string) { delete(v, EnvLogtoIssuer) },
-		"bad issuer":         func(v map[string]string) { v[EnvLogtoIssuer] = "tenant" },
-		"bad addr":           func(v map[string]string) { v[EnvAddr] = "8080" },
-		"bad level":          func(v map[string]string) { v[EnvLogLevel] = "loud" },
-		"short nonce key":    func(v map[string]string) { v[EnvNonceKey] = "c2hvcnQ" },
-		"previous alone":     func(v map[string]string) { v[EnvNonceKeyPrevious] = strings.Repeat("A", 43) },
-		"bad origin":         func(v map[string]string) { v[EnvCORSOrigins] = "https://x/path" },
-		"origin fragment":    func(v map[string]string) { v[EnvCORSOrigins] = "https://x#frag" },
-		"origin bare hash":   func(v map[string]string) { v[EnvCORSOrigins] = "https://ownsand.example#" },
+		"missing database":  func(v map[string]string) { delete(v, EnvDatabaseURL) },
+		"missing issuer":    func(v map[string]string) { delete(v, EnvLogtoIssuer) },
+		"bad issuer":        func(v map[string]string) { v[EnvLogtoIssuer] = "tenant" },
+		"bad addr":          func(v map[string]string) { v[EnvAddr] = "8080" },
+		"bad level":         func(v map[string]string) { v[EnvLogLevel] = "loud" },
+		"short nonce key":   func(v map[string]string) { v[EnvNonceKey] = "c2hvcnQ" },
+		"previous alone":    func(v map[string]string) { v[EnvNonceKeyPrevious] = strings.Repeat("A", 43) },
+		"bad origin":        func(v map[string]string) { v[EnvCORSOrigins] = "https://x/path" },
+		"origin fragment":   func(v map[string]string) { v[EnvCORSOrigins] = "https://x#frag" },
+		"origin bare hash":  func(v map[string]string) { v[EnvCORSOrigins] = "https://ownsand.example#" },
+		"origin bare query": func(v map[string]string) { v[EnvCORSOrigins] = "https://console.example.org?" },
+		"origin user info":  func(v map[string]string) { v[EnvCORSOrigins] = "https://user@console.example.org" },
+		"origin in list": func(v map[string]string) {
+			v[EnvCORSOrigins] = "https://ownsand.example, https://user:pw@console.example.org"
+		},
 		"bad trust boolean":  func(v map[string]string) { v[EnvTrustProxyClientAddress] = "maybe" },
 		"bad direct boolean": func(v map[string]string) { v[EnvAllowDirectClientAddress] = "maybe" },
 		"bad migrate switch": func(v map[string]string) { v[EnvRunMigrations] = "sometimes" },
@@ -73,6 +78,35 @@ func TestLoadRejects(t *testing.T) {
 		if _, err := Load(env(v)); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestLoadCORSOrigins(t *testing.T) {
+	for _, tc := range []struct {
+		name, origins string
+		ok            bool
+	}{
+		{"https origin", "https://console.example.org", true},
+		{"http with port", "http://127.0.0.1:13300", true},
+		{"list", "https://a.example, http://b.example:8080", true},
+		{"bare query", "https://console.example.org?", false},
+		{"user info", "https://user@console.example.org", false},
+		{"user and password", "https://user:pw@console.example.org", false},
+		{"query", "https://console.example.org?a=b", false},
+		{"fragment", "https://console.example.org#f", false},
+		{"path", "https://console.example.org/p", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := minimal()
+			v[EnvCORSOrigins] = tc.origins
+			_, err := Load(env(v))
+			if tc.ok != (err == nil) {
+				t.Fatalf("Load(%q) err = %v, want ok=%v", tc.origins, err, tc.ok)
+			}
+			if err != nil && !strings.Contains(err.Error(), EnvCORSOrigins) {
+				t.Errorf("error %q does not name %s", err, EnvCORSOrigins)
+			}
+		})
 	}
 }
 
