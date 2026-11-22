@@ -17,10 +17,12 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand/internal/credstore"
+	"github.com/delinoio/mono/cmds/ownsand/internal/logto"
 	ownsand "github.com/delinoio/mono/go/ownsand"
 )
 
@@ -51,20 +53,27 @@ func newRunner(t *testing.T) *runner {
 func (r *runner) run(args ...string) result {
 	r.t.Helper()
 	var out, errb bytes.Buffer
+	code := r.runWriters(&out, &errb, args...)
+	return result{code: code, stdout: out.String(), stderr: errb.String()}
+}
+
+// runWriters runs one invocation on the given standard output and error and
+// returns the exit status.
+func (r *runner) runWriters(stdout, stderr io.Writer, args ...string) int {
+	r.t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	code := Run(ctx, Env{
+	return Run(ctx, Env{
 		Args:   args,
 		Stdin:  strings.NewReader(r.stdin),
-		Stdout: &out,
-		Stderr: &errb,
+		Stdout: stdout,
+		Stderr: stderr,
 		LookupEnv: func(k string) (string, bool) {
 			v, ok := r.env[k]
 			return v, ok
 		},
 		LoginPollInterval: 10 * time.Millisecond,
 	})
-	return result{code: code, stdout: out.String(), stderr: errb.String()}
 }
 
 func TestUsageErrors(t *testing.T) {
@@ -396,6 +405,44 @@ func TestLoginStoresUserOnlyCredentialsAndLogout(t *testing.T) {
 	}
 }
 
+// A device code that expires while the user has not signed in ends the login
+// with the expiry message at the expiry time, not after the polling interval,
+// and without a token request after that point.
+func TestLoginReportsExpiryWithoutLateTokenRequest(t *testing.T) {
+	r := newRunner(t)
+	delete(r.env, ownsand.EnvAPIKey)
+	r.env[EnvLogtoAppID] = "app"
+	var tokenRequests atomic.Int32
+	ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/oidc/device/auth":
+			// A long interval and a lifetime of one second.
+			fmt.Fprint(w, `{"device_code":"dev-secret","user_code":"ABCD-EFGH","verification_uri":"https://login.example/device","expires_in":1,"interval":5}`)
+		case "/oidc/token":
+			tokenRequests.Add(1)
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprint(w, `{"error":"authorization_pending"}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ls.Close()
+	r.env[EnvLogtoEndpoint] = ls.URL
+	start := time.Now()
+	res := r.run("login")
+	elapsed := time.Since(start)
+	if res.code != ExitError || !strings.Contains(res.stderr, logto.ErrExpired.Error()) {
+		t.Fatalf("%+v", res)
+	}
+	if elapsed > 4*time.Second {
+		t.Fatalf("login took %v, want about 1s", elapsed)
+	}
+	if n := tokenRequests.Load(); n != 0 {
+		t.Fatalf("%d token requests after the code expired", n)
+	}
+}
+
 func TestStoredCredentialsRejectChangedLogtoConfiguration(t *testing.T) {
 	r := newRunner(t)
 	delete(r.env, ownsand.EnvAPIKey)
@@ -481,6 +528,62 @@ func TestDeviceSetLimitsKeepsCurrentOvercommit(t *testing.T) {
 	}
 	if res := r.run("device", "set-limits", r.f.dev, "--vcpu", "8", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "110"); res.code != ExitUsage {
 		t.Fatalf("overcommit not in steps of 25 accepted: %+v", res)
+	}
+}
+
+// TestDeviceSetLimitsOvercommitFlag checks that only an absent
+// --vcpu-overcommit falls back to the device's current value, that every
+// explicit value is validated before any RPC, and that an explicit valid value
+// is sent without a preceding GetDevice.
+func TestDeviceSetLimitsOvercommitFlag(t *testing.T) {
+	base := []string{"--vcpu", "8", "--memory", "16384", "--disk", "200"}
+	for _, tc := range []struct {
+		name      string
+		flag      []string
+		wantCode  int
+		wantCalls []string
+		wantPct   int32
+	}{
+		{name: "absent keeps the current value", wantCalls: []string{"GetDevice", "ReplaceDeviceLimits"}, wantPct: 150},
+		{name: "explicit 100", flag: []string{"--vcpu-overcommit", "100"}, wantCalls: []string{"ReplaceDeviceLimits"}, wantPct: 100},
+		{name: "explicit 400", flag: []string{"--vcpu-overcommit=400"}, wantCalls: []string{"ReplaceDeviceLimits"}, wantPct: 400},
+		{name: "explicit 110", flag: []string{"--vcpu-overcommit", "110"}, wantCode: ExitUsage},
+		{name: "explicit -1", flag: []string{"--vcpu-overcommit", "-1"}, wantCode: ExitUsage},
+		{name: "explicit -25", flag: []string{"--vcpu-overcommit=-25"}, wantCode: ExitUsage},
+		{name: "explicit minimum int32", flag: []string{"--vcpu-overcommit", "-2147483648"}, wantCode: ExitUsage},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newRunner(t)
+			args := append([]string{"device", "set-limits", r.f.dev}, base...)
+			res := r.run(append(args, tc.flag...)...)
+			if res.code != tc.wantCode {
+				t.Fatalf("exit code %d, want %d: %+v", res.code, tc.wantCode, res)
+			}
+			calls := r.f.callNames()
+			if len(calls) != len(tc.wantCalls) {
+				t.Fatalf("calls %v, want %v", calls, tc.wantCalls)
+			}
+			for i := range calls {
+				if calls[i] != tc.wantCalls[i] {
+					t.Fatalf("calls %v, want %v", calls, tc.wantCalls)
+				}
+			}
+			r.f.mu.Lock()
+			l := r.f.limit
+			r.f.mu.Unlock()
+			if tc.wantCode != 0 {
+				if !strings.Contains(res.stderr, "limits.vcpu_overcommit_percent") || !strings.Contains(res.stderr, "100 to 400 in steps of 25") {
+					t.Fatalf("stderr does not name the field and the allowed range: %q", res.stderr)
+				}
+				if l != nil {
+					t.Fatalf("limits were sent: %v", l)
+				}
+				return
+			}
+			if l.GetVcpuCount() != 8 || l.GetMemoryMib() != 16384 || l.GetDiskGib() != 200 || l.VcpuOvercommitPercent == nil || l.GetVcpuOvercommitPercent() != tc.wantPct {
+				t.Fatalf("limits %v, want overcommit %d", l, tc.wantPct)
+			}
+		})
 	}
 }
 
@@ -1060,5 +1163,33 @@ func TestParseDurationDayOverflow(t *testing.T) {
 	res := r.run("sandbox", "create", "--image", "linux", "--idle-ttl", "10m", "--max-ttl", "213504d", "--vcpu", "1", "--memory", "512", "--disk", "5")
 	if res.code != ExitUsage || !strings.Contains(res.stderr, "invalid duration") || len(r.f.callNames()) != 0 {
 		t.Fatalf("%+v %v", res, r.f.callNames())
+	}
+}
+
+// TestDeviceSetLimitsPrintsLargeIntegersInFull checks that text mode prints
+// the largest int32 value in decimal form, and that JSON mode keeps it too.
+func TestDeviceSetLimitsPrintsLargeIntegersInFull(t *testing.T) {
+	r := newRunner(t)
+	args := []string{"device", "set-limits", r.f.dev, "--vcpu", "2147483647", "--memory", "1", "--disk", "1", "--vcpu-overcommit", "100"}
+	res := r.run(append(args, "--no-color")...)
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	for _, want := range []string{"limits.vcpu_count: 2147483647\n", "effective_vcpu_limit: 2147483647\n"} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("stdout misses %q:\n%s", want, res.stdout)
+		}
+	}
+	if strings.Contains(res.stdout, "e+") {
+		t.Errorf("exponent form in stdout:\n%s", res.stdout)
+	}
+	res = r.run(append(args, "--format", "json")...)
+	if res.code != ExitOK {
+		t.Fatalf("%+v", res)
+	}
+	for _, want := range []string{`"vcpu_count":2147483647`, `"effective_vcpu_limit":2147483647`} {
+		if !strings.Contains(res.stdout, want) {
+			t.Errorf("JSON stdout misses %q:\n%s", want, res.stdout)
+		}
 	}
 }

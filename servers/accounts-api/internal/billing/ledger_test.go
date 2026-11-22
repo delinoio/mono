@@ -449,6 +449,139 @@ func TestLowBalanceAlertOncePerCrossing(t *testing.T) {
 	}
 }
 
+// lowBalanceState returns the number of queued low-balance notifications and
+// the low_balance_alerted flag of the billing account.
+func (f *fixture) lowBalanceState(accountID string) (queued int64, alerted bool) {
+	f.t.Helper()
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_notifications
+		WHERE billing_account_id = $1 AND kind = $2`, accountID, string(NotifyLowBalance)).Scan(&queued); err != nil {
+		f.t.Fatal(err)
+	}
+	st, err := LoadSettings(ctx(), f.db.Pool, accountID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return queued, st.LowBalanceAlerted
+}
+
+// wantLowBalance checks the low-balance notifications and alert flag.
+func (f *fixture) wantLowBalance(accountID string, queued int64, alerted bool) {
+	f.t.Helper()
+	if gotQueued, gotAlerted := f.lowBalanceState(accountID); gotQueued != queued || gotAlerted != alerted {
+		f.t.Fatalf("low-balance notifications = %d, alerted = %v, want %d and %v", gotQueued, gotAlerted, queued, alerted)
+	}
+}
+
+// expiringFixture returns a billing account with a 20 USD grant that is due
+// to expire and a 5 USD grant that is not, and sets the clock just after the
+// expiry of the first grant. The balance of 25 USD still includes the due
+// grant, because no job has expired it yet.
+func (f *fixture) expiringFixture() string {
+	f.t.Helper()
+	acct := f.account()
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+	f.wantLowBalance(acct, 0, false)
+	return acct
+}
+
+func TestZeroDeductionInlineExpiryQueuesLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.expiringFixture()
+	res := f.deduct(acct, 0)
+	if res.AutoTopUpQueued || res.BalanceAfterUSDMicros != 5*usd {
+		t.Fatalf("zero deduction result %+v", res)
+	}
+	f.wantLowBalance(acct, 1, true)
+	// The alert is not repeated while the balance stays below the threshold.
+	f.deduct(acct, 0)
+	f.deduct(acct, usd)
+	f.wantLowBalance(acct, 1, true)
+}
+
+func TestZeroDeductionInlineExpiryNeverQueuesAutoTopUp(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 50*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+
+	// With automatic top-up on, an expiry is no usage: it queues neither an
+	// automatic top-up nor a low-balance email.
+	if res := f.deduct(acct, 0); res.AutoTopUpQueued || res.BalanceAfterUSDMicros != 5*usd {
+		t.Fatalf("zero deduction result %+v", res)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 0 {
+		t.Fatalf("top-ups after a zero deduction = %v", got)
+	}
+	f.wantLowBalance(acct, 0, false)
+	// A positive usage below the threshold still queues it.
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("a usage deduction below the threshold queued no top-up")
+	}
+}
+
+func TestGrantAfterInlineExpiryQueuesLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.expiringFixture()
+	// 25 USD before, 5 USD after the expiry, 8 USD after the grant: a
+	// decrease that ends below the threshold.
+	f.grant(acct, LedgerManualTopUp, 3*usd)
+	if f.balance(acct) != 8*usd {
+		t.Fatalf("balance = %d", f.balance(acct))
+	}
+	f.wantLowBalance(acct, 1, true)
+}
+
+func TestGrantAfterInlineExpiryDoesNotQueueAutoTopUp(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 50*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+
+	f.grant(acct, LedgerManualTopUp, 3*usd)
+	if got := f.topUpStatuses(acct); len(got) != 0 {
+		t.Fatalf("top-ups after a grant = %v", got)
+	}
+	f.wantLowBalance(acct, 0, false)
+}
+
+func TestGrantRestoringBalanceRearmsLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.expiringFixture()
+	f.deduct(acct, 0) // the inline expiry brings the balance to 5 USD and alerts
+	f.wantLowBalance(acct, 1, true)
+
+	// A grant that reaches the threshold re-arms the alert and queues nothing.
+	f.grant(acct, LedgerManualTopUp, 5*usd)
+	f.wantLowBalance(acct, 1, false)
+}
+
+func TestInlineExpiryAboveThresholdQueuesNoLowBalance(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.grant(acct, LedgerSubscriptionCredit, 20*usd)
+	f.clock.Advance(30 * 24 * time.Hour)
+	f.grant(acct, LedgerManualTopUp, 25*usd)
+	f.clock.Set(GrantExpireTime(f.clock.Now().Add(-30 * 24 * time.Hour)).Add(time.Second))
+
+	// The expiry decreases the balance from 45 to 25 USD, above the threshold.
+	f.grant(acct, LedgerManualTopUp, usd)
+	f.wantLowBalance(acct, 0, false)
+	f.clock.Advance(time.Hour)
+	f.deduct(acct, 0)
+	f.wantLowBalance(acct, 0, false)
+}
+
 // activate gives the billing account an active Paddle subscription.
 func (f *fixture) activate(accountID string) string {
 	f.t.Helper()
@@ -669,6 +802,158 @@ func TestAutoTopUpPastDueAndTimeout(t *testing.T) {
 	f.completeCharge(charges[len(charges)-1], 2500)
 	if got := f.topUpStatuses(acct); got[1] != "completed" || f.balance(acct) != 23*usd {
 		t.Fatalf("after the late webhook: %v, balance %d", got, f.balance(acct))
+	}
+}
+
+// updateAutoTopUp replaces the automatic top-up settings, as an owner or an
+// admin does while a top-up waits in the queue.
+func (f *fixture) updateAutoTopUp(accountID string, enabled bool, threshold, amount, limit int64) {
+	f.t.Helper()
+	f.tx(func(tx pgx.Tx) error {
+		_, err := UpdateAutoTopUp(ctx(), tx, accountID, autoSettings(enabled, threshold, amount, limit), f.s.timestamp())
+		return err
+	})
+}
+
+// wantObsoleteTopUp checks that the only top-up was closed as obsolete
+// without a Paddle call, did not count as a failed automatic top-up and sent
+// no email.
+func (f *fixture) wantObsoleteTopUp(accountID string) {
+	f.t.Helper()
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		f.t.Fatal(err)
+	}
+	if charges := f.paddle.Charges(); len(charges) != 0 {
+		f.t.Fatalf("an obsolete top-up called Paddle: %+v", charges)
+	}
+	if got := f.topUpStatuses(accountID); len(got) != 1 || got[0] != "failed:settings_changed" {
+		f.t.Fatalf("top-ups = %v", got)
+	}
+	if st, _ := loadSettings(ctx(), f.db.Pool, accountID); st.ConsecutiveFailures != 0 {
+		f.t.Fatalf("the obsolete top-up counted as a failure: %+v", st)
+	}
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		f.t.Fatal(err)
+	}
+	for _, m := range f.email.Messages() {
+		if m.Kind == email.KindPaymentFailed || m.Kind == email.KindAutoTopUpDisabled {
+			f.t.Fatalf("the obsolete top-up sent an email: %+v", m)
+		}
+	}
+}
+
+func TestPendingAutoTopUpClosedWhenDisabled(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	f.updateAutoTopUp(acct, false, 0, 0, 0)
+	f.wantObsoleteTopUp(acct)
+	// The closed top-up no longer blocks a later one under the new settings.
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued after the obsolete one closed")
+	}
+}
+
+func TestPendingAutoTopUpClosedWhenAmountLowered(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 100*usd, 200*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	f.updateAutoTopUp(acct, true, 10*usd, 25*usd, 200*usd)
+	f.wantObsoleteTopUp(acct)
+}
+
+func TestPendingAutoTopUpClosedWhenCapLowered(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 50*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	f.completeCharge(f.paddle.Charges()[0], 2500)
+	if res := f.deduct(acct, 20*usd); !res.AutoTopUpQueued {
+		t.Fatal("second top-up not queued")
+	}
+	// 25 USD of the month is spent; a cap of 40 USD leaves 15 USD, which
+	// does not fit the second 25 USD top-up.
+	f.updateAutoTopUp(acct, true, 10*usd, 25*usd, 40*usd)
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.paddle.Charges()); n != 1 {
+		t.Fatalf("charges = %d, want only the first", n)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 2 || got[0] != "completed" || got[1] != "failed:settings_changed" {
+		t.Fatalf("top-ups = %v", got)
+	}
+	if st, _ := loadSettings(ctx(), f.db.Pool, acct); !st.AutoEnabled || st.ConsecutiveFailures != 0 {
+		t.Fatalf("settings = %+v", st)
+	}
+}
+
+func TestPendingAutoTopUpStillValidChargesOnce(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 25*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	// The pending top-up uses the whole cap and still fits it; a larger
+	// current amount and a new threshold do not change the queued amount.
+	f.updateAutoTopUp(acct, true, 15*usd, 50*usd, 50*usd)
+	for range 2 {
+		if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	charges := f.paddle.Charges()
+	if len(charges) != 1 || paddletest.ChargeAmountCents(charges[0]) != "2500" {
+		t.Fatalf("charges = %+v", charges)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "charged" {
+		t.Fatalf("top-ups = %v", got)
+	}
+}
+
+func TestSubmittedAutoTopUpSurvivesSettingsChange(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	subID := f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	f.paddle.SetSubscription(paddle.Subscription{ID: subID, Status: paddle.SubscriptionStatusActive})
+	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusBadGateway, Code: "bad_gateway"})
+	f.deduct(acct, usd)
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "unknown" {
+		t.Fatalf("top-ups = %v", got)
+	}
+	// Disabling the setting leaves the submitted charge to its webhook.
+	f.updateAutoTopUp(acct, false, 0, 0, 0)
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "unknown" {
+		t.Fatalf("top-ups after the settings change = %v", got)
+	}
+	charges := f.paddle.Charges()
+	f.completeCharge(charges[len(charges)-1], 2500)
+	if got := f.topUpStatuses(acct); got[0] != "completed" {
+		t.Fatalf("top-ups after the webhook = %v", got)
 	}
 }
 

@@ -323,6 +323,179 @@ func TestDNSForwarderBoundsTCPConns(t *testing.T) {
 	}
 }
 
+// startTCPUpstream starts a TCP-only fake upstream that runs handle for each
+// connection. The cleanup closes the listener and every connection, so a
+// handler that blocks ends with the test.
+func startTCPUpstream(t *testing.T, handle func(c net.Conn)) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var conns []net.Conn
+	t.Cleanup(func() {
+		l.Close()
+		mu.Lock()
+		defer mu.Unlock()
+		for _, c := range conns {
+			c.Close()
+		}
+	})
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			conns = append(conns, c)
+			mu.Unlock()
+			go handle(c)
+		}
+	}()
+	return l.Addr().String()
+}
+
+// readDNSFrame reads one length-prefixed message and returns its payload.
+func readDNSFrame(c net.Conn) ([]byte, error) {
+	var l [2]byte
+	if _, err := io.ReadFull(c, l[:]); err != nil {
+		return nil, err
+	}
+	msg := make([]byte, binary.BigEndian.Uint16(l[:]))
+	_, err := io.ReadFull(c, msg)
+	return msg, err
+}
+
+// requireDNSAnswer reads one length-prefixed answer from the guest side.
+func requireDNSAnswer(t *testing.T, c net.Conn, want string) {
+	t.Helper()
+	got, err := readDNSFrame(c)
+	if err != nil || string(got) != want {
+		t.Fatalf("answer %q %v, want %q", got, err, want)
+	}
+}
+
+// requireTCPSlotFree checks that a one-slot forwarder admits and answers a
+// new connection, which proves the slot of an earlier connection is free.
+func requireTCPSlotFree(t *testing.T, f *DNSForwarder) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		c := dnsTCPConn(t, f, "next")
+		if got, err := readDNSFrame(c); err == nil {
+			if string(got) != "ok:next" {
+				t.Fatalf("answer on the freed slot %q", got)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tcp slot was not released")
+		}
+	}
+}
+
+// answerThenClose reads one query, answers it with "ok:" plus the query and
+// closes the connection, like an upstream that closes first.
+func answerThenClose(c net.Conn) {
+	defer c.Close()
+	msg, err := readDNSFrame(c)
+	if err != nil {
+		return
+	}
+	answerFrame(c, msg)
+}
+
+// answerFrame writes the answer "ok:" plus the query as one length-prefixed
+// message.
+func answerFrame(c net.Conn, query []byte) {
+	ans := append([]byte("ok:"), query...)
+	c.Write(append([]byte{byte(len(ans) >> 8), byte(len(ans))}, ans...))
+}
+
+func TestDNSForwarderUpstreamClosesFirst(t *testing.T) {
+	// The default 30-second deadline stays in place: the guest must see EOF
+	// long before it.
+	up := startTCPUpstream(t, answerThenClose)
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "first")
+	requireDNSAnswer(t, c, "ok:first")
+	// The guest keeps its side open and sends nothing more; the upstream
+	// closing ends the connection toward the guest.
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("guest connection did not end after the upstream closed: %v", err)
+	}
+	requireTCPSlotFree(t, f)
+}
+
+func TestDNSForwarderGuestClosesFirst(t *testing.T) {
+	sawEOF := make(chan struct{}, 1)
+	up := startTCPUpstream(t, func(c net.Conn) {
+		defer c.Close()
+		msg, err := readDNSFrame(c)
+		if err != nil {
+			return
+		}
+		// The follow-up query of requireTCPSlotFree gets its answer at once.
+		if string(msg) != "first" {
+			answerFrame(c, msg)
+			return
+		}
+		// Wait for the forwarder to half-close the upstream, then answer:
+		// the guest's half-close must not drop this pending answer.
+		if _, err := io.Copy(io.Discard, c); err != nil {
+			return
+		}
+		sawEOF <- struct{}{}
+		answerFrame(c, msg)
+	})
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1})
+	defer f.Close()
+
+	c := dnsTCPConn(t, f, "first")
+	c.(*net.TCPConn).CloseWrite()
+	select {
+	case <-sawEOF:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not see the guest close")
+	}
+	requireDNSAnswer(t, c, "ok:first")
+	c.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("guest connection did not end after the answer: %v", err)
+	}
+	requireTCPSlotFree(t, f)
+}
+
+func TestDNSForwarderEndsSilentConnAtDeadline(t *testing.T) {
+	const deadline = 300 * time.Millisecond
+	// The upstream reads the query and then stays silent and open.
+	up := startTCPUpstream(t, func(c net.Conn) {
+		readDNSFrame(c)
+		io.Copy(io.Discard, c)
+	})
+	f := startTestDNS(t, up, slog.New(slog.NewJSONHandler(io.Discard, nil)), dnsLimits{maxUDPQueries: 1, maxTCPConns: 1, tcpDeadline: deadline})
+	defer f.Close()
+
+	start := time.Now()
+	c := dnsTCPConn(t, f, "silent")
+	c.SetReadDeadline(time.Now().Add(deadline + 2*time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil {
+		t.Fatal("silent connection delivered data")
+	}
+	elapsed := time.Since(start)
+	if elapsed < deadline {
+		t.Fatalf("connection ended after %v, before the %v deadline", elapsed, deadline)
+	}
+	if elapsed > deadline+2*time.Second {
+		t.Fatalf("connection ended after %v, long after the %v deadline", elapsed, deadline)
+	}
+}
+
 func TestDNSForwarderLimitsAreIndependentPerForwarder(t *testing.T) {
 	g := startGatedUpstream(t)
 	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))

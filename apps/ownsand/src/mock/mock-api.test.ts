@@ -189,6 +189,87 @@ describe("mock idempotent createSandbox", () => {
   });
 });
 
+describe("mock createSandbox placement", () => {
+  const organizationId = MOCK_IDS.acme;
+  const request = (deviceId?: string) => ({
+    organizationId,
+    idempotencyKey: uuidV7(),
+    source: {
+      source: { case: "baseImage" as const, value: BaseImage.LINUX },
+    },
+    resources: { vcpuCount: 1, memoryMib: 1024n, diskGib: 10n },
+    idleTtl: { seconds: 600n },
+    maxTtl: { seconds: 3600n },
+    placement: deviceId === undefined ? undefined : { deviceId },
+  });
+
+  test("an explicit online device runs the sandbox", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const { sandbox } = await client.createSandbox(request(MOCK_IDS.buildBox));
+    expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+  });
+
+  test("automatic placement picks the first online device", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const { sandbox } = await client.createSandbox(request());
+    expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+  });
+
+  test("an explicit offline device fails with Unavailable and creates nothing", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const before = await client.listSandboxes({ organizationId });
+    const error = await client
+      .createSandbox(request(MOCK_IDS.studioMac))
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.Unavailable);
+    const after = await client.listSandboxes({ organizationId });
+    expect(after.sandboxes).toHaveLength(before.sandboxes.length);
+  });
+
+  test("an unknown device fails with NotFound and creates nothing", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const before = await client.listSandboxes({ organizationId });
+    const error = await client
+      .createSandbox(request(uuidV7()))
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.NotFound);
+    const after = await client.listSandboxes({ organizationId });
+    expect(after.sandboxes).toHaveLength(before.sandboxes.length);
+  });
+
+  test("a removed device fails with NotFound and creates nothing", async () => {
+    const transport = createMockTransport();
+    const devices = createClient(DeviceService, transport);
+    const client = createClient(SandboxService, transport);
+    await devices.removeDevice({ organizationId, deviceId: MOCK_IDS.buildBox });
+    const before = await client.listSandboxes({ organizationId });
+    await expect(
+      client.createSandbox(request(MOCK_IDS.buildBox)),
+    ).rejects.toMatchObject({ code: Code.NotFound });
+    const after = await client.listSandboxes({ organizationId });
+    expect(after.sandboxes).toHaveLength(before.sandboxes.length);
+  });
+
+  test("a failed explicit placement does not store the idempotency key", async () => {
+    const client = createClient(SandboxService, createMockTransport());
+    const key = uuidV7();
+    await expect(
+      client.createSandbox({
+        ...request(MOCK_IDS.studioMac),
+        idempotencyKey: key,
+      }),
+    ).rejects.toMatchObject({ code: Code.Unavailable });
+    // The same key with another placement is a new request, not a replay.
+    const { sandbox } = await client.createSandbox({
+      ...request(MOCK_IDS.buildBox),
+      idempotencyKey: key,
+    });
+    expect(sandbox?.deviceId).toBe(MOCK_IDS.buildBox);
+  });
+});
+
 describe("mock billing", () => {
   const organizationId = MOCK_IDS.acme;
   const ADMIN = "user-admin-jun";

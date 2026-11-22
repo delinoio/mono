@@ -8,6 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { SubscriptionStatus } from "@delino/accounts-protos/v1/credit_pb";
 import { pendingInvitation } from "./invitation.ts";
 import {
@@ -20,6 +21,8 @@ import {
 } from "./testing/fake-api.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
 
+/** A token of an earlier link that waits in `sessionStorage`. */
+const EARLIER_INVITATION_TOKEN = "bai_earlier-token";
 const ACCOUNT_PATH = `/billing/${ACCOUNT_ID}`;
 const UUID_V7 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -522,9 +525,97 @@ describe("members", () => {
     expect(window.location.pathname).toBe("/billing");
   });
 
+  test.each([
+    ["a viewer", VIEWER],
+    ["an admin", ADMIN],
+  ])(
+    "%s who leaves never sees the not-found notice and the account is gone from the list",
+    async (_role, userId) => {
+      const { api } = await renderAccount(userId);
+      await openTab("Members");
+      await screen.findByRole("list", { name: "Members" });
+      // Record the not-found text at every DOM change and at the navigation
+      // itself, so that a flash between the removal and the navigation counts.
+      const notFound = "It was not found, or you no longer have access to it.";
+      const seen: string[] = [];
+      const record = (where: string) => {
+        if (document.body.textContent?.includes(notFound)) seen.push(where);
+      };
+      const observer = new MutationObserver(() => record("mutation"));
+      observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      const pushState = window.history.pushState.bind(window.history);
+      window.history.pushState = (...args) => {
+        record("navigation");
+        pushState(...args);
+      };
+      // Hold the account request that a refresh would send. The page must not
+      // wait for it: the user cannot read the account any more, so the request
+      // can only fail with the not-found notice.
+      let release!: () => void;
+      api.gates.set(
+        "GetBillingAccount",
+        new Promise<void>((resolve) => {
+          release = resolve;
+        }),
+      );
+      try {
+        await click(
+          screen.getByRole("button", { name: "Leave billing account" }),
+        );
+        const dialog = await screen.findByRole("alertdialog");
+        await click(
+          within(dialog).getByRole("button", { name: "Leave billing account" }),
+        );
+        await settle(100);
+        expect(calls(api, "RemoveMember")).toHaveLength(1);
+        expect(window.location.pathname).toBe("/billing");
+        release();
+        await settle(100);
+        expect(await screen.findByText("No billing accounts yet")).toBeTruthy();
+        expect(
+          screen.queryByRole("link", { name: /Acme Robotics/ }),
+        ).toBeNull();
+        expect(seen).toEqual([]);
+      } finally {
+        observer.disconnect();
+        window.history.pushState = pushState;
+      }
+      expect(calls(api, "RemoveMember")).toEqual([
+        expect.objectContaining({ userId }),
+      ]);
+    },
+  );
+
+  test("a failed leave shows its error in the dialog and does not navigate", async () => {
+    const { api } = await renderAccount(VIEWER);
+    await openTab("Members");
+    await screen.findByRole("list", { name: "Members" });
+    api.failNext.set(
+      "RemoveMember",
+      new ConnectError("the owner cannot leave", Code.FailedPrecondition),
+    );
+    await click(screen.getByRole("button", { name: "Leave billing account" }));
+    const dialog = await screen.findByRole("alertdialog");
+    await click(
+      within(dialog).getByRole("button", { name: "Leave billing account" }),
+    );
+    await settle(60);
+    expect(within(dialog).getByRole("alert")).toBeTruthy();
+    expect(window.location.pathname).toBe(ACCOUNT_PATH);
+    expect(screen.getByRole("alertdialog")).toBeTruthy();
+    expect(
+      screen.getByRole("heading", { name: "Acme Robotics", level: 1 }),
+    ).toBeTruthy();
+  });
+
   test("changes a role between admin and viewer", async () => {
     const { api } = await renderAccount();
     await openTab("Members");
+    const listed = calls(api, "ListMembers").length;
     await click(
       await screen.findByRole("combobox", { name: "Role of Vera Viewer" }),
     );
@@ -533,12 +624,15 @@ describe("members", () => {
     expect(calls(api, "UpdateMemberRole")).toEqual([
       expect.objectContaining({ userId: VIEWER, role: 2 }),
     ]);
+    expect(calls(api, "ListMembers").length).toBeGreaterThan(listed);
   });
 
   test("removes a member and transfers ownership after confirmation", async () => {
     const { api } = await renderAccount();
     await openTab("Members");
     const list = await screen.findByRole("list", { name: "Members" });
+    const listed = () => calls(api, "ListMembers").length;
+    let before = listed();
     await click(within(list).getAllByRole("button", { name: "Remove" })[1]!);
     let dialog = await screen.findByRole("alertdialog");
     await click(within(dialog).getByRole("button", { name: "Remove member" }));
@@ -546,6 +640,14 @@ describe("members", () => {
     expect(calls(api, "RemoveMember")).toEqual([
       expect.objectContaining({ userId: VIEWER }),
     ]);
+    // The member list is refreshed and no longer shows the removed member.
+    expect(listed()).toBeGreaterThan(before);
+    expect(
+      within(await screen.findByRole("list", { name: "Members" })).queryByText(
+        /Vera Viewer/,
+      ),
+    ).toBeNull();
+    before = listed();
     await click(screen.getByRole("button", { name: "Make owner" }));
     dialog = await screen.findByRole("alertdialog");
     await click(
@@ -555,6 +657,7 @@ describe("members", () => {
     expect(calls(api, "TransferOwnership")).toEqual([
       expect.objectContaining({ userId: ADMIN }),
     ]);
+    expect(listed()).toBeGreaterThan(before);
   });
 
   test("invites by email: focuses the email, checks it and sends the role", async () => {
@@ -642,6 +745,64 @@ describe("invitation acceptance", () => {
     expect(pendingInvitation.read()).toBeUndefined();
   });
 
+  test("a new link drops the stored token of an earlier link", async () => {
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`);
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    expect(window.location.hash).toBe("");
+    expect(pendingInvitation.read()).toBeUndefined();
+    cleanup();
+    renderApp("/billing/invitations/accept");
+    expect(await screen.findByText(/needs the link/)).toBeTruthy();
+  });
+
+  test("accepts the new link and not the stored token of an earlier link", async () => {
+    const api = createFakeApi();
+    api.userId = OUTSIDER;
+    api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
+      accountId: ACCOUNT_ID,
+      role: BillingAccountRole.ADMIN,
+    });
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`, { api });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    await settle(60);
+    expect(calls(api, "AcceptInvitation")).toEqual([
+      expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+    ]);
+  });
+
+  test("a link opened while the page is shown drops the stored token of an earlier link", async () => {
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    renderApp("/billing/invitations/accept");
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    await act(async () => {
+      window.location.hash = `token=${INVITATION_TOKEN}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await settle(30);
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.location.hash).toBe("");
+    cleanup();
+    renderApp("/billing/invitations/accept");
+    expect(await screen.findByText(/needs the link/)).toBeTruthy();
+  });
+
+  test("keeps the stored token for the sign-in return when the fragment is empty", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    renderApp("/billing/invitations/accept", { signedIn: false });
+    expect(
+      await screen.findByRole("button", { name: "Sign in to accept" }),
+    ).toBeTruthy();
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+  });
+
   test("leaving the invitation flow deletes the stored token", async () => {
     pendingInvitation.save(INVITATION_TOKEN);
     renderApp("/billing/invitations/accept");
@@ -686,6 +847,37 @@ describe("settings", () => {
           thresholdUsdMicros: 10_000_000n,
           amountUsdMicros: 50_000_000n,
           monthlyCapUsdMicros: 200_000_000n,
+        }),
+      }),
+    ]);
+  });
+
+  test("rejects an enabled automatic top-up amount above $10,000 without a request", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    await click(
+      await screen.findByRole("switch", { name: "Automatic top-up" }),
+    );
+    const threshold = screen.getByRole("textbox", { name: "Threshold (USD)" });
+    const amount = screen.getByRole("textbox", { name: "Top-up amount (USD)" });
+    const cap = screen.getByRole("textbox", { name: "Monthly cap (USD)" });
+    const form = threshold.closest("form")!;
+    const save = within(form).getByRole("button", { name: "Save" });
+    await type(threshold, "10");
+    await type(amount, "15000");
+    await type(cap, "20000");
+    await click(save);
+    expect(screen.getByText("Enter at most $10,000.00.")).toBeTruthy();
+    expect(calls(api, "UpdateAutoTopUpSettings")).toHaveLength(0);
+    await type(amount, "10000");
+    await click(save);
+    await settle(60);
+    expect(calls(api, "UpdateAutoTopUpSettings")).toEqual([
+      expect.objectContaining({
+        settings: expect.objectContaining({
+          enabled: true,
+          amountUsdMicros: 10_000_000_000n,
+          monthlyCapUsdMicros: 20_000_000_000n,
         }),
       }),
     ]);

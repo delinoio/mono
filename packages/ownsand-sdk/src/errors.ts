@@ -29,6 +29,20 @@ export class OwnSandValidationError extends OwnSandError {
 }
 
 /**
+ * The sandbox handle was closed (`Sandbox.close()` or a successful
+ * `Sandbox.delete()`). It is the error of a peer-to-peer operation on a
+ * closed handle and of one whose session setup was still running at the close.
+ * A relay-only handle keeps serving after a close.
+ */
+export class OwnSandHandleClosedError extends OwnSandError {
+  override name = "OwnSandHandleClosedError";
+
+  constructor() {
+    super("sandbox handle closed");
+  }
+}
+
+/**
  * A data path failure (peer-to-peer or relay). It is never an exit code.
  * When `outcomeUnknown` is true, the SDK cannot tell whether the command ran
  * or how it ended, for example after `AttachExec` returned `not_found`.

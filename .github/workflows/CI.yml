@@ -44,38 +44,15 @@ jobs:
           package-manager-cache: false
       - name: Resolve affected comparison
         id: comparison
+        # The script resolves a base that is an ancestor of the checkout for
+        # every event. A pull request compares the first parent of its test
+        # merge commit, not the event's `pull_request.base.sha`, which GitHub
+        # does not update when the base branch moves.
         env:
-          EVENT: ${{ github.event_name }}
-          PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
           PUSH_BASE: ${{ github.event.before }}
           MANUAL_BASE: ${{ inputs.base }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          head="$(git rev-parse HEAD)"
-          case "$EVENT" in
-            pull_request) base="$PR_BASE"; head="$PR_HEAD" ;;
-            push)
-              base="$PUSH_BASE"
-              if [[ "$base" =~ ^0+$ ]]; then
-                empty_tree="$(git hash-object -t tree /dev/null)"
-                base="$(git -c user.name=CI -c user.email=ci@example.invalid commit-tree "$empty_tree" -m 'Empty comparison')"
-              fi
-              ;;
-            workflow_dispatch)
-              if [[ -n "$MANUAL_BASE" ]]; then
-                base="$(git rev-parse --verify --end-of-options "${MANUAL_BASE}^{commit}")"
-              else
-                base="$(git merge-base origin/main "$head")"
-              fi
-              ;;
-            *) exit 1 ;;
-          esac
-          echo "base=$base" >> "$GITHUB_OUTPUT"
-          echo "head=$head" >> "$GITHUB_OUTPUT"
-          echo "Validation revision: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
-          echo "Comparison: $base..$head" >> "$GITHUB_STEP_SUMMARY"
+        run: node scripts/ci/comparison.mjs
       - name: Select affected validation
         id: plan
         env:

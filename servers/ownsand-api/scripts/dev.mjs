@@ -8,7 +8,9 @@
 // waits for it to exit and removes the build output. A signal before the
 // server starts stops the launcher without starting the server.
 //
-// The server needs Postgres. When DATABASE_URL is unset, the
+// The server needs Postgres. An empty value (empty or only whitespace) counts
+// as unset for DATABASE_URL, CORS_ORIGINS and ALLOW_DIRECT_CLIENT_ADDRESS, as
+// it does for the server. When DATABASE_URL is unset, the
 // launcher prints an `ownsand_api_dev_skipped` record and exits with status 0
 // instead of failing, so the root `pnpm dev` keeps running the other
 // development servers on machines without a database. When
@@ -86,7 +88,8 @@ function run(command, args, env) {
 const stoppedStatus = () => signalExitCode(received);
 
 async function main() {
-  if (!process.env.DATABASE_URL) {
+  // An empty value counts as unset, as it does for the server.
+  if (!process.env.DATABASE_URL?.trim()) {
     console.error(
       JSON.stringify({
         event: "ownsand_api_dev_skipped",
@@ -96,11 +99,15 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
-  env.ALLOW_DIRECT_CLIENT_ADDRESS ??= "true";
-  env.CORS_ORIGINS ??= [
-    ProductionConsoleOrigin,
-    ...DevelopmentConsoleOrigins,
-  ].join(",");
+  if (!env.ALLOW_DIRECT_CLIENT_ADDRESS?.trim()) {
+    env.ALLOW_DIRECT_CLIENT_ADDRESS = "true";
+  }
+  if (!env.CORS_ORIGINS?.trim()) {
+    env.CORS_ORIGINS = [
+      ProductionConsoleOrigin,
+      ...DevelopmentConsoleOrigins,
+    ].join(",");
+  }
   const buildDir = await mkdtemp(join(tmpdir(), "ownsand-api-dev-"));
   try {
     if (received) return stoppedStatus();

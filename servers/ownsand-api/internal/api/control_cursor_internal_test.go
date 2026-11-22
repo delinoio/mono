@@ -72,6 +72,21 @@ func (h *cursorHarness) acquire(latest int64, err error) {
 	h.c.LeaseAcquired(context.Background())
 }
 
+// interceptFirstLatestID makes the first latestID call run during, and
+// return the result of, first. Later calls, including the ones that
+// first causes through acquire, use the harness values; the nested calls
+// therefore need no guard against re-entrancy.
+func (h *cursorHarness) interceptFirstLatestID(first func() (int64, error)) {
+	next := h.c.latestID
+	calls := 0
+	h.c.latestID = func(ctx context.Context) (int64, error) {
+		if calls++; calls == 1 {
+			return first()
+		}
+		return next(ctx)
+	}
+}
+
 func equalIDs(a, b []int64) bool {
 	if len(a) != len(b) {
 		return false
@@ -236,5 +251,133 @@ func TestControlCursorUnsetCursorAcquiresWithoutWriteBack(t *testing.T) {
 	}
 	if got := h.cursor(); got != 2 {
 		t.Fatalf("cursor = %d, want 2", got)
+	}
+}
+
+func TestControlCursorInitSupersededByLeaseLost(t *testing.T) {
+	h := newCursorHarness(t, 10)
+	h.interceptFirstLatestID(func() (int64, error) {
+		h.c.LeaseLost()
+		return 5, nil
+	})
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != -1 {
+		t.Fatalf("cursor = %d, want -1 (the stale LatestID must not set the cursor after a loss)", got)
+	}
+	if len(h.delivered) != 0 {
+		t.Fatalf("delivered = %v, want none", h.delivered)
+	}
+}
+
+func TestControlCursorInitSupersededByReacquire(t *testing.T) {
+	h := newCursorHarness(t, 10)
+	h.interceptFirstLatestID(func() (int64, error) {
+		h.c.LeaseLost()
+		h.acquire(8, nil)
+		return 3, nil
+	})
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != 8 {
+		t.Fatalf("cursor = %d, want 8 (the stale LatestID 3 must not replace it)", got)
+	}
+	if len(h.delivered) != 0 {
+		t.Fatalf("delivered = %v, want none", h.delivered)
+	}
+	h.c.processEvents(context.Background())
+	if want := []int64{9, 10}; !equalIDs(h.delivered, want) {
+		t.Fatalf("delivered = %v, want %v (events 4..8 are not replayed)", h.delivered, want)
+	}
+}
+
+func TestControlCursorInitSupersededByAcquireDuringInit(t *testing.T) {
+	// OnAcquire runs while the event processor already sees the lease as
+	// held: its LeaseAcquired finishes first, with and without a failure of
+	// the processor's own LatestID read.
+	cases := []struct {
+		name  string
+		first func() (int64, error)
+	}{
+		{"stale id", func() (int64, error) { return 2, nil }},
+		{"failed read", func() (int64, error) { return 0, errors.New("db error") }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCursorHarness(t, 10)
+			h.interceptFirstLatestID(func() (int64, error) {
+				h.acquire(7, nil)
+				return tc.first()
+			})
+			h.c.processEvents(context.Background())
+			if got := h.cursor(); got != 7 {
+				t.Fatalf("cursor = %d, want 7", got)
+			}
+			if len(h.delivered) != 0 {
+				t.Fatalf("delivered = %v, want none", h.delivered)
+			}
+		})
+	}
+}
+
+func TestControlCursorInitFailedReadLeavesStateUnchanged(t *testing.T) {
+	h := newCursorHarness(t, 2)
+	h.latestErr = errors.New("database unavailable")
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != -1 {
+		t.Fatalf("cursor = %d, want -1 after a failed LatestID read", got)
+	}
+	h.c.mu.Lock()
+	gen := h.c.cursorGen
+	h.c.mu.Unlock()
+	if gen != 0 {
+		t.Fatalf("cursorGen = %d, want 0 (an initialization is not a lease transition)", gen)
+	}
+	// The next poll repeats the read.
+	h.latest, h.latestErr = 2, nil
+	h.c.processEvents(context.Background())
+	if got := h.cursor(); got != 2 {
+		t.Fatalf("cursor = %d, want 2 after the retry", got)
+	}
+}
+
+func TestControlCursorInitKeepsGeneration(t *testing.T) {
+	h := newCursorHarness(t, 2)
+	h.latest = 2
+	h.c.processEvents(context.Background())
+	h.c.mu.Lock()
+	gen := h.c.cursorGen
+	h.c.mu.Unlock()
+	if gen != 0 {
+		t.Fatalf("cursorGen = %d, want 0 (an initialization is not a lease transition)", gen)
+	}
+}
+
+// TestControlProcessedCursor checks the cursor that the janitor reads: unset
+// before the lease and after its loss or a failed read, the last processed
+// delivery ID while the lease is held.
+func TestControlProcessedCursor(t *testing.T) {
+	h := newCursorHarness(t, 3)
+	if _, ok := h.c.ProcessedCursor(); ok {
+		t.Fatal("cursor reported before the lease was acquired")
+	}
+	h.acquire(1, nil)
+	if id, ok := h.c.ProcessedCursor(); !ok || id != 1 {
+		t.Fatalf("cursor after acquire = %d, %v; want 1, true (events up to the handover are not this holder's)", id, ok)
+	}
+	h.c.processEvents(context.Background())
+	if id, ok := h.c.ProcessedCursor(); !ok || id != 3 {
+		t.Fatalf("cursor after the batch = %d, %v; want 3, true", id, ok)
+	}
+	h.c.LeaseLost()
+	if _, ok := h.c.ProcessedCursor(); ok {
+		t.Fatal("cursor reported after the lease was lost")
+	}
+	h.acquire(0, errors.New("read failed"))
+	if _, ok := h.c.ProcessedCursor(); ok {
+		t.Fatal("cursor reported after a failed read at acquisition")
+	}
+	// Zero is a valid cursor: the table was empty at acquisition.
+	h.acquire(0, nil)
+	if id, ok := h.c.ProcessedCursor(); !ok || id != 0 {
+		t.Fatalf("cursor with an empty table = %d, %v; want 0, true", id, ok)
 	}
 }

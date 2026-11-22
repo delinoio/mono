@@ -270,6 +270,44 @@ test(
   },
 );
 
+test(
+  "ASCII white space only in DATABASE_URL counts as unset",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const port = await freePort();
+    const run = startLauncher(t, {
+      port,
+      env: { DATABASE_URL: " \t\n\v\f\r " },
+      pathPrefix: fakeGo(t, "exit 3"),
+    });
+    const { code } = await run.exited;
+
+    assert.equal(code, 0, run.stderr);
+    assert.match(run.stderr, /"accounts_api_dev_skipped"/);
+    assert.deepEqual(readdirSync(run.tmp), [], "a build directory was created");
+  },
+);
+
+// The server removes only ASCII white space, so Unicode white space is a value
+// that the server rejects, not an unset one: the launcher must build and start
+// the server instead of skipping.
+test(
+  "Unicode white space only in DATABASE_URL is not unset",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const run = startLauncher(t, {
+      port: await freePort(),
+      env: { DATABASE_URL: "\u00a0" },
+      // The build fails with a distinct status that proves it ran.
+      pathPrefix: fakeGo(t, "exit 3"),
+    });
+    const { code } = await run.exited;
+
+    assert.equal(code, 3, run.stderr);
+    assert.doesNotMatch(run.stderr, /"accounts_api_dev_skipped"/);
+  },
+);
+
 // A fake `go` whose "build" writes a program that prints the origins it
 // received and exits.
 function fakeGoBuildingEnvPrinter(t) {
@@ -318,6 +356,42 @@ test(
       event: "env",
       cors: "https://a.example",
       web: "https://b.example",
+    });
+  },
+);
+
+test(
+  "ASCII white space only CORS_ORIGINS and WEB_ORIGIN select the defaults",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const run = startLauncher(t, {
+      port: await freePort(),
+      env: { CORS_ORIGINS: " \t\n\v\f\r ", WEB_ORIGIN: "\r\n" },
+      pathPrefix: fakeGoBuildingEnvPrinter(t),
+    });
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.deepEqual(envRecord(run.stdout), {
+      event: "env",
+      cors: "https://accounts.delino.io,http://127.0.0.1:13100,https://accounts.delino.localhost,http://accounts.delino.localhost",
+      web: "https://accounts.delino.localhost",
+    });
+  },
+);
+
+test(
+  "Unicode white space only CORS_ORIGINS and WEB_ORIGIN reach the server unchanged",
+  { skip, timeout: Timeout },
+  async (t) => {
+    const run = startLauncher(t, {
+      port: await freePort(),
+      env: { CORS_ORIGINS: "\u00a0", WEB_ORIGIN: "\u3000" },
+      pathPrefix: fakeGoBuildingEnvPrinter(t),
+    });
+    assert.equal((await run.exited).code, 0, run.stderr);
+    assert.deepEqual(envRecord(run.stdout), {
+      event: "env",
+      cors: "\u00a0",
+      web: "\u3000",
     });
   },
 );

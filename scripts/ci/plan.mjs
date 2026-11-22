@@ -23,6 +23,9 @@ const fixtureInputs = new Set([
   "scripts/install-git-hooks.sh",
   // The Droplet fixtures run this helper against a stubbed `docker`.
   "scripts/droplet/start-caddy.sh",
+  // `scripts/ci/protos-generate.test.mjs` runs this script against a fake `go`
+  // in `test:tooling`. It is also a protobuf input (see `protoInputs`).
+  "scripts/protos.sh",
 ]);
 
 // Shared runtime and workspace inputs that change every app e2e suite.
@@ -192,6 +195,42 @@ export function isRustInput(path) {
   );
 }
 
+// A two-dot diff from a base that is not an ancestor of the head also lists the
+// reverse of every change that only the base contains, so the selectors would
+// run checks for changes that the head never made. `scripts/ci/comparison.mjs`
+// resolves an ancestor base for every event; this check fails closed if a
+// comparison from anywhere else breaks that rule. The only accepted base that
+// is not an ancestor is a parentless commit of the empty tree: the local
+// comparison commit of a push without a prior commit, whose diff lists every
+// path of the head and nothing else.
+function assertAncestorComparison(root, base, head) {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", base, head], {
+      cwd: root,
+      stdio: "ignore",
+    });
+    return;
+  } catch (error) {
+    if (error.status !== 1) throw error;
+  }
+  const git = (...args) =>
+    execFileSync("git", args, {
+      cwd: root,
+      encoding: "utf8",
+      input: "",
+    }).trim();
+  const [, ...parents] = git("rev-list", "--parents", "-n", "1", base).split(
+    " ",
+  );
+  const emptyTree = git("hash-object", "-t", "tree", "--stdin");
+  if (parents.length === 0 && git("rev-parse", `${base}^{tree}`) === emptyTree)
+    return;
+  throw new Error(
+    `Comparison base ${base} is not an ancestor of head ${head}; ` +
+      "a two-dot diff would also select the reverse of the base's own changes",
+  );
+}
+
 export function plan(cwd, base, head) {
   // Reuse the formatter's revision validation and literal-path selection. The
   // planner runs without installed dependencies and cannot evaluate the Rstack
@@ -207,6 +246,8 @@ export function plan(cwd, base, head) {
       NonUtf8Policy.Defer,
       MissingPathPolicy.Defer,
     ).length > 0;
+  // The formatter selection above validated both revisions.
+  assertAncestorComparison(repositoryRoot(cwd), base, head);
   const paths = execFileSync(
     "git",
     ["diff", "--name-only", "--no-renames", "-z", base, head, "--"],

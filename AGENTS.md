@@ -98,6 +98,8 @@
 - Static sites under `apps/` should use Rsbuild/Rspress-style toolchains and deploy to Cloudflare Pages by default. Existing documented exceptions remain valid until their project contract changes.
 - Backend services under `servers/` should deploy to the shared DigitalOcean Droplet, and persistent relational databases should use PlanetScale Postgres, unless a project contract documents an exception.
 - File handling should default to Cloudflare R2 object storage plus signed URLs for upload and download access unless a project contract documents another storage or access pattern.
+- Product analytics should default to PostHog Cloud unless a project contract documents another product analytics service.
+- Observability data (metrics, logs and traces), dashboards and alerts should default to Grafana Cloud unless a project contract documents another observability backend.
 
 ## Documentation-First Policy
 
@@ -215,6 +217,7 @@
 - Prefer structured logging over ad-hoc plain text logs for business and system events.
 - Go code should use `log/slog` (or a compatible structured logger built on it).
 - Rust code should use `tracing` (or a compatible structured logging facade).
+- Instrument metrics, logs and traces with the OpenTelemetry SDK. Keep `log/slog` (Go) and `tracing` (Rust) as the logging APIs and send their log records to the OpenTelemetry SDK through its log bridge. Follow `docs/repository-defaults.md#repository-wide-rules`.
 - CLI and operator-facing logs should enable ANSI color by default; allow opt-out with documented flags or environment variables.
 
 ## Contract navigation

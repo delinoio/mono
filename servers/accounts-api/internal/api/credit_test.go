@@ -381,6 +381,7 @@ func TestRefundAndSettings(t *testing.T) {
 		"low threshold": {Enabled: true, ThresholdUsdMicros: 9 * usd, AmountUsdMicros: 25 * usd, MonthlyCapUsdMicros: 25 * usd},
 		"low amount":    {Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 24 * usd, MonthlyCapUsdMicros: 25 * usd},
 		"missing cap":   {Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 25 * usd},
+		"high amount":   {Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 10_000*usd + 10_000, MonthlyCapUsdMicros: 20_000 * usd},
 	} {
 		_, err := owner.UpdateAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.UpdateAutoTopUpSettingsRequest{BillingAccountId: f.AccountID, Settings: s}))
 		if connect.CodeOf(err) != connect.CodeInvalidArgument {
@@ -397,6 +398,17 @@ func TestRefundAndSettings(t *testing.T) {
 	}
 	if s := updated.Msg.GetSettings(); !s.GetEnabled() || s.GetMonthlyCapUsdMicros() != 100*usd || s.GetConsecutiveFailures() != 0 || s.GetMonthToDateUsdMicros() != 0 {
 		t.Fatalf("updated settings = %v", s)
+	}
+	// Exactly 10,000 USD is accepted when enabled; a larger whole-cent
+	// amount is kept while the setting is disabled.
+	for name, in := range map[string]*accountsv1.AutoTopUpSettings{
+		"maximum amount":        {Enabled: true, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 10_000 * usd, MonthlyCapUsdMicros: 20_000 * usd},
+		"disabled large amount": {Enabled: false, ThresholdUsdMicros: 10 * usd, AmountUsdMicros: 15_000 * usd, MonthlyCapUsdMicros: 20_000 * usd},
+	} {
+		res, err := owner.UpdateAutoTopUpSettings(ctx(), connect.NewRequest(&accountsv1.UpdateAutoTopUpSettingsRequest{BillingAccountId: f.AccountID, Settings: in}))
+		if err != nil || res.Msg.GetSettings().GetEnabled() != in.GetEnabled() || res.Msg.GetSettings().GetAmountUsdMicros() != in.GetAmountUsdMicros() {
+			t.Errorf("%s: %v, %v", name, res, err)
+		}
 	}
 
 	alert, err := owner.GetAlertSettings(ctx(), connect.NewRequest(&accountsv1.GetAlertSettingsRequest{BillingAccountId: f.AccountID}))

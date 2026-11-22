@@ -575,7 +575,16 @@ func (a *app) deviceSetLimits(ctx context.Context, name string, args []string) e
 		VcpuCount: proto.Int32(*vcpu), MemoryMib: proto.Int64(*memory), DiskGib: proto.Int64(*disk),
 		VcpuOvercommitPercent: proto.Int32(*overcommit),
 	}
-	if *overcommit < 0 {
+	// Only an absent flag falls back to the current value. An explicit
+	// negative value is validated like any other so it is never replaced
+	// silently by the stored percentage.
+	overcommitGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "vcpu-overcommit" {
+			overcommitGiven = true
+		}
+	})
+	if !overcommitGiven {
 		// Every value is required: keep the device's current overcommit.
 		dev, err := a.client.Devices().Get(ctx, &ownsandv1.GetDeviceRequest{OrganizationId: org, DeviceId: rest[0]})
 		if err != nil {

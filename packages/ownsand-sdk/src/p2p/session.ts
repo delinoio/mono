@@ -166,21 +166,39 @@ export class PeerSession {
   }
 
   /**
-   * Opens a session: `GetIceServers`, a non-trickle offer with all
-   * candidates (10 seconds at most), `OpenSession`, and the data channel
-   * open within 10 seconds after the answer is applied. `OpenSession` has no
-   * limit of its own here, so a slow signaling call does not use up the time
-   * that the channel needs to open.
+   * Opens a session: `GetIceServers` (a failure other than an abort, an
+   * authorization error or a billing error moves the handle to the relay), a
+   * non-trickle offer with all candidates (10 seconds at most),
+   * `OpenSession`, and the data channel open within 10 seconds after the
+   * answer is applied. `OpenSession` has no limit of its own here, so a slow
+   * signaling call does not use up the time that the channel needs to open.
    */
   static async open(
     ctx: OperationContext,
     Peer: PeerConnectionConstructor,
     signal: AbortSignal | undefined,
   ): Promise<PeerSession> {
-    const ice = await ctx.dataPath.getIceServers(
-      { organizationId: ctx.organizationId },
-      { signal },
-    );
+    let ice: Awaited<ReturnType<typeof ctx.dataPath.getIceServers>>;
+    try {
+      ice = await ctx.dataPath.getIceServers(
+        { organizationId: ctx.organizationId },
+        { signal },
+      );
+    } catch (error) {
+      if (
+        signal?.aborted ||
+        (error instanceof ConnectError &&
+          (AUTHORIZATION_CODES.has(error.code) || isBillingError(error)))
+      ) {
+        // An abort, an authorization error and a billing rejection end the
+        // operation, as they do for OpenSession (a billing rejection also
+        // rejects the relay).
+        throw error;
+      }
+      // Any other GetIceServers failure means the peer path is not usable:
+      // the handle moves to the relay.
+      throw new PeerUnavailableError("GetIceServers failed", { cause: error });
+    }
     const pc = new Peer({
       iceServers: ice.iceServers.map((server) => ({ urls: [...server.urls] })),
     });

@@ -211,10 +211,31 @@ func TestLabels(t *testing.T) {
 	wantInvalid(t, "long key", Labels(map[string]string{strings.Repeat("k", 64): ""}), "labels")
 	wantInvalid(t, "long value", Labels(map[string]string{"k": strings.Repeat("v", 256)}), "labels")
 	wantInvalid(t, "empty key", Labels(map[string]string{"": "v"}), "labels")
+	wantInvalid(t, "NUL in key", Labels(map[string]string{"k\x00": "v"}), "labels")
+	wantInvalid(t, "NUL in value", Labels(map[string]string{"k": "v\x00"}), "labels")
+	// Other control characters stay valid.
+	if err := Labels(map[string]string{"k\x01\x1f\x7f": "v\t\n\x01"}); err != nil {
+		t.Fatalf("control characters other than NUL rejected: %v", err)
+	}
 	// The error never contains the label value.
 	err := Labels(map[string]string{"k": strings.Repeat("secret", 50)})
 	if strings.Contains(err.Error(), "secret") {
 		t.Fatal("error message contains the value")
+	}
+}
+
+func TestNoNUL(t *testing.T) {
+	for _, ok := range []string{"", "host", "h\u00e9\u4e16", "a\x01b", "a\x7fb", "a\tb\n", "a\ufffdb"} {
+		if err := NoNUL("name", ok); err != nil {
+			t.Errorf("NoNUL(%q) = %v, want nil", ok, err)
+		}
+	}
+	for _, bad := range []string{"\x00", "a\x00b", "abc\x00", "\x00abc"} {
+		err := NoNUL("name", bad)
+		wantInvalid(t, "NUL", err, "name")
+		if err != nil && strings.Contains(err.Error(), "abc") {
+			t.Errorf("error contains the value: %v", err)
+		}
 	}
 }
 

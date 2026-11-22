@@ -5,7 +5,9 @@
 // expiry passed, audit events older than 90 days, ended sandboxes older
 // than 30 days that no longer reserve a macOS machine identifier,
 // processed control events, usage outbox rows 35 days after accounts-api
-// accepted them and R2 storage sample records after 1 day.
+// accepted them and R2 storage sample records after 1 day. The control
+// event job runs only on the lease holder and deletes only events that the
+// holder has processed.
 package janitor
 
 import (
@@ -21,6 +23,19 @@ import (
 // days, processed control events 1 hour, reported usage outbox rows 35 days
 // and storage sample records 1 day.
 const DefaultInterval = time.Hour
+
+// ControlCursor reports the delivery ID of the last control event that this
+// instance processed as the lease holder. ok is false when the instance does
+// not hold the lease or its cursor is not set; the janitor then deletes no
+// control event, because an event that no holder processed must stay until a
+// holder does. A nil ControlCursor behaves like one that always returns
+// false.
+type ControlCursor func() (id int64, ok bool)
+
+// controlEventsJob deletes the control events that the lease holder has
+// processed (delivery_id up to its cursor) and that are older than the
+// retention of 1 hour. $1 is the time of the run and $2 the cursor.
+const controlEventsJob = "DELETE FROM control_events WHERE create_time < $1::timestamptz - interval '1 hour' AND delivery_id <= $2"
 
 type job struct {
 	name string
@@ -40,7 +55,6 @@ func jobs() []job {
 		// (its max_ttl deadline has not passed).
 		{"ended_sandboxes", `DELETE FROM sandboxes WHERE end_time IS NOT NULL AND end_time < $1::timestamptz - interval '30 days'
 			AND (machine_lineage IS NULL OR max_deadline <= $1::timestamptz)`},
-		{"control_events", "DELETE FROM control_events WHERE create_time < $1::timestamptz - interval '1 hour'"},
 		// Only rows that accounts-api accepted; unreported rows stay until
 		// they are reported, also for deleted organizations.
 		{"usage_outbox", "DELETE FROM usage_outbox WHERE report_time < $1::timestamptz - interval '35 days'"},
@@ -49,26 +63,39 @@ func jobs() []job {
 	}
 }
 
-// RunOnce runs every job once at now.
-func RunOnce(ctx context.Context, d *db.DB, logger *slog.Logger, now time.Time) {
+// RunOnce runs every job once at now. The control event job runs only when
+// cursor reports a processed cursor; the other jobs run on every instance.
+func RunOnce(ctx context.Context, d *db.DB, logger *slog.Logger, now time.Time, cursor ControlCursor) {
 	for _, j := range jobs() {
-		tag, err := d.Pool.Exec(ctx, j.sql, now)
-		if err != nil {
-			logger.WarnContext(ctx, "janitor_job_failed", slog.String("job", j.name), slog.Any("error", err))
-			continue
-		}
-		if n := tag.RowsAffected(); n > 0 {
-			logger.InfoContext(ctx, "janitor_job_deleted", slog.String("job", j.name), slog.Int64("rows", n))
-		}
+		run(ctx, d, logger, j.name, j.sql, now)
+	}
+	if cursor == nil {
+		return
+	}
+	id, ok := cursor()
+	if !ok {
+		return
+	}
+	run(ctx, d, logger, "control_events", controlEventsJob, now, id)
+}
+
+func run(ctx context.Context, d *db.DB, logger *slog.Logger, name, sql string, now time.Time, extra ...any) {
+	tag, err := d.Pool.Exec(ctx, sql, append([]any{now}, extra...)...)
+	if err != nil {
+		logger.WarnContext(ctx, "janitor_job_failed", slog.String("job", name), slog.Any("error", err))
+		return
+	}
+	if n := tag.RowsAffected(); n > 0 {
+		logger.InfoContext(ctx, "janitor_job_deleted", slog.String("job", name), slog.Int64("rows", n))
 	}
 }
 
 // Run runs the jobs every interval until ctx ends.
-func Run(ctx context.Context, d *db.DB, logger *slog.Logger, now func() time.Time, interval time.Duration) {
+func Run(ctx context.Context, d *db.DB, logger *slog.Logger, now func() time.Time, interval time.Duration, cursor ControlCursor) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
-		RunOnce(ctx, d, logger, now())
+		RunOnce(ctx, d, logger, now(), cursor)
 		select {
 		case <-ctx.Done():
 			return

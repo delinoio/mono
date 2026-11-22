@@ -331,3 +331,83 @@ func TestLateEventDoesNotReplaceNewCheckout(t *testing.T) {
 		t.Fatalf("subscription = %+v", sub)
 	}
 }
+
+// TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout checks that the
+// verified payment of a canceled earlier subscription neither activates nor
+// alters the pending row of a new checkout, that the credit is still granted
+// once, and that the payment of the checkout transaction activates it.
+func TestLatePaymentOfEarlierSubscriptionKeepsNewCheckout(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	oldSub := f.activate(acct)
+	f.webhook("subscription.updated", map[string]any{
+		"id": oldSub, "status": "active", "updated_at": f.clock.Now(),
+		"scheduled_change": map[string]any{"action": "cancel", "effective_at": f.clock.Now().Add(time.Hour)},
+	})
+	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": f.clock.Now().Add(time.Minute)})
+	txnID := f.checkout(acct)
+	before, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if before.Status != SubscriptionPending || before.CheckoutTransactionID != txnID {
+		t.Fatalf("subscription before the payment: %+v", before)
+	}
+
+	late := paddletest.Transaction(paddletest.TransactionData{
+		ID: "txn_old_renewal", SubscriptionID: oldSub, Origin: paddle.OriginSubscriptionRecurring,
+		BillingAccountID: acct, PriceID: priceID, SubtotalCents: 1000, PeriodEnd: f.clock.Now().AddDate(0, 1, 0),
+	})
+	body := paddletest.Event("evt_late_pay", paddle.EventTransactionCompleted, f.clock.Now(), late)
+	sig := paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)
+	for range 3 {
+		if code := f.deliver(body, sig); code != http.StatusOK {
+			t.Fatalf("status %d", code)
+		}
+	}
+	if code := f.webhook(paddle.EventTransactionCompleted, late); code != http.StatusOK {
+		t.Fatal(code)
+	}
+	f.wantLedger(acct, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
+	after, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if after.Status != SubscriptionPending || after.CheckoutTransactionID != txnID || after.PaddleSubscriptionID != "" ||
+		after.CancelAtPeriodEnd != before.CancelAtPeriodEnd || after.CurrentPeriodEnd != nil {
+		t.Fatalf("subscription after the late payment: %+v, before %+v", after, before)
+	}
+
+	// The payment of the checkout transaction activates the new subscription.
+	newSub := f.paddle.NewID("sub")
+	periodEnd := f.clock.Now().AddDate(0, 1, 0).Truncate(time.Second)
+	if code := f.webhook(paddle.EventTransactionCompleted, paddletest.Transaction(paddletest.TransactionData{
+		ID: txnID, SubscriptionID: newSub, Origin: paddle.OriginWeb, PriceID: priceID, SubtotalCents: 1000, PeriodEnd: periodEnd,
+	})); code != http.StatusOK {
+		t.Fatal(code)
+	}
+	f.wantLedger(acct,
+		wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd},
+		wantEntry{LedgerSubscriptionCredit, 10 * usd, 20 * usd})
+	after, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if after.Status != SubscriptionActive || after.PaddleSubscriptionID != newSub || after.CheckoutTransactionID != "" ||
+		after.CancelAtPeriodEnd || after.CurrentPeriodEnd == nil || !after.CurrentPeriodEnd.Equal(periodEnd) {
+		t.Fatalf("subscription after the checkout payment: %+v", after)
+	}
+}
+
+// TestPaymentActivatesPendingRowWithoutCheckoutTransaction checks the case
+// where the payment arrives before any checkout was recorded: the first
+// verified subscription payment activates the pending row.
+func TestPaymentActivatesPendingRowWithoutCheckoutTransaction(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.tx(func(tx pgx.Tx) error {
+		return saveSubscription(ctx(), tx, acct, Subscription{Status: SubscriptionPending}, "", f.s.timestamp())
+	})
+	subID := f.paddle.NewID("sub")
+	if code := f.webhook(paddle.EventTransactionCompleted, paddletest.Transaction(paddletest.TransactionData{
+		ID: "txn_first", SubscriptionID: subID, Origin: paddle.OriginWeb, BillingAccountID: acct, PriceID: priceID, SubtotalCents: 1000,
+	})); code != http.StatusOK {
+		t.Fatal(code)
+	}
+	f.wantLedger(acct, wantEntry{LedgerSubscriptionCredit, 10 * usd, 10 * usd})
+	sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != subID {
+		t.Fatalf("subscription = %+v", sub)
+	}
+}

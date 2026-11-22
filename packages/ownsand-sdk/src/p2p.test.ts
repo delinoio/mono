@@ -6,11 +6,13 @@ import {
   DataPathError,
   InvalidFrameError,
   OwnSandConfigError,
+  OwnSandHandleClosedError,
 } from "./errors.ts";
 import { type Logger, LogEvent, type LogRecord } from "./logger.ts";
 import {
   BillingReason,
   DataPathTransport,
+  ErrorCode,
   SessionEndReason,
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
@@ -19,7 +21,9 @@ import {
   DataFrameKind,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
 import { ExecEventType, ExecResultKind } from "./operations/exec.ts";
+import type { Sandbox } from "./sandbox.ts";
 import {
   type FakeAgent,
   type FakeAgentPeer,
@@ -32,6 +36,7 @@ import {
   attachMsg,
   ev,
   execMsg,
+  file,
   SANDBOX,
   setup,
   text,
@@ -642,6 +647,149 @@ describe("peer-to-peer data path", () => {
     });
   }
 
+  describe("when GetIceServers fails", () => {
+    const relayOperations = {
+      exec: {
+        install(h: ReturnType<typeof p2pSetup>["h"]) {
+          h.api.stream(RelayService, "Exec", function* () {
+            yield execMsg(ev.accepted());
+            yield execMsg(ev.exited(0));
+          });
+        },
+        run: (h: ReturnType<typeof p2pSetup>["h"], sandbox: Sandbox) =>
+          h.clock.run(sandbox.exec({ command: ["x"] }).wait()),
+      },
+      readFile: {
+        install(h: ReturnType<typeof p2pSetup>["h"]) {
+          h.api.stream(RelayService, "ReadFile", function* () {
+            yield file.accepted();
+            yield file.chunk(0, "hi");
+            yield file.end(2);
+          });
+        },
+        run: (h: ReturnType<typeof p2pSetup>["h"], sandbox: Sandbox) =>
+          h.clock.run(sandbox.readFileBytes("/a")),
+      },
+      writeFile: {
+        install(h: ReturnType<typeof p2pSetup>["h"]) {
+          h.api.unary(RelayService, "WriteFile", (req) => ({
+            writeId: req.writeId,
+            offset: req.offset,
+            length: BigInt(req.data.length),
+            finished: true,
+            sizeBytes: req.finish?.sizeBytes ?? 0n,
+          }));
+        },
+        run: (h: ReturnType<typeof p2pSetup>["h"], sandbox: Sandbox) =>
+          h.clock.run(sandbox.writeFile("/b", "hello")),
+      },
+    };
+
+    for (const code of [
+      Code.Unavailable,
+      Code.Internal,
+      Code.DeadlineExceeded,
+      Code.ResourceExhausted,
+    ]) {
+      for (const [name, operation] of Object.entries(relayOperations)) {
+        test(`${name} completes over the relay when GetIceServers fails with ${Code[code]}`, async () => {
+          const { h, rtc } = p2pSetup(() => {});
+          h.api.unary(DataPathService, "GetIceServers", () => {
+            throw new ConnectError("down", code);
+          });
+          operation.install(h);
+          const sandbox = h.client.sandbox(SANDBOX);
+          await operation.run(h, sandbox);
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+          expect(rtc.connections).toHaveLength(0);
+          // The handle stays on the relay: no later operation calls
+          // GetIceServers again.
+          await operation.run(h, sandbox);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        });
+      }
+    }
+
+    for (const code of [
+      Code.Unauthenticated,
+      Code.PermissionDenied,
+      Code.NotFound,
+      Code.InvalidArgument,
+    ]) {
+      test(`ends the operation when GetIceServers fails with ${Code[code]}`, async () => {
+        const { h } = p2pSetup(() => {});
+        h.api.unary(DataPathService, "GetIceServers", () => {
+          throw new ConnectError("rejected", code);
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const error = await h.clock
+          .run(sandbox.exec({ command: ["x"] }).wait())
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(ConnectError);
+        expect(error.code).toBe(code);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+    }
+
+    for (const transport of [undefined, DataPathTransport.PEER_TO_PEER]) {
+      test(`ends the operation without the relay on a billing error (transport ${transport === undefined ? "auto" : DataPathTransport[transport]})`, async () => {
+        const { h } = p2pSetup(() => {}, { transport });
+        h.api.unary(DataPathService, "GetIceServers", () => {
+          throw ownsandError(
+            Code.ResourceExhausted,
+            "suspended; see https://accounts.delino.io",
+            { billingReason: BillingReason.SUSPENDED },
+          );
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        const error = await h.clock
+          .run(sandbox.exec({ command: ["x"] }).wait())
+          .catch((e) => e);
+        expect(billingReasonOf(error)).toBe(BillingReason.SUSPENDED);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+    }
+
+    test("an abort while GetIceServers is pending ends with the abort reason and keeps peer-to-peer", async () => {
+      const { h, rtc } = p2pSetup(() => {});
+      h.api.unary(DataPathService, "GetIceServers", async (_req, call) => {
+        await h.clock.sleep(5_000);
+        if (call.signal.aborted) {
+          // A transport reports the abort as Canceled, which must not move the
+          // handle to the relay.
+          throw new ConnectError("canceled", Code.Canceled);
+        }
+        return { iceServers: [{ urls: ["stun:stun.ownsand.api.test:3478"] }] };
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const pending = sandbox
+        .exec({ command: ["x"], signal: controller.signal })
+        .wait()
+        .catch((e) => e);
+      await h.clock.advance(1_000);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+      controller.abort(reason);
+      const error = await h.clock.run(pending);
+      expect(error).toBe(reason);
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(rtc.connections).toHaveLength(0);
+    });
+  });
+
   test("a forced RELAY transport never calls OpenSession", async () => {
     const { h, rtc } = p2pSetup(() => {}, {
       transport: DataPathTransport.RELAY,
@@ -738,6 +886,39 @@ describe("peer-to-peer data path", () => {
       .catch((e) => e);
     expect(error.code).toBe(Code.FailedPrecondition);
   });
+
+  for (const [name, message, expected] of [
+    [
+      "a missing file keeps the guest message",
+      "read: file does not exist",
+      "read: file does not exist",
+    ],
+    ["an expired read_id", "read expired", "the file read expired"],
+  ] as const) {
+    test(`a file read error frame with not_found: ${name}`, async () => {
+      const { h } = p2pSetup((frame, peer) => {
+        peer.send({
+          streamId: frame.streamId,
+          sandboxId: SANDBOX,
+          kind: DataFrameKind.ERROR,
+          payload: {
+            case: "error",
+            value: { code: ErrorCode.NOT_FOUND, message },
+          },
+        });
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const error = await h.clock
+        .run(sandbox.readFileBytes("/missing"))
+        .catch((e) => e);
+      expect(error).toBeInstanceOf(DataPathError);
+      expect(error.code).toBe(Code.NotFound);
+      expect(error.message).toBe(expected);
+      expect(error.cause).toBeInstanceOf(ConnectError);
+      expect(error.cause.rawMessage).toBe(message);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+  }
 
   describe("invalid frames", () => {
     const UNKNOWN_KIND = 99 as DataFrameKind;
@@ -1636,6 +1817,158 @@ describe("peer-to-peer data path", () => {
       }
       expect(rtc.channels).toHaveLength(2);
       expect(messages).toBe(0);
+    });
+  });
+
+  describe("closing the sandbox handle", () => {
+    const exiting: FakeAgent = (frame, peer) => {
+      if (frame.kind === DataFrameKind.EXEC_REQUEST) {
+        execEvent(peer, frame.streamId, ev.started());
+        execEvent(peer, frame.streamId, ev.exited(0));
+      }
+    };
+
+    test("a close while the shared setup is pending ends every waiter and sends no OpenSession", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      const sandbox = h.client.sandbox(SANDBOX);
+      const controller = new AbortController();
+      const withSignal = sandbox
+        .run({ command: ["a"], signal: controller.signal })
+        .catch((e) => e);
+      const withoutSignal = sandbox.run({ command: ["b"] }).catch((e) => e);
+      // Setup is pending (ICE gathering takes virtual time).
+      await h.clock.advance(50);
+      sandbox.close();
+      const errors = await h.clock.run(
+        Promise.all([withSignal, withoutSignal]),
+      );
+      expect(errors[0]).toBeInstanceOf(OwnSandHandleClosedError);
+      expect(errors[1]).toBeInstanceOf(OwnSandHandleClosedError);
+      expect((errors[0] as Error).message).toBe("sandbox handle closed");
+      // The setup was cancelled before the offer: no session was created.
+      expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      // The close is not a peer failure: the handle stays on peer-to-peer.
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+    });
+
+    test("a session that opens after the close is closed and never installed", async () => {
+      const { h, rtc } = p2pSetup(exiting, { openSessionMs: 5_000 });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
+      // 100 ms of gathering, then OpenSession is in flight.
+      await h.clock.advance(1_000);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      sandbox.close();
+      const error = await h.clock.run(pending);
+      expect(error).toBeInstanceOf(OwnSandHandleClosedError);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      expect(rtc.frames).toHaveLength(0);
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      // A later operation is rejected before any new setup.
+      await expect(
+        h.clock.run(sandbox.run({ command: ["b"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(rtc.connections).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("a Canceled error from OpenSession after the close still ends with the closed error", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      h.api.unary(DataPathService, "OpenSession", async () => {
+        await h.clock.sleep(5_000);
+        throw new ConnectError("canceled", Code.Canceled);
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const pending = sandbox.run({ command: ["a"] }).catch((e) => e);
+      await h.clock.advance(1_000);
+      sandbox.close();
+      expect(await h.clock.run(pending)).toBeInstanceOf(
+        OwnSandHandleClosedError,
+      );
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+    });
+
+    test("close is idempotent and a closed handle rejects before GetIceServers", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      const sandbox = h.client.sandbox(SANDBOX);
+      // No session was ever opened.
+      sandbox.close();
+      sandbox.close();
+      await expect(
+        h.clock.run(sandbox.run({ command: ["a"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(h.api.callsOf("GetIceServers")).toHaveLength(0);
+      expect(rtc.connections).toHaveLength(0);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      sandbox.close();
+    });
+
+    test("a close after the session opened closes it and rejects later operations", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      const sandbox = h.client.sandbox(SANDBOX);
+      await h.clock.run(sandbox.run({ command: ["a"] }));
+      sandbox.close();
+      sandbox.close();
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      await expect(
+        h.clock.run(sandbox.run({ command: ["b"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+      expect(rtc.connections).toHaveLength(1);
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+    });
+
+    test("a closed relay-only handle keeps serving", async () => {
+      for (const options of [
+        { transport: DataPathTransport.RELAY },
+        // A WebRTC-less client uses the relay too.
+        undefined,
+      ]) {
+        const h =
+          options === undefined ? setup() : p2pSetup(() => {}, options).h;
+        h.api.stream(RelayService, "Exec", function* () {
+          yield execMsg(ev.accepted());
+          yield execMsg(ev.exited(0));
+        });
+        const sandbox = h.client.sandbox(SANDBOX);
+        sandbox.close();
+        const result = await h.clock.run(
+          sandbox.exec({ command: ["x"] }).wait(),
+        );
+        expect(result.kind).toBe(ExecResultKind.Exited);
+        expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(0);
+      }
+    });
+
+    test("delete closes the handle only after DeleteSandbox succeeded", async () => {
+      const { h, rtc } = p2pSetup(exiting);
+      let fail = true;
+      h.api.unary(SandboxService, "DeleteSandbox", (req) => {
+        if (fail) {
+          throw new ConnectError("busy", Code.Unavailable);
+        }
+        return { sandbox: { sandboxId: req.sandboxId } };
+      });
+      const sandbox = h.client.sandbox(SANDBOX);
+      await h.clock.run(sandbox.run({ command: ["a"] }));
+      await expect(h.clock.run(sandbox.delete())).rejects.toBeInstanceOf(
+        ConnectError,
+      );
+      // The failed delete left the handle and its session usable.
+      expect(rtc.channels[0]!.readyState).not.toBe("closed");
+      await h.clock.run(sandbox.run({ command: ["b"] }));
+      expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+      fail = false;
+      await h.clock.run(sandbox.delete());
+      expect(rtc.channels[0]!.readyState).toBe("closed");
+      await expect(
+        h.clock.run(sandbox.run({ command: ["c"] })),
+      ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
     });
   });
 });

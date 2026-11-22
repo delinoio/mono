@@ -14,9 +14,15 @@ import {
   createClient,
   type Transport,
 } from "@connectrpc/connect";
+import {
+  type DeviceLimitsInput,
+  type Resources,
+} from "@delino/ownsand-protos/v1/common_pb";
+import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
+import { createQueryClient } from "./api.ts";
 import { type Auth, AuthContextProvider } from "./auth.tsx";
 import { AuthMode, type ConsoleConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
@@ -44,6 +50,7 @@ function renderConsole(
     signedIn?: boolean;
     transport?: Transport;
     config?: ConsoleConfig;
+    queryClient?: QueryClient;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -59,9 +66,14 @@ function renderConsole(
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
-  const queryClient = new QueryClient({
-    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
-  });
+  const queryClient =
+    options.queryClient ??
+    new QueryClient({
+      defaultOptions: {
+        queries: { retry: false },
+        mutations: { retry: false },
+      },
+    });
   render(
     <AuthContextProvider value={auth}>
       <Console
@@ -308,6 +320,125 @@ describe("confirmation dialog errors", () => {
   });
 });
 
+describe("form dialog errors", () => {
+  /**
+   * A transport whose CreateApiKey waits for `release()` and then fails for
+   * the first `failures` calls; without a `gate`, it fails at once.
+   */
+  function createKeyTransport(failures: number, gate = false) {
+    const mock = createMockTransport();
+    const state = {
+      calls: 0,
+      release: undefined as (() => void) | undefined,
+    };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name === "CreateApiKey") {
+          state.calls += 1;
+          if (gate) {
+            await new Promise<void>((resolve) => {
+              state.release = resolve;
+            });
+          }
+          if (state.calls <= failures) {
+            throw new ConnectError("create failed", Code.Unavailable);
+          }
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  /** The error notice inside a dialog; the live-region announcer also has the alert role. */
+  const noticeIn = (dialog: HTMLElement) =>
+    dialog.querySelector(".notice-error");
+
+  async function openCreate() {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Create API key" }));
+    });
+    await settle(60);
+    return screen.findByRole("dialog", { name: "Create an API key" });
+  }
+
+  async function submitCreate(dialog: HTMLElement, name = "deploy-bot") {
+    await act(async () => {
+      fireEvent.input(within(dialog).getByRole("textbox", { name: "Name" }), {
+        target: { value: name },
+      });
+    });
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create key" }),
+      );
+    });
+  }
+
+  test("a failure while the dialog is open shows its notice and a retry removes it", async () => {
+    const { transport, state } = createKeyTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openCreate();
+    await submitCreate(dialog);
+    await settle(60);
+    expect(noticeIn(dialog)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(
+        within(dialog).getByRole("button", { name: "Create key" }),
+      );
+    });
+    await settle(60);
+    expect(state.calls).toBe(2);
+    expect(noticeIn(dialog)).toBeNull();
+    expect(
+      await screen.findByRole("dialog", { name: "Your new API key" }),
+    ).toBeTruthy();
+  });
+
+  test("a notice does not survive Cancel and reopening", async () => {
+    const { transport } = createKeyTransport(1);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openCreate();
+    await submitCreate(dialog);
+    await settle(60);
+    expect(noticeIn(dialog)).toBeTruthy();
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    });
+    await settle(60);
+    expect(
+      screen.queryByRole("dialog", { name: "Create an API key" }),
+    ).toBeNull();
+    const reopened = await openCreate();
+    expect(noticeIn(reopened)).toBeNull();
+  });
+
+  test("a failure that arrives after Escape does not show on the next opening", async () => {
+    const { transport, state } = createKeyTransport(1, true);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/api-keys`, { transport });
+    await screen.findByText(/ci-runner/);
+    const dialog = await openCreate();
+    await submitCreate(dialog);
+    await act(async () => {
+      fireEvent.keyDown(dialog, { key: "Escape" });
+    });
+    await settle(60);
+    expect(
+      screen.queryByRole("dialog", { name: "Create an API key" }),
+    ).toBeNull();
+    // The request fails only now, while the dialog is closed.
+    await act(async () => {
+      state.release?.();
+    });
+    await settle(60);
+    const reopened = await openCreate();
+    expect(noticeIn(reopened)).toBeNull();
+  });
+});
+
 describe("devices", () => {
   test("shows the overcommitted and effective vCPU limit", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/devices`);
@@ -391,6 +522,252 @@ describe("device limits", () => {
       (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
     ).toBe("0");
   });
+
+  /**
+   * A mock transport whose build box has the given limits and that records
+   * the ReplaceDeviceLimits requests.
+   */
+  async function recordingTransport(limits: {
+    vcpuCount: number;
+    memoryMib: bigint;
+    diskGib: bigint;
+  }) {
+    const mock = createMockTransport();
+    await createClient(DeviceService, mock).replaceDeviceLimits({
+      organizationId: MOCK_IDS.acme,
+      deviceId: MOCK_IDS.buildBox,
+      limits: { ...limits, vcpuOvercommitPercent: 150 },
+    });
+    const replaced: DeviceLimitsInput[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "ReplaceDeviceLimits") {
+          replaced.push((rest[3] as { limits: DeviceLimitsInput }).limits);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, replaced };
+  }
+
+  const commit = async (input: HTMLElement, value: string) => {
+    await act(async () => {
+      fireEvent.input(input, { target: { value } });
+      fireEvent.blur(input);
+    });
+    await settle();
+  };
+
+  const save = async () => {
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Save limits" }));
+    });
+    await settle(60);
+  };
+
+  test("changing only the vCPU limit keeps memory and disk above 2^53 exact", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 9223372036854775807n,
+      diskGib: 9007199254740993n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const vcpu = await screen.findByLabelText("vCPU limit");
+    await settle();
+    expect(
+      (screen.getByLabelText("Memory limit (MiB)") as HTMLInputElement).value,
+    ).toBe("9223372036854775807");
+    expect(
+      (screen.getByLabelText("Disk limit (GiB)") as HTMLInputElement).value,
+    ).toBe("9007199254740993");
+    await commit(vcpu, "8");
+    await save();
+    expect(replaced).toHaveLength(1);
+    expect(replaced[0]?.vcpuCount).toBe(8);
+    expect(replaced[0]?.memoryMib).toBe(9223372036854775807n);
+    expect(replaced[0]?.diskGib).toBe(9007199254740993n);
+    expect(replaced[0]?.vcpuOvercommitPercent).toBe(150);
+  });
+
+  test("an explicitly edited limit keeps its exact precision", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const disk = await screen.findByLabelText("Disk limit (GiB)");
+    await settle();
+    await commit(disk, "9007199254740993");
+    await save();
+    expect(replaced[0]?.diskGib).toBe(9007199254740993n);
+    expect(replaced[0]?.memoryMib).toBe(65536n);
+  });
+
+  test("keeps an off-grid memory limit and sends 1000 as typed", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 1000n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const disk = await screen.findByLabelText("Disk limit (GiB)");
+    await settle();
+    // Saving a different limit keeps the off-grid memory value.
+    await commit(disk, "600");
+    await save();
+    expect(replaced[0]?.memoryMib).toBe(1000n);
+    const memory = screen.getByLabelText("Memory limit (MiB)");
+    await commit(memory, "1500");
+    await commit(memory, "1000");
+    expect((memory as HTMLInputElement).value).toBe("1000");
+    await save();
+    expect(replaced[1]?.memoryMib).toBe(1000n);
+    expect(replaced[1]?.diskGib).toBe(600n);
+  });
+
+  test("shows a validation error for an out-of-range limit and sends nothing", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const memory = await screen.findByLabelText("Memory limit (MiB)");
+    await settle();
+    const message =
+      "Memory limit must be a whole number from 0 to 9223372036854775807.";
+    for (const value of ["9223372036854775808", "-1", "1.5"]) {
+      await commit(memory, value);
+      await save();
+      expect(memory.getAttribute("aria-invalid")).toBe("true");
+      expect(screen.getAllByText(message).length).toBeGreaterThan(0);
+    }
+    expect(replaced).toHaveLength(0);
+    // Editing the field clears its error; the maximum is a valid value.
+    await commit(memory, "9223372036854775807");
+    expect(memory.getAttribute("aria-invalid")).not.toBe("true");
+    await save();
+    expect(replaced[0]?.memoryMib).toBe(9223372036854775807n);
+  });
+
+  test("a blank limit asks for the value and zero is a value", async () => {
+    const { transport, replaced } = await recordingTransport({
+      vcpuCount: 16,
+      memoryMib: 65536n,
+      diskGib: 500n,
+    });
+    renderConsole(`/orgs/${MOCK_IDS.acme}/devices/${MOCK_IDS.buildBox}`, {
+      transport,
+    });
+    const memory = await screen.findByLabelText("Memory limit (MiB)");
+    await settle();
+    await commit(memory, "");
+    await save();
+    expect(
+      screen.getAllByText("Memory limit is required. Enter 0 to allow none.")
+        .length,
+    ).toBeGreaterThan(0);
+    expect(replaced).toHaveLength(0);
+    await commit(memory, "0");
+    await save();
+    expect(replaced[0]?.memoryMib).toBe(0n);
+    expect(replaced[0]?.vcpuCount).toBe(16);
+    expect(replaced[0]?.diskGib).toBe(500n);
+  });
+});
+
+describe("sandbox create form resources", () => {
+  /** A mock transport that records the resources of every CreateSandbox. */
+  function recordingTransport() {
+    const mock = createMockTransport();
+    const created: Resources[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          created.push((rest[3] as { resources: Resources }).resources);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, created };
+  }
+
+  async function openForm(transport: Transport) {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Create sandbox" }),
+      );
+    });
+    await settle(60);
+    return screen.findByRole("dialog", { name: "Create a sandbox" });
+  }
+
+  const commit = async (input: HTMLElement, value: string) => {
+    await act(async () => {
+      fireEvent.input(input, { target: { value } });
+      fireEvent.blur(input);
+    });
+    await settle();
+  };
+
+  test("keeps a Memory of 1000 and sends it", async () => {
+    const { transport, created } = recordingTransport();
+    const dialog = await openForm(transport);
+    const memory = within(dialog).getByLabelText("Memory (MiB)");
+    await commit(memory, "1000");
+    // The field formats its value with a thousands separator.
+    expect((memory as HTMLInputElement).value).toBe("1,000");
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+    expect(created).toHaveLength(1);
+    expect(created[0]?.memoryMib).toBe(1000n);
+  });
+
+  test("keeps the minimum of 256 and steps by whole numbers", async () => {
+    const { transport } = recordingTransport();
+    const dialog = await openForm(transport);
+    const memory = within(dialog).getByLabelText(
+      "Memory (MiB)",
+    ) as HTMLInputElement;
+    await commit(memory, "100");
+    expect(memory.value).toBe("256");
+    await commit(memory, "1000");
+    await act(async () => {
+      fireEvent.keyDown(memory, { key: "ArrowUp" });
+    });
+    await settle();
+    expect(memory.value).toBe("1,001");
+    await act(async () => {
+      fireEvent.keyDown(memory, { key: "ArrowUp", shiftKey: true });
+    });
+    await settle();
+    expect(memory.value).toBe("1,257");
+    // The plus button of the Memory field adds one more whole number.
+    const plus = memory
+      .closest('[data-slot="number-input-group"]')!
+      .querySelector('[data-slot="number-input-increment"]')!;
+    await act(async () => {
+      fireEvent.pointerDown(plus, { button: 0 });
+      fireEvent.pointerUp(plus, { button: 0 });
+      fireEvent.click(plus);
+    });
+    await settle();
+    expect(memory.value).toMatch(/^1,25[89]$/);
+  });
 });
 
 describe("invitations", () => {
@@ -408,6 +785,33 @@ describe("invitations", () => {
     });
     expect(signIns).toHaveLength(1);
     expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
+  });
+
+  test("shows the sign-in configuration notice instead of a sign-in button when Logto is not configured", async () => {
+    // The default build: Logto mode without a registration, so no sign-in
+    // can complete and the secret has no redirect to survive.
+    const { signIns } = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      {
+        signedIn: false,
+        config: {
+          apiOrigin: "https://api.test",
+          authMode: AuthMode.Logto,
+          logto: undefined,
+        },
+      },
+    );
+    expect(
+      await screen.findByText("Sign-in is not configured for this build."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in to accept" })).toBe(
+      null,
+    );
+    expect(signIns).toHaveLength(0);
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.sessionStorage.length).toBe(0);
+    // The page still removes the secret from the address bar.
+    expect(window.location.hash).toBe("");
   });
 
   test("accepts the pending invitation after sign-in and deletes the stored secret", async () => {
@@ -538,6 +942,85 @@ describe("invitations", () => {
     expect(window.location.pathname).toBe("/invitations/accept");
     expect(
       screen.getByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+  });
+
+  /** Counts ListOrganizations calls. */
+  function listOrganizationsProbe() {
+    const mock = createMockTransport();
+    const state = { calls: 0 };
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "ListOrganizations") {
+          state.calls += 1;
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    return { transport, state };
+  }
+
+  /** Pastes the Contoso invitation link on the organizations page and accepts it. */
+  async function joinContosoFromOrganizations() {
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+    fireEvent.input(screen.getByLabelText("Invitation link"), {
+      target: {
+        value: `https://console.test/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      },
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+  }
+
+  test("lists the joined organization in the switcher while the organization list is still fresh", async () => {
+    const { transport, state } = listOrganizationsProbe();
+    // The production client: ListOrganizations stays fresh for 10 seconds.
+    renderConsole("/", { transport, queryClient: createQueryClient() });
+    await joinContosoFromOrganizations();
+    await settle(100);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+    );
+    // The page and the switcher read the list once. Accepting refetches it.
+    expect(state.calls).toBeGreaterThan(1);
+    const trigger = await screen.findByRole("combobox", {
+      name: "Organization",
+    });
+    expect(trigger.textContent).toContain("Contoso Research");
+  });
+
+  test("refreshes the organizations when an earlier accept succeeds after the user left the page", async () => {
+    const { transport, release } = delayedAcceptTransport();
+    pendingInvitation.save(MOCK_INVITATION_SECRET);
+    renderConsole("/invitations/accept", {
+      transport,
+      queryClient: createQueryClient(),
+    });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("link", { name: "Not now" }));
+    });
+    expect(window.location.pathname).toBe("/");
+    await screen.findByRole("link", { name: /Acme Robotics/ });
+    expect(screen.queryByRole("link", { name: /Contoso Research/ })).toBeNull();
+    release();
+    await settle(100);
+    // The late success does not navigate, and the list shows the new
+    // organization although it was fetched less than 10 seconds before.
+    expect(window.location.pathname).toBe("/");
+    expect(
+      await screen.findByRole("link", { name: /Contoso Research/ }),
     ).toBeTruthy();
   });
 

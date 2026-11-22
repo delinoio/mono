@@ -506,7 +506,8 @@ type AutoTopUpSettings struct {
 	Enabled bool `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
 	// Required when enabled: at least 10 USD (10,000,000), whole cents.
 	ThresholdUsdMicros int64 `protobuf:"varint,2,opt,name=threshold_usd_micros,json=thresholdUsdMicros,proto3" json:"threshold_usd_micros,omitempty"`
-	// Required when enabled: at least 25 USD (25,000,000), whole cents.
+	// Required when enabled: at least 25 USD (25,000,000) and at most 10,000
+	// USD (10,000,000,000), whole cents.
 	AmountUsdMicros int64 `protobuf:"varint,3,opt,name=amount_usd_micros,json=amountUsdMicros,proto3" json:"amount_usd_micros,omitempty"`
 	// Required when enabled: at least amount_usd_micros, whole cents. Upper
 	// limit of the automatic top-ups in one UTC calendar month.
@@ -1482,9 +1483,9 @@ type UpdateAutoTopUpSettingsRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	BillingAccountId string                 `protobuf:"bytes,1,opt,name=billing_account_id,json=billingAccountId,proto3" json:"billing_account_id,omitempty"`
 	// Required. Replaces every input field. With enabled true, a threshold
-	// below 10 USD, an amount below 25 USD, a monthly cap below the amount
-	// (including a missing cap) or an amount that is not whole cents fails
-	// with `invalid_argument`. With enabled false, the values must be zero or
+	// below 10 USD, an amount below 25 USD or above 10,000 USD, a monthly cap
+	// below the amount (including a missing cap) or an amount that is not
+	// whole cents fails with `invalid_argument`. With enabled false, the values must be zero or
 	// non-negative whole cents; they are kept for a later enable.
 	Settings      *AutoTopUpSettings `protobuf:"bytes,2,opt,name=settings,proto3" json:"settings,omitempty"`
 	unknownFields protoimpl.UnknownFields

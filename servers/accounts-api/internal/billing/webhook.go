@@ -29,6 +29,7 @@ const maxWebhookBytes = 1 << 20
 const (
 	webhookApplied          = "applied"
 	webhookDuplicate        = "duplicate"
+	webhookPending          = "pending"
 	webhookIgnored          = "ignored"
 	webhookUnmatched        = "unmatched"
 	webhookInvalidSignature = "invalid_signature"
@@ -269,6 +270,12 @@ func (s *Service) onTransactionCompleted(ctx context.Context, tx pgx.Tx, ev padd
 		return eventOutcome{Result: webhookInvalidPayload}, nil
 	}
 	out := eventOutcome{TransactionID: txn.ID}
+	// Serialize with the adjustments of this purchase before any other lock,
+	// so a refund that arrives together with the payment either finds the
+	// grant or is found as pending by the grant.
+	if err := lockPurchase(ctx, tx, txn.ID); err != nil {
+		return out, err
+	}
 	topUpID := chargeTopUpID(txn)
 	accountID, err := resolveAccount(ctx, tx, txn.ID, txn.SubscriptionID, topUpID, txn.CustomData)
 	if err != nil {
@@ -440,11 +447,24 @@ func (s *Service) onSubscription(ctx context.Context, tx pgx.Tx, ev paddle.Event
 	return out, nil
 }
 
+// lockPurchase takes a transaction-scoped advisory lock on a Paddle
+// transaction. The grant of a purchase and the approved adjustments of the
+// purchase run one after another, in either delivery order, because both
+// webhook paths take this lock first and the billing account lock second.
+// Without it, an adjustment that finds no grant and a grant that finds no
+// pending adjustment could commit at the same time and lose the reversal.
+func lockPurchase(ctx context.Context, tx pgx.Tx, transactionID string) error {
+	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('paddle_credit_txn:' || $1::text, 0))`, transactionID)
+	return err
+}
+
 // onAdjustment removes credit for an approved refund or chargeback of a
 // purchase. Each adjustment applies once, also when Paddle sends it as
 // created and again as updated. The amount is the tax-exclusive subtotal of
 // the adjustment, at most the credit of the purchase that is not refunded
-// yet; the balance can become negative.
+// yet; the balance can become negative. Paddle does not order its
+// notifications, so an adjustment whose purchase has no credit grant yet is
+// stored as pending, and the webhook that creates the grant applies it.
 func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, now time.Time) (eventOutcome, error) {
 	var adj paddle.Adjustment
 	if err := json.Unmarshal(ev.Data, &adj); err != nil || adj.ID == "" {
@@ -456,13 +476,42 @@ func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, 
 		out.Result = webhookIgnored
 		return out, nil
 	}
+	cents, err := paddle.ParseCents(adj.Totals.Subtotal)
+	if err != nil || cents < 0 {
+		out.Result = webhookInvalidPayload
+		return out, nil
+	}
+	amount, err := CentsToMicros(cents)
+	if err != nil {
+		return out, err
+	}
+	if adj.TransactionID == "" {
+		s.logger.WarnContext(ctx, "billing_refund_without_grant",
+			slog.String("paddle_event_id", ev.EventID), slog.String("paddle_adjustment_id", adj.ID))
+		out.Result = webhookUnmatched
+		return out, nil
+	}
+	if err := lockPurchase(ctx, tx, adj.TransactionID); err != nil {
+		return out, err
+	}
 	var grantID, accountID string
-	err := tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
+	err = tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
 		WHERE paddle_transaction_id = $1`, adj.TransactionID).Scan(&grantID, &accountID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		s.logger.WarnContext(ctx, "billing_refund_without_grant",
-			slog.String("paddle_event_id", ev.EventID), slog.String("paddle_transaction_id", adj.TransactionID))
-		out.Result = webhookUnmatched
+		tag, err := tx.Exec(ctx, `INSERT INTO pending_credit_adjustments (paddle_adjustment_id, paddle_transaction_id,
+				action, amount_usd_micros, create_time) VALUES ($1, $2, $3, $4, $5)
+			ON CONFLICT (paddle_adjustment_id) DO NOTHING`, adj.ID, adj.TransactionID, adj.Action, amount, now)
+		if err != nil {
+			return out, err
+		}
+		s.logger.WarnContext(ctx, "billing_refund_pending",
+			slog.String("paddle_event_id", ev.EventID),
+			slog.String("paddle_transaction_id", adj.TransactionID),
+			slog.String("paddle_adjustment_id", adj.ID),
+			slog.String("action", adj.Action),
+			slog.Int64("amount_usd_micros", amount),
+			slog.Bool("stored", tag.RowsAffected() > 0))
+		out.Result = webhookPending
 		return out, nil
 	}
 	if err != nil {
@@ -473,55 +522,104 @@ func (s *Service) onAdjustment(ctx context.Context, tx pgx.Tx, ev paddle.Event, 
 	if err != nil {
 		return out, err
 	}
+	if acct.Deleted {
+		out.Result = webhookIgnored
+		return out, nil
+	}
+	applied, err := s.applyAdjustment(ctx, tx, acct, grantID, pendingAdjustment{
+		ID: adj.ID, TransactionID: adj.TransactionID, Action: adj.Action, Amount: amount,
+	}, false, now)
+	if err != nil {
+		return out, err
+	}
+	out.Result = webhookIgnored
+	if applied {
+		out.Result = webhookApplied
+	}
+	return out, nil
+}
+
+// pendingAdjustment is an approved adjustment of a purchase: the Paddle
+// adjustment ID, the purchase, the action and the tax-exclusive amount.
+type pendingAdjustment struct {
+	ID            string
+	TransactionID string
+	Action        string
+	Amount        int64
+}
+
+// applyAdjustment removes the credit of one approved adjustment from the
+// grant of its purchase, with the cap of what the purchase added and was not
+// removed yet, and records it in credit_refunds. It does nothing for an
+// adjustment ID that credit_refunds already has, so a repeated delivery or a
+// second notification of the same adjustment removes nothing. The caller
+// holds the purchase lock and the lock of acct, and owns tx. It reports
+// whether it applied the adjustment; false means credit_refunds had it.
+func (s *Service) applyAdjustment(ctx context.Context, tx pgx.Tx, acct *accountState, grantID string, adj pendingAdjustment, fromPending bool, now time.Time) (bool, error) {
 	var original, refunded int64
 	if err := tx.QueryRow(ctx, `SELECT original_usd_micros, refunded_usd_micros FROM credit_grants
 		WHERE credit_grant_id = $1 FOR UPDATE`, grantID).Scan(&original, &refunded); err != nil {
-		return out, err
+		return false, err
 	}
 	var done bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM credit_refunds WHERE paddle_adjustment_id = $1)`,
 		adj.ID).Scan(&done); err != nil {
-		return out, err
+		return false, err
 	}
-	if done || acct.Deleted {
-		out.Result = webhookIgnored
-		return out, nil
+	if done {
+		return false, nil
 	}
-	subtotal := adj.Totals.Subtotal
-	cents, err := paddle.ParseCents(subtotal)
-	if err != nil || cents < 0 {
-		out.Result = webhookInvalidPayload
-		return out, nil
-	}
-	amount, err := CentsToMicros(cents)
-	if err != nil {
-		return out, err
-	}
-	amount = min(amount, original-refunded)
+	amount := min(adj.Amount, original-refunded)
 	var entryID *string
 	if amount > 0 {
 		id, err := s.removeCredit(ctx, tx, acct, grantID, adj.TransactionID, amount, now)
 		if err != nil {
-			return out, err
+			return false, err
 		}
 		entryID = &id
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO credit_refunds (paddle_adjustment_id, credit_grant_id, amount_usd_micros,
 			ledger_entry_id, create_time) VALUES ($1, $2, $3, $4, $5)`, adj.ID, grantID, amount, entryID, now); err != nil {
-		return out, err
+		return false, err
 	}
 	if _, err := tx.Exec(ctx, `UPDATE credit_grants SET refunded_usd_micros = refunded_usd_micros + $2
 		WHERE credit_grant_id = $1`, grantID, amount); err != nil {
-		return out, err
+		return false, err
 	}
 	s.logger.InfoContext(ctx, "billing_credit_refunded",
-		slog.String("billing_account_id", accountID),
+		slog.String("billing_account_id", acct.ID),
 		slog.String("credit_grant_id", grantID),
 		slog.String("paddle_transaction_id", adj.TransactionID),
 		slog.String("paddle_adjustment_id", adj.ID),
 		slog.String("action", adj.Action),
 		slog.Int64("amount_usd_micros", amount),
+		slog.Bool("from_pending", fromPending),
 		slog.Int64("balance_after_usd_micros", acct.Balance))
-	out.Result = webhookApplied
-	return out, nil
+	return true, nil
+}
+
+// applyPendingAdjustments applies the approved adjustments that arrived
+// before the credit grant of the purchase, oldest first, and deletes each
+// pending row in the same transaction. The caller holds the purchase lock and
+// the lock of acct.
+func (s *Service) applyPendingAdjustments(ctx context.Context, tx pgx.Tx, acct *accountState, grantID, transactionID string, now time.Time) error {
+	rows, err := tx.Query(ctx, `SELECT paddle_adjustment_id, paddle_transaction_id, action, amount_usd_micros
+		FROM pending_credit_adjustments WHERE paddle_transaction_id = $1
+		ORDER BY create_time, paddle_adjustment_id FOR UPDATE`, transactionID)
+	if err != nil {
+		return err
+	}
+	pending, err := pgx.CollectRows(rows, pgx.RowToStructByPos[pendingAdjustment])
+	if err != nil {
+		return err
+	}
+	for _, adj := range pending {
+		if _, err := s.applyAdjustment(ctx, tx, acct, grantID, adj, true, now); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM pending_credit_adjustments WHERE paddle_adjustment_id = $1`, adj.ID); err != nil {
+			return err
+		}
+	}
+	return nil
 }

@@ -26,7 +26,7 @@ func TestRulesetParsesWithNft(t *testing.T) {
 	}
 	v4, v6 := Blocked(routes, onLink)
 	cmd := exec.Command("unshare", "-rn", "nft", "-c", "-f", "-")
-	cmd.Stdin = strings.NewReader(Ruleset(v4, v6, []TapGateway{{Tap: TapName(1), Gateway: netip.MustParseAddr("172.30.0.5")}, {Tap: TapName(2), Gateway: netip.MustParseAddr("172.30.0.9")}}))
+	cmd.Stdin = strings.NewReader(Ruleset(v4, v6, []TapGateway{{Tap: TapName(1), Gateway: netip.MustParseAddr("172.30.0.5"), Guest: netip.MustParseAddr("172.30.0.6")}, {Tap: TapName(2), Gateway: netip.MustParseAddr("172.30.0.9"), Guest: netip.MustParseAddr("172.30.0.10")}}))
 	var out bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Run(); err != nil {

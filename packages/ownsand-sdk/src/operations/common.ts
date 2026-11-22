@@ -11,8 +11,28 @@ import { Timing } from "../relay/context.ts";
 import type { RecoveryWindow } from "../relay/recovery.ts";
 
 /** Reports whether the error is a Connect `not_found`. */
-export function isNotFound(error: unknown): boolean {
+export function isNotFound(error: unknown): error is ConnectError {
   return error instanceof ConnectError && error.code === Code.NotFound;
+}
+
+/**
+ * Reports whether the error is the `not_found` that the guest helper or the
+ * agent returns for a `read_id` that expired ("read expired", or "operation
+ * expired, or the caller's clock may be behind" for the operation ID check).
+ * The `ErrorDetail` has no structured expiry reason, so the message prefix is
+ * the only way to tell an expired read from a missing file. A message that
+ * the peers reword makes this return false, and the read then reports the
+ * peer's own message as a missing-file error, which stays a `NotFound`
+ * `DataPathError`. Replace the prefix match when the protocol adds a
+ * structured expiry reason.
+ */
+export function isExpiredRead(error: unknown): error is ConnectError {
+  return (
+    isNotFound(error) &&
+    ["read expired", "operation expired"].some((prefix) =>
+      error.rawMessage.startsWith(prefix),
+    )
+  );
 }
 
 /**

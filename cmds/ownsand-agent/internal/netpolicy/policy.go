@@ -145,35 +145,68 @@ func joinPrefixes(ps []netip.Prefix) string {
 	return strings.Join(parts, ", ")
 }
 
-// TapGateway is the DNS exception of one sandbox: the tap device of its
-// link and the gateway address on which the agent serves its DNS.
+// TapGateway binds the tap device of one sandbox link to the two addresses
+// of that link: the gateway address on which the agent serves the DNS of
+// the sandbox, and the guest address that the sandbox owns.
 type TapGateway struct {
 	Tap     string
 	Gateway netip.Addr
+	Guest   netip.Addr
 }
 
-// dnsAcceptRules returns the input chain rules that accept DNS (UDP and
-// TCP port 53) from each assigned tap to the gateway address of the same
-// assignment only. The output is sorted by tap so that equal assignments
-// render the same text. An assignment without a tap name or with an
-// invalid or non-IPv4 gateway renders no rule: the final drop applies.
-func dnsAcceptRules(assignments []TapGateway) string {
+// valid reports whether the assignment has a tap name and IPv4 gateway and
+// guest addresses. The rules render nothing for any other assignment: the
+// final drop of the input chain applies, and the forward chain has no
+// per-tap source check for it.
+func (a TapGateway) valid() bool {
+	return a.Tap != "" && a.Gateway.Is4() && a.Guest.Is4()
+}
+
+// sortedAssignments returns the valid assignments sorted by tap, gateway
+// and guest, without duplicates, so that equal assignments render the same
+// text.
+func sortedAssignments(assignments []TapGateway) []TapGateway {
 	sorted := slices.Clone(assignments)
 	slices.SortFunc(sorted, func(a, b TapGateway) int {
 		if c := strings.Compare(a.Tap, b.Tap); c != 0 {
 			return c
 		}
-		return a.Gateway.Compare(b.Gateway)
+		if c := a.Gateway.Compare(b.Gateway); c != 0 {
+			return c
+		}
+		return a.Guest.Compare(b.Guest)
 	})
 	sorted = slices.Compact(sorted)
+	return slices.DeleteFunc(sorted, func(a TapGateway) bool { return !a.valid() })
+}
+
+// dnsAcceptRules returns the input chain rules that accept DNS (UDP and
+// TCP port 53) from the guest address of each assigned tap to the gateway
+// address of the same assignment only. A packet from that tap with another
+// source address matches no rule and falls to the final drop of the input
+// chain. The output is sorted by tap. An invalid assignment renders no
+// rule.
+func dnsAcceptRules(assignments []TapGateway) string {
 	var sb strings.Builder
-	for _, a := range sorted {
-		if a.Tap == "" || !a.Gateway.Is4() {
-			continue
-		}
+	for _, a := range sortedAssignments(assignments) {
 		for _, proto := range []string{"udp", "tcp"} {
-			fmt.Fprintf(&sb, "\t\tiifname %q ip daddr %s %s dport 53 accept\n", a.Tap, a.Gateway, proto)
+			fmt.Fprintf(&sb, "\t\tiifname %q ip saddr %s ip daddr %s %s dport 53 accept\n", a.Tap, a.Guest, a.Gateway, proto)
 		}
+	}
+	return sb.String()
+}
+
+// sourceGuardRules returns the forward chain rules that drop an IPv4 packet
+// from an assigned tap whose source address is not the guest address of
+// that assignment, so that a guest cannot forward packets with the address
+// of another sandbox or of the host. DHCPv4 from 0.0.0.0 is delivered to
+// the host and hits the input chain only, and `ip saddr` does not match
+// IPv6 packets, so neither is affected. An invalid assignment renders no
+// rule.
+func sourceGuardRules(assignments []TapGateway) string {
+	var sb strings.Builder
+	for _, a := range sortedAssignments(assignments) {
+		fmt.Fprintf(&sb, "\t\tiifname %q ip saddr != %s drop\n", a.Tap, a.Guest)
 	}
 	return sb.String()
 }
@@ -181,11 +214,14 @@ func dnsAcceptRules(assignments []TapGateway) string {
 // Ruleset returns the nftables script that replaces the agent's table
 // atomically. Guests reach only the internet: packets to blocked prefixes
 // are dropped in forward, packets to the host itself are dropped in input
-// except DNS from each sandbox tap to that sandbox's own gateway address
-// (assignments), DHCP and IPv6 neighbor and router discovery on the guest
-// link, inbound connections to guests are dropped, and guest traffic leaves
-// through NAT. DNS to any other host address, such as the LAN address or
-// the gateway of another sandbox, falls through to the drop.
+// except DNS from the guest address of each sandbox on its tap to that
+// sandbox's own gateway address (assignments), DHCP and IPv6 neighbor and
+// router discovery on the guest link, inbound connections to guests are
+// dropped, and guest traffic leaves through NAT. DNS to any other host
+// address, such as the LAN address or the gateway of another sandbox, and
+// DNS from another source address, falls through to the drop. IPv4 packets
+// from a sandbox tap with a source other than the guest address of that
+// sandbox are dropped in forward.
 func Ruleset(v4, v6 []netip.Prefix, assignments []TapGateway) string {
 	tap := TapPrefix + "*"
 	return fmt.Sprintf(`table inet %[1]s
@@ -212,7 +248,7 @@ table inet %[1]s {
 	}
 	chain forward {
 		type filter hook forward priority filter - 10; policy accept;
-		iifname "%[4]s" ip daddr @blocked4 drop
+%[7]s		iifname "%[4]s" ip daddr @blocked4 drop
 		iifname "%[4]s" ip6 daddr @blocked6 drop
 		oifname "%[4]s" ct state established,related accept
 		oifname "%[4]s" drop
@@ -222,7 +258,7 @@ table inet %[1]s {
 		ip saddr %[5]s oifname != "%[4]s" masquerade
 	}
 }
-`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments))
+`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments), sourceGuardRules(assignments))
 }
 
 // Link is the /30 link of one sandbox.

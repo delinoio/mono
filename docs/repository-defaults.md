@@ -18,6 +18,8 @@ Repository-owned source, package metadata and future release artifacts use Apach
 - Backend services under `servers/` should deploy to the shared DigitalOcean Droplet by default, as containers behind its Caddy reverse proxy. Any exception must be documented in its project contract.
 - Persistent relational databases should use PlanetScale Postgres by default. Any exception must be documented in its project contract.
 - File handling should use Cloudflare R2 for object storage plus signed URLs for upload and download access by default. Use another storage or access pattern only when the project contract documents the reason, trust boundary, and migration considerations.
+- Product analytics should use PostHog Cloud by default. Use another product analytics service only when the project contract documents the reason.
+- Observability data (metrics, logs and traces), dashboards and alerts should use Grafana Cloud by default. Use another observability backend only when the project contract documents the reason.
 
 ## Repository-Wide Rules
 
@@ -26,6 +28,7 @@ These rules are not defaults; project and domain contracts must not deviate from
 - Authentication uses one shared Logto tenant for all services. A project may accept another credential for programs, devices or short-lived capabilities that it issues after validating another accepted credential only when the documented exceptions in `docs/repository-auth-contract.md` list it. See `docs/repository-auth-contract.md`.
 - User charges use USD with 0.000001 USD precision. See `docs/repository-billing-contract.md`.
 - Account management and billing for every service use `delino-accounts`. See `docs/repository-auth-contract.md`, `docs/repository-billing-contract.md` and `docs/project-delino-accounts.md`.
+- Metrics, logs and traces are instrumented with the OpenTelemetry SDK. Go code keeps `log/slog` and Rust code keeps `tracing` as the logging API, and sends the log records to the OpenTelemetry SDK through its log bridge. The observability backend that receives this data is a default; see [Default Technology Choices](#default-technology-choices).
 
 ## Documentation Requirements
 

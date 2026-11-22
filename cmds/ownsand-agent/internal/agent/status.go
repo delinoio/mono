@@ -34,7 +34,18 @@ func (a *Agent) setConnected(connected bool) {
 	a.writeStatus()
 }
 
+// writeStatus writes the status file. It holds statusMu for the whole
+// gather-and-save step, so stopStatusWriter waits for a write that is in
+// flight, and it does nothing once the writer is stopped.
 func (a *Agent) writeStatus() {
+	a.statusMu.Lock()
+	defer a.statusMu.Unlock()
+	if a.statusStopped {
+		return
+	}
+	if a.statusWriteHook != nil {
+		a.statusWriteHook()
+	}
 	state, target := a.updater.State()
 	a.mu.Lock()
 	s := a.status
@@ -50,6 +61,26 @@ func (a *Agent) writeStatus() {
 	if err := a.st.SaveStatus(s); err != nil {
 		a.logger.Warn("write status file failed", "error", err)
 	}
+}
+
+// stopStatusWriter fences the status file: it waits for a write that is in
+// flight, and every later writeStatus (from statusLoop or setConnected)
+// does nothing. The device removal calls it before it deletes the state
+// directory, because statusLoop keeps running during the removal and
+// would otherwise re-create status.json after the delete.
+func (a *Agent) stopStatusWriter() {
+	a.statusMu.Lock()
+	a.statusStopped = true
+	a.statusMu.Unlock()
+}
+
+// resumeStatusWriter lifts the fence after a removal attempt that failed
+// and left the agent enrolled, so that the status file renews again while
+// the removal retries.
+func (a *Agent) resumeStatusWriter() {
+	a.statusMu.Lock()
+	a.statusStopped = false
+	a.statusMu.Unlock()
 }
 
 func (a *Agent) statusLoop(ctx context.Context) {

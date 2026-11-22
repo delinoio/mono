@@ -18,6 +18,7 @@ import { Meter } from "@delino/accounts-protos/v1/usage_pb";
 import {
   PENDING_INVITATION_KEY,
   pendingInvitation,
+  openInvitationFromAddress,
   takeTokenFromAddress,
   tokenFromFragment,
 } from "./invitation.ts";
@@ -147,6 +148,39 @@ describe("forms", () => {
     }
   });
 
+  test("limits an enabled automatic top-up amount to $10,000", () => {
+    const withAmount = (amount: string, enabled = true) =>
+      checkAutoTopUp({
+        enabled,
+        threshold: "10",
+        amount,
+        monthlyCap: "20000",
+      });
+    expect(withAmount("10000")).toEqual({
+      ok: true,
+      value: {
+        enabled: true,
+        thresholdUsdMicros: 10_000_000n,
+        amountUsdMicros: 10_000_000_000n,
+        monthlyCapUsdMicros: 20_000_000_000n,
+      },
+    });
+    expect(withAmount("10000.01")).toEqual({
+      ok: false,
+      errors: { amount: "Enter at most $10,000.00." },
+    });
+    // A disabled setting keeps any whole-cent amount for a later enable.
+    expect(withAmount("15000", false)).toEqual({
+      ok: true,
+      value: {
+        enabled: false,
+        thresholdUsdMicros: 10_000_000n,
+        amountUsdMicros: 15_000_000_000n,
+        monthlyCapUsdMicros: 20_000_000_000n,
+      },
+    });
+  });
+
   test("keeps disabled automatic top-up values with zero for empty fields", () => {
     expect(
       checkAutoTopUp({
@@ -223,6 +257,28 @@ describe("invitation token", () => {
     expect(replaced).toEqual(["/billing/invitations/accept"]);
     expect(tokenFromFragment("#other=1")).toBeUndefined();
     expect(tokenFromFragment("#token=")).toBeUndefined();
+  });
+
+  test("drops the stored token only when the address carries a new one", () => {
+    const history = { replaceState: () => {} };
+    const at = (hash: string) => ({
+      hash,
+      pathname: "/billing/invitations/accept",
+      search: "",
+    });
+    window.sessionStorage.clear();
+    pendingInvitation.save("bai_old");
+    expect(openInvitationFromAddress(at(""), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("bai_old");
+    expect(openInvitationFromAddress(at("#other=1"), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("bai_old");
+    expect(openInvitationFromAddress(at("#token="), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("bai_old");
+    expect(openInvitationFromAddress(at("#token=bai_new"), history)).toBe(
+      "bai_new",
+    );
+    expect(pendingInvitation.read()).toBeUndefined();
+    window.sessionStorage.clear();
   });
 
   test("stores the pending token under one key and clears it", () => {

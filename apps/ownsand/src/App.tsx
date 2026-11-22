@@ -21,6 +21,7 @@ import {
   AuthContextProvider,
   LogtoAuthProvider,
   MockAuthProvider,
+  SIGN_IN_NOT_CONFIGURED,
   useAuth,
 } from "./auth.tsx";
 import { OrgShell, TopBar } from "./components/shell.tsx";
@@ -164,7 +165,7 @@ function Routes({ config }: { config: ConsoleConfig }) {
     return null;
   }
   if (route.id === RouteId.Invitation) {
-    return <InvitationPage />;
+    return <InvitationPage configured={configured} />;
   }
   if (!auth.isAuthenticated) {
     return <SignIn configured={configured} />;
@@ -230,7 +231,7 @@ function SignIn({ configured }: { configured: boolean }) {
       {configured ? (
         <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
       ) : (
-        <p role="alert">Sign-in is not configured for this build.</p>
+        <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
       )}
     </main>
   );

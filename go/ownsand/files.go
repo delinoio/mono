@@ -143,6 +143,16 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 			// guest helper means that the file changed during the copy.
 			return op.next, op.dpErr(err)
 		}
+		if kind == failDeadline {
+			// Only WriteFile retries deadline_exceeded, because its retry
+			// is idempotent by write_id. For a read, the status is the
+			// control plane's final answer; unless the caller's own
+			// deadline caused it, the operation ends with it.
+			if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
+				return op.next, cerr
+			}
+			return op.next, op.dpErr(err)
+		}
 		op.rec.fail(err)
 		if sess == nil && kind != failExhausted {
 			op.grant.discard()
@@ -170,7 +180,15 @@ func (op *readOp) handleEvent(ev *ownsandv1.FileReadEvent, at *readAttempt) bool
 			at.err = fmt.Errorf("%w: chunk at %d, next offset %d", errReadGap, off, op.next)
 			return true
 		}
-		if _, err := op.w.Write(data[op.next-off:]); err != nil {
+		chunk := data[op.next-off:]
+		n, err := op.w.Write(chunk)
+		if err != nil {
+			// The writer accepted n bytes before it failed: count them, so
+			// the returned size matches the bytes that the caller holds.
+			// The error ends the operation, so no retry resumes at op.next.
+			if n > 0 {
+				op.next += int64(min(n, len(chunk)))
+			}
 			at.err = &callbackError{err: err}
 			return true
 		}
@@ -263,8 +281,10 @@ func (op *readOp) relayAttempt(ctx context.Context) readAttempt {
 
 // WriteOptions configures a file write.
 type WriteOptions struct {
-	// Mode is the file mode, for example 0o644. Zero means 0o644. Windows
-	// guests ignore it.
+	// Mode is the file mode, for example 0o644. Zero means 0o644. It must not
+	// exceed 0o7777; a larger value makes WriteFile return a validation error
+	// for the field finish.mode before it sends any request. Windows guests
+	// ignore it.
 	Mode uint32
 	// OnProgress, when set, receives the acknowledged byte count.
 	OnProgress func(written int64)
@@ -290,6 +310,18 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 	}
 	first := &ownsandv1.WriteFileRequest{OrganizationId: s.org, SandboxId: s.id, WriteId: writeID, Path: path, BindingSalt: salt}
 	if err := validate.WriteFileRequest(first, true); err != nil {
+		return 0, err
+	}
+	// The first request carries no Finish, so it cannot show a bad mode that
+	// only the last request would send. Check the finish fields on a copy
+	// before any upload; first stays unchanged because its digest binds the
+	// relay grant.
+	check := &ownsandv1.WriteFileRequest{
+		OrganizationId: first.OrganizationId, SandboxId: first.SandboxId, WriteId: first.WriteId,
+		Path: first.Path, BindingSalt: first.BindingSalt,
+		Finish: &ownsandv1.WriteFileFinish{Mode: mode},
+	}
+	if err := validate.WriteFileRequest(check, true); err != nil {
 		return 0, err
 	}
 	op := &writeOp{

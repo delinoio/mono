@@ -76,11 +76,19 @@ func capAllows(monthToDate, amount, monthlyCap int64) bool {
 // MonthToDate returns the sum of the automatic top-ups of the UTC calendar
 // month of now that were not failed: completed ones and those in flight.
 func MonthToDate(ctx context.Context, q db.Querier, accountID string, now time.Time) (int64, error) {
+	return monthToDateExcept(ctx, q, accountID, now, "")
+}
+
+// monthToDateExcept is MonthToDate without the top-up exceptID, so that a
+// pending top-up can be checked against the monthly cap without counting
+// itself. An empty exceptID excludes nothing.
+func monthToDateExcept(ctx context.Context, q db.Querier, accountID string, now time.Time, exceptID string) (int64, error) {
 	start := MonthStart(now)
 	var sum int64
 	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(amount_usd_micros), 0) FROM top_ups
-		WHERE billing_account_id = $1 AND kind = 'auto' AND status <> 'failed' AND create_time >= $2 AND create_time < $3`,
-		accountID, start, start.AddDate(0, 1, 0)).Scan(&sum)
+		WHERE billing_account_id = $1 AND kind = 'auto' AND status <> 'failed' AND create_time >= $2 AND create_time < $3
+			AND ($4::text = '' OR top_up_id::text <> $4::text)`,
+		accountID, start, start.AddDate(0, 1, 0), exceptID).Scan(&sum)
 	return sum, err
 }
 
@@ -103,7 +111,7 @@ func (st Settings) AlertProto() *accountsv1.AlertSettings {
 
 // ValidateAutoTopUp applies the rules of UpdateAutoTopUpSettings: with
 // enabled true, a threshold of at least $10, an amount of at least $25 and
-// a monthly cap of at least the amount, all whole cents; with enabled false,
+// at most $10,000 and a monthly cap of at least the amount, all whole cents; with enabled false,
 // zero or non-negative whole cents.
 func ValidateAutoTopUp(in *accountsv1.AutoTopUpSettings) error {
 	if in == nil {

@@ -141,6 +141,10 @@ type vm struct {
 	cmd       *exec.Cmd
 	exited    chan struct{}
 	restore   ownsandv1.SandboxRestorePath
+	// onSignal is a test seam: it is nil in production and records each
+	// signal that signalHelper sends to the helper's group, so that a test
+	// can assert the signal order that a race would otherwise hide.
+	onSignal func(syscall.Signal)
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -172,6 +176,9 @@ func (v *vm) signalHelper(sig syscall.Signal) error {
 	if v.hasExited() {
 		return errHelperExited
 	}
+	if v.onSignal != nil {
+		v.onSignal(sig)
+	}
 	return signalGroup(v.cmd, sig)
 }
 
@@ -195,14 +202,24 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		return nil, fmt.Errorf("processrt: sandbox %s already runs", spec.SandboxID)
 	}
 	r.mu.Unlock()
-	if err := os.RemoveAll(spec.Dir); err != nil {
+	// The helper starts with the sandbox root as its working directory, so a
+	// relative spec.Dir (a relative agent state directory) would resolve a
+	// second time below the root for --state-dir: the helper records
+	// (guest-state) would land inside the root that Snapshot copies and the
+	// agent never looks for them there. Every later use takes the absolute
+	// path.
+	dir, err := filepath.Abs(spec.Dir)
+	if err != nil {
+		return nil, fmt.Errorf("processrt: resolve sandbox directory %s: %w", spec.Dir, err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
 		return nil, err
 	}
-	root := filepath.Join(spec.Dir, rootDir)
+	root := filepath.Join(dir, rootDir)
 	restore := ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_BASE_IMAGE
 	if spec.Snapshot != nil {
 		if err := fsutil.CopyTree(filepath.Join(spec.Snapshot.Dir, diskDir), root); err != nil {
-			os.RemoveAll(spec.Dir)
+			os.RemoveAll(dir)
 			return nil, fmt.Errorf("processrt: restore snapshot disk: %w", err)
 		}
 		restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT
@@ -211,13 +228,13 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	}
 	socket, socketDir, err := newSocket(spec.SandboxID)
 	if err != nil {
-		os.RemoveAll(spec.Dir)
+		os.RemoveAll(dir)
 		return nil, err
 	}
-	v := &vm{id: spec.SandboxID, dir: spec.Dir, socket: socket, socketDir: socketDir, exited: make(chan struct{}), restore: restore}
+	v := &vm{id: spec.SandboxID, dir: dir, socket: socket, socketDir: socketDir, exited: make(chan struct{}), restore: restore}
 	cmd := exec.Command(r.guestBinary,
 		"--listen", "unix://"+v.socket,
-		"--state-dir", filepath.Join(spec.Dir, stateDir),
+		"--state-dir", filepath.Join(dir, stateDir),
 		"--clock", "ignore",
 	)
 	cmd.Dir = root
@@ -226,7 +243,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	cmd.Stderr = os.Stderr
 	procgroup.Set(cmd)
 	if err := launcher.Start(cmd); err != nil {
-		os.RemoveAll(spec.Dir)
+		os.RemoveAll(dir)
 		removeSocketDir(v)
 		return nil, fmt.Errorf("processrt: start guest helper: %w", err)
 	}
@@ -505,7 +522,11 @@ func (r *Runtime) stopHelper(ctx context.Context, v *vm) error {
 		r.logger.Error("process sandbox exec workers may keep running; delete can be retried", "sandbox_id", v.id, "error", err)
 		return err
 	}
-	_ = v.signalHelper(sigCont)
+	// The helper stays stopped until it is killed: SIGKILL ends a stopped
+	// process without a SIGCONT, and a SIGCONT before it would let the helper
+	// handle a request that it received before the stop and start a worker
+	// below it after the enumeration above, an orphaned worker that nothing
+	// kills.
 	_ = v.signalHelper(sigKill)
 	select {
 	case <-v.exited:

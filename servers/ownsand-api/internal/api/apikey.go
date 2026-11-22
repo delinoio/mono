@@ -57,6 +57,10 @@ func (h APIKeyHandler) CreateApiKey(ctx context.Context, req *connect.Request[ow
 		if err := validateName("name", req.Msg.GetName()); err != nil {
 			return err
 		}
+		// A deletion in flight yields not_found, not a foreign key violation.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		secret, err := auth.NewSecret(auth.SecretAPIKey)
 		if err != nil {
 			return err

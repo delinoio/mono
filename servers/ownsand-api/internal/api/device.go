@@ -84,6 +84,10 @@ func (h DeviceHandler) CreateEnrollmentToken(ctx context.Context, req *connect.R
 		if err := validate.EnrollmentTokenTTL(req.Msg.GetTtl()); err != nil {
 			return errInvalid(err)
 		}
+		// A deletion in flight yields not_found, not a foreign key violation.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
+		}
 		secret, err := auth.NewSecret(auth.SecretEnrollmentToken)
 		if err != nil {
 			return err
@@ -703,6 +707,10 @@ func (h DeviceHandler) UpdateAgentVersionPolicy(ctx context.Context, req *connec
 			if pinned == "" || len(pinned) > maxVersionLength || strings.ContainsAny(pinned, " \t\r\n") {
 				return errInvalidf("invalid pinned_version: a version is required for PIN")
 			}
+			// PostgreSQL text cannot store U+0000.
+			if err := validate.NoNUL("pinned_version", pinned); err != nil {
+				return errInvalid(err)
+			}
 			var revoked bool
 			if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM agent_releases WHERE version = $1 AND revoked)", pinned).Scan(&revoked); err != nil {
 				return err
@@ -712,6 +720,11 @@ func (h DeviceHandler) UpdateAgentVersionPolicy(ctx context.Context, req *connec
 			}
 		default:
 			return errInvalidf("invalid mode: must be FOLLOW_DEFAULT, PIN or HOLD")
+		}
+		// A deletion in flight yields not_found, not a foreign key violation,
+		// with or without a stored policy row.
+		if err := lockOrganizationShare(ctx, tx, orgID); err != nil {
+			return err
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO agent_version_policies (organization_id, mode, pinned_version, update_time, updated_by_kind, updated_by_id)
 			VALUES ($1, $2, $3, $4, $5, $6)

@@ -11,6 +11,7 @@ import type { Sandbox as SandboxMessage } from "@delino/ownsand-protos/v1/sandbo
 import type { Snapshot } from "@delino/ownsand-protos/v1/snapshot_pb";
 import type { Client } from "@connectrpc/connect";
 import type { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
+import { ConsumerHold } from "./relay/stream.ts";
 import {
   ExecHandle,
   type ExecResult,
@@ -26,7 +27,12 @@ import {
 } from "./operations/write.ts";
 import type { PeerConnectionConstructor } from "./p2p/webrtc.ts";
 import type { OperationContext } from "./relay/context.ts";
-import { durationFromMs, validateExec, validateGuestPath } from "./validate.ts";
+import {
+  durationFromMs,
+  validateExec,
+  validateFileMode,
+  validateGuestPath,
+} from "./validate.ts";
 import { OwnSandError } from "./errors.ts";
 
 /** Options of one exec. */
@@ -98,10 +104,12 @@ export class Sandbox {
   }
 
   async delete(signal?: AbortSignal): Promise<SandboxMessage> {
-    this.#selector.close();
     const res = await this.#ctx.sandboxes.deleteSandbox(this.#ids(), {
       signal,
     });
+    // Close only after the delete succeeded: a failed delete leaves the
+    // sandbox and its handle usable.
+    this.#selector.close();
     return this.#keep(res.sandbox);
   }
 
@@ -161,6 +169,7 @@ export class Sandbox {
           : durationFromMs(options.timeoutMs),
       bindingSalt: newBindingSalt(),
     });
+    const hold = new ConsumerHold();
     return new ExecHandle(
       execId,
       runExec(
@@ -168,8 +177,10 @@ export class Sandbox {
         this.#selector,
         { execId, request, stdoutOffset: 0n, stderrOffset: 0n },
         options.signal,
+        hold,
       ),
       this.#selector,
+      hold,
     );
   }
 
@@ -185,6 +196,7 @@ export class Sandbox {
       signal?: AbortSignal;
     } = {},
   ): ExecHandle {
+    const hold = new ConsumerHold();
     return new ExecHandle(
       execId,
       runExec(
@@ -197,8 +209,10 @@ export class Sandbox {
           stderrOffset: options.stderrOffset ?? 0n,
         },
         options.signal,
+        hold,
       ),
       this.#selector,
+      hold,
     );
   }
 
@@ -251,12 +265,14 @@ export class Sandbox {
     options: { mode?: number; signal?: AbortSignal } = {},
   ): Promise<WriteFileResult> {
     validateGuestPath("path", path);
+    const mode = options.mode ?? DEFAULT_FILE_MODE;
+    validateFileMode(mode);
     return runWriteFile(
       this.#ctx,
       this.#selector,
       path,
       source,
-      options.mode ?? DEFAULT_FILE_MODE,
+      mode,
       options.signal,
     );
   }

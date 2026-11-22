@@ -20,16 +20,20 @@
 // orphan that keeps its listening port. Stop such a server by its pid.
 //
 // The server needs Postgres and the billing configuration. When DATABASE_URL
-// is unset, the launcher prints an `accounts_api_dev_skipped` record and exits
-// with status 0 instead of failing, so the root `pnpm dev` keeps running the
-// other development servers on machines without a database or Infisical. When
-// CORS_ORIGINS is unset, it allows the web app's development origins in
-// addition to the production origin: http://127.0.0.1:13100 (the fixed port of
-// `dev:app` and `PORTLESS=0`) and https://accounts.delino.localhost and
+// is unset, empty or only ASCII white space, the launcher prints an
+// `accounts_api_dev_skipped` record and exits with status 0 instead of
+// failing, so the root `pnpm dev` keeps running the other development servers
+// on machines without a database or Infisical. A value that consists only of
+// Unicode white space, such as U+00A0, is not unset: the launcher passes it on
+// and the server rejects it. When CORS_ORIGINS is unset, empty or only ASCII
+// white space, it allows the web app's development origins in addition to the
+// production origin: http://127.0.0.1:13100 (the fixed port of `dev:app` and
+// `PORTLESS=0`) and https://accounts.delino.localhost and
 // http://accounts.delino.localhost (the portless URL with the default proxy and
-// with an unprivileged proxy). When WEB_ORIGIN is unset, invitation links point
-// to https://accounts.delino.localhost. A proxy on a custom PORTLESS_PORT adds
-// that port to the URL; set CORS_ORIGINS and WEB_ORIGIN to it there.
+// with an unprivileged proxy). When WEB_ORIGIN is unset, empty or only ASCII
+// white space, invitation links point to https://accounts.delino.localhost. A
+// proxy on a custom PORTLESS_PORT adds that port to the URL; set CORS_ORIGINS
+// and WEB_ORIGIN to it there.
 //
 // Child processes use explicit argument arrays and `shell: false` according to
 // the repository environment contract. Other configuration, standard streams
@@ -56,6 +60,14 @@ const DevelopmentWebOrigins = Object.freeze([
 ]);
 const ProductionWebOrigin = "https://accounts.delino.io";
 const DevelopmentInvitationOrigin = "https://accounts.delino.localhost";
+
+// The server removes only ASCII white space (space, tab, LF, VT, FF, CR) from
+// configuration values, so the launcher must use the same rule to decide that a
+// value is unset. JavaScript's trim() and \s also remove Unicode white space
+// such as U+00A0 and U+3000, which would hide a value the server rejects.
+const AsciiWhiteSpaceOnly = /^[\t\n\v\f\r ]*$/;
+const isUnset = (value) =>
+  value === undefined || AsciiWhiteSpaceOnly.test(value);
 
 // Children run in their own process group (and session) on POSIX. A terminal
 // Ctrl-C signals the whole foreground group; with the child in that group it
@@ -113,8 +125,9 @@ function run(command, args, env) {
 const stoppedStatus = () => signalExitCode(received);
 
 async function main() {
-  // An empty value counts as unset, as it does for the server.
-  if (!process.env.DATABASE_URL?.trim()) {
+  // An empty or ASCII-white-space-only value counts as unset, as it does for
+  // the server. Unicode white space does not, so the server reports it.
+  if (isUnset(process.env.DATABASE_URL)) {
     console.error(
       JSON.stringify({
         event: "accounts_api_dev_skipped",
@@ -124,12 +137,12 @@ async function main() {
     return 0;
   }
   const env = { ...process.env };
-  if (!env.CORS_ORIGINS?.trim()) {
+  if (isUnset(env.CORS_ORIGINS)) {
     env.CORS_ORIGINS = [ProductionWebOrigin, ...DevelopmentWebOrigins].join(
       ",",
     );
   }
-  if (!env.WEB_ORIGIN?.trim()) env.WEB_ORIGIN = DevelopmentInvitationOrigin;
+  if (isUnset(env.WEB_ORIGIN)) env.WEB_ORIGIN = DevelopmentInvitationOrigin;
   const buildDir = await mkdtemp(join(tmpdir(), "accounts-api-dev-"));
   try {
     // A signal during the `mkdtemp` await above found no child to forward to

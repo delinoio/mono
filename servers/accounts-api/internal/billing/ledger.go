@@ -210,7 +210,9 @@ type grantInput struct {
 }
 
 // addGrant creates the credit grant of a verified purchase and its ledger
-// entry. A purchase that already has a grant adds nothing (created is false).
+// entry, then applies the pending adjustments of the purchase. A purchase
+// that already has a grant adds nothing (created is false). A webhook caller
+// holds the purchase lock (lockPurchase) before the lock of acct.
 func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, now time.Time) (grantID string, created bool, err error) {
 	if in.Amount <= 0 {
 		return "", false, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
@@ -223,6 +225,9 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return "", false, err
 	}
+	// The balance before the inline expiry is the baseline of the low-balance
+	// check: an expiry that the new grant does not make up for is a decrease.
+	before := acct.Balance
 	if err := s.expireDue(ctx, tx, acct, now); err != nil {
 		return "", false, err
 	}
@@ -241,7 +246,13 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 	}, now); err != nil {
 		return "", false, err
 	}
+	// afterIncrease runs first so that a grant that reaches the threshold
+	// re-arms the alert before afterDecrease reads the settings. A purchase
+	// never queues an automatic top-up (usage is false).
 	if err := s.afterIncrease(ctx, tx, acct, now); err != nil {
+		return "", false, err
+	}
+	if _, err := s.afterDecrease(ctx, tx, acct, before, now, false); err != nil {
 		return "", false, err
 	}
 	s.metrics.CreditGrant(string(in.Kind))
@@ -253,6 +264,11 @@ func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, i
 		slog.Int64("amount_usd_micros", in.Amount),
 		slog.Int64("debt_paid_usd_micros", debtPaid),
 		slog.Int64("balance_after_usd_micros", acct.Balance))
+	// Approved refunds and chargebacks of this purchase that arrived before
+	// its payment now reduce the new grant, as if they had arrived after it.
+	if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, now); err != nil {
+		return "", false, err
+	}
 	return grantID, true, nil
 }
 
@@ -319,10 +335,12 @@ func (s *Service) Deduct(ctx context.Context, tx pgx.Tx, d Deduction) (Deduction
 	if err != nil {
 		return DeductionResult{}, err
 	}
+	// before precedes the inline expiry so that a due expiry counts as a
+	// decrease, also for a zero-amount deduction.
+	before := acct.Balance
 	if err := s.expireDue(ctx, tx, acct, now); err != nil {
 		return DeductionResult{}, err
 	}
-	before := acct.Balance
 	if err := consumeGrants(ctx, tx, acct.ID, d.AmountUSDMicros, now, ""); err != nil {
 		return DeductionResult{}, err
 	}

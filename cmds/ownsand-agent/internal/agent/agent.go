@@ -86,6 +86,14 @@ type Agent struct {
 	restart    chan struct{}
 	removal    chan struct{}
 	status     Status
+
+	// statusMu serializes the status file writes and fences them during
+	// the device removal (see stopStatusWriter). It is acquired before mu.
+	statusMu      sync.Mutex
+	statusStopped bool
+	// statusWriteHook, when set by a test, runs inside writeStatus after
+	// statusMu is taken and before the file is written.
+	statusWriteHook func()
 }
 
 // New builds the agent and reconciles its local state.

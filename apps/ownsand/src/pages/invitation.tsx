@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { useMutation } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
 import { Button } from "delino-ui/button";
 import { MemberService } from "@delino/ownsand-protos/v1/member_pb";
+import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { useEffect, useRef, useState } from "react";
-import { useAuth } from "../auth.tsx";
+import { invalidateServices } from "../api.ts";
+import { SIGN_IN_NOT_CONFIGURED, useAuth } from "../auth.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";
 import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
@@ -11,9 +14,11 @@ import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 /**
  * Route `invitation`: accepts an invitation secret as the signed-in user.
  * The secret comes from the URL fragment, which the page removes at once,
- * or from `sessionStorage` after the sign-in redirect.
+ * or from `sessionStorage` after the sign-in redirect. A build without a
+ * sign-in configuration cannot sign the user in, so the page shows the
+ * not-configured notice and never stores the secret.
  */
-export function InvitationPage() {
+export function InvitationPage({ configured }: { configured: boolean }) {
   const auth = useAuth();
   const { navigate } = useRouter();
   const [secret, setSecret] = useState<string | undefined>(() => {
@@ -23,7 +28,19 @@ export function InvitationPage() {
     );
     return fromAddress ?? pendingInvitation.read();
   });
-  const accept = useMutation(MemberService.method.acceptInvitation);
+  const queryClient = useQueryClient();
+  const accept = useMutation(MemberService.method.acceptInvitation, {
+    // Joining changes the caller's organizations and their members, so the
+    // cached lists must not outlive the 10 second stale time: the switcher of
+    // the new organization has to list it. This runs for every success,
+    // including the late success of an earlier attempt that no longer
+    // navigates. The promise is not returned: TanStack Query would wait for it
+    // before `mutateAsync` resolves, so the navigation would wait for the
+    // refetch of every query that is active at that moment.
+    onSuccess: () => {
+      void invalidateServices(queryClient, MemberService, OrganizationService);
+    },
+  });
   const resetAccept = accept.reset;
   // Identifies the invitation attempt that the page currently shows. A new
   // link or the unmount of the page replaces it, so that the late success of
@@ -59,6 +76,17 @@ export function InvitationPage() {
           description="This page needs an invitation link. Ask an admin of the organization for a new one."
         />
         <Link to="/">Go to your organizations</Link>
+      </main>
+    );
+  }
+
+  if (!auth.isAuthenticated && !configured) {
+    // The secret stays in memory only: there is no sign-in redirect that it
+    // would have to survive. The fragment is already gone from the address.
+    return (
+      <main className="content content-narrow">
+        <PageHeader title="You are invited to an OwnSand organization" />
+        <p role="alert">{SIGN_IN_NOT_CONFIGURED}</p>
       </main>
     );
   }

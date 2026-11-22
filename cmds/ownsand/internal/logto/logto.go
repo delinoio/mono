@@ -159,6 +159,15 @@ func (c Config) StartDeviceAuthorization(ctx context.Context) (*DeviceAuthorizat
 // PollToken polls the token endpoint until the user signs in, denies the
 // request or the device code expires. It waits at least 5 seconds between
 // requests (more after slow_down); minInterval overrides that for tests.
+//
+// The local expiry deadline (expires_in of the device authorization, or 10
+// minutes when it is not positive) bounds the wait between requests and every
+// token request: PollToken starts no request at or after the deadline, cancels
+// a request that is still in flight at the deadline and returns ErrExpired.
+// A cancellation or deadline of ctx ends the polling earlier and is returned
+// as ctx.Err(), so callers can tell it from the expiry. The deadline applies
+// only to the device grant: the returned token does not depend on it, and ctx
+// stays usable for the refresh grant afterwards.
 func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInterval time.Duration) (*Token, error) {
 	interval := time.Duration(da.Interval) * time.Second
 	if minInterval == 0 {
@@ -169,30 +178,45 @@ func (c Config) PollToken(ctx context.Context, da *DeviceAuthorization, minInter
 	if da.ExpiresIn <= 0 {
 		deadline = time.Now().Add(10 * time.Minute)
 	}
+	pollCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	// ended reports why the polling must stop, or returns err unchanged when
+	// it must not. The caller's own cancellation or deadline wins over the
+	// expiry; a failure that happens before the deadline is not an expiry.
+	ended := func(err error) error {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if pollCtx.Err() != nil || !time.Now().Before(deadline) {
+			return ErrExpired
+		}
+		return err
+	}
 	form := url.Values{
 		"client_id":   {c.AppID},
 		"grant_type":  {"urn:ietf:params:oauth:grant-type:device_code"},
 		"device_code": {da.DeviceCode},
 	}
 	for {
-		if time.Now().After(deadline) {
-			return nil, ErrExpired
-		}
 		t := time.NewTimer(interval)
 		select {
-		case <-ctx.Done():
+		case <-pollCtx.Done():
 			t.Stop()
-			return nil, ctx.Err()
+			return nil, ended(pollCtx.Err())
 		case <-t.C:
 		}
+		// The timer and the context can be ready at the same time.
+		if err := ended(nil); err != nil {
+			return nil, err
+		}
 		var tok Token
-		err := c.post(ctx, "/oidc/token", form, &tok)
+		err := c.post(pollCtx, "/oidc/token", form, &tok)
 		if err == nil {
 			return &tok, nil
 		}
 		var oe *Error
 		if !errors.As(err, &oe) {
-			return nil, err
+			return nil, ended(err)
 		}
 		switch oe.Code {
 		case "authorization_pending":

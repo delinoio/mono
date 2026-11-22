@@ -6,12 +6,13 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
 	"github.com/jackc/pgx/v5"
-	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/attribute"
 
 	accountsv1 "github.com/delinoio/mono/protos/delino/accounts/v1"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
@@ -77,7 +78,7 @@ type statusFixture struct {
 	*fixture
 	fake     *accountstest.Server
 	statuses *billing.Statuses
-	registry *prometheus.Registry
+	registry *testMeter
 }
 
 func newStatusFixture(t *testing.T, start time.Time) *statusFixture {
@@ -85,7 +86,7 @@ func newStatusFixture(t *testing.T, start time.Time) *statusFixture {
 	f.fake = accountstest.New(t, f.clock.Now)
 	f.fake.AddAccount(accountA, "Account A", map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
 	f.fake.AddAccount(accountB, "Account B", map[string]accountsv1.BillingAccountRole{owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN})
-	f.registry = prometheus.NewRegistry()
+	f.registry = newTestMeter(t)
 	f.statuses = billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Metrics: f.registry})
 	return f
 }
@@ -354,6 +355,80 @@ func TestPendingUnlinkRetries(t *testing.T) {
 	}
 }
 
+// TestRunRetriesPendingUnlinksEveryTick checks that the status worker of the
+// lease holder retries a due pending unlink at every tick, not only at a
+// poll, and that an instance without the lease never retries.
+func TestRunRetriesPendingUnlinksEveryTick(t *testing.T) {
+	t0 := time.Date(2026, 11, 6, 9, 0, 0, 0, time.UTC)
+	f := newStatusFixture(t, t0)
+	ctx := context.Background()
+	f.addOrg(t, org1)
+	f.link(t, org1, accountA)
+	// The poll interval and the first back-off are far longer than the test,
+	// so only the tick can cause a retry.
+	timing := billing.StatusTiming{Poll: time.Hour, Tick: 20 * time.Millisecond, UnlinkBackoffMin: time.Hour, UnlinkBackoffMax: 2 * time.Hour}
+	var mu sync.Mutex
+	isHeld := false
+	statuses := billing.NewStatuses(billing.StatusOptions{DB: f.db, Logger: f.logger, Now: f.clock.Now, Client: f.fake.Client(), Timing: &timing,
+		Held: func() bool { mu.Lock(); defer mu.Unlock(); return isHeld }})
+	setHeld := func(v bool) { mu.Lock(); isHeld = v; mu.Unlock() }
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() { statuses.Run(runCtx); close(done) }()
+	defer func() { cancel(); <-done }()
+
+	if err := f.db.InTx(ctx, func(tx pgx.Tx) error {
+		_, former, _, err := billing.UnlinkTx(ctx, tx, org1, billing.SourceTransfer, t0)
+		if err != nil {
+			return err
+		}
+		return billing.AddPendingUnlinkTx(ctx, tx, org1, former, t0)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
+	calls := func() int { return f.fake.Calls(accountstest.MethodUnlinkOrganization) }
+
+	// Without the lease, a due row stays untouched.
+	time.Sleep(300 * time.Millisecond)
+	if n := calls(); n != 0 {
+		t.Fatalf("an instance without the lease retried a pending unlink %d times", n)
+	}
+
+	// With the lease, the next tick retries it although the poll interval has
+	// not elapsed since the poll of the first step.
+	setHeld(true)
+	eventually(t, "the first retry", func() bool { return calls() == 1 })
+	polls := f.fake.Calls(accountstest.MethodListBillingStatusChanges)
+	if polls != 1 {
+		t.Fatalf("polls = %d, want the single poll of the first step", polls)
+	}
+
+	// The failed attempt moved the row an hour ahead; later ticks skip it, and
+	// no further poll runs within the poll interval.
+	time.Sleep(300 * time.Millisecond)
+	if n := calls(); n != 1 {
+		t.Fatalf("a pending unlink that was not due was retried: %d calls", n)
+	}
+	if n := f.fake.Calls(accountstest.MethodListBillingStatusChanges); n != polls {
+		t.Fatalf("polls = %d, want %d: the poll interval has not elapsed", n, polls)
+	}
+
+	// Once the back-off has elapsed, the next tick sends the unlink.
+	f.fake.Fail(accountstest.MethodUnlinkOrganization, nil)
+	f.clock.Advance(time.Hour + time.Second)
+	eventually(t, "the confirmed unlink", func() bool {
+		var n int
+		if err := f.db.Pool.QueryRow(ctx, "SELECT count(*) FROM billing_pending_unlinks WHERE organization_id = $1", org1).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 0
+	})
+	if _, _, linked := f.fake.Link(org1); linked {
+		t.Fatal("delino-accounts still has the link")
+	}
+}
+
 // TestStatusMetrics checks the organizations-per-phase gauge.
 func TestStatusMetrics(t *testing.T) {
 	t0 := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
@@ -367,24 +442,13 @@ func TestStatusMetrics(t *testing.T) {
 	}
 	expect := func(phase string, want float64) {
 		t.Helper()
-		g, err := f.registry.Gather()
-		if err != nil {
-			t.Fatal(err)
+		got, ok := f.registry.gauge(t, "ownsand_billing_organizations", attribute.String("phase", phase))
+		if !ok {
+			t.Fatalf("no %s sample", phase)
 		}
-		for _, mf := range g {
-			if mf.GetName() != "ownsand_billing_organizations" {
-				continue
-			}
-			for _, m := range mf.GetMetric() {
-				if m.GetLabel()[0].GetValue() == phase {
-					if got := m.GetGauge().GetValue(); got != want {
-						t.Fatalf("%s = %v, want %v", phase, got, want)
-					}
-					return
-				}
-			}
+		if got != want {
+			t.Fatalf("%s = %v, want %v", phase, got, want)
 		}
-		t.Fatalf("no %s sample", phase)
 	}
 	expect("allowed", 1)
 	expect("blocked", 1)
@@ -397,15 +461,7 @@ func TestStatusMetrics(t *testing.T) {
 	}
 	expect("blocked", 0)
 	expect("suspended", 1)
-	g, err := f.registry.Gather()
-	if err != nil {
-		t.Fatal(err)
-	}
-	found := false
-	for _, mf := range g {
-		found = found || mf.GetName() == "ownsand_billing_pending_unlinks"
-	}
-	if !found {
-		t.Fatal("ownsand_billing_pending_unlinks is not registered")
+	if _, ok := f.registry.gauge(t, "ownsand_billing_pending_unlinks"); !ok {
+		t.Fatal("ownsand_billing_pending_unlinks is not recorded")
 	}
 }
