@@ -5,6 +5,8 @@ package api
 import (
 	"context"
 
+	"github.com/delinoio/mono/servers/ownsand-api/internal/hub"
+
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -24,3 +26,21 @@ func (s *Service) ReconcileStateReportForTest(ctx context.Context, deviceID stri
 // watch registry and which testenv (importing api) prevents an internal test
 // from using.
 func (s *Service) WatcherCount() int { return s.watch.count() }
+
+// SetAfterConfigLimitsReadForTest sets a hook that runs after a configuration
+// send read the device limits and before it queues the message; nil removes
+// it. A test pauses a sender there to open the window between the read and the
+// queueing.
+func (s *Service) SetAfterConfigLimitsReadForTest(fn func(deviceID string)) {
+	if fn == nil {
+		s.afterConfigLimitsRead.Store(nil)
+		return
+	}
+	s.afterConfigLimitsRead.Store(&fn)
+}
+
+// SendConfigurationForTest runs the configuration send that the channel
+// handler runs when the channel opens.
+func (s *Service) SendConfigurationForTest(ctx context.Context, conn *hub.Conn) error {
+	return s.sendConfiguration(ctx, conn)
+}
