@@ -42,7 +42,7 @@
   },
   "devDependencies": {
     "@e2e-dev/web": "0.16.1",
-    "@rsbuild/core": "2.3.2",
+    "@rsbuild/core": "2.3.3",
     "@rsbuild/plugin-react": "2.1.1",
     "@rstest/core": "0.12.6",
     "@testing-library/dom": "10.4.2",
