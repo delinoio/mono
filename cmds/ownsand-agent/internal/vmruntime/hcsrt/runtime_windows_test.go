@@ -141,3 +141,57 @@ func TestCopyFileEndsWithItsContext(t *testing.T) {
 		t.Fatalf("partial copy remains after a canceled copy: %v", err)
 	}
 }
+
+// recordOpenSystem makes openSystemFunc return err and record whether the
+// marker file of the VM directory still exists when the system is opened.
+func recordOpenSystem(t *testing.T, marker string, err error) *[]bool {
+	t.Helper()
+	var markerPresent []bool
+	orig := openSystemFunc
+	openSystemFunc = func(string) (*system, error) {
+		_, serr := os.Stat(marker)
+		markerPresent = append(markerPresent, serr == nil)
+		return nil, err
+	}
+	t.Cleanup(func() { openSystemFunc = orig })
+	return &markerPresent
+}
+
+func TestResetVMDirStopsLeftoverSystemBeforeRemovingDir(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		openErr error
+	}{
+		{"system absent", &hcsError{op: "HcsOpenComputeSystem", hr: hrSystemNotFound}},
+		{"unknown stop outcome", &hcsError{op: "HcsOpenComputeSystem", hr: 0x80070005}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Runtime{
+				opts:   Options{VMsDir: t.TempDir()},
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+				vms:    map[string]*vm{},
+			}
+			dir := r.vmDir("sb")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			marker := filepath.Join(dir, "disk.vhd")
+			if err := os.WriteFile(marker, []byte("disk"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			seen := recordOpenSystem(t, marker, tc.openErr)
+			if err := r.resetVMDir("sb", dir); err != nil {
+				t.Fatalf("resetVMDir = %v, want the create to go on", err)
+			}
+			if len(*seen) != 1 || !(*seen)[0] {
+				t.Errorf("the leftover system must be opened once before the directory is removed, got %v", *seen)
+			}
+			if _, serr := os.Stat(marker); !os.IsNotExist(serr) {
+				t.Errorf("the old VM directory content was not removed: %v", serr)
+			}
+			if st, serr := os.Stat(dir); serr != nil || !st.IsDir() {
+				t.Errorf("the VM directory was not recreated: %v", serr)
+			}
+		})
+	}
+}

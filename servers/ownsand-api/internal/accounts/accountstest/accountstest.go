@@ -83,8 +83,23 @@ type Server struct {
 	usage    map[usageKey][2]int64
 	reported map[string]bool
 	failures map[string]error
-	calls    map[string]int
+	// replyFailures fail a call after it took effect: a lost response.
+	replyFailures map[string]error
+	gates         map[string]*Gate
+	calls         map[string]int
 }
+
+// Gate holds the calls of one method before they take effect, until
+// Release. Tests use it to keep a call in flight while other operations run.
+type Gate struct {
+	// Entered receives one value for each call that reached the gate.
+	Entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// Release lets the held calls, and every later call, continue.
+func (g *Gate) Release() { g.once.Do(func() { close(g.release) }) }
 
 // New starts a fake. now is its clock; nil selects time.Now.
 func New(t testing.TB, now func() time.Time) *Server {
@@ -93,7 +108,7 @@ func New(t testing.TB, now func() time.Time) *Server {
 		now = time.Now
 	}
 	f := &Server{now: now, accounts: map[string]*account{}, links: map[string]*link{}, usage: map[usageKey][2]int64{},
-		reported: map[string]bool{}, failures: map[string]error{}, calls: map[string]int{}}
+		reported: map[string]bool{}, failures: map[string]error{}, replyFailures: map[string]error{}, gates: map[string]*Gate{}, calls: map[string]int{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /oidc/token", f.token)
 	path, h := accountsv1connect.NewUsageServiceHandler(handler{f}, connect.WithInterceptors(authCheck{}))
@@ -219,6 +234,29 @@ func (f *Server) Fail(method string, err error) {
 	f.failures[method] = err
 }
 
+// FailReply makes every later call of method take effect and then fail with
+// err, like a response that got lost; nil clears it. It applies to
+// LinkOrganization and UnlinkOrganization.
+func (f *Server) FailReply(method string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err == nil {
+		delete(f.replyFailures, method)
+		return
+	}
+	f.replyFailures[method] = err
+}
+
+// Hold makes every later call of method wait before it takes effect until
+// the returned gate is released.
+func (f *Server) Hold(method string) *Gate {
+	g := &Gate{Entered: make(chan struct{}, 16), release: make(chan struct{})}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gates[method] = g
+	return g
+}
+
 // Calls returns the number of calls of method, failed calls included.
 func (f *Server) Calls(method string) int {
 	f.mu.Lock()
@@ -251,9 +289,15 @@ func (f *Server) Status(org string) *accountsv1.OrganizationBillingStatus {
 // begin counts a call and returns the configured failure.
 func (f *Server) begin(method string) error {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.calls[method]++
-	return f.failures[method]
+	err := f.failures[method]
+	g := f.gates[method]
+	f.mu.Unlock()
+	if g != nil {
+		g.Entered <- struct{}{}
+		<-g.release
+	}
+	return err
 }
 
 type handler struct{ f *Server }
@@ -359,6 +403,9 @@ func (h handler) LinkOrganization(_ context.Context, req *connect.Request[accoun
 		f.links[m.GetOrganizationId()] = &link{account: a.id, name: m.GetOrganizationName(), since: f.now().UTC()}
 		f.refreshLocked(m.GetOrganizationId())
 	}
+	if err := f.replyFailures[MethodLinkOrganization]; err != nil {
+		return nil, err
+	}
 	return connect.NewResponse(&accountsv1.LinkOrganizationResponse{Status: proto.Clone(f.links[m.GetOrganizationId()].status).(*accountsv1.OrganizationBillingStatus),
 		BillingAccountName: a.name}), nil
 }
@@ -370,7 +417,11 @@ func (h handler) UnlinkOrganization(_ context.Context, req *connect.Request[acco
 	}
 	f.mu.Lock()
 	delete(f.links, req.Msg.GetOrganizationId())
+	err := f.replyFailures[MethodUnlinkOrganization]
 	f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
 	return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 }
 

@@ -133,6 +133,18 @@ func TestHyperVWindowsIntegration(t *testing.T) {
 	if _, err := m.Create(context.Background(), windowsCommand(id, "", vcpus, meta.MinimumMemoryMiB-2, ownsandv1.NetworkMode_NETWORK_MODE_NONE)); err == nil {
 		t.Fatal("a create below the memory minimum succeeded")
 	}
+	// A disk request below the virtual size of the image fails as a failed
+	// precondition before any VM starts, and its VM directory is removed.
+	vmDirsBefore, _ := os.ReadDir(vmsDir)
+	id, _ = uuidv7.NewString()
+	small := windowsCommand(id, "", vcpus, mem, ownsandv1.NetworkMode_NETWORK_MODE_NONE)
+	small.Resources.DiskGib = 1
+	if sb, _ := m.Create(context.Background(), small); sb.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED {
+		t.Fatalf("a create below the image disk size: %v", sb)
+	}
+	if vmDirsAfter, _ := os.ReadDir(vmsDir); len(vmDirsAfter) != len(vmDirsBefore) {
+		t.Fatalf("the failed create left a VM directory: %d entries before, %d after", len(vmDirsBefore), len(vmDirsAfter))
+	}
 
 	start := time.Now()
 	sb, err := create("", ownsandv1.NetworkMode_NETWORK_MODE_NONE)

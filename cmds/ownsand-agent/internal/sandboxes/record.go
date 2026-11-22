@@ -111,6 +111,11 @@ func (r *Record) ttlReason(now time.Time) ownsandv1.SandboxEndReason {
 // DELETED_BY_CALLER when a deadline passes before the retry, also when the
 // stale idle deadline of a paused sandbox is the deadline that passed.
 //
+// LOST_ON_DEVICE is the other exception: a lost VM has no deadline of its own,
+// so a deadline that passed before the retry wins and the sandbox ends with the
+// TTL reason, as a live record of a lost VM does. A lost VM whose end failed
+// keeps LOST_ON_DEVICE without a passed deadline; Tick retries that end.
+//
 // The deadlines still decide only whether an end is due, so the retry cadence
 // is the one of ttlReason: Tick retries a failed caller delete when a deadline
 // passed, and otherwise the control plane resend or the next agent start does.
@@ -118,7 +123,8 @@ func (r *Record) endReasonAt(now time.Time) ownsandv1.SandboxEndReason {
 	reason := r.ttlReason(now)
 	if reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED &&
 		r.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING &&
-		r.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
+		r.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED &&
+		r.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
 		return r.EndReason
 	}
 	return reason

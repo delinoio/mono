@@ -263,6 +263,21 @@ func removeAll(dir string) error {
 	}
 }
 
+// resetVMDir prepares an empty VM directory for a new create. A compute system
+// with the sandbox ID can be left from a failed earlier attempt and hold its
+// disk open, so the system is stopped before the directory is removed.
+// Removing the directory first would fail with a sharing violation until
+// removeTimeout. An unknown stop outcome is only logged (by stopOrphan): the
+// create goes on, and the compute system creation reports the conflict if the
+// system is still there.
+func (r *Runtime) resetVMDir(sandboxID, dir string) error {
+	_ = r.stopOrphan(sandboxID)
+	if err := removeAll(dir); err != nil {
+		return err
+	}
+	return os.MkdirAll(dir, 0o700)
+}
+
 // consolePipe is the named pipe of the COM1 port of a sandbox VM.
 func consolePipe(sandboxID string) string { return `\\.\pipe\ownsand-` + sandboxID + `-com1` }
 
@@ -288,10 +303,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		return nil, fmt.Errorf("%w: the Host Compute Service is not available: %v", vmruntime.ErrUnsupported, err)
 	}
 	start := time.Now()
-	if err := removeAll(spec.Dir); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(spec.Dir, 0o700); err != nil {
+	if err := r.resetVMDir(spec.SandboxID, spec.Dir); err != nil {
 		return nil, err
 	}
 	v := &vm{id: spec.SandboxID, dir: spec.Dir, guestOS: spec.GuestOS, network: spec.NetworkMode,
@@ -309,12 +321,6 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 			r.logger.Warn("remove VM directory failed", "sandbox_id", v.id, "error", err)
 		}
 	}
-	// A compute system with this ID is left from a failed earlier attempt.
-	// An unknown outcome is only logged here: the create goes on, and the
-	// compute system creation reports the conflict if the system is still
-	// there.
-	_ = r.stopOrphan(spec.SandboxID)
-
 	if err := grantVMGroup(spec.Dir, accessReadWrite, true); err != nil {
 		cleanup()
 		return nil, err

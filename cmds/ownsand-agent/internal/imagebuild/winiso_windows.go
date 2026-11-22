@@ -7,7 +7,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -36,81 +35,10 @@ func powershell(ctx context.Context, script string, env ...string) ([]byte, erro
 	return stdout.Bytes(), nil
 }
 
-// tail returns the last n bytes of s without surrounding space.
-func tail(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		s = "..." + s[len(s)-n:]
-	}
-	return s
-}
-
-// mountedISO is an ISO file attached as a CD-ROM volume.
-type mountedISO struct {
-	path string
-	// Root is the volume root, for example `E:\`.
-	Root string
-	// ours is set when the build attached the ISO and must detach it. A
-	// successful dismount clears it; a failed one keeps it, so a later
-	// dismount retries.
-	ours bool
-	// run replaces powershell in tests, so they need no Windows image mount.
-	// It is nil in production.
-	run func(ctx context.Context, script string, env ...string) ([]byte, error)
-}
-
 // mountISO attaches the ISO read-only, or uses it where it is attached
-// already.
+// already; see mountISOWith.
 func mountISO(ctx context.Context, path string) (*mountedISO, error) {
-	out, err := powershell(ctx, `
-$img = Get-DiskImage -ImagePath $env:OWNSAND_ISO
-$ours = $false
-if (-not $img.Attached) { $img = Mount-DiskImage -ImagePath $env:OWNSAND_ISO -StorageType ISO -Access ReadOnly -PassThru; $ours = $true }
-$letter = ($img | Get-Volume).DriveLetter
-[pscustomobject]@{ letter = [string]$letter; ours = $ours } | ConvertTo-Json -Compress`, "OWNSAND_ISO="+path)
-	if err != nil {
-		return nil, fmt.Errorf("imagebuild: mount the ISO: %w", err)
-	}
-	var r struct {
-		Letter string `json:"letter"`
-		Ours   bool   `json:"ours"`
-	}
-	if err := json.Unmarshal(bytes.TrimSpace(out), &r); err != nil {
-		return nil, fmt.Errorf("imagebuild: mount the ISO: unexpected output %q", tail(string(out), 256))
-	}
-	m := &mountedISO{path: path, ours: r.Ours}
-	if len(r.Letter) != 1 {
-		m.dismount(context.Background())
-		return nil, fmt.Errorf("imagebuild: the mounted ISO has no drive letter (is automount disabled?)")
-	}
-	m.Root = r.Letter + `:\`
-	return m, nil
-}
-
-// dismount detaches an ISO that the build attached. It clears m.ours only
-// when the detach succeeded, so a dismount that failed, for example with a
-// canceled context, can run again.
-func (m *mountedISO) dismount(ctx context.Context) error {
-	if !m.ours {
-		return nil
-	}
-	run := m.run
-	if run == nil {
-		run = powershell
-	}
-	if _, err := run(ctx, `Dismount-DiskImage -ImagePath $env:OWNSAND_ISO | Out-Null`, "OWNSAND_ISO="+m.path); err != nil {
-		return err
-	}
-	m.ours = false
-	return nil
-}
-
-// release dismounts the ISO and logs a failure without failing the build: an
-// attached ISO leaks a volume only, and the caller may call release again.
-func (m *mountedISO) release(ctx context.Context, logger *slog.Logger) {
-	if err := m.dismount(ctx); err != nil {
-		logger.Warn("dismount the ISO failed", "error", err)
-	}
+	return mountISOWith(ctx, path, powershell)
 }
 
 // installImage returns sources\install.wim or sources\install.esd of the
