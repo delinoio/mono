@@ -560,6 +560,21 @@ func (s *Service) removeDeviceTx(ctx context.Context, tx pgx.Tx, orgID, deviceID
 // is never earlier than its expiry. The export state comes from the
 // deleted row (RETURNING), which is current even when the DELETE waited.
 func (s *Service) deleteSnapshotRecordTx(ctx context.Context, tx pgx.Tx, orgID, snapshotID string) error {
+	// Lock the row before the holders are listed: an import result registers
+	// its copy under FOR SHARE on this row (registerImportedCopy), so a copy
+	// row that commits before the lock is listed below, and a result that
+	// arrives after the deletion commits finds no snapshot and gets its own
+	// delete command. The lock is the same one that DeleteSnapshot and the
+	// reconciliation already hold; a path that has no lock yet (device
+	// removal) takes it here.
+	var locked int
+	err := tx.QueryRow(ctx, "SELECT 1 FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 FOR UPDATE", orgID, snapshotID).Scan(&locked)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // deleted meanwhile by a transaction that recorded its own job
+	}
+	if err != nil {
+		return err
+	}
 	// Every device that holds a copy gets a delete-snapshot command from the
 	// lease holder; the snapshot_copies rows go with the record.
 	rows, err := tx.Query(ctx, `SELECT device_id::text FROM snapshots WHERE organization_id = $1 AND snapshot_id = $2 AND device_id IS NOT NULL
