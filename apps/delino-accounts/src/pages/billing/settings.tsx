@@ -154,13 +154,24 @@ function AutoTopUpSection() {
     </section>
   ) : (
     <AutoTopUpForm
-      // Start again from the server values after each save.
-      key={JSON.stringify(settings.data.settings, (_k, v) =>
-        typeof v === "bigint" ? v.toString() : v,
-      )}
+      // Start again from the server values after each save. Only the four
+      // editable values identify the form: the read-only counters change
+      // without any user action, and a refetch that changes only them must
+      // not discard the draft in the inputs.
+      key={autoTopUpFormKey(settings.data.settings)}
       settings={settings.data.settings}
     />
   );
+}
+
+/** The identity of the saved editable values of the automatic top-up form. */
+function autoTopUpFormKey(settings: AutoTopUpSettings | undefined): string {
+  return [
+    settings?.enabled ?? false,
+    settings?.thresholdUsdMicros ?? 0n,
+    settings?.amountUsdMicros ?? 0n,
+    settings?.monthlyCapUsdMicros ?? 0n,
+  ].join("|");
 }
 
 /** The input text of a saved amount; zero shows as an empty field. */

@@ -929,6 +929,65 @@ describe("settings", () => {
     ]);
   });
 
+  test("a refetch that changes only the read-only counters keeps the unsaved automatic top-up draft", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const amount = await screen.findByRole("textbox", {
+      name: "Top-up amount (USD)",
+    });
+    await type(amount, "75");
+    expect(
+      screen.getByText("Charged this month").nextSibling?.textContent,
+    ).toBe("$0.00");
+    const fake = api.accounts.get(ACCOUNT_ID)!;
+    fake.autoTopUp = {
+      ...fake.autoTopUp,
+      monthToDateUsdMicros: 30_000_000n,
+      consecutiveFailures: 1,
+    };
+    const before = calls(api, "GetAutoTopUpSettings").length;
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+    });
+    await settle(60);
+    expect(calls(api, "GetAutoTopUpSettings").length).toBeGreaterThan(before);
+    expect(
+      screen.getByText("Charged this month").nextSibling?.textContent,
+    ).toBe("$30.00");
+    expect(
+      screen.getByText("Failed top-ups in a row").nextSibling?.textContent,
+    ).toBe("1");
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("75");
+  });
+
+  test("a refetch that changes a saved editable value resets the automatic top-up form", async () => {
+    const { api } = await renderAccount(ADMIN);
+    await openTab("Settings");
+    const amount = await screen.findByRole("textbox", {
+      name: "Top-up amount (USD)",
+    });
+    await type(amount, "75");
+    const fake = api.accounts.get(ACCOUNT_ID)!;
+    fake.autoTopUp = { ...fake.autoTopUp, amountUsdMicros: 40_000_000n };
+    await act(async () => {
+      window.dispatchEvent(new Event("visibilitychange"));
+    });
+    await settle(60);
+    expect(
+      (
+        screen.getByRole("textbox", {
+          name: "Top-up amount (USD)",
+        }) as HTMLInputElement
+      ).value,
+    ).toBe("40.00");
+  });
+
   test("rejects an enabled automatic top-up amount above $10,000 without a request", async () => {
     const { api } = await renderAccount(ADMIN);
     await openTab("Settings");
