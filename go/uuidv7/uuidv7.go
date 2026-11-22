@@ -72,40 +72,49 @@ func NewString() (string, error) {
 }
 
 // New returns a new UUID v7.
+//
+// The whole call runs under the generator mutex: it reads the entropy,
+// computes the next (timestamp, counter) pair in locals and commits them only
+// after both succeed. A read error or an out-of-range timestamp therefore
+// leaves the generator state unchanged, and the random reader never sees
+// overlapping calls from one generator, so it does not need to be safe for
+// concurrent use.
 func (g *Generator) New() (UUID, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
 	var id UUID
 	if _, err := io.ReadFull(g.random, id[6:]); err != nil {
 		return UUID{}, fmt.Errorf("uuidv7: read random bytes: %w", err)
 	}
-	g.mu.Lock()
 	ms := g.now().UnixMilli()
 	if ms < 0 {
 		ms = 0
 	}
 	current := uint64(ms)
+
+	timestamp, counter := g.lastMs, g.counter
 	switch {
 	case !g.started || current > g.lastMs:
-		g.started = true
-		g.lastMs = current
+		timestamp = current
 		// Start the counter in the lower half of its range, so that many
 		// values fit in one millisecond before it overflows.
-		g.counter = binary.BigEndian.Uint16(id[6:8]) & 0x07ff
+		counter = binary.BigEndian.Uint16(id[6:8]) & 0x07ff
 	default:
 		// The clock did not advance or went backwards: keep the last
 		// timestamp and count up, so that values still increase.
-		g.counter++
-		if g.counter > 0x0fff {
-			g.lastMs++
-			g.counter = 0
+		counter++
+		if counter > 0x0fff {
+			timestamp++
+			counter = 0
 		}
 	}
-	if g.lastMs > maxUnixMillis {
-		g.mu.Unlock()
+	if timestamp > maxUnixMillis {
 		return UUID{}, errors.New("uuidv7: timestamp out of range")
 	}
-	timestamp := g.lastMs
-	counter := g.counter
-	g.mu.Unlock()
+	g.started = true
+	g.lastMs = timestamp
+	g.counter = counter
 
 	id[0] = byte(timestamp >> 40)
 	id[1] = byte(timestamp >> 32)
