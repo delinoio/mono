@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -333,5 +334,125 @@ func TestProxyUDPIdleCountsBothDirections(t *testing.T) {
 	case <-ended:
 	case <-time.After(5 * idle):
 		t.Fatal("the flow did not end after the idle time")
+	}
+}
+
+// fakeElapsed is an elapsed-time source that a test advances by hand. It
+// stands for the monotonic clock: a wall-clock step does not change it.
+type fakeElapsed struct{ now atomic.Int64 }
+
+func (f *fakeElapsed) elapsed() time.Duration  { return time.Duration(f.now.Load()) }
+func (f *fakeElapsed) advance(d time.Duration) { f.now.Add(int64(d)) }
+
+// The idle time of a flow counts elapsed time since the latest datagram in
+// either direction and ends after the configured idle time without traffic.
+func TestIdleTimerExpiresAfterIdleWithoutTraffic(t *testing.T) {
+	const idle = 90 * time.Second
+	clock := &fakeElapsed{}
+	timer := newIdleTimer(idle, clock.elapsed)
+	clock.advance(idle - time.Nanosecond)
+	if timer.remaining() <= 0 {
+		t.Fatal("the flow ended before the idle time passed")
+	}
+	clock.advance(time.Nanosecond)
+	if timer.remaining() > 0 {
+		t.Fatal("the flow stayed open after the idle time passed")
+	}
+}
+
+// Every datagram moves the shared deadline; a datagram from either goroutine
+// uses the same timer.
+func TestIdleTimerTouchMovesDeadline(t *testing.T) {
+	const idle = 90 * time.Second
+	clock := &fakeElapsed{}
+	timer := newIdleTimer(idle, clock.elapsed)
+	for i := 0; i < 5; i++ {
+		clock.advance(idle - time.Second)
+		timer.touch()
+		if got := timer.remaining(); got != idle {
+			t.Fatalf("remaining after a datagram = %v, want %v", got, idle)
+		}
+	}
+	clock.advance(idle)
+	if timer.remaining() > 0 {
+		t.Fatal("the flow stayed open after the idle time without traffic")
+	}
+}
+
+// The flow idle time follows only the injected elapsed source, which stands
+// for the monotonic clock: a wall-clock step, forward or backward, changes
+// neither the elapsed time nor the idle lifetime. Real time passes here while
+// the fake elapsed time stays still, so the flow must stay open; a datagram
+// after a partial advance moves the deadline for both directions; and the flow
+// ends once the elapsed time passes the idle time without traffic.
+func TestProxyUDPIdleFollowsElapsedSource(t *testing.T) {
+	guest, in := udpPair(t)
+	out, host := udpPair(t)
+	const idle = 200 * time.Millisecond
+	clock := &fakeElapsed{}
+	ended := make(chan struct{})
+	go func() { proxyUDPWithClock(in, out, idle, clock.elapsed); close(ended) }()
+
+	relayed := func(src, dst net.Conn, what string) {
+		t.Helper()
+		if _, err := src.Write([]byte("ping")); err != nil {
+			t.Fatal(err)
+		}
+		_ = dst.SetReadDeadline(time.Now().Add(2 * time.Second))
+		buf := make([]byte, 16)
+		if _, err := dst.Read(buf); err != nil {
+			t.Fatalf("%s datagram was not relayed: %v", what, err)
+		}
+	}
+	// Real time passes for several idle periods with a still elapsed clock.
+	time.Sleep(3 * idle)
+	select {
+	case <-ended:
+		t.Fatal("the flow ended although no elapsed time passed")
+	default:
+	}
+	// Both directions refresh the shared deadline.
+	clock.advance(idle - time.Millisecond)
+	relayed(guest, host, "guest-to-host")
+	clock.advance(idle - time.Millisecond)
+	relayed(host, guest, "host-to-guest")
+	time.Sleep(3 * idle)
+	select {
+	case <-ended:
+		t.Fatal("the flow ended although each datagram refreshed the deadline")
+	default:
+	}
+	// Without traffic, the passing elapsed time closes the flow.
+	clock.advance(idle)
+	select {
+	case <-ended:
+	case <-time.After(5 * idle):
+		t.Fatal("the flow did not end after the idle time without traffic")
+	}
+}
+
+// The monotonic elapsed source ignores wall-clock steps, because the start
+// time keeps its monotonic reading and time.Since uses it.
+func TestMonotonicElapsedUsesMonotonicReading(t *testing.T) {
+	elapsed := newMonotonicElapsed()
+	first := elapsed()
+	time.Sleep(5 * time.Millisecond)
+	second := elapsed()
+	if second <= first || second < 5*time.Millisecond {
+		t.Fatalf("elapsed went from %v to %v after 5ms", first, second)
+	}
+}
+
+// An out-of-order touch from a slower goroutine does not move the recorded
+// datagram time backward.
+func TestIdleTimerTouchNeverMovesBackward(t *testing.T) {
+	clock := &fakeElapsed{}
+	timer := newIdleTimer(time.Minute, clock.elapsed)
+	clock.advance(10 * time.Second)
+	timer.touch()
+	clock.now.Store(int64(5 * time.Second))
+	timer.touch()
+	if got := time.Duration(timer.last.Load()); got != 10*time.Second {
+		t.Fatalf("last = %v, want 10s", got)
 	}
 }
