@@ -417,9 +417,13 @@ function ProfileDialog({
           value={String(values.priority)}
           onValueChange={(v) => v && set("priority", Number(v) as Priority)}
         >
-          <SelectOption value={String(Priority.UNSPECIFIED)}>
-            Default of the workload kind
-          </SelectOption>
+          {creating ? (
+            // Only CreateRunnerProfile resolves UNSPECIFIED to the default
+            // of the workload kind; UpdateRunnerProfile requires a priority.
+            <SelectOption value={String(Priority.UNSPECIFIED)}>
+              Default of the workload kind
+            </SelectOption>
+          ) : null}
           {PRIORITIES.map((p) => (
             <SelectOption key={p} value={String(p)}>
               {labels.priority[p]}

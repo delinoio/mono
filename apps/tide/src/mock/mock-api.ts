@@ -1498,6 +1498,12 @@ export function createMockTransport(
               next.maxTtl = input.maxTtl;
               break;
             case "priority":
+              // Like the server: an update requires a concrete priority.
+              if (input.priority === Priority.UNSPECIFIED)
+                throw new ConnectError(
+                  "invalid priority: must be HIGH, NORMAL or LOW",
+                  Code.InvalidArgument,
+                );
               next.priority = input.priority;
               break;
             case "max_queue_wait":

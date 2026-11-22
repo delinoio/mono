@@ -313,6 +313,35 @@ describe("runner profiles", () => {
     expect(label.textContent).toBe("tide-linux-build");
   });
 
+  test("a new profile can use the default priority of the workload kind", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
+    await click(
+      await screen.findByRole("button", { name: "Create runner profile" }),
+    );
+    await settle(60);
+    const create = screen.getByRole("dialog", {
+      name: "Create a runner profile",
+    });
+    await click(within(create).getByRole("combobox", { name: "Priority" }));
+    expect(
+      await screen.findByRole("option", {
+        name: "Default of the workload kind",
+      }),
+    ).toBeTruthy();
+  });
+
+  test("an edit offers only a concrete priority", async () => {
+    renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
+    await click((await screen.findAllByRole("button", { name: "Edit" }))[0]!);
+    await settle(60);
+    const edit = screen.getByRole("dialog", { name: "Edit linux-build" });
+    await click(within(edit).getByRole("combobox", { name: "Priority" }));
+    expect(await screen.findByRole("option", { name: "High" })).toBeTruthy();
+    expect(
+      screen.queryByRole("option", { name: "Default of the workload kind" }),
+    ).toBeNull();
+  });
+
   test("requires the workspace path for a dev session profile", async () => {
     renderConsole(`/orgs/${MOCK_IDS.acme}/profiles`);
     await click(
