@@ -20,7 +20,10 @@ func TestDailyContinuesAfterFailure(t *testing.T) {
 	var logs bytes.Buffer
 	var ran []string
 	d := &jobs.Daily{Logger: slog.New(slog.NewJSONHandler(&logs, nil)), Jobs: []jobs.Job{
-		{Name: "fails", Run: func(context.Context, time.Time) (int64, error) { ran = append(ran, "fails"); return 0, errors.New("boom") }},
+		{Name: "fails", Run: func(context.Context, time.Time) (int64, error) {
+			ran = append(ran, "fails")
+			return 0, errors.New("boom")
+		}},
 		{Name: "works", Run: func(context.Context, time.Time) (int64, error) { ran = append(ran, "works"); return 3, nil }},
 	}}
 	d.RunOnce(context.Background(), time.Now())
