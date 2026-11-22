@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 )
@@ -67,6 +68,22 @@ func TestCLIMisc(t *testing.T) {
 	}
 	if code := run(nil, nil, &out, &errb); code != exitUsage {
 		t.Fatal("no command")
+	}
+	// An explicit --state-dir reaches the service definition and wins over a
+	// conflicting environment variable; without the flag the environment
+	// value stays.
+	flagDir := filepath.Join(t.TempDir(), "from-flag")
+	envDir := filepath.Join(t.TempDir(), "from-env")
+	t.Setenv(config.EnvStateDir, envDir)
+	out.Reset()
+	if code := run([]string{"service", "print", "--state-dir", flagDir}, nil, &out, &errb); code != exitOK ||
+		!strings.Contains(out.String(), flagDir) || strings.Contains(out.String(), envDir) {
+		t.Fatalf("service print --state-dir: %q", out.String())
+	}
+	out.Reset()
+	if code := run([]string{"service", "print"}, nil, &out, &errb); code != exitOK ||
+		!strings.Contains(out.String(), envDir) || strings.Contains(out.String(), flagDir) {
+		t.Fatalf("service print without --state-dir: %q", out.String())
 	}
 	// Linux base images are not built by the agent, and an unknown guest
 	// OS is a usage error; neither touches the state directory.
