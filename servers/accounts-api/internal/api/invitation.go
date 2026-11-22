@@ -146,6 +146,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		ID: id, BillingAccountID: accountID, Email: addr, Role: role, InviterUserID: userID,
 		CreateTime: now, ExpireTime: now.Add(InvitationLifetime),
 	}
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -169,7 +170,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 			id, accountID, hash, addr, emailKey(addr), string(role), userID, inv.CreateTime, inv.ExpireTime); err != nil {
 			return err
 		}
-		if err := h.recordAudit(ctx, tx, now, auditEvent{
+		if err := h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditInvitationCreated, ActorUserID: userID, InvitationID: id,
 			Details: map[string]string{"role": string(role)},
 		}); err != nil {
@@ -197,6 +198,7 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, h.internal(ctx, "create_invitation", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.CreateInvitationResponse{Invitation: inv.proto(now)}), nil
 }
 
@@ -273,6 +275,7 @@ func (h *BillingAccountHandler) RevokeInvitation(ctx context.Context, req *conne
 	}
 	now := h.timestamp()
 	var inv invitation
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -297,13 +300,14 @@ func (h *BillingAccountHandler) RevokeInvitation(ctx context.Context, req *conne
 			return err
 		}
 		inv.RevokeTime = &now
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditInvitationRevoked, ActorUserID: userID, InvitationID: invitationID,
 		})
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "revoke_invitation", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.RevokeInvitationResponse{Invitation: inv.proto(now)}), nil
 }
 
@@ -352,6 +356,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 	}
 
 	var account billingAccount
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		// Lock the billing account first, as every other change does, then
 		// read the invitation again under that lock.
@@ -391,7 +396,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 			return err
 		}
 		account = billingAccount{ID: inv.BillingAccountID, Name: name, CreateTime: createTime, CallerRole: inv.Role}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: inv.BillingAccountID, Kind: AuditInvitationAccepted, ActorUserID: userID,
 			TargetUserID: userID, InvitationID: inv.ID, Details: map[string]string{"role": string(inv.Role)},
 		})
@@ -399,6 +404,7 @@ func (h *BillingAccountHandler) AcceptInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, h.internal(ctx, "accept_invitation", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.AcceptInvitationResponse{
 		BillingAccount: account.proto(),
 		Member: &accountsv1.BillingAccountMember{

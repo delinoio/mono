@@ -49,8 +49,18 @@ type auditEvent struct {
 	Details          map[string]string
 }
 
-// recordAudit inserts the event in tx and logs it.
-func (s *Service) recordAudit(ctx context.Context, tx pgx.Tx, at time.Time, ev auditEvent) error {
+// auditLog collects the billing audit events that a handler inserted in a
+// transaction, so that their log records are written only after that
+// transaction committed. A failed or rolled-back call then logs no
+// billing_audit_event record for a row that does not exist. The zero value is
+// ready to use. A collector belongs to one call and is never shared.
+type auditLog struct {
+	events []auditEvent
+}
+
+// recordAudit inserts the event in tx and adds it to audit. The log record is
+// written by flushAudit once the transaction has committed.
+func (s *Service) recordAudit(ctx context.Context, tx pgx.Tx, audit *auditLog, at time.Time, ev auditEvent) error {
 	id, err := newID()
 	if err != nil {
 		return err
@@ -70,11 +80,20 @@ func (s *Service) recordAudit(ctx context.Context, tx pgx.Tx, at time.Time, ev a
 	if err != nil {
 		return err
 	}
-	s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_audit_event",
-		slog.String("kind", string(ev.Kind)),
-		slog.String("billing_account_id", ev.BillingAccountID),
-		slog.String("actor_user_id", ev.ActorUserID),
-		slog.String("target_user_id", ev.TargetUserID),
-		slog.String("invitation_id", ev.InvitationID))
+	audit.events = append(audit.events, ev)
 	return nil
+}
+
+// flushAudit logs the events that audit collected and empties it. Call it
+// only after the transaction that inserted the events committed.
+func (s *Service) flushAudit(ctx context.Context, audit *auditLog) {
+	for _, ev := range audit.events {
+		s.logger.LogAttrs(ctx, slog.LevelInfo, "billing_audit_event",
+			slog.String("kind", string(ev.Kind)),
+			slog.String("billing_account_id", ev.BillingAccountID),
+			slog.String("actor_user_id", ev.ActorUserID),
+			slog.String("target_user_id", ev.TargetUserID),
+			slog.String("invitation_id", ev.InvitationID))
+	}
+	audit.events = nil
 }

@@ -507,6 +507,112 @@ func TestInvitationRules(t *testing.T) {
 	wantCode(t, err, connect.CodeNotFound)
 }
 
+// auditRecordCount counts the billing_audit_event log records of kind in logs.
+func auditRecordCount(logs string, kind api.AuditKind) int {
+	return strings.Count(logs, `"msg":"billing_audit_event","kind":"`+string(kind)+`"`)
+}
+
+// auditRowCount counts the stored audit events of kind for the billing
+// account.
+func auditRowCount(t *testing.T, env *testenv.Env, accountID string, kind api.AuditKind) int {
+	t.Helper()
+	var n int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM billing_audit_events
+		WHERE billing_account_id = $1 AND kind = $2`, accountID, string(kind)).Scan(&n); err != nil {
+		t.Fatalf("count audit events: %v", err)
+	}
+	return n
+}
+
+// An audit event is logged only after its transaction committed, so a failed
+// invitation email, which rolls the transaction back, leaves neither a row nor
+// a log record.
+func TestInvitationCreateFailureLogsNoAuditEvent(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+
+	env.Email.SetErr(errors.New("resend down"))
+	_, err := owner.Client.CreateInvitation(ctx(), connect.NewRequest(&accountsv1.CreateInvitationRequest{
+		BillingAccountId: accountID, Email: "undelivered@example.com", Role: roleViewer,
+	}))
+	wantCode(t, err, connect.CodeUnavailable)
+	env.Email.SetErr(nil)
+
+	logs := env.Logs.String()
+	if !strings.Contains(logs, `"msg":"invitation_email_failed"`) {
+		t.Errorf("no invitation_email_failed record:\n%s", logs)
+	}
+	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 0 {
+		t.Errorf("%d invitation_created audit records after a failed send, want 0", n)
+	}
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 0 {
+		t.Errorf("%d invitation_created audit rows after a failed send, want 0", n)
+	}
+
+	// The retry succeeds and logs exactly one record, with the new invitation.
+	inv := invite(t, owner, accountID, "undelivered@example.com", roleViewer)
+	logs = env.Logs.String()
+	if n := auditRecordCount(logs, api.AuditInvitationCreated); n != 1 {
+		t.Fatalf("%d invitation_created audit records after a successful send, want 1", n)
+	}
+	if !strings.Contains(logs, `"invitation_id":"`+inv.GetInvitationId()+`"`) {
+		t.Errorf("no audit record carries invitation_id %s", inv.GetInvitationId())
+	}
+	if n := auditRowCount(t, env, accountID, api.AuditInvitationCreated); n != 1 {
+		t.Errorf("%d invitation_created audit rows, want 1", n)
+	}
+}
+
+// Handlers that commit write one billing_audit_event record per change, and
+// none for a call that changes nothing or fails.
+func TestAuditEventsLoggedAfterCommit(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	rename := func(c person, name string) error {
+		_, err := c.Client.UpdateBillingAccount(ctx(), connect.NewRequest(&accountsv1.UpdateBillingAccountRequest{BillingAccountId: f.AccountID, Name: name}))
+		return err
+	}
+	setRole := func(c person, role accountsv1.BillingAccountRole) error {
+		_, err := c.Client.UpdateMemberRole(ctx(), connect.NewRequest(&accountsv1.UpdateMemberRoleRequest{BillingAccountId: f.AccountID, UserId: f.Viewer2.ID, Role: role}))
+		return err
+	}
+	count := func(kind api.AuditKind) int { return auditRecordCount(env.Logs.String(), kind) }
+
+	if err := rename(f.Owner, "Renamed"); err != nil {
+		t.Fatalf("UpdateBillingAccount: %v", err)
+	}
+	if n := count(api.AuditBillingAccountRenamed); n != 1 {
+		t.Fatalf("%d billing_account_renamed records after a rename, want 1", n)
+	}
+	// The same name changes nothing and logs nothing.
+	if err := rename(f.Owner, "Renamed"); err != nil {
+		t.Fatalf("UpdateBillingAccount: %v", err)
+	}
+	// A viewer is denied before any change.
+	wantCode(t, rename(f.Viewer, "Denied"), connect.CodePermissionDenied)
+	if n := count(api.AuditBillingAccountRenamed); n != 1 {
+		t.Fatalf("%d billing_account_renamed records after a no-op and a denied call, want 1", n)
+	}
+	if n := auditRowCount(t, env, f.AccountID, api.AuditBillingAccountRenamed); n != 1 {
+		t.Fatalf("%d billing_account_renamed rows, want 1", n)
+	}
+
+	if err := setRole(f.Owner, roleAdmin); err != nil {
+		t.Fatalf("UpdateMemberRole: %v", err)
+	}
+	if err := setRole(f.Owner, roleAdmin); err != nil {
+		t.Fatalf("UpdateMemberRole: %v", err)
+	}
+	wantCode(t, setRole(f.Viewer, roleViewer), connect.CodePermissionDenied)
+	if n := count(api.AuditMemberRoleChanged); n != 1 {
+		t.Fatalf("%d member_role_changed records, want 1", n)
+	}
+	if n := auditRowCount(t, env, f.AccountID, api.AuditMemberRoleChanged); n != 1 {
+		t.Fatalf("%d member_role_changed rows, want 1", n)
+	}
+}
+
 func TestMembers(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)

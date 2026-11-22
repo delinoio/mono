@@ -120,6 +120,7 @@ func (h *BillingAccountHandler) CreateBillingAccount(ctx context.Context, req *c
 		return nil, h.internal(ctx, "create_billing_account", err)
 	}
 	now := h.timestamp()
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time)
 			VALUES ($1, $2, $3, $3)`, id, name, now); err != nil {
@@ -129,7 +130,7 @@ func (h *BillingAccountHandler) CreateBillingAccount(ctx context.Context, req *c
 			VALUES ($1, $2, $3, $4)`, id, userID, string(RoleOwner), now); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: id, Kind: AuditBillingAccountCreated, ActorUserID: userID,
 			Details: map[string]string{"name": name},
 		})
@@ -137,6 +138,7 @@ func (h *BillingAccountHandler) CreateBillingAccount(ctx context.Context, req *c
 	if err != nil {
 		return nil, h.internal(ctx, "create_billing_account", err)
 	}
+	h.flushAudit(ctx, audit)
 	account := billingAccount{ID: id, Name: name, CreateTime: now, CallerRole: RoleOwner}
 	return connect.NewResponse(&accountsv1.CreateBillingAccountResponse{BillingAccount: account.proto()}), nil
 }
@@ -229,6 +231,7 @@ func (h *BillingAccountHandler) UpdateBillingAccount(ctx context.Context, req *c
 	}
 	now := h.timestamp()
 	var account billingAccount
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err = loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -246,7 +249,7 @@ func (h *BillingAccountHandler) UpdateBillingAccount(ctx context.Context, req *c
 		}
 		oldName := account.Name
 		account.Name = name
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditBillingAccountRenamed, ActorUserID: userID,
 			Details: map[string]string{"old_name": oldName, "new_name": name},
 		})
@@ -254,6 +257,7 @@ func (h *BillingAccountHandler) UpdateBillingAccount(ctx context.Context, req *c
 	if err != nil {
 		return nil, h.internal(ctx, "update_billing_account", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.UpdateBillingAccountResponse{BillingAccount: account.proto()}), nil
 }
 
@@ -268,6 +272,7 @@ func (h *BillingAccountHandler) DeleteBillingAccount(ctx context.Context, req *c
 		return nil, err
 	}
 	now := h.timestamp()
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -306,12 +311,13 @@ func (h *BillingAccountHandler) DeleteBillingAccount(ctx context.Context, req *c
 		if _, err := tx.Exec(ctx, `DELETE FROM billing_account_members WHERE billing_account_id = $1`, accountID); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditBillingAccountDeleted, ActorUserID: userID,
 		})
 	})
 	if err != nil {
 		return nil, h.internal(ctx, "delete_billing_account", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.DeleteBillingAccountResponse{}), nil
 }
