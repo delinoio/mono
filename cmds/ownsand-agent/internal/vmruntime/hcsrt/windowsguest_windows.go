@@ -5,6 +5,7 @@ package hcsrt
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
@@ -39,11 +40,25 @@ func readWindowsImage(dir string) (images.Metadata, error) {
 	return m, nil
 }
 
+// recoverWindowsImage restores the previous Windows base image when an
+// `ownsand-agent image build` ended between the two renames of its install
+// (see images.Recover). It does nothing while a build holds the image lock.
+// A failure is logged; the callers then see the image as it is.
+func (r *Runtime) recoverWindowsImage() {
+	if r.opts.WindowsImage == "" {
+		return
+	}
+	if _, err := images.Recover(r.opts.WindowsImage); err != nil {
+		slog.Warn("recover the Windows base image failed", "image_dir", r.opts.WindowsImage, "error", err)
+	}
+}
+
 // windowsImageCheck reports whether the Windows base image is present.
 func (r *Runtime) windowsImageCheck() (bool, string) {
 	if r.opts.WindowsImage == "" {
 		return false, "no Windows image directory is configured"
 	}
+	r.recoverWindowsImage()
 	if !fileExists(filepath.Join(r.opts.WindowsImage, images.WindowsDisk)) {
 		return false, "the Windows base image is not built; run `ownsand-agent image build --iso <Windows ISO>`"
 	}
@@ -60,6 +75,7 @@ func (r *Runtime) windowsSource(spec vmruntime.Spec) (disk, metaDir string) {
 	if spec.Snapshot != nil {
 		return filepath.Join(spec.Snapshot.Dir, snapWindowsDisk), spec.Snapshot.Dir
 	}
+	r.recoverWindowsImage()
 	return filepath.Join(r.opts.WindowsImage, images.WindowsDisk), r.opts.WindowsImage
 }
 
@@ -103,7 +119,7 @@ func (r *Runtime) prepareWindowsDisk(spec vmruntime.Spec) (vmSpec, int64, error)
 	src, metaDir := r.windowsSource(spec)
 	disk := filepath.Join(spec.Dir, windowsDiskFile)
 	start := time.Now()
-	if err := copyFile(src, disk); err != nil {
+	if err := copyFile(context.Background(), src, disk); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
 	copied := time.Now()
@@ -111,7 +127,7 @@ func (r *Runtime) prepareWindowsDisk(spec vmruntime.Spec) (vmSpec, int64, error)
 	if err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: prepare disk: %w", err)
 	}
-	if err := copyFile(filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
+	if err := copyFile(context.Background(), filepath.Join(metaDir, images.MetadataFile), filepath.Join(spec.Dir, images.MetadataFile)); err != nil {
 		return vmSpec{}, 0, fmt.Errorf("hcsrt: copy the image metadata: %w", err)
 	}
 	if err := grantVMGroup(disk, accessReadWrite, false); err != nil {

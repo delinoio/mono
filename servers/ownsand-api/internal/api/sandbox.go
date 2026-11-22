@@ -757,9 +757,20 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 }
 
 // pauseOrResume runs PauseSandbox (pause true) or ResumeSandbox.
-// ResumeSandbox is rejected while billing blocks the organization; a
-// caller's pause removes the billing pause mark, so a sandbox that a caller
-// paused stays paused after a billing recovery.
+// ResumeSandbox is rejected while billing blocks the organization.
+//
+// A caller's pause removes the billing pause mark, so a sandbox that a caller
+// paused stays paused after a billing recovery. It is the only way to take the
+// ownership from billing, which otherwise keeps its mark until the sandbox
+// ends (see BillingEnforcer.resume). This includes a sandbox that
+// billing already paused: the pause succeeds without a command, and it clears
+// the mark before it returns. The caller pause and the billing worker's
+// resume of the same sandbox run one at a time under the sandbox ordering lock
+// (withSandboxOrder), on every instance: a resume that is already in flight
+// finishes, including the reconciliation of the agent's result, before the
+// pause reads the sandbox state, so a sandbox that actually resumed is paused
+// through the normal pause path; a resume that has not started finds the mark
+// removed and sends no command.
 func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxID string, pause bool) (*ownsandv1.Sandbox, error) {
 	orgID, err := normalizeID("organization_id", rawOrgID)
 	if err != nil {
@@ -777,14 +788,33 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 	if err != nil {
 		return nil, err
 	}
-	onSend := func() error { return nil }
-	if pause {
-		onSend = func() error {
-			_, err := h.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1 AND paused_by_billing", sandboxID)
-			return err
+	if !pause {
+		sb, err := h.pauseOrResumeSandbox(ctx, orgID, sandboxID, false, nil, nil)
+		if err != nil {
+			return nil, err
 		}
+		return sb.proto(), nil
 	}
-	sb, err := h.pauseOrResumeSandbox(ctx, orgID, sandboxID, pause, onSend)
+	clearMark := func() error {
+		_, err := h.DB.Pool.Exec(ctx, "UPDATE sandboxes SET paused_by_billing = false WHERE sandbox_id = $1 AND paused_by_billing", sandboxID)
+		return err
+	}
+	// The ordering lock is only taken for a sandbox of the caller's
+	// organization, so a caller cannot make another organization's pause or
+	// resume wait.
+	if _, err := loadSandbox(ctx, h.DB.Pool, orgID, sandboxID, false); err != nil {
+		return nil, h.internal(ctx, "load sandbox", err)
+	}
+	var sb *sandboxRow
+	err = h.withSandboxOrder(ctx, sandboxID, func() error {
+		var err error
+		sb, err = h.pauseOrResumeSandbox(ctx, orgID, sandboxID, true, clearMark, clearMark)
+		return err
+	})
+	var lockErr *orderLockError
+	if errors.As(err, &lockErr) {
+		return nil, h.internal(ctx, "order pause sandbox", lockErr.err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -796,8 +826,15 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 // the result. PauseSandbox, ResumeSandbox and the billing suspension worker
 // share it. onSend runs right before the command is sent, only when the
 // sandbox is in the source state; errBillingStale from it drops the command
-// and is returned as is. orgID and sandboxID must be canonical.
-func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID string, pause bool, onSend func() error) (*sandboxRow, error) {
+// and is returned as is. onSettled runs instead when the sandbox is already
+// in the destination state and no command is needed; a failure of it is an
+// internal error, so the call never reports a success that its caller's
+// preparation did not complete. Either hook can be nil. orgID and sandboxID
+// must be canonical.
+func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID string, pause bool, onSend, onSettled func() error) (*sandboxRow, error) {
+	if onSend == nil {
+		onSend = func() error { return nil }
+	}
 	sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
 	if err != nil {
 		return nil, s.internal(ctx, "load sandbox", err)
@@ -812,6 +849,11 @@ func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID str
 	}
 	state, _ := sb.shownState()
 	if state == to {
+		if onSettled != nil {
+			if err := onSettled(); err != nil {
+				return nil, s.internal(ctx, "prepare "+rpc, err)
+			}
+		}
 		return sb, nil
 	}
 	if state != from {

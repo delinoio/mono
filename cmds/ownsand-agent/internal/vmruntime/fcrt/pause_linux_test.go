@@ -34,6 +34,19 @@ func (r *recorder) add(e string) {
 	r.events = append(r.events, e)
 }
 
+// setRejectResume changes rejectResume while the fake API serves requests.
+func (r *recorder) setRejectResume(reject bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rejectResume = reject
+}
+
+func (r *recorder) rejectsResume() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rejectResume
+}
+
 func (r *recorder) list() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -129,7 +142,7 @@ func startFakeVM(t *testing.T, r *Runtime, id string, rec *recorder) *vm {
 	api := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, _ := io.ReadAll(req.Body)
 		rec.add("api " + req.Method + " " + req.URL.Path + " " + string(body))
-		if rec.rejectResume && strings.Contains(string(body), `"Resumed"`) {
+		if rec.rejectsResume() && strings.Contains(string(body), `"Resumed"`) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = w.Write([]byte(`{"fault_message":"resume rejected"}`))
@@ -223,7 +236,10 @@ func TestSnapshotReportsResumeFailure(t *testing.T) {
 		t.Fatalf("snapshot error %v, want a resume error", err)
 	}
 	if info.SizeBytes != 0 || info.HasMemoryState {
-		t.Fatalf("snapshot info %+v, want zero", info)
+		t.Fatalf("snapshot info %+v, want no capture", info)
+	}
+	if info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("source state %v, want PAUSED", info.SourceState)
 	}
 }
 
@@ -238,11 +254,63 @@ func TestSnapshotCaptureErrorWinsOverResumeFailure(t *testing.T) {
 	v := startFakeVM(t, r, "s4", rec)
 	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
 	// The source disk is missing, so the copy fails.
-	_, err = r.Snapshot(context.Background(), v, filepath.Join(t.TempDir(), "snap"))
+	info, err := r.Snapshot(context.Background(), v, filepath.Join(t.TempDir(), "snap"))
 	if err == nil || strings.Contains(err.Error(), "resume after snapshot") {
 		t.Fatalf("snapshot error %v, want the disk error", err)
 	}
+	if info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("source state %v, want PAUSED with the capture error", info.SourceState)
+	}
 	if got := strings.Join(rec.list(), "\n"); !strings.Contains(got, `"state":"Resumed"`) {
 		t.Fatalf("no resume attempted: %q", got)
+	}
+}
+
+// After a rejected resume of a snapshot, the VM is paused for good until
+// Firecracker accepts a resume: the runtime still tracks it as paused, so the
+// explicit resume that follows reaches the Firecracker API and continues it.
+func TestExplicitResumeAfterSnapshotResumeFailure(t *testing.T) {
+	r, err := New(Options{Logger: quiet()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &recorder{rejectResume: true}
+	v := startFakeVM(t, r, "s5", rec)
+	v.network = ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND
+	if err := os.WriteFile(filepath.Join(v.dir, diskFile), []byte("disk"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := r.Snapshot(context.Background(), v, filepath.Join(t.TempDir(), "snap"))
+	if err == nil || info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+		t.Fatalf("snapshot info %+v error %v, want a PAUSED outcome with an error", info, err)
+	}
+	v.mu.Lock()
+	paused := v.paused
+	v.mu.Unlock()
+	if !paused {
+		t.Fatal("the runtime tracks the VM as running after the rejected resume")
+	}
+	resumes := func() int {
+		n := 0
+		for _, e := range rec.list() {
+			if strings.Contains(e, `"state":"Resumed"`) {
+				n++
+			}
+		}
+		return n
+	}
+	before := resumes()
+	rec.setRejectResume(false)
+	if err := r.Resume(context.Background(), v); err != nil {
+		t.Fatalf("explicit resume: %v", err)
+	}
+	if got := resumes(); got != before+1 {
+		t.Fatalf("%d resume API calls, want %d", got, before+1)
+	}
+	v.mu.Lock()
+	paused = v.paused
+	v.mu.Unlock()
+	if paused {
+		t.Fatal("the runtime tracks the VM as paused after the explicit resume")
 	}
 }

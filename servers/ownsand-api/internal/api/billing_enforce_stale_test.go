@@ -204,7 +204,7 @@ func TestBillingPauseDroppedAfterRecoveryWhileQueued(t *testing.T) {
 // are selected for a resume, and one organization is suspended again while
 // its sandbox waits for a slot. The pass must not resume that sandbox, and
 // it keeps its mark so the next recovery resumes it; the other sandboxes
-// resume.
+// resume and keep theirs.
 func TestBillingResumeDroppedAfterSuspensionWhileQueued(t *testing.T) {
 	f := newStaleFixture(t)
 	c := f.victim.OwnerClient
@@ -244,18 +244,14 @@ func TestBillingResumeDroppedAfterSuspensionWhileQueued(t *testing.T) {
 		t.Fatal("the re-suspended organization's sandbox lost its billing mark")
 	}
 	// Stable status: the organization that stayed recovered resumes every
-	// sandbox, including the one that waited for a slot, and clears the marks.
+	// sandbox, including the one that waited for a slot, and billing keeps
+	// its mark (durable pause ownership).
 	for _, id := range f.hogSandboxes {
 		waitState(t, f.hog.OwnerClient, f.hog.ID, id, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	}
-	testenv.Eventually(t, "the billing marks of the recovered organization are cleared", func() bool {
-		for _, id := range f.hogSandboxes {
-			if pausedByBilling(t, f.env, id) {
-				return false
-			}
+		if !pausedByBilling(t, f.env, id) {
+			t.Fatalf("the resumed sandbox %s lost its billing mark", id)
 		}
-		return true
-	})
+	}
 	// The next pass does not resume the still-suspended organization's
 	// sandbox either.
 	enforceBilling(t, f.env)

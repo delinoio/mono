@@ -130,6 +130,24 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ownsand-agent: unknown service manager %q\n", *manager)
 		return exitUsage
 	}
+	// The service definition carries the state directory only when the flag
+	// is set: a directory that comes from the environment or the host default
+	// keeps the behavior of the environment-only service definition. The
+	// service runs in another working directory, so the path is made absolute.
+	var explicitStateDir string
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "state-dir" {
+			explicitStateDir = cfg.StateDir
+		}
+	})
+	if explicitStateDir != "" && (cmd == "service print" || cmd == "service install") {
+		abs, err := filepath.Abs(explicitStateDir)
+		if err != nil {
+			fmt.Fprintln(stderr, "ownsand-agent:", err)
+			return exitUsage
+		}
+		explicitStateDir = abs
+	}
 	c := colors{on: !*noColor && os.Getenv("NO_COLOR") == ""}
 	switch cmd {
 	case "version":
@@ -149,9 +167,9 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	case "image build":
 		return imageBuild(cfg, ib, stdout, stderr, c)
 	case "service print":
-		return servicePrint(stdout, stderr)
+		return servicePrint(explicitStateDir, stdout, stderr)
 	case "service install":
-		return serviceInstall(stdout, stderr)
+		return serviceInstall(explicitStateDir, stdout, stderr)
 	}
 	fmt.Fprint(stderr, usage)
 	return exitUsage
@@ -416,12 +434,12 @@ func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
 	return code
 }
 
-func servicePrint(stdout, stderr io.Writer) int {
+func servicePrint(stateDir string, stdout, stderr io.Writer) int {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
-	fmt.Fprint(stdout, serviceDefinition(exe))
+	fmt.Fprint(stdout, serviceDefinition(exe, stateDir))
 	return exitOK
 }

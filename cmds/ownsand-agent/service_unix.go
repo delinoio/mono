@@ -27,14 +27,14 @@ func runConfigError(cfgErr error, stderr io.Writer) int {
 	return exitUsage
 }
 
-func serviceDefinition(exe string) string {
+func serviceDefinition(exe, stateDir string) string {
 	if runtime.GOOS == "darwin" {
-		return service.LaunchdDaemon(exe, serviceEnv())
+		return service.LaunchdDaemon(exe, serviceEnv(stateDir))
 	}
-	return service.SystemdUnit(exe, serviceEnv())
+	return service.SystemdUnit(exe, serviceEnv(stateDir))
 }
 
-func serviceInstall(stdout, stderr io.Writer) int {
+func serviceInstall(stateDir string, stdout, stderr io.Writer) int {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
@@ -44,7 +44,7 @@ func serviceInstall(stdout, stderr io.Writer) int {
 	if runtime.GOOS == "darwin" {
 		path, next = service.LaunchdPlist, "launchctl bootstrap system "+service.LaunchdPlist
 	}
-	if err := store.WriteFileAtomic(path, []byte(serviceDefinition(exe)), 0o644); err != nil {
+	if err := store.WriteFileAtomic(path, []byte(serviceDefinition(exe, stateDir)), 0o644); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: write service definition (run as root):", err)
 		return exitError
 	}

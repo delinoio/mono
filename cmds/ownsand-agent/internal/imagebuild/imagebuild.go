@@ -6,7 +6,8 @@
 // Windows host applies the Windows image of an ISO file that an admin
 // supplies. Each build installs the guest helper, boots the image once
 // until the guest helper answers, shuts the guest down and then installs
-// the image directory (see package images).
+// the image directory (see package images). A per-destination file lock (see
+// ErrBuildInProgress) keeps two builds from sharing one staging directory.
 //
 // See docs/cmds-ownsand-agent-foundation.md#images.
 package imagebuild
@@ -108,7 +109,7 @@ func Build(ctx context.Context, opts Options) error {
 			return err
 		}
 		opts.GuestBinary = guest
-		return buildMacOS(ctx, dir, opts)
+		return withBuildLock(dir, opts.Logger, func() error { return buildMacOS(ctx, dir, opts) })
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
 		if opts.ISO == "" {
 			return errors.New("imagebuild: a Windows image build needs --iso <path to a Windows ISO>")
@@ -118,9 +119,28 @@ func Build(ctx context.Context, opts Options) error {
 			return err
 		}
 		opts.GuestBinary = guest
-		return buildWindows(ctx, dir, opts)
+		return withBuildLock(dir, opts.Logger, func() error { return buildWindows(ctx, dir, opts) })
 	}
 	return fmt.Errorf("%w: guest OS %v", ErrUnsupported, opts.GuestOS)
+}
+
+// withBuildLock runs build while this process holds the exclusive build lock
+// of the image directory dir. The lock covers the whole build: the removal
+// of a stale staging directory, the install and the cleanup. A second build
+// of the same destination, in this or another process, fails at once with
+// *BuildInProgressError and leaves the staging directory untouched; builds of
+// other destinations do not contend.
+func withBuildLock(dir string, logger *slog.Logger, build func() error) (err error) {
+	lock, err := acquireBuildLock(dir, logger)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := lock.release(); rerr != nil {
+			logger.Warn("release the image build lock failed", "lock_path", buildLockPath(dir), "error", rerr)
+		}
+	}()
+	return build()
 }
 
 // guestBinary finds the guest helper for the guest OS and checks that it is

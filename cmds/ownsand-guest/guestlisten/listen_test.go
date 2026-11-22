@@ -255,6 +255,45 @@ func TestBindErrorMapsAddressInUse(t *testing.T) {
 	}
 }
 
+func TestIsAddrInUse(t *testing.T) {
+	winsock := os.NewSyscallError("bind", windowsAddrInUse)
+	for _, tc := range []struct {
+		name string
+		err  error
+		goos string
+		want bool
+	}{
+		{"EADDRINUSE on linux", syscall.EADDRINUSE, "linux", true},
+		{"EADDRINUSE on windows", syscall.EADDRINUSE, "windows", true},
+		{"Winsock 10048 on windows", winsock, "windows", true},
+		{"wrapped Winsock 10048 on windows", &net.OpError{Op: "listen", Net: "unix", Err: winsock}, "windows", true},
+		{"Winsock 10048 on linux", winsock, "linux", false},
+		{"Winsock 10048 on darwin", winsock, "darwin", false},
+		{"other errno on windows", os.NewSyscallError("bind", syscall.Errno(10013)), "windows", false},
+		{"non-errno error on windows", errors.New("other"), "windows", false},
+	} {
+		if got := isAddrInUse(tc.err, tc.goos); got != tc.want {
+			t.Errorf("%s: isAddrInUse = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+func TestBindErrorWinsockAddrInUseOnWindowsOnly(t *testing.T) {
+	err := bindError(&net.OpError{Op: "listen", Net: "unix", Addr: &net.UnixAddr{Name: "secret.sock", Net: "unix"}, Err: os.NewSyscallError("bind", windowsAddrInUse)})
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("error exposes the path: %v", err)
+	}
+	if runtime.GOOS == "windows" {
+		if !errors.Is(err, ErrAddressInUse) {
+			t.Fatalf("err = %v, want ErrAddressInUse", err)
+		}
+		return
+	}
+	if !errors.Is(err, ErrBindFailed) || errors.Is(err, ErrAddressInUse) {
+		t.Fatalf("err = %v, want ErrBindFailed", err)
+	}
+}
+
 func TestListenUnixProbeFailureKeepsSocketFile(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("the mode bits of a socket file do not restrict a connection on Windows")

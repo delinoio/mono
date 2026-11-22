@@ -127,6 +127,8 @@ type Service struct {
 	// imports holds the snapshot imports that importThenCreate waits for;
 	// only a channel with an entry gets download URLs for that snapshot.
 	imports activeImports
+	// orderSlots bounds the sandbox ordering locks (withSandboxOrder).
+	orderSlots sandboxOrderSlots
 }
 
 // LeaseHolder reports whether this instance holds the instance lease.
