@@ -335,6 +335,7 @@ test("each launcher folder is the package directory", () => {
     "apps/ownsand",
     "servers/accounts-api",
     "servers/ownsand-api",
+    "servers/tide-api",
   ]);
 });
 

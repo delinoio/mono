@@ -1,0 +1,19 @@
+{
+  "name": "tide-api",
+  "version": "0.0.0",
+  "private": true,
+  "license": "FSL-1.1-ALv2",
+  "deploy": {
+    "target": "droplet",
+    "service": "tide-api",
+    "hostname": "tide.api.delino.io",
+    "port": 8080,
+    "upstreamProtocol": "h2c"
+  },
+  "scripts": {
+    "build": "go build -buildvcs=false -o dist/tide-api ./cmd/tide-api",
+    "dev": "node ../../scripts/dev/with-infisical.mjs --path=/servers/tide-api -- node scripts/dev.mjs",
+    "lint": "go vet ./...",
+    "test": "go test ./... && node --test \"scripts/*.test.mjs\""
+  }
+}
