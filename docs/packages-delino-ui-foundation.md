@@ -158,12 +158,13 @@ Root `pnpm test` and `pnpm typecheck` include the package. The package has no `b
 - `@ui-sdk/core` and `@ui-sdk/react` (Apache-2.0), pinned to the same exact version in `dependencies`. UI SDK is in public beta and its APIs can change before general availability, so upgrade both packages together, read their changelogs and run the unit tests.
 - `react` and `react-dom` 19 as peer dependencies.
 - `@rstest/core`, `happy-dom`, `@testing-library/react`, `@testing-library/dom`, `typescript` and the React type packages as development dependencies.
-- Consumers: no app uses the package yet. An app that starts using it adds `"delino-ui": "workspace:*"` to its dependencies and records the use in its own contract.
+- Consumers: the [OwnSand console](apps-ownsand-console-foundation.md#dependencies-and-integrations) (`apps/ownsand`) and [delino-accounts](apps-delino-accounts-foundation.md#dependencies-and-integrations) (`apps/delino-accounts`) declare `"delino-ui": "workspace:*"` in their dependencies. An app that starts using the package adds the same entry, records the use in its own contract and is added to this list.
 
 ## Change Triggers
 
 - Update [project-delino-ui.md](project-delino-ui.md) when exports, component IDs or the styling contract change.
 - Update the contracts of consuming apps when an export changes in a way that breaks them.
+- Update the consumer list in [Dependencies and Integrations](#dependencies-and-integrations) when an app adds or drops the `delino-ui` dependency.
 - Update [repository-workflow-contract.md](repository-workflow-contract.md) when the package enters CI.
 - Update `packages/AGENTS.md` only under the [instruction-update policy](README.md#instruction-update-policy).
 
