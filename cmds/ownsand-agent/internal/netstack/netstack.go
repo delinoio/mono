@@ -399,24 +399,72 @@ func (n *Network) forwardUDP(r *udp.ForwarderRequest) bool {
 	return true
 }
 
+// idleTimer tracks the shared idle time of one UDP flow. It stores the
+// elapsed time since the flow started, never a wall-clock timestamp, so a
+// forward or backward step of the system clock cannot shorten or lengthen the
+// idle lifetime. The elapsed source is injected so tests can drive it.
+type idleTimer struct {
+	elapsed func() time.Duration
+	idle    time.Duration
+	// last is the elapsed time of the latest datagram, in nanoseconds.
+	last atomic.Int64
+}
+
+// newMonotonicElapsed returns an elapsed source based on the monotonic clock
+// reading that time.Now carries; time.Since ignores wall-clock steps.
+func newMonotonicElapsed() func() time.Duration {
+	start := time.Now()
+	return func() time.Duration { return time.Since(start) }
+}
+
+func newIdleTimer(idle time.Duration, elapsed func() time.Duration) *idleTimer {
+	t := &idleTimer{elapsed: elapsed, idle: idle}
+	t.last.Store(int64(elapsed()))
+	return t
+}
+
+// touch records a datagram in either direction. The recorded time never moves
+// backward, so a slower goroutine cannot undo a newer datagram.
+func (t *idleTimer) touch() {
+	now := int64(t.elapsed())
+	for {
+		old := t.last.Load()
+		if now <= old || t.last.CompareAndSwap(old, now) {
+			return
+		}
+	}
+}
+
+// remaining returns how long the flow may stay idle; zero or less means the
+// flow is idle for at least the idle time.
+func (t *idleTimer) remaining() time.Duration {
+	return t.idle - (t.elapsed() - time.Duration(t.last.Load()))
+}
+
 // proxyUDP relays the datagrams of one flow until neither direction
 // carried a datagram for idle, or a side fails. Both directions share one
 // activity time, so a flow whose traffic goes mostly one way stays open
-// while that direction is active.
+// while that direction is active. The idle time follows the monotonic clock,
+// not the wall clock.
 func proxyUDP(in, out net.Conn, idle time.Duration) {
-	var last atomic.Int64
-	last.Store(time.Now().UnixNano())
+	proxyUDPWithClock(in, out, idle, newMonotonicElapsed())
+}
+
+func proxyUDPWithClock(in, out net.Conn, idle time.Duration, elapsed func() time.Duration) {
+	timer := newIdleTimer(idle, elapsed)
 	done := make(chan struct{}, 2)
 	relay := func(dst, src net.Conn) {
 		buf := make([]byte, 65535)
 		for {
 			// The read waits until the flow has been idle for idle since its
 			// last datagram in either direction.
-			deadline := time.Unix(0, last.Load()).Add(idle)
-			if !time.Now().Before(deadline) {
+			remaining := timer.remaining()
+			if remaining <= 0 {
 				break
 			}
-			_ = src.SetReadDeadline(deadline)
+			// time.Now carries a monotonic reading, so the deadline does not
+			// follow wall-clock steps either.
+			_ = src.SetReadDeadline(time.Now().Add(remaining))
 			k, err := src.Read(buf)
 			if err != nil {
 				var ne net.Error
@@ -426,7 +474,7 @@ func proxyUDP(in, out net.Conn, idle time.Duration) {
 				}
 				break
 			}
-			last.Store(time.Now().UnixNano())
+			timer.touch()
 			if _, err := dst.Write(buf[:k]); err != nil {
 				break
 			}
