@@ -264,9 +264,11 @@ func (h OrganizationHandler) UpdateOrganizationSettings(ctx context.Context, req
 			}
 			setMax = true
 		}
+		// An omitted settings message has no value for the masked path, so
+		// it clears the setting like an empty message does.
 		var newMax *int32
-		if setMax && req.Msg.GetSettings().MaxDevSessionsPerUser != nil {
-			v := req.Msg.GetSettings().GetMaxDevSessionsPerUser()
+		if settings := req.Msg.GetSettings(); setMax && settings != nil && settings.MaxDevSessionsPerUser != nil {
+			v := settings.GetMaxDevSessionsPerUser()
 			if v <= 0 {
 				return ErrInvalidf("invalid settings.max_dev_sessions_per_user: must be greater than zero, or unset for no limit")
 			}

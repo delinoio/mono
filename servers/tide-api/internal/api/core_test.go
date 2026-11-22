@@ -120,8 +120,16 @@ func TestUpdateOrganizationSettings(t *testing.T) {
 			t.Fatalf("clear: %v %v", o, err)
 		}
 	}
-	if n := countAction(auditActions(t, env, org.ID), tidev1.AuditAction_AUDIT_ACTION_ORGANIZATION_SETTINGS_CHANGED); n != 2 {
-		t.Fatalf("settings events = %d, want 2", n)
+	// An omitted settings message also clears the limit.
+	if _, err := update(org.Owner, &tidev1.OrganizationSettings{MaxDevSessionsPerUser: proto.Int32(2)}, mask); err != nil {
+		t.Fatal(err)
+	}
+	o, err = update(org.Owner, nil, mask)
+	if err != nil || o.GetSettings().MaxDevSessionsPerUser != nil {
+		t.Fatalf("clear without settings: %v %v", o, err)
+	}
+	if n := countAction(auditActions(t, env, org.ID), tidev1.AuditAction_AUDIT_ACTION_ORGANIZATION_SETTINGS_CHANGED); n != 4 {
+		t.Fatalf("settings events = %d, want 4", n)
 	}
 }
 
