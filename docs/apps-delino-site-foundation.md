@@ -30,6 +30,7 @@ This contract owns the `delino-site` marketing site at `apps/delino-site/`:
 | -------- | ---- | --------------------------------------------------------------------------------- |
 | `home`   | `/`  | Landing page with product hero, feature highlights and links to `docs.delino.io`. |
 
+- The `home` feature cards in `docs/index.md` keep distinct titles, because Rspress uses each title as the React key of its card; a repeated title makes the development console report duplicate keys. The e2e suite checks that the page renders three cards with distinct titles.
 - Build artifacts: `index.html` per route, `404.html`, `sitemap.xml` with absolute `https://delino.io` URLs, `llms.txt` and `llms-full.txt`.
 - `docs/public/_headers` sets Cloudflare Pages response headers: `X-Content-Type-Options: nosniff`, `Referrer-Policy: strict-origin-when-cross-origin` and `X-Frame-Options: DENY`.
 - Built-in search is disabled: `search: false` and `themeConfig.search: false` turn off search indexing and declare the intent, and the theme in `theme/index.tsx` exports a `Search` override that renders nothing because the Rspress 2.1.3 default navbar mounts its search button and Ctrl/Cmd+K shortcut regardless of those options. Remove the override once the default theme honours `themeConfig.search`. Documentation search belongs to `delino-docs`, which keeps the built-in search.

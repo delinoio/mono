@@ -23,6 +23,24 @@ describe("home", () => {
     );
   });
 
+  test("gives every feature card a distinct title", async ({
+    app,
+    browser,
+  }) => {
+    await app.open("/");
+
+    // Rspress keys the feature cards by title, so a repeated title makes React
+    // report duplicate keys in the development console and can drop a card.
+    const titles = await browser.evaluate(() =>
+      Array.from(document.querySelectorAll(".rp-home-feature__title")).map(
+        (element) => element.textContent?.trim() ?? "",
+      ),
+    );
+
+    expect(titles).toHaveLength(3);
+    expect(new Set(titles).size).toBe(titles.length);
+  });
+
   test(
     "presents the product features",
     { tags: ["agent"] },

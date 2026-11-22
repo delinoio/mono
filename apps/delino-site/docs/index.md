@@ -16,10 +16,10 @@ hero:
     src: /icon.svg
     alt: Delino logo
 features:
-  - title: Placeholder feature
+  - title: Placeholder feature one
     details: Replace this card with a product highlight.
-  - title: Placeholder feature
+  - title: Placeholder feature two
     details: Replace this card with a product highlight.
-  - title: Placeholder feature
+  - title: Placeholder feature three
     details: Replace this card with a product highlight.
 ---
