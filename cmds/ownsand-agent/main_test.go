@@ -4,11 +4,14 @@ package main
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/agent"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 )
 
@@ -132,5 +135,104 @@ func TestStatusPrintsCapabilities(t *testing.T) {
 	printCapabilities(&out, agent.Status{CapabilitiesAt: at}, colors{})
 	if got := out.String(); !strings.Contains(got, "guest OSes none; base images none") {
 		t.Fatalf("empty report: %q", got)
+	}
+}
+
+// Only a missing identity file or an identity without a device ID means that
+// the device is not enrolled (exit code 3, which service managers do not
+// restart). An identity file that cannot be read or decoded is an error
+// (exit code 1) with the cause in the output, so that the service manager
+// restarts the agent and the operator sees why.
+func TestIdentityReadFailureIsNotNotEnrolled(t *testing.T) {
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	t.Setenv("NO_COLOR", "1")
+	cases := []struct {
+		name      string
+		setup     func(t *testing.T, path string)
+		wantRun   int
+		wantLD    int
+		wantEnrol bool // the status output says "not enrolled"
+	}{
+		{
+			name:      "missing",
+			setup:     func(t *testing.T, path string) {},
+			wantRun:   exitNotEnrolled,
+			wantLD:    exitOK,
+			wantEnrol: true,
+		},
+		{
+			name: "pending identity without a device ID",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte(`{"device_id":"","organization_id":"","private_key_seed":"AAAA"}`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantRun:   exitNotEnrolled,
+			wantLD:    exitOK,
+			wantEnrol: true,
+		},
+		{
+			name: "corrupt",
+			setup: func(t *testing.T, path string) {
+				if err := os.WriteFile(path, []byte(`{"device_id": "dev`), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantRun: exitError,
+			wantLD:  exitError,
+		},
+		{
+			name: "directory",
+			setup: func(t *testing.T, path string) {
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantRun: exitError,
+			wantLD:  exitError,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+			tc.setup(t, filepath.Join(dir, store.IdentityFile))
+			var out, errb bytes.Buffer
+			if code := run([]string{"status"}, nil, &out, &errb); code != tc.wantRun {
+				t.Fatalf("status: %d, want %d (%q / %q)", code, tc.wantRun, out.String(), errb.String())
+			}
+			if got := strings.Contains(out.String(), "not enrolled"); got != tc.wantEnrol {
+				t.Fatalf("status prints not enrolled = %v, want %v (%q)", got, tc.wantEnrol, out.String())
+			}
+			if !tc.wantEnrol && (!strings.HasPrefix(errb.String(), "ownsand-agent: ") || out.Len() != 0) {
+				t.Fatalf("status error output %q / %q", out.String(), errb.String())
+			}
+			out.Reset()
+			errb.Reset()
+			if code := run([]string{"run"}, nil, &out, &errb); code != tc.wantRun {
+				t.Fatalf("run: %d, want %d", code, tc.wantRun)
+			}
+			if code := run([]string{"run", "--service-manager", "launchd"}, nil, &out, &errb); code != tc.wantLD {
+				t.Fatalf("launchd run: %d, want %d", code, tc.wantLD)
+			}
+		})
+	}
+}
+
+// A valid identity is enrolled: status reports it and exits 0.
+func TestStatusWithValidIdentity(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveIdentity(&store.Identity{DeviceID: "dev-1", OrganizationID: "org-1", PrivateKeySeed: make([]byte, 32)}); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	if code := run([]string{"status", "--no-color"}, nil, &out, &errb); code != exitOK || !strings.Contains(out.String(), "Enrollment: enrolled (device dev-1, organization org-1)") {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
 	}
 }
