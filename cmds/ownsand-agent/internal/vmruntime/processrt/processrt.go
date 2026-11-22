@@ -141,6 +141,10 @@ type vm struct {
 	cmd       *exec.Cmd
 	exited    chan struct{}
 	restore   ownsandv1.SandboxRestorePath
+	// onSignal is a test seam: it is nil in production and records each
+	// signal that signalHelper sends to the helper's group, so that a test
+	// can assert the signal order that a race would otherwise hide.
+	onSignal func(syscall.Signal)
 }
 
 func (v *vm) SandboxID() string                         { return v.id }
@@ -171,6 +175,9 @@ func (v *vm) hasExited() bool {
 func (v *vm) signalHelper(sig syscall.Signal) error {
 	if v.hasExited() {
 		return errHelperExited
+	}
+	if v.onSignal != nil {
+		v.onSignal(sig)
 	}
 	return signalGroup(v.cmd, sig)
 }
@@ -505,7 +512,11 @@ func (r *Runtime) stopHelper(ctx context.Context, v *vm) error {
 		r.logger.Error("process sandbox exec workers may keep running; delete can be retried", "sandbox_id", v.id, "error", err)
 		return err
 	}
-	_ = v.signalHelper(sigCont)
+	// The helper stays stopped until it is killed: SIGKILL ends a stopped
+	// process without a SIGCONT, and a SIGCONT before it would let the helper
+	// handle a request that it received before the stop and start a worker
+	// below it after the enumeration above, an orphaned worker that nothing
+	// kills.
 	_ = v.signalHelper(sigKill)
 	select {
 	case <-v.exited:
