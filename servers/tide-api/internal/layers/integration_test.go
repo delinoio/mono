@@ -29,7 +29,7 @@ func TestAgentIntegrations(t *testing.T) {
 		}
 		return resp.Msg.GetIntegration(), nil
 	}
-	secretsUsed := []string{"env-key-claude", "cursor-key", "codex-env", "codex-hook", "devin-token", "outpost-token"}
+	secretsUsed := []string{"env-key-claude", "cursor-key", "codex-env", "codex-hook", "devin-token", "outpost-token", "codex-api-key"}
 	claude, err := create(&tidev1.CreateAgentIntegrationRequest{Vendor: tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE, Name: "claude",
 		Settings:    &tidev1.CreateAgentIntegrationRequest_ClaudeCode{ClaudeCode: &tidev1.ClaudeCodeSettings{}},
 		Credentials: &tidev1.CreateAgentIntegrationRequest_ClaudeCodeCredentials{ClaudeCodeCredentials: &tidev1.ClaudeCodeCredentials{EnvironmentKey: secretsUsed[0]}}})
@@ -45,7 +45,7 @@ func TestAgentIntegrations(t *testing.T) {
 	codex, err := create(&tidev1.CreateAgentIntegrationRequest{Vendor: tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, Name: "codex",
 		Settings: &tidev1.CreateAgentIntegrationRequest_OpenaiCodex{OpenaiCodex: &tidev1.OpenAiCodexSettings{}},
 		Credentials: &tidev1.CreateAgentIntegrationRequest_OpenaiCodexCredentials{OpenaiCodexCredentials: &tidev1.OpenAiCodexCredentials{
-			EnvironmentKey: secretsUsed[2], WebhookSecret: secretsUsed[3]}}})
+			EnvironmentKey: secretsUsed[2], WebhookSecret: secretsUsed[3], ApiKey: secretsUsed[6]}}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -58,6 +58,9 @@ func TestAgentIntegrations(t *testing.T) {
 	}
 	if codex.GetWebhookUrl() != "https://tide.test/webhooks/openai/"+codex.GetAgentIntegrationId() || claude.GetWebhookUrl() != "" {
 		t.Fatalf("webhook URL %q", codex.GetWebhookUrl())
+	}
+	if c := codex.GetCredentials(); len(c) != 3 || c[2].GetCredential() != tidev1.AgentCredential_AGENT_CREDENTIAL_API_KEY || !c[2].GetCredentialSet() {
+		t.Fatalf("Codex credentials %v", c)
 	}
 	if len(devin.GetCredentials()) != 2 || !devin.GetCredentials()[0].GetCredentialSet() || devin.GetCredentials()[0].GetCredentialSetAt() == nil ||
 		cursor.GetCursor().GetPoolName() != "pool-a" || devin.GetDevin().GetOutpostName() != "outpost-a" {
@@ -86,7 +89,7 @@ func TestAgentIntegrations(t *testing.T) {
 			t.Fatalf("credential %q in a response", s)
 		}
 	}
-	if n != 6 {
+	if n != 7 {
 		t.Fatalf("%d stored credentials", n)
 	}
 	if v, err := w.l.Integrations.Credential(ctx, w.org.ID, devin.GetAgentIntegrationId(), tidev1.AgentCredential_AGENT_CREDENTIAL_OUTPOST_TOKEN); err != nil || v != "outpost-token" {
@@ -159,7 +162,7 @@ func TestAgentIntegrations(t *testing.T) {
 	newKey, _ := secrets.GenerateKey("next")
 	ring, _ := secrets.NewKeyring(append([]secrets.Key{newKey}, keyOf(t, w)...)...)
 	changed, err := w.l.Integrations.Reencrypt(ctx, ring)
-	if err != nil || changed != 6 {
+	if err != nil || changed != 7 {
 		t.Fatalf("resealed %d, %v", changed, err)
 	}
 	var left int

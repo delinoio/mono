@@ -50,7 +50,8 @@ func Credentials(v tidev1.AgentVendor) []tidev1.AgentCredential {
 	case tidev1.AgentVendor_AGENT_VENDOR_CURSOR:
 		return []tidev1.AgentCredential{tidev1.AgentCredential_AGENT_CREDENTIAL_SERVICE_ACCOUNT_API_KEY}
 	case tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX:
-		return []tidev1.AgentCredential{tidev1.AgentCredential_AGENT_CREDENTIAL_ENVIRONMENT_KEY, tidev1.AgentCredential_AGENT_CREDENTIAL_WEBHOOK_SECRET}
+		return []tidev1.AgentCredential{tidev1.AgentCredential_AGENT_CREDENTIAL_ENVIRONMENT_KEY, tidev1.AgentCredential_AGENT_CREDENTIAL_WEBHOOK_SECRET,
+			tidev1.AgentCredential_AGENT_CREDENTIAL_API_KEY}
 	case tidev1.AgentVendor_AGENT_VENDOR_DEVIN:
 		return []tidev1.AgentCredential{tidev1.AgentCredential_AGENT_CREDENTIAL_API_TOKEN, tidev1.AgentCredential_AGENT_CREDENTIAL_OUTPOST_TOKEN}
 	}
@@ -255,10 +256,12 @@ func credentialsFrom(v any) (tidev1.AgentVendor, map[tidev1.AgentCredential]stri
 	case *tidev1.CreateAgentIntegrationRequest_OpenaiCodexCredentials:
 		put(tidev1.AgentCredential_AGENT_CREDENTIAL_ENVIRONMENT_KEY, c.OpenaiCodexCredentials.GetEnvironmentKey())
 		put(tidev1.AgentCredential_AGENT_CREDENTIAL_WEBHOOK_SECRET, c.OpenaiCodexCredentials.GetWebhookSecret())
+		put(tidev1.AgentCredential_AGENT_CREDENTIAL_API_KEY, c.OpenaiCodexCredentials.GetApiKey())
 		return tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, m, true
 	case *tidev1.UpdateAgentIntegrationRequest_OpenaiCodexCredentials:
 		put(tidev1.AgentCredential_AGENT_CREDENTIAL_ENVIRONMENT_KEY, c.OpenaiCodexCredentials.GetEnvironmentKey())
 		put(tidev1.AgentCredential_AGENT_CREDENTIAL_WEBHOOK_SECRET, c.OpenaiCodexCredentials.GetWebhookSecret())
+		put(tidev1.AgentCredential_AGENT_CREDENTIAL_API_KEY, c.OpenaiCodexCredentials.GetApiKey())
 		return tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, m, true
 	case *tidev1.CreateAgentIntegrationRequest_DevinCredentials:
 		put(tidev1.AgentCredential_AGENT_CREDENTIAL_API_TOKEN, c.DevinCredentials.GetApiToken())
