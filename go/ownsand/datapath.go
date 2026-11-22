@@ -318,6 +318,16 @@ func (d *dataPath) handleSessionError(sess *p2pSession, err error) bool {
 	return false
 }
 
+// isRoutineSessionEnd reports whether err is a session end or a retirement.
+// Neither is a transport failure: the agent ended the session (idle, expiry,
+// revocation) or the SDK retired it after an interrupted send, and the next
+// attempt opens a new session on the same transport.
+func isRoutineSessionEnd(err error) bool {
+	var ended *errSessionEnded
+	var retired *errSessionRetired
+	return errors.As(err, &ended) || errors.As(err, &retired)
+}
+
 // relayGrant is the relay grant of one operation. The SDK uses a grant only
 // for its operation and renews it only between streams, with
 // replaces_grant_id, never while a stream of the old grant is open.

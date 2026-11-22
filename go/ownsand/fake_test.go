@@ -128,6 +128,15 @@ type p2pAction struct {
 	// event of an exec, with no output: a quiet exec whose session expires
 	// after the agent accepted the continuation.
 	endAfterStarted bool
+	// onRequest, when set, runs once the agent has the exec (started for an
+	// exec request, looked up for an attach) and before it serves any
+	// frame; the request then gets no frame. A test uses it to end or retire
+	// the session before the agent served the request.
+	onRequest func()
+	// afterStarted, when set, runs after the agent sent the started event
+	// of an exec, so a test can end or retire the session after the agent
+	// served the continuation.
+	afterStarted func()
 	// raw, when set, answers the request with this frame only.
 	raw func(streamID uint64, sandboxID string) *ownsandv1.DataFrame
 }
@@ -1313,6 +1322,9 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 		}
 		switch ev.GetEvent().(type) {
 		case *ownsandv1.ExecEvent_Started:
+			if act.afterStarted != nil {
+				act.afterStarted()
+			}
 			if act.endAfterStarted {
 				_ = s.send(frame(&ownsandv1.SessionEnd{Reason: act.reason}))
 				time.Sleep(20 * time.Millisecond)
@@ -1342,6 +1354,10 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 			return
 		}
 		e := cp.agent.startExec(cp, req)
+		if act.onRequest != nil {
+			act.onRequest()
+			return
+		}
 		if err := cp.agent.serveExec(s.ctx, cp, e, 0, 0, sendExec); err != nil && !errors.Is(err, errSessionGone) && s.ctx.Err() == nil {
 			errFrame(err)
 		}
@@ -1350,6 +1366,10 @@ func (s *fakeAgentSession) serve(f *ownsandv1.DataFrame) {
 		e := cp.agent.lookup(req.GetExecId())
 		if e == nil {
 			errFrame(connect.NewError(connect.CodeNotFound, errors.New("exec not found")))
+			return
+		}
+		if act.onRequest != nil {
+			act.onRequest()
 			return
 		}
 		if err := cp.agent.serveExec(s.ctx, cp, e, req.GetStdoutOffset(), req.GetStderrOffset(), sendExec); err != nil && !errors.Is(err, errSessionGone) && s.ctx.Err() == nil {
