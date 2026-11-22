@@ -101,6 +101,22 @@ func ScriptPrelude(guest tidev1.GuestOs, extraBins ...string) string {
 	return posixHome(extraBins...)
 }
 
+// PrependPath returns a line that puts bin directories relative to $HOME
+// before every other PATH entry, including $HOME/.local/bin, on Linux and
+// macOS (nothing on Windows). Use it after ScriptPrelude for a runtime that
+// tide installs and that must win over an older one of the guest.
+func PrependPath(guest tidev1.GuestOs, bins ...string) string {
+	if IsWindows(guest) || len(bins) == 0 {
+		return ""
+	}
+	s := `export PATH="`
+	for _, b := range bins {
+		s += "$HOME/" + b + ":"
+	}
+	return s + `$PATH"
+`
+}
+
 // StepError is a guest step that failed with an exit code that the step
 // explains.
 type StepError struct {
@@ -198,6 +214,9 @@ type Program struct {
 	Args []string
 	// ExtraBins are more bin directories relative to $HOME (Linux, macOS).
 	ExtraBins []string
+	// FirstBins are bin directories relative to $HOME that come before
+	// every other PATH entry (Linux, macOS); see PrependPath.
+	FirstBins []string
 }
 
 // StartScript returns the script that reads the credential file into the
@@ -207,6 +226,7 @@ type Program struct {
 func StartScript(guest tidev1.GuestOs, p Program) string {
 	var b strings.Builder
 	b.WriteString(ScriptPrelude(guest, p.ExtraBins...))
+	b.WriteString(PrependPath(guest, p.FirstBins...))
 	cred := JoinPath(guest, p.Dir, CredentialFile)
 	log := JoinPath(guest, p.Dir, LogFile)
 	if IsWindows(guest) {

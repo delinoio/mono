@@ -107,7 +107,8 @@ func TestCodexSessionLifecycle(t *testing.T) {
 	for _, want := range []string{
 		"CODEX_API_KEY=$(cat '" + dir + "/credential')",
 		"exec 'codex' 'exec-server' '--remote' 'https://api.openai.test/v1/agents/api' '--environment-id' 'ccarenv_1' >>'" + dir + "/runner.log' 2>&1",
-		`export PATH="$HOME/.local/bin:$HOME/.local/share/tide/node-v` + codex.NodeVersion + `/bin:$PATH"`,
+		`export PATH="$HOME/.local/bin:$PATH"`,
+		`export PATH="$HOME/.local/share/tide/node-v` + codex.NodeVersion + `/bin:$PATH"`,
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("start script lacks %q:\n%s", want, script)

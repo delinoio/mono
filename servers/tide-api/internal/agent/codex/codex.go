@@ -263,6 +263,6 @@ func (v *Vendor) Start(ctx context.Context, g *work.Guest, in integration.Integr
 
 // Program returns the executor of a claim.
 func Program(dir string, c *agent.Claim) agent.Program {
-	return agent.Program{Dir: dir, CredentialEnv: "CODEX_API_KEY", ExtraBins: []string{nodeBin},
+	return agent.Program{Dir: dir, CredentialEnv: "CODEX_API_KEY", FirstBins: []string{nodeBin},
 		Args: []string{"codex", "exec-server", "--remote", c.Endpoint, "--environment-id", c.Scope}}
 }

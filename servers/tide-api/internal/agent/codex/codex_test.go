@@ -171,7 +171,7 @@ func TestInstallScript(t *testing.T) {
 	npm := `[ "$NPM_CONFIG_PREFIX" = "$HOME/.local" ] || exit 9
 [ "$3" = "@openai/codex@` + CodexVersion + `" ] || exit 8
 printf '#!/bin/sh\nexit 0\n' > "$BIN/codex"; chmod +x "$BIN/codex"`
-	for name, tc := range map[string]struct {
+	cases := map[string]struct {
 		stubs map[string]string
 		code  int
 	}{
@@ -180,7 +180,17 @@ printf '#!/bin/sh\nexit 0\n' > "$BIN/codex"; chmod +x "$BIN/codex"`
 		"npm fails":            {map[string]string{"node": "echo 22", "npm": "exit 1"}, 14},
 		"node 14, no download": {map[string]string{"node": "echo 14", "npm": npm, "curl": "exit 22"}, 12},
 		"no node, no tools":    {map[string]string{}, 10},
-	} {
+	}
+	// Node.js 14 in $HOME/.local/bin and a download that succeeds: the
+	// downloaded Node.js comes first on PATH.
+	if arch := map[string]string{"amd64": "x64", "arm64": "arm64"}[runtime.GOARCH]; runtime.GOOS == "linux" && arch != "" {
+		cases["node 14, download"] = struct {
+			stubs map[string]string
+			code  int
+		}{map[string]string{"node": "echo 14", "npm": npm, "curl": "exit 0", "sha256sum": "echo " + nodeSHA256["linux-"+arch],
+			"tar": `mkdir -p "$4/bin" && printf '#!/bin/sh\necho 24\n' > "$4/bin/node" && chmod +x "$4/bin/node"`}, 0}
+	}
+	for name, tc := range cases {
 		if code, out := run(tc.stubs); code != tc.code {
 			t.Errorf("%s: exit %d, want %d: %s", name, code, tc.code, out)
 		}

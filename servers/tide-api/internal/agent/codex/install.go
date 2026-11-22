@@ -44,8 +44,9 @@ var nodeSHA256 = map[string]string{
 }
 
 // nodeDir is the guest directory of the Node.js that tide installs,
-// relative to $HOME; its bin directory is on PATH of the install and start
-// scripts, before the guest's own PATH.
+// relative to $HOME; its bin directory is the first PATH entry of the
+// install and start scripts, before $HOME/.local/bin and the guest's own
+// PATH, so that it wins over an older Node.js of the guest.
 const nodeDir = ".local/share/tide/node-v" + NodeVersion
 
 // nodeBin is the bin directory of nodeDir.
@@ -84,7 +85,7 @@ func InstallScript(guest tidev1.GuestOs) string {
 	for _, k := range keys {
 		cases.WriteString("  " + k + ") sum=" + nodeSHA256[k] + " ;;\n")
 	}
-	return agent.ScriptPrelude(guest, nodeBin) + `export NPM_CONFIG_PREFIX="$HOME/.local"
+	return agent.ScriptPrelude(guest) + agent.PrependPath(guest, nodeBin) + `export NPM_CONFIG_PREFIX="$HOME/.local"
 if command -v codex >/dev/null 2>&1 && codex --version >/dev/null 2>&1; then exit 0; fi
 node_ok() {
   command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 || return 1
@@ -122,6 +123,8 @@ if ! node_ok; then
   dest="$HOME/` + nodeDir + `"
   rm -rf "$dest.partial" && mkdir -p "$dest.partial" && tar xzf "$tmp/$file" -C "$dest.partial" --strip-components 1 || { rm -rf "$tmp"; exit 12; }
   rm -rf "$tmp" "$dest" && mv "$dest.partial" "$dest" || exit 12
+  # The shell remembers where it found node before the download.
+  hash -r 2>/dev/null || true
   node_ok || exit 12
 fi
 npm install -g "@openai/codex@` + CodexVersion + `" >/dev/null 2>&1 || exit 14
