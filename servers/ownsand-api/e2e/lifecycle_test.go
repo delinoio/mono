@@ -289,81 +289,88 @@ func testAttachExec(ctx context.Context, t *testing.T, sb *ownsand.Sandbox) {
 func TestLifecycleCLI(t *testing.T) {
 	s := newStack(t)
 	for _, tr := range transports {
-		t.Run(tr.String(), func(t *testing.T) {
-			r := s.cli(tr, nil, "sandbox", "create", "--image", "linux", "--idle-ttl", "30m", "--max-ttl", "2h",
-				"--vcpu", "1", "--memory", "512", "--disk", "1", "--network", "none", "--format", "json")
-			if r.code != 0 {
-				t.Fatalf("sandbox create exit %d: %s", r.code, r.stderr)
-			}
-			var created struct {
-				SandboxID string `json:"sandbox_id"`
-				State     string `json:"state"`
-			}
-			if err := json.Unmarshal(r.stdout, &created); err != nil {
-				t.Fatalf("sandbox create output %q: %v", r.stdout, err)
-			}
-			if created.State != "SANDBOX_STATE_RUNNING" {
-				t.Fatalf("created state %q", created.State)
-			}
-			id := created.SandboxID
-			r = s.cli(tr, nil, "sandbox", "exec", id, "--", "/bin/pwd")
-			root := strings.TrimSuffix(strings.TrimSpace(string(r.stdout)), "/")
-			if r.code != 0 || !strings.HasPrefix(root, "/") {
-				t.Fatalf("pwd = (%d, %q, %q)", r.code, r.stdout, r.stderr)
-			}
+		t.Run(tr.String(), func(t *testing.T) { cliLifecycle(t, s, tr) })
+	}
+}
 
-			r = s.cli(tr, nil, "sandbox", "exec", id, "--", "/bin/sh", "-c", "echo hi; echo oops >&2; exit 5")
-			if r.code != 5 || string(r.stdout) != "hi\n" || !strings.Contains(r.stderr, "oops\n") {
-				t.Fatalf("sandbox exec = (%d, %q, %q)", r.code, r.stdout, r.stderr)
-			}
-			r = s.cli(tr, nil, "sandbox", "exec", "--format", "json", id, "--", "/bin/echo", "json")
-			if r.code != 0 || !bytes.Contains(r.stdout, []byte(`"exit_code"`)) || !bytes.Contains(r.stdout, []byte(`"transport":"`+tr.String()+`"`)) {
-				t.Fatalf("sandbox exec json = (%d, %q, %q)", r.code, r.stdout, r.stderr)
-			}
+// cliLifecycle drives the sandbox lifecycle through the CLI binary on one
+// forced transport.
+func cliLifecycle(t *testing.T, s *stack, tr ownsand.Transport) {
+	r := s.cli(tr, nil, "sandbox", "create", "--image", "linux", "--idle-ttl", "30m", "--max-ttl", "2h",
+		"--vcpu", "1", "--memory", "512", "--disk", "1", "--network", "none", "--format", "json")
+	if r.code != 0 {
+		t.Fatalf("sandbox create exit %d: %s", r.code, r.stderr)
+	}
+	var created struct {
+		SandboxID string `json:"sandbox_id"`
+		State     string `json:"state"`
+	}
+	if err := json.Unmarshal(r.stdout, &created); err != nil {
+		t.Fatalf("sandbox create output %q: %v", r.stdout, err)
+	}
+	if created.State != "SANDBOX_STATE_RUNNING" {
+		t.Fatalf("created state %q", created.State)
+	}
+	id := created.SandboxID
+	r = s.cli(tr, nil, "sandbox", "exec", id, "--", "/bin/pwd")
+	// Check the absolute path before the trailing slash is trimmed: the
+	// working directory of a VM sandbox is "/", which trims to "".
+	root := strings.TrimSpace(string(r.stdout))
+	if r.code != 0 || !strings.HasPrefix(root, "/") {
+		t.Fatalf("pwd = (%d, %q, %q)", r.code, r.stdout, r.stderr)
+	}
+	root = strings.TrimSuffix(root, "/")
 
-			data := randomBytes(t, 2<<20+777)
-			local := filepath.Join(t.TempDir(), "local.bin")
-			if err := os.WriteFile(local, data, 0o600); err != nil {
-				t.Fatal(err)
-			}
-			if r = s.cli(tr, nil, "file", "write", id, root+"/cli.bin", "--from", local); r.code != 0 {
-				t.Fatalf("file write = (%d, %q)", r.code, r.stderr)
-			}
-			r = s.cli(tr, nil, "file", "read", id, root+"/cli.bin")
-			if r.code != 0 || !bytes.Equal(r.stdout, data) {
-				t.Fatalf("file read = (%d, %d bytes, %q)", r.code, len(r.stdout), r.stderr)
-			}
-			if r = s.cli(tr, strings.NewReader("stdin-data"), "file", "write", id, root+"/stdin.txt"); r.code != 0 {
-				t.Fatalf("file write stdin = (%d, %q)", r.code, r.stderr)
-			}
-			if r = s.cli(tr, nil, "file", "read", id, root+"/stdin.txt"); r.code != 0 || string(r.stdout) != "stdin-data" {
-				t.Fatalf("file read stdin = (%d, %q, %q)", r.code, r.stdout, r.stderr)
-			}
+	r = s.cli(tr, nil, "sandbox", "exec", id, "--", "/bin/sh", "-c", "echo hi; echo oops >&2; exit 5")
+	if r.code != 5 || string(r.stdout) != "hi\n" || !strings.Contains(r.stderr, "oops\n") {
+		t.Fatalf("sandbox exec = (%d, %q, %q)", r.code, r.stdout, r.stderr)
+	}
+	r = s.cli(tr, nil, "sandbox", "exec", "--format", "json", id, "--", "/bin/echo", "json")
+	if r.code != 0 || !bytes.Contains(r.stdout, []byte(`"exit_code"`)) || !bytes.Contains(r.stdout, []byte(`"transport":"`+tr.String()+`"`)) {
+		t.Fatalf("sandbox exec json = (%d, %q, %q)", r.code, r.stdout, r.stderr)
+	}
 
-			for _, cmd := range []string{"pause", "resume"} {
-				if r = s.cli(tr, nil, "sandbox", cmd, id, "--format", "json"); r.code != 0 {
-					t.Fatalf("sandbox %s = (%d, %q)", cmd, r.code, r.stderr)
-				}
-			}
-			r = s.cli(tr, nil, "snapshot", "create", id, "--format", "json")
-			if r.code != 0 {
-				t.Fatalf("snapshot create = (%d, %q)", r.code, r.stderr)
-			}
-			var snap struct {
-				SnapshotID string `json:"snapshot_id"`
-			}
-			if err := json.Unmarshal(r.stdout, &snap); err != nil || snap.SnapshotID == "" {
-				t.Fatalf("snapshot create output %q: %v", r.stdout, err)
-			}
-			ctx := s.ctx(2 * time.Minute)
-			waitSnapshotReady(ctx, t, s.apiKeyClient(tr), snap.SnapshotID)
-			if r = s.cli(tr, nil, "snapshot", "delete", snap.SnapshotID); r.code != 0 {
-				t.Fatalf("snapshot delete = (%d, %q)", r.code, r.stderr)
-			}
-			s.waitLocalSnapshotGone(t, s.agents[0], snap.SnapshotID)
-			if r = s.cli(tr, nil, "sandbox", "delete", id); r.code != 0 {
-				t.Fatalf("sandbox delete = (%d, %q)", r.code, r.stderr)
-			}
-		})
+	data := randomBytes(t, 2<<20+777)
+	local := filepath.Join(t.TempDir(), "local.bin")
+	if err := os.WriteFile(local, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if r = s.cli(tr, nil, "file", "write", id, root+"/cli.bin", "--from", local); r.code != 0 {
+		t.Fatalf("file write = (%d, %q)", r.code, r.stderr)
+	}
+	r = s.cli(tr, nil, "file", "read", id, root+"/cli.bin")
+	if r.code != 0 || !bytes.Equal(r.stdout, data) {
+		t.Fatalf("file read = (%d, %d bytes, %q)", r.code, len(r.stdout), r.stderr)
+	}
+	if r = s.cli(tr, strings.NewReader("stdin-data"), "file", "write", id, root+"/stdin.txt"); r.code != 0 {
+		t.Fatalf("file write stdin = (%d, %q)", r.code, r.stderr)
+	}
+	if r = s.cli(tr, nil, "file", "read", id, root+"/stdin.txt"); r.code != 0 || string(r.stdout) != "stdin-data" {
+		t.Fatalf("file read stdin = (%d, %q, %q)", r.code, r.stdout, r.stderr)
+	}
+
+	for _, cmd := range []string{"pause", "resume"} {
+		if r = s.cli(tr, nil, "sandbox", cmd, id, "--format", "json"); r.code != 0 {
+			t.Fatalf("sandbox %s = (%d, %q)", cmd, r.code, r.stderr)
+		}
+	}
+	r = s.cli(tr, nil, "snapshot", "create", id, "--format", "json")
+	if r.code != 0 {
+		t.Fatalf("snapshot create = (%d, %q)", r.code, r.stderr)
+	}
+	var snap struct {
+		SnapshotID string `json:"snapshot_id"`
+	}
+	if err := json.Unmarshal(r.stdout, &snap); err != nil || snap.SnapshotID == "" {
+		t.Fatalf("snapshot create output %q: %v", r.stdout, err)
+	}
+	ctx := s.ctx(2 * time.Minute)
+	waitSnapshotReady(ctx, t, s.apiKeyClient(tr), snap.SnapshotID)
+	if r = s.cli(tr, nil, "snapshot", "delete", snap.SnapshotID); r.code != 0 {
+		t.Fatalf("snapshot delete = (%d, %q)", r.code, r.stderr)
+	}
+	s.waitLocalSnapshotGone(t, s.agents[0], snap.SnapshotID)
+	if r = s.cli(tr, nil, "sandbox", "delete", id); r.code != 0 {
+		t.Fatalf("sandbox delete = (%d, %q)", r.code, r.stderr)
 	}
 }
