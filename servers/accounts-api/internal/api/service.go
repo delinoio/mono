@@ -79,10 +79,23 @@ func New(deps Deps) *Service {
 	}
 }
 
+// maxRequestBytes limits the decoded size of one Connect request message on
+// every procedure. connect-go reads and decompresses a request message before
+// it runs the interceptors, so without a limit an unauthenticated caller could
+// make the server buffer an arbitrarily large body or a compression bomb. The
+// largest legitimate request is a ReportUsage with 500 reports, about 163 KiB
+// with a 128-byte organization ID and large int64 values, so 1 MiB leaves a
+// wide margin and matches the limit of the Paddle webhook body. A larger
+// message fails with resource_exhausted.
+const maxRequestBytes = 1 << 20
+
 // Mounts returns the Connect handlers of every served service with the
 // interceptors applied in order. A new service adds its handler here.
 func (s *Service) Mounts(interceptors ...connect.Interceptor) []server.Mount {
-	opts := []connect.HandlerOption{connect.WithInterceptors(interceptors...)}
+	opts := []connect.HandlerOption{
+		connect.WithInterceptors(interceptors...),
+		connect.WithReadMaxBytes(maxRequestBytes),
+	}
 	var mounts []server.Mount
 	add := func(path string, handler http.Handler) {
 		mounts = append(mounts, server.Mount{Path: path, Handler: handler})
