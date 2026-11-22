@@ -4,7 +4,7 @@
 
 This contract owns the tide SDKs of [`tide`](project-tide.md):
 
-- `packages/tide-sdk/` (`planned`), component `tide-sdk-ts`: TypeScript SDK.
+- `packages/tide-sdk/` (workspace package `tide-sdk`), component `tide-sdk-ts`: TypeScript SDK.
 - `go/tide/`, component `tide-sdk-go`: Go SDK in the root Go module, import path `github.com/delinoio/mono/go/tide`, and its test fake `go/tide/tidetest`. It is under `go/` because external users import it (see the [workflow contract](repository-workflow-contract.md#public-go-packages)).
 
 The SDKs give programs and the [CLI](cmds-tide-cli-foundation.md) typed access to the public services of the [protos contract](protos-tide-api-contract.md).
@@ -30,6 +30,16 @@ The SDKs give programs and the [CLI](cmds-tide-cli-foundation.md) typed access t
   - Both SDKs: an exec helper that generates the `exec_id`, continues with `AttachDevSessionExec` after each stream end and reports lost output.
   - Go SDK only: a dev session wait helper (repeated `GetDevSession` until the session is `RUNNING`, ends, or the caller's deadline passes), and the [sync](servers-tide-api-foundation.md#dev-session-sync) and [download](servers-tide-api-foundation.md#dev-session-download) helpers that the CLI and the MCP server share. The Go SDK owns their file selection, manifest, lock, archive, limit and path-safety rules, and the exact guest commands per guest OS, which it records with the implementation.
 - Errors keep the Connect error code.
+
+### TypeScript SDK surface
+
+- `TideClient({ origin?, token, fetch?, clock? })`. `token` is a string or a function that returns one (a Logto access token or a personal API key); the client calls the function before every call and stores no token. The transport is Connect-Web with the binary Connect protocol. An interceptor and a guarded fetch refuse every URL outside the configured origin, and the token is redacted from error messages.
+- Service clients with the generated types: `organizations`, `members`, `ownSandLink`, `gitHub`, `agentIntegrations`, `runnerProfiles`, `work`, `apiKeys`, `devSessions` and `audit`. `createTideServices(transport)` creates the same clients on another transport, for example the console's.
+- Pagination: `client.iterate.<list>` (`organizations`, `invitations`, `members`, `gitHubInstallations`, `agentIntegrations`, `runnerProfiles`, `requests`, `runners`, `apiKeys`, `devSessionProfiles`, `devSessions` and `auditEvents`), one async iterator for each list RPC with a page token, built on `paginate`. An iterator ends with a `TideError` when the server repeats a page token.
+- `watchQueue(work, { organizationId, signal })` (also `client.watchQueue`) yields `Request`, `Runner`, `SnapshotComplete` and `Gap` events and skips keepalives. After a clean end or a retryable failure it waits 1 second, doubled for each stream that ended before its snapshot was complete, at most 30 seconds, then yields `Gap` and opens a new stream. A complete snapshot resets the delay. Retryable failures are transport interruptions without a server status and the codes `unavailable`, `resource_exhausted`, `aborted` and `deadline_exceeded`; every other status ends the iterator with that `ConnectError`. The signal ends it without an error.
+- `execDevSession(devSessions, input)` and `runDevSessionExec` (also on the client) generate a UUID v7 `exec_id` (Web Crypto), call `ExecDevSession` exactly once and continue with `AttachDevSessionExec` from the next stdout and stderr offsets after each stream end: at once after a clean end, with the same backoff after a retryable failure. They yield output in order without duplicates, report missing ranges (`output_truncated` or a skipped offset) as `OutputLost`, and end with `Exited`, `Failed` or `SandboxEnded`. When `ExecDevSession` failed before any event and the attach answers `not_found`, the command never started and the helper ends with the error of `ExecDevSession`.
+- Errors: server errors stay `ConnectError` values with their code; `connectCodeOf` reads the code through `cause` links. The SDK's own errors are `TideError` and `TideConfigError`.
+- Runtime sources import no `node:` module, so the package runs in Node.js 24 and in browsers.
 
 ### Go SDK surface
 
@@ -81,7 +91,7 @@ The Go SDK logs retries and reconnects at debug level through the caller's logge
 
 ## Build and Test
 
-- Package scripts `build`, `lint`, `typecheck` and `test` for the TypeScript SDK, and Go tests for the Go SDK. Record them with the implementation.
+- TypeScript SDK package scripts: `build` (`tsc -p tsconfig.build.json` into the ignored `dist/`), `lint` (`node scripts/lint.mjs`: the Apache-2.0 SPDX header, no `console` calls, no `node:` imports in runtime sources and no imports from `servers/`), `typecheck` (`tsc --noEmit`) and `test` (`rstest run`). The tests run the real Connect-Web transport against an in-memory fake server (`src/testing/fake-server.ts`, a Connect router behind a fetch function) and a recording clock.
 - Go SDK commands (from the repository root): `go test ./go/tide/...` (the sync and download tests need `git`, `sh` and `tar` on the local machine and skip on Windows hosts), `go vet ./go/tide/...`, and `GOOS=windows go vet ./go/tide/...` and `GOOS=darwin go vet ./go/tide/...` for the other targets. The Go SDK is not a workspace package and has no package scripts; CI runs it in the root Go jobs.
 - Tests: pagination, `WatchQueue` reconnects, exec attach after stream rotation and error mapping against a fake server. Go SDK sync and download tests: file selection with tracked, untracked and ignored files, incremental upload and deletion with the manifest, the size limits, case collisions and invalid Windows names, the lock, symbolic links, path traversal on extraction, and a restart after a stopped sync.
 
