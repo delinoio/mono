@@ -8,19 +8,9 @@
 
 - Follow root `AGENTS.md` and command-specific docs in `docs/project-*.md` plus relevant `docs/cmds-*.md` files.
 
-- Keep repository and domain rules in the appropriate `AGENTS.md` files.
-
-- Write all source and comments in English.
-
-- Prefer enums or typed constants over free-form string values.
-
 - Keep command boundaries explicit and documented.
 
 - Keep configuration schemas documented and synchronized with implementation.
-
-- Add enough structured logging for step-level debugging and failure diagnosis.
-
-- Do not log secret values for sensitive workflows.
 
 - Keep integration boundaries with `apps/`, `servers/`, and other domains explicit in docs.
 

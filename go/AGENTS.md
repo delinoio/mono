@@ -9,7 +9,6 @@
 - Follow root `AGENTS.md`, the [public Go package rules](../docs/repository-workflow-contract.md#public-go-packages) and the owning project/domain contracts.
 - Put only Go packages that external users import in this directory. Keep repository-only Go code in its owning project directory, and keep generated protobuf Go bindings under `protos/`.
 - Treat import paths and exported identifiers as a public interface. Mark a change that moves, renames or removes them as breaking.
-- Write all source and comments in English.
 
 ## Owning contracts
 

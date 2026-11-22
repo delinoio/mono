@@ -27,7 +27,7 @@
 - Keep `docs/` up-to-date.
 - For documentation authoring and editing tasks, do not arbitrarily omit, delete, or simplify requested or source-backed content; if content, scope, or intent is ambiguous, ask the user before deciding what to remove, merge, or reinterpret; update or create the relevant `AGENTS.md` in the same change only when development procedures, directory ownership or repository/domain development rules change.
 - Public documentation surfaces must not document repository-internal implementation details. Keep internal source-of-truth contracts, architecture notes, repo-local paths, and operational internals in `docs/`; curate public docs in their owning application around user-facing behavior, supported workflows, stable public interfaces, and maintainer-facing paths only when those paths are explicitly part of the public contract.
-- Write all code and comments in English.
+- Write all code, schemas and comments in English.
 - Write Linear issue titles and explanatory body text in English. Preserve exact code, commands, paths, diagnostic messages, search queries, direct quotations and localized UI strings when their original text is required; explain non-English evidence in English. Translate existing non-English issue prose without changing requirements, evidence, references, attachments or issue state.
 - When introducing a workaround, leave sufficient comments that explain why it exists, its scope, and the conditions for removing it.
 - Prefer enum types over strings whenever possible.
@@ -216,6 +216,7 @@
 
 - Debug by logging. Write sufficient logs to support debugging, incident analysis, and operational troubleshooting.
 - Prefer structured logging over ad-hoc plain text logs for business and system events.
+- Never log secret values, credentials or sensitive payloads.
 - Go code should use `log/slog` (or a compatible structured logger built on it).
 - Rust code should use `tracing` (or a compatible structured logging facade).
 - Instrument metrics, logs and traces with the OpenTelemetry SDK. Keep `log/slog` (Go) and `tracing` (Rust) as the logging APIs and send their log records to the OpenTelemetry SDK through its log bridge. Follow `docs/repository-defaults.md#repository-wide-rules`.

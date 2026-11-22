@@ -8,12 +8,6 @@
 
 - Follow root `AGENTS.md` and each crate-specific project document.
 
-- Keep repository and domain rules in the appropriate `AGENTS.md` files.
-
-- Write all source and comments in English.
-
-- Prefer enums over free-form strings for stable internal and external contracts.
-
 - The root `Cargo.toml` defines the Rust workspace (resolver 3, shared package fields and explicit members). Add every new crate, including Tauri app crates under `apps/<app>/src-tauri/`, as an explicit workspace member in the same change that creates it. Do not add nested workspaces.
 
 - Keep crate naming aligned with project IDs when possible.
