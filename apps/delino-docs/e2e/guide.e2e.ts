@@ -11,6 +11,7 @@ type Rgba = { r: number; g: number; b: number; a: number };
 interface ColorKit {
   parse(color: string): Rgba;
   resolve(name: string): Rgba;
+  over(foreground: Rgba, background: Rgba): Rgba;
   ratio(foreground: Rgba, background: Rgba): number;
 }
 
@@ -144,6 +145,13 @@ describe("brand colors", () => {
         probe.remove();
         return color;
       };
+      // Composites a translucent foreground over an opaque background.
+      const over = (foreground: Rgba, background: Rgba): Rgba => ({
+        r: foreground.r * foreground.a + background.r * (1 - foreground.a),
+        g: foreground.g * foreground.a + background.g * (1 - foreground.a),
+        b: foreground.b * foreground.a + background.b * (1 - foreground.a),
+        a: 1,
+      });
       const luminance = ({ r, g, b }: Rgba) => {
         const [lr, lg, lb] = [r, g, b].map((value) => {
           const channel = value / 255;
@@ -160,9 +168,55 @@ describe("brand colors", () => {
           (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
         );
       };
-      const kit: ColorKit = { parse, resolve, ratio };
+      const kit: ColorKit = { parse, resolve, over, ratio };
       (window as unknown as { colorKit: ColorKit }).colorKit = kit;
       return true;
+    };
+
+  // Adds a minimal overview group, which Rspress renders on its overview
+  // pages, because neither app has such a page. It reuses the Rspress class
+  // names, so the real Rspress and theme styles apply.
+  const addOverviewGroup = () =>
+    function () {
+      const group = document.createElement("div");
+      group.style.cssText =
+        "position:fixed;top:80px;left:200px;right:200px;z-index:9999;padding:24px;background:var(--rp-c-bg)";
+      group.innerHTML =
+        '<div class="rp-overview-group"><div class="rp-overview-group__item">' +
+        '<div class="rp-overview-group__item__title">' +
+        '<a class="rp-overview-group__item__title__link" href="#">Overview group</a>' +
+        "</div></div></div>";
+      document.body.append(group);
+      return true;
+    };
+
+  // Reads the hovered overview group title: its link text color against the
+  // translucent hover background composited over the page surfaces.
+  const readOverviewHover = () =>
+    function () {
+      const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+      const link = document.querySelector(
+        ".rp-overview-group__item__title__link",
+      );
+      const title = document.querySelector(".rp-overview-group__item__title");
+      if (!link || !title) {
+        throw new Error("The overview group is missing");
+      }
+      const text = kit.parse(getComputedStyle(link).color);
+      const hover = kit.parse(getComputedStyle(title).backgroundColor);
+      const expected = kit.resolve("--rp-c-overview-group-bg-hover");
+      const key = ({ r, g, b, a }: Rgba) =>
+        [r, g, b, a].map((value) => value.toFixed(3)).join(",");
+      return {
+        // True once the title background transition reached its end value.
+        settled: link.matches(":hover") && key(hover) === key(expected),
+        textMatchesBrand: key(text) === key(kit.resolve("--rp-c-brand")),
+        ratioOverBg: kit.ratio(text, kit.over(hover, kit.resolve("--rp-c-bg"))),
+        ratioOverBgSoft: kit.ratio(
+          text,
+          kit.over(hover, kit.resolve("--rp-c-bg-soft")),
+        ),
+      };
     };
 
   // Reads the hovered 404 home link and its colors against the page background.
@@ -279,4 +333,34 @@ describe("brand colors", () => {
     expect(hovered.borderColor).toBe(hovered.brandDark);
     expect(hovered.textRatio).toBeGreaterThanOrEqual(4.5);
   });
+
+  // Rspress mixes a translucent hover background into the overview group
+  // title and paints the hovered title text with `--rp-c-brand`.
+  for (const mode of ["light", "dark"] as const) {
+    test(`keeps the hovered overview group title at 4.5:1 in ${mode} mode`, async ({
+      app,
+      browser,
+      screen,
+    }) => {
+      await app.open("/guide/introduction");
+      await browser.evaluate(installColorKit());
+      if (mode === "dark") {
+        await browser.evaluate(() => {
+          document.documentElement.classList.add("rp-dark");
+          return true;
+        });
+      }
+      await browser.evaluate(addOverviewGroup());
+
+      await screen.getByRole("link", "Overview group").hover();
+      await expect
+        .poll(async () => (await browser.evaluate(readOverviewHover())).settled)
+        .toBe(true);
+      const hovered = await browser.evaluate(readOverviewHover());
+
+      expect(hovered.textMatchesBrand).toBe(true);
+      expect(hovered.ratioOverBg).toBeGreaterThanOrEqual(4.5);
+      expect(hovered.ratioOverBgSoft).toBeGreaterThanOrEqual(4.5);
+    });
+  }
 });

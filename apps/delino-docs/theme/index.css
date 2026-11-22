@@ -38,6 +38,24 @@ html.rp-dark {
 }
 
 /*
+ * Workaround: Rspress 2.1.3 mixes 30% of --rp-c-brand-lighter into the hover
+ * background of an overview group title, and paints the hovered title text with
+ * --rp-c-brand. In light mode that leaves 3.91:1 on --rp-c-bg and 3.74:1 on
+ * --rp-c-bg-soft. Mix only 4% of --rp-c-brand instead, so the title text keeps
+ * 4.5:1 or more on both surfaces. Scope: light mode (the selector has the
+ * specificity of the dark override below, and the two never match together).
+ * Remove it once Rspress derives this hover background from a variable that
+ * keeps brand text at 4.5:1 in light mode.
+ */
+html:not(.rp-dark) {
+  --rp-c-overview-group-bg-hover: color-mix(
+    in srgb,
+    var(--rp-c-brand) 4%,
+    transparent
+  );
+}
+
+/*
  * Workaround: Rspress 2.1.3 paints the current search suggestion with
  * --rp-c-brand as background and hard-coded #fff text. The brighter dark brand
  * would drop that white text to about 2.6:1, so keep the original brand blue
