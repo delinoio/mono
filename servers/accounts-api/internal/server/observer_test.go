@@ -1222,7 +1222,7 @@ func TestHandlerResponseBytesAreNeverARejection(t *testing.T) {
 			if _, err := io.WriteString(conn, request+"\r\n"+tc.pipelined); err != nil {
 				t.Fatalf("write: %v", err)
 			}
-			response, _ := io.ReadAll(conn)
+			response := readUntilServerClose(t, conn)
 			if !bytes.Contains(response, []byte(tc.body)) {
 				t.Fatalf("response = %q, want the handler's body", response)
 			}
@@ -1293,7 +1293,7 @@ func TestObservedOptionsStarRequestThenUnsupportedExpect(t *testing.T) {
 	if _, err := io.WriteString(conn, request); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	response, _ := io.ReadAll(conn)
+	response := readUntilServerClose(t, conn)
 	text := string(response)
 	i200 := strings.Index(text, "HTTP/1.1 200 ")
 	i417 := strings.Index(text, "HTTP/1.1 417 ")
@@ -1403,7 +1403,7 @@ func TestHandlerExpectationFailedIsNotClaimedAsARejection(t *testing.T) {
 			}
 			// net/http closes the connection after a 417 with Connection: close, and
 			// after its own 417, so the read ends at EOF.
-			response, _ := io.ReadAll(conn)
+			response := readUntilServerClose(t, conn)
 			if got := bytes.Count(response, []byte("HTTP/1.1 417 Expectation Failed\r\n")); got != tc.statuses {
 				t.Errorf("417 status lines = %d, want %d: %q", got, tc.statuses, response)
 			}
@@ -1559,6 +1559,21 @@ func TestLeadingCRLFAfterAPostKeepsTheConnectionObserved(t *testing.T) {
 	}
 }
 
+// readUntilServerClose reads from conn until the server closes the connection
+// and fails the test on any other end of the stream. io.ReadAll returns a nil
+// error only for io.EOF, so a non-nil error is the connection deadline that the
+// tests set, which means that the server held the connection open, or a reset.
+// Ignoring it would let a server that never closes pass as a server that
+// closes, so the failure carries the bytes that arrived before it.
+func readUntilServerClose(t *testing.T, conn net.Conn) []byte {
+	t.Helper()
+	response, err := io.ReadAll(conn)
+	if err != nil {
+		t.Fatalf("read until the server closed the connection: %v after %q", err, response)
+	}
+	return response
+}
+
 // TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout stalls a real net/http
 // server after a POST and four leading CR and LF bytes. net/http waits for four
 // bytes of the next request under IdleTimeout, discards them and then reads the
@@ -1605,7 +1620,7 @@ func TestLeadingCRLFAfterAPostThenStallIsAHeaderReadTimeout(t *testing.T) {
 			// net/http closes the connection without a response once the timeout
 			// expires, which the client sees as the end of the stream after the
 			// response to the POST.
-			response, _ := io.ReadAll(conn)
+			response := readUntilServerClose(t, conn)
 			if got := strings.Count(string(response), "HTTP/1.1 "); got != 1 {
 				t.Fatalf("responses = %d, want only the one to the POST: %q", got, response)
 			}
@@ -1776,7 +1791,7 @@ func TestLeadingCRLFDuringTheHandlerKeepsTheRejectedRequestStart(t *testing.T) {
 	write("\n")
 	time.Sleep(400 * time.Millisecond)
 	write("GARBAGE\r\n\r\n")
-	rest, _ := io.ReadAll(conn)
+	rest := readUntilServerClose(t, conn)
 	response = append(response, rest...)
 	if !strings.Contains(string(response), "HTTP/1.1 200 ") || !strings.Contains(string(response), "HTTP/1.1 400 ") {
 		t.Fatalf("responses = %q, want a 200 and then a 400", response)
