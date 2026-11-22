@@ -7,11 +7,12 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { LogtoAuthProvider } from "./auth.tsx";
 import { Accounts } from "./App.tsx";
 import { API_RESOURCE } from "./config.ts";
-import { TEST_CONFIG, settle } from "./testing/render.tsx";
+import { TEST_CONFIG } from "./testing/render.tsx";
 
 /**
  * Runs the real Logto SDK against a seeded session whose refresh token the
@@ -27,6 +28,18 @@ function base64Url(value: object): string {
     .replaceAll("/", "_")
     .replaceAll("=", "");
 }
+
+/**
+ * Upper bound for every wait on real Logto SDK work (discovery, the rejected
+ * refresh and the redirect start). A wait resolves as soon as its condition
+ * holds; the bound only has to outlast a CPU-starved CI runner, where the
+ * default one-second `findBy*` timeout expired while the page was still
+ * loading.
+ */
+const SDK_WAIT_MS = 20_000;
+
+/** Covers the two waits above plus rendering, so a wait fails first. */
+const TEST_TIMEOUT_MS = 2 * SDK_WAIT_MS + 5_000;
 
 const realFetch = globalThis.fetch;
 let requested: string[] = [];
@@ -78,33 +91,46 @@ afterEach(() => {
 });
 
 describe("ended Logto session", () => {
-  test("a rejected refresh token offers the sign-in redirect on a billing page", async () => {
-    window.history.replaceState(null, "", "/billing");
-    render(
-      <LogtoAuthProvider settings={SETTINGS}>
-        <Accounts
-          config={TEST_CONFIG}
-          checkout={undefined}
-          queryClient={
-            new QueryClient({ defaultOptions: { queries: { retry: false } } })
-          }
-        />
-      </LogtoAuthProvider>,
-    );
-    expect(
-      await screen.findByText("Your session ended. Sign in again."),
-    ).toBeTruthy();
-    expect(requested).toContain("/oidc/token");
-    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
-    await act(async () => {
-      fireEvent.click(
-        screen.getByRole("button", { name: "Sign in with Delino" }),
+  test(
+    "a rejected refresh token offers the sign-in redirect on a billing page",
+    async () => {
+      window.history.replaceState(null, "", "/billing");
+      render(
+        <LogtoAuthProvider settings={SETTINGS}>
+          <Accounts
+            config={TEST_CONFIG}
+            checkout={undefined}
+            queryClient={
+              new QueryClient({ defaultOptions: { queries: { retry: false } } })
+            }
+          />
+        </LogtoAuthProvider>,
       );
-    });
-    await settle(100);
-    // The SDK starts the redirect by saving its sign-in session.
-    expect(
-      window.sessionStorage.getItem(`logto:${SETTINGS.appId}:signInSession`),
-    ).toBeTruthy();
-  });
+      expect(
+        await screen.findByText(
+          "Your session ended. Sign in again.",
+          {},
+          { timeout: SDK_WAIT_MS },
+        ),
+      ).toBeTruthy();
+      expect(requested).toContain("/oidc/token");
+      expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+      await act(async () => {
+        fireEvent.click(
+          screen.getByRole("button", { name: "Sign in with Delino" }),
+        );
+      });
+      // The SDK starts the redirect by saving its sign-in session.
+      await waitFor(
+        () =>
+          expect(
+            window.sessionStorage.getItem(
+              `logto:${SETTINGS.appId}:signInSession`,
+            ),
+          ).toBeTruthy(),
+        { timeout: SDK_WAIT_MS },
+      );
+    },
+    TEST_TIMEOUT_MS,
+  );
 });
