@@ -820,6 +820,15 @@ func (z vzMachine) Terminal() bool {
 func (z vzMachine) CanStop() bool { return z.m.CanStop() }
 func (z vzMachine) Stop() error   { return z.m.Stop() }
 
+// StopVMAfterFailure stops machine after the operation that owns it failed
+// with primary, waiting at most the runtime stop timeout for the terminal
+// state, and returns the error to report: primary when the VM is stopped, or
+// primary joined with the stop failure (which wraps ErrVMMayRun) when the VM
+// may still run.
+func StopVMAfterFailure(primary error, machine *vz.VirtualMachine, exited <-chan struct{}) error {
+	return stopForCleanup(primary, vzMachine{machine}, exited, stopTimeout)
+}
+
 // stopVM stops the VM of v, if it runs, and then its network stack. It
 // returns an error, and keeps the VM handle and the network stack, when the
 // framework rejects the stop or the VM does not reach a terminal state in

@@ -61,9 +61,17 @@ func buildMacOS(ctx context.Context, dir string, opts Options) (err error) {
 		return err
 	}
 	defer func() {
-		if err != nil {
-			os.RemoveAll(build)
+		if err == nil {
+			return
 		}
+		if errors.Is(err, vzrt.ErrVMMayRun) {
+			// The first-boot VM may still use the staged disk, so deleting
+			// it could corrupt a running guest; keep it. The next build
+			// removes the directory at its start.
+			logger.Error("keeping the macOS build directory because the first-boot VM may still run", "build_dir", build)
+			return
+		}
+		os.RemoveAll(build)
 	}()
 
 	ipsw := opts.IPSW
@@ -262,8 +270,10 @@ func installMacOS(ctx context.Context, m vzrt.MacOSMachine, ipsw string, logger 
 
 // firstBootMacOS boots the provisioned guest until its guest helper answers,
 // provisions it through the helper, shuts it down and returns the helper
-// version.
-func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logger) (string, error) {
+// version. When the first boot fails, it stops the VM within a bounded time
+// and reports the stop failure together with the original error; the error
+// wraps vzrt.ErrVMMayRun when the VM may still run.
+func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logger) (version string, err error) {
 	// The guest creates the network service of its interface during this
 	// boot; the interface has the MAC address of every macOS sandbox, so the
 	// sandboxes find the service. The link carries no traffic.
@@ -288,9 +298,8 @@ func firstBootMacOS(ctx context.Context, m vzrt.MacOSMachine, logger *slog.Logge
 	}
 	stopped := false
 	defer func() {
-		if !stopped && machine.CanStop() {
-			_ = machine.Stop()
-			<-exited
+		if !stopped && err != nil {
+			err = vzrt.StopVMAfterFailure(err, machine, exited)
 		}
 	}()
 	dial := func(ctx context.Context) (net.Conn, error) {

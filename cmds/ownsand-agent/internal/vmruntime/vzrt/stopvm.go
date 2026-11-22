@@ -15,6 +15,11 @@ import (
 // errStopTimeout reports that a VM did not reach a terminal state in time.
 var errStopTimeout = errors.New("vzrt: the VM did not reach a terminal state in time")
 
+// ErrVMMayRun marks a failure cleanup that could not confirm that the VM
+// reached a terminal state. The VM may still use its files, so the caller must
+// keep them (for example the staged disk of an image build).
+var ErrVMMayRun = errors.New("vzrt: the VM may still run")
+
 // stopPollInterval is how often stopMachine re-reads the machine state while
 // it waits, so a missing state-change notification cannot hide a stopped VM.
 const stopPollInterval = 10 * time.Millisecond
@@ -68,6 +73,20 @@ func stopMachine(m stoppableMachine, exited <-chan struct{}, timeout time.Durati
 			return errStopTimeout
 		}
 	}
+}
+
+// stopForCleanup stops m after the operation that owns it failed with primary
+// and returns the error that the operation reports. It returns primary when m
+// is in a terminal state afterwards. Otherwise it joins primary with the stop
+// error, which wraps ErrVMMayRun, so the caller sees both the original cause
+// and the failed cleanup, and keeps the files that the VM may still use. It
+// waits at most timeout for the terminal state and never waits for a
+// notification without a deadline.
+func stopForCleanup(primary error, m stoppableMachine, exited <-chan struct{}, timeout time.Duration) error {
+	if err := stopMachine(m, exited, timeout); err != nil {
+		return errors.Join(primary, fmt.Errorf("%w: %w", ErrVMMayRun, err))
+	}
+	return primary
 }
 
 // releaseAfterStop ends the tracked VM v of id. It calls stop first and

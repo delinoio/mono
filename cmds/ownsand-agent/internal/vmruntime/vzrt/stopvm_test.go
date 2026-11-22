@@ -193,3 +193,58 @@ func TestReleaseAfterStopReturnsReleaseError(t *testing.T) {
 		t.Fatal("handle of a stopped VM is still tracked")
 	}
 }
+
+func TestStopForCleanupTerminalKeepsThePrimaryError(t *testing.T) {
+	primary := errors.New("first boot failed")
+	m := &fakeMachine{terminal: true, canStop: true}
+	err := stopForCleanup(primary, m, nil, testStopTimeout)
+	if err != primary {
+		t.Fatalf("error %v, want exactly the primary error", err)
+	}
+	if m.stops != 0 {
+		t.Fatalf("Stop called %d times for a terminal machine", m.stops)
+	}
+}
+
+func TestStopForCleanupStopReachesTerminal(t *testing.T) {
+	primary := errors.New("first boot failed")
+	m := &fakeMachine{canStop: true, stopEnds: true}
+	if err := stopForCleanup(primary, m, make(chan struct{}), testStopTimeout); err != primary {
+		t.Fatalf("error %v, want exactly the primary error", err)
+	}
+	if m.stops != 1 {
+		t.Fatalf("Stop called %d times, want 1", m.stops)
+	}
+}
+
+func TestStopForCleanupRejectedStopReportsBothWithoutWaiting(t *testing.T) {
+	primary := errors.New("first boot failed")
+	rejected := errors.New("framework rejected the stop")
+	m := &fakeMachine{canStop: true, stopErr: rejected}
+	// A nil-free but never closed channel: the cleanup must not wait for it.
+	start := time.Now()
+	err := stopForCleanup(primary, m, make(chan struct{}), time.Minute)
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("cleanup waited %v after a rejected stop", elapsed)
+	}
+	for _, want := range []error{primary, rejected, ErrVMMayRun} {
+		if !errors.Is(err, want) {
+			t.Fatalf("error %v does not wrap %v", err, want)
+		}
+	}
+}
+
+func TestStopForCleanupAcceptedStopWithoutTerminalTimesOut(t *testing.T) {
+	primary := errors.New("first boot failed")
+	m := &fakeMachine{canStop: true}
+	start := time.Now()
+	err := stopForCleanup(primary, m, make(chan struct{}), testStopTimeout)
+	if elapsed := time.Since(start); elapsed < testStopTimeout || elapsed > 5*time.Second {
+		t.Fatalf("cleanup waited %v, want about %v", elapsed, testStopTimeout)
+	}
+	for _, want := range []error{primary, errStopTimeout, ErrVMMayRun} {
+		if !errors.Is(err, want) {
+			t.Fatalf("error %v does not wrap %v", err, want)
+		}
+	}
+}
