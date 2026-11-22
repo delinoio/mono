@@ -46,7 +46,7 @@ func TestMain(m *testing.M) {
 // logger, for tests that start fake firecracker processes.
 func bareRuntime(opts Options) *Runtime {
 	opts.Logger = quiet()
-	r, err := newRuntime(opts, func() {})
+	r, err := newRuntime(opts, func() error { return nil })
 	if err != nil {
 		panic(err)
 	}
@@ -202,7 +202,7 @@ func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	logs := &bytes.Buffer{}
 	vms := t.TempDir()
-	r, err := newRuntime(Options{Binary: "firecracker", VMsDir: vms, Logger: slog.New(slog.NewJSONHandler(logs, nil))}, func() {})
+	r, err := newRuntime(Options{Binary: "firecracker", VMsDir: vms, Logger: slog.New(slog.NewJSONHandler(logs, nil))}, func() error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func TestDeleteAbsentVMIsIdempotent(t *testing.T) {
 		}
 	}
 	// The same with an empty process table and no VMs directory at all.
-	r, err := newRuntime(Options{Binary: "firecracker", Logger: quiet()}, func() {})
+	r, err := newRuntime(Options{Binary: "firecracker", Logger: quiet()}, func() error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +671,7 @@ func TestRealProcessOrphanCleanup(t *testing.T) {
 	}
 	bin := helperBinary(t)
 	vms := t.TempDir()
-	r, err := newRuntime(Options{Binary: bin, VMsDir: vms, Logger: quiet()}, func() {})
+	r, err := newRuntime(Options{Binary: bin, VMsDir: vms, Logger: quiet()}, func() error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -717,7 +717,7 @@ func TestRealProcessOrphanCleanup(t *testing.T) {
 func TestStartProcessRecordsLaunchAndStopKillsChild(t *testing.T) {
 	bin := helperBinary(t)
 	vms := t.TempDir()
-	r, err := newRuntime(Options{Binary: bin, VMsDir: vms, Logger: quiet()}, func() {})
+	r, err := newRuntime(Options{Binary: bin, VMsDir: vms, Logger: quiet()}, func() error { return nil })
 	if err != nil {
 		t.Fatal(err)
 	}

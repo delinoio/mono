@@ -62,6 +62,17 @@ type MacOSHardwareModelChecker interface {
 	MacOSHardwareModelSupported(model []byte) bool
 }
 
+// HostCleaner is implemented by runtimes that create host resources outside
+// the state directory: the Linux Firecracker runtime creates a tap device
+// per OUTBOUND sandbox and the nftables table of the network policy. The
+// device removal calls CleanupHost after it deleted every sandbox, because a
+// removed agent exits for good and never runs the clean-up of the next agent
+// start. CleanupHost returns the failures of the resources that it could not
+// delete; a resource that is already absent is not a failure.
+type HostCleaner interface {
+	CleanupHost() error
+}
+
 // Capabilities are the runtime facts of the capability report.
 type Capabilities struct {
 	GuestOSes            []ownsandv1.GuestOs

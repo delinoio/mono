@@ -113,6 +113,16 @@ func newFakeManager(t *testing.T) (*Manager, *fakeHost) {
 		defer h.mu.Unlock()
 		return h.taps[tap]
 	}
+	m.listTaps = func() ([]string, error) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		taps := make([]string, 0, len(h.taps))
+		for tap := range h.taps {
+			taps = append(taps, tap)
+		}
+		slices.Sort(taps)
+		return taps, nil
+	}
 	return m, h
 }
 
@@ -719,6 +729,56 @@ func (f *fakeCleanupHost) ops() hostCleanupOps {
 }
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
+
+// Manager.CleanupHost refuses while a sandbox is attached, deletes the tap
+// devices and the table through the manager's host operations once no
+// sandbox is attached (the device removal), and forgets the applied
+// ruleset, so that the next Attach applies the table again.
+func TestManagerCleanupHost(t *testing.T) {
+	m, h := newFakeManager(t)
+	applied, _ := useRealRefresh(m)
+	mustAttach(t, m, "sandbox-a")
+	if n := len(applied()); n != 1 {
+		t.Fatalf("rulesets applied by the attach = %d, want 1", n)
+	}
+	h.mu.Lock()
+	before := len(h.cmds)
+	h.mu.Unlock()
+	if err := m.CleanupHost(); !errors.Is(err, errAttached) {
+		t.Fatalf("CleanupHost with an attached sandbox = %v, want errAttached", err)
+	}
+	h.mu.Lock()
+	if len(h.cmds) != before {
+		t.Fatalf("CleanupHost with an attached sandbox ran %q", h.cmds[before:])
+	}
+	// A stale tap of an earlier process that the manager does not track.
+	h.taps["osb-00000000009"] = true
+	h.mu.Unlock()
+	m.Detach("sandbox-a")
+	h.mu.Lock()
+	before = len(h.cmds)
+	h.mu.Unlock()
+	if err := m.CleanupHost(); err != nil {
+		t.Fatalf("CleanupHost: %v", err)
+	}
+	h.mu.Lock()
+	got := append([]string(nil), h.cmds[before:]...)
+	left := len(h.taps)
+	h.mu.Unlock()
+	want := []string{"ip link del osb-00000000009", "nft delete table inet ownsand"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("CleanupHost commands %q, want %q", got, want)
+	}
+	if left != 0 {
+		t.Fatalf("%d tap devices left after CleanupHost", left)
+	}
+	// The table is gone, so the next attach applies the same ruleset again.
+	n := len(applied())
+	mustAttach(t, m, "sandbox-b")
+	if got := len(applied()); got != n+1 {
+		t.Fatalf("rulesets applied by the attach after CleanupHost = %d, want 1", got-n)
+	}
+}
 
 // Every tap and the table are deleted, and the clean-up reports no error.
 func TestCleanupHostDeletesEverything(t *testing.T) {

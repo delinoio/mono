@@ -26,7 +26,6 @@ import (
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestclient"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/guestsync"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/launcher"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
@@ -55,6 +54,9 @@ type Runtime struct {
 	// closes when it returned. Both are nil without a network manager.
 	stopRefresh context.CancelFunc
 	refreshDone chan struct{}
+	// hostCleanup deletes the tap devices and the nftables table of the
+	// network policy (see CleanupHost); tests pass a fake.
+	hostCleanup func() error
 	// hasNetAdmin and lookPath are seams so that tests can stub the host
 	// capability and the executable lookup; New sets the real ones.
 	hasNetAdmin func() bool
@@ -67,25 +69,24 @@ var _ vmruntime.Runtime = (*Runtime)(nil)
 // table of an earlier agent process, whose VMs ended with it, and runs the
 // network policy refresh loop until Close.
 func New(opts Options) (*Runtime, error) {
-	if opts.Logger == nil {
-		opts.Logger = slog.Default()
-	}
-	logger := opts.Logger
-	return newRuntime(opts, func() {
-		if hasNetAdmin() {
-			// Best effort: CleanupHost logs each failed resource, and the
-			// agent start does not depend on the result.
-			_ = netpolicy.CleanupHost(logger)
+	network := opts.Network
+	return newRuntime(opts, func() error {
+		// Without CAP_NET_ADMIN this process cannot change the host
+		// network, so the clean-up is skipped.
+		if network == nil || !hasNetAdmin() {
+			return nil
 		}
+		return network.CleanupHost()
 	})
 }
 
-// newRuntime builds the runtime with an injectable startup cleanup. With a
-// network manager it calls startupCleanup once, before the refresh loop
-// starts; without a manager it calls neither. New passes the privileged
-// host clean-up, so that tests can pass a fake and never reach the live
-// host network, whatever the capabilities of the test process are.
-func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
+// newRuntime builds the runtime with an injectable host network clean-up.
+// With a network manager it calls hostCleanup once, before the refresh loop
+// starts, and again from CleanupHost; without a manager it calls neither.
+// New passes the privileged host clean-up, so that tests can pass a fake and
+// never reach the live host network, whatever the capabilities of the test
+// process are.
+func newRuntime(opts Options, hostCleanup func() error) (*Runtime, error) {
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
 	}
@@ -96,10 +97,13 @@ func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
 		opts.Binary = p
 	}
 	if opts.Network != nil {
-		startupCleanup()
+		// Best effort: the clean-up logs each failed resource, and the
+		// agent start does not depend on the result.
+		_ = hostCleanup()
 	}
 	r := &Runtime{
 		opts: opts, logger: opts.Logger, vms: map[string]*vm{},
+		hostCleanup: hostCleanup,
 		hasNetAdmin: hasNetAdmin, lookPath: exec.LookPath,
 		host:        newLinuxProcs(),
 		signalGroup: func(pid int) error { return syscall.Kill(-pid, syscall.SIGKILL) },
@@ -114,6 +118,20 @@ func newRuntime(opts Options, startupCleanup func()) (*Runtime, error) {
 		}()
 	}
 	return r, nil
+}
+
+var _ vmruntime.HostCleaner = (*Runtime)(nil)
+
+// CleanupHost deletes the sandbox tap devices and the nftables table of the
+// network policy. The device removal calls it after it deleted every
+// sandbox: a removed agent exits for good, so the clean-up of the next agent
+// start never runs. Without a network manager it does nothing. It returns
+// the failures of the resources that it could not delete.
+func (r *Runtime) CleanupHost() error {
+	if r.opts.Network == nil || r.hostCleanup == nil {
+		return nil
+	}
+	return r.hostCleanup()
 }
 
 // Kind returns RuntimeKindFirecracker.
