@@ -387,3 +387,91 @@ func TestOrganizationDefaultKeepsCallerRequestUnchanged(t *testing.T) {
 		t.Fatalf("explicit organization: %v %v", res, err)
 	}
 }
+
+// upperUUID returns id with every hex letter in uppercase.
+func upperUUID(id string) string { return strings.ToUpper(id) }
+
+// mixedUUID returns id with the hex letters at odd positions in uppercase.
+func mixedUUID(id string) string {
+	b := []byte(id)
+	for i, c := range b {
+		if i%2 == 1 && c >= 'a' && c <= 'f' {
+			b[i] = c - 'a' + 'A'
+		}
+	}
+	return string(b)
+}
+
+func TestSandboxHandleStoresCanonicalLowercaseID(t *testing.T) {
+	cp := newFakeCP(t)
+	c := cp.client(t, TransportRelay)
+	for name, spelling := range map[string]string{
+		"lowercase": cp.sandboxID,
+		"uppercase": upperUUID(cp.sandboxID),
+		"mixed":     mixedUUID(cp.sandboxID),
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, err := c.Sandbox("", spelling)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if s.ID() != cp.sandboxID || s.Info().GetSandboxId() != cp.sandboxID {
+				t.Fatalf("handle ID %q, info ID %q, want %q", s.ID(), s.Info().GetSandboxId(), cp.sandboxID)
+			}
+		})
+	}
+}
+
+func TestSandboxHandleKeepsInvalidID(t *testing.T) {
+	cp := newFakeCP(t)
+	c := cp.client(t, TransportRelay)
+	for _, bad := range []string{"x", "", upperUUID(cp.sandboxID) + "0", "0190A5B2-0000-4000-8000-000000000000"} {
+		s, err := c.Sandbox("", bad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.ID() != bad {
+			t.Fatalf("invalid ID %q stored as %q", bad, s.ID())
+		}
+		_, err = s.Exec(context.Background(), ExecParams{Command: []string{"run"}})
+		if !validate.IsValidationError(err) {
+			t.Fatalf("invalid ID %q: want a validation error, got %v", bad, err)
+		}
+	}
+}
+
+// TestSandboxHandleUppercaseIDUsesCanonicalSpellingOnEveryPath opens a handle
+// with a non-canonical spelling. The fake control plane and agent compare the
+// identifier as text after they canonicalize it, as the real ones do, so a
+// handle that sent the given spelling would fail the peer-to-peer frame check
+// or the relay digest check.
+func TestSandboxHandleUppercaseIDUsesCanonicalSpellingOnEveryPath(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			cp.agent.run = lineRun(3, 0)
+			c := cp.client(t, tr)
+			s, err := c.Sandbox("", mixedUUID(upperUUID(cp.sandboxID)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+			if _, err := s.Get(context.Background()); err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			res, r := runExec(t, s)
+			checkLines(t, res, r, 3)
+			cp.agent.setFile("/tmp/a", []byte("hello"))
+			got, err := s.ReadFileBytes(context.Background(), "/tmp/a")
+			if err != nil || string(got) != "hello" {
+				t.Fatalf("read: %q, %v", got, err)
+			}
+			if err := s.WriteFileBytes(context.Background(), "/tmp/b", []byte("world"), WriteOptions{Mode: 0o600}); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if b, ok := cp.agent.file("/tmp/b"); !ok || string(b) != "world" {
+				t.Fatalf("written file %q, %v", b, ok)
+			}
+		})
+	}
+}

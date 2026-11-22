@@ -107,6 +107,51 @@ func TestSendStopsOnCallerContext(t *testing.T) {
 	}
 }
 
+// TestSendRejectsEndedContextWithRoom checks that a Send whose context
+// already ended returns the context error and queues nothing, also when the
+// outbound queue has room, and leaves the channel open.
+func TestSendRejectsEndedContextWithRoom(t *testing.T) {
+	h := New()
+	conn := h.Register(context.Background(), "device", "org")
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := conn.Send(canceled, ack(1)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("send with a canceled context = %v, want context.Canceled", err)
+	}
+	expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer stop()
+	if err := conn.Send(expired, ack(2)); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("send with an expired context = %v, want context.DeadlineExceeded", err)
+	}
+	select {
+	case env := <-conn.Outbound():
+		t.Fatalf("an envelope was queued for an ended context: %v", env)
+	default:
+	}
+	select {
+	case <-conn.Done():
+		t.Fatal("a caller context error closed the channel")
+	default:
+	}
+	// The channel still accepts a Send with a live context.
+	if err := conn.Send(context.Background(), ack(3)); err != nil {
+		t.Fatalf("send after the rejected sends: %v", err)
+	}
+}
+
+// TestSendClosedChannelWinsOverEndedContext checks that the channel-closed
+// result is unchanged when the caller's context also ended.
+func TestSendClosedChannelWinsOverEndedContext(t *testing.T) {
+	h := New()
+	conn := h.Register(context.Background(), "device", "org")
+	conn.Close(errors.New("test close"))
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := conn.Send(canceled, ack(1)); !errors.Is(err, ErrChannelClosed) {
+		t.Fatalf("send on a closed channel with a canceled context = %v, want ErrChannelClosed", err)
+	}
+}
+
 // TestSaturatedCloseKeepsReplacement checks that the saturation close of an
 // old channel leaves its replacement current.
 func TestSaturatedCloseKeepsReplacement(t *testing.T) {

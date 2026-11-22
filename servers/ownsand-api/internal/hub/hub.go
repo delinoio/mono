@@ -105,6 +105,13 @@ func (c *Conn) Send(ctx context.Context, env *ownsandv1.AgentEnvelope) error {
 		return ErrChannelClosed
 	default:
 	}
+	// A caller whose context already ended gets its error even when the
+	// queue has room, so the envelope is never queued for a request that
+	// stopped waiting for the result. select picks among ready cases at
+	// random, so the enqueue below needs this explicit check.
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	select {
 	case c.out <- env:
 		return nil

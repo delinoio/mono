@@ -8,6 +8,7 @@ import {
   within,
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
+import { BillingAccountRole } from "@delino/accounts-protos/v1/billing_account_pb";
 import { SubscriptionStatus } from "@delino/accounts-protos/v1/credit_pb";
 import { pendingInvitation } from "./invitation.ts";
 import {
@@ -20,6 +21,8 @@ import {
 } from "./testing/fake-api.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
 
+/** A token of an earlier link that waits in `sessionStorage`. */
+const EARLIER_INVITATION_TOKEN = "bai_earlier-token";
 const ACCOUNT_PATH = `/billing/${ACCOUNT_ID}`;
 const UUID_V7 =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -740,6 +743,64 @@ describe("invitation acceptance", () => {
     await settle(60);
     expect(await screen.findByText(/already a member/)).toBeTruthy();
     expect(pendingInvitation.read()).toBeUndefined();
+  });
+
+  test("a new link drops the stored token of an earlier link", async () => {
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`);
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    expect(window.location.hash).toBe("");
+    expect(pendingInvitation.read()).toBeUndefined();
+    cleanup();
+    renderApp("/billing/invitations/accept");
+    expect(await screen.findByText(/needs the link/)).toBeTruthy();
+  });
+
+  test("accepts the new link and not the stored token of an earlier link", async () => {
+    const api = createFakeApi();
+    api.userId = OUTSIDER;
+    api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
+      accountId: ACCOUNT_ID,
+      role: BillingAccountRole.ADMIN,
+    });
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`, { api });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    await settle(60);
+    expect(calls(api, "AcceptInvitation")).toEqual([
+      expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+    ]);
+  });
+
+  test("a link opened while the page is shown drops the stored token of an earlier link", async () => {
+    pendingInvitation.save(EARLIER_INVITATION_TOKEN);
+    renderApp("/billing/invitations/accept");
+    expect(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    ).toBeTruthy();
+    await act(async () => {
+      window.location.hash = `token=${INVITATION_TOKEN}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await settle(30);
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.location.hash).toBe("");
+    cleanup();
+    renderApp("/billing/invitations/accept");
+    expect(await screen.findByText(/needs the link/)).toBeTruthy();
+  });
+
+  test("keeps the stored token for the sign-in return when the fragment is empty", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    renderApp("/billing/invitations/accept", { signedIn: false });
+    expect(
+      await screen.findByRole("button", { name: "Sign in to accept" }),
+    ).toBeTruthy();
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
   });
 
   test("leaving the invitation flow deletes the stored token", async () => {

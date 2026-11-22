@@ -103,3 +103,23 @@ func (r *Record) ttlReason(now time.Time) ownsandv1.SandboxEndReason {
 	}
 	return ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED
 }
+
+// endReasonAt returns the end reason that an end attempt at now records, or
+// UNSPECIFIED when no end is due. It is ttlReason with one exception for a
+// record in DELETING: a failed end attempt already recorded its reason, and a
+// retry keeps it. A caller delete that failed once therefore stays
+// DELETED_BY_CALLER when a deadline passes before the retry, also when the
+// stale idle deadline of a paused sandbox is the deadline that passed.
+//
+// The deadlines still decide only whether an end is due, so the retry cadence
+// is the one of ttlReason: Tick retries a failed caller delete when a deadline
+// passed, and otherwise the control plane resend or the next agent start does.
+func (r *Record) endReasonAt(now time.Time) ownsandv1.SandboxEndReason {
+	reason := r.ttlReason(now)
+	if reason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED &&
+		r.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING &&
+		r.EndReason != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
+		return r.EndReason
+	}
+	return reason
+}

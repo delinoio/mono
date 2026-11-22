@@ -176,6 +176,14 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	defer close(e.ready)
+	if err == nil && m.entries[readID] != e {
+		// Defense in depth: sweep skips an entry whose snapshot is still
+		// being prepared, so no path forgets the entry before this point.
+		// If one ever does, nothing tracks the file that makeSnapshot just
+		// created, and no later sweep could find it. Remove it here.
+		m.removeSnapshot(readID, e.snapshot)
+		err = errorf(ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND, "read expired")
+	}
 	if err != nil {
 		e.err = err
 		// No call is left to receive the failure, and sweep keeps no
@@ -188,6 +196,13 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 		return
 	}
 	e.kind, e.size = kind, size
+	if e.open == 0 {
+		// No call is left, and the last call may have ended long before the
+		// snapshot became ready. Start the retention time now, so that a
+		// snapshot that succeeds after the last call ended stays available
+		// for a later call of the same read_id for the whole retention time.
+		e.lastEnd = m.now()
+	}
 	m.logger.Info("read snapshot ready", "read_id", readID, "kind", kind.String(), "size_bytes", size)
 }
 
@@ -270,8 +285,20 @@ func sourceUnchanged(before os.FileInfo, in *os.File, src string) bool {
 	return true
 }
 
-// sweep deletes snapshots whose last call ended more than the retention
-// time ago and forgets expired IDs after ExpiredMemory.
+// removeSnapshot removes the snapshot file of readID. The caller holds m.mu.
+func (m *readManager) removeSnapshot(readID, snapshot string) {
+	if err := os.Remove(snapshot); err != nil && !errors.Is(err, os.ErrNotExist) {
+		// The error is reduced to its reason: the helper never logs paths.
+		m.logger.Warn("remove read snapshot failed", "read_id", readID, "error", sanitizedError(err))
+	}
+}
+
+// sweep deletes snapshots whose retention time has passed since the later of
+// the last call end and the moment the snapshot became ready, and forgets
+// expired IDs after ExpiredMemory. It never deletes an entry whose snapshot is
+// still being prepared: the worker has not created the snapshot file yet or
+// still writes it, so deleting the entry would leave a file that nothing
+// tracks. A preparation always ends, so the entry is swept after that.
 func (m *readManager) sweep(now time.Time) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -279,11 +306,13 @@ func (m *readManager) sweep(now time.Time) {
 		if e.open > 0 || now.Sub(e.lastEnd) < m.retention {
 			continue
 		}
-		delete(m.entries, id)
-		if err := os.Remove(e.snapshot); err != nil && !errors.Is(err, os.ErrNotExist) {
-			// The error is reduced to its reason: the helper never logs paths.
-			m.logger.Warn("remove read snapshot failed", "read_id", id, "error", sanitizedError(err))
+		select {
+		case <-e.ready:
+		default:
+			continue
 		}
+		delete(m.entries, id)
+		m.removeSnapshot(id, e.snapshot)
 		m.expired[id] = now
 		m.logger.Info("read expired", "read_id", id)
 	}

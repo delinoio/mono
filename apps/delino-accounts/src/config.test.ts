@@ -305,6 +305,49 @@ describe("readAccountsConfig", () => {
     expect(() => readAccountsConfig(env)).toThrow(message);
   });
 
+  test.each([
+    ["https://auth.delino.io", "https://auth.delino.io"],
+    ["https://auth.delino.io/", "https://auth.delino.io"],
+    ["http://127.0.0.1:3001/", "http://127.0.0.1:3001"],
+  ])("accepts the Logto origin %s", (endpoint, origin) => {
+    expect(
+      readAccountsConfig({
+        PUBLIC_LOGTO_ENDPOINT: endpoint,
+        PUBLIC_LOGTO_APP_ID: "a",
+      }).logto?.endpoint,
+    ).toBe(origin);
+  });
+
+  // The URL parser collapses these paths to `/` or treats a backslash as a
+  // slash, so the raw text after the authority has to be rejected.
+  test.each([
+    "https://auth.delino.io/tenant/..",
+    "https://auth.delino.io/..",
+    "https://auth.delino.io/.",
+    "https://auth.delino.io/%2e",
+    "https://auth.delino.io/%2E%2e",
+    "https://auth.delino.io/%2e%2e/",
+    "https://auth.delino.io/tenant/../",
+    "https://auth.delino.io\\",
+    "https://auth.delino.io\\tenant",
+    "https://auth.delino.io//",
+    "https://auth.delino.io/tenant",
+  ])("rejects the Logto endpoint path %s without echoing it", (endpoint) => {
+    let message = "";
+    try {
+      readAccountsConfig({
+        PUBLIC_LOGTO_ENDPOINT: endpoint,
+        PUBLIC_LOGTO_APP_ID: "a",
+      });
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toBe(
+      "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
+    );
+    expect(message).not.toContain("auth.delino.io");
+  });
+
   test("reads the Paddle checkout settings", () => {
     expect(
       readAccountsConfig({

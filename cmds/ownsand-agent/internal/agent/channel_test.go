@@ -5,8 +5,11 @@
 package agent
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -153,5 +156,64 @@ func TestChannelAckTimeoutStillReconnects(t *testing.T) {
 			t.Fatal("the agent did not reconnect after the acknowledgement timeout")
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// syncBuffer is a log sink that the agent goroutines and the test share.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// TestStalledAuthenticationBacksOffAndRetries reproduces a control plane that
+// accepts the first Authenticate call and never answers it while the HTTP/2
+// connection stays healthy. The attempt must end at the authentication
+// deadline, so that channelLoop logs its back-off and the second attempt
+// opens the channel. The channel that it opens outlives the deadline: only
+// the unary authentication calls are bound.
+func TestStalledAuthenticationBacksOffAndRetries(t *testing.T) {
+	const authTimeout = 300 * time.Millisecond
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	cp.StallNextAuthenticate()
+	logs := &syncBuffer{}
+	h := startWith(t, cp, st, id, func(o *Options) {
+		o.Control.AuthTimeout = authTimeout
+		o.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	})
+
+	h.wait(0, "capability report of the channel after the stalled attempt", func(e *ownsandv1.AgentEnvelope) bool { return e.GetCapabilityReport() != nil })
+	out := logs.String()
+	for _, want := range []string{`"msg":"authentication failed"`, `"msg":"agent channel closed; reconnecting"`, `"retry_in_ms"`, "no answer within"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("agent log lacks %q:\n%s", want, out)
+		}
+	}
+	if n := cp.Channels(); n != 1 {
+		t.Fatalf("control plane saw %d channels, want 1", n)
+	}
+
+	// The channel context has no deadline: the channel is still the same
+	// one long after the authentication deadline.
+	time.Sleep(3 * authTimeout)
+	if n := cp.Channels(); n != 1 {
+		t.Fatalf("control plane saw %d channels after the authentication deadline, want 1", n)
+	}
+	select {
+	case err := <-h.errc:
+		t.Fatalf("the agent stopped: %v", err)
+	default:
 	}
 }

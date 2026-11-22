@@ -131,13 +131,21 @@ The project has one hosted server deployable (the control plane on the shared Di
 - macOS guests need an Apple silicon device, and one Mac runs at most two macOS guests at the same time. The OwnSand scheduler enforces this limit for tide too.
 - Delino distributes no macOS or Windows image. Runner profiles use OwnSand base images or OwnSand templates that the organization builds.
 
+### Recorded decisions
+
+The owning domain contracts hold the details:
+
+- Metrics: the default retention of the Grafana Cloud plan, one tide dashboard committed as Grafana dashboard JSON, and Grafana Cloud alerts to the operators' contact point ([control plane contract](servers-tide-api-foundation.md#metrics)).
+- Runner programs: tide installs them on Linux, macOS and Windows guests. It pins the GitHub Actions runner, `codex` and Node.js, and Renovate updates the pins. It installs `claude`, Cursor `agent` and `devin` at the version of the official installer, with a minimum version only for `claude` ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
+- Storage: ended requests and runners are kept for 30 days and audit events for 90 days, the migration tool is goose, and the backups are the PlanetScale Postgres defaults ([control plane contract](servers-tide-api-foundation.md#storage)).
+- Rate limits: the same values as OwnSand ([control plane contract](servers-tide-api-foundation.md#security)).
+- TypeScript SDK package: the workspace package `tide-sdk` is private and unpublished, like `ownsand-sdk` ([SDK contract](packages-tide-sdk-foundation.md#dependencies-and-integrations)).
+
 ### Open decisions
 
 Record each decision in the owning domain contract before the implementation that depends on it. The cross-domain ones are:
 
-- The retention and alerting of the metrics. The control plane records them with the OpenTelemetry SDK and, when the OTLP endpoint is configured, sends them to Grafana Cloud, the default observability backend ([control plane contract](servers-tide-api-foundation.md#metrics), [repository defaults](repository-defaults.md#default-technology-choices)).
-- The pinned versions and the update policy of the GitHub Actions runner and of each vendor runner program that tide installs ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
-- The retention period of ended requests, ended runners and audit events ([control plane contract](servers-tide-api-foundation.md#storage)).
+- The exact install commands per guest OS of each runner program. The runner implementation records them with the guest OSes on which it verified them ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
 - The npm package name and publication workflow of the TypeScript SDK, together with the same open decision of OwnSand.
 - Every new third-party dependency. Each dependency needs owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds it. Recorded owner approval: the official MCP Go SDK `github.com/modelcontextprotocol/go-sdk` for the `tide mcp` server. Its pinned version and its dependency security review are part of the change that adds it.
 

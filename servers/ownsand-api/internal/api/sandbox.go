@@ -436,8 +436,54 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		go h.importThenCreate(conn, info, src, cmd)
 	} else if _, err := h.sendCommand(ctx, conn, info, &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_CreateSandbox{CreateSandbox: cmd}}); err != nil {
 		h.Logger.WarnContext(ctx, "agent_command_send_failed", slog.String("sandbox_id", sandboxID), slog.Any("error", err))
+		// The command did not enter the queue. When the channel is still
+		// live, no reconnect will report the sandbox as lost, so the create
+		// fails now and the RPC returns the failed record, the same record
+		// that a replay of the idempotency key returns.
+		if failed := h.failCreateSendNotQueued(ctx, conn, info, err); failed != nil {
+			created = failed
+		}
 	}
 	return connect.NewResponse(&ownsandv1.CreateSandboxResponse{Sandbox: created.proto()}), nil
+}
+
+// createSendFailTimeout bounds the database work that fails a create whose
+// command was not queued. The request context cannot be used for it because
+// its end is a common cause of the send failure.
+const createSendFailTimeout = 5 * time.Second
+
+// failCreateSendNotQueued fails the create whose command send returned an
+// error before the command entered the outbound queue while the device
+// channel stayed connected (the request context ended first, for example
+// while a full outbound queue held the send). It moves the CREATING sandbox
+// to FAILED with CREATE_FAILED through the guarded rejection transition,
+// which releases its reservation, and notifies watchers. It uses a bounded
+// context that does not depend on the request. It returns the reloaded
+// sandbox, or nil when nothing was failed.
+//
+// A send error on a channel that is closed, including a channel that a queue
+// that stayed full closed, keeps reconnect reconciliation as the owner of the
+// sandbox. A command whose send returned nil is never undone here: the agent
+// owns the result of a queued command.
+func (s *Service) failCreateSendNotQueued(ctx context.Context, conn *hub.Conn, info commandInfo, sendErr error) *sandboxRow {
+	if conn.Context().Err() != nil {
+		return nil
+	}
+	dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), createSendFailTimeout)
+	defer cancel()
+	attrs := []any{slog.String("sandbox_id", info.sandboxID), slog.String("channel_id", conn.ID), slog.Any("send_error", sendErr)}
+	if err := s.failCreateRejected(dbCtx, info.sandboxID); err != nil {
+		s.Logger.ErrorContext(dbCtx, "create_send_fail_transition_failed", append(attrs, slog.Any("error", err))...)
+		return nil
+	}
+	s.Logger.WarnContext(dbCtx, "create_send_failed", attrs...)
+	s.watch.fire(info.sandboxID)
+	row, err := loadSandbox(dbCtx, s.DB.Pool, info.orgID, info.sandboxID, false)
+	if err != nil {
+		s.Logger.ErrorContext(dbCtx, "create_send_fail_reload_failed", append(attrs, slog.Any("error", err))...)
+		return nil
+	}
+	return row
 }
 
 var errIdempotencyRace = errors.New("idempotency key race")

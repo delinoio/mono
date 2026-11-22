@@ -273,7 +273,10 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		}
 	}
 	// A compute system with this ID is left from a failed earlier attempt.
-	r.stopOrphan(spec.SandboxID)
+	// An unknown outcome is only logged here: the create goes on, and the
+	// compute system creation reports the conflict if the system is still
+	// there.
+	_ = r.stopOrphan(spec.SandboxID)
 
 	if err := grantVMGroup(spec.Dir, accessReadWrite, true); err != nil {
 		cleanup()
@@ -669,21 +672,35 @@ func (r *Runtime) stopVM(v *vm) {
 	}
 }
 
+// openSystemFunc opens a compute system by ID. It is a variable only so that
+// tests can inject an open failure without a Hyper-V host; remove it when the
+// HCS calls sit behind an interface.
+var openSystemFunc = openSystem
+
 // stopOrphan stops a compute system of the sandbox that no tracked VM owns,
-// for example one that an earlier agent process left.
-func (r *Runtime) stopOrphan(sandboxID string) {
-	sys, err := openSystem(systemID(sandboxID))
+// for example one that an earlier agent process left. It returns nil when the
+// system is stopped or confirmed absent (not found or stopped already) and
+// an error when its state is unknown, for example when the open fails for
+// another reason, so a caller never takes an unknown state for an absent
+// system.
+func (r *Runtime) stopOrphan(sandboxID string) error {
+	sys, err := openSystemFunc(systemID(sandboxID))
 	if err != nil {
-		if !isNotFoundOrStopped(err) {
-			r.logger.Debug("open compute system failed", "sandbox_id", sandboxID, "error", err)
+		if isNotFoundOrStopped(err) {
+			return nil
 		}
-		return
+		r.logger.Warn("open compute system failed", "sandbox_id", sandboxID, "error", err)
+		return fmt.Errorf("hcsrt: open the compute system of sandbox %s: %w", sandboxID, err)
 	}
 	r.logger.Warn("stopping a compute system without a tracked VM", "sandbox_id", sandboxID)
 	r.stopSystem(sandboxID, sys)
+	return nil
 }
 
-// Delete stops the VM of the sandbox and removes its files.
+// Delete stops the VM of the sandbox and removes its files. When the stop
+// outcome of an untracked compute system is unknown, Delete returns the error
+// and keeps the VM directory: a VM that still runs may hold its disk, and the
+// sandbox manager retries the delete.
 func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	r.mu.Lock()
 	v, ok := r.vms[sandboxID]
@@ -692,7 +709,10 @@ func (r *Runtime) Delete(_ context.Context, sandboxID string) error {
 	if ok {
 		r.stopVM(v)
 	} else if hcsLoad() == nil {
-		r.stopOrphan(sandboxID)
+		if err := r.stopOrphan(sandboxID); err != nil {
+			r.logger.Warn("delete keeps the VM directory because the compute system state is unknown", "sandbox_id", sandboxID, "error", err)
+			return err
+		}
 	}
 	if r.opts.VMsDir != "" {
 		return removeAll(r.vmDir(sandboxID))

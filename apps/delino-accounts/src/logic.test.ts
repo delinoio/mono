@@ -18,6 +18,7 @@ import { Meter } from "@delino/accounts-protos/v1/usage_pb";
 import {
   PENDING_INVITATION_KEY,
   pendingInvitation,
+  openInvitationFromAddress,
   takeTokenFromAddress,
   tokenFromFragment,
 } from "./invitation.ts";
@@ -256,6 +257,28 @@ describe("invitation token", () => {
     expect(replaced).toEqual(["/billing/invitations/accept"]);
     expect(tokenFromFragment("#other=1")).toBeUndefined();
     expect(tokenFromFragment("#token=")).toBeUndefined();
+  });
+
+  test("drops the stored token only when the address carries a new one", () => {
+    const history = { replaceState: () => {} };
+    const at = (hash: string) => ({
+      hash,
+      pathname: "/billing/invitations/accept",
+      search: "",
+    });
+    window.sessionStorage.clear();
+    pendingInvitation.save("bai_old");
+    expect(openInvitationFromAddress(at(""), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("bai_old");
+    expect(openInvitationFromAddress(at("#other=1"), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("bai_old");
+    expect(openInvitationFromAddress(at("#token="), history)).toBeUndefined();
+    expect(pendingInvitation.read()).toBe("bai_old");
+    expect(openInvitationFromAddress(at("#token=bai_new"), history)).toBe(
+      "bai_new",
+    );
+    expect(pendingInvitation.read()).toBeUndefined();
+    window.sessionStorage.clear();
   });
 
   test("stores the pending token under one key and clears it", () => {

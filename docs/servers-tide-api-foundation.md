@@ -277,10 +277,15 @@ The Go SDK implements download for the CLI and the MCP server. Download copies a
   - GitHub Actions runner: the official release archive from `github.com/actions/runner` at the version that tide pins.
   - `claude`: the official Claude Code installer, at least version 2.1.224.
   - Cursor `agent`: the official Cursor CLI installer.
-  - `codex`: the `@openai/codex` npm package at the version that tide pins. The guest needs Node.js.
+  - `codex`: the `@openai/codex` npm package at the version that tide pins. The guest needs Node.js. When the guest has no Node.js, tide first installs the official Node.js 24 distribution at the version that tide pins.
   - `devin`: the official Devin CLI installer.
+- tide installs the runner programs on every guest OS that the runner profile allows for its workload kind and vendor: Linux, macOS and Windows.
+- Version policy (recorded decision):
+  - Pinned programs: the GitHub Actions runner, `codex` and Node.js. tide-api pins an exact version of each in its source. Renovate updates the pins through a custom manager that the runner implementation adds to `renovate.json`.
+  - Unpinned programs: `claude`, Cursor `agent` and `devin`. tide installs the version that the official installer gives at installation time. tide checks the minimum version only for `claude` (2.1.224). Cursor `agent` and `devin` have no minimum version.
+  - tide uses a program that the guest already has (for example, from an OwnSand template) at its installed version, also when that version differs from the pin. tide installs the program again only when its version is lower than the minimum version. Only `claude` has a minimum version.
 - An admin can make starts faster: create an OwnSand sandbox from the base image, let tide or the admin install the runner programs, save it as an OwnSand template and set it as the runner profile's `source`. tide then finds the program and skips the installation.
-- Open decision: the pinned versions, the update policy and the exact install commands per guest OS. Record them here before the runner implementation.
+- The exact install commands per guest OS come from the vendor documentation. The runner implementation records them here, together with the guest OSes on which it verified them.
 
 ### Webhooks
 
@@ -326,7 +331,20 @@ The server records its metrics with the OpenTelemetry SDK through the shared `se
 
 - The `kind` label includes `DEV_SESSION`. `tide_dev_session_execs_total` counts ended dev session execs by `result` (`exited`, `failed`, `sandbox_ended`). `tide_dev_session_transfer_bytes_total` counts the file bytes that `tide-api` relays, with `direction` `upload` or `download`, so that operators can see the Droplet bandwidth that dev sessions use.
 
-Open decision: the retention, dashboards and alerts for these metrics. When the OTLP endpoint is configured, the shared telemetry package sends the metrics over OTLP to Grafana Cloud, the default observability backend ([repository defaults](repository-defaults.md#default-technology-choices)), as for `accounts-api`.
+- A webhook delivery that the server rejects for a missing or invalid signature counts with `result` `invalid_signature`.
+
+When the OTLP endpoint is configured, the shared telemetry package sends the metrics over OTLP to Grafana Cloud, the default observability backend ([repository defaults](repository-defaults.md#default-technology-choices)), as for `accounts-api`.
+
+- Retention (recorded decision): the default metrics retention of the Grafana Cloud plan. tide sets no other retention.
+- Dashboard (recorded decision): one tide dashboard, committed as Grafana dashboard JSON under `servers/tide-api/` (`planned`). It shows the queue, the runners, the OwnSand calls, the webhook deliveries and the dev session transfer bytes. The implementation records the file path and how the dashboard gets to Grafana Cloud.
+- Alerts (recorded decision): Grafana Cloud alert rules send notifications to the Grafana Cloud contact point that operators manage. The repository does not record the notification channel.
+
+| Alert                       | Condition                                                                                                                          |
+| --------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
+| Runner start failures       | The increase of `tide_requests_ended_total` with `end_reason` `RUNNER_START_FAILED` in 15 minutes is 1 or more.                    |
+| OwnSand call errors         | In 10 minutes, more than 5% of `tide_ownsand_calls_total` has a `code` other than `ok`.                                            |
+| Webhook signature failures  | The increase of `tide_webhook_deliveries_total` with `result` `invalid_signature` in 5 minutes is more than 10.                    |
+| Vendor or orchestrator loss | The increase of `tide_vendor_watch_reconnects_total` or of `tide_claude_orchestrator_restarts_total` in 15 minutes is more than 5. |
 
 ### Audit events
 
@@ -341,7 +359,10 @@ The server records audit events for: organization creation and deletion, ownersh
 - PlanetScale Postgres tables (`planned`): organizations (with the organization settings), memberships, invitations, OwnSand links, GitHub installations, agent integrations, runner profiles, requests (with the dev session owner and label), runners, personal API keys (hash, display prefix, owner, name, expiry, last use, revocation), webhook deliveries, the lease and audit events.
 - Requests store the vendor or GitHub key (GitHub job ID, Claude Code session ID, Cursor or Devin request ID, OpenAI session and environment ID) with a unique constraint per organization and source, so that a repeated event or claim cannot create a second request.
 - Webhook delivery IDs are kept for 7 days.
-- Open decision: the retention period of ended requests, ended runners and audit events, the database migration tool and the backup policy. Record them here before the storage implementation.
+- Retention of ended records (recorded decision): an ended request (including an ended dev session) and an ended runner are kept for 30 days after they end, and then a daily job of the lease holder deletes them. This is the same period as for ended OwnSand sandboxes.
+- Retention of audit events (recorded decision): 90 days, the same as OwnSand. A daily job of the lease holder deletes older events. Organization deletion does not delete audit events early.
+- Migration tool (recorded decision): [goose](https://github.com/pressly/goose) (`github.com/pressly/goose/v3`), like `accounts-api`, with SQL migrations embedded from `servers/tide-api/internal/db/migrations/`. Migrations are forward-only, as in `accounts-api`.
+- Backup policy (recorded decision): the default automatic backups of PlanetScale Postgres, with no custom backup schedule. A backup is made every 12 hours and kept for 2 days, and point-in-time recovery is available in that period ([PlanetScale Postgres backups](https://planetscale.com/docs/postgres/backups)).
 - tide stores no runner output, no dev session command, environment, output or file content, and no JIT configuration. It stores a Claude Code work order only encrypted and only until the runner of the request is `BUSY` or the request ends; see [Claude Code](#claude-code).
 
 ## Security
@@ -353,7 +374,11 @@ The server records audit events for: organization creation and deletion, ownersh
 - The `spawn-runner` hook socket accepts connections only from processes in the container.
 - Dev sessions run code of their owner on the organization's devices, like the other runners. Only the session owner can run commands or read files in it, so code and secrets that a user copies into a dev session are not visible to other members through tide. Members who can reach the device or the OwnSand organization directly are outside this rule.
 - A leaked personal API key gives access only to the dev sessions of its user and to dev session creation. The user or an admin who removes the membership revokes it.
-- Rate limits: invitations, the OwnSand link validation and personal API key authentication failures have rate limits. Record the values with the implementation.
+- Rate limits (recorded decision, the same values as [OwnSand](servers-ownsand-api-foundation.md#security)): in-memory token buckets, which are service-wide because the service runs as one replica. A rejected call fails with `resource_exhausted`.
+  - `AcceptInvitation`: 10 calls per invitation display prefix per minute and 10 calls per user per minute, each with a burst of 10.
+  - The OwnSand link validation of `SetOwnSandLink`: 10 calls per user per minute with a burst of 10.
+  - Personal API key authentication failures: 10 failures per key display prefix per minute with a burst of 10. Only failures take tokens, and a prefix without tokens is rejected before validation.
+  - When the request has a client address: 120 calls per client address per minute with a burst of 60, in one bucket per address that these limits share. The client address comes from the same rule and the same configuration settings as in OwnSand (`TRUST_PROXY_CLIENT_ADDRESS` and `ALLOW_DIRECT_CLIENT_ADDRESS`); without a client address, this bucket does not apply.
 
 ## Logging
 
@@ -376,6 +401,7 @@ The server records audit events for: organization creation and deletion, ownersh
 - Upstream: [`ownsand-api`](servers-ownsand-api-foundation.md) through the [OwnSand Go SDK](packages-ownsand-sdk-foundation.md); the GitHub REST API and webhooks; the Claude Code CLI; the Cursor, OpenAI and Devin APIs; Logto; PlanetScale Postgres.
 - Downstream: the [web console](apps-tide-console-foundation.md), the [CLI](cmds-tide-cli-foundation.md) and the [SDKs](packages-tide-sdk-foundation.md).
 - tide depends on a working OwnSand runtime. tide runtime implementation starts after the OwnSand sandbox lifecycle (create, exec, delete) works on real devices.
+- The migration tool goose is a recorded owner decision (see [Storage](#storage)); its version follows the root `go.mod`.
 - New dependencies (Connect, protobuf, a Postgres driver and any GitHub or vendor client library) need owner approval and a [dependency security](repository-dependency-security-contract.md) review in the change that adds them.
 
 ## Change Triggers
