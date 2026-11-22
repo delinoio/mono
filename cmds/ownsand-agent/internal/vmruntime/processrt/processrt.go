@@ -108,6 +108,12 @@ func findGuestBinary() string {
 // image that Capabilities reports, and Create rejects other guest OSes.
 func HostGuest() (ownsandv1.GuestOs, ownsandv1.BaseImage) { return hostGuestOS, hostBaseImage }
 
+// MacOSHardwareModelSupported reports true for every model. The runtime boots
+// no VM, so a macOS snapshot runs on a macOS host whatever hardware model it
+// records. The agent asks only for macOS guests, which this runtime runs only
+// on a macOS host.
+func (r *Runtime) MacOSHardwareModelSupported([]byte) bool { return true }
+
 // Kind returns RuntimeKindProcess.
 func (r *Runtime) Kind() config.RuntimeKind { return config.RuntimeKindProcess }
 
