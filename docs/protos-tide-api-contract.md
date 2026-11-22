@@ -8,7 +8,7 @@ This contract owns the Connect RPC schemas of [`tide`](project-tide.md) in the p
 
 - Protobuf schemas, proto3 syntax.
 - Go bindings are committed in the root Go module, like the other packages under `protos/`. TypeScript code is generated for the [console](apps-tide-console-foundation.md) and the [TypeScript SDK](packages-tide-sdk-foundation.md).
-- The code generation tool is the same tool that OwnSand selects. It is an open decision in the [OwnSand project index](project-ownsand.md#open-decisions).
+- The code generation tool is the tool that the [OwnSand protos contract](protos-ownsand-api-contract.md#runtime-and-language) records: the buf CLI and the Go protobuf and Connect plugins, run by `scripts/protos.sh` with the module configuration in `protos/buf.yaml` and `protos/buf.gen.yaml`.
 
 ## Users and Operators
 
