@@ -8,6 +8,7 @@ import { DataPathError, OwnSandValidationError } from "./errors.ts";
 import { Timing } from "./relay/context.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import {
+  BillingReason,
   DataPathTransport,
   RelayOperationKind,
   SandboxEndReason,
@@ -16,8 +17,12 @@ import {
 } from "@delino/ownsand-protos/v1/common_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
+import type { DataPathSelector } from "./datapath.ts";
+import { billingReasonOf } from "./errors.ts";
 import {
   ExecEventType,
+  ExecHandle,
+  type ExecResult,
   ExecResultKind,
   type ExecStreamEvent,
 } from "./operations/exec.ts";
@@ -54,6 +59,172 @@ function stdoutText(events: ExecStreamEvent[]): string {
     .map((e) => (e.type === ExecEventType.Stdout ? text(e.data) : ""))
     .join("");
 }
+
+/**
+ * An exec generator that yields one event, then waits for `gate` and ends
+ * with `outcome`. It stands in for the relay generator, whose reads queue in
+ * order and which closes after a rejection.
+ */
+function gatedGenerator(
+  gate: Promise<void>,
+  outcome: { reject: unknown } | { result: ExecResult },
+): AsyncGenerator<ExecStreamEvent, ExecResult> {
+  return (async function* () {
+    yield { type: ExecEventType.Started, execId: "e" } as ExecStreamEvent;
+    await gate;
+    if ("reject" in outcome) throw outcome.reject;
+    return outcome.result;
+  })();
+}
+
+function gatedHandle(
+  gate: Promise<void>,
+  outcome: { reject: unknown } | { result: ExecResult },
+): ExecHandle {
+  return new ExecHandle(
+    "e",
+    gatedGenerator(gate, outcome),
+    {} as DataPathSelector,
+  );
+}
+
+function openGate() {
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    open = resolve;
+  });
+  return { gate, open };
+}
+
+/** Lets queued microtasks run, so every read is queued before the gate opens. */
+const settle = () => new Promise<void>((resolve) => setImmediate(resolve));
+
+describe("exec handle after a terminal failure", () => {
+  const failure = new DataPathError("the exec stream failed", {
+    code: Code.ResourceExhausted,
+  });
+
+  test("an iterator that is queued before wait() and a later wait() both see the rejection", async () => {
+    const { gate, open } = openGate();
+    const handle = gatedHandle(gate, { reject: failure });
+    const iterator = handle[Symbol.asyncIterator]();
+    expect((await iterator.next()).done).toBe(false);
+    const nextEvent = iterator.next().catch((e: unknown) => e);
+    const waited = handle.wait().catch((e: unknown) => e);
+    await settle();
+    open();
+    expect(await nextEvent).toBe(failure);
+    expect(await waited).toBe(failure);
+    expect(await handle.wait().catch((e: unknown) => e)).toBe(failure);
+    expect(await handle.wait().catch((e: unknown) => e)).toBe(failure);
+  });
+
+  test("wait() owns the failing read and the iterator, which queued behind it, still sees the rejection", async () => {
+    const { gate, open } = openGate();
+    const handle = gatedHandle(gate, { reject: failure });
+    const iterator = handle[Symbol.asyncIterator]();
+    expect((await iterator.next()).done).toBe(false);
+    // wait() reads first; the iterator's next read queues behind it.
+    const waited = handle.wait().catch((e: unknown) => e);
+    const nextEvent = iterator.next().catch((e: unknown) => e);
+    await settle();
+    open();
+    expect(await waited).toBe(failure);
+    expect(await nextEvent).toBe(failure);
+    expect(await handle.wait().catch((e: unknown) => e)).toBe(failure);
+  });
+
+  test("overlapping wait() calls share the rejection", async () => {
+    const { gate, open } = openGate();
+    const handle = gatedHandle(gate, { reject: failure });
+    const first = handle.wait().catch((e: unknown) => e);
+    const second = handle.wait().catch((e: unknown) => e);
+    await settle();
+    open();
+    expect(await first).toBe(failure);
+    expect(await second).toBe(failure);
+  });
+
+  test("a rejection that is not an Error, including undefined, is reported as it is", async () => {
+    for (const reason of ["aborted by the caller", undefined, 0, null]) {
+      const { gate, open } = openGate();
+      const handle = gatedHandle(gate, { reject: reason });
+      const iterator = handle[Symbol.asyncIterator]();
+      await iterator.next();
+      const nextEvent = iterator.next().then(
+        () => "resolved" as const,
+        (e: unknown) => ({ rejected: e }),
+      );
+      const waited = handle.wait().then(
+        () => "resolved" as const,
+        (e: unknown) => ({ rejected: e }),
+      );
+      await settle();
+      open();
+      expect(await nextEvent).toEqual({ rejected: reason });
+      expect(await waited).toEqual({ rejected: reason });
+      expect(
+        await handle.wait().then(
+          () => "resolved" as const,
+          (e: unknown) => ({ rejected: e }),
+        ),
+      ).toEqual({ rejected: reason });
+    }
+  });
+
+  test("a success is unchanged: both readers finish and wait() keeps the result", async () => {
+    const { gate, open } = openGate();
+    const result: ExecResult = {
+      kind: ExecResultKind.Exited,
+      exitCode: 0n,
+      signal: undefined,
+      timedOut: false,
+      complete: true,
+    };
+    const handle = gatedHandle(gate, { result });
+    const events = collect(handle);
+    const waited = handle.wait();
+    await settle();
+    open();
+    await events;
+    expect(await waited).toBe(result);
+    expect(await handle.wait()).toBe(result);
+  });
+
+  test("reports a billing suspension of a relay exec to the iterator and to every wait()", async () => {
+    for (const order of ["iterator-first", "wait-first"] as const) {
+      const h = setup();
+      h.api.stream(RelayService, "Exec", function* () {
+        yield execMsg(ev.accepted());
+        yield execMsg(ev.started());
+        throw ownsandError(Code.ResourceExhausted, "suspended", {
+          billingReason: BillingReason.SUSPENDED,
+        });
+      });
+      const handle = h.client.sandbox(SANDBOX).exec({ command: ["x"] });
+      const settled = (p: Promise<unknown>) => p.catch((e: unknown) => e);
+      const run = async () => {
+        const iterator = handle[Symbol.asyncIterator]();
+        expect((await iterator.next()).done).toBe(false);
+        // Iterator-first: the iterator owns the failing read and wait() queues
+        // behind it. Wait-first: wait() owns the failing read and the
+        // iterator queues behind it.
+        const [first, second] =
+          order === "iterator-first"
+            ? [settled(iterator.next()), settled(handle.wait())]
+            : [settled(handle.wait()), settled(iterator.next())];
+        return { first: await first, second: await second };
+      };
+      const { first, second } = await h.clock.run(run());
+      for (const error of [first, second, await settled(handle.wait())]) {
+        expect(error).toBeInstanceOf(Error);
+        expect(billingReasonOf(error)).toBe(BillingReason.SUSPENDED);
+      }
+      expect(second).toBe(first);
+      expect(h.api.callsOf("Exec")).toHaveLength(1);
+    }
+  });
+});
 
 describe("exec over the relay", () => {
   test("runs a command relay-only without OpenSession and binds the grant to the request digest", async () => {
