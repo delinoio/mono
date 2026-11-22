@@ -111,6 +111,36 @@ describe("credentials", () => {
     expect(server.calls).toEqual([]);
   });
 
+  test("a token that is not a valid header value fails without the token in the error", async () => {
+    const server = fakeServer(() => {});
+    for (const token of [
+      "secret-access\ntoken",
+      () => "secret-access\u20actoken",
+    ]) {
+      const client = new TideClient({
+        origin: FAKE_ORIGIN,
+        fetch: server.fetch,
+        token,
+      });
+      const error = (await client.organizations
+        .getOrganization({ organizationId: ORG })
+        .catch((e: unknown) => e)) as ConnectError;
+      expect(error).toBeInstanceOf(ConnectError);
+      const cause = error.cause as Error;
+      expect(cause).toBeInstanceOf(TideConfigError);
+      expect(cause.cause).toBeUndefined();
+      for (const text of [
+        error.message,
+        String(error.stack),
+        cause.message,
+        String(cause.stack),
+      ]) {
+        expect(text).not.toContain("secret-access");
+      }
+    }
+    expect(server.calls).toEqual([]);
+  });
+
   test("the guarded fetch refuses every other origin", async () => {
     const seen: string[] = [];
     const fetch = guardedFetch(FAKE_ORIGIN, async (input) => {
