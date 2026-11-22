@@ -73,6 +73,10 @@ writeFileSync(out + ".start", JSON.stringify({
   SHELL_ONLY: process.env.SHELL_ONLY ?? null,
   HOME: process.env.HOME ?? null,
   LOG_LEVEL: process.env.LOG_LEVEL ?? null,
+  PROTO_OWN: Object.hasOwn(process.env, "__proto__"),
+  PROTO_VALUE: Object.hasOwn(process.env, "__proto__")
+    ? process.env["__proto__"]
+    : null,
 }));
 process.on("SIGINT", () => {
   appendFileSync(out + ".signals", "SIGINT\\n");
@@ -343,6 +347,27 @@ test("parseExport keeps valid names and skips reserved and invalid ones", () => 
   });
 });
 
+test("parseExport keeps a variable named __proto__ as an own property", () => {
+  const { variables, reserved, invalid } = parseExport(
+    exported([
+      { key: "DATABASE_URL", value: "postgres://x" },
+      { key: "__proto__", value: "first" },
+      { key: "PATH", value: "/evil" },
+      { key: "BAD-NAME", value: "x" },
+      { key: "__proto__", value: "second" },
+    ]),
+  );
+  assert.equal(Object.hasOwn(variables, "__proto__"), true);
+  assert.equal(
+    Object.getOwnPropertyDescriptor(variables, "__proto__").value,
+    "second",
+  );
+  assert.equal(Object.getPrototypeOf(variables), Object.prototype);
+  assert.deepEqual(Object.keys(variables), ["DATABASE_URL", "__proto__"]);
+  assert.equal(reserved, 1);
+  assert.equal(invalid, 1);
+});
+
 test("parseExport rejects output that is not the export array", async (t) => {
   for (const output of [
     "",
@@ -438,6 +463,38 @@ test(
         assert.equal(result.stdout.includes(secretValue), false);
       });
     }
+  },
+);
+
+test(
+  "the command receives a variable named __proto__ over an inherited one",
+  posixOnly,
+  async (t) => {
+    const f = fixture(t, {
+      config: ProjectConfigFile.Yaml,
+      env: {
+        // A computed key creates an own property; a literal `__proto__` key
+        // would set the prototype of the object instead.
+        ["__proto__"]: "from-shell",
+        FAKE_INFISICAL_OUTPUT: exported([
+          { key: "__proto__", value: secretValue },
+        ]),
+      },
+    });
+    const result = await startLauncher(f, ["--path=/api", ...commandArgs(0)])
+      .exited;
+    assert.equal(result.code, 0, result.stderr);
+    const start = started(f);
+    assert.equal(start.PROTO_OWN, true);
+    assert.equal(start.PROTO_VALUE, secretValue);
+    assert.deepEqual(
+      records(result.stderr).map(({ variables, invalidSkipped }) => ({
+        variables,
+        invalidSkipped,
+      })),
+      [{ variables: 1, invalidSkipped: 0 }],
+    );
+    assert.equal(result.stderr.includes(secretValue), false);
   },
 );
 
