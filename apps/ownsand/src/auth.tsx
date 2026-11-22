@@ -10,6 +10,7 @@ import {
   useState,
 } from "react";
 import { API_RESOURCE, type LogtoSettings } from "./config.ts";
+import { pendingInvitation } from "./invitation.ts";
 
 /** The signed-in state that the console needs, independent of the provider. */
 export interface Auth {
@@ -171,6 +172,8 @@ export function LogtoBridge({ children }: { children: ReactNode }) {
       userId,
       signIn: () => signIn(window.location.origin + CALLBACK_PATH),
       signOut: async () => {
+        // A pending invitation secret must not outlive the session.
+        pendingInvitation.clear();
         await signOut(window.location.origin);
       },
       getAccessToken: async () =>
@@ -217,6 +220,7 @@ export function MockAuthProvider({ children }: { children: ReactNode }) {
     window.location.assign(CALLBACK_PATH);
   }, []);
   const signOut = useCallback(async () => {
+    pendingInvitation.clear();
     try {
       window.sessionStorage.removeItem(key);
     } catch {

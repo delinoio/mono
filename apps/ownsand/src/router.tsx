@@ -47,6 +47,15 @@ export type Route =
   | { id: RouteId.Sandbox; organizationId: string; sandboxId: string }
   | { id: RouteId.Device; organizationId: string; deviceId: string };
 
+/**
+ * Whether a route belongs to the invitation flow: the invitation page and the
+ * sign-in callback that returns to it. The console keeps a pending invitation
+ * secret only while the user stays on these routes.
+ */
+export function isInvitationFlowRoute(route: Route): boolean {
+  return route.id === RouteId.Invitation || route.id === RouteId.Callback;
+}
+
 // A Map keeps inherited Object.prototype names such as "constructor" or
 // "__proto__" from resolving as sections.
 const ORG_SECTIONS: ReadonlyMap<string, RouteId> = new Map<string, RouteId>([

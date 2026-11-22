@@ -203,6 +203,20 @@ describe("LogtoCallbackPage", () => {
     expect(window.location.pathname).toBe("/callback");
     expect(navigations).toEqual([]);
   });
+
+  test("drops the pending invitation secret when the callback fails", async () => {
+    storeSignInSession();
+    pendingInvitation.save("osi_pending");
+    handleSignInCallback = async () => {
+      throw new Error("callback failed");
+    };
+    renderCallback({ strict: true });
+    await settle();
+    expect(screen.getByRole("alert").textContent).toContain(
+      "Something went wrong",
+    );
+    expect(pendingInvitation.read()).toBeUndefined();
+  });
 });
 
 describe("isLogtoSignInPending", () => {
@@ -268,5 +282,30 @@ describe("isLogtoSignInPending", () => {
       },
     };
     expect(isLogtoSignInPending("app", location, throwing)).toBe(false);
+  });
+});
+
+describe("sign-out", () => {
+  test("drops the pending invitation secret", async () => {
+    pendingInvitation.save("osi_pending");
+    let signOut: () => Promise<void> = async () => {};
+    function Capture() {
+      signOut = useAuth().signOut;
+      return null;
+    }
+    render(
+      <LogtoProvider
+        config={{ endpoint: "https://logto.test", appId: APP_ID }}
+        LogtoClientClass={FakeLogtoClient as never}
+      >
+        <LogtoBridge>
+          <Capture />
+        </LogtoBridge>
+      </LogtoProvider>,
+    );
+    await act(async () => {
+      await signOut();
+    });
+    expect(pendingInvitation.read()).toBeUndefined();
   });
 });

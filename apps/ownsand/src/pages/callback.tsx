@@ -17,6 +17,7 @@ export function afterSignInPath(): string {
  * Route `callback` with Logto: completes the sign-in redirect. A visit with
  * no sign-in redirect in progress (a typed address, a bookmark or a reload
  * after the SDK finished the sign-in) leaves the route for the same target.
+ * The error of a failed callback drops the pending invitation secret.
  */
 export function LogtoCallbackPage({ appId }: { appId: string }) {
   const { navigate } = useRouter();
@@ -35,6 +36,9 @@ export function LogtoCallbackPage({ appId }: { appId: string }) {
     left.current = true;
     navigate(afterSignInPath(), { replace: true });
   }, [pending, navigate]);
+  useEffect(() => {
+    if (error) pendingInvitation.clear();
+  }, [error]);
   if (error) return <ErrorNotice error={error} />;
   return isLoading ? <Loading label="Signing in" /> : null;
 }
