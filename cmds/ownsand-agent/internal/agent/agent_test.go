@@ -106,6 +106,25 @@ func start(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity)
 // startWith starts the agent like start, after tweak changed its options.
 func startWith(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity, tweak func(*Options)) *harness {
 	t.Helper()
+	a := newAgent(t, cp, st, id, tweak)
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &harness{t: t, cp: cp, st: st, id: id, agent: a, errc: make(chan error, 1), stop: cancel}
+	go func() { h.errc <- a.Run(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-h.errc:
+		case <-time.After(15 * time.Second):
+			t.Error("agent did not stop")
+		}
+	})
+	return h
+}
+
+// newAgent builds the agent like start, after tweak changed its options,
+// and does not run it.
+func newAgent(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Identity, tweak func(*Options)) *Agent {
+	t.Helper()
 	logger := quietLogger()
 	rt, err := processrt.New(guestBinary, logger)
 	if err != nil {
@@ -125,18 +144,7 @@ func startWith(t *testing.T, cp *testcp.Server, st *store.Store, id *store.Ident
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	h := &harness{t: t, cp: cp, st: st, id: id, agent: a, errc: make(chan error, 1), stop: cancel}
-	go func() { h.errc <- a.Run(ctx) }()
-	t.Cleanup(func() {
-		cancel()
-		select {
-		case <-h.errc:
-		case <-time.After(15 * time.Second):
-			t.Error("agent did not stop")
-		}
-	})
-	return h
+	return a
 }
 
 func (h *harness) wait(from int, what string, match func(*ownsandv1.AgentEnvelope) bool) (*ownsandv1.AgentEnvelope, int) {
@@ -264,6 +272,104 @@ func TestChannelLifecycleCommandsAndRemoval(t *testing.T) {
 	if _, err := st.LoadIdentity(); !errors.Is(err, store.ErrNotFound) {
 		t.Fatal("device key kept after removal")
 	}
+	requireEmptyStateDir(t, st)
+}
+
+// requireEmptyStateDir fails when a finished removal left any entry in the
+// state directory, for example a status.json that a status write created
+// after the delete.
+func requireEmptyStateDir(t *testing.T, st *store.Store) {
+	t.Helper()
+	entries, err := os.ReadDir(st.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		t.Errorf("state directory keeps %q after the removal", e.Name())
+	}
+}
+
+// TestRemovalFencesInFlightStatusWrite pauses a status write inside the
+// writer, starts the removal and releases the write: the removal waits for
+// the write, deletes the state directory afterwards, and no status write
+// (statusLoop or setConnected) re-creates a file.
+func TestRemovalFencesInFlightStatusWrite(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	a := newAgent(t, cp, st, id, nil)
+	t.Cleanup(a.shutdown)
+
+	// Normal renewal is unchanged: the writer creates the status file.
+	a.writeStatus()
+	var status Status
+	if err := st.LoadStatus(&status); err != nil || status.DeviceID != id.DeviceID {
+		t.Fatalf("status file before the removal: %+v, %v", status, err)
+	}
+
+	cp.MarkRemoved(id.DeviceID)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	a.statusWriteHook = func() {
+		close(entered)
+		<-release
+	}
+	written := make(chan struct{})
+	go func() {
+		defer close(written)
+		a.writeStatus()
+	}()
+	<-entered
+
+	removed := make(chan error, 1)
+	go func() { removed <- a.removeDevice(context.Background()) }()
+	select {
+	case err := <-removed:
+		t.Fatalf("removal finished while a status write was in flight: %v", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	close(release)
+	select {
+	case err := <-removed:
+		if !errors.Is(err, ErrRemoved) {
+			t.Fatalf("removal returned %v", err)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("removal did not finish")
+	}
+	<-written
+	requireEmptyStateDir(t, st)
+
+	// The writer stays fenced: later writes do nothing.
+	a.writeStatus()
+	a.setConnected(true)
+	a.setConnected(false)
+	requireEmptyStateDir(t, st)
+}
+
+// TestFailedRemovalResumesStatusWrites checks that a removal that fails
+// keeps the agent enrolled and lifts the status fence, so the status file
+// renews while the removal retries.
+func TestFailedRemovalResumesStatusWrites(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	a := newAgent(t, cp, st, id, nil)
+	t.Cleanup(a.shutdown)
+
+	// A canceled context makes the removal fail before it deletes the
+	// device key.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := a.removeDevice(ctx); err == nil || errors.Is(err, ErrRemoved) {
+		t.Fatalf("removal with a canceled context returned %v", err)
+	}
+	if _, err := st.LoadIdentity(); err != nil {
+		t.Fatalf("device key after a failed removal: %v", err)
+	}
+	a.writeStatus()
+	var status Status
+	if err := st.LoadStatus(&status); err != nil || status.DeviceID != id.DeviceID {
+		t.Fatalf("status file after a failed removal: %+v, %v", status, err)
+	}
 }
 
 func TestRemovalNoticeAtAuthenticate(t *testing.T) {
@@ -283,6 +389,7 @@ func TestRemovalNoticeAtAuthenticate(t *testing.T) {
 	if cp.Confirms() != 1 {
 		t.Fatal("removal not confirmed")
 	}
+	requireEmptyStateDir(t, st)
 }
 
 func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {
