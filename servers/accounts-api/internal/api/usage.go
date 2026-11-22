@@ -268,6 +268,7 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 	now := h.timestamp()
 	var account billingAccount
 	var status billing.OrganizationStatus
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err = loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -276,7 +277,7 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 		if err := require(account, PermissionManage); err != nil {
 			return err
 		}
-		if err := h.link(ctx, tx, service, orgID, accountID, userID, name, now); err != nil {
+		if err := h.link(ctx, tx, audit, service, orgID, accountID, userID, name, now); err != nil {
 			return err
 		}
 		// The status of a new link, or a suspension of an existing link
@@ -297,13 +298,14 @@ func (h *UsageHandler) LinkOrganization(ctx context.Context, req *connect.Reques
 	if err != nil {
 		return nil, h.internal(ctx, "link_organization", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.LinkOrganizationResponse{Status: status.Proto(), BillingAccountName: account.Name}), nil
 }
 
 // link creates the link of the organization to the billing account, which
 // tx holds locked, or changes the name of an existing link to it. A link to
 // another billing account is already_exists.
-func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, service, orgID, accountID, userID, name string, now time.Time) error {
+func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, audit *auditLog, service, orgID, accountID, userID, name string, now time.Time) error {
 	var linkID, linkedAccount, oldName string
 	err := tx.QueryRow(ctx, `SELECT organization_link_id::text, billing_account_id::text, organization_name
 		FROM organization_links WHERE service = $1 AND organization_id = $2 AND unlink_time IS NULL FOR UPDATE`,
@@ -319,7 +321,7 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, service, orgID, acco
 			linkID, name); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditOrganizationLinkRenamed, ActorUserID: userID,
 			Details: map[string]string{"service": service, "organization_id": orgID, "old_name": oldName, "new_name": name},
 		})
@@ -343,7 +345,7 @@ func (h *UsageHandler) link(ctx context.Context, tx pgx.Tx, service, orgID, acco
 	h.logger.LogAttrs(ctx, slog.LevelInfo, "billing_organization_linked",
 		slog.String("billing_account_id", accountID), slog.String("service", service),
 		slog.String("organization_id", orgID), slog.String("actor_user_id", userID))
-	return h.recordAudit(ctx, tx, now, auditEvent{
+	return h.recordAudit(ctx, tx, audit, now, auditEvent{
 		BillingAccountID: accountID, Kind: AuditOrganizationLinked, ActorUserID: userID,
 		Details: map[string]string{"service": service, "organization_id": orgID, "organization_name": name},
 	})
@@ -372,6 +374,7 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 		return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 	}
 	now := h.timestamp()
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		// The billing account lock comes first, as for every change of a
 		// billing account; the link row is locked after it.
@@ -388,7 +391,7 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 			slog.String("organization_id", orgID), slog.String("client_id", clientID))
 		// The calling service names no user; the actor is its
 		// machine-to-machine application.
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: current.BillingAccountID, Kind: AuditOrganizationUnlinked, ActorUserID: clientID,
 			Details: map[string]string{"service": service, "organization_id": orgID, "actor_kind": "machine_to_machine"},
 		})
@@ -396,6 +399,7 @@ func (h *UsageHandler) UnlinkOrganization(ctx context.Context, req *connect.Requ
 	if err != nil {
 		return nil, h.internal(ctx, "unlink_organization", err)
 	}
+	h.flushAudit(ctx, audit)
 	return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 }
 

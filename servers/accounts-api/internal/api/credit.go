@@ -45,7 +45,7 @@ func (h *CreditHandler) read(ctx context.Context, rawID string, p Permission) (s
 // change runs fn in a transaction after the membership and owner-or-admin
 // role checks, which lock the billing account row. Callers check the request
 // fields before, as the contract orders the checks.
-func (h *CreditHandler) change(ctx context.Context, op, rawID string, fn func(tx pgx.Tx, accountID, userID string, now time.Time) error) error {
+func (h *CreditHandler) change(ctx context.Context, op, rawID string, fn func(tx pgx.Tx, audit *auditLog, accountID, userID string, now time.Time) error) error {
 	userID, err := callerUserID(ctx)
 	if err != nil {
 		return err
@@ -55,6 +55,7 @@ func (h *CreditHandler) change(ctx context.Context, op, rawID string, fn func(tx
 		return err
 	}
 	now := h.timestamp()
+	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
 		if err != nil {
@@ -63,11 +64,12 @@ func (h *CreditHandler) change(ctx context.Context, op, rawID string, fn func(tx
 		if err := require(account, PermissionManage); err != nil {
 			return err
 		}
-		return fn(tx, accountID, userID, now)
+		return fn(tx, audit, accountID, userID, now)
 	})
 	if err != nil {
 		return h.internal(ctx, op, err)
 	}
+	h.flushAudit(ctx, audit)
 	return nil
 }
 
@@ -145,7 +147,7 @@ func (h *CreditHandler) GetSubscription(ctx context.Context, req *connect.Reques
 // subscription. Owner and admin only.
 func (h *CreditHandler) StartSubscription(ctx context.Context, req *connect.Request[accountsv1.StartSubscriptionRequest]) (*connect.Response[accountsv1.StartSubscriptionResponse], error) {
 	resp := &accountsv1.StartSubscriptionResponse{}
-	err := h.change(ctx, "start_subscription", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, accountID, userID string, now time.Time) error {
+	err := h.change(ctx, "start_subscription", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, audit *auditLog, accountID, userID string, now time.Time) error {
 		txnID, sub, created, err := h.billing.StartSubscription(ctx, tx, accountID)
 		if err != nil {
 			return err
@@ -155,7 +157,7 @@ func (h *CreditHandler) StartSubscription(ctx context.Context, req *connect.Requ
 		if !created {
 			return nil
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditSubscriptionStarted, ActorUserID: userID,
 			Details: map[string]string{"paddle_transaction_id": txnID},
 		})
@@ -170,7 +172,7 @@ func (h *CreditHandler) StartSubscription(ctx context.Context, req *connect.Requ
 // only.
 func (h *CreditHandler) CancelSubscription(ctx context.Context, req *connect.Request[accountsv1.CancelSubscriptionRequest]) (*connect.Response[accountsv1.CancelSubscriptionResponse], error) {
 	resp := &accountsv1.CancelSubscriptionResponse{}
-	err := h.change(ctx, "cancel_subscription", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, accountID, userID string, now time.Time) error {
+	err := h.change(ctx, "cancel_subscription", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, audit *auditLog, accountID, userID string, now time.Time) error {
 		sub, changed, err := h.billing.CancelSubscription(ctx, tx, accountID)
 		if err != nil {
 			return err
@@ -179,7 +181,7 @@ func (h *CreditHandler) CancelSubscription(ctx context.Context, req *connect.Req
 		if !changed {
 			return nil
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{BillingAccountID: accountID, Kind: AuditSubscriptionCanceled, ActorUserID: userID})
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{BillingAccountID: accountID, Kind: AuditSubscriptionCanceled, ActorUserID: userID})
 	})
 	if err != nil {
 		return nil, err
@@ -190,7 +192,7 @@ func (h *CreditHandler) CancelSubscription(ctx context.Context, req *connect.Req
 // ResumeSubscription removes a scheduled cancellation. Owner and admin only.
 func (h *CreditHandler) ResumeSubscription(ctx context.Context, req *connect.Request[accountsv1.ResumeSubscriptionRequest]) (*connect.Response[accountsv1.ResumeSubscriptionResponse], error) {
 	resp := &accountsv1.ResumeSubscriptionResponse{}
-	err := h.change(ctx, "resume_subscription", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, accountID, userID string, now time.Time) error {
+	err := h.change(ctx, "resume_subscription", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, audit *auditLog, accountID, userID string, now time.Time) error {
 		sub, changed, err := h.billing.ResumeSubscription(ctx, tx, accountID)
 		if err != nil {
 			return err
@@ -199,7 +201,7 @@ func (h *CreditHandler) ResumeSubscription(ctx context.Context, req *connect.Req
 		if !changed {
 			return nil
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{BillingAccountID: accountID, Kind: AuditSubscriptionResumed, ActorUserID: userID})
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{BillingAccountID: accountID, Kind: AuditSubscriptionResumed, ActorUserID: userID})
 	})
 	if err != nil {
 		return nil, err
@@ -233,13 +235,14 @@ func (h *CreditHandler) CreateTopUp(ctx context.Context, req *connect.Request[ac
 		}
 		return require(account, PermissionManage)
 	}
+	audit := &auditLog{}
 	created := func(tx pgx.Tx, topUpID string) error {
-		return h.recordAudit(ctx, tx, h.timestamp(), auditEvent{
+		return h.recordAudit(ctx, tx, audit, h.timestamp(), auditEvent{
 			BillingAccountID: accountID, Kind: AuditTopUpRequested, ActorUserID: userID,
 			Details: map[string]string{"top_up_id": topUpID, "amount_usd_micros": strconv.FormatInt(amount, 10)},
 		})
 	}
-	err = h.billing.CreateTopUp(ctx, accountID, userID, key, amount, authorize, created)
+	err = h.billing.CreateTopUp(ctx, accountID, userID, key, amount, authorize, created, func() { h.flushAudit(ctx, audit) })
 	if err != nil {
 		return nil, h.internal(ctx, "create_top_up", err)
 	}
@@ -282,13 +285,13 @@ func (h *CreditHandler) UpdateAutoTopUpSettings(ctx context.Context, req *connec
 		return nil, err
 	}
 	var accountID string
-	err := h.change(ctx, "update_auto_top_up_settings", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, id, userID string, now time.Time) error {
+	err := h.change(ctx, "update_auto_top_up_settings", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, audit *auditLog, id, userID string, now time.Time) error {
 		accountID = id
 		in := req.Msg.GetSettings()
 		if _, err := billing.UpdateAutoTopUp(ctx, tx, id, in, now); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: id, Kind: AuditAutoTopUpSettingsUpdated, ActorUserID: userID,
 			Details: map[string]string{
 				"enabled":                strconv.FormatBool(in.GetEnabled()),
@@ -336,12 +339,12 @@ func (h *CreditHandler) UpdateAlertSettings(ctx context.Context, req *connect.Re
 		return nil, invalidArgument("low_balance_threshold_usd_micros must be non-negative whole cents")
 	}
 	var st billing.Settings
-	err := h.change(ctx, "update_alert_settings", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, accountID, userID string, now time.Time) error {
+	err := h.change(ctx, "update_alert_settings", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, audit *auditLog, accountID, userID string, now time.Time) error {
 		var err error
 		if st, err = billing.UpdateAlert(ctx, tx, accountID, in, now); err != nil {
 			return err
 		}
-		return h.recordAudit(ctx, tx, now, auditEvent{
+		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: accountID, Kind: AuditAlertSettingsUpdated, ActorUserID: userID,
 			Details: map[string]string{"low_balance_threshold_usd_micros": strconv.FormatInt(in.GetLowBalanceThresholdUsdMicros(), 10)},
 		})
