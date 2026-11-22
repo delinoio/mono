@@ -55,7 +55,9 @@ type Timing struct {
 	// of a new window, seals ended windows and every instance refreshes the
 	// outbox metrics.
 	Tick time.Duration
-	// Report is the interval of the reporter when nothing is due earlier.
+	// Report is the interval of the reporter when nothing is due earlier and
+	// this instance holds the lease. An instance without the lease checks it
+	// every Tick instead.
 	Report time.Duration
 	// BackoffMin and BackoffMax bound the exponential retry delay of a
 	// failed report.
@@ -218,8 +220,14 @@ func (m *Metering) runReport(ctx context.Context) {
 		case <-timer.C:
 		case <-m.kick:
 		}
-		wait := m.timing.Report
+		// An instance that does not hold the lease checks it again after one
+		// Tick, so a new holder reports the due rows that an earlier holder
+		// left in the outbox without waiting for the idle Report interval.
+		// The holder waits the longer Report interval, or until the next
+		// row is due.
+		wait := m.timing.Tick
 		if m.held() {
+			wait = m.timing.Report
 			_ = m.Report(ctx)
 			if due, ok, err := m.nextDue(ctx); err == nil && ok {
 				if d := due.Sub(m.now()); d < wait {
