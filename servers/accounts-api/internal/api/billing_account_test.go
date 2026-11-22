@@ -422,6 +422,72 @@ func TestInvitationAcceptance(t *testing.T) {
 	}
 }
 
+// TestInvitationTokenHelperIgnoresOtherEmails covers the InvitationToken test
+// helper: a later billing notice to the same address, whose body holds the
+// "#token=" marker, must not hide or replace the token of the newest
+// invitation.
+func TestInvitationTokenHelperIgnoresOtherEmails(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	invitee := newPerson(env, "invitee")
+	accountID := createAccount(t, owner, "Acme").GetBillingAccountId()
+	invite(t, owner, accountID, invitee.Email, roleViewer)
+	token := env.InvitationToken(invitee.Email)
+	if !strings.HasPrefix(token, "bai_") || len(token) != 4+43 {
+		t.Fatalf("token %q has the wrong format", token)
+	}
+
+	// A later billing notice to the same address comes after the invitation.
+	notice, err := email.NoticeMessage(email.Notice{
+		Kind:               email.KindLowBalance,
+		BillingAccountID:   accountID,
+		BillingAccountName: "Acme",
+		To:                 invitee.Email,
+		Link:               email.BillingAccountPath(testenv.WebOrigin, accountID),
+		Lines:              []string{"Your balance is low. #token=bai_forged"},
+		IdempotencyKey:     "low_balance/" + accountID + "/helper",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := env.Email.Send(ctx(), notice); err != nil {
+		t.Fatal(err)
+	}
+	if got := env.InvitationToken(invitee.Email); got != token {
+		t.Fatalf("token after a billing notice = %q, want %q", got, token)
+	}
+
+	// The newest invitation to the address wins over the older one.
+	secondID := createAccount(t, owner, "Second").GetBillingAccountId()
+	invite(t, owner, secondID, invitee.Email, roleAdmin)
+	newest := env.InvitationToken(invitee.Email)
+	if newest == token || !strings.HasPrefix(newest, "bai_") || len(newest) != 4+43 {
+		t.Fatalf("newest token = %q, previous %q", newest, token)
+	}
+	if _, err := accept(invitee, newest); err != nil {
+		t.Fatalf("AcceptInvitation with the newest token: %v", err)
+	}
+}
+
+// TestInvitationTokenHelperIgnoresMarkerInAccountName covers a billing
+// account name that holds the "#token=" marker: the invitation email shows
+// the name before the acceptance link, and the helper must still return the
+// token of the link.
+func TestInvitationTokenHelperIgnoresMarkerInAccountName(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	invitee := newPerson(env, "invitee")
+	accountID := createAccount(t, owner, "Acme #token=bai_forged").GetBillingAccountId()
+	invite(t, owner, accountID, invitee.Email, roleViewer)
+	token := env.InvitationToken(invitee.Email)
+	if !strings.HasPrefix(token, "bai_") || len(token) != 4+43 || strings.Contains(token, "forged") {
+		t.Fatalf("token %q is not the link token", token)
+	}
+	if _, err := accept(invitee, token); err != nil {
+		t.Fatalf("AcceptInvitation: %v", err)
+	}
+}
+
 func TestInvitationRules(t *testing.T) {
 	env := testenv.New(t)
 	owner := newPerson(env, "owner")

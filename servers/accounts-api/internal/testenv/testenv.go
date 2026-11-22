@@ -264,20 +264,24 @@ func (e *Env) User(userID, primaryEmail, name string) accountsv1connect.BillingA
 }
 
 // InvitationToken returns the token of the invitation email sent to addr,
-// read from the link in the latest such email.
+// read from the acceptance link of the newest such email. Emails of another
+// kind, such as a billing notice to the same address, are skipped, and the
+// token is read only from the line that starts with the acceptance link, so
+// text before it (the billing account name is chosen by users and may hold
+// "#token=") cannot change the result.
 func (e *Env) InvitationToken(addr string) string {
 	e.t.Helper()
+	linkPrefix := strings.TrimRight(WebOrigin, "/") + email.InvitationPath + "#token="
 	msgs := e.Email.Messages()
 	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].To != addr {
+		if msgs[i].To != addr || msgs[i].Kind != email.KindInvitation {
 			continue
 		}
-		_, token, ok := strings.Cut(msgs[i].Text, "#token=")
-		if !ok {
-			break
+		for _, line := range strings.Split(msgs[i].Text, "\n") {
+			if token, ok := strings.CutPrefix(strings.TrimSpace(line), linkPrefix); ok {
+				return token
+			}
 		}
-		token, _, _ = strings.Cut(token, "\n")
-		return token
 	}
 	e.t.Fatalf("no invitation email to %s", addr)
 	return ""
