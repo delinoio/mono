@@ -1778,6 +1778,13 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
 //                 (`docker rm --force` of a replacement still succeeds).
 //   STUB_START_FAIL glob of the container names that `docker start` fails for.
+//   STUB_OLD_IMAGES space-separated `<container ID>=<image>` pairs: the image
+//                 that `docker inspect --format {{.Config.Image}}` prints for
+//                 an old container (default: `olderImage`).
+//   STUB_INSPECT_IMAGE_FAIL space-separated container IDs whose image
+//                 `docker inspect` cannot read.
+//   STUB_IMAGE_RM_FAIL space-separated image references that `docker image rm`
+//                 fails for.
 //   STUB_RUN_EXIT   exit code of `docker run` (default 0), printed with a
 //                 Docker diagnostic when not 0.
 //   STUB_CREATE_EXIT exit code of `docker create` (default 0), like STUB_RUN_EXIT.
@@ -1829,6 +1836,12 @@ function setupDroplet(
   inspect)
     case "$3" in
       *State.Status*) echo "\${STUB_STATUS:-running}" ;;
+      *Config.Image*)
+        [[ " \${STUB_INSPECT_IMAGE_FAIL:-} " != *" \$4 "* ]] || exit 1
+        for pair in \${STUB_OLD_IMAGES:-}; do
+          [[ "\${pair%%=*}" != "\$4" ]] || { echo "\${pair#*=}"; exit 0; }
+        done
+        echo "${olderImage}" ;;
       *) echo 172.18.0.5 ;;
     esac ;;
   run|create)
@@ -1839,6 +1852,7 @@ function setupDroplet(
   exec) exit "\${STUB_RELOAD:-0}" ;;
   stop) [[ " \${STUB_STOP_FAIL:-} " != *" \$4 "* ]] || exit 1 ;;
   start) [[ -z "\${STUB_START_FAIL:-}" || "\$2" != \$STUB_START_FAIL ]] || exit 1 ;;
+  image) [[ "\$2" != rm || " \${STUB_IMAGE_RM_FAIL:-} " != *" \$3 "* ]] || exit 1 ;;
   rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
   logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
 esac`,
@@ -1903,8 +1917,10 @@ test(
       "docker inspect",
       "curl --silent",
       "docker exec",
+      "docker inspect",
       "docker stop",
       "docker rm",
+      "docker image",
       "docker image",
     ]);
     const run = result.calls.find((call) => call.startsWith("docker run"));
@@ -2071,8 +2087,10 @@ test(
       "docker inspect",
       "curl --silent",
       "docker exec",
+      "docker inspect",
       "docker stop",
       "docker rm",
+      "docker image",
       "docker image",
     ]);
     const running = result.calls.filter((call) => call.startsWith("docker ps"));
@@ -2228,6 +2246,138 @@ test(
         name,
       );
     }
+  },
+);
+
+const imageCalls = (calls) =>
+  calls.filter((call) => call.startsWith("docker image"));
+
+test(
+  "droplet deploy removes the image of a removed old container after the removal",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, { old: ["old1"] });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // The image is read before the container goes, removed after it, and the
+    // prune of dangling images still runs last.
+    assert.deepEqual(result.calls.slice(-5), [
+      "docker inspect --format {{.Config.Image}} old1",
+      "docker stop --time 30 old1",
+      "docker rm old1",
+      `docker image rm ${olderImage}`,
+      "docker image prune --force",
+    ]);
+  },
+);
+
+test(
+  "droplet deploy removes no image when the old container ran the new image",
+  { skip },
+  (t) => {
+    // A retry of the same image after a failed cleanup.
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      env: { STUB_OLD_IMAGES: `old1=${dropletImage}` },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(imageCalls(result.calls), ["docker image prune --force"]);
+  },
+);
+
+test("droplet deploy removes each distinct old image once", { skip }, (t) => {
+  const result = runDroplet(t, undefined, {
+    old: ["old1", "old2", "old3"],
+    env: {
+      STUB_OLD_IMAGES: `old1=${olderImage} old2=${oldestImage} old3=${olderImage}`,
+    },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  // old3 shares the image of old1, so the image goes after the last
+  // container that used it, and only once.
+  assert.deepEqual(imageCalls(result.calls), [
+    `docker image rm ${olderImage}`,
+    `docker image rm ${oldestImage}`,
+    "docker image prune --force",
+  ]);
+  const lastRm = result.calls.lastIndexOf("docker rm old3");
+  assert.ok(
+    lastRm > 0 &&
+      lastRm < result.calls.indexOf(`docker image rm ${olderImage}`),
+  );
+});
+
+test(
+  "droplet deploy still succeeds and prunes when the removal of an old image fails",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      old: ["old1"],
+      state: `${olderImage}\n`,
+      env: { STUB_IMAGE_RM_FAIL: olderImage },
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.ok(
+      result.stderr.includes(
+        `docker image rm failed for the previous image ${olderImage}`,
+      ),
+      result.stderr,
+    );
+    assert.ok(!result.stderr.includes("::error::"), result.stderr);
+    assert.equal(result.calls.at(-1), "docker image prune --force");
+    assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+    assert.match(
+      result.stdout,
+      /api runs .* behind https:\/\/api\.example\.com/,
+    );
+  },
+);
+
+test(
+  "droplet deploy keeps the image of an old container that it could not remove or inspect",
+  { skip },
+  (t) => {
+    // old1 stays (its removal fails), so its image stays; old2 shares that
+    // image. old3 has an unreadable image and old4 has its own image.
+    const result = runDroplet(t, undefined, {
+      old: ["old1", "old2", "old3", "old4"],
+      env: {
+        STUB_RM_FAIL: "old1",
+        STUB_INSPECT_IMAGE_FAIL: "old3",
+        STUB_OLD_IMAGES: `old1=${olderImage} old2=${olderImage} old4=${oldestImage}`,
+      },
+    });
+    assert.equal(result.status, 1, result.stdout + result.stderr);
+    assert.match(
+      result.stderr,
+      /docker rm failed for the previous container old1/,
+    );
+    assert.match(
+      result.stderr,
+      /Could not read the image of the previous container old3/,
+    );
+    assert.deepEqual(imageCalls(result.calls), [
+      `docker image rm ${oldestImage}`,
+      "docker image prune --force",
+    ]);
+    assert.ok(result.calls.includes("docker rm old3"));
+  },
+);
+
+test(
+  "droplet deploy removes the old image of a service with UDP ports",
+  { skip },
+  (t) => {
+    // The previous containers are already stopped when the cleanup starts.
+    const result = runDroplet(t, udpArgs, { old: ["old1"] });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(imageCalls(result.calls), [
+      `docker image rm ${olderImage}`,
+      "docker image prune --force",
+    ]);
+    assert.ok(
+      result.calls.indexOf(`docker image rm ${olderImage}`) >
+        result.calls.indexOf("docker rm old1"),
+    );
   },
 );
 

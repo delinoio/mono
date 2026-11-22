@@ -24,9 +24,10 @@
 # a request. A failure before the proxy reload removes the new container, so
 # the old one keeps serving. After the reload the replacement is the deployed
 # image: the script records it in the state files first, and then stops and
-# removes the old containers. A failed stop or removal makes the script exit
+# removes the old containers and the images that they ran (a different image
+# than the replacement). A failed stop or removal makes the script exit
 # non-zero and name the container, but the state files already name the
-# replacement. The exit code is the deployment verdict.
+# replacement. A failed image removal is only logged. The exit code is the deployment verdict.
 #
 # A service that publishes UDP host ports cannot run next to its replacement,
 # because only one container can publish a host port. For such a service the
@@ -255,21 +256,57 @@ main() {
   record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
 
   local -a failed=()
-  local id
+  # Image references of the removed old containers, and of the old containers
+  # that are still there because their stop or removal failed.
+  # An empty reference (an unreadable image) is never recorded; it is not a
+  # valid array key.
+  local -a superseded=()
+  local -A in_use=() seen_image=()
+  local id old_image
   for id in "${old[@]}"; do
+    # Read the image before the removal. The reference is what the container
+    # was created from (a digest reference for every deployment of this
+    # script). A failed read only skips the image cleanup of this container.
+    if ! old_image="$(docker inspect --format '{{.Config.Image}}' "$id")"; then
+      echo "Could not read the image of the previous container $id; its image stays." >&2
+      old_image=""
+    fi
     echo "Stop the previous container $id"
     if ! docker stop --time "$stop_timeout" "$id" > /dev/null; then
       echo "::error::docker stop failed for the previous container $id." >&2
       failed+=("docker stop $id")
+      if [[ -n "$old_image" ]]; then in_use[$old_image]=1; fi
       continue
     fi
     if ! docker rm "$id" > /dev/null; then
       echo "::error::docker rm failed for the previous container $id." >&2
       failed+=("docker rm $id")
+      if [[ -n "$old_image" ]]; then in_use[$old_image]=1; fi
+      continue
+    fi
+    if [[ -n "$old_image" && -z "${seen_image[$old_image]:-}" ]]; then
+      seen_image[$old_image]=1
+      superseded+=("$old_image")
     fi
   done
-  # Removes images that no container uses any more. A rollback pulls the
-  # previous image from the registry again.
+  # Removes the image of every removed old container, once per reference and
+  # only when no old container that is still there uses it, and not when it is
+  # the image of the replacement (a retry of the same image). The prune below
+  # does not remove them: an image that was pulled by digest has no tag, and
+  # the containerd image store (the default of a fresh Docker Engine 29) does
+  # not count it as dangling. A failed removal is only logged: the replacement
+  # already serves and the state files name it.
+  for old_image in "${superseded[@]}"; do
+    if [[ "$old_image" == "$image" || -n "${in_use[$old_image]:-}" ]]; then
+      continue
+    fi
+    echo "Remove the previous image $old_image"
+    if ! docker image rm "$old_image" > /dev/null; then
+      echo "docker image rm failed for the previous image $old_image; it stays on the Droplet." >&2
+    fi
+  done
+  # Removes images that no container uses any more and that are dangling. A
+  # rollback pulls the previous image from the registry again.
   docker image prune --force > /dev/null || true
   if (( ${#failed[@]} > 0 )); then
     fail "the replacement $new already serves $service as $image, but the cleanup of the previous containers failed (${failed[*]}). Remove them by hand, or deploy the same image again to retry."
