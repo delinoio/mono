@@ -34,6 +34,19 @@ export interface QueueView {
   reconnects: number;
 }
 
+/** Kinds of the view actions that do not come from `watchQueue`. */
+export enum QueueViewActionKind {
+  /**
+   * The console opens a new `watchQueue` iterator, for example after a
+   * manual retry. The new stream starts with a snapshot and without a `Gap`.
+   */
+  Restart = "restart",
+}
+
+/** An action of the queue view reducer. */
+export type QueueViewAction =
+  WatchQueueEvent | { kind: QueueViewActionKind.Restart };
+
 /** A new view before the first snapshot. */
 export function initialQueueView(): QueueView {
   return {
@@ -58,9 +71,10 @@ function upsert<T>(
 }
 
 /**
- * Applies one `watchQueue` event. A gap starts a new snapshot, because the
- * changes between two streams are lost; the view keeps showing the last
- * state until the new snapshot is complete and then replaces it. Terminal
+ * Applies one `watchQueue` event or view action. A gap or a restart starts a
+ * new snapshot, because the changes between two streams are lost; the view
+ * keeps showing the last state until the new snapshot is complete and then
+ * replaces it. Only a gap counts as a reconnect. Terminal
  * requests and runners leave the view. Snapshot items go into the pending
  * maps in place (set and delete are idempotent, so a repeated reducer call
  * in React strict mode is harmless) and render once the snapshot is
@@ -68,9 +82,18 @@ function upsert<T>(
  */
 export function applyQueueEvent(
   view: QueueView,
-  event: WatchQueueEvent,
+  event: QueueViewAction,
 ): QueueView {
   switch (event.kind) {
+    case QueueViewActionKind.Restart:
+      return {
+        ...view,
+        live:
+          view.live === LiveState.Connecting
+            ? LiveState.Connecting
+            : LiveState.Reconnecting,
+        pending: { requests: new Map(), runners: new Map() },
+      };
     case WatchQueueEventKind.Gap:
       return {
         ...view,

@@ -42,6 +42,7 @@ import {
   applyQueueEvent,
   initialQueueView,
   LiveState,
+  QueueViewActionKind,
   waitingInQueueOrder,
 } from "./queue.ts";
 import {
@@ -301,6 +302,31 @@ describe("queue view", () => {
     expect(view.live).toBe(LiveState.Live);
     expect([...view.runners.keys()]).toEqual(["w2"]);
     expect(view.reconnects).toBe(1);
+  });
+
+  test("a restart replaces the last state with the snapshot of the new stream", () => {
+    let view = initialQueueView();
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.Runner,
+      runner: create(RunnerSchema, { runnerId: "w1", state: RunnerState.WARM }),
+    });
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    // A manual retry opens a new iterator, which sends no gap.
+    view = applyQueueEvent(view, { kind: QueueViewActionKind.Restart });
+    expect(view.live).toBe(LiveState.Reconnecting);
+    expect([...view.runners.keys()]).toEqual(["w1"]);
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.Runner,
+      runner: create(RunnerSchema, { runnerId: "w2", state: RunnerState.BUSY }),
+    });
+    view = applyQueueEvent(view, {
+      kind: WatchQueueEventKind.SnapshotComplete,
+    });
+    expect(view.live).toBe(LiveState.Live);
+    expect([...view.runners.keys()]).toEqual(["w2"]);
+    expect(view.reconnects).toBe(0);
   });
 
   test("orders waiting requests by priority, queue time and ID", () => {

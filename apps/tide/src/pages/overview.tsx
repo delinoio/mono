@@ -28,6 +28,7 @@ import {
   applyQueueEvent,
   initialQueueView,
   LiveState,
+  QueueViewActionKind,
   waitingInQueueOrder,
 } from "../queue.ts";
 
@@ -71,6 +72,10 @@ export function OverviewPage() {
   useEffect(() => {
     const abort = new AbortController();
     const work = createClient(WorkService, transport);
+    // A new iterator sends no initial gap, so start a new snapshot here.
+    // Otherwise a retry merges its snapshot into the old state and keeps
+    // requests and runners that ended while no stream was open.
+    dispatch({ kind: QueueViewActionKind.Restart });
     void (async () => {
       try {
         for await (const event of watchQueue(work, {
