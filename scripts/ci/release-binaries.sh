@@ -267,7 +267,13 @@ run_manifest_tool() {
 
 keychain=""
 signing_work=""
+# The user keychain search list before sign_macos added its keychain.
+keychain_search_list=()
+keychain_search_list_saved=""
 cleanup_signing() {
+  if [[ -n "$keychain_search_list_saved" ]]; then
+    security list-keychains -d user -s "${keychain_search_list[@]}" > /dev/null 2>&1 || true
+  fi
   if [[ -n "$keychain" ]]; then
     security delete-keychain "$keychain" > /dev/null 2>&1 || true
   fi
@@ -303,6 +309,19 @@ sign_macos() {
   security unlock-keychain -p "$keychain_password" "$keychain"
   security import "$work/certificate.p12" -k "$keychain" -P "$APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD" -T /usr/bin/codesign > /dev/null
   security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain" > /dev/null
+  # `codesign --keychain` finds the identity only in a keychain of the
+  # search list ("no identity found" otherwise), so put the job keychain
+  # first and keep the existing entries. Each entry is a separate argument;
+  # cleanup restores the saved list before it deletes the keychain.
+  local entry
+  while IFS= read -r entry; do
+    entry="${entry#"${entry%%[![:space:]]*}"}"
+    entry="${entry#\"}"
+    entry="${entry%\"}"
+    [[ -n "$entry" ]] && keychain_search_list+=("$entry")
+  done < <(security list-keychains -d user)
+  keychain_search_list_saved=1
+  security list-keychains -d user -s "$keychain" "${keychain_search_list[@]}"
   rm -f "$work/certificate.p12"
   local identities identity
   identities="$(security find-identity -v -p codesigning "$keychain" | grep -c '"Developer ID Application: ' || true)"
