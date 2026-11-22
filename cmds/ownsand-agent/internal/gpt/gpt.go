@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"hash/crc32"
 	"io"
+	"math"
 	"os"
 	"strings"
 )
@@ -33,6 +34,17 @@ const (
 	signature  = "EFI PART"
 	headerSize = 92
 )
+
+// maxEntryArrayBytes is the largest entry array (NumEntries x EntrySize
+// bytes) that Read accepts, whatever the disk size is. It is a support limit
+// of this package, not of the GPT format: the format sets no upper bound, and
+// the limit equals the maximum of 4096 entries of the usual 128 bytes. The
+// header fields that size the array come from the disk image, which a guest
+// or an imported snapshot wrote, and a header checksum only proves that the
+// header is self-consistent. Read checks the limit before it allocates the
+// array, because a failed allocation of that size is a fatal Go runtime error
+// that no code can recover from, and it ends the whole agent process.
+const maxEntryArrayBytes = 512 << 10
 
 // header is the GPT header (all fields little-endian).
 type header struct {
@@ -93,6 +105,30 @@ func parseHeader(buf []byte) (header, error) {
 	return h, nil
 }
 
+// entryArrayRange returns the byte length and the byte offset of the entry
+// array that h declares on a disk of size bytes. It fails, without any disk
+// access or allocation, when the array is larger than maxEntryArrayBytes,
+// when its offset or its end cannot be represented, or when it does not lie
+// inside the disk. All comparisons subtract on values that are already known
+// to be in range, so no step can overflow.
+func entryArrayRange(h header, size int64) (length int, offset int64, err error) {
+	// Both factors are 32-bit values, so the product fits a uint64.
+	total := uint64(h.NumEntries) * uint64(h.EntrySize)
+	if total > maxEntryArrayBytes {
+		return 0, 0, fmt.Errorf("gpt: unsupported entry array (%d entries of %d bytes: %d bytes exceed the limit of %d bytes)",
+			h.NumEntries, h.EntrySize, total, maxEntryArrayBytes)
+	}
+	if size < 0 || h.EntriesLBA > uint64(math.MaxInt64)/SectorSize {
+		return 0, 0, fmt.Errorf("gpt: the entry array starts at sector %d, which is not a valid disk offset", h.EntriesLBA)
+	}
+	start := h.EntriesLBA * SectorSize
+	if start > uint64(size) || total > uint64(size)-start {
+		return 0, 0, fmt.Errorf("gpt: the entry array (%d entries of %d bytes at sector %d) lies outside the disk of %d bytes",
+			h.NumEntries, h.EntrySize, h.EntriesLBA, size)
+	}
+	return int(total), int64(start), nil
+}
+
 // Read parses the primary partition table of the disk image f.
 func Read(f io.ReaderAt, size int64) (*Table, error) {
 	if size%SectorSize != 0 || size < 34*SectorSize*2 {
@@ -109,8 +145,12 @@ func Read(f io.ReaderAt, size int64) (*Table, error) {
 	if h.EntrySize < 128 || h.EntrySize%8 != 0 || h.NumEntries == 0 || h.NumEntries > 4096 {
 		return nil, fmt.Errorf("gpt: unsupported entry array (%d entries of %d bytes)", h.NumEntries, h.EntrySize)
 	}
-	entries := make([]byte, int(h.NumEntries)*int(h.EntrySize))
-	if _, err := f.ReadAt(entries, int64(h.EntriesLBA)*SectorSize); err != nil {
+	length, offset, err := entryArrayRange(h, size)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]byte, length)
+	if _, err := f.ReadAt(entries, offset); err != nil {
 		return nil, fmt.Errorf("gpt: read the entries: %w", err)
 	}
 	if crc32.ChecksumIEEE(entries) != h.EntriesCRC {
