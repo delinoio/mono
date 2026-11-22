@@ -101,6 +101,26 @@ export function TextWithAccountsLink({ text }: { text: string }) {
 }
 
 /**
+ * The sign-in button of an `unauthenticated` notice. It reads the auth context
+ * here and not in `ErrorNotice`, so that a notice for any other error (for
+ * example the callback page's, which a test or a caller may mount without an
+ * auth provider) does not need one.
+ */
+function SignInButton({ onSignIn }: { onSignIn?: () => void | Promise<void> }) {
+  const auth = useAuth();
+  return (
+    <Button
+      variant={ButtonVariant.Secondary}
+      onClick={() => {
+        void (onSignIn ?? auth.signIn)();
+      }}
+    >
+      Sign in with Delino
+    </Button>
+  );
+}
+
+/**
  * A failed request, with a retry button. A billing error shows the server
  * message with its link and never offers a retry, because it is terminal.
  * An `unauthenticated` error, from the server or from a token request that
@@ -118,7 +138,6 @@ export function ErrorNotice({
   onRetry?: () => void;
   onSignIn?: () => void | Promise<void>;
 }) {
-  const auth = useAuth();
   const billing = billingReasonOf(error) !== undefined;
   const unauthenticated =
     error instanceof ConnectError && error.code === Code.Unauthenticated;
@@ -128,14 +147,7 @@ export function ErrorNotice({
         <TextWithAccountsLink text={errorMessage(error)} />
       </p>
       {unauthenticated ? (
-        <Button
-          variant={ButtonVariant.Secondary}
-          onClick={() => {
-            void (onSignIn ?? auth.signIn)();
-          }}
-        >
-          Sign in with Delino
-        </Button>
+        <SignInButton onSignIn={onSignIn} />
       ) : onRetry && !billing ? (
         <Button variant={ButtonVariant.Secondary} onClick={onRetry}>
           Try again
