@@ -40,6 +40,11 @@ const (
 	AgentCredential_AGENT_CREDENTIAL_API_TOKEN AgentCredential = 4
 	// DEVIN.
 	AgentCredential_AGENT_CREDENTIAL_OUTPOST_TOKEN AgentCredential = 5
+	// OPENAI_CODEX: an OpenAI API key of the project with `api.agents.read`.
+	// tide reads the session of an `agent.session.action_required` webhook
+	// with it, because the webhook carries no environment ID or remote URL.
+	// It never enters a runner.
+	AgentCredential_AGENT_CREDENTIAL_API_KEY AgentCredential = 6
 )
 
 // Enum value maps for AgentCredential.
@@ -51,6 +56,7 @@ var (
 		3: "AGENT_CREDENTIAL_WEBHOOK_SECRET",
 		4: "AGENT_CREDENTIAL_API_TOKEN",
 		5: "AGENT_CREDENTIAL_OUTPOST_TOKEN",
+		6: "AGENT_CREDENTIAL_API_KEY",
 	}
 	AgentCredential_value = map[string]int32{
 		"AGENT_CREDENTIAL_UNSPECIFIED":             0,
@@ -59,6 +65,7 @@ var (
 		"AGENT_CREDENTIAL_WEBHOOK_SECRET":          3,
 		"AGENT_CREDENTIAL_API_TOKEN":               4,
 		"AGENT_CREDENTIAL_OUTPOST_TOKEN":           5,
+		"AGENT_CREDENTIAL_API_KEY":                 6,
 	}
 )
 
@@ -346,8 +353,11 @@ type OpenAiCodexCredentials struct {
 	state          protoimpl.MessageState `protogen:"open.v1"`
 	EnvironmentKey string                 `protobuf:"bytes,1,opt,name=environment_key,json=environmentKey,proto3" json:"environment_key,omitempty"`
 	WebhookSecret  string                 `protobuf:"bytes,2,opt,name=webhook_secret,json=webhookSecret,proto3" json:"webhook_secret,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	// An OpenAI API key of the project with `api.agents.read`. It stays in
+	// tide.
+	ApiKey        string `protobuf:"bytes,3,opt,name=api_key,json=apiKey,proto3" json:"api_key,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *OpenAiCodexCredentials) Reset() {
@@ -390,6 +400,13 @@ func (x *OpenAiCodexCredentials) GetEnvironmentKey() string {
 func (x *OpenAiCodexCredentials) GetWebhookSecret() string {
 	if x != nil {
 		return x.WebhookSecret
+	}
+	return ""
+}
+
+func (x *OpenAiCodexCredentials) GetApiKey() string {
+	if x != nil {
+		return x.ApiKey
 	}
 	return ""
 }
@@ -1548,10 +1565,11 @@ const file_delino_tide_v1_agent_integration_proto_rawDesc = "" +
 	"\x15ClaudeCodeCredentials\x12'\n" +
 	"\x0fenvironment_key\x18\x01 \x01(\tR\x0eenvironmentKey\"J\n" +
 	"\x11CursorCredentials\x125\n" +
-	"\x17service_account_api_key\x18\x01 \x01(\tR\x14serviceAccountApiKey\"h\n" +
+	"\x17service_account_api_key\x18\x01 \x01(\tR\x14serviceAccountApiKey\"\x81\x01\n" +
 	"\x16OpenAiCodexCredentials\x12'\n" +
 	"\x0fenvironment_key\x18\x01 \x01(\tR\x0eenvironmentKey\x12%\n" +
-	"\x0ewebhook_secret\x18\x02 \x01(\tR\rwebhookSecret\"T\n" +
+	"\x0ewebhook_secret\x18\x02 \x01(\tR\rwebhookSecret\x12\x17\n" +
+	"\aapi_key\x18\x03 \x01(\tR\x06apiKey\"T\n" +
 	"\x10DevinCredentials\x12\x1b\n" +
 	"\tapi_token\x18\x01 \x01(\tR\bapiToken\x12#\n" +
 	"\routpost_token\x18\x02 \x01(\tR\foutpostToken\"\xc6\x01\n" +
@@ -1637,14 +1655,15 @@ const file_delino_tide_v1_agent_integration_proto_rawDesc = "" +
 	"\x1dDeleteAgentIntegrationRequest\x12'\n" +
 	"\x0forganization_id\x18\x01 \x01(\tR\x0eorganizationId\x120\n" +
 	"\x14agent_integration_id\x18\x02 \x01(\tR\x12agentIntegrationId\" \n" +
-	"\x1eDeleteAgentIntegrationResponse*\xf0\x01\n" +
+	"\x1eDeleteAgentIntegrationResponse*\x8e\x02\n" +
 	"\x0fAgentCredential\x12 \n" +
 	"\x1cAGENT_CREDENTIAL_UNSPECIFIED\x10\x00\x12$\n" +
 	" AGENT_CREDENTIAL_ENVIRONMENT_KEY\x10\x01\x12,\n" +
 	"(AGENT_CREDENTIAL_SERVICE_ACCOUNT_API_KEY\x10\x02\x12#\n" +
 	"\x1fAGENT_CREDENTIAL_WEBHOOK_SECRET\x10\x03\x12\x1e\n" +
 	"\x1aAGENT_CREDENTIAL_API_TOKEN\x10\x04\x12\"\n" +
-	"\x1eAGENT_CREDENTIAL_OUTPOST_TOKEN\x10\x052\xea\x04\n" +
+	"\x1eAGENT_CREDENTIAL_OUTPOST_TOKEN\x10\x05\x12\x1c\n" +
+	"\x18AGENT_CREDENTIAL_API_KEY\x10\x062\xea\x04\n" +
 	"\x17AgentIntegrationService\x12w\n" +
 	"\x16CreateAgentIntegration\x12-.delino.tide.v1.CreateAgentIntegrationRequest\x1a..delino.tide.v1.CreateAgentIntegrationResponse\x12n\n" +
 	"\x13GetAgentIntegration\x12*.delino.tide.v1.GetAgentIntegrationRequest\x1a+.delino.tide.v1.GetAgentIntegrationResponse\x12t\n" +
