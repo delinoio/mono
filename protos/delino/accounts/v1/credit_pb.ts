@@ -253,7 +253,8 @@ export type AutoTopUpSettings = Message<"delino.accounts.v1.AutoTopUpSettings"> 
   thresholdUsdMicros: bigint;
 
   /**
-   * Required when enabled: at least 25 USD (25,000,000), whole cents.
+   * Required when enabled: at least 25 USD (25,000,000) and at most 10,000
+   * USD (10,000,000,000), whole cents.
    *
    * @generated from field: int64 amount_usd_micros = 3;
    */
@@ -687,9 +688,9 @@ export type UpdateAutoTopUpSettingsRequest = Message<"delino.accounts.v1.UpdateA
 
   /**
    * Required. Replaces every input field. With enabled true, a threshold
-   * below 10 USD, an amount below 25 USD, a monthly cap below the amount
-   * (including a missing cap) or an amount that is not whole cents fails
-   * with `invalid_argument`. With enabled false, the values must be zero or
+   * below 10 USD, an amount below 25 USD or above 10,000 USD, a monthly cap
+   * below the amount (including a missing cap) or an amount that is not
+   * whole cents fails with `invalid_argument`. With enabled false, the values must be zero or
    * non-negative whole cents; they are kept for a later enable.
    *
    * @generated from field: delino.accounts.v1.AutoTopUpSettings settings = 2;

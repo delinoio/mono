@@ -116,9 +116,9 @@ export type AutoTopUpErrors = Partial<
 
 /**
  * Checks the automatic top-up settings like the server. When enabled: a
- * threshold of at least $10, an amount of at least $25 and a required
- * monthly cap of at least the amount, all in whole cents. When disabled, the
- * values are kept for a later enable and must be empty (zero) or
+ * threshold of at least $10, an amount from $25 to $10,000 and a required
+ * monthly cap of at least the amount, all in whole cents. When disabled,
+ * the values are kept for a later enable and must be empty (zero) or
  * non-negative whole cents.
  */
 export function checkAutoTopUp(
@@ -131,9 +131,10 @@ export function checkAutoTopUp(
     key: keyof AutoTopUpErrors,
     text: string,
     min: bigint | undefined,
+    max?: bigint,
   ): bigint => {
     if (!input.enabled && text.trim() === "") return 0n;
-    const checked = checkAmount(text, { min });
+    const checked = checkAmount(text, { min, max });
     if (!checked.ok) {
       errors[key] = checked.error;
       return 0n;
@@ -149,6 +150,7 @@ export function checkAutoTopUp(
     "amount",
     input.amount,
     input.enabled ? AUTO_TOP_UP_MIN_AMOUNT_USD_MICROS : undefined,
+    input.enabled ? TOP_UP_MAX_USD_MICROS : undefined,
   );
   const monthlyCap = read("monthlyCap", input.monthlyCap, undefined);
   if (
