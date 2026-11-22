@@ -45,15 +45,18 @@ func TestVsockHandshake(t *testing.T) {
 			line, _ := r.ReadString('\n')
 			if line == "CONNECT 1024\n" {
 				c.Write([]byte("OK 1073741824\npayload"))
-			} else {
-				c.Close()
 			}
+			// Close the accepted connection in both branches, so no
+			// descriptor stays open until a finalizer closes it (see
+			// TestCreateFailureReleasesVM).
+			c.Close()
 		}
 	}()
 	c, err := v.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c.Close()
 	buf := make([]byte, 7)
 	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "payload" {
 		t.Fatalf("stream after handshake %q %v", buf, err)
@@ -86,6 +89,9 @@ func TestAPIClientErrors(t *testing.T) {
 	go srv.Serve(l)
 	defer srv.Close()
 	c := newAPIClient(v.path(apiSocket))
+	// Close the idle keep-alive connections of the client, so no descriptor
+	// stays open until a finalizer closes it (see TestCreateFailureReleasesVM).
+	defer c.hc.CloseIdleConnections()
 	if err := c.waitReady(context.Background(), make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
