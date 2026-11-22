@@ -112,7 +112,20 @@ func TestReadTarRejectsChainedSymlinkEscape(t *testing.T) {
 		{hdr: tar.Header{Name: "l2", Typeflag: tar.TypeSymlink, Linkname: "a/b/.."}},
 		{hdr: tar.Header{Name: "l2/evil", Typeflag: tar.TypeReg, Mode: 0o644}, data: "pwned"},
 	})
-	if err := ReadTar(buf, dir); err == nil {
+	err := ReadTar(buf, dir)
+	if runtime.GOOS == "windows" {
+		// Windows removes ".." elements lexically before it follows a link,
+		// and os.Root does the same there, so "a/b/.." is "a" and the file
+		// is "a/evil" inside the root. ReadTar may accept the archive, but
+		// then the file must be inside the root.
+		if err == nil {
+			if b, err := os.ReadFile(filepath.Join(dir, "a", "evil")); err != nil || string(b) != "pwned" {
+				t.Fatalf("accepted the archive, but a/evil is not the file in the root: %q, %v", b, err)
+			}
+		}
+	} else if err == nil {
+		// On other systems the link "a/b" is resolved first, so "a/b/.."
+		// is the parent of the root.
 		t.Fatal("accepted a chained symbolic link escape")
 	}
 	if _, err := os.Lstat(filepath.Join(parent, "evil")); !errors.Is(err, os.ErrNotExist) {
