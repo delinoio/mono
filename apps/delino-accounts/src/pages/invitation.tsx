@@ -6,7 +6,7 @@ import { useAuth } from "../auth.tsx";
 import { Page } from "../components/shell.tsx";
 import { ErrorNotice, PageHeader } from "../components/ui.tsx";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
-import { pendingInvitation, takeTokenFromAddress } from "../invitation.ts";
+import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /**
@@ -18,7 +18,10 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   const auth = useAuth();
   const { navigate } = useRouter();
   const [token, setToken] = useState<string | undefined>(() => {
-    const fromAddress = takeTokenFromAddress(window.location, window.history);
+    const fromAddress = openInvitationFromAddress(
+      window.location,
+      window.history,
+    );
     return fromAddress ?? pendingInvitation.read();
   });
   const accept = useMutation(BillingAccountService.method.acceptInvitation);
@@ -37,7 +40,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
   useEffect(() => {
     // A new link opened while the page is shown.
     const onHash = () => {
-      const next = takeTokenFromAddress(window.location, window.history);
+      const next = openInvitationFromAddress(window.location, window.history);
       if (next !== undefined) {
         currentAttempt.current += 1;
         resetAccept();
