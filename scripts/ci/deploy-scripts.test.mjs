@@ -7,7 +7,7 @@
 // `start-caddy.sh` (against a stubbed `docker`) and
 // `deploy-release.sh` (against a local bare remote).
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   mkdirSync,
@@ -42,9 +42,12 @@ const bashVersion = spawnSync(
   .map(Number) ?? [0, 0];
 // The scripts and the stubs call jq, which the Ubuntu runners provide.
 const hasJq = spawnSync("sh", ["-c", "command -v jq"]).status === 0;
+// droplet-deploy.sh serializes deployments with util-linux `flock`.
+const hasFlock = spawnSync("sh", ["-c", "command -v flock"]).status === 0;
 function skipReason() {
   if (process.platform === "win32") return "the deploy scripts run on Linux";
   if (!hasJq) return "jq is not installed";
+  if (!hasFlock) return "flock is not installed";
   if (bashVersion[0] < 4 || (bashVersion[0] === 4 && bashVersion[1] < 4)) {
     return `the deploy scripts need Bash 4.4 or newer, found ${bashVersion.join(".")}`;
   }
@@ -1656,11 +1659,10 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //                 (`docker rm --force` of a replacement still succeeds).
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
-function runDroplet(
+function setupDroplet(
   t,
   args = ["api", dropletImage, "8080", "api.example.com"],
   {
-    env = {},
     old = [],
     envFile = "LOG_LEVEL=info\n",
     route,
@@ -1720,18 +1722,6 @@ esac`,
     shellStub(bin, name, body);
   }
   prepare?.(deployRoot);
-  const result = spawnSync("bash", ["-s", "--", ...args], {
-    encoding: "utf8",
-    input: readFileSync(dropletDeploy, "utf8"),
-    env: {
-      ...baseEnv,
-      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
-      STUB_DIR: dir,
-      DROPLET_ROOT: deployRoot,
-      DROPLET_HEALTH_TIMEOUT: "3",
-      ...env,
-    },
-  });
   const read = (path) => {
     try {
       return readFileSync(join(deployRoot, path), "utf8");
@@ -1739,11 +1729,31 @@ esac`,
       return undefined;
     }
   };
-  return {
-    ...result,
-    read,
-    calls: readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n"),
-  };
+  const calls = () =>
+    readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n");
+  const spawnEnv = (env = {}) => ({
+    ...baseEnv,
+    PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+    STUB_DIR: dir,
+    DROPLET_ROOT: deployRoot,
+    DROPLET_HEALTH_TIMEOUT: "3",
+    ...env,
+  });
+  return { dir, bin, deployRoot, read, calls, spawnEnv };
+}
+
+function runDroplet(
+  t,
+  args = ["api", dropletImage, "8080", "api.example.com"],
+  { env = {}, ...options } = {},
+) {
+  const setup = setupDroplet(t, args, options);
+  const result = spawnSync("bash", ["-s", "--", ...args], {
+    encoding: "utf8",
+    input: readFileSync(dropletDeploy, "utf8"),
+    env: setup.spawnEnv(env),
+  });
+  return { ...result, read: setup.read, calls: setup.calls() };
 }
 
 const commands = (calls) =>
@@ -2172,6 +2182,202 @@ test(
       assert.ok(removeAt > logsAt, `${logs}: logs before rm`);
       assert.ok(!result.calls.some((call) => call.startsWith("docker stop")));
     }
+  },
+);
+
+// Starts droplet-deploy.sh without waiting for it, for the fixtures that run
+// several deployments at once. The promise resolves with the exit status and
+// the output; the process is killed when the test ends.
+function startDroplet(t, setup, args, env = {}) {
+  const child = spawn("bash", ["-s", "--", ...args], {
+    env: setup.spawnEnv(env),
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  t.after(() => child.kill("SIGKILL"));
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  child.stdin.end(readFileSync(dropletDeploy, "utf8"));
+  const done = new Promise((resolve, reject) => {
+    child.on("error", reject);
+    child.on("close", (status) => resolve({ status, stdout, stderr }));
+  });
+  return { child, done };
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function waitFor(condition, what) {
+  for (let waited = 0; waited < 15000; waited += 50) {
+    if (condition()) return;
+    await sleep(50);
+  }
+  assert.fail(`timed out waiting for ${what}`);
+}
+
+// The `curl` of a run with STUB_BLOCK set does not answer until `release`
+// exists, so that the run holds its deployment lock for as long as the test
+// needs.
+const blockingCurl = `if [[ -n "\${STUB_BLOCK:-}" ]]; then
+  while [[ ! -e "$STUB_DIR/release" ]]; do sleep 0.05; done
+fi
+printf 200`;
+
+const concurrentImage = `registry.digitalocean.com/delino/api@sha256:${"f".repeat(64)}`;
+
+test(
+  "droplet deploy serializes concurrent deployments of one service",
+  { skip },
+  async (t) => {
+    const setup = setupDroplet(t, undefined, {
+      old: ["old1"],
+      stubs: { curl: blockingCurl },
+    });
+    const first = startDroplet(
+      t,
+      setup,
+      ["api", dropletImage, "8080", "api.example.com"],
+      { STUB_BLOCK: "1" },
+    );
+    // The first run holds the lock once it waits for its health check.
+    await waitFor(
+      () => setup.calls().some((call) => call.startsWith("curl")),
+      "the first deployment to reach its health check",
+    );
+    // The second run is the direct rollback of the documentation: another
+    // image of the same service while the first deployment still runs.
+    const second = startDroplet(t, setup, [
+      "api",
+      concurrentImage,
+      "8080",
+      "api.example.com",
+    ]);
+    await sleep(750);
+    assert.deepEqual(
+      setup.calls().filter((call) => call.includes(concurrentImage)),
+      [],
+      "the second deployment must wait for the lock",
+    );
+    assert.equal(setup.read("state/api.current"), undefined);
+    writeFileSync(join(setup.dir, "release"), "");
+    const [firstResult, secondResult] = await Promise.all([
+      first.done,
+      second.done,
+    ]);
+    assert.equal(firstResult.status, 0, firstResult.stderr);
+    assert.equal(secondResult.status, 0, secondResult.stderr);
+    const calls = setup.calls();
+    const secondStart = calls.findIndex((call) =>
+      call.includes(concurrentImage),
+    );
+    const firstEnd = calls.findIndex((call) =>
+      call.startsWith("docker image prune"),
+    );
+    // The first run ends (its last call is `docker image prune`) before the
+    // second run makes its first call, so the second run never removes a
+    // container or rewrites the route files in the middle of the first run.
+    assert.ok(firstEnd >= 0 && secondStart > firstEnd, calls.join("\n"));
+    assert.equal(
+      calls.filter((call) => call.startsWith("docker image prune")).length,
+      2,
+    );
+    assert.equal(setup.read("state/api.current"), `${concurrentImage}\n`);
+    assert.equal(setup.read("state/api.previous"), `${dropletImage}\n`);
+    assert.equal(setup.read("caddy/sites/api.caddy.new"), undefined);
+    assert.equal(
+      setup.read("caddy/sites/api.caddy.previous") !== undefined,
+      true,
+    );
+  },
+);
+
+test(
+  "droplet deploy gives up without a change when the lock stays held",
+  { skip },
+  async (t) => {
+    const setup = setupDroplet(t, undefined, {
+      old: ["old1"],
+      stubs: { curl: blockingCurl },
+    });
+    const first = startDroplet(
+      t,
+      setup,
+      ["api", dropletImage, "8080", "api.example.com"],
+      { STUB_BLOCK: "1" },
+    );
+    await waitFor(
+      () => setup.calls().some((call) => call.startsWith("curl")),
+      "the first deployment to reach its health check",
+    );
+    const before = setup.calls();
+    const second = await startDroplet(
+      t,
+      setup,
+      ["api", concurrentImage, "8080", "api.example.com"],
+      { DROPLET_LOCK_TIMEOUT: "1" },
+    ).done;
+    assert.equal(second.status, 1);
+    assert.match(
+      second.stderr,
+      /another deployment of api held .*api\.lock for 1 seconds; nothing was changed/,
+    );
+    assert.deepEqual(setup.calls(), before);
+    writeFileSync(join(setup.dir, "release"), "");
+    assert.equal((await first.done).status, 0);
+    assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy does not make deployments of different services wait",
+  { skip },
+  async (t) => {
+    const setup = setupDroplet(t, undefined, {
+      old: ["old1"],
+      stubs: { curl: blockingCurl },
+      prepare: (deployRoot) =>
+        writeFileSync(
+          join(deployRoot, "env", "worker.env"),
+          "LOG_LEVEL=info\n",
+        ),
+    });
+    const first = startDroplet(
+      t,
+      setup,
+      ["api", dropletImage, "8080", "api.example.com"],
+      { STUB_BLOCK: "1" },
+    );
+    await waitFor(
+      () => setup.calls().some((call) => call.startsWith("curl")),
+      "the first deployment to reach its health check",
+    );
+    const other = await startDroplet(t, setup, [
+      "worker",
+      concurrentImage,
+      "9000",
+      "worker.example.com",
+    ]).done;
+    assert.equal(other.status, 0, other.stderr);
+    assert.equal(setup.read("state/worker.current"), `${concurrentImage}\n`);
+    writeFileSync(join(setup.dir, "release"), "");
+    assert.equal((await first.done).status, 0);
+  },
+);
+
+test(
+  "droplet deploy fails before any change when the lock file cannot be opened",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, undefined, {
+      // A directory in the place of the lock file.
+      prepare: (deployRoot) => {
+        mkdirSync(join(deployRoot, "state", "api.lock"), { recursive: true });
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, /could not open the lock file .*api\.lock/);
+    assert.deepEqual(result.calls, [""]);
   },
 );
 

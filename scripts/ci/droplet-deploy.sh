@@ -10,6 +10,9 @@
 # A maintainer rolls a service back with the same command and the image of
 # the previous deployment (`/srv/delino/state/<service>.previous`).
 #
+# A lock file `state/<service>.lock` (`flock`) serializes deployments and
+# rollbacks of one service: a second run waits until the first one ends.
+#
 # Steps: pull the image by digest, start a new container next to the running
 # one under its own unique network alias (it does not join the alias of the
 # running one), wait until `GET /healthz` returns a success status, write the
@@ -42,6 +45,9 @@
 #   DROPLET_HEALTH_TIMEOUT  seconds to wait for the health check (default 120).
 #   DROPLET_STOP_TIMEOUT    seconds between SIGTERM and SIGKILL when the old
 #                           container stops (default 30).
+#   DROPLET_LOCK_TIMEOUT    seconds to wait for a running deployment of the
+#                           same service to finish before the script gives up
+#                           without a change (default 600).
 set -euo pipefail
 
 # The whole script is one function that the last line calls with standard
@@ -51,6 +57,10 @@ set -euo pipefail
 main() {
   if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
     echo "::error::droplet-deploy.sh needs Bash 4.4 or newer, not $BASH_VERSION." >&2
+    exit 2
+  fi
+  if ! command -v flock > /dev/null; then
+    echo "::error::droplet-deploy.sh needs flock (util-linux) for the deployment lock." >&2
     exit 2
   fi
   if (( $# != 4 )); then
@@ -80,6 +90,7 @@ main() {
   local proxy="${DROPLET_PROXY:-caddy}"
   local health_timeout="${DROPLET_HEALTH_TIMEOUT:-120}"
   local stop_timeout="${DROPLET_STOP_TIMEOUT:-30}"
+  local lock_timeout="${DROPLET_LOCK_TIMEOUT:-600}"
   local env_file="$root/env/$service.env"
   local site="$root/caddy/sites/$service.caddy"
   local state="$root/state/$service"
@@ -91,6 +102,20 @@ main() {
   # process agree on the port.
   if grep -Eq '^[[:space:]]*ADDR=' "$env_file"; then
     fail "$env_file sets ADDR. Remove it; the deployment sets ADDR=:$port."
+  fi
+
+  # One deployment of a service at a time. A deployment from the workflow and
+  # a rollback that a maintainer runs by hand both run this script on the
+  # Droplet, so they take the same lock. Without it, one run could stop and
+  # remove the container that the route of the other run names, and both runs
+  # would write the same route staging and backup files. The lock belongs to
+  # the open file description of the file descriptor below and the kernel
+  # releases it when the script exits, however it ends.
+  mkdir -p "$root/state" || fail "could not create the state directory $root/state."
+  local lock_fd
+  { exec {lock_fd}> "$state.lock"; } 2> /dev/null || fail "could not open the lock file $state.lock."
+  if ! flock --wait "$lock_timeout" "$lock_fd"; then
+    fail "another deployment of $service held $state.lock for $lock_timeout seconds; nothing was changed. Run the deployment again when it has finished."
   fi
 
   echo "Pull $image"
