@@ -155,6 +155,10 @@ func hyperVAgentCrash(t *testing.T, s *stack) {
 	c := s.apiKeyClient(ownsand.TransportRelay)
 	sb := createHyperVSandbox(ctx, t, c)
 	s.killAgent(0)
+	// The compute system is bound to the agent process
+	// (ShouldTerminateOnLastHandleClosed), so the VM ends with the agent
+	// even before a restarted agent stops leftover VMs.
+	requireNoComputeSystem(t, sb.ID())
 	waitSandboxState(ctx, t, sb, "UNREACHABLE", func(info *ownsandv1.Sandbox) bool {
 		return info.GetState() == ownsandv1.SandboxState_SANDBOX_STATE_UNREACHABLE
 	})
