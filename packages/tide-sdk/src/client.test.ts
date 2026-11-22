@@ -209,6 +209,26 @@ describe("error mapping", () => {
     expect(error.rawMessage).toBe("bad token [redacted]");
   });
 
+  test("redacts the token from the retained cause of a fetch failure", async () => {
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: async (_input, init) => {
+        const auth = new Headers(init?.headers).get("authorization");
+        throw new TypeError(`fetch failed with ${auth}`);
+      },
+      token: () => "secret-access-token",
+    });
+    const error = (await client.organizations
+      .getOrganization({ organizationId: ORG })
+      .catch((e: unknown) => e)) as ConnectError;
+    expect(error).toBeInstanceOf(ConnectError);
+    expect(error.rawMessage).toBe("fetch failed with Bearer [redacted]");
+    const cause = error.cause as Error;
+    expect(cause).toBeInstanceOf(TypeError);
+    expect(cause.message).toBe("fetch failed with Bearer [redacted]");
+    expect(String(cause.stack)).not.toContain("secret-access-token");
+  });
+
   test("a network failure is a ConnectError that keeps the cause", async () => {
     const server = fakeServer(() => {}, { failFetch: () => true });
     const client = new TideClient({

@@ -91,50 +91,83 @@ function hasConfigErrorCause(error: Error): boolean {
 }
 
 /**
- * Replaces every occurrence of each secret in the error message, and keeps
- * the Connect code, metadata and details of a `ConnectError`. Connect errors
+ * Replaces every occurrence of each secret in the error message and in the
+ * messages of its `cause` chain, and keeps the Connect code, metadata and
+ * details of a `ConnectError` and the class of other errors. Connect errors
  * never contain request headers, but this keeps a credential out of an error
- * even when a lower layer echoed it.
+ * even when a lower layer echoed it, for example a fetch failure that Connect
+ * keeps as the cause.
  */
 export function redactError(
   error: unknown,
   secrets: readonly string[],
 ): unknown {
   const present = secrets.filter((s) => s.length > 0);
-  if (present.length === 0 || !(error instanceof Error)) {
+  if (present.length === 0) {
     return error;
   }
-  let changed = false;
-  const redact = (text: string): string => {
-    let out = text;
-    for (const secret of present) {
-      if (out.includes(secret)) {
-        out = out.split(secret).join("[redacted]");
-        changed = true;
-      }
+  return redactChain(error, present, 0);
+}
+
+function redactText(text: string, secrets: readonly string[]): string {
+  let out = text;
+  for (const secret of secrets) {
+    if (out.includes(secret)) {
+      out = out.split(secret).join("[redacted]");
     }
-    return out;
-  };
-  if (error instanceof ConnectError) {
-    const raw = redact(error.rawMessage);
-    if (!changed) {
-      return error;
+  }
+  return out;
+}
+
+/**
+ * Returns the value itself when it contains no secret, or a redacted copy.
+ * A string cause is redacted; a cause that is neither a string nor an error
+ * stays unchanged.
+ */
+function redactChain(
+  value: unknown,
+  secrets: readonly string[],
+  depth: number,
+): unknown {
+  if (typeof value === "string") {
+    return redactText(value, secrets);
+  }
+  if (!(value instanceof Error)) {
+    return value;
+  }
+  if (depth > MAX_CAUSE_DEPTH) {
+    // Drop a cause that is too deep to check, so no unchecked text stays.
+    return undefined;
+  }
+  const cause =
+    value.cause === undefined
+      ? undefined
+      : redactChain(value.cause, secrets, depth + 1);
+  const causeChanged = cause !== value.cause;
+  if (value instanceof ConnectError) {
+    const raw = redactText(value.rawMessage, secrets);
+    if (raw === value.rawMessage && !causeChanged) {
+      return value;
     }
     const copy = new ConnectError(
       raw,
-      error.code,
-      error.metadata,
+      value.code,
+      value.metadata,
       undefined,
-      error.cause,
+      cause,
     );
-    copy.details = error.details;
+    copy.details = value.details;
     return copy;
   }
-  const message = redact(error.message);
-  if (!changed) {
-    return error;
+  const message = redactText(value.message, secrets);
+  if (message === value.message && !causeChanged) {
+    return value;
   }
-  const copy = new TideError(message, { cause: error.cause });
-  copy.name = error.name;
+  // The copy keeps the prototype, so `instanceof` checks of the original
+  // class (for example `TypeError` or `TideConfigError`) still hold. Its
+  // stack starts with the redacted message.
+  const copy = new Error(message, cause === undefined ? undefined : { cause });
+  Object.setPrototypeOf(copy, Object.getPrototypeOf(value));
+  copy.name = value.name;
   return copy;
 }
