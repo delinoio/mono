@@ -129,7 +129,20 @@ func TestImportRejectsSymlinkEscape(t *testing.T) {
 	tr := &Transfer{HTTP: b.srv.Client(), URLs: b, Logger: slog.New(slog.NewJSONHandler(io.Discard, nil)), TempDir: t.TempDir()}
 	base := t.TempDir()
 	dst := filepath.Join(base, "content")
-	if err := tr.Import(context.Background(), "snap", parts, dst); err == nil {
+	err := tr.Import(context.Background(), "snap", parts, dst)
+	if runtime.GOOS == "windows" {
+		// Windows removes ".." elements lexically before it follows a link,
+		// and os.Root does the same there, so "a/b/.." is "a" and the file
+		// is "a/evil" inside the restore root. Import may accept the
+		// archive, but then the file must be inside the root.
+		if err == nil {
+			if b, err := os.ReadFile(filepath.Join(dst, "a", "evil")); err != nil || string(b) != "pwned" {
+				t.Fatalf("import accepted the archive, but a/evil is not the file in the restore root: %q, %v", b, err)
+			}
+		}
+	} else if err == nil {
+		// On other systems the link "a/b" is resolved first, so "a/b/.."
+		// is the parent of the restore root.
 		t.Fatal("import accepted an archive that escapes through symbolic links")
 	}
 	// The staging directory is the parent of the restore root ("content.importing");
