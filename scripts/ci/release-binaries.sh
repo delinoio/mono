@@ -278,8 +278,8 @@ cleanup_signing() {
 
 # Signs and notarizes every darwin executable. A bare executable cannot carry
 # a stapled ticket, so notarization is verified with the notarytool status
-# and an online Gatekeeper assessment (`spctl`), and Gatekeeper checks the
-# ticket online on a user's Mac.
+# and an online `codesign --check-notarization` check, and Gatekeeper checks
+# the ticket online on a user's Mac.
 sign_macos() {
   local in="$1" out="$2"
   require_binaries
@@ -355,10 +355,12 @@ sign_macos() {
         fi
         exit 1
       fi
-      # Gatekeeper assesses a command-line tool with the install type; it
-      # finds the notarization ticket online.
-      if ! spctl --assess --type install --verbose=4 "$target" < /dev/null 2>&1 | tee "$work/spctl.txt" | grep -q 'source=Notarized Developer ID'; then
-        echo "::error::Gatekeeper does not accept $asset as notarized: $(tr '\n' ' ' < "$work/spctl.txt")" >&2
+      # `spctl --assess` has types only for apps (execute), disk images
+      # (open) and installer packages (install), not for a bare
+      # command-line executable. Apple's DTS guidance checks such code with
+      # the `notarized` code requirement, which finds the ticket online.
+      if ! codesign -vvvv -R=notarized --check-notarization "$target" < /dev/null > "$work/notarization-check.txt" 2>&1; then
+        echo "::error::codesign does not accept $asset as notarized: $(tr '\n' ' ' < "$work/notarization-check.txt")" >&2
         exit 1
       fi
       rm -f "$work/$asset.zip"

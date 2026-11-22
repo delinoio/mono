@@ -2,7 +2,7 @@
 //
 // Fixtures for `scripts/ci/release-binaries.sh`, the binary release steps of
 // `.github/workflows/deploy.yml`, against stubbed `go`, `gh`, `curl`, macOS
-// signing tools (`security`, `codesign`, `ditto`, `xcrun`, `spctl`) and a
+// signing tools (`security`, `codesign`, `ditto`, `xcrun`) and a
 // stubbed release manifest tool.
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -178,6 +178,10 @@ echo "codesign $*" >> "$STUB_LOG"
 if [[ "$1" == --display ]]; then
   [[ -n "\${STUB_NO_ENTITLEMENT:-}" ]] || echo '<key>com.apple.security.virtualization</key>'
 fi
+if [[ " $* " == *" --check-notarization "* && -n "\${STUB_NOT_NOTARIZED:-}" ]]; then
+  echo "test-requirement: code failed to satisfy specified code requirement(s)" >&2
+  exit 3
+fi
 `,
   ditto: `#!/usr/bin/env bash
 echo "ditto $*" >> "$STUB_LOG"
@@ -188,11 +192,6 @@ echo "xcrun $*" >> "$STUB_LOG"
 if [[ "$2" == submit ]]; then
   printf '{"id":"submission-1","status":"%s"}\\n' "\${STUB_NOTARY_STATUS:-Accepted}"
 fi
-`,
-  spctl: `#!/usr/bin/env bash
-echo "spctl $*" >> "$STUB_LOG"
-echo "$4: accepted" >&2
-echo "source=Notarized Developer ID" >&2
 `,
   openssl: `#!/usr/bin/env bash
 echo "openssl $*" >> "$STUB_LOG"
@@ -538,7 +537,15 @@ test(
       result.log,
       /xcrun notarytool submit \S+ownsand-agent-darwin-arm64\.zip --key \S+ --key-id KEYID --issuer issuer --wait --timeout 45m --output-format json/,
     );
-    assert.match(result.log, /spctl --assess --type install/);
+    assert.match(
+      result.log,
+      /codesign -vvvv -R=notarized --check-notarization \S+\/ownsand-agent-darwin-arm64$/m,
+    );
+    assert.match(
+      result.log,
+      /codesign -vvvv -R=notarized --check-notarization \S+\/ownsand-darwin-amd64$/m,
+    );
+    assert.doesNotMatch(result.log, /spctl/);
     // The password and the key are never command-line arguments of a tool
     // other than `security import`, and the keychain is deleted.
     assert.doesNotMatch(
@@ -566,6 +573,27 @@ test(
     assert.notEqual(result.status, 0);
     assert.match(result.stderr, /status Invalid \(submission submission-1\)/);
     assert.match(result.log, /xcrun notarytool log submission-1/);
+    assert.match(result.log, /security delete-keychain/);
+  },
+);
+
+test(
+  "sign-macos fails when codesign does not accept the notarization",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const result = f.run(
+      ["sign-macos", darwinBuilds(f), join(f.dir, "signed")],
+      {
+        ...appleEnv,
+        STUB_NOT_NOTARIZED: "1",
+      },
+    );
+    assert.notEqual(result.status, 0);
+    assert.match(
+      result.stderr,
+      /codesign does not accept \S+ as notarized: .*failed to satisfy specified code requirement/,
+    );
     assert.match(result.log, /security delete-keychain/);
   },
 );
