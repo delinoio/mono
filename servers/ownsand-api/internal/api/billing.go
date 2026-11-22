@@ -285,6 +285,56 @@ func (s *Service) authorizeBillingOwnerLocked(ctx context.Context, tx pgx.Tx, or
 	return p, err
 }
 
+// pendingUnlinkError maps a failure of Statuses.UnlinkPendingTx that a
+// billing RPC returns to its caller: a link attempt that can still be
+// running and an unlink that delino-accounts did not take are unavailable.
+func pendingUnlinkError(err error) error {
+	switch {
+	case errors.Is(err, billing.ErrLinkInProgress):
+		return errUnavailable("a billing link of the organization is in progress; try again shortly")
+	case errors.Is(err, billing.ErrUnlinkFailed), errors.Is(err, billing.ErrReportingDisabled):
+		return errUnavailable("delino-accounts is unavailable; try again later")
+	}
+	return err
+}
+
+// linkAttempt is a LinkOrganization call that LinkBillingAccount makes after
+// it committed the link attempt record.
+type linkAttempt struct {
+	id        string
+	accountID string
+	request   *accountsv1.LinkOrganizationRequest
+}
+
+// definitiveLinkFailure reports whether a failed LinkOrganization call
+// proves that delino-accounts created no link: it rejected the request. Any
+// other failure (a timeout, a lost response, an unavailable server) leaves
+// the outcome unknown.
+func definitiveLinkFailure(err error) bool {
+	switch connect.CodeOf(err) {
+	case connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeAlreadyExists, connect.CodeInvalidArgument:
+		return true
+	}
+	return false
+}
+
+// lockOrganizationNoKey takes the organization row lock in the mode of the link
+// RPCs and the pending unlinks (FOR NO KEY UPDATE), if the organization exists.
+func lockOrganizationNoKey(ctx context.Context, tx pgx.Tx, orgID string) error {
+	_, err := tx.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR NO KEY UPDATE", orgID)
+	return err
+}
+
+// LinkBillingAccount links the organization in two local transactions around
+// the LinkOrganization call, so that the call never runs inside a
+// transaction that can roll back after delino-accounts accepted it. The
+// first transaction authorizes the caller, validates the request, sends a
+// pending unlink first and commits a link attempt record. The call runs
+// without a local transaction. The second transaction takes the attempt over
+// from the record and records the link. A failure with an unknown outcome
+// leaves the record for the reconciliation. A repeated link of the account
+// that the organization is linked to needs no record, because the local link
+// is the durable trace.
 func (h BillingHandler) LinkBillingAccount(ctx context.Context, req *connect.Request[ownsandv1.LinkBillingAccountRequest]) (*connect.Response[ownsandv1.LinkBillingAccountResponse], error) {
 	orgID, err := normalizeID("organization_id", req.Msg.GetOrganizationId())
 	if err != nil {
@@ -293,7 +343,9 @@ func (h BillingHandler) LinkBillingAccount(ctx context.Context, req *connect.Req
 	var st billing.Status
 	var change billing.Change
 	var accountName string
+	var attempt *linkAttempt
 	err = h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		attempt = nil
 		p, err := h.authorizeBillingOwnerLocked(ctx, tx, orgID)
 		if err != nil {
 			return err
@@ -320,31 +372,121 @@ func (h BillingHandler) LinkBillingAccount(ctx context.Context, req *connect.Req
 		if cur.Linked() && cur.BillingAccountID != accountID {
 			return errAlreadyExists("the organization is linked to another billing account; unlink it first")
 		}
-		// An unlink that an ownership transfer or a deletion left pending
-		// must reach delino-accounts first, or its retry would remove this
-		// link.
+		// An unlink that an ownership transfer or a deletion left pending, or
+		// an earlier link attempt with an unknown outcome, must reach
+		// delino-accounts first, or its retry would remove this link.
 		now := h.now()
 		if err := h.Billing.UnlinkPendingTx(ctx, tx, orgID, now); err != nil {
-			if errors.Is(err, billing.ErrUnlinkFailed) {
-				return errUnavailable("delino-accounts is unavailable; try again later")
+			return pendingUnlinkError(err)
+		}
+		call := &accountsv1.LinkOrganizationRequest{
+			Service: billing.ServiceID, OrganizationId: orgID, BillingAccountId: accountID, UserId: p.ID, OrganizationName: name,
+		}
+		if cur.Linked() {
+			resp, err := client.LinkOrganization(ctx, connect.NewRequest(call))
+			if err != nil {
+				return h.accountsError(ctx, "LinkOrganization", err, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeAlreadyExists, connect.CodeInvalidArgument)
 			}
+			accountName = resp.Msg.GetBillingAccountName()
+			st, change, err = billing.LinkTx(ctx, tx, orgID, accountID, resp.Msg.GetStatus(), h.now())
 			return err
 		}
-		resp, err := client.LinkOrganization(ctx, connect.NewRequest(&accountsv1.LinkOrganizationRequest{
-			Service: billing.ServiceID, OrganizationId: orgID, BillingAccountId: accountID, UserId: p.ID, OrganizationName: name,
-		}))
-		if err != nil {
-			return h.accountsError(ctx, "LinkOrganization", err, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeAlreadyExists, connect.CodeInvalidArgument)
-		}
-		accountName = resp.Msg.GetBillingAccountName()
-		st, change, err = billing.LinkTx(ctx, tx, orgID, accountID, resp.Msg.GetStatus(), h.now())
-		return err
+		attempt = &linkAttempt{id: newID(), accountID: accountID, request: call}
+		return billing.BeginLinkAttemptTx(ctx, tx, orgID, attempt.id, accountID, now)
 	})
+	if err == nil && attempt != nil {
+		st, change, accountName, err = h.finishLinkAttempt(ctx, orgID, attempt)
+	}
 	if err != nil {
 		return nil, h.internal(ctx, "link billing account", err)
 	}
 	h.Billing.Committed(ctx, change)
 	return connect.NewResponse(&ownsandv1.LinkBillingAccountResponse{Billing: st.Proto(h.now()), BillingAccountName: accountName}), nil
+}
+
+// finishLinkAttempt makes the LinkOrganization call of a committed link
+// attempt and records its result. The call and the second transaction run on
+// a context that outlives the request, so that a caller that gives up cannot
+// leave the attempt half-finished.
+func (h BillingHandler) finishLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) (billing.Status, billing.Change, string, error) {
+	client, err := h.usageClient()
+	if err != nil {
+		h.releaseLinkAttempt(ctx, orgID, attempt)
+		return billing.Status{}, billing.Change{}, "", err
+	}
+	detached := context.WithoutCancel(ctx)
+	callCtx, cancel := context.WithTimeout(detached, billing.LinkCallTimeout)
+	resp, cerr := client.LinkOrganization(callCtx, connect.NewRequest(attempt.request))
+	cancel()
+	if cerr != nil {
+		if definitiveLinkFailure(cerr) {
+			h.abandonLinkAttempt(detached, orgID, attempt)
+			return billing.Status{}, billing.Change{}, "", h.accountsError(ctx, "LinkOrganization", cerr, connect.CodePermissionDenied, connect.CodeNotFound, connect.CodeAlreadyExists, connect.CodeInvalidArgument)
+		}
+		h.releaseLinkAttempt(detached, orgID, attempt)
+		return billing.Status{}, billing.Change{}, "", h.accountsError(ctx, "LinkOrganization", cerr)
+	}
+	var st billing.Status
+	var change billing.Change
+	txCtx, cancelTx := context.WithTimeout(detached, billing.LinkCallTimeout)
+	defer cancelTx()
+	err = h.DB.InTx(txCtx, func(tx pgx.Tx) error {
+		if err := lockOrganizationNoKey(txCtx, tx, orgID); err != nil {
+			return err
+		}
+		current, err := billing.CompleteLinkAttemptTx(txCtx, tx, orgID, attempt.id)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return errLinkSuperseded
+		}
+		st, change, err = billing.LinkTx(txCtx, tx, orgID, attempt.accountID, resp.Msg.GetStatus(), h.now())
+		return err
+	})
+	if errors.Is(err, errLinkSuperseded) {
+		// An unlink, a transfer, a deletion or a newer attempt took the attempt
+		// over under the organization lock and owns the cleanup of the link
+		// that the call may have created.
+		h.Logger.WarnContext(ctx, "billing_link_attempt_superseded", slog.String("organization_id", orgID), slog.String("billing_account_id", attempt.accountID),
+			slog.String("link_attempt_id", attempt.id))
+		return billing.Status{}, billing.Change{}, "", connect.NewError(connect.CodeAborted, errors.New("the billing link was interrupted by another change of the organization; try again"))
+	}
+	if err != nil {
+		// The record stays for the reconciliation.
+		h.releaseLinkAttempt(detached, orgID, attempt)
+		return billing.Status{}, billing.Change{}, "", err
+	}
+	return st, change, resp.Msg.GetBillingAccountName(), nil
+}
+
+// errLinkSuperseded marks a link attempt that another operation took over.
+var errLinkSuperseded = errors.New("billing: the link attempt was taken over")
+
+// abandonLinkAttempt deletes the record of an attempt that delino-accounts
+// rejected. A failure to delete leaves a record whose reconciliation sends a
+// harmless unlink after the call deadline.
+func (h BillingHandler) abandonLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
+	err := h.DB.InTx(ctx, func(tx pgx.Tx) error {
+		if err := lockOrganizationNoKey(ctx, tx, orgID); err != nil {
+			return err
+		}
+		return h.Billing.AbandonLinkAttempt(ctx, tx, orgID, attempt.id)
+	})
+	if err != nil {
+		h.Logger.WarnContext(ctx, "billing_link_attempt_abandon_failed", slog.String("organization_id", orgID), slog.String("link_attempt_id", attempt.id), slog.Any("error", err))
+	}
+}
+
+// releaseLinkAttempt records that the call of an attempt without a confirmed
+// local link has returned, so that the reconciliation can start.
+func (h BillingHandler) releaseLinkAttempt(ctx context.Context, orgID string, attempt *linkAttempt) {
+	if err := h.Billing.ReleaseLinkAttempt(ctx, orgID, attempt.id); err != nil {
+		h.Logger.WarnContext(ctx, "billing_link_attempt_release_failed", slog.String("organization_id", orgID), slog.String("link_attempt_id", attempt.id), slog.Any("error", err))
+		return
+	}
+	h.Logger.WarnContext(ctx, "billing_link_attempt_unconfirmed", slog.String("organization_id", orgID), slog.String("billing_account_id", attempt.accountID),
+		slog.String("link_attempt_id", attempt.id))
 }
 
 func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.Request[ownsandv1.UnlinkBillingAccountRequest]) (*connect.Response[ownsandv1.UnlinkBillingAccountResponse], error) {
@@ -369,7 +511,13 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 			return errNotFound("organization")
 		}
 		if !cur.Linked() {
-			// Idempotent: nothing to remove.
+			// No local link, but a link attempt with an unknown outcome, or an
+			// unlink that delino-accounts has not confirmed, may have left a
+			// link there: send it now. Without a row there is nothing to
+			// remove, and the call is idempotent.
+			if err := h.Billing.UnlinkPendingTx(ctx, tx, orgID, h.now()); err != nil {
+				return pendingUnlinkError(err)
+			}
 			st = cur
 			return nil
 		}
@@ -397,16 +545,22 @@ func (h BillingHandler) UnlinkBillingAccount(ctx context.Context, req *connect.R
 
 // removeBillingLinkTx removes the billing link of the organization in the
 // transaction of TransferOwnership or DeleteOrganization and records a
-// pending unlink for delino-accounts. It returns the change and whether an
-// unlink is pending; after the commit, finishBillingUnlink sends it.
+// pending unlink for delino-accounts. An organization without a local link
+// can still have a link attempt with an unknown outcome; its record becomes
+// the pending unlink. It returns the change and whether an unlink is
+// pending; after the commit, finishBillingUnlink sends it.
 func (s *Service) removeBillingLinkTx(ctx context.Context, tx pgx.Tx, orgID, source string) (billing.Change, bool, error) {
 	if s.Billing == nil {
 		return billing.Change{}, false, nil
 	}
 	now := s.now()
 	_, former, change, err := billing.UnlinkTx(ctx, tx, orgID, source, now)
-	if err != nil || former == "" {
+	if err != nil {
 		return billing.Change{}, false, err
+	}
+	if former == "" {
+		taken, err := billing.TakeOverLinkAttemptTx(ctx, tx, orgID, now)
+		return billing.Change{}, taken, err
 	}
 	if err := billing.AddPendingUnlinkTx(ctx, tx, orgID, former, now); err != nil {
 		return billing.Change{}, false, err

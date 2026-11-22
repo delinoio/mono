@@ -623,3 +623,52 @@ func TestLegacyWriterMigrationWithConcurrentCreates(t *testing.T) {
 		t.Fatalf("organizations = %d, status rows = %d, %v, want 2 each", orgs, rows, err)
 	}
 }
+
+// linkAttemptMigration is the version of 0010_billing_link_attempts.sql.
+const linkAttemptMigration = 10
+
+// TestLinkAttemptMigrationKeepsPendingUnlinks upgrades a database at the
+// schema of migration 0009 that holds a pending unlink, and checks that the
+// row keeps its meaning (no link attempt), that the previous release's
+// column list still writes rows, and that a link attempt row with a call
+// deadline is accepted while a deadline without an attempt ID is not.
+func TestLinkAttemptMigrationKeepsPendingUnlinks(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, linkAttemptMigration-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const oldInsert = `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, attempts, next_attempt_time)
+		VALUES ($1, '018f0000-0000-7000-8000-0000000000b1', now(), 2, now())`
+	org1, org2, org3 := "018f0000-0000-7000-8000-0000000000d1", "018f0000-0000-7000-8000-0000000000d2", "018f0000-0000-7000-8000-0000000000d3"
+	if _, err := d.Pool.Exec(ctx, oldInsert, org1); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	// The previous release keeps serving during a rolling deployment.
+	if _, err := d.Pool.Exec(ctx, oldInsert, org2); err != nil {
+		t.Fatalf("insert with the previous column list: %v", err)
+	}
+	for _, org := range []string{org1, org2} {
+		var attempts int
+		var attemptID *string
+		var deadline *time.Time
+		if err := d.Pool.QueryRow(ctx, "SELECT attempts, link_attempt_id::text, link_call_deadline FROM billing_pending_unlinks WHERE organization_id = $1", org).
+			Scan(&attempts, &attemptID, &deadline); err != nil {
+			t.Fatal(err)
+		}
+		if attempts != 2 || attemptID != nil || deadline != nil {
+			t.Fatalf("pending unlink %s = %d %v %v, want a plain pending unlink", org, attempts, attemptID, deadline)
+		}
+	}
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_pending_unlinks (organization_id, billing_account_id, create_time, next_attempt_time, link_attempt_id, link_call_deadline)
+		VALUES ($1, '018f0000-0000-7000-8000-0000000000b1', now(), now(), '018f0000-0000-7000-8000-0000000000e1', now())`, org3); err != nil {
+		t.Fatalf("insert a link attempt: %v", err)
+	}
+	if _, err := d.Pool.Exec(ctx, "UPDATE billing_pending_unlinks SET link_attempt_id = NULL WHERE organization_id = $1", org3); err == nil {
+		t.Fatal("a call deadline without an attempt ID was accepted")
+	}
+}

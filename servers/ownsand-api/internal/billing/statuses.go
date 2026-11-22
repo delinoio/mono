@@ -329,10 +329,13 @@ func (s *Statuses) Advance(ctx context.Context) error {
 }
 
 // UnlinkPending sends UnlinkOrganization for the pending unlink of the
-// organization, if it has one, and deletes it after delino-accounts
-// accepted it. It takes the organization row lock in the mode that
-// LinkBillingAccount takes, so a pending unlink never removes a link that
-// the new owner made after it.
+// organization, if it has one that is due, and deletes it after
+// delino-accounts accepted it. A pending unlink is a link that
+// TransferOwnership or DeleteOrganization removed locally or a link attempt
+// whose outcome is unknown. It takes the organization row lock in the mode
+// that LinkBillingAccount takes, so a pending unlink never removes a link
+// that the new owner made after it. A link attempt whose call can still be
+// running is left alone.
 func (s *Statuses) UnlinkPending(ctx context.Context, orgID string) error {
 	if s.client == nil {
 		return ErrReportingDisabled
@@ -342,9 +345,17 @@ func (s *Statuses) UnlinkPending(ctx context.Context, orgID string) error {
 		if _, err := tx.Exec(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR NO KEY UPDATE", orgID); err != nil {
 			return err
 		}
-		err := s.UnlinkPendingTx(ctx, tx, orgID, now)
-		if errors.Is(err, ErrUnlinkFailed) {
-			// The attempt is recorded in the transaction; commit it.
+		var due bool
+		err := tx.QueryRow(ctx, "SELECT next_attempt_time <= $2 FROM billing_pending_unlinks WHERE organization_id = $1", orgID, now).Scan(&due)
+		if errors.Is(err, pgx.ErrNoRows) || (err == nil && !due) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		err = s.UnlinkPendingTx(ctx, tx, orgID, now)
+		if errors.Is(err, ErrUnlinkFailed) || errors.Is(err, ErrLinkInProgress) {
+			// The failed attempt is recorded in the transaction; commit it.
 			return nil
 		}
 		return err
@@ -359,16 +370,22 @@ var ErrUnlinkFailed = errors.New("billing: UnlinkOrganization failed")
 // must hold the organization row lock (FOR NO KEY UPDATE or stronger) when
 // the organization exists. It deletes the pending row after delino-accounts
 // accepted the unlink. When the call fails, it records the next attempt
-// time in tx and returns an error that wraps the Connect error.
+// time in tx and returns an error that wraps the Connect error and
+// ErrUnlinkFailed. It sends nothing and returns ErrLinkInProgress while the
+// row is a link attempt whose LinkOrganization call can still be running.
 func (s *Statuses) UnlinkPendingTx(ctx context.Context, tx pgx.Tx, orgID string, now time.Time) error {
 	var account string
 	var attempts int
-	err := tx.QueryRow(ctx, "SELECT billing_account_id::text, attempts FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&account, &attempts)
+	var running *time.Time
+	err := tx.QueryRow(ctx, "SELECT billing_account_id::text, attempts, link_call_deadline FROM billing_pending_unlinks WHERE organization_id = $1 FOR UPDATE", orgID).Scan(&account, &attempts, &running)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
+	}
+	if running != nil && running.After(now) {
+		return ErrLinkInProgress
 	}
 	if s.client == nil {
 		return ErrReportingDisabled
@@ -525,6 +542,6 @@ func newStatusMetrics(provider metric.MeterProvider) *statusMetrics {
 	return &statusMetrics{
 		organizations:  int64Gauge(m, "ownsand_billing_organizations", "Organizations in each confirmed billing phase (allowed, blocked or suspended)."),
 		pollFailures:   int64Counter(m, "ownsand_billing_status_poll_failures", "Failed ListBillingStatusChanges requests, by Connect code."),
-		pendingUnlinks: int64Gauge(m, "ownsand_billing_pending_unlinks", "Billing links that were removed locally and that delino-accounts has not confirmed yet."),
+		pendingUnlinks: int64Gauge(m, "ownsand_billing_pending_unlinks", "Billing links that were removed locally, or link attempts with an unknown outcome, that delino-accounts has not confirmed yet."),
 	}
 }
