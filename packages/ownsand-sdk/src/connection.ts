@@ -138,15 +138,58 @@ export function createApiTransport(options: ConnectionOptions): Transport {
   });
 }
 
-async function currentSecret(credential: Credential): Promise<string> {
+/**
+ * Returns the secret of one request. An access token callback can take
+ * arbitrarily long, so the wait ends as soon as the request signal aborts:
+ * a caller cancellation or the authorization deadline. A callback that
+ * resolves after the abort is ignored and no RPC starts.
+ */
+async function currentSecret(
+  credential: Credential,
+  signal: AbortSignal,
+): Promise<string> {
   if ("apiKey" in credential) {
     return credential.apiKey;
   }
-  const token = await credential.accessToken();
+  signal.throwIfAborted();
+  // A synchronous throw of the callback stays a rejection of the race.
+  const token = await raceAbort(
+    new Promise<string>((resolve) => resolve(credential.accessToken())),
+    signal,
+  );
   if (typeof token !== "string" || token === "") {
     throw new OwnSandConfigError("accessToken returned no token");
   }
   return token;
+}
+
+/**
+ * Settles with the promise or rejects with the abort reason of the signal,
+ * whichever comes first. The single abort listener is removed on settlement,
+ * and a later rejection of the losing promise is swallowed so that it does
+ * not surface as an unhandled rejection.
+ */
+function raceAbort<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => {
+      signal.removeEventListener("abort", onAbort);
+      reject(signal.reason);
+    };
+    signal.addEventListener("abort", onAbort);
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+    if (signal.aborted) {
+      onAbort();
+    }
+  });
 }
 
 function credentialInterceptor(options: ConnectionOptions): Interceptor {
@@ -157,7 +200,7 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
         Code.PermissionDenied,
       );
     }
-    const secret = await currentSecret(options.credential);
+    const secret = await currentSecret(options.credential, req.signal);
     req.header.set("Authorization", `Bearer ${secret}`);
     // Redact with the exact credential of this request. The access token
     // differs per request, so the value lives only in this closure and never

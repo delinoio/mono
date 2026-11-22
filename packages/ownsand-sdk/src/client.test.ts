@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { getEventListeners } from "node:events";
 import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
@@ -269,6 +270,110 @@ describe("credentials", () => {
     expect(error).toBeInstanceOf(ConnectError);
     expect(error!.message).toContain("[redacted]");
     expect(error!.message).not.toContain("sentinel-token-stream");
+  });
+
+  describe("an access token callback", () => {
+    function transportOf(accessToken: () => string | Promise<string>) {
+      const h = setup();
+      h.api.unary(SandboxService, "GetSandbox", () => ({ sandbox: {} }));
+      const transport = createApiTransport({
+        origin: h.api.origin,
+        credential: { accessToken },
+        organizationId: ORG,
+        fetch: h.api.fetch,
+        logger: undefined,
+        activity: new ActivityRegistry(),
+        now: () => 0,
+      });
+      const call = (signal?: AbortSignal) =>
+        transport.unary(
+          SandboxService.method.getSandbox,
+          signal,
+          undefined,
+          undefined,
+          { sandboxId: SANDBOX },
+        );
+      return { h, call };
+    }
+
+    test("ends a pending call with the abort reason, starts no request and leaves no abort listener", async () => {
+      let resolveToken!: (token: string) => void;
+      const { h, call } = transportOf(
+        () => new Promise<string>((r) => (resolveToken = r)),
+      );
+      const abort = new AbortController();
+      const before = getEventListeners(abort.signal, "abort").length;
+      const reason = new Error("caller gave up");
+      const outcome = call(abort.signal).catch((e) => e);
+      await h.clock.settle();
+      abort.abort(reason);
+      // Connect wraps the abort reason of a unary call in a canceled error.
+      const error = await outcome;
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Canceled);
+      expect(error.cause).toBe(reason);
+      resolveToken("late-token");
+      await h.clock.settle();
+      expect(h.api.calls).toHaveLength(0);
+      expect(getEventListeners(abort.signal, "abort")).toHaveLength(before);
+    });
+
+    test("does not call the callback for a signal that is already aborted", async () => {
+      let calls = 0;
+      const { h, call } = transportOf(() => {
+        calls++;
+        return "token";
+      });
+      const abort = new AbortController();
+      const reason = new Error("already aborted");
+      abort.abort(reason);
+      const error = await call(abort.signal).catch((e) => e);
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.Canceled);
+      expect(error.cause).toBe(reason);
+      expect(calls).toBe(0);
+      expect(h.api.calls).toHaveLength(0);
+    });
+
+    test("leaves no abort listener after a callback that resolves or rejects", async () => {
+      const abort = new AbortController();
+      const before = getEventListeners(abort.signal, "abort").length;
+      const ok = transportOf(async () => "token");
+      await ok.call(abort.signal);
+      expect(ok.h.api.calls).toHaveLength(1);
+      expect(ok.h.api.calls[0]!.headers.get("authorization")).toBe(
+        "Bearer token",
+      );
+      const failing = transportOf(() => {
+        throw new Error("token source failed");
+      });
+      const error = await failing.call(abort.signal).catch((e) => e);
+      expect(error.message).toContain("token source failed");
+      expect(failing.h.api.calls).toHaveLength(0);
+      expect(getEventListeners(abort.signal, "abort")).toHaveLength(before);
+    });
+
+    test("does not raise an unhandled rejection when the callback rejects after the abort", async () => {
+      let rejectToken!: (error: Error) => void;
+      const { h, call } = transportOf(
+        () => new Promise<string>((_, r) => (rejectToken = r)),
+      );
+      const unhandled: unknown[] = [];
+      const onUnhandled = (e: unknown) => unhandled.push(e);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const abort = new AbortController();
+        const outcome = call(abort.signal).catch((e) => e);
+        await h.clock.settle();
+        abort.abort(new Error("caller gave up"));
+        await outcome;
+        rejectToken(new Error("token source failed late"));
+        await h.clock.settle();
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+      expect(unhandled).toEqual([]);
+    });
   });
 
   test("returns an error without the secret unchanged", async () => {

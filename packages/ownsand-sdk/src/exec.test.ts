@@ -1560,6 +1560,113 @@ describe("exec handle iteration that ends early", () => {
   });
 });
 
+describe("a pending accessToken callback", () => {
+  /** A token source whose promise the test settles by hand. */
+  function deferredToken() {
+    let resolve!: (token: string) => void;
+    const promise = new Promise<string>((r) => (resolve = r));
+    let calls = 0;
+    return {
+      accessToken: () => {
+        calls++;
+        return promise;
+      },
+      resolve,
+      calls: () => calls,
+    };
+  }
+
+  function relayHarness(accessToken: () => string | Promise<string>) {
+    // setup() spreads these options after apiKey, so clear the API key.
+    const h = setup({ apiKey: undefined, accessToken });
+    h.api.stream(RelayService, "Exec", async function* () {
+      yield execMsg(ev.accepted());
+      yield execMsg(ev.exited(0));
+    });
+    return h;
+  }
+
+  test("ends the operation with the caller's abort reason without waiting for the callback", async () => {
+    const token = deferredToken();
+    const h = relayHarness(token.accessToken);
+    const caller = new AbortController();
+    const reason = new Error("caller gave up");
+    const outcome = h.client
+      .sandbox(SANDBOX)
+      .exec({ command: ["x"], signal: caller.signal })
+      .wait()
+      .catch((e) => e);
+    await h.clock.advance(10_000);
+    expect(token.calls()).toBe(1);
+    caller.abort(reason);
+    // The callback is still pending: the abort alone ends the operation.
+    expect(await outcome).toBe(reason);
+    expect(h.clock.now()).toBe(10_000);
+    expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("ends the operation with the existing deadline error and sends no request when the 60-second window ends", async () => {
+    const token = deferredToken();
+    const h = relayHarness(token.accessToken);
+    const outcome = h.client
+      .sandbox(SANDBOX)
+      .exec({ command: ["x"] })
+      .wait()
+      .catch((e) => e);
+    let settled = false;
+    outcome.then(() => (settled = true));
+    await h.clock.advance(60_000 - 1);
+    expect(settled).toBe(false);
+    await h.clock.advance(1);
+    const error = await outcome;
+    expect(error).toBeInstanceOf(DataPathError);
+    expect(error.code).toBe(Code.Unavailable);
+    expect(h.clock.now()).toBe(60_000);
+    expect(h.api.calls).toHaveLength(0);
+    // A token that arrives after the deadline starts no request.
+    token.resolve("late-token");
+    await h.clock.settle();
+    expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("starts no request when the callback resolves after the caller aborted", async () => {
+    const token = deferredToken();
+    const h = relayHarness(token.accessToken);
+    const caller = new AbortController();
+    const reason = new Error("caller gave up");
+    const outcome = h.client
+      .sandbox(SANDBOX)
+      .exec({ command: ["x"], signal: caller.signal })
+      .wait()
+      .catch((e) => e);
+    await h.clock.advance(1_000);
+    caller.abort(reason);
+    expect(await outcome).toBe(reason);
+    token.resolve("late-token");
+    await h.clock.settle();
+    expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("uses a token that resolves within the window as the bearer secret", async () => {
+    const token = deferredToken();
+    const h = relayHarness(token.accessToken);
+    const outcome = h.client
+      .sandbox(SANDBOX)
+      .exec({ command: ["x"] })
+      .wait();
+    await h.clock.advance(5_000);
+    expect(h.api.calls).toHaveLength(0);
+    token.resolve("good-token");
+    const result = await h.clock.run(outcome);
+    expect(result.kind).toBe(ExecResultKind.Exited);
+    const [auth] = h.api.callsOf("AuthorizeRelay");
+    const [exec] = h.api.callsOf("Exec");
+    expect(auth!.headers.get("authorization")).toBe("Bearer good-token");
+    expect(exec!.headers.get("authorization")).toBe("Bearer good-token");
+    expect(token.calls()).toBe(2);
+  });
+});
+
 /** Runs fn after ms of virtual time. */
 function setTimeoutVirtual(
   h: { clock: { sleep(ms: number): Promise<void> } },
