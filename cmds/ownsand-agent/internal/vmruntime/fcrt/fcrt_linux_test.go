@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -154,13 +155,34 @@ func TestCapabilitiesWithoutFirecracker(t *testing.T) {
 	}
 }
 
-func openFDs(t *testing.T) int {
+// openFDs returns the open descriptors of the test process, each mapped to
+// its link target.
+func openFDs(t *testing.T) map[string]string {
 	t.Helper()
 	entries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(entries)
+	fds := make(map[string]string, len(entries))
+	for _, e := range entries {
+		// The descriptor of the directory read itself is gone by now.
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil {
+			fds[e.Name()] = target
+		}
+	}
+	return fds
+}
+
+// newFDs returns the descriptors in after that before does not have with the
+// same target.
+func newFDs(before, after map[string]string) []string {
+	var added []string
+	for fd, target := range after {
+		if before[fd] != target {
+			added = append(added, fd+" -> "+target)
+		}
+	}
+	return added
 }
 
 // A create whose boot fails releases the VM registration and the directory
@@ -199,8 +221,20 @@ func TestCreateFailureReleasesVM(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("%d failed VMs still registered", n)
 	}
-	if after := openFDs(t); after != before {
-		t.Fatalf("open descriptors %d before, %d after failed creates", before, after)
+	// A leak adds descriptors. The test compares the descriptors and not
+	// their count, because descriptors of earlier tests in the same process
+	// can close meanwhile. It waits briefly for descriptors that close
+	// asynchronously.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		added := newFDs(before, openFDs(t))
+		if len(added) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("descriptors opened by failed creates are still open: %v", added)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
