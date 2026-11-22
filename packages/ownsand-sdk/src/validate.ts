@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { create, toBinary } from "@bufbuild/protobuf";
 import { OwnSandValidationError } from "./errors.ts";
+import { isUuidV7 } from "./uuidv7.ts";
 import { ExecRequestSchema } from "@delino/ownsand-protos/v1/data_frame_pb";
 
 /**
@@ -252,6 +253,37 @@ export function validateGuestPath(field: string, path: string): void {
   const absolute = isAbsoluteGuestPath(path);
   if (!absolute) {
     throw new OwnSandValidationError(field, "must be an absolute guest path");
+  }
+}
+
+/**
+ * Checks the ID of an exec to attach to: a canonical UUID v7 in lowercase.
+ * The UUID v7 check accepts either hex case, so an uppercase spelling gets
+ * the lowercase rule; two spellings of one UUID would be two different execs.
+ * Mirrors the Go `validate.ExecID`.
+ */
+export function validateExecId(field: string, value: string): void {
+  if (value === "") {
+    throw new OwnSandValidationError(field, "is required");
+  }
+  if (!isUuidV7(value.toLowerCase())) {
+    throw new OwnSandValidationError(field, "must be a canonical UUID v7");
+  }
+  if (value !== value.toLowerCase()) {
+    throw new OwnSandValidationError(
+      field,
+      "must be a canonical lowercase UUID v7",
+    );
+  }
+}
+
+/**
+ * Checks a stream or file offset: it must not be negative. Mirrors the Go
+ * validator, which rejects a negative `int64` offset.
+ */
+export function validateOffset(field: string, value: bigint): void {
+  if (value < 0n) {
+    throw new OwnSandValidationError(field, "must not be negative");
   }
 }
 

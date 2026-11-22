@@ -957,6 +957,45 @@ describe("file write", () => {
     expect(h.api.calls).toHaveLength(0);
   });
 
+  test.each([-1n, -(2n ** 62n)])(
+    "rejects readFile offset %j synchronously before any request",
+    (offset) => {
+      const h = setup();
+      let error: unknown;
+      try {
+        h.client.sandbox(SANDBOX).readFile("/f", { offset });
+      } catch (e) {
+        error = e;
+      }
+      expect(error).toBeInstanceOf(OwnSandValidationError);
+      expect((error as OwnSandValidationError).field).toBe("offset");
+      expect((error as OwnSandValidationError).message).toContain(
+        "must not be negative",
+      );
+      expect(h.api.calls).toHaveLength(0);
+    },
+  );
+
+  test("rejects readFileBytes with a negative offset before any request", async () => {
+    const h = setup();
+    await expect(
+      h.client.sandbox(SANDBOX).readFileBytes("/f", { offset: -1n } as never),
+    ).rejects.toBeInstanceOf(OwnSandValidationError);
+    expect(h.api.calls).toHaveLength(0);
+  });
+
+  test("reports the path before a negative offset", () => {
+    const h = setup();
+    let error: unknown;
+    try {
+      h.client.sandbox(SANDBOX).readFile("relative", { offset: -1n });
+    } catch (e) {
+      error = e;
+    }
+    expect((error as OwnSandValidationError).field).toBe("path");
+    expect(h.api.calls).toHaveLength(0);
+  });
+
   test.each([0o10000, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY])(
     "rejects write mode %j with finish.mode before any request",
     async (mode) => {
