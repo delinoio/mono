@@ -1880,3 +1880,102 @@ func TestLockSnapshotImportCanceledContextAbortsWithFreeLock(t *testing.T) {
 		t.Fatalf("%d import locks remain after every release", left)
 	}
 }
+
+// TestIdleReportRetriesAfterRevisionWriteFailure checks that a failed revision
+// write keeps the idle-deadline report pending: a later tick publishes the
+// current deadline with a newer revision after storage recovers, without
+// another activity event, and a successful report still follows the throttle.
+func TestIdleReportRetriesAfterRevisionWriteFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission faults do not apply to root")
+	}
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	acked := e.out.lastEntry(id)
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: acked.GetRevision()})
+	n := e.out.count()
+
+	e.clk.Advance(30 * time.Second)
+	e.m.Touch(id)
+	wantDeadline := e.clk.Now().Add(10 * time.Minute)
+
+	// A read-only state directory makes the revision write in agent.json
+	// fail. The sandbox record directory stays writable, so only the revision
+	// persistence fails.
+	root := e.st.Path()
+	if err := os.Chmod(root, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
+	e.m.Tick(context.Background(), false)
+	if e.out.count() != n {
+		t.Fatal("idle deadline reported although the revision write failed")
+	}
+	if err := os.Chmod(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	// Storage recovered; no new Touch. The next tick retries.
+	e.m.Tick(context.Background(), false)
+	if e.out.count() != n+1 {
+		t.Fatalf("idle deadline not retried after recovery: %d entries, want %d", e.out.count(), n+1)
+	}
+	got := e.out.lastEntry(id)
+	if got.GetRevision().GetCounter() <= acked.GetRevision().GetCounter() {
+		t.Fatalf("revision %d, want newer than %d", got.GetRevision().GetCounter(), acked.GetRevision().GetCounter())
+	}
+	if !got.GetIdleDeadline().AsTime().Equal(wantDeadline) {
+		t.Fatalf("idle deadline %v, want %v", got.GetIdleDeadline().AsTime(), wantDeadline)
+	}
+
+	// The successful report starts the one-minute throttle.
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: got.GetRevision()})
+	e.m.Touch(id)
+	e.m.Tick(context.Background(), false)
+	if e.out.count() != n+1 {
+		t.Fatal("idle deadline reported again within a minute of a successful report")
+	}
+	e.clk.Advance(time.Minute)
+	e.m.Tick(context.Background(), false)
+	if e.out.count() != n+2 {
+		t.Fatal("idle deadline not reported after the throttle")
+	}
+}
+
+// TestIdleReportSkipsAcknowledgedTerminalRecord checks that an idle report
+// that Tick collected cannot publish a revision or recreate the record file of
+// a sandbox that ended and was acknowledged before the report ran.
+func TestIdleReportSkipsAcknowledgedTerminalRecord(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(10*time.Minute, 2*time.Hour).GetSandboxId()
+	e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: e.out.lastEntry(id).GetRevision()})
+	e.m.Touch(id)
+
+	e.m.beforeIdleReports = func() {
+		e.m.beforeIdleReports = nil
+		del, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: id})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		e.m.AckSandboxUpdate(&ownsandv1.SandboxUpdateAck{SandboxId: id, Revision: del.GetRevision()})
+	}
+	e.m.Tick(context.Background(), false)
+
+	if e.m.beforeIdleReports != nil {
+		t.Fatal("the tick did not collect an idle report")
+	}
+	if _, ok := e.m.State(id); ok {
+		t.Fatal("acknowledged terminal record kept")
+	}
+	if _, err := os.Stat(e.st.Path(store.SandboxesDir, id+".json")); !os.IsNotExist(err) {
+		t.Fatalf("record file recreated by a stale idle report: %v", err)
+	}
+	if got := e.out.lastEntry(id); got.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_DELETED {
+		t.Fatalf("last update state %v, want DELETED", got.GetState())
+	}
+	e.restart()
+	if _, ok := e.m.State(id); ok {
+		t.Fatal("restarted manager loaded the dropped record")
+	}
+}

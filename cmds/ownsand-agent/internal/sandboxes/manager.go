@@ -128,6 +128,9 @@ type Manager struct {
 	execs       ExecTracker
 	gate        CreateGate
 	closed      bool
+	// beforeIdleReports is a test hook that Tick calls after it collected the
+	// pending idle reports and released mu, before it publishes them.
+	beforeIdleReports func()
 	// bg tracks the background sandbox ends (TTL expiries and unexpected
 	// VM exits). Add is called only under mu while closed is false, so
 	// that Close can wait for them.
@@ -299,9 +302,26 @@ func (m *Manager) commitLocked(sb *sandbox, change func(*Record)) error {
 	return nil
 }
 
+// errSandboxGone reports that updateIf skipped a stale sandbox: its guard
+// rejected the sandbox, so nothing was committed or sent.
+var errSandboxGone = errors.New("sandboxes: sandbox is gone or no longer live")
+
 // update commits a change and sends the sandbox update.
 func (m *Manager) update(sb *sandbox, change func(*Record)) (*ownsandv1.SandboxStateEntry, error) {
+	return m.updateIf(sb, nil, change)
+}
+
+// updateIf is update with a guard that runs under m.mu before the commit. A
+// nil guard always accepts. When the guard rejects, updateIf commits nothing
+// and returns errSandboxGone. A caller that holds a *sandbox obtained under an
+// earlier m.mu section uses the guard to verify that the sandbox is still
+// the one in m.sandboxes, so that it cannot recreate a dropped record.
+func (m *Manager) updateIf(sb *sandbox, guard func() bool, change func(*Record)) (*ownsandv1.SandboxStateEntry, error) {
 	m.mu.Lock()
+	if guard != nil && !guard() {
+		m.mu.Unlock()
+		return nil, errSandboxGone
+	}
 	before := sb.rec.State
 	err := m.commitLocked(sb, change)
 	entry := sb.rec.Entry(m.epoch)
@@ -891,7 +911,14 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 		reason ownsandv1.SandboxEndReason
 	}
 	var expired []expiry
-	var reports []*sandbox
+	// idleReport is one pending idle-deadline report. previous is the
+	// lastIdleReport value before the report consumed the pending flag, so a
+	// failed report can put both back.
+	type idleReport struct {
+		sb       *sandbox
+		previous time.Time
+	}
+	var reports []idleReport
 	var unacked []*ownsandv1.SandboxStateEntry
 	m.mu.Lock()
 	if m.closed {
@@ -926,9 +953,9 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			}
 		}
 		if sb.idleDirty && now.Sub(sb.lastIdleReport) >= IdleReportInterval {
+			reports = append(reports, idleReport{sb: sb, previous: sb.lastIdleReport})
 			sb.idleDirty = false
 			sb.lastIdleReport = now
-			reports = append(reports, sb)
 		}
 		if resend && !sb.rec.Acked {
 			unacked = append(unacked, sb.rec.Entry(m.epoch))
@@ -948,16 +975,52 @@ func (m *Manager) Tick(ctx context.Context, resend bool) {
 			}
 		}(e)
 	}
-	for _, sb := range reports {
-		if _, err := m.update(sb, func(*Record) {}); err != nil {
-			m.logger.Warn("report idle deadline failed", "sandbox_id", sb.rec.SandboxID, "error", err)
-		}
+	if m.beforeIdleReports != nil {
+		m.beforeIdleReports()
+	}
+	for _, r := range reports {
+		m.reportIdle(r.sb, r.previous)
 	}
 	if outbox != nil {
 		for _, e := range unacked {
 			outbox.SendSandboxUpdate(e)
 		}
 	}
+}
+
+// idleReportableLocked reports whether sb is still the live, registered
+// sandbox that can publish an idle-deadline report. A sandbox that an
+// acknowledgement dropped, or that is ending or terminal, must not commit a
+// new revision: that would recreate its deleted record file. The caller holds
+// m.mu.
+func (m *Manager) idleReportableLocked(sb *sandbox) bool {
+	return m.sandboxes[sb.rec.SandboxID] == sb && !sb.ending && sb.rec.Live()
+}
+
+// reportIdle publishes the moved idle deadline of sb with a new revision. Tick
+// consumed the pending report (idleDirty and the throttle timestamp) when it
+// collected sb; previous is the timestamp from before that. When the revision
+// cannot be persisted, reportIdle restores both so that a later tick retries
+// without another activity event; the one-minute throttle applies only after
+// a successful report. A sandbox that stopped being reportable since the
+// collection is skipped.
+func (m *Manager) reportIdle(sb *sandbox, previous time.Time) {
+	id := sb.rec.SandboxID
+	_, err := m.updateIf(sb, func() bool { return m.idleReportableLocked(sb) }, func(*Record) {})
+	if err == nil {
+		return
+	}
+	if errors.Is(err, errSandboxGone) {
+		m.logger.Debug("skipped idle deadline report of a sandbox that is no longer live", "sandbox_id", id)
+		return
+	}
+	m.mu.Lock()
+	if m.idleReportableLocked(sb) {
+		sb.idleDirty = true
+		sb.lastIdleReport = previous
+	}
+	m.mu.Unlock()
+	m.logger.Warn("report idle deadline failed; retrying on a later tick", "sandbox_id", id, "error", err)
 }
 
 // Run calls Tick every second and resends unacknowledged updates every
