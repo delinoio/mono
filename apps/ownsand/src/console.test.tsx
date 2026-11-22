@@ -410,6 +410,33 @@ describe("invitations", () => {
     expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
   });
 
+  test("shows the sign-in configuration notice instead of a sign-in button when Logto is not configured", async () => {
+    // The default build: Logto mode without a registration, so no sign-in
+    // can complete and the secret has no redirect to survive.
+    const { signIns } = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      {
+        signedIn: false,
+        config: {
+          apiOrigin: "https://api.test",
+          authMode: AuthMode.Logto,
+          logto: undefined,
+        },
+      },
+    );
+    expect(
+      await screen.findByText("Sign-in is not configured for this build."),
+    ).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Sign in to accept" })).toBe(
+      null,
+    );
+    expect(signIns).toHaveLength(0);
+    expect(pendingInvitation.read()).toBeUndefined();
+    expect(window.sessionStorage.length).toBe(0);
+    // The page still removes the secret from the address bar.
+    expect(window.location.hash).toBe("");
+  });
+
   test("accepts the pending invitation after sign-in and deletes the stored secret", async () => {
     pendingInvitation.save(MOCK_INVITATION_SECRET);
     renderConsole("/invitations/accept");
