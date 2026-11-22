@@ -494,3 +494,37 @@ func (w *workWorld) waitState(t *testing.T, id string, state tidev1.RequestState
 	})
 	return last
 }
+
+// TestCreateDevSessionDuringProfileDeletion: CreateDevSession waits for a
+// profile deletion that holds the profile row and then fails with
+// not_found, so no session of a deleted profile stays queued.
+func TestCreateDevSessionDuringProfileDeletion(t *testing.T) {
+	w := newWorkWorld(t, devsession.Timing{})
+	ctx := context.Background()
+	profileID := w.createProfile(t, devProfileProto("linux-dev", 0, 0))
+	tx, err := w.env.DB.Pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, "SELECT 1 FROM runner_profiles WHERE runner_profile_id = $1 FOR UPDATE", profileID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := w.env.User(w.org.Member).DevSession.CreateDevSession(ctx, connect.NewRequest(&tidev1.CreateDevSessionRequest{OrganizationId: w.org.ID, RunnerProfileId: profileID}))
+		done <- err
+	}()
+	time.Sleep(300 * time.Millisecond)
+	if _, err := tx.Exec(ctx, "DELETE FROM runner_profiles WHERE runner_profile_id = $1", profileID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, "create during deletion", <-done, connect.CodeNotFound)
+	var n int
+	if err := w.env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM requests WHERE runner_profile_id = $1", profileID).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("%d requests of the deleted profile (%v)", n, err)
+	}
+}

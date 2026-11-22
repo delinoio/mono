@@ -257,6 +257,19 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[tid
 		if err := api.LockOrganizationShare(ctx, tx, c.OrganizationID); err != nil {
 			return err
 		}
+		// A shared lock of the profile row until the commit: a concurrent
+		// DeleteRunnerProfile, which locks the row FOR UPDATE before its
+		// hook cancels the queued requests, either waits and cancels this
+		// request too, or deletes the row first and this call fails with
+		// not_found.
+		var locked int
+		if err := tx.QueryRow(ctx, "SELECT 1 FROM runner_profiles WHERE organization_id = $1 AND runner_profile_id = $2 FOR SHARE",
+			c.OrganizationID, profileID).Scan(&locked); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return api.ErrNotFound("runner profile")
+			}
+			return err
+		}
 		p, err := h.e.Profiles().Get(ctx, tx, c.OrganizationID, profileID)
 		if err != nil {
 			return err
@@ -264,7 +277,6 @@ func (h *Handler) CreateDevSession(ctx context.Context, req *connect.Request[tid
 		if p.Kind != tidev1.WorkloadKind_WORKLOAD_KIND_DEV_SESSION {
 			return api.ErrInvalidf("invalid runner_profile_id: the profile is not a DEV_SESSION profile")
 		}
-		var locked int
 		var limit *int32
 		if err := tx.QueryRow(ctx, "SELECT 1 FROM memberships WHERE organization_id = $1 AND user_id = $2 FOR UPDATE", c.OrganizationID, c.UserID).Scan(&locked); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
