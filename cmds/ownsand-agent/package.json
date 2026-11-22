@@ -2,5 +2,28 @@
   "name": "ownsand-agent",
   "version": "0.0.0",
   "private": true,
-  "license": "FSL-1.1-ALv2"
+  "license": "FSL-1.1-ALv2",
+  "deploy": {
+    "target": "github-release",
+    "binary": "ownsand-agent",
+    "platforms": [
+      "linux-amd64",
+      "linux-arm64",
+      "darwin-arm64",
+      "windows-amd64",
+      "windows-arm64"
+    ],
+    "cgoPlatforms": [
+      "darwin-arm64"
+    ],
+    "versionVariable": "github.com/delinoio/mono/cmds/ownsand-agent/internal/version.Version",
+    "entitlements": "entitlements.plist",
+    "licenseFiles": [
+      "cmds/ownsand-agent/LICENSE"
+    ],
+    "updateManifest": {
+      "objectKey": "ownsand-agent/manifest.json",
+      "publicUrl": "https://releases.delino.io/ownsand-agent/manifest.json"
+    }
+  }
 }
