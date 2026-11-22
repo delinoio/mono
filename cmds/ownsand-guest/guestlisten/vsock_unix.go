@@ -35,12 +35,48 @@ type vsockListener struct {
 	once sync.Once
 }
 
+// setCloseOnExec marks fd close-on-exec. It is a variable so that tests can
+// inject a failure.
+var setCloseOnExec = func(fd int) error {
+	_, err := unix.FcntlInt(uintptr(fd), unix.F_SETFD, unix.FD_CLOEXEC)
+	return err
+}
+
+// createCloexec runs create, which makes a new file descriptor, and marks the
+// descriptor close-on-exec while it holds syscall.ForkLock for reading.
+//
+// macOS has no SOCK_CLOEXEC and no accept4, so the descriptor is created
+// first and marked afterwards. Without the lock, an os/exec fork between the
+// two steps copies the descriptor into the child. os/exec takes ForkLock for
+// writing around fork, so holding it for reading makes creation and marking
+// atomic with respect to every fork of this process. When the mark fails, the
+// descriptor is closed and the error is returned.
+//
+// create must not block: a reader that waits holds off every pending fork.
+// Callers pass a non-blocking listener, so accept returns EAGAIN at once.
+func createCloexec(create func() (int, error), mark func(int) error) (int, error) {
+	syscall.ForkLock.RLock()
+	defer syscall.ForkLock.RUnlock()
+	fd, err := create()
+	if err != nil {
+		return -1, err
+	}
+	if err := mark(fd); err != nil {
+		unix.Close(fd)
+		return -1, fmt.Errorf("guestlisten: mark close-on-exec: %w", err)
+	}
+	return fd, nil
+}
+
 func listenVsock(port uint32) (net.Listener, error) {
-	fd, err := unix.Socket(unix.AF_VSOCK, unix.SOCK_STREAM, 0)
+	fd, err := socketCloexec()
 	if err != nil {
 		return nil, fmt.Errorf("guestlisten: vsock socket: %w", err)
 	}
-	unix.CloseOnExec(fd)
+	// The listener must stay non-blocking: acceptNonblock holds
+	// syscall.ForkLock for reading around each accept on macOS, and a
+	// blocking accept would hold it until a peer connects and stall every
+	// os/exec start in the process.
 	if err := unix.SetNonblock(fd, true); err != nil {
 		unix.Close(fd)
 		return nil, fmt.Errorf("guestlisten: vsock nonblock: %w", err)
