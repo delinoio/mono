@@ -62,12 +62,12 @@ docker run --rm \
     fi
     apt-get update -qq >/dev/null
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends $packages >/dev/null
+    # Fills the shared cache with a verified archive: a unique temporary file
+    # that is checked before an atomic rename, so concurrent builds never see
+    # a partial archive and a bad cached archive is replaced.
+    bash /src/fetch-kernel-source.sh "$VERSION" "$SHA256" \
+      "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$VERSION.tar.xz" /cache
     tarball="/cache/linux-$VERSION.tar.xz"
-    if [ ! -f "$tarball" ]; then
-      curl -fsSL -o "$tarball.download" "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$VERSION.tar.xz"
-      mv "$tarball.download" "$tarball"
-    fi
-    echo "$SHA256  $tarball" | sha256sum -c --quiet -
     mkdir -p /build
     tar -xJf "$tarball" -C /build
     cd "/build/linux-$VERSION"
