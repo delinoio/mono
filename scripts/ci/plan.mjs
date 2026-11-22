@@ -42,7 +42,8 @@ const e2eInputs = new Set([
 ]);
 
 // Workspace packages that the apps depend on through `workspace:*` (the shared
-// UI package and the generated TypeScript binding packages). The app e2e
+// UI package, the tide TypeScript SDK and the generated TypeScript binding
+// packages). The app e2e
 // suites render these sources in a browser, so a change inside one of them
 // changes the app behavior without touching an `apps/<app>/` path. Keep this
 // list equal to the directories of the workspace dependencies of the apps;
@@ -51,8 +52,10 @@ const e2eInputs = new Set([
 // `packages/ownsand-sdk/` is not an app dependency and stays out.
 export const e2eWorkspacePackages = [
   "packages/delino-ui/",
+  "packages/tide-sdk/",
   "protos/delino/accounts/",
   "protos/delino/ownsand/",
+  "protos/delino/tide/",
 ];
 
 // Paths inside an app package or inside a workspace package that an app
