@@ -3,12 +3,14 @@
 package layers_test
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/agent"
@@ -16,6 +18,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/agent/devin/devinfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/layers"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 const (
@@ -162,6 +165,36 @@ func TestDevinClaimRelease(t *testing.T) {
 	if w.devin.Releases("ses-lost") != 0 {
 		t.Fatal("tide released another acceptor's claim")
 	}
+}
+
+// TestDevinCancelReleasedByPoller: when the claim poller releases the claim
+// of a canceled request (as after a restart between the cancellation commit
+// and its release step), the session that returns to the queue is still
+// declined.
+func TestDevinCancelReleasedByPoller(t *testing.T) {
+	w := newDevinWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.full()
+	w.devin.AddSession("ses-recover", true)
+	req := w.requestBySource(t, "ses-recover")
+	ctx := context.Background()
+	// The cancellation commits without its release step.
+	err := w.env.DB.InTx(ctx, func(tx pgx.Tx) error {
+		_, err := w.l.Engine.EndRequestTx(ctx, tx, req.GetRequestId(), work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_CANCELED,
+			Reason: tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the poller releases the claim", func() bool { return w.devin.Releases("ses-recover") == 1 })
+	stays(t, "no request after the cancel", func() bool {
+		for _, r := range w.requests(t) {
+			if r.GetSourceKey() == "ses-recover#2" {
+				return false
+			}
+		}
+		return true
+	})
 }
 
 // TestDevinStartCheckPartialFailure: when the poller cannot read the queue

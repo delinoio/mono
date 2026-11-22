@@ -256,9 +256,7 @@ func (a *Adapter) ReleaseClaim(ctx context.Context, req *work.Request) error {
 }
 
 // releaseRequest releases the held claim of an ended request (no claim: no
-// call). A user cancellation before a runner took the session also marks
-// the claim declined, so the watcher does not claim the same vendor entry
-// again.
+// call).
 func (h *Hub) releaseRequest(ctx context.Context, req *work.Request) error {
 	c, err := h.claim(ctx, h.svc.DB.Pool, req.ID)
 	if errors.Is(err, errNoClaim) {
@@ -266,11 +264,6 @@ func (h *Hub) releaseRequest(ctx context.Context, req *work.Request) error {
 	}
 	if err != nil {
 		return err
-	}
-	if req.StartTime == nil && req.EndReason == tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER && !c.Declined {
-		if _, err := h.svc.DB.Pool.Exec(ctx, "UPDATE agent_claims SET declined = true, update_time = $2 WHERE request_id = $1", c.RequestID, h.svc.NowUTC()); err != nil {
-			return err
-		}
 	}
 	if c.State != ClaimHeld {
 		return nil

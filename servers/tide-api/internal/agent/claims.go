@@ -46,18 +46,17 @@ type Claim struct {
 	// outpost ID.
 	Scope      string
 	State      ClaimState
-	Declined   bool
 	CreateTime time.Time
 }
 
 const claimColumns = `c.request_id::text, c.organization_id::text, c.agent_integration_id::text, c.vendor, c.vendor_request_id, c.demand_marker,
-	c.worker_id, c.scope, c.state, c.declined, c.create_time`
+	c.worker_id, c.scope, c.state, c.create_time`
 
 func scanClaim(row interface{ Scan(dest ...any) error }) (*Claim, error) {
 	var c Claim
 	var vendor, state int16
 	dest := []any{&c.RequestID, &c.OrganizationID, &c.IntegrationID, &vendor, &c.VendorRequestID, &c.DemandMarker,
-		&c.WorkerID, &c.Scope, &state, &c.Declined, &c.CreateTime}
+		&c.WorkerID, &c.Scope, &state, &c.CreateTime}
 	if err := row.Scan(dest...); err != nil {
 		return nil, err
 	}
@@ -233,7 +232,7 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 		h.log.LogAttrs(ctx, slog.LevelInfo, "agent_claim_renewed", append(logAttrs, slog.String("request_id", c.RequestID))...)
 		return nil
 	}
-	if c != nil && c.Declined && c.DemandMarker == d.Marker {
+	if c != nil && canceledBeforeStart(req) && c.DemandMarker == d.Marker {
 		return nil
 	}
 	p, err := h.profileFor(ctx, h.svc.DB.Pool, in)
@@ -290,6 +289,16 @@ func (h *Hub) admit(ctx context.Context, v Vendor, in integration.Integration, d
 	h.log.LogAttrs(ctx, slog.LevelInfo, "agent_request_claimed", append(logAttrs, slog.String("request_id", requestID), slog.String("runner_profile_id", p.ID))...)
 	h.svc.WorkChanged(in.OrganizationID)
 	return nil
+}
+
+// canceledBeforeStart reports whether a user canceled the request in tide
+// before a runner took its session; then tide does not claim the same
+// vendor entry again. The rule reads the request's end, which the
+// cancellation commits, and not a flag that a later release step sets, so
+// it also holds when the claim poller releases the claim after a restart
+// or before the cancellation's own release step.
+func canceledBeforeStart(req *work.Request) bool {
+	return req.StartTime == nil && req.EndReason == tidev1.RequestEndReason_REQUEST_END_REASON_CANCELED_BY_USER
 }
 
 // lost marks a claim as no longer tide's and ends its request when no

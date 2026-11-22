@@ -179,7 +179,7 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 		return ok && strings.Contains(m, "canceled")
 	})
 	c, err := w.l.Agents.Claim(context.Background(), canceled.GetRequestId())
-	if err != nil || c.State != agent.ClaimReleased || !c.Declined {
+	if err != nil || c.State != agent.ClaimReleased {
 		t.Fatalf("claim %+v %v", c, err)
 	}
 	// The same entry again: declined, so no second request.

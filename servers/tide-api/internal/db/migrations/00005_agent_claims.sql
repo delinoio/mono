@@ -18,14 +18,13 @@ CREATE TABLE agent_claims (
     vendor_request_id text NOT NULL,
     -- The demand marker of the vendor entry (Cursor createdAtMs, Devin
     -- metadata.created_at), so that tide does not claim an entry again
-    -- that a user canceled in tide.
+    -- that a user canceled in tide (the request's end reason records the
+    -- cancellation).
     demand_marker text NOT NULL DEFAULT '',
     worker_id text NOT NULL,
     scope text NOT NULL DEFAULT '',
     -- agent.ClaimState: 1 held, 2 released (or no longer tide's).
     state smallint NOT NULL CHECK (state IN (1, 2)),
-    -- A user canceled the request in tide before a runner took it.
-    declined boolean NOT NULL DEFAULT false,
     create_time timestamptz NOT NULL,
     update_time timestamptz NOT NULL
 );
