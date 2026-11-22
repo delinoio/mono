@@ -23,31 +23,58 @@ import (
 // Dialer connects to the guest helper.
 type Dialer func(ctx context.Context) (net.Conn, error)
 
+// DialError reports that a dial to the guest helper failed, so the failed
+// call sent no request byte to the helper. Callers that must never deliver a
+// request twice use it as the proof that a request was not delivered: any
+// other error of a call can follow a delivered request.
+type DialError struct {
+	Err error
+}
+
+func (e *DialError) Error() string { return "dial guest helper: " + e.Err.Error() }
+
+// Unwrap returns the error of the dialer.
+func (e *DialError) Unwrap() error { return e.Err }
+
 // Client is the GuestService client of one sandbox.
 type Client struct {
+	dial      Dialer
 	transport *http.Transport
 	svc       ownsandv1connect.GuestServiceClient
 }
 
-// New returns a client that dials with dial.
+// New returns a client that dials with dial. A failure of dial reaches the
+// caller of a call as a *DialError, reachable with errors.As.
 func New(dial Dialer) *Client {
 	var protocols http.Protocols
 	protocols.SetUnencryptedHTTP2(true)
 	transport := &http.Transport{
 		Protocols: &protocols,
 		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return dial(ctx)
+			conn, err := dial(ctx)
+			if err != nil {
+				return nil, &DialError{Err: err}
+			}
+			return conn, nil
 		},
 		IdleConnTimeout: 5 * time.Minute,
 	}
 	hc := &http.Client{Transport: transport}
 	return &Client{
+		dial:      dial,
 		transport: transport,
 		svc: ownsandv1connect.NewGuestServiceClient(hc, "http://ownsand-guest",
 			connect.WithReadMaxBytes(datapath.MaxFrameSize+(64<<10)),
 			connect.WithAcceptCompression("gzip", nil, nil),
 		),
 	}
+}
+
+// WithDialer returns a new client, without shared connections, that dials
+// with wrap applied to the dialer of c. Fault-injection tests use it to make
+// a dial fail or to cut an established connection.
+func (c *Client) WithDialer(wrap func(Dialer) Dialer) *Client {
+	return New(wrap(c.dial))
 }
 
 // CheckReady asks the guest helper once.
