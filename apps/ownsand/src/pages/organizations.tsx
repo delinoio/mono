@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { LIST_ORGANIZATIONS_REQUEST } from "../api.ts";
-import { useMutation, useQuery } from "@connectrpc/connect-query";
+import { useMutation } from "@connectrpc/connect-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
 import { TextField } from "delino-ui/text-field";
@@ -16,15 +15,13 @@ import {
 } from "../components/ui.tsx";
 import { labels } from "../format.ts";
 import { secretFromInput, SECRET_PARAM } from "../invitation.ts";
+import { useOrganizations } from "../organizations.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
 /** Route `organizations`: the organization list, creation and invitations. */
 export function OrganizationsPage() {
   const { navigate } = useRouter();
-  const orgs = useQuery(
-    OrganizationService.method.listOrganizations,
-    LIST_ORGANIZATIONS_REQUEST,
-  );
+  const orgs = useOrganizations();
   const create = useMutation(OrganizationService.method.createOrganization);
   const [creating, setCreating] = useState(false);
   const [name, setName] = useState("");
@@ -61,27 +58,42 @@ export function OrganizationsPage() {
           <Loading label="Loading organizations" />
         ) : orgs.error ? (
           <ErrorNotice error={orgs.error} onRetry={() => void orgs.refetch()} />
-        ) : orgs.data.organizations.length === 0 ? (
+        ) : orgs.organizations.length === 0 && !orgs.isIncomplete ? (
           <Empty title="You are not in an organization yet">
             Create one, or open an invitation link from an admin.
           </Empty>
         ) : (
-          <ul className="list" aria-label="Your organizations">
-            {orgs.data.organizations.map((org) => (
-              <li key={org.organizationId} className="list-row">
-                <Link
-                  className="list-link"
-                  to={routePath({
-                    id: RouteId.Sandboxes,
-                    organizationId: org.organizationId,
-                  })}
-                >
-                  <span className="list-title">{org.name}</span>
-                  <Badge>{labels.role[org.callerRole]}</Badge>
-                </Link>
-              </li>
-            ))}
-          </ul>
+          <>
+            <ul className="list" aria-label="Your organizations">
+              {orgs.organizations.map((org) => (
+                <li key={org.organizationId} className="list-row">
+                  <Link
+                    className="list-link"
+                    to={routePath({
+                      id: RouteId.Sandboxes,
+                      organizationId: org.organizationId,
+                    })}
+                  >
+                    <span className="list-title">{org.name}</span>
+                    <Badge>{labels.role[org.callerRole]}</Badge>
+                  </Link>
+                </li>
+              ))}
+            </ul>
+            {orgs.loadMoreError ? (
+              <>
+                <p className="muted">Some organizations are not shown yet.</p>
+                <ErrorNotice
+                  error={orgs.loadMoreError}
+                  onRetry={orgs.retryLoadMore}
+                />
+              </>
+            ) : orgs.isIncomplete ? (
+              <p className="muted" role="status">
+                Loading more organizations
+              </p>
+            ) : null}
+          </>
         )}
         <section className="section" aria-labelledby="join-title">
           <h2 id="join-title">Join with an invitation</h2>
