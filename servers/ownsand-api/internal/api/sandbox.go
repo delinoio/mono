@@ -760,7 +760,9 @@ func (h SandboxHandler) DeleteSandbox(ctx context.Context, req *connect.Request[
 // ResumeSandbox is rejected while billing blocks the organization.
 //
 // A caller's pause removes the billing pause mark, so a sandbox that a caller
-// paused stays paused after a billing recovery. This includes a sandbox that
+// paused stays paused after a billing recovery. It is the only way to take the
+// ownership from billing, which otherwise keeps its mark until the sandbox
+// ends (see BillingEnforcer.resume). This includes a sandbox that
 // billing already paused: the pause succeeds without a command, and it clears
 // the mark before it returns. The caller pause and the billing worker's
 // resume of the same sandbox run one at a time under the sandbox ordering lock
