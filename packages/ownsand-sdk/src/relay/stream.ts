@@ -117,7 +117,8 @@ export class ConsumerHold {
  * releases `hold` (it left its iteration early), the held event no longer
  * pauses the idle clock: the call is aborted after the idle limit and the
  * stream's timers and listeners are released even if nobody resumes the
- * generator.
+ * generator. A caller abort releases them the same way while an event is
+ * held.
  */
 export async function* watchedRelayStream<T>(
   ctx: OperationContext,
@@ -168,6 +169,15 @@ export async function* watchedRelayStream<T>(
         );
       } catch {
         if (stopWatch.signal.aborted || call.signal.aborted) {
+          if (holding && !stopWatch.signal.aborted) {
+            // The caller cancelled the call while the consumer holds or has
+            // abandoned an event, so the generator is suspended at its
+            // `yield` and its `finally` does not run until someone resumes
+            // it. Release the registration and the caller-signal listener
+            // now; the later `finally` repeats both calls harmlessly.
+            registration.dispose();
+            unlink();
+          }
           return;
         }
         // A release woke the sleep: arm a new wake signal and look again.
