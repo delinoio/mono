@@ -49,12 +49,25 @@ export function isE2eInput(path) {
 // plan.test.mjs cross-checks them.
 export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
 
+// Single workspace packages outside the workspace roots: the release-only Go
+// command packages under `cmds/`. Their manifests declare no package tasks
+// and exist so that Changesets versions them and `deploy.yml` releases them
+// (see the deployment workflow contract), so only the manifest, not the Go
+// source, is a workspace input. plan.test.mjs checks that they declare no
+// scripts and that `pnpm-workspace.yaml` lists exactly these directories.
+export const workspacePackageDirs = ["cmds/ownsand", "cmds/ownsand-agent"];
+
+function isWorkspacePackageFile(path, file) {
+  return workspacePackageDirs.some((dir) => path === `${dir}/${file}`);
+}
+
 // Only the root `turbo.json` and the `turbo.json` placed directly inside a
 // workspace package configure the tasks that the Turbo fixtures inspect. Turbo
 // ignores a `turbo.json` at any other depth, so it does not select fixtures.
 export function isTurboConfigInput(path) {
   return (
     path === "turbo.json" ||
+    isWorkspacePackageFile(path, "turbo.json") ||
     new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/turbo\\.json$`).test(path)
   );
 }
@@ -62,9 +75,12 @@ export function isTurboConfigInput(path) {
 // A package manifest directly inside a workspace package selects the Turbo
 // fixtures, which resolve every workspace package.
 export function isWorkspaceManifest(path) {
-  return new RegExp(
-    `^(${workspaceRoots.join("|")})/[^/]+/package\\.json$`,
-  ).test(path);
+  return (
+    isWorkspacePackageFile(path, "package.json") ||
+    new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/package\\.json$`).test(
+      path,
+    )
+  );
 }
 
 // Root inputs of every workspace package task: the runtime selector, the
@@ -91,6 +107,7 @@ export function isWorkspaceInput(path) {
   return (
     workspaceTaskInputs.has(path) ||
     path === relayDigestVectors ||
+    isWorkspaceManifest(path) ||
     new RegExp(`^(${workspaceRoots.join("|")})/[^/]+/`).test(path)
   );
 }

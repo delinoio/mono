@@ -1,0 +1,22 @@
+{
+  "name": "ownsand-cli",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "deploy": {
+    "target": "github-release",
+    "binary": "ownsand",
+    "platforms": [
+      "linux-amd64",
+      "linux-arm64",
+      "darwin-amd64",
+      "darwin-arm64",
+      "windows-amd64",
+      "windows-arm64"
+    ],
+    "licenseFiles": [
+      "LICENSE",
+      "NOTICE"
+    ]
+  }
+}

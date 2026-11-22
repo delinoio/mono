@@ -79,6 +79,7 @@ test("no pending changesets select nothing", () => {
     releases: [],
     servers: [],
     staticSites: [],
+    binaries: [],
   });
 });
 
@@ -761,7 +762,7 @@ test("check and the --check CLI reject a nameless deployable", () => {
 });
 
 const invalidTargetMessage =
-  /^(web|api): deploy\.target must be one of droplet, cloudflare-pages$/;
+  /^(web|api): deploy\.target must be one of droplet, cloudflare-pages, github-release$/;
 
 test("an unknown deploy target fails", () => {
   const bad = [pkg("servers/api", { name: "api", deploy: { target: "fly" } })];
@@ -1414,6 +1415,297 @@ test("repository deployables use the documented targets", () => {
       ["ownsand-console", "ownsand-console", "apps/ownsand/dist"],
     ],
   );
+  assert.deepEqual(
+    result.binaries.map((d) => [
+      d.name,
+      d.dir,
+      d.binary,
+      d.platforms,
+      d.cgoPlatforms,
+      d.entitlements,
+      d.licenseFiles,
+      d.manifestObjectKey,
+    ]),
+    [
+      [
+        "ownsand-agent",
+        "cmds/ownsand-agent",
+        "ownsand-agent",
+        [
+          "linux-amd64",
+          "linux-arm64",
+          "darwin-arm64",
+          "windows-amd64",
+          "windows-arm64",
+        ],
+        ["darwin-arm64"],
+        "cmds/ownsand-agent/entitlements.plist",
+        ["cmds/ownsand-agent/LICENSE"],
+        "ownsand-agent/manifest.json",
+      ],
+      [
+        "ownsand-cli",
+        "cmds/ownsand",
+        "ownsand",
+        [
+          "linux-amd64",
+          "linux-arm64",
+          "darwin-amd64",
+          "darwin-arm64",
+          "windows-amd64",
+          "windows-arm64",
+        ],
+        [],
+        "",
+        ["LICENSE", "NOTICE"],
+        "",
+      ],
+    ],
+  );
+});
+
+// A complete `github-release` deploy field.
+const githubRelease = (binary, fields = {}) => ({
+  target: DeployTarget.GithubRelease,
+  binary,
+  platforms: ["linux-amd64", "darwin-arm64", "windows-arm64"],
+  licenseFiles: ["LICENSE"],
+  ...fields,
+});
+
+const binaryWorkspace = (fields = {}, name = "tool") => [
+  pkg(`cmds/${name}`, { name, deploy: githubRelease(name, fields) }),
+];
+
+test("a binary release plans its build fields after servers and static sites", () => {
+  const packages = [
+    ...workspace,
+    ...binaryWorkspace({
+      cgoPlatforms: ["darwin-arm64"],
+      versionVariable:
+        "github.com/delinoio/mono/cmds/tool/internal/version.Version",
+      entitlements: "./entitlements.plist",
+      licenseFiles: ["cmds/tool/LICENSE", "NOTICE"],
+      updateManifest: {
+        objectKey: "tool/manifest.json",
+        publicUrl: "https://releases.example.com/tool/manifest.json",
+      },
+      needs: ["api"],
+    }),
+  ];
+  const result = plan(
+    status(["tool", "1.2.3"], ["api", "0.0.2"], ["web", "0.0.3"]),
+    packages,
+  );
+  assert.deepEqual(
+    result.servers.map((d) => d.name),
+    ["api"],
+  );
+  assert.deepEqual(
+    result.staticSites.map((d) => d.name),
+    ["web"],
+  );
+  assert.deepEqual(result.binaries, [
+    {
+      name: "tool",
+      dir: "cmds/tool",
+      kind: DeployKind.Binary,
+      target: DeployTarget.GithubRelease,
+      binary: "tool",
+      platforms: ["linux-amd64", "darwin-arm64", "windows-arm64"],
+      cgoPlatforms: ["darwin-arm64"],
+      versionVariable:
+        "github.com/delinoio/mono/cmds/tool/internal/version.Version",
+      entitlements: "cmds/tool/entitlements.plist",
+      licenseFiles: ["cmds/tool/LICENSE", "NOTICE"],
+      manifestObjectKey: "tool/manifest.json",
+      manifestPublicUrl: "https://releases.example.com/tool/manifest.json",
+      version: "1.2.3",
+    },
+  ]);
+  assert.deepEqual(result.releases.map((r) => r.name).sort(), [
+    "api",
+    "tool",
+    "web",
+  ]);
+});
+
+test("a none binary release publishes nothing", () => {
+  const result = plan(
+    status(["tool", "1.0.0", ReleaseType.None]),
+    binaryWorkspace(),
+  );
+  assert.deepEqual(result.binaries, []);
+  assert.deepEqual(result.releases, []);
+});
+
+test("a binary release version must be MAJOR.MINOR.PATCH", () => {
+  for (const version of ["1.0.0-rc.0", "1.0.0-next.1"]) {
+    assert.throws(
+      () => plan(status(["tool", version]), binaryWorkspace()),
+      (error) =>
+        error instanceof DeployPlanError &&
+        error.message ===
+          `tool: a binary release version must be MAJOR.MINOR.PATCH, not ${version}`,
+    );
+  }
+});
+
+test("invalid github-release fields fail", async (t) => {
+  const cases = [
+    [{ binary: "Tool" }, /deploy\.binary must be an executable name/],
+    [{ binary: undefined }, /deploy\.binary must be an executable name/],
+    [{ platforms: [] }, /deploy\.platforms must be a nonempty list/],
+    [{ platforms: ["linux-386"] }, /deploy\.platforms must be a nonempty list/],
+    [
+      { platforms: ["linux-amd64", "linux-amd64"] },
+      /deploy\.platforms must be a nonempty list/,
+    ],
+    [{ cgoPlatforms: [] }, /deploy\.cgoPlatforms must be/],
+    [{ cgoPlatforms: ["linux-amd64"] }, /deploy\.cgoPlatforms must be/],
+    [
+      { platforms: ["linux-amd64"], cgoPlatforms: ["darwin-arm64"] },
+      /deploy\.cgoPlatforms must be/,
+    ],
+    [
+      { versionVariable: "github.com/other/repo/version.Version" },
+      /deploy\.versionVariable must be a Go variable/,
+    ],
+    [
+      { versionVariable: "github.com/delinoio/mono/cmds/tool/version" },
+      /deploy\.versionVariable must be a Go variable/,
+    ],
+    [{ entitlements: "../x.plist" }, /deploy\.entitlements must be a \.plist/],
+    [{ entitlements: "x.xml" }, /deploy\.entitlements must be a \.plist/],
+    [
+      { platforms: ["linux-amd64"], entitlements: "x.plist" },
+      /deploy\.entitlements needs a darwin platform/,
+    ],
+    [{ licenseFiles: [] }, /deploy\.licenseFiles must be a nonempty list/],
+    [{ licenseFiles: ["/LICENSE"] }, /deploy\.licenseFiles must be/],
+    [{ licenseFiles: ["../LICENSE"] }, /deploy\.licenseFiles must be/],
+    [{ licenseFiles: ["a\tb"] }, /deploy\.licenseFiles must be/],
+    [
+      { licenseFiles: ["LICENSE", "cmds/tool/LICENSE"] },
+      /second release asset named LICENSE/,
+    ],
+    [{ licenseFiles: ["SHA256SUMS"] }, /second release asset named SHA256SUMS/],
+    [
+      { licenseFiles: ["x/tool-linux-amd64"] },
+      /second release asset named tool-linux-amd64/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "../m.json",
+          publicUrl: "https://x.test/../m.json",
+        },
+      },
+      /deploy\.updateManifest\.objectKey/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "http://x.test/tool/m.json",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://x.test/other/m.json",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://x.test/tool/m.json?v=1",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl/,
+    ],
+    [{ updateManifest: null }, /deploy\.updateManifest\.objectKey/],
+  ];
+  for (const [fields, message] of cases) {
+    await t.test(JSON.stringify(fields), () => {
+      assert.throws(
+        () => plan(status(["tool", "1.0.0"]), binaryWorkspace(fields)),
+        (error) =>
+          error instanceof DeployPlanError && message.test(error.message),
+      );
+    });
+  }
+});
+
+test("a github-release deployable must be under cmds/", () => {
+  assert.throws(
+    () =>
+      plan(status(["tool", "1.0.0"]), [
+        pkg("apps/tool", { name: "tool", deploy: githubRelease("tool") }),
+      ]),
+    /deploy\.target github-release is allowed only under cmds\//,
+  );
+});
+
+test("two binaries with the same executable or manifest fail", () => {
+  const manifest = {
+    objectKey: "m/manifest.json",
+    publicUrl: "https://x.test/m/manifest.json",
+  };
+  assert.throws(
+    () =>
+      plan({ changesets: [], releases: [] }, [
+        pkg("cmds/a", { name: "a", deploy: githubRelease("tool") }),
+        pkg("cmds/b", { name: "b", deploy: githubRelease("tool") }),
+      ]),
+    /a and b both deploy to github-release:tool/,
+  );
+  assert.throws(
+    () =>
+      plan({ changesets: [], releases: [] }, [
+        pkg("cmds/a", {
+          name: "a",
+          deploy: githubRelease("a", { updateManifest: manifest }),
+        }),
+        pkg("cmds/b", {
+          name: "b",
+          deploy: githubRelease("b", { updateManifest: manifest }),
+        }),
+      ]),
+    /a and b both deploy to github-release-manifest:m\/manifest\.json/,
+  );
+});
+
+test("check rejects a missing license or entitlements file", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "deploy-plan-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // check() reads the single workspace package directories, so the fixture
+  // package sits at one of them.
+  mkdirSync(join(dir, "cmds/ownsand"), { recursive: true });
+  writeFileSync(
+    join(dir, "cmds/ownsand/package.json"),
+    JSON.stringify({
+      name: "tool",
+      deploy: githubRelease("tool", {
+        licenseFiles: ["LICENSE"],
+        entitlements: "entitlements.plist",
+      }),
+    }),
+  );
+  assert.throws(() => check(dir), /tool: LICENSE does not exist/);
+  writeFileSync(join(dir, "LICENSE"), "license\n");
+  assert.throws(
+    () => check(dir),
+    /tool: cmds\/ownsand\/entitlements\.plist does not exist/,
+  );
+  writeFileSync(join(dir, "cmds/ownsand/entitlements.plist"), "<plist/>\n");
+  check(dir);
 });
 
 test("main writes GitHub outputs and a summary", () => {
@@ -1446,6 +1738,10 @@ test("main writes GitHub outputs and a summary", () => {
     assert.deepEqual(JSON.parse(outputs.changesets), ["change"]);
     assert.equal(outputs.has_servers, "true");
     assert.equal(outputs.has_static_sites, "false");
+    assert.equal(outputs.has_binaries, "false");
+    assert.equal(outputs.has_cgo_binaries, "false");
+    assert.equal(outputs.has_darwin_binaries, "false");
+    assert.deepEqual(JSON.parse(outputs.binaries), []);
     assert.deepEqual(JSON.parse(outputs.releases), [
       { name: "accounts-api", version: "0.1.0" },
     ]);
@@ -1454,6 +1750,44 @@ test("main writes GitHub outputs and a summary", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("main writes the binary outputs", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "deploy-plan-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const statusPath = join(dir, "status.json");
+  const outputPath = join(dir, "output");
+  writeFileSync(
+    statusPath,
+    JSON.stringify(
+      status(["ownsand-agent", "0.1.0"], ["ownsand-cli", "0.0.1"]),
+    ),
+  );
+  writeFileSync(outputPath, "");
+  main({
+    argv: [statusPath],
+    env: { GITHUB_OUTPUT: outputPath },
+    repoRoot: root,
+  });
+  const outputs = Object.fromEntries(
+    readFileSync(outputPath, "utf8")
+      .trim()
+      .split("\n")
+      .map((line) => [
+        line.slice(0, line.indexOf("=")),
+        line.slice(line.indexOf("=") + 1),
+      ]),
+  );
+  assert.equal(outputs.has_binaries, "true");
+  assert.equal(outputs.has_cgo_binaries, "true");
+  assert.equal(outputs.has_darwin_binaries, "true");
+  assert.deepEqual(
+    JSON.parse(outputs.binaries).map((d) => [d.name, d.version]),
+    [
+      ["ownsand-agent", "0.1.0"],
+      ["ownsand-cli", "0.0.1"],
+    ],
+  );
 });
 
 test("check and the --check CLI reject non-target deploy.target values", () => {
@@ -1591,5 +1925,16 @@ test("an unnamed deployable still fails beside named packages", () => {
   assert.throws(
     () => plan(status(["api", "1.0.1"]), packages),
     /servers\/nameless: a deployable package name must be a string/,
+  );
+});
+
+test("a binary release with deploy.buildEnv fails", () => {
+  assert.throws(
+    () =>
+      plan(
+        status(["tool", "1.0.0"]),
+        binaryWorkspace({ buildEnv: { PUBLIC_A: "A" } }),
+      ),
+    /tool: deploy.buildEnv is allowed only for the cloudflare-pages target/,
   );
 });
