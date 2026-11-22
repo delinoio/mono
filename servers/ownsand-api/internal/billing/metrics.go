@@ -69,18 +69,23 @@ func add(c metric.Int64Counter, attrs ...attribute.KeyValue) {
 // _total or unit suffix: the Prometheus exporter adds them, so the served
 // names stay the same as the names in the contract.
 type metrics struct {
-	outboxDepth    metric.Int64Gauge
-	reportLag      metric.Float64Gauge
-	reports        metric.Int64Counter
-	reportFailures metric.Int64Counter
-	sealedRows     metric.Int64Counter
-	flushFailures  metric.Int64Counter
+	outboxDepth metric.Int64Gauge
+	// unsupportedDepth counts the unreported outbox rows of a meter value that
+	// is not an OwnSand meter; the reporter never sends them.
+	unsupportedDepth metric.Int64Gauge
+	reportLag        metric.Float64Gauge
+	reports          metric.Int64Counter
+	reportFailures   metric.Int64Counter
+	sealedRows       metric.Int64Counter
+	flushFailures    metric.Int64Counter
 }
 
 func newMetrics(provider metric.MeterProvider) *metrics {
 	m := meter(provider)
 	return &metrics{
 		outboxDepth: int64Gauge(m, "ownsand_billing_usage_outbox_depth", "Usage outbox rows that accounts-api has not accepted yet."),
+		unsupportedDepth: int64Gauge(m, "ownsand_billing_usage_outbox_unsupported_depth",
+			"Unreported usage outbox rows whose meter is not an OwnSand meter; the reporter skips them and keeps them unchanged."),
 		reportLag: float64Gauge(m, "ownsand_billing_usage_report_lag", "s",
 			"Seconds since the end of the oldest window with an unreported outbox row; 0 when every row is reported."),
 		reports:        int64Counter(m, "ownsand_billing_usage_reports", "Outbox rows that accounts-api accepted, by result (charged, duplicate or unattributed)."),

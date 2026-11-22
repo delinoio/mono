@@ -177,14 +177,28 @@ func insertOutbox(ctx context.Context, tx pgx.Tx, rows []outboxRow, now time.Tim
 	return conflicts, nil
 }
 
-// dueRows returns up to limit unreported outbox rows whose next attempt is
-// due, oldest window first.
+// supportedMeters returns the stored values of the OwnSand meters, the only
+// meters that can be reported to delino-accounts (AccountsMeter maps every
+// other value to METER_UNSPECIFIED, which accounts-api rejects for the whole
+// request). The outbox queries of the reporter filter on it, so a row with
+// another meter value neither fails nor delays the reports of supported rows.
+func supportedMeters() []int16 {
+	out := make([]int16, len(Meters))
+	for i, m := range Meters {
+		out[i] = int16(m)
+	}
+	return out
+}
+
+// dueRows returns up to limit unreported outbox rows of a supported meter
+// whose next attempt is due, oldest window first. Rows of another meter value
+// are skipped (and never modified), so they do not use up the limit.
 func dueRows(ctx context.Context, q interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }, now time.Time, limit int) ([]outboxRow, error) {
 	rows, err := q.Query(ctx, `SELECT organization_id::text, meter, window_start, quantity, amount_usd_micros, attempts FROM usage_outbox
-		WHERE report_time IS NULL AND next_attempt_time <= $1
-		ORDER BY window_start, organization_id, meter LIMIT $2`, now, limit)
+		WHERE report_time IS NULL AND next_attempt_time <= $1 AND meter = ANY($3::smallint[])
+		ORDER BY window_start, organization_id, meter LIMIT $2`, now, limit, supportedMeters())
 	if err != nil {
 		return nil, err
 	}
