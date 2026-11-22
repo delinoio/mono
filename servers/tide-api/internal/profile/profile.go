@@ -119,12 +119,13 @@ type Profiles struct {
 	svc          *api.Service
 	links        *link.Links
 	integrations *integration.Store
+	rules        Rules
 	hooks        []DeletionHook
 }
 
-// Register mounts RunnerProfileService.
-func Register(r *app.Registry, links *link.Links, integrations *integration.Store) *Profiles {
-	p := &Profiles{svc: r.Service, links: links, integrations: integrations}
+// Register mounts RunnerProfileService with the validation rules.
+func Register(r *app.Registry, links *link.Links, integrations *integration.Store, rules Rules) *Profiles {
+	p := &Profiles{svc: r.Service, links: links, integrations: integrations, rules: rules}
 	r.Handle(tidev1connect.NewRunnerProfileServiceHandler(&Handler{p: p}, r.HandlerOptions()...))
 	return p
 }
@@ -331,7 +332,7 @@ func (h *Handler) CreateRunnerProfile(ctx context.Context, req *connect.Request[
 	if err != nil {
 		return nil, s.Internal(ctx, "create runner profile", err)
 	}
-	if err := Validate(p, vendor); err != nil {
+	if err := ps.rules.Validate(p, vendor); err != nil {
 		return nil, err
 	}
 	if p.TemplateID != "" {
@@ -515,7 +516,7 @@ func (ps *Profiles) applyUpdate(ctx context.Context, c api.Caller, id string, in
 	if err != nil {
 		return nil, err
 	}
-	if err := Validate(p, vendor); err != nil {
+	if err := ps.rules.Validate(p, vendor); err != nil {
 		return nil, err
 	}
 	if p.TemplateID != "" {

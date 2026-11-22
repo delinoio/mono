@@ -102,8 +102,10 @@ type desired struct {
 // settings or a credential change, so the watcher restarts with them.
 func (h *Hub) desiredWatchers(ctx context.Context) (map[string]desired, error) {
 	vendors := make([]int16, 0, len(h.vendors))
-	for v := range h.vendors {
-		vendors = append(vendors, int16(v))
+	for v, impl := range h.vendors {
+		if _, push := impl.(Pusher); !push {
+			vendors = append(vendors, int16(v))
+		}
 	}
 	rows, err := h.svc.DB.Pool.Query(ctx, `SELECT i.agent_integration_id::text, i.organization_id::text, i.vendor, i.name, i.pool_name, i.outpost_name,
 		i.create_time, i.update_time, COALESCE((SELECT max(c.set_time) FROM agent_integration_credentials c WHERE c.agent_integration_id = i.agent_integration_id), i.create_time)
@@ -225,8 +227,12 @@ func (h *Hub) watch(ctx context.Context, v Vendor, in integration.Integration) {
 			backoff = h.timing.BackoffMin
 			continue
 		}
-		h.engine.Metrics().VendorWatchReconnect(VendorLabel(in.Vendor))
-		log.WarnContext(ctx, "vendor_watch_reconnect", slog.String("cause", "error"), slog.Duration("backoff", backoff), slog.Any("error", err))
+		if rs, ok := v.(Restarter); ok {
+			rs.Restarted(ctx, log, backoff, err)
+		} else {
+			h.engine.Metrics().VendorWatchReconnect(VendorLabel(in.Vendor))
+			log.WarnContext(ctx, "vendor_watch_reconnect", slog.String("cause", "error"), slog.Duration("backoff", backoff), slog.Any("error", err))
+		}
 		t := time.NewTimer(backoff)
 		select {
 		case <-ctx.Done():

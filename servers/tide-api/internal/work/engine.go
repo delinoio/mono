@@ -245,6 +245,10 @@ type NewRequest struct {
 	PoolKey string
 	// RequestID is the ID of the new request; empty selects a new UUID v7.
 	RequestID string
+	// MaxQueueWait, when greater than zero, caps the profile's maximum
+	// queue wait for this request (for example, the lifetime of a Claude
+	// Code work order).
+	MaxQueueWait time.Duration
 }
 
 // CreateRequest creates a QUEUED request in tx, or returns the existing
@@ -262,6 +266,10 @@ func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*R
 		key = id
 	}
 	now := e.svc.NowUTC()
+	wait := p.MaxQueueWait
+	if n.MaxQueueWait > 0 && n.MaxQueueWait < wait {
+		wait = n.MaxQueueWait
+	}
 	var pool any
 	if n.PoolKey != "" {
 		pool = n.PoolKey
@@ -271,7 +279,7 @@ func (e *Engine) CreateRequest(ctx context.Context, tx pgx.Tx, n NewRequest) (*R
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $9, $9)
 		ON CONFLICT (organization_id, source, source_key) DO NOTHING RETURNING `+requestColumns,
 		id, p.OrganizationID, p.ID, int16(p.Kind), int16(n.Source), key, int16(reqQueued), int16(p.Priority),
-		now, now.Add(p.MaxQueueWait), n.OwnerUserID, n.Label, pool))
+		now, now.Add(wait), n.OwnerUserID, n.Label, pool))
 	if errors.Is(err, pgx.ErrNoRows) {
 		existing, err := scanRequest(tx.QueryRow(ctx, "SELECT "+requestColumns+" FROM requests WHERE organization_id = $1 AND source = $2 AND source_key = $3",
 			p.OrganizationID, int16(n.Source), key))

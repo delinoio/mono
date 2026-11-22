@@ -30,17 +30,40 @@ const (
 
 var namePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
 
-// VerifiedCodexGuestOSes are the guest OSes on which the OpenAI Codex
-// adapter verified `codex exec-server`. OpenAI documents no host OS for it,
-// and the contract lets tide accept only verified guest OSes. Interim rule
-// (recorded in the contract): no Codex adapter exists yet, so the list is
-// empty and an AGENT_SESSION profile of an OPENAI_CODEX integration is
-// rejected for every guest OS. The Codex adapter change adds the guest OSes
-// that it verified here and in the contract.
+// VerifiedCodexGuestOSes are the guest OSes on which `codex exec-server`
+// was verified on real devices. OpenAI documents no host OS for it, and
+// the contract lets tide accept only verified guest OSes. Interim rule
+// (recorded in the contract): the Codex adapter exists and installs and
+// starts the executor on Linux and macOS guests, but it was verified only
+// against fakes, so no guest OS is verified yet and an AGENT_SESSION
+// profile of an OPENAI_CODEX integration is rejected for every guest OS.
+//
+// How an acceptance run adds a verified guest OS: run a build of tide-api
+// whose layers accept the guest OS under test (layers.Options.
+// CodexGuestOSes, which the in-process tests also use, or a local change
+// of this list), and run the full Codex session lifecycle on a real
+// device of that guest OS. When it passes, add the guest OS here (only
+// CodexCandidateGuestOSes can pass) and record it with the run in the
+// OpenAI Codex section of the contract, in the same change.
 var VerifiedCodexGuestOSes = []tidev1.GuestOs{}
 
+// CodexCandidateGuestOSes are the guest OSes for which the Codex adapter
+// has install and start scripts (POSIX shell). Windows has none: the
+// adapter fails the preparation of a Windows guest.
+var CodexCandidateGuestOSes = []tidev1.GuestOs{tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS}
+
+// Rules are the validation inputs that a deployment or a test can change.
+type Rules struct {
+	// CodexGuestOSes are the guest OSes that OPENAI_CODEX profiles may use.
+	CodexGuestOSes []tidev1.GuestOs
+}
+
+// DefaultRules returns the production rules.
+func DefaultRules() Rules { return Rules{CodexGuestOSes: VerifiedCodexGuestOSes} }
+
 // AgentGuestOSes returns the guest OSes that an AGENT_SESSION profile of a
-// vendor may use (the Agent integrations table of the contract).
+// vendor may use (the Agent integrations table of the contract), with the
+// production rules.
 //
 // Cursor and Devin workers run on Linux, macOS and Windows. Devin has no
 // worker binary for macOS on x64 and Windows on arm64; a profile cannot
@@ -49,6 +72,11 @@ var VerifiedCodexGuestOSes = []tidev1.GuestOs{}
 // Windows images with an amd64 guest helper only. The Devin Prepare step
 // still checks the guest architecture and fails clearly.
 func AgentGuestOSes(vendor tidev1.AgentVendor) []tidev1.GuestOs {
+	return DefaultRules().AgentGuestOSes(vendor)
+}
+
+// AgentGuestOSes returns the guest OSes of a vendor under the rules.
+func (r Rules) AgentGuestOSes(vendor tidev1.AgentVendor) []tidev1.GuestOs {
 	all := []tidev1.GuestOs{tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS, tidev1.GuestOs_GUEST_OS_WINDOWS}
 	switch vendor {
 	case tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE:
@@ -56,7 +84,7 @@ func AgentGuestOSes(vendor tidev1.AgentVendor) []tidev1.GuestOs {
 	case tidev1.AgentVendor_AGENT_VENDOR_CURSOR, tidev1.AgentVendor_AGENT_VENDOR_DEVIN:
 		return all
 	case tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX:
-		return VerifiedCodexGuestOSes
+		return r.CodexGuestOSes
 	}
 	return nil
 }
@@ -121,8 +149,11 @@ func isLetter(c byte) bool { return 'a' <= c && c <= 'z' || 'A' <= c && c <= 'Z'
 // Validate checks every field of p against the Runner profiles table.
 // vendor is the vendor of the profile's agent integration (UNSPECIFIED for
 // the other kinds). It does not check the OwnSand template, which needs an
-// OwnSand call (Profiles.checkTemplate).
-func Validate(p *Profile, vendor tidev1.AgentVendor) error {
+// OwnSand call (Profiles.checkTemplate). It uses the production rules.
+func Validate(p *Profile, vendor tidev1.AgentVendor) error { return DefaultRules().Validate(p, vendor) }
+
+// Validate checks p under the rules.
+func (rules Rules) Validate(p *Profile, vendor tidev1.AgentVendor) error {
 	if len(p.Name) == 0 || len(p.Name) > maxNameLength || !namePattern.MatchString(p.Name) {
 		return api.ErrInvalidf("invalid name: must be lowercase kebab-case, 1 to %d characters", maxNameLength)
 	}
@@ -140,9 +171,12 @@ func Validate(p *Profile, vendor tidev1.AgentVendor) error {
 		if p.AgentIntegrationID == "" {
 			return api.ErrInvalidf("invalid agent_integration_id: is required for AGENT_SESSION")
 		}
-		if !slices.Contains(AgentGuestOSes(vendor), p.GuestOS) {
+		if !slices.Contains(rules.AgentGuestOSes(vendor), p.GuestOS) {
 			if vendor == tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX {
-				return api.ErrInvalidf("invalid guest_os: no guest OS is verified for OPENAI_CODEX yet")
+				if len(rules.CodexGuestOSes) == 0 {
+					return api.ErrInvalidf("invalid guest_os: no guest OS is verified for OPENAI_CODEX yet")
+				}
+				return api.ErrInvalidf("invalid guest_os: %s is not verified for OPENAI_CODEX", p.GuestOS)
 			}
 			return api.ErrInvalidf("invalid guest_os: %s does not support %s", vendor, p.GuestOS)
 		}

@@ -180,7 +180,9 @@ func WriteCredential(ctx context.Context, g *work.Guest, value string) (dir stri
 }
 
 // HomeArg is a program argument that the start script replaces with the
-// guest user's home directory.
+// guest user's home directory. An argument that starts with HomeArg is the
+// home directory followed by the rest of the argument (for example
+// HomeArg + "/claude-workspace").
 const HomeArg = "\x00home"
 
 // Program is a runner program start.
@@ -220,8 +222,12 @@ func StartScript(guest tidev1.GuestOs, p Program) string {
 			if i > 0 {
 				b.WriteByte(' ')
 			}
-			if a == HomeArg {
-				b.WriteString("$env:USERPROFILE")
+			if rest, ok := strings.CutPrefix(a, HomeArg); ok {
+				if rest != "" {
+					b.WriteString("($env:USERPROFILE + " + Quote(guest, rest) + ")")
+				} else {
+					b.WriteString("$env:USERPROFILE")
+				}
 			} else {
 				b.WriteString(Quote(guest, a))
 			}
@@ -236,8 +242,11 @@ func StartScript(guest tidev1.GuestOs, p Program) string {
 	b.WriteString("cd \"$HOME\" || exit 21\nexec")
 	for _, a := range p.Args {
 		b.WriteByte(' ')
-		if a == HomeArg {
+		if rest, ok := strings.CutPrefix(a, HomeArg); ok {
 			b.WriteString(`"$HOME"`)
+			if rest != "" {
+				b.WriteString(Quote(guest, rest))
+			}
 		} else {
 			b.WriteString(Quote(guest, a))
 		}

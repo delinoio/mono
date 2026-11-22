@@ -44,19 +44,23 @@ type Claim struct {
 	WorkerID string
 	// Scope is what the claim names: the Cursor pool name or the Devin
 	// outpost ID.
-	Scope      string
+	Scope string
+	// Endpoint is a non-secret address that the runner program needs
+	// (OpenAI Codex: the session's environment.remote_url); empty for the
+	// other vendors.
+	Endpoint   string
 	State      ClaimState
 	CreateTime time.Time
 }
 
 const claimColumns = `c.request_id::text, c.organization_id::text, c.agent_integration_id::text, c.vendor, c.vendor_request_id, c.demand_marker,
-	c.worker_id, c.scope, c.state, c.create_time`
+	c.worker_id, c.scope, c.endpoint, c.state, c.create_time`
 
 func scanClaim(row interface{ Scan(dest ...any) error }) (*Claim, error) {
 	var c Claim
 	var vendor, state int16
 	dest := []any{&c.RequestID, &c.OrganizationID, &c.IntegrationID, &vendor, &c.VendorRequestID, &c.DemandMarker,
-		&c.WorkerID, &c.Scope, &state, &c.CreateTime}
+		&c.WorkerID, &c.Scope, &c.Endpoint, &state, &c.CreateTime}
 	if err := row.Scan(dest...); err != nil {
 		return nil, err
 	}
