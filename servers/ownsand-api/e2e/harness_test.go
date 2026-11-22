@@ -269,6 +269,20 @@ func (l *logSink) hasLine(line string) bool {
 	return slices.Contains(l.lines, line)
 }
 
+// hasLineContaining reports whether the process name logged a line that
+// contains text.
+func (l *logSink) hasLineContaining(name, text string) bool {
+	prefix := name + ": "
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, line := range l.lines {
+		if rest, ok := strings.CutPrefix(line, prefix); ok && strings.Contains(rest, text) {
+			return true
+		}
+	}
+	return false
+}
+
 // hasStateReport reports whether the process name logged an
 // agent_state_report event for the device. The control plane logs this event
 // after it marked the connection of the device as reconciled, which is when
@@ -419,11 +433,8 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 		t.Fatal(err)
 	}
 
-	addr := freeTCPPort(t)
-	stunAddr := freeUDPPort(t)
-	s := &stack{t: t, bins: bins, apiURL: "http://" + addr, stunAddr: stunAddr, key: key, userSub: "e2e-user-" + randomSuffix(t), logs: logs}
+	s := &stack{t: t, bins: bins, key: key, userSub: "e2e-user-" + randomSuffix(t), logs: logs}
 	apiEnv := []string{
-		"ADDR=" + addr,
 		// The e2e clients connect to the server directly, so the TCP peer is
 		// the client address for rate limits.
 		"ALLOW_DIRECT_CLIENT_ADDRESS=true",
@@ -431,8 +442,6 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 		"DATABASE_URL=" + dbtest.NewURL(t),
 		"LOGTO_ISSUER=" + testIssuer,
 		"LOGTO_JWKS_FILE=" + jwksFile,
-		"STUN_ADDR=" + stunAddr,
-		"STUN_URLS=stun:" + stunAddr,
 	}
 	if o.objects {
 		s.objects = newFakeS3(t)
@@ -452,10 +461,8 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 	// runs as an organization in good standing.
 	s.accounts = accountstest.New(t, nil)
 	apiEnv = append(apiEnv, s.accounts.Env()...)
-	s.apiEnv = apiEnv
 	s.work = work
-	s.api = startProcess(t, logs, "api", apiEnv, filepath.Join(bins, "ownsand-api"))
-	s.waitHealthy()
+	s.startAPI(apiEnv)
 
 	ctx := s.ctx(2 * time.Minute)
 	user := s.userClient(ownsand.TransportAuto)
@@ -581,6 +588,46 @@ func (s *stack) killAPI() {
 	killProcess(s.t, s.api)
 }
 
+// apiStartAttempts bounds the starts of the control plane on new ports.
+const apiStartAttempts = 3
+
+// startAPI starts the control plane on free ports with the environment env
+// and waits until it is healthy.
+//
+// freeTCPPort and freeUDPPort close their listeners again, so another process
+// (for example a test server of another package that go test runs at the
+// same time) can take a port before the control plane binds it. The control
+// plane then exits with "address already in use", and the other server can
+// answer the health probe. startAPI then starts the control plane again on
+// new ports. Any other failure fails the test at once.
+func (s *stack) startAPI(env []string) {
+	s.t.Helper()
+	for attempt := 1; ; attempt++ {
+		addr := freeTCPPort(s.t)
+		stunAddr := freeUDPPort(s.t)
+		s.apiURL = "http://" + addr
+		s.stunAddr = stunAddr
+		s.apiEnv = append([]string{
+			"ADDR=" + addr,
+			"STUN_ADDR=" + stunAddr,
+			"STUN_URLS=stun:" + stunAddr,
+		}, env...)
+		name := "api"
+		if attempt > 1 {
+			name = fmt.Sprintf("api-attempt%d", attempt)
+		}
+		s.api = startProcess(s.t, s.logs, name, s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
+		err := pollHealthyWhile(s.apiURL+"/healthz", healthStartupBudget, s.api.done)
+		if err == nil {
+			return
+		}
+		if !errors.Is(err, errProcessExited) || !s.logs.hasLineContaining(name, "address already in use") || attempt == apiStartAttempts {
+			s.t.Fatalf("the control plane did not become healthy: %v", err)
+		}
+		s.t.Logf("the control plane could not bind its ports (attempt %d); starting it on new ports", attempt)
+	}
+}
+
 // restartAPI starts the control plane again on the same address over the
 // same database.
 func (s *stack) restartAPI() {
@@ -621,6 +668,18 @@ func (s *stack) waitHealthy() {
 // requests too, so a connection that is accepted but never answered cannot
 // outlive it.
 func pollHealthy(url string, budget time.Duration) error {
+	return pollHealthyWhile(url, budget, nil)
+}
+
+// errProcessExited reports that the probed process exited before it became
+// healthy.
+var errProcessExited = errors.New("the process exited")
+
+// pollHealthyWhile is pollHealthy that also stops with errProcessExited when
+// exited closes, so a server that exited is not waited for, and an answer
+// from another server on the same port does not count. A nil exited never
+// closes.
+func pollHealthyWhile(url string, budget time.Duration, exited <-chan struct{}) error {
 	ctx, cancel := context.WithTimeout(context.Background(), budget)
 	defer cancel()
 	var lastErr error
@@ -639,6 +698,8 @@ func pollHealthy(url string, budget time.Duration) error {
 		}
 		lastErr = err
 		select {
+		case <-exited:
+			return fmt.Errorf("%w before it became healthy (last probe: %v)", errProcessExited, lastErr)
 		case <-ctx.Done():
 			return fmt.Errorf("not healthy within %s: %w", budget, lastErr)
 		case <-time.After(healthPollInterval):

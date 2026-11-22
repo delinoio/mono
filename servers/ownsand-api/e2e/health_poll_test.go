@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -71,5 +72,26 @@ func TestPollHealthyReportsLastStatusOnTimeout(t *testing.T) {
 
 	if err := pollHealthy(srv.URL, 300*time.Millisecond); err == nil {
 		t.Fatal("pollHealthy succeeded against a 503 server")
+	}
+}
+
+// A server that answers on the probed port does not count when the probed
+// process exited: another process can hold a port that the process could
+// not bind.
+func TestPollHealthyWhileStopsWhenTheProcessExited(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+	exited := make(chan struct{})
+	close(exited)
+
+	start := time.Now()
+	err := pollHealthyWhile(srv.URL, 10*time.Second, exited)
+	if !errors.Is(err, errProcessExited) {
+		t.Fatalf("pollHealthyWhile = %v, want errProcessExited", err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("pollHealthyWhile took %s, want it to stop when the process exited", d)
 	}
 }
