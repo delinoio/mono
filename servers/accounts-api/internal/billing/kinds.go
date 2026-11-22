@@ -118,12 +118,19 @@ const (
 	// invalid API key or rate limiting). It does not count as a failed
 	// automatic top-up, because nothing was charged or declined.
 	FailureNotApplied FailureReason = "not_applied"
+	// FailureSettingsChanged: the automatic top-up settings changed after
+	// the top-up was queued, and the current settings no longer allow it
+	// (automatic top-up is off, the amount is above the current amount or
+	// the monthly cap leaves no room). Nothing was charged, so it does not
+	// count as a failed automatic top-up.
+	FailureSettingsChanged FailureReason = "settings_changed"
 )
 
 // CountsAsFailure reports whether the reason counts toward the 2-failure
-// shutoff of automatic top-up.
+// shutoff of automatic top-up. A reason that left the payment provider
+// uncalled does not count.
 func (r FailureReason) CountsAsFailure() bool {
-	return r != FailureNotApplied
+	return r != FailureNotApplied && r != FailureSettingsChanged
 }
 
 // NotificationKind is the kind of a billing notification email.

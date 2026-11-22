@@ -422,7 +422,12 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 
 // ProcessAutoTopUps charges the queued automatic top-ups. Each top-up moves
 // to charging in its own transaction under the billing account lock before
-// the Paddle call, so two workers never charge one top-up twice.
+// the Paddle call, so two workers never charge one top-up twice. The same
+// transaction revalidates the current settings, because an owner or admin
+// may have changed them after the top-up was queued: a pending top-up that
+// the current settings no longer allow fails as settings_changed without a
+// Paddle call and without counting as a failed automatic top-up. Top-ups
+// that already left pending (charging, charged or unknown) are not touched.
 func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 	for range 100 {
 		var candidate topUp
@@ -456,6 +461,16 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 			if acct.Deleted || sub.PaddleSubscriptionID == "" || !sub.Manageable() {
 				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureNoSubscription, now)
 			}
+			if reason, err := s.obsoleteReason(ctx, tx, acct.ID, claimed, now); err != nil {
+				return err
+			} else if reason != "" {
+				s.logger.InfoContext(ctx, "billing_auto_top_up_obsolete",
+					slog.String("billing_account_id", acct.ID),
+					slog.String("top_up_id", claimed.ID),
+					slog.String("reason", reason),
+					slog.Int64("amount_usd_micros", claimed.Amount))
+				return s.failTopUp(ctx, tx, acct, claimed.ID, FailureSettingsChanged, now)
+			}
 			claimed.PaddleSubscriptionID = sub.PaddleSubscriptionID
 			claimed.Status = TopUpCharging
 			ok = true
@@ -474,6 +489,31 @@ func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// obsoleteReason reports why the current automatic top-up settings no longer
+// allow the pending automatic top-up t, or "" when they allow it. tx holds
+// the billing account lock. The month-to-date total leaves t out, because the
+// pending top-up counts toward the cap itself.
+func (s *Service) obsoleteReason(ctx context.Context, tx pgx.Tx, accountID string, t topUp, now time.Time) (string, error) {
+	st, err := loadSettings(ctx, tx, accountID)
+	if err != nil {
+		return "", err
+	}
+	if !st.AutoEnabled {
+		return "disabled", nil
+	}
+	if t.Amount > st.AutoAmount {
+		return "amount_above_current", nil
+	}
+	mtd, err := monthToDateExcept(ctx, tx, accountID, now, t.ID)
+	if err != nil {
+		return "", err
+	}
+	if !capAllows(mtd, t.Amount, st.AutoCap) {
+		return "monthly_cap", nil
+	}
+	return "", nil
 }
 
 // TimeOutTopUps fails the top-ups that waited longer than TopUpTimeout for

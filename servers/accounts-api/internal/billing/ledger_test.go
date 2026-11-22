@@ -805,6 +805,158 @@ func TestAutoTopUpPastDueAndTimeout(t *testing.T) {
 	}
 }
 
+// updateAutoTopUp replaces the automatic top-up settings, as an owner or an
+// admin does while a top-up waits in the queue.
+func (f *fixture) updateAutoTopUp(accountID string, enabled bool, threshold, amount, limit int64) {
+	f.t.Helper()
+	f.tx(func(tx pgx.Tx) error {
+		_, err := UpdateAutoTopUp(ctx(), tx, accountID, autoSettings(enabled, threshold, amount, limit), f.s.timestamp())
+		return err
+	})
+}
+
+// wantObsoleteTopUp checks that the only top-up was closed as obsolete
+// without a Paddle call, did not count as a failed automatic top-up and sent
+// no email.
+func (f *fixture) wantObsoleteTopUp(accountID string) {
+	f.t.Helper()
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		f.t.Fatal(err)
+	}
+	if charges := f.paddle.Charges(); len(charges) != 0 {
+		f.t.Fatalf("an obsolete top-up called Paddle: %+v", charges)
+	}
+	if got := f.topUpStatuses(accountID); len(got) != 1 || got[0] != "failed:settings_changed" {
+		f.t.Fatalf("top-ups = %v", got)
+	}
+	if st, _ := loadSettings(ctx(), f.db.Pool, accountID); st.ConsecutiveFailures != 0 {
+		f.t.Fatalf("the obsolete top-up counted as a failure: %+v", st)
+	}
+	if err := f.s.DeliverNotifications(ctx()); err != nil {
+		f.t.Fatal(err)
+	}
+	for _, m := range f.email.Messages() {
+		if m.Kind == email.KindPaymentFailed || m.Kind == email.KindAutoTopUpDisabled {
+			f.t.Fatalf("the obsolete top-up sent an email: %+v", m)
+		}
+	}
+}
+
+func TestPendingAutoTopUpClosedWhenDisabled(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	f.updateAutoTopUp(acct, false, 0, 0, 0)
+	f.wantObsoleteTopUp(acct)
+	// The closed top-up no longer blocks a later one under the new settings.
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued after the obsolete one closed")
+	}
+}
+
+func TestPendingAutoTopUpClosedWhenAmountLowered(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 100*usd, 200*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	f.updateAutoTopUp(acct, true, 10*usd, 25*usd, 200*usd)
+	f.wantObsoleteTopUp(acct)
+}
+
+func TestPendingAutoTopUpClosedWhenCapLowered(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 50*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	f.completeCharge(f.paddle.Charges()[0], 2500)
+	if res := f.deduct(acct, 20*usd); !res.AutoTopUpQueued {
+		t.Fatal("second top-up not queued")
+	}
+	// 25 USD of the month is spent; a cap of 40 USD leaves 15 USD, which
+	// does not fit the second 25 USD top-up.
+	f.updateAutoTopUp(acct, true, 10*usd, 25*usd, 40*usd)
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(f.paddle.Charges()); n != 1 {
+		t.Fatalf("charges = %d, want only the first", n)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 2 || got[0] != "completed" || got[1] != "failed:settings_changed" {
+		t.Fatalf("top-ups = %v", got)
+	}
+	if st, _ := loadSettings(ctx(), f.db.Pool, acct); !st.AutoEnabled || st.ConsecutiveFailures != 0 {
+		t.Fatalf("settings = %+v", st)
+	}
+}
+
+func TestPendingAutoTopUpStillValidChargesOnce(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 25*usd)
+	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
+		t.Fatal("no top-up queued")
+	}
+	// The pending top-up uses the whole cap and still fits it; a larger
+	// current amount and a new threshold do not change the queued amount.
+	f.updateAutoTopUp(acct, true, 15*usd, 50*usd, 50*usd)
+	for range 2 {
+		if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	charges := f.paddle.Charges()
+	if len(charges) != 1 || paddletest.ChargeAmountCents(charges[0]) != "2500" {
+		t.Fatalf("charges = %+v", charges)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "charged" {
+		t.Fatalf("top-ups = %v", got)
+	}
+}
+
+func TestSubmittedAutoTopUpSurvivesSettingsChange(t *testing.T) {
+	f := newFixture(t)
+	acct := f.account()
+	subID := f.activate(acct)
+	f.enableAutoTopUp(acct, 10*usd, 25*usd, 100*usd)
+	f.paddle.SetSubscription(paddle.Subscription{ID: subID, Status: paddle.SubscriptionStatusActive})
+	f.paddle.FailCharges(&paddletest.Failure{Status: http.StatusBadGateway, Code: "bad_gateway"})
+	f.deduct(acct, usd)
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "unknown" {
+		t.Fatalf("top-ups = %v", got)
+	}
+	// Disabling the setting leaves the submitted charge to its webhook.
+	f.updateAutoTopUp(acct, false, 0, 0, 0)
+	if err := f.s.ProcessAutoTopUps(ctx()); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.topUpStatuses(acct); len(got) != 1 || got[0] != "unknown" {
+		t.Fatalf("top-ups after the settings change = %v", got)
+	}
+	charges := f.paddle.Charges()
+	f.completeCharge(charges[len(charges)-1], 2500)
+	if got := f.topUpStatuses(acct); got[0] != "completed" {
+		t.Fatalf("top-ups after the webhook = %v", got)
+	}
+}
+
 func autoSettings(enabled bool, threshold, amount, limit int64) *accountsv1.AutoTopUpSettings {
 	return &accountsv1.AutoTopUpSettings{Enabled: enabled, ThresholdUsdMicros: threshold, AmountUsdMicros: amount, MonthlyCapUsdMicros: limit}
 }
