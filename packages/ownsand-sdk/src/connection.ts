@@ -6,7 +6,11 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import { createConnectTransport } from "@connectrpc/connect-web";
-import { OwnSandConfigError, redactError } from "./errors.ts";
+import {
+  OwnSandConfigError,
+  OwnSandCredentialError,
+  redactError,
+} from "./errors.ts";
 import { type Logger, LogEvent, safeLog } from "./logger.ts";
 
 /** Production origin of the OwnSand control plane. */
@@ -152,13 +156,28 @@ async function currentSecret(
     return credential.apiKey;
   }
   signal.throwIfAborted();
-  // A synchronous throw of the callback stays a rejection of the race.
+  // A synchronous throw of the callback stays a rejection of the race. A
+  // failure of the callback is a terminal credential error that keeps the
+  // callback's message; the abort reason of the race stays unwrapped.
   const token = await raceAbort(
-    new Promise<string>((resolve) => resolve(credential.accessToken())),
+    new Promise<string>((resolve, reject) => {
+      const fail = (error: unknown) =>
+        reject(
+          new OwnSandCredentialError(
+            error instanceof Error ? error.message : String(error),
+            { cause: error },
+          ),
+        );
+      try {
+        Promise.resolve(credential.accessToken()).then(resolve, fail);
+      } catch (error) {
+        fail(error);
+      }
+    }),
     signal,
   );
   if (typeof token !== "string" || token === "") {
-    throw new OwnSandConfigError("accessToken returned no token");
+    throw new OwnSandCredentialError("accessToken returned no token");
   }
   return token;
 }
