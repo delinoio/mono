@@ -1309,3 +1309,142 @@ func TestRelayStreamCloseCancelsBlockedRequestAccepted(t *testing.T) {
 		t.Fatal("the connection was closed")
 	}
 }
+
+// grantReceived returns the instant at which the relay installed grant g, so
+// a test can drive sweep at exact offsets from the grant's expiry.
+func (e *relayEnv) grantReceived(g *ownsandv1.RelayGrant) time.Time {
+	e.t.Helper()
+	e.dp.relay.mu.Lock()
+	defer e.dp.relay.mu.Unlock()
+	held := e.dp.relay.grants[g.GetGrantId()]
+	if held == nil {
+		e.t.Fatal("the grant is not installed")
+	}
+	return held.received
+}
+
+// waitNoStreams waits until grant g holds no open stream.
+func (e *relayEnv) waitNoStreams(g *ownsandv1.RelayGrant) {
+	e.t.Helper()
+	waitFor(e.t, "the streams of the grant to end", func() bool {
+		e.dp.relay.mu.Lock()
+		defer e.dp.relay.mu.Unlock()
+		held := e.dp.relay.grants[g.GetGrantId()]
+		return held == nil || len(held.streams) == 0
+	})
+}
+
+// TestRelayIdleGrantWaitsForAdmissionToleranceAfterExpiry checks that a
+// grant whose last stream ended before its expiry (or that never admitted a
+// stream) stays admittable for the 30-second admission tolerance after its
+// expiry, as the contract says, and is released only after that. The agent
+// and the control plane then agree on which grants can still admit a first
+// request frame.
+func TestRelayIdleGrantWaitsForAdmissionToleranceAfterExpiry(t *testing.T) {
+	const expiry = 15 * time.Minute
+	for _, tc := range []string{"never_opened", "stream_closed_before_expiry", "request_accepted_then_closed"} {
+		t.Run(tc, func(t *testing.T) {
+			e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 30 * time.Second}, RelayLimits{})
+			req := e.execReq("/bin/sh", "-c", "sleep 30")
+			g, ack := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, req.GetExecId(), relaybinding.ExecDigest(req), expiry, time.Hour, "")
+			if ack.GetResult() != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
+				t.Fatalf("grant ack %v", ack)
+			}
+			if tc != "never_opened" {
+				rc := e.conn()
+				e.openOK(rc, 1, g.GetGrantId())
+				if tc == "request_accepted_then_closed" {
+					rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+					if f := rc.nextOn(1); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+						t.Fatalf("expected the accepted notice, got %v", f)
+					}
+				}
+				rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamClose{}))
+				e.waitNoStreams(g)
+			}
+			received := e.grantReceived(g)
+			// Before the expiry and shortly after it, the grant is held and
+			// admittable.
+			for _, d := range []time.Duration{expiry - time.Second, expiry + time.Second, expiry + 5*time.Second, expiry + 29*time.Second} {
+				e.dp.relay.sweep(received.Add(d))
+				if e.ch.released(g.GetGrantId()) {
+					t.Fatalf("the grant was released %v after its installation, before expiry plus the admission tolerance", d)
+				}
+			}
+			e.dp.relay.mu.Lock()
+			held := e.dp.relay.grants[g.GetGrantId()]
+			admittable := held != nil && held.admittable(received.Add(expiry+5*time.Second), e.dp.timing.AdmissionTolerance)
+			e.dp.relay.mu.Unlock()
+			if !admittable {
+				t.Fatal("the grant is not admittable 5 seconds after its expiry")
+			}
+			e.dp.relay.sweep(received.Add(expiry + 31*time.Second))
+			if !e.ch.released(g.GetGrantId()) {
+				t.Fatal("the grant was not released after its expiry plus the admission tolerance")
+			}
+		})
+	}
+}
+
+// TestRelayGrantWhoseLastStreamEndedAfterExpiryReleasesAtOnce checks that a
+// grant whose last stream ended at or after the grant's expiry is released
+// without waiting for the admission tolerance, and that an open stream keeps
+// the grant.
+func TestRelayGrantWhoseLastStreamEndedAfterExpiryReleasesAtOnce(t *testing.T) {
+	e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 30 * time.Second}, RelayLimits{})
+	g, _ := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, newID(t), nil, 15*time.Minute, time.Hour, "")
+	received := e.grantReceived(g)
+	late := received.Add(15*time.Minute + 2*time.Second)
+	e.dp.relay.mu.Lock()
+	held := e.dp.relay.grants[g.GetGrantId()]
+	held.streams[&rstream{}] = true
+	held.idleSince = late.Add(-time.Hour)
+	e.dp.relay.mu.Unlock()
+	e.dp.relay.sweep(late)
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("a grant with an open stream was released")
+	}
+	// The last stream ends after the expiry, as finishStream records it.
+	e.dp.relay.mu.Lock()
+	clear(held.streams)
+	held.idleSince = late
+	e.dp.relay.mu.Unlock()
+	e.dp.relay.sweep(late)
+	if !e.ch.released(g.GetGrantId()) {
+		t.Fatal("the grant whose last stream ended after its expiry was not released at once")
+	}
+}
+
+// TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime runs the
+// expiry with real time: with an expiry of 1 second and an admission
+// tolerance of 8 seconds, an idle grant still admits a stream and its
+// request 2.2 seconds after its installation, without a release message, and
+// is released as soon as that stream ends after the expiry.
+func TestRelayExpiredGrantAdmitsStreamWithinToleranceInRealTime(t *testing.T) {
+	e := newRelayEnv(t, Timing{GrantIdle: time.Hour, AdmissionTolerance: 8 * time.Second}, RelayLimits{})
+	req := e.execReq("/bin/sh", "-c", "sleep 30")
+	start := time.Now()
+	g, ack := e.grant(ownsandv1.RelayOperationKind_RELAY_OPERATION_KIND_EXEC, req.GetExecId(), relaybinding.ExecDigest(req), time.Second, time.Hour, "")
+	if ack.GetResult() != ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED {
+		t.Fatalf("grant ack %v", ack)
+	}
+	rc := e.conn()
+	time.Sleep(time.Until(start.Add(2200 * time.Millisecond)))
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the idle grant was released at its expiry, before the admission tolerance ended")
+	}
+	e.openOK(rc, 1, g.GetGrantId())
+	rc.send(datapath.MustNewFrame(1, e.sandbox, req))
+	if f := rc.nextOn(1); f.GetKind() != ownsandv1.DataFrameKind_DATA_FRAME_KIND_REQUEST_ACCEPTED {
+		t.Fatalf("a request within the admission tolerance got %v", f)
+	}
+	if e.ch.released(g.GetGrantId()) {
+		t.Fatal("the grant was released while its stream was open")
+	}
+	ended := time.Now()
+	rc.send(datapath.MustNewFrame(1, e.sandbox, &ownsandv1.RelayStreamClose{}))
+	waitFor(t, "release after the stream ended past the expiry", func() bool { return e.ch.released(g.GetGrantId()) })
+	if d := time.Since(ended); d > 3*time.Second {
+		t.Fatalf("the grant was released %v after its last stream ended past the expiry", d)
+	}
+}
