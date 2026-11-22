@@ -744,12 +744,16 @@ func TestFileReadDanglingSymlinkDotDotAfterMissingDirectory(t *testing.T) {
 	}
 	// missing does not exist, so the kernel fails the lookup of
 	// missing/../out.txt. A lexical clean would turn it into out.txt beside
-	// the link and create that file.
+	// the link and create that file. Windows path handling cleans the path
+	// that way, so the CLI must reject the missing directory itself.
 	dir := t.TempDir()
 	link := filepath.Join(dir, "link")
 	// Build the target without filepath.Join, which would clean it.
 	if err := os.Symlink("missing"+string(filepath.Separator)+".."+string(filepath.Separator)+"out.txt", link); err != nil {
 		t.Skipf("symlink: %v", err)
+	}
+	if _, err := resolveMissingTarget(link); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("resolve a link through a missing directory: %v, want an error that wraps os.ErrNotExist", err)
 	}
 	if res := r.run("file", "read", "--to", link, r.f.sb, "/tmp/x"); res.code == 0 {
 		t.Fatalf("read --to a link through a missing directory succeeded: %+v", res)
@@ -960,10 +964,22 @@ func TestFileReadLongDestinationName(t *testing.T) {
 		}
 	})
 	t.Run("name over the limit", func(t *testing.T) {
+		// The operating systems report an over-limit name with different
+		// errors (ENAMETOOLONG on Linux and macOS, ERROR_INVALID_NAME on
+		// Windows), so expect the error that the platform reports when the
+		// test creates such a file itself.
+		over := strings.Repeat("a", 256)
+		var want *os.PathError
+		if f, err := os.Create(filepath.Join(probe, over)); err == nil {
+			_ = f.Close()
+			t.Skip("the temporary directory accepts a 256-byte name")
+		} else if !errors.As(err, &want) {
+			t.Fatalf("create an over-limit name: %v", err)
+		}
 		dir := t.TempDir()
-		res := r.run("file", "read", "--to", filepath.Join(dir, strings.Repeat("a", 256)), r.f.sb, "/tmp/x")
-		if res.code != ExitError || !strings.Contains(res.stderr, "file name too long") {
-			t.Fatalf("over limit: %+v", res)
+		res := r.run("file", "read", "--to", filepath.Join(dir, over), r.f.sb, "/tmp/x")
+		if res.code != ExitError || !strings.Contains(res.stderr, want.Err.Error()) {
+			t.Fatalf("over limit: %+v, want an error that contains %q", res, want.Err.Error())
 		}
 		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
 			t.Fatalf("files created: %v", entries)

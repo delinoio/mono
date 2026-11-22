@@ -423,9 +423,6 @@ jobs:
               ;;
             Windows)
               known_failures=(
-                # The dangling-symlink and long-destination-name file read
-                # tests expect Linux errors.
-                cmds/ownsand/internal/cli
                 # The read snapshot does not abort when the path is swapped
                 # before open.
                 cmds/ownsand-guest/guest
