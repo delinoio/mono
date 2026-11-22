@@ -1,0 +1,185 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.tide.v1;
+
+import "delino/tide/v1/common.proto";
+import "google/protobuf/field_mask.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/tide/v1;tidev1";
+
+// AgentIntegrationService manages the vendor accounts and pools that agent
+// session runner profiles use.
+service AgentIntegrationService {
+  // Create an integration with a vendor, name, settings and credentials.
+  rpc CreateAgentIntegration(CreateAgentIntegrationRequest) returns (CreateAgentIntegrationResponse);
+  // Read one integration without credentials.
+  rpc GetAgentIntegration(GetAgentIntegrationRequest) returns (GetAgentIntegrationResponse);
+  // List integrations without credentials.
+  rpc ListAgentIntegrations(ListAgentIntegrationsRequest) returns (ListAgentIntegrationsResponse);
+  // Change the name or settings, or replace credentials.
+  rpc UpdateAgentIntegration(UpdateAgentIntegrationRequest) returns (UpdateAgentIntegrationResponse);
+  // Delete an integration. Fails with `failed_precondition` while a runner
+  // profile names it.
+  rpc DeleteAgentIntegration(DeleteAgentIntegrationRequest) returns (DeleteAgentIntegrationResponse);
+}
+
+// One credential of an agent integration.
+enum AgentCredential {
+  AGENT_CREDENTIAL_UNSPECIFIED = 0;
+  // CLAUDE_CODE and OPENAI_CODEX.
+  AGENT_CREDENTIAL_ENVIRONMENT_KEY = 1;
+  // CURSOR.
+  AGENT_CREDENTIAL_SERVICE_ACCOUNT_API_KEY = 2;
+  // OPENAI_CODEX.
+  AGENT_CREDENTIAL_WEBHOOK_SECRET = 3;
+  // DEVIN.
+  AGENT_CREDENTIAL_API_TOKEN = 4;
+  // DEVIN.
+  AGENT_CREDENTIAL_OUTPOST_TOKEN = 5;
+}
+
+message ClaudeCodeSettings {}
+
+message CursorSettings {
+  // Name of the Cursor self-hosted pool.
+  string pool_name = 1;
+}
+
+message OpenAiCodexSettings {}
+
+message DevinSettings {
+  // Name of the Devin outpost.
+  string outpost_name = 1;
+}
+
+// Credentials of a CLAUDE_CODE integration. Secrets: never log.
+message ClaudeCodeCredentials {
+  string environment_key = 1;
+}
+
+// Credentials of a CURSOR integration. Secrets: never log.
+message CursorCredentials {
+  string service_account_api_key = 1;
+}
+
+// Credentials of an OPENAI_CODEX integration. Secrets: never log.
+message OpenAiCodexCredentials {
+  string environment_key = 1;
+  string webhook_secret = 2;
+}
+
+// Credentials of a DEVIN integration. Secrets: never log.
+message DevinCredentials {
+  string api_token = 1;
+  string outpost_token = 2;
+}
+
+// Whether one credential is set. It never carries the value.
+message AgentCredentialState {
+  AgentCredential credential = 1;
+  bool credential_set = 2;
+  google.protobuf.Timestamp credential_set_at = 3;
+}
+
+message AgentIntegration {
+  string agent_integration_id = 1;
+  string organization_id = 2;
+  AgentVendor vendor = 3;
+  // 1 to 64 characters, unique in the organization.
+  string name = 4;
+  // Exactly the settings of `vendor`.
+  oneof settings {
+    ClaudeCodeSettings claude_code = 5;
+    CursorSettings cursor = 6;
+    OpenAiCodexSettings openai_codex = 7;
+    DevinSettings devin = 8;
+  }
+  // One entry for each credential of the vendor.
+  repeated AgentCredentialState credentials = 9;
+  // OPENAI_CODEX only: the webhook URL to register in the OpenAI project.
+  string webhook_url = 10;
+  google.protobuf.Timestamp create_time = 11;
+  google.protobuf.Timestamp update_time = 12;
+}
+
+message CreateAgentIntegrationRequest {
+  string organization_id = 1;
+  AgentVendor vendor = 2;
+  string name = 3;
+  // Exactly the settings of `vendor`.
+  oneof settings {
+    ClaudeCodeSettings claude_code = 4;
+    CursorSettings cursor = 5;
+    OpenAiCodexSettings openai_codex = 6;
+    DevinSettings devin = 7;
+  }
+  // Exactly the credentials of `vendor`. Every credential is required.
+  oneof credentials {
+    ClaudeCodeCredentials claude_code_credentials = 8;
+    CursorCredentials cursor_credentials = 9;
+    OpenAiCodexCredentials openai_codex_credentials = 10;
+    DevinCredentials devin_credentials = 11;
+  }
+}
+
+message CreateAgentIntegrationResponse {
+  AgentIntegration integration = 1;
+}
+
+message GetAgentIntegrationRequest {
+  string organization_id = 1;
+  string agent_integration_id = 2;
+}
+
+message GetAgentIntegrationResponse {
+  AgentIntegration integration = 1;
+}
+
+message ListAgentIntegrationsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+}
+
+message ListAgentIntegrationsResponse {
+  repeated AgentIntegration integrations = 1;
+  string next_page_token = 2;
+}
+
+message UpdateAgentIntegrationRequest {
+  string organization_id = 1;
+  string agent_integration_id = 2;
+  // New name, for the mask path `name`.
+  string name = 3;
+  // New settings of the integration's vendor, for the mask path `settings`.
+  oneof settings {
+    ClaudeCodeSettings claude_code = 4;
+    CursorSettings cursor = 5;
+    OpenAiCodexSettings openai_codex = 6;
+    DevinSettings devin = 7;
+  }
+  // Replacement credentials, for the mask path `credentials`. Only the
+  // non-empty fields replace stored credentials.
+  oneof credentials {
+    ClaudeCodeCredentials claude_code_credentials = 8;
+    CursorCredentials cursor_credentials = 9;
+    OpenAiCodexCredentials openai_codex_credentials = 10;
+    DevinCredentials devin_credentials = 11;
+  }
+  // `name`, `settings` and `credentials`.
+  google.protobuf.FieldMask update_mask = 12;
+}
+
+message UpdateAgentIntegrationResponse {
+  AgentIntegration integration = 1;
+}
+
+message DeleteAgentIntegrationRequest {
+  string organization_id = 1;
+  string agent_integration_id = 2;
+}
+
+message DeleteAgentIntegrationResponse {}

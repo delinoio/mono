@@ -1,0 +1,226 @@
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package delino.tide.v1;
+
+import "delino/tide/v1/common.proto";
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/delinoio/mono/protos/delino/tide/v1;tidev1";
+
+// WorkService reads and controls requests, runners and the device pool.
+service WorkService {
+  // List requests, with optional profile, kind and state filters; ended
+  // requests only on request.
+  rpc ListRequests(ListRequestsRequest) returns (ListRequestsResponse);
+  // Read one request.
+  rpc GetRequest(GetRequestRequest) returns (GetRequestResponse);
+  // End a QUEUED request with CANCELED.
+  rpc CancelRequest(CancelRequestRequest) returns (CancelRequestResponse);
+  // List runners, with optional profile and state filters; ended runners
+  // only on request.
+  rpc ListRunners(ListRunnersRequest) returns (ListRunnersResponse);
+  // Read one runner.
+  rpc GetRunner(GetRunnerRequest) returns (GetRunnerResponse);
+  // Delete a runner and its sandbox.
+  rpc DeleteRunner(DeleteRunnerRequest) returns (DeleteRunnerResponse);
+  // Return the device pool view.
+  rpc GetCapacity(GetCapacityRequest) returns (GetCapacityResponse);
+  // Stream request and runner changes of the organization for live views.
+  // The stream first sends every non-terminal request and runner, then
+  // `snapshot_complete`, then changes. It sends a keepalive at least every 30
+  // seconds and ends before 14 minutes; the client reconnects.
+  rpc WatchQueue(WatchQueueRequest) returns (stream WatchQueueResponse);
+}
+
+// GitHub job details of a GITHUB_JOB request.
+message GitHubJob {
+  // GitHub numeric installation ID.
+  int64 github_installation_id = 1;
+  // `owner/name`.
+  string repository_full_name = 2;
+  int64 github_workflow_run_id = 3;
+  string job_name = 4;
+  int64 github_job_id = 5;
+}
+
+message Request {
+  string request_id = 1;
+  string organization_id = 2;
+  string runner_profile_id = 3;
+  WorkloadKind kind = 4;
+  // The GitHub job ID or vendor request key as text, for display. Empty for
+  // DEV_SESSION.
+  string source_key = 5;
+  RequestState state = 6;
+  RequestEndReason end_reason = 7;
+  Priority priority = 8;
+  google.protobuf.Timestamp queued_at = 9;
+  google.protobuf.Timestamp started_at = 10;
+  google.protobuf.Timestamp ended_at = 11;
+  // Set while or after a runner serves the request.
+  string runner_id = 12;
+  // GITHUB_JOB only.
+  GitHubJob github_job = 13;
+  // DEV_SESSION only: the session owner.
+  string owner_user_id = 14;
+  // Number of runner start attempts so far.
+  int32 start_attempts = 15;
+}
+
+message Runner {
+  string runner_id = 1;
+  string organization_id = 2;
+  string runner_profile_id = 3;
+  WorkloadKind kind = 4;
+  RunnerState state = 5;
+  RunnerEndReason end_reason = 6;
+  string ownsand_sandbox_id = 7;
+  string ownsand_device_id = 8;
+  // Set when it serves a request.
+  string request_id = 9;
+  // GITHUB_JOB only: GitHub numeric installation ID.
+  int64 github_installation_id = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp ended_at = 12;
+  // The OwnSand end reason as text, when the sandbox ended for an OwnSand
+  // reason.
+  string ownsand_end_reason = 13;
+  GuestOs guest_os = 14;
+}
+
+message ListRequestsRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  // Optional filters.
+  string runner_profile_id = 4;
+  WorkloadKind kind = 5;
+  repeated RequestState states = 6;
+  // Include terminal requests. Default: only QUEUED, STARTING and RUNNING.
+  bool include_ended = 7;
+}
+
+message ListRequestsResponse {
+  // Non-terminal requests in queue order first, then ended requests, newest
+  // first.
+  repeated Request requests = 1;
+  string next_page_token = 2;
+}
+
+message GetRequestRequest {
+  string organization_id = 1;
+  string request_id = 2;
+}
+
+message GetRequestResponse {
+  Request request = 1;
+}
+
+message CancelRequestRequest {
+  string organization_id = 1;
+  string request_id = 2;
+}
+
+message CancelRequestResponse {
+  Request request = 1;
+}
+
+message ListRunnersRequest {
+  string organization_id = 1;
+  int32 page_size = 2;
+  string page_token = 3;
+  string runner_profile_id = 4;
+  repeated RunnerState states = 5;
+  // Include terminal runners. Default: only non-terminal runners.
+  bool include_ended = 6;
+}
+
+message ListRunnersResponse {
+  repeated Runner runners = 1;
+  string next_page_token = 2;
+}
+
+message GetRunnerRequest {
+  string organization_id = 1;
+  string runner_id = 2;
+}
+
+message GetRunnerResponse {
+  Runner runner = 1;
+}
+
+message DeleteRunnerRequest {
+  string organization_id = 1;
+  string runner_id = 2;
+}
+
+message DeleteRunnerResponse {
+  Runner runner = 1;
+}
+
+message GetCapacityRequest {
+  string organization_id = 1;
+}
+
+// Limits of an OwnSand device.
+message DeviceLimits {
+  int32 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+  int32 vcpu_overcommit_percent = 4;
+}
+
+// Allocated resources of an OwnSand device.
+message DeviceAllocation {
+  int64 vcpu_count = 1;
+  int64 memory_mib = 2;
+  int64 disk_gib = 3;
+  int32 macos_guest_count = 4;
+}
+
+// Number of tide runners on a device in one state.
+message RunnerStateCount {
+  RunnerState state = 1;
+  int32 count = 2;
+}
+
+// One device of the linked OwnSand organization.
+message DeviceCapacity {
+  string ownsand_device_id = 1;
+  string name = 2;
+  DeviceState state = 3;
+  // The host OS as OwnSand reports it, for display.
+  string host_os = 4;
+  // The CPU architecture as OwnSand reports it, for display.
+  string arch = 5;
+  DeviceLimits limits = 6;
+  int64 effective_vcpu_limit = 7;
+  DeviceAllocation allocation = 8;
+  repeated RunnerStateCount runners = 9;
+}
+
+message GetCapacityResponse {
+  repeated DeviceCapacity devices = 1;
+}
+
+message WatchQueueRequest {
+  string organization_id = 1;
+}
+
+message WatchQueueKeepalive {}
+
+message WatchQueueSnapshotComplete {}
+
+message WatchQueueResponse {
+  oneof event {
+    WatchQueueKeepalive keepalive = 1;
+    // A request was created or changed.
+    Request request = 2;
+    // A runner was created or changed.
+    Runner runner = 3;
+    // Every non-terminal request and runner was sent.
+    WatchQueueSnapshotComplete snapshot_complete = 4;
+  }
+}
