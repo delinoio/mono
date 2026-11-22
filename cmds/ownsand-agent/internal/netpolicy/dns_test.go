@@ -20,7 +20,7 @@ import (
 
 func TestDNSForwarder(t *testing.T) {
 	// Upstream: UDP and TCP echo with a marker, answering at once. The helpers
-	// retry when the TCP port with the number of the kernel-chosen UDP port is
+	// retry when the UDP port with the number of the kernel-chosen TCP port is
 	// taken already.
 	up := startGatedUpstream(t)
 	up.open()
@@ -81,20 +81,23 @@ type gatedUpstream struct {
 
 func startGatedUpstream(t *testing.T) *gatedUpstream {
 	t.Helper()
-	// The kernel picks the UDP port, and the TCP port with the same number can
-	// be taken already: retry with another UDP port.
+	// The kernel picks the TCP port, and the UDP port with the same number can
+	// be taken already: retry with another TCP port. TCP goes first because
+	// Windows reserves blocks of TCP port numbers in its dynamic range and
+	// hands out UDP ports one after another, so all retries of a UDP-first
+	// order can land in one reserved TCP block.
 	var up *net.UDPConn
 	var upTCP net.Listener
 	for attempt := 0; ; attempt++ {
 		var err error
-		up, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(netip.MustParseAddrPort("127.0.0.1:0")))
+		upTCP, err = net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		if upTCP, err = net.Listen("tcp", up.LocalAddr().String()); err == nil {
+		if up, err = net.ListenUDP("udp", net.UDPAddrFromAddrPort(upTCP.Addr().(*net.TCPAddr).AddrPort())); err == nil {
 			break
 		}
-		up.Close()
+		upTCP.Close()
 		if attempt == 20 {
 			t.Fatal(err)
 		}
@@ -146,7 +149,7 @@ func startGatedUpstream(t *testing.T) *gatedUpstream {
 }
 
 // startTestDNS is startDNS with retries: the forwarder listens on one port
-// number for UDP and TCP, and the TCP side of a kernel-chosen UDP port can be
+// number for UDP and TCP, and the UDP side of a kernel-chosen TCP port can be
 // taken already.
 func startTestDNS(t *testing.T, upstream string, logger *slog.Logger, limits dnsLimits) *DNSForwarder {
 	t.Helper()

@@ -134,6 +134,15 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 			}
 			continue
 		}
+		// The caller's context stays authoritative. It can end while the
+		// attempt fails, so the attempt can report a status that the server
+		// answered for the caller's deadline (Connect sends the deadline as a
+		// timeout header, and the server's timer can fire first) or the
+		// stream reset of the cancellation. classify would take such an
+		// error for a terminal failure of the operation.
+		if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
+			return op.next, cerr
+		}
 		if at.authErr {
 			return op.next, op.dpErr(err)
 		}
@@ -147,10 +156,8 @@ func (op *readOp) run(ctx context.Context) (int64, error) {
 			// Only WriteFile retries deadline_exceeded, because its retry
 			// is idempotent by write_id. For a read, the status is the
 			// control plane's final answer; unless the caller's own
-			// deadline caused it, the operation ends with it.
-			if cerr := callerDeadlineEnded(ctx, err, s.c.timing.callerDeadlineSkew); cerr != nil {
-				return op.next, cerr
-			}
+			// deadline caused it (handled above), the operation ends with
+			// it.
 			return op.next, op.dpErr(err)
 		}
 		op.rec.fail(err)
@@ -463,6 +470,15 @@ func (op *writeOp) send(ctx context.Context, req *ownsandv1.WriteFileRequest) (*
 				return nil, op.dpErr(err)
 			}
 			continue
+		}
+		// The caller's context stays authoritative. It can end while the
+		// attempt fails, so the attempt can report a status that the server
+		// answered for the caller's deadline (Connect sends the deadline as a
+		// timeout header, and the server's timer can fire first) or the
+		// stream reset of the cancellation. classify would take such an
+		// error for a terminal failure of the operation.
+		if cerr := callerDeadlineEnded(ctx, err, t.callerDeadlineSkew); cerr != nil {
+			return nil, cerr
 		}
 		if authErr {
 			return nil, op.dpErr(err)

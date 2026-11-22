@@ -432,8 +432,13 @@ func TestRelayRecoveryWindowEnds(t *testing.T) {
 	start := time.Now()
 	_, err := s.Exec(context.Background(), ExecParams{Command: []string{"echo"}})
 	var dp *DataPathError
-	if !errors.As(err, &dp) || connect.CodeOf(errors.Unwrap(err)) != connect.CodeUnavailable {
-		t.Fatalf("want a DataPathError with unavailable, got %v", err)
+	// The window usually ends in a back-off or a stream attempt, and the
+	// operation ends with the last stream error (unavailable). On a slow
+	// runner it can end while the renewal before the next attempt is in
+	// flight; the SDK then cancels that AuthorizeRelay call and ends with
+	// errAuthorizeDeadline (see TestStalledAuthorizeRelayEndsWithTheWindow).
+	if !errors.As(err, &dp) || !(connect.CodeOf(errors.Unwrap(err)) == connect.CodeUnavailable || errors.Is(err, errAuthorizeDeadline)) {
+		t.Fatalf("want a DataPathError with unavailable or errAuthorizeDeadline, got %v", err)
 	}
 	if d := time.Since(start); d > c.timing.recoveryWindow+time.Second {
 		t.Fatalf("recovery took %v, longer than the window", d)

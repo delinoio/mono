@@ -208,6 +208,23 @@ func (m *readManager) readEntryOpen(readID string) int {
 	return 0
 }
 
+// waitReadCallsEnded waits until the helper has ended every call of a
+// read_id. The handler ends a call (and records its end time) in a deferred
+// call after it sent the end event, so the client can see the end of a read
+// before the helper counts the call as ended. A test that advances the clock
+// right after a read must wait for that, or the call ends at the advanced
+// time, or is still open when the sweep runs.
+func (h *harness) waitReadCallsEnded(readID string) {
+	h.t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for h.srv.reads.readEntryOpen(readID) != 0 {
+		if time.Now().After(deadline) {
+			h.t.Fatal("the read calls did not end")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // A stalled chunk read must not stop the keepalives, and the stream
 // continues with the right offset after the read returns.
 func TestReadKeepaliveWhileChunkPending(t *testing.T) {
@@ -307,11 +324,13 @@ func TestReadRetention(t *testing.T) {
 	os.WriteFile(path, []byte("x"), 0o644)
 	req := readReq(t, path)
 	h.readAll(req)
+	h.waitReadCallsEnded(req.GetReadId())
 	h.clock.Advance(14 * time.Minute)
 	h.srv.Sweep()
 	if data, _, errd := h.readAll(req); errd != nil || string(data) != "x" {
 		t.Fatalf("read within 15 minutes: %v", errd)
 	}
+	h.waitReadCallsEnded(req.GetReadId())
 	h.clock.Advance(15 * time.Minute)
 	h.srv.Sweep()
 	if _, _, errd := h.readAll(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND {

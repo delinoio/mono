@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/vmruntime"
@@ -44,15 +45,18 @@ func TestVsockHandshake(t *testing.T) {
 			line, _ := r.ReadString('\n')
 			if line == "CONNECT 1024\n" {
 				c.Write([]byte("OK 1073741824\npayload"))
-			} else {
-				c.Close()
 			}
+			// Close the accepted connection in both branches, so no
+			// descriptor stays open until a finalizer closes it (see
+			// TestCreateFailureReleasesVM).
+			c.Close()
 		}
 	}()
 	c, err := v.Dial(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer c.Close()
 	buf := make([]byte, 7)
 	if _, err := io.ReadFull(c, buf); err != nil || string(buf) != "payload" {
 		t.Fatalf("stream after handshake %q %v", buf, err)
@@ -85,6 +89,9 @@ func TestAPIClientErrors(t *testing.T) {
 	go srv.Serve(l)
 	defer srv.Close()
 	c := newAPIClient(v.path(apiSocket))
+	// Close the idle keep-alive connections of the client, so no descriptor
+	// stays open until a finalizer closes it (see TestCreateFailureReleasesVM).
+	defer c.hc.CloseIdleConnections()
 	if err := c.waitReady(context.Background(), make(chan struct{})); err != nil {
 		t.Fatal(err)
 	}
@@ -154,13 +161,34 @@ func TestCapabilitiesWithoutFirecracker(t *testing.T) {
 	}
 }
 
-func openFDs(t *testing.T) int {
+// openFDs returns the open descriptors of the test process, each mapped to
+// its link target.
+func openFDs(t *testing.T) map[string]string {
 	t.Helper()
 	entries, err := os.ReadDir("/proc/self/fd")
 	if err != nil {
 		t.Fatal(err)
 	}
-	return len(entries)
+	fds := make(map[string]string, len(entries))
+	for _, e := range entries {
+		// The descriptor of the directory read itself is gone by now.
+		if target, err := os.Readlink(filepath.Join("/proc/self/fd", e.Name())); err == nil {
+			fds[e.Name()] = target
+		}
+	}
+	return fds
+}
+
+// newFDs returns the descriptors in after that before does not have with the
+// same target.
+func newFDs(before, after map[string]string) []string {
+	var added []string
+	for fd, target := range after {
+		if before[fd] != target {
+			added = append(added, fd+" -> "+target)
+		}
+	}
+	return added
 }
 
 // A create whose boot fails releases the VM registration and the directory
@@ -199,8 +227,20 @@ func TestCreateFailureReleasesVM(t *testing.T) {
 	if n != 0 {
 		t.Fatalf("%d failed VMs still registered", n)
 	}
-	if after := openFDs(t); after != before {
-		t.Fatalf("open descriptors %d before, %d after failed creates", before, after)
+	// A leak adds descriptors. The test compares the descriptors and not
+	// their count, because descriptors of earlier tests in the same process
+	// can close meanwhile. It waits briefly for descriptors that close
+	// asynchronously.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		added := newFDs(before, openFDs(t))
+		if len(added) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("descriptors opened by failed creates are still open: %v", added)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
 
