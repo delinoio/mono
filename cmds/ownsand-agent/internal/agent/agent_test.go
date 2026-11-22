@@ -33,6 +33,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/cpclient"
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/sandboxes"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/testcp"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/update"
@@ -896,6 +897,56 @@ func TestImportStopsWithItsChannelContext(t *testing.T) {
 	}
 	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
 		t.Fatalf("import after the cancelled one = %v", res)
+	}
+	f.requireRestorable(t, id)
+}
+
+// TestImportWithCanceledContextAbortsEvenWithFreeLockAndReadyCopy checks that
+// an import whose channel context ended before the lock was free to take
+// returns ABORTED and not the ready entry, whether or not a ready copy of the
+// snapshot exists, and that the aborted imports leave no lock token behind, so
+// a later import with a live context reuses the ready copy.
+func TestImportWithCanceledContextAbortsEvenWithFreeLockAndReadyCopy(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	f := newImportFixture(t, nil)
+	cmd := f.stage(t, id, false).GetImportSnapshot()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	abortedBefore := func(label string) {
+		t.Helper()
+		// A free lock and a canceled context are both ready; the lock case
+		// must not win, whatever the random choice of select is.
+		for i := 0; i < 100; i++ {
+			_, err := f.h.agent.importSnapshot(ctx, cmd)
+			var ce *sandboxes.CommandError
+			if !errors.As(err, &ce) || ce.Code != ownsandv1.ErrorCode_ERROR_CODE_ABORTED {
+				t.Fatalf("%s, iteration %d: canceled import = %v, want ABORTED", label, i, err)
+			}
+		}
+	}
+	// No ready copy: the canceled import publishes nothing and downloads nothing.
+	abortedBefore("without a ready copy")
+	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+		t.Fatal("a canceled import published a ready snapshot")
+	}
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("snapshot directory after canceled imports: %v", err)
+	}
+	// A live import publishes the copy; a canceled one must still abort and
+	// leave the copy alone.
+	if res := f.h.command(f.command(id, false)); res.GetError() != nil {
+		t.Fatalf("import with a live context = %v", res)
+	}
+	abortedBefore("with a ready copy")
+	f.requireRestorable(t, id)
+	// The aborted imports left no token: a live import reuses the ready copy,
+	// even one that would fail its hash check.
+	if res := f.h.command(f.command(id, true)); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("later import = %v", res)
 	}
 	f.requireRestorable(t, id)
 }
