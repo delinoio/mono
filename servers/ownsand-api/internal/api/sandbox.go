@@ -784,7 +784,8 @@ func (h SandboxHandler) pauseOrResume(ctx context.Context, rawOrgID, rawSandboxI
 // through its device's agent channel and waits up to the command wait for
 // the result. PauseSandbox, ResumeSandbox and the billing suspension worker
 // share it. onSend runs right before the command is sent, only when the
-// sandbox is in the source state. orgID and sandboxID must be canonical.
+// sandbox is in the source state; errBillingStale from it drops the command
+// and is returned as is. orgID and sandboxID must be canonical.
 func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID string, pause bool, onSend func() error) (*sandboxRow, error) {
 	sb, err := loadSandbox(ctx, s.DB.Pool, orgID, sandboxID, false)
 	if err != nil {
@@ -810,6 +811,11 @@ func (s *Service) pauseOrResumeSandbox(ctx context.Context, orgID, sandboxID str
 		return nil, errUnavailable("the sandbox's device has no live agent channel")
 	}
 	if err := onSend(); err != nil {
+		if errors.Is(err, errBillingStale) {
+			// The billing worker's recheck dropped obsolete work; it is not an
+			// internal error.
+			return nil, err
+		}
 		return nil, s.internal(ctx, "prepare "+rpc, err)
 	}
 	wait := s.Hub.Commands.Register(cmd.CommandId)
