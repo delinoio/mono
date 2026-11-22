@@ -1161,8 +1161,32 @@ test("repository deployables use the documented targets", () => {
   const all = packages.map((p) => [p.manifest.name, "1.0.0"]);
   const result = plan(status(...all), packages);
   assert.deepEqual(
-    result.servers.map((d) => [d.name, d.service]),
-    [["accounts-api", "accounts-api"]],
+    result.servers.map((d) => [
+      d.name,
+      d.service,
+      d.hostname,
+      d.port,
+      d.upstreamProtocol,
+      d.udpPorts,
+    ]),
+    [
+      [
+        "accounts-api",
+        "accounts-api",
+        "accounts.api.delino.io",
+        "8080",
+        "http1",
+        "none",
+      ],
+      [
+        "ownsand-api",
+        "ownsand-api",
+        "ownsand.api.delino.io",
+        "8080",
+        "h2c",
+        "3478",
+      ],
+    ],
   );
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.project, d.output]),
