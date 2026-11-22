@@ -602,6 +602,99 @@ func TestExecAdmissionRacesSandboxEnd(t *testing.T) {
 	}
 }
 
+// admittedSandboxes pauses the first WithRunning call of the dispatcher after
+// its function returned, so that a test can hold an exec between its admission
+// and the start of its forwarding goroutine.
+type admittedSandboxes struct {
+	*sandboxes.Manager
+	once     sync.Once
+	admitted chan struct{}
+	release  chan struct{}
+}
+
+func newAdmittedSandboxes(m *sandboxes.Manager) *admittedSandboxes {
+	return &admittedSandboxes{Manager: m, admitted: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (a *admittedSandboxes) WithRunning(id string, fn func()) bool {
+	ok := a.Manager.WithRunning(id, fn)
+	if ok {
+		a.once.Do(func() {
+			close(a.admitted)
+			<-a.release
+		})
+	}
+	return ok
+}
+
+// TestCloseWaitsForAdmittedExec covers a shutdown that starts after an exec
+// was admitted and before its forwarding goroutine started: Close does not
+// return until that worker has finished, and an exec that arrives once
+// shutdown has started is refused.
+func TestCloseWaitsForAdmittedExec(t *testing.T) {
+	var gate *admittedSandboxes
+	e := newEnvWith(t, envOptions{wrap: func(m *sandboxes.Manager) ops.Sandboxes {
+		gate = newAdmittedSandboxes(m)
+		return gate
+	}})
+	req := e.execReq("/bin/sh", "-c", "sleep 60")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handled := make(chan ops.Outcome, 1)
+	go func() {
+		handled <- e.d.Handle(ctx, ops.Request{
+			Frame:     datapath.MustNewFrame(7, e.sandbox, req),
+			SandboxID: e.sandbox,
+		}, &sink{})
+	}()
+	select {
+	case <-gate.admitted:
+	case <-time.After(waitBound):
+		t.Fatal("exec was not admitted")
+	}
+	// The exec is registered, but its worker has not started yet.
+	if err, kept := e.d.ExecContextErr(req.GetExecId()); !kept || err != nil {
+		t.Fatalf("admitted exec: kept %v err %v", kept, err)
+	}
+
+	closed := make(chan struct{})
+	go func() {
+		e.d.Close()
+		close(closed)
+	}()
+	select {
+	case <-closed:
+		t.Fatal("Close returned while an admitted exec worker had not started")
+	case <-time.After(300 * time.Millisecond):
+	}
+
+	close(gate.release)
+	select {
+	case <-closed:
+	case <-time.After(waitBound):
+		t.Fatal("Close did not return after the admitted exec was released")
+	}
+	// The worker ended, and Close canceled its forwarding context.
+	if err, kept := e.d.ExecContextErr(req.GetExecId()); !kept || err == nil {
+		t.Fatalf("exec after Close: kept %v err %v, want a canceled context", kept, err)
+	}
+
+	// A new exec after shutdown started is refused and leaves no record.
+	late := e.execReq("/bin/sh", "-c", "sleep 60")
+	out, frames, accepted := e.handle(late, nil)
+	if accepted || out.Error.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("exec after Close: outcome %+v accepted %v frames %d", out, accepted, len(frames))
+	}
+	if _, kept := e.d.ExecContextErr(late.GetExecId()); kept {
+		t.Fatal("exec record kept for an exec refused at shutdown")
+	}
+
+	cancel()
+	if _, ok := awaitOutcome(handled, waitBound); !ok {
+		t.Fatal("the handler of the admitted exec did not return")
+	}
+}
+
 func TestGrantChecks(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/echo", "hi")
