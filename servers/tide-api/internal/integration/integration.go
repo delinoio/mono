@@ -71,8 +71,19 @@ type Integration struct {
 
 // Store reads integrations and their credentials.
 type Store struct {
-	svc          *api.Service
-	publicOrigin string
+	svc            *api.Service
+	publicOrigin   string
+	deletionChecks []DeletionCheck
+}
+
+// DeletionCheck can refuse the deletion of an integration. It runs in the
+// deletion transaction after the integration row is locked, and refuses
+// with an error such as api.ErrPrecondition.
+type DeletionCheck func(ctx context.Context, tx pgx.Tx, orgID, integrationID string) error
+
+// OnDeletion adds a deletion check. Call it before the app runs.
+func (st *Store) OnDeletion(check DeletionCheck) {
+	st.deletionChecks = append(st.deletionChecks, check)
 }
 
 // Register mounts AgentIntegrationService and its daily re-encryption job.
@@ -594,7 +605,8 @@ func (h *Handler) UpdateAgentIntegration(ctx context.Context, req *connect.Reque
 }
 
 // DeleteAgentIntegration fails with failed_precondition while a runner
-// profile names the integration. Its credentials are deleted with it.
+// profile names the integration or a deletion check refuses it. Its
+// credentials are deleted with it.
 func (h *Handler) DeleteAgentIntegration(ctx context.Context, req *connect.Request[tidev1.DeleteAgentIntegrationRequest]) (*connect.Response[tidev1.DeleteAgentIntegrationResponse], error) {
 	s := h.st.svc
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
@@ -620,6 +632,11 @@ func (h *Handler) DeleteAgentIntegration(ctx context.Context, req *connect.Reque
 		}
 		if used {
 			return api.ErrPrecondition("a runner profile names this agent integration; delete the profile first")
+		}
+		for _, check := range h.st.deletionChecks {
+			if err := check(ctx, tx, c.OrganizationID, id); err != nil {
+				return err
+			}
 		}
 		if _, err := tx.Exec(ctx, "DELETE FROM agent_integrations WHERE agent_integration_id = $1", id); err != nil {
 			return err

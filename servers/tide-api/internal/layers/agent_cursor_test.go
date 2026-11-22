@@ -265,6 +265,43 @@ func TestCursorClaimEndsBeforeRunner(t *testing.T) {
 	eventually(t, "the watch stops without a profile", func() bool { return w.cursor.Streams() == 0 })
 }
 
+// TestCursorIntegrationDeletionKeepsHeldClaims: when the release of a
+// queued request's claim fails at the profile deletion, the integration
+// cannot be deleted until the claim poller released the claim.
+func TestCursorIntegrationDeletionKeepsHeldClaims(t *testing.T) {
+	w := newCursorWorld(t, tidev1.GuestOs_GUEST_OS_LINUX)
+	w.fake.Update(w.osOrg, func(o *ownsandfake.Org) {
+		o.CreateError = connect.NewWireError(connect.CodeUnavailable, errors.New("full"))
+	})
+	ctx := context.Background()
+	w.cursor.AddRequest("bc-held", true)
+	req := w.requestBySource(t, "bc-held")
+	w.cursor.FailClaimCalls(true)
+	if _, err := w.env.User(w.org.Admin).Profile.DeleteRunnerProfile(ctx, connect.NewRequest(&tidev1.DeleteRunnerProfileRequest{
+		OrganizationId: w.org.ID, RunnerProfileId: w.profileID})); err != nil {
+		t.Fatal(err)
+	}
+	del := func() error {
+		_, err := w.env.User(w.org.Admin).Integration.DeleteAgentIntegration(ctx, connect.NewRequest(&tidev1.DeleteAgentIntegrationRequest{
+			OrganizationId: w.org.ID, AgentIntegrationId: w.integrationID}))
+		return err
+	}
+	if err := del(); connect.CodeOf(err) != connect.CodeFailedPrecondition {
+		t.Fatalf("delete with a held claim: %v", err)
+	}
+	w.cursor.FailClaimCalls(false)
+	eventually(t, "the poller releases the claim", func() bool {
+		c, err := w.l.Agents.Claim(ctx, req.GetRequestId())
+		return err == nil && c.State == agent.ClaimReleased
+	})
+	if m, ok := w.cursor.Failed("bc-held"); !ok || !strings.Contains(m, "profile") {
+		t.Fatalf("fail message %q %v", m, ok)
+	}
+	if err := del(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // TestCursorWatchReconnect: after the stream drops, tide reconnects with
 // backoff, lists again and claims a request whose created event it missed.
 func TestCursorWatchReconnect(t *testing.T) {

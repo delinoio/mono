@@ -133,6 +133,7 @@ func Register(r *app.Registry, engine *work.Engine, integrations *integration.St
 		vendors: map[tidev1.AgentVendor]Vendor{}, bySource: map[work.Source]Vendor{},
 		claimLocks: map[string]*claimLock{}, watchers: map[string]*watcher{}, stopped: map[string]bool{}, syncNow: make(chan struct{}, 1)}
 	engine.RegisterAdapter(&Adapter{h: h})
+	integrations.OnDeletion(h.checkIntegrationDeletion)
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_watchers", RunFunc: h.runWatchers})
 	r.AddLeaseComponent(lease.ComponentFunc{ComponentName: "agent_claims", RunFunc: h.runPoller})
 	r.OnOrganizationDeletion(api.OrganizationDeletionHook{
@@ -393,6 +394,25 @@ func (h *Hub) prepareOrgDeletion(ctx context.Context, d api.OrganizationDeletion
 		}
 	}
 	return errors.Join(errs...)
+}
+
+// checkIntegrationDeletion refuses to delete an integration while tide
+// holds a vendor claim of it, for example the claim of a busy runner that
+// outlived the deletion of its profile, or a claim whose release failed.
+// The deletion would remove the credentials and the claim row, so no
+// poller could release the vendor claim. The lock of the integration row
+// (FOR UPDATE) conflicts with the foreign key lock of a new claim row, so no
+// claim appears after the check.
+func (h *Hub) checkIntegrationDeletion(ctx context.Context, tx pgx.Tx, orgID, integrationID string) error {
+	var held bool
+	if err := tx.QueryRow(ctx, "SELECT EXISTS (SELECT 1 FROM agent_claims WHERE organization_id = $1 AND agent_integration_id = $2 AND state = $3)",
+		orgID, integrationID, int16(ClaimHeld)).Scan(&held); err != nil {
+		return err
+	}
+	if held {
+		return api.ErrPrecondition("tide still holds a vendor claim of this agent integration; try again when its runners ended and tide released the claims")
+	}
+	return nil
 }
 
 func (h *Hub) resumeOrg(orgID string) {

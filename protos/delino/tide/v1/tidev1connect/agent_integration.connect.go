@@ -63,7 +63,7 @@ type AgentIntegrationServiceClient interface {
 	// Change the name or settings, or replace credentials.
 	UpdateAgentIntegration(context.Context, *connect.Request[v1.UpdateAgentIntegrationRequest]) (*connect.Response[v1.UpdateAgentIntegrationResponse], error)
 	// Delete an integration. Fails with `failed_precondition` while a runner
-	// profile names it.
+	// profile names it or while tide holds a vendor claim of it.
 	DeleteAgentIntegration(context.Context, *connect.Request[v1.DeleteAgentIntegrationRequest]) (*connect.Response[v1.DeleteAgentIntegrationResponse], error)
 }
 
@@ -157,7 +157,7 @@ type AgentIntegrationServiceHandler interface {
 	// Change the name or settings, or replace credentials.
 	UpdateAgentIntegration(context.Context, *connect.Request[v1.UpdateAgentIntegrationRequest]) (*connect.Response[v1.UpdateAgentIntegrationResponse], error)
 	// Delete an integration. Fails with `failed_precondition` while a runner
-	// profile names it.
+	// profile names it or while tide holds a vendor claim of it.
 	DeleteAgentIntegration(context.Context, *connect.Request[v1.DeleteAgentIntegrationRequest]) (*connect.Response[v1.DeleteAgentIntegrationResponse], error)
 }
 
