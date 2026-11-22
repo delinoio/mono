@@ -1314,6 +1314,12 @@ test("repository deployables use the documented targets", () => {
       ],
     ],
   );
+  // The billing rollout deploys accounts-api before ownsand-api.
+  assert.deepEqual(
+    packages.find((p) => p.manifest.name === "ownsand-api").manifest.deploy
+      .needs,
+    ["accounts-api"],
+  );
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.project, d.output]),
     [
