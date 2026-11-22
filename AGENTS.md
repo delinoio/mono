@@ -44,7 +44,7 @@
 - Use Infisical only for local development variables. Package `dev` scripts that read configuration start their command through `scripts/dev/with-infisical.mjs` with an Infisical folder equal to their package directory (for example `/servers/accounts-api`); never commit Infisical project IDs, tokens or values. Follow `docs/repository-environment-contract.md#local-development-injection`.
 - After addressing pull request review comments and pushing updates, mark the corresponding review threads as resolved.
 - When no explicit scope is specified and you are currently working within a pull request scope, interpret instructions within the current pull request scope.
-- Do not guess; rather search for the web.
+- Do not guess; search the web instead.
 - Follow `docs/repository-dependency-security-contract.md` for dependency security updates, validation evidence, and unresolved upstream constraints. Keep unresolved advisories visible; a fixed runtime pin or an unavailable patch is not a vulnerability fix.
 - All Go code belongs to the single root Go module `github.com/delinoio/mono` defined in root `go.mod`. Do not add nested `go.mod` or `go.work` files.
 - Put Go packages that external users import under root `go/` (one tree per `go/<name>/`); keep repository-only Go code in its owning project directory. Generated protobuf Go bindings stay under `protos/`. Follow `docs/repository-workflow-contract.md#public-go-packages`.
