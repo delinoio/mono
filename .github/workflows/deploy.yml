@@ -1,7 +1,9 @@
 name: Deploy
 # Deploys the packages selected by the pending changesets on `main`, in
 # dependency order: servers (the shared DigitalOcean Droplet) first, then
-# static sites (Cloudflare Pages). The PlanetScale Postgres database has no migration job yet; see
+# static sites (Cloudflare Pages). After the version commit and tags, it
+# publishes the binary releases (GitHub Releases and the signed agent update
+# manifest on R2). The PlanetScale Postgres database has no migration job yet; see
 # docs/repository-workflow-contract.md#deployment-workflow.
 on:
   workflow_dispatch:
@@ -25,10 +27,14 @@ jobs:
       releases: ${{ steps.plan.outputs.releases }}
       servers: ${{ steps.plan.outputs.servers }}
       static_sites: ${{ steps.plan.outputs.static_sites }}
+      binaries: ${{ steps.plan.outputs.binaries }}
       changeset_blobs: ${{ steps.blobs.outputs.changeset_blobs }}
       has_changesets: ${{ steps.plan.outputs.has_changesets }}
       has_servers: ${{ steps.plan.outputs.has_servers }}
       has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
+      has_binaries: ${{ steps.plan.outputs.has_binaries }}
+      has_cgo_binaries: ${{ steps.plan.outputs.has_cgo_binaries }}
+      has_darwin_binaries: ${{ steps.plan.outputs.has_darwin_binaries }}
     steps:
       - name: Require the main branch
         if: github.ref != 'refs/heads/main'
@@ -160,10 +166,20 @@ jobs:
 
   deploy-servers:
     name: Deploy servers
-    # Every build, the static sites included, finishes before the first
-    # upload, so a broken site cannot leave new servers without a release.
-    # `!failure()` keeps the job when no site (or no server build) ran.
-    needs: [plan, build-servers, build-static-sites]
+    # Every build, the static sites and the signed binaries included,
+    # finishes before the first upload, so a broken site or binary cannot
+    # leave new servers without a release. `!failure()` keeps the job when
+    # no site, binary (or no server build) ran. `deploy-static-sites` needs
+    # this job, so it also runs only after the binary builds.
+    needs:
+      [
+        plan,
+        build-servers,
+        build-static-sites,
+        build-binaries,
+        build-macos-binaries,
+        sign-macos-binaries,
+      ]
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_servers == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -374,6 +390,9 @@ jobs:
         deploy-servers,
         build-static-sites,
         deploy-static-sites,
+        build-binaries,
+        build-macos-binaries,
+        sign-macos-binaries,
       ]
     # Run only after every selected deployment succeeded. Skipped deployments
     # (no server or no static site selected) do not block the release.
@@ -416,3 +435,196 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           scripts/ci/deploy-release.sh
+
+  build-binaries:
+    name: Build binaries
+    needs: plan
+    if: needs.plan.outputs.has_binaries == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # No deployment environment and no secrets: the build compiles
+    # third-party modules. The signing and publishing jobs receive only the
+    # built files.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          # Production artifacts must contain Git LFS objects, not pointers.
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build every platform without cgo and the license notices
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+        run: scripts/ci/release-binaries.sh build cross "$RUNNER_TEMP/binaries"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-release
+          path: ${{ runner.temp }}/binaries/release
+          if-no-files-found: error
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-unsigned-darwin-cross
+          path: ${{ runner.temp }}/binaries/darwin
+          # A run whose darwin executables all need cgo builds none here.
+          if-no-files-found: ignore
+          retention-days: 7
+
+  build-macos-binaries:
+    name: Build cgo binaries on macOS
+    needs: plan
+    if: needs.plan.outputs.has_cgo_binaries == 'true'
+    # The Virtualization.framework binding of the agent needs cgo on a macOS
+    # host; macos-15 is arm64.
+    runs-on: macos-15
+    timeout-minutes: 30
+    # No deployment environment and no secrets, as in `build-binaries`.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          lfs: true
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - name: Build the cgo platforms
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+        run: scripts/ci/release-binaries.sh build cgo "$RUNNER_TEMP/binaries"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-unsigned-darwin-cgo
+          path: ${{ runner.temp }}/binaries/darwin
+          if-no-files-found: error
+          retention-days: 7
+
+  sign-macos-binaries:
+    name: Sign and notarize macOS binaries
+    needs: [plan, build-binaries, build-macos-binaries]
+    # Also when no cgo build ran.
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_darwin_binaries == 'true' }}
+    runs-on: macos-15
+    # Notarization usually takes minutes; notarytool waits up to 45 minutes
+    # for each executable.
+    timeout-minutes: 60
+    environment: releases
+    # Only the Apple signing and notary secrets reach this job. It runs no
+    # build: it signs the downloaded executables with Apple's tools.
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: binaries-unsigned-darwin-*
+          path: ${{ runner.temp }}/unsigned
+          merge-multiple: true
+      - name: Sign with the Developer ID and notarize
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_P12: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_P12 }}
+          APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+          APPLE_NOTARY_API_KEY: ${{ secrets.APPLE_NOTARY_API_KEY }}
+          APPLE_NOTARY_API_KEY_ID: ${{ secrets.APPLE_NOTARY_API_KEY_ID }}
+          APPLE_NOTARY_API_ISSUER_ID: ${{ secrets.APPLE_NOTARY_API_ISSUER_ID }}
+        run: scripts/ci/release-binaries.sh sign-macos "$RUNNER_TEMP/unsigned" "$RUNNER_TEMP/signed"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: binaries-signed-darwin
+          path: ${{ runner.temp }}/signed
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-binaries:
+    name: Publish binary releases
+    # After the release job pushed the tags: each GitHub Release belongs to
+    # its `<name>@<version>` tag, and the manifest names only published
+    # downloads. A failure here leaves the tags without a complete release;
+    # rerun this job, whose steps are idempotent (see the deployment workflow
+    # contract).
+    needs: [plan, build-binaries, sign-macos-binaries, release]
+    if: ${{ !cancelled() && !failure() && needs.release.result == 'success' && needs.plan.outputs.has_binaries == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: releases
+    # Job permissions replace the workflow permissions. Creating a release
+    # and uploading its assets needs `contents: write`.
+    permissions:
+      contents: write
+    steps:
+      # No build runs in this job. The release manifest tool is built from
+      # the checkout with the standard library only, in a step without
+      # secrets, and each secret reaches only the step that needs it.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: binaries-release
+          path: ${{ runner.temp }}/artifacts/release
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        if: needs.plan.outputs.has_darwin_binaries == 'true'
+        with:
+          name: binaries-signed-darwin
+          path: ${{ runner.temp }}/artifacts/signed
+      - name: Assemble the release assets
+        # The artifacts are unpacked outside the checkout and checked against
+        # the plan, so they cannot replace a script that a later step runs
+        # with a secret.
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+        run: scripts/ci/release-binaries.sh assemble "$RUNNER_TEMP/artifacts" "$RUNNER_TEMP/assets"
+      - name: Create the GitHub Releases
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/release-binaries.sh github-releases "$RUNNER_TEMP/assets"
+      - name: Download the current release manifests
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          RELEASES_R2_ACCOUNT_ID: ${{ secrets.RELEASES_R2_ACCOUNT_ID }}
+          RELEASES_R2_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+          RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
+          RELEASES_R2_BUCKET: ${{ secrets.RELEASES_R2_BUCKET }}
+        run: scripts/ci/release-binaries.sh fetch-manifests "$RUNNER_TEMP/manifests"
+      - name: Add the releases to the manifests
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          REPOSITORY: ${{ github.repository }}
+        run: scripts/ci/release-binaries.sh prepare-manifests "$RUNNER_TEMP/manifests" "$RUNNER_TEMP/assets"
+      - name: Sign the manifests
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          OWNSAND_AGENT_RELEASE_SIGNING_KEY: ${{ secrets.OWNSAND_AGENT_RELEASE_SIGNING_KEY }}
+        run: scripts/ci/release-binaries.sh sign-manifests "$RUNNER_TEMP/manifests"
+      - name: Upload the manifests
+        env:
+          BINARIES: ${{ needs.plan.outputs.binaries }}
+          RELEASES_R2_ACCOUNT_ID: ${{ secrets.RELEASES_R2_ACCOUNT_ID }}
+          RELEASES_R2_ACCESS_KEY_ID: ${{ secrets.RELEASES_R2_ACCESS_KEY_ID }}
+          RELEASES_R2_SECRET_ACCESS_KEY: ${{ secrets.RELEASES_R2_SECRET_ACCESS_KEY }}
+          RELEASES_R2_BUCKET: ${{ secrets.RELEASES_R2_BUCKET }}
+        run: scripts/ci/release-binaries.sh upload-manifests "$RUNNER_TEMP/manifests"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        # The signed manifests, to restore the bucket by hand when an upload
+        # stopped between the manifest and its signature.
+        if: always()
+        with:
+          name: release-manifests
+          path: ${{ runner.temp }}/manifests
+          if-no-files-found: ignore
+          retention-days: 30
