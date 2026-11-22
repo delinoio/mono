@@ -169,6 +169,12 @@ cp "$path" "$out"
 `,
   security: `#!/usr/bin/env bash
 echo "security $*" >> "$STUB_LOG"
+if [[ "$1" == list-keychains && "$*" == *" -s "* ]]; then
+  printf 'security-args'; printf ' [%s]' "$@"; echo
+fi >> "$STUB_LOG"
+if [[ "$1" == list-keychains && "$*" != *" -s "* ]]; then
+  printf '    "%s"\\n' "/Users/runner/Library/Keychains/login.keychain-db" "/Users/runner/Library/Keychains/other keychain.keychain-db"
+fi
 if [[ "$1" == find-identity ]]; then
   printf '  1) ABCDEF "%s"\\n     1 valid identities found\\n' "\${STUB_IDENTITY:-Developer ID Application: Delino (TEAM123)}"
 fi
@@ -553,6 +559,37 @@ test(
       /p12-password/,
     );
     assert.match(result.log, /security delete-keychain/);
+    // The job keychain goes first in the search list, before signing, with
+    // each existing entry as its own argument, and the saved list comes back
+    // before the keychain is deleted.
+    const lines = result.log.split("\n");
+    const added = lines.findIndex((l) =>
+      /^security list-keychains -d user -s \S+\/macos-signing\/release\.keychain-db \/Users\/runner\/Library\/Keychains\/login\.keychain-db \/Users\/runner\/Library\/Keychains\/other keychain\.keychain-db$/.test(
+        l,
+      ),
+    );
+    const firstSign = lines.findIndex((l) => l.startsWith("codesign --force"));
+    const restored = lines.findIndex(
+      (l) =>
+        l ===
+        "security-args [list-keychains] [-d] [user] [-s] [/Users/runner/Library/Keychains/login.keychain-db] [/Users/runner/Library/Keychains/other keychain.keychain-db]",
+    );
+    assert.ok(
+      lines.some((l) =>
+        /^security-args \[list-keychains\] \[-d\] \[user\] \[-s\] \[\S+\/release\.keychain-db\] \[\/Users\/runner\/Library\/Keychains\/login\.keychain-db\] \[\/Users\/runner\/Library\/Keychains\/other keychain\.keychain-db\]$/.test(
+          l,
+        ),
+      ),
+      "each search list entry is its own argument",
+    );
+    const deleted = lines.findIndex((l) =>
+      l.startsWith("security delete-keychain"),
+    );
+    assert.ok(added >= 0 && added < firstSign, "keychain added before signing");
+    assert.ok(
+      restored > firstSign && restored < deleted,
+      "list restored before deletion",
+    );
     assert.equal(existsSync(join(f.runnerTemp, "macos-signing")), false);
     assert.match(result.summary, /notarization `submission-1` Accepted/);
   },
