@@ -99,11 +99,9 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() {
-		if derr := m.dismount(context.Background()); derr != nil {
-			logger.Warn("dismount the ISO failed", "error", derr)
-		}
-	}()
+	// The deferred dismount is the retry of a failed explicit dismount below:
+	// dismount keeps m.ours set until the detach succeeded.
+	defer m.release(context.Background(), logger)
 	wim, err := m.installImage()
 	if err != nil {
 		return err
@@ -147,10 +145,7 @@ func buildWindows(ctx context.Context, dir string, opts Options) (err error) {
 	if err := applyImage(ctx, logger, disk, build, wim, chosen.Index, lang, opts.GuestBinary); err != nil {
 		return err
 	}
-	if err := m.dismount(ctx); err != nil {
-		logger.Warn("dismount the ISO failed", "error", err)
-	}
-	m.ours = false
+	m.release(ctx, logger)
 	applied := time.Now()
 
 	logger.Info("booting the image once; Windows Setup finishes the specialize and OOBE passes")
