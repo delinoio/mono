@@ -5,6 +5,7 @@ package api
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -34,5 +35,18 @@ func TestSendCommandEndedContextQueuesNothing(t *testing.T) {
 	}
 	if n := s.commands.len(); n != 0 {
 		t.Fatalf("pending command records = %d, want 0", n)
+	}
+}
+
+// TestFailCreateSendNotQueuedKeepsClosedChannelToReconciliation checks that
+// a send error on a channel that is already closed fails nothing: the
+// reconnect reconciliation owns the sandbox then. The service has no
+// database, so any attempt to fail the create would panic.
+func TestFailCreateSendNotQueuedKeepsClosedChannelToReconciliation(t *testing.T) {
+	s := &Service{Now: time.Now, Logger: slog.New(slog.DiscardHandler)}
+	conn := hub.New().Register(context.Background(), "dev", "org")
+	conn.Close(hub.ErrQueueFull)
+	if got := s.failCreateSendNotQueued(context.Background(), conn, commandInfo{kind: cmdCreateSandbox, orgID: "org", sandboxID: "sb"}, hub.ErrQueueFull); got != nil {
+		t.Fatalf("failCreateSendNotQueued on a closed channel = %v, want nil", got)
 	}
 }
