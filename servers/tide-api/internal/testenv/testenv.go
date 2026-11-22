@@ -33,6 +33,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/ratelimit"
 	"github.com/delinoio/mono/servers/tide-api/internal/secrets"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 // UserTokenPrefix marks a fake Logto access token: the rest is the user ID.
@@ -108,10 +109,29 @@ func WithExtension(ext app.Extension) Option {
 }
 
 // WithLayers wires every layer of tide-api with the fake OwnSand API and
-// fills out with the shared parts.
+// fills out with the shared parts. The engine uses short intervals.
 func WithLayers(fake *ownsandfake.Fake, out *layers.Layers) Option {
+	return WithLayerOptions(layers.Options{OwnSand: fake}, out)
+}
+
+// FastWorkTiming returns engine intervals for tests.
+func FastWorkTiming() work.Timing {
+	return work.Timing{PassInterval: 200 * time.Millisecond, ReconcileInterval: 100 * time.Millisecond, SandboxPoll: 50 * time.Millisecond,
+		StartTimeout: time.Minute, GaugeInterval: 100 * time.Millisecond}
+}
+
+// WithLayerOptions is WithLayers with explicit layer options; empty fields
+// get test defaults.
+func WithLayerOptions(opts layers.Options, out *layers.Layers) Option {
+	if opts.PublicOrigin == "" {
+		opts.PublicOrigin = "https://tide.test"
+	}
+	if opts.WorkTiming == nil {
+		t := FastWorkTiming()
+		opts.WorkTiming = &t
+	}
 	return func(o *app.Options) {
-		o.Extensions = append(o.Extensions, layers.Extensions(layers.Options{OwnSand: fake, PublicOrigin: "https://tide.test"}, out)...)
+		o.Extensions = append(o.Extensions, layers.Extensions(opts, out)...)
 	}
 }
 

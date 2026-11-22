@@ -14,6 +14,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/metrics"
 	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient"
 	"github.com/delinoio/mono/servers/tide-api/internal/profile"
+	"github.com/delinoio/mono/servers/tide-api/internal/work"
 )
 
 // Options configures the layers.
@@ -22,6 +23,9 @@ type Options struct {
 	OwnSand ownsandclient.Factory
 	// PublicOrigin is the public origin of tide-api (webhook URLs).
 	PublicOrigin string
+	// WorkTiming overrides the engine durations (tests); nil selects the
+	// production values.
+	WorkTiming *work.Timing
 }
 
 // Layers holds the shared parts of the wired layers, for tests.
@@ -30,6 +34,7 @@ type Layers struct {
 	Links        *link.Links
 	Integrations *integration.Store
 	Profiles     *profile.Profiles
+	Engine       *work.Engine
 }
 
 // Extensions returns the extensions; New fills out while it wires the app.
@@ -44,6 +49,11 @@ func Extensions(opts Options, out *Layers) []app.Extension {
 			out.Links = link.Register(r, opts.OwnSand, m)
 			out.Integrations = integration.Register(r, opts.PublicOrigin)
 			out.Profiles = profile.Register(r, out.Links, out.Integrations)
+			timing := work.DefaultTiming()
+			if opts.WorkTiming != nil {
+				timing = *opts.WorkTiming
+			}
+			out.Engine = work.Register(r, out.Links, out.Profiles, m, timing)
 			return nil
 		},
 	}
