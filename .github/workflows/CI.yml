@@ -410,14 +410,6 @@ jobs:
           case "$RUNNER_OS" in
             macOS)
               known_failures=(
-                # The process test runtime runs only guests of the host OS,
-                # but the tests create Linux guests, and the guest helper
-                # socket paths under the macOS TMPDIR exceed the 104-byte unix
-                # socket path limit, so every sandbox create fails.
-                cmds/ownsand-agent
-                cmds/ownsand-agent/internal/agent
-                cmds/ownsand-agent/internal/dataplane
-                cmds/ownsand-agent/internal/ops
                 # The exec test compares the working directory with the
                 # TMPDIR path, which macOS reports as `/private/var/...`.
                 cmds/ownsand-guest/guest
