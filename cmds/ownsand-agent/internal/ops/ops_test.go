@@ -420,22 +420,84 @@ func TestAttachOffsetsAndPaused(t *testing.T) {
 	}
 }
 
+// waitBound bounds every wait of a test on the exec of a guest command, so a
+// command that never starts or never completes fails the test and does not
+// hang it until the test binary times out.
+const waitBound = 15 * time.Second
+
+// waitUntil polls cond until it holds and reports whether it held within bound.
+func waitUntil(bound time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(bound)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return true
+}
+
+// awaitOutcome receives the outcome of an exec and reports whether it arrived
+// within bound.
+func awaitOutcome(done <-chan ops.Outcome, bound time.Duration) (ops.Outcome, bool) {
+	timer := time.NewTimer(bound)
+	defer timer.Stop()
+	select {
+	case out := <-done:
+		return out, true
+	case <-timer.C:
+		return ops.Outcome{}, false
+	}
+}
+
+func TestWaitHelpersAreBounded(t *testing.T) {
+	const bound = 50 * time.Millisecond
+	begin := time.Now()
+	if waitUntil(bound, func() bool { return false }) {
+		t.Fatal("waitUntil reported a condition that never holds")
+	}
+	if _, ok := awaitOutcome(make(chan ops.Outcome), bound); ok {
+		t.Fatal("awaitOutcome reported an outcome that never came")
+	}
+	if elapsed := time.Since(begin); elapsed > 5*time.Second {
+		t.Fatalf("the bounded waits took %v", elapsed)
+	}
+	calls := 0
+	if !waitUntil(bound, func() bool { calls++; return calls == 3 }) {
+		t.Fatal("waitUntil missed a condition that holds")
+	}
+	done := make(chan ops.Outcome, 1)
+	done <- ops.Outcome{Finished: true}
+	if out, ok := awaitOutcome(done, bound); !ok || !out.Finished {
+		t.Fatalf("awaitOutcome: %+v %v", out, ok)
+	}
+}
+
 func TestExecSandboxEnded(t *testing.T) {
 	e := newEnv(t)
 	req := e.execReq("/bin/sh", "-c", "sleep 60")
 	s := &sink{}
+	// Cancelling the context ends the forwarding of the exec, and with it the
+	// handler goroutine, when the test fails before the sandbox ends.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	done := make(chan ops.Outcome, 1)
 	go func() {
-		done <- e.d.Handle(context.Background(), ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, req), SandboxID: e.sandbox}, s)
+		done <- e.d.Handle(ctx, ops.Request{Frame: datapath.MustNewFrame(1, e.sandbox, req), SandboxID: e.sandbox}, s)
 	}()
-	for !e.d.HasRunningExec(e.sandbox) {
-		time.Sleep(10 * time.Millisecond)
+	if !waitUntil(waitBound, func() bool { return e.d.HasRunningExec(e.sandbox) }) {
+		cancel()
+		t.Fatalf("exec did not start within %v", waitBound)
 	}
 	time.Sleep(200 * time.Millisecond)
 	if _, err := e.m.Delete(context.Background(), &ownsandv1.DeleteSandboxCommand{SandboxId: e.sandbox}); err != nil {
 		t.Fatal(err)
 	}
-	out := <-done
+	out, ok := awaitOutcome(done, waitBound)
+	if !ok {
+		cancel()
+		t.Fatalf("exec did not complete within %v after its sandbox was deleted", waitBound)
+	}
 	if !out.Finished || last(s.frames).GetExecEvent().GetSandboxEnded().GetReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
 		t.Fatalf("outcome %+v last %v", out, last(s.frames))
 	}
