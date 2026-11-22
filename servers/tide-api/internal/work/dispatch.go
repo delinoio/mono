@@ -127,7 +127,7 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		}
 		res := e.createRunner(ctx, client, p, req, req.PoolKey)
 		if res == createUnavailable && !reclaimed {
-			reclaimed = e.reclaimWarm(ctx, runners, p.ID)
+			reclaimed = e.reclaimWarm(ctx, queued, runners, p.ID)
 		}
 		if res == createStalled {
 			// OwnSand did not answer in time: end this organization's pass,
@@ -637,33 +637,102 @@ func (e *Engine) requeueTx(ctx context.Context, tx pgx.Tx, requestID string) err
 
 // reclaimWarm deletes one warm runner of another profile after OwnSand had
 // no capacity: the one of the lowest priority profile first, then the
-// oldest. It reports whether it deleted one.
-func (e *Engine) reclaimWarm(ctx context.Context, runners []*Runner, profileID string) bool {
-	var best *Runner
-	var bestPriority tidev1.Priority
-	for _, r := range runners {
-		if r.ProfileID == profileID || r.State != runWarm || r.RequestID != "" {
-			continue
+// oldest. The warm runners of a runner pool of a WarmReclaimer kind count
+// too (see warmPoolRunners). It reports whether it deleted one.
+func (e *Engine) reclaimWarm(ctx context.Context, queued []*Request, runners []*Runner, profileID string) bool {
+	type candidate struct {
+		r    *Runner
+		prio tidev1.Priority
+	}
+	var cands []candidate
+	prios := map[string]tidev1.Priority{}
+	priority := func(r *Runner) tidev1.Priority {
+		if prio, ok := prios[r.ProfileID]; ok {
+			return prio
 		}
-		p, err := e.profiles.Get(ctx, e.svc.DB.Pool, r.OrganizationID, r.ProfileID)
 		prio := tidev1.Priority_PRIORITY_LOW + 1 // a deleted profile goes first
-		if err == nil {
+		if p, err := e.profiles.Get(ctx, e.svc.DB.Pool, r.OrganizationID, r.ProfileID); err == nil {
 			prio = p.Priority
 		}
-		// Priority values grow from HIGH (1) to LOW (3): the larger value is
-		// the lower priority. runners is oldest first, so ">" keeps the
-		// oldest of equal priority.
-		if best == nil || prio > bestPriority {
-			best, bestPriority = r, prio
+		prios[r.ProfileID] = prio
+		return prio
+	}
+	for _, r := range runners {
+		if r.ProfileID != profileID && r.State == runWarm && r.RequestID == "" {
+			cands = append(cands, candidate{r, priority(r)})
 		}
 	}
-	if best == nil {
-		return false
+	for _, r := range e.warmPoolRunners(queued, runners) {
+		if r.ProfileID != profileID {
+			cands = append(cands, candidate{r, priority(r)})
+		}
 	}
-	if _, err := e.deleteRunner(ctx, best.OrganizationID, best.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_WARM_RECLAIMED, 0); err != nil {
-		e.svc.Logger.WarnContext(ctx, "warm_reclaim_failed", slog.String("runner_id", best.ID), slog.Any("error", err))
-		return false
+	// Priority values grow from HIGH (1) to LOW (3): the larger value is the
+	// lower priority. Equal priorities go oldest first.
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].prio != cands[j].prio {
+			return cands[i].prio > cands[j].prio
+		}
+		if !cands[i].r.CreateTime.Equal(cands[j].r.CreateTime) {
+			return cands[i].r.CreateTime.Before(cands[j].r.CreateTime)
+		}
+		return cands[i].r.ID < cands[j].r.ID
+	})
+	for _, c := range cands {
+		best := c.r
+		if wr, ok := e.adapters[best.Kind].(WarmReclaimer); ok && !e.adapters[best.Kind].BindsAtDispatch() {
+			// A pool runner may have taken work meanwhile (the adapter then
+			// keeps it), so the next candidate is tried.
+			done, err := wr.ReclaimWarm(ctx, best)
+			if err != nil {
+				e.svc.Logger.WarnContext(ctx, "warm_reclaim_failed", slog.String("runner_id", best.ID), slog.Any("error", err))
+			}
+			if !done {
+				continue
+			}
+		} else if _, err := e.deleteRunner(ctx, best.OrganizationID, best.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_WARM_RECLAIMED, 0); err != nil {
+			e.svc.Logger.WarnContext(ctx, "warm_reclaim_failed", slog.String("runner_id", best.ID), slog.Any("error", err))
+			return false
+		}
+		best.State = runDeleting
+		return true
 	}
-	best.State = runDeleting
-	return true
+	return false
+}
+
+// warmPoolRunners returns the warm runners of the runner pools of the
+// WarmReclaimer kinds: in each pool, the idle runners (CREATING, PREPARING
+// or WAITING_FOR_WORK without a request) beyond the pool's QUEUED requests.
+// The newest idle runners count as warm, as in the surplus rule, so the
+// older ones keep covering the requests.
+func (e *Engine) warmPoolRunners(queued []*Request, runners []*Runner) []*Runner {
+	demand := map[string]int{}
+	for _, q := range queued {
+		demand[q.ProfileID+"\x00"+q.PoolKey]++
+	}
+	idle := map[string][]*Runner{}
+	var keys []string
+	for _, r := range runners {
+		a := e.adapters[r.Kind]
+		if _, ok := a.(WarmReclaimer); !ok || a.BindsAtDispatch() || r.RequestID != "" {
+			continue
+		}
+		if r.State != runCreating && r.State != runPrep && r.State != runWaiting {
+			continue
+		}
+		key := r.ProfileID + "\x00" + r.PoolKey
+		if idle[key] == nil {
+			keys = append(keys, key)
+		}
+		idle[key] = append(idle[key], r)
+	}
+	var out []*Runner
+	for _, key := range keys {
+		// runners is oldest first.
+		list := idle[key]
+		if n := len(list) - demand[key]; n > 0 {
+			out = append(out, list[len(list)-n:]...)
+		}
+	}
+	return out
 }

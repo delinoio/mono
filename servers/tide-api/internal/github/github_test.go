@@ -18,6 +18,7 @@ import (
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/github"
 	"github.com/delinoio/mono/servers/tide-api/internal/githubapi"
+	"github.com/delinoio/mono/servers/tide-api/internal/ownsandclient/ownsandfake"
 	"github.com/delinoio/mono/servers/tide-api/internal/webhook"
 )
 
@@ -357,6 +358,52 @@ func TestWarmRunnerPerPool(t *testing.T) {
 	w.l.GitHub.Wait()
 	eventually(t, "one surplus runner removed", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1 })
 	stays(t, "the warm runner stays", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1 })
+}
+
+// TestWarmRunnerReclaim: when OwnSand has no capacity for a job, the
+// dispatcher reclaims a warm runner of a lower priority GITHUB_JOB pool. A
+// warm runner whose registration removal GitHub refuses took a job and
+// stays.
+func TestWarmRunnerReclaim(t *testing.T) {
+	w := newGHWorld(t, worldOpts{})
+	w.os.Update(w.osOrg, func(o *ownsandfake.Org) { o.MaxSandboxes = 1 })
+	w.link(t, 501, "acme")
+	low := ghProfile("linux", 1)
+	low.Priority = tidev1.Priority_PRIORITY_LOW
+	w.createProfile(t, low)
+	eventually(t, "a warm runner", func() bool { return len(w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)) == 1 })
+	warm := w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK)[0]
+	high := ghProfile("big", 0)
+	high.Priority = tidev1.Priority_PRIORITY_HIGH
+	highID := w.createProfile(t, high)
+
+	// GitHub gave the warm runner a job meanwhile: it stays.
+	w.gh.SetBusy("tide-"+warm.GetRunnerId(), true)
+	w.send(t, "workflow_job", job("queued", 501, 1, []string{"tide-big"}, ""))
+	stays(t, "the busy warm runner", func() bool {
+		return w.runner(t, warm.GetRunnerId()).GetState() == tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK
+	})
+	if _, ok := w.gh.RunnerByName("tide-" + warm.GetRunnerId()); !ok {
+		t.Fatal("the busy registration was removed")
+	}
+
+	w.gh.SetBusy("tide-"+warm.GetRunnerId(), false)
+	w.send(t, "workflow_job", job("queued", 501, 2, []string{"tide-big"}, ""))
+	eventually(t, "the warm runner reclaimed", func() bool {
+		r := w.runner(t, warm.GetRunnerId())
+		return r.GetState() == tidev1.RunnerState_RUNNER_STATE_DELETED && r.GetEndReason() == tidev1.RunnerEndReason_RUNNER_END_REASON_WARM_RECLAIMED
+	})
+	if _, ok := w.gh.RunnerByName("tide-" + warm.GetRunnerId()); ok {
+		t.Fatal("the reclaimed registration was not removed")
+	}
+	eventually(t, "a runner of the high priority profile", func() bool {
+		for _, r := range w.runnersIn(t, tidev1.RunnerState_RUNNER_STATE_WAITING_FOR_WORK) {
+			if r.GetRunnerProfileId() == highID {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // TestLostDeliveries: a delivery that GitHub could not deliver is

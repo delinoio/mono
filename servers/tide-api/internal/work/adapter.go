@@ -97,6 +97,17 @@ type WarmPooler interface {
 	WarmPools(ctx context.Context, orgID string) ([]string, error)
 }
 
+// WarmReclaimer is an optional interface of a WarmPooler. When OwnSand has
+// no capacity for a request, the dispatcher may reclaim a warm runner of a
+// runner pool of another profile; ReclaimWarm deletes that runner r with
+// RUNNER_END_REASON_WARM_RECLAIMED after it removed its registration
+// outside OwnSand, and reports whether it deleted it (false: the runner
+// took work meanwhile or its registration stays). Without WarmReclaimer,
+// the warm runners of the kind are not reclaimed.
+type WarmReclaimer interface {
+	ReclaimWarm(ctx context.Context, r *Runner) (bool, error)
+}
+
 // RequestDecorator is an optional interface of an Adapter that adds
 // kind-specific fields (GITHUB_JOB: the GitHub job) to the API form of its
 // requests. WorkService calls it for every response; an error is logged and

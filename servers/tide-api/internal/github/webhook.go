@@ -496,7 +496,8 @@ func (l *Layer) removeSurplus(ctx context.Context, orgID, profileID, pool string
 // accepted its removal (a refusal means that the runner took a job, and it
 // stays), and a runner without one changes to DELETING, so its start
 // records the registration later, removes it and does not start the runner
-// program. Without an ACTIVE installation, a registered runner stays.
+// program. Without an ACTIVE installation (or a GitHub App configuration),
+// a registered runner stays.
 func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID, runnerID string, reason tidev1.RunnerEndReason) (bool, error) {
 	// Two rounds: the registration removal, then the deletion.
 	for range 2 {
@@ -545,7 +546,7 @@ func (l *Layer) removeIdleRunner(ctx context.Context, inst *Installation, orgID,
 			l.svc.WorkChanged(orgID)
 			return true, nil
 		}
-		if inst == nil || !inst.Active() {
+		if !l.Configured() || inst == nil || !inst.Active() {
 			return false, nil
 		}
 		refused, err := l.removeRegistration(ctx, inst, runnerID)

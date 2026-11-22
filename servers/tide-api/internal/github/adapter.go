@@ -38,6 +38,7 @@ var (
 	_ work.Adapter             = (*Adapter)(nil)
 	_ work.RegistrationRemover = (*Adapter)(nil)
 	_ work.WarmPooler          = (*Adapter)(nil)
+	_ work.WarmReclaimer       = (*Adapter)(nil)
 	_ work.RequestDecorator    = (*Adapter)(nil)
 )
 
@@ -265,6 +266,19 @@ func (a *Adapter) WarmPools(ctx context.Context, orgID string) ([]string, error)
 		out = append(out, strconv.FormatInt(id, 10))
 	}
 	return out, rows.Err()
+}
+
+// ReclaimWarm deletes a warm runner of a pool for the capacity of a request
+// of another profile (WARM_RECLAIMED). Like a surplus runner, it first
+// loses its GitHub registration, and a runner whose removal GitHub refuses
+// took a job and stays.
+func (a *Adapter) ReclaimWarm(ctx context.Context, r *work.Runner) (bool, error) {
+	l := a.l
+	inst, err := l.poolInstallation(ctx, l.svc.DB.Pool, r.OrganizationID, r.PoolKey)
+	if err != nil {
+		return false, err
+	}
+	return l.removeIdleRunner(ctx, inst, r.OrganizationID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_WARM_RECLAIMED)
 }
 
 // DecorateRequests adds the GitHub job to GITHUB_JOB requests.
