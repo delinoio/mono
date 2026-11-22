@@ -872,17 +872,32 @@ export function createMockTransport(
         return { organization: withRole(org.organization, role) };
       },
       listOrganizations(req) {
-        // Mirror the control plane page size: 50 by default, at most 200.
+        // Mirror the control plane: 50 rows by default, at most 200, in a
+        // stable order, with a continuation token whenever a page is full,
+        // even when no row follows. The token is the ID of the last row.
         const pageSize = req.pageSize === 0 ? 50 : Math.min(req.pageSize, 200);
-        const organizations = [...orgs.values()]
+        const all = [...orgs.values()]
           .map((org) => ({
             org,
             m: org.members.find((x) => x.userId === userId),
           }))
           .filter((x) => x.m !== undefined)
-          .map((x) => withRole(x.org.organization, x.m!.role))
-          .slice(0, pageSize);
-        return { organizations };
+          .map((x) => withRole(x.org.organization, x.m!.role));
+        const after = req.pageToken
+          ? all.findIndex((o) => o.organizationId === req.pageToken)
+          : -1;
+        if (req.pageToken && after === -1) {
+          throw new ConnectError("invalid page_token", Code.InvalidArgument);
+        }
+        const organizations = all.slice(after + 1, after + 1 + pageSize);
+        const last = organizations.at(-1);
+        return {
+          organizations,
+          nextPageToken:
+            organizations.length === pageSize && last !== undefined
+              ? last.organizationId
+              : "",
+        };
       },
       deleteOrganization(req) {
         const { role } = membership(req.organizationId);

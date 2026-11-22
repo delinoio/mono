@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, test } from "@rstest/core";
+import { create } from "@bufbuild/protobuf";
 import { StrictMode } from "react";
 import {
   act,
@@ -23,7 +24,10 @@ import {
 import { ApiKeyService } from "@delino/ownsand-protos/v1/api_key_pb";
 import { DeviceService } from "@delino/ownsand-protos/v1/device_pb";
 import { type Sandbox } from "@delino/ownsand-protos/v1/sandbox_pb";
-import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
+import {
+  ListOrganizationsResponseSchema,
+  OrganizationService,
+} from "@delino/ownsand-protos/v1/organization_pb";
 import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
 import { QueryClient } from "@tanstack/react-query";
 import { Console } from "./App.tsx";
@@ -123,7 +127,7 @@ describe("organizations", () => {
     ).toContain("Member");
   });
 
-  test("requests the first 200 organizations on the page and in the switcher", async () => {
+  test("requests pages of 200 organizations on the page and in the switcher", async () => {
     const mock = createMockTransport();
     const client = createClient(OrganizationService, mock);
     for (let i = 0; i < 50; i++) {
@@ -143,6 +147,193 @@ describe("organizations", () => {
     expect(await screen.findByRole("link", { name: /Extra 49/ })).toBeTruthy();
     expect(pageSizes.length).toBeGreaterThan(0);
     expect(pageSizes.every((size) => size === 200)).toBe(true);
+  });
+
+  /**
+   * A control plane whose ListOrganizations returns the seeded organizations
+   * of the mock one page each, with the token `page-<n>` that leads to page
+   * n. `pages[i]` lists the organization IDs of page i + 1. `failPage` is
+   * the 1-based page that fails with `unavailable` while it is set.
+   */
+  async function pagedOrganizations(pages: string[][]) {
+    const mock = createMockTransport();
+    const real = await createClient(
+      OrganizationService,
+      mock,
+    ).listOrganizations({ pageSize: 200 });
+    const state = {
+      tokens: [] as string[],
+      failPage: undefined as number | undefined,
+    };
+    const transport: Transport = {
+      ...mock,
+      async unary(method, ...rest) {
+        if (method.name !== "ListOrganizations") {
+          return mock.unary(method, ...rest);
+        }
+        const token = (rest[3] as { pageToken: string }).pageToken;
+        state.tokens.push(token);
+        const page = token === "" ? 1 : Number(token.slice("page-".length));
+        if (state.failPage === page) {
+          throw new ConnectError("the page failed", Code.Unavailable);
+        }
+        // Only the envelope of the response matters; the rows come from `real`.
+        const res = await mock.unary(
+          method,
+          rest[0],
+          rest[1],
+          rest[2],
+          { pageSize: 200 } as never,
+          rest[4],
+        );
+        return {
+          ...res,
+          message: create(ListOrganizationsResponseSchema, {
+            organizations: real.organizations.filter((o) =>
+              pages[page - 1]!.includes(o.organizationId),
+            ),
+            nextPageToken: page < pages.length ? `page-${page + 1}` : "",
+          }),
+        } as unknown as typeof res;
+      },
+    };
+    return { transport, state };
+  }
+
+  test("follows the continuation token and lists a later-page organization with its role", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    renderConsole("/", { transport });
+    const later = await screen.findByRole("link", { name: /Northwind Labs/ });
+    expect(later.textContent).toContain("Member");
+    expect(
+      screen.getByRole("link", { name: /Acme Robotics/ }).textContent,
+    ).toContain("Owner");
+    // The first request has no token, the second one sends the token of the
+    // first response, and the page and the switcher share both requests.
+    expect(state.tokens).toEqual(["", "page-2"]);
+    expect(screen.queryByText("Loading more organizations")).toBeNull();
+  });
+
+  test("offers a later-page organization in the switcher", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Organization" }),
+      );
+    });
+    expect(
+      await screen.findByRole("option", { name: "Northwind Labs" }),
+    ).toBeTruthy();
+    expect(state.tokens).toEqual(["", "page-2"]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("option", { name: "Northwind Labs" }));
+    });
+    await settle(60);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.northwind}/sandboxes`,
+    );
+    // The member of Northwind does not see the admin sections.
+    const nav = await screen.findByRole("navigation", { name: "Organization" });
+    expect(nav.textContent).not.toContain("API keys");
+  });
+
+  test("stops at a final empty page after a full page", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme, MOCK_IDS.northwind],
+      [],
+    ]);
+    renderConsole("/", { transport });
+    expect(
+      await screen.findByRole("link", { name: /Northwind Labs/ }),
+    ).toBeTruthy();
+    await settle(60);
+    expect(state.tokens).toEqual(["", "page-2"]);
+    expect(screen.queryByText("Loading more organizations")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+  });
+
+  test("requests no second page when the first response has no token", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme, MOCK_IDS.northwind],
+    ]);
+    renderConsole("/", { transport });
+    await screen.findByRole("link", { name: /Northwind Labs/ });
+    await settle(60);
+    expect(state.tokens).toEqual([""]);
+  });
+
+  test("shows an incomplete list with a retry when a later page fails", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    state.failPage = 2;
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Organization" }),
+      );
+    });
+    // The switcher says that it is incomplete and offers the retry.
+    const retryOption = await screen.findByRole("option", {
+      name: /Some organizations did not load/,
+    });
+    expect(screen.queryByRole("option", { name: "Northwind Labs" })).toBeNull();
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement ?? document.body, {
+        key: "Escape",
+      });
+    });
+    await settle(60);
+    // A failed page is not requested again without a retry.
+    expect(state.tokens).toEqual(["", "page-2"]);
+    state.failPage = undefined;
+    await act(async () => {
+      fireEvent.click(retryOption);
+    });
+    await settle(60);
+    expect(state.tokens).toEqual(["", "page-2", "page-2"]);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("combobox", { name: "Organization" }));
+    });
+    expect(
+      await screen.findByRole("option", { name: "Northwind Labs" }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByRole("option", { name: /Some organizations did not load/ }),
+    ).toBeNull();
+  });
+
+  test("keeps the loaded organizations and offers Try again on the list when a later page fails", async () => {
+    const { transport, state } = await pagedOrganizations([
+      [MOCK_IDS.acme],
+      [MOCK_IDS.northwind],
+    ]);
+    state.failPage = 2;
+    renderConsole("/", { transport });
+    expect(
+      await screen.findByText("Some organizations are not shown yet."),
+    ).toBeTruthy();
+    expect(screen.getByRole("link", { name: /Acme Robotics/ })).toBeTruthy();
+    expect(screen.queryByRole("link", { name: /Northwind Labs/ })).toBeNull();
+    state.failPage = undefined;
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+    });
+    expect(
+      await screen.findByRole("link", { name: /Northwind Labs/ }),
+    ).toBeTruthy();
+    expect(
+      screen.queryByText("Some organizations are not shown yet."),
+    ).toBeNull();
+    expect(state.tokens).toEqual(["", "page-2", "page-2"]);
   });
 
   test("opens an organization's sandboxes and hides ended sandboxes by default", async () => {
@@ -1419,15 +1610,15 @@ describe("invitations", () => {
     ).toBeTruthy();
   });
 
-  /** Counts ListOrganizations calls. */
-  function listOrganizationsProbe() {
-    const mock = createMockTransport();
-    const state = { calls: 0 };
+  /** Counts ListOrganizations calls and records their page tokens. */
+  function listOrganizationsProbe(mock = createMockTransport()) {
+    const state = { calls: 0, tokens: [] as string[] };
     const transport: Transport = {
       ...mock,
       unary(method, ...rest) {
         if (method.name === "ListOrganizations") {
           state.calls += 1;
+          state.tokens.push((rest[3] as { pageToken: string }).pageToken);
         }
         return mock.unary(method, ...rest);
       },
@@ -1468,6 +1659,38 @@ describe("invitations", () => {
       name: "Organization",
     });
     expect(trigger.textContent).toContain("Contoso Research");
+  });
+
+  test("lists organizations past the first page of the mock and refreshes them after a membership change", async () => {
+    const mock = createMockTransport();
+    const client = createClient(OrganizationService, mock);
+    // 2 seeded organizations and 200 more fill the first page and leave a
+    // second one.
+    for (let i = 0; i < 200; i++) {
+      await client.createOrganization({ name: `Extra ${i}` });
+    }
+    const { transport, state } = listOrganizationsProbe(mock);
+    renderConsole("/", { transport, queryClient: createQueryClient() });
+    expect(await screen.findByRole("link", { name: /Extra 199/ })).toBeTruthy();
+    expect(state.tokens).toHaveLength(2);
+    expect(state.tokens[0]).toBe("");
+    expect(state.tokens[1]).not.toBe("");
+    // Joining Contoso refreshes the shared list from the first page.
+    await joinContosoFromOrganizations();
+    await settle(100);
+    expect(window.location.pathname).toBe(
+      `/orgs/${MOCK_IDS.contoso}/sandboxes`,
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Organization" }),
+      );
+    });
+    expect(
+      await screen.findByRole("option", { name: "Contoso Research" }),
+    ).toBeTruthy();
+    expect(screen.getByRole("option", { name: "Extra 199" })).toBeTruthy();
+    expect(state.tokens.length).toBeGreaterThan(2);
   });
 
   test("refreshes the organizations when an earlier accept succeeds after the user left the page", async () => {

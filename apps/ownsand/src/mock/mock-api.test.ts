@@ -12,6 +12,7 @@ import {
   DeviceState,
   ErrorDetailSchema,
   GuestOs,
+  Role,
   SandboxEndReason,
   SandboxState,
 } from "@delino/ownsand-protos/v1/common_pb";
@@ -689,5 +690,68 @@ describe("mock billing", () => {
     expect(error.findDetails(ErrorDetailSchema)[0]?.billingReason).toBe(
       BillingReason.BLOCKED,
     );
+  });
+});
+
+describe("mock organization list paging", () => {
+  async function withExtras(count: number) {
+    const client = createClient(OrganizationService, createMockTransport());
+    for (let i = 0; i < count; i++) {
+      await client.createOrganization({ name: `Extra ${i}` });
+    }
+    return client;
+  }
+
+  test("returns the first 50 rows by default and a token after a full page", async () => {
+    const client = await withExtras(60);
+    const first = await client.listOrganizations({});
+    expect(first.organizations).toHaveLength(50);
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listOrganizations({
+      pageToken: first.nextPageToken,
+    });
+    // 2 seeded and 60 created organizations.
+    expect(second.organizations).toHaveLength(12);
+    expect(second.nextPageToken).toBe("");
+  });
+
+  test("walks every page once, in order, with the caller's role", async () => {
+    const client = await withExtras(4);
+    const ids: string[] = [];
+    let pageToken = "";
+    do {
+      const page = await client.listOrganizations({ pageSize: 2, pageToken });
+      ids.push(...page.organizations.map((o) => o.organizationId));
+      pageToken = page.nextPageToken;
+    } while (pageToken !== "");
+    const all = await client.listOrganizations({ pageSize: 200 });
+    expect(ids).toEqual(all.organizations.map((o) => o.organizationId));
+    expect(new Set(ids).size).toBe(6);
+    expect(
+      all.organizations.find((o) => o.organizationId === MOCK_IDS.northwind)!
+        .callerRole,
+    ).toBe(Role.MEMBER);
+  });
+
+  test("returns a token and then an empty last page when the rows fill the page exactly", async () => {
+    const client = createClient(OrganizationService, createMockTransport());
+    const first = await client.listOrganizations({ pageSize: 2 });
+    expect(first.organizations).toHaveLength(2);
+    expect(first.nextPageToken).not.toBe("");
+    const last = await client.listOrganizations({
+      pageSize: 2,
+      pageToken: first.nextPageToken,
+    });
+    expect(last.organizations).toHaveLength(0);
+    expect(last.nextPageToken).toBe("");
+  });
+
+  test("rejects a token that names no row", async () => {
+    const client = createClient(OrganizationService, createMockTransport());
+    const error = await client
+      .listOrganizations({ pageToken: "unknown" })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.InvalidArgument);
   });
 });
