@@ -226,7 +226,9 @@ func TestSTUNAddrDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(dockerfile), "\nENV "+EnvSTUNAddr+"=0.0.0.0:3478\n") {
+	// A Windows checkout with core.autocrlf has CRLF line endings, which
+	// Docker accepts; compare the lines, not the line endings.
+	if !strings.Contains(strings.ReplaceAll(string(dockerfile), "\r\n", "\n"), "\nENV "+EnvSTUNAddr+"=0.0.0.0:3478\n") {
 		t.Errorf("Dockerfile does not set %s=0.0.0.0:3478", EnvSTUNAddr)
 	}
 }
