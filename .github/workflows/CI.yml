@@ -440,9 +440,6 @@ jobs:
                 # The HTTP observer receives no response for a request that
                 # starts with CRLF after a POST.
                 servers/accounts-api/internal/server
-                # The relay test that blocks socket writes ends with
-                # `context canceled` before the idle timeout.
-                servers/ownsand-api/internal/api
               )
               ;;
             *)
