@@ -148,8 +148,8 @@ func (h *handler) finish(code int, updated, stopRequested bool) (bool, uint32) {
 	return serviceSpecific, exit
 }
 
-func serviceDefinition(exe string) string {
-	return service.WindowsDefinition(exe, serviceEnv())
+func serviceDefinition(exe, stateDir string) string {
+	return service.WindowsDefinition(exe, serviceEnv(stateDir))
 }
 
 // setServiceEnvironment writes the REG_MULTI_SZ Environment value of the
@@ -164,7 +164,7 @@ func setServiceEnvironment(entries []string) error {
 	return k.SetStringsValue(service.WindowsEnvironmentValue, entries)
 }
 
-func serviceInstall(stdout, stderr io.Writer) int {
+func serviceInstall(stateDir string, stdout, stderr io.Writer) int {
 	exe, err := os.Executable()
 	if err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
@@ -199,7 +199,7 @@ func serviceInstall(stdout, stderr io.Writer) int {
 	// so the OWNSAND_AGENT_* variables go into the service Environment value
 	// before the service can start. Only names and the count are logged:
 	// values can hold secrets such as release keys.
-	env := serviceEnv()
+	env := serviceEnv(stateDir)
 	if err := service.InstallWindowsEnvironment(env, setServiceEnvironment, s.Delete); err != nil {
 		slog.New(slog.NewJSONHandler(stderr, nil)).With("component", "ownsand-agent").Error("service environment write failed", "service", service.Name, "variable_count", len(env), "variables", environmentNames(env), "error", err.Error())
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
