@@ -40,9 +40,17 @@ type snapshot struct {
 	// users counts the creates and exports that read the content now; a
 	// delete waits until it is zero.
 	users int
-	// deleting is set when a delete arrived while users was not zero. The
-	// snapshot takes no new users, and the last user deletes it.
+	// deleting is set when a delete arrived while users was not zero, or when
+	// a removal started. The snapshot takes no new users, and the last user
+	// deletes it. The entry leaves Manager.snapshots only after the stored
+	// record and content were removed, so a failed removal stays visible in
+	// the state report and a repeated delete can retry it.
 	deleting bool
+	// removeMu serializes the removals of this snapshot: an explicit delete,
+	// the release of the last reader and the removal that an import runs
+	// before it replaces the copy. It is taken before Manager.mu, never while
+	// Manager.mu is held.
+	removeMu sync.Mutex
 }
 
 // pendingSnapshot marks a snapshot whose content the runtime is capturing.
@@ -106,7 +114,7 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	m.mu.Lock()
 	if snap, ok := m.snapshots[id]; ok {
 		m.mu.Unlock()
-		return snap.entry(), nil
+		return existingSnapshotEntry(snap)
 	}
 	sb, ok := m.sandboxes[cmd.GetSandboxId()]
 	m.mu.Unlock()
@@ -121,7 +129,7 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	// snapshot that the first create published.
 	if snap, ok := m.snapshots[id]; ok {
 		m.mu.Unlock()
-		return snap.entry(), nil
+		return existingSnapshotEntry(snap)
 	}
 	m.mu.Unlock()
 	if state != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && state != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
@@ -170,8 +178,17 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 	info, err := m.rt.Snapshot(ctx, vm, filepath.Join(dir, contentDir))
 	if err != nil {
 		os.RemoveAll(dir)
-		m.logger.Error("snapshot failed", "snapshot_id", id, "error", err)
+		m.logger.Error("snapshot failed", "snapshot_id", id, "sandbox_id", cmd.GetSandboxId(), "error", err)
+		if state == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING && info.SourceState == ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
+			m.recordSourcePausedAfterSnapshot(sb)
+		}
 		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be taken")
+	}
+	// A runtime can return success after ctx ended, for example when it
+	// ignores the cancellation of its disk copy. The command result can no
+	// longer reach the control plane, so the capture is not published.
+	if err := ctx.Err(); err != nil {
+		return nil, m.abortCanceledSnapshotCreate(id, dir, err)
 	}
 	if m.snapshotDeletedDuringCreate(pending) {
 		return nil, m.abortSnapshotCreate(id, dir)
@@ -205,11 +222,51 @@ func (m *Manager) CreateSnapshot(ctx context.Context, cmd *ownsandv1.CreateSnaps
 		_ = m.st.DeleteSnapshot(id)
 		return nil, m.abortedSnapshotError(id)
 	}
+	// The same critical section checks the cancellation, so that a capture
+	// whose context ended while the record was saved is never published.
+	if err := ctx.Err(); err != nil {
+		delete(m.pending, id)
+		m.mu.Unlock()
+		published = true // The pending entry is already removed.
+		if derr := m.st.DeleteSnapshot(id); derr != nil {
+			m.logger.Error("canceled snapshot could not be removed", "snapshot_id", id, "error", derr)
+		}
+		return nil, m.canceledSnapshotError(id, err)
+	}
 	m.snapshots[snap.rec.SnapshotID] = snap
 	delete(m.pending, id)
 	m.mu.Unlock()
 	published = true
 	m.logger.Info("snapshot ready", "snapshot_id", snap.rec.SnapshotID, "size_bytes", snap.rec.SizeBytes, "has_memory_state", snap.rec.HasMemoryState)
+	return snap.entry(), nil
+}
+
+// recordSourcePausedAfterSnapshot publishes the paused state of a source
+// sandbox that the runtime paused for a capture and could not resume (see
+// vmruntime.SnapshotInfo.SourceState). The VM is paused while the record says
+// running, and a resume command that finds a running record returns success
+// without reaching the runtime, so the record must follow the VM. The caller
+// holds sb.cmdMu, so no other command of the sandbox moves its state meanwhile;
+// the guard skips a sandbox that ended or was dropped in the meantime. The
+// snapshot stays failed when the state cannot be published: the failure is
+// only logged, because the snapshot error is the result of the command.
+func (m *Manager) recordSourcePausedAfterSnapshot(sb *sandbox) {
+	id := sb.rec.SandboxID
+	_, err := m.updateIf(sb, func() bool {
+		return m.sandboxes[id] == sb && !sb.ending && sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_RUNNING
+	}, func(r *Record) { r.State = ownsandv1.SandboxState_SANDBOX_STATE_PAUSED })
+	if err != nil {
+		m.logger.Error("sandbox paused by a failed snapshot could not be recorded as paused", "sandbox_id", id, "error", err)
+	}
+}
+
+// existingSnapshotEntry answers a create for a snapshot ID that the device
+// already holds. A copy that a delete or a failed removal marked is not
+// returned as ready: the create fails until the removal finished.
+func existingSnapshotEntry(snap *snapshot) (*ownsandv1.SnapshotStateEntry, error) {
+	if !snap.usable() {
+		return nil, cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot is being deleted")
+	}
 	return snap.entry(), nil
 }
 
@@ -229,6 +286,21 @@ func (m *Manager) abortSnapshotCreate(id, dir string) error {
 		m.logger.Error("aborted snapshot content could not be removed", "snapshot_id", id, "error", err)
 	}
 	return m.abortedSnapshotError(id)
+}
+
+// abortCanceledSnapshotCreate removes the record and content of a capture
+// whose context ended before publication and returns the error of the
+// create. The pending entry is removed by the caller's deferred cleanup.
+func (m *Manager) abortCanceledSnapshotCreate(id, dir string, cause error) error {
+	if err := removeDirIfExists(dir); err != nil {
+		m.logger.Error("canceled snapshot content could not be removed", "snapshot_id", id, "error", err)
+	}
+	return m.canceledSnapshotError(id, cause)
+}
+
+func (m *Manager) canceledSnapshotError(id string, cause error) error {
+	m.logger.Info("snapshot create aborted by a canceled command", "snapshot_id", id, "error", cause)
+	return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_ABORTED, "snapshot create was canceled")
 }
 
 func (m *Manager) abortedSnapshotError(id string) error {
@@ -260,23 +332,22 @@ func (m *Manager) snapshotReleaser(snap *snapshot) func() {
 			snap.users--
 			id := snap.rec.SnapshotID
 			remove := snap.deleting && snap.users == 0 && m.snapshots[id] == snap
-			if remove {
-				delete(m.snapshots, id)
-			}
 			m.mu.Unlock()
 			if remove {
 				// The command result was sent when the delete was deferred,
-				// so a failure here is only logged; the copy stays on disk
-				// until a restart reloads it and the control plane sends the
-				// delete again after the next state report.
-				_ = m.removeSnapshot(id)
+				// so a failure here is only logged. The entry stays in
+				// m.snapshots (unusable), so the next state report lists the
+				// copy and the control plane sends the delete again; the
+				// copy also stays on disk until a restart reloads it.
+				if err := m.removeSnapshotEntry(snap); err != nil {
+					m.logger.Error("snapshot removal after its last reader failed; the copy stays in the state report", "snapshot_id", id)
+				}
 			}
 		})
 	}
 }
 
-// removeSnapshot deletes the stored record and content of a snapshot that
-// is no longer in m.snapshots.
+// removeSnapshot deletes the stored record and content of a snapshot.
 func (m *Manager) removeSnapshot(id string) error {
 	if err := m.st.DeleteSnapshot(id); err != nil {
 		m.logger.Error("snapshot delete failed", "snapshot_id", id, "error", err)
@@ -286,8 +357,65 @@ func (m *Manager) removeSnapshot(id string) error {
 	return nil
 }
 
+// removeSnapshotEntry removes the stored record and content of snap and then
+// its entry. The entry stays in m.snapshots, unusable, until the removal
+// succeeded, so a failed removal is still reported and a repeated delete
+// finds it. Removals of one snapshot run one at a time (snap.removeMu); a
+// removal that finds the entry gone or replaced does nothing, so a second
+// cleanup never deletes the content of a replacement copy.
+func (m *Manager) removeSnapshotEntry(snap *snapshot) error {
+	id := snap.rec.SnapshotID
+	snap.removeMu.Lock()
+	defer snap.removeMu.Unlock()
+	m.mu.Lock()
+	if m.snapshots[id] != snap || snap.users > 0 {
+		// Another removal finished first, or a reader is still active; the
+		// last reader removes the snapshot.
+		m.mu.Unlock()
+		return nil
+	}
+	snap.deleting = true
+	m.mu.Unlock()
+	if err := m.removeSnapshot(id); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	if m.snapshots[id] == snap {
+		delete(m.snapshots, id)
+	}
+	m.mu.Unlock()
+	return nil
+}
+
+// PrepareSnapshotImport finishes the removal of a copy that a delete marked
+// before an import replaces its content, so the import never overwrites a
+// copy that is being removed or that a reader still reads. It fails with
+// INTERNAL when the removal fails, with FAILED_PRECONDITION while a reader
+// still uses the copy, and does nothing when the device holds no copy. The
+// caller holds the import lock of id (LockSnapshotImport).
+func (m *Manager) PrepareSnapshotImport(id string) error {
+	m.mu.Lock()
+	snap, ok := m.snapshots[id]
+	if !ok {
+		m.mu.Unlock()
+		return nil
+	}
+	if snap.usable() {
+		m.mu.Unlock()
+		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot is already ready on this device")
+	}
+	if snap.users > 0 {
+		m.mu.Unlock()
+		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION, "snapshot is being deleted and still read")
+	}
+	m.mu.Unlock()
+	return m.removeSnapshotEntry(snap)
+}
+
 // DeleteSnapshot deletes the local copy of a snapshot whose record the
-// control plane deleted. It succeeds when the device holds no copy. While
+// control plane deleted. It succeeds when the device holds no copy. The copy
+// stays in the state report, unusable, until its removal succeeded: a removal
+// failure returns INTERNAL and a repeated delete retries it. While
 // a create or an export reads the copy, the snapshot takes no new users and
 // the last of the current users deletes it; the command succeeds at once,
 // because the control plane sends it only once while the agent channel
@@ -320,9 +448,11 @@ func (m *Manager) DeleteSnapshot(cmd *ownsandv1.DeleteSnapshotCommand) error {
 		m.logger.Info("snapshot delete deferred until its readers end", "snapshot_id", id, "users", users)
 		return nil
 	}
-	delete(m.snapshots, id)
+	// Mark the copy under the lock, so that no reader starts before the
+	// removal; the entry leaves m.snapshots only when the removal succeeded.
+	snap.deleting = true
 	m.mu.Unlock()
-	return m.removeSnapshot(id)
+	return m.removeSnapshotEntry(snap)
 }
 
 // SnapshotContent returns the content directory and entry of a ready local

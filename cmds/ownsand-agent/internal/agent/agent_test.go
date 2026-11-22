@@ -502,6 +502,88 @@ func TestRemovalCleansUpHostNetwork(t *testing.T) {
 	}
 }
 
+// failFirstDeleteRuntime fails the first Delete call and counts all calls.
+type failFirstDeleteRuntime struct {
+	vmruntime.Runtime
+	mu          sync.Mutex
+	deleteCalls int
+}
+
+func (r *failFirstDeleteRuntime) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	r.deleteCalls++
+	first := r.deleteCalls == 1
+	r.mu.Unlock()
+	if first {
+		return errors.New("injected stop failure")
+	}
+	return r.Runtime.Delete(ctx, id)
+}
+
+// TestRemovalRetriesFailedSandboxDeletion checks that a runtime deletion
+// that fails during the device removal keeps the clean-up pending, with the
+// sandbox record on disk and no removal confirmation, and that the retry of
+// the removal (the interrupted-removal path of the next agent start) deletes
+// the sandbox again and confirms the removal only then.
+func TestRemovalRetriesFailedSandboxDeletion(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	var rt *failFirstDeleteRuntime
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt = &failFirstDeleteRuntime{Runtime: o.Runtime}
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, _ := uuidv7.NewString()
+	if res := h.command(createCommand(sandboxID)); res.GetCreateSandbox().GetSandbox().GetState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("create result %v", res)
+	}
+	cp.MarkRemoved(id.DeviceID)
+	cmdID, _ := uuidv7.NewString()
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Command{Command: &ownsandv1.AgentCommand{CommandId: cmdID, Command: &ownsandv1.AgentCommand_CleanUp{CleanUp: &ownsandv1.CleanUpCommand{}}}}})
+	select {
+	case err := <-h.errc:
+		if err == nil || errors.Is(err, ErrRemoved) {
+			t.Fatalf("run returned %v, want the failed deletion", err)
+		}
+		h.errc <- err
+	case <-time.After(20 * time.Second):
+		t.Fatal("agent did not finish the first removal attempt")
+	}
+	rt.mu.Lock()
+	calls := rt.deleteCalls
+	rt.mu.Unlock()
+	if calls != 1 {
+		t.Fatalf("Delete calls after the first attempt = %d, want 1", calls)
+	}
+	if cp.Confirms() != 0 {
+		t.Fatal("removal confirmed although the clean-up failed")
+	}
+	if state, err := st.LoadAgent(); err != nil || !state.Removal.NoticeReceived || state.Removal.CleanupDone {
+		t.Fatalf("removal state after the failed clean-up: %+v, %v", state.Removal, err)
+	}
+	if _, err := os.Stat(st.Path(store.SandboxesDir, sandboxID+".json")); err != nil {
+		t.Fatalf("sandbox record after the failed clean-up: %v", err)
+	}
+
+	// The retry: the next agent start continues the interrupted removal.
+	h2 := start(t, cp, st, id)
+	select {
+	case err := <-h2.errc:
+		if !errors.Is(err, ErrRemoved) {
+			t.Fatalf("retry returned %v", err)
+		}
+		h2.errc <- err
+	case <-time.After(20 * time.Second):
+		t.Fatal("agent did not finish the retried removal")
+	}
+	if cp.Confirms() != 1 {
+		t.Fatalf("removal confirmations = %d, want 1", cp.Confirms())
+	}
+	requireEmptyStateDir(t, st)
+}
+
 func TestInterruptedRemovalTreatsUnknownDeviceAsConfirmed(t *testing.T) {
 	cp := testcp.New(t)
 	st, id := enrollDevice(t, cp)
@@ -1490,5 +1572,13 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 	h.agent.handleCommand(chanCtx, context.Background(), &ownsandv1.AgentCommand{CommandId: snapID, Command: &ownsandv1.AgentCommand_CreateSnapshot{CreateSnapshot: &ownsandv1.CreateSnapshotCommand{SnapshotId: snapID, SandboxId: sandboxID}}}, 0)
 	if err := <-rt.ctxErr; err == nil {
 		t.Fatal("snapshot capture ran on a context that outlives its channel")
+	}
+	// The runtime completed the capture although its channel ended. The
+	// snapshot must not become known or ready.
+	if h.agent.Sandboxes.HasSnapshot(snapID) {
+		t.Fatal("snapshot captured after its channel ended is known to the manager")
+	}
+	for _, s := range h.agent.Sandboxes.StateReport(2, nil).GetSnapshots() {
+		t.Fatalf("state report holds the snapshot %v after its channel ended", s)
 	}
 }

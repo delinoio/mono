@@ -37,15 +37,23 @@ const (
 // the tests drive the poll and the suspension passes.
 func billingEnv(t *testing.T) (*testenv.Env, *accountstest.Server) {
 	t.Helper()
+	return billingEnvWith(t)
+}
+
+// billingEnvWith is billingEnv with more options, applied after the billing
+// ones.
+func billingEnvWith(t *testing.T, extra ...testenv.Option) (*testenv.Env, *accountstest.Server) {
+	t.Helper()
 	var env *testenv.Env
 	fake := accountstest.New(t, func() time.Time { return env.Clock.Now() })
-	env = testenv.New(t, testenv.WithAccounts(fake), func(o *app.Options) {
+	opts := append([]testenv.Option{testenv.WithAccounts(fake), func(o *app.Options) {
 		o.BillingStatusTiming = &billing.StatusTiming{Poll: time.Hour, Tick: time.Hour, UnlinkBackoffMin: time.Second, UnlinkBackoffMax: 5 * time.Minute}
 		o.BillingEnforceInterval = time.Hour
 		// No usage report in the background: its statuses would refresh the
 		// sync time that the fail-open test lets age.
 		o.BillingTiming = &billing.Timing{Flush: time.Hour, Tick: time.Hour, Report: time.Hour, BackoffMin: time.Second, BackoffMax: time.Minute}
-	})
+	}}, extra...)
+	env = testenv.New(t, opts...)
 	return env, fake
 }
 
@@ -262,17 +270,24 @@ func (g *gateFixture) openCalls() []gatedCall {
 }
 
 // expectGates checks every gated and open call in the phase: the calls in
-// rejected fail with reason, every other call has no billing error.
+// rejected fail with reason, every other gated call has no billing error
+// (it may still fail for another reason, such as a missing ID), and every
+// open call succeeds.
 func (g *gateFixture) expectGates(t *testing.T, rejected map[string]bool, reason ownsandv1.BillingReason) {
 	t.Helper()
 	ctx := context.Background()
 	all := append(append(g.blockedCalls(), g.suspendedCalls()...), g.openCalls()...)
 	for _, c := range all {
-		if !rejected[c.name] {
+		err := c.call(ctx)
+		got := billingReasonOf(t, c.name, err)
+		if rejected[c.name] {
+			if got != reason {
+				t.Errorf("%s: billing reason = %v, want %v", c.name, got, reason)
+			}
 			continue
 		}
-		if got := billingReasonOf(t, c.name, c.call(ctx)); got != reason {
-			t.Errorf("%s: billing reason = %v, want %v", c.name, got, reason)
+		if got != ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED {
+			t.Errorf("%s: unexpected billing reason %v", c.name, got)
 		}
 	}
 	for _, c := range g.openCalls() {
@@ -418,7 +433,16 @@ func TestBillingPhasesOfLinkedOrganization(t *testing.T) {
 	pollBilling(t, env)
 	enforceBilling(t, env)
 	waitState(t, c, org.ID, running, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
-	testenv.Eventually(t, "the billing mark is cleared", func() bool { return !pausedByBilling(t, env, running) })
+	// The mark is durable billing pause ownership: the resume keeps it, and a
+	// stable pass sends the RUNNING sandbox no command.
+	if !pausedByBilling(t, env, running) {
+		t.Fatal("the recovery cleared the billing mark of the resumed sandbox")
+	}
+	resumes := resumeCommands(agent, running)
+	enforceBilling(t, env)
+	if got := resumeCommands(agent, running); got != resumes || !pausedByBilling(t, env, running) {
+		t.Fatalf("a stable pass changed the marked RUNNING sandbox: resume commands %d -> %d, marked=%v", resumes, got, pausedByBilling(t, env, running))
+	}
 	if s := getSandbox(t, c, org.ID, userPaused); s.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_PAUSED {
 		t.Fatalf("the caller-paused sandbox is %v", s.GetState())
 	}

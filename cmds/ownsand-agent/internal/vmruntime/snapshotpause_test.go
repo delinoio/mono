@@ -9,6 +9,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
@@ -37,7 +39,7 @@ func (c *snapshotCalls) order() string { return strings.Join(c.calls, ",") }
 func TestSnapshotWithPauseSuccess(t *testing.T) {
 	c := &snapshotCalls{}
 	info, err := c.run(false)
-	if err != nil || info.SizeBytes != 7 || !info.HasMemoryState {
+	if err != nil || info.SizeBytes != 7 || !info.HasMemoryState || info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED {
 		t.Fatalf("info %+v err %v, want the captured info", info, err)
 	}
 	if c.order() != "pause,capture,resume" {
@@ -52,8 +54,8 @@ func TestSnapshotWithPauseResumeFailureFailsSnapshot(t *testing.T) {
 	if !errors.Is(err, resumeErr) || !strings.Contains(err.Error(), "resume after snapshot") {
 		t.Fatalf("error %v, want the resume error", err)
 	}
-	if !reflect.DeepEqual(info, SnapshotInfo{}) {
-		t.Fatalf("info %+v, want zero", info)
+	if want := (SnapshotInfo{SourceState: ownsandv1.SandboxState_SANDBOX_STATE_PAUSED}); !reflect.DeepEqual(info, want) {
+		t.Fatalf("info %+v, want %+v: the source stays paused and no capture is usable", info, want)
 	}
 }
 
@@ -71,8 +73,8 @@ func TestSnapshotWithPauseCaptureErrorWinsAndKeepsResumeDiagnostic(t *testing.T)
 	if !strings.HasPrefix(err.Error(), captureErr.Error()) {
 		t.Fatalf("error %q must lead with the capture error", err)
 	}
-	if !reflect.DeepEqual(info, SnapshotInfo{}) {
-		t.Fatalf("info %+v, want zero", info)
+	if want := (SnapshotInfo{SourceState: ownsandv1.SandboxState_SANDBOX_STATE_PAUSED}); !reflect.DeepEqual(info, want) {
+		t.Fatalf("info %+v, want %+v", info, want)
 	}
 	if c.order() != "pause,capture,resume" {
 		t.Fatalf("calls %s, want the resume attempted after the failed capture", c.order())
@@ -82,9 +84,12 @@ func TestSnapshotWithPauseCaptureErrorWinsAndKeepsResumeDiagnostic(t *testing.T)
 func TestSnapshotWithPauseCaptureErrorOnly(t *testing.T) {
 	captureErr := errors.New("disk copy failed")
 	c := &snapshotCalls{captureErr: captureErr}
-	_, err := c.run(false)
+	info, err := c.run(false)
 	if err != captureErr {
 		t.Fatalf("error %v, want the capture error unchanged", err)
+	}
+	if info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED {
+		t.Fatalf("source state %v, want UNSPECIFIED after a successful resume", info.SourceState)
 	}
 }
 
@@ -93,23 +98,23 @@ func TestSnapshotWithPauseAlreadyPaused(t *testing.T) {
 	// would fail.
 	c := &snapshotCalls{resumeErr: errors.New("must not run")}
 	info, err := c.run(true)
-	if err != nil || info.SizeBytes != 7 {
+	if err != nil || info.SizeBytes != 7 || info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED {
 		t.Fatalf("info %+v err %v", info, err)
 	}
 	if c.order() != "capture" {
 		t.Fatalf("calls %s, want capture only", c.order())
 	}
 	c = &snapshotCalls{captureErr: errors.New("boom")}
-	if _, err := c.run(true); err == nil || c.order() != "capture" {
-		t.Fatalf("err %v calls %s", err, c.order())
+	if info, err := c.run(true); err == nil || c.order() != "capture" || info.SourceState != ownsandv1.SandboxState_SANDBOX_STATE_UNSPECIFIED {
+		t.Fatalf("info %+v err %v calls %s", info, err, c.order())
 	}
 }
 
 func TestSnapshotWithPausePauseFailure(t *testing.T) {
 	pauseErr := errors.New("pause rejected")
 	c := &snapshotCalls{pauseErr: pauseErr}
-	_, err := c.run(false)
-	if err != pauseErr || c.order() != "pause" {
-		t.Fatalf("err %v calls %s", err, c.order())
+	info, err := c.run(false)
+	if err != pauseErr || c.order() != "pause" || !reflect.DeepEqual(info, SnapshotInfo{}) {
+		t.Fatalf("info %+v err %v calls %s, want the pause error, no source state change and no capture", info, err, c.order())
 	}
 }

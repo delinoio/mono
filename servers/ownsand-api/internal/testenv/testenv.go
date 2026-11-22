@@ -196,6 +196,39 @@ func (e *Env) Restart() {
 	e.start()
 }
 
+// StartPeer starts a second control plane instance over the same database
+// and returns it as an Env: its own connection pool, service value and HTTP
+// server, with the options of the first instance. The peer serves requests
+// but never runs the lease, the agent channel owner or the background
+// workers, so it behaves as an instance that does not hold the lease: a
+// caller can send RPCs to it, while commands for agents and the billing
+// worker stay with the first instance. Clients and fake agents of the first
+// instance are not bound to it; create clients with the peer's Clients.
+func (e *Env) StartPeer() *Env {
+	e.T.Helper()
+	d, err := db.Open(context.Background(), e.DB.Pool.Config().ConnString())
+	if err != nil {
+		e.T.Fatalf("open peer database pool: %v", err)
+	}
+	o := e.opts
+	o.DB = d
+	o.InstanceID = ""
+	a, err := app.New(o)
+	if err != nil {
+		d.Close()
+		e.T.Fatalf("wire peer app: %v", err)
+	}
+	srv := httptest.NewUnstartedServer(a.Handler())
+	srv.EnableHTTP2 = true
+	srv.StartTLS()
+	e.T.Cleanup(func() {
+		srv.Close()
+		d.Close()
+	})
+	peer := &Env{T: e.T, DB: d, App: a, Server: srv, Clock: e.Clock, Logs: e.Logs, Logger: e.Logger, Objects: e.Objects, opts: o, stop: func() {}}
+	return peer
+}
+
 // WithAccounts points usage reporting, the billing status poll and the
 // billing RPCs at a fake delino-accounts API.
 func WithAccounts(f *accountstest.Server) Option {

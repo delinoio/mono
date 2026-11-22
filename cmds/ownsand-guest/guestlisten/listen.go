@@ -196,11 +196,26 @@ func isStaleSocketDialError(err error) bool {
 	return runtime.GOOS == "windows" && errors.Is(err, windowsConnRefused)
 }
 
-// bindError converts the error of a failed unix bind to an error without the
-// socket path. EADDRINUSE means that another listener won the path after the
-// probe, which is the same condition as a live listener.
-func bindError(err error) error {
+// windowsAddrInUse is WSAEADDRINUSE. The syscall package of Windows defines
+// EADDRINUSE as an invented value that a Winsock error never carries, so the
+// Windows build matches the Winsock code itself.
+const windowsAddrInUse syscall.Errno = 10048
+
+// isAddrInUse reports whether err says that another listener holds the bind
+// address. goos selects the Windows Winsock code; the parameter exists so that
+// tests cover both platform branches on any host.
+func isAddrInUse(err error, goos string) bool {
 	if errors.Is(err, syscall.EADDRINUSE) {
+		return true
+	}
+	return goos == "windows" && errors.Is(err, windowsAddrInUse)
+}
+
+// bindError converts the error of a failed unix bind to an error without the
+// socket path. An address-in-use error means that another listener won the
+// path after the probe, which is the same condition as a live listener.
+func bindError(err error) error {
+	if isAddrInUse(err, runtime.GOOS) {
 		return ErrAddressInUse
 	}
 	return pathFreeError(ErrBindFailed, err)

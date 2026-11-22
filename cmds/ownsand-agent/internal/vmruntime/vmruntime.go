@@ -52,6 +52,15 @@ type SnapshotInfo struct {
 	// MacOSHardwareModel is the opaque Virtualization.framework hardware
 	// model of a macOS guest snapshot, and nil for other guests.
 	MacOSHardwareModel []byte
+	// SourceState reports a state change of the source sandbox that the
+	// snapshot attempt left behind, and is valid together with a non-nil
+	// error. SANDBOX_STATE_UNSPECIFIED means that the attempt left the source
+	// in the state that the manager recorded. SANDBOX_STATE_PAUSED means that
+	// the runtime paused a running source for the capture and could not resume
+	// it, so the VM is still paused while the manager records it as running;
+	// the manager then records the sandbox as paused, so that a later explicit
+	// resume reaches the runtime. No other value is valid.
+	SourceState ownsandv1.SandboxState
 }
 
 // MacOSHardwareModelChecker is implemented by runtimes that run macOS

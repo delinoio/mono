@@ -11,10 +11,17 @@ import (
 
 // serviceEnv carries the agent settings of the current environment into
 // the service definition on every host OS: unset and empty variables are
-// skipped.
-func serviceEnv() []string {
+// skipped. A non-empty stateDir is the value of an explicit --state-dir flag:
+// it replaces OWNSAND_AGENT_STATE_DIR of the environment (or adds it when the
+// environment does not set it), because the service does not receive the
+// flags of the installing command.
+func serviceEnv(stateDir string) []string {
 	var env []string
 	for _, name := range config.EnvNames {
+		if name == config.EnvStateDir && stateDir != "" {
+			env = append(env, name+"="+stateDir)
+			continue
+		}
 		if v, ok := os.LookupEnv(name); ok && v != "" {
 			env = append(env, name+"="+v)
 		}

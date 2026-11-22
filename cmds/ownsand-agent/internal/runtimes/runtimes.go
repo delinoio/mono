@@ -26,12 +26,29 @@ func New(cfg config.Config, st *store.Store, logger *slog.Logger) (vmruntime.Run
 		return newFirecracker(cfg, st, logger)
 	case config.RuntimeKindVirtualization:
 		kernel, rootfs := linuxImage(cfg, st)
+		recoverImage(st.Path(store.ImagesDir, images.MacOSDir), logger)
 		return vzrt.New(vzrt.Options{Kernel: kernel, Rootfs: rootfs, MacOSImage: st.Path(store.ImagesDir, images.MacOSDir),
 			VMsDir: st.Path(store.VMsDir), Logger: logger})
 	case config.RuntimeKindHyperV:
 		kernel, rootfs := linuxImage(cfg, st)
+		recoverImage(st.Path(store.ImagesDir, images.WindowsDir), logger)
 		return hcsrt.New(hcsrt.Options{Kernel: kernel, Rootfs: rootfs, WindowsImage: st.Path(store.ImagesDir, images.WindowsDir),
 			VMsDir: st.Path(store.VMsDir), Logger: logger})
 	}
 	return nil, fmt.Errorf("%w: no sandbox runtime for this host; set %s", vmruntime.ErrUnsupported, config.EnvRuntime)
+}
+
+// recoverImage restores the previous base image in dir when an image build
+// ended between the two renames of its install, so the first capability
+// report of the agent already sees the image (see images.Recover). A failure
+// is logged and does not stop the agent: the image then reads as not built.
+func recoverImage(dir string, logger *slog.Logger) {
+	res, err := images.Recover(dir)
+	if err != nil {
+		logger.Warn("recover the base image failed", "image_dir", dir, "error", err)
+		return
+	}
+	if res == images.RecoverRestored {
+		logger.Warn("restored the previous base image after an interrupted image build", "image_dir", dir)
+	}
 }

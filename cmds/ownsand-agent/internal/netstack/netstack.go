@@ -84,8 +84,29 @@ const (
 	tcpConnectTimeout = 30 * time.Second
 	// udpIdleTimeout ends a UDP flow without traffic in either direction.
 	udpIdleTimeout = 90 * time.Second
-	maxInFlightTCP = 256
+	// tcpHalfCloseIdleTimeout ends a TCP connection whose one direction has
+	// ended, once the other direction carried no data for this long. A
+	// connection with both directions open has no idle timeout.
+	tcpHalfCloseIdleTimeout = 30 * time.Second
+	maxInFlightTCP          = 256
 )
+
+// Default admission limits of one sandbox network. Each admitted flow holds
+// one host socket and goroutines of the shared agent process, and a UDP flow
+// also holds two 65535-byte relay buffers, so the limits bound what one
+// untrusted guest can make the agent open. The two transports have separate
+// limits, so a flood of one never starves the other.
+const (
+	// defaultMaxTCPConns is the value of maxInFlightTCP, the repository's
+	// bound on simultaneous TCP work for one sandbox.
+	defaultMaxTCPConns = maxInFlightTCP
+	defaultMaxUDPFlows = 256
+)
+
+// flowRejectLogInterval is the minimum time between two rejection log
+// records of one transport. Rejections in between only increase the count
+// that the next record reports.
+const flowRejectLogInterval = 5 * time.Second
 
 func init() {
 	// gvisor-tap-vsock logs through logrus; the agent logs through slog
@@ -109,6 +130,118 @@ type Options struct {
 	Logger *slog.Logger
 	// dial opens host connections; tests replace it.
 	dial func(ctx context.Context, network, address string) (net.Conn, error)
+	// limits override the admission limits and idle times; tests set it and
+	// production leaves it zero, which selects the defaults.
+	limits flowLimits
+}
+
+// flowLimits holds the admission limits and idle times of one sandbox
+// network. A zero field selects its default.
+type flowLimits struct {
+	maxUDPFlows int
+	maxTCPConns int
+	// udpIdle ends a UDP flow without traffic in either direction.
+	udpIdle time.Duration
+	// tcpHalfCloseIdle ends a TCP connection whose one direction has ended
+	// once the other direction carried no data for this long.
+	tcpHalfCloseIdle time.Duration
+}
+
+func (l flowLimits) withDefaults() flowLimits {
+	if l.maxUDPFlows <= 0 {
+		l.maxUDPFlows = defaultMaxUDPFlows
+	}
+	if l.maxTCPConns <= 0 {
+		l.maxTCPConns = defaultMaxTCPConns
+	}
+	if l.udpIdle <= 0 {
+		l.udpIdle = udpIdleTimeout
+	}
+	if l.tcpHalfCloseIdle <= 0 {
+		l.tcpHalfCloseIdle = tcpHalfCloseIdleTimeout
+	}
+	return l
+}
+
+// Transport names a transport protocol of the guest flows that the stack
+// forwards.
+type Transport string
+
+const (
+	TransportTCP Transport = "tcp"
+	TransportUDP Transport = "udp"
+)
+
+// flowSlots is the admission state of one transport.
+type flowSlots struct {
+	limit  int
+	inUse  int
+	logged bool
+	last   time.Time
+	// rejected counts the rejections since the previous log record.
+	rejected int
+}
+
+// flowLimiter bounds the concurrent guest flows of one sandbox network, with
+// separate slots per transport, and logs rejections at most once per
+// flowRejectLogInterval per transport. It never logs a destination or any
+// payload. The clock is injected so tests can drive the log interval.
+type flowLimiter struct {
+	logger *slog.Logger
+	now    func() time.Time
+	mu     sync.Mutex
+	slots  map[Transport]*flowSlots
+}
+
+func newFlowLimiter(logger *slog.Logger, limits flowLimits, now func() time.Time) *flowLimiter {
+	return &flowLimiter{logger: logger, now: now, slots: map[Transport]*flowSlots{
+		TransportTCP: {limit: limits.maxTCPConns},
+		TransportUDP: {limit: limits.maxUDPFlows},
+	}}
+}
+
+// acquire takes a slot of the transport. When the transport is full, it
+// counts and maybe logs a rejection and reports false. The returned release
+// function returns the slot, and a second call does nothing, so every path
+// of a flow can release without coordinating.
+func (l *flowLimiter) acquire(t Transport) (release func(), ok bool) {
+	l.mu.Lock()
+	s := l.slots[t]
+	if s.inUse < s.limit {
+		s.inUse++
+		l.mu.Unlock()
+		var once sync.Once
+		return func() {
+			once.Do(func() {
+				l.mu.Lock()
+				s.inUse--
+				l.mu.Unlock()
+			})
+		}, true
+	}
+	s.rejected++
+	now := l.now()
+	if s.logged && now.Sub(s.last) < flowRejectLogInterval {
+		l.mu.Unlock()
+		return nil, false
+	}
+	count, limit := s.rejected, s.limit
+	s.rejected = 0
+	s.logged = true
+	s.last = now
+	l.mu.Unlock()
+	l.logger.Warn("sandbox network stack at capacity; rejected flows",
+		slog.String("transport", string(t)),
+		slog.Int("rejected", count),
+		slog.Int("limit", limit))
+	return nil, false
+}
+
+// inUse returns the number of slots of the transport that are taken.
+func (l *flowLimiter) inUse(t Transport) int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.slots[t].inUse
 }
 
 // Network is the stack of one sandbox.
@@ -127,6 +260,8 @@ type Network struct {
 	mu     sync.Mutex
 	closed bool
 	conns  map[io.Closer]bool
+	// limiter bounds the guest TCP connections and UDP flows.
+	limiter *flowLimiter
 }
 
 // RandomMAC returns a random locally administered unicast MAC address.
@@ -151,6 +286,7 @@ func New(opts Options) (*Network, error) {
 		var d net.Dialer
 		opts.dial = d.DialContext
 	}
+	opts.limits = opts.limits.withDefaults()
 	gatewayMAC, err := RandomMAC()
 	if err != nil {
 		return nil, err
@@ -200,6 +336,7 @@ func New(opts Options) (*Network, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	n := &Network{opts: opts, logger: opts.Logger.With("sandbox_id", opts.SandboxID), stack: s, sw: sw,
 		ctx: ctx, cancel: cancel, conns: map[io.Closer]bool{}}
+	n.limiter = newFlowLimiter(n.logger, opts.limits, time.Now)
 
 	tcpFwd := tcp.NewForwarder(s, 0, maxInFlightTCP, n.forwardTCP)
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, func(id stack.TransportEndpointID, pkt *stack.PacketBuffer) bool {
@@ -326,8 +463,10 @@ func destination(addr tcpip.Address) netip.Addr {
 }
 
 // forwardTCP opens the host connection of one guest TCP connection after
-// the filter allowed its destination, and then completes the guest's
-// handshake. A blocked or unreachable destination gets a reset.
+// the filter allowed its destination and a connection slot is free, and then
+// completes the guest's handshake. A blocked or unreachable destination, and
+// a connection beyond the limit, get a reset. The slot is held through the
+// host dial and the relay and returns on every path.
 func (n *Network) forwardTCP(r *tcp.ForwarderRequest) {
 	id := r.ID()
 	dst := destination(id.LocalAddress)
@@ -336,10 +475,16 @@ func (n *Network) forwardTCP(r *tcp.ForwarderRequest) {
 		r.Complete(true)
 		return
 	}
+	release, ok := n.limiter.acquire(TransportTCP)
+	if !ok {
+		r.Complete(true)
+		return
+	}
 	ctx, cancel := context.WithTimeout(n.ctx, tcpConnectTimeout)
 	out, err := n.opts.dial(ctx, "tcp", net.JoinHostPort(dst.String(), strconv.Itoa(int(id.LocalPort))))
 	cancel()
 	if err != nil {
+		release()
 		r.Complete(true)
 		return
 	}
@@ -348,22 +493,80 @@ func (n *Network) forwardTCP(r *tcp.ForwarderRequest) {
 	r.Complete(false)
 	if terr != nil {
 		out.Close()
+		release()
 		return
 	}
 	in := gonet.NewTCPConn(&wq, ep)
-	n.startProxy(func() { proxy(in, out) }, in, out)
+	halfCloseIdle := n.opts.limits.tcpHalfCloseIdle
+	if !n.startProxy(func() {
+		defer release()
+		proxy(in, out, halfCloseIdle)
+	}, in, out) {
+		release()
+	}
+}
+
+// halfCloseGuard is shared by both directions of a proxy. Once one direction
+// has ended, every read and write of the other direction renews a deadline of
+// idle, so that direction ends after idle without data.
+type halfCloseGuard struct {
+	ended atomic.Bool
+	idle  time.Duration
+}
+
+type guardedReader struct {
+	net.Conn
+	g *halfCloseGuard
+}
+
+func (r guardedReader) Read(p []byte) (int, error) {
+	if r.g.ended.Load() {
+		_ = r.Conn.SetReadDeadline(time.Now().Add(r.g.idle))
+	}
+	return r.Conn.Read(p)
+}
+
+type guardedWriter struct {
+	net.Conn
+	g *halfCloseGuard
+}
+
+func (w guardedWriter) Write(p []byte) (int, error) {
+	if w.g.ended.Load() {
+		_ = w.Conn.SetWriteDeadline(time.Now().Add(w.g.idle))
+	}
+	return w.Conn.Write(p)
 }
 
 // proxy copies both directions until both ended; a side's end closes the
-// other side's write direction.
-func proxy(a, b net.Conn) {
+// other side's write direction. Once one direction has ended, the other one
+// ends after halfCloseIdle without data (any data renews the time), and then
+// proxy closes both sides, so a remote side that stays silent cannot hold the
+// flow forever. A connection with both directions open has no idle time. A
+// halfCloseIdle of zero or less disables the deadline.
+func proxy(a, b net.Conn, halfCloseIdle time.Duration) {
+	g := &halfCloseGuard{idle: halfCloseIdle}
 	done := make(chan struct{}, 2)
 	cp := func(dst, src net.Conn) {
-		_, _ = io.Copy(dst, src)
+		in, out := io.Reader(src), io.Writer(dst)
+		if halfCloseIdle > 0 {
+			in, out = guardedReader{src, g}, guardedWriter{dst, g}
+		}
+		_, _ = io.Copy(out, in)
 		if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 			_ = cw.CloseWrite()
 		} else {
 			_ = dst.Close()
+		}
+		if halfCloseIdle > 0 {
+			// The other direction reads from dst and writes to src. Set the
+			// flag first: a read or write that starts later renews its own
+			// deadline, and the deadlines set here wake the ones that are
+			// blocked already.
+			g.ended.Store(true)
+			deadline := time.Now().Add(halfCloseIdle)
+			_ = dst.SetReadDeadline(deadline)
+			_ = src.SetWriteDeadline(deadline)
 		}
 		done <- struct{}{}
 	}
@@ -376,7 +579,10 @@ func proxy(a, b net.Conn) {
 }
 
 // forwardUDP opens the host flow of one guest UDP flow (by its source and
-// destination) after the filter allowed its destination.
+// destination) after the filter allowed its destination and a flow slot is
+// free. The datagram of a new flow beyond the limit is dropped and the guest
+// application retries; datagrams of existing flows reach their endpoints
+// directly and are not affected. The slot is held until the relay ends.
 func (n *Network) forwardUDP(r *udp.ForwarderRequest) bool {
 	id := r.ID()
 	dst := destination(id.LocalAddress)
@@ -384,39 +590,99 @@ func (n *Network) forwardUDP(r *udp.ForwarderRequest) bool {
 		n.logger.Debug("guest UDP flow blocked by the network policy", "destination", dst.String(), "port", id.LocalPort)
 		return true
 	}
+	release, ok := n.limiter.acquire(TransportUDP)
+	if !ok {
+		return true
+	}
 	var wq waiter.Queue
 	ep, terr := r.CreateEndpoint(&wq)
 	if terr != nil {
+		release()
 		return true
 	}
 	in := gonet.NewUDPConn(&wq, ep)
 	out, err := n.opts.dial(n.ctx, "udp", net.JoinHostPort(dst.String(), strconv.Itoa(int(id.LocalPort))))
 	if err != nil {
 		in.Close()
+		release()
 		return true
 	}
-	n.startProxy(func() { proxyUDP(in, out, udpIdleTimeout) }, in, out)
+	idle := n.opts.limits.udpIdle
+	if !n.startProxy(func() {
+		defer release()
+		proxyUDP(in, out, idle)
+	}, in, out) {
+		release()
+	}
 	return true
+}
+
+// idleTimer tracks the shared idle time of one UDP flow. It stores the
+// elapsed time since the flow started, never a wall-clock timestamp, so a
+// forward or backward step of the system clock cannot shorten or lengthen the
+// idle lifetime. The elapsed source is injected so tests can drive it.
+type idleTimer struct {
+	elapsed func() time.Duration
+	idle    time.Duration
+	// last is the elapsed time of the latest datagram, in nanoseconds.
+	last atomic.Int64
+}
+
+// newMonotonicElapsed returns an elapsed source based on the monotonic clock
+// reading that time.Now carries; time.Since ignores wall-clock steps.
+func newMonotonicElapsed() func() time.Duration {
+	start := time.Now()
+	return func() time.Duration { return time.Since(start) }
+}
+
+func newIdleTimer(idle time.Duration, elapsed func() time.Duration) *idleTimer {
+	t := &idleTimer{elapsed: elapsed, idle: idle}
+	t.last.Store(int64(elapsed()))
+	return t
+}
+
+// touch records a datagram in either direction. The recorded time never moves
+// backward, so a slower goroutine cannot undo a newer datagram.
+func (t *idleTimer) touch() {
+	now := int64(t.elapsed())
+	for {
+		old := t.last.Load()
+		if now <= old || t.last.CompareAndSwap(old, now) {
+			return
+		}
+	}
+}
+
+// remaining returns how long the flow may stay idle; zero or less means the
+// flow is idle for at least the idle time.
+func (t *idleTimer) remaining() time.Duration {
+	return t.idle - (t.elapsed() - time.Duration(t.last.Load()))
 }
 
 // proxyUDP relays the datagrams of one flow until neither direction
 // carried a datagram for idle, or a side fails. Both directions share one
 // activity time, so a flow whose traffic goes mostly one way stays open
-// while that direction is active.
+// while that direction is active. The idle time follows the monotonic clock,
+// not the wall clock.
 func proxyUDP(in, out net.Conn, idle time.Duration) {
-	var last atomic.Int64
-	last.Store(time.Now().UnixNano())
+	proxyUDPWithClock(in, out, idle, newMonotonicElapsed())
+}
+
+func proxyUDPWithClock(in, out net.Conn, idle time.Duration, elapsed func() time.Duration) {
+	timer := newIdleTimer(idle, elapsed)
 	done := make(chan struct{}, 2)
 	relay := func(dst, src net.Conn) {
 		buf := make([]byte, 65535)
 		for {
 			// The read waits until the flow has been idle for idle since its
 			// last datagram in either direction.
-			deadline := time.Unix(0, last.Load()).Add(idle)
-			if !time.Now().Before(deadline) {
+			remaining := timer.remaining()
+			if remaining <= 0 {
 				break
 			}
-			_ = src.SetReadDeadline(deadline)
+			// time.Now carries a monotonic reading, so the deadline does not
+			// follow wall-clock steps either.
+			_ = src.SetReadDeadline(time.Now().Add(remaining))
 			k, err := src.Read(buf)
 			if err != nil {
 				var ne net.Error
@@ -426,7 +692,7 @@ func proxyUDP(in, out net.Conn, idle time.Duration) {
 				}
 				break
 			}
-			last.Store(time.Now().UnixNano())
+			timer.touch()
 			if _, err := dst.Write(buf[:k]); err != nil {
 				break
 			}
