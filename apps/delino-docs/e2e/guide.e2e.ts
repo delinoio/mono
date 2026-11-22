@@ -2,6 +2,18 @@
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
 
+// An sRGB color with 0..255 channels and a 0..1 alpha.
+type Rgba = { r: number; g: number; b: number; a: number };
+
+// Helpers that `installColorKit` attaches to `window`. `browser.evaluate`
+// serializes one function, so a test that needs color math installs the kit
+// first and reads it from the page in the function that it evaluates.
+interface ColorKit {
+  parse(color: string): Rgba;
+  resolve(name: string): Rgba;
+  ratio(foreground: Rgba, background: Rgba): number;
+}
+
 describe("guide", () => {
   test("opens the introduction from the home page", async ({
     app,
@@ -96,6 +108,87 @@ describe("brand colors", () => {
       return result;
     };
 
+  // Installs the `ColorKit` in the page. `resolve` fails on an undefined custom
+  // property, for the reason that `readBrandContrast` gives.
+  const installColorKit = () =>
+    function () {
+      const parse = (color: string): Rgba => {
+        // `color-mix()` computes to `color(srgb r g b / a)` with 0..1 channels,
+        // while `rgb()` and `rgba()` use 0..255 channels.
+        if (color.startsWith("color(") && !color.startsWith("color(srgb ")) {
+          throw new Error(`Unsupported color space in ${color}`);
+        }
+        const scale = color.startsWith("color(") ? 255 : 1;
+        const channels = (color.match(/\d*\.?\d+(?:e-?\d+)?/gi) ?? []).map(
+          Number,
+        );
+        return {
+          r: channels[0]! * scale,
+          g: channels[1]! * scale,
+          b: channels[2]! * scale,
+          a: channels[3] ?? 1,
+        };
+      };
+      const resolve = (name: string): Rgba => {
+        if (
+          !getComputedStyle(document.documentElement)
+            .getPropertyValue(name)
+            .trim()
+        ) {
+          throw new Error(`${name} is not defined`);
+        }
+        const probe = document.createElement("span");
+        document.body.append(probe);
+        probe.style.color = `var(${name})`;
+        const color = parse(getComputedStyle(probe).color);
+        probe.remove();
+        return color;
+      };
+      const luminance = ({ r, g, b }: Rgba) => {
+        const [lr, lg, lb] = [r, g, b].map((value) => {
+          const channel = value / 255;
+          return channel <= 0.03928
+            ? channel / 12.92
+            : ((channel + 0.055) / 1.055) ** 2.4;
+        });
+        return 0.2126 * lr! + 0.7152 * lg! + 0.0722 * lb!;
+      };
+      const ratio = (foreground: Rgba, background: Rgba) => {
+        const first = luminance(foreground);
+        const second = luminance(background);
+        return (
+          (Math.max(first, second) + 0.05) / (Math.min(first, second) + 0.05)
+        );
+      };
+      const kit: ColorKit = { parse, resolve, ratio };
+      (window as unknown as { colorKit: ColorKit }).colorKit = kit;
+      return true;
+    };
+
+  // Reads the hovered 404 home link and its colors against the page background.
+  const readNotFoundLink = () =>
+    function () {
+      const { colorKit: kit } = window as unknown as { colorKit: ColorKit };
+      const link = document.querySelector(".rp-not-found__home-link");
+      if (!link) {
+        throw new Error("The 404 home link is missing");
+      }
+      const style = getComputedStyle(link);
+      const background = kit.resolve("--rp-c-bg");
+      const text = kit.parse(style.color);
+      const border = kit.parse(style.borderTopColor);
+      const join = ({ r, g, b }: Rgba) => [r, g, b].join(",");
+      return {
+        hovered: link.matches(":hover"),
+        color: join(text),
+        borderColor: join(border),
+        brandDark: join(kit.resolve("--rp-c-brand-dark")),
+        brandLight: join(kit.resolve("--rp-c-brand-light")),
+        textRatio: kit.ratio(text, background),
+        borderRatio: kit.ratio(border, background),
+      };
+    };
+
   test("keeps brand text at 4.5:1 or more on every dark surface", async ({
     app,
     browser,
@@ -131,5 +224,59 @@ describe("brand colors", () => {
     expect(light.brand).toBe("59,91,253");
     expect(dark.brandDark).toBe(light.brandDark);
     expect(dark.brandDarker).toBe(light.brandDarker);
+  });
+
+  // Rspress paints the 404 home link hover (text and border) with
+  // `--rp-c-brand-dark`, which stays unchanged for the hero gradient. The
+  // theme overrides the hover in dark mode, so it must stay readable there.
+  test("keeps the 404 home link hover readable in dark mode", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/this-route-does-not-exist");
+    await browser.evaluate(installColorKit());
+    await browser.evaluate(() => {
+      document.documentElement.classList.add("rp-dark");
+      return true;
+    });
+
+    // The link text is "Take me home"; its accessible name is the aria-label.
+    await screen.getByRole("link", "go to home").hover();
+    // Rspress transitions the link colors for 0.3s, so wait for the end value.
+    await expect
+      .poll(async () => {
+        const hovered = await browser.evaluate(readNotFoundLink());
+        return hovered.hovered && hovered.color === hovered.brandLight;
+      })
+      .toBe(true);
+    const hovered = await browser.evaluate(readNotFoundLink());
+
+    expect(hovered.color).toBe("163,180,255");
+    expect(hovered.borderColor).toBe("163,180,255");
+    expect(hovered.textRatio).toBeGreaterThanOrEqual(4.5);
+    expect(hovered.borderRatio).toBeGreaterThanOrEqual(3);
+  });
+
+  test("keeps the 404 home link hover on the brand blue in light mode", async ({
+    app,
+    browser,
+    screen,
+  }) => {
+    await app.open("/this-route-does-not-exist");
+    await browser.evaluate(installColorKit());
+
+    await screen.getByRole("link", "go to home").hover();
+    await expect
+      .poll(async () => {
+        const hovered = await browser.evaluate(readNotFoundLink());
+        return hovered.hovered && hovered.color === hovered.brandDark;
+      })
+      .toBe(true);
+    const hovered = await browser.evaluate(readNotFoundLink());
+
+    expect(hovered.color).toBe(hovered.brandDark);
+    expect(hovered.borderColor).toBe(hovered.brandDark);
+    expect(hovered.textRatio).toBeGreaterThanOrEqual(4.5);
   });
 });
