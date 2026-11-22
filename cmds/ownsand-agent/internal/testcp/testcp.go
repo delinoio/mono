@@ -75,6 +75,37 @@ type Server struct {
 	relayCreds []string
 	urlBase    string
 	stallNext  bool
+	stallCh    bool
+	stallAuth  bool
+}
+
+// StallNextCreateChallenge makes the fake accept the next CreateChallenge
+// call and never answer it, as a control plane does that stalls after it
+// accepted the request. The call ends when its client gives up. Later calls
+// answer normally.
+func (s *Server) StallNextCreateChallenge() {
+	s.mu.Lock()
+	s.stallCh = true
+	s.mu.Unlock()
+}
+
+// StallNextAuthenticate makes the fake accept the next Authenticate call
+// and never answer it. The call ends when its client gives up. Later calls
+// answer normally.
+func (s *Server) StallNextAuthenticate() {
+	s.mu.Lock()
+	s.stallAuth = true
+	s.mu.Unlock()
+}
+
+// stalled reports whether the unary call that flag guards must stall, and
+// clears the flag.
+func (s *Server) stalled(flag *bool) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	was := *flag
+	*flag = false
+	return was
 }
 
 // StallNextChannelReads makes the fake never read from the next agent
@@ -142,7 +173,11 @@ func (s *Server) Enroll(_ context.Context, req *connect.Request[ownsandv1.Enroll
 }
 
 // CreateChallenge implements AgentService.
-func (s *Server) CreateChallenge(_ context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
+func (s *Server) CreateChallenge(ctx context.Context, req *connect.Request[ownsandv1.CreateChallengeRequest]) (*connect.Response[ownsandv1.CreateChallengeResponse], error) {
+	if s.stalled(&s.stallCh) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if _, ok := s.devices[req.Msg.GetDeviceId()]; !ok {
@@ -170,7 +205,11 @@ func (s *Server) checkSignature(deviceID string, nonce, sig []byte, purpose stri
 }
 
 // Authenticate implements AgentService.
-func (s *Server) Authenticate(_ context.Context, req *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
+func (s *Server) Authenticate(ctx context.Context, req *connect.Request[ownsandv1.AuthenticateRequest]) (*connect.Response[ownsandv1.AuthenticateResponse], error) {
+	if s.stalled(&s.stallAuth) {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	d, err := s.checkSignature(req.Msg.GetDeviceId(), req.Msg.GetNonce(), req.Msg.GetSignature(), identity.PurposeAuthenticate)
