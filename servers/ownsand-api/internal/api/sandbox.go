@@ -364,11 +364,11 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		idle, maxTTL := m.GetIdleTtl().AsDuration(), m.GetMaxTtl().AsDuration()
 		if _, err := tx.Exec(ctx, `INSERT INTO sandboxes (sandbox_id, organization_id, device_id, agent_state, source_base_image, source_snapshot_id,
 			source_template_id, resolved_snapshot_id, vcpu_count, memory_mib, disk_gib, guest_os, host_os, arch, network_mode, labels,
-			idle_ttl_ms, max_ttl_ms, idle_deadline, max_deadline, machine_lineage, created_by_kind, created_by_id, create_time)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`,
+			idle_ttl_ms, max_ttl_ms, idle_ttl_ns, max_ttl_ns, idle_deadline, max_deadline, machine_lineage, created_by_kind, created_by_id, create_time)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`,
 			sandboxID, orgID, decision.DeviceID, int16(ownsandv1.SandboxState_SANDBOX_STATE_CREATING), base, srcSnapshot, srcTemplate, resolved,
 			sreq.VCPUCount, sreq.MemoryMiB, sreq.DiskGiB, int16(sreq.GuestOS), int16(hostOS), int16(arch), int16(network), labels,
-			idle.Milliseconds(), maxTTL.Milliseconds(), now.Add(idle), now.Add(maxTTL), machine, int16(p.Kind), p.ID, now); err != nil {
+			idle.Milliseconds(), maxTTL.Milliseconds(), idle.Nanoseconds(), maxTTL.Nanoseconds(), now.Add(idle), now.Add(maxTTL), machine, int16(p.Kind), p.ID, now); err != nil {
 			return err
 		}
 		tag, err := tx.Exec(ctx, `INSERT INTO sandbox_create_keys (organization_id, idempotency_key, request_sha256, sandbox_id, expire_time)

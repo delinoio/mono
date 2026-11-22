@@ -54,7 +54,7 @@ const sandboxSelect = `SELECT s.sandbox_id::text, s.organization_id::text, s.dev
 	s.revision_epoch, s.revision_counter, s.delete_pending, COALESCE(s.delete_end_reason, 0), COALESCE(s.delete_actor_kind, 0), COALESCE(s.delete_actor_id, ''),
 	COALESCE(s.source_base_image, 0), COALESCE(s.source_snapshot_id::text, ''), COALESCE(s.source_template_id::text, ''), COALESCE(s.resolved_snapshot_id::text, ''),
 	s.vcpu_count, s.memory_mib, s.disk_gib, s.guest_os, s.host_os, s.arch, s.network_mode, s.labels,
-	s.idle_ttl_ms, s.max_ttl_ms, s.idle_deadline, s.max_deadline, s.restore_path, COALESCE(s.machine_lineage::text, ''),
+	COALESCE(s.idle_ttl_ns, s.idle_ttl_ms * 1000000), COALESCE(s.max_ttl_ns, s.max_ttl_ms * 1000000), s.idle_deadline, s.max_deadline, s.restore_path, COALESCE(s.machine_lineage::text, ''),
 	s.created_by_kind, s.created_by_id, s.create_time, s.end_time, COALESCE(d.state, 3)
 	FROM sandboxes s LEFT JOIN devices d ON d.device_id = s.device_id`
 
@@ -63,10 +63,10 @@ func scanSandbox(row pgx.Row) (*sandboxRow, error) {
 	var agentState, endReason, delReason, delKind, base, guest, host, arch, network, restore, createdKind, devState int16
 	var counter int64
 	var labels []byte
-	var idleMs, maxMs int64
+	var idleNs, maxNs int64
 	if err := row.Scan(&r.ID, &r.OrgID, &r.DeviceID, &agentState, &endReason, &r.Epoch, &counter, &r.DeletePending, &delReason, &delKind, &r.DeleteActor.ID,
 		&base, &r.SourceSnapshotID, &r.SourceTemplateID, &r.ResolvedSnapshotID, &r.VCPUCount, &r.MemoryMiB, &r.DiskGiB, &guest, &host, &arch, &network, &labels,
-		&idleMs, &maxMs, &r.IdleDeadline, &r.MaxDeadline, &restore, &r.MachineLineage, &createdKind, &r.CreatedBy.ID, &r.CreateTime, &r.EndTime, &devState); err != nil {
+		&idleNs, &maxNs, &r.IdleDeadline, &r.MaxDeadline, &restore, &r.MachineLineage, &createdKind, &r.CreatedBy.ID, &r.CreateTime, &r.EndTime, &devState); err != nil {
 		return nil, err
 	}
 	r.AgentState = ownsandv1.SandboxState(agentState)
@@ -79,8 +79,8 @@ func scanSandbox(row pgx.Row) (*sandboxRow, error) {
 	r.HostOS = ownsandv1.HostOs(host)
 	r.Arch = ownsandv1.Arch(arch)
 	r.NetworkMode = ownsandv1.NetworkMode(network)
-	r.IdleTTL = time.Duration(idleMs) * time.Millisecond
-	r.MaxTTL = time.Duration(maxMs) * time.Millisecond
+	r.IdleTTL = time.Duration(idleNs)
+	r.MaxTTL = time.Duration(maxNs)
 	r.RestorePath = ownsandv1.SandboxRestorePath(restore)
 	r.CreatedBy.Kind = ownsandv1.PrincipalKind(createdKind)
 	r.DeviceState = ownsandv1.DeviceState(devState)
