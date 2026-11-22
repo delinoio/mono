@@ -257,6 +257,60 @@ func TestLeaseExpiresWhileRenewalBlocked(t *testing.T) {
 	}
 }
 
+// TestWaitIgnoresExpiredAcquisition checks that Wait does not report a lease
+// whose confirmed expiry has passed before the watcher recorded the loss: the
+// acquisition channel is still closed then. Wait must record the loss itself,
+// block until a current acquisition or the end of its context, and not spin.
+func TestWaitIgnoresExpiredAcquisition(t *testing.T) {
+	clock := newTestClock()
+	l, lost := newTestLease()
+	l.DeadlineNow = clock.Now
+	acquireFor(t, l, clock.Now().Add(TTL))
+
+	// A current acquisition returns at once.
+	if err := l.Wait(context.Background()); err != nil {
+		t.Fatalf("Wait with a current lease: %v", err)
+	}
+
+	// The expiry passes and no watcher runs, so the loss is not recorded yet.
+	clock.Advance(TTL)
+	if l.Held() {
+		t.Fatal("the instance holds the lease at the confirmed expiry")
+	}
+
+	// Wait ends only with its own context. Count the loops through the loss
+	// callback: a spin on the closed channel would never record the loss, and
+	// a Wait that returned nil would fail the check below.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := l.Wait(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Wait for an expired lease returned %v, want the context error", err)
+	}
+	if got := lost.Load(); got != 1 {
+		t.Fatalf("OnLose ran %d times, want 1 (Wait records the expiry once)", got)
+	}
+
+	// A waiter that is blocked returns when a new period is acquired.
+	waitDone := make(chan error, 1)
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer waitCancel()
+	go func() { waitDone <- l.Wait(waitCtx) }()
+	select {
+	case err := <-waitDone:
+		t.Fatalf("Wait returned %v without a current lease", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	acquireFor(t, l, clock.Now().Add(TTL))
+	select {
+	case err := <-waitDone:
+		if err != nil {
+			t.Fatalf("Wait after the new acquisition: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Wait did not return after the new acquisition")
+	}
+}
+
 // TestLeaseAcquireCallbackBoundedByExpiry checks that the work that runs on
 // acquisition cannot delay the expiry transition: its context ends at the
 // confirmed expiry, so a callback that waits on I/O (a database read) returns
