@@ -63,9 +63,10 @@ func invitationEmail(value string) (string, error) {
 	return addr, nil
 }
 
-// userIDField checks a Logto user ID in a request.
+// userIDField checks a Logto user ID in a request: 1 to 256 bytes of valid
+// UTF-8 without a NUL character, which Postgres cannot store in text.
 func userIDField(value string) (string, error) {
-	if value == "" || len(value) > maxUserIDBytes || !utf8.ValidString(value) {
+	if value == "" || len(value) > maxUserIDBytes || !utf8.ValidString(value) || strings.ContainsRune(value, 0) {
 		return "", invalidArgument("user_id must be a Logto user ID")
 	}
 	return value, nil

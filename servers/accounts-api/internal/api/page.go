@@ -5,6 +5,7 @@ package api
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 )
 
 // Page sizes of every list RPC.
@@ -50,14 +51,19 @@ func encodePageToken(tok pageToken) string {
 }
 
 // decodePageToken returns the token for the RPC and scope, the zero token
-// for an empty string, and invalid_argument for any other value.
+// for an empty string, and invalid_argument for any other value. Because
+// tokens are not signed, the position is checked too: a negative time
+// (the server issues none) and a NUL character in the sort key (which
+// Postgres cannot store in text) are invalid, so a forged token never
+// reaches a query that fails with an internal error.
 func decodePageToken(raw, rpc, scope string) (pageToken, error) {
 	if raw == "" {
 		return pageToken{}, nil
 	}
 	body, err := base64.RawURLEncoding.DecodeString(raw)
 	var tok pageToken
-	if err != nil || json.Unmarshal(body, &tok) != nil || tok.RPC != rpc || tok.Scope != scope || tok.After == "" {
+	if err != nil || json.Unmarshal(body, &tok) != nil || tok.RPC != rpc || tok.Scope != scope || tok.After == "" ||
+		tok.AfterTime < 0 || strings.ContainsRune(tok.After, 0) {
 		return pageToken{}, invalidArgument("page_token is not valid for this request")
 	}
 	return tok, nil
