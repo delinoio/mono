@@ -6,14 +6,24 @@
 # before the deployment has a final status. These helpers read the deployment
 # ID and wait for an explicit terminal status. Droplet server deployments need
 # no helper: `droplet-deploy.sh` waits for the health check itself and its
-# exit code is the verdict.
+# exit code is the verdict. `backup-database` creates an on-demand backup of a
+# PlanetScale Postgres branch and waits until its state is `success`, then
+# prints the backup ID.
 #
 # Usage:
 #   deploy-provider.sh pages-id <wrangler-output-file>
 #   deploy-provider.sh wait-pages <project> <deployment-id>
+#   deploy-provider.sh backup-database <database> <branch> <backup-name>
 #
 # Environment:
 #   CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID  for wait-pages.
+#   PLANETSCALE_ORGANIZATION, PLANETSCALE_SERVICE_TOKEN  for backup-database.
+#                         The service token needs the `write_backups` and
+#                         `read_backups` accesses on the database.
+#   PLANETSCALE_API       API base URL (default https://api.planetscale.com/v1).
+#   DEPLOY_BACKUP_RETENTION_DAYS  days that PlanetScale keeps the backup
+#                         (default 14).
+#   DEPLOY_BACKUP_TIMEOUT seconds to wait for the backup (default 2400).
 #   DEPLOY_POLL_INTERVAL  seconds between status reads (default 10).
 #   DEPLOY_POLL_TIMEOUT   seconds before giving up (default 600).
 #   DEPLOY_POLL_ERRORS    failed status reads in a row before giving up
@@ -115,21 +125,102 @@ pages_classify() {
   esac
 }
 
+# A PlanetScale organization, database or branch name. They become API path
+# segments, so only lowercase letters, digits and inner hyphens are accepted.
+planetscale_name='^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$'
+
+planetscale_backups_url() {
+  echo "${PLANETSCALE_API:-https://api.planetscale.com/v1}/organizations/$PLANETSCALE_ORGANIZATION/databases/$1/branches/$2/backups"
+}
+
+# Status read of a backup. `$1` is `<database>:<branch>` and `$2` the backup
+# ID.
+backup_status() {
+  local database="${1%%:*}" branch="${1#*:}" id="$2"
+  curl -fsS --retry 3 \
+    -H "Authorization: Bearer $PLANETSCALE_SERVICE_TOKEN" \
+    "$(planetscale_backups_url "$database" "$branch")/$id" \
+    | jq -r '.state'
+}
+
+# `pending` and `running` are transient; `failed`, `canceled` and `ignored` are
+# terminal failures, and so is any state that PlanetScale does not document.
+backup_classify() {
+  case "$1" in
+    success) echo success ;;
+    pending | running) echo pending ;;
+    *) echo failure ;;
+  esac
+}
+
+backup_database() {
+  local database="$1" branch="$2" name="$3" variable
+  for variable in PLANETSCALE_ORGANIZATION PLANETSCALE_SERVICE_TOKEN; do
+    if [[ -z "${!variable:-}" ]]; then
+      echo "::error::backup-database needs $variable." >&2
+      return 2
+    fi
+  done
+  local -A names=([organization]="$PLANETSCALE_ORGANIZATION" [database]="$database" [branch]="$branch")
+  local label
+  for label in organization database branch; do
+    if [[ ! "${names[$label]}" =~ $planetscale_name ]]; then
+      echo "::error::The PlanetScale $label ${names[$label]@Q} is not valid." >&2
+      return 2
+    fi
+  done
+  # The backup name is longer than one path segment name: it carries the
+  # service, the revision and the run.
+  if [[ ! "$name" =~ ^[a-z0-9][a-z0-9-]{0,126}[a-z0-9]$ ]]; then
+    echo "::error::The PlanetScale backup name ${name@Q} is not valid." >&2
+    return 2
+  fi
+  local retention="${DEPLOY_BACKUP_RETENTION_DAYS:-14}"
+  if [[ ! "$retention" =~ ^[1-9][0-9]{0,2}$ ]]; then
+    echo "::error::DEPLOY_BACKUP_RETENTION_DAYS ${retention@Q} is not a number of days from 1 to 999." >&2
+    return 2
+  fi
+  local body response id
+  body="$(jq -cn --arg name "$name" --argjson days "$retention" \
+    '{name: $name, retention_unit: "day", retention_value: $days, emergency: false}')"
+  # No retry: a repeated request could create a second backup. A failed
+  # request fails the deployment before any server deploys.
+  if ! response="$(curl -fsS -X POST \
+    -H "Authorization: Bearer $PLANETSCALE_SERVICE_TOKEN" \
+    -H "Content-Type: application/json" \
+    --data "$body" \
+    "$(planetscale_backups_url "$database" "$branch")")"; then
+    echo "::error::PlanetScale did not create the backup $name of $database/$branch." >&2
+    return 1
+  fi
+  id="$(jq -r '.id | select(type == "string")' <<< "$response" 2> /dev/null)" || id=""
+  if [[ ! "$id" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "::error::PlanetScale returned no backup ID for $name of $database/$branch." >&2
+    return 1
+  fi
+  echo "Created the PlanetScale backup $name ($id) of $database/$branch." >&2
+  # Status lines go to standard error: standard output carries only the ID.
+  poll "PlanetScale backup $name of $database/$branch" "${DEPLOY_BACKUP_TIMEOUT:-2400}" \
+    read-backup backup_classify "$database:$branch" "$id" >&2
+  echo "$id"
+}
+
 # Prints the usage line and exits with status 2. The `*)` branch of the command
 # dispatch and the argument-count check below share it.
 usage() {
-  echo "usage: $0 pages-id <file> | wait-pages <project> <id>" >&2
+  echo "usage: $0 pages-id <file> | wait-pages <project> <id> | backup-database <database> <branch> <name>" >&2
   exit 2
 }
 
 command="${1:-}"
 # `set -u` would stop a missing positional argument with a Bash diagnostic and
 # exit status 1, so count the arguments of each subcommand before dispatch.
-# `read-pages` is the internal status read of `poll` and stays out of the
-# usage line.
+# `read-pages` and `read-backup` are the internal status reads of `poll` and
+# stay out of the usage line.
 case "$command" in
   pages-id) required_arguments=1 ;;
-  read-pages | wait-pages) required_arguments=2 ;;
+  read-pages | wait-pages | read-backup) required_arguments=2 ;;
+  backup-database) required_arguments=3 ;;
   *) required_arguments=0 ;;
 esac
 if (( $# <= required_arguments )); then
@@ -139,6 +230,14 @@ fi
 case "$command" in
   pages-id) pages_id "$2" ;;
   read-pages) pages_status "$2" "$3" ;;
+  read-backup) backup_status "$2" "$3" ;;
+  backup-database)
+    if [[ -z "$timeout_command" ]]; then
+      echo "::error::$0 $command needs GNU coreutils timeout (or gtimeout)." >&2
+      exit 2
+    fi
+    backup_database "$2" "$3" "$4"
+    ;;
   wait-pages)
     if [[ -z "$timeout_command" ]]; then
       echo "::error::$0 $command needs GNU coreutils timeout (or gtimeout)." >&2

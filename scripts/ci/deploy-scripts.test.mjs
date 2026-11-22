@@ -1098,7 +1098,8 @@ test(
   },
 );
 
-const providerUsage = /usage: .*pages-id <file> \| wait-pages <project> <id>/;
+const providerUsage =
+  /usage: .*pages-id <file> \| wait-pages <project> <id> \| backup-database <database> <branch> <name>/;
 
 for (const args of [
   ["pages-id"],
@@ -1106,6 +1107,8 @@ for (const args of [
   ["read-pages", "proj"],
   ["wait-pages"],
   ["wait-pages", "proj"],
+  ["read-backup", "db:main"],
+  ["backup-database", "db", "main"],
 ]) {
   test(
     `provider prints the usage line for \`${args.join(" ")}\``,
@@ -1194,6 +1197,156 @@ test(
         result.stdout,
         new RegExp(`ended with production ${name} ${status}`),
       );
+    }
+  },
+);
+
+const backupEnv = {
+  PLANETSCALE_ORGANIZATION: "delino",
+  PLANETSCALE_SERVICE_TOKEN: "pscale-token",
+};
+
+test(
+  "provider creates a PlanetScale backup and waits for its success",
+  { skip: skipWait },
+  (t) => {
+    const result = runProvider(
+      t,
+      ["backup-database", "ownsand-api", "main", "deploy-ownsand-api-abc-7-1"],
+      {
+        env: backupEnv,
+        responses: {
+          curl: [
+            { stdout: { id: "bk_123", state: "pending" } },
+            { stdout: { state: "pending" } },
+            { stdout: { state: "running" } },
+            { stdout: { state: "success" } },
+          ],
+        },
+      },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // Standard output carries only the backup ID.
+    assert.equal(result.stdout, "bk_123\n");
+    const calls = result.calls.trim().split("\n");
+    assert.equal(calls.length, 4, result.calls);
+    const url =
+      "https://api.planetscale.com/v1/organizations/delino/databases/ownsand-api/branches/main/backups";
+    assert.ok(calls[0].includes("-X POST"), calls[0]);
+    assert.ok(calls[0].includes("Authorization: Bearer pscale-token"));
+    assert.ok(
+      calls[0].includes(
+        '{"name":"deploy-ownsand-api-abc-7-1","retention_unit":"day","retention_value":14,"emergency":false}',
+      ),
+      calls[0],
+    );
+    assert.ok(calls[0].endsWith(url), calls[0]);
+    // The create request is never retried; status reads are.
+    assert.ok(!calls[0].includes("--retry"), calls[0]);
+    for (const call of calls.slice(1)) {
+      assert.ok(call.endsWith(`${url}/bk_123`), call);
+      assert.ok(call.includes("--retry 3"), call);
+    }
+    assert.match(result.stderr, /PlanetScale backup .*: success/);
+  },
+);
+
+test(
+  "provider fails on a failed, canceled or ignored PlanetScale backup",
+  { skip: skipWait },
+  (t) => {
+    for (const state of ["failed", "canceled", "ignored", "unknown"]) {
+      const result = runProvider(t, ["backup-database", "db", "main", "b-1"], {
+        env: backupEnv,
+        responses: {
+          curl: [{ stdout: { id: "bk_1" } }, { stdout: { state } }],
+        },
+      });
+      assert.equal(result.status, 1, state);
+      assert.equal(result.stdout, "", state);
+      assert.match(result.stderr, new RegExp(`ended with ${state}`), state);
+    }
+  },
+);
+
+test(
+  "provider fails when PlanetScale creates no backup",
+  { skip: skipWait },
+  (t) => {
+    for (const response of [
+      { exit: 22 },
+      { stdout: { state: "pending" } },
+      { stdout: "not json" },
+      { stdout: { id: "bk/../x" } },
+    ]) {
+      const result = runProvider(t, ["backup-database", "db", "main", "b-1"], {
+        env: backupEnv,
+        responses: { curl: [response] },
+      });
+      const label = JSON.stringify(response);
+      assert.equal(result.status, 1, label);
+      assert.match(
+        result.stderr,
+        /did not create the backup|returned no backup ID/,
+        label,
+      );
+      // No status read follows a failed create.
+      assert.equal(result.calls.trim().split("\n").length, 1, label);
+    }
+  },
+);
+
+test(
+  "provider stops waiting for a PlanetScale backup at its deadline",
+  { skip: skipWait },
+  (t) => {
+    const result = runProvider(t, ["backup-database", "db", "main", "b-1"], {
+      env: { ...backupEnv, DEPLOY_BACKUP_TIMEOUT: "1" },
+      responses: {
+        curl: [{ stdout: { id: "bk_1" } }, { stdout: { state: "running" } }],
+      },
+    });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /did not finish within 1 seconds/);
+  },
+);
+
+test(
+  "provider rejects PlanetScale names and settings before any request",
+  { skip: skipWait },
+  (t) => {
+    for (const [args, env, message] of [
+      [
+        ["db", "main", "b-1"],
+        { PLANETSCALE_ORGANIZATION: "" },
+        /needs PLANETSCALE_ORGANIZATION/,
+      ],
+      [
+        ["db", "main", "b-1"],
+        { PLANETSCALE_SERVICE_TOKEN: "" },
+        /needs PLANETSCALE_SERVICE_TOKEN/,
+      ],
+      [
+        ["db", "main", "b-1"],
+        { PLANETSCALE_ORGANIZATION: "Org" },
+        /organization/,
+      ],
+      [["db/x", "main", "b-1"], {}, /database/],
+      [["db", "main?x", "b-1"], {}, /branch/],
+      [["db", "main", "B 1"], {}, /backup name/],
+      [
+        ["db", "main", "b-1"],
+        { DEPLOY_BACKUP_RETENTION_DAYS: "0" },
+        /RETENTION_DAYS/,
+      ],
+    ]) {
+      const result = runProvider(t, ["backup-database", ...args], {
+        env: { ...backupEnv, ...env },
+      });
+      const label = JSON.stringify([args, env]);
+      assert.equal(result.status, 2, label);
+      assert.match(result.stderr, message, label);
+      assert.equal(result.calls, "", label);
     }
   },
 );
@@ -1357,7 +1510,7 @@ function runTargets(
   const providerStub = shellStub(
     bin,
     "provider",
-    'case "$1" in pages-id) echo pages ;; esac',
+    'case "$1" in pages-id) echo pages ;; backup-database) echo "backup-$3" ;; esac',
   );
   mkdirSync(join(dir, "servers"));
   // Site outputs, relative to the working directory, as after a build.
@@ -1409,6 +1562,23 @@ function runTargets(
           udpPorts: "3478",
         },
       ]),
+      DATABASES: JSON.stringify([
+        {
+          name: "api",
+          version: "1.0.0",
+          service: "api",
+          database: "api-db",
+          branch: "main",
+        },
+        {
+          name: "worker",
+          version: "1.0.0",
+          service: "worker-svc",
+          database: "worker-db",
+          branch: "production",
+        },
+      ]),
+      BACKUP_RUN: "77-1",
       SITES: JSON.stringify([
         {
           name: "docs",
@@ -1619,6 +1789,67 @@ test(
     });
     assert.equal(result.status, 1);
     assert.match(result.stdout, /ended with preview deploy success/);
+  },
+);
+
+test(
+  "targets back up each database in plan order after a plan check",
+  { skip },
+  (t) => {
+    const result = runTargets(t, "databases");
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    const sha12 = "a".repeat(12);
+    assert.deepEqual(result.calls, [
+      "guard ",
+      `provider backup-database api-db main deploy-api-${sha12}-77-1`,
+      "guard ",
+      `provider backup-database worker-db production deploy-worker-svc-${sha12}-77-1`,
+    ]);
+  },
+);
+
+test(
+  "targets stop the database backups when the plan is stale or the backup fails",
+  { skip },
+  (t) => {
+    const stale = runTargets(t, "databases", {
+      pnpmBody: "",
+      env: { DEPLOY_GUARD: "false" },
+    });
+    assert.notEqual(stale.status, 0);
+    assert.ok(!stale.calls.some((call) => call.startsWith("provider")));
+    const failed = runTargets(t, "databases", {
+      env: {
+        DEPLOY_PROVIDER: shellStub(
+          join(scratch(t), "."),
+          "failing-provider",
+          "exit 1",
+        ),
+      },
+    });
+    assert.notEqual(failed.status, 0);
+    // The first failure stops the loop before the second database.
+    assert.deepEqual(
+      failed.calls.filter((call) => call.startsWith("guard")),
+      ["guard "],
+    );
+    for (const value of ["", "77", "77-x", "a-1"]) {
+      const result = runTargets(t, "databases", {
+        env: { BACKUP_RUN: value },
+      });
+      assert.equal(result.status, 1, value);
+      assert.match(result.stderr, /BACKUP_RUN is not <run id>-<run attempt>/);
+      assert.deepEqual(result.calls, [""]);
+    }
+    const missing = runTargets(t, "databases", {
+      env: {
+        DATABASES: JSON.stringify([
+          { name: "api", version: "1", service: "api", database: "api-db" },
+        ]),
+      },
+    });
+    assert.equal(missing.status, 1);
+    assert.match(missing.stderr, /DATABASES is not a nonempty list/);
   },
 );
 

@@ -78,6 +78,7 @@ test("no pending changesets select nothing", () => {
     changesets: [],
     releases: [],
     servers: [],
+    databases: [],
     staticSites: [],
   });
 });
@@ -166,6 +167,7 @@ test("deployables follow workspace dependency order within each kind", () => {
     udpPorts: "none",
     version: "0.1.0",
   });
+  assert.deepEqual(result.databases, []);
   assert.equal(result.staticSites[0].output, "apps/web/dist");
   assert.equal(result.staticSites[1].output, "apps/a-site/doc_build");
   assert.deepEqual(
@@ -281,26 +283,53 @@ test("invalid Droplet service names, host names and ports fail", () => {
   }
 });
 
-test("a Droplet server declares its upstream protocol and UDP ports", () => {
+test("a Droplet server declares its upstream protocol, UDP ports and database", () => {
   const packages = [
     pkg("servers/api", {
       name: "api",
       deploy: droplet("api", {
         upstream: UpstreamProtocol.H2c,
         udpPorts: [3478, 3479],
+        database: { name: "api-db", branch: "production" },
       }),
     }),
-    pkg("servers/worker", { name: "worker", deploy: droplet("worker") }),
+    pkg("servers/worker", {
+      name: "worker",
+      deploy: droplet("worker", { database: { name: "worker-db" } }),
+    }),
+    pkg("servers/plain", { name: "plain", deploy: droplet("plain") }),
   ];
-  const result = plan(status(["api", "1.0.0"], ["worker", "1.0.0"]), packages);
+  const result = plan(
+    status(["api", "1.0.0"], ["worker", "1.0.0"], ["plain", "1.0.0"]),
+    packages,
+  );
   const byName = Object.fromEntries(result.servers.map((d) => [d.name, d]));
   assert.equal(byName.api.upstream, "h2c");
   assert.equal(byName.api.udpPorts, "3478,3479");
   assert.equal(byName.worker.upstream, "http1");
   assert.equal(byName.worker.udpPorts, "none");
+  assert.equal(byName.plain.database, undefined);
+  // Only the servers with a database are backed up, in server order, and a
+  // database without a branch uses the PlanetScale production branch `main`.
+  assert.deepEqual(result.databases, [
+    {
+      name: "api",
+      version: "1.0.0",
+      service: "api",
+      database: "api-db",
+      branch: "production",
+    },
+    {
+      name: "worker",
+      version: "1.0.0",
+      service: "worker",
+      database: "worker-db",
+      branch: "main",
+    },
+  ]);
 });
 
-test("invalid upstream protocols and UDP ports fail", () => {
+test("invalid upstream protocols, UDP ports and databases fail", () => {
   for (const [fields, message] of [
     [{ upstream: "h2" }, /deploy\.upstream must be one of http1, h2c/],
     [{ upstream: "" }, /deploy\.upstream/],
@@ -310,6 +339,16 @@ test("invalid upstream protocols and UDP ports fail", () => {
     [{ udpPorts: [443] }, /deploy\.udpPorts/],
     [{ udpPorts: [70000] }, /deploy\.udpPorts/],
     [{ udpPorts: [3478, 3478] }, /deploy\.udpPorts/],
+    [{ database: "api" }, /deploy\.database\.name/],
+    [{ database: null }, /deploy\.database\.name/],
+    [{ database: {} }, /deploy\.database\.name/],
+    [{ database: { name: "Api" } }, /deploy\.database\.name/],
+    [{ database: { name: "api/x" } }, /deploy\.database\.name/],
+    [
+      { database: { name: "api", branch: "main/x" } },
+      /deploy\.database\.branch/,
+    ],
+    [{ database: { name: "api", branch: "" } }, /deploy\.database\.branch/],
   ]) {
     const packages = [
       pkg("servers/api", { name: "api", deploy: droplet("api", fields) }),
@@ -1191,6 +1230,10 @@ test("repository deployables use the documented targets", () => {
     ],
   );
   assert.deepEqual(
+    result.databases.map((d) => [d.name, d.database, d.branch]),
+    [["accounts-api", "accounts-api", "main"]],
+  );
+  assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.project, d.output]),
     [
       ["delino-accounts", "delino-accounts", "apps/delino-accounts/dist"],
@@ -1230,12 +1273,27 @@ test("main writes GitHub outputs and a summary", () => {
     assert.equal(outputs.has_changesets, "true");
     assert.deepEqual(JSON.parse(outputs.changesets), ["change"]);
     assert.equal(outputs.has_servers, "true");
+    assert.equal(outputs.has_databases, "true");
+    assert.deepEqual(JSON.parse(outputs.databases), [
+      {
+        name: "accounts-api",
+        version: "0.1.0",
+        service: "accounts-api",
+        database: "accounts-api",
+        branch: "main",
+      },
+    ]);
     assert.equal(outputs.has_static_sites, "false");
     assert.deepEqual(JSON.parse(outputs.releases), [
       { name: "accounts-api", version: "0.1.0" },
     ]);
     assert.equal(JSON.parse(outputs.servers)[0].service, "accounts-api");
-    assert.match(readFileSync(summaryPath, "utf8"), /accounts-api@0\.1\.0/);
+    const summary = readFileSync(summaryPath, "utf8");
+    assert.match(summary, /accounts-api@0\.1\.0/);
+    assert.match(
+      summary,
+      /Backed up before the servers deploy: accounts-api\/main \(accounts-api\)/,
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

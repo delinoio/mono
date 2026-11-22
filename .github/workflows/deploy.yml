@@ -1,7 +1,9 @@
 name: Deploy
 # Deploys the packages selected by the pending changesets on `main`, in
-# dependency order: servers (the shared DigitalOcean Droplet) first, then
-# static sites (Cloudflare Pages). The PlanetScale Postgres database has no migration job yet; see
+# dependency order: a backup of the PlanetScale Postgres database of each
+# selected server first, then the servers (the shared DigitalOcean Droplet),
+# then the static sites (Cloudflare Pages). The servers apply their own
+# migrations when they start; see
 # docs/repository-workflow-contract.md#deployment-workflow.
 on:
   workflow_dispatch:
@@ -24,10 +26,12 @@ jobs:
       sha: ${{ steps.revision.outputs.sha }}
       releases: ${{ steps.plan.outputs.releases }}
       servers: ${{ steps.plan.outputs.servers }}
+      databases: ${{ steps.plan.outputs.databases }}
       static_sites: ${{ steps.plan.outputs.static_sites }}
       changeset_blobs: ${{ steps.blobs.outputs.changeset_blobs }}
       has_changesets: ${{ steps.plan.outputs.has_changesets }}
       has_servers: ${{ steps.plan.outputs.has_servers }}
+      has_databases: ${{ steps.plan.outputs.has_databases }}
       has_static_sites: ${{ steps.plan.outputs.has_static_sites }}
     steps:
       - name: Require the main branch
@@ -158,12 +162,68 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  backup-databases:
+    name: Back up databases
+    # The servers apply forward-only migrations when they start, so each
+    # database of a selected server gets a backup before the first server
+    # deploys. Like the server deployment, it waits for every build.
+    needs: [plan, build-servers, build-static-sites]
+    if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_databases == 'true' }}
+    runs-on: ubuntu-latest
+    # An estimate, like the other limits: two backups of up to 40 minutes
+    # each (DEPLOY_BACKUP_TIMEOUT) and the plan checks.
+    timeout-minutes: 90
+    # A database belongs to the server deployable that declares it, so the
+    # backup runs in the servers environment with its PlanetScale secrets.
+    environment: servers
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+          sparse-checkout: |
+            scripts/ci/check-pending-changesets.sh
+            scripts/ci/deploy-provider.sh
+            scripts/ci/deploy-targets.sh
+          sparse-checkout-cone-mode: false
+      - name: Check that the plan is still current
+        env:
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/check-pending-changesets.sh
+      - name: Back up in plan order
+        env:
+          DATABASES: ${{ needs.plan.outputs.databases }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          BACKUP_RUN: ${{ github.run_id }}-${{ github.run_attempt }}
+          PLANETSCALE_ORGANIZATION: ${{ secrets.PLANETSCALE_ORGANIZATION }}
+          PLANETSCALE_SERVICE_TOKEN: ${{ secrets.PLANETSCALE_SERVICE_TOKEN }}
+          # The stale-plan check runs again right before each backup.
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for secret in PLANETSCALE_ORGANIZATION PLANETSCALE_SERVICE_TOKEN; do
+            if [[ -z "${!secret:-}" ]]; then
+              echo "::error::The servers environment has no $secret secret."
+              exit 1
+            fi
+          done
+          scripts/ci/deploy-targets.sh databases
+
   deploy-servers:
     name: Deploy servers
     # Every build, the static sites included, finishes before the first
     # upload, so a broken site cannot leave new servers without a release.
-    # `!failure()` keeps the job when no site (or no server build) ran.
-    needs: [plan, build-servers, build-static-sites]
+    # The database backups finish first as well. `!failure()` keeps the job
+    # when no site, no server build or no backup ran.
+    needs: [plan, build-servers, build-static-sites, backup-databases]
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_servers == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -371,6 +431,7 @@ jobs:
       [
         plan,
         build-servers,
+        backup-databases,
         deploy-servers,
         build-static-sites,
         deploy-static-sites,

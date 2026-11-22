@@ -47,8 +47,7 @@ The project has two deployables. The web app is a static single-page application
 - `delino-accounts` is the shared account management and billing system for every Delino service, according to the [authentication](repository-auth-contract.md#account-management) and [billing](repository-billing-contract.md#billing-ownership) contracts. Other services link users to `https://accounts.delino.io` and call `https://accounts.api.delino.io`. They do not keep their own account management, payment-provider integration or balances.
 - Deviation from repository defaults: the web app uses Rsbuild instead of Rspress because it is an authenticated application, not a documentation or marketing site. It still deploys to Cloudflare Pages as static output.
 - The API server deploys to the shared DigitalOcean Droplet and its database is PlanetScale Postgres, according to the repository defaults. The [API server contract](servers-accounts-api-foundation.md) records the details.
-- Recorded decisions: the payment provider is Paddle, the database migration tool is goose and email delivery uses Resend ([API server contract](servers-accounts-api-foundation.md)).
-- Open decisions: the backup policy. Record it in the API server contract before the first deployment of a revision with persisted entities.
+- Recorded decisions: the payment provider is Paddle, the database migration tool is goose, email delivery uses Resend and the database follows the [repository backup policy](repository-workflow-contract.md#database-backups) ([API server contract](servers-accounts-api-foundation.md)).
 - Rollout: no feature flag. Deploy `accounts-api` with the billing APIs before the consuming services start to report usage. Migrations are forward-only.
 
 ## Change Policy

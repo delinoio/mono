@@ -18,7 +18,7 @@ This contract owns the `accounts-api` component of [`delino-accounts`](project-d
 - `servers/accounts-api/internal/db/`: Postgres pool, embedded goose migrations in `internal/db/migrations/` and the test database helper `internal/db/dbtest/`.
 - `servers/accounts-api/internal/testenv/`: in-process server for the Postgres-backed integration tests.
 - `servers/accounts-api/.env.example`: configuration names and safe loopback defaults.
-- `servers/accounts-api/package.json` and `turbo.json`: workspace task wiring and the `deploy` field.
+- `servers/accounts-api/package.json` and `turbo.json`: workspace task wiring and the `deploy` field (with the PlanetScale database `accounts-api`).
 - `servers/accounts-api/Dockerfile`: runtime image of the Droplet deployment.
 - `servers/accounts-api/scripts/`: development launcher (`dev.mjs`) and its process-level tests.
 
@@ -270,8 +270,8 @@ The database is PlanetScale Postgres, according to the repository defaults. File
 - The server stores Paddle customer, subscription, transaction and event IDs only. It never stores card data.
 - Billing audit events record member, role, invitation, ownership, settings, subscription, top-up and link changes with the actor's Logto user ID. Implemented kinds: `billing_account_created`, `billing_account_renamed`, `billing_account_deleted`, `invitation_created`, `invitation_revoked`, `invitation_accepted`, `member_role_changed`, `member_removed`, `ownership_transferred`, `subscription_started` (a new checkout), `subscription_canceled`, `subscription_resumed`, `top_up_requested` (a new manual top-up, with its ID and amount), `auto_top_up_settings_updated` and `alert_settings_updated` (with the new values), `organization_linked` (with the service, the organization ID and name; the actor is the user that the service named), `organization_link_renamed` (a repeated link with another organization name) and `organization_unlinked` (the actor is the machine-to-machine application ID of the calling service, with `actor_kind` `machine_to_machine` in the details). Their details hold names, roles, amounts and Paddle IDs, never email addresses or tokens. Changes that Paddle webhooks and the worker make have no actor and are logged instead.
 - Retention (recorded decision): usage records, the ledger, credit grants and billing audit events are kept for 7 years. Deleting a billing account (a soft delete) or unlinking or deleting an organization keeps these records. The first version has no job that deletes records after the retention period.
-- Open decision: the backup policy. Record it here before the first deployment of a revision with persisted entities.
-- Deployment: the database stage that runs before the servers is `planned` in the [deployment workflow](repository-workflow-contract.md#deployment-workflow). It must exist before the first deployment of an `accounts-api` revision with persisted entities.
+- Backup policy (recorded): the [repository backup policy](repository-workflow-contract.md#database-backups) of the PlanetScale database `accounts-api` (branch `main`): the included backup every 12 hours, kept for 2 days, with point-in-time recovery in that window, and a backup before every deployment of `accounts-api`, kept for 14 days. The balances, credits and charges have no other copy, so a restore to a new branch and an image rollback are the recovery path for a migration defect.
+- Deployment: the database stage of the [deployment workflow](repository-workflow-contract.md#database-backups) backs up the database before `accounts-api` deploys; the server applies its goose migrations when it starts.
 
 ## Security
 

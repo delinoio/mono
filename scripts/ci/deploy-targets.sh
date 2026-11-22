@@ -7,12 +7,15 @@
 # deploys or this target builds stops the upload.
 #
 # Usage:
+#   deploy-targets.sh databases      # DATABASES: plan databases JSON
 #   deploy-targets.sh servers        # SERVERS: plan servers JSON
 #   deploy-targets.sh build-static-sites  # SITES; run without deploy secrets
 #   deploy-targets.sh static-sites   # SITES: plan static sites JSON
 #
 # Environment:
 #   SHA                  deployed revision.
+#   BACKUP_RUN           unique suffix of the database backup names for
+#                        `databases`, for example `<run id>-<run attempt>`.
 #   RUNNER_TEMP          directory with the `servers/<name>.tar.gz` images
 #                        that `build-servers` saved as `<name>:<SHA>`, and
 #                        room for scratch files.
@@ -58,6 +61,27 @@ require_targets() {
 
 check_plan() {
   "$guard" < /dev/null
+}
+
+# Backs up the database of each selected server before the first server
+# deploys, because the servers apply their forward-only migrations when they
+# start. The provider helper waits until each backup succeeded.
+backup_databases() {
+  require_targets DATABASES "${DATABASES:-}" name version service database branch
+  if [[ ! "${BACKUP_RUN:-}" =~ ^[0-9]+-[0-9]+$ ]]; then
+    echo "::error::BACKUP_RUN is not <run id>-<run attempt>: ${BACKUP_RUN:-<empty>}" >&2
+    exit 1
+  fi
+  echo "## Database backups" >> "$summary"
+  local name version service database branch backup id
+  while IFS=$'\t' read -r -u 3 name version service database branch; do
+    echo "::group::Back up $database/$branch for $name@$version"
+    backup="deploy-$service-${SHA:0:12}-$BACKUP_RUN"
+    check_plan
+    id="$("$provider" backup-database "$database" "$branch" "$backup")"
+    echo "::endgroup::"
+    echo "- $name@$version: PlanetScale database \`$database\`, branch \`$branch\`, backup \`$backup\` (\`$id\`)" >> "$summary"
+  done 3< <(jq -r '.[] | [.name, .version, .service, .database, .branch] | @tsv' <<< "$DATABASES")
 }
 
 # Pushes each server image to the registry and replaces its container on the
@@ -141,11 +165,12 @@ deploy_static_sites() {
 }
 
 case "${1:-}" in
+  databases) backup_databases ;;
   servers) deploy_servers ;;
   build-static-sites) build_static_sites ;;
   static-sites) deploy_static_sites ;;
   *)
-    echo "usage: $0 servers | build-static-sites | static-sites" >&2
+    echo "usage: $0 databases | servers | build-static-sites | static-sites" >&2
     exit 2
     ;;
 esac

@@ -36,9 +36,10 @@ export const UpstreamProtocol = Object.freeze({
   H2c: "h2c",
 });
 
-// Kind order of a deployment: the database stage (not implemented yet; see
-// the deployment workflow contract) comes first, then servers, then static
-// sites, which call the servers.
+// Kind order of a deployment: servers, then static sites, which call the
+// servers. The database stage (`backup-databases`) backs up the databases of
+// the selected servers before the first server deploys; it is not a kind,
+// because a database is part of the server deployable that declares it.
 const kindOrder = [DeployKind.Server, DeployKind.StaticSite];
 
 // A Map, not a plain object: `Map.get` matches by SameValueZero, so inherited
@@ -134,6 +135,15 @@ const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 const minimumDropletPort = 1024;
 const maximumDropletPort = 65535;
 
+// A PlanetScale database or branch name. Both become path segments of the
+// PlanetScale API, so the planner allows only lowercase letters, digits and
+// inner hyphens; PlanetScale may accept more.
+const planetscaleName = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
+
+// The branch that PlanetScale creates as the production branch of a new
+// Postgres database.
+const defaultDatabaseBranch = "main";
+
 function dropletUpstream(name, value) {
   const upstream = value ?? UpstreamProtocol.Http1;
   if (!Object.values(UpstreamProtocol).includes(upstream)) {
@@ -164,6 +174,28 @@ function dropletUdpPorts(name, value) {
     );
   }
   return value;
+}
+
+function dropletDatabase(name, value) {
+  if (value === undefined) return undefined;
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    Array.isArray(value) ||
+    typeof value.name !== "string" ||
+    !planetscaleName.test(value.name)
+  ) {
+    throw new DeployPlanError(
+      `${name}: deploy.database.name must be a PlanetScale database name matching ${planetscaleName}`,
+    );
+  }
+  const branch = value.branch ?? defaultDatabaseBranch;
+  if (typeof branch !== "string" || !planetscaleName.test(branch)) {
+    throw new DeployPlanError(
+      `${name}: deploy.database.branch must be a PlanetScale branch name matching ${planetscaleName}`,
+    );
+  }
+  return { database: value.name, databaseBranch: branch };
 }
 
 export class DeployPlanError extends Error {}
@@ -259,6 +291,7 @@ function deployable(pkg) {
       port: String(deploy.port),
       upstream: dropletUpstream(name, deploy.upstream),
       udpPorts: udpPorts.length > 0 ? udpPorts.join(",") : "none",
+      ...dropletDatabase(name, deploy.database),
     };
   }
   if (typeof deploy.project !== "string" || deploy.project === "") {
@@ -523,6 +556,17 @@ export function plan(status, packages) {
     changesets: (status.changesets ?? []).map(({ id }) => checkChangesetId(id)),
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
     servers,
+    // The database stage backs up these databases, in server order, before
+    // the first server deploys.
+    databases: servers
+      .filter((d) => d.database !== undefined)
+      .map(({ name, version, service, database, databaseBranch }) => ({
+        name,
+        version,
+        service,
+        database,
+        branch: databaseBranch,
+      })),
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
   };
 }
@@ -553,6 +597,7 @@ export function main({
       changesets: result.changesets,
       releases: result.releases,
       servers: result.servers.map((d) => d.name),
+      databases: result.databases.map((d) => d.database),
       staticSites: result.staticSites.map((d) => d.name),
     }),
   );
@@ -562,12 +607,14 @@ export function main({
       [
         `releases=${JSON.stringify(result.releases)}`,
         `servers=${JSON.stringify(result.servers)}`,
+        `databases=${JSON.stringify(result.databases)}`,
         `static_sites=${JSON.stringify(result.staticSites)}`,
         // Any pending changeset, including one with only `none` releases,
         // needs the release job to consume it.
         `changesets=${JSON.stringify(result.changesets)}`,
         `has_changesets=${result.changesets.length > 0}`,
         `has_servers=${result.servers.length > 0}`,
+        `has_databases=${result.databases.length > 0}`,
         `has_static_sites=${result.staticSites.length > 0}`,
         "",
       ].join("\n"),
@@ -586,6 +633,9 @@ export function main({
         );
       });
       lines.push("");
+      lines.push(
+        `Backed up before the servers deploy: ${result.databases.map((d) => `${d.database}/${d.branch} (${d.name})`).join(", ") || "none"}`,
+      );
       lines.push(
         `Versioned and tagged: ${result.releases.map((r) => `${r.name}@${r.version}`).join(", ") || "none"}`,
       );

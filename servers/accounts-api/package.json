@@ -7,7 +7,10 @@
     "target": "droplet",
     "service": "accounts-api",
     "hostname": "accounts.api.delino.io",
-    "port": 8080
+    "port": 8080,
+    "database": {
+      "name": "accounts-api"
+    }
   },
   "scripts": {
     "build": "go build -buildvcs=false -o dist/accounts-api ./cmd/accounts-api",
