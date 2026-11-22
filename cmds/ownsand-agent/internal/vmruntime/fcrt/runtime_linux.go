@@ -269,21 +269,37 @@ func (v *vm) path(name string) string {
 }
 
 // Dial connects to the guest helper through the Firecracker vsock device:
-// it connects to the device's unix socket and asks for the guest port.
+// it connects to the device's unix socket and asks for the guest port. A
+// canceled ctx aborts the handshake promptly and closes the connection, and a
+// ctx that is done never yields a connection.
 func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 	var d net.Dialer
 	c, err := d.DialContext(ctx, "unix", v.path(vsockSocket))
 	if err != nil {
 		return nil, err
 	}
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		deadline = time.Now().Add(10 * time.Second)
+	// A ctx with a deadline bounds the handshake through the callback below
+	// and not through a socket deadline of its own: a socket deadline at the
+	// same instant could fire before ctx reports its error, and the handshake
+	// would then fail with a socket timeout in place of the context error.
+	if _, ok := ctx.Deadline(); !ok {
+		c.SetDeadline(time.Now().Add(10 * time.Second))
 	}
-	c.SetDeadline(deadline)
-	if _, err := fmt.Fprintf(c, "CONNECT %d\n", GuestPort); err != nil {
+	// DialContext watches ctx only while connecting. Expire the deadline when
+	// ctx is done, so a blocked handshake read or write returns at once.
+	stop := context.AfterFunc(ctx, func() { c.SetDeadline(time.Unix(1, 0)) })
+	defer stop()
+	// fail closes the connection and reports the caller's cancellation in
+	// place of the deadline error that the cancellation caused.
+	fail := func(err error) (net.Conn, error) {
 		c.Close()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
+	}
+	if _, err := fmt.Fprintf(c, "CONNECT %d\n", GuestPort); err != nil {
+		return fail(err)
 	}
 	// Read the acknowledgement byte by byte, so no byte of the stream is
 	// consumed.
@@ -291,8 +307,7 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 	b := make([]byte, 1)
 	for len(line) < 64 {
 		if _, err := c.Read(b); err != nil {
-			c.Close()
-			return nil, fmt.Errorf("fcrt: vsock handshake: %w", err)
+			return fail(fmt.Errorf("fcrt: vsock handshake: %w", err))
 		}
 		if b[0] == '\n' {
 			break
@@ -300,8 +315,13 @@ func (v *vm) Dial(ctx context.Context) (net.Conn, error) {
 		line = append(line, b[0])
 	}
 	if !bytes.HasPrefix(line, []byte("OK ")) {
-		c.Close()
-		return nil, errors.New("fcrt: vsock handshake refused")
+		return fail(errors.New("fcrt: vsock handshake refused"))
+	}
+	// A late acknowledgement must not turn a canceled dial into a success.
+	// stop reports false when the cancellation callback already started, and
+	// it may still be running, so it must not touch the returned connection.
+	if !stop() || ctx.Err() != nil {
+		return fail(ctx.Err())
 	}
 	c.SetDeadline(time.Time{})
 	return c, nil
