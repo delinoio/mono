@@ -14,8 +14,10 @@ import { pendingInvitation } from "./invitation.ts";
 import {
   ACCOUNT_ID,
   ADMIN,
+  addBillingAccounts,
   createFakeApi,
   INVITATION_TOKEN,
+  numbered,
   OUTSIDER,
   VIEWER,
 } from "./testing/fake-api.ts";
@@ -930,5 +932,105 @@ describe("settings", () => {
       screen.getAllByText("Only owners and admins can change these settings.")
         .length,
     ).toBe(3);
+  });
+});
+
+/** The titles of the rows of a list, in order. */
+function rowTitles(list: HTMLElement) {
+  return within(list)
+    .getAllByRole("listitem")
+    .map((row) => row.querySelector(".list-title")?.textContent ?? "");
+}
+
+/** The continuation tokens that the requests of a method sent, in order. */
+function pageTokens(api: ReturnType<typeof createFakeApi>, method: string) {
+  return calls(api, method).map((request) => request.pageToken);
+}
+
+describe("paged lists", () => {
+  describe("billing accounts", () => {
+    test("reads every page in server order", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 200);
+      renderApp("/billing", { api });
+      const list = await screen.findByRole("list", {
+        name: "Billing accounts",
+      });
+      await settle(100);
+      const titles = rowTitles(list);
+      expect(titles).toHaveLength(201);
+      expect(titles[0]).toBe("Acme Robotics");
+      expect(titles[1]).toBe(`Account ${numbered(1)}`);
+      expect(titles[200]).toBe(`Account ${numbered(200)}`);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1"]);
+      expect(calls(api, "ListBillingAccounts")[1]).toMatchObject({
+        pageSize: 200,
+      });
+    });
+
+    test("an exact page and an empty token make no continuation request", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 199);
+      renderApp("/billing", { api });
+      const list = await screen.findByRole("list", {
+        name: "Billing accounts",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual([""]);
+    });
+
+    test("no account keeps the empty state and makes one request", async () => {
+      const api = createFakeApi();
+      api.userId = OUTSIDER;
+      renderApp("/billing", { api });
+      expect(await screen.findByText("No billing accounts yet")).toBeTruthy();
+      await settle(100);
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual([""]);
+    });
+
+    test("a failed continuation keeps the first page and retries at the failed page", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 200);
+      api.failContinuation.set(
+        "ListBillingAccounts",
+        new ConnectError("temporarily unavailable", Code.Unavailable),
+      );
+      renderApp("/billing", { api });
+      const list = await screen.findByRole("list", {
+        name: "Billing accounts",
+      });
+      await settle(100);
+      expect(rowTitles(list)).toHaveLength(200);
+      expect(await screen.findByText(/Some items did not load/)).toBeTruthy();
+      // The failure stops the loop: no further request until the retry.
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1"]);
+      await click(screen.getByRole("button", { name: "Try again" }));
+      await settle(100);
+      const titles = rowTitles(
+        await screen.findByRole("list", { name: "Billing accounts" }),
+      );
+      expect(titles).toHaveLength(201);
+      expect(new Set(titles).size).toBe(201);
+      expect(screen.queryByText(/Some items did not load/)).toBeNull();
+      expect(pageTokens(api, "ListBillingAccounts")).toEqual(["", "p1", "p1"]);
+    });
+
+    test("opens the last account of the second page", async () => {
+      const api = createFakeApi();
+      addBillingAccounts(api, 200);
+      renderApp("/billing", { api });
+      const link = await screen.findByRole("link", {
+        name: new RegExp(`Account ${numbered(200)}`),
+      });
+      await settle(100);
+      await click(link);
+      expect(
+        await screen.findByRole("heading", {
+          name: `Account ${numbered(200)}`,
+          level: 1,
+        }),
+      ).toBeTruthy();
+    });
   });
 });
