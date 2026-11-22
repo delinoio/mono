@@ -5,10 +5,11 @@
 # `deploy-targets.sh servers` runs this script on the Droplet as the `deploy`
 # user over SSH, with the script on standard input:
 #
-#   ssh <droplet> bash -s -- <service> <image> <port> <hostname> < droplet-deploy.sh
+#   ssh <droplet> bash -s -- <service> <image> <port> <hostname> <upstream> <udp-ports> < droplet-deploy.sh
 #
 # A maintainer rolls a service back with the same command and the image of
-# the previous deployment (`/srv/delino/state/<service>.previous`).
+# the previous deployment (`/srv/delino/state/<service>.previous`), with the
+# `deploy` fields of the service's package.json.
 #
 # A lock file `state/<service>.lock` (`flock`) serializes deployments and
 # rollbacks of one service: a second run waits until the first one ends.
@@ -26,6 +27,14 @@
 # non-zero and name the container, but the state files already name the
 # replacement. The exit code is the deployment verdict.
 #
+# A service that publishes host UDP ports cannot run two containers at the
+# same time, because only one container can hold a host port. For such a
+# service the script creates the replacement, stops the old containers (it
+# keeps them), starts the replacement, waits for the health check and
+# switches the route. Requests fail between the stop and the route switch.
+# When the start, the health check or the route switch fails, the script
+# removes the replacement and starts the old containers again.
+#
 # Arguments:
 #   service   Droplet service name: container name prefix, label value and
 #             env file name. A deployment by an earlier version of this
@@ -36,6 +45,11 @@
 #   port      port that the server listens on inside the container. The
 #             script sets `ADDR=:<port>`.
 #   hostname  public host name that the reverse proxy routes to the service.
+#   upstream  protocol from the reverse proxy to the container: `http1`
+#             (HTTP/1.1) or `h2c` (HTTP/2 without TLS, for bidirectional
+#             streams).
+#   udp-ports host UDP ports that the container publishes on IPv4 with the
+#             same container port, comma-separated, or `none`.
 #
 # Environment (defaults match `scripts/droplet/provision.sh`):
 #   DROPLET_ROOT            state directory (default /srv/delino).
@@ -63,11 +77,11 @@ main() {
     echo "::error::droplet-deploy.sh needs flock (util-linux) for the deployment lock." >&2
     exit 2
   fi
-  if (( $# != 4 )); then
-    echo "usage: droplet-deploy.sh <service> <image> <port> <hostname>" >&2
+  if (( $# != 6 )); then
+    echo "usage: droplet-deploy.sh <service> <image> <port> <hostname> <http1|h2c> <udp-ports|none>" >&2
     exit 2
   fi
-  local service="$1" image="$2" port="$3" hostname="$4"
+  local service="$1" image="$2" port="$3" hostname="$4" upstream="$5" udp_list="$6"
   # The planner already checks these values; check them again, because they
   # become file names, container names and proxy configuration here.
   # A DNS label has at most 63 characters, as in the planner's host check.
@@ -83,6 +97,27 @@ main() {
   fi
   if [[ ! "$hostname" =~ ^$label(\.$label)+$ ]] || (( ${#hostname} > 253 )); then
     fail "the host name ${hostname@Q} is not valid."
+  fi
+  if [[ "$upstream" != http1 && "$upstream" != h2c ]]; then
+    fail "the upstream protocol ${upstream@Q} is not http1 or h2c."
+  fi
+  local -a udp_ports=()
+  if [[ "$udp_list" != none ]]; then
+    local udp_port
+    if [[ ! "$udp_list" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+      fail "the UDP ports ${udp_list@Q} are not a comma-separated list of ports or none."
+    fi
+    IFS=, read -r -a udp_ports <<< "$udp_list"
+    local -A seen=()
+    for udp_port in "${udp_ports[@]}"; do
+      if [[ ! "$udp_port" =~ ^[1-9][0-9]{3,4}$ ]] || (( udp_port < 1024 || udp_port > 65535 )); then
+        fail "the UDP port ${udp_port@Q} is not a number from 1024 to 65535."
+      fi
+      if [[ -n "${seen[$udp_port]:-}" ]]; then
+        fail "the UDP port $udp_port is listed twice."
+      fi
+      seen[$udp_port]=1
+    done
   fi
 
   local root="${DROPLET_ROOT:-/srv/delino}"
@@ -134,31 +169,69 @@ main() {
       old+=("$old_id")
     fi
   done <<< "$old_ids"
-  local stamp new upstream
+  local stamp new alias id
   stamp="$(date -u +%Y%m%d%H%M%S)-${image: -12}"
   new="$service-$stamp"
-  upstream="$(upstream_alias "$service" "$stamp")"
-  echo "Start $new as $upstream"
+  alias="$(upstream_alias "$service" "$stamp")"
   # The replacement takes no `--network-alias "$service"`. The running
   # container keeps that alias (and the route still names it), and Docker DNS
   # would hand out the replacement address with the shared alias while the
   # replacement still starts or fails its health check. The route switches to
   # the unique alias only after the health check passed.
-  docker run --detach --name "$new" \
-    --network "$network" --network-alias "$upstream" \
-    --label "io.delino.service=$service" --label "io.delino.image=$image" \
-    --restart unless-stopped \
-    --env-file "$env_file" --env "ADDR=:$port" \
-    "$image" > /dev/null
+  local -a options=(--name "$new"
+    --network "$network" --network-alias "$alias"
+    --label "io.delino.service=$service" --label "io.delino.image=$image"
+    --restart unless-stopped
+    --env-file "$env_file" --env "ADDR=:$port")
+  if (( ${#udp_ports[@]} == 0 )); then
+    echo "Start $new as $alias"
+    docker run --detach "${options[@]}" "$image" > /dev/null
 
-  if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
-    discard_replacement "$new"
-    fail "$new did not pass the health check; the previous container keeps serving."
-  fi
+    if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
+      discard_replacement "$new"
+      fail "$new did not pass the health check; the previous container keeps serving."
+    fi
 
-  if ! write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy"; then
-    discard_replacement "$new"
-    fail "the route of $service was not switched; the previous container keeps serving."
+    if ! write_route "$site" "$service" "$alias" "$port" "$hostname" "$proxy" "$upstream"; then
+      discard_replacement "$new"
+      fail "the route of $service was not switched; the previous container keeps serving."
+    fi
+  else
+    # Publish on IPv4 only (`0.0.0.0`): Docker forwards IPv6 traffic to a
+    # container without IPv6 through its userland proxy, which replaces the
+    # client source address that STUN reports back.
+    local udp_port
+    for udp_port in "${udp_ports[@]}"; do
+      options+=(--publish "0.0.0.0:$udp_port:$udp_port/udp")
+    done
+    echo "Create $new as $alias with the UDP ports ${udp_ports[*]}"
+    docker create "${options[@]}" "$image" > /dev/null
+    # Only one container can hold the host ports, so the old containers stop
+    # before the replacement starts. They stay until the route switched, so a
+    # failure can start them again.
+    for id in "${old[@]}"; do
+      echo "Stop the previous container $id to free the UDP ports"
+      if ! docker stop --time "$stop_timeout" "$id" > /dev/null; then
+        discard_replacement "$new"
+        restart_previous "${old[@]}"
+        fail "docker stop failed for the previous container $id; the previous containers were started again."
+      fi
+    done
+    if ! docker start "$new" > /dev/null; then
+      discard_replacement "$new"
+      restart_previous "${old[@]}"
+      fail "$new did not start; the previous containers were started again."
+    fi
+    if ! wait_healthy "$new" "$network" "$port" "$health_timeout"; then
+      discard_replacement "$new"
+      restart_previous "${old[@]}"
+      fail "$new did not pass the health check; the previous containers were started again."
+    fi
+    if ! write_route "$site" "$service" "$alias" "$port" "$hostname" "$proxy" "$upstream"; then
+      discard_replacement "$new"
+      restart_previous "${old[@]}"
+      fail "the route of $service was not switched; the previous containers were started again."
+    fi
   fi
 
   # The proxy routes to the replacement now, so it is the deployed image.
@@ -167,13 +240,15 @@ main() {
   record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
 
   local -a failed=()
-  local id
   for id in "${old[@]}"; do
-    echo "Stop the previous container $id"
-    if ! docker stop --time "$stop_timeout" "$id" > /dev/null; then
-      echo "::error::docker stop failed for the previous container $id." >&2
-      failed+=("docker stop $id")
-      continue
+    # The containers of a service with UDP ports are already stopped.
+    if (( ${#udp_ports[@]} == 0 )); then
+      echo "Stop the previous container $id"
+      if ! docker stop --time "$stop_timeout" "$id" > /dev/null; then
+        echo "::error::docker stop failed for the previous container $id." >&2
+        failed+=("docker stop $id")
+        continue
+      fi
     fi
     if ! docker rm "$id" > /dev/null; then
       echo "::error::docker rm failed for the previous container $id." >&2
@@ -232,6 +307,17 @@ discard_replacement() {
   docker rm --force "$1" > /dev/null || true
 }
 
+# Starts the previous containers again after a failed replacement of a service
+# with UDP ports. The route still names their alias. A failed start is
+# reported, but does not hide the deployment failure that the caller reports.
+restart_previous() {
+  local id
+  for id in "$@"; do
+    echo "Start the previous container $id again"
+    docker start "$id" > /dev/null || echo "::error::docker start failed for the previous container $id; start it by hand." >&2
+  done
+}
+
 # Waits until the container answers `GET /healthz` with a 2xx status. Redirects
 # are not followed, so a 3xx answer is not healthy. A transport failure (no
 # status) is retried until the deadline. Fails at once when the container stops.
@@ -261,24 +347,34 @@ wait_healthy() {
 }
 
 # Writes the reverse proxy route of the service to the unique alias of its
-# replacement container and reloads the proxy. The caller evaluates this function as an `if` condition, which
-# disables `set -e` inside it, so every step checks its own status and names
+# replacement container and reloads the proxy. An `h2c` upstream proxies
+# HTTP/2 without TLS (`transport http { versions h2c }`). Caddy forwards every
+# response without a Content-Length at once, so streams need no
+# `flush_interval`.
+#
+# The caller evaluates this function as an `if` condition, which disables
+# `set -e` inside it, so every step checks its own status and names
 # the failed operation. The previous route stays in place until the new route
 # is complete (the new route goes to a temporary file that `mv` renames over
 # the route file), and the proxy reloads only after that. Restores the
 # previous route when the proxy rejects the new one.
 write_route() {
-  local site="$1" service="$2" upstream="$3" port="$4" hostname="$5" proxy="$6"
+  local site="$1" service="$2" alias="$3" port="$4" hostname="$5" proxy="$6" upstream="$7"
+  local -a lines=(
+    "# Written by scripts/ci/droplet-deploy.sh for $service. Do not edit."
+    "$hostname {"
+    "	reverse_proxy $alias:$port {"
+    # `lb_try_duration` retries a failed connection for 10 seconds, so a
+    # request that reaches the old container while it stops is sent to the
+    # new one.
+    "		lb_try_duration 10s"
+  )
+  if [[ "$upstream" == h2c ]]; then
+    lines+=("		transport http {" "			versions h2c" "		}")
+  fi
+  lines+=("	}" "}")
   local route
-  # `lb_try_duration` retries a failed connection for 10 seconds, so a request
-  # that reaches the old container while it stops is sent to the new one.
-  route="$(printf '%s\n' \
-    "# Written by scripts/ci/droplet-deploy.sh for $service. Do not edit." \
-    "$hostname {" \
-    "	reverse_proxy $upstream:$port {" \
-    "		lb_try_duration 10s" \
-    "	}" \
-    "}")"
+  route="$(printf '%s\n' "${lines[@]}")"
   # The proxy imports `sites/*.caddy`; the suffixes below keep the backup and
   # the temporary file out of that glob.
   local backup="" pending="$site.new"
@@ -304,7 +400,7 @@ write_route() {
     return 1
   fi
   if docker exec "$proxy" caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile; then
-    echo "Reloaded the reverse proxy with the route https://$hostname -> $upstream:$port"
+    echo "Reloaded the reverse proxy with the route https://$hostname -> $alias:$port ($upstream)"
     return 0
   fi
   echo "::error::the reverse proxy rejected the route of $service; restoring the previous route." >&2

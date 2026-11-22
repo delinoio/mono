@@ -28,6 +28,14 @@ export const DeployKind = Object.freeze({
   StaticSite: "static-site",
 });
 
+// Protocol from the reverse proxy to a Droplet server container, the
+// `deploy.upstream` manifest field. `h2c` (HTTP/2 without TLS) carries
+// bidirectional streams; `http1` is the default.
+export const UpstreamProtocol = Object.freeze({
+  Http1: "http1",
+  H2c: "h2c",
+});
+
 // Kind order of a deployment: the database stage (not implemented yet; see
 // the deployment workflow contract) comes first, then servers, then static
 // sites, which call the servers.
@@ -121,8 +129,42 @@ const pagesProjectName = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
 
 // The container listens on this port inside its own network namespace. Ports
 // below 1024 need privileges that the non-root server images do not have.
+// The same range applies to published UDP ports, which the container also
+// listens on.
 const minimumDropletPort = 1024;
 const maximumDropletPort = 65535;
+
+function dropletUpstream(name, value) {
+  const upstream = value ?? UpstreamProtocol.Http1;
+  if (!Object.values(UpstreamProtocol).includes(upstream)) {
+    throw new DeployPlanError(
+      `${name}: deploy.upstream must be one of ${Object.values(UpstreamProtocol).join(", ")}`,
+    );
+  }
+  return upstream;
+}
+
+// Returns the published UDP ports as droplet-deploy.sh takes them: a
+// comma-separated list, or `none`.
+function dropletUdpPorts(name, value) {
+  if (value === undefined) return [];
+  const valid =
+    Array.isArray(value) &&
+    value.length > 0 &&
+    value.every(
+      (port) =>
+        Number.isInteger(port) &&
+        port >= minimumDropletPort &&
+        port <= maximumDropletPort,
+    ) &&
+    new Set(value).size === value.length;
+  if (!valid) {
+    throw new DeployPlanError(
+      `${name}: deploy.udpPorts must be a nonempty list of distinct integers from ${minimumDropletPort} to ${maximumDropletPort}`,
+    );
+  }
+  return value;
+}
 
 export class DeployPlanError extends Error {}
 
@@ -208,12 +250,15 @@ function deployable(pkg) {
         `${name}: deploy.port must be an integer from ${minimumDropletPort} to ${maximumDropletPort}`,
       );
     }
+    const udpPorts = dropletUdpPorts(name, deploy.udpPorts);
     return {
       ...base,
       service: deploy.service,
       hostname: deploy.hostname,
-      // A string, so that the deploy loop can require nonempty string fields.
+      // Strings, so that the deploy loop can require nonempty string fields.
       port: String(deploy.port),
+      upstream: dropletUpstream(name, deploy.upstream),
+      udpPorts: udpPorts.length > 0 ? udpPorts.join(",") : "none",
     };
   }
   if (typeof deploy.project !== "string" || deploy.project === "") {
@@ -393,7 +438,8 @@ export function check(repoRoot) {
 
 // Two deployables that name the same Droplet service or Pages project would
 // overwrite each other, while both get a release tag. Two Droplet services
-// with the same host name would replace each other's reverse proxy route.
+// with the same host name would replace each other's reverse proxy route, and
+// two that publish the same UDP port could not both start.
 // Checks every deployable of the workspace, selected or not.
 function rejectSharedDestinations(packages) {
   const owners = new Map();
@@ -403,6 +449,11 @@ function rejectSharedDestinations(packages) {
     const keys = [`${d.target}:${d.service ?? d.project}`];
     if (d.hostname !== undefined)
       keys.push(`${d.target}-hostname:${d.hostname}`);
+    if (d.udpPorts !== undefined && d.udpPorts !== "none") {
+      for (const port of d.udpPorts.split(",")) {
+        keys.push(`${d.target}-udp:${port}`);
+      }
+    }
     for (const key of keys) {
       const owner = owners.get(key);
       if (owner) {
@@ -464,13 +515,14 @@ export function plan(status, packages) {
       byName.get(name),
     );
   });
+  const servers = deployables.filter((d) => d.kind === DeployKind.Server);
   return {
     // The deploy jobs check that these changeset files are still pending on
     // `main` before they upload, so a rerun of an old run cannot deploy a
     // superseded revision.
     changesets: (status.changesets ?? []).map(({ id }) => checkChangesetId(id)),
     releases: releases.sort((a, b) => a.name.localeCompare(b.name)),
-    servers: deployables.filter((d) => d.kind === DeployKind.Server),
+    servers,
     staticSites: deployables.filter((d) => d.kind === DeployKind.StaticSite),
   };
 }

@@ -17,6 +17,7 @@ import {
   DeployPlanError,
   DeployTarget,
   ReleaseType,
+  UpstreamProtocol,
   check,
   main,
   plan,
@@ -161,6 +162,8 @@ test("deployables follow workspace dependency order within each kind", () => {
     service: "api-svc",
     hostname: "api-svc.example.com",
     port: "8080",
+    upstream: UpstreamProtocol.Http1,
+    udpPorts: "none",
     version: "0.1.0",
   });
   assert.equal(result.staticSites[0].output, "apps/web/dist");
@@ -276,6 +279,62 @@ test("invalid Droplet service names, host names and ports fail", () => {
       JSON.stringify(fields),
     );
   }
+});
+
+test("a Droplet server declares its upstream protocol and UDP ports", () => {
+  const packages = [
+    pkg("servers/api", {
+      name: "api",
+      deploy: droplet("api", {
+        upstream: UpstreamProtocol.H2c,
+        udpPorts: [3478, 3479],
+      }),
+    }),
+    pkg("servers/worker", { name: "worker", deploy: droplet("worker") }),
+  ];
+  const result = plan(status(["api", "1.0.0"], ["worker", "1.0.0"]), packages);
+  const byName = Object.fromEntries(result.servers.map((d) => [d.name, d]));
+  assert.equal(byName.api.upstream, "h2c");
+  assert.equal(byName.api.udpPorts, "3478,3479");
+  assert.equal(byName.worker.upstream, "http1");
+  assert.equal(byName.worker.udpPorts, "none");
+});
+
+test("invalid upstream protocols and UDP ports fail", () => {
+  for (const [fields, message] of [
+    [{ upstream: "h2" }, /deploy\.upstream must be one of http1, h2c/],
+    [{ upstream: "" }, /deploy\.upstream/],
+    [{ udpPorts: [] }, /deploy\.udpPorts/],
+    [{ udpPorts: 3478 }, /deploy\.udpPorts/],
+    [{ udpPorts: ["3478"] }, /deploy\.udpPorts/],
+    [{ udpPorts: [443] }, /deploy\.udpPorts/],
+    [{ udpPorts: [70000] }, /deploy\.udpPorts/],
+    [{ udpPorts: [3478, 3478] }, /deploy\.udpPorts/],
+  ]) {
+    const packages = [
+      pkg("servers/api", { name: "api", deploy: droplet("api", fields) }),
+    ];
+    assert.throws(
+      () => plan(status(["api", "1.0.0"]), packages),
+      (error) =>
+        error instanceof DeployPlanError && message.test(error.message),
+      JSON.stringify(fields),
+    );
+  }
+});
+
+test("two Droplet services that publish the same UDP port fail", () => {
+  const packages = [
+    pkg("servers/a", { name: "a", deploy: droplet("a", { udpPorts: [3478] }) }),
+    pkg("servers/b", {
+      name: "b",
+      deploy: droplet("b", { udpPorts: [4000, 3478] }),
+    }),
+  ];
+  assert.throws(
+    () => plan(status(["a", "1.0.0"]), packages),
+    /a and b both deploy to droplet-udp:3478/,
+  );
 });
 
 test("an unknown release fails", () => {
@@ -1114,8 +1173,22 @@ test("repository deployables use the documented targets", () => {
   const all = packages.map((p) => [p.manifest.name, "1.0.0"]);
   const result = plan(status(...all), packages);
   assert.deepEqual(
-    result.servers.map((d) => [d.name, d.service]),
-    [["accounts-api", "accounts-api"]],
+    result.servers.map((d) => [
+      d.name,
+      d.service,
+      d.hostname,
+      d.upstream,
+      d.udpPorts,
+    ]),
+    [
+      [
+        "accounts-api",
+        "accounts-api",
+        "accounts.api.delino.io",
+        UpstreamProtocol.Http1,
+        "none",
+      ],
+    ],
   );
   assert.deepEqual(
     result.staticSites.map((d) => [d.name, d.project, d.output]),

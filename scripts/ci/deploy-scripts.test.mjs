@@ -1396,6 +1396,8 @@ function runTargets(
           service: "api",
           hostname: "api.example.com",
           port: "8080",
+          upstream: "http1",
+          udpPorts: "none",
         },
         {
           name: "worker",
@@ -1403,6 +1405,8 @@ function runTargets(
           service: "worker-svc",
           hostname: "worker.example.com",
           port: "9000",
+          upstream: "h2c",
+          udpPorts: "3478",
         },
       ]),
       SITES: JSON.stringify([
@@ -1549,13 +1553,13 @@ test(
       `docker push --quiet ${registry}/api:${sha}`,
       `docker buildx imagetools inspect ${registry}/api:${sha} --format {{json .Manifest}}`,
       "guard ",
-      `ssh -F ${result.dir}/ssh_config droplet bash -s -- api ${registry}/api@${digest} 8080 api.example.com`,
+      `ssh -F ${result.dir}/ssh_config droplet bash -s -- api ${registry}/api@${digest} 8080 api.example.com http1 none`,
       `docker load --quiet --input ${result.dir}/servers/worker.tar.gz`,
       `docker tag worker:${sha} ${registry}/worker-svc:${sha}`,
       `docker push --quiet ${registry}/worker-svc:${sha}`,
       `docker buildx imagetools inspect ${registry}/worker-svc:${sha} --format {{json .Manifest}}`,
       "guard ",
-      `ssh -F ${result.dir}/ssh_config droplet bash -s -- worker-svc ${registry}/worker-svc@${digest} 9000 worker.example.com`,
+      `ssh -F ${result.dir}/ssh_config droplet bash -s -- worker-svc ${registry}/worker-svc@${digest} 9000 worker.example.com h2c 3478`,
     ]);
     // The remote side receives the deploy script on standard input.
     assert.equal(
@@ -1657,11 +1661,13 @@ const dropletImage = `registry.digitalocean.com/delino/api@sha256:${"e".repeat(6
 //   STUB_STOP_FAIL  space-separated container IDs that `docker stop` fails for.
 //   STUB_RM_FAIL    space-separated container IDs that `docker rm` fails for
 //                 (`docker rm --force` of a replacement still succeeds).
+//   STUB_START_NEW  exit code of `docker start` for the replacement (default
+//                 0); `docker start` of an old container always succeeds.
 // `stubs` adds stub commands (name -> shell body) that shadow system tools, and
 // `prepare(deployRoot)` changes the scratch state before the run.
 function setupDroplet(
   t,
-  args = ["api", dropletImage, "8080", "api.example.com"],
+  args = ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
   {
     old = [],
     envFile = "LOG_LEVEL=info\n",
@@ -1708,6 +1714,7 @@ function setupDroplet(
       *) echo 172.18.0.5 ;;
     esac ;;
   exec) exit "\${STUB_RELOAD:-0}" ;;
+  start) [[ "\$2" == old* ]] || exit "\${STUB_START_NEW:-0}" ;;
   stop) [[ " \${STUB_STOP_FAIL:-} " != *" \$4 "* ]] || exit 1 ;;
   rm) [[ "\$2" == --force || " \${STUB_RM_FAIL:-} " != *" \$2 "* ]] || exit 1 ;;
   logs) echo "server log line"; exit "\${STUB_LOGS:-0}" ;;
@@ -1744,7 +1751,7 @@ esac`,
 
 function runDroplet(
   t,
-  args = ["api", dropletImage, "8080", "api.example.com"],
+  args = ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
   { env = {}, ...options } = {},
 ) {
   const setup = setupDroplet(t, args, options);
@@ -1844,7 +1851,7 @@ test(
     for (const service of services) {
       const result = runDroplet(
         t,
-        [service, dropletImage, "8080", "api.example.com"],
+        [service, dropletImage, "8080", "api.example.com", "http1", "none"],
         { old: ["old1"] },
       );
       assert.equal(result.status, 0, `${service}: ${result.stderr}`);
@@ -2185,6 +2192,209 @@ test(
   },
 );
 
+// The route text that droplet-deploy.sh writes for each upstream protocol.
+const caddyRoute = (service, hostname, upstream, h2c) =>
+  [
+    `# Written by scripts/ci/droplet-deploy.sh for ${service}. Do not edit.`,
+    `${hostname} {`,
+    `\treverse_proxy ${upstream} {`,
+    "\t\tlb_try_duration 10s",
+    ...(h2c ? ["\t\ttransport http {", "\t\t\tversions h2c", "\t\t}"] : []),
+    "\t}",
+    "}",
+    "",
+  ].join("\n");
+
+const aliasOf = (calls, command = "docker run") =>
+  calls
+    .find((call) => call.startsWith(command))
+    .match(/--network-alias (\S+)/)[1];
+
+test(
+  "droplet deploy writes the verified route for each upstream protocol",
+  { skip },
+  (t) => {
+    for (const [upstream, h2c] of [
+      ["http1", false],
+      ["h2c", true],
+    ]) {
+      const result = runDroplet(t, [
+        "api",
+        dropletImage,
+        "8080",
+        "api.example.com",
+        upstream,
+        "none",
+      ]);
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(
+        result.read("caddy/sites/api.caddy"),
+        caddyRoute(
+          "api",
+          "api.example.com",
+          `${aliasOf(result.calls)}:8080`,
+          h2c,
+        ),
+        upstream,
+      );
+    }
+  },
+);
+
+const udpArgs = [
+  "api",
+  dropletImage,
+  "8080",
+  "api.example.com",
+  "h2c",
+  "3478,3479",
+];
+
+test(
+  "droplet deploy stops the old container before a replacement with UDP ports starts",
+  { skip },
+  (t) => {
+    const result = runDroplet(t, udpArgs, { old: ["old1", "old2"] });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.deepEqual(commands(result.calls), [
+      "docker pull",
+      "docker ps",
+      "docker create",
+      "docker stop",
+      "docker stop",
+      "docker start",
+      "docker inspect",
+      "docker inspect",
+      "curl --silent",
+      "docker exec",
+      "docker rm",
+      "docker rm",
+      "docker image",
+    ]);
+    const create = result.calls.find((call) =>
+      call.startsWith("docker create"),
+    );
+    // IPv4 only, with the same host and container port.
+    for (const part of [
+      "--publish 0.0.0.0:3478:3478/udp",
+      "--publish 0.0.0.0:3479:3479/udp",
+      "--label io.delino.service=api",
+      "--restart unless-stopped",
+      "--env ADDR=:8080",
+      dropletImage,
+    ]) {
+      assert.ok(create.includes(part), `${part} in ${create}`);
+    }
+    assert.ok(!create.includes("--detach"), create);
+    const alias = aliasOf(result.calls, "docker create");
+    assert.ok(
+      result.calls.includes(`docker start api-${alias.slice("api-".length)}`),
+      result.calls.join("\n"),
+    );
+    // The old containers are stopped once, before the start, and removed
+    // after the route switched.
+    assert.deepEqual(
+      result.calls.filter((call) => call.startsWith("docker stop")),
+      ["docker stop --time 30 old1", "docker stop --time 30 old2"],
+    );
+    assert.deepEqual(
+      result.calls.filter((call) => call.startsWith("docker rm")),
+      ["docker rm old1", "docker rm old2"],
+    );
+    assert.equal(
+      result.read("caddy/sites/api.caddy"),
+      caddyRoute("api", "api.example.com", `${alias}:8080`, true),
+    );
+    assert.equal(result.read("state/api.current"), `${dropletImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy starts the old containers again when a replacement with UDP ports fails",
+  { skip },
+  (t) => {
+    const route = "# previous route\n";
+    for (const [label, options, message] of [
+      [
+        "health check",
+        { env: { STUB_HEALTHY: "0" } },
+        /did not pass the health check; the previous containers were started again/,
+      ],
+      [
+        "start",
+        { env: { STUB_START_NEW: "1" } },
+        /did not start; the previous containers were started again/,
+      ],
+      [
+        "stop",
+        { env: { STUB_STOP_FAIL: "old2" } },
+        /docker stop failed for the previous container old2; the previous containers were started again/,
+      ],
+      [
+        "proxy reload",
+        { env: { STUB_RELOAD: "1" } },
+        /was not switched; the previous containers were started again/,
+      ],
+    ]) {
+      const result = runDroplet(t, udpArgs, {
+        old: ["old1", "old2"],
+        route,
+        state: "previous-image\n",
+        ...options,
+      });
+      assert.notEqual(result.status, 0, label);
+      assert.match(result.stderr, message, label);
+      // The replacement is removed, the old containers run again, and the
+      // route and the state files are unchanged.
+      assert.ok(
+        result.calls.some((call) => /^docker rm --force api-/.test(call)),
+        label,
+      );
+      assert.deepEqual(
+        result.calls.filter((call) => /^docker start old/.test(call)),
+        ["docker start old1", "docker start old2"],
+        label,
+      );
+      assert.ok(
+        !result.calls.some((call) => /^docker rm old/.test(call)),
+        label,
+      );
+      assert.equal(result.read("caddy/sites/api.caddy"), route, label);
+      assert.equal(result.read("state/api.current"), "previous-image\n", label);
+    }
+  },
+);
+
+test(
+  "droplet deploy rejects a bad upstream protocol or UDP port list before any change",
+  { skip },
+  (t) => {
+    const base = ["api", dropletImage, "8080", "api.example.com"];
+    for (const [upstream, udp, message] of [
+      ["h2", "none", /upstream protocol/],
+      ["", "none", /upstream protocol/],
+      ["h2c", "", /comma-separated list/],
+      ["h2c", "3478,", /comma-separated list/],
+      ["h2c", "a", /comma-separated list/],
+      ["h2c", "80", /UDP port '80'/],
+      ["h2c", "70000", /UDP port '70000'/],
+      ["h2c", "3478,3478", /listed twice/],
+    ]) {
+      const result = runDroplet(t, [...base, upstream, udp]);
+      const label = JSON.stringify([upstream, udp]);
+      assert.notEqual(result.status, 0, label);
+      assert.match(result.stderr, message, label);
+      assert.deepEqual(result.calls, [""], label);
+    }
+    const short = runDroplet(t, base);
+    assert.equal(short.status, 2);
+    assert.match(
+      short.stderr,
+      /usage: droplet-deploy\.sh .* <http1\|h2c> <udp-ports\|none>/,
+    );
+  },
+);
+
 // Starts droplet-deploy.sh without waiting for it, for the fixtures that run
 // several deployments at once. The promise resolves with the exit status and
 // the output; the process is killed when the test ends.
@@ -2237,7 +2447,7 @@ test(
     const first = startDroplet(
       t,
       setup,
-      ["api", dropletImage, "8080", "api.example.com"],
+      ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
       { STUB_BLOCK: "1" },
     );
     // The first run holds the lock once it waits for its health check.
@@ -2252,6 +2462,8 @@ test(
       concurrentImage,
       "8080",
       "api.example.com",
+      "http1",
+      "none",
     ]);
     await sleep(750);
     assert.deepEqual(
@@ -2303,7 +2515,7 @@ test(
     const first = startDroplet(
       t,
       setup,
-      ["api", dropletImage, "8080", "api.example.com"],
+      ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
       { STUB_BLOCK: "1" },
     );
     await waitFor(
@@ -2314,7 +2526,7 @@ test(
     const second = await startDroplet(
       t,
       setup,
-      ["api", concurrentImage, "8080", "api.example.com"],
+      ["api", concurrentImage, "8080", "api.example.com", "http1", "none"],
       { DROPLET_LOCK_TIMEOUT: "1" },
     ).done;
     assert.equal(second.status, 1);
@@ -2345,7 +2557,7 @@ test(
     const first = startDroplet(
       t,
       setup,
-      ["api", dropletImage, "8080", "api.example.com"],
+      ["api", dropletImage, "8080", "api.example.com", "http1", "none"],
       { STUB_BLOCK: "1" },
     );
     await waitFor(
@@ -2357,6 +2569,8 @@ test(
       concurrentImage,
       "9000",
       "worker.example.com",
+      "http1",
+      "none",
     ]).done;
     assert.equal(other.status, 0, other.stderr);
     assert.equal(setup.read("state/worker.current"), `${concurrentImage}\n`);
@@ -2388,30 +2602,60 @@ test(
     const image = dropletImage;
     for (const [args, options, message] of [
       [["api", image, "8080"], {}, /usage: droplet-deploy\.sh/],
-      [["API", image, "8080", "api.example.com"], {}, /service name/],
-      [["api;x", image, "8080", "api.example.com"], {}, /service name/],
       [
-        ["api", "registry/api:latest", "8080", "api.example.com"],
+        ["API", image, "8080", "api.example.com", "http1", "none"],
+        {},
+        /service name/,
+      ],
+      [
+        ["api;x", image, "8080", "api.example.com", "http1", "none"],
+        {},
+        /service name/,
+      ],
+      [
+        [
+          "api",
+          "registry/api:latest",
+          "8080",
+          "api.example.com",
+          "http1",
+          "none",
+        ],
         {},
         /pinned by digest/,
       ],
-      [["api", image, "80", "api.example.com"], {}, /port/],
-      [["api", image, "70000", "api.example.com"], {}, /port/],
-      [["api", image, "8080", "localhost"], {}, /host name/],
-      [["api", image, "8080", "a.example.com;x"], {}, /host name/],
+      [["api", image, "80", "api.example.com", "http1", "none"], {}, /port/],
+      [["api", image, "70000", "api.example.com", "http1", "none"], {}, /port/],
+      [["api", image, "8080", "localhost", "http1", "none"], {}, /host name/],
       [
-        ["api", image, "8080", `${"a".repeat(64)}.example.com`],
+        ["api", image, "8080", "a.example.com;x", "http1", "none"],
         {},
         /host name/,
       ],
-      [["api", image, "8080", `api.${"a".repeat(64)}.com`], {}, /host name/],
       [
-        ["api", image, "8080", "api.example.com"],
+        [
+          "api",
+          image,
+          "8080",
+          `${"a".repeat(64)}.example.com`,
+          "http1",
+          "none",
+        ],
+        {},
+        /host name/,
+      ],
+      [
+        ["api", image, "8080", `api.${"a".repeat(64)}.com`, "http1", "none"],
+        {},
+        /host name/,
+      ],
+      [
+        ["api", image, "8080", "api.example.com", "http1", "none"],
         { envFile: null },
         /api\.env does not exist/,
       ],
       [
-        ["api", image, "8080", "api.example.com"],
+        ["api", image, "8080", "api.example.com", "http1", "none"],
         { envFile: "ADDR=:1\n" },
         /sets ADDR/,
       ],
@@ -2425,7 +2669,7 @@ test(
     // A 63-character label is the longest valid one and passes validation.
     const valid = runDroplet(
       t,
-      ["api", image, "8080", `${"a".repeat(63)}.example.com`],
+      ["api", image, "8080", `${"a".repeat(63)}.example.com`, "http1", "none"],
       {},
     );
     assert.doesNotMatch(valid.stderr, /host name/);
