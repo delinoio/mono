@@ -238,6 +238,31 @@ describe("watchQueue", () => {
     expect(server.calls).toEqual([]);
   });
 
+  test("ends without an error when the signal aborts a pending token source", async () => {
+    const server = watchServer([["snapshot"]]);
+    const abort = new AbortController();
+    let asked = 0;
+    const client = new TideClient({
+      origin: FAKE_ORIGIN,
+      fetch: server.fetch,
+      token: () => {
+        asked++;
+        // Abort while the interceptor waits for the token.
+        setTimeout(() => abort.abort(), 0);
+        return new Promise<string>(() => {});
+      },
+      clock: new RecordingClock(),
+    });
+    const events = await take(
+      client.watchQueue({ organizationId: ORG, signal: abort.signal }),
+      1,
+      abort,
+    );
+    expect(events).toEqual([]);
+    expect(asked).toBe(1);
+    expect(server.calls).toEqual([]);
+  });
+
   test("ends without an error when the signal aborts an open stream", async () => {
     const server = watchServer([["snapshot", "hang"]]);
     const client = new TideClient({

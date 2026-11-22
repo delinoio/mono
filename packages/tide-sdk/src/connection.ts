@@ -78,15 +78,44 @@ export function createApiTransport(options: ConnectionOptions): Transport {
   });
 }
 
-async function currentToken(token: TokenSource): Promise<string> {
+async function currentToken(
+  token: TokenSource,
+  signal: AbortSignal,
+): Promise<string> {
   if (typeof token === "string") {
     return token;
   }
-  const value = await token();
+  const value = await untilAborted(
+    new Promise<string>((resolve) => resolve(token())),
+    signal,
+  );
   if (typeof value !== "string" || value === "") {
     throw new TideConfigError("the token source returned no token");
   }
   return value;
+}
+
+/**
+ * Waits for a promise, but rejects with the reason of the signal when the
+ * signal aborts first. A late result of the promise is then ignored, so a
+ * token source that answers after the abort starts no request.
+ */
+function untilAborted<T>(promise: Promise<T>, signal: AbortSignal): Promise<T> {
+  signal.throwIfAborted();
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = () => reject(signal.reason);
+    signal.addEventListener("abort", onAbort, { once: true });
+    promise.then(
+      (value) => {
+        signal.removeEventListener("abort", onAbort);
+        resolve(value);
+      },
+      (error: unknown) => {
+        signal.removeEventListener("abort", onAbort);
+        reject(error);
+      },
+    );
+  });
 }
 
 function credentialInterceptor(options: ConnectionOptions): Interceptor {
@@ -98,7 +127,7 @@ function credentialInterceptor(options: ConnectionOptions): Interceptor {
       );
     }
     req.signal.throwIfAborted();
-    const secret = await currentToken(options.token);
+    const secret = await currentToken(options.token, req.signal);
     req.header.set("Authorization", `Bearer ${secret}`);
     let res;
     try {
