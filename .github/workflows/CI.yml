@@ -415,9 +415,6 @@ jobs:
               ;;
             Windows)
               known_failures=(
-                # The read snapshot does not abort when the path is swapped
-                # before open.
-                cmds/ownsand-guest/guest
                 # The tar escape checks accept links such as `/etc/passwd`,
                 # which are not absolute paths on Windows.
                 internal/fsutil

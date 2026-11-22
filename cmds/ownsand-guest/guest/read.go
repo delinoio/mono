@@ -192,7 +192,10 @@ func (m *readManager) prepare(readID string, e *readEntry) {
 }
 
 func (m *readManager) makeSnapshot(src, dst string) (SnapshotKind, int64, error) {
-	before, err := os.Stat(src)
+	// statSource captures the identity of the file together with its size
+	// and modification time, so that the comparisons below detect a path
+	// that was swapped after this stat on every platform.
+	before, err := statSource(src)
 	if err != nil {
 		return 0, 0, fsError("read", err)
 	}
@@ -255,7 +258,7 @@ func sourceUnchanged(before os.FileInfo, in *os.File, src string) bool {
 	if err != nil {
 		return false
 	}
-	pathInfo, err := os.Stat(src)
+	pathInfo, err := statSource(src)
 	if err != nil {
 		return false
 	}
