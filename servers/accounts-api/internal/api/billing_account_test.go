@@ -1038,3 +1038,134 @@ func TestCORSPreflight(t *testing.T) {
 		t.Fatalf("preflight = %d %v", resp.StatusCode, resp.Header)
 	}
 }
+
+// acceptanceRows counts the rows an acceptance writes for one billing account,
+// and reports whether the invitation is still unaccepted.
+func acceptanceRows(t *testing.T, env *testenv.Env, accountID string) (members, accepted, audits int) {
+	t.Helper()
+	pool := env.DB.Pool
+	if err := pool.QueryRow(ctx(), `SELECT count(*) FROM billing_account_members WHERE billing_account_id = $1`, accountID).Scan(&members); err != nil {
+		t.Fatalf("count members: %v", err)
+	}
+	if err := pool.QueryRow(ctx(), `SELECT count(*) FROM billing_account_invitations
+		WHERE billing_account_id = $1 AND accept_time IS NOT NULL`, accountID).Scan(&accepted); err != nil {
+		t.Fatalf("count accepted invitations: %v", err)
+	}
+	if err := pool.QueryRow(ctx(), `SELECT count(*) FROM billing_audit_events
+		WHERE billing_account_id = $1 AND kind = $2`, accountID, string(api.AuditInvitationAccepted)).Scan(&audits); err != nil {
+		t.Fatalf("count audit events: %v", err)
+	}
+	return members, accepted, audits
+}
+
+// An invitation that expires after the early check, while the Logto lookup is
+// in flight, must be rejected by the check inside the transaction.
+func TestAcceptInvitationExpiresDuringDirectoryLookup(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	invitee := newPerson(env, "invitee")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+	invite(t, owner, accountID, invitee.Email, roleViewer)
+	token := env.InvitationToken(invitee.Email)
+	members, accepted, audits := acceptanceRows(t, env, accountID)
+
+	// The invitation is still pending at the early check. The clock then
+	// passes the expiry during the lookup.
+	env.Directory.SetOnUser(func() { env.Clock.Advance(api.InvitationLifetime + time.Second) })
+	_, err := accept(invitee, token)
+	env.Directory.SetOnUser(nil)
+	wantCode(t, err, connect.CodeFailedPrecondition)
+
+	gotMembers, gotAccepted, gotAudits := acceptanceRows(t, env, accountID)
+	if gotMembers != members || gotAccepted != accepted || gotAudits != audits {
+		t.Fatalf("rows after the rejected accept = members %d accepted %d audits %d, want %d %d %d",
+			gotMembers, gotAccepted, gotAudits, members, accepted, audits)
+	}
+}
+
+// An invitation that expires while the acceptance waits for the billing
+// account lock held by another transaction must be rejected as well.
+func TestAcceptInvitationExpiresWhileWaitingForAccountLock(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	invitee := newPerson(env, "invitee")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+	invite(t, owner, accountID, invitee.Email, roleViewer)
+	token := env.InvitationToken(invitee.Email)
+	members, accepted, audits := acceptanceRows(t, env, accountID)
+
+	// During the lookup, a second transaction takes the account lock. Once
+	// the acceptance blocks on it, the clock passes the expiry and the second
+	// transaction commits.
+	released := make(chan error, 1)
+	env.Directory.SetOnUser(func() {
+		env.Directory.SetOnUser(nil)
+		tx, err := env.DB.Pool.Begin(ctx())
+		if err != nil {
+			released <- err
+			return
+		}
+		if _, err := tx.Exec(ctx(), `SELECT 1 FROM billing_accounts WHERE billing_account_id = $1 FOR UPDATE`, accountID); err != nil {
+			_ = tx.Rollback(ctx())
+			released <- err
+			return
+		}
+		go func() {
+			defer func() { released <- tx.Commit(ctx()) }()
+			deadline := time.Now().Add(10 * time.Second)
+			for time.Now().Before(deadline) {
+				var waiting bool
+				err := env.DB.Pool.QueryRow(ctx(), `SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+					WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR UPDATE%' AND pid <> pg_backend_pid())`).Scan(&waiting)
+				if err == nil && waiting {
+					break
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			env.Clock.Advance(api.InvitationLifetime + time.Second)
+		}()
+	})
+	_, err := accept(invitee, token)
+	if rerr := <-released; rerr != nil {
+		t.Fatalf("lock holder: %v", rerr)
+	}
+	wantCode(t, err, connect.CodeFailedPrecondition)
+
+	gotMembers, gotAccepted, gotAudits := acceptanceRows(t, env, accountID)
+	if gotMembers != members || gotAccepted != accepted || gotAudits != audits {
+		t.Fatalf("rows after the rejected accept = members %d accepted %d audits %d, want %d %d %d",
+			gotMembers, gotAccepted, gotAudits, members, accepted, audits)
+	}
+}
+
+// A valid invitation is still accepted when the lookup and the lock wait take
+// time, and the response and rows carry the acceptance time.
+func TestAcceptInvitationBeforeExpiryRecordsAcceptanceTime(t *testing.T) {
+	env := testenv.New(t)
+	owner := newPerson(env, "owner")
+	invitee := newPerson(env, "invitee")
+	accountID := createAccount(t, owner, "Team").GetBillingAccountId()
+	inv := invite(t, owner, accountID, invitee.Email, roleViewer)
+	token := env.InvitationToken(invitee.Email)
+
+	env.Directory.SetOnUser(func() { env.Clock.Advance(time.Hour) })
+	resp, err := accept(invitee, token)
+	env.Directory.SetOnUser(nil)
+	if err != nil {
+		t.Fatalf("AcceptInvitation: %v", err)
+	}
+	if !resp.Msg.GetMember().GetCreateTime().AsTime().After(inv.GetCreateTime().AsTime().Add(time.Hour)) {
+		t.Fatalf("member create time %v does not include the lookup delay after %v",
+			resp.Msg.GetMember().GetCreateTime().AsTime(), inv.GetCreateTime().AsTime())
+	}
+	var memberTime, acceptTime time.Time
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT m.create_time, i.accept_time
+		FROM billing_account_members m, billing_account_invitations i
+		WHERE m.billing_account_id = $1 AND m.user_id = $2 AND i.invitation_id = $3::uuid`,
+		accountID, invitee.ID, inv.GetInvitationId()).Scan(&memberTime, &acceptTime); err != nil {
+		t.Fatalf("read acceptance rows: %v", err)
+	}
+	if !memberTime.Equal(acceptTime) || !memberTime.Equal(resp.Msg.GetMember().GetCreateTime().AsTime()) {
+		t.Fatalf("member %v, accept %v and response %v times differ", memberTime, acceptTime, resp.Msg.GetMember().GetCreateTime().AsTime())
+	}
+}
