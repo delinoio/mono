@@ -4,6 +4,7 @@ package hcsrt
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/images"
@@ -26,13 +27,25 @@ func TestCheckWindowsResources(t *testing.T) {
 }
 
 func TestWindowsOutboundUnsupported(t *testing.T) {
+	// The image directory stays empty, so only the order of the checks tells the two cases apart:
+	// the OUTBOUND guard must run before the missing-disk check.
 	r := &Runtime{opts: Options{WindowsImage: t.TempDir()}}
-	err := r.checkWindowsSpec(vmruntime.Spec{GuestOS: ownsandv1.GuestOs_GUEST_OS_WINDOWS, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND})
-	if !errors.Is(err, vmruntime.ErrUnsupported) {
-		t.Fatalf("OUTBOUND Windows sandbox: %v", err)
-	}
-	err = r.checkWindowsSpec(vmruntime.Spec{GuestOS: ownsandv1.GuestOs_GUEST_OS_WINDOWS, NetworkMode: ownsandv1.NetworkMode_NETWORK_MODE_NONE})
-	if !errors.Is(err, vmruntime.ErrUnsupported) {
-		t.Fatalf("Windows sandbox without an image: %v", err)
+	for _, tc := range []struct {
+		name string
+		mode ownsandv1.NetworkMode
+		want string
+	}{
+		{"outbound", ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND, "Windows sandboxes run only with network mode NONE in this version"},
+		{"none without an image", ownsandv1.NetworkMode_NETWORK_MODE_NONE, "the Windows base image is not built"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := r.checkWindowsSpec(vmruntime.Spec{GuestOS: ownsandv1.GuestOs_GUEST_OS_WINDOWS, NetworkMode: tc.mode})
+			if !errors.Is(err, vmruntime.ErrUnsupported) {
+				t.Fatalf("errors.Is(err, ErrUnsupported) is false: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("the error does not contain %q: %v", tc.want, err)
+			}
+		})
 	}
 }
