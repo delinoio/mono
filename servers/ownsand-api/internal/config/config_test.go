@@ -136,6 +136,68 @@ func TestLoadCanonicalizesCORSOrigins(t *testing.T) {
 	}
 }
 
+// TestLoadCanonicalizesIPv4CORSOrigins checks that every IPv4 spelling that a
+// browser normalizes is stored as the dotted decimal origin that the browser
+// sends in the Origin header, and that a host that browsers reject stops the
+// server at startup.
+func TestLoadCanonicalizesIPv4CORSOrigins(t *testing.T) {
+	v := minimal()
+	v[EnvCORSOrigins] = "http://127.1:3000, http://0x7f.1:3000, http://2130706433:3000, http://0177.0.0.1:3000, http://127.0.0.1.:3000, http://127.0.0.1:80, http://127.0.0.1:3001"
+	cfg, err := Load(env(v))
+	if err != nil {
+		t.Fatalf("Load() err = %v", err)
+	}
+	want := []string{
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1",
+		"http://127.0.0.1:3001",
+	}
+	if !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	for _, value := range []string{"http://1.2.3.4.5", "http://256.1.1.1", "http://example.1", "http://4294967296"} {
+		v := minimal()
+		v[EnvCORSOrigins] = value
+		_, err := Load(env(v))
+		if err == nil || !strings.Contains(err.Error(), EnvCORSOrigins) {
+			t.Errorf("CORS_ORIGINS=%q: err = %v, want an error that names %s", value, err, EnvCORSOrigins)
+		}
+	}
+}
+
+// TestLoadCanonicalizesIPv6CORSOrigins checks that every spelling of an IPv6
+// host is stored in the compressed lower-case form that a browser sends in the
+// Origin header, and that an address with a zone, which a browser rejects, stops
+// the server at startup.
+func TestLoadCanonicalizesIPv6CORSOrigins(t *testing.T) {
+	v := minimal()
+	v[EnvCORSOrigins] = "https://[0:0:0:0:0:0:0:1]:443, https://[::1]:8443, https://[::ffff:192.0.2.1]:8443, HTTP://[2001:DB8:0:0:1:0:0:1]:80"
+	cfg, err := Load(env(v))
+	if err != nil {
+		t.Fatalf("Load() err = %v", err)
+	}
+	want := []string{
+		"https://[::1]",
+		"https://[::1]:8443",
+		"https://[::ffff:c000:201]:8443",
+		"http://[2001:db8::1:0:0:1]",
+	}
+	if !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	for _, value := range []string{"https://[fe80::1%25eth0]", "https://[::1%25eth0]:443"} {
+		v := minimal()
+		v[EnvCORSOrigins] = value
+		if _, err := Load(env(v)); err == nil || !strings.Contains(err.Error(), EnvCORSOrigins) {
+			t.Errorf("CORS_ORIGINS=%q: err = %v, want an error that names %s", value, err, EnvCORSOrigins)
+		}
+	}
+}
+
 func TestLoadR2AndSTUN(t *testing.T) {
 	v := minimal()
 	v[EnvSTUNURLs] = "stun:a:3478, stun:b:3478"

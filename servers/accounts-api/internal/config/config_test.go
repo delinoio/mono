@@ -480,6 +480,84 @@ func TestLoadCanonicalizesOrigins(t *testing.T) {
 	}
 }
 
+// TestLoadCanonicalizesIPv4Origins checks that every IPv4 spelling that a
+// browser normalizes is stored as the dotted decimal origin that the browser
+// sends in the Origin header, for CORS_ORIGINS and WEB_ORIGIN alike.
+func TestLoadCanonicalizesIPv4Origins(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvCORSOrigins: "http://127.1:3000, http://0x7f.1:3000, http://2130706433:3000, http://0177.0.0.1:3000, http://127.0.0.1.:3000, http://127.0.0.1:80, http://127.0.0.1:3001",
+		EnvWebOrigin:   "http://127.1:3000",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1:3000",
+		"http://127.0.0.1",
+		"http://127.0.0.1:3001",
+	}
+	if !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	if cfg.WebOrigin != "http://127.0.0.1:3000" {
+		t.Errorf("WebOrigin = %q, want http://127.0.0.1:3000", cfg.WebOrigin)
+	}
+}
+
+// TestLoadRejectsHostsThatBrowsersRejectAsIPv4 checks that a host whose last
+// label is a number but that is not an IPv4 address stops the server at startup,
+// because a browser never sends such an origin.
+func TestLoadRejectsHostsThatBrowsersRejectAsIPv4(t *testing.T) {
+	for _, value := range []string{"http://1.2.3.4.5", "http://256.1.1.1", "http://example.1", "http://4294967296"} {
+		_, err := Load(lookupFrom(map[string]string{EnvCORSOrigins: value}))
+		if err == nil || !strings.Contains(err.Error(), EnvCORSOrigins) {
+			t.Errorf("CORS_ORIGINS=%q: err = %v, want an error that names %s", value, err, EnvCORSOrigins)
+		}
+		_, err = Load(lookupFrom(map[string]string{EnvWebOrigin: value}))
+		if err == nil || !strings.Contains(err.Error(), EnvWebOrigin) {
+			t.Errorf("WEB_ORIGIN=%q: err = %v, want an error that names %s", value, err, EnvWebOrigin)
+		}
+	}
+}
+
+// TestLoadCanonicalizesIPv6Origins checks that every spelling of an IPv6 host
+// is stored in the compressed lower-case form that a browser sends in the
+// Origin header, for CORS_ORIGINS and WEB_ORIGIN alike, and that an address with
+// a zone, which a browser rejects, stops the server at startup.
+func TestLoadCanonicalizesIPv6Origins(t *testing.T) {
+	cfg, err := Load(lookupFrom(map[string]string{
+		EnvCORSOrigins: "https://[0:0:0:0:0:0:0:1]:443, https://[::1]:8443, https://[::ffff:192.0.2.1]:8443, HTTP://[2001:DB8:0:0:1:0:0:1]:80",
+		EnvWebOrigin:   "https://[0:0:0:0:0:0:0:1]:443",
+	}))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{
+		"https://[::1]",
+		"https://[::1]:8443",
+		"https://[::ffff:c000:201]:8443",
+		"http://[2001:db8::1:0:0:1]",
+	}
+	if !slices.Equal(cfg.CORSOrigins, want) {
+		t.Errorf("CORSOrigins = %q, want %q", cfg.CORSOrigins, want)
+	}
+	if cfg.WebOrigin != "https://[::1]" {
+		t.Errorf("WebOrigin = %q, want https://[::1]", cfg.WebOrigin)
+	}
+	for _, value := range []string{"https://[fe80::1%25eth0]", "https://[::1%25eth0]:443"} {
+		if _, err := Load(lookupFrom(map[string]string{EnvCORSOrigins: value})); err == nil || !strings.Contains(err.Error(), EnvCORSOrigins) {
+			t.Errorf("CORS_ORIGINS=%q: err = %v, want an error that names %s", value, err, EnvCORSOrigins)
+		}
+		if _, err := Load(lookupFrom(map[string]string{EnvWebOrigin: value})); err == nil || !strings.Contains(err.Error(), EnvWebOrigin) {
+			t.Errorf("WEB_ORIGIN=%q: err = %v, want an error that names %s", value, err, EnvWebOrigin)
+		}
+	}
+}
+
 func TestLoadRejectsInvalidOriginPorts(t *testing.T) {
 	for _, value := range []string{"https://accounts.delino.io:99999", "https://accounts.delino.io:port"} {
 		_, err := Load(lookupFrom(map[string]string{EnvCORSOrigins: value}))

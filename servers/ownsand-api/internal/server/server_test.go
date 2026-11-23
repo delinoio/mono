@@ -44,13 +44,21 @@ func TestCORS(t *testing.T) {
 // browser sends for an origin that config.Load canonicalized (lower-case host,
 // no default port), keeps other ports distinct and sends Vary: Origin.
 func TestCORSMatchesBrowserSerializedOrigin(t *testing.T) {
-	h := NewHandler(Options{CORSOrigins: []string{"https://ownsand.delino.io", "http://ownsand.delino.localhost:8080"}})
+	h := NewHandler(Options{CORSOrigins: []string{"https://ownsand.delino.io", "http://ownsand.delino.localhost:8080", "http://127.0.0.1:3000", "https://[::1]"}})
 	for origin, want := range map[string]int{
 		"https://ownsand.delino.io":            http.StatusNoContent,
 		"http://ownsand.delino.localhost:8080": http.StatusNoContent,
 		"https://ownsand.delino.io:8443":       http.StatusForbidden,
 		"http://ownsand.delino.localhost":      http.StatusForbidden,
 		"http://ownsand.delino.io":             http.StatusForbidden,
+		// config.Load stores http://127.1:3000 as this origin, which a browser sends.
+		"http://127.0.0.1:3000": http.StatusNoContent,
+		"http://127.0.0.1:3001": http.StatusForbidden,
+		"http://127.0.0.2:3000": http.StatusForbidden,
+		// config.Load stores https://[0:0:0:0:0:0:0:1]:443 as this origin, which a browser sends.
+		"https://[::1]":      http.StatusNoContent,
+		"https://[::2]":      http.StatusForbidden,
+		"https://[::1]:8443": http.StatusForbidden,
 	} {
 		req := httptest.NewRequest(http.MethodOptions, "/x/y", nil)
 		req.Header.Set("Origin", origin)
