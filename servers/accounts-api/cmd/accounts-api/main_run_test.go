@@ -12,12 +12,19 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/delinoio/mono/servers/accounts-api/internal/config"
 )
 
 // setRunEnv sets the configuration that lets run start without external
 // services. The database pool opens lazily and RUN_MIGRATIONS=false skips the
 // migrations, so the unreachable database (port 1 refuses connections) is
 // contacted only by billing work, which these tests must never reach.
+//
+// LOG_LEVEL is set explicitly because run builds its logger from it and the
+// billing_worker_started event is logged at INFO. Without it the test would
+// inherit the parent's LOG_LEVEL, and a warn or error level would drop that
+// event and let the "worker did not start" assertion pass vacuously.
 func setRunEnv(t *testing.T, metricsAddr string) {
 	t.Helper()
 	env := map[string]string{
@@ -25,6 +32,7 @@ func setRunEnv(t *testing.T, metricsAddr string) {
 		"RUN_MIGRATIONS":               "false",
 		"ADDR":                         "127.0.0.1:0",
 		"METRICS_ADDR":                 metricsAddr,
+		config.EnvLogLevel:             "info",
 		"LOGTO_ISSUER":                 "http://127.0.0.1:1/oidc",
 		"LOGTO_MANAGEMENT_ENDPOINT":    "http://127.0.0.1:1",
 		"LOGTO_M2M_CLIENT_ID":          "run-test",
