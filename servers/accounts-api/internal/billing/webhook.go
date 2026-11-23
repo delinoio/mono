@@ -72,7 +72,16 @@ func (s *Service) WebhookHandler() http.Handler {
 		ctx := r.Context()
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxWebhookBytes))
 		if err != nil {
-			s.webhookRejected(ctx, w, http.StatusRequestEntityTooLarge, webhookInvalidPayload, "body_too_large")
+			// Only *http.MaxBytesError means that the body exceeds the limit.
+			// Any other error is a failed read (a reset connection, a
+			// truncated body or a timeout) of a body that may be within the
+			// limit, so it gets 400 and a distinct reason.
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				s.webhookRejected(ctx, w, http.StatusRequestEntityTooLarge, webhookInvalidPayload, "body_too_large")
+				return
+			}
+			s.webhookRejected(ctx, w, http.StatusBadRequest, webhookInvalidPayload, "body_read_failed")
 			return
 		}
 		if err := paddle.VerifySignature(r.Header.Get(paddle.SignatureHeader), body, s.webhookSecret, s.now(), paddle.SignatureTolerance); err != nil {
