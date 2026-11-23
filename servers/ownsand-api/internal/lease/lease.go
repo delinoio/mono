@@ -235,8 +235,10 @@ func (l *Lease) expireIfDue() {
 // result from an earlier period (the instance lost or released the lease
 // while the call was in flight) is dropped, so a late success cannot
 // reactivate it, and a result that arrives after the expiry does not extend
-// it. A fresh acquisition starts a new period.
-func (l *Lease) applyRenewal(epoch uint64, ok bool, reason string, expireAt time.Time) {
+// it. A fresh acquisition starts a new period. The OnAcquire callback runs
+// under ctx, the run context of the lease workers, so that stopping them
+// cancels an acquisition callback that is still in progress.
+func (l *Lease) applyRenewal(ctx context.Context, epoch uint64, ok bool, reason string, expireAt time.Time) {
 	l.init()
 	l.transitionMu.Lock()
 	defer l.transitionMu.Unlock()
@@ -264,8 +266,10 @@ func (l *Lease) applyRenewal(epoch uint64, ok bool, reason string, expireAt time
 		// OnAcquire holds transitionMu, which the expiry transition needs
 		// before it can run OnLose. Bound it by the confirmed expiry, so
 		// that its I/O cannot keep the channels admitted in the remaining
-		// ownership window open past it.
-		acquireCtx, cancel := context.WithTimeout(context.Background(), expireAt.Sub(now))
+		// ownership window open past it. It also ends when the lease
+		// workers stop, because Run releases the lease (which needs
+		// transitionMu) only after the renewal that runs it returns.
+		acquireCtx, cancel := context.WithTimeout(ctx, expireAt.Sub(now))
 		defer cancel()
 		l.mu.Unlock()
 		l.Logger.Info("lease_acquired", slog.String("instance_id", l.InstanceID))
@@ -346,7 +350,7 @@ func (l *Lease) renewOnce(ctx context.Context) {
 		l.Logger.Warn("lease_renew_failed", slog.Any("error", err))
 		return
 	}
-	l.applyRenewal(epoch, ok, reasonNotHolder, start.Add(TTL))
+	l.applyRenewal(ctx, epoch, ok, reasonNotHolder, start.Add(TTL))
 }
 
 // Run keeps the lease until ctx ends and then releases it.
