@@ -42,17 +42,30 @@ func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
 	}
 	before := len(configs())
 
-	// The first send to read the limits pauses; later sends do not.
+	// The first send to read the limits pauses; later sends do not. A later
+	// send that reads the limits while the first is still paused did not wait
+	// for the configuration lock; the hook runs on the sender goroutine, so it
+	// records that for the test goroutine to report.
 	var reads atomic.Int32
+	var released, unlockedRead atomic.Bool
 	paused := make(chan struct{})
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	releaseFirst := func() { releaseOnce.Do(func() { close(release) }) }
+	releaseFirst := func() {
+		releaseOnce.Do(func() {
+			released.Store(true)
+			close(release)
+		})
+	}
 	t.Cleanup(releaseFirst)
 	env.App.Service.SetAfterConfigLimitsReadForTest(func(string) {
 		if reads.Add(1) == 1 {
 			close(paused)
 			<-release
+			return
+		}
+		if !released.Load() {
+			unlockedRead.Store(true)
 		}
 	})
 	t.Cleanup(func() { env.App.Service.SetAfterConfigLimitsReadForTest(nil) })
@@ -71,10 +84,15 @@ func TestConfigurationSendsKeepTheNewestLimitsLast(t *testing.T) {
 		Limits: &ownsandv1.DeviceLimits{VcpuCount: 6, MemoryMib: 8192, DiskGib: 100, VcpuOvercommitPercent: 200}})); err != nil {
 		t.Fatal(err)
 	}
-	// Give the event processor time to run its send while the first one is
-	// paused. With the lock it waits for the first send; without it, it
-	// sends the new limits at once.
-	time.Sleep(500 * time.Millisecond)
+	// Wait until the event processor's send is blocked on the configuration
+	// lock behind the paused first send. Without the lock it reads the limits
+	// at once, which the hook records.
+	testenv.Eventually(t, "the second configuration send to wait for the configuration lock", func() bool {
+		return conn.ConfigLockWaiters() == 1 || unlockedRead.Load()
+	})
+	if unlockedRead.Load() {
+		t.Fatal("the second configuration send read the limits without the configuration lock")
+	}
 	releaseFirst()
 	if err := <-firstDone; err != nil {
 		t.Fatal(err)

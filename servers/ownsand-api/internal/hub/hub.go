@@ -75,6 +75,9 @@ type Conn struct {
 	// configMu serializes the configuration sends of the channel, from
 	// reading the device limits to queueing the message; see LockConfig.
 	configMu sync.Mutex
+	// configWaiters counts the senders that are blocked in LockConfig; see
+	// ConfigLockWaiters.
+	configWaiters atomic.Int32
 }
 
 // Context ends when the channel closes.
@@ -173,9 +176,17 @@ func (c *Conn) LockUpdates() (unlock func()) {
 // the limits until the message is queued, so the sender that runs later also
 // reads the newer committed limits.
 func (c *Conn) LockConfig() (unlock func()) {
+	c.configWaiters.Add(1)
 	c.configMu.Lock()
+	c.configWaiters.Add(-1)
 	return c.configMu.Unlock
 }
+
+// ConfigLockWaiters reports the number of senders that wait in LockConfig for
+// the holder to release the lock. A sync.Mutex cannot report its waiters, so a
+// test uses this count to see that a second sender reached the lock instead of
+// sleeping for an assumed time. Production code does not read it.
+func (c *Conn) ConfigLockWaiters() int { return int(c.configWaiters.Load()) }
 
 // Hub is the registry of agent channels.
 type Hub struct {
