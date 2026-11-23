@@ -160,11 +160,16 @@ function portlessVersionOf(path) {
 
 // Returns { pid, version } of the proxy that the portless state directory
 // records, or null when no proxy is recorded or its version is unknown.
-// The state directory matches `resolveStateDir` in portless 0.18.1.
-function findRunningProxy() {
+// The state directory matches `resolveStateDir` in portless 0.18.1, which uses
+// `PORTLESS_STATE_DIR` as written. A relative value therefore resolves against
+// the working directory of the portless process, and this script runs portless
+// from `appDir`, not from the directory where this script runs. An absolute
+// value and the default `~/.portless` do not depend on the working directory.
+function findRunningProxy(appDir) {
   if (process.platform === "win32") return null;
-  const stateDir =
-    process.env.PORTLESS_STATE_DIR || join(homedir(), ".portless");
+  const stateDir = process.env.PORTLESS_STATE_DIR
+    ? resolve(appDir, process.env.PORTLESS_STATE_DIR)
+    : join(homedir(), ".portless");
   let pid;
   try {
     pid = Number.parseInt(
@@ -193,7 +198,7 @@ function findRunningProxy() {
 // Stops a running proxy that is older than the pinned portless. Returns 0 when
 // no such proxy runs or it stopped, otherwise the exit status for the script.
 function stopOutdatedProxy(found) {
-  const running = findRunningProxy();
+  const running = findRunningProxy(found.appDir);
   if (running === null || !isOlderVersion(running.version, found.version)) {
     return 0;
   }
