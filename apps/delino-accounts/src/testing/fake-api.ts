@@ -96,8 +96,8 @@ export interface FakeApi {
   /**
    * Holds every call of a method until the promise settles, so that a test
    * can observe what the page does while a request is still in flight. Only
-   * `GetBillingAccount`, `GetInvoiceUrl`, `ListLedgerEntries`, `ListInvoices`
-   * and `ListUsageSummary` honor a gate. `AcceptInvitation` honors a gate
+   * `GetBillingAccount`, `GetInvoiceUrl`, `ListBillingAccounts`,
+   * `ListLedgerEntries`, `ListInvoices` and `ListUsageSummary` honor a gate. `AcceptInvitation` honors a gate
    * per invitation token, under the key `AcceptInvitation:<token>`, so that a
    * test can hold the request of one link while another link goes through.
    */
@@ -386,8 +386,9 @@ export function createFakeApi(): FakeApi {
         await api.gates.get("GetBillingAccount");
         return { billingAccount: view(load(req.billingAccountId).account) };
       },
-      listBillingAccounts(req) {
+      async listBillingAccounts(req) {
         record("ListBillingAccounts", req);
+        await api.gates.get("ListBillingAccounts");
         const { page, nextPageToken } = paginate(
           [...api.accounts.values()]
             .filter((a) => !a.deleted && member(a) !== undefined)
