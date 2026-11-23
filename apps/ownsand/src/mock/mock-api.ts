@@ -562,6 +562,19 @@ export interface MockTransportOptions {
    * another guest.
    */
   deviceCapabilities?: Readonly<Record<string, MockDeviceCapabilities>>;
+  /**
+   * How many unused enrollment tokens to add to the Acme organization after
+   * the seeded one, in listing order. A test uses this to fill more than one
+   * page of 200 rows without a request for each row.
+   */
+  extraEnrollmentTokens?: number;
+  /**
+   * How many active API keys, named `key-0`, `key-1` and so on, to add to the
+   * Acme organization after the seeded one, in listing order. A test uses
+   * this to fill more than one page of 200 rows without a request for each
+   * row.
+   */
+  extraApiKeys?: number;
 }
 
 /** The capability fields of a seeded device that a fixture can replace. */
@@ -688,6 +701,35 @@ export function createMockTransport(
   })) {
     const org = orgs.get(orgId);
     if (org !== undefined) applyBillingState(org, state);
+  }
+  const acmeOrg = orgs.get(MOCK_IDS.acme);
+  if (acmeOrg !== undefined) {
+    for (let i = 0; i < (options.extraEnrollmentTokens ?? 0); i++) {
+      acmeOrg.tokens.push(
+        create(EnrollmentTokenSchema, {
+          enrollmentTokenId: uuidV7(),
+          organizationId: MOCK_IDS.acme,
+          state: EnrollmentTokenState.PENDING,
+          createdBy: { kind: PrincipalKind.USER, id: userId },
+          createTime: ts(),
+          expireTime: ts(HOUR),
+          tokenPrefix: `ose_${String(i).padStart(4, "0")}`,
+        }),
+      );
+    }
+    for (let i = 0; i < (options.extraApiKeys ?? 0); i++) {
+      acmeOrg.apiKeys.push(
+        create(ApiKeySchema, {
+          apiKeyId: uuidV7(),
+          organizationId: MOCK_IDS.acme,
+          name: `key-${i}`,
+          state: ApiKeyState.ACTIVE,
+          createdBy: { kind: PrincipalKind.USER, id: userId },
+          createTime: ts(),
+          keyPrefix: `osk_${String(i).padStart(4, "0")}`,
+        }),
+      );
+    }
   }
   for (const org of orgs.values()) {
     for (const device of org.devices) {

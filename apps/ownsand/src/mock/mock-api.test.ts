@@ -1154,3 +1154,80 @@ describe("mock API key list paging", () => {
     expect((error as ConnectError).code).toBe(Code.InvalidArgument);
   });
 });
+
+describe("mock seeded extra list rows", () => {
+  const organizationId = MOCK_IDS.acme;
+
+  test("adds unused enrollment tokens after the seeded one and pages them", async () => {
+    const client = createClient(
+      DeviceService,
+      createMockTransport({ extraEnrollmentTokens: 201 }),
+    );
+    const first = await client.listEnrollmentTokens({
+      organizationId,
+      pageSize: 200,
+    });
+    expect(first.tokens).toHaveLength(200);
+    expect(first.tokens[0]!.state).toBe(EnrollmentTokenState.USED);
+    expect(first.nextPageToken).not.toBe("");
+    const second = await client.listEnrollmentTokens({
+      organizationId,
+      pageSize: 200,
+      pageToken: first.nextPageToken,
+    });
+    // One seeded and 201 added tokens.
+    expect(second.tokens).toHaveLength(2);
+    expect(second.nextPageToken).toBe("");
+    expect(
+      new Set([...first.tokens, ...second.tokens].map((t) => t.tokenPrefix))
+        .size,
+    ).toBe(202);
+    expect(
+      second.tokens.every((t) => t.state === EnrollmentTokenState.PENDING),
+    ).toBe(true);
+    // A token that a request creates is listed after the added ones.
+    const { token } = await client.createEnrollmentToken({
+      organizationId,
+      ttl: { seconds: 3600n },
+    });
+    const last = await client.listEnrollmentTokens({
+      organizationId,
+      pageSize: 200,
+      pageToken: first.nextPageToken,
+    });
+    expect(last.tokens.at(-1)!.enrollmentTokenId).toBe(
+      token!.enrollmentTokenId,
+    );
+  });
+
+  test("adds active API keys after the seeded one and pages them", async () => {
+    const client = createClient(
+      ApiKeyService,
+      createMockTransport({ extraApiKeys: 201 }),
+    );
+    const first = await client.listApiKeys({ organizationId, pageSize: 200 });
+    expect(first.apiKeys).toHaveLength(200);
+    expect(first.apiKeys[0]!.name).toBe("ci-runner");
+    expect(first.apiKeys[1]!.name).toBe("key-0");
+    const second = await client.listApiKeys({
+      organizationId,
+      pageSize: 200,
+      pageToken: first.nextPageToken,
+    });
+    // One seeded and 201 added keys.
+    expect(second.apiKeys.map((k) => k.name)).toEqual(["key-199", "key-200"]);
+    expect(second.nextPageToken).toBe("");
+  });
+
+  test("seeds no extra rows by default", async () => {
+    const mock = createMockTransport();
+    const tokens = await createClient(DeviceService, mock).listEnrollmentTokens(
+      { organizationId },
+    );
+    const keys = await createClient(ApiKeyService, mock).listApiKeys({
+      organizationId,
+    });
+    expect(tokens.tokens).toHaveLength(1);
+    expect(keys.apiKeys).toHaveLength(1);
+  });
+});
