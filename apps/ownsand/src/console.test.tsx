@@ -148,7 +148,13 @@ describe("organizations", () => {
     ).toContain("Member");
   });
 
-  test("requests pages of 200 organizations on the page and in the switcher", async () => {
+  /**
+   * A mock control plane that holds 50 organizations besides the seeded
+   * ones, and the page sizes of the ListOrganizations requests that reach it.
+   * The mock returns 50 organizations per page by default, so only the
+   * requested page size tells a request for 200 from one for 50.
+   */
+  async function manyOrganizations() {
     const mock = createMockTransport();
     const client = createClient(OrganizationService, mock);
     for (let i = 0; i < 50; i++) {
@@ -164,8 +170,31 @@ describe("organizations", () => {
         return mock.unary(method, ...rest);
       },
     };
+    return { transport, pageSizes };
+  }
+
+  test("requests pages of 200 organizations on the organizations page", async () => {
+    const { transport, pageSizes } = await manyOrganizations();
     renderConsole("/", { transport });
     expect(await screen.findByRole("link", { name: /Extra 49/ })).toBeTruthy();
+    expect(pageSizes.length).toBeGreaterThan(0);
+    expect(pageSizes.every((size) => size === 200)).toBe(true);
+  });
+
+  // The organizations page mounts the top bar without an organization, so it
+  // never renders the switcher: this case opens an organization route, where
+  // the switcher is the only consumer that the test can observe.
+  test("requests pages of 200 organizations in the switcher", async () => {
+    const { transport, pageSizes } = await manyOrganizations();
+    renderConsole(`/orgs/${MOCK_IDS.acme}/sandboxes`, { transport });
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("combobox", { name: "Organization" }),
+      );
+    });
+    expect(
+      await screen.findByRole("option", { name: "Extra 49" }),
+    ).toBeTruthy();
     expect(pageSizes.length).toBeGreaterThan(0);
     expect(pageSizes.every((size) => size === 200)).toBe(true);
   });
