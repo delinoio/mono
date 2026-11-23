@@ -1057,6 +1057,7 @@ type fakeAgent struct {
 	watchers  []chan struct{}
 	writeReqs []*ownsandv1.WriteFileRequest
 	readReqs  []*ownsandv1.ReadFileRequest
+	execReqs  []*ownsandv1.ExecRequest
 }
 
 type fakeWrite struct {
@@ -1118,6 +1119,9 @@ func (a *fakeAgent) startExec(_ *fakeCP, req *ownsandv1.ExecRequest) *fakeExec {
 	if e := a.execs[req.GetExecId()]; e != nil {
 		return e
 	}
+	// Record only the first request seen for each exec_id so a recovery retry of
+	// the same operation does not look like a second operation.
+	a.execReqs = append(a.execReqs, proto.Clone(req).(*ownsandv1.ExecRequest))
 	e := &fakeExec{id: req.GetExecId(), digest: relaybinding.ExecDigest(req), changed: make(chan struct{}), runs: 1}
 	a.execs[e.id] = e
 	run := a.run
@@ -1464,6 +1468,12 @@ func (a *fakeAgent) setFile(path string, b []byte) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.files[path] = b
+}
+
+func (a *fakeAgent) execRequests() []*ownsandv1.ExecRequest {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]*ownsandv1.ExecRequest(nil), a.execReqs...)
 }
 
 func (a *fakeAgent) writeRequests() []*ownsandv1.WriteFileRequest {
