@@ -59,6 +59,13 @@ type Status struct {
 	SyncTime *time.Time
 	// Sequence is the delino-accounts sequence of the applied status.
 	Sequence int64
+	// RemoteBlockedSince is the block start that delino-accounts reported
+	// with the last applied BLOCKED or SUSPENDED status of the current link
+	// (not the local BlockedSince, which can be earlier). It is nil without
+	// a link, in ALLOWED, after an unlink and until a status that carries a
+	// block start is applied. mergeRemote compares it with the next
+	// reported start to tell a new non-payment interval from the same one.
+	RemoteBlockedSince *time.Time
 }
 
 // Linked reports whether the organization has a billing account link.
@@ -152,13 +159,13 @@ func unlinkedStatus(orgID string, start time.Time, sequence int64, now time.Time
 	return st
 }
 
-const statusSelect = `SELECT organization_id::text, COALESCE(billing_account_id::text, ''), phase, blocked_since, status_sync_time, status_sequence
+const statusSelect = `SELECT organization_id::text, COALESCE(billing_account_id::text, ''), phase, blocked_since, status_sync_time, status_sequence, remote_blocked_since
 	FROM organization_billing`
 
 func scanStatus(row pgx.Row) (Status, error) {
 	var st Status
 	var phase int16
-	if err := row.Scan(&st.OrganizationID, &st.BillingAccountID, &phase, &st.BlockedSince, &st.SyncTime, &st.Sequence); err != nil {
+	if err := row.Scan(&st.OrganizationID, &st.BillingAccountID, &phase, &st.BlockedSince, &st.SyncTime, &st.Sequence, &st.RemoteBlockedSince); err != nil {
 		return Status{}, err
 	}
 	st.Phase = ownsandv1.BillingPhase(phase)
@@ -191,7 +198,7 @@ func InsertStatus(ctx context.Context, q db.Querier, orgID string, now time.Time
 
 func insertStatus(ctx context.Context, q db.Querier, st Status, now time.Time) error {
 	_, err := q.Exec(ctx, `INSERT INTO organization_billing (organization_id, billing_account_id, phase, reason, blocked_since, suspend_time,
-		status_sync_time, status_sequence, update_time) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9)`, statusArgs(st, now)...)
+		status_sync_time, status_sequence, update_time, remote_blocked_since) VALUES ($1, NULLIF($2, '')::uuid, $3, $4, $5, $6, $7, $8, $9, $10)`, statusArgs(st, now)...)
 	return err
 }
 
@@ -201,13 +208,13 @@ func statusArgs(st Status, now time.Time) []any {
 		t := st.SuspendTime()
 		suspend = &t
 	}
-	return []any{st.OrganizationID, st.BillingAccountID, int16(st.Phase), int16(ReasonOf(st.Phase, st.Linked())), st.BlockedSince, suspend, st.SyncTime, st.Sequence, now}
+	return []any{st.OrganizationID, st.BillingAccountID, int16(st.Phase), int16(ReasonOf(st.Phase, st.Linked())), st.BlockedSince, suspend, st.SyncTime, st.Sequence, now, st.RemoteBlockedSince}
 }
 
 // writeStatus replaces the status row of st.OrganizationID.
 func writeStatus(ctx context.Context, q db.Querier, st Status, now time.Time) error {
 	_, err := q.Exec(ctx, `UPDATE organization_billing SET billing_account_id = NULLIF($2, '')::uuid, phase = $3, reason = $4, blocked_since = $5,
-		suspend_time = $6, status_sync_time = $7, status_sequence = $8, update_time = $9 WHERE organization_id = $1`, statusArgs(st, now)...)
+		suspend_time = $6, status_sync_time = $7, status_sequence = $8, update_time = $9, remote_blocked_since = $10 WHERE organization_id = $1`, statusArgs(st, now)...)
 	return err
 }
 
@@ -265,23 +272,34 @@ func LogChange(ctx context.Context, logger *slog.Logger, c Change) {
 }
 
 // mergeRemote returns st with the delino-accounts status r applied at now.
-// While the organization stays in non-payment, the earlier block start is
-// kept, so a link or a new remote block start never restarts the 3-day
-// period. It reports false for a status without a known value.
+// While the organization stays in the same non-payment interval, the earlier
+// block start is kept, so a link, a repeated poll or a BLOCKED to SUSPENDED
+// change never restarts the 3-day period. A reported block start that is
+// later than the one that was last applied for the link
+// (Status.RemoteBlockedSince) is a new interval: delino-accounts started a
+// new non-payment after a recovery that the control plane never saw, because
+// it exposes only the newest status of a link. The new start then replaces
+// the local one. It reports false for a status without a known value.
 func mergeRemote(st Status, r *accountsv1.OrganizationBillingStatus, now time.Time) (Status, bool) {
 	next := st
 	next.Sequence = r.GetSequence()
 	next.SyncTime = &now
 	switch r.GetStatus() {
 	case accountsv1.BillingStatus_BILLING_STATUS_ALLOWED:
-		next.Phase, next.BlockedSince = PhaseAllowed, nil
+		next.Phase, next.BlockedSince, next.RemoteBlockedSince = PhaseAllowed, nil, nil
 		return next, true
 	case accountsv1.BillingStatus_BILLING_STATUS_BLOCKED, accountsv1.BillingStatus_BILLING_STATUS_SUSPENDED:
 		start := now
+		newInterval := false
 		if r.GetBlockedSince() != nil {
 			start = r.GetBlockedSince().AsTime().UTC()
+			newInterval = st.RemoteBlockedSince != nil && start.After(*st.RemoteBlockedSince)
+			remote := start
+			next.RemoteBlockedSince = &remote
 		}
-		if st.Phase != PhaseAllowed && st.BlockedSince != nil && st.BlockedSince.Before(start) {
+		// A status without a block start never counts as a new interval and
+		// leaves the stored reported start unchanged.
+		if !newInterval && st.Phase != PhaseAllowed && st.BlockedSince != nil && st.BlockedSince.Before(start) {
 			start = *st.BlockedSince
 		}
 		next.BlockedSince = &start
@@ -354,6 +372,8 @@ func LinkTx(ctx context.Context, tx pgx.Tx, orgID, billingAccountID string, r *a
 	next := st
 	if !st.Linked() {
 		next.BillingAccountID, next.Sequence, next.SyncTime = billingAccountID, 0, nil
+		// The block start of an earlier link is not an interval of this one.
+		next.RemoteBlockedSince = nil
 	}
 	if r.GetSequence() >= next.Sequence {
 		if merged, ok := mergeRemote(next, r, now); ok {
