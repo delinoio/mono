@@ -56,7 +56,7 @@ func newTestLease() (*Lease, *atomic.Int32) {
 func acquireFor(t *testing.T, l *Lease, expireAt time.Time) {
 	t.Helper()
 	epoch, _, _ := l.snapshot()
-	l.applyRenewal(epoch, true, "", expireAt)
+	l.applyRenewal(context.Background(), epoch, true, "", expireAt)
 	if !l.Held() {
 		t.Fatal("the acquisition did not give the lease")
 	}
@@ -173,7 +173,7 @@ func TestHeldEndsAtConfirmedExpiry(t *testing.T) {
 
 	// The watcher has not run: a renewal result of the same period arrives
 	// after the expiry. It ends the period and does not extend it.
-	l.applyRenewal(epoch, true, "", expireAt.Add(TTL))
+	l.applyRenewal(context.Background(), epoch, true, "", expireAt.Add(TTL))
 	if l.Held() {
 		t.Fatal("a result after the expiry extended the ownership")
 	}
@@ -182,7 +182,7 @@ func TestHeldEndsAtConfirmedExpiry(t *testing.T) {
 	}
 	// The result of the ended period cannot restore it, and a second
 	// expiry check does not run OnLose again.
-	l.applyRenewal(epoch, true, "", clock.Now().Add(TTL))
+	l.applyRenewal(context.Background(), epoch, true, "", clock.Now().Add(TTL))
 	l.expireIfDue()
 	if l.Held() || lost.Load() != 1 {
 		t.Fatalf("held %v, OnLose ran %d times", l.Held(), lost.Load())
@@ -352,7 +352,7 @@ func TestLeaseAcquireCallbackBoundedByExpiry(t *testing.T) {
 	applied := make(chan struct{})
 	go func() {
 		defer close(applied)
-		l.applyRenewal(0, true, "", expireAt)
+		l.applyRenewal(context.Background(), 0, true, "", expireAt)
 	}()
 	<-started
 	// The context is a timeout of the remaining time, so its deadline can
@@ -411,6 +411,57 @@ func TestLeaseRenewalExtendsOwnership(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	if !a.Held() || lost.Load() != 0 {
 		t.Fatalf("held %v, OnLose ran %d times after the renewal", a.Held(), lost.Load())
+	}
+}
+
+// TestLeaseRunCancelStopsAcquireCallback checks that stopping the lease
+// workers cancels an acquisition callback that is still running, so the
+// release and OnLose do not wait for the callback's own I/O bound (the
+// cursor read timeout) or for the lease expiry.
+func TestLeaseRunCancelStopsAcquireCallback(t *testing.T) {
+	database := dbtest.New(t)
+	var lost atomic.Int32
+	l := &Lease{DB: database, InstanceID: "a",
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)), OnLose: func() { lost.Add(1) },
+		renewEvery: 20 * time.Millisecond, poll: 5 * time.Millisecond}
+	started := make(chan struct{})
+	l.OnAcquire = func(ctx context.Context) {
+		close(started)
+		// Stand-in for a cursor read that runs until its context ends.
+		select {
+		case <-ctx.Done():
+		case <-time.After(20 * time.Second):
+		}
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); l.Run(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the acquisition callback did not start")
+	}
+	begin := time.Now()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel while the acquisition callback was running")
+	}
+	if took := time.Since(begin); took > 5*time.Second {
+		t.Fatalf("Run took %v to return after cancel", took)
+	}
+	if l.Held() || lost.Load() != 1 {
+		t.Fatalf("held %v, OnLose ran %d times, want not held and once", l.Held(), lost.Load())
+	}
+	var rows int
+	if err := database.Pool.QueryRow(context.Background(), "SELECT count(*) FROM instance_leases WHERE lease_name = $1 AND holder = $2", Name, "a").Scan(&rows); err != nil {
+		t.Fatal(err)
+	}
+	if rows != 0 {
+		t.Fatalf("the release left %d lease rows", rows)
 	}
 }
 
