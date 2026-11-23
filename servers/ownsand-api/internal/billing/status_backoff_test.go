@@ -9,44 +9,9 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"github.com/jackc/pgx/v5"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/accounts/accountstest"
-	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 )
-
-// addPendingUnlink links org1, removes the link like TransferOwnership does
-// and records its pending unlink at the current fake time.
-func (f *statusFixture) addPendingUnlink(t *testing.T) {
-	t.Helper()
-	ctx := context.Background()
-	f.addOrg(t, org1)
-	f.link(t, org1, accountA)
-	now := f.clock.Now()
-	if err := f.db.InTx(ctx, func(tx pgx.Tx) error {
-		_, former, _, err := billing.UnlinkTx(ctx, tx, org1, billing.SourceTransfer, now)
-		if err != nil {
-			return err
-		}
-		return billing.AddPendingUnlinkTx(ctx, tx, org1, former, now)
-	}); err != nil {
-		t.Fatal(err)
-	}
-}
-
-// pendingUnlink returns the attempt count and the next attempt time of the
-// pending unlink of org1; ok is false when no row exists.
-func (f *statusFixture) pendingUnlink(t *testing.T) (attempts int, next time.Time, ok bool) {
-	t.Helper()
-	err := f.db.Pool.QueryRow(context.Background(), "SELECT attempts, next_attempt_time FROM billing_pending_unlinks WHERE organization_id = $1", org1).Scan(&attempts, &next)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, time.Time{}, false
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	return attempts, next, true
-}
 
 // TestPendingUnlinkBackoffStartsAtFailure checks that the back-off of a
 // failed pending unlink starts when the delino-accounts call failed, not when
@@ -55,7 +20,9 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	t0 := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
-	f.addPendingUnlink(t)
+	f.addOrg(t, org1)
+	f.link(t, org1, accountA)
+	f.addPendingUnlink(t, org1)
 	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 
 	// attempt 1: the call takes 2 seconds, the delay is 1 second.
@@ -69,7 +36,7 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if a, next, ok := f.pendingUnlink(t); !ok || a != 1 || !next.Equal(t0.Add(3*time.Second)) {
+	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !next.Equal(t0.Add(3*time.Second)) {
 		t.Fatalf("after a failure at t0+2s: attempts=%d next=%v ok=%v, want 1 and t0+3s", a, next, ok)
 	}
 
@@ -84,7 +51,7 @@ func TestPendingUnlinkBackoffStartsAtFailure(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if a, next, ok := f.pendingUnlink(t); !ok || a != 2 || !next.Equal(t0.Add(10*time.Second)) {
+	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 2 || !next.Equal(t0.Add(10*time.Second)) {
 		t.Fatalf("after a failure at t0+8s: attempts=%d next=%v ok=%v, want 2 and t0+10s", a, next, ok)
 	}
 }
@@ -95,7 +62,9 @@ func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
 	t0 := time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
-	f.addPendingUnlink(t)
+	f.addOrg(t, org1)
+	f.link(t, org1, accountA)
+	f.addPendingUnlink(t, org1)
 	f.fake.Fail(accountstest.MethodUnlinkOrganization, connect.NewError(connect.CodeUnavailable, errors.New("down")))
 
 	holder, err := f.db.Pool.Begin(ctx)
@@ -130,7 +99,7 @@ func TestPendingUnlinkBackoffAfterLockWait(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
-	if a, next, ok := f.pendingUnlink(t); !ok || a != 1 || !next.Equal(t0.Add(11*time.Second)) {
+	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 1 || !next.Equal(t0.Add(11*time.Second)) {
 		t.Fatalf("after a failure at t0+10s: attempts=%d next=%v ok=%v, want 1 and t0+11s", a, next, ok)
 	}
 }
@@ -142,7 +111,9 @@ func TestPendingUnlinkGuardAndSuccess(t *testing.T) {
 	t0 := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
 	f := newStatusFixture(t, t0)
 	ctx := context.Background()
-	f.addPendingUnlink(t)
+	f.addOrg(t, org1)
+	f.link(t, org1, accountA)
+	f.addPendingUnlink(t, org1)
 	guard := t0.Add(30 * time.Second)
 	if _, err := f.db.Pool.Exec(ctx, "UPDATE billing_pending_unlinks SET unlink_not_before = $2, next_attempt_time = $2 WHERE organization_id = $1", org1, guard); err != nil {
 		t.Fatal(err)
@@ -155,7 +126,7 @@ func TestPendingUnlinkGuardAndSuccess(t *testing.T) {
 	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 0 {
 		t.Fatalf("UnlinkOrganization calls = %d before the guard, want 0", n)
 	}
-	if a, next, ok := f.pendingUnlink(t); !ok || a != 0 || !next.Equal(guard) {
+	if a, next, ok := f.pendingUnlink(t, org1); !ok || a != 0 || !next.Equal(guard) {
 		t.Fatalf("before the guard: attempts=%d next=%v ok=%v, want the row untouched", a, next, ok)
 	}
 
@@ -166,7 +137,7 @@ func TestPendingUnlinkGuardAndSuccess(t *testing.T) {
 	if n := f.fake.Calls(accountstest.MethodUnlinkOrganization); n != 1 {
 		t.Fatalf("UnlinkOrganization calls = %d at the guard, want 1", n)
 	}
-	if _, _, ok := f.pendingUnlink(t); ok {
+	if _, _, ok := f.pendingUnlink(t, org1); ok {
 		t.Fatal("the pending unlink stayed after a success")
 	}
 	if _, _, linked := f.fake.Link(org1); linked {
