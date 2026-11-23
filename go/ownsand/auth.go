@@ -26,13 +26,29 @@ func (s staticCredential) bearer(context.Context) (string, error) { return strin
 
 type tokenCredential TokenSource
 
+// errLocalCredential marks a failure to produce the bearer value on this
+// machine: the token source returned an error or an empty token. No request
+// left the process, so the failure says nothing about the control plane or
+// the data path. The data path router therefore ends the operation with it
+// and neither falls back to the relay nor moves the handle off peer-to-peer;
+// a later operation asks the token source again.
+type errLocalCredential struct {
+	cause error
+}
+
+func (e *errLocalCredential) Error() string { return e.cause.Error() }
+
+// Unwrap keeps errors.Is and errors.As working on the error that the token
+// source returned.
+func (e *errLocalCredential) Unwrap() error { return e.cause }
+
 func (t tokenCredential) bearer(ctx context.Context) (string, error) {
 	tok, err := t(ctx)
 	if err != nil {
-		return "", fmt.Errorf("ownsand: token source: %w", err)
+		return "", &errLocalCredential{cause: fmt.Errorf("ownsand: token source: %w", err)}
 	}
 	if tok == "" {
-		return "", errors.New("ownsand: token source returned an empty token")
+		return "", &errLocalCredential{cause: errors.New("ownsand: token source returned an empty token")}
 	}
 	return tok, nil
 }
