@@ -20,8 +20,8 @@ import {
   OwnSandClient,
   type Sandbox,
   SandboxState,
-  SnapshotState,
 } from "./index.ts";
+import { waitForSnapshotReady, withCleanup } from "./testing/e2e-support.ts";
 
 const env = process.env;
 const apiUrl = env.OWNSAND_E2E_API_URL ?? "";
@@ -32,7 +32,20 @@ const enabled = apiUrl !== "" && apiKey !== "" && org !== "";
 // billing status of the organization through the fake delino-accounts.
 const billingUrl = env.OWNSAND_E2E_BILLING_URL ?? "";
 
+// Time budget of the lifecycle test. The rstest limit is 3 minutes and the Go
+// launcher (servers/ownsand-api/e2e/tssdk_test.go) bounds the whole command
+// at 5 minutes. The snapshot poll gives up after 60 seconds, and each of the
+// two network cleanup steps after 15 seconds, so a snapshot that never
+// becomes READY still leaves time for the cleanup inside both limits.
+const SNAPSHOT_READY_TIMEOUT_MS = 60_000;
+const CLEANUP_STEP_TIMEOUT_MS = 15_000;
+
 const decoder = new TextDecoder();
+
+function required<T>(value: T | undefined): T {
+  if (value === undefined) throw new Error("response has no snapshot");
+  return value;
+}
 
 function randomBytes(n: number): Uint8Array {
   const out = new Uint8Array(n);
@@ -162,79 +175,104 @@ async function expectSuspended(
           maxTtl: 2 * 60 * 60_000,
           network: NetworkMode.NONE,
         });
-        try {
-          const info = await sandbox.waitUntilStable({ pollMs: 200 });
-          expect(info.state).toBe(SandboxState.RUNNING);
+        // Created once the snapshot call returns, so that the cleanup
+        // deletes it also when its poll fails or times out.
+        let snapshotId = "";
+        await withCleanup(
+          async () => {
+            const info = await sandbox.waitUntilStable({ pollMs: 200 });
+            expect(info.state).toBe(SandboxState.RUNNING);
 
-          const run = await sandbox.run({
-            command: ["/bin/sh", "-c", "echo out; echo err >&2; exit 4"],
-          });
-          expect(decoder.decode(run.stdout)).toBe("out\n");
-          expect(decoder.decode(run.stderr)).toBe("err\n");
-          expect(run.result.kind).toBe(ExecResultKind.Exited);
-          if (run.result.kind === ExecResultKind.Exited) {
-            expect(run.result.exitCode).toBe(4n);
-          }
-
-          // The process runtime's guest paths are host paths below the
-          // sandbox root, which is the exec working directory. In a VM
-          // guest the working directory is "/", so root is empty there.
-          const pwd = await sandbox.run({ command: ["/bin/pwd"] });
-          const dir = decoder.decode(pwd.stdout).trim();
-          expect(dir.startsWith("/")).toBe(true);
-          const root = dir.replace(/\/$/, "");
-
-          const data = randomBytes(2 * 1024 * 1024 + 4321);
-          await sandbox.writeFile(`${root}/ts.bin`, data);
-          const read = await sandbox.readFileBytes(`${root}/ts.bin`);
-          expect(sameBytes(read, data)).toBe(true);
-
-          // Detach after the first output, then attach from its offset.
-          const handle = sandbox.exec({
-            command: ["/bin/sh", "-c", "echo one; sleep 2; echo two; exit 3"],
-          });
-          let first = "";
-          for await (const event of handle) {
-            if (event.type === ExecEventType.Stdout) {
-              first = decoder.decode(event.data);
-              break;
+            const run = await sandbox.run({
+              command: ["/bin/sh", "-c", "echo out; echo err >&2; exit 4"],
+            });
+            expect(decoder.decode(run.stdout)).toBe("out\n");
+            expect(decoder.decode(run.stderr)).toBe("err\n");
+            expect(run.result.kind).toBe(ExecResultKind.Exited);
+            if (run.result.kind === ExecResultKind.Exited) {
+              expect(run.result.exitCode).toBe(4n);
             }
-          }
-          expect(first).toBe("one\n");
-          const attached = sandbox.attachExec(handle.execId, {
-            stdoutOffset: BigInt(first.length),
-          });
-          let rest = "";
-          for await (const event of attached) {
-            if (event.type === ExecEventType.Stdout) {
-              rest += decoder.decode(event.data);
+
+            // The process runtime's guest paths are host paths below the
+            // sandbox root, which is the exec working directory. In a VM
+            // guest the working directory is "/", so root is empty there.
+            const pwd = await sandbox.run({ command: ["/bin/pwd"] });
+            const dir = decoder.decode(pwd.stdout).trim();
+            expect(dir.startsWith("/")).toBe(true);
+            const root = dir.replace(/\/$/, "");
+
+            const data = randomBytes(2 * 1024 * 1024 + 4321);
+            await sandbox.writeFile(`${root}/ts.bin`, data);
+            const read = await sandbox.readFileBytes(`${root}/ts.bin`);
+            expect(sameBytes(read, data)).toBe(true);
+
+            // Detach after the first output, then attach from its offset.
+            const handle = sandbox.exec({
+              command: ["/bin/sh", "-c", "echo one; sleep 2; echo two; exit 3"],
+            });
+            let first = "";
+            for await (const event of handle) {
+              if (event.type === ExecEventType.Stdout) {
+                first = decoder.decode(event.data);
+                break;
+              }
             }
-          }
-          const result = await attached.wait();
-          expect(rest).toBe("two\n");
-          expect(result.kind).toBe(ExecResultKind.Exited);
-          if (result.kind === ExecResultKind.Exited) {
-            expect(result.exitCode).toBe(3n);
-          }
+            expect(first).toBe("one\n");
+            const attached = sandbox.attachExec(handle.execId, {
+              stdoutOffset: BigInt(first.length),
+            });
+            let rest = "";
+            for await (const event of attached) {
+              if (event.type === ExecEventType.Stdout) {
+                rest += decoder.decode(event.data);
+              }
+            }
+            const result = await attached.wait();
+            expect(rest).toBe("two\n");
+            expect(result.kind).toBe(ExecResultKind.Exited);
+            if (result.kind === ExecResultKind.Exited) {
+              expect(result.exitCode).toBe(3n);
+            }
 
-          expect((await sandbox.pause()).state).toBe(SandboxState.PAUSED);
-          expect((await sandbox.resume()).state).toBe(SandboxState.RUNNING);
+            expect((await sandbox.pause()).state).toBe(SandboxState.PAUSED);
+            expect((await sandbox.resume()).state).toBe(SandboxState.RUNNING);
 
-          const snapshot = await sandbox.snapshot();
-          for (;;) {
-            const s = await client.getSnapshot(snapshot.snapshotId);
-            if (s.state === SnapshotState.READY) break;
-            expect(s.state).not.toBe(SnapshotState.FAILED);
-            await new Promise((resolve) => setTimeout(resolve, 200));
-          }
-          await client.deleteSnapshot(snapshot.snapshotId);
-        } finally {
-          const deleted = await sandbox.delete();
-          sandbox.close();
-          expect([SandboxState.DELETING, SandboxState.DELETED]).toContain(
-            deleted.state,
-          );
-        }
+            const snapshot = await sandbox.snapshot();
+            snapshotId = snapshot.snapshotId;
+            await waitForSnapshotReady(
+              (signal) =>
+                client.snapshots
+                  .getSnapshot(
+                    { organizationId: org, snapshotId: snapshot.snapshotId },
+                    { signal },
+                  )
+                  .then((res) => required(res.snapshot)),
+              { timeoutMs: SNAPSHOT_READY_TIMEOUT_MS, pollMs: 200 },
+            );
+          },
+          [
+            (signal) =>
+              snapshotId === ""
+                ? undefined
+                : client.snapshots.deleteSnapshot(
+                    { organizationId: org, snapshotId },
+                    { signal },
+                  ),
+            async (signal) => {
+              const deleted = await sandbox.delete(signal);
+              expect([SandboxState.DELETING, SandboxState.DELETED]).toContain(
+                deleted.state,
+              );
+            },
+            // Runs even when the delete failed, so the handle never leaks.
+            () => sandbox.close(),
+          ],
+          {
+            stepTimeoutMs: CLEANUP_STEP_TIMEOUT_MS,
+            onCleanupError: (error) =>
+              process.stderr.write(`cleanup failed: ${String(error)}\n`),
+          },
+        );
       },
       3 * 60_000,
     );
