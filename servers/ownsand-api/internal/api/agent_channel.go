@@ -607,21 +607,53 @@ func (s *Service) applyImportResult(ctx context.Context, conn *hub.Conn, info co
 var errImportResultNotApplied = errors.New("the import-snapshot result could not be applied")
 
 // registerImportedCopy records the local copy that a successful import
-// result reports. The parent snapshot row is locked FOR SHARE while the
-// copy row is inserted, which conflicts with the FOR UPDATE lock that every
-// snapshot deletion takes before it lists the holders of the snapshot, so
-// the two orders are consistent: when the result commits first, the
-// deletion reads the copy row and includes the importer in its fanout, and
-// when the deletion commits first, the snapshot is absent here, no row is
-// written and the importer is sent the delete command itself, because the
-// deletion's fanout could not know a device that had not reported its copy
-// yet. The command is sent after the transaction ended, so no database
-// lock is held while the channel is written.
+// result reports. The transaction first locks the importing device row
+// FOR SHARE and skips the write when the device is absent or removed, then
+// locks the parent snapshot row FOR SHARE while the copy row is inserted.
+//
+// The device lock keeps a copy row from outliving a removal: the removal
+// holds the device row FOR UPDATE before it deletes the snapshot_copies rows
+// of the device, and snapshot_copies has no foreign key on device_id, so
+// without the lock an insert that commits after that delete would leave a row
+// for a removed device that a later snapshot deletion would then list as a
+// holder. A result that waits for an in-flight removal finds the removed
+// state once the removal commits and writes nothing. No delete_snapshot is
+// sent in that case: the removal already deleted the copy rows and closes the
+// channel, and the agent's data for the device is the removal's concern. The
+// device row comes before the snapshot row, the order of the removal (device
+// FOR UPDATE, then snapshot rows FOR UPDATE), so the two cannot deadlock. The
+// organization row is not locked: the device row already serializes with the
+// removal.
+//
+// The snapshot lock conflicts with the FOR UPDATE lock that every snapshot
+// deletion takes before it lists the holders of the snapshot, so the two
+// orders are consistent: when the result commits first, the deletion reads
+// the copy row and includes the importer in its fanout, and when the
+// deletion commits first, the snapshot is absent here, no row is written and
+// the importer is sent the delete command itself, because the deletion's
+// fanout could not know a device that had not reported its copy yet. The
+// command is sent after the transaction ended, so no database lock is held
+// while the channel is written.
 func (s *Service) registerImportedCopy(ctx context.Context, conn *hub.Conn, info commandInfo, log *slog.Logger) error {
 	present := false
+	deviceActive := true
 	err := s.DB.InTx(ctx, func(tx pgx.Tx) error {
+		present, deviceActive = false, true
+		var state int16
+		err := tx.QueryRow(ctx, "SELECT state FROM devices WHERE device_id = $1 FOR SHARE", conn.DeviceID).Scan(&state)
+		if errors.Is(err, pgx.ErrNoRows) {
+			deviceActive = false
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		if ownsandv1.DeviceState(state) == ownsandv1.DeviceState_DEVICE_STATE_REMOVED {
+			deviceActive = false
+			return nil
+		}
 		var one int
-		err := tx.QueryRow(ctx, "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR SHARE", info.snapshotID).Scan(&one)
+		err = tx.QueryRow(ctx, "SELECT 1 FROM snapshots WHERE snapshot_id = $1 FOR SHARE", info.snapshotID).Scan(&one)
 		if errors.Is(err, pgx.ErrNoRows) {
 			present = false
 			return nil
@@ -635,6 +667,10 @@ func (s *Service) registerImportedCopy(ctx context.Context, conn *hub.Conn, info
 	})
 	if err != nil {
 		return err
+	}
+	if !deviceActive {
+		log.InfoContext(ctx, "snapshot_import_result_device_removed", slog.String("snapshot_id", info.snapshotID))
+		return nil
 	}
 	if !present {
 		log.InfoContext(ctx, "snapshot_import_result_late", slog.String("snapshot_id", info.snapshotID))

@@ -447,6 +447,11 @@ func (h DeviceHandler) RemoveDevice(ctx context.Context, req *connect.Request[ow
 		// row, and the second one finds the tombstone the first one wrote.
 		// A deletion of the organization holds the organization row
 		// FOR UPDATE, so a removal that waits for it finds no organization.
+		// The device row lock also serializes the removal with an import
+		// result (registerImportedCopy), which takes the device row
+		// FOR SHARE before it inserts a copy row: a result that waits here
+		// finds the removed state and writes no row, so the copy rows that
+		// removeDeviceTx deletes are not recreated.
 		var locked int
 		err = tx.QueryRow(ctx, "SELECT 1 FROM organizations WHERE organization_id = $1 FOR KEY SHARE", orgID).Scan(&locked)
 		if errors.Is(err, pgx.ErrNoRows) {
