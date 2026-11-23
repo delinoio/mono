@@ -48,6 +48,8 @@ export function renderApp(
      * of the fake API transport.
      */
     appTransport?: boolean;
+    /** Reports a sign-in that failed before the redirect. */
+    signInFailed?: boolean;
     /** Renders inside `StrictMode`, as `index.tsx` does. */
     strict?: boolean;
   } = {},
@@ -63,6 +65,7 @@ export function renderApp(
     signIn: async () => {
       signIns.push(1);
     },
+    signInFailed: options.signInFailed ?? false,
     signOut: async () => {},
     getAccessToken: options.getAccessToken ?? (async () => "token"),
   };

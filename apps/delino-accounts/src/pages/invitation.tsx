@@ -4,7 +4,11 @@ import { Button } from "delino-ui/button";
 import { useEffect, useRef, useState } from "react";
 import { useAuth } from "../auth.tsx";
 import { Page } from "../components/shell.tsx";
-import { ErrorNotice, PageHeader } from "../components/ui.tsx";
+import {
+  ErrorNotice,
+  PageHeader,
+  SignInFailureNotice,
+} from "../components/ui.tsx";
 import { BillingAccountService } from "@delino/accounts-protos/v1/billing_account_pb";
 import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
@@ -73,16 +77,19 @@ export function InvitationPage({ configured }: { configured: boolean }) {
           description="Sign in with the email address that received the invitation to accept it."
         />
         {configured ? (
-          <Button
-            onClick={async () => {
-              // The fragment does not survive the sign-in redirect, so the
-              // token waits in sessionStorage until AcceptInvitation returns.
-              pendingInvitation.save(token);
-              await auth.signIn();
-            }}
-          >
-            Sign in to accept
-          </Button>
+          <>
+            <Button
+              onClick={async () => {
+                // The fragment does not survive the sign-in redirect, so the
+                // token waits in sessionStorage until AcceptInvitation returns.
+                pendingInvitation.save(token);
+                await auth.signIn();
+              }}
+            >
+              Sign in to accept
+            </Button>
+            <SignInFailureNotice />
+          </>
         ) : (
           <p role="alert">Sign-in is not configured for this build.</p>
         )}

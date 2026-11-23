@@ -60,6 +60,7 @@ const AUTH: Auth = {
   isAuthenticated: false,
   userId: undefined,
   signIn: async () => {},
+  signInFailed: false,
   signOut: async () => {},
   getAccessToken: async () => undefined,
 };
