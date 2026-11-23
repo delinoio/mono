@@ -78,7 +78,11 @@ export function resolveOrigin(
     // The URL parser treats a backslash as a path separator for http(s), so
     // it can hide a path (`https://host\tenant\..` normalizes to `/`).
     raw.includes("\\") ||
-    /^[a-z]+:\/\/[^/]+\/./i.test(raw.trim())
+    // The URL parser also accepts zero, one or three or more slashes after
+    // the scheme and resolves dot segments, so `https:///host/a/..` and
+    // `https:host/a/..` normalize to a bare origin and hide a path. Accept
+    // only the written shape `scheme://host[:port][/]`.
+    !/^https?:\/\/[^/?#\\]+\/?$/i.test(raw.trim())
   ) {
     throw new Error(
       `${name} must be an origin without a path, query or fragment`,
