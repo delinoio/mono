@@ -171,7 +171,11 @@ export class Sandbox {
           : durationFromMs(options.timeoutMs),
       bindingSalt: newBindingSalt(),
     });
-    const hold = new ConsumerHold();
+    // The exec starts now: the exec ID is minted here and the agent admits an
+    // unknown ID only for 15 minutes, so the first request must not wait for
+    // the first read of the handle. Nobody holds the event that the stream
+    // yields ahead of a reader, so the hold starts unclaimed.
+    const hold = new ConsumerHold({ claimed: false });
     return new ExecHandle(
       execId,
       runExec(
@@ -183,6 +187,7 @@ export class Sandbox {
       ),
       this.#selector,
       hold,
+      true,
     );
   }
 

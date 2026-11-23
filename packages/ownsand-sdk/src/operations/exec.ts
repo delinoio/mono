@@ -491,17 +491,44 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
    */
   #failure: { readonly error: unknown } | undefined;
   #draining: Promise<void> | undefined;
+  /**
+   * The first read of the generator when the handle starts the exec at
+   * creation. It settles to a box, so a handle that nobody reads never
+   * produces an unhandled rejection. The first reader takes it.
+   */
+  #primed:
+    | Promise<
+        | { readonly next: IteratorResult<ExecStreamEvent, ExecResult> }
+        | { readonly error: unknown }
+      >
+    | undefined;
 
+  /**
+   * With `startNow`, the generator makes its first read before the
+   * constructor returns, so that the exec request goes out when the caller
+   * starts the exec and not when it first reads the handle. The exec ID is
+   * minted at that moment, and the agent admits an unknown ID only for 15
+   * minutes after its timestamp. Pass the `hold` of the generator, created
+   * unclaimed, so that a handle that is never read still lets the idle
+   * limit end the stream.
+   */
   constructor(
     execId: string,
     generator: AsyncGenerator<ExecStreamEvent, ExecResult>,
     selector: DataPathSelector,
     hold?: ConsumerHold,
+    startNow = false,
   ) {
     this.#hold = hold;
     this.execId = execId;
     this.#generator = generator;
     this.#selector = selector;
+    if (startNow) {
+      this.#primed = generator.next().then(
+        (next) => ({ next }),
+        (error: unknown) => ({ error }),
+      );
+    }
   }
 
   /** The transport that the sandbox handle uses now. */
@@ -585,7 +612,18 @@ export class ExecHandle implements AsyncIterable<ExecStreamEvent> {
     }
     let next: IteratorResult<ExecStreamEvent, ExecResult>;
     try {
-      next = await this.#generator.next();
+      const primed = this.#primed;
+      this.#primed = undefined;
+      if (primed !== undefined) {
+        // The event that the stream yielded at creation is now held by this
+        // reader, so the idle clock pauses until the reader asks for more.
+        this.#hold?.claim();
+        const settled = await primed;
+        if ("error" in settled) throw settled.error;
+        next = settled.next;
+      } else {
+        next = await this.#generator.next();
+      }
     } catch (error) {
       this.#failure ??= { error };
       throw this.#failure.error;
