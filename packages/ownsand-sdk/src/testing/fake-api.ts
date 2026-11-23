@@ -307,8 +307,15 @@ export class FakeApi {
             // A Sleep step enqueues nothing, and a web stream pulls again only
             // when a read is outstanding while a pull runs. Keep reading steps
             // in this pull so consecutive Sleep steps cannot stall the stream.
-            // Stop once the call is aborted or the reader cancelled.
-            if (signal.aborted || finished) return;
+            // Stop once the reader cancelled. When the call is aborted, error
+            // the body with the reason so a pending read rejects instead of
+            // hanging, and do not advance the script.
+            if (finished) return;
+            if (signal.aborted) {
+              finished = true;
+              controller.error(signal.reason);
+              return;
+            }
             continue;
           }
           if (step instanceof Disconnect) {

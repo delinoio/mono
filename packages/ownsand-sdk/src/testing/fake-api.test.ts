@@ -139,13 +139,31 @@ describe("FakeApi stream scripts", () => {
 
     expect((await h.clock.run(readFrame())).flags).toBe(0);
     const pending = readFrame();
+    pending.catch(() => {});
     await h.clock.advance(50);
-    controller.abort(new Error("caller canceled"));
-    await h.clock.settle();
+    const reason = new Error("caller canceled");
+    controller.abort(reason);
+    // The pending read rejects with the abort reason instead of hanging.
+    await expect(pending).rejects.toBe(reason);
     // The script must not run past the sleeps once the call is aborted.
     await h.clock.advance(1_000);
     expect(reachedAfterSleeps).toBe(false);
+  });
+
+  test("errors the body of an aborted Sleep for a later read too", async () => {
+    const h = setup();
+    h.api.stream(RelayService, "Exec", function* () {
+      yield new Sleep(100);
+      yield execMsg(ev.accepted());
+    });
+    const { controller, reader, readFrame } = await open(h);
+
+    const pending = readFrame();
     pending.catch(() => {});
+    const reason = new Error("caller canceled");
+    controller.abort(reason);
+    await expect(pending).rejects.toBe(reason);
+    await expect(reader.read()).rejects.toBe(reason);
   });
 
   test("stops the sleep loop when the reader cancels during a Sleep", async () => {
