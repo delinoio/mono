@@ -8,6 +8,7 @@ import (
 	"time"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
+	"github.com/delinoio/mono/servers/ownsand-api/internal/billing"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db/dbtest"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/events"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/janitor"
@@ -41,6 +42,9 @@ func TestRetentionJobs(t *testing.T) {
 		('01900000-0000-7000-8000-000000000000', 3, $1, 1, 1, $1, $1, NULL)`,
 		now.Add(-36*24*time.Hour), now.Add(-34*24*time.Hour))
 	exec("INSERT INTO usage_storage_samples VALUES ($1, $1), ($2, $2)", now.Add(-25*time.Hour), now.Add(-23*time.Hour))
+	// A flush receipt goes after billing.FlushReceiptRetention.
+	exec("INSERT INTO usage_flush_receipts VALUES ('01900000-0000-7000-8000-0000000000a1', $1), ('01900000-0000-7000-8000-0000000000a2', $2)",
+		now.Add(-billing.FlushReceiptRetention-time.Hour), now.Add(-billing.FlushReceiptRetention+time.Hour))
 	janitor.RunOnce(ctx, d, testenv.Discard(), now, nil)
 	count := func(sql string) int {
 		var n int
@@ -88,6 +92,9 @@ func TestRetentionJobs(t *testing.T) {
 	}
 	if n := count("SELECT count(*) FROM usage_outbox WHERE meter IN (2, 3)"); n != 2 || count("SELECT count(*) FROM usage_outbox") != 2 {
 		t.Fatalf("usage outbox = %d", n)
+	}
+	if n := count("SELECT count(*) FROM usage_flush_receipts"); n != 1 || !exists("SELECT 1 FROM usage_flush_receipts WHERE batch_id = '01900000-0000-7000-8000-0000000000a2'") {
+		t.Fatalf("flush receipts = %d, want only the one inside the retention", n)
 	}
 	if n := count("SELECT count(*) FROM usage_storage_samples"); n != 1 {
 		t.Fatalf("storage samples = %d", n)

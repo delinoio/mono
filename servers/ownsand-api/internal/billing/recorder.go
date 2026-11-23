@@ -4,6 +4,7 @@ package billing
 
 import (
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -22,14 +23,18 @@ func (k counterKey) windowStart() time.Time { return time.Unix(k.window, 0).UTC(
 
 // Recorder adds usage to in-memory counters of this instance. The metering
 // worker moves them to the shared counter rows in Postgres (see
-// Metering.Flush). It is safe for concurrent use.
+// Metering.Flush) in batches that carry a receipt ID. It is safe for concurrent use.
 type Recorder struct {
 	logger *slog.Logger
 
-	mu     sync.Mutex
+	mu sync.Mutex
+	// counts are the live counters that no batch holds yet.
 	counts map[counterKey]int64
-	// closed is set by takeAndClose: the final snapshot of the process was
-	// taken, so a later Add can no longer reach Postgres.
+	// pending are the sealed batches that no flush has applied yet, oldest
+	// first. A failed flush leaves its batch here for the retry.
+	pending []*flushBatch
+	// closed is set by the final sealBatch: the final snapshot of the process
+	// was taken, so a later Add can no longer reach Postgres.
 	closed bool
 }
 
@@ -69,46 +74,67 @@ func (r *Recorder) Add(orgID string, meter ownsandv1.BillingMeter, at time.Time,
 	r.mu.Unlock()
 }
 
-// take removes and returns every counter.
-func (r *Recorder) take() map[counterKey]int64 {
+// flushBatch is a set of counters that one flush attempt writes to Postgres
+// under one receipt ID. A batch keeps its ID and its counters until a flush
+// of it succeeded: the retry of a batch whose commit outcome is unknown
+// carries the same ID, so Postgres can tell that the batch was applied.
+type flushBatch struct {
+	id      string
+	counts  map[counterKey]int64
+	created time.Time
+}
+
+// sealBatch moves every live counter into a new pending batch (nothing when
+// there is none) and, when closeRecorder is set, closes the recorder in the
+// same step, so every Add either lands in a batch or is rejected and logged
+// by Add. A counter that Add records later goes to the live counters and
+// never into a batch that a flush may already have sent. The batch ID is a
+// UUID v7; an error of the ID source leaves the live counters in place.
+func (r *Recorder) sealBatch(closeRecorder bool, now time.Time) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if closeRecorder {
+		r.closed = true
+	}
 	if len(r.counts) == 0 {
 		return nil
 	}
-	out := r.counts
+	id, err := uuidv7.NewString()
+	if err != nil {
+		return err
+	}
+	r.pending = append(r.pending, &flushBatch{id: id, counts: r.counts, created: now})
 	r.counts = map[counterKey]int64{}
-	return out
+	return nil
 }
 
-// takeAndClose removes and returns every counter and closes the recorder in
-// one step, so every Add either lands in the returned snapshot or is
-// rejected and logged by Add.
-func (r *Recorder) takeAndClose() map[counterKey]int64 {
+// firstPending returns the oldest batch that no flush has applied yet, or
+// nil.
+func (r *Recorder) firstPending() *flushBatch {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.closed = true
-	if len(r.counts) == 0 {
+	if len(r.pending) == 0 {
 		return nil
 	}
-	out := r.counts
-	r.counts = map[counterKey]int64{}
-	return out
+	return r.pending[0]
 }
 
-// restore adds counters that take returned back, after a failed flush.
-func (r *Recorder) restore(counts map[counterKey]int64) {
+// ack drops a batch whose flush succeeded (or whose receipt shows that an
+// earlier attempt applied it).
+func (r *Recorder) ack(b *flushBatch) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for k, v := range counts {
-		r.counts[k] = saturatingAdd(r.counts[k], v)
-	}
+	r.pending = slices.DeleteFunc(r.pending, func(p *flushBatch) bool { return p == b })
 }
 
-// Pending returns the number of counters that wait for a flush (tests and
-// metrics).
+// Pending returns the number of counters that wait for a flush, in the live
+// counters and in pending batches (tests and metrics).
 func (r *Recorder) Pending() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.counts)
+	n := len(r.counts)
+	for _, b := range r.pending {
+		n += len(b.counts)
+	}
+	return n
 }
