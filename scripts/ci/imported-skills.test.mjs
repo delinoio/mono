@@ -7,6 +7,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -287,3 +288,98 @@ test("the repository copy test reads the checked-in tree unchanged", (t) => {
   cpSync(join(repositoryRoot, ManifestFile), join(root, ManifestFile));
   assert.deepEqual(verifyImportedSkills(root), []);
 });
+
+// Creating a symbolic link needs a privilege or developer mode on Windows, so
+// the link fixtures run on other platforms only.
+const symlinkTest = process.platform === "win32" ? test.skip : test;
+
+symlinkTest(
+  "a relative in-tree symbolic link is reported with its path",
+  (t) => {
+    const f = fixture(t);
+    symlinkSync("one.md", join(f.root, SkillsDirectory, "demo/rules/link.md"));
+    const problems = verifyImportedSkills(f.root);
+    assert.equal(problems.length, 1);
+    assert.equal(problems[0].kind, ProblemKind.SymlinkUnsupported);
+    assert.equal(problems[0].skill, "demo");
+    assert.equal(problems[0].path, "rules/link.md");
+    assert.ok(
+      problems[0].message.includes(`${SkillsDirectory}/demo/rules/link.md`),
+    );
+  },
+);
+
+symlinkTest(
+  "a dangling and a directory symbolic link are reported without being followed",
+  (t) => {
+    const f = fixture(t);
+    symlinkSync(
+      "missing-target",
+      join(f.root, SkillsDirectory, "demo/dangling"),
+    );
+    symlinkSync("..", join(f.root, SkillsDirectory, "licensed/loop"));
+    const problems = verifyImportedSkills(f.root);
+    assert.deepEqual(
+      problems.map((problem) => [problem.kind, problem.skill, problem.path]),
+      [
+        [ProblemKind.SymlinkUnsupported, "demo", "dangling"],
+        [ProblemKind.SymlinkUnsupported, "licensed", "loop"],
+      ],
+    );
+  },
+);
+
+symlinkTest(
+  "an unlisted regular file is still file-unexpected next to a symbolic link",
+  (t) => {
+    const f = fixture(t);
+    f.write(`${SkillsDirectory}/demo/rules/extra.md`, "extra\n");
+    symlinkSync("one.md", join(f.root, SkillsDirectory, "demo/rules/link.md"));
+    assert.deepEqual(kinds(f.root).sort(), [
+      ProblemKind.FileUnexpected,
+      ProblemKind.SymlinkUnsupported,
+    ]);
+  },
+);
+
+symlinkTest(
+  "--write-manifest rejects a symbolic link and writes nothing",
+  (t) => {
+    const f = fixture(t);
+    symlinkSync(
+      "missing-target",
+      join(f.root, SkillsDirectory, "demo/dangling"),
+    );
+    assert.throws(
+      () => buildManifest(f.root),
+      /demo\/dangling is a symbolic link/u,
+    );
+    const manifest = f.read(ManifestFile);
+    const result = spawnSync(
+      process.execPath,
+      [script, "--root", f.root, "--write-manifest"],
+      { encoding: "utf8" },
+    );
+    assert.equal(result.status, 2);
+    assert.match(result.stderr, /imported_skills_error .*demo\/dangling/u);
+    assert.equal(f.read(ManifestFile), manifest);
+  },
+);
+
+symlinkTest(
+  "the command line reports a symbolic link and exits with status 1",
+  (t) => {
+    const f = fixture(t);
+    symlinkSync("one.md", join(f.root, SkillsDirectory, "demo/rules/link.md"));
+    const manifest = f.read(ManifestFile);
+    const result = spawnSync(process.execPath, [script, "--root", f.root], {
+      encoding: "utf8",
+    });
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /imported_skills_problem kind=symlink-unsupported/u,
+    );
+    assert.equal(f.read(ManifestFile), manifest);
+  },
+);
