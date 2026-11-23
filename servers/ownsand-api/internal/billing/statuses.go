@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"connectrpc.com/connect"
@@ -455,7 +456,11 @@ func (s *Statuses) unlinkBackoff(attempt int) time.Duration {
 	return min(d, s.timing.UnlinkBackoffMax)
 }
 
-// RetryPendingUnlinks sends every pending unlink that is due.
+// RetryPendingUnlinks sends every pending unlink that is due, oldest
+// next_attempt_time first, one at a time. It stops at the next row when
+// this instance no longer holds the instance lease, so a batch that a lease
+// handover overtook does not keep sending: the new holder retries the
+// remaining rows, which stay due.
 func (s *Statuses) RetryPendingUnlinks(ctx context.Context) error {
 	if s.client == nil {
 		return ErrReportingDisabled
@@ -478,6 +483,9 @@ func (s *Statuses) RetryPendingUnlinks(ctx context.Context) error {
 		return err
 	}
 	for _, orgID := range orgs {
+		if !s.held() {
+			return nil
+		}
 		if err := s.UnlinkPending(ctx, orgID); err != nil && ctx.Err() != nil {
 			return err
 		}
@@ -519,8 +527,11 @@ func (s *Statuses) RefreshMetrics(ctx context.Context) error {
 }
 
 // Run runs the status worker until ctx ends: on the lease holder it polls
-// every Poll interval (measured between poll starts) and, every Tick, records time-based suspensions and
-// retries due pending unlinks; every instance refreshes the metrics.
+// every Poll interval (measured between poll starts) and, every Tick,
+// records time-based suspensions and starts a retry of the due pending
+// unlinks unless the previous retry is still running; every instance
+// refreshes the metrics. A slow UnlinkOrganization call delays none of
+// these steps. Run returns after the running retry ended.
 func (s *Statuses) Run(ctx context.Context) {
 	if s.client == nil {
 		s.logger.Warn("billing_status_sync_disabled",
@@ -528,6 +539,13 @@ func (s *Statuses) Run(ctx context.Context) {
 	}
 	t := time.NewTicker(s.timing.Tick)
 	defer t.Stop()
+	// A retry batch can take as long as ten seconds for each due row, so it
+	// runs in its own goroutine, one batch at a time: the poll, the
+	// time-based suspensions and the metrics keep their schedule. Run waits
+	// for the running batch before it returns; the batch ends with ctx.
+	var batch sync.WaitGroup
+	defer batch.Wait()
+	var retrying atomic.Bool
 	var lastPoll time.Time
 	for {
 		if s.held() {
@@ -547,8 +565,18 @@ func (s *Statuses) Run(ctx context.Context) {
 				// Due pending unlinks are retried at every tick, not only at
 				// a poll: the back-off bounds (1 second to 5 minutes) are
 				// shorter than the poll interval, and an attempt that is not
-				// due yet is skipped by the query.
-				_ = s.RetryPendingUnlinks(ctx)
+				// due yet is skipped by the query. A tick that finds the
+				// previous batch still running starts none: the rows that it
+				// has not reached stay due and are selected first by the
+				// next batch.
+				if retrying.CompareAndSwap(false, true) {
+					batch.Add(1)
+					go func() {
+						defer batch.Done()
+						defer retrying.Store(false)
+						_ = s.RetryPendingUnlinks(ctx)
+					}()
+				}
 			}
 			_ = s.Advance(ctx)
 		}
