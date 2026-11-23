@@ -44,6 +44,54 @@ func TestCopyTreeAndTarRoundTrip(t *testing.T) {
 	}
 }
 
+// errAfterContext reports context.Canceled from its Err method after the
+// first n calls, so a test cancels a walk at a fixed entry without timing.
+type errAfterContext struct {
+	context.Context
+	left int
+}
+
+func (c *errAfterContext) Err() error {
+	if c.left <= 0 {
+		return context.Canceled
+	}
+	c.left--
+	return nil
+}
+
+func TestCopyTreeContextStopsWhenCanceled(t *testing.T) {
+	src := t.TempDir()
+	for _, name := range []string{"a", "b", "c", "d"} {
+		if err := os.WriteFile(filepath.Join(src, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dst := filepath.Join(t.TempDir(), "copy")
+	// The root and one file pass; the next entry sees the cancellation.
+	err := CopyTreeContext(&errAfterContext{Context: context.Background(), left: 3}, src, dst)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("CopyTreeContext error = %v; want context.Canceled", err)
+	}
+	if entries, _ := os.ReadDir(dst); len(entries) >= 4 {
+		t.Fatalf("copied %d entries after the cancellation", len(entries))
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := CopyTreeContext(canceled, src, filepath.Join(t.TempDir(), "none")); !errors.Is(err, context.Canceled) {
+		t.Fatalf("CopyTreeContext with a canceled context = %v; want context.Canceled", err)
+	}
+
+	// An uncanceled context copies the whole tree.
+	full := filepath.Join(t.TempDir(), "full")
+	if err := CopyTreeContext(context.Background(), src, full); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := TreeSize(full); n != 4 {
+		t.Fatalf("size %d; want 4", n)
+	}
+}
+
 func TestReadTarRejectsEscapes(t *testing.T) {
 	for _, hdr := range []*tar.Header{
 		{Name: "../evil", Typeflag: tar.TypeReg, Mode: 0o644},
