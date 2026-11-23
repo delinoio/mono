@@ -1328,7 +1328,9 @@ describe("chunkSource", () => {
 
     const slice = Uint8Array.prototype.slice;
     const set = Uint8Array.prototype.set;
+    const NativeUint8Array = globalThis.Uint8Array;
     let copied = 0;
+    let constructed = 0;
     Uint8Array.prototype.slice = function (
       this: Uint8Array,
       ...args: Parameters<Uint8Array["slice"]>
@@ -1345,16 +1347,46 @@ describe("chunkSource", () => {
       copied += array.length;
       return set.call(this, array, offset);
     } as typeof set;
+    // `new Uint8Array(typedArrayOrArrayLike)` copies its argument without
+    // calling `slice` or `set`, so count those constructor calls too. A
+    // numeric length allocates without copying and an `ArrayBuffer` argument
+    // creates a view, so neither counts. `subarray` builds its views through
+    // the original constructor, which this proxy does not see.
+    globalThis.Uint8Array = new Proxy(NativeUint8Array, {
+      construct(target, args, newTarget) {
+        const first: unknown = args[0];
+        if (
+          typeof first === "object" &&
+          first !== null &&
+          !(first instanceof ArrayBuffer) &&
+          !(first instanceof SharedArrayBuffer)
+        ) {
+          const length = (first as ArrayLike<number>).length;
+          copied += length;
+          constructed += length;
+        }
+        return Reflect.construct(
+          target,
+          args,
+          newTarget === globalThis.Uint8Array ? target : newTarget,
+        );
+      },
+    });
 
     try {
       for (const source of [input, split()]) {
         copied = 0;
+        constructed = 0;
         const chunks: Uint8Array[] = [];
         let lasts = 0;
         for await (const c of chunkSource(source, size)) {
           chunks.push(c.data);
           if (c.last) lasts++;
         }
+        // The ownership copy in `chunkSource` copies every byte once and
+        // `take` copies it once more, so the volume is about twice the input.
+        // An extra copy on either path pushes it above the bound.
+        expect(constructed).toBeGreaterThan(0);
         expect(copied).toBeLessThanOrEqual(2 * total);
         expect(lasts).toBe(1);
         expect(chunks.slice(0, -1).every((c) => c.length === size)).toBe(true);
@@ -1368,6 +1400,7 @@ describe("chunkSource", () => {
         expect(Buffer.compare(joined, input)).toBe(0);
       }
     } finally {
+      globalThis.Uint8Array = NativeUint8Array;
       Uint8Array.prototype.slice = slice;
       Uint8Array.prototype.set = set;
     }
