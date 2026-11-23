@@ -79,6 +79,35 @@ type Server struct {
 	stallAuth  bool
 	stallEnr   bool
 	enrollKeys []ed25519.PublicKey
+	// Enroll hook; see HoldNextEnroll.
+	hold *EnrollHold
+}
+
+// EnrollHold holds one Enroll call after it reached the fake and before the
+// fake handles it.
+type EnrollHold struct {
+	arrived chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// Arrived is closed when the held Enroll call reached the fake.
+func (h *EnrollHold) Arrived() <-chan struct{} { return h.arrived }
+
+// Release lets the held call continue. It is safe to call more than once.
+func (h *EnrollHold) Release() { h.once.Do(func() { close(h.release) }) }
+
+// HoldNextEnroll makes the fake hold the next Enroll call until Release (or
+// the end of the call's context). Later calls run normally.
+func (s *Server) HoldNextEnroll() *EnrollHold {
+	h := &EnrollHold{arrived: make(chan struct{}), release: make(chan struct{})}
+	s.mu.Lock()
+	s.hold = h
+	s.mu.Unlock()
+	// Release at the end of the test, so that a failed test does not leave
+	// the handler blocked in the server's shutdown.
+	s.t.Cleanup(h.Release)
+	return h
 }
 
 // EnrollPublicKeys returns the public key of every Enroll call that reached
@@ -183,7 +212,17 @@ func randomToken(prefix string) string {
 func (s *Server) Enroll(ctx context.Context, req *connect.Request[ownsandv1.EnrollRequest]) (*connect.Response[ownsandv1.EnrollResponse], error) {
 	s.mu.Lock()
 	s.enrollKeys = append(s.enrollKeys, append(ed25519.PublicKey(nil), req.Msg.GetPublicKey()...))
+	hold := s.hold
+	s.hold = nil
 	s.mu.Unlock()
+	if hold != nil {
+		close(hold.arrived)
+		select {
+		case <-hold.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.stalled(&s.stallEnr) {
 		<-ctx.Done()
 		return nil, ctx.Err()

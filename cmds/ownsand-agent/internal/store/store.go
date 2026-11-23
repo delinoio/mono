@@ -8,6 +8,7 @@
 // Layout:
 //
 //	identity.json             device ID, organization ID, private key (0600)
+//	enrollment.lock           lock file of the enrollment sequence (0600)
 //	agent.json                control plane origin, state epoch, revision
 //	                          counter, removal record, pending update
 //	status.json               last status of the running agent (for `status`)
