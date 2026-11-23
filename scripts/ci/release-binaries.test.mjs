@@ -245,8 +245,13 @@ function fixture(t, parent = tmpdir()) {
   writeFileSync(githubEnv, "");
   const runnerTemp = join(dir, "runner");
   mkdirSync(runnerTemp);
-  const run = (args, env = {}, binaries = [agent, cli]) => {
-    const result = spawnSync("bash", [script, ...args], {
+  const run = (
+    args,
+    env = {},
+    binaries = [agent, cli],
+    scriptPath = script,
+  ) => {
+    const result = spawnSync("bash", [scriptPath, ...args], {
       encoding: "utf8",
       cwd: root,
       env: {
@@ -788,6 +793,84 @@ test(
     const sums = readFileSync(join(assets, "ownsand-cli/SHA256SUMS"), "utf8");
     assert.match(sums, /^[0-9a-f]{64} {2}ownsand-linux-arm64$/m);
     assert.equal(sums.trim().split("\n").length, 6);
+  },
+);
+
+// A checkout whose root holds a dot-prefixed license file, with its own copy
+// of the script: the script reads the license files from the repository root
+// that it sits in.
+function hiddenLicenseCheckout(f) {
+  const checkout = join(f.dir, "checkout");
+  const copy = join(checkout, "scripts/ci/release-binaries.sh");
+  write(copy, readFileSync(script), 0o755);
+  write(join(checkout, "LICENSE"), "visible license\n");
+  write(join(checkout, ".license"), "hidden license\n");
+  const binary = { ...cli, licenseFiles: ["LICENSE", ".license"] };
+  return (assets) =>
+    f.run(["assemble", artifacts(f), assets], {}, [binary], copy);
+}
+
+// Prints the file names that SHA256SUMS lists, in order.
+function listedNames(sums) {
+  return sums
+    .trim()
+    .split("\n")
+    .map((line) => line.replace(/^[0-9a-f]{64} {2}/, ""));
+}
+
+function sha256Check(dir) {
+  return spawnSync(
+    "sh",
+    ["-c", "sha256sum -c SHA256SUMS || shasum -a 256 -c SHA256SUMS"],
+    { cwd: dir, encoding: "utf8" },
+  );
+}
+
+test(
+  "assemble lists a dot-prefixed license file in SHA256SUMS exactly once",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const assets = join(f.dir, "assets");
+    const result = hiddenLicenseCheckout(f)(assets);
+    assert.equal(result.status, 0, result.stderr);
+    const dir = join(assets, "ownsand-cli");
+    const published = readdirSync(dir)
+      .filter((name) => name !== "SHA256SUMS")
+      .sort();
+    assert.ok(published.includes(".license"));
+    assert.ok(published.includes("LICENSE"));
+    const names = listedNames(readFileSync(join(dir, "SHA256SUMS"), "utf8"));
+    assert.deepEqual([...names].sort(), published);
+    assert.equal(names.filter((name) => name === ".license").length, 1);
+    const check = sha256Check(dir);
+    assert.equal(check.status, 0, check.stdout + check.stderr);
+    writeFileSync(join(dir, ".license"), "changed license\n");
+    assert.notEqual(sha256Check(dir).status, 0);
+  },
+);
+
+test(
+  "a repeated assemble into the same directory keeps SHA256SUMS verifiable and free of itself",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const assets = join(f.dir, "assets");
+    const assemble = hiddenLicenseCheckout(f);
+    const dir = join(assets, "ownsand-cli");
+    let previous;
+    for (const run of ["first", "second", "third"]) {
+      const result = assemble(assets);
+      assert.equal(result.status, 0, `${run}: ${result.stderr}`);
+      const sums = readFileSync(join(dir, "SHA256SUMS"), "utf8");
+      const names = listedNames(sums);
+      assert.ok(!names.includes("SHA256SUMS"), `${run}: lists itself`);
+      assert.equal(new Set(names).size, names.length, `${run}: duplicates`);
+      const check = sha256Check(dir);
+      assert.equal(check.status, 0, `${run}: ${check.stdout}${check.stderr}`);
+      if (previous !== undefined) assert.equal(sums, previous);
+      previous = sums;
+    }
   },
 );
 
