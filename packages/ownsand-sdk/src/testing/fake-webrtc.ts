@@ -40,6 +40,10 @@ class Emitter {
   }
 }
 
+/** The peer connection methods that a test can hold pending. */
+export type HoldableMethod =
+  "createOffer" | "setLocalDescription" | "setRemoteDescription";
+
 /** The fake agent side of a data channel. */
 export interface FakeAgentPeer {
   /** Sends a frame to the SDK. */
@@ -64,6 +68,12 @@ export interface FakeWebRtcOptions {
   openDelayMs?: number;
   /** Opens the channel while the offer is created, before the answer. */
   openBeforeAnswer?: boolean;
+  /**
+   * Methods whose calls stay pending until `FakeWebRtc.release` for that
+   * method. A released call then runs its normal behavior, so a test can model
+   * a WebRTC stack that answers late, after the setup was cancelled.
+   */
+  hold?: readonly HoldableMethod[];
 }
 
 /** Test control over the send buffer of a fake data channel. */
@@ -112,6 +122,12 @@ export interface FakeWebRtc {
   peers: FakeAgentPeer[];
   /** One control per data channel, in creation order. */
   channels: FakeChannelControl[];
+  /** The number of calls of `method` that wait for `release`. */
+  held(method: HoldableMethod): number;
+  /** Lets every held call of `method` continue, and the later ones too. */
+  release(method: HoldableMethod): void;
+  /** Peer connections that `close()` was called on. */
+  closedConnections: number;
 }
 
 class FakeChannel
@@ -169,6 +185,32 @@ export function fakeWebRtc(
     frames: [],
     peers: [],
     channels: [],
+    closedConnections: 0,
+    held: (method) => holds.get(method)?.waiting ?? 0,
+    release: (method) => {
+      const hold = holds.get(method);
+      if (hold !== undefined) {
+        hold.waiting = 0;
+        hold.open();
+      }
+    },
+  };
+  const holds = new Map<
+    HoldableMethod,
+    { waiting: number; gate: Promise<void>; open: () => void }
+  >();
+  for (const method of options.hold ?? []) {
+    let open!: () => void;
+    const gate = new Promise<void>((resolve) => (open = resolve));
+    holds.set(method, { waiting: 0, gate, open });
+  }
+  /** Waits for the release of `method` when a test holds it. */
+  const held = async (method: HoldableMethod): Promise<void> => {
+    const hold = holds.get(method);
+    if (hold !== undefined) {
+      hold.waiting++;
+      await hold.gate;
+    }
   };
   class FakePeerConnection extends Emitter implements PeerConnectionLike {
     iceGatheringState = "new";
@@ -228,6 +270,7 @@ export function fakeWebRtc(
     }
 
     async createOffer(): Promise<SessionDescriptionLike> {
+      await held("createOffer");
       if (options.openBeforeAnswer && this.channel) {
         const channel = this.channel;
         queueMicrotask(() => {
@@ -239,6 +282,7 @@ export function fakeWebRtc(
     }
 
     async setLocalDescription(d: SessionDescriptionLike): Promise<void> {
+      await held("setLocalDescription");
       this.localDescription = d;
       this.iceGatheringState = "gathering";
       void clock.sleep(options.gatherMs ?? 100).then(() => {
@@ -252,6 +296,7 @@ export function fakeWebRtc(
     }
 
     async setRemoteDescription(): Promise<void> {
+      await held("setRemoteDescription");
       if (options.neverOpen) return;
       const open = () => {
         if (this.channel && this.channel.readyState === "connecting") {
@@ -271,6 +316,7 @@ export function fakeWebRtc(
     }
 
     close(): void {
+      record.closedConnections++;
       this.channel?.close();
     }
   }
