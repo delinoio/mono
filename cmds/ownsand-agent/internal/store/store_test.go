@@ -5,9 +5,12 @@ package store
 import (
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
+	"sort"
 	"testing"
 )
 
@@ -60,8 +63,30 @@ func TestIdentityAndAgentState(t *testing.T) {
 }
 
 func TestSandboxAndSnapshotRecords(t *testing.T) {
-	s, _ := Open(t.TempDir())
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	type rec struct{ ID string }
+	// loadIDs decodes every saved record and returns the sorted record IDs. It
+	// fails the test on any load or decode error.
+	loadIDs := func(load func(func([]byte) error) error) []string {
+		t.Helper()
+		ids := []string{}
+		err := load(func(b []byte) error {
+			var r rec
+			if err := json.Unmarshal(b, &r); err != nil {
+				return err
+			}
+			ids = append(ids, r.ID)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("load records: %v", err)
+		}
+		sort.Strings(ids)
+		return ids
+	}
 	for _, id := range []string{"a", "b"} {
 		if err := s.SaveSandbox(id, rec{id}); err != nil {
 			t.Fatal(err)
@@ -70,27 +95,28 @@ func TestSandboxAndSnapshotRecords(t *testing.T) {
 	if err := s.SaveSandbox("../x", rec{}); err == nil {
 		t.Fatal("path traversal accepted")
 	}
-	var ids []string
-	s.LoadSandboxes(func(b []byte) error {
-		var r rec
-		json.Unmarshal(b, &r)
-		ids = append(ids, r.ID)
-		return nil
-	})
-	if len(ids) != 2 {
-		t.Fatalf("sandboxes %v", ids)
+	if got := loadIDs(s.LoadSandboxes); !reflect.DeepEqual(got, []string{"a", "b"}) {
+		t.Fatalf("sandboxes before delete %v", got)
 	}
-	s.DeleteSandbox("a")
+	if err := s.DeleteSandbox("a"); err != nil {
+		t.Fatalf("delete sandbox: %v", err)
+	}
+	if _, err := os.Stat(s.Path(SandboxesDir, "a.json")); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("deleted sandbox record kept: stat error is not ErrNotExist")
+	}
+	if got := loadIDs(s.LoadSandboxes); !reflect.DeepEqual(got, []string{"b"}) {
+		t.Fatalf("sandboxes after delete %v", got)
+	}
 	if err := s.SaveSnapshot("s1", rec{"s1"}); err != nil {
 		t.Fatal(err)
 	}
-	os.MkdirAll(s.Path(SnapshotsDir, "partial"), 0o700)
-	n := 0
-	s.LoadSnapshots(func([]byte) error { n++; return nil })
-	if n != 1 {
-		t.Fatalf("snapshots %d", n)
+	if err := os.MkdirAll(s.Path(SnapshotsDir, "partial"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(s.Path(SnapshotsDir, "partial")); !os.IsNotExist(err) {
+	if got := loadIDs(s.LoadSnapshots); !reflect.DeepEqual(got, []string{"s1"}) {
+		t.Fatalf("snapshots %v", got)
+	}
+	if _, err := os.Stat(s.Path(SnapshotsDir, "partial")); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatal("partial snapshot kept")
 	}
 }
