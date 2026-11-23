@@ -79,8 +79,13 @@ type Server struct {
 	stallAuth  bool
 	stallEnr   bool
 	enrollKeys []ed25519.PublicKey
-	// Enroll hook; see HoldNextEnroll.
-	hold *EnrollHold
+	// Enroll hooks; see ConsumeEnrollToken, DropNextEnrollResponse and
+	// HoldNextEnroll.
+	singleUse   bool
+	consumedKey ed25519.PublicKey
+	consumedDev string
+	dropReply   bool
+	hold        *EnrollHold
 }
 
 // EnrollHold holds one Enroll call after it reached the fake and before the
@@ -108,6 +113,25 @@ func (s *Server) HoldNextEnroll() *EnrollHold {
 	// the handler blocked in the server's shutdown.
 	s.t.Cleanup(h.Release)
 	return h
+}
+
+// ConsumeEnrollToken gives the enrollment token the semantics of the
+// control plane: the first Enroll call consumes it for its public key and
+// creates the device, a retry with the same public key gets the same device,
+// and a call with another public key is rejected.
+func (s *Server) ConsumeEnrollToken() {
+	s.mu.Lock()
+	s.singleUse = true
+	s.mu.Unlock()
+}
+
+// DropNextEnrollResponse makes the fake commit the next Enroll call (it
+// creates the device) and answer with an unavailable error, as a lost
+// response looks to the agent. Later calls answer normally.
+func (s *Server) DropNextEnrollResponse() {
+	s.mu.Lock()
+	s.dropReply = true
+	s.mu.Unlock()
 }
 
 // EnrollPublicKeys returns the public key of every Enroll call that reached
@@ -230,10 +254,25 @@ func (s *Server) Enroll(ctx context.Context, req *connect.Request[ownsandv1.Enro
 	if req.Msg.GetEnrollmentToken() != Token || len(req.Msg.GetPublicKey()) != ed25519.PublicKeySize {
 		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid enrollment token"))
 	}
-	id, _ := uuidv7.NewString()
 	s.mu.Lock()
-	s.devices[id] = &device{pub: req.Msg.GetPublicKey()}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	id := s.consumedDev
+	if s.singleUse && s.consumedKey != nil {
+		if !s.consumedKey.Equal(ed25519.PublicKey(req.Msg.GetPublicKey())) {
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid enrollment token"))
+		}
+	} else {
+		id, _ = uuidv7.NewString()
+		s.devices[id] = &device{pub: req.Msg.GetPublicKey()}
+		if s.singleUse {
+			s.consumedKey = append(ed25519.PublicKey(nil), req.Msg.GetPublicKey()...)
+			s.consumedDev = id
+		}
+	}
+	if s.dropReply {
+		s.dropReply = false
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("response lost"))
+	}
 	return connect.NewResponse(&ownsandv1.EnrollResponse{DeviceId: id, OrganizationId: OrganizationID}), nil
 }
 

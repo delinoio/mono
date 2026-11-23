@@ -107,6 +107,75 @@ func TestEnrollWaitingAttemptKeepsCompletedIdentity(t *testing.T) {
 	}
 }
 
+// TestEnrollWaitingAttemptReusesPendingKey checks that a second command
+// that waits while the first fails after it wrote the pending key uses that
+// same key, so both attempts of one enrollment send one public key.
+func TestEnrollWaitingAttemptReusesPendingKey(t *testing.T) {
+	cp, st, client := newEnrollFixture(t)
+	cp.ConsumeEnrollToken()
+	cp.DropNextEnrollResponse()
+	hold := cp.HoldNextEnroll()
+	first := enrollAsync(t, context.Background(), st, client)
+	<-hold.Arrived()
+	pubKey := requirePendingKey(t, st)
+
+	st2, client2 := openSecond(t, st, cp)
+	second := enrollAsync(t, context.Background(), st2, client2)
+	hold.Release()
+
+	// The first attempt commits and loses its reply.
+	if r := <-first; r.err == nil {
+		t.Fatalf("first enrollment succeeded; want the lost reply: %+v", r.id)
+	}
+	// The waiting attempt reuses the pending key and recovers the device.
+	r2 := <-second
+	if r2.err != nil || r2.id.DeviceID == "" {
+		t.Fatalf("second enrollment: %+v", r2)
+	}
+	keys := cp.EnrollPublicKeys()
+	if len(keys) != 2 || !bytes.Equal(keys[0], pubKey) || !bytes.Equal(keys[1], pubKey) {
+		t.Fatalf("public keys sent: %x, want twice %x", keys, pubKey)
+	}
+}
+
+// TestEnrollRetryAfterLostResponseRecoversDevice checks, against a control
+// plane that consumes the token on the first call, that a retry with the
+// same token after a committed enrollment with a lost response sends the
+// preserved key and records the committed device.
+func TestEnrollRetryAfterLostResponseRecoversDevice(t *testing.T) {
+	cp, st, client := newEnrollFixture(t)
+	cp.ConsumeEnrollToken()
+	cp.DropNextEnrollResponse()
+
+	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); err == nil {
+		t.Fatal("enrollment succeeded; want the lost reply")
+	}
+	pubKey := requirePendingKey(t, st)
+
+	id, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger())
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	keys := cp.EnrollPublicKeys()
+	if len(keys) != 2 || !bytes.Equal(keys[0], pubKey) || !bytes.Equal(keys[1], pubKey) {
+		t.Fatalf("public keys sent: %x, want twice %x", keys, pubKey)
+	}
+	stored, err := st.LoadIdentity()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.DeviceID == "" || stored.DeviceID != id.DeviceID {
+		t.Fatalf("stored identity %+v, returned %+v", stored, id)
+	}
+	// A later attempt cannot replace the identity that has a device ID.
+	if _, err := Enroll(context.Background(), st, client, testcp.Token, "host", quietLogger()); !errors.Is(err, ErrAlreadyEnrolled) {
+		t.Fatalf("later enrollment error = %v, want ErrAlreadyEnrolled", err)
+	}
+	if len(cp.EnrollPublicKeys()) != 2 {
+		t.Fatal("a later enrollment reached the control plane")
+	}
+}
+
 // TestEnrollGivesUpWhileAnotherEnrollmentRuns checks that an attempt whose
 // context ends while it waits for the lock fails with ErrEnrollmentBusy and
 // writes nothing, so it cannot touch the pending key of the running one.
