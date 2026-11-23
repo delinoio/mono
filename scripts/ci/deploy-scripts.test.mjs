@@ -1611,7 +1611,9 @@ const digest = `sha256:${"d".repeat(64)}`;
 // Runs deploy-targets.sh with stubbed `pnpm`, `docker`, `ssh`, guard and
 // provider. The guard fails once `withdrawn` exists, as when a changeset is
 // withdrawn on main. The `ssh` stub saves the remote script from standard
-// input to `remote-<n>.sh`.
+// input to `remote-<n>.sh`. The script appends its job summary to `summary.md`
+// in the fixture directory, never to the `GITHUB_STEP_SUMMARY` file that this
+// process may inherit from a CI job; the content is returned as `summary`.
 function runTargets(
   t,
   command,
@@ -1661,12 +1663,15 @@ function runTargets(
       ".",
     ]);
   }
+  const summary = join(dir, "summary.md");
+  writeFileSync(summary, "");
   const result = spawnSync("bash", [targets, command], {
     cwd: dir,
     encoding: "utf8",
     env: {
       ...baseEnv,
       PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      GITHUB_STEP_SUMMARY: summary,
       STUB_DIR: dir,
       RUNNER_TEMP: dir,
       SHA: "a".repeat(40),
@@ -1714,6 +1719,7 @@ function runTargets(
   return {
     ...result,
     dir,
+    summary: readFileSync(summary, "utf8"),
     calls: readFileSync(join(dir, "calls.log"), "utf8").trim().split("\n"),
   };
 }
@@ -1755,6 +1761,68 @@ test("targets deploy site outputs from SITES_ROOT", { skip }, (t) => {
     uploads[0],
   );
 });
+
+test("targets write the job summary to a fixture-local file", { skip }, (t) => {
+  const sites = runTargets(t, "static-sites");
+  assert.equal(sites.status, 0, sites.stdout + sites.stderr);
+  assert.equal(
+    sites.summary,
+    [
+      "## Static sites",
+      "- docs@1.0.0: Cloudflare Pages project `docs`, deployment `pages`",
+      "- site@1.0.0: Cloudflare Pages project `site`, deployment `pages`",
+      "",
+    ].join("\n"),
+  );
+  const servers = runTargets(t, "servers");
+  assert.equal(servers.status, 0, servers.stdout + servers.stderr);
+  const registry = "registry.digitalocean.com/delino";
+  assert.equal(
+    servers.summary,
+    [
+      "## Servers",
+      `- api@1.0.0: Droplet service \`api\` at \`https://api.example.com\`, image \`${registry}/api@${digest}\``,
+      `- worker@1.0.0: Droplet service \`worker-svc\` at \`https://worker.example.com\`, image \`${registry}/worker-svc@${digest}\``,
+      "",
+    ].join("\n"),
+  );
+});
+
+// Re-runs the target tests that reach `deploy-targets.sh` in a child Node test
+// process whose `GITHUB_STEP_SUMMARY` names a sentinel file, as in a CI job.
+// The child must leave the sentinel byte-for-byte unchanged.
+test(
+  "targets tests leave an inherited GITHUB_STEP_SUMMARY file unchanged",
+  { skip },
+  (t) => {
+    const dir = scratch(t);
+    const sentinel = join(dir, "job-summary.md");
+    const content = "## Job summary of the surrounding CI job\n";
+    writeFileSync(sentinel, content);
+    // The child must not join the parent's test run, and must not recurse
+    // into this test.
+    const env = { ...process.env, GITHUB_STEP_SUMMARY: sentinel };
+    delete env.NODE_TEST_CONTEXT;
+    const names = [
+      "targets check the plan before each site upload",
+      "targets push each server image and deploy it by digest over SSH",
+      "targets fail when a site build or its output is missing",
+    ];
+    const result = spawnSync(
+      process.execPath,
+      [
+        "--test",
+        "--test-reporter=tap",
+        ...names.map((name) => `--test-name-pattern=^${name}$`),
+        fileURLToPath(import.meta.url),
+      ],
+      { cwd: root, encoding: "utf8", env },
+    );
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    assert.match(result.stdout, /# pass 3\b/);
+    assert.equal(readFileSync(sentinel, "utf8"), content);
+  },
+);
 
 test("targets build sites without uploading them", { skip }, (t) => {
   const result = runTargets(t, "build-static-sites");
@@ -1908,6 +1976,7 @@ test(
           },
         ]),
         DEPLOY_GUARD: "/bin/false",
+        GITHUB_STEP_SUMMARY: join(dir, "summary.md"),
       },
     });
     assert.equal(result.status, 1);
