@@ -87,6 +87,14 @@ func newRotationHarness(t *testing.T, timing RelayTiming) *rotationHarness {
 		S:      &Service{Logger: slog.New(slog.NewJSONHandler(h.logs, nil)), Now: time.Now},
 		Timing: timing,
 	}
+	// The stream was allocated an hour ago. With the one-minute Rotation of
+	// pastRotation, the rotation time passed 59 minutes ago, so the rotation
+	// branch is reached at the first frame on every platform. The tests must
+	// not rely on a short rotation interval that elapses between two
+	// time.Now calls: on Windows the Go clock only advances every 0.5 to
+	// 15.6 ms, so the allocation time and the first frame can read the same
+	// instant, the rotation check is false and the handler forwards the frame.
+	stream.Started = time.Now().Add(-time.Hour)
 	h.call = &relayCall{procedure: "/delino.ownsand.v1.RelayService/Exec", grant: &grants.Grant{ID: "grant-1"}, stream: stream, conn: conn, start: time.Now()}
 	return h
 }
@@ -193,9 +201,11 @@ func (h *rotationHarness) logCode() string {
 	return ""
 }
 
-// pastRotation is a rotation interval that has already passed when the first
-// frame after the accepted event is received.
-var pastRotation = RelayTiming{Rotation: time.Nanosecond, Keepalive: time.Minute, Acceptance: time.Minute, RequestDeadline: time.Minute}
+// pastRotation is a timing whose rotation time has already passed when the
+// first frame after the accepted event is received: newRotationHarness
+// allocates the stream an hour in the past, which is far beyond this one-minute
+// Rotation and beyond the resolution of any platform clock.
+var pastRotation = RelayTiming{Rotation: time.Minute, Keepalive: time.Minute, Acceptance: time.Minute, RequestDeadline: time.Minute}
 
 func stdout(data string) *ownsandv1.ExecEvent {
 	return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Stdout{Stdout: &ownsandv1.ExecOutput{Data: []byte(data)}}}
