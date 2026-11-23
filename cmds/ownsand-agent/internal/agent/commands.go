@@ -242,6 +242,18 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	if _, e, ok := a.Sandboxes.SnapshotContent(snapshotID); ok {
 		return e, nil
 	}
+	// Reserve the device against the update installation before the removal
+	// of a stale copy, any transfer I/O or any import directory change. The
+	// cached-copy answer above needs no reservation: it only reads the entry.
+	// The removal below changes the import directory and the manager entry,
+	// so an installation that already started must refuse the import before
+	// it, and one that is queued waits for the removal and the import.
+	end, err := a.beginTransfer()
+	if err != nil {
+		a.logger.Warn("snapshot import refused", "snapshot_id", snapshotID, "error", err)
+		return nil, err
+	}
+	defer end()
 	// A copy that a delete marked, or whose removal failed, is removed before
 	// the import writes into its directory.
 	if err := a.Sandboxes.PrepareSnapshotImport(snapshotID); err != nil {
@@ -260,15 +272,6 @@ func (a *Agent) importSnapshot(ctx context.Context, cmd *ownsandv1.ImportSnapsho
 	for _, p := range cmd.GetParts() {
 		total += p.GetSizeBytes()
 	}
-	// Reserve the device against the update installation before any transfer
-	// I/O or import directory change. The cached-copy answer above needs no
-	// reservation: it only reads the entry.
-	end, err := a.beginTransfer()
-	if err != nil {
-		a.logger.Warn("snapshot import refused", "snapshot_id", snapshotID, "error", err)
-		return nil, err
-	}
-	defer end()
 	if free, err := sysinfo.FreeDiskBytes(a.st.Dir()); err == nil && free < 2*total {
 		return nil, &sandboxes.CommandError{Code: ownsandv1.ErrorCode_ERROR_CODE_RESOURCE_EXHAUSTED, Message: "free disk does not fit the snapshot import"}
 	}

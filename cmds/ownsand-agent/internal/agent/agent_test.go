@@ -1291,6 +1291,198 @@ func TestTransfersRefusedWhileUpdateInstalls(t *testing.T) {
 	}
 }
 
+// getCounter counts the part downloads of one snapshot ID and never blocks.
+type getCounter struct {
+	id string
+	n  atomic.Int32
+}
+
+func (c *getCounter) hook(r *http.Request) int {
+	if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/"+c.id+"/") {
+		c.n.Add(1)
+	}
+	return 0
+}
+
+// removalScript scripts the removal of stored snapshot copies through the
+// removal hook of the sandbox manager: it fails the removal, holds it until
+// the test releases it, or lets it run.
+type removalScript struct {
+	mu      sync.Mutex
+	fail    bool
+	pause   bool
+	calls   int
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newRemovalScript() *removalScript {
+	return &removalScript{entered: make(chan struct{}), release: make(chan struct{})}
+}
+
+func (r *removalScript) set(fail, pause bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.fail, r.pause = fail, pause
+}
+
+func (r *removalScript) count() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.calls
+}
+
+func (r *removalScript) hook(string) error {
+	r.mu.Lock()
+	r.calls++
+	fail, pause := r.fail, r.pause
+	r.mu.Unlock()
+	if fail {
+		return errors.New("injected removal failure")
+	}
+	if pause {
+		r.once.Do(func() { close(r.entered) })
+		<-r.release
+	}
+	return nil
+}
+
+// markedCopy imports id, then deletes it while a reader holds it and lets the
+// last reader fail the removal, so the device keeps a marked copy without a
+// reader. It returns the command that imports the copy again. The removal
+// keeps failing until the test calls script.set.
+func (f *importFixture) markedCopy(t *testing.T, id string, script *removalScript) *ownsandv1.AgentCommand {
+	t.Helper()
+	f.h.agent.Sandboxes.SetSnapshotRemovalHookForTest(script.hook)
+	t.Cleanup(func() { f.h.agent.Sandboxes.SetSnapshotRemovalHookForTest(nil) })
+	staged := f.stage(t, id, false)
+	if res := f.h.command(staged); res.GetError() != nil {
+		t.Fatalf("import = %v", res)
+	}
+	script.set(true, false)
+	_, release, ok := f.h.agent.Sandboxes.AcquireSnapshot(id)
+	if !ok {
+		t.Fatal("imported copy is not readable")
+	}
+	del := &ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_DeleteSnapshot{DeleteSnapshot: &ownsandv1.DeleteSnapshotCommand{SnapshotId: id}}}
+	if res := f.h.command(del); res.GetError() != nil {
+		t.Fatalf("delete = %v", res)
+	}
+	release() // The removal fails here; the entry stays, marked.
+	if !f.h.agent.Sandboxes.HasSnapshot(id) {
+		t.Fatal("marked copy left the manager")
+	}
+	if _, _, ok := f.h.agent.Sandboxes.SnapshotContent(id); ok {
+		t.Fatal("marked copy is still usable")
+	}
+	if script.count() != 1 {
+		t.Fatalf("removal attempts after the mark = %d, want 1", script.count())
+	}
+	return staged
+}
+
+// TestMarkedImportRefusedWhileUpdateInstalls checks that an import of a copy
+// that a delete marked returns UNAVAILABLE once the installation started,
+// before it removes the copy, touches its directory or downloads a part.
+func TestMarkedImportRefusedWhileUpdateInstalls(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	counter := &getCounter{id: id}
+	script := newRemovalScript()
+	env := newUpdateEnv(t, true)
+	f := newImportFixtureWith(t, counter.hook, env.tweak)
+	t.Cleanup(func() { close(env.unblock) })
+	staged := f.markedCopy(t, id, script)
+	// Let a removal that the import wrongly started succeed, so that the
+	// assertions below see its effect.
+	script.set(false, false)
+	downloads := counter.n.Load()
+	f.stageUpdate(t)
+	go f.h.agent.updater.TryInstall()
+	waitClosed(t, env.entered, "the installer")
+	if res := f.h.command(staged); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_UNAVAILABLE {
+		t.Fatalf("import of a marked copy during the installation = %v", res)
+	}
+	if n := script.count(); n != 1 {
+		t.Fatalf("removal attempts = %d, want only the one of the mark", n)
+	}
+	if n := counter.n.Load(); n != downloads {
+		t.Fatalf("part downloads of the refused import = %d", n-downloads)
+	}
+	if !f.h.agent.Sandboxes.HasSnapshot(id) {
+		t.Fatal("refused import removed the manager entry")
+	}
+	dir, err := f.h.st.SnapshotDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("refused import changed the snapshot directory: %v", err)
+	}
+}
+
+// TestUpdateWaitsForStaleCopyRemovalOfImport checks that an import that took
+// the reservation first holds the installation back through the removal of
+// the marked copy and through the import itself.
+func TestUpdateWaitsForStaleCopyRemovalOfImport(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	script := newRemovalScript()
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, nil, env.tweak)
+	staged := f.markedCopy(t, id, script)
+	script.set(false, true)
+	// A failed assertion must not leave the removal blocked: the agent
+	// cleanup waits for its commands.
+	t.Cleanup(func() {
+		select {
+		case <-script.release:
+		default:
+			close(script.release)
+		}
+	})
+	f.stageUpdate(t)
+	cmdID := f.h.sendCommand(staged)
+	waitClosed(t, script.entered, "the removal of the marked copy")
+	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil {
+		t.Fatalf("install during the removal: %v %v", ok, err)
+	}
+	settle()
+	if n := env.installs.Load(); n != 0 {
+		t.Fatalf("installer calls during the removal = %d", n)
+	}
+	close(script.release)
+	res := f.h.result(cmdID)
+	if res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
+		t.Fatalf("import = %v", res)
+	}
+	// The release of the reservation wakes the installation loop.
+	waitInstalls(t, env, 1)
+}
+
+// TestImportStopsWhenStaleCopyRemovalFails checks that a failed removal of
+// the marked copy still stops the import, with the copy left in place, and
+// that the import releases its reservation.
+func TestImportStopsWhenStaleCopyRemovalFails(t *testing.T) {
+	id, _ := uuidv7.NewString()
+	counter := &getCounter{id: id}
+	script := newRemovalScript()
+	env := newUpdateEnv(t, false)
+	f := newImportFixtureWith(t, counter.hook, env.tweak)
+	staged := f.markedCopy(t, id, script)
+	downloads := counter.n.Load()
+	f.stageUpdate(t)
+	if res := f.h.command(staged); res.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_INTERNAL {
+		t.Fatalf("import with a failing removal = %v", res)
+	}
+	if n := counter.n.Load(); n != downloads {
+		t.Fatalf("part downloads after the failed removal = %d", n-downloads)
+	}
+	if !f.h.agent.Sandboxes.HasSnapshot(id) {
+		t.Fatal("failed removal dropped the manager entry")
+	}
+	waitInstalls(t, env, 1)
+}
+
 // TestUpdateDefersToSandboxDuringTransfers checks that a live sandbox still
 // defers the installation after the transfers ended.
 func TestUpdateDefersToSandboxDuringTransfers(t *testing.T) {

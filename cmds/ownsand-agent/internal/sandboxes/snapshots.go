@@ -347,9 +347,31 @@ func (m *Manager) snapshotReleaser(snap *snapshot) func() {
 	}
 }
 
+// SetSnapshotRemovalHookForTest installs a hook that runs before the removal
+// of a stored snapshot copy deletes anything. The hook may block to hold the
+// removal at that point; a non-nil error fails the removal as a failed
+// deletion of the directory would, and leaves the copy untouched. Pass nil to
+// remove the hook. Only tests of other packages call it, because they cannot
+// reach the unexported test hooks of Manager.
+func (m *Manager) SetSnapshotRemovalHookForTest(hook func(id string) error) {
+	m.hookMu.Lock()
+	defer m.hookMu.Unlock()
+	m.removalHook = hook
+}
+
 // removeSnapshot deletes the stored record and content of a snapshot.
 func (m *Manager) removeSnapshot(id string) error {
-	if err := m.st.DeleteSnapshot(id); err != nil {
+	m.hookMu.Lock()
+	hook := m.removalHook
+	m.hookMu.Unlock()
+	var err error
+	if hook != nil {
+		err = hook(id)
+	}
+	if err == nil {
+		err = m.st.DeleteSnapshot(id)
+	}
+	if err != nil {
 		m.logger.Error("snapshot delete failed", "snapshot_id", id, "error", err)
 		return cmdErr(ownsandv1.ErrorCode_ERROR_CODE_INTERNAL, "snapshot could not be deleted")
 	}
