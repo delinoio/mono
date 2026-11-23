@@ -198,14 +198,31 @@ func hyperVDeviceRemoval(t *testing.T, s *stack) {
 	requireNoComputeSystem(t, sb.ID())
 	// A finished removal leaves the state directory empty: no VM disk,
 	// snapshot, image, record or device key.
+	left, err := remainingStatePaths(s.agents[0].stateDir)
+	if err != nil {
+		t.Fatalf("inspect the state directory %s: %v", s.agents[0].stateDir, err)
+	}
+	if len(left) != 0 {
+		t.Fatalf("the state directory is not empty after the removal: %v", left)
+	}
+}
+
+// remainingStatePaths returns every path below root, without root itself. A
+// lookup or read error of root or of any entry is returned, so that an
+// unreadable or missing directory is never mistaken for an empty one.
+func remainingStatePaths(root string) ([]string, error) {
 	var left []string
-	_ = filepath.WalkDir(s.agents[0].stateDir, func(path string, d os.DirEntry, err error) error {
-		if err == nil && path != s.agents[0].stateDir {
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if path != root {
 			left = append(left, path)
 		}
 		return nil
 	})
-	if len(left) != 0 {
-		t.Fatalf("the state directory is not empty after the removal: %v", left)
+	if err != nil {
+		return nil, err
 	}
+	return left, nil
 }
