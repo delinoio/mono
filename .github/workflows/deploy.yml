@@ -680,10 +680,13 @@ jobs:
         run: scripts/ci/release-binaries.sh upload-manifests "$RUNNER_TEMP/manifests"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         # The signed manifests, to restore the bucket by hand when an upload
-        # stopped between the manifest and its signature.
+        # stopped between the manifest and its signature. The name carries the
+        # attempt: an artifact name is unique within a run, and a rerun keeps
+        # the run ID, so a fixed name would fail the upload of a later attempt
+        # and hide the files of the attempt that wrote the incomplete pair.
         if: always()
         with:
-          name: release-manifests
+          name: release-manifests-${{ github.run_attempt }}
           path: ${{ runner.temp }}/manifests
           if-no-files-found: ignore
           retention-days: 30

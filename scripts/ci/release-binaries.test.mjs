@@ -1262,6 +1262,33 @@ test(
   },
 );
 
+// The steps of the `publish-binaries` job of `deploy.yml`, as text.
+function publishSteps() {
+  const workflow = readFileSync(
+    join(root, ".github/workflows/deploy.yml"),
+    "utf8",
+  );
+  const job =
+    workflow.match(/^ {2}publish-binaries:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
+  return job.split(/^ {6}- /m).slice(1);
+}
+
+test("publish-binaries saves the manifests under an attempt-specific name", () => {
+  const steps = publishSteps();
+  const saves = steps.filter((step) =>
+    step.includes("actions/upload-artifact@"),
+  );
+  assert.equal(saves.length, 1);
+  // A rerun keeps the run ID, so a fixed name would collide with the artifact
+  // of the earlier attempt.
+  assert.match(
+    saves[0],
+    /^ {10}name: release-manifests-\$\{\{ github\.run_attempt \}\}$/m,
+  );
+  assert.match(saves[0], /^ {10}retention-days: 30$/m);
+  assert.doesNotMatch(saves[0], /^ {10}name: release-manifests$/m);
+});
+
 test("malformed plans and arguments fail", { skip }, async (t) => {
   for (const binaries of [
     [],
