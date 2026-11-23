@@ -133,6 +133,18 @@ func defaultLinuxGuestRuntime(goos, vzKernel, vzRootfs string) (linuxGuestRuntim
 	}
 }
 
+// noSandboxProcessRuntimeSkip returns the skip reason of a stack that creates
+// no sandbox and selects no runtime, or "" when the host can run it. Such a
+// stack still starts its agent with the process runtime, which exists only on
+// Linux and macOS hosts: on a Windows host the agent fails at startup, after
+// the binaries are built and the test database is created.
+func noSandboxProcessRuntimeSkip(goos string) string {
+	if goos == "windows" {
+		return "the agent process runtime needs a Linux or macOS host, even for a test that creates no sandbox (" + goos + " host)"
+	}
+	return ""
+}
+
 // findModuleRoot returns the directory of the root go.mod. When go env fails,
 // the error includes the stderr of the command, so the cause is not lost.
 func findModuleRoot() (string, error) {
@@ -433,7 +445,8 @@ type stackOptions struct {
 	// defaultLinuxGuestRuntime selects for the host.
 	agentEnv []string
 	// noSandboxes marks a test that creates no sandbox, so it runs with the
-	// process runtime on every host.
+	// process runtime on Linux and macOS hosts and is skipped on other
+	// hosts (see noSandboxProcessRuntimeSkip).
 	noSandboxes bool
 }
 
@@ -463,6 +476,13 @@ func newStack(t *testing.T, opts ...stackOptions) *stack {
 		o.agents = 1
 	}
 	runtimeEnv := o.agentEnv
+	if runtimeEnv == nil && o.noSandboxes {
+		// Skip before buildBinaries and the test database, which the agent
+		// startup failure on a Windows host would otherwise waste.
+		if reason := noSandboxProcessRuntimeSkip(runtime.GOOS); reason != "" {
+			t.Skip(reason)
+		}
+	}
 	if runtimeEnv == nil && !o.noSandboxes {
 		kernel, rootfs := os.Getenv(envVZKernel), os.Getenv(envVZRootfs)
 		switch kind, reason := defaultLinuxGuestRuntime(runtime.GOOS, kernel, rootfs); kind {
