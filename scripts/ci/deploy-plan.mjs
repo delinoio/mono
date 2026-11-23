@@ -11,10 +11,23 @@
 // (`github-release`) are published from their tags after that. A `none` release (a
 // dependent through `devDependencies`, or an explicit `none` changeset) is
 // deployed when it is deployable, but keeps its version and gets no tag.
-import { appendFileSync, readdirSync, readFileSync, existsSync } from "node:fs";
+import {
+  appendFileSync,
+  existsSync,
+  lstatSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+} from "node:fs";
 import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
-import { workspacePackageDirs, workspaceRoots } from "./plan.mjs";
+import {
+  entitlementsPath,
+  readWorkspacePackages,
+  relativePath,
+} from "./workspace-packages.mjs";
+
+export { readWorkspacePackages };
 
 // Stable deployment target identifiers of the `deploy.target` manifest field.
 export const DeployTarget = Object.freeze({
@@ -84,27 +97,6 @@ const manifestObjectKey = /^(?!.*\.\.)(?!.*\/\/)[a-z0-9][a-z0-9._\/-]*\.json$/;
 const binaryReleaseVersion =
   /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 
-// Control characters and backslashes break the tab- and line-separated
-// transports of the deploy scripts.
-const transportUnsafe = /[\u0000-\u001f\u007f\\]/;
-
-// Normalizes a relative path and returns it, or undefined when it is empty,
-// absolute, outside its base or unsafe for the deploy scripts.
-function relativePath(raw) {
-  if (typeof raw !== "string" || transportUnsafe.test(raw)) return undefined;
-  const path = posix.normalize(raw).replace(/\/+$/, "");
-  if (
-    path === "" ||
-    path === "." ||
-    path.startsWith("/") ||
-    path === ".." ||
-    path.startsWith("../")
-  ) {
-    return undefined;
-  }
-  return path;
-}
-
 // A nonempty list of different strings, or undefined.
 function stringList(value) {
   if (
@@ -160,7 +152,7 @@ function binaryFields(name, deploy, dir) {
   }
   let entitlements = "";
   if (deploy.entitlements !== undefined) {
-    const path = relativePath(deploy.entitlements);
+    const path = entitlementsPath(dir, deploy.entitlements);
     if (!path || !path.endsWith(".plist")) {
       throw new DeployPlanError(
         `${name}: deploy.entitlements must be a .plist file inside the package`,
@@ -171,7 +163,7 @@ function binaryFields(name, deploy, dir) {
         `${name}: deploy.entitlements needs a darwin platform`,
       );
     }
-    entitlements = `${dir}/${path}`;
+    entitlements = path;
   }
   const rawLicenses = stringList(deploy.licenseFiles);
   const licenseFiles = rawLicenses?.map(relativePath);
@@ -211,9 +203,14 @@ function binaryFields(name, deploy, dir) {
       typeof publicUrl !== "string" ||
       url?.protocol !== "https:" ||
       url.href !== publicUrl ||
+      url.username !== "" ||
+      url.password !== "" ||
       url.pathname !== `/${objectKey}` ||
       url.search !== "" ||
-      url.hash !== ""
+      url.hash !== "" ||
+      // A URL parser drops a bare `?` or `#` delimiter, so it leaves `search`
+      // and `hash` empty. Compare the exact canonical string to reject them.
+      publicUrl !== `https://${url.host}/${objectKey}`
     ) {
       throw new DeployPlanError(
         `${name}: deploy.updateManifest.publicUrl must be https://<host>/${objectKey}`,
@@ -342,34 +339,6 @@ export const UpstreamProtocol = Object.freeze({
 export const noUdpPorts = "none";
 
 export class DeployPlanError extends Error {}
-
-// Reads every workspace package directly inside a workspace root, and the
-// single workspace packages outside them.
-export function readWorkspacePackages(repoRoot) {
-  const packages = [];
-  for (const dir of workspacePackageDirs) {
-    const manifestPath = join(repoRoot, dir, "package.json");
-    if (!existsSync(manifestPath)) continue;
-    packages.push({
-      dir,
-      manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
-    });
-  }
-  for (const workspaceRoot of workspaceRoots) {
-    const rootPath = join(repoRoot, workspaceRoot);
-    if (!existsSync(rootPath)) continue;
-    for (const entry of readdirSync(rootPath, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const manifestPath = join(rootPath, entry.name, "package.json");
-      if (!existsSync(manifestPath)) continue;
-      packages.push({
-        dir: `${workspaceRoot}/${entry.name}`,
-        manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
-      });
-    }
-  }
-  return packages;
-}
 
 function deployable(pkg) {
   const { name, deploy } = pkg.manifest;
@@ -695,9 +664,34 @@ export function check(repoRoot) {
   for (const pkg of packages) {
     const d = deployable(pkg);
     if (d?.target !== DeployTarget.GithubRelease) continue;
-    for (const file of [...d.licenseFiles, d.entitlements].filter(Boolean)) {
-      if (!existsSync(join(repoRoot, file))) {
-        throw new DeployPlanError(`${d.name}: ${file} does not exist`);
+    // The release script ships a license file only as a regular file that is
+    // not a symlink, so a directory or a symlink there fails the release
+    // after the tags exist. `codesign` reads the entitlements file by path, so
+    // it may be a symlink to a regular file.
+    const inputs = [
+      ...d.licenseFiles.map((file) => ({ file, followSymlinks: false })),
+      ...(d.entitlements
+        ? [{ file: d.entitlements, followSymlinks: true }]
+        : []),
+    ];
+    for (const { file, followSymlinks } of inputs) {
+      const path = join(repoRoot, file);
+      let stat;
+      try {
+        stat = followSymlinks ? statSync(path) : lstatSync(path);
+      } catch (error) {
+        if (error?.code === "ENOENT" || error?.code === "ENOTDIR") {
+          // A dangling entitlements symlink is also a missing file.
+          throw new DeployPlanError(`${d.name}: ${file} does not exist`);
+        }
+        throw error;
+      }
+      if (!stat.isFile()) {
+        throw new DeployPlanError(
+          `${d.name}: ${file} is not a regular file${
+            followSymlinks ? "" : " (a directory or a symlink is not allowed)"
+          }`,
+        );
       }
     }
   }

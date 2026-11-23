@@ -6,6 +6,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1649,6 +1650,42 @@ test("invalid github-release fields fail", async (t) => {
       },
       /deploy\.updateManifest\.publicUrl/,
     ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://x.test/tool/m.json?",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://x.test/tool/m.json#",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://test-user@x.test/tool/m.json",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
+    [
+      {
+        updateManifest: {
+          objectKey: "tool/m.json",
+          publicUrl: "https://test-user:secret@x.test/tool/m.json",
+        },
+      },
+      /deploy\.updateManifest\.publicUrl must be https:\/\/<host>\/tool\/m\.json/,
+    ],
     [{ updateManifest: null }, /deploy\.updateManifest\.objectKey/],
   ];
   for (const [fields, message] of cases) {
@@ -1725,6 +1762,85 @@ test("check rejects a missing license or entitlements file", (t) => {
   );
   writeFileSync(join(dir, "cmds/ownsand/entitlements.plist"), "<plist/>\n");
   check(dir);
+});
+
+// Writes a `tool` package with a license file and optional entitlements under
+// a temporary repository root, and returns the root.
+function releaseFixture(t, { entitlements = "entitlements.plist" } = {}) {
+  const dir = mkdtempSync(join(tmpdir(), "deploy-plan-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, "cmds/ownsand"), { recursive: true });
+  writeFileSync(
+    join(dir, "cmds/ownsand/package.json"),
+    JSON.stringify({
+      name: "tool",
+      deploy: githubRelease("tool", {
+        licenseFiles: ["LICENSE"],
+        ...(entitlements ? { entitlements } : {}),
+      }),
+    }),
+  );
+  return dir;
+}
+
+test("check rejects a directory at a license or entitlements path", (t) => {
+  const dir = releaseFixture(t);
+  mkdirSync(join(dir, "LICENSE"));
+  writeFileSync(join(dir, "cmds/ownsand/entitlements.plist"), "<plist/>\n");
+  assert.throws(() => check(dir), /tool: LICENSE is not a regular file/);
+  rmSync(join(dir, "LICENSE"), { recursive: true });
+  writeFileSync(join(dir, "LICENSE"), "license\n");
+  check(dir);
+  rmSync(join(dir, "cmds/ownsand/entitlements.plist"));
+  mkdirSync(join(dir, "cmds/ownsand/entitlements.plist"));
+  assert.throws(
+    () => check(dir),
+    /tool: cmds\/ownsand\/entitlements\.plist is not a regular file/,
+  );
+});
+
+test("check accepts omitted entitlements with a regular license file", (t) => {
+  const dir = releaseFixture(t, { entitlements: null });
+  assert.throws(() => check(dir), /tool: LICENSE does not exist/);
+  writeFileSync(join(dir, "LICENSE"), "license\n");
+  check(dir);
+});
+
+test("check rejects a license symlink, even to a regular file", (t) => {
+  const dir = releaseFixture(t, { entitlements: null });
+  writeFileSync(join(dir, "real-license"), "license\n");
+  try {
+    symlinkSync("real-license", join(dir, "LICENSE"));
+  } catch (error) {
+    // Windows needs a privilege to create a symlink.
+    if (error?.code === "EPERM") {
+      t.skip("cannot create a symlink on this system");
+      return;
+    }
+    throw error;
+  }
+  assert.throws(() => check(dir), /tool: LICENSE is not a regular file/);
+});
+
+test("check accepts an entitlements symlink to a regular file only", (t) => {
+  const dir = releaseFixture(t);
+  writeFileSync(join(dir, "LICENSE"), "license\n");
+  writeFileSync(join(dir, "cmds/ownsand/real.plist"), "<plist/>\n");
+  try {
+    symlinkSync("real.plist", join(dir, "cmds/ownsand/entitlements.plist"));
+  } catch (error) {
+    if (error?.code === "EPERM") {
+      t.skip("cannot create a symlink on this system");
+      return;
+    }
+    throw error;
+  }
+  check(dir);
+  rmSync(join(dir, "cmds/ownsand/real.plist"));
+  assert.throws(
+    () => check(dir),
+    /tool: cmds\/ownsand\/entitlements\.plist does not exist/,
+  );
 });
 
 test("main writes GitHub outputs and a summary", () => {
