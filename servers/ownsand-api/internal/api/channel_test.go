@@ -4,6 +4,7 @@ package api_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
@@ -530,13 +531,24 @@ func TestOfflineWriteOfClosedChannelSkipsReplacement(t *testing.T) {
 
 	// Let A's clean-up run to its end.
 	releaseOnce()
-	testenv.Eventually(t, "the clean-up of channel A decided its offline write", func() bool {
-		return strings.Contains(env.Logs.String(), `"msg":"device_offline"`) || strings.Contains(env.Logs.String(), `"msg":"device_offline_skipped"`) ||
-			strings.Contains(env.Logs.String(), `"msg":"device_offline_update_failed"`)
+	// The fence must skip the write. A database error in markOffline logs
+	// device_offline_update_failed and also leaves the device ONLINE, so
+	// only a device_offline_skipped record for this device proves that the
+	// replacement channel was seen.
+	testenv.Eventually(t, "the clean-up of channel A skipped its offline write", func() bool {
+		for _, rec := range deviceOfflineLogs(t, env, dev.ID) {
+			switch rec.Msg {
+			case "device_offline", "device_offline_update_failed":
+				t.Fatalf("the clean-up of channel A logged %s for the device: %s", rec.Msg, rec.Line)
+			case "device_offline_skipped":
+				if rec.Reason != "a newer agent channel is registered" {
+					t.Fatalf("device_offline_skipped reason = %q", rec.Reason)
+				}
+				return true
+			}
+		}
+		return false
 	})
-	if strings.Contains(env.Logs.String(), `"msg":"device_offline"`) {
-		t.Fatal("the closed channel A took the device offline")
-	}
 	if st := deviceState(); st != ownsandv1.DeviceState_DEVICE_STATE_ONLINE {
 		t.Fatalf("device after the clean-up of A = %v", st)
 	}
@@ -553,6 +565,39 @@ func TestOfflineWriteOfClosedChannelSkipsReplacement(t *testing.T) {
 	if sb.GetLastKnownState() != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
 		t.Fatalf("last known state = %v", sb.GetLastKnownState())
 	}
+}
+
+// offlineLog is one device_offline* record of the server log.
+type offlineLog struct {
+	Msg    string `json:"msg"`
+	Reason string `json:"reason"`
+	Line   string `json:"-"`
+}
+
+// deviceOfflineLogs returns the device_offline, device_offline_skipped and
+// device_offline_update_failed records that carry deviceID. The log buffer
+// is shared by the whole server, so the records are matched by device_id.
+func deviceOfflineLogs(t *testing.T, env *testenv.Env, deviceID string) []offlineLog {
+	t.Helper()
+	var out []offlineLog
+	for _, line := range strings.Split(env.Logs.String(), "\n") {
+		if !strings.Contains(line, `"device_offline`) {
+			continue
+		}
+		var rec struct {
+			offlineLog
+			DeviceID string `json:"device_id"`
+		}
+		if err := json.Unmarshal([]byte(line), &rec); err != nil || rec.DeviceID != deviceID {
+			continue
+		}
+		switch rec.Msg {
+		case "device_offline", "device_offline_skipped", "device_offline_update_failed":
+			rec.offlineLog.Line = line
+			out = append(out, rec.offlineLog)
+		}
+	}
+	return out
 }
 
 // TestOfflineSweepWithEmptyRegistry checks that the sweep marks a stale
