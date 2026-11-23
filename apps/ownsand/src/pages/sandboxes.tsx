@@ -4,6 +4,7 @@ import {
   useMutation,
   useQuery,
 } from "@connectrpc/connect-query";
+import { Code, ConnectError } from "@connectrpc/connect";
 import { useQueryClient } from "@tanstack/react-query";
 import { Badge } from "delino-ui/badge";
 import { Button, ButtonVariant } from "delino-ui/button";
@@ -13,6 +14,7 @@ import { Select, SelectOption } from "delino-ui/select";
 import { Textarea } from "delino-ui/textarea";
 import {
   BaseImage,
+  DeviceState,
   NetworkMode,
   SandboxState,
   SnapshotState,
@@ -43,7 +45,13 @@ import {
   isTerminalError,
   shortIdText,
 } from "../components/ui.tsx";
-import { formatMib, formatTime, labels } from "../format.ts";
+import {
+  deviceOptionLabel,
+  formatMib,
+  formatTime,
+  labels,
+  offlineDeviceMessage,
+} from "../format.ts";
 import { parseLabels, resourceErrors, ttlErrors } from "../forms.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 import { uuidV7 } from "../uuid.ts";
@@ -342,21 +350,46 @@ function CreateSandboxDialog({
         if ("error" in parsed) next.labels = parsed.error;
         setErrors(next);
         if (Object.keys(next).length > 0 || "error" in parsed) return;
-        const res = await create.mutateAsync({
-          organizationId,
-          idempotencyKey,
-          source: sourceOf(source),
-          resources: {
-            vcpuCount: vcpu!,
-            memoryMib: BigInt(memory!),
-            diskGib: BigInt(disk!),
-          },
-          idleTtl: { seconds: BigInt(Math.round(idleMinutes! * 60)) },
-          maxTtl: { seconds: BigInt(Math.round(maxHours! * 3600)) },
-          placement: device === ALL ? undefined : { deviceId: device },
-          network: { mode: Number(network) as NetworkMode },
-          labels: parsed.labels,
-        });
+        let res;
+        try {
+          res = await create.mutateAsync({
+            organizationId,
+            idempotencyKey,
+            source: sourceOf(source),
+            resources: {
+              vcpuCount: vcpu!,
+              memoryMib: BigInt(memory!),
+              diskGib: BigInt(disk!),
+            },
+            idleTtl: { seconds: BigInt(Math.round(idleMinutes! * 60)) },
+            maxTtl: { seconds: BigInt(Math.round(maxHours! * 3600)) },
+            placement: device === ALL ? undefined : { deviceId: device },
+            network: { mode: Number(network) as NetworkMode },
+            labels: parsed.labels,
+          });
+        } catch (error) {
+          // The control plane answers `Unavailable` without a reason. When
+          // the selected device is offline in the loaded device list, name
+          // it, so the notice does not read as an outage of OwnSand.
+          const selected =
+            device === ALL
+              ? undefined
+              : devices.data?.devices.find((d) => d.deviceId === device);
+          if (
+            error instanceof ConnectError &&
+            error.code === Code.Unavailable &&
+            selected?.state === DeviceState.OFFLINE
+          ) {
+            throw new ConnectError(
+              offlineDeviceMessage(selected.name),
+              Code.FailedPrecondition,
+              undefined,
+              undefined,
+              error,
+            );
+          }
+          throw error;
+        }
         // A new sandbox changes the allocation of its device. The device
         // and sandbox queries are marked stale and refetched in the
         // background; the dialog closes and the detail page opens from the
@@ -477,7 +510,7 @@ function CreateSandboxDialog({
           <SelectOption value={ALL}>Any device that fits</SelectOption>
           {(devices.data?.devices ?? []).map((d) => (
             <SelectOption key={d.deviceId} value={d.deviceId}>
-              {d.name}
+              {deviceOptionLabel(d.name, d.state)}
             </SelectOption>
           ))}
         </Select>
