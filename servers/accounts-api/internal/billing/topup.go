@@ -33,6 +33,16 @@ const (
 	// billing account lock and the write: the unknown result must not be
 	// lost to a deadline that the call already spent.
 	topUpOutcomeTimeout = 10 * time.Second
+	// autoTopUpBudget is the time that one run of ProcessAutoTopUps may
+	// spend before it starts another top-up. The run shares the 2 minute
+	// deadline of the worker tick with the later tasks, and one top-up may
+	// take up to paddleCallTimeout plus topUpOutcomeTimeout, so without the
+	// budget a long queue would use the whole tick and the later tasks
+	// would not run. The run stops between top-ups only: a charge that has
+	// started is never canceled, so at most one charge ends after the
+	// budget, and a top-up that is not claimed yet stays pending for the
+	// next run.
+	autoTopUpBudget = 30 * time.Second
 )
 
 // topUp is a top-up row.
@@ -472,9 +482,20 @@ func (s *Service) completeTopUp(ctx context.Context, tx pgx.Tx, t topUp, transac
 // also moves the cap time of the top-up to the claim time, so the top-up
 // counts toward the monthly cap of the UTC month of the claim and not of the
 // month in which it was queued. Top-ups that already left pending (charging,
-// charged or unknown) are not touched.
+// charged or unknown) are not touched. A run spends at most autoTopUpBudget
+// before it claims another top-up and then returns nil: the rest stay
+// pending for the next run, so the other worker tasks keep their time.
 func (s *Service) ProcessAutoTopUps(ctx context.Context) error {
+	start := s.elapsed()
 	for range 100 {
+		// The budget is checked before a top-up is claimed, never during a
+		// charge, so the pending top-ups that remain are untouched.
+		if spent := s.elapsed().Sub(start); spent >= s.autoTopUpBudget {
+			s.logger.InfoContext(ctx, "billing_auto_top_up_budget_spent",
+				slog.Int64("elapsed_ms", spent.Milliseconds()),
+				slog.Int64("budget_ms", s.autoTopUpBudget.Milliseconds()))
+			return nil
+		}
 		candidate, err := scanTopUp(s.db.Pool.QueryRow(ctx, `SELECT `+topUpColumns+` FROM top_ups WHERE status = 'pending'
 			ORDER BY create_time LIMIT 1`))
 		if errors.Is(err, pgx.ErrNoRows) {
