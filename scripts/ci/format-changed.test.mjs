@@ -2239,26 +2239,44 @@ test("formatter CLI runs main through a symlinked script path", (t) => {
   }
 });
 
-// Stand-in Rstack for process-boundary tests: records its pid per batch and
-// every termination signal it receives, then either exits with STANDIN_EXIT or
-// sleeps long enough for the test to signal the parent. The signal handlers are
-// installed before the batch is recorded: the test signals as soon as it sees
-// batches.log, and a signal that arrived earlier would kill the stand-in by the
-// default action without a signals.log entry.
+// Stand-in Rstack for process-boundary tests. Every invocation selects its
+// behavior explicitly through STANDIN_MODE; an ambient STANDIN_EXIT (for
+// example inherited from the developer's shell) never changes the behavior of a
+// signal-mode run, and a missing or unknown mode fails loudly with status 97.
+//   signal: record the batch, then stay alive until a termination signal is
+//           forwarded or the test cleanup kills it. The only timer is a long
+//           safety expiry that stops an orphaned stand-in; it records `marker`
+//           so a test can tell that the child ran to the end.
+//   exit:   record the batch and exit with STANDIN_EXIT.
+// STANDIN_IGNORE_SIGNALS=1 makes signal mode record a signal but keep running,
+// which models a child that never honors the forwarded signal.
+// The signal handlers are installed before the batch is recorded: the test
+// signals as soon as it sees batches.log, and a signal that arrived earlier
+// would kill the stand-in by the default action without a signals.log entry.
+const StandInMode = Object.freeze({ Exit: "exit", Signal: "signal" });
+const StandInInvalidModeStatus = 97;
+const StandInSafetyExpiryMs = 120_000;
 const standIn = `// Test stand-in for the Rstack entry point.
 const fs = require("node:fs");
 const dir = process.env.STANDIN_DIR;
+const mode = process.env.STANDIN_MODE;
+if (mode !== ${JSON.stringify(StandInMode.Signal)} && mode !== ${JSON.stringify(StandInMode.Exit)}) {
+  fs.appendFileSync(dir + "/errors.log", "invalid STANDIN_MODE: " + mode + "\\n");
+  process.exit(${StandInInvalidModeStatus});
+}
+const ignoreSignals = process.env.STANDIN_IGNORE_SIGNALS === "1";
 for (const signal of ["SIGTERM", "SIGINT", "SIGHUP"])
   process.on(signal, () => {
     fs.appendFileSync(dir + "/signals.log", process.pid + " " + signal + "\\n");
-    process.exit(0);
+    if (!ignoreSignals) process.exit(0);
   });
 fs.appendFileSync(dir + "/batches.log", process.pid + "\\n");
-if (process.env.STANDIN_EXIT) process.exit(Number(process.env.STANDIN_EXIT));
+if (mode === ${JSON.stringify(StandInMode.Exit)})
+  process.exit(Number(process.env.STANDIN_EXIT));
 setTimeout(() => {
   fs.appendFileSync(dir + "/marker", process.pid + "\\n");
   process.exit(0);
-}, 5000);
+}, ${StandInSafetyExpiryMs});
 `;
 
 // An isolated repository with its own copy of the script and a stand-in
@@ -2292,22 +2310,140 @@ function standInFixture(t, fileCount) {
   return { f, state, lines };
 }
 
-async function waitFor(predicate, what) {
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    if (predicate()) return;
-    await new Promise((done) => setTimeout(done, 50));
-  }
-  assert.fail(`Timed out waiting for ${what}`);
+// Upper bounds for waits on a process the test started. A passing run never
+// approaches them; they exist so a missing forwarded signal fails inside the
+// test deadline instead of hanging.
+const StandInDeadlineMs = Object.freeze({
+  Poll: 20,
+  Ready: 15_000,
+  Reap: 15_000,
+  Stop: 15_000,
+});
+
+// Rejects once `ms` has passed without `promise` settling.
+function within(promise, ms, what) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`Timed out waiting for ${what}`)),
+      ms,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+async function waitFor(predicate, what, ms = StandInDeadlineMs.Ready) {
+  const deadline = Date.now() + ms;
+  while (!predicate()) {
+    if (Date.now() >= deadline) assert.fail(`Timed out waiting for ${what}`);
+    await new Promise((done) => setTimeout(done, StandInDeadlineMs.Poll));
+  }
+}
+
+// A zombie still answers `kill(pid, 0)`; Linux reports it as state Z, which
+// counts as dead here because nothing can signal or reap it further.
 function isAlive(pid) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     return error.code !== "ESRCH";
   }
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    return (
+      stat.slice(stat.lastIndexOf(")") + 2, stat.lastIndexOf(")") + 3) !== "Z"
+    );
+  } catch {
+    return true;
+  }
 }
+
+// The stand-in environment for one explicit mode. Every inherited STANDIN_*
+// variable is dropped first, so only the variables a caller passes in `extra`
+// reach the stand-in.
+function standInEnv(f, state, mode, extra = {}) {
+  const env = { ...f.env };
+  for (const name of Object.keys(env))
+    if (name.startsWith("STANDIN_")) delete env[name];
+  return { ...env, ...extra, STANDIN_DIR: state, STANDIN_MODE: mode };
+}
+
+// Spawns the formatter against a stand-in fixture. The cleanup registered here
+// kills the formatter and every stand-in pid recorded in batches.log, then
+// waits (bounded) until all of them are gone; `reap()` runs the same cleanup on
+// demand and is idempotent.
+function startFormatter(t, { f, state, lines, args, env }) {
+  const parent = spawn(
+    process.execPath,
+    [join(f.cwd, "scripts/ci/format-changed.mjs"), ...args],
+    { cwd: f.cwd, env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stderr = "";
+  parent.stdout.resume();
+  parent.stderr.on("data", (chunk) => (stderr += chunk));
+  const closed = new Promise((done) =>
+    parent.once("close", (code, closeSignal) => done({ code, closeSignal })),
+  );
+  let reaped = null;
+  const reap = () =>
+    (reaped ??= (async () => {
+      if (parent.exitCode === null && parent.signalCode === null)
+        parent.kill("SIGKILL");
+      const children = lines("batches.log").map(Number);
+      for (const pid of children) {
+        if (!isAlive(pid)) continue;
+        try {
+          process.kill(pid, "SIGKILL");
+        } catch (error) {
+          if (error.code !== "ESRCH") throw error;
+        }
+      }
+      await within(
+        closed,
+        StandInDeadlineMs.Reap,
+        "the formatter to be reaped",
+      );
+      for (const pid of children)
+        await waitFor(
+          () => !isAlive(pid),
+          `stand-in ${pid} to exit`,
+          StandInDeadlineMs.Reap,
+        );
+    })());
+  t.after(reap);
+  return { parent, closed, reap, stderr: () => stderr };
+}
+
+// Starts a signal-mode run, waits for the first batch and returns the run plus
+// the first stand-in pid. `extra` adds stand-in variables to the environment.
+async function startReadyRun(t, kind, extra = {}) {
+  // 120 tracked files plus the fixture files are more than two 50-path batches.
+  const { f, state, lines } = standInFixture(t, 120);
+  let args = ["--all"];
+  let env = standInEnv(f, state, StandInMode.Signal, extra);
+  if (kind === RunKind.PathspecStaged) {
+    // Stage a change for every file so the staged selection spans batches.
+    for (let index = 0; index < 120; index += 1)
+      f.write(`files/f${index}.ts`, `export const value${index} = 2;\n`);
+    f.git("add", ".");
+    const gitDir = join(f.cwd, f.git("rev-parse", "--git-dir"));
+    const throwaway = join(gitDir, "next-index-1.lock");
+    copyFileSync(join(gitDir, "index"), throwaway);
+    args = ["--staged", "--write"];
+    env = standInEnv(f, state, StandInMode.Signal, {
+      ...extra,
+      GIT_INDEX_FILE: throwaway,
+    });
+  }
+  const run = startFormatter(t, { f, state, lines, args, env });
+  await waitFor(() => lines("batches.log").length > 0, "the first batch");
+  return { run, lines, child: Number(lines("batches.log")[0]) };
+}
+
+const RunKind = Object.freeze({
+  Forwarded: "forwarded",
+  PathspecStaged: "pathspec-staged",
+});
 
 const signalCases = [
   { signal: "SIGTERM", exitCode: 143 },
@@ -2315,35 +2451,25 @@ const signalCases = [
   { signal: "SIGHUP", exitCode: 129 },
 ];
 
+// Signals the formatter and waits (bounded) for it to exit by itself.
+async function stopWithSignal(run, signal) {
+  run.parent.kill(signal);
+  const result = await within(
+    run.closed,
+    StandInDeadlineMs.Stop,
+    `the formatter to stop after ${signal}`,
+  );
+  assert.equal(result.closeSignal, null, "the parent must exit by itself");
+  return result;
+}
+
 for (const { signal, exitCode } of signalCases) {
   test(
     `${signal} to the formatter is forwarded to the Rstack child and stops further batches`,
     { skip: process.platform === "win32" },
     async (t) => {
-      // 120 tracked files plus the fixture files are more than two 50-path batches.
-      const { f, state, lines } = standInFixture(t, 120);
-      const parent = spawn(
-        process.execPath,
-        [join(f.cwd, "scripts/ci/format-changed.mjs"), "--all"],
-        {
-          cwd: f.cwd,
-          env: { ...f.env, STANDIN_DIR: state },
-          stdio: ["ignore", "ignore", "pipe"],
-        },
-      );
-      t.after(() => parent.kill("SIGKILL"));
-      let stderr = "";
-      parent.stderr.on("data", (chunk) => (stderr += chunk));
-      const closed = new Promise((done) =>
-        parent.once("close", (code, closeSignal) =>
-          done({ code, closeSignal }),
-        ),
-      );
-      await waitFor(() => lines("batches.log").length > 0, "the first batch");
-      const child = Number(lines("batches.log")[0]);
-      parent.kill(signal);
-      const { code, closeSignal } = await closed;
-      assert.equal(closeSignal, null, "the parent must exit by itself");
+      const { run, lines, child } = await startReadyRun(t, RunKind.Forwarded);
+      const { code } = await stopWithSignal(run, signal);
       assert.equal(code, exitCode);
       assert.deepEqual(lines("signals.log"), [`${child} ${signal}`]);
       assert.equal(isAlive(child), false, "the child must be dead");
@@ -2354,7 +2480,7 @@ for (const { signal, exitCode } of signalCases) {
         "the child must not run to the end",
       );
       assert.match(
-        stderr,
+        run.stderr(),
         new RegExp(`"event":"ci_format_signal","signal":"${signal}"`),
       );
     },
@@ -2369,45 +2495,96 @@ for (const { signal, exitCode } of signalCases) {
     `${signal} during a pathspec-commit staged run exits ${exitCode} without ci_format_error`,
     { skip: process.platform === "win32" },
     async (t) => {
-      const { f, state, lines } = standInFixture(t, 120);
-      // Stage a change for every file so the staged selection spans batches.
-      for (let index = 0; index < 120; index += 1)
-        f.write(`files/f${index}.ts`, `export const value${index} = 2;\n`);
-      f.git("add", ".");
-      const gitDir = join(f.cwd, f.git("rev-parse", "--git-dir"));
-      const throwaway = join(gitDir, "next-index-1.lock");
-      copyFileSync(join(gitDir, "index"), throwaway);
-      const parent = spawn(
-        process.execPath,
-        [join(f.cwd, "scripts/ci/format-changed.mjs"), "--staged", "--write"],
-        {
-          cwd: f.cwd,
-          env: { ...f.env, GIT_INDEX_FILE: throwaway, STANDIN_DIR: state },
-          stdio: ["ignore", "pipe", "pipe"],
-        },
-      );
-      t.after(() => parent.kill("SIGKILL"));
-      let stderr = "";
-      parent.stderr.on("data", (chunk) => (stderr += chunk));
-      const closed = new Promise((done) =>
-        parent.once("close", (code, closeSignal) =>
-          done({ code, closeSignal }),
-        ),
-      );
-      await waitFor(() => lines("batches.log").length > 0, "the first batch");
-      parent.kill(signal);
-      const { code, closeSignal } = await closed;
-      assert.equal(closeSignal, null, "the parent must exit by itself");
-      assert.equal(code, exitCode, stderr);
+      const { run, lines } = await startReadyRun(t, RunKind.PathspecStaged);
+      const { code } = await stopWithSignal(run, signal);
+      assert.equal(code, exitCode, run.stderr());
       assert.equal(lines("batches.log").length, 1, "no further batch starts");
       assert.match(
-        stderr,
+        run.stderr(),
         new RegExp(`"event":"ci_format_signal","signal":"${signal}"`),
       );
-      assert.doesNotMatch(stderr, /ci_format_error/u);
+      assert.doesNotMatch(run.stderr(), /ci_format_error/u);
     },
   );
 }
+
+// The stand-in used to exit on a fixed 5 s timer, so an observer that was slower
+// than that found no live child, and an inherited STANDIN_EXIT ended the child
+// at once. Signal mode must ignore both: the child stays alive past the old
+// timer and is stopped only by the forwarded signal. One shared delay covers
+// both signal test groups.
+const ObserverDelayMs = 5500;
+test(
+  "signal-mode stand-ins outlive a slow observer and an inherited STANDIN_EXIT",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const inherited = { STANDIN_EXIT: "1" };
+    const runs = await Promise.all(
+      Object.values(RunKind).map((kind) => startReadyRun(t, kind, inherited)),
+    );
+    await new Promise((done) => setTimeout(done, ObserverDelayMs));
+    for (const { run, lines, child } of runs) {
+      assert.equal(isAlive(child), true, "the child must still be alive");
+      assert.equal(run.parent.exitCode, null, "the formatter must still run");
+      assert.deepEqual(lines("marker"), []);
+      assert.deepEqual(lines("signals.log"), []);
+      assert.equal(lines("batches.log").length, 1);
+      const { code } = await stopWithSignal(run, "SIGTERM");
+      assert.equal(code, 143);
+      assert.deepEqual(lines("signals.log"), [`${child} SIGTERM`]);
+      assert.equal(isAlive(child), false, "the child must be dead");
+    }
+  },
+);
+
+test(
+  "a child that ignores the forwarded signal fails the bounded wait and is reaped",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const { f, state, lines } = standInFixture(t, 120);
+    const run = startFormatter(t, {
+      f,
+      state,
+      lines,
+      args: ["--all"],
+      env: standInEnv(f, state, StandInMode.Signal, {
+        STANDIN_IGNORE_SIGNALS: "1",
+      }),
+    });
+    await waitFor(() => lines("batches.log").length > 0, "the first batch");
+    const child = Number(lines("batches.log")[0]);
+    run.parent.kill("SIGTERM");
+    await waitFor(
+      () => lines("signals.log").length > 0,
+      "the child to record the forwarded signal",
+    );
+    // The child never exits, so the formatter keeps waiting for it; a short
+    // bound is enough because no outcome other than the timeout is possible.
+    await assert.rejects(
+      within(run.closed, 250, "the formatter to stop"),
+      /Timed out waiting for the formatter to stop/u,
+    );
+    assert.equal(isAlive(child), true);
+    assert.equal(run.parent.exitCode, null);
+    await run.reap();
+    assert.equal(isAlive(child), false, "the child must be reaped");
+    assert.equal(run.parent.signalCode, "SIGKILL");
+  },
+);
+
+test("a stand-in without an explicit mode fails instead of guessing one", async (t) => {
+  const { f, state, lines } = standInFixture(t, 3);
+  const env = standInEnv(f, state, StandInMode.Exit, { STANDIN_EXIT: "0" });
+  delete env.STANDIN_MODE;
+  const result = spawnSync(
+    process.execPath,
+    [join(f.cwd, "scripts/ci/format-changed.mjs"), "--all"],
+    { cwd: f.cwd, env, encoding: "utf8" },
+  );
+  assert.equal(result.status, StandInInvalidModeStatus, result.stderr);
+  assert.deepEqual(lines("batches.log"), []);
+  assert.match(lines("errors.log").join("\n"), /invalid STANDIN_MODE/u);
+});
 
 test("a pathspec-commit staged run still exits 2 with guidance when a check fails", async (t) => {
   const { f, state } = standInFixture(t, 3);
@@ -2422,12 +2599,10 @@ test("a pathspec-commit staged run still exits 2 with guidance when a check fail
     [join(f.cwd, "scripts/ci/format-changed.mjs"), "--staged", "--write"],
     {
       cwd: f.cwd,
-      env: {
-        ...f.env,
+      env: standInEnv(f, state, StandInMode.Exit, {
         GIT_INDEX_FILE: throwaway,
-        STANDIN_DIR: state,
         STANDIN_EXIT: "1",
-      },
+      }),
       encoding: "utf8",
     },
   );
@@ -2445,7 +2620,9 @@ for (const status of [0, 1, 2]) {
       [join(f.cwd, "scripts/ci/format-changed.mjs"), "--all"],
       {
         cwd: f.cwd,
-        env: { ...f.env, STANDIN_DIR: state, STANDIN_EXIT: String(status) },
+        env: standInEnv(f, state, StandInMode.Exit, {
+          STANDIN_EXIT: String(status),
+        }),
         encoding: "utf8",
       },
     );
