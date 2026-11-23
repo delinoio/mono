@@ -833,6 +833,16 @@ func (m *Manager) watchVM(sb *sandbox, vm vmruntime.VM) {
 		return
 	}
 	reason := sb.rec.endReasonAt(m.now())
+	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED &&
+		sb.rec.State == ownsandv1.SandboxState_SANDBOX_STATE_DELETING &&
+		sb.rec.EndReason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_DELETED_BY_CALLER {
+		// A failed caller delete left the record in DELETING with the caller
+		// reason. Without a passed deadline, the VM exit completes that delete
+		// and does not turn it into a lost VM, as the retried delete and
+		// reconcile also keep the caller reason. Other recorded reasons (a failed
+		// create or a lost VM) keep the lost-VM outcome of the exit.
+		reason = sb.rec.EndReason
+	}
 	m.mu.Unlock()
 	if reason == ownsandv1.SandboxEndReason_SANDBOX_END_REASON_UNSPECIFIED {
 		reason = ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE
