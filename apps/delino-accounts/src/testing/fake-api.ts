@@ -97,7 +97,9 @@ export interface FakeApi {
    * Holds every call of a method until the promise settles, so that a test
    * can observe what the page does while a request is still in flight. Only
    * `GetBillingAccount`, `GetInvoiceUrl`, `ListLedgerEntries`, `ListInvoices`
-   * and `ListUsageSummary` honor a gate.
+   * and `ListUsageSummary` honor a gate. `AcceptInvitation` honors a gate
+   * per invitation token, under the key `AcceptInvitation:<token>`, so that a
+   * test can hold the request of one link while another link goes through.
    */
   gates: Map<string, Promise<unknown>>;
   transport: ReturnType<typeof createRouterTransport>;
@@ -455,8 +457,9 @@ export function createFakeApi(): FakeApi {
         invitation.state = InvitationState.REVOKED;
         return { invitation };
       },
-      acceptInvitation(req) {
+      async acceptInvitation(req) {
         record("AcceptInvitation", req);
+        await api.gates.get(`AcceptInvitation:${req.invitationToken}`);
         const invitation = api.invitationTokens.get(req.invitationToken);
         if (invitation === undefined) {
           throw new ConnectError("invitation not found", Code.NotFound);

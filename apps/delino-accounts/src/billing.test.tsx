@@ -1451,6 +1451,58 @@ describe("invitation acceptance", () => {
     expect(await screen.findByText(/needs the link/)).toBeTruthy();
   });
 
+  test("a replacement link opened while an earlier request is pending can be accepted once", async () => {
+    const api = createFakeApi();
+    api.userId = OUTSIDER;
+    api.invitationTokens.set(EARLIER_INVITATION_TOKEN, {
+      accountId: ACCOUNT_ID,
+      role: BillingAccountRole.ADMIN,
+    });
+    // Hold the request of the earlier link so that it stays pending.
+    let release!: () => void;
+    api.gates.set(
+      `AcceptInvitation:${EARLIER_INVITATION_TOKEN}`,
+      new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    renderApp(`/billing/invitations/accept#token=${EARLIER_INVITATION_TOKEN}`, {
+      api,
+    });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    expect(calls(api, "AcceptInvitation")).toEqual([
+      expect.objectContaining({ invitationToken: EARLIER_INVITATION_TOKEN }),
+    ]);
+    await act(async () => {
+      window.location.hash = `token=${INVITATION_TOKEN}`;
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+    });
+    await settle(30);
+    const accept = screen.getByRole("button", {
+      name: "Accept invitation",
+    }) as HTMLButtonElement;
+    expect(accept.disabled).toBe(false);
+    expect(accept.getAttribute("aria-disabled")).not.toBe("true");
+    // Two quick clicks send one request.
+    await act(async () => {
+      fireEvent.click(accept);
+      fireEvent.click(accept);
+    });
+    await settle(60);
+    expect(calls(api, "AcceptInvitation")).toEqual([
+      expect.objectContaining({ invitationToken: EARLIER_INVITATION_TOKEN }),
+      expect.objectContaining({ invitationToken: INVITATION_TOKEN }),
+    ]);
+    expect(window.location.pathname).toBe(ACCOUNT_PATH);
+    // The late result of the earlier request changes nothing on screen.
+    release();
+    await settle(60);
+    expect(window.location.pathname).toBe(ACCOUNT_PATH);
+    expect(calls(api, "AcceptInvitation")).toHaveLength(2);
+  });
+
   test("keeps the stored token for the sign-in return when the fragment is empty", async () => {
     pendingInvitation.save(INVITATION_TOKEN);
     renderApp("/billing/invitations/accept", { signedIn: false });
