@@ -323,8 +323,14 @@ func (p *DataPlane) open(ctx context.Context, procedure string, header http.Head
 	if hc == nil || hc.Generation != g.ChannelGen {
 		return nil, errGrantInvalid()
 	}
-	conn := p.Relays.Wait(ctx, g.DeviceID, g.ChannelGen, relayWaitForConn)
+	conn := p.Relays.Wait(ctx, g.DeviceID, g.ChannelGen, p.Timing.connWait())
 	if conn == nil {
+		// Wait returns nil when the connection wait expired and when the RPC
+		// context ended first. Only the second case is the caller's deadline
+		// or cancellation; an expired connection wait stays unavailable.
+		if err := admissionContextError(ctx); err != nil {
+			return nil, err
+		}
 		return nil, errUnavailable("the device has no relay connection")
 	}
 	s, err := conn.Open(ctx, g.ID, g.SandboxID)
@@ -332,9 +338,30 @@ func (p *DataPlane) open(ctx context.Context, procedure string, header http.Head
 		return nil, errRateLimited(time.Second)
 	}
 	if err != nil {
+		// Open returns the context error while it waits for its turn or for
+		// room in the outbound queue; a closed connection stays unavailable.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if cerr := admissionContextError(ctx); cerr != nil {
+				return nil, cerr
+			}
+		}
 		return nil, errUnavailable("the relay connection closed")
 	}
 	return &relayCall{procedure: procedure, grant: g, stream: s, conn: conn, start: time.Now()}, nil
+}
+
+// admissionContextError maps the end of the RPC context during relay
+// admission: deadline_exceeded for a deadline and canceled for a
+// cancellation. It returns nil while the context is active.
+func admissionContextError(ctx context.Context) error {
+	switch ctx.Err() {
+	case nil:
+		return nil
+	case context.DeadlineExceeded:
+		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("the request deadline passed before the relay stream opened"))
+	default:
+		return connect.NewError(connect.CodeCanceled, errors.New("the request was canceled before the relay stream opened"))
+	}
 }
 
 // begin takes over the call that the request gate opened for a relay RPC,
