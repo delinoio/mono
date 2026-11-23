@@ -15,7 +15,7 @@
         "SKILL.md": "f64f17253d3b74da106027701fc2f0ea385d4cdaf28ff80115265b9fd307c358",
         "references/backup-recovery.md": "f15d748b172f3f88a9e2091203f5c52b26475a5cb54304f71cbaa99a092b4668",
         "references/index-optimization.md": "e0a1599a9bb90ae0bf0c99672e64b4394f09a86fad11baa7734a0e04ef125409",
-        "references/indexing.md": "ec76832c154ebd0eb580242562c2bfb16da6016564862ad7f0190ea92368e91c",
+        "references/indexing.md": "609fdceeeba6b01246ccb599b9761d0346281e3d015ab87d782293ea585d0813",
         "references/memory-management-ops.md": "254473cffe6b6d61c24de3bb993f142462a54612bb7e4fbfbfd1ded9ed39747d",
         "references/monitoring.md": "7a5204b12f64f8053b0e6279436be6765338cfbcffc05e14724721edd8d24c66",
         "references/mvcc-transactions.md": "d852c5104a815ceb631fe13062da627f6de07a8592be5b45e855cc3a7f777958",
