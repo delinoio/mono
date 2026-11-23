@@ -980,8 +980,10 @@ export const UsageService: GenService<{
    *
    * Attribution: a report is charged to the billing account whose link to
    * the organization overlapped the window [window_start, window_start + 5
-   * minutes); when several links overlapped, the link active at the end of
-   * the window. This keeps the usage of an unlinked or deleted organization
+   * minutes); when several links overlapped, the nonempty link with the
+   * latest link time among them, even when every overlapping link ended
+   * before the end of the window. A link whose unlink time equals its link
+   * time covers no time and never overlaps. This keeps the usage of an unlinked or deleted organization
    * on its former billing account. A report without an overlapping link is
    * stored as unattributed usage (kept 7 years, nothing deducted) and
    * returns unattributed set to true. Usage is never dropped.
