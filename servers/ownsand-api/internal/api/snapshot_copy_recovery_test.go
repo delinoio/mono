@@ -113,11 +113,18 @@ func stateReportLogs(t *testing.T, env *testenv.Env, deviceID string) []int {
 
 // reportAndWait sends a state report of agent and waits until the server
 // logged it as applied. It returns the recovered copy count of that report.
+//
+// The control plane marks a channel live before it logs the startup report, so
+// the helper first waits for that startup entry. Without it the baseline could
+// be taken before the startup entry is logged, and the startup entry would then
+// satisfy the wait for the explicit report. The channel handles reports one at
+// a time, so the startup entry always precedes the explicit one.
 func reportAndWait(t *testing.T, env *testenv.Env, agent *testenv.FakeAgent) int {
 	t.Helper()
+	testenv.Eventually(t, "startup state report applied", func() bool { return len(stateReportLogs(t, env, agent.Device.ID)) > 0 })
 	before := len(stateReportLogs(t, env, agent.Device.ID))
 	agent.SendStateReport()
-	testenv.Eventually(t, "state report applied", func() bool { return len(stateReportLogs(t, env, agent.Device.ID)) > before })
+	testenv.Eventually(t, "explicit state report applied", func() bool { return len(stateReportLogs(t, env, agent.Device.ID)) > before })
 	logs := stateReportLogs(t, env, agent.Device.ID)
 	return logs[before]
 }
