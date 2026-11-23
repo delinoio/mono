@@ -2187,7 +2187,12 @@ function runDroplet(
     input: readFileSync(dropletDeploy, "utf8"),
     env: setup.spawnEnv(env),
   });
-  return { ...result, read: setup.read, calls: setup.calls() };
+  return {
+    ...result,
+    read: setup.read,
+    calls: setup.calls(),
+    deployRoot: setup.deployRoot,
+  };
 }
 
 const commands = (calls) =>
@@ -2836,6 +2841,36 @@ test(
       result.calls.indexOf(`docker image rm ${olderImage}`) >
         result.calls.indexOf("docker rm old1"),
     );
+  },
+);
+
+test(
+  "droplet deploy keeps the previous image after an interrupted state write",
+  { skip },
+  (t) => {
+    // An interrupted earlier attempt left `current` empty or missing while
+    // `previous` still names the image that served before it. Recording the
+    // new image must not replace that rollback image with an empty file.
+    for (const [name, state] of [
+      ["empty current", ""],
+      ["missing current", undefined],
+    ]) {
+      const result = runDroplet(t, undefined, {
+        state,
+        previous: `${olderImage}\n`,
+      });
+      assert.equal(result.status, 0, `${name}: ${result.stderr}`);
+      assert.equal(result.read("state/api.current"), `${dropletImage}\n`, name);
+      assert.equal(result.read("state/api.previous"), `${olderImage}\n`, name);
+      // The temporary files of the atomic writes do not stay behind.
+      assert.deepEqual(
+        readdirSync(join(result.deployRoot, "state"))
+          .filter((file) => file !== "api.lock")
+          .sort(),
+        ["api.current", "api.previous"],
+        name,
+      );
+    }
   },
 );
 

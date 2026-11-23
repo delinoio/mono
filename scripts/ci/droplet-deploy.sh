@@ -400,16 +400,25 @@ interrupted() {
 # Records the image that the route serves: `<state>.current` becomes the image
 # and `<state>.previous` the image that `<state>.current` held. A retry with
 # the same image keeps `<state>.previous`, so a rollback still finds the image
-# that served before the first attempt. The caller evaluates this function as
-# an `if` or `||` operand, which disables `set -e` inside it, so every step
-# checks its own status.
+# that served before the first attempt. An empty or missing `<state>.current`
+# (a write that an interrupted earlier attempt left behind) names no image, so
+# it never replaces `<state>.previous`. `<state>.current` is published through
+# a temporary file and a rename, so an interruption leaves either the old or
+# the new file and never an empty one. The caller evaluates this function as an
+# `if` or `||` operand, which disables `set -e` inside it, so every step checks
+# its own status.
 record_state() {
-  local state="$1" image="$2"
+  local state="$1" image="$2" current=""
   mkdir -p "$(dirname "$state")" || return 1
-  if [[ -f "$state.current" ]] && [[ "$(< "$state.current")" != "$image" ]]; then
-    mv -f "$state.current" "$state.previous" || return 1
+  if [[ -f "$state.current" ]]; then
+    current="$(< "$state.current")" || return 1
   fi
-  echo "$image" > "$state.current"
+  if [[ -n "$current" && "$current" != "$image" ]]; then
+    cp -f "$state.current" "$state.previous.new" || return 1
+    mv -f "$state.previous.new" "$state.previous" || return 1
+  fi
+  echo "$image" > "$state.current.new" || return 1
+  mv -f "$state.current.new" "$state.current" || return 1
 }
 
 # Prints the unique network alias of a replacement container. The alias is a
