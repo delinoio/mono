@@ -486,5 +486,9 @@ func validSTUNURL(u string) bool {
 		return false
 	}
 	uri, err := pionstun.ParseURI(u)
-	return err == nil && uri.Scheme == pionstun.SchemeTypeSTUN && uri.Host != ""
+	// Pion parses the port with strconv.Atoi, so it also accepts -1, 0 and
+	// 65536. None of them is a UDP port that a STUN server can listen on. A
+	// URL without a port has already been rewritten to the default port.
+	return err == nil && uri.Scheme == pionstun.SchemeTypeSTUN && uri.Host != "" &&
+		uri.Port >= 1 && uri.Port <= 65535
 }

@@ -213,6 +213,13 @@ func TestLoadSTUNURLs(t *testing.T) {
 		{"query", "stun:a:3478?transport=udp", false},
 		{"turn", "turn:a:3478", false},
 		{"stuns", "stuns:a:5349", false},
+		{"highest port", "stun:a:65535", true},
+		{"lowest port", "stun:a:1", true},
+		{"port above range", "stun:a:65536", false},
+		{"port above range after valid", "stun:a:3478, stun:a:65536", false},
+		{"negative port", "stun:a:-1", false},
+		{"negative port after valid", "stun:a:3478, stun:a:-1", false},
+		{"port zero", "stun:a:0", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			v := minimal()
