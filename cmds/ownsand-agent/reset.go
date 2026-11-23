@@ -8,7 +8,6 @@ import (
 
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 	"github.com/delinoio/mono/cmds/ownsand-agent/internal/netpolicy"
-	"github.com/delinoio/mono/cmds/ownsand-agent/internal/store"
 )
 
 // cleanupHost is the host network clean-up of reset; tests replace it so
@@ -20,7 +19,7 @@ var cleanupHost = netpolicy.CleanupHost
 // table (Linux only; a no-op elsewhere). It returns the joined failures of
 // the resources that it could not delete; a resource that is already absent
 // is not a failure.
-func resetHost(cfg config.Config, _ *store.Store) error {
+func resetHost(cfg config.Config) error {
 	if cfg.Runtime != config.RuntimeKindFirecracker {
 		return nil
 	}

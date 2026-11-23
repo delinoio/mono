@@ -36,6 +36,7 @@ import {
   OWNER,
   VIEWER,
 } from "./testing/fake-api.ts";
+import { listItems } from "./testing/list-rows.ts";
 import { fakeCheckout, renderApp, settle } from "./testing/render.tsx";
 
 /** A token of an earlier link that waits in `sessionStorage`. */
@@ -1865,11 +1866,20 @@ describe("settings", () => {
   });
 });
 
+/**
+ * The test timeout of the tests that render a 200-row list with a select
+ * control in every row and open a dialog over it. The dialog re-renders every
+ * row; the tests take about 2 s on an idle machine and 5 s on a loaded CI
+ * runner, which is the default timeout. The bound is explicit so that CI load
+ * cannot flake them; a hang still fails after this time.
+ */
+const HEAVY_LIST_TEST_TIMEOUT_MS = 20_000;
+
 /** The titles of the rows of a list, in order. */
 function rowTitles(list: HTMLElement) {
-  return within(list)
-    .getAllByRole("listitem")
-    .map((row) => row.querySelector(".list-title")?.textContent ?? "");
+  return listItems(list).map(
+    (row) => row.querySelector(".list-title")?.textContent ?? "",
+  );
 }
 
 /** The continuation tokens that the requests of a method sent, in order. */
@@ -1965,68 +1975,76 @@ describe("paged lists", () => {
   });
 
   describe("members", () => {
-    test("reads every page in server order with the controls of the last member", async () => {
-      const api = createFakeApi();
-      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
-      await renderAccount(undefined, { api });
-      await openTab("Members");
-      const list = await screen.findByRole("list", { name: "Members" });
-      await settle(100);
-      const titles = rowTitles(list);
-      expect(titles).toHaveLength(201);
-      expect(titles[0]).toContain("Olivia Owner");
-      expect(titles[200]).toContain(`Member ${numbered(198)}`);
-      expect(calls(api, "ListMembers")).toEqual([
-        expect.objectContaining({
-          billingAccountId: ACCOUNT_ID,
-          pageToken: "",
-        }),
-        expect.objectContaining({
-          billingAccountId: ACCOUNT_ID,
-          pageToken: "p1",
-        }),
-      ]);
-      const last = within(list).getAllByRole("listitem")[200]!;
-      expect(
-        within(last).getByRole("button", { name: "Make owner" }),
-      ).toBeTruthy();
-      expect(
-        within(last).getByRole("combobox", {
-          name: `Role of Member ${numbered(198)}`,
-        }),
-      ).toBeTruthy();
-      await click(within(last).getByRole("button", { name: "Remove" }));
-      const dialog = await screen.findByRole("alertdialog");
-      await click(
-        within(dialog).getByRole("button", { name: "Remove member" }),
-      );
-      await settle(100);
-      expect(calls(api, "RemoveMember")).toEqual([
-        expect.objectContaining({
-          billingAccountId: ACCOUNT_ID,
-          userId: `user-${numbered(198)}`,
-        }),
-      ]);
-    });
+    test(
+      "reads every page in server order with the controls of the last member",
+      async () => {
+        const api = createFakeApi();
+        addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+        await renderAccount(undefined, { api });
+        await openTab("Members");
+        const list = await screen.findByRole("list", { name: "Members" });
+        await settle(100);
+        const titles = rowTitles(list);
+        expect(titles).toHaveLength(201);
+        expect(titles[0]).toContain("Olivia Owner");
+        expect(titles[200]).toContain(`Member ${numbered(198)}`);
+        expect(calls(api, "ListMembers")).toEqual([
+          expect.objectContaining({
+            billingAccountId: ACCOUNT_ID,
+            pageToken: "",
+          }),
+          expect.objectContaining({
+            billingAccountId: ACCOUNT_ID,
+            pageToken: "p1",
+          }),
+        ]);
+        const last = listItems(list)[200]!;
+        expect(
+          within(last).getByRole("button", { name: "Make owner" }),
+        ).toBeTruthy();
+        expect(
+          within(last).getByRole("combobox", {
+            name: `Role of Member ${numbered(198)}`,
+          }),
+        ).toBeTruthy();
+        await click(within(last).getByRole("button", { name: "Remove" }));
+        const dialog = await screen.findByRole("alertdialog");
+        await click(
+          within(dialog).getByRole("button", { name: "Remove member" }),
+        );
+        await settle(100);
+        expect(calls(api, "RemoveMember")).toEqual([
+          expect.objectContaining({
+            billingAccountId: ACCOUNT_ID,
+            userId: `user-${numbered(198)}`,
+          }),
+        ]);
+      },
+      HEAVY_LIST_TEST_TIMEOUT_MS,
+    );
 
-    test("the last member can receive ownership", async () => {
-      const api = createFakeApi();
-      addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
-      await renderAccount(undefined, { api });
-      await openTab("Members");
-      const list = await screen.findByRole("list", { name: "Members" });
-      await settle(100);
-      const last = within(list).getAllByRole("listitem")[200]!;
-      await click(within(last).getByRole("button", { name: "Make owner" }));
-      const dialog = await screen.findByRole("alertdialog");
-      await click(
-        within(dialog).getByRole("button", { name: "Transfer ownership" }),
-      );
-      await settle(100);
-      expect(calls(api, "TransferOwnership")).toEqual([
-        expect.objectContaining({ userId: `user-${numbered(198)}` }),
-      ]);
-    });
+    test(
+      "the last member can receive ownership",
+      async () => {
+        const api = createFakeApi();
+        addMembers(api.accounts.get(ACCOUNT_ID)!, 198);
+        await renderAccount(undefined, { api });
+        await openTab("Members");
+        const list = await screen.findByRole("list", { name: "Members" });
+        await settle(100);
+        const last = listItems(list)[200]!;
+        await click(within(last).getByRole("button", { name: "Make owner" }));
+        const dialog = await screen.findByRole("alertdialog");
+        await click(
+          within(dialog).getByRole("button", { name: "Transfer ownership" }),
+        );
+        await settle(100);
+        expect(calls(api, "TransferOwnership")).toEqual([
+          expect.objectContaining({ userId: `user-${numbered(198)}` }),
+        ]);
+      },
+      HEAVY_LIST_TEST_TIMEOUT_MS,
+    );
 
     test("an exact page and an empty token make no continuation request", async () => {
       const api = createFakeApi();
@@ -2079,7 +2097,7 @@ describe("paged lists", () => {
       expect(titles).toHaveLength(201);
       expect(titles[0]).toBe("Acme sandboxes");
       expect(titles[200]).toBe(`Org ${numbered(200)}`);
-      const last = within(list).getAllByRole("listitem")[200]!;
+      const last = listItems(list)[200]!;
       expect(last.textContent).toContain("OwnSand");
       expect(last.textContent).toContain("Active");
       expect(calls(api, "ListLinkedOrganizations")).toEqual([
@@ -2209,7 +2227,7 @@ describe("paged lists", () => {
           pageToken: "p1",
         }),
       ]);
-      const last = within(list).getAllByRole("listitem")[200]!;
+      const last = listItems(list)[200]!;
       await click(within(last).getByRole("button", { name: "Revoke" }));
       await settle(100);
       expect(calls(api, "RevokeInvitation")).toEqual([

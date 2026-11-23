@@ -10,6 +10,7 @@ import {
 } from "@testing-library/react";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { addBillingAccounts, createFakeApi } from "./testing/fake-api.ts";
+import { listRows } from "./testing/list-rows.ts";
 import { renderApp } from "./testing/render.tsx";
 
 /**
@@ -44,10 +45,7 @@ function pageTokens(api: ReturnType<typeof createFakeApi>) {
     .map((c) => c.request.pageToken);
 }
 
-const rows = () =>
-  within(screen.getByRole("list", { name: "Billing accounts" })).getAllByRole(
-    "listitem",
-  );
+const rows = () => listRows("Billing accounts");
 
 /**
  * A gate that lets the first request through and holds every later one until

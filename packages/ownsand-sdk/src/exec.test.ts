@@ -489,8 +489,12 @@ describe("exec over the relay", () => {
     const h = setup();
     h.api.unary(DataPathService, "AuthorizeRelay", (_req, call) => ({
       grantId: `grant-${call.index + 1}`,
-      // A server clock 10 hours ahead of the caller.
-      expireTime: { seconds: BigInt(Math.floor(Date.now() / 1000) + 36_000) },
+      // A server clock 10 hours ahead of the caller's virtual wall clock.
+      // The harness clock, not the host clock, is the caller's wall clock, so
+      // the skew does not depend on the date the test runs on.
+      expireTime: {
+        seconds: BigInt(Math.floor(h.clock.wallNow() / 1000) + 36_000),
+      },
       expiresIn: { seconds: 900n },
     }));
     h.api.stream(RelayService, "Exec", async function* () {

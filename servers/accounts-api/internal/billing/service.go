@@ -69,6 +69,15 @@ type Service struct {
 	paddleCallTimeout time.Duration
 	outcomeTimeout    time.Duration
 
+	// autoTopUpBudget is the time that one ProcessAutoTopUps run may spend
+	// before it starts another top-up, and elapsed measures it. They are
+	// fields so that tests can shorten the budget and drive the time without
+	// waiting. elapsed is a monotonic clock, not the business clock now:
+	// the budget is real time of the worker, which a test clock must not
+	// change.
+	autoTopUpBudget time.Duration
+	elapsed         func() time.Time
+
 	// wake asks the worker to charge queued automatic top-ups at once.
 	wake chan struct{}
 }
@@ -96,6 +105,8 @@ func New(cfg Config) *Service {
 
 		paddleCallTimeout: paddleCallTimeout,
 		outcomeTimeout:    topUpOutcomeTimeout,
+		autoTopUpBudget:   autoTopUpBudget,
+		elapsed:           time.Now,
 		wake:              make(chan struct{}, 1),
 	}
 }

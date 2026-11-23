@@ -1879,13 +1879,15 @@ describe("peer-to-peer data path", () => {
       expect(chunks).toHaveLength(1);
     });
 
-    test("a transport failure still lets the consumer drain the buffered chunks", async () => {
-      const file = source(3 << 10);
+    test("a transport failure still lets the consumer drain the buffered chunks and continues the read on the relay", async () => {
+      const file4k = source(4 << 10);
+      const kib = 1 << 10;
       let peerRef: FakeAgentPeer | undefined;
+      // The agent sends the first three KiB and then never ends the read.
       const p = p2pSetup((frame, peer) => {
         if (frame.payload.case !== "fileReadRequest") return;
         peerRef = peer;
-        for (let at = 0; at < file.length; at += 1 << 10) {
+        for (let at = 0; at < 3 * kib; at += kib) {
           peer.send({
             streamId: frame.streamId,
             sandboxId: SANDBOX,
@@ -1897,7 +1899,7 @@ describe("peer-to-peer data path", () => {
                   case: "chunk",
                   value: {
                     offset: BigInt(at),
-                    data: file.subarray(at, at + (1 << 10)),
+                    data: file4k.subarray(at, at + kib),
                   },
                 },
               },
@@ -1905,8 +1907,15 @@ describe("peer-to-peer data path", () => {
           });
         }
       });
+      // The relay serves the rest of the file from the delivered offset.
+      p.h.api.stream(RelayService, "ReadFile", function* () {
+        yield file.accepted();
+        yield file.chunk(3 * kib, file4k.subarray(3 * kib));
+        yield file.end(4 * kib);
+      });
       const chunks: Uint8Array[] = [];
       const wait = gate();
+      // No catch: a rejected continuation must fail the test.
       const done = (async () => {
         for await (const chunk of p.h.client
           .sandbox(SANDBOX)
@@ -1914,7 +1923,7 @@ describe("peer-to-peer data path", () => {
           chunks.push(chunk);
           if (chunks.length === 1) await wait.promise;
         }
-      })().catch((e: unknown) => e);
+      })();
       await p.h.clock.advance(1000);
       expect(chunks).toHaveLength(1);
       // The channel fails while two chunks are still buffered.
@@ -1924,9 +1933,18 @@ describe("peer-to-peer data path", () => {
       await p.h.clock.run(done);
       // The buffered chunks were delivered before the failure took effect;
       // the read then continued from the delivered offset.
-      expect(chunks.length).toBeGreaterThanOrEqual(3);
-      expect(chunks[1]!.length).toBe(1 << 10);
-      expect(readOffsets(p.rtc)[0]).toBe(0n);
+      expect(Buffer.compare(concat(chunks), file4k)).toBe(0);
+      expect(readOffsets(p.rtc)).toEqual([0n]);
+      const peerRead = p.rtc.frames.find(
+        (f) => f.payload.case === "fileReadRequest",
+      )!.payload.value as { readId: string; path: string };
+      const relayReads = p.h.api.callsOf("ReadFile");
+      expect(relayReads).toHaveLength(1);
+      const relayRead = relayReads[0]!.request as any;
+      expect(relayRead.offset).toBe(BigInt(3 * kib));
+      expect(relayRead.path).toBe("/big");
+      expect(relayRead.path).toBe(peerRead.path);
+      expect(relayRead.readId).toBe(peerRead.readId);
     });
 
     describe("a channel failure that an old session reports late", () => {

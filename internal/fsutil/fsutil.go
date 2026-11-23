@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-// Package fsutil copies directory trees and packs them into tar streams
-// for snapshots.
+// Package fsutil copies directory trees, removes them again and packs them
+// into tar streams for snapshots.
 package fsutil
 
 import (
@@ -13,21 +13,44 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 )
 
 // CopyTree copies the regular files, directories and symbolic links of src
-// into dst, which must not exist yet.
+// into dst, which must not exist yet. Every copied file and directory ends
+// with the permission bits of its source, whatever the umask of the process
+// is; see CopyTreeContext.
 func CopyTree(src, dst string) error {
 	return CopyTreeContext(context.Background(), src, dst)
+}
+
+// dirMode is a directory that CopyTreeContext created and whose final
+// permission bits it applies after the copy.
+type dirMode struct {
+	path string
+	perm fs.FileMode
 }
 
 // CopyTreeContext is CopyTree that stops with the context error before each
 // entry and between the chunks of a file once ctx is done. The entries that it
 // copied before the stop stay in dst; the caller removes them.
+//
+// The permission bits of a copied file are those of its source: CopyFile sets
+// them explicitly, so the umask does not clear any. A directory is created
+// owner-writable, so that its entries can be copied into it, and receives its
+// source permission bits only after the whole tree is copied, deepest
+// directories first; a read-only source directory therefore copies with its
+// content and ends read-only. A copy that fails or stops early skips this
+// step and leaves the directories that it created owner-writable, so that the
+// caller's removal of the partial copy does not meet a read-only directory.
+//
+// On Windows a directory keeps the mode that the create call gives it: the
+// read-only attribute of a directory has no effect on its entries there.
 func CopyTreeContext(ctx context.Context, src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+	var dirs []dirMode
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -45,7 +68,11 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		}
 		switch {
 		case d.IsDir():
-			return os.MkdirAll(target, info.Mode().Perm()|0o700)
+			if err := os.MkdirAll(target, info.Mode().Perm()|0o700); err != nil {
+				return err
+			}
+			dirs = append(dirs, dirMode{path: target, perm: info.Mode().Perm()})
+			return nil
 		case info.Mode()&fs.ModeSymlink != 0:
 			link, err := os.Readlink(path)
 			if err != nil {
@@ -58,9 +85,24 @@ func CopyTreeContext(ctx context.Context, src, dst string) error {
 		// Sockets, devices and pipes are not part of a snapshot.
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	// The walk visits a directory before its entries, so the reverse order
+	// changes the mode of a directory after the modes of its entries.
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := os.Chmod(dirs[i].path, dirs[i].perm); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
-// CopyFile copies one regular file.
+// CopyFile copies one regular file. The copy has the permission bits perm
+// whatever the umask of the process is.
 func CopyFile(src, dst string, perm fs.FileMode) error {
 	return copyFile(context.Background(), src, dst, perm)
 }
@@ -81,7 +123,78 @@ func copyFile(ctx context.Context, src, dst string, perm fs.FileMode) error {
 		out.Close()
 		return err
 	}
+	// OpenFile applies the umask to perm, so set the mode explicitly. A file
+	// that is not owner-writable has been written already, so this is the
+	// first point at which it can become read-only.
+	if err := out.Chmod(perm); err != nil {
+		out.Close()
+		return err
+	}
 	return out.Close()
+}
+
+// RemoveAll removes path and the tree below it like os.RemoveAll. A tree that
+// CopyTree copied from a read-only source keeps the read-only directory modes,
+// and a process without the privilege to override them cannot delete the
+// entries of such a directory. When the first attempt fails with a permission
+// error, RemoveAll therefore grants the owner read, write and search access on
+// every directory of the tree (symbolic links are not followed) and removes
+// the tree again. It returns the error of that second attempt, so a tree that
+// stays undeletable (for example because its parent directory is read-only)
+// is still reported. A missing path is not an error.
+//
+// Workaround: Go 1.26 os.RemoveAll can return an error that wraps the
+// unexported os.errSymlink when it cannot unlink a symbolic link inside a
+// read-only directory. The Error method of that value panics ("errSymlink is
+// not user-visible"), so printing the error crashes the caller. The cause is
+// a permission failure, so RemoveAll treats such an error like one, and it
+// never returns an error that cannot be printed. Remove this handling when
+// the minimum Go version includes the fix for Go issue 78490.
+func RemoveAll(path string) error {
+	err := os.RemoveAll(path)
+	if err == nil || !(errors.Is(err, fs.ErrPermission) || !printable(err)) {
+		return err
+	}
+	makeDirsWritable(path)
+	err = os.RemoveAll(path)
+	if err != nil && !printable(err) {
+		return &fs.PathError{Op: "remove", Path: path, Err: fs.ErrPermission}
+	}
+	return err
+}
+
+// printable reports whether err.Error() returns instead of panicking.
+func printable(err error) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	_ = err.Error()
+	return true
+}
+
+// makeDirsWritable adds the owner read, write and search bits to every
+// directory at or below path. It ignores errors: the removal that follows
+// reports whatever still blocks it.
+func makeDirsWritable(path string) {
+	info, err := os.Lstat(path)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	const need = 0o700
+	if info.Mode().Perm()&need != need {
+		_ = os.Chmod(path, info.Mode().Perm()|need)
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			makeDirsWritable(filepath.Join(path, e.Name()))
+		}
+	}
 }
 
 // TreeSize returns the total size of the regular files under dir.

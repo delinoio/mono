@@ -1,0 +1,5 @@
+---
+"ownsand-agent": patch
+---
+
+The process test runtime now copies the permission bits of every file and directory when it captures or restores a snapshot, whatever the umask of the agent process is. Before, a copied directory was always created owner-writable and never restored, and the umask cleared bits of copied files, so a read-only source directory ended writable and a file mode such as `0660` ended as `0640` under umask `022`. A read-only directory now copies with its content and ends read-only (on Windows, directories keep the mode that the create call gives them). A copy that fails or is canceled leaves its directories owner-writable. Symbolic links and error reporting are unchanged. Because a copied tree now keeps read-only directory modes, the agent deletes sandbox directories and snapshot copies with a removal that makes the directories of the tree owner-writable when the first attempt fails with a permission error, so deleting such a tree still works for a user that is not root.

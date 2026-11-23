@@ -434,21 +434,19 @@ func reset(cfg config.Config, yes bool, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent: reset deletes every local sandbox, snapshot, image and the device key; stop the service and pass --yes")
 		return exitUsage
 	}
-	st, err := store.Open(cfg.StateDir)
-	if err != nil {
-		fmt.Fprintln(stderr, "ownsand-agent:", err)
-		return exitError
-	}
 	// A failed host clean-up does not stop the deletion of the local data, so
 	// that one reset removes everything that it can; it still makes the reset
 	// fail, and running reset again deletes the remaining host resources.
 	code := exitOK
-	if err := resetHost(cfg, st); err != nil {
+	if err := resetHost(cfg); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: reset host resources:", err)
 		fmt.Fprintln(stderr, "ownsand-agent: run reset again, as an operator with CAP_NET_ADMIN, to delete the remaining host resources")
 		code = exitError
 	}
-	if err := st.Reset(); err != nil {
+	// ResetDir, not store.Open: reset must work on a damaged state directory
+	// (for example a regular file where a runtime subdirectory belongs), and
+	// Open would fail on it before it deleted anything.
+	if err := store.ResetDir(cfg.StateDir); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}

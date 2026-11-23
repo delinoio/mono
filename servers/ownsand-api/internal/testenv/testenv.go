@@ -387,7 +387,7 @@ const TestBillingAccountID = "01900000-0000-7000-8000-00000000b111"
 func (e *Env) AllowBilling(orgID string) {
 	e.T.Helper()
 	if _, err := e.DB.Pool.Exec(context.Background(), `UPDATE organization_billing SET billing_account_id = $2, phase = $3, reason = $4,
-		blocked_since = NULL, suspend_time = NULL, status_sync_time = $5, status_sequence = 0, update_time = $6 WHERE organization_id = $1`,
+		blocked_since = NULL, suspend_time = NULL, remote_blocked_since = NULL, status_sync_time = $5, status_sequence = 0, update_time = $6 WHERE organization_id = $1`,
 		orgID, TestBillingAccountID, int16(ownsandv1.BillingPhase_BILLING_PHASE_ALLOWED), int16(ownsandv1.BillingReason_BILLING_REASON_UNSPECIFIED),
 		time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC), e.Clock.Now()); err != nil {
 		e.T.Fatalf("allow billing: %v", err)
