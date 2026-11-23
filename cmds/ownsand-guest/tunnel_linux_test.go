@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -323,5 +324,105 @@ func TestParseTunnelSpec(t *testing.T) {
 		if _, ok, err := parseTunnelSpec(bad); !ok || err == nil {
 			t.Errorf("%q: ok %v err %v", bad, ok, err)
 		}
+	}
+}
+
+// setupRecorder builds tunnelDeps whose operations succeed and record their
+// calls; a test overrides one operation to inject a failure.
+type setupRecorder struct {
+	tap          *fakeTap
+	listener     *fakeListener
+	listenCalls  int
+	listenAddr   string
+	resolverPath string
+	resolverData string
+}
+
+func (r *setupRecorder) deps() tunnelDeps {
+	return tunnelDeps{
+		openTap: func(string) (io.ReadWriteCloser, error) { return r.tap, nil },
+		configureInterface: func(string, netip.Prefix, netip.Addr) error {
+			return nil
+		},
+		writeResolver: func(path string, data []byte) error {
+			r.resolverPath, r.resolverData = path, string(data)
+			return nil
+		},
+		listen: func(address string) (net.Listener, error) {
+			r.listenCalls++
+			r.listenAddr = address
+			return r.listener, nil
+		},
+	}
+}
+
+func newSetupRecorder() *setupRecorder {
+	return &setupRecorder{tap: newFakeTap(), listener: newFakeListener()}
+}
+
+func testTunnelSpec() tunnelSpec {
+	return tunnelSpec{port: 1025, guest: netip.MustParsePrefix("172.30.0.6/30"), gateway: netip.MustParseAddr("172.30.0.5")}
+}
+
+func TestTunnelSetupResolverWriteFailureClosesTapAndSkipsListener(t *testing.T) {
+	rec := newSetupRecorder()
+	deps := rec.deps()
+	writeErr := errors.New("read-only file system")
+	deps.writeResolver = func(string, []byte) error { return writeErr }
+
+	fatal, err := startTunnelWith(testTunnelSpec(), deps, testLogger())
+	if err == nil {
+		t.Fatal("setup succeeded although the resolver write failed")
+	}
+	if fatal != nil {
+		t.Fatal("a failed setup returned a fatal channel")
+	}
+	if !errors.Is(err, writeErr) {
+		t.Errorf("error %q does not wrap the write error", err)
+	}
+	if !strings.Contains(err.Error(), "/etc/resolv.conf") {
+		t.Errorf("error %q does not name /etc/resolv.conf", err)
+	}
+	if !rec.tap.isClosed() {
+		t.Error("the TAP device stayed open")
+	}
+	if rec.listenCalls != 0 {
+		t.Errorf("the listener opened %d times", rec.listenCalls)
+	}
+}
+
+func TestTunnelSetupWritesGatewayAndStartsRelay(t *testing.T) {
+	rec := newSetupRecorder()
+	fatal, err := startTunnelWith(testTunnelSpec(), rec.deps(), testLogger())
+	if err != nil {
+		t.Fatalf("setup: %v", err)
+	}
+	if fatal == nil {
+		t.Fatal("no fatal channel")
+	}
+	t.Cleanup(func() { rec.listener.Close(); rec.tap.Close() })
+	if rec.resolverPath != "/etc/resolv.conf" || rec.resolverData != "nameserver 172.30.0.5\n" {
+		t.Errorf("resolver %q: %q", rec.resolverPath, rec.resolverData)
+	}
+	if rec.listenCalls != 1 || rec.listenAddr != "vsock://:1025" {
+		t.Errorf("listen calls %d address %q", rec.listenCalls, rec.listenAddr)
+	}
+	if rec.tap.isClosed() {
+		t.Error("the TAP device closed on a successful setup")
+	}
+}
+
+func TestTunnelSetupConfigureFailureClosesTapBeforeResolverAndListener(t *testing.T) {
+	rec := newSetupRecorder()
+	deps := rec.deps()
+	deps.configureInterface = func(string, netip.Prefix, netip.Addr) error { return errors.New("no route") }
+	resolverWrites := 0
+	deps.writeResolver = func(string, []byte) error { resolverWrites++; return nil }
+
+	if _, err := startTunnelWith(testTunnelSpec(), deps, testLogger()); err == nil {
+		t.Fatal("setup succeeded although the interface configuration failed")
+	}
+	if !rec.tap.isClosed() || resolverWrites != 0 || rec.listenCalls != 0 {
+		t.Errorf("tap closed %v, resolver writes %d, listen calls %d", rec.tap.isClosed(), resolverWrites, rec.listenCalls)
 	}
 }
