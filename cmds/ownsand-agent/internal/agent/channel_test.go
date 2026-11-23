@@ -7,6 +7,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -215,5 +217,146 @@ func TestStalledAuthenticationBacksOffAndRetries(t *testing.T) {
 	case err := <-h.errc:
 		t.Fatalf("the agent stopped: %v", err)
 	default:
+	}
+}
+
+// newURLRequestAgent builds an agent with a live channel connection and no
+// store or runtime, enough for RequestURLs. The returned queue receives the
+// signed URL request.
+func newURLRequestAgent() (*Agent, chan *ownsandv1.AgentEnvelope) {
+	queue := make(chan *ownsandv1.AgentEnvelope, 4)
+	a := &Agent{
+		urlWaiters: map[string]chan *ownsandv1.SignedUrlGrant{},
+		conn: &conn{
+			queue:  queue,
+			done:   make(chan struct{}),
+			logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		},
+	}
+	return a, queue
+}
+
+func (a *Agent) waiterCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.urlWaiters)
+}
+
+func TestRequestURLsReportsParentEnd(t *testing.T) {
+	canceledWithCause := errors.New("shutting down")
+	cases := []struct {
+		name    string
+		parent  func() (context.Context, context.CancelFunc)
+		wantIs  []error
+		wantNot []error
+	}{
+		{
+			name: "canceled",
+			parent: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				return ctx, func() {}
+			},
+			wantIs:  []error{context.Canceled},
+			wantNot: []error{errURLGrantTimeout, context.DeadlineExceeded},
+		},
+		{
+			name: "canceled with cause",
+			parent: func() (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancelCause(context.Background())
+				cancel(canceledWithCause)
+				return ctx, func() {}
+			},
+			wantIs:  []error{context.Canceled, canceledWithCause},
+			wantNot: []error{errURLGrantTimeout},
+		},
+		{
+			name: "parent deadline before the grant timeout",
+			parent: func() (context.Context, context.CancelFunc) {
+				return context.WithTimeout(context.Background(), 20*time.Millisecond)
+			},
+			wantIs:  []error{context.DeadlineExceeded},
+			wantNot: []error{errURLGrantTimeout, context.Canceled},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a, queue := newURLRequestAgent()
+			ctx, cancel := tc.parent()
+			defer cancel()
+			_, err := a.RequestURLs(ctx, "snap", ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD, []int32{1})
+			if err == nil {
+				t.Fatal("RequestURLs returned no error")
+			}
+			for _, want := range tc.wantIs {
+				if !errors.Is(err, want) {
+					t.Errorf("error %q does not wrap %v", err, want)
+				}
+			}
+			for _, not := range tc.wantNot {
+				if errors.Is(err, not) {
+					t.Errorf("error %q wraps %v", err, not)
+				}
+			}
+			if len(queue) != 1 {
+				t.Errorf("sent %d requests, want 1", len(queue))
+			}
+			if n := a.waiterCount(); n != 0 {
+				t.Errorf("%d URL waiters left behind", n)
+			}
+		})
+	}
+}
+
+func TestRequestURLsGrantTimeoutIsDistinct(t *testing.T) {
+	a, _ := newURLRequestAgent()
+	a.urlGrantTimeout = 20 * time.Millisecond
+	_, err := a.RequestURLs(context.Background(), "snap", ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD, []int32{1})
+	if !errors.Is(err, errURLGrantTimeout) {
+		t.Fatalf("error = %v, want the grant timeout", err)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("grant timeout %q wraps a context error", err)
+	}
+	if n := a.waiterCount(); n != 0 {
+		t.Errorf("%d URL waiters left behind", n)
+	}
+}
+
+func TestRequestURLsGrantAndRejectionRemoveWaiter(t *testing.T) {
+	for _, reject := range []bool{false, true} {
+		a, queue := newURLRequestAgent()
+		go func() {
+			env := <-queue
+			req := env.GetSignedUrlRequest()
+			g := &ownsandv1.SignedUrlGrant{RequestId: req.GetRequestId()}
+			if reject {
+				g.Error = &ownsandv1.ErrorDetail{Message: "no"}
+			} else {
+				g.PartUrls = []*ownsandv1.SignedPartUrl{{PartNumber: 1}}
+			}
+			a.deliverURLs(g)
+		}()
+		urls, err := a.RequestURLs(context.Background(), "snap", ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD, []int32{1})
+		if reject {
+			if err == nil {
+				t.Error("rejected request returned no error")
+			}
+		} else if err != nil || len(urls) != 1 {
+			t.Errorf("urls = %v, err = %v", urls, err)
+		}
+		if n := a.waiterCount(); n != 0 {
+			t.Errorf("reject=%v: %d URL waiters left behind", reject, n)
+		}
+	}
+}
+
+func TestRequestURLsWithoutChannelRemovesWaiter(t *testing.T) {
+	a := &Agent{urlWaiters: map[string]chan *ownsandv1.SignedUrlGrant{}}
+	if _, err := a.RequestURLs(context.Background(), "snap", ownsandv1.SignedUrlOperation_SIGNED_URL_OPERATION_DOWNLOAD, []int32{1}); err == nil {
+		t.Fatal("RequestURLs returned no error without a channel")
+	}
+	if n := a.waiterCount(); n != 0 {
+		t.Errorf("%d URL waiters left behind", n)
 	}
 }
