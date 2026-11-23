@@ -2661,6 +2661,102 @@ describe("peer-to-peer data path", () => {
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
     });
 
+    describe.each([
+      // The method that the WebRTC stack never answers, and the OpenSession
+      // calls that the setup has made when it stops there.
+      ["createOffer", 0],
+      ["setLocalDescription", 0],
+      ["setRemoteDescription", 1],
+    ] as const)(
+      "while %s of the peer connection is pending",
+      (method, opens) => {
+        /** Starts two waiters, one without a signal, and holds `method`. */
+        async function start() {
+          const { h, rtc } = p2pSetup(exiting, { hold: [method] });
+          const sandbox = h.client.sandbox(SANDBOX);
+          const controller = new AbortController();
+          const withSignal = sandbox
+            .run({ command: ["a"], signal: controller.signal })
+            .catch((e) => e);
+          const withoutSignal = sandbox.run({ command: ["b"] }).catch((e) => e);
+          // Gathering takes 100 virtual ms and the fake OpenSession is instant.
+          await h.clock.advance(1_000);
+          expect(rtc.held(method)).toBe(1);
+          expect(rtc.connections).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(opens);
+          return { h, rtc, sandbox, controller, withSignal, withoutSignal };
+        }
+
+        test("a close ends every waiter, closes the peer connection and starts no relay", async () => {
+          const { h, rtc, sandbox, withSignal, withoutSignal } = await start();
+          sandbox.close();
+          const errors = await h.clock.run(
+            Promise.all([withSignal, withoutSignal]),
+          );
+          expect(errors[0]).toBeInstanceOf(OwnSandHandleClosedError);
+          expect(errors[1]).toBeInstanceOf(OwnSandHandleClosedError);
+          expect(rtc.closedConnections).toBe(1);
+          expect(rtc.channels[0]!.readyState).toBe("closed");
+          expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        });
+
+        test("a late completion after the close installs no peer", async () => {
+          const { h, rtc, sandbox, withSignal, withoutSignal } = await start();
+          sandbox.close();
+          await h.clock.run(Promise.all([withSignal, withoutSignal]));
+          rtc.release(method);
+          await h.clock.settle();
+          // The late completion starts no further signaling or channel work.
+          expect(h.api.callsOf("OpenSession")).toHaveLength(opens);
+          expect(rtc.connections).toHaveLength(1);
+          expect(rtc.frames).toHaveLength(0);
+          expect(rtc.channels[0]!.readyState).toBe("closed");
+          await expect(
+            h.clock.run(sandbox.run({ command: ["c"] })),
+          ).rejects.toBeInstanceOf(OwnSandHandleClosedError);
+          expect(rtc.connections).toHaveLength(1);
+          expect(h.api.callsOf("GetIceServers")).toHaveLength(1);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        });
+
+        test("the last caller that aborts ends with its reason and closes the peer connection", async () => {
+          const { h, rtc, sandbox, controller, withSignal, withoutSignal } =
+            await start();
+          const reason = new Error("caller cancelled");
+          // The caller without a signal still waits, so the abort keeps the
+          // shared setup.
+          controller.abort(reason);
+          expect(await h.clock.run(withSignal)).toBe(reason);
+          expect(rtc.closedConnections).toBe(0);
+          // The close then ends the remaining waiter.
+          sandbox.close();
+          expect(await h.clock.run(withoutSignal)).toBeInstanceOf(
+            OwnSandHandleClosedError,
+          );
+          expect(rtc.closedConnections).toBe(1);
+        });
+      },
+    );
+
+    test("a caller abort while the offer is pending cancels the setup and the next caller starts afresh", async () => {
+      const { h, rtc } = p2pSetup(exiting, { hold: ["createOffer"] });
+      const sandbox = h.client.sandbox(SANDBOX);
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled");
+      const first = sandbox
+        .run({ command: ["a"], signal: controller.signal })
+        .catch((e) => e);
+      await h.clock.advance(1_000);
+      expect(rtc.held("createOffer")).toBe(1);
+      controller.abort(reason);
+      expect(await h.clock.run(first)).toBe(reason);
+      // The sole waiter left: the setup was cancelled and its peer closed.
+      expect(rtc.closedConnections).toBe(1);
+      expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+    });
+
     test("a session that opens after the close is closed and never installed", async () => {
       const { h, rtc } = p2pSetup(exiting, {
         openSessionMs: 5_000,

@@ -236,7 +236,12 @@ export class PeerSession {
       // is applied still counts. It never rejects; the 10 second limit
       // starts only after the answer is applied (below).
       const opened = channelOpened(channel);
-      await pc.setLocalDescription(await pc.createOffer());
+      // The WebRTC stack can leave these calls pending (no timeout applies to
+      // them), so each one ends when the setup signal aborts: a handle close
+      // or the abort of every waiting caller. The catch below then closes the
+      // peer connection, and a call that completes later changes nothing.
+      const offerInit = await rejectOnAbort(pc.createOffer(), signal);
+      await rejectOnAbort(pc.setLocalDescription(offerInit), signal);
       await waitForGathering(pc, ctx, signal);
       const offer = pc.localDescription?.sdp;
       if (offer === undefined || offer === "") {
@@ -278,7 +283,10 @@ export class PeerSession {
       }
       // The answer carries the agent's DTLS fingerprint; the WebRTC stack
       // accepts only that fingerprint for the data channel.
-      await pc.setRemoteDescription({ type: "answer", sdp: answer });
+      await rejectOnAbort(
+        pc.setRemoteDescription({ type: "answer", sdp: answer }),
+        signal,
+      );
       await waitForOpen(opened, ctx, signal);
       if (channel.readyState !== "open") {
         throw new PeerUnavailableError("data channel did not open");

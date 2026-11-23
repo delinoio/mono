@@ -17,6 +17,7 @@ function connect(options: FakeWebRtcOptions) {
   });
   return {
     clock,
+    rtc,
     connection,
     channel,
     opens: () => opened,
@@ -89,5 +90,35 @@ describe("fakeWebRtc open timing", () => {
     await clock.advance(1_000);
     expect(channel.readyState).toBe("open");
     expect(opens()).toBe(1);
+  });
+});
+
+describe("fakeWebRtc held methods", () => {
+  test.each([
+    "createOffer",
+    "setLocalDescription",
+    "setRemoteDescription",
+  ] as const)("%s stays pending until it is released", async (method) => {
+    const { clock, rtc, connection } = connect({
+      hold: [method],
+      openDelayMs: 0,
+    });
+    const calls = {
+      createOffer: () => connection.createOffer(),
+      setLocalDescription: () =>
+        connection.setLocalDescription({ type: "offer", sdp: "v=0" }),
+      setRemoteDescription: () =>
+        connection.setRemoteDescription({ type: "answer" }),
+    };
+    let done = false;
+    const pending = calls[method]().then(() => {
+      done = true;
+    });
+    await clock.settle();
+    expect(done).toBe(false);
+    expect(rtc.held(method)).toBe(1);
+    rtc.release(method);
+    await pending;
+    expect(done).toBe(true);
   });
 });
