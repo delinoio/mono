@@ -138,8 +138,16 @@ func (c *Client) CreateSandbox(ctx context.Context, p CreateSandboxParams) (*San
 			return nil, rec.err()
 		}
 		if err == nil {
-			c.logger.DebugContext(ctx, "ownsand sandbox created", "sandbox_id", res.Msg.GetSandbox().GetSandboxId())
-			return c.handle(org, res.Msg.GetSandbox()), nil
+			sb := res.Msg.GetSandbox()
+			if sb == nil {
+				// A successful response without its sandbox is a protocol
+				// violation, not a lost response: do not retry it, because the
+				// server accepted the idempotency key.
+				c.logger.ErrorContext(ctx, "ownsand sandbox response missing resource", "rpc", "CreateSandbox")
+				return nil, errMissingResource("CreateSandbox", "sandbox")
+			}
+			c.logger.DebugContext(ctx, "ownsand sandbox created", "sandbox_id", sb.GetSandboxId())
+			return c.handle(org, sb), nil
 		}
 		kind, delay := classify(ctx, err)
 		if kind == failTerminal {
@@ -167,6 +175,23 @@ func (c *Client) Sandbox(org, sandboxID string) (*Sandbox, error) {
 		sandboxID = u.String()
 	}
 	return c.handle(o, &ownsandv1.Sandbox{SandboxId: sandboxID, OrganizationId: o}), nil
+}
+
+// errMissingResource reports a successful response that lacks the resource it
+// must carry. A plain error is terminal for classify, so no retry or wait loop
+// treats it as transient. The TypeScript SDK rejects the same responses.
+func errMissingResource(rpc, resource string) error {
+	return fmt.Errorf("ownsand: %s response carried no %s", rpc, resource)
+}
+
+// accept stores the sandbox of a successful response in the handle. It
+// returns an error when the response carries no sandbox.
+func (s *Sandbox) accept(rpc string, sb *ownsandv1.Sandbox) (*ownsandv1.Sandbox, error) {
+	if sb == nil {
+		s.c.logger.Error("ownsand sandbox response missing resource", "rpc", rpc, "sandbox_id", s.id)
+		return nil, errMissingResource(rpc, "sandbox")
+	}
+	return s.setInfo(sb), nil
 }
 
 func (c *Client) handle(org string, sb *ownsandv1.Sandbox) *Sandbox {
@@ -217,7 +242,7 @@ func (s *Sandbox) Get(ctx context.Context) (*ownsandv1.Sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.setInfo(res.Msg.GetSandbox()), nil
+	return s.accept("GetSandbox", res.Msg.GetSandbox())
 }
 
 // Delete deletes the sandbox and closes the handle's data path.
@@ -226,8 +251,10 @@ func (s *Sandbox) Delete(ctx context.Context) (*ownsandv1.Sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The server deleted the sandbox, so the data path closes even when the
+	// response lacks the sandbox record.
 	s.dp.close()
-	return s.setInfo(res.Msg.GetSandbox()), nil
+	return s.accept("DeleteSandbox", res.Msg.GetSandbox())
 }
 
 // Pause pauses the sandbox.
@@ -236,7 +263,7 @@ func (s *Sandbox) Pause(ctx context.Context) (*ownsandv1.Sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.setInfo(res.Msg.GetSandbox()), nil
+	return s.accept("PauseSandbox", res.Msg.GetSandbox())
 }
 
 // Resume resumes the sandbox.
@@ -245,7 +272,7 @@ func (s *Sandbox) Resume(ctx context.Context) (*ownsandv1.Sandbox, error) {
 	if err != nil {
 		return nil, err
 	}
-	return s.setInfo(res.Msg.GetSandbox()), nil
+	return s.accept("ResumeSandbox", res.Msg.GetSandbox())
 }
 
 // Snapshot takes a snapshot of the sandbox. The snapshot starts in
@@ -255,7 +282,12 @@ func (s *Sandbox) Snapshot(ctx context.Context) (*ownsandv1.Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	return res.Msg.GetSnapshot(), nil
+	snap := res.Msg.GetSnapshot()
+	if snap == nil {
+		s.c.logger.Error("ownsand snapshot response missing resource", "rpc", "CreateSnapshot", "sandbox_id", s.id)
+		return nil, errMissingResource("CreateSnapshot", "snapshot")
+	}
+	return snap, nil
 }
 
 // Close closes the handle's peer-to-peer session and cancels a session setup
