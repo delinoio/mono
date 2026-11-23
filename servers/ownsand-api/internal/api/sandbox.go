@@ -81,12 +81,14 @@ func canonicalizeCreateSandbox(m *ownsandv1.CreateSandboxRequest) {
 }
 
 // lookupIdempotent returns the sandbox of a known idempotency key, or nil.
-// A known key with other parameters fails with already_exists.
-func (s *Service) lookupIdempotent(ctx context.Context, q db.Querier, orgID, key string, hash []byte) (*sandboxRow, error) {
+// A known key with other parameters fails with already_exists. A key is known
+// while its expire_time is after now. The caller supplies now so that a lookup
+// and a later write that decide on the same key's expiry use one time sample.
+func (s *Service) lookupIdempotent(ctx context.Context, q db.Querier, orgID, key string, hash []byte, now time.Time) (*sandboxRow, error) {
 	var stored []byte
 	var sandboxID string
 	err := q.QueryRow(ctx, "SELECT request_sha256, sandbox_id::text FROM sandbox_create_keys WHERE organization_id = $1 AND idempotency_key = $2 AND expire_time > $3",
-		orgID, key, s.now()).Scan(&stored, &sandboxID)
+		orgID, key, now).Scan(&stored, &sandboxID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -259,7 +261,7 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	}
 	// The idempotency key is checked right after authorization and before
 	// placement or the live-channel check.
-	if existing, err := h.lookupIdempotent(ctx, h.DB.Pool, orgID, m.GetIdempotencyKey(), hash); err != nil || existing != nil {
+	if existing, err := h.lookupIdempotent(ctx, h.DB.Pool, orgID, m.GetIdempotencyKey(), hash, h.now()); err != nil || existing != nil {
 		if err != nil {
 			return nil, h.internal(ctx, "create sandbox", err)
 		}
@@ -284,7 +286,11 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1::text || ':' || $2::text, 0))", orgID, m.GetIdempotencyKey()); err != nil {
 			return err
 		}
-		existing, err := h.lookupIdempotent(ctx, tx, orgID, m.GetIdempotencyKey(), hash)
+		// Use the same now as the key upsert below: the lookup and the upsert's
+		// expiry condition must agree on whether an existing key has expired,
+		// or a key that expires between two samples makes the upsert match no
+		// row after the lookup found nothing to replay.
+		existing, err := h.lookupIdempotent(ctx, tx, orgID, m.GetIdempotencyKey(), hash, now)
 		if err != nil || existing != nil {
 			// Another request committed the key first: return its sandbox
 			// without a reservation, audit event or command.
@@ -393,7 +399,9 @@ func (h SandboxHandler) CreateSandbox(ctx context.Context, req *connect.Request[
 	})
 	if errors.Is(err, errIdempotencyRace) {
 		// A concurrent request with the same key committed first.
-		existing, lerr := h.lookupIdempotent(ctx, h.DB.Pool, orgID, m.GetIdempotencyKey(), hash)
+		// The race fallback samples the clock again: it runs after the
+		// transaction ended, so it must see the committed key as of now.
+		existing, lerr := h.lookupIdempotent(ctx, h.DB.Pool, orgID, m.GetIdempotencyKey(), hash, h.now())
 		if lerr != nil || existing == nil {
 			return nil, h.internal(ctx, "create sandbox", errors.Join(err, lerr))
 		}
