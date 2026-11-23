@@ -14,7 +14,7 @@
 
 - Keep repository and domain rules in the appropriate `AGENTS.md` files.
 
-- The web app development servers of `delino-accounts`, `ownsand-console`, `delino-docs` and `delino-site` run through portless: the `dev` script runs `portless run --prefix=` (behind `scripts/dev/with-infisical.mjs` for `delino-accounts` and `ownsand-console`), so the URL does not depend on the checkout, the real server command is the `dev:app` script, and the app's Turbo `dev` task passes `PORTLESS` and `PORTLESS_*` through. The `delidev` frontend `dev` script runs `rsbuild dev` directly. Follow [Frontend development URLs](../docs/repository-environment-contract.md#frontend-development-urls).
+- The web app development servers of `delino-accounts`, `ownsand-console`, `tide-console`, `delino-docs` and `delino-site` run through portless: the `dev` script runs `portless run --prefix=` (behind `scripts/dev/with-infisical.mjs` for `delino-accounts`, `ownsand-console` and `tide-console`), so the URL does not depend on the checkout, the real server command is the `dev:app` script, and the app's Turbo `dev` task passes `PORTLESS` and `PORTLESS_*` through. The `delidev` frontend `dev` script runs `rsbuild dev` directly. Follow [Frontend development URLs](../docs/repository-environment-contract.md#frontend-development-urls).
 
 - Write all source and comments in English.
 
@@ -30,5 +30,5 @@
 - `apps/delino-accounts/`: [project index](../docs/project-delino-accounts.md) and [web app foundation contract](../docs/apps-delino-accounts-foundation.md)
 - `apps/delidev/`: [project index](../docs/project-delidev.md) and [foundation contract](../docs/apps-delidev-foundation.md)
 - `apps/ownsand/`: [project index](../docs/project-ownsand.md) and [web console foundation contract](../docs/apps-ownsand-console-foundation.md)
-- `apps/tide/` (`planned`): [project index](../docs/project-tide.md) and [web console foundation contract](../docs/apps-tide-console-foundation.md)
+- `apps/tide/`: [project index](../docs/project-tide.md) and [web console foundation contract](../docs/apps-tide-console-foundation.md)
 - Register each new project and its domain contracts in [the documentation catalog](../docs/README.md) before implementation.

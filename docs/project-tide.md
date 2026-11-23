@@ -22,10 +22,10 @@ Success criterion: a tide organization is linked to an OwnSand organization that
 
 ## Domain Ownership Map
 
-Paths marked `planned` do not exist yet. Create each path, its workspace membership and its validation scripts in the change that starts its runtime implementation.
+Every path below exists. A new path starts as `planned` and changes to an actual path in the change that creates it, together with its workspace membership and its validation scripts.
 
 - `servers/tide-api/`: Go control plane on the shared DigitalOcean Droplet, served at `https://tide.api.delino.io`. It owns the queue, the dispatcher, the GitHub App integration, the agent vendor adapters and the Claude Code orchestrator processes.
-- `apps/tide/` (`planned`): Rsbuild React web console served at `https://tide.delino.io`.
+- `apps/tide/`: Rsbuild React web console (workspace package `tide-console`) served at `https://tide.delino.io`.
 - `cmds/tide/`: Go command-line interface. The same binary serves the `tide mcp` MCP server for coding agents.
 - `protos/delino/tide/`: the workspace package `@delino/tide-protos` with the Connect RPC schemas in `v1/`, the committed Go bindings and the committed TypeScript bindings.
 - `packages/tide-sdk/`: TypeScript SDK (workspace package `tide-sdk`).
