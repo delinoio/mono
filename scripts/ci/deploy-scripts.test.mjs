@@ -2125,7 +2125,9 @@ function setupDroplet(
     bin,
     "docker",
     `if [[ -n "\${STUB_BLOCK_ON:-}" && "$*" == \$STUB_BLOCK_ON ]]; then
-  while [[ ! -e "$STUB_DIR/release-docker" ]]; do sleep 0.05; done
+  # The loop also ends when the scratch directory is gone, so that a stub
+  # of a test that failed does not outlive it.
+  while [[ -d "$STUB_DIR" && ! -e "$STUB_DIR/release-docker" ]]; do sleep 0.05; done
 fi
 case "$1" in
   ps)
@@ -2873,7 +2875,7 @@ test(
       // The temporary files of the atomic writes do not stay behind.
       assert.deepEqual(
         readdirSync(join(result.deployRoot, "state"))
-          .filter((file) => file !== "api.lock")
+          .filter((file) => file !== "api.lock" && file !== ".proxy.lock")
           .sort(),
         ["api.current", "api.previous"],
         name,
@@ -4003,3 +4005,207 @@ test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
     assert.deepEqual(result.calls, []);
   }
 });
+
+// The proxy lock `state/.proxy.lock` serializes the route change and the
+// proxy reload of every service on the Droplet. The tests below pause the
+// first deployment inside `caddy reload` (STUB_BLOCK_ON, released by the
+// `release-docker` file) and start the deployment of another service.
+const hasPgrep = spawnSync("sh", ["-c", "command -v pgrep"]).status === 0;
+const skipProxyLock =
+  skip || (!hasPgrep && "pgrep is not installed (procps is missing)");
+const workerArgs = [
+  "worker",
+  concurrentImage,
+  "9000",
+  "worker.example.com",
+  "http1",
+  "none",
+];
+const apiArgs = [
+  "api",
+  dropletImage,
+  "8080",
+  "api.example.com",
+  "http1",
+  "none",
+];
+
+// A `mv` stub that records its calls (like every stub) and then runs the real
+// `mv`, so that a test can see when a route file is restored.
+const loggingMv = 'exec "$(command -v -p mv)" "$@"';
+
+// Starts the deployment of `api` and pauses it inside the proxy reload, with
+// the route of `api` already installed. Returns the setup and the run.
+async function startPausedApiReload(t, env = {}) {
+  const setup = setupDroplet(t, apiArgs, {
+    route: "# previous api route\n",
+    stubs: { mv: loggingMv },
+    prepare: (deployRoot) =>
+      writeFileSync(join(deployRoot, "env", "worker.env"), "LOG_LEVEL=info\n"),
+  });
+  const first = startDroplet(t, setup, apiArgs, {
+    STUB_BLOCK_ON: "exec *",
+    ...env,
+  });
+  await waitFor(
+    () => setup.calls().some((call) => call.startsWith("docker exec")),
+    "the first proxy reload",
+  );
+  return { setup, first };
+}
+
+// Waits until the run waits for the proxy lock: its `flock` child process is
+// alive only while the lock is held by another process, because the service
+// lock of the run was free.
+async function waitForLockWait(run, what) {
+  await waitFor(
+    () =>
+      spawnSync("pgrep", ["-P", String(run.child.pid), "-x", "flock"])
+        .status === 0,
+    what,
+  );
+}
+
+test(
+  "droplet deploy serializes the route changes and proxy reloads of different services",
+  { skip: skipProxyLock },
+  async (t) => {
+    const { setup, first } = await startPausedApiReload(t);
+    const second = startDroplet(t, setup, workerArgs);
+    await waitForLockWait(
+      second,
+      "the second deployment to wait for the proxy lock",
+    );
+    // The second run did not touch its route file or the proxy, while the
+    // first run still reloads.
+    assert.equal(setup.read("caddy/sites/worker.caddy"), undefined);
+    assert.equal(setup.read("caddy/sites/worker.caddy.new"), undefined);
+    assert.equal(
+      setup.calls().filter((call) => call.startsWith("docker exec")).length,
+      1,
+    );
+    writeFileSync(join(setup.dir, "release-docker"), "");
+    const [firstResult, secondResult] = await Promise.all([
+      first.done,
+      second.done,
+    ]);
+    assert.equal(firstResult.status, 0, firstResult.stderr);
+    assert.equal(secondResult.status, 0, secondResult.stderr);
+    assert.match(setup.read("caddy/sites/api.caddy"), /api\.example\.com/);
+    assert.match(
+      setup.read("caddy/sites/worker.caddy"),
+      /worker\.example\.com/,
+    );
+    assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+    assert.equal(setup.read("state/worker.current"), `${concurrentImage}\n`);
+    assert.equal(
+      setup.calls().filter((call) => call.startsWith("docker exec")).length,
+      2,
+    );
+  },
+);
+
+test(
+  "droplet deploy restores a rejected route before another service adapts the Caddyfile",
+  { skip: skipProxyLock },
+  async (t) => {
+    const { setup, first } = await startPausedApiReload(t, {
+      STUB_RELOAD: "1",
+    });
+    const second = startDroplet(t, setup, workerArgs);
+    await waitForLockWait(
+      second,
+      "the second deployment to wait for the proxy lock",
+    );
+    // The rejected route of the first run is still installed while it reloads.
+    assert.match(setup.read("caddy/sites/api.caddy"), /api\.example\.com/);
+    writeFileSync(join(setup.dir, "release-docker"), "");
+    const [firstResult, secondResult] = await Promise.all([
+      first.done,
+      second.done,
+    ]);
+    assert.equal(firstResult.status, 1, firstResult.stderr);
+    assert.match(firstResult.stderr, /rejected the route of api/);
+    assert.equal(secondResult.status, 0, secondResult.stderr);
+    assert.equal(setup.read("caddy/sites/api.caddy"), "# previous api route\n");
+    assert.match(
+      setup.read("caddy/sites/worker.caddy"),
+      /worker\.example\.com/,
+    );
+    const calls = setup.calls();
+    const restored = calls.findIndex(
+      (call) => call.includes("mv -f") && call.includes("api.caddy.previous"),
+    );
+    const execs = calls
+      .map((call, index) => (call.startsWith("docker exec") ? index : -1))
+      .filter((index) => index >= 0);
+    assert.equal(execs.length, 2, calls.join("\n"));
+    // The restore of the rejected route happens before the second reload,
+    // which adapts the Caddyfile with every route file.
+    assert.ok(restored >= 0 && restored < execs[1], calls.join("\n"));
+  },
+);
+
+test(
+  "droplet deploy changes no route when the proxy lock stays held",
+  { skip: skipProxyLock },
+  async (t) => {
+    const { setup, first } = await startPausedApiReload(t);
+    const second = await startDroplet(t, setup, workerArgs, {
+      DROPLET_PROXY_LOCK_TIMEOUT: "1",
+    }).done;
+    assert.equal(second.status, 1, second.stderr);
+    assert.match(
+      second.stderr,
+      /another deployment held the proxy lock .*\.proxy\.lock for 1 seconds; the route of worker was not changed/,
+    );
+    assert.match(
+      second.stderr,
+      /the route of worker was not switched; the previous container keeps serving/,
+    );
+    assert.equal(setup.read("caddy/sites/worker.caddy"), undefined);
+    assert.equal(setup.read("caddy/sites/worker.caddy.new"), undefined);
+    assert.equal(setup.read("caddy/sites/worker.caddy.previous"), undefined);
+    assert.equal(setup.read("state/worker.current"), undefined);
+    assert.equal(
+      setup.calls().filter((call) => call.startsWith("docker exec")).length,
+      1,
+    );
+    // The replacement of the failed run is removed; the first run is intact.
+    assert.ok(
+      setup.calls().some((call) => /^docker rm --force worker-/.test(call)),
+    );
+    writeFileSync(join(setup.dir, "release-docker"), "");
+    assert.equal((await first.done).status, 0);
+    assert.match(setup.read("caddy/sites/api.caddy"), /api\.example\.com/);
+    assert.equal(setup.read("state/api.current"), `${dropletImage}\n`);
+  },
+);
+
+test(
+  "droplet deploy changes no route when the proxy lock file cannot be opened",
+  { skip },
+  (t) => {
+    const route = "# previous api route\n";
+    const result = runDroplet(t, undefined, {
+      route,
+      // A directory in the place of the proxy lock file.
+      prepare: (deployRoot) => {
+        mkdirSync(join(deployRoot, "state", ".proxy.lock"), {
+          recursive: true,
+        });
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(
+      result.stderr,
+      /could not open the proxy lock file .*\.proxy\.lock/,
+    );
+    assert.match(result.stderr, /the route of api was not switched/);
+    assert.equal(result.read("caddy/sites/api.caddy"), route);
+    assert.equal(result.read("caddy/sites/api.caddy.new"), undefined);
+    assert.equal(result.read("caddy/sites/api.caddy.previous"), undefined);
+    assert.equal(result.read("state/api.current"), undefined);
+    assert.ok(!result.calls.some((call) => call.startsWith("docker exec")));
+  },
+);

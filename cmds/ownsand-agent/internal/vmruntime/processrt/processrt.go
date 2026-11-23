@@ -325,7 +325,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	if err != nil {
 		return nil, fmt.Errorf("processrt: resolve sandbox directory %s: %w", spec.Dir, err)
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	if err := fsutil.RemoveAll(dir); err != nil {
 		return nil, err
 	}
 	root := filepath.Join(dir, rootDir)
@@ -335,7 +335,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 		// stops with the context error once ctx is done; the partial copy is
 		// removed with the sandbox directory and no helper starts.
 		if err := fsutil.CopyTreeContext(ctx, filepath.Join(spec.Snapshot.Dir, diskDir), root); err != nil {
-			os.RemoveAll(dir)
+			fsutil.RemoveAll(dir)
 			return nil, fmt.Errorf("processrt: restore snapshot disk: %w", err)
 		}
 		restore = ownsandv1.SandboxRestorePath_SANDBOX_RESTORE_PATH_DISK_COLD_BOOT
@@ -344,12 +344,12 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	}
 	socket, socketDir, err := newSocket(spec.SandboxID)
 	if err != nil {
-		os.RemoveAll(dir)
+		fsutil.RemoveAll(dir)
 		return nil, err
 	}
 	v := &vm{id: spec.SandboxID, dir: dir, socket: socket, socketDir: socketDir, exited: make(chan struct{}), restore: restore}
 	if err := recordSocketDir(dir, socketDir); err != nil {
-		os.RemoveAll(dir)
+		fsutil.RemoveAll(dir)
 		removeSocketDir(v)
 		return nil, err
 	}
@@ -359,7 +359,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	// sandbox after the helper started and cleans it up.
 	if spec.Snapshot != nil {
 		if err := ctx.Err(); err != nil {
-			os.RemoveAll(dir)
+			fsutil.RemoveAll(dir)
 			removeSocketDir(v)
 			return nil, fmt.Errorf("processrt: restore snapshot canceled before the helper started: %w", err)
 		}
@@ -375,7 +375,7 @@ func (r *Runtime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM
 	cmd.Stderr = os.Stderr
 	procgroup.Set(cmd)
 	if err := launcher.Start(cmd); err != nil {
-		os.RemoveAll(dir)
+		fsutil.RemoveAll(dir)
 		removeSocketDir(v)
 		return nil, fmt.Errorf("processrt: start guest helper: %w", err)
 	}
@@ -698,7 +698,7 @@ func (r *Runtime) removeUntracked(sandboxID string) error {
 			return err
 		}
 	}
-	if err := os.RemoveAll(dir); err != nil {
+	if err := fsutil.RemoveAll(dir); err != nil {
 		return err
 	}
 	r.logger.Info("process sandbox files removed", "sandbox_id", sandboxID)
@@ -709,7 +709,7 @@ func (r *Runtime) removeUntracked(sandboxID string) error {
 // including its socket directory, and then stops tracking it. A failed
 // removal keeps the sandbox tracked.
 func (r *Runtime) removeSandbox(v *vm) error {
-	if err := errors.Join(os.RemoveAll(v.dir), removeSocketDir(v)); err != nil {
+	if err := errors.Join(fsutil.RemoveAll(v.dir), removeSocketDir(v)); err != nil {
 		return err
 	}
 	r.mu.Lock()

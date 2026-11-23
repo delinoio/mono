@@ -23,11 +23,13 @@ import { useOrg } from "../components/shell.tsx";
 import {
   ConfirmDialog,
   Detail,
+  MorePagesNotice,
   PageHeader,
   QueryBoundary,
   toastError,
 } from "../components/ui.tsx";
 import { formatTime, labels } from "../format.ts";
+import { useMembers } from "../members.ts";
 import { can, Permission } from "../roles.ts";
 import { useRouter } from "../router.tsx";
 import { BillingSection } from "./billing-settings.tsx";
@@ -178,10 +180,9 @@ function OwnerActions() {
   const { organizationId, name } = useOrg();
   const { navigate } = useRouter();
   const queryClient = useQueryClient();
-  const members = useQuery(MemberService.method.listMembers, {
-    organizationId,
-    pageSize: 200,
-  });
+  // Read every page: the new owner can be a member that sorts after the
+  // first 200.
+  const members = useMembers(organizationId);
   const transfer = useMutation(OrganizationService.method.transferOwnership, {
     onSuccess: () =>
       invalidateServices(
@@ -198,8 +199,7 @@ function OwnerActions() {
   const [target, setTarget] = useState<string | null>(null);
   const [confirmTransfer, setConfirmTransfer] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const candidates =
-    members.data?.members.filter((m) => m.role !== Role.OWNER) ?? [];
+  const candidates = members.members.filter((m) => m.role !== Role.OWNER);
   const targetName = (() => {
     const m = candidates.find((c) => c.userId === target);
     return m ? m.displayName || m.userId : "";
@@ -233,6 +233,7 @@ function OwnerActions() {
             Transfer
           </Button>
         </div>
+        <MorePagesNotice noun="members" pages={members} />
       </section>
       <section className="section danger-zone" aria-labelledby="delete-title">
         <h2 id="delete-title">Delete organization</h2>

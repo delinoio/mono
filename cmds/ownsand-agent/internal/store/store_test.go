@@ -139,26 +139,23 @@ func TestLoadSnapshotsRemovesAbandonedTransferArchives(t *testing.T) {
 // so that a stuck log file never keeps identity.json on disk, and it reports
 // the failure.
 func TestResetDeletesIdentityWhenAnotherEntryFails(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("directory permissions do not block deletion on Windows")
-	}
-	if os.Geteuid() == 0 {
-		t.Skip("root deletes entries of a read-only directory")
-	}
 	dir := t.TempDir()
 	// "a-stuck" sorts first, so the failure comes before every other entry,
-	// as the first failing entry of a lexical removal order.
+	// as the first failing entry of a lexical removal order. The removal of
+	// a tree makes its read-only directories writable, so a read-only
+	// directory no longer makes the removal fail; a seam does.
 	stuck := filepath.Join(dir, "a-stuck")
 	if err := os.Mkdir(stuck, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(stuck, "x"), []byte("x"), 0o600); err != nil {
-		t.Fatal(err)
+	orig := removeAll
+	t.Cleanup(func() { removeAll = orig })
+	removeAll = func(path string) error {
+		if path == stuck {
+			return errors.New("stuck entry")
+		}
+		return orig(path)
 	}
-	if err := os.Chmod(stuck, 0o500); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chmod(stuck, 0o700) })
 	for _, name := range []string{AgentFile, IdentityFile, "agent.log"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte("{}"), 0o600); err != nil {
 			t.Fatal(err)

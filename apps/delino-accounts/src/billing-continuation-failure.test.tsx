@@ -17,6 +17,7 @@ import {
   createFakeApi,
   OWNER,
 } from "./testing/fake-api.ts";
+import { listRows } from "./testing/list-rows.ts";
 import { renderApp } from "./testing/render.tsx";
 
 /**
@@ -31,8 +32,8 @@ type FakeApi = ReturnType<typeof createFakeApi>;
 const ACCOUNT_PATH = `/billing/${ACCOUNT_ID}`;
 const UNAVAILABLE =
   "Delino Accounts is not available right now. Try again in a moment.";
-const SIGN_IN = { name: "Sign in with Delino" };
-const TRY_AGAIN = { name: "Try again" };
+const SIGN_IN = "Sign in with Delino";
+const TRY_AGAIN = "Try again";
 
 beforeEach(() => {
   window.sessionStorage.clear();
@@ -59,12 +60,33 @@ function pageTokens(api: FakeApi, method: string) {
     .map((c) => c.request.pageToken);
 }
 
-/** The rendered rows of the list: list items, or usage table rows. */
+/**
+ * The rendered rows of the list: list items, or usage table rows.
+ *
+ * The rows are counted from the DOM instead of with `getAllByRole`. A role
+ * query computes the accessible role of every element of a list of 200 rows,
+ * which costs tens of milliseconds, and `waitFor` and `findBy*` repeat it on
+ * every DOM mutation while the lists render. On a loaded CI runner that made
+ * the tests exceed the 5 s test timeout. See `testing/list-rows.ts`; the
+ * usage table rows are the `tr` elements of the table.
+ */
 function rowCount(list: string | undefined) {
-  return list === undefined
-    ? within(screen.getByRole("table")).getAllByRole("row").length - 1
-    : within(screen.getByRole("list", { name: list })).getAllByRole("listitem")
-        .length;
+  if (list === undefined) {
+    const table = document.querySelector("table");
+    if (table === null) throw new Error("no table");
+    return table.querySelectorAll("tr").length - 1;
+  }
+  return listRows(list).length;
+}
+
+/**
+ * The "read on" button, found by its text. `findByRole` with a name would
+ * compute the role of every element of the 200 rows on each DOM mutation.
+ */
+function moreButton(more: string) {
+  return screen.queryByText(more, {
+    selector: "button",
+  }) as HTMLButtonElement | null;
 }
 
 /**
@@ -117,7 +139,7 @@ async function openList(
   entry.seed(accountOf(api));
   const { signIns } = renderApp(ACCOUNT_PATH, { api });
   await click(await screen.findByRole("tab", { name: entry.tab }));
-  await screen.findByRole("button", { name: entry.more });
+  await screen.findByText(entry.more, { selector: "button" });
   await waitFor(() => expect(rowCount(entry.list)).toBe(entry.firstPage));
   if (failure !== undefined) api.failContinuation.set(entry.method, failure);
   return { api, signIns };
@@ -130,24 +152,21 @@ for (const entry of lists) {
         entry,
         new ConnectError("the page service is down", Code.Unavailable),
       );
-      await click(screen.getByRole("button", { name: entry.more }));
+      await click(moreButton(entry.more)!);
       const notice = (await screen.findByText(UNAVAILABLE)).closest(
         '[role="alert"]',
       ) as HTMLElement;
       expect(rowCount(entry.list)).toBe(entry.firstPage);
       expect(pageTokens(api, entry.method)).toEqual(["", "p1"]);
       // The button still reads on, and no request starts by itself.
-      expect(
-        (screen.getByRole("button", { name: entry.more }) as HTMLButtonElement)
-          .disabled,
-      ).toBe(false);
+      expect(moreButton(entry.more)!.disabled).toBe(false);
 
-      await click(within(notice).getByRole("button", TRY_AGAIN));
+      await click(within(notice).getByRole("button", { name: TRY_AGAIN }));
       await waitFor(() => expect(rowCount(entry.list)).toBe(entry.total));
       // The retry sent the failed cursor, not a refetch of the first page.
       expect(pageTokens(api, entry.method)).toEqual(["", "p1", "p1"]);
       expect(screen.queryByText(UNAVAILABLE)).toBeNull();
-      expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
+      expect(moreButton(entry.more)).toBeNull();
     });
 
     test("an ended session keeps the rows and offers the sign-in action", async () => {
@@ -155,10 +174,10 @@ for (const entry of lists) {
         entry,
         new ConnectError("token expired", Code.Unauthenticated),
       );
-      await click(screen.getByRole("button", { name: entry.more }));
-      const signIn = await screen.findByRole("button", SIGN_IN);
+      await click(moreButton(entry.more)!);
+      const signIn = await screen.findByText(SIGN_IN, { selector: "button" });
       expect(rowCount(entry.list)).toBe(entry.firstPage);
-      expect(screen.queryByRole("button", TRY_AGAIN)).toBeNull();
+      expect(screen.queryByText(TRY_AGAIN, { selector: "button" })).toBeNull();
       expect(pageTokens(api, entry.method)).toEqual(["", "p1"]);
       await click(signIn);
       expect(signIns).toHaveLength(1);
@@ -176,7 +195,7 @@ for (const entry of lists) {
       renderApp(ACCOUNT_PATH, { api });
       await click(await screen.findByRole("tab", { name: entry.tab }));
       await screen.findByText(UNAVAILABLE);
-      expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
+      expect(moreButton(entry.more)).toBeNull();
       if (entry.list !== undefined) {
         expect(screen.queryByRole("list", { name: entry.list })).toBeNull();
       }
