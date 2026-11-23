@@ -127,11 +127,17 @@ export function readConsoleConfig(
   }
   const endpoint = (env.PUBLIC_LOGTO_ENDPOINT ?? "").trim();
   const appId = (env.PUBLIC_LOGTO_APP_ID ?? "").trim();
+  // Validate a supplied endpoint even when the application ID is missing, so
+  // a typo fails the build instead of silently showing "not configured".
+  const logtoOrigin =
+    endpoint === ""
+      ? undefined
+      : resolveOrigin("PUBLIC_LOGTO_ENDPOINT", endpoint, endpoint);
   const logto =
-    endpoint === "" || appId === ""
+    logtoOrigin === undefined || appId === ""
       ? undefined
       : {
-          endpoint: resolveOrigin("PUBLIC_LOGTO_ENDPOINT", endpoint, endpoint),
+          endpoint: logtoOrigin,
           appId,
           scopes: [
             REQUIRED_API_SCOPE,
