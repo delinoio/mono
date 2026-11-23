@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -247,6 +248,42 @@ func TestSyncCaseCollisionsAndWindowsNames(t *testing.T) {
 	needPOSIX(t)
 	c, srv, org := newTestClient(t, "")
 	ctx := context.Background()
+	// The colliding paths exist only on a case-sensitive local file system.
+	// On a case-insensitive one (the default on macOS) the second write
+	// replaces the first file, so there is no collision to detect.
+	if !caseSensitiveDir(t, t.TempDir()) {
+		t.Log("the local file system ignores case; the case collision checks are skipped")
+	} else {
+		testSyncCaseCollisions(t, c, srv, org)
+	}
+
+	writes := srv.Calls(writeProc)
+	invalid := newRepo(t, map[string]string{"con.txt": "x", "a:b.txt": "x", "trailing. ": "x", "ok.txt": "x", "dir/AUX": "x"}, nil, "")
+	win := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_WINDOWS)
+	_, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: win.GetDevSessionId(), LocalDir: invalid})
+	var pe *PathRuleError
+	if !errors.As(err, &pe) || pe.Rule != PathRuleInvalidWindowsName || len(pe.Paths) != 4 {
+		t.Fatalf("invalid names error = %v", err)
+	}
+	if srv.Calls(writeProc) != writes {
+		t.Fatal("a rejected sync uploaded")
+	}
+}
+
+// caseSensitiveDir reports whether dir keeps two names that differ only in
+// case as two files.
+func caseSensitiveDir(t *testing.T, dir string) bool {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "case"), []byte("lower"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Stat(filepath.Join(dir, "CASE"))
+	return errors.Is(err, fs.ErrNotExist)
+}
+
+func testSyncCaseCollisions(t *testing.T, c *Client, srv *tidetest.Server, org string) {
+	t.Helper()
+	ctx := context.Background()
 	collide := newRepo(t, map[string]string{"Readme.md": "1", "README.md": "2", "Src/a.go": "a", "src/b.go": "b"}, nil, "")
 	for _, os := range []tidev1.GuestOs{tidev1.GuestOs_GUEST_OS_MACOS, tidev1.GuestOs_GUEST_OS_WINDOWS} {
 		ds := newSession(t, c, srv, org, os)
@@ -265,17 +302,6 @@ func TestSyncCaseCollisionsAndWindowsNames(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	writes := srv.Calls(writeProc)
-	invalid := newRepo(t, map[string]string{"con.txt": "x", "a:b.txt": "x", "trailing. ": "x", "ok.txt": "x", "dir/AUX": "x"}, nil, "")
-	win := newSession(t, c, srv, org, tidev1.GuestOs_GUEST_OS_WINDOWS)
-	_, err := c.Sync(ctx, SyncParams{OrganizationID: org, DevSessionID: win.GetDevSessionId(), LocalDir: invalid})
-	var pe *PathRuleError
-	if !errors.As(err, &pe) || pe.Rule != PathRuleInvalidWindowsName || len(pe.Paths) != 4 {
-		t.Fatalf("invalid names error = %v", err)
-	}
-	if srv.Calls(writeProc) != writes {
-		t.Fatal("a rejected sync uploaded")
-	}
 }
 
 func TestInvalidWindowsPath(t *testing.T) {
