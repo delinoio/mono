@@ -396,31 +396,97 @@ func TestImportRejectsACorruptDownload(t *testing.T) {
 }
 
 // TestImportRejectsATruncatedBody checks a response that promises more bytes
-// than it sends.
+// than it sends. The fixture writes the response by hand on the hijacked
+// connection and flushes it, so the client really receives a nonempty body
+// that is shorter than the declared length before the connection closes.
 func TestImportRejectsATruncatedBody(t *testing.T) {
+	const delivered = 100
 	data := bytes.Repeat([]byte("x"), 10000)
 	sum := sha256.Sum256(data)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
-		w.Write(data[:100])
-		// Closing the connection before the promised length is an
-		// interrupted download.
-		hj, _ := w.(http.Hijacker)
-		conn, _, _ := hj.Hijack()
-		conn.Close()
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("test server does not support hijacking")
+			return
+		}
+		conn, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		// A hijacked connection does not flush the buffered writer, so the
+		// response is written and flushed explicitly. Closing the connection
+		// before the promised length is an interrupted download.
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: " + strconv.Itoa(len(data)) + "\r\n\r\n")
+		buf.Write(data[:delivered])
+		if err := buf.Flush(); err != nil {
+			t.Errorf("flush: %v", err)
+		}
 	}))
 	defer srv.Close()
+	counter := &bodyCountingTransport{base: srv.Client().Transport}
 	urls := fixedURLs{url: srv.URL + "/part?sig=secret"}
 	tempDir := t.TempDir()
-	tr := &Transfer{HTTP: srv.Client(), URLs: urls, Logger: quietLogger(), TempDir: tempDir}
+	contentDir := filepath.Join(t.TempDir(), "content")
+	tr := &Transfer{HTTP: &http.Client{Transport: counter}, URLs: urls, Logger: quietLogger(), TempDir: tempDir}
 	parts := []*ownsandv1.SnapshotPart{{PartNumber: 1, SizeBytes: int64(len(data)), Sha256: sum[:]}}
-	err := tr.Import(context.Background(), "snap", parts, filepath.Join(t.TempDir(), "content"))
-	if err == nil || strings.Contains(err.Error(), "sig=") {
+	err := tr.Import(context.Background(), "snap", parts, contentDir)
+	if got := counter.bytesRead(); got != delivered {
+		t.Fatalf("client read %d body bytes, want the %d bytes the server sent", got, delivered)
+	}
+	if err == nil {
+		t.Fatal("import of a truncated body succeeded")
+	}
+	if strings.Contains(err.Error(), "sig=") || strings.Contains(err.Error(), srv.URL) {
 		t.Fatalf("err = %v, want a sanitized failure", err)
+	}
+	if !strings.Contains(err.Error(), "download interrupted") {
+		t.Fatalf("err = %v, want a download interruption", err)
+	}
+	for _, path := range []string{contentDir, contentDir + ".importing"} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("import published %s (stat error %v)", path, statErr)
+		}
 	}
 	if names := listDir(t, tempDir); len(names) != 0 {
 		t.Fatalf("import left temporary files %v", names)
 	}
+}
+
+// bodyCountingTransport counts the response body bytes that the client reads.
+type bodyCountingTransport struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	n    int
+}
+
+func (c *bodyCountingTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := c.base.RoundTrip(r)
+	if err != nil {
+		return resp, err
+	}
+	resp.Body = &countingBody{ReadCloser: resp.Body, c: c}
+	return resp, nil
+}
+
+func (c *bodyCountingTransport) bytesRead() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+type countingBody struct {
+	io.ReadCloser
+	c *bodyCountingTransport
+}
+
+func (b *countingBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	b.c.mu.Lock()
+	b.c.n += n
+	b.c.mu.Unlock()
+	return n, err
 }
 
 type fixedURLs struct{ url string }
