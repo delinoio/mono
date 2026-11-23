@@ -6,6 +6,7 @@ package guest
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -230,6 +231,61 @@ while :; do sleep 0.05; done`
 	}
 }
 
+// requireExplicitSuccess reports an error unless ev is an ExecExited event whose
+// status is an explicit exit code of 0 and that did not time out. The
+// scalar getters return zero values for a missing payload, so a failed event
+// or an unset status would otherwise pass a check on GetExitCode() and
+// GetTimedOut().
+func requireExplicitSuccess(ev *ownsandv1.ExecEvent) error {
+	exit, ok := ev.GetEvent().(*ownsandv1.ExecEvent_Exited)
+	if !ok || exit.Exited == nil {
+		return fmt.Errorf("terminal event is not an exit: %v", ev)
+	}
+	code, ok := exit.Exited.GetStatus().(*ownsandv1.ExecExited_ExitCode)
+	if !ok {
+		return fmt.Errorf("exit has no explicit exit code: %v", ev)
+	}
+	if code.ExitCode != 0 || exit.Exited.GetTimedOut() {
+		return fmt.Errorf("exit is not a clean zero exit: %v", ev)
+	}
+	return nil
+}
+
+func TestRequireExplicitSuccess(t *testing.T) {
+	exited := func(x *ownsandv1.ExecExited) *ownsandv1.ExecEvent {
+		return &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Exited{Exited: x}}
+	}
+	code := func(c int64) *ownsandv1.ExecExited_ExitCode {
+		return &ownsandv1.ExecExited_ExitCode{ExitCode: c}
+	}
+	cases := []struct {
+		name string
+		ev   *ownsandv1.ExecEvent
+		ok   bool
+	}{
+		{"failed event", &ownsandv1.ExecEvent{Event: &ownsandv1.ExecEvent_Failed{
+			Failed: &ownsandv1.ExecFailed{Message: "boom"}}}, false},
+		{"nil exit payload", exited(nil), false},
+		{"empty exit", exited(&ownsandv1.ExecExited{}), false},
+		{"signal 15", exited(&ownsandv1.ExecExited{
+			Status: &ownsandv1.ExecExited_Signal{Signal: 15}}), false},
+		{"exit 7", exited(&ownsandv1.ExecExited{Status: code(7)}), false},
+		{"zero with timed_out", exited(&ownsandv1.ExecExited{Status: code(0), TimedOut: true}), false},
+		{"explicit zero", exited(&ownsandv1.ExecExited{Status: code(0)}), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := requireExplicitSuccess(tc.ev)
+			if tc.ok && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatal("expected an error")
+			}
+		})
+	}
+}
+
 func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
 	h := newHarness(t, nil)
 	h.srv.execs.mu.Lock()
@@ -242,9 +298,8 @@ func TestExecNoKillWhenCommandEndsBeforeTimeout(t *testing.T) {
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
 	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
-	ex := evs[len(evs)-1].GetExited()
-	if ex.GetTimedOut() || ex.GetExitCode() != 0 {
-		t.Fatalf("exited %v", ex)
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatal(err)
 	}
 	// Neither the timeout nor the escalation may run for a finished command.
 	time.Sleep(time.Second)
@@ -274,9 +329,8 @@ func TestExecNoTimeoutWhenDescendantHoldsPipeAfterExit(t *testing.T) {
 	})
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
-	ex := evs[len(evs)-1].GetExited()
-	if ex.GetTimedOut() || ex.GetExitCode() != 0 {
-		t.Fatalf("exited %v", ex)
+	if err := requireExplicitSuccess(evs[len(evs)-1]); err != nil {
+		t.Fatal(err)
 	}
 	time.Sleep(500 * time.Millisecond)
 	if !pidRunning(childPid) {
