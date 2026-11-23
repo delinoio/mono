@@ -88,7 +88,12 @@ func (a *app) login(ctx context.Context, args []string) error {
 	if url == "" {
 		url = da.VerificationURI
 	}
-	fmt.Fprintf(a.env.Stderr, "Open %s in a browser and enter the code %s to sign in.\n", a.bold(url), a.bold(da.UserCode))
+	// Without the instructions the user cannot complete the sign-in, so a
+	// failed write (a closed pipe or a full disk) ends the login before any
+	// token polling instead of waiting for a code that nobody can enter.
+	if _, err := fmt.Fprintf(a.env.Stderr, "Open %s in a browser and enter the code %s to sign in.\n", a.bold(url), a.bold(da.UserCode)); err != nil {
+		return fmt.Errorf("write the sign-in instructions: %w", err)
+	}
 	tok, err := cfg.PollToken(ctx, da, a.env.LoginPollInterval)
 	if err != nil {
 		return err
