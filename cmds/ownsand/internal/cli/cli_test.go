@@ -572,6 +572,55 @@ func TestLoginReportsExpiryWithoutLateTokenRequest(t *testing.T) {
 	}
 }
 
+// slowWriter blocks each write for delay, like a terminal that the user does
+// not read yet.
+type slowWriter struct {
+	buf   bytes.Buffer
+	delay time.Duration
+}
+
+func (w *slowWriter) Write(p []byte) (int, error) {
+	time.Sleep(w.delay)
+	return w.buf.Write(p)
+}
+
+// The device code lifetime starts at the device authorization response, so a
+// sign-in prompt write that blocks past the lifetime ends the login with the
+// expiry message, without any token request and without stored credentials.
+func TestLoginCountsPromptWriteTimeAgainstCodeLifetime(t *testing.T) {
+	r := newRunner(t)
+	delete(r.env, ownsand.EnvAPIKey)
+	r.env[EnvLogtoAppID] = "app"
+	var tokenRequests atomic.Int32
+	ls := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch req.URL.Path {
+		case "/oidc/device/auth":
+			fmt.Fprint(w, `{"device_code":"dev-secret","user_code":"ABCD-EFGH","verification_uri":"https://login.example/device","expires_in":1,"interval":0}`)
+		case "/oidc/token":
+			tokenRequests.Add(1)
+			fmt.Fprint(w, `{"access_token":"opaque","refresh_token":"refresh-1","expires_in":3600}`)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer ls.Close()
+	r.env[EnvLogtoEndpoint] = ls.URL
+	var out bytes.Buffer
+	errw := &slowWriter{delay: 1200 * time.Millisecond}
+	code := r.runWriters(&out, errw, "login")
+	stderr := errw.buf.String()
+	if code != ExitError || !strings.Contains(stderr, logto.ErrExpired.Error()) {
+		t.Fatalf("code %d stderr %q", code, stderr)
+	}
+	if n := tokenRequests.Load(); n != 0 {
+		t.Fatalf("%d token requests after the code expired", n)
+	}
+	if _, err := os.Stat(filepath.Join(r.env[EnvConfigDir], credstore.FileName)); !os.IsNotExist(err) {
+		t.Fatalf("the expired login stored credentials: %v", err)
+	}
+}
+
 func TestStoredCredentialsRejectChangedLogtoConfiguration(t *testing.T) {
 	r := newRunner(t)
 	delete(r.env, ownsand.EnvAPIKey)

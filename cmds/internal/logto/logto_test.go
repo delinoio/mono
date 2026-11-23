@@ -226,6 +226,194 @@ func TestPollTokenWithoutExpiresInKeepsPolling(t *testing.T) {
 	}
 }
 
+// StartDeviceAuthorization records the local expiry deadline relative to the
+// time of the response: expires_in seconds later, or 10 minutes later when
+// expires_in is not positive.
+func TestStartDeviceAuthorizationRecordsResponseRelativeDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		expiresIn int
+		lifetime  time.Duration
+	}{
+		{"positive", 90, 90 * time.Second},
+		{"missing", 0, 10 * time.Minute},
+		{"negative", -5, 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				fmt.Fprintf(w, `{"device_code":"d","user_code":"u","verification_uri":"https://login.example","expires_in":%d}`, tc.expiresIn)
+			}))
+			defer srv.Close()
+			before := time.Now()
+			da, err := Config{Endpoint: srv.URL, AppID: "app"}.StartDeviceAuthorization(context.Background())
+			after := time.Now()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if da.ExpiresAt.Before(before.Add(tc.lifetime)) || da.ExpiresAt.After(after.Add(tc.lifetime)) {
+				t.Fatalf("ExpiresAt %v, want between %v and %v", da.ExpiresAt, before.Add(tc.lifetime), after.Add(tc.lifetime))
+			}
+		})
+	}
+}
+
+// A device authorization whose deadline passed before the polling started
+// returns ErrExpired at once and sends no token request.
+func TestPollTokenAlreadyExpiredSendsNoRequest(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		fmt.Fprint(w, `{"access_token":"a","refresh_token":"r","expires_in":60}`)
+	}))
+	defer srv.Close()
+	cfg := Config{Endpoint: srv.URL, AppID: "app"}
+	start := time.Now()
+	da := &DeviceAuthorization{DeviceCode: "d", ExpiresIn: 60, ExpiresAt: time.Now().Add(-time.Second)}
+	_, err := cfg.PollToken(context.Background(), da, time.Millisecond)
+	if !errors.Is(err, ErrExpired) {
+		t.Fatalf("got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("returned after %v, want at once", elapsed)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("%d token requests for an expired authorization", n)
+	}
+}
+
+// Time that passes between the device authorization response and the start of
+// the polling (the caller blocks while it writes the sign-in prompt) counts
+// against the code lifetime.
+func TestPollTokenCountsTimeSinceAuthorizationResponse(t *testing.T) {
+	var tokenRequests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/oidc/device/auth" {
+			fmt.Fprint(w, `{"device_code":"d","user_code":"u","verification_uri":"https://login.example","expires_in":1,"interval":0}`)
+			return
+		}
+		tokenRequests.Add(1)
+		fmt.Fprint(w, `{"access_token":"a","refresh_token":"r","expires_in":60}`)
+	}))
+	defer srv.Close()
+	cfg := Config{Endpoint: srv.URL, AppID: "app"}
+	da, err := cfg.StartDeviceAuthorization(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The code lives 1 second; the caller is blocked for longer.
+	time.Sleep(1200 * time.Millisecond)
+	start := time.Now()
+	_, err = cfg.PollToken(context.Background(), da, time.Millisecond)
+	if !errors.Is(err, ErrExpired) {
+		t.Fatalf("got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("returned after %v, want at once", elapsed)
+	}
+	if n := tokenRequests.Load(); n != 0 {
+		t.Fatalf("%d token requests after the code expired", n)
+	}
+}
+
+// The response-relative deadline cancels a token request that is still in
+// flight, even though the polling started well before it.
+func TestPollTokenCancelsPendingRequestAtResponseRelativeDeadline(t *testing.T) {
+	started := make(chan struct{}, 1)
+	cancelled := make(chan struct{}, 1)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		started <- struct{}{}
+		select {
+		case <-r.Context().Done():
+			cancelled <- struct{}{}
+		case <-release:
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	cfg := Config{Endpoint: srv.URL, AppID: "app"}
+	start := time.Now()
+	// The authorization response arrived 2 seconds ago; the code lives 3.
+	da := &DeviceAuthorization{DeviceCode: "d", ExpiresIn: 3, ExpiresAt: start.Add(time.Second)}
+	_, err := cfg.PollToken(context.Background(), da, 10*time.Millisecond)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrExpired) {
+		t.Fatalf("got %v", err)
+	}
+	if elapsed < 900*time.Millisecond || elapsed > expiryUpperBound {
+		t.Fatalf("expired after %v, want about 1s", elapsed)
+	}
+	select {
+	case <-started:
+	default:
+		t.Fatal("the token request never started")
+	}
+	select {
+	case <-cancelled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the pending token request was not cancelled")
+	}
+}
+
+// An earlier cancellation or deadline of the caller still returns the caller
+// error, also when the authorization is already expired or a deadline is set.
+func TestPollTokenCallerEndsWinOverResponseRelativeDeadline(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprint(w, `{"error":"authorization_pending"}`)
+	}))
+	defer srv.Close()
+	cfg := Config{Endpoint: srv.URL, AppID: "app"}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		at   time.Time
+		want error
+	}{
+		{"cancelled before an expired deadline", cancelled, time.Now().Add(-time.Second), context.Canceled},
+		{"cancelled before a future deadline", cancelled, time.Now().Add(time.Minute), context.Canceled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := cfg.PollToken(tc.ctx, &DeviceAuthorization{DeviceCode: "d", ExpiresIn: 60, ExpiresAt: tc.at}, time.Millisecond)
+			if !errors.Is(err, tc.want) || errors.Is(err, ErrExpired) {
+				t.Fatalf("got %v, want %v", err, tc.want)
+			}
+		})
+	}
+	t.Run("caller deadline before the code deadline", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+		_, err := cfg.PollToken(ctx, &DeviceAuthorization{DeviceCode: "d", ExpiresIn: 60, ExpiresAt: time.Now().Add(time.Minute)}, 10*time.Millisecond)
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrExpired) {
+			t.Fatalf("got %v, want the caller deadline", err)
+		}
+	})
+}
+
+// A device grant that succeeds before the response-relative deadline returns
+// the token, and the caller context stays usable afterwards.
+func TestPollTokenSucceedsBeforeResponseRelativeDeadline(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"access_token":"a","refresh_token":"r","expires_in":60}`)
+	}))
+	defer srv.Close()
+	cfg := Config{Endpoint: srv.URL, AppID: "app"}
+	ctx := context.Background()
+	da := &DeviceAuthorization{DeviceCode: "d", ExpiresIn: 60, ExpiresAt: time.Now().Add(time.Minute)}
+	tok, err := cfg.PollToken(ctx, da, time.Millisecond)
+	if err != nil || tok.RefreshToken != "r" {
+		t.Fatalf("got %+v, %v", tok, err)
+	}
+	if _, err := cfg.Refresh(ctx, tok.RefreshToken); err != nil {
+		t.Fatalf("the refresh grant after the device grant failed: %v", err)
+	}
+}
+
 func TestErrorsNeverContainTokens(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
