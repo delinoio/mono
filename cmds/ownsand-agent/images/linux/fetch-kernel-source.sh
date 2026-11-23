@@ -17,10 +17,11 @@
 #   leaves the published path (and any valid archive there) untouched.
 # - A directory at the archive path is an error that the helper never fixes:
 #   it exits non-zero, names the path and leaves the directory, its contents
-#   and the rest of the cache untouched. The final rename uses mv -T (GNU
-#   coreutils, which the Debian build container provides) so that a directory
-#   that appears after the check also fails the rename; a plain mv would move
-#   the archive into the directory and report success.
+#   and the rest of the cache untouched. A directory that appears after the
+#   check is caught after the final rename: a plain mv then moved the archive
+#   into the directory, so the helper removes that copy again and fails. It
+#   avoids mv -T, which only GNU coreutils supports (the BSD mv of macOS
+#   hosts, where the tests also run, rejects it).
 #
 # The helper needs no lock: concurrent fills each publish a verified archive
 # with identical content. A lock would not help either, because flock is
@@ -71,8 +72,15 @@ if ! verify "$tmp"; then
 fi
 # mktemp creates the file with mode 0600; a published archive is readable.
 chmod 0644 "$tmp"
-# -T treats $archive as the destination file and never as a directory to move
-# $tmp into; the rename fails when a directory appeared there since the check
-# above, and the EXIT trap then removes $tmp.
-mv -f -T "$tmp" "$archive"
+# When a directory appeared at $archive since the check above, mv moves $tmp
+# into it under its own name instead of replacing it. Portable mv has no
+# option to refuse that (-T is GNU only), so detect it afterwards, remove the
+# copy the move left in the directory and fail. The directory ends up as it
+# was before.
+mv -f "$tmp" "$archive"
+if [ -d "$archive" ]; then
+  rm -f "$archive/${tmp##*/}"
+  echo "the kernel source path $archive became a directory; remove it and run the build again" >&2
+  exit 1
+fi
 echo "cached the kernel source $archive" >&2
