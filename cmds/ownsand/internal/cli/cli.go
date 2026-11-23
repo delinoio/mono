@@ -46,7 +46,10 @@ const (
 	ExitSandboxEnded    = 125
 	ExitCommandNotStart = 127
 	ExitSignalBase      = 128
-	ExitDataPath        = 255
+	// ExitInterrupted is the status of a command that an interrupt (Ctrl-C)
+	// ended: 128 plus SIGINT.
+	ExitInterrupted = 130
+	ExitDataPath    = 255
 )
 
 // Format is the output format.

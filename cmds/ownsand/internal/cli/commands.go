@@ -410,7 +410,10 @@ func (a *app) memberAccept(ctx context.Context, name string, args []string) erro
 	if _, err := a.positional(fs, args); err != nil {
 		return err
 	}
-	var r io.Reader = a.env.Stdin
+	// Standard input can block without data, for example on a terminal, and a
+	// blocked read cannot observe ctx: read it through a reader that returns
+	// when an interrupt cancels ctx.
+	var r io.Reader = newCtxReader(ctx, a.env.Stdin)
 	if *secretFile != "" {
 		f, err := os.Open(*secretFile)
 		if err != nil {
@@ -421,6 +424,9 @@ func (a *app) memberAccept(ctx context.Context, name string, args []string) erro
 	}
 	line, err := bufio.NewReader(io.LimitReader(r, 4096)).ReadString('\n')
 	if err != nil && err != io.EOF {
+		if ctx.Err() != nil {
+			return &exitError{code: ExitInterrupted, msg: "interrupted"}
+		}
 		return fmt.Errorf("read the invitation secret: %w", err)
 	}
 	secret := strings.TrimSpace(line)
