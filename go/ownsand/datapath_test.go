@@ -528,9 +528,7 @@ var heldOps = []heldOp{
 			_, err := s.ReadFileBytes(context.Background(), "/f")
 			out <- err
 		}()
-		if got := <-cp.agentHits; got != "read" {
-			t.Fatalf("agent gate %q", got)
-		}
+		requireAgentGate(t, "read", "read", cp.agentHits, out)
 		return out
 	}},
 	{"write", func(t *testing.T, cp *fakeCP, s *Sandbox) <-chan error {
@@ -538,9 +536,7 @@ var heldOps = []heldOp{
 		cp.agentHits = make(chan string, 4)
 		out := make(chan error, 1)
 		go func() { out <- s.WriteFileBytes(context.Background(), "/f", []byte("data"), WriteOptions{}) }()
-		if got := <-cp.agentHits; got != "write" {
-			t.Fatalf("agent gate %q", got)
-		}
+		requireAgentGate(t, "write", "write", cp.agentHits, out)
 		return out
 	}},
 }
