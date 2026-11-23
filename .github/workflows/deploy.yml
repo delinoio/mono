@@ -571,9 +571,14 @@ jobs:
     # Also when no cgo build ran.
     if: ${{ !cancelled() && !failure() && needs.plan.outputs.has_darwin_binaries == 'true' }}
     runs-on: macos-15
-    # Notarization usually takes minutes; notarytool waits up to 45 minutes
-    # for each executable.
-    timeout-minutes: 60
+    # Notarization usually takes minutes, but the job notarizes the darwin
+    # executables one after another and notarytool waits up to 45 minutes
+    # for each of them. The limit is the number of darwin assets of all
+    # release binaries (5: ownsand 2, ownsand-agent 1, tide 2) times 45
+    # minutes, plus 15 minutes for the setup, the signing and the checks.
+    # Raise it with every added darwin platform;
+    # scripts/ci/deploy-signing-budget.test.mjs enforces the sum.
+    timeout-minutes: 240
     environment: releases
     # Only the Apple signing and notary secrets reach this job. It runs no
     # build: it signs the downloaded executables with Apple's tools.
