@@ -4,7 +4,7 @@
 
 tide runs GitHub Actions jobs, coding-agent sessions and dev sessions on one shared pool of devices that a team already owns. The devices are the devices of an [OwnSand](project-ownsand.md) organization. tide gives every job and every session a fresh OwnSand sandbox, and deletes the sandbox when the work ends.
 
-Problem: a small team has only a few devices. Existing products run either CI jobs or agent sessions on the team's machines, never both. When a team splits its few devices into "CI devices" and "agent devices", one group often waits while the other group is idle. On a Mac this is worse, because one Mac runs at most two macOS guests at the same time. tide keeps one queue for both kinds of work, so every request can use every free device.
+Problem: a small team has only a few devices. Existing products run either CI jobs or agent sessions on the team's machines, never both. When a team splits its few devices into "CI devices" and "agent devices", one group often waits while the other group is idle. On a Mac this is worse, because one Mac runs at most two macOS guests at the same time. tide keeps one queue for CI jobs and agent sessions, so every request can use every free device.
 
 tide also lets a coding agent develop across platforms. An agent that works on one machine (for example, Claude Code or OpenAI Codex on a Linux machine) uses the `tide mcp` MCP server to create a dev session with another guest OS (for example, Windows or macOS), copy its local working tree into the session, run builds and tests there, and download the results. Dev sessions use the same queue and the same devices as the other work.
 
@@ -74,7 +74,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 
 ### Scheduling
 
-- tide keeps one queue per tide organization for both workload kinds.
+- tide keeps one queue per tide organization for all three workload kinds (`GITHUB_JOB`, `AGENT_SESSION` and `DEV_SESSION`). Each request waits in it with the priority and maximum queue wait of its runner profile.
 - Priorities use the enum `Priority`: `HIGH`, `NORMAL` and `LOW`. A new `GITHUB_JOB` runner profile has `HIGH`, and a new `AGENT_SESSION` or `DEV_SESSION` runner profile has `NORMAL`. An admin can change the priority of each runner profile.
 - tide does not preempt work in this version. It never stops, pauses or deletes a runner that serves a request in order to free capacity. tide frees capacity only by deleting warm runners.
 - tide uses the vCPU overcommit of OwnSand devices and does not overcommit on its own.
