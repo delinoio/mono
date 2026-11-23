@@ -96,6 +96,22 @@ func assetName(binary string, p Platform) string {
 // target: MAJOR.MINOR.PATCH without a prefix or a pre-release suffix.
 var releaseVersion = regexp.MustCompile(`^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`)
 
+// checkReleaseVersion reports whether v is a release version the agent can
+// use as an update target. The spelling check alone accepts a component such
+// as 9223372036854775808 that the agent's semver parser rejects as too large,
+// so a manifest with such a version would pass the tool and then fail every
+// comparison. The regular expression is stricter than semver.Parse (which also
+// accepts a "v" prefix and a pre-release suffix), so both checks are needed.
+func checkReleaseVersion(v string) error {
+	if !releaseVersion.MatchString(v) {
+		return fmt.Errorf("release version %q is not MAJOR.MINOR.PATCH", v)
+	}
+	if _, err := semver.Parse(v); err != nil {
+		return fmt.Errorf("release version %q: %w", v, err)
+	}
+	return nil
+}
+
 var binaryName = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
 
 var sha256Hex = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -135,8 +151,8 @@ func (m *manifest) validate() error {
 	}
 	seen := map[string]bool{}
 	for _, r := range m.Releases {
-		if !releaseVersion.MatchString(r.Version) {
-			return fmt.Errorf("release version %q is not MAJOR.MINOR.PATCH", r.Version)
+		if err := checkReleaseVersion(r.Version); err != nil {
+			return err
 		}
 		if seen[r.Version] {
 			return fmt.Errorf("release %s is listed twice", r.Version)
@@ -209,8 +225,8 @@ type releaseInput struct {
 // newRelease builds the release entry: the SHA-256 and download URL of the
 // executable of every platform.
 func newRelease(in releaseInput) (release, error) {
-	if !releaseVersion.MatchString(in.Version) {
-		return release{}, fmt.Errorf("version %q is not MAJOR.MINOR.PATCH", in.Version)
+	if err := checkReleaseVersion(in.Version); err != nil {
+		return release{}, err
 	}
 	if !binaryName.MatchString(in.Binary) {
 		return release{}, fmt.Errorf("binary name %q is not a lowercase kebab-case name", in.Binary)
