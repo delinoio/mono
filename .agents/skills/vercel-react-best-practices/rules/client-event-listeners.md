@@ -38,15 +38,19 @@ const keyCallbacks = new Map<string, Set<() => void>>()
 function useKeyboardShortcut(key: string, callback: () => void) {
   // Register this callback in the Map
   useEffect(() => {
+    // A Set stores one entry per function reference, so wrap the callback:
+    // consumers that share a function still get their own registration
+    const registration = () => callback()
+
     if (!keyCallbacks.has(key)) {
       keyCallbacks.set(key, new Set())
     }
-    keyCallbacks.get(key)!.add(callback)
+    keyCallbacks.get(key)!.add(registration)
 
     return () => {
       const set = keyCallbacks.get(key)
       if (set) {
-        set.delete(callback)
+        set.delete(registration)
         if (set.size === 0) {
           keyCallbacks.delete(key)
         }
