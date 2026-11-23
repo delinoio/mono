@@ -11,6 +11,7 @@ package testenv
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +24,7 @@ import (
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/protos/delino/tide/v1/tidev1connect"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent/claude"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/auth"
@@ -129,6 +131,13 @@ func WithLayerOptions(opts layers.Options, out *layers.Layers) Option {
 	if opts.WorkTiming == nil {
 		t := FastWorkTiming()
 		opts.WorkTiming = &t
+	}
+	if opts.Claude.Start == nil {
+		// Tests never start a real claude binary; Claude Code tests pass
+		// the claudefake orchestrator.
+		opts.Claude.Start = func(claude.ProcessSpec) (claude.Process, error) {
+			return nil, errors.New("no Claude Code orchestrator in this test")
+		}
 	}
 	return func(o *app.Options) {
 		o.Extensions = append(o.Extensions, layers.Extensions(opts, out)...)

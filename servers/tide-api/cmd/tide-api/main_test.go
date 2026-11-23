@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
@@ -59,5 +60,22 @@ func TestServerClosesConnectionWithBlockedWrites(t *testing.T) {
 	srv := newServer(http.NotFoundHandler(), slog.New(slog.NewJSONHandler(io.Discard, nil)))
 	if srv.HTTP2 == nil || srv.HTTP2.WriteByteTimeout != writeByteTimeout || writeByteTimeout <= 0 {
 		t.Fatalf("HTTP2 config = %+v, want WriteByteTimeout %v", srv.HTTP2, writeByteTimeout)
+	}
+}
+
+// TestHookMode: the binary is the spawn-runner hook under the hook name
+// (the link in the hooks directory) or with it as the first argument.
+func TestHookMode(t *testing.T) {
+	for args, want := range map[string]bool{
+		"/tmp/tc1/hooks/spawn-runner":            true,
+		"/usr/local/bin/tide-api spawn-runner":   true,
+		"/usr/local/bin/tide-api":                false,
+		"/usr/local/bin/tide-api serve --x=y":    false,
+		"spawn-runner-other":                     false,
+		"/usr/local/bin/tide-api x spawn-runner": false,
+	} {
+		if got := hookMode(strings.Fields(args)); got != want {
+			t.Errorf("%q: %v", args, got)
+		}
 	}
 }

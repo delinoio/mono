@@ -39,6 +39,11 @@ enum AgentCredential {
   AGENT_CREDENTIAL_API_TOKEN = 4;
   // DEVIN.
   AGENT_CREDENTIAL_OUTPOST_TOKEN = 5;
+  // OPENAI_CODEX: an OpenAI API key of the project with `api.agents.read`.
+  // tide reads the session of an `agent.session.action_required` webhook
+  // with it, because the webhook carries no environment ID or remote URL.
+  // It never enters a runner.
+  AGENT_CREDENTIAL_API_KEY = 6;
 }
 
 message ClaudeCodeSettings {}
@@ -69,6 +74,9 @@ message CursorCredentials {
 message OpenAiCodexCredentials {
   string environment_key = 1;
   string webhook_secret = 2;
+  // An OpenAI API key of the project with `api.agents.read`. It stays in
+  // tide.
+  string api_key = 3;
 }
 
 // Credentials of a DEVIN integration. Secrets: never log.

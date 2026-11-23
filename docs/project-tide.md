@@ -124,10 +124,10 @@ The project has one hosted server deployable (the control plane on the shared Di
 ### Platform and vendor constraints
 
 - GitHub: only github.com and GitHub Enterprise Cloud organizations. tide registers organization-level runners only, so repositories of personal accounts and GitHub Enterprise Server are out of scope.
-- Claude Code self-hosted runners run on Linux and macOS, not on Windows. Self-hosted environments are a beta feature of the Claude Team and Enterprise plans.
+- Claude Code self-hosted runners run on Linux and macOS, not on Windows. Self-hosted environments are a beta feature of the Claude Team and Enterprise plans. A Claude Code work order is single-use and expires with its spawn request, so tide hands it to at most one runner and does not keep a request in the queue after the work order expired; Anthropic then sends a new spawn request ([control plane contract](servers-tide-api-foundation.md#claude-code)).
 - Cursor Self-Hosted Pools need a Cursor Enterprise plan and a service account API key.
 - Devin Outposts need a Devin plan that includes Outposts.
-- OpenAI Codex self-hosted sandboxes need an OpenAI environment key and an OpenAI webhook for the project.
+- OpenAI Codex self-hosted sandboxes need an OpenAI environment key, an OpenAI webhook for the project and an OpenAI API key of the project with `api.agents.read`: the webhook carries only the session ID, so tide reads the session's environment with that key. The API key and the webhook secret stay in tide; only the environment key enters a runner.
 - macOS guests need an Apple silicon device, and one Mac runs at most two macOS guests at the same time. The OwnSand scheduler enforces this limit for tide too.
 - Delino distributes no macOS or Windows image. Runner profiles use OwnSand base images or OwnSand templates that the organization builds.
 
@@ -136,7 +136,7 @@ The project has one hosted server deployable (the control plane on the shared Di
 The owning domain contracts hold the details:
 
 - Metrics: the default retention of the Grafana Cloud plan, one tide dashboard committed as Grafana dashboard JSON, and Grafana Cloud alerts to the operators' contact point ([control plane contract](servers-tide-api-foundation.md#metrics)).
-- Runner programs: tide installs them on Linux, macOS and Windows guests. It pins the GitHub Actions runner, `codex` and Node.js, and Renovate updates the pins. It installs `claude`, Cursor `agent` and `devin` at the version of the official installer, with a minimum version only for `claude` ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
+- Runner programs: tide installs them on the guest OSes that each workload kind and vendor allows (Linux, macOS and Windows; Claude Code and OpenAI Codex on Linux and macOS only). It pins the GitHub Actions runner, `codex` and Node.js, and Renovate updates the pins. It installs `claude`, Cursor `agent` and `devin` at the version of the official installer, with a minimum version only for `claude` ([control plane contract](servers-tide-api-foundation.md#runner-installation)).
 - Storage: ended requests and runners are kept for 30 days and audit events for 90 days, the migration tool is goose, and the backups are the PlanetScale Postgres defaults ([control plane contract](servers-tide-api-foundation.md#storage)).
 - Rate limits: the same values as OwnSand ([control plane contract](servers-tide-api-foundation.md#security)).
 - TypeScript SDK package: the workspace package `tide-sdk` is private and unpublished, like `ownsand-sdk` ([SDK contract](packages-tide-sdk-foundation.md#dependencies-and-integrations)).

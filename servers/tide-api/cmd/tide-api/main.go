@@ -2,6 +2,13 @@
 
 // Command tide-api serves the tide control plane. The owning contract is
 // docs/servers-tide-api-foundation.md.
+//
+// The same binary is the spawn-runner hook of the Claude Code
+// orchestrators that the lease holder runs: started under the name
+// spawn-runner (the hooks directory links it) or as
+// `tide-api spawn-runner`, it sends the orchestrator's spawn request to
+// the parent process over the hook socket and exits with the code of the
+// spawn-runner contract (package agent/claude).
 package main
 
 import (
@@ -12,11 +19,13 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/delinoio/mono/servers/internal/telemetry"
+	"github.com/delinoio/mono/servers/tide-api/internal/agent/claude"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
 	"github.com/delinoio/mono/servers/tide-api/internal/auth"
 	"github.com/delinoio/mono/servers/tide-api/internal/config"
@@ -44,11 +53,19 @@ const (
 )
 
 func main() {
+	if hookMode(os.Args) {
+		os.Exit(claude.RunHook(os.Getenv, os.Args[0], os.Stderr))
+	}
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(); err != nil {
 		slog.Error("server_exited", slog.Any("error", err))
 		os.Exit(1)
 	}
+}
+
+// hookMode reports whether the process is the spawn-runner hook.
+func hookMode(args []string) bool {
+	return len(args) > 0 && (filepath.Base(args[0]) == claude.HookName || len(args) > 1 && args[1] == claude.HookName)
 }
 
 func run() error {

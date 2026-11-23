@@ -41,7 +41,8 @@ func TestStartScriptPOSIX(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := Program{Dir: dir, CredentialEnv: "TIDE_TEST_KEY", Env: [][2]string{{"TIDE_TEST_WORKER", "tide-1"}},
-		Args: []string{"/bin/sh", "-c", `printf '%s|%s|%s|%s' "$TIDE_TEST_KEY" "$TIDE_TEST_WORKER" "$1" "$(pwd)"`, "x", "arg 'with' quotes", HomeArg}}
+		Args: []string{"/bin/sh", "-c", `printf '%s|%s|%s|%s|%s' "$TIDE_TEST_KEY" "$TIDE_TEST_WORKER" "$1" "$(pwd)" "$3"`, "x", "arg 'with' quotes", HomeArg,
+			HomeArg + "/sub dir"}}
 	script := StartScript(linux, p)
 	if strings.Contains(script, "s3cr") {
 		t.Fatal("the script contains the credential")
@@ -55,7 +56,7 @@ func TestStartScriptPOSIX(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(log) != "s3cr'et value|tide-1|arg 'with' quotes|"+home {
+	if string(log) != "s3cr'et value|tide-1|arg 'with' quotes|"+home+"|"+home+"/sub dir" {
 		t.Fatalf("log %q", log)
 	}
 	if _, err := os.Stat(filepath.Join(dir, CredentialFile)); !os.IsNotExist(err) {
@@ -71,12 +72,12 @@ func TestStartScriptPOSIX(t *testing.T) {
 
 func TestStartScriptWindows(t *testing.T) {
 	s := StartScript(windows, Program{Dir: `C:\ProgramData\tide\runners\r1`, CredentialEnv: "CURSOR_API_KEY", Env: [][2]string{{"CURSOR_AGENT_WORKER_ID", "tide-1"}},
-		Args: []string{"agent", "worker", "--pool", "it's", "--worker-dir", HomeArg, "start"}})
+		Args: []string{"agent", "worker", "--pool", "it's", "--worker-dir", HomeArg, "--base", HomeArg + `\w`, "start"}})
 	for _, want := range []string{
 		`$env:CURSOR_API_KEY = [IO.File]::ReadAllText('C:\ProgramData\tide\runners\r1\credential')`,
 		`Remove-Item -Force -LiteralPath 'C:\ProgramData\tide\runners\r1\credential'`,
 		`$env:CURSOR_AGENT_WORKER_ID = 'tide-1'`,
-		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE 'start' *>> 'C:\ProgramData\tide\runners\r1\runner.log'`,
+		`& 'agent' 'worker' '--pool' 'it''s' '--worker-dir' $env:USERPROFILE '--base' ($env:USERPROFILE + '\w') 'start' *>> 'C:\ProgramData\tide\runners\r1\runner.log'`,
 		"exit $LASTEXITCODE",
 	} {
 		if !strings.Contains(s, want) {

@@ -109,12 +109,14 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 
 `AgentIntegration` has `agent_integration_id`, `vendor`, `name`, a vendor settings `oneof` and the credential state: one `AgentCredentialState` (`AgentCredential`, `credential_set` and `credential_set_at`) for each credential of the vendor. Create and update requests carry the credentials in a vendor credentials `oneof`; `UpdateAgentIntegration` uses a field mask with the paths `name`, `settings` and `credentials`, and replaces only the non-empty credential fields. The settings and credentials per vendor:
 
-| Vendor         | Settings       | Credentials                         |
-| -------------- | -------------- | ----------------------------------- |
-| `CLAUDE_CODE`  | none           | `environment_key`                   |
-| `CURSOR`       | `pool_name`    | `service_account_api_key`           |
-| `OPENAI_CODEX` | none           | `environment_key`, `webhook_secret` |
-| `DEVIN`        | `outpost_name` | `api_token`, `outpost_token`        |
+| Vendor         | Settings       | Credentials                                    |
+| -------------- | -------------- | ---------------------------------------------- |
+| `CLAUDE_CODE`  | none           | `environment_key`                              |
+| `CURSOR`       | `pool_name`    | `service_account_api_key`                      |
+| `OPENAI_CODEX` | none           | `environment_key`, `webhook_secret`, `api_key` |
+| `DEVIN`        | `outpost_name` | `api_token`, `outpost_token`                   |
+
+- `OPENAI_CODEX` `api_key` (`AgentCredential` `API_KEY`, field 3 of `OpenAiCodexCredentials`) is an OpenAI API key of the project with the `api.agents.read` permission. The OpenAI `agent.session.action_required` webhook carries only the session ID and the action type, so `tide-api` reads the session's environment ID and remote URL with this key; the key stays in tide. The field and the enum value are additive changes of `v1`.
 
 ### Personal API key and dev session messages
 
@@ -150,7 +152,7 @@ The control plane serves every public service at `https://tide.api.delino.io`. E
 | `OwnSandLinkState`        | `ACTIVE`, `INVALID`                                                                                                                                                                                                                       |
 | `GitHubInstallationState` | `ACTIVE`, `SUSPENDED`, `DELETED`                                                                                                                                                                                                          |
 | `ApiKeyState`             | `ACTIVE`, `EXPIRED`, `REVOKED`                                                                                                                                                                                                            |
-| `AgentCredential`         | `ENVIRONMENT_KEY`, `SERVICE_ACCOUNT_API_KEY`, `WEBHOOK_SECRET`, `API_TOKEN`, `OUTPOST_TOKEN`                                                                                                                                              |
+| `AgentCredential`         | `ENVIRONMENT_KEY`, `SERVICE_ACCOUNT_API_KEY`, `WEBHOOK_SECRET`, `API_TOKEN`, `OUTPOST_TOKEN`, `API_KEY`                                                                                                                                   |
 | `NetworkMode`             | `OUTBOUND`                                                                                                                                                                                                                                |
 | `InvitationState`         | `PENDING`, `ACCEPTED`, `REVOKED`, `EXPIRED`                                                                                                                                                                                               |
 | `DeviceState`             | `ONLINE`, `OFFLINE`                                                                                                                                                                                                                       |

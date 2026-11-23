@@ -6,7 +6,7 @@
 // Agent integrations, Cursor and Devin, Runner lifecycle and Runner
 // installation sections of docs/servers-tide-api-foundation.md.
 //
-// Building blocks (a later Claude Code or OpenAI Codex layer reuses them):
+// Building blocks (the vendor layers share them):
 //
 //   - The Hub registers the AGENT_SESSION adapter and asks the Vendor of a
 //     request (by work.Source) or of a profile (by the vendor of its agent
@@ -24,6 +24,12 @@
 //     released by Adapter.ReleaseClaim at once and by the claim poller until
 //     the vendor confirms; the poller also reports runners as BUSY when the
 //     vendor says that the runner program took its session.
+//   - Pushed demand (direct.go): a vendor that pushes its demand to tide
+//     (the Claude Code spawn-runner hook, OpenAI webhooks) creates the
+//     request and its claim row with CreateDirectTx in its own
+//     transaction, without a claim at the vendor; optional interfaces let
+//     a vendor skip the watcher (Pusher), count its own restarts
+//     (Restarter) and map a sandbox end (SandboxEnder).
 //   - Guest helpers (guest.go): a runner directory that only the guest user
 //     reads, the credential file, install scripts and the runner program
 //     start with its output in a guest log file.
@@ -40,6 +46,7 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"github.com/delinoio/mono/go/ownsand"
+	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
 	"github.com/delinoio/mono/servers/tide-api/internal/api"
 	"github.com/delinoio/mono/servers/tide-api/internal/app"
@@ -253,6 +260,20 @@ func (*Adapter) ProgramExited(_ *work.Request, res *ownsand.ExecResult) (work.Re
 		return work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_ENDED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_COMPLETED}, false
 	}
 	return work.RequestEnd{State: tidev1.RequestState_REQUEST_STATE_FAILED, Reason: tidev1.RequestEndReason_REQUEST_END_REASON_RUNNER_LOST}, false
+}
+
+// SandboxEnded asks the request's vendor (SandboxEnder) and otherwise
+// keeps the default: the runner FAILED and the request FAILED with
+// RUNNER_LOST.
+func (a *Adapter) SandboxEnded(req *work.Request, reason ownsandv1.SandboxEndReason) work.SandboxOutcome {
+	if req != nil {
+		if se, ok := a.h.bySource[req.Source].(SandboxEnder); ok {
+			if out, ok := se.SandboxEnded(req, reason); ok {
+				return out
+			}
+		}
+	}
+	return work.BaseAdapter{}.SandboxEnded(req, reason)
 }
 
 // ReleaseClaim releases the vendor claim of a request that tide ended

@@ -3,6 +3,7 @@
 package profile
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -123,7 +124,8 @@ func TestAgentGuestOSes(t *testing.T) {
 		{tidev1.AgentVendor_AGENT_VENDOR_DEVIN, linux, true},
 		{tidev1.AgentVendor_AGENT_VENDOR_DEVIN, macos, true},
 		{tidev1.AgentVendor_AGENT_VENDOR_DEVIN, windows, true},
-		// Interim rule: no guest OS is verified for Codex yet.
+		// Interim rule: no guest OS is verified for Codex yet, although the
+		// adapter has scripts for the candidates.
 		{tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, linux, false},
 		{tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, macos, false},
 		{tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, windows, false},
@@ -136,19 +138,20 @@ func TestAgentGuestOSes(t *testing.T) {
 }
 
 func TestCodexQueueWait(t *testing.T) {
-	old := VerifiedCodexGuestOSes
-	VerifiedCodexGuestOSes = []tidev1.GuestOs{linux}
-	defer func() { VerifiedCodexGuestOSes = old }()
+	rules := Rules{CodexGuestOSes: []tidev1.GuestOs{linux}}
 	p := agentProfile(linux)
 	p.MaxQueueWait = 5 * time.Minute
-	if err := Validate(p, tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX); err != nil {
+	if err := rules.Validate(p, tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX); err != nil {
 		t.Fatal(err)
 	}
+	if err := rules.Validate(agentProfile(macos), tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX); connect.CodeOf(err) != connect.CodeInvalidArgument {
+		t.Fatalf("a guest OS outside the rules: %v", err)
+	}
 	p.MaxQueueWait = 5*time.Minute + time.Second
-	if err := Validate(p, tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX); connect.CodeOf(err) != connect.CodeInvalidArgument {
+	if err := rules.Validate(p, tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX); connect.CodeOf(err) != connect.CodeInvalidArgument {
 		t.Fatalf("over 5 minutes: %v", err)
 	}
-	if err := Validate(p, tidev1.AgentVendor_AGENT_VENDOR_CURSOR); err != nil {
+	if err := rules.Validate(p, tidev1.AgentVendor_AGENT_VENDOR_CURSOR); err != nil {
 		t.Fatalf("other vendors allow more: %v", err)
 	}
 }
@@ -178,6 +181,16 @@ func TestWorkspacePaths(t *testing.T) {
 	} {
 		if got := ValidWorkspacePath(tc.guest, tc.path); got != tc.ok {
 			t.Errorf("%v %q = %v", tc.guest, tc.path, got)
+		}
+	}
+}
+
+// TestCodexVerifiedSubset: a verified Codex guest OS must be one for which
+// the adapter has scripts.
+func TestCodexVerifiedSubset(t *testing.T) {
+	for _, g := range VerifiedCodexGuestOSes {
+		if !slices.Contains(CodexCandidateGuestOSes, g) {
+			t.Errorf("%v is verified but has no Codex scripts", g)
 		}
 	}
 }

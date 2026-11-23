@@ -131,6 +131,11 @@ func (e *Engine) cleanUpRunners(ctx context.Context, orgID string, match func(*R
 		}
 		if r.State != runDeleting {
 			if _, err := e.deleteRunner(ctx, orgID, r.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_CLEAN_UP, DeleteCleanUp); err != nil {
+				if isCode(err, connect.CodeNotFound) {
+					// The dispatcher removed a runner whose sandbox
+					// OwnSand never created (no capacity) after the list.
+					continue
+				}
 				errs = append(errs, err)
 				continue
 			}

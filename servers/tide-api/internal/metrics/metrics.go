@@ -31,6 +31,8 @@ type Metrics struct {
 	// webhookDeliveries is tide_webhook_deliveries_total.
 	webhookDeliveries metric.Int64Counter
 	vendorWatch       metric.Int64Counter
+	// claudeRestarts is tide_claude_orchestrator_restarts_total.
+	claudeRestarts metric.Int64Counter
 }
 
 // New creates the instruments with provider; nil selects a no-op provider.
@@ -52,6 +54,7 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 	m.webhookDeliveries = counter("tide_webhook_deliveries", "Webhook deliveries by sender and result.")
 	m.transferBytes = counter("tide_dev_session_transfer_bytes", "File bytes that tide-api relays for dev sessions, by direction and guest OS.")
 	m.vendorWatch = counter("tide_vendor_watch_reconnects", "Reconnects of a vendor watch stream after an error or an unexpected end, by vendor.")
+	m.claudeRestarts = counter("tide_claude_orchestrator_restarts", "Restarts of a Claude Code orchestrator child process after it exited or failed to start.")
 	gauge := func(name, help string) metric.Int64Gauge {
 		g, err := meter.Int64Gauge(name, metric.WithDescription(help))
 		errs = append(errs, err)
@@ -144,5 +147,13 @@ func (m *Metrics) WebhookDelivery(sender, result string) {
 func (m *Metrics) VendorWatchReconnect(vendor string) {
 	if m != nil {
 		m.vendorWatch.Add(context.Background(), 1, metric.WithAttributes(attribute.String("vendor", vendor)))
+	}
+}
+
+// ClaudeOrchestratorRestart counts one restart of a Claude Code
+// orchestrator after it exited or failed to start.
+func (m *Metrics) ClaudeOrchestratorRestart() {
+	if m != nil {
+		m.claudeRestarts.Add(context.Background(), 1)
 	}
 }
