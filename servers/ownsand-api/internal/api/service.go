@@ -342,7 +342,13 @@ func (s *Service) internal(ctx context.Context, op string, err error) error {
 	if ce := new(connect.Error); errors.As(err, &ce) {
 		return err
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	// A deadline that ran out is not a cancellation: report it as
+	// deadline_exceeded so callers can tell a slow request from an abandoned
+	// one.
+	if errors.Is(err, context.DeadlineExceeded) {
+		return connect.NewError(connect.CodeDeadlineExceeded, errors.New("request deadline exceeded"))
+	}
+	if errors.Is(err, context.Canceled) {
 		return connect.NewError(connect.CodeCanceled, errors.New("request canceled"))
 	}
 	s.Logger.ErrorContext(ctx, "internal_error", slog.String("op", op), slog.Any("error", err))
