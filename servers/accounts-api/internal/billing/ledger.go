@@ -556,8 +556,33 @@ func deref(s *string) string {
 	return *s
 }
 
-// ListLedger returns up to limit entries of the billing account, newest
-// first, that are older than beforeID (all when empty).
+// ListLedgerByTime returns up to limit entries of the billing account, newest
+// first by (create_time, ledger_entry_id), after the position (afterTime,
+// afterID); a zero afterTime starts at the newest. Entries with the same
+// create_time follow in descending ID order. The order is the business time
+// that the API presents, not the write order: an entry whose ID was
+// generated later can carry an earlier create_time.
+func ListLedgerByTime(ctx context.Context, q db.Querier, accountID string, afterTime time.Time, afterID string, limit int) ([]LedgerEntry, error) {
+	if afterTime.IsZero() {
+		afterTime = time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+		afterID = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+	}
+	rows, err := q.Query(ctx, `SELECT ledger_entry_id::text, billing_account_id::text, kind, amount_usd_micros,
+			balance_after_usd_micros, create_time, paddle_transaction_id, credit_grant_id::text, service, organization_id,
+			meter, window_start, quantity
+		FROM ledger_entries WHERE billing_account_id = $1 AND (create_time, ledger_entry_id) < ($2, $3::uuid)
+		ORDER BY create_time DESC, ledger_entry_id DESC LIMIT $4`, accountID, afterTime, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByPos[LedgerEntry])
+}
+
+// ListLedger returns up to limit entries of the billing account in
+// descending ID order that are before beforeID (all when empty). It is the
+// legacy traversal that resumes page tokens issued before ListLedgerByTime
+// existed; those tokens carry only an ID. New traversals use
+// ListLedgerByTime.
 func ListLedger(ctx context.Context, q db.Querier, accountID, beforeID string, limit int) ([]LedgerEntry, error) {
 	if beforeID == "" {
 		beforeID = "ffffffff-ffff-ffff-ffff-ffffffffffff"

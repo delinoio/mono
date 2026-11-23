@@ -290,3 +290,42 @@ func TestTopUpProviderAcceptTimeMigrationKeepsExistingRows(t *testing.T) {
 		t.Fatalf("provider_accept_time = %v, want NULL for an existing row", *acceptTime)
 	}
 }
+
+func TestLedgerTimeIndexMigrationKeepsExistingRows(t *testing.T) {
+	ctx := context.Background()
+	// Migration 00007 is the last one before the ledger time index.
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, 7))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const account = "01900000-0000-7000-8000-000000000001"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time) VALUES ($1, 'a', now(), now())`, account); err != nil {
+		t.Fatal(err)
+	}
+	const entry = "01900000-0000-7000-8000-000000000601"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO ledger_entries (ledger_entry_id, billing_account_id, kind, amount_usd_micros, balance_after_usd_micros, create_time)
+		VALUES ($1, $2, 'manual_top_up', 5000000, 5000000, '2026-01-02 03:04:05.678901+00')`, entry, account); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, discard()); err != nil {
+		t.Fatalf("migrate with an existing ledger entry: %v", err)
+	}
+	// The migration adds the index and leaves the row as it was.
+	var indexes int
+	if err := d.Pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE tablename = 'ledger_entries'
+		AND indexname IN ('ledger_entries_by_account', 'ledger_entries_by_account_time')`).Scan(&indexes); err != nil {
+		t.Fatal(err)
+	}
+	if indexes != 2 {
+		t.Fatalf("ledger indexes = %d, want the ID index and the time index", indexes)
+	}
+	var amount int64
+	var createTime time.Time
+	if err := d.Pool.QueryRow(ctx, `SELECT amount_usd_micros, create_time FROM ledger_entries WHERE ledger_entry_id = $1`, entry).Scan(&amount, &createTime); err != nil {
+		t.Fatal(err)
+	}
+	if want := time.Date(2026, 1, 2, 3, 4, 5, 678901000, time.UTC); amount != 5000000 || !createTime.Equal(want) {
+		t.Fatalf("ledger entry = %d at %v, want 5000000 at %v", amount, createTime, want)
+	}
+}
