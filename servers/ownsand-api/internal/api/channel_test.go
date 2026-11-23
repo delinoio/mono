@@ -772,6 +772,36 @@ func TestHoldWithdrawsQueuedAgentUpdate(t *testing.T) {
 		}
 	})
 
+	t.Run("each entry into hold sends one withdrawal without a target in between", func(t *testing.T) {
+		env := testenv.New(t)
+		ctx := context.Background()
+		org := env.NewOrg("alice")
+		// The default equals the running version, so FOLLOW_DEFAULT sends no
+		// command between the two HOLD periods.
+		if _, err := env.DB.Pool.Exec(ctx, "INSERT INTO agent_releases (version, host_os, arch, is_default, revoked) VALUES ('1.0.0', 1, 1, true, false)"); err != nil {
+			t.Fatal(err)
+		}
+		dev, agent := setupAgent(t, env, org, nil)
+		settle(t, org, dev, agent)
+
+		setPolicy(t, org, hold)
+		agent.Eventually("the first withdrawal", func() bool { _, w := count(agent); return w == 1 })
+		setPolicy(t, org, follow)
+		settle(t, org, dev, agent)
+		if u, w := count(agent); u != 0 || w != 1 {
+			t.Fatalf("after FOLLOW_DEFAULT: %d updates, %d withdrawals, want 0 and 1", u, w)
+		}
+
+		setPolicy(t, org, hold)
+		agent.Eventually("the second withdrawal", func() bool { _, w := count(agent); return w == 2 })
+		// A repeated evaluation inside the second HOLD period adds none.
+		setPolicy(t, org, hold)
+		settle(t, org, dev, agent)
+		if u, w := count(agent); u != 0 || w != 2 {
+			t.Fatalf("after the second HOLD: %d updates, %d withdrawals, want 0 and 2", u, w)
+		}
+	})
+
 	t.Run("a reconnect under hold sends one withdrawal", func(t *testing.T) {
 		env := testenv.New(t)
 		ctx := context.Background()

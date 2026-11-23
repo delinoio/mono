@@ -757,6 +757,13 @@ func (s *Service) evaluateUpdate(ctx context.Context, conn *hub.Conn) error {
 			&ownsandv1.AgentCommand{Command: &ownsandv1.AgentCommand_WithdrawAgentUpdate{WithdrawAgentUpdate: &ownsandv1.WithdrawAgentUpdateCommand{}}})
 		return err
 	}
+	// A decision that is not a withdrawal ends the HOLD period, also when it
+	// sends no command (for example a default that is not newer than the
+	// running version). Clearing the marker makes the next HOLD send its own
+	// withdrawal instead of being skipped as a duplicate.
+	if conn.Value(releaseKey{}) == withdrawKey {
+		conn.SetValue(releaseKey{}, nil)
+	}
 	var running string
 	if err := s.DB.Pool.QueryRow(ctx, "SELECT agent_version FROM devices WHERE device_id = $1", conn.DeviceID).Scan(&running); err != nil {
 		return err
