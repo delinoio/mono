@@ -17,15 +17,26 @@ import (
 )
 
 func TestCopyTreeAndTarRoundTrip(t *testing.T) {
+	requireSymlinks(t)
 	src := t.TempDir()
-	os.MkdirAll(filepath.Join(src, "a", "b"), 0o755)
-	os.WriteFile(filepath.Join(src, "a", "b", "f"), []byte("hello"), 0o640)
-	os.Symlink("b/f", filepath.Join(src, "a", "link"))
+	if err := os.MkdirAll(filepath.Join(src, "a", "b"), 0o755); err != nil {
+		t.Fatalf("create fixture directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "a", "b", "f"), []byte("hello"), 0o640); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	if err := os.Symlink("b/f", filepath.Join(src, "a", "link")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
 	dst := filepath.Join(t.TempDir(), "copy")
 	if err := CopyTree(src, dst); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dst, "a", "link")); string(b) != "hello" {
+	b, err := os.ReadFile(filepath.Join(dst, "a", "link"))
+	if err != nil {
+		t.Fatalf("read copied link: %v", err)
+	}
+	if string(b) != "hello" {
 		t.Fatalf("copy: %q", b)
 	}
 	if n, _ := TreeSize(dst); n != 5 {
@@ -39,7 +50,11 @@ func TestCopyTreeAndTarRoundTrip(t *testing.T) {
 	if err := ReadTar(&buf, out); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(out, "a", "b", "f")); string(b) != "hello" {
+	b, err = os.ReadFile(filepath.Join(out, "a", "b", "f"))
+	if err != nil {
+		t.Fatalf("read extracted file: %v", err)
+	}
+	if string(b) != "hello" {
 		t.Fatalf("tar: %q", b)
 	}
 }
@@ -708,10 +723,17 @@ func TestReadTarContextStopsBeforeTheFirstEntry(t *testing.T) {
 }
 
 func TestContextVariantsKeepTheTarFormat(t *testing.T) {
+	requireSymlinks(t)
 	src := t.TempDir()
-	os.MkdirAll(filepath.Join(src, "d"), 0o755)
-	os.WriteFile(filepath.Join(src, "d", "f"), []byte("hello"), 0o640)
-	os.Symlink("f", filepath.Join(src, "d", "l"))
+	if err := os.MkdirAll(filepath.Join(src, "d"), 0o755); err != nil {
+		t.Fatalf("create fixture directory: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(src, "d", "f"), []byte("hello"), 0o640); err != nil {
+		t.Fatalf("write fixture file: %v", err)
+	}
+	if err := os.Symlink("f", filepath.Join(src, "d", "l")); err != nil {
+		t.Fatalf("create symlink: %v", err)
+	}
 	var plain, withCtx bytes.Buffer
 	if err := WriteTar(&plain, src); err != nil {
 		t.Fatal(err)
@@ -726,7 +748,11 @@ func TestContextVariantsKeepTheTarFormat(t *testing.T) {
 	if err := ReadTarContext(context.Background(), &withCtx, out); err != nil {
 		t.Fatal(err)
 	}
-	if b, _ := os.ReadFile(filepath.Join(out, "d", "l")); string(b) != "hello" {
+	b, err := os.ReadFile(filepath.Join(out, "d", "l"))
+	if err != nil {
+		t.Fatalf("read extracted link: %v", err)
+	}
+	if string(b) != "hello" {
 		t.Fatalf("extracted %q", b)
 	}
 }
