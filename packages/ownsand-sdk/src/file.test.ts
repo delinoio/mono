@@ -3,7 +3,9 @@ import { runInNewContext } from "node:vm";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
 import { readFileBinding, requestDigest, writeFileBinding } from "./digest.ts";
+import type { Clock } from "./clock.ts";
 import { DataPathError, OwnSandValidationError } from "./errors.ts";
+import { Timing } from "./relay/context.ts";
 import { AcceptanceDeadlineError } from "./relay/stream.ts";
 import { RelayOperationKind } from "@delino/ownsand-protos/v1/common_pb";
 import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
@@ -17,6 +19,7 @@ import {
   Trickle,
 } from "./testing/fake-api.ts";
 import { file, SANDBOX, setup, text } from "./testing/harness.ts";
+import type { VirtualClock } from "./testing/virtual-clock.ts";
 import { uuidV7TimestampMs } from "./uuidv7.ts";
 import { validateGuestPath } from "./validate.ts";
 
@@ -355,6 +358,90 @@ describe("file write", () => {
     for (const write of writes) {
       expect(write.headers.get("ownsand-relay-grant-id")).toBe("grant-1");
     }
+  });
+
+  /**
+   * A clock whose first back-off sleep wakes `lateByMs` after its time, as a
+   * suspended process or a starved event loop does. The monotonic time jumps
+   * by that amount when the sleep resolves.
+   */
+  function lateWakeClock(clock: VirtualClock, lateByMs: number): Clock {
+    let skew = 0;
+    let slept = false;
+    return {
+      now: () => clock.now() + skew,
+      wallNow: () => clock.wallNow() + skew,
+      async sleep(ms, signal) {
+        await clock.sleep(ms, signal);
+        if (!slept) {
+          slept = true;
+          skew += lateByMs;
+        }
+      },
+    };
+  }
+
+  // The wake that uses up the whole 60 second recovery window while the idle
+  // time of the kept grant is exactly at its limit (not longer), so that
+  // `acquire` returns the kept grant without renewing it.
+  const KEPT_GRANT_LATE_MS = Timing.recoveryWindowMs - Timing.backoffInitialMs;
+
+  function acknowledge(req: any) {
+    return {
+      writeId: req.writeId,
+      offset: req.offset,
+      length: BigInt(req.data.length),
+      finished: true,
+      sizeBytes: req.finish?.sizeBytes ?? 0n,
+    };
+  }
+
+  test("starts no WriteFile when the back-off wakes after the recovery window ended and returns the last failure", async () => {
+    const h = setup((clock) => ({
+      clock: lateWakeClock(clock, KEPT_GRANT_LATE_MS),
+    }));
+    h.api.unary(RelayService, "WriteFile", (req, call) => {
+      if (call.index === 0) {
+        throw ownsandError(Code.ResourceExhausted, "agent capacity");
+      }
+      return acknowledge(req);
+    });
+    const error: any = await h.clock
+      .run(h.client.sandbox(SANDBOX).writeFile("/f", "hello"))
+      .catch((e) => e);
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toContain("agent capacity");
+    // The kept grant (resource_exhausted keeps it) must not send a second call.
+    expect(h.api.callsOf("WriteFile")).toHaveLength(1);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+  });
+
+  test("sends the retry when the back-off wakes inside the recovery window", async () => {
+    const h = setup((clock) => ({ clock: lateWakeClock(clock, 30_000) }));
+    h.api.unary(RelayService, "WriteFile", (req, call) => {
+      if (call.index === 0) {
+        throw ownsandError(Code.ResourceExhausted, "agent capacity");
+      }
+      return acknowledge(req);
+    });
+    await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", "hello"));
+    expect(h.api.callsOf("WriteFile")).toHaveLength(2);
+  });
+
+  test("keeps the per-attempt deadline for a retry that starts in time", async () => {
+    const h = setup((clock) => ({ clock: lateWakeClock(clock, 30_000) }));
+    h.api.unary(RelayService, "WriteFile", async (req, call) => {
+      if (call.index === 0) {
+        throw ownsandError(Code.ResourceExhausted, "agent capacity");
+      }
+      // The retry started in time, so it may run far beyond the 60 second
+      // recovery budget, up to the 5 min 30 s attempt deadline.
+      await h.clock.sleep(5 * MIN + 20_000);
+      return acknowledge(req);
+    });
+    await h.clock.run(h.client.sandbox(SANDBOX).writeFile("/f", "hello"));
+    expect(h.api.callsOf("WriteFile")).toHaveLength(2);
+    expect(h.clock.now()).toBeGreaterThanOrEqual(5 * MIN + 20_000);
   });
 
   test("renews the grant after a chunk call hits the call limit", async () => {
