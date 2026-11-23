@@ -27,6 +27,11 @@ const MaxMacOSGuests = 2
 // new sandboxes, so that a busy device can drain and install an update.
 const MaxPendingIdle = 24 * time.Hour
 
+// CheckOutboundNetwork is the check_id of the hypervisor check that an agent
+// reports for OUTBOUND networking. The agent runtimes report the same id
+// (see cmds/ownsand-agent/internal/vmruntime); keep them in step.
+const CheckOutboundNetwork = "outbound-network"
+
 // Snapshot describes a snapshot or template source.
 type Snapshot struct {
 	ID string
@@ -163,9 +168,16 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 		if req.BaseImage != ownsandv1.BaseImage_BASE_IMAGE_UNSPECIFIED && !slices.Contains(caps.GetBuiltBaseImages(), req.BaseImage) {
 			return Permanent, "the device has not built the base image"
 		}
-		if s := req.Snapshot; s != nil && s.GuestOS == ownsandv1.GuestOs_GUEST_OS_MACOS && len(s.MacOSHardwareModel) > 0 &&
-			!slices.ContainsFunc(caps.GetMacosHardwareModels(), func(m []byte) bool { return bytes.Equal(m, s.MacOSHardwareModel) }) {
+		// A device that holds the snapshot reports the model of its copy, so
+		// its absence there is a mismatch. A device that needs an import does
+		// not report the model before it imports the snapshot: its absence
+		// is unknown, not unsupported (see modelUnknown). The agent checks
+		// the model again before the download.
+		if s := req.Snapshot; s != nil && holds(s, d.ID) && macOSModelMissing(s, caps) {
 			return Permanent, "the device does not support the snapshot's macOS hardware model"
+		}
+		if req.NetworkMode == ownsandv1.NetworkMode_NETWORK_MODE_OUTBOUND && outboundNetworkFailed(caps) {
+			return Permanent, "the device cannot provide outbound networking"
 		}
 	}
 
@@ -231,6 +243,28 @@ func EffectiveMemoryMiB(hostOS ownsandv1.HostOs, requested int64) int64 {
 	return requested
 }
 
+// macOSModelMissing reports whether the snapshot is a macOS snapshot with a
+// hardware model that the capability report does not list.
+func macOSModelMissing(s *Snapshot, caps *ownsandv1.DeviceCapabilities) bool {
+	return s.GuestOS == ownsandv1.GuestOs_GUEST_OS_MACOS && len(s.MacOSHardwareModel) > 0 &&
+		!slices.ContainsFunc(caps.GetMacosHardwareModels(), func(m []byte) bool { return bytes.Equal(m, s.MacOSHardwareModel) })
+}
+
+// modelUnknown reports whether an eligible device would import an exported
+// macOS snapshot whose hardware model the device does not report yet.
+func modelUnknown(req Request, d Device) bool {
+	s := req.Snapshot
+	return s != nil && !holds(s, d.ID) && macOSModelMissing(s, d.Capabilities)
+}
+
+// outboundNetworkFailed reports whether the device explicitly reports a
+// failed outbound network check. A report without the check does not fail.
+func outboundNetworkFailed(caps *ownsandv1.DeviceCapabilities) bool {
+	return slices.ContainsFunc(caps.GetHypervisorChecks(), func(c *ownsandv1.HypervisorCheck) bool {
+		return c.GetCheckId() == CheckOutboundNetwork && !c.GetPassed()
+	})
+}
+
 func holds(s *Snapshot, deviceID string) bool {
 	return s.DeviceID == deviceID || slices.Contains(s.CopyDeviceIDs, deviceID)
 }
@@ -274,9 +308,11 @@ func share(d Device) float64 {
 }
 
 // Place selects a device. Among eligible devices it prefers the snapshot
-// device when memory state can restore there, and otherwise the device
-// with the lowest allocated share of its most constrained resource, then
-// the lowest device ID. With req.DeviceID it checks only that device. The
+// device when memory state can restore there, and otherwise a device that
+// reports support for the macOS hardware model of an exported snapshot over
+// one that does not report the model yet, then the device with the lowest
+// allocated share of its most constrained resource, then the lowest device
+// ID. With req.DeviceID it checks only that device. The
 // error code is unavailable when a device could run the request after a
 // transient condition ends and failed_precondition otherwise.
 func Place(req Request, devices []Device, now time.Time) (Decision, error) {
@@ -316,6 +352,10 @@ func Place(req Request, devices []Device, now time.Time) (Decision, error) {
 		}
 	}
 	sort.SliceStable(eligible, func(i, j int) bool {
+		ui, uj := modelUnknown(req, eligible[i]), modelUnknown(req, eligible[j])
+		if ui != uj {
+			return uj
+		}
 		si, sj := share(eligible[i]), share(eligible[j])
 		if si != sj {
 			return si < sj
