@@ -492,7 +492,7 @@ func TestReportUsageAttributionThroughLinkHistory(t *testing.T) {
 	if len(resp.GetStatuses()) != 1 || resp.GetStatuses()[0].GetBillingAccountId() != b.AccountID {
 		t.Fatalf("statuses = %v", resp.GetStatuses())
 	}
-	// A window that overlaps both links goes to the link active at its end.
+	// A window that overlaps both links goes to the overlapping link with the latest link time.
 	org2 := newOrg(t)
 	link(t, env, a.AccountID, org2, a.Owner.ID, "")
 	unlink(t, env, org2)
