@@ -163,6 +163,10 @@ jobs:
           # The binary statically links the Go standard library and runtime
           # (BSD-3-Clause), whose notice must ship with it.
           cp "$(go env GOROOT)/LICENSE" "$context/GO-LICENSE"
+          # The license files of every third-party Go module that the
+          # production command package links (a failure, or a module without a
+          # license file, stops the job before the artifact upload).
+          scripts/ci/server-notices.sh "$NAME" "./$DIR/cmd/$NAME" "$context/THIRD-PARTY-LICENSES.txt"
           cp -R "$DIR/dist" "$context/dist"
           docker build --platform linux/amd64 --tag "$NAME:$SHA" "$context"
           docker save "$NAME:$SHA" | gzip > "$RUNNER_TEMP/$NAME.tar.gz"
