@@ -735,11 +735,11 @@ func TestSandboxTTLMigrationKeepsMillisecondRows(t *testing.T) {
 }
 
 // exportVerificationMigration is the version of
-// 0012_snapshot_export_verification.sql.
-const exportVerificationMigration = 12
+// 0013_snapshot_export_verification.sql.
+const exportVerificationMigration = 13
 
 // TestExportVerificationMigrationKeepsExportedRows upgrades a database at the
-// schema of migration 0011 that holds an EXPORTED snapshot and checks that
+// schema of migration 0012 that holds an EXPORTED snapshot and checks that
 // the row is unverified without a verification time (the verifier schedules
 // it), that the previous release's statements, which know neither column,
 // still insert snapshots and mark them EXPORTED, and that the columns accept
