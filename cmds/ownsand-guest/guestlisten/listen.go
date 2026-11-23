@@ -116,6 +116,13 @@ func Listen(spec string) (net.Listener, error) {
 	case SchemeHvsock:
 		return listenHvsock(s.Address)
 	case SchemeUnix:
+		// Hold the path lock from the probe to the end of the bind, so that
+		// no other start removes or binds the path in between.
+		release, err := lockUnixAddress(s.Address)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 		if err := prepareUnixAddress(s.Address); err != nil {
 			return nil, err
 		}
@@ -135,8 +142,8 @@ func Listen(spec string) (net.Listener, error) {
 // live listener serves is never removed, because a new bind would take the
 // path from that listener. It never deletes any other kind of entry. A Linux
 // abstract address (leading "@") has no filesystem entry, so it needs no
-// cleanup. The returned errors never contain the path, because the caller
-// logs them.
+// cleanup. The caller holds the path lock (lockUnixAddress). The returned
+// errors never contain the path, because the caller logs them.
 func prepareUnixAddress(address string) error {
 	if runtime.GOOS == "linux" && strings.HasPrefix(address, "@") {
 		return nil
@@ -174,6 +181,9 @@ func prepareUnixAddress(address string) error {
 	}
 	if !os.SameFile(info, current) {
 		return ErrAddressInUse
+	}
+	if beforeUnixRemove != nil {
+		beforeUnixRemove()
 	}
 	if err := os.Remove(address); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.New("guestlisten: remove stale unix socket failed")
