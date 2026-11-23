@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -102,6 +103,39 @@ func TestWhileHeldRunsOnlyWhileHeld(t *testing.T) {
 	}
 }
 
+// waitLossBlockedOnOwnership waits until a goroutine that runs
+// (*Lease).lose is blocked on a mutex. The caller holds the ownership lock
+// and no other goroutine holds the transition lock, so that mutex is the
+// ownership lock. Go has no mutex waiter count, so the helper reads the
+// goroutine stacks, whose blocked state shows as sync.Mutex.Lock (or
+// semacquire in older Go releases).
+func waitLossBlockedOnOwnership(t *testing.T) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		buf := make([]byte, 1<<16)
+		for {
+			n := runtime.Stack(buf, true)
+			if n < len(buf) {
+				buf = buf[:n]
+				break
+			}
+			buf = make([]byte, 2*len(buf))
+		}
+		for _, g := range strings.Split(string(buf), "\n\n") {
+			header, _, _ := strings.Cut(g, "\n")
+			blocked := strings.Contains(header, "[sync.Mutex.Lock") || strings.Contains(header, "[semacquire")
+			if blocked && strings.Contains(g, "(*Lease).lose(") {
+				return
+			}
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the loss transition did not reach the ownership wait")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 // TestWhileHeldSerializesWithLoss checks that the loss transition waits for
 // a running fn and runs OnLose only after it, so OnLose sees the effects of
 // fn, and that a call after the transition does not run fn.
@@ -125,11 +159,14 @@ func TestWhileHeldSerializesWithLoss(t *testing.T) {
 		defer close(setDone)
 		l.lose(reasonReleased)
 	}()
-	// The loss transition is blocked on the ownership lock held by fn.
+	// Wait until the loss transition is blocked on the ownership lock that fn
+	// holds, instead of assuming that a fixed delay was long enough for the
+	// goroutine to start.
+	waitLossBlockedOnOwnership(t)
 	select {
 	case <-setDone:
 		t.Fatal("the loss transition did not wait for the running fn")
-	case <-time.After(100 * time.Millisecond):
+	default:
 	}
 	if got := lost.Load(); got != 0 {
 		t.Fatalf("OnLose ran %d times before fn returned", got)
