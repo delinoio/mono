@@ -6,7 +6,11 @@
   "type": "module",
   "deploy": {
     "target": "cloudflare-pages",
-    "project": "tide-console"
+    "project": "tide-console",
+    "buildEnv": {
+      "PUBLIC_LOGTO_ENDPOINT": "LOGTO_ENDPOINT",
+      "PUBLIC_LOGTO_APP_ID": "TIDE_CONSOLE_LOGTO_APP_ID"
+    }
   },
   "scripts": {
     "build": "rsbuild build",

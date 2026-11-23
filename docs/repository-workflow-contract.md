@@ -136,13 +136,14 @@ Each deployment job sets `environment` to the environment of its deployable kind
 
 Static sites also need public build-time values, such as the Logto application ID of a single-page application, which end up in the public bundle. They are GitHub repository variables (configuration variables, not secrets), because the job that builds the sites has no deployment environment and no secrets (see `build-static-sites` below). The `deploy.buildEnv` field of each site names the variables that it reads; a missing or empty variable fails the build of the site before the first upload of the run.
 
-| Repository variable                   | Site build variable          | Site                                 |
-| ------------------------------------- | ---------------------------- | ------------------------------------ |
-| `LOGTO_ENDPOINT`                      | `PUBLIC_LOGTO_ENDPOINT`      | `ownsand-console`, `delino-accounts` |
-| `OWNSAND_CONSOLE_LOGTO_APP_ID`        | `PUBLIC_LOGTO_APP_ID`        | `ownsand-console`                    |
-| `DELINO_ACCOUNTS_LOGTO_APP_ID`        | `PUBLIC_LOGTO_APP_ID`        | `delino-accounts`                    |
-| `DELINO_ACCOUNTS_PADDLE_CLIENT_TOKEN` | `PUBLIC_PADDLE_CLIENT_TOKEN` | `delino-accounts`                    |
-| `DELINO_ACCOUNTS_PADDLE_ENVIRONMENT`  | `PUBLIC_PADDLE_ENVIRONMENT`  | `delino-accounts`                    |
+| Repository variable                   | Site build variable          | Site                                                 |
+| ------------------------------------- | ---------------------------- | ---------------------------------------------------- |
+| `LOGTO_ENDPOINT`                      | `PUBLIC_LOGTO_ENDPOINT`      | `ownsand-console`, `tide-console`, `delino-accounts` |
+| `OWNSAND_CONSOLE_LOGTO_APP_ID`        | `PUBLIC_LOGTO_APP_ID`        | `ownsand-console`                                    |
+| `TIDE_CONSOLE_LOGTO_APP_ID`           | `PUBLIC_LOGTO_APP_ID`        | `tide-console`                                       |
+| `DELINO_ACCOUNTS_LOGTO_APP_ID`        | `PUBLIC_LOGTO_APP_ID`        | `delino-accounts`                                    |
+| `DELINO_ACCOUNTS_PADDLE_CLIENT_TOKEN` | `PUBLIC_PADDLE_CLIENT_TOKEN` | `delino-accounts`                                    |
+| `DELINO_ACCOUNTS_PADDLE_ENVIRONMENT`  | `PUBLIC_PADDLE_ENVIRONMENT`  | `delino-accounts`                                    |
 
 ## Deployment workflow
 
