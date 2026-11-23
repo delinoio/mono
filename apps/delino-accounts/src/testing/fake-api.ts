@@ -466,6 +466,14 @@ export function createFakeApi(): FakeApi {
           throw new ConnectError("invitation not found", Code.NotFound);
         }
         const account = api.accounts.get(invitation.accountId)!;
+        // Like the production service, reject before touching the membership
+        // or consuming the token, so that the link stays a stable failure.
+        if (account.deleted) {
+          throw new ConnectError(
+            "the billing account was deleted",
+            Code.FailedPrecondition,
+          );
+        }
         if (member(account) !== undefined) {
           throw new ConnectError(
             "you are already a member of this billing account",
