@@ -7,8 +7,8 @@ import { useBillingAccount } from "../../components/shell.tsx";
 import {
   Empty,
   ErrorNotice,
+  InfiniteListNotice,
   Loading,
-  RefetchNotice,
 } from "../../components/ui.tsx";
 import {
   addMonths,
@@ -92,10 +92,7 @@ function UsageSummary() {
           </Button>
         </div>
       </div>
-      <RefetchNotice
-        error={summary.isRefetchError ? summary.error : undefined}
-        onRetry={() => void summary.refetch()}
-      />
+      <InfiniteListNotice list={summary} />
       {summary.isPending ? (
         <Loading label="Loading usage" />
       ) : summary.isLoadingError ? (
@@ -218,10 +215,7 @@ function Ledger() {
     <section className="section" aria-labelledby="ledger-title">
       <h2 id="ledger-title">Ledger</h2>
       <p className="muted">Every change of the balance, newest first.</p>
-      <RefetchNotice
-        error={ledger.isRefetchError ? ledger.error : undefined}
-        onRetry={() => void ledger.refetch()}
-      />
+      <InfiniteListNotice list={ledger} />
       {ledger.isPending ? (
         <Loading label="Loading the ledger" />
       ) : ledger.isLoadingError ? (

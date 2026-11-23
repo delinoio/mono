@@ -134,11 +134,14 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
     items,
     isPending: query.isPending,
     error: query.isLoadingError ? query.error : undefined,
-    // A failed next page also has `isRefetchError`; it is the continuation
-    // error below, not a failed refresh.
-    refreshError:
-      isRefetchError && !isFetchNextPageError ? query.error : undefined,
-    isLoadingMore: hasNextPage && !isFetchNextPageError,
+    // TanStack Query reports a failed next page as `isFetchNextPageError` and
+    // not as `isRefetchError` (the observer excludes it), so the two errors
+    // are distinct and a failed refresh is never also the continuation error.
+    refreshError: isRefetchError ? query.error : undefined,
+    // After a failed refresh the cache can still hold the token of its last
+    // loaded page, but the effect above pauses until the retry, so nothing
+    // is loading.
+    isLoadingMore: hasNextPage && !isFetchNextPageError && !isRefetchError,
     continuationError: isFetchNextPageError ? query.error : undefined,
     refetch: () => void refetch(),
     retryContinuation: () => void fetchNextPage(),
