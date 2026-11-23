@@ -4,16 +4,19 @@
 // `check-pending-changesets.sh` (against a stubbed `gh`),
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
 // `droplet-deploy.sh` (against stubbed `docker` and `curl`),
-// `start-caddy.sh` (against a stubbed `docker`) and
+// `start-caddy.sh` (against a stubbed `docker`),
+// `configure-docker-logs.sh` (against a stubbed `systemctl`) and
 // `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  statSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -3307,7 +3310,15 @@ const caddyImage = `caddy:2.11.9@sha256:${"c".repeat(64)}`;
 //                 fails (for example `start`).
 //   STUB_NO_IMAGE set when the pinned image is not local: `docker image
 //                 inspect` fails, as for an image that was never pulled.
-function runCaddy(t, { inspect, fail, noImage, args } = {}) {
+//   STUB_STATE    the container state that the readiness check reads
+//                 (default `running`); STUB_STATE_GONE makes that read fail.
+//   STUB_WGET_FAILS  the number of readiness probes that fail before one
+//                 succeeds, or `always`.
+// The readiness wait runs with a short deadline and interval.
+function runCaddy(
+  t,
+  { inspect, fail, noImage, args, state, gone, wgetFails, env: extra } = {},
+) {
   const dir = scratch(t);
   const bin = join(dir, "bin");
   mkdirSync(bin);
@@ -3320,9 +3331,26 @@ function runCaddy(t, { inspect, fail, noImage, args } = {}) {
   exit 1
 fi
 case "$1" in
-  inspect) [[ -n "\${STUB_INSPECT:-}" ]] && echo "$STUB_INSPECT" || exit 1 ;;
+  inspect)
+    if [[ "$3" == "{{.State.Status}}" ]]; then
+      [[ -z "\${STUB_STATE_GONE:-}" ]] || { echo "Error: No such object: caddy" >&2; exit 1; }
+      echo "\${STUB_STATE:-running}"
+    else
+      [[ -n "\${STUB_INSPECT:-}" ]] && echo "$STUB_INSPECT" || exit 1
+    fi
+    ;;
   image)
     if [[ "$2" == "inspect" && -n "\${STUB_NO_IMAGE:-}" ]]; then exit 1; fi
+    ;;
+  exec)
+    if [[ "$*" == *wget* ]]; then
+      count="$(cat "$STUB_DIR/wget.count" 2> /dev/null || echo 0)"
+      echo $((count + 1)) > "$STUB_DIR/wget.count"
+      if [[ "\${STUB_WGET_FAILS:-0}" == always ]] || (( count < \${STUB_WGET_FAILS:-0} )); then
+        echo "wget: can't connect to remote host" >&2
+        exit 1
+      fi
+    fi
     ;;
 esac`,
   );
@@ -3331,6 +3359,12 @@ esac`,
   if (inspect !== undefined) env.STUB_INSPECT = inspect;
   if (fail !== undefined) env.STUB_FAIL = fail;
   if (noImage) env.STUB_NO_IMAGE = "1";
+  if (state !== undefined) env.STUB_STATE = state;
+  if (gone) env.STUB_STATE_GONE = "1";
+  if (wgetFails !== undefined) env.STUB_WGET_FAILS = String(wgetFails);
+  env.START_CADDY_READY_TIMEOUT = "2";
+  env.START_CADDY_READY_INTERVAL = "0.1";
+  Object.assign(env, extra);
   const result = spawnSync(
     "bash",
     [startCaddy, ...(args ?? [caddyImage, "/srv/delino", "delino"])],
@@ -3348,6 +3382,9 @@ esac`,
 const caddyRun = `docker run --detach --name caddy --network delino --restart unless-stopped --publish 80:80 --publish 443:443 --publish 443:443/udp --volume /srv/delino/caddy:/etc/caddy:ro --volume caddy-data:/data --volume caddy-config:/config ${caddyImage}`;
 const caddyInspect =
   "docker inspect --format {{.Config.Image}} {{.State.Running}} caddy";
+const caddyState = "docker inspect --format {{.State.Status}} caddy";
+const caddyProbe =
+  "docker exec caddy wget -q -T 2 -O /dev/null http://127.0.0.1:2019/config/";
 const caddyImageInspect = `docker image inspect ${caddyImage}`;
 const caddyPull = `docker pull ${caddyImage}`;
 const caddyReload =
@@ -3361,6 +3398,8 @@ test("start-caddy creates a missing container", { skip }, (t) => {
     caddyImageInspect,
     "docker rm --force caddy",
     caddyRun,
+    caddyState,
+    caddyProbe,
   ]);
 });
 
@@ -3373,7 +3412,12 @@ test("start-caddy reloads a running container", { skip }, (t) => {
 test("start-caddy starts a stopped container", { skip }, (t) => {
   const result = runCaddy(t, { inspect: `${caddyImage} false` });
   assert.equal(result.status, 0, result.stderr);
-  assert.deepEqual(result.calls, [caddyInspect, "docker start caddy"]);
+  assert.deepEqual(result.calls, [
+    caddyInspect,
+    "docker start caddy",
+    caddyState,
+    caddyProbe,
+  ]);
 });
 
 test("start-caddy recreates a container with another image", { skip }, (t) => {
@@ -3384,7 +3428,14 @@ test("start-caddy recreates a container with another image", { skip }, (t) => {
     assert.equal(result.status, 0, result.stderr);
     assert.deepEqual(
       result.calls,
-      [caddyInspect, caddyImageInspect, "docker rm --force caddy", caddyRun],
+      [
+        caddyInspect,
+        caddyImageInspect,
+        "docker rm --force caddy",
+        caddyRun,
+        caddyState,
+        caddyProbe,
+      ],
       running,
     );
   }
@@ -3410,6 +3461,8 @@ test(
           caddyPull,
           "docker rm --force caddy",
           caddyRun,
+          caddyState,
+          caddyProbe,
         ],
         String(inspect),
       );
@@ -3477,4 +3530,259 @@ test("start-caddy rejects bad usage before any change", { skip }, (t) => {
   assert.equal(result.status, 2);
   assert.match(result.stderr, /usage: start-caddy\.sh/);
   assert.deepEqual(result.calls, []);
+});
+
+// --- configure-docker-logs.sh ----------------------------------------------
+
+const configureLogs = join(root, "scripts/droplet/configure-docker-logs.sh");
+
+// Runs configure-docker-logs.sh on `<scratch>/docker/daemon.json` against a
+// stubbed `systemctl`. `content` is the original file (absent when
+// undefined). `readOnlyDirectory` removes the write permission of the
+// directory during the run, which makes the write fail for an unprivileged
+// user.
+function runLogs(t, { content, readOnlyDirectory, noDirectory } = {}) {
+  const dir = scratch(t);
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(dir, "calls.log"), "");
+  shellStub(bin, "systemctl");
+  const configDirectory = join(dir, "docker");
+  if (!noDirectory) mkdirSync(configDirectory);
+  const config = join(configDirectory, "daemon.json");
+  if (content !== undefined) writeFileSync(config, content, { mode: 0o600 });
+  if (readOnlyDirectory) chmodSync(configDirectory, 0o555);
+  const env = {
+    ...baseEnv,
+    PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+    STUB_DIR: dir,
+  };
+  const result = spawnSync("bash", [configureLogs, config], {
+    encoding: "utf8",
+    env,
+  });
+  // Restore the permission now, so the scratch directory can be removed.
+  if (readOnlyDirectory) chmodSync(configDirectory, 0o755);
+  return {
+    ...result,
+    config,
+    read: () => readFileSync(config, "utf8"),
+    leftovers: () =>
+      existsSync(configDirectory)
+        ? readdirSync(configDirectory).filter((name) => name !== "daemon.json")
+        : [],
+    calls: readFileSync(join(dir, "calls.log"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean),
+  };
+}
+
+const restartDocker = "systemctl restart docker";
+
+test("configure-docker-logs creates a missing file", { skip }, (t) => {
+  const result = runLogs(t);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.read()), { "log-driver": "local" });
+  assert.deepEqual(result.calls, [restartDocker]);
+  assert.deepEqual(result.leftovers(), []);
+});
+
+test(
+  "configure-docker-logs keeps the other settings and is idempotent",
+  { skip },
+  (t) => {
+    const original = {
+      "data-root": "/mnt/docker",
+      "registry-mirrors": ["https://mirror.example.com"],
+      "log-driver": "json-file",
+      "log-opts": { "max-size": "10m" },
+      "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
+    };
+    const first = runLogs(t, { content: JSON.stringify(original) });
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual(JSON.parse(first.read()), {
+      ...original,
+      "log-driver": "local",
+    });
+    assert.deepEqual(first.calls, [restartDocker]);
+    assert.equal(statSync(first.config).mode & 0o777, 0o600);
+    assert.deepEqual(first.leftovers(), []);
+
+    // A second run on the written file changes nothing and restarts nothing.
+    const written = first.read();
+    const second = runLogs(t, { content: written });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.read(), written);
+    assert.deepEqual(second.calls, []);
+  },
+);
+
+test(
+  "configure-docker-logs adds the key to an object without it",
+  {
+    skip,
+  },
+  (t) => {
+    const result = runLogs(t, { content: '{"data-root": "/mnt/docker"}' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.read()), {
+      "data-root": "/mnt/docker",
+      "log-driver": "local",
+    });
+    assert.deepEqual(result.calls, [restartDocker]);
+  },
+);
+
+test(
+  "configure-docker-logs leaves a correct file byte for byte",
+  { skip },
+  (t) => {
+    // Unusual formatting, key order and an extra setting must all stay.
+    const content = '{"data-root":"/x",   "log-driver":"local"}\n\n';
+    const result = runLogs(t, { content });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.read(), content);
+    assert.deepEqual(result.calls, []);
+  },
+);
+
+test(
+  "configure-docker-logs rejects invalid input before any change",
+  { skip },
+  (t) => {
+    for (const content of [
+      "{ not json",
+      "",
+      "[]",
+      '["log-driver", "local"]',
+      '"local"',
+      "null",
+      "42",
+    ]) {
+      const result = runLogs(t, { content });
+      const label = JSON.stringify(content);
+      assert.notEqual(result.status, 0, label);
+      assert.match(result.stderr, /error: .*daemon\.json/, label);
+      assert.equal(result.read(), content, label);
+      assert.deepEqual(result.calls, [], label);
+      assert.deepEqual(result.leftovers(), [], label);
+    }
+  },
+);
+
+test(
+  "configure-docker-logs keeps the file and Docker when the write fails",
+  { skip },
+  (t) => {
+    // The directory of a missing configuration directory makes the write
+    // fail for every user, root included.
+    const missing = runLogs(t, { noDirectory: true });
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /cannot write .*daemon\.json/);
+    assert.deepEqual(missing.calls, []);
+
+    // A read-only directory blocks the temporary file for an unprivileged
+    // user; root ignores directory permissions.
+    if (process.getuid?.() === 0) return;
+    const content = '{"data-root": "/mnt/docker"}';
+    const result = runLogs(t, { content, readOnlyDirectory: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot write .*daemon\.json/);
+    assert.match(result.stderr, /was not changed and Docker was not restarted/);
+    assert.equal(result.read(), content);
+    assert.deepEqual(result.calls, []);
+  },
+);
+
+test("start-caddy waits until Caddy answers its admin API", { skip }, (t) => {
+  for (const inspect of [undefined, `${caddyImage} false`]) {
+    const result = runCaddy(t, { inspect, wgetFails: 2 });
+    const label = String(inspect);
+    assert.equal(result.status, 0, `${label}: ${result.stderr}`);
+    const probes = result.calls.filter((call) => call === caddyProbe);
+    assert.equal(probes.length, 3, label);
+    assert.equal(
+      result.calls.filter((call) => call === caddyState).length,
+      3,
+      label,
+    );
+  }
+});
+
+test(
+  "start-caddy fails at once for a container that is not running",
+  {
+    skip,
+  },
+  (t) => {
+    for (const inspect of [undefined, `${caddyImage} false`]) {
+      for (const state of ["exited", "dead", "restarting"]) {
+        const result = runCaddy(t, { inspect, state });
+        const label = `${inspect} ${state}`;
+        assert.notEqual(result.status, 0, label);
+        assert.match(result.stderr, new RegExp(`container is ${state}`), label);
+        assert.match(result.stderr, /docker logs caddy/, label);
+        assert.deepEqual(
+          result.calls.filter((call) => call === caddyProbe),
+          [],
+          label,
+        );
+        assert.equal(
+          result.calls.filter((call) => call === caddyState).length,
+          1,
+          label,
+        );
+      }
+    }
+  },
+);
+
+test("start-caddy fails when Caddy never answers", { skip }, (t) => {
+  for (const inspect of [undefined, `${caddyImage} false`]) {
+    const result = runCaddy(t, { inspect, wgetFails: "always" });
+    const label = String(inspect);
+    assert.notEqual(result.status, 0, label);
+    assert.match(result.stderr, /did not answer its admin API/, label);
+    assert.match(result.stderr, /within 2 seconds/, label);
+    assert.match(result.stderr, /container state is running/, label);
+    assert.match(result.stderr, /docker logs caddy/, label);
+    const probes = result.calls.filter((call) => call === caddyProbe).length;
+    // The deadline bounds the attempts: at least two, far below an
+    // unbounded loop.
+    assert.ok(probes >= 2 && probes <= 60, `${label}: ${probes} probes`);
+  }
+});
+
+test("start-caddy fails when the container disappears", { skip }, (t) => {
+  const result = runCaddy(t, { gone: true });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /cannot read the state of the caddy container/);
+  assert.match(result.stderr, /docker logs caddy/);
+  assert.deepEqual(
+    result.calls.filter((call) => call === caddyProbe),
+    [],
+  );
+});
+
+test("start-caddy does not wait on the reload path", { skip }, (t) => {
+  const result = runCaddy(t, {
+    inspect: `${caddyImage} true`,
+    state: "exited",
+    wgetFails: "always",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls, [caddyInspect, caddyReload]);
+});
+
+test("start-caddy rejects a bad readiness setting", { skip }, (t) => {
+  for (const env of [
+    { START_CADDY_READY_TIMEOUT: "soon" },
+    { START_CADDY_READY_INTERVAL: "-1" },
+  ]) {
+    const result = runCaddy(t, { env });
+    assert.equal(result.status, 2, JSON.stringify(env));
+    assert.match(result.stderr, /START_CADDY_READY_TIMEOUT/);
+    assert.deepEqual(result.calls, []);
+  }
 });
