@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -24,6 +25,15 @@ const refreshMargin = time.Minute
 // maxRefreshAttempts bounds the refresh requests of one token request when
 // other processes keep rotating the stored refresh token meanwhile.
 const maxRefreshAttempts = 3
+
+// defaultRefreshAdoptWait bounds how long a token request waits for another
+// process to publish the rotated refresh token after the token endpoint
+// rejected the one that this process sent with invalid_grant.
+const defaultRefreshAdoptWait = 5 * time.Second
+
+// defaultRefreshAdoptPoll is how often that wait reloads the stored
+// credentials.
+const defaultRefreshAdoptPoll = 50 * time.Millisecond
 
 func (a *app) logtoConfig() logto.Config {
 	resource := a.getenv(EnvLogtoResource)
@@ -201,6 +211,41 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 		*creds = *stored
 		return rotated, nil
 	}
+	// awaitRotation waits for another process to publish a new generation of
+	// the same session after the token endpoint rejected the refresh token
+	// with invalid_grant while the store still holds that token. The other
+	// process refreshes without the store lock, so the issuer may already
+	// have rotated the token that this process sent while the rotation is not
+	// published yet. It returns true once a new generation is adopted, false
+	// when none appeared within the bound (a revoked token), and an error when
+	// ctx ends or the session was removed or replaced.
+	awaitRotation := func(ctx context.Context) (bool, error) {
+		wait, poll := a.env.RefreshAdoptWait, a.env.RefreshAdoptPoll
+		if wait <= 0 {
+			wait = defaultRefreshAdoptWait
+		}
+		if poll <= 0 {
+			poll = defaultRefreshAdoptPoll
+		}
+		a.logger.Debug("ownsand waits for another process to publish the rotated Logto refresh token",
+			slog.Duration("wait", wait), slog.Duration("poll", poll))
+		deadline := time.NewTimer(wait)
+		defer deadline.Stop()
+		tick := time.NewTicker(poll)
+		defer tick.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return false, fmt.Errorf("wait for the rotated Logto refresh token: %w", ctx.Err())
+			case <-deadline.C:
+				return false, nil
+			case <-tick.C:
+				if rotated, err := adopt(); err != nil || rotated {
+					return rotated, err
+				}
+			}
+		}
+	}
 	return func(ctx context.Context) (string, error) {
 		mu.Lock()
 		defer mu.Unlock()
@@ -235,6 +280,13 @@ func (a *app) tokenSource() (ownsand.TokenSource, error) {
 					rotated, aerr := adopt()
 					if aerr != nil {
 						return "", aerr
+					}
+					if !rotated {
+						// The refresh in another process may have rotated
+						// the token without publishing the result yet.
+						if rotated, aerr = awaitRotation(ctx); aerr != nil {
+							return "", aerr
+						}
 					}
 					if rotated {
 						a.logger.Debug("ownsand retries the Logto token refresh with the token that another process stored")

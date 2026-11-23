@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -117,18 +118,133 @@ func (f *rotationFixture) save(session, refresh, access string, expiry time.Time
 }
 
 // source returns the token source of one process: it loads the stored
-// credentials when it is created.
+// credentials when it is created. The wait for a rotation that another process
+// has not published yet is short, so that a revoked token fails quickly.
 func (f *rotationFixture) source() func(context.Context) (string, error) {
 	f.t.Helper()
+	return f.sourceWith(50*time.Millisecond, 5*time.Millisecond, io.Discard)
+}
+
+// sourceWith is source with the bound and the poll interval of the wait for a
+// rotation and the writer that receives the debug log of the source.
+func (f *rotationFixture) sourceWith(wait, poll time.Duration, logs io.Writer) func(context.Context) (string, error) {
+	f.t.Helper()
 	a := &app{
-		env:    Env{LookupEnv: func(k string) (string, bool) { v, ok := f.env[k]; return v, ok }},
-		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		env: Env{
+			LookupEnv:        func(k string) (string, bool) { v, ok := f.env[k]; return v, ok },
+			RefreshAdoptWait: wait,
+			RefreshAdoptPoll: poll,
+		},
+		logger: slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	ts, err := a.tokenSource()
 	if err != nil {
 		f.t.Fatal(err)
 	}
 	return ts
+}
+
+// rotationWait bounds every wait of a rotation test, so that a regression
+// fails the test promptly instead of hanging it until the package timeout.
+const rotationWait = 10 * time.Second
+
+// signalWriter closes signal when a write contains the marker. The source
+// logs that marker when it starts to wait for a rotation, so a test can act
+// during the wait instead of guessing with a sleep.
+type signalWriter struct {
+	marker string
+	once   sync.Once
+	signal chan struct{}
+}
+
+func newSignalWriter(marker string) *signalWriter {
+	return &signalWriter{marker: marker, signal: make(chan struct{})}
+}
+
+func (w *signalWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), w.marker) {
+		w.once.Do(func() { close(w.signal) })
+	}
+	return len(p), nil
+}
+
+// awaitWaiting waits until the source logged that it waits for a rotation.
+func awaitWaiting(t *testing.T, w *signalWriter, done <-chan tokenResult) {
+	t.Helper()
+	select {
+	case <-w.signal:
+	case res := <-done:
+		t.Fatalf("the token request ended without waiting for a rotation: token %q, error %v", res.tok, res.err)
+	case <-time.After(rotationWait):
+		t.Fatal("the source did not wait for a rotation")
+	}
+}
+
+// tokenResult is the outcome of one token request.
+type tokenResult struct {
+	tok string
+	err error
+}
+
+// hold makes the issuer pause every request whose refresh token match
+// accepts, until release runs. started closes when the first such request
+// arrived. release is idempotent and is also registered as a cleanup that
+// runs before the httptest.Server cleanup of the fixture (cleanups run in
+// reverse order): the server waits for in-flight handlers, so a held handler
+// would hang the cleanup when a test fails before it releases the request.
+func (f *rotationFixture) hold(match func(refreshToken string) bool) (started <-chan struct{}, release func()) {
+	f.t.Helper()
+	startedCh, releaseCh := make(chan struct{}), make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	f.l.mu.Lock()
+	f.l.hook = func(rt string) {
+		if !match(rt) {
+			return
+		}
+		startOnce.Do(func() { close(startedCh) })
+		<-releaseCh
+	}
+	f.l.mu.Unlock()
+	release = func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	f.t.Cleanup(release)
+	return startedCh, release
+}
+
+// tokenAsync requests a token on a worker goroutine. The worker only runs
+// the token source: it must not call t.Fatal, which is for the test goroutine.
+func tokenAsync(ctx context.Context, ts func(context.Context) (string, error)) <-chan tokenResult {
+	done := make(chan tokenResult, 1)
+	go func() {
+		tok, err := ts(ctx)
+		done <- tokenResult{tok, err}
+	}()
+	return done
+}
+
+// awaitHeld waits until the issuer holds a request. A worker that finished
+// before that (for example with an error) or a missing request fails the test
+// at once, with the result of the worker.
+func awaitHeld(t *testing.T, started <-chan struct{}, done <-chan tokenResult) {
+	t.Helper()
+	select {
+	case <-started:
+	case res := <-done:
+		t.Fatalf("the token request ended before the issuer held a refresh request: token %q, error %v", res.tok, res.err)
+	case <-time.After(rotationWait):
+		t.Fatal("the issuer received no refresh request")
+	}
+}
+
+// awaitResult waits for the outcome of a token request.
+func awaitResult(t *testing.T, done <-chan tokenResult) tokenResult {
+	t.Helper()
+	select {
+	case res := <-done:
+		return res
+	case <-time.After(rotationWait):
+		t.Fatal("the token request did not finish")
+		return tokenResult{}
+	}
 }
 
 func (f *rotationFixture) stored() *credstore.Credentials {
@@ -181,25 +297,16 @@ func TestTokenSourceRefreshesWithStoredRefreshToken(t *testing.T) {
 // the same session must not replace it.
 func TestStaleRefreshDoesNotOverwriteNewerRotation(t *testing.T) {
 	f := newRotationFixture(t)
-	started, release := make(chan struct{}), make(chan struct{})
-	f.l.hook = func(string) {
-		close(started)
-		<-release
-	}
-	type out struct {
-		tok string
-		err error
-	}
-	done := make(chan out, 1)
-	go func() {
-		tok, err := f.source()(context.Background())
-		done <- out{tok, err}
-	}()
-	<-started
-	// Another process refreshed and stored its rotation meanwhile.
+	started, release := f.hold(func(string) bool { return true })
+	// The source is created on the test goroutine: it calls t.Fatal on error.
+	ts := f.source()
+	done := tokenAsync(context.Background(), ts)
+	awaitHeld(t, started, done)
+	// Another process refreshed and stored its rotation meanwhile. The held
+	// request is released even when the save fails.
 	f.save("s", "rt-newer", "newer-jwt", time.Now().Add(time.Hour))
-	close(release)
-	res := <-done
+	release()
+	res := awaitResult(t, done)
 	if res.err != nil || res.tok != "newer-jwt" {
 		t.Fatalf("got %q %v, want the newer stored token", res.tok, res.err)
 	}
@@ -213,29 +320,15 @@ func TestStaleRefreshDoesNotOverwriteNewerRotation(t *testing.T) {
 // is rejected with invalid_grant; the source retries with the stored one.
 func TestInvalidGrantRetriesWithRotatedStoredToken(t *testing.T) {
 	f := newRotationFixture(t)
-	started, release := make(chan struct{}), make(chan struct{})
-	f.l.hook = func(rt string) {
-		if rt != "rt-0" {
-			return
-		}
-		close(started)
-		<-release
-	}
-	type out struct {
-		tok string
-		err error
-	}
-	done := make(chan out, 1)
-	go func() {
-		tok, err := f.source()(context.Background())
-		done <- out{tok, err}
-	}()
-	<-started
+	started, release := f.hold(func(rt string) bool { return rt == "rt-0" })
+	ts := f.source()
+	done := tokenAsync(context.Background(), ts)
+	awaitHeld(t, started, done)
 	// Another process rotated rt-0 to rt-other; its access token is expired.
 	f.l.setValid("rt-other")
 	f.save("s", "rt-other", "expired", time.Now().Add(-time.Hour))
-	close(release)
-	res := <-done
+	release()
+	res := awaitResult(t, done)
 	if res.err != nil || res.tok != "jwt-1" {
 		t.Fatalf("got %q %v, want a token from the retry", res.tok, res.err)
 	}
@@ -258,6 +351,134 @@ func TestInvalidGrantWithUnchangedStoreFails(t *testing.T) {
 	}
 	if calls := f.l.refreshCalls(); len(calls) != 1 {
 		t.Fatalf("refresh requests %v", calls)
+	}
+}
+
+// waitMarker is the debug message that a source logs when it starts to wait
+// for another process to publish a rotated refresh token.
+const waitMarker = "waits for another process to publish the rotated Logto refresh token"
+
+// Two processes send the same refresh token. The issuer rotates it for the
+// first one, so it rejects the second with invalid_grant before the first one
+// published the rotation. The second source waits for the publication and
+// adopts it instead of reporting a revoked token.
+func TestInvalidGrantWaitsForPendingRotation(t *testing.T) {
+	f := newRotationFixture(t)
+	started, release := f.hold(func(rt string) bool { return rt == "rt-0" })
+	logs := newSignalWriter(waitMarker)
+	ts := f.sourceWith(rotationWait, 5*time.Millisecond, logs)
+	done := tokenAsync(context.Background(), ts)
+	awaitHeld(t, started, done)
+	// The first process got rt-0 rotated to rt-1 and has not stored it yet.
+	f.l.setValid("rt-1")
+	release()
+	awaitWaiting(t, logs, done)
+	// The first process publishes its rotation, with a valid access token.
+	f.save("s", "rt-1", "published-jwt", time.Now().Add(time.Hour))
+	res := awaitResult(t, done)
+	if res.err != nil || res.tok != "published-jwt" {
+		t.Fatalf("got %q %v, want the published token", res.tok, res.err)
+	}
+	if calls := f.l.refreshCalls(); !slices.Equal(calls, []string{"rt-0"}) {
+		t.Fatalf("refresh requests %v, want only the rejected one", calls)
+	}
+}
+
+// The published rotation may need a refresh again: the source then retries
+// with the published refresh token.
+func TestInvalidGrantWaitRetriesWithPublishedToken(t *testing.T) {
+	f := newRotationFixture(t)
+	started, release := f.hold(func(rt string) bool { return rt == "rt-0" })
+	logs := newSignalWriter(waitMarker)
+	ts := f.sourceWith(rotationWait, 5*time.Millisecond, logs)
+	done := tokenAsync(context.Background(), ts)
+	awaitHeld(t, started, done)
+	f.l.setValid("rt-1")
+	release()
+	awaitWaiting(t, logs, done)
+	f.save("s", "rt-1", "expired", time.Now().Add(-time.Hour))
+	res := awaitResult(t, done)
+	if res.err != nil || res.tok != "jwt-1" {
+		t.Fatalf("got %q %v, want a token from the retry", res.tok, res.err)
+	}
+	if calls := f.l.refreshCalls(); !slices.Equal(calls, []string{"rt-0", "rt-1"}) {
+		t.Fatalf("refresh requests %v", calls)
+	}
+}
+
+// A revoked token is reported after the bound of the wait.
+func TestInvalidGrantWaitEndsAtTheBound(t *testing.T) {
+	f := newRotationFixture(t)
+	f.l.setValid()
+	const bound = 150 * time.Millisecond
+	ts := f.sourceWith(bound, 5*time.Millisecond, io.Discard)
+	start := time.Now()
+	done := tokenAsync(context.Background(), ts)
+	res := awaitResult(t, done)
+	if res.err == nil || !strings.Contains(res.err.Error(), "invalid_grant") || !strings.Contains(res.err.Error(), "ownsand login") {
+		t.Fatalf("got %q %v", res.tok, res.err)
+	}
+	if elapsed := time.Since(start); elapsed < bound {
+		t.Fatalf("the error came after %v, before the %v bound", elapsed, bound)
+	}
+	if calls := f.l.refreshCalls(); len(calls) != 1 {
+		t.Fatalf("refresh requests %v", calls)
+	}
+}
+
+// Cancelling the request ends the wait at once, long before its bound.
+func TestInvalidGrantWaitStopsOnCancel(t *testing.T) {
+	f := newRotationFixture(t)
+	f.l.setValid()
+	logs := newSignalWriter(waitMarker)
+	ts := f.sourceWith(time.Hour, 5*time.Millisecond, logs)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := tokenAsync(ctx, ts)
+	awaitWaiting(t, logs, done)
+	cancel()
+	res := awaitResult(t, done)
+	if !errors.Is(res.err, context.Canceled) {
+		t.Fatalf("got %q %v, want context.Canceled", res.tok, res.err)
+	}
+}
+
+// A logout or a newer login during the wait keeps its own error, and the
+// source keeps returning it.
+func TestInvalidGrantWaitSeesLogoutAndNewLogin(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(f *rotationFixture)
+		want   string
+	}{
+		{"signed out", func(f *rotationFixture) {
+			if err := f.st.Delete(); err != nil {
+				t.Fatal(err)
+			}
+		}, "signed out"},
+		{"signed in again", func(f *rotationFixture) {
+			f.save("other", "rt-9", "jwt-9", time.Now().Add(time.Hour))
+		}, "replaced"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRotationFixture(t)
+			f.l.setValid()
+			logs := newSignalWriter(waitMarker)
+			ts := f.sourceWith(rotationWait, 5*time.Millisecond, logs)
+			done := tokenAsync(context.Background(), ts)
+			awaitWaiting(t, logs, done)
+			tc.change(f)
+			res := awaitResult(t, done)
+			if res.err == nil || !strings.Contains(res.err.Error(), tc.want) {
+				t.Fatalf("got %q %v, want %q", res.tok, res.err, tc.want)
+			}
+			if _, err := ts(context.Background()); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("second call: got %v, want %q", err, tc.want)
+			}
+			if calls := f.l.refreshCalls(); len(calls) != 1 {
+				t.Fatalf("refresh requests %v", calls)
+			}
+		})
 	}
 }
 

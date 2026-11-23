@@ -79,6 +79,12 @@ type Env struct {
 	HTTPClient *http.Client
 	// LoginPollInterval overrides the 5-second device flow polling (tests).
 	LoginPollInterval time.Duration
+	// RefreshAdoptWait overrides the 5-second bound of the wait for another
+	// process to publish a rotated refresh token after invalid_grant (tests).
+	RefreshAdoptWait time.Duration
+	// RefreshAdoptPoll overrides the 50-millisecond interval at which that
+	// wait reloads the stored credentials (tests).
+	RefreshAdoptPoll time.Duration
 }
 
 // exitError ends a run with a status and an optional message.
