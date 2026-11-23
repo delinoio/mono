@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"errors"
 	"io"
 	"io/fs"
 	"log/slog"
@@ -1290,7 +1291,10 @@ func TestReadSnapshotAbortsWhenPathSwappedBeforeOpen(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "file changed during the snapshot copy") {
 			t.Fatalf("forceCopy=%v: expected abort, got %v", forceCopy, err)
 		}
-		os.Remove(dst)
+		// The abort must leave no snapshot file behind.
+		if _, err := os.Lstat(dst); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("forceCopy=%v: snapshot file left after abort", forceCopy)
+		}
 		// Restore the fixture for the next round.
 		os.WriteFile(path, []byte("aaaa"), 0o644)
 		os.WriteFile(other, []byte("bbbb"), 0o644)
