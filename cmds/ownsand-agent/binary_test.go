@@ -108,7 +108,10 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 		}
 	}
 	cp := testcp.New(t)
-	env := append(os.Environ(),
+	// Inherited OWNSAND_AGENT_* variables must not reach either subprocess:
+	// an invalid value would fail enroll and run in config.FromEnv, and a
+	// valid OWNSAND_AGENT_API_URL takes precedence over the stored URL.
+	env := append(withoutAgentEnv(os.Environ()),
 		"OWNSAND_AGENT_STATE_DIR="+t.TempDir(),
 		"OWNSAND_AGENT_RUNTIME=process",
 		"OWNSAND_AGENT_GUEST_BINARY="+filepath.Join(bin, "ownsand-guest"),
