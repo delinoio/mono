@@ -2634,3 +2634,140 @@ func TestIdleReportSkipsAcknowledgedTerminalRecord(t *testing.T) {
 		t.Fatal("restarted manager loaded the dropped record")
 	}
 }
+
+// retainFailedCreate models a runtime whose Create failed and whose stop
+// failed: it keeps the VM handle and the files of the sandbox for a later
+// stop.
+func (r *fakeRuntime) retainFailedCreate(id string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.vms[id] = &fakeVM{id: id, exited: make(chan struct{})}
+	r.files[id] = true
+}
+
+func (r *fakeRuntime) deleteCallCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.deleteCalls
+}
+
+func (e *env) pendingCleanups() int {
+	e.m.mu.Lock()
+	defer e.m.mu.Unlock()
+	return len(e.m.cleanupPending)
+}
+
+// tickAndWait runs a Tick and waits for the background work that it started.
+func (e *env) tickAndWait() {
+	e.t.Helper()
+	e.m.Tick(context.Background(), false)
+	e.m.bg.Wait()
+}
+
+// TestFailedCreateRetriesStopUntilItSucceeds checks that a failed create
+// whose VM stop failed stays eligible for clean-up: Tick retries the runtime
+// Delete, the retained VM handle and files stay until a Delete succeeds, and
+// no further Delete follows the success.
+func TestFailedCreateRetriesStopUntilItSucceeds(t *testing.T) {
+	e := newEnv(t)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	id := cmd.GetSandboxId()
+	e.rt.createErr = errors.New("injected create failure")
+	e.rt.deleteFails = 2
+	e.rt.retainFailedCreate(id)
+
+	entry, err := e.m.Create(context.Background(), cmd)
+	if err == nil {
+		t.Fatal("create succeeded although the runtime failed")
+	}
+	if entry.GetState() != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || entry.GetEndReason() != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_CREATE_FAILED {
+		t.Fatalf("entry %v/%v, want FAILED/CREATE_FAILED", entry.GetState(), entry.GetEndReason())
+	}
+	if got := e.pendingCleanups(); got != 1 {
+		t.Fatalf("pending clean-ups after the failed create = %d, want 1", got)
+	}
+	if calls := e.rt.deleteCallCount(); calls != 0 {
+		t.Fatalf("Create itself called the runtime Delete %d times, want 0", calls)
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		e.tickAndWait()
+		if calls := e.rt.deleteCallCount(); calls != attempt {
+			t.Fatalf("runtime Delete calls after tick %d = %d, want %d", attempt, calls, attempt)
+		}
+		if !e.rt.hasFiles(id) || len(e.rt.vms) != 1 {
+			t.Fatalf("retained VM released by failing Delete %d", attempt)
+		}
+		if got := e.pendingCleanups(); got != 1 {
+			t.Fatalf("pending clean-ups after failing tick %d = %d, want 1", attempt, got)
+		}
+	}
+
+	e.tickAndWait()
+	if calls := e.rt.deleteCallCount(); calls != 3 {
+		t.Fatalf("runtime Delete calls after the successful tick = %d, want 3", calls)
+	}
+	if e.rt.hasFiles(id) {
+		t.Fatal("files retained after a successful Delete")
+	}
+	if running, _ := e.rt.Running(context.Background()); len(running) != 0 {
+		t.Fatalf("VM handles retained after a successful Delete: %v", running)
+	}
+	if got := e.pendingCleanups(); got != 0 {
+		t.Fatalf("pending clean-ups after success = %d, want 0", got)
+	}
+	e.tickAndWait()
+	if calls := e.rt.deleteCallCount(); calls != 3 {
+		t.Fatalf("runtime Delete calls after a completed clean-up = %d, want 3", calls)
+	}
+}
+
+// TestSuccessfulCreateSchedulesNoCleanup checks that a successful create adds
+// no clean-up and that Tick makes no runtime Delete for a running sandbox.
+func TestSuccessfulCreateSchedulesNoCleanup(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, time.Hour).GetSandboxId()
+	if got := e.pendingCleanups(); got != 0 {
+		t.Fatalf("pending clean-ups after a successful create = %d, want 0", got)
+	}
+	e.tickAndWait()
+	if calls := e.rt.deleteCallCount(); calls != 0 {
+		t.Fatalf("Tick called the runtime Delete %d times for sandbox %s, want 0", calls, id)
+	}
+}
+
+// TestFailedCreateCleanupWaitsForLiveRecord checks that the retry leaves the
+// sandbox alone while a live record with the same ID exists: that record owns
+// the VM and its own end calls the runtime Delete.
+func TestFailedCreateCleanupWaitsForLiveRecord(t *testing.T) {
+	e := newEnv(t)
+	id := e.create(time.Hour, time.Hour).GetSandboxId()
+	e.m.mu.Lock()
+	e.m.cleanupPending[id] = struct{}{}
+	e.m.mu.Unlock()
+	e.tickAndWait()
+	if calls := e.rt.deleteCallCount(); calls != 0 {
+		t.Fatalf("clean-up retry stopped the live sandbox: %d runtime Delete calls", calls)
+	}
+	if s, _ := e.m.State(id); s != ownsandv1.SandboxState_SANDBOX_STATE_RUNNING {
+		t.Fatalf("sandbox state %v, want RUNNING", s)
+	}
+}
+
+// TestFailedCreateCleanupStopsAfterClose checks that no retry starts after
+// Close.
+func TestFailedCreateCleanupStopsAfterClose(t *testing.T) {
+	e := newEnv(t)
+	cmd := e.createCmd(1, time.Hour, time.Hour)
+	e.rt.createErr = errors.New("injected create failure")
+	e.rt.deleteFails = 1
+	e.rt.retainFailedCreate(cmd.GetSandboxId())
+	if _, err := e.m.Create(context.Background(), cmd); err == nil {
+		t.Fatal("create succeeded although the runtime failed")
+	}
+	e.m.Close()
+	e.tickAndWait()
+	if calls := e.rt.deleteCallCount(); calls != 0 {
+		t.Fatalf("Tick retried the clean-up after Close: %d runtime Delete calls", calls)
+	}
+}

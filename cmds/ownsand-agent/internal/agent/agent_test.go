@@ -1774,3 +1774,89 @@ func TestSnapshotCaptureEndsWithItsChannel(t *testing.T) {
 		t.Fatalf("state report holds the snapshot %v after its channel ended", s)
 	}
 }
+
+// retainedCreateRuntime models a runtime whose create failed and whose stop
+// of the failed create failed too: Create starts a real VM through the
+// wrapped runtime and then fails without stopping it, and the first
+// failDeletes Delete calls fail before the wrapped Delete stops the VM and
+// removes its files.
+type retainedCreateRuntime struct {
+	vmruntime.Runtime
+	mu          sync.Mutex
+	failDeletes int
+	deleteCalls int
+}
+
+func (r *retainedCreateRuntime) Create(ctx context.Context, spec vmruntime.Spec) (vmruntime.VM, error) {
+	if _, err := r.Runtime.Create(ctx, spec); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("injected create failure after the VM started")
+}
+
+func (r *retainedCreateRuntime) Delete(ctx context.Context, id string) error {
+	r.mu.Lock()
+	r.deleteCalls++
+	fail := r.deleteCalls <= r.failDeletes
+	r.mu.Unlock()
+	if fail {
+		return errors.New("injected stop failure")
+	}
+	return r.Runtime.Delete(ctx, id)
+}
+
+func (r *retainedCreateRuntime) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.deleteCalls
+}
+
+// TestFailedCreateRetainedVMIsStoppedByRunningAgent checks that a running
+// agent stops the VM that a failed create kept after a failed stop, without
+// a restart: the VM and its directory stay while the stop fails, and the
+// retry that succeeds stops the VM and removes the directory.
+func TestFailedCreateRetainedVMIsStoppedByRunningAgent(t *testing.T) {
+	cp := testcp.New(t)
+	st, id := enrollDevice(t, cp)
+	var rt *retainedCreateRuntime
+	h := startWith(t, cp, st, id, func(o *Options) {
+		rt = &retainedCreateRuntime{Runtime: o.Runtime, failDeletes: 2}
+		o.Runtime = rt
+	})
+	h.wait(0, "state report", func(e *ownsandv1.AgentEnvelope) bool { return e.GetStateReport() != nil })
+	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Configuration{Configuration: &ownsandv1.AgentConfiguration{Limits: limits}}})
+	sandboxID, _ := uuidv7.NewString()
+	res := h.command(createCommand(sandboxID))
+	if res.GetError() == nil {
+		t.Fatalf("create result %v, want a failure", res)
+	}
+	vmDir := st.Path(store.VMsDir, sandboxID)
+	running, err := rt.Runtime.Running(context.Background())
+	if err != nil || len(running) != 1 || running[0] != sandboxID {
+		t.Fatalf("VMs after the failed create: %v, %v; want the retained VM", running, err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	for rt.calls() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the agent retried the stop %d times, want 3", rt.calls())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	for {
+		running, err = rt.Runtime.Running(context.Background())
+		_, statErr := os.Stat(vmDir)
+		if err == nil && len(running) == 0 && os.IsNotExist(statErr) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("retained VM not released after the successful stop: running %v, dir stat %v", running, statErr)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	calls := rt.calls()
+	time.Sleep(2500 * time.Millisecond)
+	if got := rt.calls(); got != calls {
+		t.Fatalf("the agent kept stopping after success: %d Delete calls, want %d", got, calls)
+	}
+}
