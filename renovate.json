@@ -8,5 +8,27 @@
     "schedule": ["* 0-3 * * 1"]
   },
   "semanticCommits": "enabled",
-  "semanticCommitScope": "deps"
+  "semanticCommitScope": "deps",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The GitHub Actions runner version that tide-api installs in GITHUB_JOB guests.",
+      "managerFilePatterns": [
+        "/^servers/tide-api/internal/github/install\\.go$/"
+      ],
+      "matchStrings": [
+        "// renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)\\s+const RunnerVersion = \"(?<currentValue>[^\"]+)\""
+      ],
+      "extractVersionTemplate": "^v(?<version>.+)$"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchManagers": ["custom.regex"],
+      "matchPackageNames": ["actions/runner"],
+      "prBodyNotes": [
+        "Copy the sha256 values of the six release archives into `runnerSHA256` and set `runnerChecksumsVersion` in `servers/tide-api/internal/github/install.go`; `TestRunnerChecksums` fails until then."
+      ]
+    }
+  ]
 }

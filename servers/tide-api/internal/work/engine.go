@@ -161,6 +161,24 @@ func runStateLabel(s tidev1.RunnerState) string { return label(s, "RUNNER_STATE_
 func guestLabel(g tidev1.GuestOs) string        { return label(g, "GUEST_OS_") }
 func priorityLabel(p tidev1.Priority) string    { return label(p, "PRIORITY_") }
 
+// decorate runs the RequestDecorator of each kind on the API form of
+// requests of one organization.
+func (e *Engine) decorate(ctx context.Context, orgID string, reqs ...*tidev1.Request) {
+	byKind := map[tidev1.WorkloadKind][]*tidev1.Request{}
+	for _, r := range reqs {
+		byKind[r.GetKind()] = append(byKind[r.GetKind()], r)
+	}
+	for kind, list := range byKind {
+		d, ok := e.adapters[kind].(RequestDecorator)
+		if !ok {
+			continue
+		}
+		if err := d.DecorateRequests(ctx, e.svc.DB.Pool, orgID, list); err != nil && ctx.Err() == nil {
+			e.svc.Logger.WarnContext(ctx, "request_decorate_failed", slog.String("organization_id", orgID), slog.String("kind", kindLabel(kind)), slog.Any("error", err))
+		}
+	}
+}
+
 // GetRequest loads a request of the organization (not_found otherwise).
 func (e *Engine) GetRequest(ctx context.Context, q db.Querier, orgID, id string) (*Request, error) {
 	r, err := scanRequest(q.QueryRow(ctx, "SELECT "+requestColumns+" FROM requests WHERE organization_id = $1 AND request_id = $2", orgID, id))
@@ -381,30 +399,93 @@ func (e *Engine) setRunnerTx(ctx context.Context, tx pgx.Tx, id string, from []t
 // requestID binds the request to the runner when the source binds work
 // later (GITHUB_JOB); empty keeps the runner's request.
 func (e *Engine) MarkBusy(ctx context.Context, orgID, runnerID, requestID string) error {
-	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error {
-		r, err := e.GetRunner(ctx, tx, orgID, runnerID)
-		if err != nil {
-			return err
-		}
-		if requestID == "" {
-			requestID = r.RequestID
-		}
-		r, err = e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runWaiting, runPrep, runWarm}, runBusy, "request_id = $4", nullable(requestID))
-		if err != nil || r == nil {
-			if err == nil {
-				err = api.ErrPrecondition("the runner does not wait for work")
-			}
-			return err
-		}
-		if requestID != "" {
-			return e.startRequestTx(ctx, tx, requestID, r.ID, []tidev1.RequestState{reqQueued, reqStarting}, reqRunning)
-		}
-		return nil
-	})
+	err := e.svc.DB.InTx(ctx, func(tx pgx.Tx) error { return e.MarkBusyTx(ctx, tx, orgID, runnerID, requestID) })
 	if err == nil {
 		e.kickRunner(runnerID)
 	}
 	return err
+}
+
+// MarkBusyTx is MarkBusy in the caller's transaction, for a webhook that
+// stores its delivery with the change. After the commit, call
+// RunnerChanged. A runner that does not wait for work fails with
+// failed_precondition.
+func (e *Engine) MarkBusyTx(ctx context.Context, tx pgx.Tx, orgID, runnerID, requestID string) error {
+	r, err := e.GetRunner(ctx, tx, orgID, runnerID)
+	if err != nil {
+		return err
+	}
+	if requestID == "" {
+		requestID = r.RequestID
+	}
+	r, err = e.setRunnerTx(ctx, tx, r.ID, []tidev1.RunnerState{runWaiting, runPrep, runWarm}, runBusy, "request_id = $4", nullable(requestID))
+	if err != nil || r == nil {
+		if err == nil {
+			err = api.ErrPrecondition("the runner does not wait for work")
+		}
+		return err
+	}
+	if requestID != "" {
+		return e.startRequestTx(ctx, tx, requestID, r.ID, []tidev1.RequestState{reqQueued, reqStarting}, reqRunning)
+	}
+	return nil
+}
+
+// RunnerChanged wakes the driver of a runner on this instance after a
+// change that a transaction of another layer made (MarkBusyTx,
+// DeleteRunnerTx). On another instance, the next reconciler step picks the
+// change up.
+func (e *Engine) RunnerChanged(runnerID string) { e.kickRunner(runnerID) }
+
+// PoolSurplus returns the surplus runners of a runner pool (see
+// Adapter.BindsAtDispatch), newest first: the runners of the profile and
+// pool in CREATING, PREPARING or WAITING_FOR_WORK without a request beyond
+// the pool's QUEUED requests plus reserve (the profile's warm count).
+func (e *Engine) PoolSurplus(ctx context.Context, orgID, profileID, poolKey string, reserve int) ([]*Runner, error) {
+	var queued int
+	if err := e.svc.DB.Pool.QueryRow(ctx, `SELECT count(*) FROM requests WHERE organization_id = $1 AND runner_profile_id = $2 AND pool_key = $3 AND state = $4`,
+		orgID, profileID, poolKey, int16(reqQueued)).Scan(&queued); err != nil {
+		return nil, err
+	}
+	rows, err := e.svc.DB.Pool.Query(ctx, "SELECT "+runnerColumns+` FROM runners WHERE organization_id = $1 AND runner_profile_id = $2 AND pool_key = $3
+		AND request_id IS NULL AND state = ANY($4) ORDER BY create_time DESC, runner_id DESC`,
+		orgID, profileID, poolKey, []int16{int16(runCreating), int16(runPrep), int16(runWaiting)})
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var idle []*Runner
+	for rows.Next() {
+		r, err := scanRunner(rows)
+		if err != nil {
+			return nil, err
+		}
+		idle = append(idle, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if n := len(idle) - queued - max(reserve, 0); n > 0 {
+		return idle[:n], nil
+	}
+	return nil, nil
+}
+
+// DeleteIdleRunnerTx deletes a runner with reason in the caller's
+// transaction only while it is still in CREATING, PREPARING or
+// WAITING_FOR_WORK without a request (a surplus or clean-up of a runner
+// pool). It returns nil when the runner changed meanwhile, for example
+// because it took work. After the commit, call RunnerChanged (or
+// DeleteSandboxOf) for the runner.
+func (e *Engine) DeleteIdleRunnerTx(ctx context.Context, tx pgx.Tx, orgID, runnerID string, reason tidev1.RunnerEndReason) (*Runner, error) {
+	if _, err := e.GetRunner(ctx, tx, orgID, runnerID); err != nil {
+		return nil, err
+	}
+	cur, err := e.lockRunner(ctx, tx, runnerID)
+	if err != nil || cur.RequestID != "" {
+		return nil, err
+	}
+	return e.setRunnerTx(ctx, tx, cur.ID, []tidev1.RunnerState{runCreating, runPrep, runWaiting, runWarm}, runDeleting, "end_reason = $4", int16(reason))
 }
 
 // startRequestTx moves a request to STARTING or RUNNING with its runner.

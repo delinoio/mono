@@ -28,6 +28,8 @@ type Metrics struct {
 	runnerStart   metric.Float64Histogram
 	devExecs      metric.Int64Counter
 	transferBytes metric.Int64Counter
+	// webhookDeliveries is tide_webhook_deliveries_total.
+	webhookDeliveries metric.Int64Counter
 }
 
 // New creates the instruments with provider; nil selects a no-op provider.
@@ -46,6 +48,7 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 	m.ownsandCalls = counter("tide_ownsand_calls", "Calls of the OwnSand API by RPC and Connect code.")
 	m.requestsEnded = counter("tide_requests_ended", "Ended requests by kind, state and end reason.")
 	m.devExecs = counter("tide_dev_session_execs", "Ended dev session execs by guest OS and result.")
+	m.webhookDeliveries = counter("tide_webhook_deliveries", "Webhook deliveries by sender and result.")
 	m.transferBytes = counter("tide_dev_session_transfer_bytes", "File bytes that tide-api relays for dev sessions, by direction and guest OS.")
 	gauge := func(name, help string) metric.Int64Gauge {
 		g, err := meter.Int64Gauge(name, metric.WithDescription(help))
@@ -123,5 +126,13 @@ func (m *Metrics) DevSessionExec(guestOS, result string) {
 func (m *Metrics) TransferBytes(direction, guestOS string, n int64) {
 	if m != nil && n > 0 {
 		m.transferBytes.Add(context.Background(), n, metric.WithAttributes(attribute.String("direction", direction), attribute.String("guest_os", guestOS)))
+	}
+}
+
+// WebhookDelivery counts one webhook delivery by sender (github, openai)
+// and result (see webhook.Result).
+func (m *Metrics) WebhookDelivery(sender, result string) {
+	if m != nil {
+		m.webhookDeliveries.Add(context.Background(), 1, metric.WithAttributes(attribute.String("sender", sender), attribute.String("result", result)))
 	}
 }

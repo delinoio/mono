@@ -125,9 +125,9 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 				continue
 			}
 		}
-		res := e.createRunner(ctx, client, p, req)
+		res := e.createRunner(ctx, client, p, req, req.PoolKey)
 		if res == createUnavailable && !reclaimed {
-			reclaimed = e.reclaimWarm(ctx, runners, p.ID)
+			reclaimed = e.reclaimWarm(ctx, queued, runners, p.ID)
 		}
 		if res == createStalled {
 			// OwnSand did not answer in time: end this organization's pass,
@@ -145,6 +145,12 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 		if a == nil || p.WarmCount == 0 {
 			continue
 		}
+		if !a.BindsAtDispatch() {
+			if !e.fillPoolWarm(ctx, client, a, p, queued, runners) {
+				return nil
+			}
+			continue
+		}
 		idle := 0
 		for _, r := range runners {
 			if r.ProfileID == p.ID && r.RequestID == "" && (r.State == runCreating || r.State == runPrep || r.State == runWarm) {
@@ -152,12 +158,49 @@ func (e *Engine) pass(ctx context.Context, orgID string) error {
 			}
 		}
 		for ; idle < int(p.WarmCount); idle++ {
-			if e.createRunner(ctx, client, p, nil) != createOK {
+			if e.createRunner(ctx, client, p, nil, "") != createOK {
 				return nil
 			}
 		}
 	}
 	return nil
+}
+
+// fillPoolWarm keeps the warm count of a profile of a kind without
+// BindsAtDispatch in each runner pool that its WarmPooler lists. Every
+// request is covered when it runs, so a pool's runners in CREATING,
+// PREPARING or WAITING_FOR_WORK without a request beyond its QUEUED
+// requests are its warm runners. It reports false when a creation failed,
+// which ends the pass.
+func (e *Engine) fillPoolWarm(ctx context.Context, client ownsandclient.Client, a Adapter, p *profile.Profile, queued []*Request, runners []*Runner) bool {
+	wp, ok := a.(WarmPooler)
+	if !ok {
+		return true
+	}
+	pools, err := wp.WarmPools(ctx, p.OrganizationID)
+	if err != nil {
+		e.svc.Logger.WarnContext(ctx, "dispatch_warm_pools_failed", slog.String("organization_id", p.OrganizationID), slog.Any("error", err))
+		return true
+	}
+	for _, pool := range pools {
+		idle := 0
+		for _, r := range runners {
+			if r.ProfileID == p.ID && r.PoolKey == pool && r.RequestID == "" && (r.State == runCreating || r.State == runPrep || r.State == runWaiting) {
+				idle++
+			}
+		}
+		for _, q := range queued {
+			if q.ProfileID == p.ID && q.PoolKey == pool {
+				idle--
+			}
+		}
+		for ; idle < int(p.WarmCount); idle++ {
+			if e.createRunner(ctx, client, p, nil, pool) != createOK {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // expire ends the QUEUED requests whose maximum queue wait ended.
@@ -367,17 +410,14 @@ func sandboxRequest(p *profile.Profile, r *Runner) *ownsandv1.CreateSandboxReque
 
 // createRunner stores a new runner with its idempotency key, binds the
 // request for binding kinds, and calls CreateSandbox. req is nil for a warm
-// runner.
-func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request) createResult {
+// runner; pool is the runner pool of a kind without BindsAtDispatch.
+func (e *Engine) createRunner(ctx context.Context, client ownsandclient.Client, p *profile.Profile, req *Request, pool string) createResult {
 	a := e.adapters[p.Kind]
 	r := &Runner{
 		ID: api.NewID(), OrganizationID: p.OrganizationID, ProfileID: p.ID, Kind: p.Kind, GuestOS: p.GuestOS,
-		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath,
+		IdempotencyKey: api.NewID(), WorkspacePath: p.WorkspacePath, PoolKey: pool,
 	}
 	bind := req != nil && a.BindsAtDispatch()
-	if req != nil {
-		r.PoolKey = req.PoolKey
-	}
 	// The request is stored with the runner, so every retry sends the same
 	// parameters with the key.
 	sreq := sandboxRequest(p, r)
@@ -597,33 +637,102 @@ func (e *Engine) requeueTx(ctx context.Context, tx pgx.Tx, requestID string) err
 
 // reclaimWarm deletes one warm runner of another profile after OwnSand had
 // no capacity: the one of the lowest priority profile first, then the
-// oldest. It reports whether it deleted one.
-func (e *Engine) reclaimWarm(ctx context.Context, runners []*Runner, profileID string) bool {
-	var best *Runner
-	var bestPriority tidev1.Priority
-	for _, r := range runners {
-		if r.ProfileID == profileID || r.State != runWarm || r.RequestID != "" {
-			continue
+// oldest. The warm runners of a runner pool of a WarmReclaimer kind count
+// too (see warmPoolRunners). It reports whether it deleted one.
+func (e *Engine) reclaimWarm(ctx context.Context, queued []*Request, runners []*Runner, profileID string) bool {
+	type candidate struct {
+		r    *Runner
+		prio tidev1.Priority
+	}
+	var cands []candidate
+	prios := map[string]tidev1.Priority{}
+	priority := func(r *Runner) tidev1.Priority {
+		if prio, ok := prios[r.ProfileID]; ok {
+			return prio
 		}
-		p, err := e.profiles.Get(ctx, e.svc.DB.Pool, r.OrganizationID, r.ProfileID)
 		prio := tidev1.Priority_PRIORITY_LOW + 1 // a deleted profile goes first
-		if err == nil {
+		if p, err := e.profiles.Get(ctx, e.svc.DB.Pool, r.OrganizationID, r.ProfileID); err == nil {
 			prio = p.Priority
 		}
-		// Priority values grow from HIGH (1) to LOW (3): the larger value is
-		// the lower priority. runners is oldest first, so ">" keeps the
-		// oldest of equal priority.
-		if best == nil || prio > bestPriority {
-			best, bestPriority = r, prio
+		prios[r.ProfileID] = prio
+		return prio
+	}
+	for _, r := range runners {
+		if r.ProfileID != profileID && r.State == runWarm && r.RequestID == "" {
+			cands = append(cands, candidate{r, priority(r)})
 		}
 	}
-	if best == nil {
-		return false
+	for _, r := range e.warmPoolRunners(queued, runners) {
+		if r.ProfileID != profileID {
+			cands = append(cands, candidate{r, priority(r)})
+		}
 	}
-	if _, err := e.deleteRunner(ctx, best.OrganizationID, best.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_WARM_RECLAIMED, 0); err != nil {
-		e.svc.Logger.WarnContext(ctx, "warm_reclaim_failed", slog.String("runner_id", best.ID), slog.Any("error", err))
-		return false
+	// Priority values grow from HIGH (1) to LOW (3): the larger value is the
+	// lower priority. Equal priorities go oldest first.
+	sort.SliceStable(cands, func(i, j int) bool {
+		if cands[i].prio != cands[j].prio {
+			return cands[i].prio > cands[j].prio
+		}
+		if !cands[i].r.CreateTime.Equal(cands[j].r.CreateTime) {
+			return cands[i].r.CreateTime.Before(cands[j].r.CreateTime)
+		}
+		return cands[i].r.ID < cands[j].r.ID
+	})
+	for _, c := range cands {
+		best := c.r
+		if wr, ok := e.adapters[best.Kind].(WarmReclaimer); ok && !e.adapters[best.Kind].BindsAtDispatch() {
+			// A pool runner may have taken work meanwhile (the adapter then
+			// keeps it), so the next candidate is tried.
+			done, err := wr.ReclaimWarm(ctx, best)
+			if err != nil {
+				e.svc.Logger.WarnContext(ctx, "warm_reclaim_failed", slog.String("runner_id", best.ID), slog.Any("error", err))
+			}
+			if !done {
+				continue
+			}
+		} else if _, err := e.deleteRunner(ctx, best.OrganizationID, best.ID, tidev1.RunnerEndReason_RUNNER_END_REASON_WARM_RECLAIMED, 0); err != nil {
+			e.svc.Logger.WarnContext(ctx, "warm_reclaim_failed", slog.String("runner_id", best.ID), slog.Any("error", err))
+			return false
+		}
+		best.State = runDeleting
+		return true
 	}
-	best.State = runDeleting
-	return true
+	return false
+}
+
+// warmPoolRunners returns the warm runners of the runner pools of the
+// WarmReclaimer kinds: in each pool, the idle runners (CREATING, PREPARING
+// or WAITING_FOR_WORK without a request) beyond the pool's QUEUED requests.
+// The newest idle runners count as warm, as in the surplus rule, so the
+// older ones keep covering the requests.
+func (e *Engine) warmPoolRunners(queued []*Request, runners []*Runner) []*Runner {
+	demand := map[string]int{}
+	for _, q := range queued {
+		demand[q.ProfileID+"\x00"+q.PoolKey]++
+	}
+	idle := map[string][]*Runner{}
+	var keys []string
+	for _, r := range runners {
+		a := e.adapters[r.Kind]
+		if _, ok := a.(WarmReclaimer); !ok || a.BindsAtDispatch() || r.RequestID != "" {
+			continue
+		}
+		if r.State != runCreating && r.State != runPrep && r.State != runWaiting {
+			continue
+		}
+		key := r.ProfileID + "\x00" + r.PoolKey
+		if idle[key] == nil {
+			keys = append(keys, key)
+		}
+		idle[key] = append(idle[key], r)
+	}
+	var out []*Runner
+	for _, key := range keys {
+		// runners is oldest first.
+		list := idle[key]
+		if n := len(list) - demand[key]; n > 0 {
+			out = append(out, list[len(list)-n:]...)
+		}
+	}
+	return out
 }

@@ -3,6 +3,7 @@
 package work
 
 import (
+	"strconv"
 	"time"
 
 	tidev1 "github.com/delinoio/mono/protos/delino/tide/v1"
@@ -172,11 +173,16 @@ func (r *Request) Proto() *tidev1.Request {
 	return out
 }
 
-// Proto returns the API form of a runner.
+// Proto returns the API form of a runner. The runner pool of a GITHUB_JOB
+// runner is the GitHub numeric installation ID in decimal.
 func (r *Runner) Proto() *tidev1.Runner {
-	return &tidev1.Runner{
+	out := &tidev1.Runner{
 		RunnerId: r.ID, OrganizationId: r.OrganizationID, RunnerProfileId: r.ProfileID, Kind: r.Kind, State: r.State, EndReason: r.EndReason,
 		OwnsandSandboxId: r.SandboxID, OwnsandDeviceId: r.DeviceID, RequestId: r.RequestID, CreatedAt: api.Timestamp(r.CreateTime),
 		EndedAt: api.TimestampPtr(r.EndTime), OwnsandEndReason: r.OwnSandEndReason, GuestOs: r.GuestOS,
 	}
+	if r.Kind == tidev1.WorkloadKind_WORKLOAD_KIND_GITHUB_JOB {
+		out.GithubInstallationId, _ = strconv.ParseInt(r.PoolKey, 10, 64)
+	}
+	return out
 }

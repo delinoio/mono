@@ -116,6 +116,7 @@ func (h *Handler) ListRequests(ctx context.Context, req *connect.Request[tidev1.
 	if err := rows.Err(); err != nil {
 		return nil, s.Internal(ctx, "list requests", err)
 	}
+	h.e.decorate(ctx, c.OrganizationID, resp.Requests...)
 	if len(resp.Requests) == int(limit) {
 		resp.NextPageToken = offsetToken(offset + int(limit))
 	}
@@ -136,7 +137,9 @@ func (h *Handler) GetRequest(ctx context.Context, req *connect.Request[tidev1.Ge
 	if err != nil {
 		return nil, s.Internal(ctx, "get request", err)
 	}
-	return connect.NewResponse(&tidev1.GetRequestResponse{Request: r.Proto()}), nil
+	out := r.Proto()
+	h.e.decorate(ctx, c.OrganizationID, out)
+	return connect.NewResponse(&tidev1.GetRequestResponse{Request: out}), nil
 }
 
 // CancelRequest ends a QUEUED request with CANCELED and CANCELED_BY_USER.
@@ -182,7 +185,9 @@ func (h *Handler) CancelRequest(ctx context.Context, req *connect.Request[tidev1
 		return nil, s.Internal(ctx, "cancel request", err)
 	}
 	e.releaseClaim(ctx, out)
-	return connect.NewResponse(&tidev1.CancelRequestResponse{Request: out.Proto()}), nil
+	msg := out.Proto()
+	e.decorate(ctx, out.OrganizationID, msg)
+	return connect.NewResponse(&tidev1.CancelRequestResponse{Request: msg}), nil
 }
 
 func (h *Handler) ListRunners(ctx context.Context, req *connect.Request[tidev1.ListRunnersRequest]) (*connect.Response[tidev1.ListRunnersResponse], error) {
@@ -546,6 +551,11 @@ func (h *Handler) watchRows(ctx context.Context, orgID string, after int64, snap
 		out = append(out, watchRow{id: "q" + r.ID, seq: r.ChangeSeq, msg: &tidev1.WatchQueueResponse{Event: &tidev1.WatchQueueResponse_Request{Request: r.Proto()}}})
 	}
 	rows.Close()
+	var reqs []*tidev1.Request
+	for _, r := range out {
+		reqs = append(reqs, r.msg.GetRequest())
+	}
+	h.e.decorate(ctx, orgID, reqs...)
 	runArgs := args
 	if snapshot {
 		runArgs = []any{orgID, openRunnerStates}
