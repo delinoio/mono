@@ -10,6 +10,7 @@ package scheduler
 import (
 	"bytes"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"time"
@@ -144,7 +145,8 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 	if req.VCPUCount > limits.GetVcpuCount() {
 		return Permanent, "the request has more vCPUs than the device vCPU limit"
 	}
-	if req.MemoryMiB > limits.GetMemoryMib() {
+	memory := EffectiveMemoryMiB(d.HostOS, req.MemoryMiB)
+	if memory > limits.GetMemoryMib() {
 		return Permanent, "the request needs more memory than the device limit"
 	}
 	if req.DiskGiB > limits.GetDiskGib() {
@@ -194,7 +196,7 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 	if allocatedVCPU(alloc)+int64(req.VCPUCount) > validate.EffectiveVCPULimit(limits) {
 		return Transient, "running sandboxes hold the vCPU capacity"
 	}
-	if alloc.GetMemoryMib()+req.MemoryMiB > limits.GetMemoryMib() {
+	if alloc.GetMemoryMib()+memory > limits.GetMemoryMib() {
 		return Transient, "running sandboxes hold the memory capacity"
 	}
 	if alloc.GetDiskGib()+req.DiskGiB > limits.GetDiskGib() {
@@ -213,6 +215,20 @@ func Evaluate(req Request, d Device, now time.Time) (Outcome, string) {
 		}
 	}
 	return Eligible, ""
+}
+
+// EffectiveMemoryMiB returns the memory that a sandbox of the requested size
+// reserves on a device of the host OS. The Hyper-V runtime, the only runtime
+// on a Windows host, rounds the memory of a VM up to an even number of MiB
+// (see newComputeSystemDoc in the agent's hcsrt package), so an odd request
+// reserves one MiB more there. Other hosts reserve the requested size. The
+// sandbox record keeps the requested size; only the reservation changes.
+// Keep this rule in step with the memory allocation sums in the api package.
+func EffectiveMemoryMiB(hostOS ownsandv1.HostOs, requested int64) int64 {
+	if hostOS == ownsandv1.HostOs_HOST_OS_WINDOWS && requested%2 != 0 && requested < math.MaxInt64 {
+		return requested + 1
+	}
+	return requested
 }
 
 func holds(s *Snapshot, deviceID string) bool {

@@ -210,7 +210,7 @@ const deviceSelect = `SELECT d.device_id::text, d.organization_id::text, d.name,
 	d.create_time, d.last_seen_time, d.pending_idle_since,
 	COALESCE(a.vcpu, 0), COALESCE(a.memory, 0), COALESCE(a.disk, 0), COALESCE(a.macos, 0)
 	FROM devices d LEFT JOIN LATERAL (
-		SELECT sum(s.vcpu_count)::bigint AS vcpu, sum(s.memory_mib)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
+		SELECT sum(s.vcpu_count)::bigint AS vcpu, sum(s.memory_mib + CASE WHEN d.host_os = 3 /* HOST_OS_WINDOWS: Hyper-V rounds VM memory up to even MiB */ AND mod(s.memory_mib, 2) = 1 THEN 1 ELSE 0 END)::bigint AS memory, sum(s.disk_gib)::bigint AS disk,
 			count(*) FILTER (WHERE s.guest_os = 2)::int AS macos
 		FROM sandboxes s WHERE s.device_id = d.device_id AND s.agent_state IN (1, 2, 3, 4)
 	) a ON true`
