@@ -346,8 +346,8 @@ func (h *BillingAccountHandler) RevokeInvitation(ctx context.Context, req *conne
 	if err != nil {
 		return nil, err
 	}
-	now := h.timestamp()
 	var inv invitation
+	var now time.Time
 	audit := &auditLog{}
 	err = h.db.InTx(ctx, func(tx pgx.Tx) error {
 		account, err := loadAccess(ctx, tx, accountID, userID, lockAccount)
@@ -365,6 +365,10 @@ func (h *BillingAccountHandler) RevokeInvitation(ctx context.Context, req *conne
 		if err != nil {
 			return err
 		}
+		// Sample the clock only after the account and invitation locks are
+		// held: the wait for them can outlast the invitation, so one fresh
+		// time decides the pending check and is stored, audited and returned.
+		now = h.timestamp()
 		if inv.state(now) != accountsv1.InvitationState_INVITATION_STATE_PENDING {
 			return failedPrecondition("the invitation is not pending")
 		}
