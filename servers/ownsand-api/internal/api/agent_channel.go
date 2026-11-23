@@ -58,6 +58,14 @@ type commandInfo struct {
 // errDeviceRemoved closes a channel after the clean-up command.
 var errDeviceRemoved = errors.New("the device was removed")
 
+// errInitialStateReportFailed closes a channel whose first full state report
+// could not be reconciled with the database. Such a channel never becomes
+// reconciled, so it is not eligible for placement, yet its heartbeats would
+// keep it open until the agent restarts: the agent sends one full report per
+// channel. Closing it makes the agent reconnect through its normal backoff
+// and report again.
+var errInitialStateReportFailed = errors.New("the first state report of the channel could not be applied")
+
 // DefaultWriterDrainTimeout bounds the wait for the channel writer before
 // the device state changes after the channel closed. A writer that is still
 // blocked in a send after that (the agent does not read) no longer holds
@@ -438,6 +446,17 @@ func (s *Service) handleCapabilityReport(ctx context.Context, conn *hub.Conn, r 
 func (s *Service) handleStateReport(ctx context.Context, conn *hub.Conn, r *ownsandv1.StateReport) error {
 	res, err := s.reconcileStateReport(ctx, conn.DeviceID, conn.ID, r)
 	if err != nil {
+		if !conn.Reconciled() && ctx.Err() == nil {
+			// No acknowledgement is sent and the channel stays not
+			// reconciled. Close it so that the agent connects again and
+			// sends a new full report once the database recovers. A failed
+			// report on an already reconciled channel keeps the channel,
+			// which is eligible and keeps its earlier state.
+			s.Logger.WarnContext(ctx, "agent_state_report_failed", slog.String("device_id", conn.DeviceID),
+				slog.String("channel_id", conn.ID), slog.Int("sandboxes", len(r.GetSandboxes())), slog.Any("error", err))
+			conn.Close(errInitialStateReportFailed)
+			return nil
+		}
 		return err
 	}
 	if res.removed {
