@@ -9,6 +9,7 @@ import type { ConnectError } from "@connectrpc/connect";
 import { useInfiniteQuery } from "@connectrpc/connect-query";
 import type {
   InfiniteData,
+  Query,
   UseInfiniteQueryResult,
 } from "@tanstack/react-query";
 import { useEffect } from "react";
@@ -61,11 +62,28 @@ type PageTokenInfiniteQuery = <I extends DescMessage, O extends DescMessage>(
   options: {
     pageParamKey: "pageToken";
     getNextPageParam: (last: MessageShape<O>) => string | undefined;
+    refetchOnWindowFocus: (query: Query) => boolean;
   },
 ) => UseInfiniteQueryResult<
   InfiniteData<MessageShape<O>, unknown>,
   ConnectError
 >;
+
+/**
+ * Whether a focus of the tab may refetch the list. A failed request for a
+ * later page leaves the list waiting for the user to retry it. A refetch on
+ * focus would read the cached pages again from the first page, clear the
+ * failure and let the continuation effect request the failed token without
+ * the user's retry, so the list refetches on focus only when no continuation
+ * request has failed. TanStack Query marks the failed request with the
+ * `forward` direction of `fetchMore`, as it does for `isFetchNextPageError`.
+ */
+function refetchListOnFocus(query: Query): boolean {
+  return !(
+    query.state.status === "error" &&
+    query.state.fetchMeta?.fetchMore?.direction === "forward"
+  );
+}
 
 /**
  * Reads a list RPC that returns `page_token` pages until the server returns an
@@ -89,6 +107,7 @@ export function useAllPages<I extends DescMessage, O extends DescMessage, Item>(
     {
       pageParamKey: "pageToken",
       getNextPageParam: (last) => read(last).nextPageToken || undefined,
+      refetchOnWindowFocus: refetchListOnFocus,
     },
   );
   const {
