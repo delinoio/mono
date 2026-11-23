@@ -387,24 +387,62 @@ func TestExecRetention(t *testing.T) {
 	}
 }
 
+// TestExecKeepalive checks that a silent exec produces a keepalive event. The
+// command stays alive until the test sees a keepalive after the start event,
+// or until cleanup releases it, so a delayed Serve reader cannot observe an
+// exec that already ended without any idle time.
 func TestExecKeepalive(t *testing.T) {
 	h := newHarness(t, func(c *Config) { c.KeepaliveInterval = 50 * time.Millisecond })
+	release := filepath.Join(t.TempDir(), "release")
+	// Registered after newHarness, so it runs before the harness cleanup that
+	// waits for the exec: a failing test never leaves the fixture running.
+	t.Cleanup(func() { _ = os.WriteFile(release, nil, 0o600) })
+	req := execReq(t, "/bin/sh", "-c", `while [ ! -e "$RELEASE" ]; do sleep 0.02; done`)
+	req.Env = map[string]string{"RELEASE": release}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	s := h.open(ctx)
-	s.send(1, execReq(t, "/bin/sh", "-c", "sleep 0.3"))
-	sawKeepalive := false
+	s.send(1, req)
+
+	started := false
 	for {
-		ev := s.recv().GetExecEvent()
-		if ev.GetKeepalive() != nil {
-			sawKeepalive = true
+		f := s.recv()
+		if f.GetError() != nil {
+			t.Fatalf("error frame: %v", f.GetError())
 		}
-		if ev.GetExited() != nil {
-			break
+		ev := f.GetExecEvent()
+		switch ev.GetEvent().(type) {
+		case *ownsandv1.ExecEvent_Started:
+			started = true
+		case *ownsandv1.ExecEvent_Keepalive:
+			if !started {
+				// The log records the start event only after the process
+				// spawned, so a slow spawn legitimately gets keepalives
+				// first. Only a keepalive after the start event counts.
+				continue
+			}
+			if err := os.WriteFile(release, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			// The command is released: it must now exit successfully.
+			for {
+				ev := s.recv().GetExecEvent()
+				if ev.GetFailed() != nil {
+					t.Fatalf("exec failed after release: %v", ev.GetFailed())
+				}
+				if ex := ev.GetExited(); ex != nil {
+					if ex.GetExitCode() != 0 || ex.GetTimedOut() {
+						t.Fatalf("exit code %d, timed out %t; want a clean exit", ex.GetExitCode(), ex.GetTimedOut())
+					}
+					return
+				}
+			}
+		case *ownsandv1.ExecEvent_Failed:
+			t.Fatalf("exec failed before a keepalive: %v", ev.GetFailed())
+		case *ownsandv1.ExecEvent_Exited:
+			t.Fatal("command exited before a keepalive although it was held open")
 		}
-	}
-	if !sawKeepalive {
-		t.Fatal("no keepalive while the command was silent")
 	}
 }
 
