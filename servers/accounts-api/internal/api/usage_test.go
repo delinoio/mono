@@ -744,7 +744,7 @@ func TestListManageableBillingAccounts(t *testing.T) {
 	ids = append(ids, f.AccountID)
 
 	var got []string
-	token := ""
+	token, firstToken := "", ""
 	for {
 		resp, err := env.Service().ListManageableBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
 			UserId: user.ID, PageSize: 3, PageToken: token,
@@ -762,6 +762,9 @@ func TestListManageableBillingAccounts(t *testing.T) {
 			}
 			got = append(got, a.GetBillingAccountId())
 		}
+		if firstToken == "" {
+			firstToken = resp.Msg.GetNextPageToken()
+		}
 		if token = resp.Msg.GetNextPageToken(); token == "" {
 			break
 		}
@@ -769,9 +772,37 @@ func TestListManageableBillingAccounts(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(ids, ",") {
 		t.Fatalf("accounts = %v, want %v (in ID order, without the viewer account)", got, ids)
 	}
-	_, err := env.Service().ListManageableBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
-		UserId: "someone-else", PageToken: token + "x",
-	}))
+
+	// The last page has no continuation token, so the page token checks use
+	// the token that the first page returned (3 of 4 accounts per page).
+	if firstToken == "" {
+		t.Fatal("first page returned no next_page_token")
+	}
+	list := func(userID, pageToken string) (*accountsv1.ListManageableBillingAccountsResponse, error) {
+		resp, err := env.Service().ListManageableBillingAccounts(ctx(), connect.NewRequest(&accountsv1.ListManageableBillingAccountsRequest{
+			UserId: userID, PageSize: 3, PageToken: pageToken,
+		}))
+		if err != nil {
+			return nil, err
+		}
+		return resp.Msg, nil
+	}
+	// The token continues the listing for the user it was issued to.
+	next, err := list(user.ID, firstToken)
+	if err != nil {
+		t.Fatalf("first-page token for the original user: %v", err)
+	}
+	if len(next.GetBillingAccounts()) != 1 || next.GetBillingAccounts()[0].GetBillingAccountId() != ids[3] {
+		t.Fatalf("continuation page = %v, want only %s", next.GetBillingAccounts(), ids[3])
+	}
+	// The same unmodified token is scoped to its user: another user gets
+	// invalid_argument.
+	_, err = list(newPerson(env, "other").ID, firstToken)
+	wantCode(t, err, connect.CodeInvalidArgument)
+	// A malformed token is rejected independently of the scope check.
+	_, err = list(user.ID, "x")
+	wantCode(t, err, connect.CodeInvalidArgument)
+	_, err = list(user.ID, firstToken+"x")
 	wantCode(t, err, connect.CodeInvalidArgument)
 }
 
