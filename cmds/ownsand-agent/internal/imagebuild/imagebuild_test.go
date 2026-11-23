@@ -55,16 +55,21 @@ func TestParseGuestOS(t *testing.T) {
 	}
 }
 
-// minimalWindowsAMD64PE is the smallest image debug/pe accepts as an amd64
-// executable: an MZ header whose e_lfanew (offset 0x3c) points at 0x40, the
-// "PE\0\0" signature, and a COFF file header with machine 0x8664 and no
-// sections or optional header.
+// minimalWindowsAMD64PE is the smallest image that checkWindowsAMD64 accepts
+// as an amd64 executable: an MZ header whose e_lfanew (offset 0x3c) points at
+// 0x40, the "PE\0\0" signature, and a COFF file header with machine 0x8664,
+// the IMAGE_FILE_EXECUTABLE_IMAGE flag and a 240-byte PE32+ optional header
+// (magic 0x20b) and no sections.
 func minimalWindowsAMD64PE() []byte {
-	b := make([]byte, 96)
+	b := make([]byte, 0x40+4+20+240+16)
 	b[0], b[1] = 'M', 'Z'
 	b[0x3c] = 0x40
 	copy(b[0x40:], "PE\x00\x00")
 	b[0x44], b[0x45] = 0x64, 0x86 // IMAGE_FILE_MACHINE_AMD64, little endian
+	b[0x54], b[0x55] = 0xf0, 0x00 // SizeOfOptionalHeader
+	b[0x56] = 0x02                // IMAGE_FILE_EXECUTABLE_IMAGE
+	b[0x58], b[0x59] = 0x0b, 0x02 // PE32+ optional header magic
+	b[0x58+108] = 16              // NumberOfRvaAndSizes
 	return b
 }
 

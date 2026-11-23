@@ -252,13 +252,8 @@ func fakeGuestBinary(t *testing.T, guest ownsandv1.GuestOs) string {
 		}
 	case ownsandv1.GuestOs_GUEST_OS_WINDOWS:
 		name += ".exe"
-		// DOS header with e_lfanew 0x40, then "PE\0\0" and a COFF header of
-		// machine amd64 without sections, symbols or optional header.
-		b = make([]byte, 0x200)
-		b[0], b[1] = 'M', 'Z'
-		b[0x3c] = 0x40
-		copy(b[0x40:], "PE\x00\x00")
-		b[0x44], b[0x45] = 0x64, 0x86
+		// An amd64 executable image that checkWindowsAMD64 accepts.
+		b = minimalWindowsAMD64PE()
 	default:
 		t.Fatalf("no fake guest binary for %v", guest)
 	}
