@@ -120,6 +120,13 @@ describe("ended Logto session", () => {
           screen.getByRole("button", { name: "Sign in with Delino" }),
         );
       });
+      // The failed token request is an earlier SDK error, not the failure of
+      // this sign-in attempt, so no sign-in failure alert appears.
+      expect(
+        screen.queryByText(
+          "Sign-in did not start. Check your connection and try again.",
+        ),
+      ).toBeNull();
       // The SDK starts the redirect by saving its sign-in session.
       await waitFor(
         () =>

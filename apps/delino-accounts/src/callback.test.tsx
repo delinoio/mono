@@ -74,12 +74,13 @@ const AUTH: Auth = {
   signIn: async () => {
     signIns++;
   },
+  signInFailed: false,
   signOut: async () => {},
   getAccessToken: async () => undefined,
 };
 
 function renderCallback(
-  options: { strict?: boolean; url?: string } = {},
+  options: { strict?: boolean; url?: string; auth?: Partial<Auth> } = {},
 ): void {
   window.history.replaceState(null, "", options.url ?? "/callback");
   const app = (
@@ -87,7 +88,7 @@ function renderCallback(
       config={{ endpoint: "https://logto.test", appId: APP_ID }}
       LogtoClientClass={FakeLogtoClient as never}
     >
-      <AuthContextProvider value={AUTH}>
+      <AuthContextProvider value={{ ...AUTH, ...options.auth }}>
         <Accounts
           config={TEST_CONFIG}
           queryClient={new QueryClient()}
@@ -206,6 +207,8 @@ describe("sign-in callback with a redirect in progress", () => {
   });
 });
 
+const SIGN_IN_FAILURE_MESSAGE =
+  "Sign-in did not start. Check your connection and try again.";
 const UNREADABLE_MESSAGE = "The sign-in could not be completed. Sign in again.";
 
 /** The notice for an unreadable session, without the other alerts of the app. */
@@ -277,6 +280,21 @@ describe("sign-in callback with an unreadable stored session", () => {
         .click();
     });
     expect(signIns).toBe(1);
+  });
+
+  test("shows the sign-in failure alert only after a failed sign-in start", async () => {
+    window.sessionStorage.setItem(SIGN_IN_SESSION_KEY, "{not json");
+    renderCallback();
+    await settle();
+    expect(screen.queryByText(SIGN_IN_FAILURE_MESSAGE)).toBeNull();
+    cleanup();
+    renderCallback({ auth: { signInFailed: true } });
+    await settle();
+    expect(screen.getByText(SIGN_IN_FAILURE_MESSAGE)).toBeTruthy();
+    expect(failureNotice()).toBeTruthy();
+    expect(
+      screen.getByRole("button", { name: "Sign in with Delino" }),
+    ).toBeTruthy();
   });
 });
 

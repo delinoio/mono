@@ -109,15 +109,33 @@ export function TextWithAccountsLink({ text }: { text: string }) {
 function SignInButton({ onSignIn }: { onSignIn?: () => void | Promise<void> }) {
   const auth = useAuth();
   return (
-    <Button
-      variant={ButtonVariant.Secondary}
-      onClick={() => {
-        void (onSignIn ?? auth.signIn)();
-      }}
-    >
-      Sign in with Delino
-    </Button>
+    <>
+      <Button
+        variant={ButtonVariant.Secondary}
+        onClick={() => {
+          void (onSignIn ?? auth.signIn)();
+        }}
+      >
+        Sign in with Delino
+      </Button>
+      <SignInFailureNotice />
+    </>
   );
+}
+
+/**
+ * The alert for a sign-in that failed before the redirect started. The text
+ * is fixed: the SDK error can carry request details, and the user can only
+ * retry. It renders nothing while the latest attempt did not fail, and the
+ * next attempt clears it.
+ */
+export function SignInFailureNotice() {
+  const auth = useAuth();
+  return auth.signInFailed ? (
+    <p role="alert">
+      Sign-in did not start. Check your connection and try again.
+    </p>
+  ) : null;
 }
 
 /**

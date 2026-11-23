@@ -667,6 +667,7 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
     "servers/tide-api/internal/db/migrations/00001_core.sql",
     "go/ownsand/relaybinding/testdata/request-digest-vectors.json",
     "servers/ownsand-api/scripts/dev.mjs",
+    "cmds/ownsand-agent/images/linux/build-rootfs.sh",
     "go/example/testdata/case.golden",
     "cmds/example/internal/testdata/input.json",
     "internal/example/testdata/input.txt",
@@ -695,6 +696,11 @@ test("Go sources, module files, protobuf inputs and OwnSand end-to-end inputs se
   // Go-built server. The launcher test and the accounts-api launcher are not.
   f.write("servers/ownsand-api/scripts/dev.test.mjs");
   f.write("servers/accounts-api/scripts/dev.mjs");
+  // Only the root filesystem builder is a Go input; the kernel scripts and
+  // the builder of another image directory are not.
+  f.write("cmds/ownsand-agent/images/linux/fetch-kernel.sh");
+  f.write("cmds/ownsand-agent/images/linux/build-kernel.sh");
+  f.write("cmds/ownsand-agent/images/other/build-rootfs.sh");
   f.write(".github/workflows/deploy.yml");
   f.write("docs/testdata/example.json");
   f.write("go/example/mytestdata/example.json");
@@ -709,6 +715,18 @@ test("the ownsand-api launcher selects the Go checks and the workspace jobs", (t
   assert.equal(selected.go, true);
   assert.equal(selected.workspace, true);
   assert.equal(selected.e2e, false);
+});
+
+test("the root filesystem builder selects only the Go checks", (t) => {
+  const f = fixture(t);
+  f.write("cmds/ownsand-agent/images/linux/build-rootfs.sh");
+  const selected = plan(f.cwd, f.base, f.commit());
+  assert.equal(selected.go, true);
+  assert.equal(selected.workspace, false);
+  assert.equal(selected.rust, false);
+  assert.equal(selected.e2e, false);
+  assert.equal(selected.workflows, false);
+  assert.equal(selected.fixtures, false);
 });
 
 test("The relay request digest vectors select Go checks and workspace jobs", (t) => {

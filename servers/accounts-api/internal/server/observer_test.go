@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"maps"
@@ -460,9 +461,26 @@ func TestObservedConnForwardsTrafficUnchanged(t *testing.T) {
 		t.Fatalf("dial: %v", err)
 	}
 	defer client.Close()
-	conn := <-accepted
+	var conn net.Conn
+	select {
+	case conn = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the accepted connection")
+	}
 	if conn == nil {
 		t.Fatal("accept failed")
+	}
+	// Close the accepted socket on every exit path, including a failed
+	// assertion above the explicit close below. Closing twice is harmless.
+	t.Cleanup(func() { _ = conn.Close() })
+	// Bound every read and write so a stalled peer fails the test instead of
+	// hanging it.
+	ioDeadline := time.Now().Add(5 * time.Second)
+	if err := conn.SetDeadline(ioDeadline); err != nil {
+		t.Fatalf("set server deadline: %v", err)
+	}
+	if err := client.SetDeadline(ioDeadline); err != nil {
+		t.Fatalf("set client deadline: %v", err)
 	}
 	if _, ok := conn.(interface{ CloseWrite() error }); !ok {
 		t.Error("observed connection hides CloseWrite")
@@ -503,6 +521,68 @@ func TestObservedConnForwardsTrafficUnchanged(t *testing.T) {
 	}
 	if after := runtime.NumGoroutine(); after > before {
 		t.Errorf("goroutines = %d after closing the connection, want at most %d", after, before)
+	}
+}
+
+// TestObservedConnStalledReadFailsWithTimeout checks that a read on an observed
+// connection whose peer sends nothing fails with a bounded timeout error and
+// that the connection is closed afterwards.
+func TestObservedConnStalledReadFailsWithTimeout(t *testing.T) {
+	logger := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+	observed := ObserveListener(listener, logger)
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := observed.Accept()
+		if err != nil {
+			close(accepted)
+			return
+		}
+		accepted <- conn
+	}()
+	client, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer client.Close()
+	var conn net.Conn
+	select {
+	case conn = <-accepted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the accepted connection")
+	}
+	if conn == nil {
+		t.Fatal("accept failed")
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+
+	if err := conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("set read deadline: %v", err)
+	}
+	start := time.Now()
+	n, err := conn.Read(make([]byte, 1))
+	var netErr net.Error
+	if n != 0 || !errors.As(err, &netErr) || !netErr.Timeout() {
+		t.Fatalf("stalled read = %d, %v; want a timeout error", n, err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("stalled read took %v, want it bounded by the deadline", elapsed)
+	}
+
+	if err := conn.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	// The peer sees the close as EOF, which shows the socket was released.
+	if err := client.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		t.Fatalf("set client read deadline: %v", err)
+	}
+	if n, err := client.Read(make([]byte, 1)); n != 0 || err != io.EOF {
+		t.Errorf("client read after close = %d, %v; want EOF", n, err)
 	}
 }
 

@@ -13,7 +13,7 @@ import {
   useAuth,
 } from "./auth.tsx";
 import { Page } from "./components/shell.tsx";
-import { PageHeader } from "./components/ui.tsx";
+import { PageHeader, SignInFailureNotice } from "./components/ui.tsx";
 import type { AccountsConfig } from "./config.ts";
 import { pendingInvitation } from "./invitation.ts";
 import {
@@ -197,7 +197,10 @@ function SignIn({ configured }: { configured: boolean }) {
         description="Use your Delino account to manage billing accounts, credit and invoices."
       />
       {configured ? (
-        <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+        <>
+          <Button onClick={() => auth.signIn()}>Sign in with Delino</Button>
+          <SignInFailureNotice />
+        </>
       ) : (
         <p role="alert">Sign-in is not configured for this build.</p>
       )}

@@ -488,7 +488,9 @@ func (s *Server) Run(ctx context.Context, l net.Listener) error {
 		case <-done:
 		}
 	}()
-	s.logger.Info("guest helper serving", "address", l.Addr().String(), "network", l.Addr().Network())
+	// The listener address is not logged: for a unix listener it is the
+	// socket path, and the helper never logs paths.
+	s.logger.Info("guest helper serving", "network", l.Addr().Network())
 	err := srv.Serve(l)
 	close(done)
 	if errors.Is(err, http.ErrServerClosed) {

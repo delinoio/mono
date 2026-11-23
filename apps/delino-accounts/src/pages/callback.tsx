@@ -7,7 +7,11 @@ import {
   readLogtoSignInRedirect,
   useAuth,
 } from "../auth.tsx";
-import { ErrorNotice, Loading } from "../components/ui.tsx";
+import {
+  ErrorNotice,
+  Loading,
+  SignInFailureNotice,
+} from "../components/ui.tsx";
 import { pendingInvitation } from "../invitation.ts";
 import { RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -59,6 +63,7 @@ function UnreadableSignInSession() {
           Sign in with Delino
         </Button>
       </div>
+      <SignInFailureNotice />
     </main>
   );
 }

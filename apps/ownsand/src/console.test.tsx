@@ -66,6 +66,8 @@ function renderConsole(
     /** The signed-in user; the mock user by default. */
     userId?: string;
     strict?: boolean;
+    /** Reports a sign-in that failed before the redirect. */
+    signInFailed?: boolean;
   } = {},
 ) {
   window.history.replaceState(null, "", path);
@@ -78,6 +80,7 @@ function renderConsole(
     signIn: async () => {
       signIns.push(1);
     },
+    signInFailed: options.signInFailed ?? false,
     signOut: async () => {},
     getAccessToken: async () => "token",
   };
@@ -1836,6 +1839,27 @@ describe("invitations", () => {
     expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
   });
 
+  test("shows an alert next to Sign in to accept when the sign-in did not start", async () => {
+    renderConsole(`/invitations/accept#secret=${MOCK_INVITATION_SECRET}`, {
+      signedIn: false,
+      signInFailed: true,
+    });
+    expect(
+      (
+        await screen.findByText(
+          "Sign-in did not start. Check your connection and try again.",
+        )
+      ).getAttribute("role"),
+    ).toBe("alert");
+    expect(
+      (
+        screen.getByRole("button", {
+          name: "Sign in to accept",
+        }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(false);
+  });
+
   test("shows the sign-in configuration notice instead of a sign-in button when Logto is not configured", async () => {
     // The default build: Logto mode without a registration, so no sign-in
     // can complete and the secret has no redirect to survive.
@@ -2906,6 +2930,56 @@ describe("ended session", () => {
       );
     });
     expect(signIns).toHaveLength(1);
+  });
+
+  test("shows an alert and keeps the sign-in button usable when the sign-in did not start", async () => {
+    const { signIns } = renderConsole("/", {
+      transport: failing("ListOrganizations", Code.Unauthenticated),
+      signInFailed: true,
+    });
+    expect(
+      await screen.findByText(
+        "Sign-in did not start. Check your connection and try again.",
+      ),
+    ).toBeTruthy();
+    const signIn = screen.getByRole("button", {
+      name: "Sign in with Delino",
+    }) as HTMLButtonElement;
+    expect(signIn.disabled).toBe(false);
+    await act(async () => {
+      fireEvent.click(signIn);
+    });
+    expect(signIns).toHaveLength(1);
+  });
+
+  test("keeps the invitation secret for a retry after the sign-in did not start", async () => {
+    const { signIns } = renderConsole(
+      `/invitations/accept#secret=${MOCK_INVITATION_SECRET}`,
+      {
+        transport: failing("AcceptInvitation", Code.Unauthenticated),
+        signInFailed: true,
+      },
+    );
+    await act(async () => {
+      fireEvent.click(
+        await screen.findByRole("button", { name: "Accept invitation" }),
+      );
+    });
+    await settle(60);
+    expect(
+      (
+        await screen.findByText(
+          "Sign-in did not start. Check your connection and try again.",
+        )
+      ).getAttribute("role"),
+    ).toBe("alert");
+    await act(async () => {
+      fireEvent.click(
+        screen.getByRole("button", { name: "Sign in with Delino" }),
+      );
+    });
+    expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(MOCK_INVITATION_SECRET);
   });
 
   test("keeps Try again and offers no sign-in when the failure is unavailable", async () => {

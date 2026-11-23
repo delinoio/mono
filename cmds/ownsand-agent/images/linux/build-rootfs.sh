@@ -31,7 +31,10 @@ if [ -z "$busybox" ]; then
   echo "busybox is required" >&2
   exit 1
 fi
-if ! file "$busybox" | grep -q 'statically linked'; then
+# -L follows a symlink, because file describes the link and not its target
+# otherwise, and a dangling link prints no linkage so it is still rejected.
+# file prints "static-pie linked" for a static position-independent executable.
+if ! file -L -- "$busybox" | grep -Eq 'statically linked|static-pie linked'; then
   echo "busybox must be statically linked: $busybox" >&2
   exit 1
 fi

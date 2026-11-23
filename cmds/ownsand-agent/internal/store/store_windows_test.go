@@ -3,10 +3,12 @@
 package store
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -437,5 +439,132 @@ func TestCheckOwnerRejectsUntrustedOwner(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "must be owned by") || !strings.Contains(err.Error(), owner.String()) {
 		t.Errorf("error does not name the owner and the rule: %v", err)
+	}
+}
+
+// openHeld opens path with the given share mode and keeps it open, as a
+// concurrent reader does.
+func openHeld(t *testing.T, path string, share uint32) windows.Handle {
+	t.Helper()
+	name, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := windows.CreateFile(name, windows.GENERIC_READ, share, nil,
+		windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", path, err)
+	}
+	return h
+}
+
+const shareReadWrite = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE
+
+// A reader that holds the file open (os.Open and os.ReadFile, an older CLI,
+// antivirus) blocks the rename. The replacement succeeds when the
+// reader closes within the retry window.
+func TestWriteFileAtomicRetriesWhileReaderHoldsFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "status.json")
+	if err := WriteFileAtomic(path, []byte("old report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := openHeld(t, path, shareReadWrite)
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		time.Sleep(200 * time.Millisecond)
+		windows.CloseHandle(h)
+	}()
+	err := WriteFileAtomic(path, []byte("new report"), 0o600)
+	<-released
+	if err != nil {
+		t.Fatalf("replace after the reader closed: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "new report" {
+		t.Fatalf("read after replace: %q, %v", got, err)
+	}
+}
+
+// A reader that never closes makes the replacement fail after the bounded
+// retry, keeps the old file complete and leaves no temporary file.
+func TestWriteFileAtomicGivesUpOnStuckReader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "status.json")
+	if err := WriteFileAtomic(path, []byte("old report"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	h := openHeld(t, path, shareReadWrite)
+	err := WriteFileAtomic(path, []byte("new report"), 0o600)
+	windows.CloseHandle(h)
+	if err == nil {
+		t.Fatal("replace succeeded while a handle was open")
+	}
+	if !isSharingError(err) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil || string(got) != "old report" {
+		t.Fatalf("old file after failed replace: %q, %v", got, err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("temporary files left behind: %v, %v", entries, err)
+	}
+}
+
+// Concurrent status readers (LoadStatus reads with os.ReadFile, the default
+// Go sharing mode, as `ownsand-agent status` does) never make a write fail
+// and never read an incomplete report.
+func TestConcurrentStatusReadsDoNotLoseWrites(t *testing.T) {
+	s, err := Open(t.TempDir())
+	if err != nil {
+		t.Skipf("open the store (needs an elevated administrator): %v", err)
+	}
+	type report struct {
+		Seq     int    `json:"seq"`
+		Padding string `json:"padding"`
+	}
+	padding := strings.Repeat("x", 4096)
+	if err := s.SaveStatus(report{Seq: 0, Padding: padding}); err != nil {
+		t.Fatal(err)
+	}
+	stop := make(chan struct{})
+	readerErr := make(chan error, 1)
+	go func() {
+		defer close(readerErr)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			var r report
+			err := s.LoadStatus(&r)
+			// An open that races with the rename may see a sharing error
+			// or access denied. It is not an incomplete report, and the
+			// next read succeeds, so the test does not count it.
+			if err != nil && isSharingError(err) {
+				continue
+			}
+			if err != nil || r.Padding != padding {
+				readerErr <- fmt.Errorf("incomplete report: %v (padding %d bytes)", err, len(r.Padding))
+				return
+			}
+		}
+	}()
+	for i := 1; i <= 300; i++ {
+		if err := s.SaveStatus(report{Seq: i, Padding: padding}); err != nil {
+			close(stop)
+			t.Fatalf("write %d failed: %v", i, err)
+		}
+	}
+	close(stop)
+	if err := <-readerErr; err != nil {
+		t.Fatal(err)
+	}
+	var last report
+	if err := s.LoadStatus(&last); err != nil || last.Seq != 300 {
+		t.Fatalf("last report %+v, %v", last, err)
 	}
 }

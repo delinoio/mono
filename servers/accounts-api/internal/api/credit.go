@@ -284,13 +284,22 @@ func (h *CreditHandler) UpdateAutoTopUpSettings(ctx context.Context, req *connec
 	if err := billing.ValidateAutoTopUp(req.Msg.GetSettings()); err != nil {
 		return nil, err
 	}
-	var accountID string
+	// The response is built inside the transaction, while it holds the
+	// billing account lock, from the settings this request wrote. Reading
+	// it after the commit could return a later writer's settings, and a read
+	// error after the commit would report a saved change as failed.
+	var settings *accountsv1.AutoTopUpSettings
 	err := h.change(ctx, "update_auto_top_up_settings", req.Msg.GetBillingAccountId(), func(tx pgx.Tx, audit *auditLog, id, userID string, now time.Time) error {
-		accountID = id
 		in := req.Msg.GetSettings()
-		if _, err := billing.UpdateAutoTopUp(ctx, tx, id, in, now); err != nil {
+		st, err := billing.UpdateAutoTopUp(ctx, tx, id, in, now)
+		if err != nil {
 			return err
 		}
+		mtd, err := billing.MonthToDate(ctx, tx, id, now)
+		if err != nil {
+			return err
+		}
+		settings = st.AutoTopUpProto(mtd)
 		return h.recordAudit(ctx, tx, audit, now, auditEvent{
 			BillingAccountID: id, Kind: AuditAutoTopUpSettingsUpdated, ActorUserID: userID,
 			Details: map[string]string{
@@ -303,10 +312,6 @@ func (h *CreditHandler) UpdateAutoTopUpSettings(ctx context.Context, req *connec
 	})
 	if err != nil {
 		return nil, err
-	}
-	settings, err := h.autoTopUp(ctx, accountID)
-	if err != nil {
-		return nil, h.internal(ctx, "update_auto_top_up_settings", err)
 	}
 	return connect.NewResponse(&accountsv1.UpdateAutoTopUpSettingsResponse{Settings: settings}), nil
 }
