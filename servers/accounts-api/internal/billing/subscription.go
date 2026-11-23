@@ -242,6 +242,23 @@ func (s *Service) activateFromPayment(ctx context.Context, tx pgx.Tx, acct *acco
 		// state.
 		return nil
 	}
+	if current.PaddleSubscriptionID == txn.SubscriptionID && current.Status == SubscriptionPastDue &&
+		txn.BillingPeriod != nil && current.CurrentPeriodEnd != nil &&
+		txn.BillingPeriod.EndsAt.Before(*current.CurrentPeriodEnd) {
+		// A payment of an older billing period, for example a renewal whose
+		// webhook arrived after the newer failed renewal moved the
+		// subscription to PAST_DUE. It does not show that the current period
+		// is paid, so the subscription webhooks keep owning the status. The
+		// credit grant of the payment stays.
+		s.logger.InfoContext(ctx, "billing_subscription_payment_ignored",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", txn.SubscriptionID),
+			slog.String("paddle_transaction_id", txn.ID),
+			slog.String("reason", "older_billing_period"),
+			slog.Time("payment_period_end", txn.BillingPeriod.EndsAt.UTC()),
+			slog.Time("current_period_end", current.CurrentPeriodEnd.UTC()))
+		return nil
+	}
 	next := current
 	next.Status = SubscriptionActive
 	next.PaddleSubscriptionID = txn.SubscriptionID
