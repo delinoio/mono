@@ -196,6 +196,31 @@ func dnsAcceptRules(assignments []TapGateway) string {
 	return sb.String()
 }
 
+// linkAcceptRules returns the input chain rules that accept the link-local
+// configuration traffic of each assigned tap, one group of three rules per
+// tap sorted by tap, each rule naming its own tap:
+//
+//   - DHCPv4 from the unspecified address or the guest address of the
+//     assignment to the gateway address of the assignment or the limited
+//     broadcast address (UDP port 68 to 67);
+//   - DHCPv6 from a link-local source to the All_DHCP_Relay_Agents_and_Servers
+//     address (UDP port 546 to 547);
+//   - IPv6 neighbor and router discovery with hop limit 255 to a link-local
+//     or link-scope multicast address, the only form that RFC 4861 accepts.
+//
+// A packet from a tap that matches none of them, and every packet from a tap
+// without a valid assignment, falls to the final drop of the input chain.
+// An invalid assignment renders no rule.
+func linkAcceptRules(assignments []TapGateway) string {
+	var sb strings.Builder
+	for _, a := range sortedAssignments(assignments) {
+		fmt.Fprintf(&sb, "\t\tiifname %q ip saddr { 0.0.0.0, %s } ip daddr { %s, 255.255.255.255 } udp sport 68 udp dport 67 accept\n", a.Tap, a.Guest, a.Gateway)
+		fmt.Fprintf(&sb, "\t\tiifname %q ip6 saddr fe80::/10 ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept\n", a.Tap)
+		fmt.Fprintf(&sb, "\t\tiifname %q ip6 hoplimit 255 ip6 daddr { fe80::/10, ff02::/16 } icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept\n", a.Tap)
+	}
+	return sb.String()
+}
+
 // sourceGuardRules returns the forward chain rules that drop an IPv4 packet
 // from an assigned tap whose source address is not the guest address of
 // that assignment, so that a guest cannot forward packets with the address
@@ -216,8 +241,9 @@ func sourceGuardRules(assignments []TapGateway) string {
 // atomically. Guests reach only the internet: packets to blocked prefixes
 // are dropped in forward, packets to the host itself are dropped in input
 // except DNS from the guest address of each sandbox on its tap to that
-// sandbox's own gateway address (assignments), DHCP and IPv6 neighbor and
-// router discovery on the guest link, inbound connections to guests are
+// sandbox's own gateway address (assignments), DHCPv4, DHCPv6 and IPv6
+// neighbor and router discovery that each name one sandbox tap and match the
+// addresses of the guest link (linkAcceptRules), inbound connections to guests are
 // dropped, and guest traffic leaves through NAT. DNS to any other host
 // address, such as the LAN address or the gateway of another sandbox, and
 // DNS from another source address, falls through to the drop. IPv4 packets
@@ -251,10 +277,7 @@ table inet %[1]s {
 	}
 	chain input {
 		type filter hook input priority filter - 10; policy accept;
-%[6]s		iifname "%[4]s" udp sport 68 udp dport 67 accept
-		iifname "%[4]s" udp sport 546 udp dport 547 accept
-		iifname "%[4]s" icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept
-		iifname != "lo" iifname != "%[4]s" ip daddr %[5]s drop
+%[6]s%[8]s		iifname != "lo" iifname != "%[4]s" ip daddr %[5]s drop
 		iifname "%[4]s" drop
 	}
 	chain forward {
@@ -270,7 +293,7 @@ table inet %[1]s {
 		ip saddr %[5]s oifname != "%[4]s" masquerade
 	}
 }
-`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments), sourceGuardRules(assignments))
+`, TableName, joinPrefixes(v4), joinPrefixes(v6), tap, GuestSubnet, dnsAcceptRules(assignments), sourceGuardRules(assignments), linkAcceptRules(assignments))
 }
 
 // Link is the /30 link of one sandbox.
