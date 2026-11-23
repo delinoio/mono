@@ -256,6 +256,89 @@ func TestStatusWithValidIdentity(t *testing.T) {
 	}
 }
 
+// statusFixture enrolls a device in a scratch state directory and returns the
+// store, so a test can place a status.json of its choice.
+func statusFixture(t *testing.T) *store.Store {
+	t.Helper()
+	dir := t.TempDir()
+	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveIdentity(&store.Identity{DeviceID: "dev-1", OrganizationID: "org-1", PrivateKeySeed: make([]byte, 32)}); err != nil {
+		t.Fatal(err)
+	}
+	return st
+}
+
+// An absent status.json is the first-run case: the unknown line and exit 0.
+func TestStatusAbsentStatusFile(t *testing.T) {
+	statusFixture(t)
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitOK || !strings.Contains(out.String(), "Connection: unknown (the agent has not run)") || errb.Len() != 0 {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+// A valid status.json keeps the existing report and exit 0.
+func TestStatusValidStatusFile(t *testing.T) {
+	st := statusFixture(t)
+	if err := st.SaveStatus(&agent.Status{Connected: true, AgentVersion: "1.2.3", Runtime: "process"}); err != nil {
+		t.Fatal(err)
+	}
+	var out, errb bytes.Buffer
+	code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+	if code != exitOK || !strings.Contains(out.String(), "Connection: connected") || !strings.Contains(out.String(), "Agent: 1.2.3, runtime process") || strings.Contains(out.String(), "has not run") || errb.Len() != 0 {
+		t.Fatalf("status: %d %q / %q", code, out.String(), errb.String())
+	}
+}
+
+// A status.json that cannot be decoded or read is an error: a diagnostic on
+// standard error, exit 1 and never the first-run line. The other sections
+// still print.
+func TestStatusUnreadableStatusFile(t *testing.T) {
+	tests := map[string]func(t *testing.T, path string){
+		"malformed": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("{not json"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"truncated": func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte(`{"connected": tr`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"directory": func(t *testing.T, path string) {
+			if err := os.Mkdir(path, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		},
+	}
+	for name, setup := range tests {
+		t.Run(name, func(t *testing.T) {
+			st := statusFixture(t)
+			setup(t, st.Path(store.StatusFile))
+			var out, errb bytes.Buffer
+			code := run([]string{"status", "--no-color"}, nil, &out, &errb)
+			if code != exitError {
+				t.Fatalf("status exit code = %d, want %d (%q / %q)", code, exitError, out.String(), errb.String())
+			}
+			if !strings.Contains(errb.String(), "ownsand-agent: read status.json:") {
+				t.Fatalf("stderr = %q, want a read status.json diagnostic", errb.String())
+			}
+			if strings.Contains(out.String(), "has not run") || strings.Contains(out.String(), "Connection:") {
+				t.Fatalf("stdout = %q, must not report a connection state", out.String())
+			}
+			if !strings.Contains(out.String(), "Sandboxes: 0 records") || !strings.Contains(out.String(), "Snapshots: 0") {
+				t.Fatalf("stdout = %q, want the other sections", out.String())
+			}
+		})
+	}
+}
+
 // TestImageBuildResourceRanges runs the real flag parser: a value that does
 // not fit the conversion to bytes or to a 32-bit vCPU count is a usage error
 // that names its flag, for both guest OS values, and no state is created.
