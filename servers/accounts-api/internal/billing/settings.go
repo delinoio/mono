@@ -74,7 +74,10 @@ func capAllows(monthToDate, amount, monthlyCap int64) bool {
 }
 
 // MonthToDate returns the sum of the automatic top-ups of the UTC calendar
-// month of now that were not failed: completed ones and those in flight.
+// month of now that were not failed: completed ones and those in flight. A
+// top-up belongs to the month of its cap time, which is the queue time of a
+// pending top-up and the claim time of a claimed one; a row without cap time
+// belongs to the month of its create_time.
 func MonthToDate(ctx context.Context, q db.Querier, accountID string, now time.Time) (int64, error) {
 	return monthToDateExcept(ctx, q, accountID, now, "")
 }
@@ -86,7 +89,8 @@ func monthToDateExcept(ctx context.Context, q db.Querier, accountID string, now 
 	start := MonthStart(now)
 	var sum int64
 	err := q.QueryRow(ctx, `SELECT COALESCE(SUM(amount_usd_micros), 0) FROM top_ups
-		WHERE billing_account_id = $1 AND kind = 'auto' AND status <> 'failed' AND create_time >= $2 AND create_time < $3
+		WHERE billing_account_id = $1 AND kind = 'auto' AND status <> 'failed'
+			AND COALESCE(cap_time, create_time) >= $2 AND COALESCE(cap_time, create_time) < $3
 			AND ($4::text = '' OR top_up_id::text <> $4::text)`,
 		accountID, start, start.AddDate(0, 1, 0), exceptID).Scan(&sum)
 	return sum, err

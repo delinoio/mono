@@ -225,3 +225,68 @@ func TestOrganizationLinkStatusMigrationKeepsCompleteRows(t *testing.T) {
 		t.Fatalf("insert an incomplete row after migration 00005: error = %v, want a violation of organization_links_status_complete", err)
 	}
 }
+
+func TestTopUpCapTimeMigrationKeepsExistingRows(t *testing.T) {
+	ctx := context.Background()
+	// Migration 00005 is the last one before the cap time column.
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, 5))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const account = "01900000-0000-7000-8000-000000000001"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time) VALUES ($1, 'a', now(), now())`, account); err != nil {
+		t.Fatal(err)
+	}
+	const pending = "01900000-0000-7000-8000-000000000401"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, amount_usd_micros, status, create_time, update_time)
+		VALUES ($1, $2, 'auto', 25000000, 'pending', '2026-12-31T23:59:00Z', '2026-12-31T23:59:00Z')`, pending, account); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, discard()); err != nil {
+		t.Fatalf("migrate with an existing pending top-up: %v", err)
+	}
+	// The existing row has no cap time, so the month-to-date total falls back
+	// to its create_time.
+	var capTime *time.Time
+	var effective time.Time
+	if err := d.Pool.QueryRow(ctx, `SELECT cap_time, COALESCE(cap_time, create_time) FROM top_ups WHERE top_up_id = $1`, pending).Scan(&capTime, &effective); err != nil {
+		t.Fatal(err)
+	}
+	if capTime != nil {
+		t.Fatalf("cap_time = %v, want NULL for an existing row", *capTime)
+	}
+	if want := time.Date(2026, 12, 31, 23, 59, 0, 0, time.UTC); !effective.Equal(want) {
+		t.Fatalf("effective cap time = %v, want create_time %v", effective, want)
+	}
+}
+
+func TestTopUpProviderAcceptTimeMigrationKeepsExistingRows(t *testing.T) {
+	ctx := context.Background()
+	// Migration 00006 is the last one before the provider acceptance column.
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, 6))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const account = "01900000-0000-7000-8000-000000000001"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO billing_accounts (billing_account_id, name, create_time, update_time) VALUES ($1, 'a', now(), now())`, account); err != nil {
+		t.Fatal(err)
+	}
+	const legacy = "01900000-0000-7000-8000-000000000501"
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO top_ups (top_up_id, billing_account_id, kind, idempotency_key, amount_usd_micros, status, failure_reason, create_time, update_time)
+		VALUES ($1, $2, 'manual', '01900000-0000-7000-8000-000000000502', 25000000, 'failed', 'timed_out', now(), now())`, legacy, account); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, discard()); err != nil {
+		t.Fatalf("migrate with an existing timed-out top-up: %v", err)
+	}
+	// The existing row has no evidence that Paddle accepted the charge.
+	var acceptTime *time.Time
+	if err := d.Pool.QueryRow(ctx, `SELECT provider_accept_time FROM top_ups WHERE top_up_id = $1`, legacy).Scan(&acceptTime); err != nil {
+		t.Fatal(err)
+	}
+	if acceptTime != nil {
+		t.Fatalf("provider_accept_time = %v, want NULL for an existing row", *acceptTime)
+	}
+}
