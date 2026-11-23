@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -672,4 +673,92 @@ func (s *Service) applyPendingAdjustments(ctx context.Context, tx pgx.Tx, acct *
 		}
 	}
 	return nil
+}
+
+// reconcilePendingBatch bounds the purchases that one run of
+// ReconcilePendingAdjustments reconciles; the next run takes the rest.
+const reconcilePendingBatch = 100
+
+// ReconcilePendingAdjustments applies and deletes the pending adjustments
+// whose purchase has a credit grant. The webhook that creates a grant drains
+// the pending rows of its purchase, but a grant that another release created
+// does not (for example, the previous release during a rollout or rollback,
+// which has no pending adjustment table), and a repeated delivery of the
+// payment event is a no-op by the event record. This task finds those rows by
+// their purchase, so no pending row stays behind a grant. Each purchase runs
+// in its own transaction that takes the purchase lock before the lock of the
+// billing account, like the webhook paths. applyAdjustment records every
+// adjustment ID in credit_refunds, so a row that was applied before is only
+// deleted, and the credit of an adjustment is never removed twice. A row of a
+// purchase without a grant, and a row of a deleted billing account, stay
+// stored.
+func (s *Service) ReconcilePendingAdjustments(ctx context.Context) error {
+	rows, err := s.db.Pool.Query(ctx, `SELECT DISTINCT p.paddle_transaction_id FROM pending_credit_adjustments p
+		JOIN credit_grants g ON g.paddle_transaction_id = p.paddle_transaction_id
+		JOIN billing_accounts a ON a.billing_account_id = g.billing_account_id
+		WHERE a.delete_time IS NULL
+		ORDER BY p.paddle_transaction_id LIMIT $1`, reconcilePendingBatch)
+	if err != nil {
+		return err
+	}
+	transactions, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return err
+	}
+	for _, transactionID := range transactions {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := s.reconcilePurchase(ctx, transactionID); err != nil {
+			return fmt.Errorf("reconcile pending adjustments of purchase %s: %w", transactionID, err)
+		}
+	}
+	return nil
+}
+
+// reconcilePurchase applies the pending adjustments of one purchase that has
+// a credit grant.
+func (s *Service) reconcilePurchase(ctx context.Context, transactionID string) error {
+	return s.db.InTx(ctx, func(tx pgx.Tx) error {
+		now := s.timestamp()
+		if err := lockPurchase(ctx, tx, transactionID); err != nil {
+			return err
+		}
+		var grantID, accountID string
+		err := tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
+			WHERE paddle_transaction_id = $1`, transactionID).Scan(&grantID, &accountID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		acct, err := lockAccount(ctx, tx, accountID)
+		if err != nil {
+			return err
+		}
+		if acct.Deleted {
+			return nil
+		}
+		var pending int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM pending_credit_adjustments WHERE paddle_transaction_id = $1`,
+			transactionID).Scan(&pending); err != nil {
+			return err
+		}
+		if pending == 0 {
+			return nil
+		}
+		if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, transactionID, now); err != nil {
+			return err
+		}
+		s.logger.InfoContext(ctx, "billing_pending_adjustments_reconciled",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("credit_grant_id", grantID),
+			slog.String("paddle_transaction_id", transactionID),
+			slog.Int("pending_rows", pending),
+			slog.Int64("balance_after_usd_micros", acct.Balance))
+		// A reversal can change the billing status of the linked
+		// organizations, like the webhook that applies one.
+		return s.syncStatuses(ctx, tx, acct.ID, now)
+	})
 }

@@ -215,15 +215,26 @@ type grantInput struct {
 
 // addGrant creates the credit grant of a verified purchase and its ledger
 // entry, then applies the pending adjustments of the purchase. A purchase
-// that already has a grant adds nothing (created is false). A webhook caller
-// holds the purchase lock (lockPurchase) before the lock of acct.
+// that already has a grant adds no credit (created is false), but it still
+// applies the pending adjustments of the purchase, because a release that
+// predates the pending adjustment table creates grants without draining it.
+// A webhook caller holds the purchase lock (lockPurchase) before the lock of
+// acct.
 func (s *Service) addGrant(ctx context.Context, tx pgx.Tx, acct *accountState, in grantInput, now time.Time) (grantID string, created bool, err error) {
 	if in.Amount <= 0 {
 		return "", false, fmt.Errorf("credit grant amount %d is not positive", in.Amount)
 	}
-	err = tx.QueryRow(ctx, `SELECT credit_grant_id::text FROM credit_grants WHERE paddle_transaction_id = $1`,
-		in.PaddleTransactionID).Scan(&grantID)
+	var grantAccountID string
+	err = tx.QueryRow(ctx, `SELECT credit_grant_id::text, billing_account_id::text FROM credit_grants
+		WHERE paddle_transaction_id = $1`, in.PaddleTransactionID).Scan(&grantID, &grantAccountID)
 	if err == nil {
+		// The pending rows are applied under the lock of the account of the
+		// grant, which is acct for every grant that a webhook resolves.
+		if grantAccountID == acct.ID {
+			if err := s.applyPendingAdjustments(ctx, tx, acct, grantID, in.PaddleTransactionID, now); err != nil {
+				return "", false, err
+			}
+		}
 		return grantID, false, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {

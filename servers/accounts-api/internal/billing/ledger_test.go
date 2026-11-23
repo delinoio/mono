@@ -74,7 +74,12 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	database := dbtest.New(t)
+	return newFixtureOn(t, dbtest.New(t))
+}
+
+// newFixtureOn is newFixture on an open, fully migrated database.
+func newFixtureOn(t *testing.T, database *db.DB) *fixture {
+	t.Helper()
 	f := &fixture{
 		t:      t,
 		db:     database,
