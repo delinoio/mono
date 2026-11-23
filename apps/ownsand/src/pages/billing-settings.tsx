@@ -305,7 +305,7 @@ function LinkBillingDialog({
       description={`OwnSand charges the usage of ${name} to the billing account you choose. You can choose a billing account in which you are an owner or admin.`}
       submitLabel="Link"
       submitDisabled={list === undefined || list.length === 0}
-      onSubmit={async () => {
+      onSubmit={async (opening) => {
         if (selected === null) {
           setSelectionError("Choose a billing account.");
           return;
@@ -314,7 +314,9 @@ function LinkBillingDialog({
           organizationId,
           billingAccountId: selected,
         });
-        close(false);
+        // The success is real for a dismissed opening too, so its toast
+        // stays; only the close of a later opening is guarded.
+        if (opening.isCurrent()) close(false);
         toast.success(`${res.billingAccountName} is linked.`);
       }}
     >

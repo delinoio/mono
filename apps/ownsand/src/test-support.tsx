@@ -76,8 +76,8 @@ export interface HeldCall {
 export function holdingTransport(
   methods: string[],
   shouldHold: (method: string) => boolean = () => true,
+  mock: Transport = createMockTransport(),
 ) {
-  const mock = createMockTransport();
   const calls: Record<string, HeldCall[]> = {};
   const seen: Record<string, number> = {};
   const transport: Transport = {

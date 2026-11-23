@@ -94,7 +94,7 @@ export function ApiKeysPage() {
         }}
         title="Create an API key"
         submitLabel="Create key"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           if (name.trim() === "") {
             setNameError(
               "Enter a name, for example the program that uses the key.",
@@ -105,6 +105,10 @@ export function ApiKeysPage() {
             organizationId,
             name: name.trim(),
           });
+          // The list refreshes either way (`onSuccess`). A request of a
+          // dismissed opening neither closes the form of a later opening nor
+          // shows its key; the key stays listed and can be revoked.
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");
           setSecret(res.apiKeySecret);

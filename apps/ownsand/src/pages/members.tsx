@@ -247,11 +247,15 @@ function Invitations() {
         title="Invite someone"
         description="You get a one-time link that works for 7 days. Send it to the person you invite."
         submitLabel="Create link"
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const res = await create.mutateAsync({
             organizationId,
             role: Number(inviteRole) as Role,
           });
+          // The list refreshes either way (`onSuccess`). A request of a
+          // dismissed opening neither closes the form of a later opening nor
+          // shows its link; the invitation stays listed and can be revoked.
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setLink(invitationLink(window.location.origin, res.invitationSecret));
         }}

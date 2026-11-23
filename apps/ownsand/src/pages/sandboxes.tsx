@@ -305,7 +305,7 @@ function CreateSandboxDialog({
         onOpenChange(next);
         if (!next) reset();
       }}
-      onSubmit={async () => {
+      onSubmit={async (opening) => {
         const next: Record<string, string> = {};
         const ttl = ttlErrors({ idleMinutes, maxHours });
         if (ttl.idle) next.idle = ttl.idle;
@@ -336,6 +336,9 @@ function CreateSandboxDialog({
         // created sandbox without waiting for the list refetch.
         void invalidateServices(queryClient, DeviceService);
         void invalidateServices(queryClient, SandboxService);
+        // A request of a dismissed opening neither closes the form of a
+        // later opening nor moves the user away from the page they went to.
+        if (!opening.isCurrent()) return;
         onOpenChange(false);
         reset();
         navigate(

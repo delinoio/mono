@@ -126,12 +126,15 @@ export function OrganizationsPage() {
           setCreating(open);
           if (!open) setName("");
         }}
-        onSubmit={async () => {
+        onSubmit={async (opening) => {
           const res = await create.mutateAsync({ name: name.trim() });
           // The list and the switcher refresh in the background. The console
           // opens the new organization from the `CreateOrganization`
           // response instead of waiting for the list refetch.
           void invalidateServices(queryClient, OrganizationService);
+          // A request of a dismissed opening neither closes the form of a
+          // later opening nor moves the user away from the page they went to.
+          if (!opening.isCurrent()) return;
           setCreating(false);
           setName("");
           navigate(

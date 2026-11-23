@@ -391,6 +391,35 @@ export interface DialogOpening {
 }
 
 /**
+ * The identity of the current opening of a dialog. Every open, dismissal,
+ * controlled close and unmount ends the opening and starts a new one, so a
+ * request that settles later can tell that its opening is over and must not
+ * close or show an error on the next opening, which can be for another
+ * target or for the same one.
+ *
+ * `begin` captures the opening when a request starts; `end` ends it on a
+ * dismissal that the dialog itself sees.
+ */
+function useDialogOpening(open: boolean) {
+  const opening = useRef(0);
+  useEffect(
+    () => () => {
+      opening.current += 1;
+    },
+    [open],
+  );
+  return {
+    begin(): DialogOpening {
+      const mine = opening.current;
+      return { isCurrent: () => opening.current === mine };
+    },
+    end() {
+      opening.current += 1;
+    },
+  };
+}
+
+/**
  * An explicit confirmation step for a destructive action. The cancel
  * button comes first and gets the focus; Escape closes the dialog.
  *
@@ -426,31 +455,20 @@ export function ConfirmDialog({
     setPending(false);
     if (open) setError(undefined);
   }
-  // The identity of the current opening. Every open, dismissal, controlled
-  // close and unmount ends the opening and starts a new one, so a request
-  // that settles later can tell that its opening is over and must not close
-  // or show an error on the next opening, which can be for another target
-  // or for the same one.
-  const opening = useRef(0);
-  useEffect(
-    () => () => {
-      opening.current += 1;
-    },
-    [open],
-  );
+  const dialogOpening = useDialogOpening(open);
   const confirm = async () => {
     if (pending) return;
-    const mine = opening.current;
+    const mine = dialogOpening.begin();
     setPending(true);
     // A retry removes the notice of the previous failure.
     setError(undefined);
     try {
-      await onConfirm({ isCurrent: () => opening.current === mine });
-      if (opening.current === mine) onOpenChange(false);
+      await onConfirm(mine);
+      if (mine.isCurrent()) onOpenChange(false);
     } catch (e) {
-      if (opening.current === mine) setError(e);
+      if (mine.isCurrent()) setError(e);
     } finally {
-      if (opening.current === mine) setPending(false);
+      if (mine.isCurrent()) setPending(false);
     }
   };
   return (
@@ -458,7 +476,7 @@ export function ConfirmDialog({
       open={open}
       onOpenChange={(next) => {
         if (!next) {
-          opening.current += 1;
+          dialogOpening.end();
           setPending(false);
           setError(undefined);
         }
@@ -504,7 +522,16 @@ export function FormDialog({
   submitDisabled?: boolean;
   /** A wider panel for forms with several fields per row. */
   wide?: boolean;
-  onSubmit: () => Promise<unknown>;
+  /**
+   * Sends the request of the form. `opening` is the opening that submitted
+   * it. The caller changes what belongs to that opening (closing the form,
+   * resetting its fields, showing a new secret or opening the new object's
+   * page) only while `opening.isCurrent()`, so a request that settles after
+   * Escape, Cancel or a click outside does not change the next opening.
+   * Work that belongs to the data, such as cache invalidation, runs either
+   * way.
+   */
+  onSubmit: (opening: DialogOpening) => Promise<unknown>;
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
@@ -514,28 +541,38 @@ export function FormDialog({
   if (open !== wasOpen) {
     // Adjust state while rendering: every time the dialog opens again it
     // starts without the notice of an earlier failure, including a failure
-    // that arrived after the dialog was already closed.
+    // that arrived after the dialog was already closed, and without the
+    // pending state of an earlier request.
     setWasOpen(open);
+    setPending(false);
     if (open) setError(undefined);
   }
+  const dialogOpening = useDialogOpening(open);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
     if (pending || submitDisabled) return;
+    const mine = dialogOpening.begin();
     setPending(true);
     setError(undefined);
     try {
-      await onSubmit();
+      await onSubmit(mine);
     } catch (e) {
-      setError(e);
+      if (mine.isCurrent()) setError(e);
     } finally {
-      setPending(false);
+      // A request of an ended opening must not clear the pending state of
+      // the request that the current opening sent.
+      if (mine.isCurrent()) setPending(false);
     }
   };
   return (
     <Dialog
       open={open}
       onOpenChange={(next) => {
-        if (!next) setError(undefined);
+        if (!next) {
+          dialogOpening.end();
+          setPending(false);
+          setError(undefined);
+        }
         onOpenChange(next);
       }}
     >
