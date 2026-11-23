@@ -489,11 +489,20 @@ func TestAuthorizeRelayRules(t *testing.T) {
 	// pending grant and a retry with the same authorization_id returns it.
 	heldCh := make(chan *ownsandv1.RelayGrant, 1)
 	agent.SetOnGrant(func(g *ownsandv1.RelayGrant) *ownsandv1.RelayGrantAck { heldCh <- g; return nil })
-	if _, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq)); testenv.Code(err) != connect.CodeUnavailable {
+	// The callback stays installed until the grant arrived: without it, a
+	// grant that arrives late is acknowledged by the fake agent default.
+	t.Cleanup(func() { agent.SetOnGrant(nil) })
+	_, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
+	if testenv.Code(err) != connect.CodeUnavailable {
 		t.Fatalf("no ack: %v", err)
 	}
+	var held *ownsandv1.RelayGrant
+	select {
+	case held = <-heldCh:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("AuthorizeRelay returned [%v] without delivering the grant to the agent", err)
+	}
 	agent.SetOnGrant(nil)
-	held := <-heldCh
 	agent.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_RelayGrantAck{RelayGrantAck: &ownsandv1.RelayGrantAck{GrantId: held.GetGrantId(), Result: ownsandv1.RelayGrantResult_RELAY_GRANT_RESULT_ACCEPTED}}})
 	testenv.Eventually(t, "late ack", func() bool { return env.App.Plane.Grants.Admittable(held.GetGrantId()) != nil })
 	retry, err := c.DataPath.AuthorizeRelay(ctx, connect.NewRequest(areq))
