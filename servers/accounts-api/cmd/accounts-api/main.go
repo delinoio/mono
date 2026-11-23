@@ -124,31 +124,73 @@ func run() error {
 		}
 	}
 
-	// The background tasks (the billing worker and the internal metrics
-	// listener) run until the HTTP server has drained, and run waits for
-	// them before it returns. The worker finishes the run in progress, so a
-	// Paddle call that has started records its result.
-	background, stopBackground := context.WithCancel(context.Background())
-	defer stopBackground()
-	backgroundErrs := []<-chan error{runAsync(func() error {
-		billingService.RunWorker(background, billing.DefaultWorkerInterval)
-		return nil
-	})}
-	if metricsListener != nil {
-		backgroundErrs = append(backgroundErrs, runAsync(func() error {
-			return metrics.Serve(background, metricsListener, tel.MetricsHandler(slog.NewLogLogger(logger.Handler(), slog.LevelError)), logger)
-		}))
-	}
-
 	srv := newServer(handler, logger)
 
 	logger.Info("server_started", slog.String("addr", listener.Addr().String()), slog.String("log_level", string(cfg.LogLevel)),
 		slog.Bool("otlp_metrics_export", tel.MetricsExport), slog.Bool("otlp_logs_export", tel.LogsExport))
-	serveErr := serve(ctx, stop, srv, listener, logger, shutdownTimeout)
+	worker := func(background context.Context) {
+		billingService.RunWorker(background, billing.DefaultWorkerInterval)
+	}
+	var serveMetrics func(context.Context) error
+	if metricsListener != nil {
+		metricsHandler := tel.MetricsHandler(slog.NewLogLogger(logger.Handler(), slog.LevelError))
+		serveMetrics = func(background context.Context) error {
+			return metrics.Serve(background, metricsListener, metricsHandler, logger)
+		}
+	}
+	return runServers(ctx, stop, srv, listener, logger, shutdownTimeout, worker, serveMetrics)
+}
+
+// runServers serves the public srv on listener together with the background
+// tasks: the billing worker and, when serveMetrics is not nil, the internal
+// metrics listener. It returns after srv has drained and both tasks have
+// returned, so no task outlives it. The worker finishes the run in progress, so
+// a Paddle call that has started records its result.
+//
+// The metrics listener is not optional infrastructure once it is bound: when
+// serveMetrics fails by itself (for example a permanent Accept error), runServers
+// logs the error and starts the bounded shutdown of srv as if a signal had
+// arrived, so the process does not keep serving without its metrics. The
+// original error is joined into the result, also when a shutdown signal races
+// the failure, so the process exits non-zero with the error in its exit log.
+//
+// worker and serveMetrics receive a context that is cancelled only after srv
+// has drained. runServers takes them as functions so tests can inject failures
+// without OS signals.
+func runServers(ctx context.Context, stop func(), srv *http.Server, listener net.Listener, logger *slog.Logger, timeout time.Duration,
+	worker func(context.Context), serveMetrics func(context.Context) error) error {
+	// serveCtx ends when the shutdown trigger fires or when the metrics
+	// listener fails; only the first of them reaches serve through ctx.
+	serveCtx, cancelServe := context.WithCancel(ctx)
+	defer cancelServe()
+
+	background, stopBackground := context.WithCancel(context.Background())
+	defer stopBackground()
+	backgroundErrs := []<-chan error{runAsync(func() error {
+		worker(background)
+		return nil
+	})}
+	if serveMetrics != nil {
+		backgroundErrs = append(backgroundErrs, runAsync(func() error {
+			err := serveMetrics(background)
+			// metrics.Serve returns nil after a shutdown, so an error here, while
+			// background is still live, is a terminal listener failure. The
+			// error is also returned through the channel and joined below.
+			if err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("metrics_listener_failed", slog.Any("error", err))
+				cancelServe()
+			}
+			return err
+		}))
+	}
+
+	serveErr := serve(serveCtx, stop, srv, listener, logger, timeout)
 	stopBackground()
 	errs := []error{serveErr}
 	for _, errc := range backgroundErrs {
-		errs = append(errs, <-errc)
+		if err := <-errc; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			errs = append(errs, err)
+		}
 	}
 	return errors.Join(errs...)
 }
