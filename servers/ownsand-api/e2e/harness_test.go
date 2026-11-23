@@ -659,9 +659,11 @@ const apiStartAttempts = 3
 // freeTCPPort and freeUDPPort close their listeners again, so another process
 // (for example a test server of another package that go test runs at the
 // same time) can take a port before the control plane binds it. The control
-// plane then exits with "address already in use", and the other server can
-// answer the health probe. startAPI then starts the control plane again on
-// new ports. Any other failure fails the test at once.
+// plane then exits and logs server_exited with the structured
+// startup_failure_reason=address_in_use (whatever the native error text is),
+// and the other server can answer the health probe. startAPI then starts the
+// control plane again on new ports, up to apiStartAttempts times (see
+// shouldRetryAPIStart). Any other failure fails the test at once.
 func (s *stack) startAPI(env []string) {
 	s.t.Helper()
 	for attempt := 1; ; attempt++ {
@@ -690,7 +692,7 @@ func (s *stack) startAPI(env []string) {
 		if err == nil {
 			return
 		}
-		if !errors.Is(err, errProcessExited) || !s.logs.hasLineContaining(name, "address already in use") || attempt == apiStartAttempts {
+		if !shouldRetryAPIStart(err, attempt, s.logs, name) {
 			s.t.Fatalf("the control plane did not become healthy: %v", err)
 		}
 		s.t.Logf("the control plane could not bind its ports (attempt %d); starting it on new ports", attempt)
