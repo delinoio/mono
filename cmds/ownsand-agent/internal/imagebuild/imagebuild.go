@@ -177,8 +177,20 @@ func checkDarwinARM64(path string) error {
 	if f.Cpu != macho.CpuArm64 {
 		return fmt.Errorf("imagebuild: the guest helper %s is built for %v; macOS guests need arm64 (GOOS=darwin GOARCH=arm64)", path, f.Cpu)
 	}
+	// A relocatable object, a dynamic library or a core file of the right CPU
+	// cannot run as the guest helper, so the file type must be MH_EXECUTE.
+	if f.Type != macho.TypeExec {
+		return fmt.Errorf("imagebuild: the guest helper %s is a Mach-O file of type %v, not an executable (MH_EXECUTE); build it with go build for GOOS=darwin GOARCH=arm64", path, f.Type)
+	}
 	return nil
 }
+
+// PE/COFF file header characteristics bits. debug/pe exports no constants for
+// them.
+const (
+	imageFileExecutableImage = 0x0002
+	imageFileDLL             = 0x2000
+)
 
 func checkWindowsAMD64(path string) error {
 	f, err := pe.Open(path)
@@ -188,6 +200,14 @@ func checkWindowsAMD64(path string) error {
 	defer f.Close()
 	if f.Machine != pe.IMAGE_FILE_MACHINE_AMD64 {
 		return fmt.Errorf("imagebuild: the guest helper %s is not an amd64 executable; Windows guests need GOOS=windows GOARCH=amd64", path)
+	}
+	// A COFF object file (no IMAGE_FILE_EXECUTABLE_IMAGE flag and no optional
+	// header) or a DLL of the right machine cannot run as the guest helper.
+	if f.Characteristics&imageFileExecutableImage == 0 || f.OptionalHeader == nil {
+		return fmt.Errorf("imagebuild: the guest helper %s is a COFF file that is not an executable image (no IMAGE_FILE_EXECUTABLE_IMAGE flag or no optional header); build it with go build for GOOS=windows GOARCH=amd64", path)
+	}
+	if f.Characteristics&imageFileDLL != 0 {
+		return fmt.Errorf("imagebuild: the guest helper %s is a DLL, not an executable; build it with go build for GOOS=windows GOARCH=amd64", path)
 	}
 	return nil
 }
