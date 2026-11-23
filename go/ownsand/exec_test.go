@@ -17,6 +17,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/delinoio/mono/go/ownsand/datapath"
+	"github.com/delinoio/mono/go/ownsand/relaybinding"
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 )
 
@@ -929,6 +930,21 @@ func TestNewSaltForEachOperation(t *testing.T) {
 	auths := cp.authRequests()
 	if len(auths) != 2 || bytes.Equal(auths[0].GetRequestDigest(), auths[1].GetRequestDigest()) {
 		t.Fatal("two identical commands must have different digests")
+	}
+	// The digest also covers the per-call exec_id, so it cannot prove that the
+	// salts differ. Check the salt that reached the agent directly.
+	reqs := cp.agent.execRequests()
+	if len(reqs) != 2 {
+		t.Fatalf("agent saw %d exec requests, want 2", len(reqs))
+	}
+	salts := [2][]byte{reqs[0].GetBindingSalt(), reqs[1].GetBindingSalt()}
+	for i, salt := range salts {
+		if len(salt) != relaybinding.SaltSize {
+			t.Fatalf("exec request %d binding salt has %d bytes, want %d", i, len(salt), relaybinding.SaltSize)
+		}
+	}
+	if bytes.Equal(salts[0], salts[1]) {
+		t.Fatal("two operations must use different binding salts")
 	}
 }
 
