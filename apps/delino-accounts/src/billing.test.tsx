@@ -1367,6 +1367,38 @@ describe("invitation acceptance", () => {
     expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
   });
 
+  test("an ended session shows a sign-in failure and keeps the token for a retry", async () => {
+    pendingInvitation.save(INVITATION_TOKEN);
+    const api = createFakeApi();
+    api.userId = OUTSIDER;
+    api.failNext.set(
+      "AcceptInvitation",
+      new ConnectError("token expired", Code.Unauthenticated),
+    );
+    const { signIns } = renderApp("/billing/invitations/accept", {
+      api,
+      signInFailed: true,
+    });
+    await click(
+      await screen.findByRole("button", { name: "Accept invitation" }),
+    );
+    await settle(60);
+    expect(
+      screen
+        .getByText(
+          "Sign-in did not start. Check your connection and try again.",
+        )
+        .getAttribute("role"),
+    ).toBe("alert");
+    const signIn = screen.getByRole("button", {
+      name: "Sign in with Delino",
+    }) as HTMLButtonElement;
+    expect(signIn.disabled).toBe(false);
+    await click(signIn);
+    expect(signIns).toHaveLength(1);
+    expect(pendingInvitation.read()).toBe(INVITATION_TOKEN);
+  });
+
   test("a new link drops the stored token of an earlier link", async () => {
     pendingInvitation.save(EARLIER_INVITATION_TOKEN);
     renderApp(`/billing/invitations/accept#token=${INVITATION_TOKEN}`);

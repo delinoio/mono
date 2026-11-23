@@ -7,7 +7,11 @@ import { OrganizationService } from "@delino/ownsand-protos/v1/organization_pb";
 import { useEffect, useRef, useState } from "react";
 import { invalidateServices } from "../api.ts";
 import { SIGN_IN_NOT_CONFIGURED, useAuth } from "../auth.tsx";
-import { ErrorNotice, PageHeader } from "../components/ui.tsx";
+import {
+  ErrorNotice,
+  PageHeader,
+  SignInFailureNotice,
+} from "../components/ui.tsx";
 import { openInvitationFromAddress, pendingInvitation } from "../invitation.ts";
 import { Link, RouteId, routePath, useRouter } from "../router.tsx";
 
@@ -108,6 +112,7 @@ export function InvitationPage({ configured }: { configured: boolean }) {
         >
           Sign in to accept
         </Button>
+        <SignInFailureNotice />
       </main>
     );
   }
