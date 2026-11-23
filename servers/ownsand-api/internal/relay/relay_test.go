@@ -346,6 +346,40 @@ func openAsync(ctx context.Context, c *Conn, grant string) <-chan openResult {
 	return ch
 }
 
+// doneProbeContext reports the first Done call. Conn.Open evaluates ctx.Done()
+// when it builds the select that waits for the open gate and calls it nowhere
+// earlier, so the first call shows that the Open is about to wait at the gate.
+type doneProbeContext struct {
+	context.Context
+	once    sync.Once
+	reached chan struct{}
+}
+
+func (p *doneProbeContext) Done() <-chan struct{} {
+	p.once.Do(func() { close(p.reached) })
+	return p.Context.Done()
+}
+
+// openAsyncObserved is openAsync for an Open that the caller expects to wait
+// at the open gate. The second result closes when the Open reaches the gate
+// wait; the probe runs one step before the park, so the Open is not yet
+// proven blocked, but the gate is held and it cannot pass.
+func openAsyncObserved(ctx context.Context, c *Conn, grant string) (<-chan openResult, <-chan struct{}) {
+	probe := &doneProbeContext{Context: ctx, reached: make(chan struct{})}
+	return openAsync(probe, c, grant), probe.reached
+}
+
+// waitGateReached fails the test when the Open does not reach the open gate
+// within the bound.
+func waitGateReached(t *testing.T, reached <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-reached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the second Open did not reach the open gate in time")
+	}
+}
+
 func waitOpen(t *testing.T, ch <-chan openResult, within time.Duration) openResult {
 	t.Helper()
 	select {
@@ -384,9 +418,9 @@ func TestOpenEnqueuesInStreamIDOrderWhileQueueIsFull(t *testing.T) {
 	filler := fillOutbound(c)
 	first := openAsync(context.Background(), c, "grant-a")
 	waitStreams(t, c, 1)
-	second := openAsync(context.Background(), c, "grant-b")
+	second, reached := openAsyncObserved(context.Background(), c, "grant-b")
 	// The second Open waits for the gate and holds no stream slot or ID.
-	time.Sleep(50 * time.Millisecond)
+	waitGateReached(t, reached)
 	if got := c.StreamCount(); got != 1 {
 		t.Fatalf("StreamCount while the first Open waits = %d, want 1", got)
 	}
@@ -492,8 +526,8 @@ func TestOpenCancelWhileQueueIsFull(t *testing.T) {
 	waitStreams(t, c, 1)
 	secondCtx, cancelSecond := context.WithCancel(context.Background())
 	defer cancelSecond()
-	second := openAsync(secondCtx, c, "grant-b")
-	time.Sleep(20 * time.Millisecond)
+	second, reached := openAsyncObserved(secondCtx, c, "grant-b")
+	waitGateReached(t, reached)
 
 	cancelSecond()
 	if r := waitOpen(t, second, time.Second); !errors.Is(r.err, context.Canceled) {
@@ -539,8 +573,8 @@ func TestOpenReturnsWhenConnectionClosesWhileWaitingForGate(t *testing.T) {
 	fillOutbound(c)
 	first := openAsync(context.Background(), c, "grant-a")
 	waitStreams(t, c, 1)
-	second := openAsync(context.Background(), c, "grant-b")
-	time.Sleep(20 * time.Millisecond)
+	second, reached := openAsyncObserved(context.Background(), c, "grant-b")
+	waitGateReached(t, reached)
 	c.Close(ErrConnClosed)
 	for _, ch := range []<-chan openResult{first, second} {
 		if r := waitOpen(t, ch, time.Second); !errors.Is(r.err, ErrConnClosed) {
