@@ -150,16 +150,27 @@ func TestUsageSummaryEmptyPeriod(t *testing.T) {
 	if rows == nil || len(rows) != 0 || total != 0 {
 		t.Fatalf("empty period: rows %v, total %d", rows, total)
 	}
-	// A report in the first window after the period is not counted, and
-	// neither is a report of another account.
+	// A report in the first window after the period is not counted.
 	s.report("org-a", "ownsand.relay_egress", 32, 1, 5_000_000)
-	other := s.account()
-	if rows, total, err := UsageSummary(ctx(), s.db.Pool, other, s.from, s.to, nil, 2); err != nil || len(rows) != 0 || total != 0 {
-		t.Fatalf("other account: rows %v, total %d, err %v", rows, total, err)
-	}
 	rows, total = s.summary(nil, 2)
 	if len(rows) != 0 || total != 0 {
 		t.Fatalf("report after the period: rows %v, total %d", summaryKeys(rows), total)
+	}
+	// A report inside the period is counted for its own account only. The
+	// other account is queried over the same interval, so only the account
+	// predicate (not the date bounds) can keep this row out of its summary.
+	s.report("org-a", "ownsand.relay_egress", 1, 1, 1_000_000)
+	rows, total = s.summary(nil, 2)
+	if want := []SummaryRow{{"ownsand", "org-a", "ownsand.relay_egress", 1, 1_000_000}}; !slices.Equal(rows, want) || total != 1_000_000 {
+		t.Fatalf("report in the period: rows %+v, total %d, want %+v and 1000000", rows, total, want)
+	}
+	other := s.account()
+	otherRows, otherTotal, err := UsageSummary(ctx(), s.db.Pool, other, s.from, s.to, nil, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherRows == nil || len(otherRows) != 0 || otherTotal != 0 {
+		t.Fatalf("other account: rows %v, total %d", otherRows, otherTotal)
 	}
 }
 
