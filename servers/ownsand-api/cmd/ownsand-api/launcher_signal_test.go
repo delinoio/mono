@@ -235,7 +235,8 @@ func freeLoopbackPort(t *testing.T) int {
 // startLauncher runs the real Node launcher in the package directory. The
 // environment carries the generated database URL as DATABASE_URL and never
 // the administration URL, so the launched server cannot reach the
-// administration database.
+// administration database. It sets LOG_LEVEL to info explicitly instead of
+// inheriting the parent's value.
 func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 	t.Helper()
 	packageDir, err := filepath.Abs(filepath.Join("..", ".."))
@@ -247,7 +248,7 @@ func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 	var env []string
 	for _, kv := range os.Environ() {
 		name, _, _ := strings.Cut(kv, "=")
-		if name == "DATABASE_URL" || name == dbtest.EnvTestDatabaseURL {
+		if name == "DATABASE_URL" || name == dbtest.EnvTestDatabaseURL || name == "LOG_LEVEL" {
 			continue
 		}
 		env = append(env, kv)
@@ -257,6 +258,9 @@ func startLauncher(t *testing.T, databaseURL string, port int) *launcherProc {
 		"DATABASE_URL="+databaseURL,
 		"LOGTO_ISSUER=http://127.0.0.1:9/oidc",
 		"STUN_ADDR=127.0.0.1:0",
+		// The test asserts the INFO server_shutdown_completed record, so it
+		// must not inherit a LOG_LEVEL of warn or error from the parent.
+		"LOG_LEVEL=info",
 	)
 	return newLauncherProc(t, cmd)
 }
