@@ -4,16 +4,19 @@
 // `check-pending-changesets.sh` (against a stubbed `gh`),
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
 // `droplet-deploy.sh` (against stubbed `docker` and `curl`),
-// `start-caddy.sh` (against a stubbed `docker`) and
+// `start-caddy.sh` (against a stubbed `docker`),
+// `configure-docker-logs.sh` (against a stubbed `systemctl`) and
 // `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
+  statSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -3478,3 +3481,166 @@ test("start-caddy rejects bad usage before any change", { skip }, (t) => {
   assert.match(result.stderr, /usage: start-caddy\.sh/);
   assert.deepEqual(result.calls, []);
 });
+
+// --- configure-docker-logs.sh ----------------------------------------------
+
+const configureLogs = join(root, "scripts/droplet/configure-docker-logs.sh");
+
+// Runs configure-docker-logs.sh on `<scratch>/docker/daemon.json` against a
+// stubbed `systemctl`. `content` is the original file (absent when
+// undefined). `readOnlyDirectory` removes the write permission of the
+// directory during the run, which makes the write fail for an unprivileged
+// user.
+function runLogs(t, { content, readOnlyDirectory, noDirectory } = {}) {
+  const dir = scratch(t);
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(dir, "calls.log"), "");
+  shellStub(bin, "systemctl");
+  const configDirectory = join(dir, "docker");
+  if (!noDirectory) mkdirSync(configDirectory);
+  const config = join(configDirectory, "daemon.json");
+  if (content !== undefined) writeFileSync(config, content, { mode: 0o600 });
+  if (readOnlyDirectory) chmodSync(configDirectory, 0o555);
+  const env = {
+    ...baseEnv,
+    PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+    STUB_DIR: dir,
+  };
+  const result = spawnSync("bash", [configureLogs, config], {
+    encoding: "utf8",
+    env,
+  });
+  // Restore the permission now, so the scratch directory can be removed.
+  if (readOnlyDirectory) chmodSync(configDirectory, 0o755);
+  return {
+    ...result,
+    config,
+    read: () => readFileSync(config, "utf8"),
+    leftovers: () =>
+      existsSync(configDirectory)
+        ? readdirSync(configDirectory).filter((name) => name !== "daemon.json")
+        : [],
+    calls: readFileSync(join(dir, "calls.log"), "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean),
+  };
+}
+
+const restartDocker = "systemctl restart docker";
+
+test("configure-docker-logs creates a missing file", { skip }, (t) => {
+  const result = runLogs(t);
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(JSON.parse(result.read()), { "log-driver": "local" });
+  assert.deepEqual(result.calls, [restartDocker]);
+  assert.deepEqual(result.leftovers(), []);
+});
+
+test(
+  "configure-docker-logs keeps the other settings and is idempotent",
+  { skip },
+  (t) => {
+    const original = {
+      "data-root": "/mnt/docker",
+      "registry-mirrors": ["https://mirror.example.com"],
+      "log-driver": "json-file",
+      "log-opts": { "max-size": "10m" },
+      "default-address-pools": [{ base: "10.10.0.0/16", size: 24 }],
+    };
+    const first = runLogs(t, { content: JSON.stringify(original) });
+    assert.equal(first.status, 0, first.stderr);
+    assert.deepEqual(JSON.parse(first.read()), {
+      ...original,
+      "log-driver": "local",
+    });
+    assert.deepEqual(first.calls, [restartDocker]);
+    assert.equal(statSync(first.config).mode & 0o777, 0o600);
+    assert.deepEqual(first.leftovers(), []);
+
+    // A second run on the written file changes nothing and restarts nothing.
+    const written = first.read();
+    const second = runLogs(t, { content: written });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(second.read(), written);
+    assert.deepEqual(second.calls, []);
+  },
+);
+
+test(
+  "configure-docker-logs adds the key to an object without it",
+  {
+    skip,
+  },
+  (t) => {
+    const result = runLogs(t, { content: '{"data-root": "/mnt/docker"}' });
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.read()), {
+      "data-root": "/mnt/docker",
+      "log-driver": "local",
+    });
+    assert.deepEqual(result.calls, [restartDocker]);
+  },
+);
+
+test(
+  "configure-docker-logs leaves a correct file byte for byte",
+  { skip },
+  (t) => {
+    // Unusual formatting, key order and an extra setting must all stay.
+    const content = '{"data-root":"/x",   "log-driver":"local"}\n\n';
+    const result = runLogs(t, { content });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(result.read(), content);
+    assert.deepEqual(result.calls, []);
+  },
+);
+
+test(
+  "configure-docker-logs rejects invalid input before any change",
+  { skip },
+  (t) => {
+    for (const content of [
+      "{ not json",
+      "",
+      "[]",
+      '["log-driver", "local"]',
+      '"local"',
+      "null",
+      "42",
+    ]) {
+      const result = runLogs(t, { content });
+      const label = JSON.stringify(content);
+      assert.notEqual(result.status, 0, label);
+      assert.match(result.stderr, /error: .*daemon\.json/, label);
+      assert.equal(result.read(), content, label);
+      assert.deepEqual(result.calls, [], label);
+      assert.deepEqual(result.leftovers(), [], label);
+    }
+  },
+);
+
+test(
+  "configure-docker-logs keeps the file and Docker when the write fails",
+  { skip },
+  (t) => {
+    // The directory of a missing configuration directory makes the write
+    // fail for every user, root included.
+    const missing = runLogs(t, { noDirectory: true });
+    assert.notEqual(missing.status, 0);
+    assert.match(missing.stderr, /cannot write .*daemon\.json/);
+    assert.deepEqual(missing.calls, []);
+
+    // A read-only directory blocks the temporary file for an unprivileged
+    // user; root ignores directory permissions.
+    if (process.getuid?.() === 0) return;
+    const content = '{"data-root": "/mnt/docker"}';
+    const result = runLogs(t, { content, readOnlyDirectory: true });
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /cannot write .*daemon\.json/);
+    assert.match(result.stderr, /was not changed and Docker was not restarted/);
+    assert.equal(result.read(), content);
+    assert.deepEqual(result.calls, []);
+  },
+);

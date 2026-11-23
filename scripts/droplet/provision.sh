@@ -9,7 +9,8 @@
 #
 # The script:
 #   - installs Docker Engine from the Docker apt repository,
-#   - makes Docker rotate container logs (`local` log driver),
+#   - makes Docker rotate container logs (`local` log driver) with
+#     configure-docker-logs.sh, which keeps every other daemon setting,
 #   - creates the `deploy` user that the deploy workflow connects as, with
 #     the given public key as its only SSH key,
 #   - creates /srv/delino (server env files, reverse proxy routes, deployment
@@ -79,13 +80,11 @@ fi
 
 log "Rotate container logs"
 # The `local` log driver keeps at most 100 MB per container by default.
-daemon_config='{
-  "log-driver": "local"
-}'
-if [[ ! -f /etc/docker/daemon.json ]] || [[ "$(< /etc/docker/daemon.json)" != "$daemon_config" ]]; then
-  printf '%s\n' "$daemon_config" > /etc/docker/daemon.json
-  systemctl restart docker
-fi
+# configure-docker-logs.sh sets only the `log-driver` key and keeps the other
+# daemon settings; it restarts Docker only after it changed the file. The
+# helper is resolved from this script, so provisioning works from any current
+# directory.
+"$(dirname "${BASH_SOURCE[0]}")/configure-docker-logs.sh" /etc/docker/daemon.json
 systemctl enable --now docker
 
 log "Create the $deploy_user user"
