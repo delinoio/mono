@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -168,13 +169,19 @@ func (t *Telemetry) MetricsHandler(errorLog *log.Logger) http.Handler {
 }
 
 // Shutdown flushes and stops OTLP export. It returns when ctx is done at the
-// latest.
+// latest. The metrics and the log export shut down in parallel under the same
+// ctx: run one after the other, a metrics collector that does not answer would
+// use up the whole deadline and the queued log records would never be sent.
+// The returned error joins the errors of both providers.
 func (t *Telemetry) Shutdown(ctx context.Context) error {
-	err := t.meterProvider.Shutdown(ctx)
+	var metricsErr, logsErr error
+	var wg sync.WaitGroup
+	wg.Go(func() { metricsErr = t.meterProvider.Shutdown(ctx) })
 	if t.loggerProvider != nil {
-		err = errors.Join(err, t.loggerProvider.Shutdown(ctx))
+		wg.Go(func() { logsErr = t.loggerProvider.Shutdown(ctx) })
 	}
-	return err
+	wg.Wait()
+	return errors.Join(metricsErr, logsErr)
 }
 
 // ShutdownTimeout is a suitable bound for Shutdown at process exit.
