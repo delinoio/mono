@@ -137,6 +137,30 @@ function abortable<T>(
 function ignoreFailure(): void {}
 
 /**
+ * Reports whether `value` is a readable stream of any realm. `instanceof`
+ * compares constructor identity, so it misses a stream from another realm (a
+ * `node:vm` context, an iframe or a worker boundary) and a stream whose
+ * prototype was replaced. Such a stream would fall through to the generic
+ * iterator branch, where a pending `next()` queues `return()` behind it and
+ * an abort leaves the stream locked. The check therefore looks for the
+ * reader interface (`getReader`, `cancel` and a boolean `locked`) and not for
+ * a constructor.
+ */
+function isReadableStream(value: unknown): value is ReadableStream<Uint8Array> {
+  if (typeof value !== "object" || value === null) return false;
+  const candidate = value as {
+    getReader?: unknown;
+    cancel?: unknown;
+    locked?: unknown;
+  };
+  return (
+    typeof candidate.getReader === "function" &&
+    typeof candidate.cancel === "function" &&
+    typeof candidate.locked === "boolean"
+  );
+}
+
+/**
  * Yields the pieces of a source. The signal is observed while the source is
  * idle: an abort rejects with the signal's reason at once, even when a pending
  * read or `next()` never settles, and the source is released without waiting
@@ -153,7 +177,7 @@ async function* iterateSource(
     yield source;
   } else if (isArrayBuffer(source)) {
     yield new Uint8Array(source);
-  } else if (source instanceof ReadableStream) {
+  } else if (isReadableStream(source)) {
     const reader = source.getReader();
     let finished = false;
     try {
