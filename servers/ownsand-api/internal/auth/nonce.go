@@ -85,10 +85,18 @@ func (n *NonceIssuer) Check(deviceID string, nonce []byte) (time.Time, error) {
 		return time.Time{}, ErrInvalidNonce
 	}
 	expiry := time.UnixMilli(int64(binary.BigEndian.Uint64(body[16+nonceRandomSize:])))
-	if !n.now().Before(expiry) {
+	if NonceExpired(n.now(), expiry) {
 		return time.Time{}, ErrInvalidNonce
 	}
 	return expiry, nil
+}
+
+// NonceExpired reports whether a nonce with the given expiry is no longer
+// valid at now. The expiry instant itself is already expired. Check and the
+// locked validation in the API use this one predicate, so both agree on the
+// exact deadline.
+func NonceExpired(now, expiry time.Time) bool {
+	return !now.Before(expiry)
 }
 
 func mac(key, body []byte) []byte {
