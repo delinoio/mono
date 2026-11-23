@@ -9,6 +9,8 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/delinoio/mono/cmds/ownsand-agent/internal/config"
 )
 
 // stubCleanupHost replaces the host network clean-up of reset and counts its
@@ -22,8 +24,24 @@ func stubCleanupHost(t *testing.T, err error) *int {
 	return calls
 }
 
+// clearAgentEnv removes every agent variable from the environment of the
+// test, so that a value inherited from the parent environment (for example an
+// invalid OWNSAND_AGENT_LOG_LEVEL) cannot make run fail in config.FromEnv
+// before it reaches the reset handler. t.Setenv registers the restore of the
+// original value; the following Unsetenv makes the variable truly unset.
+func clearAgentEnv(t *testing.T) {
+	t.Helper()
+	for _, name := range config.EnvNames {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func enrolledStateDir(t *testing.T) string {
 	t.Helper()
+	clearAgentEnv(t)
 	dir := t.TempDir()
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
 	t.Setenv("NO_COLOR", "1")
@@ -75,7 +93,35 @@ func TestResetWithoutYesLeavesEverything(t *testing.T) {
 	calls := stubCleanupHost(t, errors.New("must not run"))
 	var out, errb bytes.Buffer
 	if code := run([]string{"reset"}, nil, &out, &errb); code != exitUsage {
-		t.Fatalf("reset: %d", code)
+		t.Fatalf("reset: %d, stderr %q", code, errb.String())
+	}
+	// exitUsage also comes from a configuration error, so the diagnostic
+	// proves that run reached the reset handler.
+	if !strings.Contains(errb.String(), "pass --yes") {
+		t.Fatalf("stderr %q misses the --yes diagnostic", errb.String())
+	}
+	if *calls != 0 {
+		t.Fatalf("host clean-up ran %d times", *calls)
+	}
+	if _, err := os.Stat(dir + "/marker"); err != nil {
+		t.Fatalf("local data changed: %v", err)
+	}
+}
+
+// An invalid agent variable inherited from the parent environment must not
+// keep the reset tests from reaching the reset handler.
+func TestResetIgnoresInheritedAgentEnv(t *testing.T) {
+	t.Setenv("OWNSAND_AGENT_LOG_LEVEL", "invalid-reset-test-level")
+	t.Setenv("OWNSAND_AGENT_RELEASE_PUBLIC_KEYS", "bad")
+	dir := enrolledStateDir(t)
+	t.Setenv("OWNSAND_AGENT_RUNTIME", "firecracker")
+	calls := stubCleanupHost(t, errors.New("must not run"))
+	var out, errb bytes.Buffer
+	if code := run([]string{"reset"}, nil, &out, &errb); code != exitUsage {
+		t.Fatalf("reset: %d, stderr %q", code, errb.String())
+	}
+	if !strings.Contains(errb.String(), "pass --yes") {
+		t.Fatalf("stderr %q misses the --yes diagnostic", errb.String())
 	}
 	if *calls != 0 {
 		t.Fatalf("host clean-up ran %d times", *calls)
