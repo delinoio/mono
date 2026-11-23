@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -26,6 +27,12 @@ var ErrAlreadyEnrolled = errors.New("agent: this device is already enrolled; run
 // context.DeadlineExceeded.
 var ErrEnrollTimeout = errors.New("enrollment timed out")
 
+// enrollLockWait bounds how long Enroll waits for another enrollment of the
+// same state directory. It exceeds the default Enroll call deadline (30
+// seconds), so a waiting command outlasts a holder that stalls until its
+// deadline and then sees its pending key or its completed identity.
+const enrollLockWait = 45 * time.Second
+
 // Enroll creates the device key pair and enrolls the device with a
 // one-time enrollment token. The key is written before the call, so a retry
 // after a lost response uses the same key, which the control plane accepts
@@ -34,7 +41,26 @@ var ErrEnrollTimeout = errors.New("enrollment timed out")
 // by default): a control plane that accepts the call and never answers ends
 // it with ErrEnrollTimeout, and the pending key stays for a retry. An earlier
 // deadline or cancellation of ctx ends the call at once, with its own error.
+//
+// The whole sequence (the identity read, the pending key write, the Enroll
+// call and the completion write) runs under the enrollment lock of the
+// state directory, so two commands never use different pending keys for one
+// attempt and a later command cannot replace the key or the completed
+// identity of an earlier one. A command that finds the lock held waits up to
+// 45 seconds, reads the identity the holder left (a pending key that it then
+// reuses, or the completed identity, which ends it with ErrAlreadyEnrolled)
+// and otherwise fails with store.ErrEnrollmentBusy. Other state directories
+// are independent.
 func Enroll(ctx context.Context, st *store.Store, cp *cpclient.Client, token, name string, logger *slog.Logger) (*store.Identity, error) {
+	lctx, lcancel := context.WithTimeout(ctx, enrollLockWait)
+	unlock, err := st.LockEnrollment(lctx)
+	lcancel()
+	if err != nil {
+		logger.Error("enrollment lock not acquired", "error", err)
+		return nil, fmt.Errorf("agent: enroll: %w", err)
+	}
+	defer unlock()
+
 	id, err := st.LoadIdentity()
 	switch {
 	case err == nil && id.DeviceID != "":

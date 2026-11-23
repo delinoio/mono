@@ -79,6 +79,59 @@ type Server struct {
 	stallAuth  bool
 	stallEnr   bool
 	enrollKeys []ed25519.PublicKey
+	// Enroll hooks; see ConsumeEnrollToken, DropNextEnrollResponse and
+	// HoldNextEnroll.
+	singleUse   bool
+	consumedKey ed25519.PublicKey
+	consumedDev string
+	dropReply   bool
+	hold        *EnrollHold
+}
+
+// EnrollHold holds one Enroll call after it reached the fake and before the
+// fake handles it.
+type EnrollHold struct {
+	arrived chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// Arrived is closed when the held Enroll call reached the fake.
+func (h *EnrollHold) Arrived() <-chan struct{} { return h.arrived }
+
+// Release lets the held call continue. It is safe to call more than once.
+func (h *EnrollHold) Release() { h.once.Do(func() { close(h.release) }) }
+
+// HoldNextEnroll makes the fake hold the next Enroll call until Release (or
+// the end of the call's context). Later calls run normally.
+func (s *Server) HoldNextEnroll() *EnrollHold {
+	h := &EnrollHold{arrived: make(chan struct{}), release: make(chan struct{})}
+	s.mu.Lock()
+	s.hold = h
+	s.mu.Unlock()
+	// Release at the end of the test, so that a failed test does not leave
+	// the handler blocked in the server's shutdown.
+	s.t.Cleanup(h.Release)
+	return h
+}
+
+// ConsumeEnrollToken gives the enrollment token the semantics of the
+// control plane: the first Enroll call consumes it for its public key and
+// creates the device, a retry with the same public key gets the same device,
+// and a call with another public key is rejected.
+func (s *Server) ConsumeEnrollToken() {
+	s.mu.Lock()
+	s.singleUse = true
+	s.mu.Unlock()
+}
+
+// DropNextEnrollResponse makes the fake commit the next Enroll call (it
+// creates the device) and answer with an unavailable error, as a lost
+// response looks to the agent. Later calls answer normally.
+func (s *Server) DropNextEnrollResponse() {
+	s.mu.Lock()
+	s.dropReply = true
+	s.mu.Unlock()
 }
 
 // EnrollPublicKeys returns the public key of every Enroll call that reached
@@ -183,7 +236,17 @@ func randomToken(prefix string) string {
 func (s *Server) Enroll(ctx context.Context, req *connect.Request[ownsandv1.EnrollRequest]) (*connect.Response[ownsandv1.EnrollResponse], error) {
 	s.mu.Lock()
 	s.enrollKeys = append(s.enrollKeys, append(ed25519.PublicKey(nil), req.Msg.GetPublicKey()...))
+	hold := s.hold
+	s.hold = nil
 	s.mu.Unlock()
+	if hold != nil {
+		close(hold.arrived)
+		select {
+		case <-hold.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	if s.stalled(&s.stallEnr) {
 		<-ctx.Done()
 		return nil, ctx.Err()
@@ -191,10 +254,25 @@ func (s *Server) Enroll(ctx context.Context, req *connect.Request[ownsandv1.Enro
 	if req.Msg.GetEnrollmentToken() != Token || len(req.Msg.GetPublicKey()) != ed25519.PublicKeySize {
 		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid enrollment token"))
 	}
-	id, _ := uuidv7.NewString()
 	s.mu.Lock()
-	s.devices[id] = &device{pub: req.Msg.GetPublicKey()}
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	id := s.consumedDev
+	if s.singleUse && s.consumedKey != nil {
+		if !s.consumedKey.Equal(ed25519.PublicKey(req.Msg.GetPublicKey())) {
+			return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("invalid enrollment token"))
+		}
+	} else {
+		id, _ = uuidv7.NewString()
+		s.devices[id] = &device{pub: req.Msg.GetPublicKey()}
+		if s.singleUse {
+			s.consumedKey = append(ed25519.PublicKey(nil), req.Msg.GetPublicKey()...)
+			s.consumedDev = id
+		}
+	}
+	if s.dropReply {
+		s.dropReply = false
+		return nil, connect.NewError(connect.CodeUnavailable, errors.New("response lost"))
+	}
 	return connect.NewResponse(&ownsandv1.EnrollResponse{DeviceId: id, OrganizationId: OrganizationID}), nil
 }
 
