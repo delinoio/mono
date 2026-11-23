@@ -101,16 +101,18 @@ func attribute(ctx context.Context, q db.Querier, r UsageReport) (attribution, b
 
 // LockOrganization takes a transaction-scoped advisory lock on one
 // organization of a service. It serializes the creation of a link of the
-// organization with the unattributed report of the organization, whose
-// last attribution read and insert would otherwise miss a link that
-// commits in between. The lock is held until tx ends.
+// organization with every report of the organization, attributed or not,
+// whose last attribution read and insert would otherwise miss a link that
+// commits in between (a link to another billing account, for a report that
+// an earlier link attributed). The lock is held until tx ends.
 //
 // Lock order: a transaction that takes a billing account lock takes it
-// first and this lock second (a new link). The unattributed report path
-// takes only this lock and no billing account lock, and the attributed path
-// takes only the billing account lock, so the two orders cannot form a
-// cycle. A report that must lock a billing account after it found a link
-// rolls back, which releases this lock, and retries.
+// first and this lock second: a new link and an attributed report both do.
+// The unattributed report path takes only this lock and no billing account
+// lock, and an unlink takes only the billing account lock, so no two
+// orders form a cycle. An unattributed report that finds a link after it
+// holds this lock rolls back, which releases the lock, and retries; the
+// retry locks the billing account of the link first.
 func LockOrganization(ctx context.Context, tx pgx.Tx, service, organizationID string) error {
 	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended('usage_attr:' || $1::text || ':' || $2::text, 0))`,
 		service, organizationID)
@@ -128,10 +130,14 @@ var errAttributionChanged = errors.New("the attribution of the usage report chan
 // which can make the balance negative; without such a link it is stored
 // as unattributed usage.
 //
-// Concurrency: the attributed path locks the billing account before it
-// claims the key, so concurrent reports of one billing account serialize,
-// and a concurrent report with the same key waits for the first one and
-// then reads its result.
+// Concurrency: the attributed path locks the billing account, then the
+// organization (see LockOrganization), and reads the attribution again
+// before it claims the key. Concurrent reports of one billing account
+// serialize, a new link of the organization waits until the report
+// commits, and a concurrent report with the same key waits for the first
+// one and then reads its result. A report whose attribution changed before
+// it held both locks rolls back and retries, so the stored attribution,
+// the result and the deduction agree.
 func (s *Service) ReportUsage(ctx context.Context, r UsageReport) (UsageResult, error) {
 	r.WindowStart = r.WindowStart.UTC()
 	if st, ok, err := loadReport(ctx, s.db.Pool, r); err != nil || ok {
@@ -172,7 +178,16 @@ func (s *Service) applyReport(ctx context.Context, r UsageReport) (UsageResult, 
 				return err
 			}
 			// A link or unlink of the organization locks the billing account
-			// too; read the attribution again under the lock.
+			// too; read the attribution again under the lock. A new link to
+			// another billing account does not wait for the lock above, so
+			// take the organization lock as well (after the billing account
+			// lock, like a new link) and hold both to the commit: a link
+			// that commits before the lock is seen by the read below, and a
+			// link that waits for the lock inserts after the report, whose
+			// stored attribution then stands.
+			if err := LockOrganization(ctx, tx, r.Service, r.OrganizationID); err != nil {
+				return err
+			}
 			again, ok, err := attribute(ctx, tx, r)
 			if err != nil {
 				return err
