@@ -26,6 +26,7 @@ import {
   PageHeader,
   QueryBoundary,
   RefreshFailedNotice,
+  TableRegion,
   showsFullError,
   toastError,
 } from "../components/ui.tsx";
@@ -80,7 +81,7 @@ export function DevicesPage() {
               device.
             </Empty>
           ) : (
-            <div className="table-wrap">
+            <TableRegion label="Device list">
               <table className="table">
                 <thead>
                   <tr>
@@ -129,7 +130,7 @@ export function DevicesPage() {
                   ))}
                 </tbody>
               </table>
-            </div>
+            </TableRegion>
           )
         }
       </QueryBoundary>
