@@ -142,3 +142,24 @@ func TestConfirmRemovalEndsWhenTheControlPlaneStalls(t *testing.T) {
 		t.Fatalf("ConfirmRemoval returned after %s, want about %s", elapsed, authTestTimeout)
 	}
 }
+
+func TestEnrollContextDeadline(t *testing.T) {
+	c := &Client{}
+	if got := c.EnrollTimeout(); got != DefaultAuthTimeout {
+		t.Fatalf("zero AuthTimeout gives EnrollTimeout %s, want %s", got, DefaultAuthTimeout)
+	}
+	c.AuthTimeout = time.Minute
+	ctx, cancel := c.EnrollContext(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok || time.Until(deadline) > time.Minute || time.Until(deadline) < 50*time.Second {
+		t.Fatalf("deadline = %v, %v; want about one minute", deadline, ok)
+	}
+	parent, cancelParent := context.WithTimeout(context.Background(), time.Second)
+	defer cancelParent()
+	ctx2, cancel2 := c.EnrollContext(parent)
+	defer cancel2()
+	if d, _ := ctx2.Deadline(); time.Until(d) > time.Second {
+		t.Fatalf("an earlier caller deadline must win, got %v", d)
+	}
+}

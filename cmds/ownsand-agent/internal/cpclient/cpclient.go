@@ -38,9 +38,10 @@ type Client struct {
 
 	// AuthTimeout bounds one Authenticate or ConfirmRemoval attempt, so a
 	// control plane that accepts the call and then stalls ends the attempt
-	// and the caller's back-off and retry run. Zero means
-	// DefaultAuthTimeout. Only these unary calls are bound: the agent
-	// channel and the relay connection stream without a deadline.
+	// and the caller's back-off and retry run. The unary Enroll call has the
+	// same deadline (EnrollContext). Zero means DefaultAuthTimeout. Only
+	// these unary calls are bound: the agent channel and the relay
+	// connection stream without a deadline.
 	AuthTimeout time.Duration
 }
 
@@ -55,6 +56,18 @@ func (c *Client) authTimeout() time.Duration {
 // deadline.
 func (c *Client) authContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, c.authTimeout())
+}
+
+// EnrollTimeout is the deadline of the unary Enroll call: AuthTimeout, or
+// DefaultAuthTimeout when that is zero.
+func (c *Client) EnrollTimeout() time.Duration { return c.authTimeout() }
+
+// EnrollContext bounds the unary Enroll call with EnrollTimeout, so a
+// control plane that accepts the request and then stalls does not hang the
+// enroll command. An earlier deadline or cancellation of ctx still ends the
+// call first.
+func (c *Client) EnrollContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, c.EnrollTimeout())
 }
 
 // NewHTTPClient returns an HTTP client that speaks HTTP/2 to apiURL: TLS
