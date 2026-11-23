@@ -29,9 +29,8 @@ import (
 
 // Data path timing of the contract.
 const (
-	sessionLifetime  = time.Hour
-	authorizeRate    = 10 // AuthorizeRelay calls per second per principal
-	relayWaitForConn = 10 * time.Second
+	sessionLifetime = time.Hour
+	authorizeRate   = 10 // AuthorizeRelay calls per second per principal
 )
 
 // session is an open peer-to-peer session that the lease holder signaled.
@@ -143,12 +142,27 @@ type RelayTiming struct {
 	// Signaling the wait for an SDP answer (30 s).
 	GrantAck  time.Duration
 	Signaling time.Duration
+	// ConnWait bounds the wait for the agent relay connection of the grant's
+	// device at relay admission (10 s). Zero means the default.
+	ConnWait time.Duration
+}
+
+// defaultRelayConnWait is the contract wait for the agent relay connection.
+const defaultRelayConnWait = 10 * time.Second
+
+// connWait returns the wait for the agent relay connection; a zero ConnWait
+// keeps the contract value.
+func (t RelayTiming) connWait() time.Duration {
+	if t.ConnWait <= 0 {
+		return defaultRelayConnWait
+	}
+	return t.ConnWait
 }
 
 // DefaultRelayTiming returns the contract values.
 func DefaultRelayTiming() RelayTiming {
 	return RelayTiming{Rotation: 14*time.Minute - 10*time.Second, Keepalive: 50 * time.Second, Acceptance: 30 * time.Second, RequestDeadline: 5 * time.Minute,
-		GrantAck: 10 * time.Second, Signaling: 30 * time.Second}
+		GrantAck: 10 * time.Second, Signaling: 30 * time.Second, ConnWait: defaultRelayConnWait}
 }
 
 // NewDataPlane wires the data path into s.
