@@ -883,3 +883,61 @@ func TestPendingUnlinkGuardMigrationKeepsRows(t *testing.T) {
 		t.Fatalf("store the guard: %v", err)
 	}
 }
+
+// flushReceiptMigration is the version of
+// 0015_billing_usage_flush_receipts.sql.
+const flushReceiptMigration = 15
+
+// TestFlushReceiptMigrationKeepsUsageRows upgrades a database at the schema
+// of migration 0014 that holds counters and a sealed outbox row, and checks
+// that they survive, that the receipt table starts empty and that the
+// counter write of the previous release, which uses no receipt, still works.
+func TestFlushReceiptMigrationKeepsUsageRows(t *testing.T) {
+	ctx := context.Background()
+	d, err := db.Open(ctx, dbtest.NewURLAtVersion(t, flushReceiptMigration-1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(d.Close)
+	const org = "018f0000-0000-7000-8000-0000000000e1"
+	window := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
+	if _, err := d.Pool.Exec(ctx, "INSERT INTO usage_counters (organization_id, meter, window_start, quantity) VALUES ($1, 1, $2, 7)", org, window); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO usage_outbox (organization_id, meter, window_start, quantity, amount_usd_micros, seal_time, next_attempt_time)
+		VALUES ($1, 1, $2, 5, 23, $2, $2)`, org, window.Add(-5*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Migrate(ctx, testenv.Discard()); err != nil {
+		t.Fatal(err)
+	}
+	var counter, sealed, receipts int64
+	if err := d.Pool.QueryRow(ctx, "SELECT quantity FROM usage_counters WHERE organization_id = $1", org).Scan(&counter); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Pool.QueryRow(ctx, "SELECT quantity FROM usage_outbox WHERE organization_id = $1", org).Scan(&sealed); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.Pool.QueryRow(ctx, "SELECT count(*) FROM usage_flush_receipts").Scan(&receipts); err != nil {
+		t.Fatal(err)
+	}
+	if counter != 7 || sealed != 5 || receipts != 0 {
+		t.Fatalf("after the upgrade: counter %d, outbox %d, receipts %d; want 7, 5, 0", counter, sealed, receipts)
+	}
+	// The previous release adds to the counters without a receipt.
+	if _, err := d.Pool.Exec(ctx, `INSERT INTO usage_counters (organization_id, meter, window_start, quantity) VALUES ($1, 1, $2, 2)
+		ON CONFLICT (organization_id, meter, window_start) DO UPDATE SET quantity = usage_counters.quantity + EXCLUDED.quantity`, org, window); err != nil {
+		t.Fatalf("counter write of the previous release: %v", err)
+	}
+	if err := d.Pool.QueryRow(ctx, "SELECT quantity FROM usage_counters WHERE organization_id = $1", org).Scan(&counter); err != nil || counter != 9 {
+		t.Fatalf("counter = %d, %v; want 9", counter, err)
+	}
+	// A receipt ID is unique.
+	const insertReceipt = "INSERT INTO usage_flush_receipts (batch_id, create_time) VALUES ('018f0000-0000-7000-8000-0000000000f1', now())"
+	if _, err := d.Pool.Exec(ctx, insertReceipt); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Pool.Exec(ctx, insertReceipt); err == nil {
+		t.Fatal("a second receipt with the same batch ID was accepted")
+	}
+}

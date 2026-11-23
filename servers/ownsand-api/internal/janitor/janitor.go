@@ -58,6 +58,9 @@ func jobs() []job {
 		// Only rows that accounts-api accepted; unreported rows stay until
 		// they are reported, also for deleted organizations.
 		{"usage_outbox", "DELETE FROM usage_outbox WHERE report_time < $1::timestamptz - interval '35 days'"},
+		// A flush receipt only guards the retry of its own batch; 7 days is
+		// billing.FlushReceiptRetention (the janitor does not import billing).
+		{"usage_flush_receipts", "DELETE FROM usage_flush_receipts WHERE create_time < $1::timestamptz - interval '7 days'"},
 		// A sample record only guards the sampling of its own window.
 		{"usage_storage_samples", "DELETE FROM usage_storage_samples WHERE window_start < $1::timestamptz - interval '1 day'"},
 	}
