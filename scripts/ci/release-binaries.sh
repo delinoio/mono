@@ -156,10 +156,12 @@ write_notices() {
   fi
   cp "$goroot/LICENSE" "$out/GO-LICENSE"
   modules="$(mktemp)"
+  # Scan each platform with the cgo setting that its build uses. Bind the
+  # platform to `$p` first: inside `$cgo | index(...)` a bare `.` is `$cgo`.
   while IFS=$'\t' read -r -u 3 platform cgo; do
     GOOS="${platform%-*}" GOARCH="${platform#*-}" CGO_ENABLED="$cgo" \
       go list -deps -buildvcs=false -f '{{with .Module}}{{if not .Main}}{{.Path}}{{"\t"}}{{.Version}}{{"\t"}}{{.Dir}}{{end}}{{end}}' "./$dir" < /dev/null >> "$modules"
-  done 3< <(jq -r --arg name "$name" '.[] | select(.name == $name) | .cgoPlatforms as $cgo | .platforms[] | [., (if ($cgo | index(.)) != null then "1" else "0" end)] | @tsv' <<< "$BINARIES")
+  done 3< <(jq -r --arg name "$name" '.[] | select(.name == $name) | .cgoPlatforms as $cgo | .platforms[] | . as $p | [$p, (if ($cgo | index($p)) != null then "1" else "0" end)] | @tsv' <<< "$BINARIES")
   {
     echo "Third-party licenses of $name"
     echo
