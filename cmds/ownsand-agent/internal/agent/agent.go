@@ -83,9 +83,11 @@ type Agent struct {
 	generation uint64
 	reportSeq  uint64
 	urlWaiters map[string]chan *ownsandv1.SignedUrlGrant
-	restart    chan struct{}
-	removal    chan struct{}
-	status     Status
+	// urlGrantTimeout overrides defaultURLGrantTimeout; tests set it.
+	urlGrantTimeout time.Duration
+	restart         chan struct{}
+	removal         chan struct{}
+	status          Status
 
 	// statusMu serializes the status file writes and fences them during
 	// the device removal (see stopStatusWriter). It is acquired before mu.
@@ -307,6 +309,14 @@ func (a *Agent) send(env *ownsandv1.AgentEnvelope) bool {
 	return c.Send(env)
 }
 
+// defaultURLGrantTimeout is how long RequestURLs waits for a signed URL grant.
+const defaultURLGrantTimeout = time.Minute
+
+// errURLGrantTimeout reports that the control plane sent no grant within the
+// grant wait. RequestURLs returns it only while the caller's context is live;
+// it is distinct from the caller's own cancellation or deadline.
+var errURLGrantTimeout = errors.New("agent: no signed URL grant within a minute")
+
 // RequestURLs implements snapxfer.URLSource over the agent channel.
 func (a *Agent) RequestURLs(ctx context.Context, snapshotID string, op ownsandv1.SignedUrlOperation, parts []int32) ([]*ownsandv1.SignedPartUrl, error) {
 	requestID := fmt.Sprintf("%s-%d-%d", snapshotID, time.Now().UnixNano(), len(parts))
@@ -324,11 +334,25 @@ func (a *Agent) RequestURLs(ctx context.Context, snapshotID string, op ownsandv1
 	}}}) {
 		return nil, errors.New("agent: no agent channel for signed URLs")
 	}
-	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	timeout := a.urlGrantTimeout
+	if timeout <= 0 {
+		timeout = defaultURLGrantTimeout
+	}
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	select {
-	case <-ctx.Done():
-		return nil, errors.New("agent: no signed URL grant within a minute")
+	case <-waitCtx.Done():
+		// The parent context ended first (canceled, or its own earlier
+		// deadline): report that cause, not a missing grant. Only a live
+		// parent means that the grant wait itself timed out.
+		if ctx.Err() != nil {
+			cause := context.Cause(ctx)
+			if cause == ctx.Err() {
+				return nil, fmt.Errorf("agent: signed URL request ended: %w", ctx.Err())
+			}
+			return nil, fmt.Errorf("agent: signed URL request ended: %w: %w", ctx.Err(), cause)
+		}
+		return nil, errURLGrantTimeout
 	case g := <-ch:
 		if g.GetError() != nil {
 			return nil, fmt.Errorf("agent: signed URL request rejected: %s", g.GetError().GetMessage())
