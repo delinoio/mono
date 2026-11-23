@@ -5,7 +5,7 @@
 // `deploy-provider.sh` and `deploy-targets.sh` (against stubbed CLIs),
 // `droplet-deploy.sh` (against stubbed `docker` and `curl`),
 // `start-caddy.sh` (against a stubbed `docker`) and
-// `deploy-release.sh` (against a local bare remote).
+// `deploy-release.sh` and `release-recovery.sh` (against a local bare remote).
 import assert from "node:assert/strict";
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import {
@@ -27,6 +27,7 @@ import { isolateGitEnvironment } from "./git-fixture-env.mjs";
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const guard = join(root, "scripts/ci/check-pending-changesets.sh");
 const release = join(root, "scripts/ci/deploy-release.sh");
+const recovery = join(root, "scripts/ci/release-recovery.sh");
 const baseEnv = isolateGitEnvironment({ ...process.env });
 const provider = join(root, "scripts/ci/deploy-provider.sh");
 // The scripts need Bash 4.4 or newer (`mapfile`, empty arrays under `set -u`);
@@ -1018,6 +1019,262 @@ test("release stops when main keeps moving", { skip }, (t) => {
   assert.equal(result.status, 1);
   assert.match(result.stdout, /main kept moving/);
   assert.equal(remoteGit(remote, "tag"), "");
+});
+
+// --- release-recovery.sh ---------------------------------------------------
+
+const recoveryRunId = "555";
+
+// The state of a rerun after the atomic push landed although the job failed:
+// the remote holds the version commit and the tags, and the rerun checks out
+// the planned revision again. `moved` moves `main` during the deployment, so
+// that the release pushes a cherry-picked copy of the tagged commit.
+function landedRelease(t, { moved = false, land = true } = {}) {
+  const fixture = releaseFixture(t);
+  const { dir, remote, work } = fixture;
+  const sha = addChangeset(work, "one", { a: "patch" });
+  const releases = [{ name: "a", version: "0.0.1" }];
+  const blobs = changesetBlobs(work, sha);
+  if (moved) moveMain(dir, remote, "moved.txt", "moved\n");
+  if (land) {
+    const result = runRelease(work, sha, releases, {
+      GITHUB_RUN_ID: recoveryRunId,
+    });
+    assert.equal(result.status, 0, result.stdout + result.stderr);
+    // The rerun starts from a fresh checkout of the planned revision.
+    git(work, "reset", "--quiet", "--hard", sha);
+    git(work, "tag", "--delete", "a@0.0.1");
+  }
+  return { ...fixture, sha, releases, blobs };
+}
+
+// Every ref of the remote, to prove that a recovery writes nothing.
+const remoteRefs = (remote) =>
+  remoteGit(remote, "for-each-ref", "--format=%(refname) %(objectname)");
+
+function runRecovery(t, state, { env = {}, responses } = {}) {
+  const dir = scratch(t);
+  const bin = stubGh(
+    dir,
+    responses ??
+      runs([7, "completed", "success", 2], [6, "completed", "success"]),
+  );
+  const output = join(dir, "output");
+  const summary = join(dir, "summary.md");
+  writeFileSync(output, "");
+  writeFileSync(summary, "");
+  const before = remoteRefs(state.remote);
+  const result = spawnSync("bash", [recovery], {
+    cwd: state.work,
+    encoding: "utf8",
+    env: {
+      ...baseEnv,
+      PATH: `${bin}${delimiter}${baseEnv.PATH}`,
+      RELEASES: JSON.stringify(state.releases),
+      CHANGESET_BLOBS: JSON.stringify(state.blobs),
+      SHA: state.sha,
+      GITHUB_RUN_ID: recoveryRunId,
+      GITHUB_RUN_ATTEMPT: "2",
+      GITHUB_RUN_NUMBER: "7",
+      REPOSITORY: "owner/repo",
+      WORKFLOW: "deploy.yml",
+      GH_TOKEN: "token",
+      CHECK_RETRY_DELAY: "0",
+      GITHUB_OUTPUT: output,
+      GITHUB_STEP_SUMMARY: summary,
+      ...env,
+    },
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  return {
+    ...result,
+    recovered: readFileSync(output, "utf8").trim(),
+    summary: readFileSync(summary, "utf8"),
+    refsUnchanged: remoteRefs(state.remote) === before,
+  };
+}
+
+const identity = ["-c", "user.name=t", "-c", "user.email=t@example.invalid"];
+
+test("release records the run of the deployment", { skip }, (t) => {
+  const { remote, work } = releaseFixture(t);
+  const sha = addChangeset(work, "one", { a: "patch" });
+  const result = runRelease(work, sha, [{ name: "a", version: "0.0.1" }], {
+    GITHUB_RUN_ID: "42",
+  });
+  assert.equal(result.status, 0, result.stdout + result.stderr);
+  const message = remoteGit(remote, "log", "-1", "--format=%B", "main");
+  assert.match(message, /^Deployed revision: [0-9a-f]{40}$/m);
+  assert.match(message, /^Deployment run: 42$/m);
+});
+
+test("recovery accepts a release that already landed", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=true");
+  assert.ok(result.refsUnchanged);
+  assert.match(result.summary, /Recovered/);
+  assert.match(result.summary, /`a@0.0.1`/);
+  // The planned revision stays checked out and nothing was committed.
+  assert.equal(git(state.work, "rev-parse", "HEAD"), state.sha);
+});
+
+test("recovery accepts a cherry-picked version commit", { skip }, (t) => {
+  const state = landedRelease(t, { moved: true });
+  const tagged = remoteGit(state.remote, "rev-parse", "a@0.0.1^{commit}");
+  assert.notEqual(tagged, remoteGit(state.remote, "rev-parse", "main"));
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=true");
+  assert.ok(result.refsUnchanged);
+});
+
+test("recovery proves nothing when the push never landed", { skip }, (t) => {
+  const state = landedRelease(t, { land: false });
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /not exactly one|missing on the remote/);
+  assert.ok(result.refsUnchanged);
+});
+
+test("recovery needs a rerun", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, state, { env: { GITHUB_RUN_ATTEMPT: "1" } });
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /not a rerun/);
+});
+
+test("recovery rejects a version commit of another run", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, state, { env: { GITHUB_RUN_ID: "556" } });
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /not exactly one/);
+});
+
+test("recovery rejects a missing tag", { skip }, (t) => {
+  const state = landedRelease(t);
+  remoteGit(state.remote, "tag", "--delete", "a@0.0.1");
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /tag a@0\.0\.1 is missing/);
+});
+
+test("recovery rejects a tag on the wrong commit", { skip }, (t) => {
+  const state = landedRelease(t);
+  // The tag keeps its message but moved to the deployed revision.
+  git(
+    state.remote,
+    ...identity,
+    "tag",
+    "--force",
+    "--annotate",
+    "a@0.0.1",
+    "--message",
+    `a@0.0.1 deployed from ${state.sha}`,
+    state.sha,
+  );
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /does not have the deployed revision/);
+});
+
+test("recovery rejects a tag of another deployment", { skip }, (t) => {
+  const state = landedRelease(t);
+  const tagged = remoteGit(state.remote, "rev-parse", "a@0.0.1^{commit}");
+  git(
+    state.remote,
+    ...identity,
+    "tag",
+    "--force",
+    "--annotate",
+    "a@0.0.1",
+    "--message",
+    `a@0.0.1 deployed from ${"d".repeat(40)}`,
+    tagged,
+  );
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /not an annotated tag of the deployment/);
+});
+
+test("recovery rejects changesets that differ from the plan", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, {
+    ...state,
+    blobs: { one: "e".repeat(40) },
+  });
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /not consumed by the version commit/);
+});
+
+test("recovery rejects a changeset that exists again", { skip }, (t) => {
+  const state = landedRelease(t);
+  // The same file content returns to main, so its blob equals the plan.
+  git(state.work, "fetch", "--quiet", "origin", "main");
+  git(state.work, "checkout", "--quiet", "--detach", "FETCH_HEAD");
+  writeFileSync(
+    join(state.work, ".changeset/one.md"),
+    `---\n"a": patch\n---\n\nChange one.\n`,
+  );
+  commitAll(state.work, "restore changeset");
+  git(state.work, "push", "--quiet", "origin", "HEAD:refs/heads/main");
+  git(state.work, "checkout", "--quiet", "--detach", state.sha);
+  const result = runRecovery(t, state);
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /exists again on the tip of main/);
+});
+
+test(
+  "recovery rejects a version commit that changes other files",
+  { skip },
+  (t) => {
+    const state = landedRelease(t, { moved: true });
+    // The commit on `main` is a copy of the tagged commit with an extra file.
+    const other = join(state.dir, "forge");
+    git(state.dir, "clone", "--quiet", "--branch", "main", state.remote, other);
+    const version = git(other, "rev-parse", "HEAD");
+    git(other, "reset", "--quiet", "--hard", `${version}~1`);
+    git(other, "cherry-pick", "--no-commit", version);
+    writeFileSync(join(other, "extra.txt"), "extra\n");
+    git(other, "add", "-A");
+    git(other, ...identity, "commit", "--quiet", "--no-verify", "-C", version);
+    git(other, "push", "--quiet", "--force", "origin", "HEAD:refs/heads/main");
+    const result = runRecovery(t, state);
+    assert.equal(result.recovered, "recovered=false");
+    assert.match(result.stdout, /change different files/);
+  },
+);
+
+test("recovery rejects a superseding deployment", { skip }, (t) => {
+  const state = landedRelease(t);
+  const result = runRecovery(t, state, {
+    responses: runs(
+      [8, "completed", "success"],
+      [7, "completed", "success", 2],
+    ),
+  });
+  assert.equal(result.recovered, "recovered=false");
+  assert.match(result.stdout, /run #8 of deploy\.yml started after this run/);
+  assert.match(result.stdout, /newer deployment run exists/);
+  assert.ok(result.refsUnchanged);
+});
+
+test("deploy.yml tries the recovery before the stale-plan check", () => {
+  const workflow = readFileSync(
+    join(root, ".github/workflows/deploy.yml"),
+    "utf8",
+  );
+  const job = workflow.match(/^ {2}release:\n(?:(?: {4}.*)?\n)+/m)?.[0] ?? "";
+  const steps = job.split(/^ {6}- /m).slice(1);
+  const index = (needle) => steps.findIndex((step) => step.includes(needle));
+  const recover = index("scripts/ci/release-recovery.sh");
+  assert.ok(recover >= 0);
+  assert.ok(recover < index("scripts/ci/check-pending-changesets.sh"));
+  assert.match(steps[recover], /id: recover/);
+  assert.match(steps[recover], /github\.run_attempt > 1/);
+  // Every step after the recovery is skipped when the release already landed.
+  for (const step of steps.slice(recover + 1)) {
+    assert.match(step, /steps\.recover\.outputs\.recovered != 'true'/);
+  }
 });
 
 test(

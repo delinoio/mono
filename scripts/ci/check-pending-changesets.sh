@@ -29,6 +29,12 @@
 #   SHA                 planned revision; `main` must still contain it.
 #   GH_TOKEN            token with contents: read and actions: read.
 #   CHECK_RETRY_DELAY   optional seconds between retries (default 5).
+#   RUNS_ONLY           `true` stops after the newer-run check. The release
+#                       recovery (`release-recovery.sh`) uses it after it
+#                       proved that the planned release already landed: the
+#                       planned changesets are then gone from `main` and
+#                       the version commit changed the manifests, so the
+#                       other checks would always report a stale plan.
 set -euo pipefail
 
 # Empty arrays under `set -u` and `mapfile` need Bash 4.4 or newer.
@@ -143,6 +149,11 @@ while IFS=$'\t' read -r run_id run_number kind; do
   fi
   stale "run #$run_number of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."
 done <<< "$newer_runs"
+
+if [[ "${RUNS_ONLY:-}" == true ]]; then
+  echo "No newer run of $WORKFLOW started after this run #$GITHUB_RUN_NUMBER."
+  exit 0
+fi
 
 # The planned revision must still be on `main`. A `main` that was rewound or
 # rewritten after planning can keep a changeset with the same blob, but the

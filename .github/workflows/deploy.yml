@@ -440,7 +440,24 @@ jobs:
           ref: ${{ needs.plan.outputs.sha }}
           token: ${{ steps.release-bot.outputs.token }}
           fetch-depth: 0 # zizmor: ignore[artipacked]
+      # A rerun of the failed job: the atomic push of an earlier attempt can
+      # have landed although the job failed. The step proves that, without
+      # any write, and then the steps below are skipped so that the job
+      # concludes with success and `publish-binaries` continues with the
+      # original plan. Without the complete proof, `recovered` is `false`.
+      - name: Recover a release that already landed
+        id: recover
+        if: ${{ github.run_attempt > 1 }}
+        env:
+          RELEASES: ${{ needs.plan.outputs.releases }}
+          CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
+          SHA: ${{ needs.plan.outputs.sha }}
+          REPOSITORY: ${{ github.repository }}
+          WORKFLOW: deploy.yml
+          GH_TOKEN: ${{ github.token }}
+        run: scripts/ci/release-recovery.sh
       - name: Check that the plan is still current
+        if: ${{ steps.recover.outputs.recovered != 'true' }}
         env:
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
           SHA: ${{ needs.plan.outputs.sha }}
@@ -448,13 +465,17 @@ jobs:
           WORKFLOW: deploy.yml
           GH_TOKEN: ${{ github.token }}
         run: scripts/ci/check-pending-changesets.sh
-      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - if: ${{ steps.recover.outputs.recovered != 'true' }}
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v5
+      - if: ${{ steps.recover.outputs.recovered != 'true' }}
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version-file: .nvmrc
           package-manager-cache: false
-      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - if: ${{ steps.recover.outputs.recovered != 'true' }}
+        run: pnpm install --frozen-lockfile --ignore-scripts
       - name: Commit versions, tag and push
+        if: ${{ steps.recover.outputs.recovered != 'true' }}
         env:
           RELEASES: ${{ needs.plan.outputs.releases }}
           CHANGESET_BLOBS: ${{ needs.plan.outputs.changeset_blobs }}
