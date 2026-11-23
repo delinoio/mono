@@ -35,6 +35,7 @@ import {
   ServiceId,
   type UsageSummaryRow,
 } from "@delino/accounts-protos/v1/usage_pb";
+import { awaitDeferredCall } from "./form-submit-deferral.ts";
 
 type Init<T> = Omit<T, "$typeName" | "$unknown">;
 
@@ -344,8 +345,9 @@ export function createFakeApi(): FakeApi {
 
   api.transport = createRouterTransport(({ service }) => {
     service(BillingAccountService, {
-      createBillingAccount(req) {
+      async createBillingAccount(req) {
         record("CreateBillingAccount", req);
+        await awaitDeferredCall(api, "CreateBillingAccount");
         const id = newId();
         const account = seedAccount();
         Object.assign(account, {
@@ -411,8 +413,9 @@ export function createFakeApi(): FakeApi {
         account.deleted = true;
         return {};
       },
-      createInvitation(req) {
+      async createInvitation(req) {
         record("CreateInvitation", req);
+        await awaitDeferredCall(api, "CreateInvitation");
         const { account } = load(req.billingAccountId, PAYMENT_ROLES);
         const invitation = {
           invitationId: newId(),
@@ -561,8 +564,9 @@ export function createFakeApi(): FakeApi {
         account.subscription.cancelAtPeriodEnd = false;
         return { subscription: subscription(account) };
       },
-      createTopUp(req) {
+      async createTopUp(req) {
         record("CreateTopUp", req);
+        await awaitDeferredCall(api, "CreateTopUp");
         load(req.billingAccountId, PAYMENT_ROLES);
         return {};
       },

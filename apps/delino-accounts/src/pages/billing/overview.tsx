@@ -14,6 +14,8 @@ import {
   ErrorNotice,
   RefetchNotice,
   FormDialog,
+  formInvalid,
+  formSubmitted,
   Loading,
 } from "../../components/ui.tsx";
 import {
@@ -167,7 +169,7 @@ function TopUpDialog({
         const checked = checkTopUpAmount(amount);
         if (!checked.ok) {
           setError(checked.error);
-          return;
+          return formInvalid();
         }
         setError(undefined);
         await topUp.mutateAsync({
@@ -175,11 +177,16 @@ function TopUpDialog({
           idempotencyKey,
           amountUsdMicros: checked.value,
         });
-        onOpenChange(false);
-        toast.success(
-          `Paddle accepted the ${formatUsd(checked.value)} top-up. The credit appears when the payment is confirmed.`,
-        );
-        await invalidateServices(queryClient, CreditService);
+        // The balance refreshes for every accepted top-up, and the dialog
+        // does not wait for the refetch. The close and the toast belong to
+        // the opening that sent the top-up.
+        void invalidateServices(queryClient, CreditService);
+        return formSubmitted(() => {
+          onOpenChange(false);
+          toast.success(
+            `Paddle accepted the ${formatUsd(checked.value)} top-up. The credit appears when the payment is confirmed.`,
+          );
+        });
       }}
     >
       <TextField

@@ -11,6 +11,8 @@ import {
   Empty,
   ErrorNotice,
   FormDialog,
+  formInvalid,
+  formSubmitted,
   Loading,
   MorePages,
   PageHeader,
@@ -111,18 +113,21 @@ function CreateBillingAccountDialog({
         const checked = checkAccountName(name);
         if (!checked.ok) {
           setError(checked.error);
-          return;
+          return formInvalid();
         }
         setError(undefined);
         const res = await create.mutateAsync({ name: checked.value });
         await invalidateServices(queryClient, BillingAccountService);
-        reset(false);
-        navigate(
-          routePath({
-            id: RouteId.BillingAccount,
-            billingAccountId: res.billingAccount!.billingAccountId,
-          }),
-        );
+        // Close and navigate only when this opening is still current.
+        return formSubmitted(() => {
+          reset(false);
+          navigate(
+            routePath({
+              id: RouteId.BillingAccount,
+              billingAccountId: res.billingAccount!.billingAccountId,
+            }),
+          );
+        });
       }}
     >
       <TextField

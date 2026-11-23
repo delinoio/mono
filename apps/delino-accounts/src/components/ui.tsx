@@ -319,6 +319,36 @@ export function ConfirmDialog({
   );
 }
 
+export enum FormSubmitOutcome {
+  /** The input passed the checks and the request was sent and succeeded. */
+  Submitted = "submitted",
+  /** The input failed a check; the form shows the message and sent nothing. */
+  Invalid = "invalid",
+}
+
+/**
+ * What `FormDialog.onSubmit` resolves with. `onSucceeded` holds the effects
+ * that belong to the opening that submitted the form (close, reset, navigate,
+ * toast). The dialog runs it only when that opening is still the current one,
+ * so a request that succeeds after the dialog closed or opened again cannot
+ * close the new opening, clear its draft, navigate or notify. Work that must
+ * happen for every success, such as refreshing cached data, stays in
+ * `onSubmit` before it resolves.
+ */
+export type FormSubmission =
+  | { outcome: FormSubmitOutcome.Invalid }
+  | { outcome: FormSubmitOutcome.Submitted; onSucceeded?: () => void };
+
+/** The submission of a form whose input failed a check. */
+export function formInvalid(): FormSubmission {
+  return { outcome: FormSubmitOutcome.Invalid };
+}
+
+/** The submission of a form whose request succeeded. */
+export function formSubmitted(onSucceeded?: () => void): FormSubmission {
+  return { outcome: FormSubmitOutcome.Submitted, onSucceeded };
+}
+
 /** A dialog with a form and one submit button. */
 export function FormDialog({
   open,
@@ -336,14 +366,25 @@ export function FormDialog({
   submitLabel: string;
   /** A wider panel for forms with several fields per row. */
   wide?: boolean;
-  onSubmit: () => Promise<unknown>;
+  onSubmit: () => Promise<FormSubmission>;
   onOpenChange: (open: boolean) => void;
   children: ReactNode;
 }) {
   const { error, pending, clearError, submit: run } = useDialogSubmission(open);
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    await run(onSubmit);
+    // The holder keeps the submission outside the action, because the action
+    // can settle after the opening that started it is gone.
+    const settled: { submission?: FormSubmission } = {};
+    const result = await run(async () => {
+      settled.submission = await onSubmit();
+    });
+    if (
+      result === SubmissionResult.Succeeded &&
+      settled.submission?.outcome === FormSubmitOutcome.Submitted
+    ) {
+      settled.submission.onSucceeded?.();
+    }
   };
   return (
     <Dialog
