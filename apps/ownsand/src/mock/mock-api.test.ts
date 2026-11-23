@@ -932,3 +932,72 @@ describe("mock enrollment token expiry", () => {
     );
   });
 });
+
+describe("mock revokeEnrollmentToken", () => {
+  const organizationId = MOCK_IDS.acme;
+
+  test("revokes a pending token and a repeated revoke returns it again", async () => {
+    const client = createClient(DeviceService, createMockTransport());
+    const { token } = await client.createEnrollmentToken({
+      organizationId,
+      ttl: { seconds: 3600n },
+    });
+    const enrollmentTokenId = token!.enrollmentTokenId;
+    expect(token?.state).toBe(EnrollmentTokenState.PENDING);
+
+    const first = await client.revokeEnrollmentToken({
+      organizationId,
+      enrollmentTokenId,
+    });
+    expect(first.token?.state).toBe(EnrollmentTokenState.REVOKED);
+    expect(first.token?.enrollmentTokenId).toBe(enrollmentTokenId);
+
+    const second = await client.revokeEnrollmentToken({
+      organizationId,
+      enrollmentTokenId,
+    });
+    expect(second.token?.state).toBe(EnrollmentTokenState.REVOKED);
+    expect(second.token?.enrollmentTokenId).toBe(enrollmentTokenId);
+
+    const { tokens } = await client.listEnrollmentTokens({ organizationId });
+    expect(
+      tokens.filter((t) => t.enrollmentTokenId === enrollmentTokenId),
+    ).toHaveLength(1);
+    expect(
+      tokens.find((t) => t.enrollmentTokenId === enrollmentTokenId)?.state,
+    ).toBe(EnrollmentTokenState.REVOKED);
+  });
+
+  test("a used token still fails with FailedPrecondition and stays used", async () => {
+    const client = createClient(DeviceService, createMockTransport());
+    const { tokens } = await client.listEnrollmentTokens({ organizationId });
+    const used = tokens.find((t) => t.state === EnrollmentTokenState.USED);
+    expect(used).toBeDefined();
+
+    const error = await client
+      .revokeEnrollmentToken({
+        organizationId,
+        enrollmentTokenId: used!.enrollmentTokenId,
+      })
+      .catch((e: unknown) => e);
+    expect(error).toBeInstanceOf(ConnectError);
+    expect((error as ConnectError).code).toBe(Code.FailedPrecondition);
+
+    const after = await client.listEnrollmentTokens({ organizationId });
+    expect(
+      after.tokens.find((t) => t.enrollmentTokenId === used!.enrollmentTokenId)
+        ?.state,
+    ).toBe(EnrollmentTokenState.USED);
+  });
+
+  test("an unknown token is NotFound", async () => {
+    const client = createClient(DeviceService, createMockTransport());
+    const error = await client
+      .revokeEnrollmentToken({
+        organizationId,
+        enrollmentTokenId: uuidV7(),
+      })
+      .catch((e: unknown) => e);
+    expect((error as ConnectError).code).toBe(Code.NotFound);
+  });
+});

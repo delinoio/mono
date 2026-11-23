@@ -1102,6 +1102,8 @@ export function createMockTransport(
         );
         if (token === undefined)
           throw new ConnectError("token not found", Code.NotFound);
+        // Mirrors the real API: revoking a revoked token returns it unchanged.
+        if (token.state === EnrollmentTokenState.REVOKED) return { token };
         if (token.state !== EnrollmentTokenState.PENDING) {
           throw new ConnectError(
             "only an unused token can be revoked",
