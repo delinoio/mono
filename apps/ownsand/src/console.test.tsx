@@ -17,6 +17,7 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import {
+  BaseImage,
   type DeviceLimitsInput,
   type Resources,
   SandboxState,
@@ -1400,6 +1401,62 @@ describe("sandbox create form resources", () => {
         typeof v === "bigint" ? String(v) : v,
       ),
     ).toContain(MOCK_IDS.snapshot);
+  });
+
+  test("shows the names of the sources on every open and sends the raw values", async () => {
+    const mock = createMockTransport();
+    const sources: unknown[] = [];
+    const transport: Transport = {
+      ...mock,
+      unary(method, ...rest) {
+        if (method.name === "CreateSandbox") {
+          sources.push((rest[3] as { source: unknown }).source);
+        }
+        return mock.unary(method, ...rest);
+      },
+    };
+    const dialog = await openForm(transport);
+    const trigger = within(dialog).getByRole("combobox", { name: "Source" });
+    const expectNames = async () => {
+      await act(async () => {
+        fireEvent.click(trigger);
+      });
+      const texts = (await screen.findAllByRole("option")).map(
+        (o) => o.textContent ?? "",
+      );
+      expect(texts).toContain("Linux base image");
+      expect(texts).toContain("Template: node-24-toolchain");
+      for (const text of texts) {
+        expect(text).not.toMatch(/^(base|template|snapshot):/);
+      }
+      expect(trigger.textContent).toContain("Linux base image");
+    };
+    expect(trigger.textContent).toContain("Linux base image");
+    await act(async () => {
+      fireEvent.pointerEnter(trigger);
+      fireEvent.mouseEnter(trigger);
+    });
+    expect(trigger.textContent).toContain("Linux base image");
+    expect(trigger.textContent).not.toContain("base:");
+    await expectNames();
+    await act(async () => {
+      fireEvent.keyDown(document.activeElement ?? trigger, { key: "Escape" });
+    });
+    await settle();
+    await expectNames();
+
+    await act(async () => {
+      fireEvent.click(within(dialog).getByRole("button", { name: "Create" }));
+    });
+    await settle(60);
+    expect(sources).toHaveLength(1);
+    expect(
+      JSON.stringify(sources[0], (_, v) =>
+        typeof v === "bigint" ? String(v) : v,
+      ),
+    ).toBe(
+      JSON.stringify({ source: { case: "baseImage", value: BaseImage.LINUX } }),
+    );
   });
 
   test("keeps the minimum of 256 and steps by whole numbers", async () => {
