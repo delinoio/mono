@@ -28,11 +28,17 @@ const TOKEN = "bai_TESTTOKEN";
 const FAILURE_TEXT =
   "Sign-in did not start. Check your connection and try again.";
 
+const APP_URL = "http://localhost:3000/";
+
 const realFetch = globalThis.fetch;
 let discoveryWorks = false;
 let discoveryRequests = 0;
 
 beforeEach(() => {
+  // A started redirect navigates the window to the Logto tenant.
+  (
+    window as unknown as { happyDOM: { setURL(url: string): void } }
+  ).happyDOM.setURL(APP_URL);
   window.sessionStorage.clear();
   window.localStorage.clear();
   discoveryWorks = false;
@@ -96,6 +102,55 @@ async function expectRedirectStarted() {
 }
 
 describe("sign-in that fails before the redirect", () => {
+  test(
+    "the billing sign-in view shows an alert, keeps the button, and a retry recovers",
+    async () => {
+      renderAt("/billing");
+      const button = (await screen.findByRole(
+        "button",
+        { name: "Sign in with Delino" },
+        { timeout: SDK_WAIT_MS },
+      )) as HTMLButtonElement;
+      expect(screen.queryByText(FAILURE_TEXT)).toBeNull();
+
+      await click("Sign in with Delino");
+      const alert = await screen.findByText(
+        FAILURE_TEXT,
+        {},
+        { timeout: SDK_WAIT_MS },
+      );
+      expect(alert.getAttribute("role")).toBe("alert");
+      // The raw SDK message never reaches the page.
+      expect(document.body.textContent).not.toContain("secret-detail");
+      expect(button.disabled).toBe(false);
+      expect(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)).toBeNull();
+
+      // A repeated failure shows the alert again.
+      const before = discoveryRequests;
+      await click("Sign in with Delino");
+      await waitFor(() => expect(discoveryRequests).toBeGreaterThan(before), {
+        timeout: SDK_WAIT_MS,
+      });
+      expect(await screen.findByText(FAILURE_TEXT)).toBeTruthy();
+
+      // A successful retry clears the alert and starts the redirect to the
+      // existing callback address.
+      discoveryWorks = true;
+      await click("Sign in with Delino");
+      await expectRedirectStarted();
+      await waitFor(() => expect(screen.queryByText(FAILURE_TEXT)).toBeNull(), {
+        timeout: SDK_WAIT_MS,
+      });
+      expect(
+        JSON.parse(window.sessionStorage.getItem(SIGN_IN_SESSION_KEY)!)
+          .redirectUri,
+      ).toBe(`${new URL(APP_URL).origin}/callback`);
+      // The SDK navigated to the authorization endpoint of the tenant.
+      expect(window.location.href).toContain("https://logto.test/oidc/auth");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
   test(
     "Sign in to accept shows the alert, keeps the pending invitation and recovers",
     async () => {
