@@ -74,25 +74,39 @@ func TestExecRequest(t *testing.T) {
 }
 
 func TestExecRequestSizeLimit(t *testing.T) {
-	r := validExec()
-	r.Env = nil
-	r.WorkingDirectory = ""
-	r.Command = []string{"echo", ""}
-	// Grow the argument until the encoded fields are exactly at the limit.
-	r.Command[1] = strings.Repeat("x", MaxExecFieldsSize-ExecFieldsSize(r))
-	for ExecFieldsSize(r) > MaxExecFieldsSize {
-		r.Command[1] = r.Command[1][1:]
+	// The documented budget for command, env and working_directory is 256 KiB.
+	// Fixtures are sized with proto.Size on a message that carries only the
+	// budget fields, independent of ExecFieldsSize and MaxExecFieldsSize, so a
+	// drift in either production symbol cannot move the test with it.
+	const documentedLimit = 256 * 1024
+	// A two-element command encodes "echo" as 6 bytes and the argument as a
+	// 1-byte tag, a 3-byte length varint (lengths from 16384 to 2097151) and
+	// the argument itself, so the command is 10 bytes larger than the argument.
+	commandOnly := func(argBytes int) *ownsandv1.ExecRequest {
+		r := validExec()
+		r.Env = nil
+		r.WorkingDirectory = ""
+		r.Command = []string{"echo", strings.Repeat("x", argBytes)}
+		return r
 	}
-	for ExecFieldsSize(r) < MaxExecFieldsSize {
-		r.Command[1] += "x"
+	budgetSize := func(r *ownsandv1.ExecRequest) int {
+		return proto.Size(&ownsandv1.ExecRequest{
+			Command:          r.Command,
+			Env:              r.Env,
+			WorkingDirectory: r.WorkingDirectory,
+		})
 	}
-	if ExecFieldsSize(r) != MaxExecFieldsSize {
-		t.Fatalf("size %d", ExecFieldsSize(r))
+	r := commandOnly(documentedLimit - 10)
+	if got := budgetSize(r); got != documentedLimit {
+		t.Fatalf("at-limit fixture encodes to %d bytes, want %d", got, documentedLimit)
 	}
 	if err := ExecRequest(r); err != nil {
 		t.Fatalf("exactly 256 KiB rejected: %v", err)
 	}
-	r.Command[1] += "x"
+	r = commandOnly(documentedLimit - 10 + 1)
+	if got := budgetSize(r); got != documentedLimit+1 {
+		t.Fatalf("over-limit fixture encodes to %d bytes, want %d", got, documentedLimit+1)
+	}
 	wantInvalid(t, "over limit", ExecRequest(r), "command")
 	// The limit counts env and working_directory too.
 	r = validExec()
