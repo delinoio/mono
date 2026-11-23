@@ -191,6 +191,51 @@ func TestDeletePrefix(t *testing.T) {
 	}
 }
 
+// TestDeletePrefixRejectsIncompleteListing checks that DeletePrefix returns
+// an error and deletes nothing when a successful (HTTP 200) listing is
+// truncated and has an omitted or empty continuation token. Returning nil
+// there would let the caller finish a cleanup job while objects under the
+// prefix remain. The fixture holds two keys under the prefix but serves only
+// the first one.
+func TestDeletePrefixRejectsIncompleteListing(t *testing.T) {
+	const prefix = "organizations/o/"
+	for _, tc := range []struct {
+		name  string
+		token string
+	}{
+		{name: "omitted token", token: ""},
+		{name: "empty token", token: "<NextContinuationToken></NextContinuationToken>"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var lists, deletes int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				mu.Lock()
+				defer mu.Unlock()
+				switch req.Method {
+				case http.MethodGet:
+					lists++
+					_, _ = w.Write([]byte("<ListBucketResult><Contents><Key>" + prefix + "1</Key></Contents>" +
+						"<IsTruncated>true</IsTruncated>" + tc.token + "</ListBucketResult>"))
+				case http.MethodDelete:
+					deletes++
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer srv.Close()
+			r := &R2{Endpoint: srv.URL, Bucket: "bucket", AccessKeyID: "k", SecretAccessKey: "s"}
+			if err := r.DeletePrefix(context.Background(), prefix); err == nil {
+				t.Fatal("DeletePrefix = nil, want an error for a truncated page without a continuation token")
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if lists != 1 || deletes != 0 {
+				t.Fatalf("list requests = %d, delete requests = %d, want 1 and 0", lists, deletes)
+			}
+		})
+	}
+}
+
 // listServer serves the ListObjectsV2 pages that pages maps by continuation
 // token ("" is the first page) and records every request token.
 func listServer(t *testing.T, prefix string, pages map[string]string) (*R2, *[]string) {
