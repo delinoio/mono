@@ -1151,6 +1151,12 @@ export function createMockTransport(
               i.invitation.state === InvitationState.PENDING,
           );
           if (entry === undefined) continue;
+          // Like the control plane, an invitation at or after its expiry is
+          // indistinguishable from an unknown secret, and the check runs
+          // before the membership check.
+          const { expireTime } = entry.invitation;
+          if (expireTime !== undefined && now() >= timestampMs(expireTime))
+            continue;
           if (org.members.some((m) => m.userId === userId)) {
             throw new ConnectError(
               "you are already a member",
