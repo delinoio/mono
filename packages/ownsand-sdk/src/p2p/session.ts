@@ -28,6 +28,7 @@ import {
   type WriteFileRequest,
   type WriteFileResponse,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
+import { isArrayBuffer, isUint8Array } from "../binary.ts";
 import { LogEvent, safeLog } from "../logger.ts";
 import {
   type OperationContext,
@@ -528,12 +529,16 @@ export class PeerSession {
 
   #onMessage(event: unknown): void {
     const data = (event as { data?: unknown }).data;
-    const bytes =
-      data instanceof ArrayBuffer
-        ? new Uint8Array(data)
-        : data instanceof Uint8Array
-          ? data
-          : undefined;
+    // Binary data of any realm: `instanceof` misses an ArrayBuffer or a
+    // Uint8Array that another realm built (for example a WebRTC
+    // implementation in a `node:vm` context). A Uint8Array supplies only the
+    // bytes of its own view; any other type (a string, a DataView) ends the
+    // session.
+    const bytes = isArrayBuffer(data)
+      ? new Uint8Array(data)
+      : isUint8Array(data)
+        ? data
+        : undefined;
     if (bytes === undefined) {
       this.#terminate(
         new PeerUnavailableError("non-binary data channel message"),

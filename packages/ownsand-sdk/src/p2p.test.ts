@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+import { runInNewContext } from "node:vm";
+import { create } from "@bufbuild/protobuf";
 import { Code, ConnectError } from "@connectrpc/connect";
 import { describe, expect, test } from "@rstest/core";
+import { encodeMessages } from "./codec.ts";
 import {
   billingReasonOf,
   DataPathError,
@@ -20,6 +23,7 @@ import { DataPathService } from "@delino/ownsand-protos/v1/data_path_pb";
 import {
   type DataFrame,
   DataFrameKind,
+  DataFrameSchema,
 } from "@delino/ownsand-protos/v1/data_frame_pb";
 import { RelayService } from "@delino/ownsand-protos/v1/relay_pb";
 import { SandboxService } from "@delino/ownsand-protos/v1/sandbox_pb";
@@ -827,6 +831,118 @@ describe("peer-to-peer data path", () => {
       expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
     });
   }
+
+  describe("binary data channel messages of any realm", () => {
+    /** A Uint8Array that a `node:vm` context built, so `instanceof` misses it. */
+    const foreignBytes = (bytes: Uint8Array): Uint8Array =>
+      runInNewContext("(src) => Uint8Array.from(src)")(bytes) as Uint8Array;
+    /** A view of `bytes` inside a larger foreign buffer with sentinel bytes. */
+    const foreignView = (bytes: Uint8Array): Uint8Array => {
+      const padded = foreignBytes(
+        new Uint8Array([
+          ...Array(7).fill(0xee),
+          ...bytes,
+          ...Array(5).fill(0xdd),
+        ]),
+      );
+      return padded.subarray(7, 7 + bytes.length);
+    };
+    const localView = (bytes: Uint8Array): Uint8Array => {
+      const padded = new Uint8Array([
+        ...Array(7).fill(0xee),
+        ...bytes,
+        ...Array(5).fill(0xdd),
+      ]);
+      return padded.subarray(7, 7 + bytes.length);
+    };
+
+    const valid: [string, (bytes: Uint8Array) => unknown][] = [
+      ["a same-realm ArrayBuffer", (b) => b.slice().buffer],
+      ["a same-realm Uint8Array", (b) => b.slice()],
+      ["a same-realm Uint8Array view", localView],
+      ["a cross-realm ArrayBuffer", (b) => foreignBytes(b).buffer],
+      ["a cross-realm Uint8Array", foreignBytes],
+      ["a cross-realm Uint8Array view", foreignView],
+    ];
+    const invalid: [string, (bytes: Uint8Array) => unknown][] = [
+      ["a string", () => "not binary"],
+      ["a same-realm DataView", (b) => new DataView(b.slice().buffer)],
+      [
+        "a cross-realm DataView",
+        (b) =>
+          runInNewContext("(src) => new DataView(Uint8Array.from(src).buffer)")(
+            b,
+          ),
+      ],
+    ];
+
+    /** An agent that answers an exec with raw messages that `wrap` builds. */
+    function rawAgent(
+      channelOf: () => { receive(data: unknown): void },
+      wrap: (bytes: Uint8Array) => unknown,
+    ): FakeAgent {
+      return (frame) => {
+        if (frame.kind !== DataFrameKind.EXEC_REQUEST) return;
+        for (const event of [ev.started(), ev.stdout(0, "ok"), ev.exited(0)]) {
+          const reply = create(DataFrameSchema, {
+            streamId: frame.streamId,
+            sandboxId: SANDBOX,
+            kind: DataFrameKind.EXEC_EVENT,
+            payload: { case: "execEvent", value: { event } },
+          });
+          for (const message of encodeMessages(reply)) {
+            // A copy, so that no message shares bytes with the encoder.
+            channelOf().receive(wrap(message.slice()));
+          }
+        }
+      };
+    }
+
+    for (const [name, wrap] of valid) {
+      test(`${name} reaches the decoder and leaves the session usable`, async () => {
+        const holder: { p?: ReturnType<typeof p2pSetup> } = {};
+        const p = p2pSetup(
+          rawAgent(() => holder.p!.rtc.channels[0]!, wrap),
+          { transport: DataPathTransport.PEER_TO_PEER },
+        );
+        holder.p = p;
+        const { h, rtc } = p;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const first = await h.clock.run(sandbox.run({ command: ["a"] }));
+        expect(text(first.stdout)).toBe("ok");
+        expect(first.result.kind).toBe(ExecResultKind.Exited);
+        // The same session serves the next operation.
+        const second = await h.clock.run(sandbox.run({ command: ["b"] }));
+        expect(text(second.stdout)).toBe("ok");
+        expect(rtc.channels).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+    }
+
+    for (const [name, wrap] of invalid) {
+      test(`${name} ends the session as a non-binary message`, async () => {
+        const holder: { p?: ReturnType<typeof p2pSetup> } = {};
+        const p = p2pSetup(
+          rawAgent(() => holder.p!.rtc.channels[0]!, wrap),
+          { transport: DataPathTransport.PEER_TO_PEER },
+        );
+        holder.p = p;
+        const { h } = p;
+        const sandbox = h.client.sandbox(SANDBOX);
+        const error = await h.clock
+          .run(sandbox.run({ command: ["a"] }))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(DataPathError);
+        const cause = (error as DataPathError).cause;
+        expect(cause).toBeInstanceOf(PeerUnavailableError);
+        expect((cause as Error).message).toBe(
+          "non-binary data channel message",
+        );
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+      });
+    }
+  });
 
   describe("when GetIceServers fails", () => {
     const relayOperations = {

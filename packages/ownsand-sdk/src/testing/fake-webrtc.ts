@@ -82,6 +82,13 @@ export interface FakeChannelControl {
   sendError: Error | undefined;
   /** Runs after each message that the SDK sent, before the next one. */
   afterSend: (bytes: Uint8Array) => void;
+  /**
+   * Delivers `data` to the SDK as the `data` of a message event, as the agent
+   * would. The fake agent always sends an `ArrayBuffer` of this realm; a test
+   * uses this to send another binary type, a binary value of another realm or
+   * a value that is not binary.
+   */
+  receive(data: unknown): void;
   /** Sets `bufferedAmount` and emits `bufferedamountlow`, as a drained buffer. */
   drain(bufferedAmount?: number): void;
 }
@@ -124,6 +131,10 @@ class FakeChannel
     if (this.sendError !== undefined) throw this.sendError;
     this.onSend(data);
     this.afterSend(data);
+  }
+
+  receive(data: unknown): void {
+    if (this.readyState === "open") this.emit("message", { data });
   }
 
   drain(bufferedAmount = 0): void {
