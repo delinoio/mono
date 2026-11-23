@@ -2098,6 +2098,99 @@ describe("peer-to-peer data path", () => {
       expect(rtc.frames).toHaveLength(1);
     });
 
+    describe("a first message that fails on a channel that is not open", () => {
+      function installRelayRead(h: Harness) {
+        h.api.stream(RelayService, "ReadFile", function* () {
+          yield file.accepted();
+          yield file.chunk(0, "relay");
+          yield file.end(5);
+        });
+      }
+
+      for (const readyState of ["closing", "closed"]) {
+        test(`a ${readyState} channel moves an automatic handle to the relay before its close event`, async () => {
+          const p = p2pSetup(writeAgent());
+          const { h, rtc } = p;
+          const { sandbox, channel } = await warmUp(p);
+          installRelayRead(h);
+          // The close event of the channel has not arrived: the session is
+          // still installed, but every send fails.
+          channel.readyState = readyState;
+          const bytes = await h.clock.run(sandbox.readFileBytes("/a"));
+          expect(text(bytes)).toBe("relay");
+          expect(sandbox.transport).toBe(DataPathTransport.RELAY);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(1);
+          const reads = h.api.callsOf("ReadFile");
+          expect(reads).toHaveLength(1);
+          expect(
+            (reads[0]!.request as unknown as { offset: bigint }).offset,
+          ).toBe(0n);
+          // No second peer was opened, and the next operation uses the relay.
+          expect(rtc.channels).toHaveLength(1);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+          await h.clock.run(sandbox.readFileBytes("/a"));
+          expect(h.api.callsOf("ReadFile")).toHaveLength(2);
+          expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(2);
+          expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+          expect(rtc.channels).toHaveLength(1);
+        });
+      }
+
+      test("a forced peer-to-peer handle returns the unavailable error and no relay authorization", async () => {
+        const p = p2pSetup(writeAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h } = p;
+        const { sandbox, channel } = await warmUp(p);
+        installRelayRead(h);
+        channel.readyState = "closing";
+        const error = await h.clock
+          .run(sandbox.readFileBytes("/a"))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(DataPathError);
+        expect((error as DataPathError).code).toBe(Code.Unavailable);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(h.api.callsOf("ReadFile")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+
+      test("the send failure is the cause of the peer failure", async () => {
+        const p = p2pSetup(writeAgent(), {
+          transport: DataPathTransport.PEER_TO_PEER,
+        });
+        const { h } = p;
+        const { sandbox, channel } = await warmUp(p);
+        channel.readyState = "closing";
+        const error = await h.clock
+          .run(sandbox.readFileBytes("/a"))
+          .catch((e) => e);
+        const peerFailure = (error as DataPathError).cause;
+        expect(peerFailure).toBeInstanceOf(PeerUnavailableError);
+        expect(((peerFailure as Error).cause as Error).message).toBe(
+          "channel not open",
+        );
+      });
+
+      test("a first message that fails on a channel that is still open keeps the session", async () => {
+        const p = p2pSetup(writeAgent());
+        const { h, rtc } = p;
+        const { sandbox, channel } = await warmUp(p);
+        channel.sendError = new Error("OperationError: send queue is full");
+        const error = await h.clock
+          .run(sandbox.run({ command: ["a"] }))
+          .catch((e) => e);
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain("send queue is full");
+        channel.sendError = undefined;
+        // The session is not retired: the next write uses it.
+        await h.clock.run(sandbox.writeFile("/b", "x"));
+        expect(rtc.channels).toHaveLength(1);
+        expect(h.api.callsOf("OpenSession")).toHaveLength(1);
+        expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(0);
+        expect(sandbox.transport).toBe(DataPathTransport.PEER_TO_PEER);
+      });
+    });
+
     test("a caller aborted while its first message waits for the buffer sends nothing", async () => {
       const p = p2pSetup(writeAgent());
       const { h, rtc } = p;

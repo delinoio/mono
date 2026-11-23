@@ -68,10 +68,18 @@ export interface FakeWebRtcOptions {
 
 /** Test control over the send buffer of a fake data channel. */
 export interface FakeChannelControl {
-  /** The channel state, such as `closed` after the connection closed. */
-  readonly readyState: string;
+  /**
+   * The channel state, such as `closed` after the connection closed. A test
+   * sets it to model a channel that is closing before its close event.
+   */
+  readyState: string;
   /** The reported send buffer size; a test sets it to model back-pressure. */
   bufferedAmount: number;
+  /**
+   * Makes each send throw this error before the message is recorded, as an
+   * `RTCDataChannel` does with an `OperationError`; undefined sends normally.
+   */
+  sendError: Error | undefined;
   /** Runs after each message that the SDK sent, before the next one. */
   afterSend: (bytes: Uint8Array) => void;
   /** Sets `bufferedAmount` and emits `bufferedamountlow`, as a drained buffer. */
@@ -102,6 +110,7 @@ class FakeChannel
   bufferedAmount = 0;
   bufferedAmountLowThreshold = 0;
   readonly label: string;
+  sendError: Error | undefined;
   onSend: (bytes: Uint8Array) => void = () => {};
   afterSend: (bytes: Uint8Array) => void = () => {};
 
@@ -112,6 +121,7 @@ class FakeChannel
 
   send(data: Uint8Array): void {
     if (this.readyState !== "open") throw new Error("channel not open");
+    if (this.sendError !== undefined) throw this.sendError;
     this.onSend(data);
     this.afterSend(data);
   }

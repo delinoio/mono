@@ -475,8 +475,22 @@ export class PeerSession {
         this.#channel.send(message);
       } catch (error) {
         if (index === 0) {
-          // Nothing of this frame is on the byte stream, so the session
-          // stays usable and the caller sees the send failure.
+          if (this.#channel.readyState !== "open") {
+            // A channel that is closing or closed fails every send, and the
+            // close event that would retire the session may not have arrived
+            // yet. Retire it now, so the failure is a peer failure that moves
+            // an automatic handle to the relay instead of a send error that
+            // leaves a dead session installed.
+            this.#terminate(
+              new PeerUnavailableError("data channel is not open", {
+                cause: error,
+              }),
+            );
+            throw this.#ended;
+          }
+          // Nothing of this frame is on the byte stream and the channel is
+          // still open, so the session stays usable and the caller sees the
+          // send failure.
           throw error;
         }
         // A prefix of the frame is already queued, so no later frame can
