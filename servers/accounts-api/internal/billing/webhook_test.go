@@ -117,9 +117,15 @@ func TestWebhookSubscriptionPaymentAndReplay(t *testing.T) {
 		"current_billing_period": map[string]any{"starts_at": f.clock.Now(), "ends_at": periodEnd},
 		"scheduled_change":       map[string]any{"action": "cancel", "effective_at": periodEnd},
 	}
-	f.webhook("subscription.updated", entity)
+	if code := f.webhook("subscription.updated", entity); code != http.StatusOK {
+		t.Fatalf("subscription.updated status = %d, want %d", code, http.StatusOK)
+	}
 	stale := map[string]any{"id": subID, "status": "past_due", "updated_at": f.clock.Now()}
-	f.webhook("subscription.past_due", stale)
+	// A stale delivery is acknowledged without changing the state; a 500 here
+	// would make Paddle retry it.
+	if code := f.webhook("subscription.past_due", stale); code != http.StatusOK {
+		t.Fatalf("stale subscription.past_due status = %d, want %d", code, http.StatusOK)
+	}
 	sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
 	if sub.Status != SubscriptionActive || !sub.CancelAtPeriodEnd {
 		t.Fatalf("subscription after the events: %+v", sub)
