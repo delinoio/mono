@@ -260,6 +260,24 @@ export function formatTime(ts: Timestamp | undefined): string {
 }
 
 /**
+ * The text of a Device option in the Create sandbox dialog: the device name
+ * and its state. It is one string, because the select derives the text of its
+ * trigger from the option children.
+ */
+export function deviceOptionLabel(name: string, state: DeviceState): string {
+  return `${name} (${labels.deviceState[state] ?? labels.deviceState[DeviceState.UNSPECIFIED]})`;
+}
+
+/**
+ * The create-sandbox notice for an explicitly selected device that is
+ * offline. The control plane answers `Unavailable` without a reason, so the
+ * console derives this text from the loaded device state.
+ */
+export function offlineDeviceMessage(name: string): string {
+  return `${name} is offline, so the sandbox cannot start on it. Choose another device or "Any device that fits", or try again when it is back online.`;
+}
+
+/**
  * A short, plain message for an RPC error. It never includes request data
  * or credentials, only the server's message for validation errors.
  */
