@@ -78,6 +78,9 @@ type fakeRuntime struct {
 	// the Pause and Resume of the fake, so a resumeErr models a rejected
 	// resume that leaves the VM paused.
 	snapshotViaHelper bool
+	// runningErr, when set, makes Running fail like a runtime whose VM
+	// inventory is incomplete; it still returns the IDs it knows.
+	runningErr error
 	// deleteFails is the number of Delete calls that fail before one works.
 	deleteFails int
 	deleteCalls int
@@ -228,7 +231,7 @@ func (r *fakeRuntime) Running(context.Context) ([]string, error) {
 	for id := range r.vms {
 		ids = append(ids, id)
 	}
-	return ids, nil
+	return ids, r.runningErr
 }
 func (r *fakeRuntime) Close() error { return nil }
 
@@ -1091,6 +1094,48 @@ func TestRestartReconcile(t *testing.T) {
 	e.restart()
 	if e.m.Epoch() == epoch {
 		t.Fatal("epoch kept after the state was lost")
+	}
+}
+
+// TestRestartFailsWhenRuntimeInventoryFails checks that a failed VM inventory
+// fails the startup reconciliation before any delete or record transition,
+// and that the error wraps the runtime error.
+func TestRestartFailsWhenRuntimeInventoryFails(t *testing.T) {
+	e := newEnv(t)
+	live := e.create(time.Hour, 2*time.Hour).GetSandboxId()
+	// The agent restarts: the VM ended, its files stay, and the inventory
+	// fails with an ID that it did know.
+	cause := errors.New("enumeration denied")
+	rt := newFakeRuntime()
+	rt.files[live] = true
+	rt.runningErr = cause
+	e.rt = rt
+	e.m.Close()
+	_, err := New(context.Background(), Options{Store: e.st, Runtime: rt, Now: e.clk.Now, FreeDisk: func() (int64, error) { return 1 << 50, nil }})
+	if !errors.Is(err, cause) {
+		t.Fatalf("New = %v, want an error that wraps %v", err, cause)
+	}
+	if rt.deleteCalls != 0 || !rt.hasFiles(live) {
+		t.Fatalf("reconcile deleted before the inventory succeeded (delete calls %d)", rt.deleteCalls)
+	}
+	// The record stays live: no transition was committed.
+	rt.runningErr = nil
+	e.restart()
+	if s, _ := e.m.State(live); s != ownsandv1.SandboxState_SANDBOX_STATE_FAILED || endReason(e.m, live) != ownsandv1.SandboxEndReason_SANDBOX_END_REASON_LOST_ON_DEVICE {
+		t.Fatalf("after a successful retry the sandbox is %v %v, want FAILED LOST_ON_DEVICE", s, endReason(e.m, live))
+	}
+}
+
+// TestRestartDeletesSurvivorFromInventory checks that a successful inventory
+// that lists a VM unknown to the records still stops it.
+func TestRestartDeletesSurvivorFromInventory(t *testing.T) {
+	e := newEnv(t)
+	survivor := "0197a000-0000-7000-8000-000000000001"
+	e.rt.files[survivor] = true
+	e.rt.vms[survivor] = &fakeVM{id: survivor, exited: make(chan struct{})}
+	e.restart()
+	if e.rt.hasFiles(survivor) || e.rt.deleteCalls == 0 {
+		t.Fatalf("the surviving VM was not deleted (delete calls %d)", e.rt.deleteCalls)
 	}
 }
 
