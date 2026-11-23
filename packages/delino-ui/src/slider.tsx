@@ -47,6 +47,11 @@ function isEmptyArray(value: unknown): boolean {
  * is a number when no value is given. A later re-render with `value={[20]}`
  * shows one thumb with the value 20.
  *
+ * A slider that mounted as a range keeps one thumb per committed value. An
+ * accepted controller update (such as `setValue`) from one array of more than
+ * one value to another adds or removes thumbs, and the positional names use
+ * the current total. A canceled update changes nothing.
+ *
  * When `value={[]}` replaces a number or a non-empty array, the slider resets
  * to that default, as if it mounted again with no value.
  */
@@ -130,56 +135,76 @@ export function Slider({
         defaultValue={defaultValue}
         {...props}
       >
-        <div className="dui-slider-header">
-          <FieldLabel
-            className="dui-text-field-label"
-            id={isRange ? labelId : undefined}
-          >
-            {label}
-          </FieldLabel>
-          {showValue ? <SliderValue className="dui-slider-value" /> : null}
-        </div>
-        <SliderControl className="dui-slider-control">
-          <SliderTrack className="dui-slider-track">
-            <SliderIndicator className="dui-slider-indicator" />
-            {Array.from({ length: thumbCount }, (_, index) => (
-              <SliderThumb
-                // Thumbs are positional and never reorder, so the index is a
-                // stable key.
-                key={index}
-                index={index}
-                className="dui-slider-thumb"
-                // An explicit name keeps `aria-label`. Without one, the thumb is
-                // named by the label and the hidden position text below;
-                // `aria-labelledby` would override `aria-label`, so the two are
-                // never set together.
-                aria-label={
-                  isRange && hasThumbLabel(index)
-                    ? thumbLabels?.[index]
-                    : undefined
-                }
-                aria-labelledby={
-                  isRange && !hasThumbLabel(index)
-                    ? `${labelId} ${positionIdPrefix}-${index}`
-                    : undefined
-                }
-              />
-            ))}
-          </SliderTrack>
-        </SliderControl>
+        {(state) => {
+          // The mounted shape decides whether this is a range. Once it is,
+          // an accepted change of the committed value (a controller
+          // `setValue`, for example) can add or remove thumbs, so the count
+          // follows the committed array of the UI SDK root and not the props.
+          // A single thumb, and a change between a single thumb and a range,
+          // keep the count of the props.
+          const committed = state.value;
+          const count =
+            isRange && Array.isArray(committed) && committed.length > 1
+              ? committed.length
+              : thumbCount;
+          return (
+            <>
+              <div className="dui-slider-header">
+                <FieldLabel
+                  className="dui-text-field-label"
+                  id={isRange ? labelId : undefined}
+                >
+                  {label}
+                </FieldLabel>
+                {showValue ? (
+                  <SliderValue className="dui-slider-value" />
+                ) : null}
+              </div>
+              <SliderControl className="dui-slider-control">
+                <SliderTrack className="dui-slider-track">
+                  <SliderIndicator className="dui-slider-indicator" />
+                  {Array.from({ length: count }, (_, index) => (
+                    <SliderThumb
+                      // Thumbs are positional and never reorder, so the index
+                      // is a stable key.
+                      key={index}
+                      index={index}
+                      className="dui-slider-thumb"
+                      // An explicit name keeps `aria-label`. Without one, the
+                      // thumb is named by the label and the hidden position
+                      // text below; `aria-labelledby` would override
+                      // `aria-label`, so the two are never set together.
+                      aria-label={
+                        isRange && hasThumbLabel(index)
+                          ? thumbLabels?.[index]
+                          : undefined
+                      }
+                      aria-labelledby={
+                        isRange && !hasThumbLabel(index)
+                          ? `${labelId} ${positionIdPrefix}-${index}`
+                          : undefined
+                      }
+                    />
+                  ))}
+                </SliderTrack>
+              </SliderControl>
+              {isRange
+                ? Array.from({ length: count }, (_, index) =>
+                    hasThumbLabel(index) ? null : (
+                      // Hidden text that only `aria-labelledby` of a thumb
+                      // reads.
+                      <span
+                        key={index}
+                        id={`${positionIdPrefix}-${index}`}
+                        hidden
+                      >{`${index + 1} of ${count}`}</span>
+                    ),
+                  )
+                : null}
+            </>
+          );
+        }}
       </SliderRoot>
-      {isRange
-        ? Array.from({ length: thumbCount }, (_, index) =>
-            hasThumbLabel(index) ? null : (
-              // Hidden text that only `aria-labelledby` of a thumb reads.
-              <span
-                key={index}
-                id={`${positionIdPrefix}-${index}`}
-                hidden
-              >{`${index + 1} of ${thumbCount}`}</span>
-            ),
-          )
-        : null}
       {/* Workaround: the UI SDK Field predicts the description id in
           aria-describedby before the field binds on the client, so static
           markup would point at a missing element. Always render the

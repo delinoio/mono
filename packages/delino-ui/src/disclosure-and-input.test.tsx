@@ -8,6 +8,7 @@ import {
   screen,
   waitFor,
 } from "@testing-library/react";
+import { createSliderController } from "@ui-sdk/react/slider";
 import { readFileSync } from "node:fs";
 import type * as React from "react";
 import {
@@ -554,6 +555,176 @@ describe("Slider", () => {
       });
     });
     expect(values).toEqual([[21]]);
+  });
+
+  describe("when a controller changes the range values", () => {
+    const thumbs = () =>
+      screen.getAllByRole("slider") as unknown as HTMLInputElement[];
+    const thumbValues = () => thumbs().map((thumb) => thumb.value);
+
+    test("adds a thumb for an accepted update and removes it again", async () => {
+      const controller = createSliderController();
+      render(
+        <Slider
+          label="Price"
+          defaultValue={[20, 80]}
+          controller={controller}
+          showValue
+        />,
+      );
+      expect(thumbValues()).toEqual(["20", "80"]);
+
+      let accepted = false;
+      await act(async () => {
+        accepted = controller.setValue([20, 50, 80]);
+      });
+
+      expect(accepted).toBe(true);
+      expect(thumbValues()).toEqual(["20", "50", "80"]);
+      for (const position of [1, 2, 3]) {
+        expect(
+          screen.getByRole("slider", { name: `Price ${position} of 3` }),
+        ).toBeTruthy();
+      }
+      expect(screen.queryByRole("slider", { name: /of 2/ })).toBeNull();
+
+      await act(async () => {
+        controller.focus(2);
+      });
+      expect(document.activeElement).toBe(
+        screen.getByRole("slider", { name: "Price 3 of 3" }),
+      );
+
+      await act(async () => {
+        accepted = controller.setValue([25, 75]);
+      });
+
+      expect(accepted).toBe(true);
+      expect(thumbValues()).toEqual(["25", "75"]);
+      expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
+      expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
+      expect(screen.queryByRole("slider", { name: /of 3/ })).toBeNull();
+    });
+
+    test("keeps explicit thumb names and numbers the other thumbs by the new total", async () => {
+      const controller = createSliderController();
+      render(
+        <Slider
+          label="Price"
+          defaultValue={[20, 80]}
+          thumbLabels={["Min"]}
+          controller={controller}
+        />,
+      );
+
+      await act(async () => {
+        controller.setValue([20, 50, 80]);
+      });
+
+      expect(thumbValues()).toEqual(["20", "50", "80"]);
+      const first = screen.getByRole("slider", { name: "Min" });
+      expect(first.getAttribute("aria-label")).toBe("Min");
+      expect(first.hasAttribute("aria-labelledby")).toBe(false);
+      expect(screen.getByRole("slider", { name: "Price 2 of 3" })).toBeTruthy();
+      expect(screen.getByRole("slider", { name: "Price 3 of 3" })).toBeTruthy();
+    });
+
+    test("follows an accepted update of a controlled range", async () => {
+      const controller = createSliderController();
+      const values: (number | number[])[] = [];
+      const { rerender } = render(
+        <Slider
+          label="Price"
+          value={[20, 80]}
+          controller={controller}
+          onValueChange={(value) => values.push(value)}
+        />,
+      );
+
+      await act(async () => {
+        controller.setValue([20, 50, 80]);
+      });
+      expect(values).toEqual([[20, 50, 80]]);
+
+      rerender(
+        <Slider
+          label="Price"
+          value={[20, 50, 80]}
+          controller={controller}
+          onValueChange={(value) => values.push(value)}
+        />,
+      );
+
+      expect(thumbValues()).toEqual(["20", "50", "80"]);
+      expect(screen.getByRole("slider", { name: "Price 3 of 3" })).toBeTruthy();
+    });
+
+    test("keeps the thumbs, names and values when the update is canceled", async () => {
+      const controller = createSliderController();
+      render(
+        <Slider
+          label="Price"
+          defaultValue={[20, 80]}
+          controller={controller}
+          onValueChange={(_value, details) => details.cancel()}
+        />,
+      );
+
+      let accepted = true;
+      await act(async () => {
+        accepted = controller.setValue([20, 50, 80]);
+      });
+
+      expect(accepted).toBe(false);
+      expect(thumbValues()).toEqual(["20", "80"]);
+      expect(screen.getByRole("slider", { name: "Price 1 of 2" })).toBeTruthy();
+      expect(screen.getByRole("slider", { name: "Price 2 of 2" })).toBeTruthy();
+      expect(screen.queryByRole("slider", { name: /of 3/ })).toBeNull();
+    });
+
+    test("still ignores a later defaultValue and keeps the committed values", async () => {
+      const controller = createSliderController();
+      const { rerender } = render(
+        <Slider
+          label="Price"
+          defaultValue={[20, 80]}
+          controller={controller}
+        />,
+      );
+      await act(async () => {
+        controller.setValue([20, 50, 80]);
+      });
+
+      rerender(
+        <Slider label="Price" defaultValue={[1, 2]} controller={controller} />,
+      );
+
+      expect(thumbValues()).toEqual(["20", "50", "80"]);
+    });
+
+    test("resets to one thumb when an empty array replaces the controlled range", async () => {
+      const controller = createSliderController();
+      const { rerender } = render(
+        <Slider
+          label="Price"
+          value={[20, 80]}
+          controller={controller}
+          onValueChange={() => {}}
+        />,
+      );
+
+      rerender(
+        <Slider
+          label="Price"
+          value={[]}
+          controller={controller}
+          onValueChange={() => {}}
+        />,
+      );
+
+      expect(thumbValues()).toEqual(["0"]);
+      expect(screen.getByRole("slider", { name: "Price" })).toBeTruthy();
+    });
   });
 
   function expectOneDefaultThumb(container: HTMLElement) {
