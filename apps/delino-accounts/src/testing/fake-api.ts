@@ -96,7 +96,8 @@ export interface FakeApi {
   /**
    * Holds every call of a method until the promise settles, so that a test
    * can observe what the page does while a request is still in flight. Only
-   * `GetBillingAccount` and `GetInvoiceUrl` honor a gate.
+   * `GetBillingAccount`, `GetInvoiceUrl`, `ListLedgerEntries`, `ListInvoices`
+   * and `ListUsageSummary` honor a gate.
    */
   gates: Map<string, Promise<unknown>>;
   transport: ReturnType<typeof createRouterTransport>;
@@ -295,9 +296,10 @@ export function createFakeApi(): FakeApi {
   /**
    * Serves one page of a list like the server: at most `pageSize` items and
    * a `next_page_token` that is empty on the last page. A token is `p<n>`,
-   * the index of the page. Only ListBillingAccounts, ListMembers,
-   * ListInvitations and ListLinkedOrganizations page; every other list
-   * returns all of its items.
+   * the index of the page. ListBillingAccounts, ListMembers,
+   * ListInvitations, ListLinkedOrganizations, ListLedgerEntries,
+   * ListInvoices and ListUsageSummary page; every other list returns all of
+   * its items.
    */
   const paginate = <T>(
     items: T[],
@@ -530,9 +532,14 @@ export function createFakeApi(): FakeApi {
           creditGrants: account.grants,
         };
       },
-      listLedgerEntries(req) {
+      async listLedgerEntries(req) {
         record("ListLedgerEntries", req);
-        return { ledgerEntries: load(req.billingAccountId).account.ledger };
+        await api.gates.get("ListLedgerEntries");
+        const { page, nextPageToken } = paginate(
+          load(req.billingAccountId).account.ledger,
+          req,
+        );
+        return { ledgerEntries: page, nextPageToken };
       },
       getSubscription(req) {
         record("GetSubscription", req);
@@ -604,11 +611,14 @@ export function createFakeApi(): FakeApi {
           settings: { lowBalanceThresholdUsdMicros: account.alertThreshold },
         };
       },
-      listInvoices(req) {
+      async listInvoices(req) {
         record("ListInvoices", req);
-        return {
-          invoices: load(req.billingAccountId, PAYMENT_ROLES).account.invoices,
-        };
+        await api.gates.get("ListInvoices");
+        const { page, nextPageToken } = paginate(
+          load(req.billingAccountId, PAYMENT_ROLES).account.invoices,
+          req,
+        );
+        return { invoices: page, nextPageToken };
       },
       async getInvoiceUrl(req) {
         record("GetInvoiceUrl", req);
@@ -628,8 +638,9 @@ export function createFakeApi(): FakeApi {
         );
         return { linkedOrganizations: page, nextPageToken };
       },
-      listUsageSummary(req) {
+      async listUsageSummary(req) {
         record("ListUsageSummary", req);
+        await api.gates.get("ListUsageSummary");
         const { account } = load(req.billingAccountId);
         // The seeded usage belongs to the current UTC month.
         const now = new Date();
@@ -638,13 +649,14 @@ export function createFakeApi(): FakeApi {
           req.month === now.getUTCMonth() + 1
             ? account.usage
             : [];
-        return {
-          rows,
-          totalAmountUsdMicros: rows.reduce(
-            (sum, row) => sum + row.amountUsdMicros,
-            0n,
-          ),
-        };
+        // The server reports the total of the whole month on every page,
+        // so sum all rows before paging them.
+        const totalAmountUsdMicros = rows.reduce(
+          (sum, row) => sum + row.amountUsdMicros,
+          0n,
+        );
+        const { page, nextPageToken } = paginate(rows, req);
+        return { rows: page, totalAmountUsdMicros, nextPageToken };
       },
     });
   });
@@ -730,6 +742,58 @@ export function addLinkedOrganizations(
         reason: BillingStatusReason.NONE,
         sequence: 1n,
       }),
+    });
+  }
+}
+
+/**
+ * Adds usage ledger entries `ledger-0001` and so on, newest first like the
+ * seeded entries, after the seeded ones. Each entry takes 1 micro-USD.
+ */
+export function addLedgerEntries(account: FakeAccount, count: number) {
+  for (let n = 1; n <= count; n++) {
+    account.ledger.push({
+      ledgerEntryId: `0193a1b2-0003-7000-8000-${String(n).padStart(12, "0")}`,
+      billingAccountId: account.id,
+      kind: LedgerEntryKind.USAGE,
+      amountUsdMicros: -1n,
+      balanceAfterUsdMicros: account.balance,
+      createTime: ts(new Date("2026-11-02T00:00:00Z")),
+      paddleTransactionId: "",
+      creditGrantId: "",
+      service: "ownsand",
+      organizationId: `org-${numbered(n)}`,
+      meter: "ownsand.relay_egress",
+      windowStart: ts(new Date("2026-11-02T00:00:00Z")),
+      quantity: 1n,
+    });
+  }
+}
+
+/** Adds invoices for the transactions `txn_inv0001` and so on. */
+export function addInvoices(account: FakeAccount, count: number) {
+  for (let n = 1; n <= count; n++) {
+    account.invoices.push({
+      paddleTransactionId: `txn_inv${numbered(n)}`,
+      kind: LedgerEntryKind.MANUAL_TOP_UP,
+      amountUsdMicros: 1_000_000n,
+      createTime: ts(new Date("2026-10-15T00:00:00Z")),
+    });
+  }
+}
+
+/**
+ * Adds usage summary rows for the organizations `usage-org-0001` and so on,
+ * after the seeded rows. Each row bills 1 micro-USD.
+ */
+export function addUsageRows(account: FakeAccount, count: number) {
+  for (let n = 1; n <= count; n++) {
+    account.usage.push({
+      service: ServiceId.OWNSAND,
+      organizationId: `usage-org-${numbered(n)}`,
+      meter: Meter.OWNSAND_RELAY_EGRESS,
+      quantity: 1n,
+      amountUsdMicros: 1n,
     });
   }
 }
