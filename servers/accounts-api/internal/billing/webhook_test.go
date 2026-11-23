@@ -4,6 +4,7 @@ package billing
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -488,6 +489,135 @@ func TestLateActiveEventDoesNotReplaceNewCheckout(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// webhookResult delivers a signed webhook event, requires HTTP 200 and returns
+// the result stored for the event.
+func (f *fixture) webhookResult(eventType string, data any) string {
+	f.t.Helper()
+	eventID := fmt.Sprintf("evt_result_%d", txnSeq.Add(1))
+	body := paddletest.Event(eventID, eventType, f.clock.Now(), data)
+	if code := f.deliver(body, paddle.SignatureHeaderValue(whSecret, f.clock.Now(), body)); code != http.StatusOK {
+		f.t.Fatalf("webhook %s status = %d", eventType, code)
+	}
+	var result string
+	if err := f.db.Pool.QueryRow(ctx(), `SELECT result FROM paddle_events WHERE paddle_event_id = $1`, eventID).Scan(&result); err != nil {
+		f.t.Fatal(err)
+	}
+	return result
+}
+
+// canceledReplacement ends subscription A, completes a new checkout with
+// subscription B and cancels B at cancelTime. It returns A, B and the
+// canceled row of B.
+func (f *fixture) canceledReplacement(acct string, cancelTime time.Time) (oldSub, newSub string, sub Subscription) {
+	f.t.Helper()
+	oldSub = f.activate(acct)
+	f.webhook("subscription.canceled", map[string]any{"id": oldSub, "status": "canceled", "updated_at": cancelTime.Add(-2 * time.Hour)})
+	txnID := f.checkout(acct)
+	newSub = f.paddle.NewID("sub")
+	f.webhook("subscription.created", map[string]any{"id": newSub, "status": "active", "transaction_id": txnID, "updated_at": cancelTime.Add(-time.Hour)})
+	f.webhook("subscription.canceled", map[string]any{"id": newSub, "status": "canceled", "updated_at": cancelTime})
+	sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+	if sub.Status != SubscriptionCanceled || sub.PaddleSubscriptionID != newSub {
+		f.t.Fatalf("subscription after the cancellation of the new subscription = %+v", sub)
+	}
+	return oldSub, newSub, sub
+}
+
+// TestOlderEntityOfEarlierSubscriptionDoesNotReplaceCanceledSubscription
+// checks that a late entity of an earlier subscription A, with a provider
+// updated_at before the cancellation of the later subscription B, leaves the
+// canceled row of B and its update time in place, is recorded as ignored and
+// lets the next StartSubscription create a checkout.
+func TestOlderEntityOfEarlierSubscriptionDoesNotReplaceCanceledSubscription(t *testing.T) {
+	for _, status := range []string{paddle.SubscriptionStatusActive, paddle.SubscriptionStatusPastDue} {
+		t.Run(status, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			cancelTime := f.clock.Now()
+			oldSub, newSub, before := f.canceledReplacement(acct, cancelTime)
+			if before.PaddleUpdateTime == nil || !before.PaddleUpdateTime.Equal(cancelTime) {
+				t.Fatalf("update time of the canceled row = %v, want %v", before.PaddleUpdateTime, cancelTime)
+			}
+
+			got := f.webhookResult("subscription.updated", map[string]any{"id": oldSub, "status": status, "updated_at": cancelTime.Add(-30 * time.Minute)})
+			if got != webhookIgnored {
+				t.Fatalf("event result = %q, want %q", got, webhookIgnored)
+			}
+			sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if sub.Status != SubscriptionCanceled || sub.PaddleSubscriptionID != newSub ||
+				sub.PaddleUpdateTime == nil || !sub.PaddleUpdateTime.Equal(cancelTime) {
+				t.Fatalf("subscription after the older entity = %+v", sub)
+			}
+			// The next authorized StartSubscription creates a checkout.
+			txnID := f.checkout(acct)
+			sub, _ = LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if txnID == "" || sub.Status != SubscriptionPending || sub.CheckoutTransactionID != txnID {
+				t.Fatalf("subscription after StartSubscription = %+v (transaction %q)", sub, txnID)
+			}
+		})
+	}
+}
+
+// TestNewerEntityAfterCancellationStillApplies checks that an entity whose
+// updated_at is after the cancellation, or equal to it, or missing, still
+// replaces a canceled subscription of a different ID.
+func TestNewerEntityAfterCancellationStillApplies(t *testing.T) {
+	cases := map[string]func(cancelTime time.Time) any{
+		"newer":   func(c time.Time) any { return c.Add(time.Minute) },
+		"equal":   func(c time.Time) any { return c },
+		"missing": func(time.Time) any { return nil },
+	}
+	for name, updatedAt := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			cancelTime := f.clock.Now()
+			oldSub, _, _ := f.canceledReplacement(acct, cancelTime)
+			entity := map[string]any{"id": oldSub, "status": "active"}
+			if v := updatedAt(cancelTime); v != nil {
+				entity["updated_at"] = v
+			}
+			if got := f.webhookResult("subscription.updated", entity); got != webhookApplied {
+				t.Fatalf("event result = %q, want %q", got, webhookApplied)
+			}
+			sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if sub.Status != SubscriptionActive || sub.PaddleSubscriptionID != oldSub {
+				t.Fatalf("subscription = %+v", sub)
+			}
+		})
+	}
+}
+
+// TestDifferentSubscriptionDoesNotReplaceManageableRow checks that a
+// different subscription ID cannot replace an ACTIVE or PAST_DUE row, also
+// with a later updated_at, and that an older entity of the same ID is still
+// ignored.
+func TestDifferentSubscriptionDoesNotReplaceManageableRow(t *testing.T) {
+	for _, status := range []string{paddle.SubscriptionStatusActive, paddle.SubscriptionStatusPastDue} {
+		t.Run(status, func(t *testing.T) {
+			f := newFixture(t)
+			acct := f.account()
+			cur := f.activate(acct)
+			f.webhook("subscription.updated", map[string]any{"id": cur, "status": status, "updated_at": f.clock.Now()})
+			other := f.paddle.NewID("sub")
+			if got := f.webhookResult("subscription.updated", map[string]any{
+				"id": other, "status": "active", "updated_at": f.clock.Now().Add(time.Hour),
+				"custom_data": map[string]any{paddle.CustomDataBillingAccountID: acct},
+			}); got != webhookIgnored {
+				t.Fatalf("event result = %q, want %q", got, webhookIgnored)
+			}
+			// An older entity of the same ID is still ignored.
+			if got := f.webhookResult("subscription.canceled", map[string]any{"id": cur, "status": "canceled", "updated_at": f.clock.Now().Add(-time.Hour)}); got != webhookIgnored {
+				t.Fatalf("event result = %q, want %q", got, webhookIgnored)
+			}
+			sub, _ := LoadSubscription(ctx(), f.db.Pool, acct, false)
+			if !sub.Manageable() || sub.PaddleSubscriptionID != cur {
+				t.Fatalf("subscription = %+v", sub)
+			}
+		})
 	}
 }
 

@@ -134,14 +134,22 @@ func (s *Service) applyPaddleSubscription(ctx context.Context, tx pgx.Tx, acct *
 	if err != nil {
 		return false, err
 	}
-	if current.PaddleSubscriptionID != "" && current.PaddleSubscriptionID != entity.ID {
-		if current.Manageable() {
-			s.logger.WarnContext(ctx, "billing_subscription_not_current",
-				slog.String("billing_account_id", acct.ID),
-				slog.String("paddle_subscription_id", entity.ID))
-			return false, nil
-		}
-	} else if current.PaddleUpdateTime != nil && !entity.UpdatedAt.IsZero() && entity.UpdatedAt.Before(*current.PaddleUpdateTime) {
+	if current.PaddleSubscriptionID != "" && current.PaddleSubscriptionID != entity.ID && current.Manageable() {
+		s.logger.WarnContext(ctx, "billing_subscription_not_current",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", entity.ID))
+		return false, nil
+	}
+	// An entity older than the stored one is ignored whether or not it
+	// belongs to the stored subscription. A late event of an earlier
+	// subscription must not replace a later, canceled subscription, or the
+	// row would turn ACTIVE again and StartSubscription would fail with
+	// already_exists.
+	if current.PaddleUpdateTime != nil && !entity.UpdatedAt.IsZero() && entity.UpdatedAt.Before(*current.PaddleUpdateTime) {
+		s.logger.InfoContext(ctx, "billing_subscription_entity_ignored",
+			slog.String("billing_account_id", acct.ID),
+			slog.String("paddle_subscription_id", entity.ID),
+			slog.String("reason", "older_than_stored_entity"))
 		return false, nil
 	}
 	if current.Status == SubscriptionPending && current.PaddleSubscriptionID == "" {
