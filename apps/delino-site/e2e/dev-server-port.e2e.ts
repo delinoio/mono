@@ -42,6 +42,23 @@ const release = (holder: Server | undefined): Promise<void> =>
     holder.close(() => resolve());
   });
 
+// The host variables the e2e runner passes to the app command: `PATH`, `HOME`
+// and the temporary-directory variables. The child gets only these, so a
+// variable such as `PORTLESS_URL` or `PORT` in the parent environment cannot
+// make `rspress.config.ts` select another port than the one under test.
+const HOST_ENV_NAMES = ["PATH", "HOME", "TMPDIR", "TMP", "TEMP"] as const;
+
+const hostEnv = (): NodeJS.ProcessEnv => {
+  const env: NodeJS.ProcessEnv = {};
+  for (const name of HOST_ENV_NAMES) {
+    const value = process.env[name];
+    if (value !== undefined) {
+      env[name] = value;
+    }
+  }
+  return env;
+};
+
 // Runs `rspress dev` from the app directory with an argument array and no
 // shell (through the CLI file that `rspressBin` resolves), and waits for it to
 // exit. A server that survives the timeout counts as a failure of the rule
@@ -50,6 +67,7 @@ const runDevServer = (args: string[]): Promise<DevServerResult> =>
   new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [rspressBin(), "dev", ...args], {
       cwd: APP_DIRECTORY,
+      env: hostEnv(),
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
     });
