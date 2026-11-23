@@ -19,6 +19,8 @@ import (
 )
 
 func TestCLIEnrollStatusReset(t *testing.T) {
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	cp := testcp.New(t)
 	dir := t.TempDir()
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
@@ -58,6 +60,8 @@ func TestCLIEnrollStatusReset(t *testing.T) {
 }
 
 func TestCLIMisc(t *testing.T) {
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	var out, errb bytes.Buffer
 	if code := run([]string{"version"}, nil, &out, &errb); code != exitOK || out.Len() == 0 {
 		t.Fatal("version")
@@ -111,6 +115,8 @@ func TestCLIMisc(t *testing.T) {
 // and the error on standard error; the test process is no Windows service,
 // so the Windows build does not connect to the service control manager.
 func TestRunWithInvalidConfiguration(t *testing.T) {
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", t.TempDir())
 	t.Setenv("OWNSAND_AGENT_LOG_LEVEL", "bogus")
 	var out, errb bytes.Buffer
@@ -163,6 +169,8 @@ func TestStatusPrintsCapabilities(t *testing.T) {
 // (exit code 1) with the cause in the output, so that the service manager
 // restarts the agent and the operator sees why.
 func TestIdentityReadFailureIsNotNotEnrolled(t *testing.T) {
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
 	t.Setenv("NO_COLOR", "1")
 	cases := []struct {
@@ -240,6 +248,8 @@ func TestIdentityReadFailureIsNotNotEnrolled(t *testing.T) {
 
 // A valid identity is enrolled: status reports it and exits 0.
 func TestStatusWithValidIdentity(t *testing.T) {
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	dir := t.TempDir()
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
 	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
@@ -260,6 +270,8 @@ func TestStatusWithValidIdentity(t *testing.T) {
 // store, so a test can place a status.json of its choice.
 func statusFixture(t *testing.T) *store.Store {
 	t.Helper()
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	dir := t.TempDir()
 	t.Setenv("OWNSAND_AGENT_STATE_DIR", dir)
 	t.Setenv("OWNSAND_AGENT_RUNTIME", "process")
@@ -453,6 +465,8 @@ func TestStatusUnreadableSnapshotDirectory(t *testing.T) {
 // not fit the conversion to bytes or to a 32-bit vCPU count is a usage error
 // that names its flag, for both guest OS values, and no state is created.
 func TestImageBuildResourceRanges(t *testing.T) {
+	// Inherited OWNSAND_AGENT_* variables of the caller must not reach run.
+	clearAgentEnv(t)
 	big := func(v uint64) string { return strconv.FormatUint(v, 10) }
 	tests := []struct {
 		flag, value string

@@ -108,7 +108,10 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 		}
 	}
 	cp := testcp.New(t)
-	env := append(os.Environ(),
+	// Inherited OWNSAND_AGENT_* variables must not reach either subprocess:
+	// an invalid value would fail enroll and run in config.FromEnv, and a
+	// valid OWNSAND_AGENT_API_URL takes precedence over the stored URL.
+	env := append(withoutAgentEnv(os.Environ()),
 		"OWNSAND_AGENT_STATE_DIR="+t.TempDir(),
 		"OWNSAND_AGENT_RUNTIME=process",
 		"OWNSAND_AGENT_GUEST_BINARY="+filepath.Join(bin, "ownsand-guest"),
@@ -183,13 +186,13 @@ func TestBinaryWithProcessRuntime(t *testing.T) {
 	if _, err := pc.CreateDataChannel("ownsand-data", nil); err != nil {
 		t.Fatal(err)
 	}
-	offer, _ := pc.CreateOffer(nil)
-	gathered := webrtc.GatheringCompletePromise(pc)
-	pc.SetLocalDescription(offer)
-	<-gathered
+	offerSDP, err := createLocalOffer(pionOfferPeer{pc}, 20*time.Second)
+	if err != nil {
+		t.Fatalf("local offer: %v", err)
+	}
 	sessionID, _ := uuidv7.NewString()
 	cp.Send(&ownsandv1.AgentEnvelope{Message: &ownsandv1.AgentEnvelope_Signaling{Signaling: &ownsandv1.SignalingMessage{Message: &ownsandv1.SignalingMessage_Offer{Offer: &ownsandv1.SignalingOffer{
-		SessionId: sessionID, SandboxId: id, ExpiresIn: durationpb.New(time.Hour), Sdp: pc.LocalDescription().SDP,
+		SessionId: sessionID, SandboxId: id, ExpiresIn: durationpb.New(time.Hour), Sdp: offerSDP,
 	}}}}})
 	answer, _ := cp.WaitFor(20*time.Second, 0, func(e *ownsandv1.AgentEnvelope) bool {
 		return e.GetSignaling().GetAnswer().GetSessionId() == sessionID
