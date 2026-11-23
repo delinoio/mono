@@ -1544,6 +1544,18 @@ describe("ToastRegion", () => {
     expect(block(".dui-toast-button::before")).toContain("display: none");
   });
 
+  // happy-dom computes no layout, so this checks the stylesheet source: the
+  // toast hides overflow, so an unbroken token in the title or description
+  // (for example an email address) must break inside the text column, and the
+  // column must be allowed to shrink below its content width.
+  test("wraps long unbroken title and description text inside the toast", () => {
+    expect(block(".dui-toast-title")).toContain("overflow-wrap: anywhere");
+    expect(block(".dui-toast-description")).toContain(
+      "overflow-wrap: anywhere",
+    );
+    expect(block(".dui-toast-text")).toContain("min-width: 0");
+  });
+
   // happy-dom computes no cascade, so this checks the stylesheet source. The
   // UI SDK draws its toast border only in its optional stylesheet, which no
   // app loads, so the package resets the border for every type except `error`
