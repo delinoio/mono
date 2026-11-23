@@ -121,9 +121,10 @@ func TestRulesetDNSMatchesTapAndGateway(t *testing.T) {
 	}
 	// Controls: the other exceptions and the final drop stay.
 	for _, want := range []string{
-		`iifname "osb-*" udp sport 68 udp dport 67 accept`,
-		`iifname "osb-*" udp sport 546 udp dport 547 accept`,
-		`iifname "osb-*" icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept`,
+		`iifname "osb-00000000001" ip saddr { 0.0.0.0, 172.30.0.6 } ip daddr { 172.30.0.5, 255.255.255.255 } udp sport 68 udp dport 67 accept`,
+		`iifname "osb-00000000001" ip6 saddr fe80::/10 ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept`,
+		`iifname "osb-00000000001" ip6 hoplimit 255 ip6 daddr { fe80::/10, ff02::/16 } icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert } accept`,
+		`iifname "osb-00000000002" ip saddr { 0.0.0.0, 172.30.0.10 } ip daddr { 172.30.0.9, 255.255.255.255 } udp sport 68 udp dport 67 accept`,
 	} {
 		if !slices.Contains(in, want) {
 			t.Errorf("input chain lacks %q", want)
@@ -193,7 +194,8 @@ func forwardChain(t *testing.T, rs string) []string {
 // The forward chain drops IPv4 packets from each tap whose source is not
 // the guest address of that tap, ahead of every other rule that accepts or
 // matches guest traffic; the blocked-set drops, the reply accept and the
-// final drop to the guest link stay.
+// final drop to the guest link stay. All IPv6 from a tap is dropped after the
+// guards and before the blocked-set drops.
 func TestRulesetForwardDropsForeignSourceFromTap(t *testing.T) {
 	v4, v6 := Blocked(nil, nil)
 	a := TapGateway{Tap: TapName(2), Gateway: netip.MustParseAddr("172.30.0.9"), Guest: netip.MustParseAddr("172.30.0.10")}
@@ -203,6 +205,7 @@ func TestRulesetForwardDropsForeignSourceFromTap(t *testing.T) {
 	want := []string{
 		`iifname "osb-00000000001" ip saddr != 172.30.0.6 drop`,
 		`iifname "osb-00000000002" ip saddr != 172.30.0.10 drop`,
+		`iifname "osb-*" meta nfproto ipv6 drop`,
 		`iifname "osb-*" ip daddr @blocked4 drop`,
 		`iifname "osb-*" ip6 daddr @blocked6 drop`,
 		`oifname "osb-*" ct state established,related accept`,
@@ -218,8 +221,11 @@ func TestRulesetForwardDropsForeignSourceFromTap(t *testing.T) {
 		}
 	}
 	// The guards come from the assignments only: the input chain keeps the
-	// DHCP accept lines for the source 0.0.0.0 without a source match.
-	for _, want := range []string{`iifname "osb-*" udp sport 68 udp dport 67 accept`, `iifname "osb-*" udp sport 546 udp dport 547 accept`} {
+	// per-tap DHCP accept lines for the source 0.0.0.0.
+	for _, want := range []string{
+		`iifname "osb-00000000001" ip saddr { 0.0.0.0, 172.30.0.6 } ip daddr { 172.30.0.5, 255.255.255.255 } udp sport 68 udp dport 67 accept`,
+		`iifname "osb-00000000002" ip6 saddr fe80::/10 ip6 daddr ff02::1:2 udp sport 546 udp dport 547 accept`,
+	} {
 		if !slices.Contains(inputChain(t, rs), want) {
 			t.Errorf("input chain lacks %q", want)
 		}
