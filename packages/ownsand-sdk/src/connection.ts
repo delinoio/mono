@@ -164,10 +164,9 @@ async function currentSecret(
     new Promise<string>((resolve, reject) => {
       const fail = (error: unknown) =>
         reject(
-          new OwnSandCredentialError(
-            error instanceof Error ? error.message : String(error),
-            { cause: error },
-          ),
+          new OwnSandCredentialError(callbackFailureMessage(error), {
+            cause: error,
+          }),
         );
       try {
         Promise.resolve(credential.accessToken()).then(resolve, fail);
@@ -181,6 +180,24 @@ async function currentSecret(
     throw new OwnSandCredentialError("accessToken returned no token");
   }
   return token;
+}
+
+const CALLBACK_FAILED_MESSAGE = "accessToken callback failed";
+
+/**
+ * Returns the message of a failure of the access token callback. The callback
+ * can reject with any value, so reading the message or formatting the value
+ * can itself throw (for example a null-prototype object, a throwing getter or
+ * a throwing toString). That must not escape the rejection handler, because
+ * the call would then never end; a fixed message replaces the unreadable one.
+ */
+function callbackFailureMessage(error: unknown): string {
+  try {
+    const message = error instanceof Error ? error.message : String(error);
+    return typeof message === "string" ? message : CALLBACK_FAILED_MESSAGE;
+  } catch {
+    return CALLBACK_FAILED_MESSAGE;
+  }
 }
 
 /**
