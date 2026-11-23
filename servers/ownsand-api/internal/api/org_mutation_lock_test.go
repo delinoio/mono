@@ -108,8 +108,8 @@ func holdOrganizationDeletion(t *testing.T, env *testenv.Env, orgID string) func
 // insert waited for the deletion and then failed with a foreign key
 // violation (23503) that surfaced as an internal error. The test also
 // requires that the server logged no internal error and that the failed RPC
-// left no record. UpdateAgentVersionPolicy runs with and without a stored
-// policy row.
+// left no record and no audit or control event. UpdateAgentVersionPolicy
+// runs with and without a stored policy row.
 func TestCreateRPCAfterInFlightOrganizationDeletionCommits(t *testing.T) {
 	rpcs := append([]orgMutationRPC{}, orgMutationRPCs...)
 	rpcs = append(rpcs, policyRPC("UpdateAgentVersionPolicyWithExistingRow", ownsandv1.AgentVersionPolicyMode_AGENT_VERSION_POLICY_MODE_HOLD))
@@ -125,6 +125,12 @@ func TestCreateRPCAfterInFlightOrganizationDeletionCommits(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			table := rpc.table
+			// Audit and control events keep no foreign key to the organization,
+			// so a stray event written by the losing RPC would outlive the
+			// deletion. Rows that exist before the RPC (for example from
+			// NewOrg) stay, so the check compares the counts before and after.
+			before := orgRecordCounts(t, env, org.ID, table)
 			commit := holdOrganizationDeletion(t, env, org.ID)
 
 			rpcDone := make(chan error, 1)
@@ -140,9 +146,15 @@ func TestCreateRPCAfterInFlightOrganizationDeletionCommits(t *testing.T) {
 			if strings.Contains(env.Logs.String(), "internal_error") {
 				t.Fatalf("the server logged an internal error:\n%s", env.Logs.String())
 			}
-			table := rpc.table
-			if got := orgRecordCounts(t, env, org.ID, table); got[0] != 0 {
-				t.Fatalf("%s rows of the deleted organization = %d, want 0", table, got[0])
+			after := orgRecordCounts(t, env, org.ID, table)
+			if after[0] != 0 {
+				t.Fatalf("%s rows of the deleted organization = %d, want 0", table, after[0])
+			}
+			if after[1] != before[1] {
+				t.Fatalf("audit_events of the deleted organization = %d, want %d (the count before the RPC)", after[1], before[1])
+			}
+			if after[2] != before[2] {
+				t.Fatalf("control_events of the deleted organization = %d, want %d (the count before the RPC)", after[2], before[2])
 			}
 		})
 	}
