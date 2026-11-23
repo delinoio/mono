@@ -113,3 +113,44 @@ func TestRemoveAllStillReportsAnUndeletableTree(t *testing.T) {
 		t.Fatalf("tree was removed: %v", err)
 	}
 }
+
+type unprintableError struct{}
+
+func (unprintableError) Error() string { panic("not user-visible") }
+
+func TestPrintable(t *testing.T) {
+	if !printable(errors.New("x")) {
+		t.Fatal("an ordinary error must be printable")
+	}
+	if printable(&fs.PathError{Op: "openfdat", Path: "p", Err: unprintableError{}}) {
+		t.Fatal("an error whose Error method panics must not be printable")
+	}
+}
+
+func TestRemoveAllErrorIsPrintableWhenSymlinkCannotBeUnlinked(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can remove entries of a read-only directory")
+	}
+	parent := t.TempDir()
+	dir := filepath.Join(parent, "parent")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(parent, filepath.Join(dir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	// The link cannot be unlinked while the parent directory is read-only and
+	// the parent itself stays read-only after RemoveAll fixes the tree below
+	// the path it was given.
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(dir, 0o755) })
+	err := RemoveAll(filepath.Join(dir, "link"))
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("RemoveAll = %v; want a permission error", err)
+	}
+	if !printable(err) {
+		t.Fatal("RemoveAll returned an error that cannot be printed")
+	}
+}

@@ -142,13 +142,36 @@ func copyFile(ctx context.Context, src, dst string, perm fs.FileMode) error {
 // the tree again. It returns the error of that second attempt, so a tree that
 // stays undeletable (for example because its parent directory is read-only)
 // is still reported. A missing path is not an error.
+//
+// Workaround: Go 1.26 os.RemoveAll can return an error that wraps the
+// unexported os.errSymlink when it cannot unlink a symbolic link inside a
+// read-only directory. The Error method of that value panics ("errSymlink is
+// not user-visible"), so printing the error crashes the caller. The cause is
+// a permission failure, so RemoveAll treats such an error like one, and it
+// never returns an error that cannot be printed. Remove this handling when
+// the minimum Go version includes the fix for Go issue 78490.
 func RemoveAll(path string) error {
 	err := os.RemoveAll(path)
-	if err == nil || !errors.Is(err, fs.ErrPermission) {
+	if err == nil || !(errors.Is(err, fs.ErrPermission) || !printable(err)) {
 		return err
 	}
 	makeDirsWritable(path)
-	return os.RemoveAll(path)
+	err = os.RemoveAll(path)
+	if err != nil && !printable(err) {
+		return &fs.PathError{Op: "remove", Path: path, Err: fs.ErrPermission}
+	}
+	return err
+}
+
+// printable reports whether err.Error() returns instead of panicking.
+func printable(err error) (ok bool) {
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
+	_ = err.Error()
+	return true
 }
 
 // makeDirsWritable adds the owner read, write and search bits to every
