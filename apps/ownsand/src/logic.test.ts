@@ -165,6 +165,11 @@ describe("console configuration", () => {
     "https://api.example.test\\tenant\\..",
     "https://api.example.test\\",
     "https://api.example.test/tenant/..",
+    "https:///api.example.test/tenant/..",
+    "https:///api.example.test/tenant/../",
+    "https:api.example.test/tenant/..",
+    "https:/api.example.test/tenant/..",
+    "https:////api.example.test/tenant/..",
   ])("rejects a hidden path in the API origin %s", (value) => {
     expect(() =>
       readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false }),
@@ -177,6 +182,11 @@ describe("console configuration", () => {
     "https://api.example.test\\tenant\\..",
     "https://api.example.test\\",
     "https://api.example.test/tenant/..",
+    "https:///api.example.test/tenant/..",
+    "https:///api.example.test/tenant/../",
+    "https:api.example.test/tenant/..",
+    "https:/api.example.test/tenant/..",
+    "https:////api.example.test/tenant/..",
   ])("rejects a hidden path in the Logto endpoint %s", (value) => {
     expect(() =>
       readConsoleConfig(
@@ -187,6 +197,16 @@ describe("console configuration", () => {
       "PUBLIC_LOGTO_ENDPOINT must be an origin without a path, query or fragment",
     );
   });
+
+  test.each(["", "   ", "\t\n"])(
+    "falls back to the default API origin for the blank value %j",
+    (value) => {
+      expect(
+        readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false })
+          .apiOrigin,
+      ).toBe(DEFAULT_API_ORIGIN);
+    },
+  );
 
   test("omits the rejected value from the origin error", () => {
     expect(() =>
@@ -201,6 +221,8 @@ describe("console configuration", () => {
     ["https://api.example.test", "https://api.example.test"],
     ["https://api.example.test/", "https://api.example.test"],
     ["http://127.0.0.1:18300/", "http://127.0.0.1:18300"],
+    ["HTTPS://api.example.test", "https://api.example.test"],
+    ["  https://api.example.test/  ", "https://api.example.test"],
   ])("accepts the origin %s", (value, origin) => {
     expect(
       readConsoleConfig({ PUBLIC_API_ORIGIN: value }, { production: false })
