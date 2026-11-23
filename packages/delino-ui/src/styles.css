@@ -1953,6 +1953,13 @@
        align-self, which applies to grid items too. */
     align-self: flex-start;
     justify-self: flex-start;
+    /* A flex item has flex-shrink: 1 and a zero automatic minimum width,
+       because the placeholder has no content. A row with less room than the
+       diameter would otherwise narrow the circle, and the square
+       aspect-ratio would then shrink the other side too, so the circle would
+       no longer be round. A circle is a fixed-size avatar placeholder, so it
+       keeps its main-axis size. A rectangular Skeleton still shrinks. */
+    flex-shrink: 0;
   }
 
   @keyframes dui-skeleton-pulse {
