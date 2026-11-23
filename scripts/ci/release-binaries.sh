@@ -33,6 +33,11 @@
 #   sign-manifests <dir>          publish job, the signing key only.
 #   upload-manifests <dir>        publish job, RELEASES_R2_*: uploads the
 #                                 manifest and its signature.
+#   has-manifests                 publish job, no secrets: writes
+#                                 `has_manifests=true|false` to GITHUB_OUTPUT,
+#                                 so that the workflow requires the signed
+#                                 manifest artifact only for a release with an
+#                                 update manifest.
 #
 # Environment:
 #   BINARIES             plan `binaries` JSON (deploy-plan.mjs).
@@ -69,7 +74,7 @@ repo_root="$(cd "$here/../.." && pwd)"
 summary="${GITHUB_STEP_SUMMARY:-/dev/null}"
 
 usage() {
-  echo "usage: $0 build <cross|cgo> <out> | sign-macos <in> <out> | assemble <artifacts> <assets> | github-releases <assets> <manifests> | fetch-manifests <dir> | prepare-manifests <dir> <assets> | sign-manifests <dir> | upload-manifests <dir>" >&2
+  echo "usage: $0 build <cross|cgo> <out> | sign-macos <in> <out> | assemble <artifacts> <assets> | github-releases <assets> <manifests> | fetch-manifests <dir> | prepare-manifests <dir> <assets> | sign-manifests <dir> | upload-manifests <dir> | has-manifests" >&2
   exit 2
 }
 
@@ -619,6 +624,17 @@ has_manifests() {
   return 1
 }
 
+# Writes `has_manifests=true` or `has_manifests=false` to the step output. The
+# plan is required, so a malformed plan fails instead of reading as "false".
+report_has_manifests() {
+  require_binaries
+  if has_manifests; then
+    echo "has_manifests=true" >> "${GITHUB_OUTPUT:-/dev/null}"
+  else
+    echo "has_manifests=false" >> "${GITHUB_OUTPUT:-/dev/null}"
+  fi
+}
+
 r2_url() {
   echo "https://$RELEASES_R2_ACCOUNT_ID.r2.cloudflarestorage.com/$RELEASES_R2_BUCKET/$1"
 }
@@ -749,6 +765,7 @@ command="${1:-}"
 case "$command" in
   build | sign-macos | assemble | prepare-manifests | github-releases) (( $# == 3 )) || usage ;;
   fetch-manifests | sign-manifests | upload-manifests) (( $# == 2 )) || usage ;;
+  has-manifests) (( $# == 1 )) || usage ;;
   *) usage ;;
 esac
 
@@ -761,4 +778,5 @@ case "$command" in
   prepare-manifests) prepare_manifests "$2" "$3" ;;
   sign-manifests) sign_manifests "$2" ;;
   upload-manifests) upload_manifests "$2" ;;
+  has-manifests) report_has_manifests ;;
 esac

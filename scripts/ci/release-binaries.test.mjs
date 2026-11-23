@@ -1565,6 +1565,7 @@ test("publish-binaries checks the signed manifest before it changes a release", 
     "release-binaries.sh prepare-manifests",
     "release-binaries.sh sign-manifests",
     "release-binaries.sh github-releases",
+    "actions/upload-artifact@",
     "release-binaries.sh upload-manifests",
   ].map(index);
   assert.ok(
@@ -1581,6 +1582,61 @@ test("publish-binaries checks the signed manifest before it changes a release", 
     /github-releases "\$RUNNER_TEMP\/assets" "\$RUNNER_TEMP\/manifests"/,
   );
 });
+
+test("publish-binaries stores the signed manifests before the first R2 upload", () => {
+  const steps = publishSteps();
+  const index = (needle) => steps.findIndex((step) => step.includes(needle));
+  const saveAt = index("actions/upload-artifact@");
+  const save = steps[saveAt];
+  const sign = index("release-binaries.sh sign-manifests");
+  const upload = index("release-binaries.sh upload-manifests");
+  assert.ok(sign >= 0 && sign < saveAt);
+  assert.ok(saveAt < upload);
+  // Only `upload-manifests` writes to the bucket.
+  assert.equal(
+    steps.filter((step) => step.includes("upload-manifests")).length,
+    1,
+  );
+  // A failed save stops the job: no `always()`, no ignored missing files.
+  assert.doesNotMatch(save, /always\(\)|continue-on-error/);
+  assert.match(save, /^ {10}if-no-files-found: error$/m);
+  assert.doesNotMatch(save, /if-no-files-found: (ignore|warn)/);
+  // Only a release with an update manifest requires the artifact: a CLI-only
+  // release has no manifests and skips the step.
+  assert.match(
+    save,
+    /^ {8}if: steps\.manifests\.outputs\.has_manifests == 'true'$/m,
+  );
+  const checkAt = index("release-binaries.sh has-manifests");
+  assert.ok(checkAt >= 0 && checkAt < sign);
+  assert.match(steps[checkAt], /^ {8}id: manifests$/m);
+});
+
+test(
+  "has-manifests reports whether a release has an update manifest",
+  { skip },
+  (t) => {
+    const f = fixture(t);
+    const output = join(f.dir, "github-output");
+    for (const [binaries, expected] of [
+      [[agent, cli], "has_manifests=true\n"],
+      [[cli], "has_manifests=false\n"],
+    ]) {
+      writeFileSync(output, "");
+      const result = f.run(
+        ["has-manifests"],
+        { GITHUB_OUTPUT: output },
+        binaries,
+      );
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(readFileSync(output, "utf8"), expected);
+    }
+    // A malformed plan fails instead of reading as "no manifest".
+    const result = f.run(["has-manifests"], { GITHUB_OUTPUT: output }, []);
+    assert.notEqual(result.status, 0);
+    assert.match(result.stderr, /BINARIES is not a nonempty list/);
+  },
+);
 
 test("publish-binaries saves the manifests under an attempt-specific name", () => {
   const steps = publishSteps();
