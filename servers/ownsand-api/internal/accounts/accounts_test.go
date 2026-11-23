@@ -362,6 +362,176 @@ func TestUsageClientSendsTokenAndDropsRejectedToken(t *testing.T) {
 	}
 }
 
+func TestTokenSourceInvalidateTokenDropsOnlyTheRejectedToken(t *testing.T) {
+	c := &clock{now: time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)}
+	ts := &tokenServer{t: t, expires: 3600}
+	src := newSource(t, ts, c)
+	ctx := context.Background()
+	if tok, _ := src.Token(ctx); tok != "token-1" {
+		t.Fatal(tok)
+	}
+	// A rejection of a token that is not cached, and an empty token, change
+	// nothing.
+	src.InvalidateToken("token-0")
+	src.InvalidateToken("")
+	if tok, _ := src.Token(ctx); tok != "token-1" || ts.calls.Load() != 1 {
+		t.Fatalf("after a rejection of another token: %q (calls %d)", tok, ts.calls.Load())
+	}
+	// A rejection of the cached token drops it and allows a refresh.
+	src.InvalidateToken("token-1")
+	if tok, _ := src.Token(ctx); tok != "token-2" || ts.calls.Load() != 2 {
+		t.Fatalf("after a rejection of the cached token: %q (calls %d)", tok, ts.calls.Load())
+	}
+	// The rejection of the superseded token is late and changes nothing.
+	src.InvalidateToken("token-1")
+	if tok, _ := src.Token(ctx); tok != "token-2" || ts.calls.Load() != 2 {
+		t.Fatalf("after a late rejection: %q (calls %d)", tok, ts.calls.Load())
+	}
+}
+
+// gatedUsageHandler is a fake UsageService that holds each call with the
+// gated Authorization header until the test sends on reject, and then fails
+// it with unauthenticated. A call with another header succeeds at once.
+type gatedUsageHandler struct {
+	accountsv1connect.UnimplementedUsageServiceHandler
+	gated   string
+	arrived chan struct{}
+	reject  chan struct{}
+	mu      sync.Mutex
+	headers []string
+}
+
+func (h *gatedUsageHandler) ReportUsage(ctx context.Context, req *connect.Request[accountsv1.ReportUsageRequest]) (*connect.Response[accountsv1.ReportUsageResponse], error) {
+	auth := req.Header().Get("Authorization")
+	h.mu.Lock()
+	h.headers = append(h.headers, auth)
+	h.mu.Unlock()
+	if auth != h.gated {
+		return connect.NewResponse(&accountsv1.ReportUsageResponse{}), nil
+	}
+	h.arrived <- struct{}{}
+	select {
+	case <-h.reject:
+		return nil, connect.NewError(connect.CodeUnauthenticated, errors.New("expired token"))
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (h *gatedUsageHandler) lastHeader() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.headers[len(h.headers)-1]
+}
+
+// lateRejectionFixture runs two usage calls that both carry token-1, held by
+// the fake API. Rejecting them one at a time reproduces a rejection that
+// arrives after another call already replaced the token.
+type lateRejectionFixture struct {
+	ts     *tokenServer
+	src    *TokenSource
+	h      *gatedUsageHandler
+	client accountsv1connect.UsageServiceClient
+	calls  [2]chan error
+}
+
+func newLateRejectionFixture(t *testing.T) *lateRejectionFixture {
+	t.Helper()
+	c := &clock{now: time.Now()}
+	f := &lateRejectionFixture{ts: &tokenServer{t: t, expires: 3600}}
+	f.src = newSource(t, f.ts, c)
+	f.h = &gatedUsageHandler{gated: "Bearer token-1", arrived: make(chan struct{}, 2), reject: make(chan struct{})}
+	mux := http.NewServeMux()
+	mux.Handle(accountsv1connect.NewUsageServiceHandler(f.h))
+	api := httptest.NewServer(mux)
+	t.Cleanup(api.Close)
+	// Runs before api.Close, so a failed test never hangs on a held call.
+	t.Cleanup(func() { close(f.h.reject) })
+	f.client = NewUsageClient(api.Client(), api.URL+"/", f.src)
+	for i := range f.calls {
+		f.calls[i] = make(chan error, 1)
+		go func() {
+			_, err := f.client.ReportUsage(context.Background(), connect.NewRequest(&accountsv1.ReportUsageRequest{}))
+			f.calls[i] <- err
+		}()
+	}
+	for range f.calls {
+		select {
+		case <-f.h.arrived:
+		case <-time.After(5 * time.Second):
+			t.Fatal("a call with the first token did not reach the API")
+		}
+	}
+	return f
+}
+
+// rejectOne makes the API reject one held call and returns that call's error.
+func (f *lateRejectionFixture) rejectOne(t *testing.T) error {
+	t.Helper()
+	f.h.reject <- struct{}{}
+	for {
+		for _, ch := range f.calls {
+			select {
+			case err := <-ch:
+				return err
+			default:
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestUsageClientLateRejectionKeepsTheReplacementToken(t *testing.T) {
+	f := newLateRejectionFixture(t)
+	ctx := context.Background()
+	if err := f.rejectOne(t); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("first rejection: %v", err)
+	}
+	// A later call gets and caches the replacement token.
+	if _, err := f.client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{})); err != nil {
+		t.Fatalf("call with the replacement: %v", err)
+	}
+	if got := f.h.lastHeader(); got != "Bearer token-2" || f.ts.calls.Load() != 2 {
+		t.Fatalf("replacement call used %q (token requests %d)", got, f.ts.calls.Load())
+	}
+	// The token endpoint is down from now on, and the late rejection of the
+	// first token arrives.
+	f.ts.status, f.ts.errorStr = http.StatusServiceUnavailable, "temporarily_unavailable"
+	if err := f.rejectOne(t); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("late rejection: %v", err)
+	}
+	if _, err := f.client.ReportUsage(ctx, connect.NewRequest(&accountsv1.ReportUsageRequest{})); err != nil {
+		t.Fatalf("call after the late rejection: %v", err)
+	}
+	if got := f.h.lastHeader(); got != "Bearer token-2" || f.ts.calls.Load() != 2 {
+		t.Fatalf("call after the late rejection used %q (token requests %d)", got, f.ts.calls.Load())
+	}
+}
+
+func TestUsageClientLateRejectionKeepsTheReplacementRefreshInProgress(t *testing.T) {
+	f := newLateRejectionFixture(t)
+	if err := f.rejectOne(t); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("first rejection: %v", err)
+	}
+	// Hold the replacement token request. No token request is in progress
+	// here, so setting the gate cannot race with the endpoint.
+	f.ts.block, f.ts.entered = make(chan struct{}), make(chan struct{}, 4)
+	replacement := tokenAsync(f.src, context.Background())
+	awaitEntry(t, f.ts.entered, replacement, "the replacement request")
+	if err := f.rejectOne(t); connect.CodeOf(err) != connect.CodeUnauthenticated {
+		t.Fatalf("late rejection: %v", err)
+	}
+	f.ts.release()
+	if r := receive(t, replacement, "the replacement request"); r.err != nil || r.token != "token-2" {
+		t.Fatalf("replacement = %+v", r)
+	}
+	// The replacement request still caches its token, and the late rejection
+	// did not start a third request.
+	if tok, err := f.src.Token(context.Background()); err != nil || tok != "token-2" || f.ts.calls.Load() != 2 {
+		t.Fatalf("cached token = %q, %v (token requests %d)", tok, err, f.ts.calls.Load())
+	}
+}
+
 func TestTokenSourceRejectsMalformedSuccessfulResponse(t *testing.T) {
 	bodies := map[string]string{
 		"expires_in as a string":    `{"access_token":"leaked-token","token_type":"Bearer","expires_in":"3600"}`,
