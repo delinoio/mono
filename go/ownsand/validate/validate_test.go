@@ -108,6 +108,22 @@ func TestExecRequestSizeLimit(t *testing.T) {
 		t.Fatalf("over-limit fixture encodes to %d bytes, want %d", got, documentedLimit+1)
 	}
 	wantInvalid(t, "over limit", ExecRequest(r), "command")
+	// The limit counts working_directory too: with a "/" directory (3 bytes
+	// encoded) the command argument is 13 bytes smaller than the limit, and
+	// changing only the directory to "/x" (one more byte) tips the request over.
+	r = commandOnly(documentedLimit - 13)
+	r.WorkingDirectory = "/"
+	if got := budgetSize(r); got != documentedLimit {
+		t.Fatalf("directory at-limit fixture encodes to %d bytes, want %d", got, documentedLimit)
+	}
+	if err := ExecRequest(r); err != nil {
+		t.Fatalf("exactly 256 KiB with working_directory rejected: %v", err)
+	}
+	r.WorkingDirectory = "/x"
+	if got := budgetSize(r); got != documentedLimit+1 {
+		t.Fatalf("directory over-limit fixture encodes to %d bytes, want %d", got, documentedLimit+1)
+	}
+	wantInvalid(t, "working_directory over limit", ExecRequest(r), "command")
 	// The limit counts env and working_directory too.
 	r = validExec()
 	r.Env = map[string]string{"BIG": strings.Repeat("v", MaxExecFieldsSize)}
