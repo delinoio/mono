@@ -52,6 +52,33 @@ type execManager struct {
 	wg        sync.WaitGroup
 	// escalations tracks the pending SIGKILL goroutines, which outlive run.
 	escalations sync.WaitGroup
+	// escalationHooks are the timer and the process-group operations of a
+	// pending SIGKILL. Tests replace them to control the grace period and to
+	// record signals; production keeps the defaults of newExecManager.
+	escalationHooks escalationHooks
+}
+
+// escalationHooks is the seam between a pending SIGKILL and the clock and the
+// process group. It exists only for tests.
+type escalationHooks struct {
+	// graceTimer starts the grace period and returns the channel that fires
+	// when it ends, plus a function that releases the timer.
+	graceTimer func(d time.Duration) (<-chan time.Time, func() bool)
+	// groupAlive reports whether the process group of p has a member.
+	groupAlive func(p *os.Process) bool
+	// killGroup sends SIGKILL to the process group of p.
+	killGroup func(p *os.Process)
+}
+
+func defaultEscalationHooks() escalationHooks {
+	return escalationHooks{
+		graceTimer: func(d time.Duration) (<-chan time.Time, func() bool) {
+			t := time.NewTimer(d)
+			return t.C, t.Stop
+		},
+		groupAlive: processGroupAlive,
+		killGroup:  kill,
+	}
 }
 
 func newExecManager(now func() time.Time, logger *slog.Logger) *execManager {
@@ -63,6 +90,8 @@ func newExecManager(now func() time.Time, logger *slog.Logger) *execManager {
 		killGrace: KillGrace,
 		groupPoll: groupPollInterval,
 		logger:    logger,
+
+		escalationHooks: defaultEscalationHooks(),
 	}
 }
 
@@ -266,6 +295,7 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 	m.mu.Lock()
 	grace := m.killGrace
 	poll := m.groupPoll
+	hooks := m.escalationHooks
 	m.mu.Unlock()
 	if timeout := req.GetTimeout(); timeout != nil && timeout.AsDuration() > 0 {
 		timersMu.Lock()
@@ -283,7 +313,7 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 			logger.Info("exec timeout reached; terminating")
 			terminate(cmd.Process)
 			if forceAfterTerminate {
-				m.escalate(cmd.Process, grace, poll, logger)
+				m.escalate(cmd.Process, grace, poll, hooks, logger)
 			}
 		})
 		timersMu.Unlock()
@@ -323,7 +353,7 @@ func (m *execManager) run(req *ownsandv1.ExecRequest, l *execlog.Log) {
 // SIGKILL is never sent to a reused id after the original group is gone. A
 // pid reuse inside one poll interval remains theoretically possible, but a
 // reuse needs a full pid wrap-around.
-func (m *execManager) escalate(p *os.Process, grace, poll time.Duration, logger *slog.Logger) {
+func (m *execManager) escalate(p *os.Process, grace, poll time.Duration, hooks escalationHooks, logger *slog.Logger) {
 	if poll <= 0 || poll > grace {
 		poll = grace
 	}
@@ -333,20 +363,20 @@ func (m *execManager) escalate(p *os.Process, grace, poll time.Duration, logger 
 	m.escalations.Add(1)
 	go func() {
 		defer m.escalations.Done()
-		deadline := time.NewTimer(grace)
-		defer deadline.Stop()
+		deadline, stopDeadline := hooks.graceTimer(grace)
+		defer stopDeadline()
 		tick := time.NewTicker(poll)
 		defer tick.Stop()
 		for {
 			select {
 			case <-tick.C:
-				if !processGroupAlive(p) {
+				if !hooks.groupAlive(p) {
 					return
 				}
-			case <-deadline.C:
-				if processGroupAlive(p) {
+			case <-deadline:
+				if hooks.groupAlive(p) {
 					logger.Info("exec process group did not stop after SIGTERM; killing")
-					kill(p)
+					hooks.killGroup(p)
 				}
 				return
 			}

@@ -178,24 +178,22 @@ while :; do sleep 0.05; done`
 	evs := h.runExec(req)
 	childPid := readPidFile(t, pidFile)
 	t.Cleanup(func() { _ = syscall.Kill(childPid, syscall.SIGKILL) })
-	exitedAt := time.Now()
 	ex := evs[len(evs)-1].GetExited()
 	if !ex.GetTimedOut() || ex.GetExitCode() != 0 {
 		t.Fatalf("exited %v", ex)
 	}
-	// The exited event does not wait for the group, so the child still runs.
-	if !pidRunning(childPid) {
-		t.Fatal("child ended before the grace period")
-	}
-	deadline := exitedAt.Add(grace + 5*time.Second)
+	// What the consumer sees of the child depends on its own scheduling, not
+	// on the order of the producer: a slow consumer can read the exited event
+	// after the grace period ended and the child is already dead. The
+	// ordering of the event and the SIGKILL is covered with an injected timer
+	// by TestExecTimeoutEscalationKillsGroupOnlyAfterGraceTimer. This test checks only
+	// that the escalation still kills a group that survives its leader.
+	deadline := time.Now().Add(grace + 5*time.Second)
 	for pidRunning(childPid) {
 		if time.Now().After(deadline) {
 			t.Fatal("child ignoring SIGTERM survived the grace period")
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-	if since := time.Since(exitedAt); since < grace/2 {
-		t.Fatalf("child was killed after %v, before the grace period", since)
 	}
 }
 
