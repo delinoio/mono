@@ -4,6 +4,7 @@ import { createServer, type Server } from "node:net";
 import { fileURLToPath } from "node:url";
 import { describe, test } from "@e2e-dev/web";
 import { expect } from "e2e";
+import { rspressBin } from "./rspress-bin";
 
 // The fixed development port that `rspress.config.ts` declares.
 const FIXED_PORT = 13600;
@@ -41,13 +42,13 @@ const release = (holder: Server | undefined): Promise<void> =>
     holder.close(() => resolve());
   });
 
-// Runs `rspress dev` as the e2e runner does, from the app directory with an
-// argument array and no shell, and waits for it to exit. A server that
-// survives the timeout counts as a failure of the rule under test and is
-// killed.
+// Runs `rspress dev` from the app directory with an argument array and no
+// shell (through the CLI file that `rspressBin` resolves), and waits for it to
+// exit. A server that survives the timeout counts as a failure of the rule
+// under test and is killed.
 const runDevServer = (args: string[]): Promise<DevServerResult> =>
   new Promise((resolve, reject) => {
-    const child = spawn("rspress", ["dev", ...args], {
+    const child = spawn(process.execPath, [rspressBin(), "dev", ...args], {
       cwd: APP_DIRECTORY,
       shell: false,
       stdio: ["ignore", "pipe", "pipe"],
