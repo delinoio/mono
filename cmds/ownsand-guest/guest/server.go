@@ -137,10 +137,15 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Close releases the lock of the state directory. Call it after Run
-// returned; a replacement server on the same directory then starts. It is
-// safe to call more than once. The lock also ends with the process.
+// Close ends the read snapshot work and then releases the lock of the state
+// directory. Call it after Run returned; a replacement server on the same
+// directory then starts. Before the lock is released, Close makes further
+// writes of snapshot workers impossible: it waits for them for a bounded
+// time and fences any worker that is stuck in source I/O (see
+// readManager.close). It is safe to call more than once. The lock also ends
+// with the process.
 func (s *Server) Close() error {
+	s.reads.close(readCloseGrace)
 	s.lock.release()
 	return nil
 }
