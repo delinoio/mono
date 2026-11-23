@@ -399,11 +399,27 @@ func TestWorkerWakeAndStop(t *testing.T) {
 			t.Errorf("RunWorker did not stop during cleanup")
 		}
 	})
+	// RunWorker reads the wake channel only after the startup RunOnce scan has
+	// returned. Send a wake with nothing queued and wait until the worker has
+	// received it: the drained channel proves the startup scan has finished,
+	// so the startup scan cannot be what charges the top-up queued below. The
+	// wake channel holds one signal and the idle wake handler does nothing.
+	f.s.Wake()
+	deadline := time.Now().Add(10 * time.Second)
+	for len(f.s.wake) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the worker did not finish its startup scan")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if res := f.deduct(acct, usd); !res.AutoTopUpQueued {
 		t.Fatal("not queued")
 	}
+	if n := len(f.paddle.Charges()); n != 0 {
+		t.Fatalf("%d charges before Wake", n)
+	}
 	f.s.Wake()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline = time.Now().Add(10 * time.Second)
 	for len(f.paddle.Charges()) == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("Wake did not charge the queued top-up")
