@@ -444,9 +444,14 @@ func (m *Metering) Seal(ctx context.Context) (int, error) {
 }
 
 // Report sends the due unreported outbox rows of the OwnSand meters to
-// delino-accounts in batches
-// of at most MaxReportBatch until none is due or a batch fails. A failed
-// batch is retried with exponential back-off.
+// delino-accounts in batches of at most MaxReportBatch until none is due, a
+// batch fails or this instance no longer holds the lease. A failed batch is
+// retried with exponential back-off. The lease is checked immediately before
+// each batch RPC: a former holder ends the pass without an error and sends no
+// later batch, and it leaves the unsent rows due with their attempts and
+// next attempt time unchanged for the new holder. A batch RPC that has
+// already started finishes, and its acknowledgement or retry handling
+// applies.
 func (m *Metering) Report(ctx context.Context) error {
 	if m.client == nil {
 		return ErrReportingDisabled
@@ -463,6 +468,10 @@ func (m *Metering) Report(ctx context.Context) error {
 			return err
 		}
 		if len(rows) == 0 {
+			return nil
+		}
+		if !m.held() {
+			m.logger.Info("billing_usage_report_lease_lost", slog.Int("skipped_due_rows", len(rows)))
 			return nil
 		}
 		if err := m.reportBatch(ctx, rows); err != nil {

@@ -69,9 +69,16 @@ type fakeAccounts struct {
 	unattributed map[string]bool
 	statuses     []*accountsv1.OrganizationBillingStatus
 	badResults   bool
+	// beforeRequest, when set before the first request, runs at the start of
+	// every ReportUsage call, before the fake takes its lock and counts the
+	// request. A test uses it to hold an RPC in flight.
+	beforeRequest func()
 }
 
 func (f *fakeAccounts) ReportUsage(_ context.Context, req *connect.Request[accountsv1.ReportUsageRequest]) (*connect.Response[accountsv1.ReportUsageResponse], error) {
+	if f.beforeRequest != nil {
+		f.beforeRequest()
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests++
@@ -496,6 +503,101 @@ func TestReportBatchesAndRejectsMismatchedResults(t *testing.T) {
 	}
 	depth, _, err := m.OutboxStats(ctx)
 	if err != nil || depth != 0 {
+		t.Fatalf("depth = %d %v", depth, err)
+	}
+}
+
+// TestReportStopsAfterTheLeaseIsLost covers a pass that loses the lease while
+// a batch RPC is in flight: that RPC finishes and is acknowledged, no later
+// batch is sent, and the unsent row stays due and unchanged for the next
+// holder.
+func TestReportStopsAfterTheLeaseIsLost(t *testing.T) {
+	f := newFixture(t, t0.Add(24*time.Hour))
+	accounts, client := newFakeAccounts(t)
+	ctx := context.Background()
+	f.seedOutbox(t, org2, classB, t0.Add(-48*time.Hour), billing.MaxReportBatch+1)
+	lastWindow := t0.Add(-48*time.Hour + time.Duration(billing.MaxReportBatch)*5*time.Minute)
+	before, ok := f.outbox(t, org2, classB, lastWindow)
+	if !ok || before.reported || before.attempts != 0 {
+		t.Fatalf("seeded last row: %+v %v", before, ok)
+	}
+
+	var held atomic.Bool
+	held.Store(true)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	accounts.beforeRequest = func() {
+		if calls.Add(1) == 1 {
+			close(entered)
+			<-release
+		}
+	}
+	m := f.metering(client, func(o *billing.Options) { o.Held = held.Load })
+
+	errc := make(chan error, 1)
+	go func() { errc <- m.Report(ctx) }()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the first batch RPC did not start")
+	}
+	held.Store(false)
+	close(release)
+	select {
+	case err := <-errc:
+		if err != nil {
+			t.Fatalf("a pass that lost the lease must end without an error: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Report did not return")
+	}
+
+	if requests, reports := accounts.count(); requests != 1 || reports != billing.MaxReportBatch {
+		t.Fatalf("requests = %d, reports = %d, want 1 and %d", requests, reports, billing.MaxReportBatch)
+	}
+	if depth, _, err := m.OutboxStats(ctx); err != nil || depth != 1 {
+		t.Fatalf("outbox depth = %d %v, want 1", depth, err)
+	}
+	after, ok := f.outbox(t, org2, classB, lastWindow)
+	if !ok || after != before {
+		t.Fatalf("unsent row changed: before %+v, after %+v", before, after)
+	}
+	if first, ok := f.outbox(t, org2, classB, t0.Add(-48*time.Hour)); !ok || !first.reported {
+		t.Fatalf("the acknowledged batch was not marked reported: %+v %v", first, ok)
+	}
+	if !strings.Contains(f.logText(), "billing_usage_report_lease_lost") {
+		t.Fatalf("missing lease-lost log: %s", f.logText())
+	}
+
+	// A new holder reports the remaining row.
+	next := f.metering(client)
+	if err := next.Report(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if requests, reports := accounts.count(); requests != 2 || reports != billing.MaxReportBatch+1 {
+		t.Fatalf("after the handover: requests = %d, reports = %d", requests, reports)
+	}
+	if s, ok := f.outbox(t, org2, classB, lastWindow); !ok || !s.reported {
+		t.Fatalf("remaining row not reported: %+v %v", s, ok)
+	}
+}
+
+// TestReportDrainsAllBatchesWhileTheLeaseIsHeld checks that continuous
+// ownership still drains every due batch in one pass: 500 rows, then 1.
+func TestReportDrainsAllBatchesWhileTheLeaseIsHeld(t *testing.T) {
+	f := newFixture(t, t0.Add(24*time.Hour))
+	accounts, client := newFakeAccounts(t)
+	ctx := context.Background()
+	f.seedOutbox(t, org2, classB, t0.Add(-48*time.Hour), billing.MaxReportBatch+1)
+	m := f.metering(client, func(o *billing.Options) { o.Held = func() bool { return true } })
+	if err := m.Report(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if requests, reports := accounts.count(); requests != 2 || reports != billing.MaxReportBatch+1 {
+		t.Fatalf("requests = %d, reports = %d", requests, reports)
+	}
+	if depth, _, err := m.OutboxStats(ctx); err != nil || depth != 0 {
 		t.Fatalf("depth = %d %v", depth, err)
 	}
 }
