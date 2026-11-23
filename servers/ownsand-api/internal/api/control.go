@@ -280,7 +280,7 @@ func (c *Control) handle(ctx context.Context, e events.Event) {
 // synthesizes no command failure: the result of an expired command was lost,
 // and the agent's next state report reconciles the sandbox as usual.
 func (s *Service) expireCommands(ctx context.Context) {
-	if n := s.commands.expire(s.now(), s.commandGrace()); n > 0 {
+	if n := s.commands.expire(s.commandRetentionNow(), s.commandGrace()); n > 0 {
 		s.Logger.InfoContext(ctx, "agent_commands_expired", slog.Int("commands", n), slog.Duration("grace", s.commandGrace()))
 	}
 }

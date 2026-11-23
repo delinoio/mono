@@ -105,6 +105,13 @@ type Service struct {
 	// Timing of the contract; tests shorten them.
 	Timing Timing
 
+	// CommandElapsed reports the elapsed (monotonic) time that measures the
+	// retention window of unanswered commands (Timing.CommandGrace). Nil
+	// selects the process monotonic clock, which ignores wall-clock
+	// corrections; tests set it to step the wall clock without moving the
+	// window.
+	CommandElapsed func() time.Duration
+
 	// DataPath handles the data path envelopes of the agent channel
 	// (signaling answers, revocation and relay grant acknowledgements and
 	// releases) and the revocation events. Nil until the data path exists.
@@ -279,6 +286,28 @@ func (s *Service) afterDeviceRemoved(ctx context.Context, deviceID string) {
 }
 
 func (s *Service) now() time.Time { return s.Now().UTC() }
+
+// commandRetentionOrigin is the fixed instant that commandRetentionNow adds
+// the elapsed reading to. It is not the zero time, so a reading never
+// equals the zero value that pendingCommand.closedAt uses for "open".
+var commandRetentionOrigin = time.Unix(0, 0).UTC()
+
+// commandRetentionStart is the process start whose monotonic reading backs
+// the default CommandElapsed.
+var commandRetentionStart = time.Now()
+
+// commandRetentionNow returns the reading that commandStore compares for the
+// retention window of unanswered commands: the origin plus the elapsed time
+// of CommandElapsed. It carries no wall clock, so a forward or backward
+// correction of the wall clock neither expires a record early nor keeps it
+// longer. Persisted timestamps, lease timing and every other time keep
+// using now.
+func (s *Service) commandRetentionNow() time.Time {
+	if s.CommandElapsed != nil {
+		return commandRetentionOrigin.Add(s.CommandElapsed())
+	}
+	return commandRetentionOrigin.Add(time.Since(commandRetentionStart))
+}
 
 // newID returns a new UUID v7 string.
 func newID() string {

@@ -38,6 +38,9 @@ type Options struct {
 	DB     *db.DB
 	Logger *slog.Logger
 	Now    func() time.Time
+	// CommandElapsed overrides the elapsed-time source of the command
+	// retention window; nil selects the process monotonic clock (tests).
+	CommandElapsed func() time.Duration
 
 	Logto api.TokenValidator
 
@@ -150,6 +153,7 @@ func New(opts Options) (*App, error) {
 		DB:                    opts.DB,
 		Logger:                opts.Logger,
 		Now:                   opts.Now,
+		CommandElapsed:        opts.CommandElapsed,
 		Nonces:                auth.NewNonceIssuer(key, opts.NonceKeyPrevious, opts.Now),
 		Limits:                limits,
 		DisplayNames:          opts.DisplayNames,
