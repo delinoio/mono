@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/delinoio/mono/servers/ownsand-api/internal/db"
 )
@@ -68,14 +69,9 @@ func newURL(t testing.TB, maxVersion int64) string {
 	}
 	_ = conn.Close(ctx)
 	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		conn, err := pgx.Connect(ctx, admin)
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close(ctx) }()
-		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+		dropDatabase(t, name, func(ctx context.Context) (adminConn, error) {
+			return pgx.Connect(ctx, admin)
+		})
 	})
 	child, err := childURL(admin, name)
 	if err != nil {
@@ -90,6 +86,41 @@ func newURL(t testing.TB, maxVersion int64) string {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
+}
+
+// cleanupTimeout bounds the whole cleanup of one generated database.
+const cleanupTimeout = 30 * time.Second
+
+// errorfer is the part of testing.TB that dropDatabase reports failures to.
+type errorfer interface {
+	Helper()
+	Errorf(format string, args ...any)
+}
+
+// adminConn is the part of *pgx.Conn that dropDatabase uses.
+type adminConn interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
+	Close(ctx context.Context) error
+}
+
+// dropDatabase drops the generated database name through a fresh admin
+// connection and marks the test failed when it cannot connect or cannot drop
+// the database, so a leaked database is not silent. The messages name the
+// failed operation and the database but never the connection error, because
+// a pgx error can contain the host, the user or the connection URL.
+func dropDatabase(t errorfer, name string, connect func(ctx context.Context) (adminConn, error)) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), cleanupTimeout)
+	defer cancel()
+	conn, err := connect(ctx)
+	if err != nil {
+		t.Errorf("dbtest: connect to drop test database %s failed", name)
+		return
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
+		t.Errorf("dbtest: drop test database %s failed", name)
+	}
 }
 
 // childURL returns the admin URL retargeted to the database name. It rewrites
