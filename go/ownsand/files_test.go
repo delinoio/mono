@@ -969,3 +969,98 @@ func TestWriteFileRetryKeepsOperationIdentity(t *testing.T) {
 		}
 	}
 }
+
+// TestReadFileFromOffsetAcrossCalls checks a read that a relay serves in
+// several calls: each call starts at the offset that the previous one
+// reached, with the same read_id and salt, and reads the same snapshot.
+func TestReadFileFromOffsetAcrossCalls(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			want := randomBytes(t, 2*datapath.MaxFileChunkSize+500)
+			cp.agent.setFile("/f", want)
+			s := cp.handle(t, cp.client(t, tr))
+			readID := mustID(t)
+			salt := randomBytes(t, 32)
+			ctx := context.Background()
+			// The first call stops after the first chunk.
+			var first bytes.Buffer
+			stop := errors.New("client stream ended")
+			_, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: readID, Path: "/f", BindingSalt: salt}, writerFunc(func(p []byte) (int, error) {
+				n, _ := first.Write(p)
+				return n, stop
+			}))
+			if !errors.Is(err, stop) || first.Len() == 0 {
+				t.Fatalf("first call: %d bytes, %v", first.Len(), err)
+			}
+			// The file changes; the second call still reads the snapshot.
+			cp.agent.setFile("/f", []byte("changed"))
+			var rest bytes.Buffer
+			size, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: readID, Path: "/f", BindingSalt: salt, Offset: int64(first.Len())}, &rest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := append(first.Bytes(), rest.Bytes()...)
+			if size != int64(len(want)) || !bytes.Equal(got, want) {
+				t.Fatalf("size %d, %d bytes", size, len(got))
+			}
+			if _, err := s.ReadFileFrom(ctx, FileReadParams{ReadID: readID, Path: "/f", BindingSalt: salt, Offset: -1}, &rest); !validate.IsValidationError(err) {
+				t.Fatalf("negative offset: %v", err)
+			}
+		})
+	}
+}
+
+type writerFunc func(p []byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// TestFileWriteChunksAcrossCalls checks a write whose chunks arrive in
+// separate calls and out of order, and that a second FileWrite with the same
+// write_id and salt (another process) continues it.
+func TestFileWriteChunksAcrossCalls(t *testing.T) {
+	for _, tr := range []Transport{TransportPeerToPeer, TransportRelay} {
+		t.Run(tr.String(), func(t *testing.T) {
+			cp := newFakeCP(t)
+			s := cp.handle(t, cp.client(t, tr))
+			ctx := context.Background()
+			writeID := mustID(t)
+			salt := randomBytes(t, 32)
+			data := randomBytes(t, 3000)
+			fw, err := s.OpenFileWrite(FileWriteParams{WriteID: writeID, Path: "/out", BindingSalt: salt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := fw.WriteChunk(ctx, 1000, data[1000:2000]); err != nil || res.GetOffset() != 1000 || res.GetLength() != 1000 {
+				t.Fatalf("middle chunk: %v %v", res, err)
+			}
+			if _, err := fw.WriteChunk(ctx, 0, data[:1000]); err != nil {
+				t.Fatal(err)
+			}
+			// Another FileWrite of the same write (for example after a
+			// process restart) finishes it.
+			fw2, err := s.OpenFileWrite(FileWriteParams{WriteID: writeID, Path: "/out", BindingSalt: salt})
+			if err != nil {
+				t.Fatal(err)
+			}
+			res, err := fw2.Finish(ctx, 2000, data[2000:], int64(len(data)), 0o755)
+			if err != nil || !res.GetFinished() || res.GetSizeBytes() != int64(len(data)) {
+				t.Fatalf("finish: %v %v", res, err)
+			}
+			if !bytes.Equal(must(cp.agent.file("/out")), data) {
+				t.Fatal("file content")
+			}
+			reqs := cp.agent.writeRequests()
+			if len(reqs) != 3 || reqs[0].GetPath() != "/out" || reqs[1].GetPath() != "" || reqs[2].GetPath() != "/out" || reqs[2].GetFinish().GetMode() != 0o755 {
+				t.Fatalf("requests %v", reqs)
+			}
+			if _, err := s.OpenFileWrite(FileWriteParams{WriteID: "bad", Path: "/out"}); !validate.IsValidationError(err) {
+				t.Fatalf("bad write_id: %v", err)
+			}
+			big, _ := s.OpenFileWrite(FileWriteParams{WriteID: mustID(t), Path: "/big"})
+			if _, err := big.WriteChunk(ctx, 0, make([]byte, datapath.MaxFileChunkSize+1)); !validate.IsValidationError(err) {
+				t.Fatalf("chunk above 1 MiB: %v", err)
+			}
+		})
+	}
+}

@@ -32,7 +32,9 @@ import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -107,6 +109,9 @@ type Keyring struct {
 	primary string
 	ids     []string
 	aeads   map[string]cipher.AEAD
+	// deriveKey is HMAC-SHA256(primary key, "tide-derive-v1"), the key of
+	// Derive. The primary key itself is used only for AES-GCM.
+	deriveKey []byte
 }
 
 // NewKeyring returns a keyring whose primary key is the first key. Key IDs
@@ -133,8 +138,27 @@ func NewKeyring(keys ...Key) (*Keyring, error) {
 		}
 		r.aeads[k.ID] = aead
 		r.ids = append(r.ids, k.ID)
+		if k.ID == r.primary {
+			mac := hmac.New(sha256.New, k.material[:])
+			mac.Write([]byte("tide-derive-v1"))
+			r.deriveKey = mac.Sum(nil)
+		}
 	}
 	return r, nil
+}
+
+// Derive returns 32 bytes that only holders of the primary key can compute
+// for (purpose, value): HMAC-SHA256 with a key derived from the primary key.
+// Every instance with the same TIDE_SECRET_KEYS derives the same bytes, so
+// for example the OwnSand binding salt of a relayed file operation is the
+// same when another instance continues the operation after a deployment.
+// The bytes change when the primary key changes.
+func (r *Keyring) Derive(purpose, value string) []byte {
+	mac := hmac.New(sha256.New, r.deriveKey)
+	mac.Write([]byte(purpose))
+	mac.Write([]byte{0})
+	mac.Write([]byte(value))
+	return mac.Sum(nil)
 }
 
 // ParseKeys parses the TIDE_SECRET_KEYS format: a comma-separated list of

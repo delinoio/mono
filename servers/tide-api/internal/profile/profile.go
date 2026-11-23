@@ -110,6 +110,8 @@ type DeletionHook struct {
 	Name    string
 	Prepare func(ctx context.Context, orgID, profileID string) error
 	InTx    func(ctx context.Context, tx pgx.Tx, orgID, profileID string) error
+	// AfterCommit runs after the profile is deleted (best effort).
+	AfterCommit func(ctx context.Context, orgID, profileID string)
 }
 
 // Profiles stores runner profiles.
@@ -624,6 +626,11 @@ func (h *Handler) DeleteRunnerProfile(ctx context.Context, req *connect.Request[
 	})
 	if err != nil {
 		return nil, s.Internal(ctx, "delete runner profile", err)
+	}
+	for _, hook := range ps.hooks {
+		if hook.AfterCommit != nil {
+			hook.AfterCommit(context.WithoutCancel(ctx), c.OrganizationID, id)
+		}
 	}
 	ps.changed(ctx, c.OrganizationID)
 	return connect.NewResponse(&tidev1.DeleteRunnerProfileResponse{}), nil
