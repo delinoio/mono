@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -33,9 +34,10 @@ const (
 )
 
 // TestSignalHelperProcess is not a test. The signal tests re-execute the test
-// binary into it. It serves /ping and /slow?ms=<n> (a handler that blocks for n
-// milliseconds), prints "listening <addr>" and "slow_started" lines, and exits
-// with serve's result.
+// binary into it. It serves /ping, /slow?ms=<n> (a handler that blocks for n
+// milliseconds) and /hold (a handler that blocks until the parent releases it
+// over the helper's stdin), prints "listening <addr>", "slow_started" and
+// "hold_started" lines, and exits with serve's result.
 func TestSignalHelperProcess(t *testing.T) {
 	if os.Getenv(signalHelperEnv) != "1" {
 		t.Skip("helper process for the signal tests")
@@ -48,6 +50,14 @@ func TestSignalHelperProcess(t *testing.T) {
 		ms, _ := strconv.Atoi(r.URL.Query().Get("ms"))
 		fmt.Println("slow_started")
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+	})
+	mux.HandleFunc("GET /hold", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Println("hold_started")
+		// The handler returns only when the parent writes the release byte, or
+		// closes the control pipe (which is what the test cleanup does). It is
+		// never time based, so the request is still in flight whenever the parent
+		// has not released it, however long the parent is stalled.
+		_, _ = io.ReadFull(os.Stdin, make([]byte, 1))
 	})
 
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -72,6 +82,9 @@ type helperProcess struct {
 	addr   string
 	exited chan struct{}
 	out    *syncBuffer
+	// control is the write end of the helper's stdin. The /hold handler blocks
+	// until it receives a byte on it.
+	control io.WriteCloser
 }
 
 func startHelperProcess(t *testing.T) *helperProcess {
@@ -84,16 +97,24 @@ func startHelperProcess(t *testing.T) *helperProcess {
 	cmd.Env = append(os.Environ(), signalHelperEnv+"=1")
 	cmd.Stdout = out
 	cmd.Stderr = out
+	control, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("create the helper control pipe: %v", err)
+	}
 	if err := cmd.Start(); err != nil {
+		_ = control.Close()
 		t.Fatalf("start helper: %v", err)
 	}
-	h := &helperProcess{t: t, cmd: cmd, exited: make(chan struct{}), out: out}
+	h := &helperProcess{t: t, cmd: cmd, exited: make(chan struct{}), out: out, control: control}
 	// Wait runs once, here: it reaps the process and flushes the output copy.
 	go func() {
 		_ = cmd.Wait()
 		close(h.exited)
 	}()
 	t.Cleanup(func() {
+		// Closing the control pipe releases a handler that is still held; the
+		// kill and the reap then end the process whatever state it is in.
+		_ = control.Close()
 		_ = cmd.Process.Kill()
 		<-h.exited
 	})
@@ -150,11 +171,39 @@ func (h *helperProcess) wait(limit time.Duration) syscall.WaitStatus {
 	return h.cmd.ProcessState.Sys().(syscall.WaitStatus)
 }
 
+// release lets the /hold handler of the helper return.
+func (h *helperProcess) release() {
+	h.t.Helper()
+	if _, err := h.control.Write([]byte{1}); err != nil {
+		h.t.Fatalf("write the release byte to the helper control pipe: %v; output:\n%s", err, h.out.String())
+	}
+}
+
+// finished reports whether the helper has exited.
+func (h *helperProcess) finished() bool {
+	select {
+	case <-h.exited:
+		return true
+	default:
+		return false
+	}
+}
+
 // getAsync starts a GET and delivers the status code, or -1 on a client error.
 func getAsync(url string) <-chan int {
+	return getAsyncContext(context.Background(), url)
+}
+
+// getAsyncContext is getAsync with a request that ctx can cancel.
+func getAsyncContext(ctx context.Context, url string) <-chan int {
 	status := make(chan int, 1)
 	go func() {
-		resp, err := http.Get(url)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			status <- -1
+			return
+		}
+		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			status <- -1
 			return
@@ -191,14 +240,56 @@ func TestSecondTerminationSignalTerminatesProcessDuringDrain(t *testing.T) {
 
 func TestSingleTerminationSignalDrainsInFlightRequestAndExitsZero(t *testing.T) {
 	h := startHelperProcess(t)
-	status := getAsync("http://" + h.addr + "/slow?ms=500")
-	h.waitForLine("slow_started")
+	// The /hold handler returns only when the test releases it, so the request
+	// is guaranteed to be in flight while the signal and the shutdown happen.
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	status := getAsyncContext(ctx, "http://"+h.addr+"/hold")
+	h.waitForLine("hold_started")
+	requireHeld := func(stage string) {
+		t.Helper()
+		select {
+		case got := <-status:
+			t.Fatalf("held request finished with status %d %s; output:\n%s", got, stage, h.out.String())
+		default:
+		}
+		if h.finished() {
+			t.Fatalf("helper exited %s; output:\n%s", stage, h.out.String())
+		}
+	}
+	requireHeld("before the signal")
 
 	h.signal(syscall.SIGINT)
 	h.waitForLine("server_shutdown_started")
 
-	if got := <-status; got != http.StatusOK {
-		t.Errorf("in-flight request status = %d, want %d", got, http.StatusOK)
+	// server_shutdown_started is logged just before the server closes its
+	// listeners, so the listener only stops accepting a moment later. A fresh
+	// dial that fails proves that the shutdown has reached the listener.
+	dialDeadline := time.Now().Add(5 * time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", h.addr, time.Second)
+		if err != nil {
+			break
+		}
+		_ = conn.Close()
+		if time.Now().After(dialDeadline) {
+			t.Fatalf("helper listener still accepts connections after the shutdown started; output:\n%s", h.out.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	requireHeld("while the shutdown waits for the held request")
+	if strings.Contains(h.out.String(), "server_shutdown_completed") {
+		t.Fatalf("shutdown completed while the request was still held; output:\n%s", h.out.String())
+	}
+
+	h.release()
+	select {
+	case got := <-status:
+		if got != http.StatusOK {
+			t.Errorf("in-flight request status = %d, want %d; output:\n%s", got, http.StatusOK, h.out.String())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("held request did not finish within 5s of the release; output:\n%s", h.out.String())
 	}
 	ws := h.wait(5 * time.Second)
 	if !ws.Exited() || ws.ExitStatus() != 0 {
