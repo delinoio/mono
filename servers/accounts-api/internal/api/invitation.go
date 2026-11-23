@@ -185,6 +185,9 @@ func (h *BillingAccountHandler) CreateInvitation(ctx context.Context, req *conne
 		if pending {
 			return alreadyExists("a pending invitation for this email address exists")
 		}
+		if err := h.enforceInvitationRate(ctx, tx, accountID, userID, emailKey(addr), now); err != nil {
+			return err
+		}
 		if _, err := tx.Exec(ctx, `INSERT INTO billing_account_invitations
 			(invitation_id, billing_account_id, token_sha256, email, email_key, role, inviter_user_id, create_time, expire_time)
 			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
