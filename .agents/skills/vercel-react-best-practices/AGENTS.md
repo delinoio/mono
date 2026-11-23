@@ -2900,7 +2900,14 @@ function SearchResults() {
     const requestId = ++latestRequest.current
 
     startTransition(async () => {
-      const data = await fetchResults(value)
+      let data
+      try {
+        data = await fetchResults(value)
+      } catch (error) {
+        // A newer search superseded this request: its failure is stale
+        if (requestId !== latestRequest.current) return
+        throw error
+      }
       // React orders state updates, not async responses: ignore stale ones
       if (requestId !== latestRequest.current) return
       // Updates after an await need their own startTransition
@@ -2926,7 +2933,7 @@ function SearchResults() {
 
 - **Better responsiveness**: Keeps the UI responsive during updates
 
-- **Stale response guard**: The request id check keeps a slow earlier response from replacing newer results
+- **Stale response guard**: The request id check keeps a slow earlier response from replacing newer results, and ignores the failure of a superseded request while the current request still rethrows to the error boundary
 
 Reference: [https://react.dev/reference/react/useTransition](https://react.dev/reference/react/useTransition)
 
