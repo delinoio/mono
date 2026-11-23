@@ -34,10 +34,22 @@ image="debian:trixie-20261104"
 mkdir -p "$out_dir"
 out_dir="$(cd "$out_dir" && pwd)"
 
-(cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -o "$out_dir/ownsand-guest" ./cmds/ownsand-guest)
+# The guest helper goes to a unique staging directory that the root file system
+# container mounts read-only, so a file that already exists at
+# "$out_dir/ownsand-guest" stays untouched on success and on failure. The
+# directory is inside the output directory, which Docker already has to share
+# with the container (Docker Desktop on macOS shares only some host paths), and
+# the trap removes it on success, on a failed step and on a signal.
+stage="$(mktemp -d "$out_dir/.ownsand-guest-stage.XXXXXX")"
+trap 'rm -rf "$stage"' EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+(cd "$repo" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -o "$stage/ownsand-guest" ./cmds/ownsand-guest)
 
 docker run --rm --platform "linux/$arch" \
   -v "$repo/cmds/ownsand-agent/images/linux:/scripts:ro" \
+  -v "$stage:/stage:ro" \
   -v "$out_dir:/out" \
   -e "SIZE_MIB=$size_mib" \
   "$image" bash -euo pipefail -c '
@@ -45,10 +57,10 @@ docker run --rm --platform "linux/$arch" \
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends busybox-static e2fsprogs file >/dev/null
     mkdir -p /work/cmds/ownsand-agent/images/linux
     cp /scripts/build-rootfs.sh /work/cmds/ownsand-agent/images/linux/
-    GUEST_BINARY=/out/ownsand-guest BUSYBOX=/bin/busybox \
+    GUEST_BINARY=/stage/ownsand-guest BUSYBOX=/bin/busybox \
       /work/cmds/ownsand-agent/images/linux/build-rootfs.sh /out/rootfs.ext4 "$SIZE_MIB"
   '
-rm -f "$out_dir/ownsand-guest"
+rm -rf "$stage"
 
 "$here/build-kernel.sh" "$arch" "$out_dir/vmlinux"
 echo "wrote $out_dir/vmlinux and $out_dir/rootfs.ext4"
