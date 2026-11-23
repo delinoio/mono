@@ -5,7 +5,6 @@ package api
 import (
 	"sync"
 	"testing"
-	"time"
 )
 
 func closed(ch <-chan struct{}) bool {
@@ -84,11 +83,16 @@ func TestWatchConcurrentFireAndUnregister(t *testing.T) {
 		go func() { defer wg.Done(); w.fire("a") }()
 	}
 	wg.Wait()
-	w.fire("a")
+	// Check right after the workers finish, with no further fire: the
+	// concurrent fires alone must have notified the retained watcher, and
+	// every other registration must already be gone (fired or unregistered).
 	select {
 	case <-keep:
-	case <-time.After(time.Second):
-		t.Fatal("kept waiter never notified")
+	default:
+		t.Fatal("no concurrent fire notified the retained watcher")
+	}
+	if w.count() != 0 {
+		t.Fatalf("count after concurrent fire and unregister = %d", w.count())
 	}
 	keepUnreg()
 	if w.count() != 0 {
