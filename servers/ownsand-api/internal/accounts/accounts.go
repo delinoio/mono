@@ -80,6 +80,22 @@ type tokenFlight struct {
 	done  chan struct{}
 	token string
 	err   error
+	// waiters counts the callers that started or joined the flight. It is
+	// guarded by TokenSource.mu and exists only so that tests can tell that
+	// a caller waits on the flight; no production code reads it.
+	waiters int
+}
+
+// flightWaiters returns the number of callers that started or joined the
+// token request in progress, or 0 when none is in progress. Tests use it to
+// wait until a caller is in the in-flight wait.
+func (s *TokenSource) flightWaiters() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.flight == nil {
+		return 0
+	}
+	return s.flight.waiters
 }
 
 // NewTokenSource returns a token source for cfg.
@@ -140,6 +156,7 @@ func (s *TokenSource) Token(ctx context.Context) (string, error) {
 		s.flight = f
 		go s.refresh(context.WithoutCancel(ctx), f, s.cfg.Now())
 	}
+	f.waiters++
 	s.mu.Unlock()
 	select {
 	case <-f.done:
