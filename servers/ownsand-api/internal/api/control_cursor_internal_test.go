@@ -27,6 +27,9 @@ type cursorHarness struct {
 	// transitions with it.
 	onRead   func(after int64)
 	onHandle func(id int64)
+	// handleErr, when set, returns the error that the delivery of the event
+	// with the given ID returns; a failed delivery is not recorded.
+	handleErr func(id int64) error
 }
 
 // newCursorHarness serves the events 1..n; the processor reads 500 per page.
@@ -51,11 +54,17 @@ func newCursorHarness(t *testing.T, n int64) *cursorHarness {
 		}
 		return out, nil
 	}
-	h.c.handleEvent = func(_ context.Context, e events.Event) {
+	h.c.handleEvent = func(_ context.Context, e events.Event) error {
 		if h.onHandle != nil {
 			h.onHandle(e.ID)
 		}
+		if h.handleErr != nil {
+			if err := h.handleErr(e.ID); err != nil {
+				return err
+			}
+		}
 		h.delivered = append(h.delivered, e.ID)
+		return nil
 	}
 	return h
 }
