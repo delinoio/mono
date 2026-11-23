@@ -4,6 +4,7 @@ package guest
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"io/fs"
 	"log/slog"
@@ -295,6 +296,206 @@ func TestWriteRecoveryKeepsReplacedFile(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(target); string(got) != "old" {
 		t.Fatalf("target %q", got)
+	}
+}
+
+// demoteRecordToTemp turns the canonical record of the write into its
+// temporary file, the state that a crash between the fsync and the rename of
+// the first record save leaves. It returns the paths of both names.
+func demoteRecordToTemp(t *testing.T, h *harness, req *ownsandv1.WriteFileRequest) (canonical, temp string) {
+	t.Helper()
+	canonical = filepath.Join(h.srv.cfg.StateDir, "writes", writeRecordName(req.GetWriteId()))
+	temp = canonical + ".tmp"
+	if err := os.Rename(canonical, temp); err != nil {
+		t.Fatal(err)
+	}
+	return canonical, temp
+}
+
+func TestWriteRecoveryPromotesFirstTempRecord(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	tmp := tempPath(target, req.GetWriteId())
+	canonical, temp := demoteRecordToTemp(t, h, req)
+
+	h2 := restart(t, h, nil)
+	if exists(temp) || !exists(canonical) {
+		t.Fatalf("records after restart: %v", recordFiles(t, h2))
+	}
+	// The write is registered as recovered, like a write with a canonical record.
+	if _, errd := h2.write(req); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_NOT_FOUND || !strings.Contains(errd.GetMessage(), "helper restart") {
+		t.Fatalf("chunk of a recovered write: %v", errd)
+	}
+	h2.clock.Advance(14 * time.Minute)
+	h2.srv.Sweep()
+	if !exists(tmp) {
+		t.Fatal("staging file removed too early after restart")
+	}
+	h2.clock.Advance(2 * time.Minute)
+	h2.srv.Sweep()
+	if exists(tmp) {
+		t.Fatal("staging file of a promoted temporary record kept after 15 minutes")
+	}
+	if got := recordFiles(t, h2); len(got) != 0 {
+		t.Fatalf("record kept after cleanup: %v", got)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "old" {
+		t.Fatalf("target %q %v", got, err)
+	}
+}
+
+func TestWriteRecoveryCanonicalRecordWinsOverTempRecord(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	tmp := tempPath(target, req.GetWriteId())
+	canonical, temp := demoteRecordToTemp(t, h, req)
+	// The canonical record is the newer one; the temporary file is stale and
+	// names another staging path that must stay untouched.
+	other := filepath.Join(t.TempDir(), "unrelated")
+	if err := os.WriteFile(other, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec, err := readWriteRecord(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale := rec
+	stale.TmpPath = other
+	data, err := json.Marshal(stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(temp, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err = json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(canonical, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	h2 := restart(t, h, nil)
+	if exists(temp) {
+		t.Fatal("stale temporary record kept next to the canonical record")
+	}
+	if got, err := readWriteRecord(canonical); err != nil || got.TmpPath != tmp {
+		t.Fatalf("canonical record replaced: %+v %v", got, err)
+	}
+	h2.clock.Advance(16 * time.Minute)
+	h2.srv.Sweep()
+	if exists(tmp) {
+		t.Fatal("staging file of the canonical record kept")
+	}
+	if got, err := os.ReadFile(other); err != nil || string(got) != "keep" {
+		t.Fatalf("unrelated file %q %v", got, err)
+	}
+}
+
+func TestWriteRecoveryRemovesInvalidTempRecords(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	tmp := tempPath(target, req.GetWriteId())
+	canonical, temp := demoteRecordToTemp(t, h, req)
+	valid, err := os.ReadFile(temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(temp); err != nil {
+		t.Fatal(err)
+	}
+	// The write record that names an unrelated file: a temporary record that
+	// is valid in itself but under the name of another write must never lead
+	// to the removal of that file.
+	other := filepath.Join(t.TempDir(), "unrelated")
+	if err := os.WriteFile(other, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var rec writeRecord
+	if err := json.Unmarshal(valid, &rec); err != nil {
+		t.Fatal(err)
+	}
+	rec.WriteID = "someone-else"
+	rec.TmpPath = other
+	wrongName, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.WriteID = ""
+	emptyID, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec.WriteID = "future"
+	rec.Version = 99
+	future, err := json.Marshal(rec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Dir(canonical)
+	files := map[string][]byte{
+		"broken" + writeRecordTempSuffix:                  []byte("{"),
+		writeRecordName("wrong") + ".tmp":                 wrongName,
+		writeRecordName("") + ".tmp":                      emptyID,
+		writeRecordName("future") + ".tmp":                future,
+		"keep-unknown-file.txt":                           []byte("x"),
+		strings.TrimSuffix(writeRecordName("a"), ".json"): []byte("not a record name"),
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), content, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	h2 := restart(t, h, nil)
+	got := recordFiles(t, h2)
+	want := map[string]bool{
+		"keep-unknown-file.txt":                           true,
+		strings.TrimSuffix(writeRecordName("a"), ".json"): true,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("records after restart: %v", got)
+	}
+	for _, name := range got {
+		if !want[name] {
+			t.Fatalf("records after restart: %v", got)
+		}
+	}
+	h2.srv.writes.mu.Lock()
+	n := len(h2.srv.writes.entries)
+	h2.srv.writes.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("recovered entries: %d", n)
+	}
+	h2.clock.Advance(time.Hour)
+	h2.srv.Sweep()
+	if got, err := os.ReadFile(other); err != nil || string(got) != "keep" {
+		t.Fatalf("unrelated file %q %v", got, err)
+	}
+	// The staging file of the discarded valid record is not tracked and stays.
+	if !exists(tmp) {
+		t.Fatal("staging file removed without a record")
+	}
+}
+
+func TestWriteRecoveryDropsTempRecordWithoutStagingFile(t *testing.T) {
+	h := newHarness(t, nil)
+	target, req := startPartialWrite(t, h)
+	releaseWriteFiles(h)
+	if err := os.Remove(tempPath(target, req.GetWriteId())); err != nil {
+		t.Fatal(err)
+	}
+	demoteRecordToTemp(t, h, req)
+	h2 := restart(t, h, nil)
+	if got := recordFiles(t, h2); len(got) != 0 {
+		t.Fatalf("records after restart: %v", got)
+	}
+	h2.srv.writes.mu.Lock()
+	n := len(h2.srv.writes.entries)
+	h2.srv.writes.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("recovered entries: %d", n)
 	}
 }
 

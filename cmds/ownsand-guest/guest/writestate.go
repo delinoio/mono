@@ -29,7 +29,9 @@ import (
 //
 // Record lifecycle:
 //  1. The staging file is created exclusively, then its record is written
-//     (temporary file and rename).
+//     (temporary file and rename). A crash between the sync and the rename of
+//     this first save leaves only the temporary record; the next start
+//     promotes it when it is complete and valid.
 //  2. Each accepted chunk replaces the record to refresh the time of the last
 //     chunk. A failure only logs: the next chunk or the sweep tries again.
 //  3. A finish removes the record after the rename into place.
@@ -171,8 +173,9 @@ func (m *writeManager) persistRecord(e *writeEntry, durable bool) {
 // the lookup.
 var lstatStaging = os.Lstat
 
-// loadRecords registers the writes of an earlier helper process. A record
-// whose file is confirmed gone is dropped; a record whose file lookup fails
+// loadRecords registers the writes of an earlier helper process. A complete
+// temporary record without a canonical record is promoted first (see
+// settleTempRecords). A record whose file is confirmed gone is dropped; a record whose file lookup fails
 // for another reason is kept and registered; a record that cannot be read is
 // removed; the time of the last chunk is clamped to now, because the guest
 // clock may have been set backwards since the record was written.
@@ -183,6 +186,10 @@ func (m *writeManager) loadRecords() error {
 	if err := os.MkdirAll(m.dir, 0o700); err != nil {
 		return fmt.Errorf("guest: create write record directory: %w", err)
 	}
+	// Settle the temporary records first: ReadDir sorts "<hash>.json" before
+	// "<hash>.json.tmp", so a record that this pass promotes would be missed by
+	// a single pass over the directory.
+	m.settleTempRecords()
 	items, err := os.ReadDir(m.dir)
 	if err != nil {
 		return fmt.Errorf("guest: read write record directory: %w", err)
@@ -193,10 +200,8 @@ func (m *writeManager) loadRecords() error {
 		path := filepath.Join(m.dir, name)
 		switch {
 		case strings.HasSuffix(name, writeRecordTempSuffix):
-			// An interrupted save: the record it would replace is intact.
-			if err := os.Remove(path); err != nil {
-				m.logger.Warn("remove write record temporary file failed", "error", sanitizedError(err))
-			}
+			// settleTempRecords handled every temporary record; one that is
+			// left here could not be removed and stays for the next start.
 			continue
 		case !strings.HasSuffix(name, writeRecordSuffix):
 			continue
@@ -238,6 +243,62 @@ func (m *writeManager) loadRecords() error {
 		m.logger.Info("write recovered after restart", "write_id", rec.WriteID)
 	}
 	return nil
+}
+
+// settleTempRecords handles the temporary files of interrupted record saves.
+// A temporary record exists only between the write of a save and its rename.
+// When the canonical record exists, the save replaced an intact record and
+// the temporary file is stale: it is removed. When the canonical record is
+// absent, the interrupted save was the first one of a write (it is durable:
+// the helper syncs it before the rename), so the temporary record is the only
+// record of a staging file that exists. A complete, valid temporary record
+// whose content belongs to its name is promoted to the canonical name, and the
+// normal load checks (staging file lookup, identity at cleanup) apply to it.
+// Any other temporary file is removed; only the temporary file itself is
+// touched, never the staging file that a record names.
+func (m *writeManager) settleTempRecords() {
+	items, err := os.ReadDir(m.dir)
+	if err != nil {
+		// loadRecords reports the same failure for its own read.
+		return
+	}
+	for _, item := range items {
+		name := item.Name()
+		if !strings.HasSuffix(name, writeRecordTempSuffix) {
+			continue
+		}
+		tempPath := filepath.Join(m.dir, name)
+		canonical := strings.TrimSuffix(name, ".tmp")
+		canonicalPath := filepath.Join(m.dir, canonical)
+		if _, err := os.Lstat(canonicalPath); err == nil {
+			// A canonical record keeps precedence over a stale temporary file.
+			m.removeTempRecord(tempPath)
+			continue
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			// The canonical record may exist; keep the temporary file and let
+			// the next start decide.
+			m.logger.Warn("write record temporary file kept: canonical lookup failed", "error", sanitizedError(err))
+			continue
+		}
+		rec, err := readWriteRecord(tempPath)
+		if err != nil || rec.WriteID == "" || writeRecordName(rec.WriteID) != canonical {
+			m.logger.Warn("drop unreadable write record temporary file", "error", recordLoadError(err))
+			m.removeTempRecord(tempPath)
+			continue
+		}
+		if err := os.Rename(tempPath, canonicalPath); err != nil {
+			m.logger.Warn("promote write record temporary file failed", "write_id", rec.WriteID, "error", sanitizedError(err))
+			m.removeTempRecord(tempPath)
+			continue
+		}
+		m.logger.Info("promoted write record temporary file", "write_id", rec.WriteID)
+	}
+}
+
+func (m *writeManager) removeTempRecord(path string) {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		m.logger.Warn("remove write record temporary file failed", "error", sanitizedError(err))
+	}
 }
 
 func recordLoadError(err error) string {
