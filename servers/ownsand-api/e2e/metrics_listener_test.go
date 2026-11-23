@@ -40,10 +40,10 @@ func TestFixtureIgnoresInheritedMetricsAddr(t *testing.T) {
 
 	// "server_started" carries the address of the metrics listener; it is
 	// empty when the listener is off.
-	if !s.logs.hasLineContaining("api", "server_started") {
+	if !s.apiHasLineContaining("server_started") {
 		t.Fatal("the control plane did not log server_started")
 	}
-	if s.logs.hasLineContaining("api", held.Addr().String()) {
+	if s.apiHasLineContaining(held.Addr().String()) {
 		t.Errorf("the control plane used the inherited metrics address %s", held.Addr())
 	}
 	// A restart reuses the environment of the first start (and a start that

@@ -48,7 +48,7 @@ func TestTypeScriptSDKRelay(t *testing.T) {
 	}
 	t.Logf("TypeScript SDK end-to-end test:\n%s", out)
 	// The log scanner stores the records asynchronously, so wait for them.
-	s.logs.requireLogMessages(ctx, t, "api", "billing_sandbox_paused", "billing_sandbox_resumed")
+	s.requireAPILogMessages(ctx, t, "billing_sandbox_paused", "billing_sandbox_resumed")
 }
 
 // billingControlPath is the path prefix of the billing control endpoint.

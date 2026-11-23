@@ -659,9 +659,11 @@ const apiStartAttempts = 3
 // freeTCPPort and freeUDPPort close their listeners again, so another process
 // (for example a test server of another package that go test runs at the
 // same time) can take a port before the control plane binds it. The control
-// plane then exits with "address already in use", and the other server can
-// answer the health probe. startAPI then starts the control plane again on
-// new ports. Any other failure fails the test at once.
+// plane then exits and logs server_exited with the structured
+// startup_failure_reason=address_in_use (whatever the native error text is),
+// and the other server can answer the health probe. startAPI then starts the
+// control plane again on new ports, up to apiStartAttempts times (see
+// shouldRetryAPIStart). Any other failure fails the test at once.
 func (s *stack) startAPI(env []string) {
 	s.t.Helper()
 	for attempt := 1; ; attempt++ {
@@ -686,11 +688,18 @@ func (s *stack) startAPI(env []string) {
 			name = fmt.Sprintf("api-attempt%d", attempt)
 		}
 		s.api = startProcess(s.t, s.logs, name, s.apiEnv, filepath.Join(s.bins, "ownsand-api"))
-		err := pollHealthyWhile(s.apiURL+"/healthz", healthStartupBudget, s.api.done)
+		// A 200 counts only after this process logged server_started for the
+		// chosen address, so another server that took the port cannot stand in
+		// for a control plane that is still loading its configuration or that
+		// exits because it could not bind. The wait ends with errProcessExited
+		// when the process exits (it logs server_exited first) and is bounded
+		// by healthStartupBudget.
+		owned := func() bool { return s.logs.hasServerStarted(name, addr) }
+		err := pollReadyWhile(s.apiURL+"/healthz", healthStartupBudget, s.api.done, owned)
 		if err == nil {
 			return
 		}
-		if !errors.Is(err, errProcessExited) || !s.logs.hasLineContaining(name, "address already in use") || attempt == apiStartAttempts {
+		if !shouldRetryAPIStart(err, attempt, s.logs, name) {
 			s.t.Fatalf("the control plane did not become healthy: %v", err)
 		}
 		s.t.Logf("the control plane could not bind its ports (attempt %d); starting it on new ports", attempt)
@@ -747,9 +756,15 @@ func pollHealthy(url string, budget time.Duration) error {
 var errProcessExited = errors.New("the process exited")
 
 // pollHealthyWhile is pollHealthy that also stops with errProcessExited when
-// exited closes, so a server that exited is not waited for, and an answer
-// from another server on the same port does not count. A nil exited never
-// closes.
+// exited closes, so a server that exited is not waited for. It returns nil at
+// the first 200 answer unless exited is closed at that moment, in which case
+// it returns errProcessExited even though the probe answered 200. A nil
+// exited never closes.
+//
+// It does not show that the process behind exited gave the answer: while that
+// process still runs, a 200 from another server on the same address counts.
+// A caller that must know that the process owns the listener uses
+// pollReadyWhile with an ownership check, as startAPI and restartAPI do.
 func pollHealthyWhile(url string, budget time.Duration, exited <-chan struct{}) error {
 	return pollReadyWhile(url, budget, exited, nil)
 }

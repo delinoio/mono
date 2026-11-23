@@ -96,7 +96,7 @@ func finishUsage(a usageFinisher, logger *slog.Logger, flushTimeout, drainTimeou
 func main() {
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	if err := run(); err != nil {
-		slog.Error("server_exited", slog.Any("error", err))
+		logServerExited(slog.Default(), err)
 		os.Exit(1)
 	}
 }
@@ -174,14 +174,17 @@ func run() error {
 		return err
 	}
 
+	// Only the HTTP and STUN bind errors carry a startup failure reason: they
+	// are the addresses another process can take between the choice of a
+	// free port and the bind, which a supervisor retries on new ports.
 	listener, err := net.Listen("tcp", cfg.Addr)
 	if err != nil {
-		return err
+		return classifyBindError(err)
 	}
 	udp, err := net.ListenPacket("udp", cfg.STUNAddr)
 	if err != nil {
 		_ = listener.Close()
-		return err
+		return classifyBindError(err)
 	}
 	var metricsListener net.Listener
 	if cfg.MetricsAddr != "" {

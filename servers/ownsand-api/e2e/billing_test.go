@@ -241,5 +241,5 @@ func TestBillingBlockSuspendRecover(t *testing.T) {
 		t.Fatal("the fake delino-accounts still has the link")
 	}
 	// The log scanner stores the records asynchronously, so wait for them.
-	s.logs.requireLogMessages(ctx, t, "api", "billing_sandbox_paused", "billing_sandbox_resumed")
+	s.requireAPILogMessages(ctx, t, "billing_sandbox_paused", "billing_sandbox_resumed")
 }
