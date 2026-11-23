@@ -82,6 +82,9 @@ func TestRolledBackEventDoesNotStallTheEventLoop(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Release the connection even when events.Write fails below: the pool close
+	// registered by the test database waits for every checked-out connection.
+	t.Cleanup(func() { _ = tx.Rollback(ctx) })
 	if err := events.Write(ctx, tx, events.Event{Kind: events.KindDeviceRemoved, OrganizationID: org.ID, DeviceID: dev.ID}); err != nil {
 		t.Fatal(err)
 	}
