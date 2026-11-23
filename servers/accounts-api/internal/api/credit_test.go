@@ -262,6 +262,131 @@ func TestSubscriptionLifecycle(t *testing.T) {
 	}
 }
 
+// Deleting a billing account whose first checkout is still open cancels the
+// checkout transaction at Paddle, so a late payment cannot create a
+// subscription for the deleted account. A Paddle failure fails the deletion
+// and leaves the account and its open checkout.
+func TestDeleteBillingAccountCancelsPendingCheckout(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	started, err := env.Credit(f.Owner.ID).StartSubscription(ctx(), connect.NewRequest(&accountsv1.StartSubscriptionRequest{BillingAccountId: f.AccountID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	txnID := started.Msg.GetPaddleTransactionId()
+	del := func() error {
+		_, err := f.Owner.Client.DeleteBillingAccount(ctx(), connect.NewRequest(&accountsv1.DeleteBillingAccountRequest{BillingAccountId: f.AccountID}))
+		return err
+	}
+
+	env.Paddle.Fail("PATCH /transactions/", &paddletest.Failure{Status: http.StatusServiceUnavailable, Code: "unavailable"})
+	wantCode(t, del(), connect.CodeUnavailable)
+	if _, err := f.Owner.Client.GetBillingAccount(ctx(), connect.NewRequest(&accountsv1.GetBillingAccountRequest{BillingAccountId: f.AccountID})); err != nil {
+		t.Fatalf("the billing account is gone after a failed deletion: %v", err)
+	}
+	var checkouts int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM paddle_checkouts WHERE billing_account_id = $1 AND paddle_transaction_id = $2`,
+		f.AccountID, txnID).Scan(&checkouts); err != nil || checkouts != 1 {
+		t.Fatalf("checkout records = %d, %v", checkouts, err)
+	}
+	if txn, _ := env.Paddle.Transaction(txnID); txn.Status != paddle.TransactionStatusDraft {
+		t.Fatalf("Paddle transaction after the failed deletion = %s", txn.Status)
+	}
+
+	env.Paddle.Fail("PATCH /transactions/", nil)
+	wantCode(t, del(), 0)
+	if txn, _ := env.Paddle.Transaction(txnID); txn.Status != paddle.TransactionStatusCanceled {
+		t.Fatalf("Paddle transaction after the deletion = %s", txn.Status)
+	}
+}
+
+// Paddle cancels the subscription, then a later write of DeleteBillingAccount
+// fails and the transaction rolls back. The account stays, and the retry
+// completes the deletion after it reads the canceled subscription at Paddle,
+// with one cancellation request that Paddle accepted and one forfeiture.
+func TestDeleteBillingAccountRetryAfterRollback(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subID := subscribe(t, env, f)
+	del := func() error {
+		_, err := f.Owner.Client.DeleteBillingAccount(ctx(), connect.NewRequest(&accountsv1.DeleteBillingAccountRequest{BillingAccountId: f.AccountID}))
+		return err
+	}
+	// The member rows are deleted after the cancellation: fail that write.
+	for _, stmt := range []string{
+		`CREATE FUNCTION fail_member_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected failure'; END $$`,
+		`CREATE TRIGGER fail_member_delete BEFORE DELETE ON billing_account_members FOR EACH ROW EXECUTE FUNCTION fail_member_delete()`,
+	} {
+		if _, err := env.DB.Pool.Exec(ctx(), stmt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	wantCode(t, del(), connect.CodeInternal)
+	if sub, _ := env.Paddle.Subscription(subID); sub.Status != paddle.SubscriptionStatusCanceled {
+		t.Fatalf("Paddle subscription after the failed deletion = %s, want canceled", sub.Status)
+	}
+	if _, err := f.Owner.Client.GetBillingAccount(ctx(), connect.NewRequest(&accountsv1.GetBillingAccountRequest{BillingAccountId: f.AccountID})); err != nil {
+		t.Fatalf("the billing account is gone after the rolled-back deletion: %v", err)
+	}
+	var status string
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT status FROM subscriptions WHERE billing_account_id = $1`, f.AccountID).Scan(&status); err != nil || status == "canceled" {
+		t.Fatalf("local subscription after the rollback = %q, %v; want it unchanged", status, err)
+	}
+	var expiries int
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM ledger_entries WHERE billing_account_id = $1 AND kind = 'expiry'`, f.AccountID).Scan(&expiries); err != nil || expiries != 0 {
+		t.Fatalf("EXPIRY entries after the rollback = %d, %v", expiries, err)
+	}
+
+	if _, err := env.DB.Pool.Exec(ctx(), `DROP TRIGGER fail_member_delete ON billing_account_members`); err != nil {
+		t.Fatal(err)
+	}
+	wantCode(t, del(), 0)
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT status FROM subscriptions WHERE billing_account_id = $1`, f.AccountID).Scan(&status); err != nil || status != "canceled" {
+		t.Fatalf("local subscription after the retry = %q, %v", status, err)
+	}
+	if err := env.DB.Pool.QueryRow(ctx(), `SELECT count(*) FROM ledger_entries WHERE billing_account_id = $1 AND kind = 'expiry'`, f.AccountID).Scan(&expiries); err != nil || expiries != 1 {
+		t.Fatalf("EXPIRY entries after the retry = %d, %v; want the credit forfeited once", expiries, err)
+	}
+}
+
+// A 2xx answer of Paddle that does not confirm the cancellation (here an empty
+// entity and another subscription) fails DeleteBillingAccount with unavailable
+// and leaves the account, the subscription and the credit as they were. The
+// retry after a confirmed answer completes the deletion.
+func TestDeleteBillingAccountRequiresConfirmedCancellation(t *testing.T) {
+	env := testenv.New(t)
+	f := newFixture(t, env)
+	subID := subscribe(t, env, f)
+	before := balanceOf(t, env, f.Owner.ID, f.AccountID).GetBalanceUsdMicros()
+	del := func() error {
+		_, err := f.Owner.Client.DeleteBillingAccount(ctx(), connect.NewRequest(&accountsv1.DeleteBillingAccountRequest{BillingAccountId: f.AccountID}))
+		return err
+	}
+	for name, body := range map[string]string{
+		"empty entity":       `{"data":{}}`,
+		"other subscription": `{"data":{"id":"sub_other","status":"canceled"}}`,
+		"not canceled":       `{"data":{"id":"` + subID + `","status":"active"}}`,
+	} {
+		env.Paddle.Respond("POST /subscriptions/", http.StatusOK, body)
+		wantCode(t, del(), connect.CodeUnavailable)
+		if _, err := f.Owner.Client.GetBillingAccount(ctx(), connect.NewRequest(&accountsv1.GetBillingAccountRequest{BillingAccountId: f.AccountID})); err != nil {
+			t.Fatalf("%s: the billing account is gone after a failed deletion: %v", name, err)
+		}
+		if got := balanceOf(t, env, f.Owner.ID, f.AccountID).GetBalanceUsdMicros(); got != before || before == 0 {
+			t.Fatalf("%s: balance = %d, want %d (non-zero)", name, got, before)
+		}
+		var status string
+		if err := env.DB.Pool.QueryRow(ctx(), `SELECT status FROM subscriptions WHERE billing_account_id = $1`, f.AccountID).Scan(&status); err != nil || status == "canceled" {
+			t.Fatalf("%s: local subscription = %q, %v; want it unchanged", name, status, err)
+		}
+	}
+	env.Paddle.Respond("POST /subscriptions/", 0, "")
+	wantCode(t, del(), 0)
+	if sub, _ := env.Paddle.Subscription(subID); sub.Status != paddle.SubscriptionStatusCanceled {
+		t.Fatalf("Paddle subscription after the deletion = %s", sub.Status)
+	}
+}
+
 func TestManualTopUp(t *testing.T) {
 	env := testenv.New(t)
 	f := newFixture(t, env)

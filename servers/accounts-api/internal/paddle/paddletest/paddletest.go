@@ -56,6 +56,7 @@ type Server struct {
 	mu            sync.Mutex
 	requests      []Request
 	subscriptions map[string]*paddle.Subscription
+	transactions  map[string]*paddle.Transaction
 	chargeFailure *Failure
 	failures      map[string]*Failure
 	raw           map[string]rawResponse
@@ -64,7 +65,7 @@ type Server struct {
 
 // New starts a fake Paddle API that stops when the test ends.
 func New(t testing.TB) *Server {
-	s := &Server{subscriptions: map[string]*paddle.Subscription{}, failures: map[string]*Failure{}, raw: map[string]rawResponse{}}
+	s := &Server{subscriptions: map[string]*paddle.Subscription{}, transactions: map[string]*paddle.Transaction{}, failures: map[string]*Failure{}, raw: map[string]rawResponse{}}
 	srv := httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(srv.Close)
 	s.URL = srv.URL
@@ -93,6 +94,28 @@ func (s *Server) Subscription(id string) (paddle.Subscription, bool) {
 		return paddle.Subscription{}, false
 	}
 	return *sub, true
+}
+
+// SetTransactionStatus changes the status of a transaction that the fake
+// created, for example to `completed` to model a checkout that was paid.
+func (s *Server) SetTransactionStatus(id, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if txn, ok := s.transactions[id]; ok {
+		txn.Status = status
+		txn.UpdatedAt = time.Now().UTC()
+	}
+}
+
+// Transaction returns the stored transaction that the fake created.
+func (s *Server) Transaction(id string) (paddle.Transaction, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	txn, ok := s.transactions[id]
+	if !ok {
+		return paddle.Transaction{}, false
+	}
+	return *txn, true
 }
 
 // FailCharges makes every following one-time charge fail with f; nil
@@ -221,19 +244,50 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	switch {
 	case r.Method == http.MethodPost && r.URL.Path == "/transactions":
-		writeJSON(w, http.StatusCreated, map[string]any{"data": map[string]any{
-			"id": s.NewID("txn"), "status": "draft", "custom_data": body["custom_data"],
-			"created_at": time.Now().UTC(), "updated_at": time.Now().UTC(),
-		}})
+		now := time.Now().UTC()
+		txn := paddle.Transaction{ID: s.NewID("txn"), Status: paddle.TransactionStatusDraft, CreatedAt: now, UpdatedAt: now}
+		if custom, ok := body["custom_data"].(map[string]any); ok {
+			txn.CustomData = custom
+		}
+		s.mu.Lock()
+		s.transactions[txn.ID] = &txn
+		s.mu.Unlock()
+		writeJSON(w, http.StatusCreated, map[string]any{"data": txn})
 	case len(parts) == 3 && parts[0] == "transactions" && parts[2] == "invoice" && r.Method == http.MethodGet:
 		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
 			"url": "https://paddle.example.test/invoices/" + parts[1] + ".pdf?token=secret",
 		}})
+	case len(parts) == 2 && parts[0] == "transactions" && (r.Method == http.MethodGet || r.Method == http.MethodPatch):
+		s.serveTransaction(w, r, parts[1], body)
 	case len(parts) >= 2 && parts[0] == "subscriptions":
 		s.serveSubscription(w, r, parts, body)
 	default:
 		writeError(w, r, &Failure{Status: http.StatusNotFound, Code: "not_found"})
 	}
+}
+
+// serveTransaction reads a transaction and applies a cancellation. Like
+// Paddle it cancels a transaction that has not been paid and rejects the
+// change of a transaction that is completed or canceled.
+func (s *Server) serveTransaction(w http.ResponseWriter, r *http.Request, id string, body map[string]any) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	txn, ok := s.transactions[id]
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"error": map[string]any{"type": "request_error", "code": "not_found"}})
+		return
+	}
+	if r.Method == http.MethodPatch && body["status"] == paddle.TransactionStatusCanceled {
+		switch txn.Status {
+		case paddle.TransactionStatusDraft, paddle.TransactionStatusReady, paddle.TransactionStatusBilled, paddle.TransactionStatusPastDue:
+			txn.Status = paddle.TransactionStatusCanceled
+			txn.UpdatedAt = time.Now().UTC()
+		default:
+			writeJSON(w, http.StatusConflict, map[string]any{"error": map[string]any{"type": "request_error", "code": "transaction_immutable"}})
+			return
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"data": txn})
 }
 
 func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, parts []string, body map[string]any) {
@@ -253,6 +307,15 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, parts
 			sub.UpdatedAt = now
 		}
 	case len(parts) == 3 && parts[2] == "cancel" && r.Method == http.MethodPost:
+		// Paddle documents only the success answer of a cancellation. The
+		// fake rejects the cancellation of a canceled subscription, the
+		// stricter of the possible behaviors, so that a retry after a lost
+		// confirmation has to read the subscription instead of repeating
+		// the cancellation.
+		if sub.Status == paddle.SubscriptionStatusCanceled {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": map[string]any{"type": "request_error", "code": "subscription_update_when_canceled"}})
+			return
+		}
 		if body["effective_from"] == string(paddle.EffectiveImmediately) {
 			sub.Status = paddle.SubscriptionStatusCanceled
 			sub.CanceledAt = &now
