@@ -156,6 +156,11 @@ type Conn struct {
 	// final frames.
 	perGrant  map[string]int
 	peerKinds map[ownsandv1.DataFrameKind]bool
+
+	// writeWaiters maps a frame that SendConfirmed queued to the channel on
+	// which the writer reports the result of its send (see writeConfirmed).
+	// The queue and the outFrame stay unchanged for every other sender.
+	writeWaiters sync.Map // *ownsandv1.DataFrame -> chan error
 }
 
 // outFrame is a frame in the outbound queue. final marks a stream's final
@@ -212,10 +217,19 @@ func (c *Conn) SetWireBytes(written func() int64) { c.wireBytes = written }
 // prefix (one flag byte and a 4-byte length).
 const envelopePrefix = 5
 
-// sendMeasured sends of.frame with send and reports its bytes to
+// sendMeasured sends of.frame with send, reports its bytes to of.onWritten
+// (see sendCounted) and tells a SendConfirmed caller that waits for the frame
+// that the send returned.
+func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) error {
+	err := c.sendCounted(of, send)
+	c.writeConfirmed(of.frame, err)
+	return err
+}
+
+// sendCounted sends of.frame with send and reports its bytes to
 // of.onWritten: the bytes that the send wrote, also when it failed after a
 // partial write.
-func (c *Conn) sendMeasured(of outFrame, send func(*ownsandv1.DataFrame) error) error {
+func (c *Conn) sendCounted(of outFrame, send func(*ownsandv1.DataFrame) error) error {
 	if of.onWritten == nil {
 		return send(of.frame)
 	}
