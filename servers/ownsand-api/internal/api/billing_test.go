@@ -679,6 +679,44 @@ func TestBillingOwnershipTransferAndDeletionUnlink(t *testing.T) {
 	}
 }
 
+// TestBillingLinkableAccountsTokenBoundToUser checks that a page token of
+// ListLinkableBillingAccounts belongs to the user that listed: after the
+// ownership moves to the admin, the new owner cannot resume the listing of
+// the former owner, and the error is an invalid argument.
+func TestBillingLinkableAccountsTokenBoundToUser(t *testing.T) {
+	env, fake := billingEnv(t)
+	ctx := context.Background()
+	org := env.NewUnlinkedOrg("ivy")
+	fake.AddAccount(billingAccountA, "Owned", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER, org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER})
+	fake.AddAccount(billingAccountB, "Administered", map[string]accountsv1.BillingAccountRole{org.Owner: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN, org.Admin: accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN})
+	list := func(c *testenv.Clients, token string) (*ownsandv1.ListLinkableBillingAccountsResponse, error) {
+		resp, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID, PageSize: 1, PageToken: token}))
+		if err != nil {
+			return nil, err
+		}
+		return resp.Msg, nil
+	}
+	first, err := list(org.OwnerClient, "")
+	if err != nil || first.GetNextPageToken() == "" {
+		t.Fatalf("first page = %v, %v", first, err)
+	}
+	if _, err := org.OwnerClient.Organization.TransferOwnership(ctx, connect.NewRequest(&ownsandv1.TransferOwnershipRequest{OrganizationId: org.ID, UserId: org.Admin})); err != nil {
+		t.Fatal(err)
+	}
+	newOwner := env.User(org.Admin)
+	if _, err := list(newOwner, first.GetNextPageToken()); testenv.Code(err) != connect.CodeInvalidArgument {
+		t.Fatalf("token of another user: %v, want InvalidArgument", err)
+	}
+	// The new owner's own token resumes the listing.
+	own, err := list(newOwner, "")
+	if err != nil || own.GetNextPageToken() == "" {
+		t.Fatalf("new owner first page = %v, %v", own, err)
+	}
+	if rest, err := list(newOwner, own.GetNextPageToken()); err != nil || len(rest.GetBillingAccounts()) != 1 || rest.GetBillingAccounts()[0].GetBillingAccountId() != billingAccountB {
+		t.Fatalf("new owner second page = %v, %v", rest, err)
+	}
+}
+
 // TestBillingRPCs checks the BillingService answers and their errors.
 func TestBillingRPCs(t *testing.T) {
 	env, fake := billingEnv(t)
@@ -701,6 +739,24 @@ func TestBillingRPCs(t *testing.T) {
 	page, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID, PageSize: 1}))
 	if err != nil || len(page.Msg.GetBillingAccounts()) != 1 || page.Msg.GetNextPageToken() == "" {
 		t.Fatalf("first page = %v, %v", page, err)
+	}
+	token := page.Msg.GetNextPageToken()
+	if token == billingAccountA || len(page.Msg.GetBillingAccounts()) != 1 || page.Msg.GetBillingAccounts()[0].GetBillingAccountId() != billingAccountA {
+		t.Fatalf("first page = %v, the token must be opaque", page.Msg)
+	}
+	// The returned token resumes after the last account, keeps the owner and
+	// admin filter (the viewer account is skipped) and ends the listing.
+	rest, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID, PageSize: 1, PageToken: token}))
+	if err != nil || len(rest.Msg.GetBillingAccounts()) != 1 || rest.Msg.GetBillingAccounts()[0].GetBillingAccountId() != billingAccountB || rest.Msg.GetNextPageToken() != "" {
+		t.Fatalf("second page = %v, %v", rest, err)
+	}
+	// A malformed token and a raw account ID are invalid arguments of the
+	// listing and reach the caller as such.
+	for name, bad := range map[string]string{"malformed": "not-a-token", "raw account": billingAccountA} {
+		_, err := c.Billing.ListLinkableBillingAccounts(ctx, connect.NewRequest(&ownsandv1.ListLinkableBillingAccountsRequest{OrganizationId: org.ID, PageSize: 1, PageToken: bad}))
+		if testenv.Code(err) != connect.CodeInvalidArgument {
+			t.Errorf("%s page token: code = %v, want InvalidArgument (%v)", name, testenv.Code(err), err)
+		}
 	}
 
 	link := func(account string) error {

@@ -10,6 +10,7 @@ package accountstest
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -425,6 +426,45 @@ func (h handler) UnlinkOrganization(_ context.Context, req *connect.Request[acco
 	return connect.NewResponse(&accountsv1.UnlinkOrganizationResponse{}), nil
 }
 
+// manageablePageToken is the content of a ListManageableBillingAccounts page
+// token. Like the token of accounts-api it is opaque to clients, remembers the
+// sort position (the last account ID returned) and is bound to the RPC and to
+// the user that listed, so a raw account ID or another user's token is
+// rejected.
+type manageablePageToken struct {
+	RPC   string `json:"rpc"`
+	Scope string `json:"scope"`
+	After string `json:"after"`
+}
+
+// errInvalidPageToken is the error of accounts-api for a page token that is
+// malformed or does not belong to the request.
+func errInvalidPageToken() error {
+	return connect.NewError(connect.CodeInvalidArgument, errors.New("page_token is not valid for this request"))
+}
+
+func encodeManageablePageToken(userID, after string) string {
+	raw, _ := json.Marshal(manageablePageToken{RPC: MethodListManageableBillingAccounts, Scope: userID, After: after})
+	return base64.RawURLEncoding.EncodeToString(raw)
+}
+
+// decodeManageablePageToken returns the account ID after which the page of
+// userID resumes; an empty token is the first page.
+func decodeManageablePageToken(userID, token string) (string, error) {
+	if token == "" {
+		return "", nil
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	if err != nil {
+		return "", errInvalidPageToken()
+	}
+	var t manageablePageToken
+	if err := json.Unmarshal(raw, &t); err != nil || t.RPC != MethodListManageableBillingAccounts || t.Scope != userID || t.After == "" {
+		return "", errInvalidPageToken()
+	}
+	return t.After, nil
+}
+
 func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.Request[accountsv1.ListManageableBillingAccountsRequest]) (*connect.Response[accountsv1.ListManageableBillingAccountsResponse], error) {
 	f := h.f
 	if err := f.begin(MethodListManageableBillingAccounts); err != nil {
@@ -434,12 +474,17 @@ func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.R
 	if size <= 0 {
 		size = 50
 	}
+	userID := req.Msg.GetUserId()
+	after, err := decodeManageablePageToken(userID, req.Msg.GetPageToken())
+	if err != nil {
+		return nil, err
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	var out []*accountsv1.BillingAccount
 	for _, a := range f.accounts {
-		role := a.members[req.Msg.GetUserId()]
-		if (role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER || role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN) && a.id > req.Msg.GetPageToken() {
+		role := a.members[userID]
+		if (role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_OWNER || role == accountsv1.BillingAccountRole_BILLING_ACCOUNT_ROLE_ADMIN) && a.id > after {
 			out = append(out, &accountsv1.BillingAccount{BillingAccountId: a.id, Name: a.name, CallerRole: role})
 		}
 	}
@@ -455,7 +500,7 @@ func (h handler) ListManageableBillingAccounts(_ context.Context, req *connect.R
 	next := ""
 	if len(out) > size {
 		out = out[:size]
-		next = out[size-1].GetBillingAccountId()
+		next = encodeManageablePageToken(userID, out[size-1].GetBillingAccountId())
 	}
 	return connect.NewResponse(&accountsv1.ListManageableBillingAccountsResponse{BillingAccounts: out, NextPageToken: next}), nil
 }
