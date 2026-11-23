@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,14 +65,29 @@ func TestPollHealthyRetriesUntilReady(t *testing.T) {
 	}
 }
 
+// The probe that is running when the budget expires ends with the context
+// deadline; the timeout error must still report the last status that a
+// probe observed.
 func TestPollHealthyReportsLastStatusOnTimeout(t *testing.T) {
+	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusServiceUnavailable)
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		<-r.Context().Done()
 	}))
 	defer srv.Close()
 
-	if err := pollHealthy(srv.URL, 300*time.Millisecond); err == nil {
-		t.Fatal("pollHealthy succeeded against a 503 server")
+	err := pollHealthy(srv.URL, 500*time.Millisecond)
+	if err == nil {
+		t.Fatal("pollHealthy succeeded against a server that never became healthy")
+	}
+	if !strings.Contains(err.Error(), "unexpected status 503") {
+		t.Fatalf("pollHealthy error = %q, want it to report the last status (unexpected status 503)", err)
+	}
+	if calls.Load() < 2 {
+		t.Fatalf("calls = %d, want the second probe to be held until the deadline", calls.Load())
 	}
 }
 

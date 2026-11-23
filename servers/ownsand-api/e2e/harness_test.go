@@ -758,7 +758,12 @@ func pollHealthyWhile(url string, budget time.Duration, exited <-chan struct{}) 
 			}
 			err = fmt.Errorf("unexpected status %d", resp.StatusCode)
 		}
-		lastErr = err
+		// A probe that ended because the budget expired carries no news about
+		// the process; keep the earlier error, such as the last status, so the
+		// timeout error still reports it.
+		if ctx.Err() == nil || lastErr == nil {
+			lastErr = err
+		}
 		select {
 		case <-exited:
 			return fmt.Errorf("%w before it became healthy (last probe: %v)", errProcessExited, lastErr)
