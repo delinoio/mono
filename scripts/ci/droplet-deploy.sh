@@ -38,6 +38,19 @@
 # fails, the script removes it and starts the stopped containers again; the
 # route still names them.
 #
+# The same recovery runs when a `SIGTERM`, `SIGINT` or `SIGHUP` (for example a
+# dropped SSH connection or a cancelled workflow run) ends the script between
+# the first stop and the route switch: the handler removes the replacement,
+# starts the stopped containers again and exits with 128 plus the signal
+# number. Bash runs a trap only after the foreground command (`docker` or
+# `curl`) returns, so the handler waits for that command, which the stop
+# timeout and the 5-second `curl` limit bound. `SIGKILL` cannot be caught and
+# still leaves the containers stopped. A signal during the route switch waits
+# until the route switch has finished: when the route switched, the script
+# records the state and exits without a restart, because the route names the
+# replacement; when it did not, the script restores the stopped containers as
+# above.
+#
 # Arguments:
 #   service   Droplet service name: container name prefix, label value and
 #             env file name. A deployment by an earlier version of this
@@ -225,6 +238,13 @@ main() {
       discard_replacement "$new"
       fail "$new was not created; the previous containers keep serving."
     fi
+    # From the first stop until the route switch, a signal restores the
+    # previous containers (see `interrupted`). Bash expands the quoted trap
+    # text when the signal arrives, in the frame of the running command, so
+    # `$new` and `stopped` are the values of this deployment.
+    trap 'interrupted TERM "$new" "${stopped[@]}"' TERM
+    trap 'interrupted INT "$new" "${stopped[@]}"' INT
+    trap 'interrupted HUP "$new" "${stopped[@]}"' HUP
     for running_id in "${stopped[@]}"; do
       echo "Stop the previous container $running_id to free the UDP ports"
       if ! docker stop --time "$stop_timeout" "$running_id" > /dev/null; then
@@ -241,6 +261,15 @@ main() {
     fi
   fi
 
+  # A signal during the route switch is only recorded: the route file and the
+  # proxy reload run as one step, and restoring the previous containers after
+  # a switch that succeeded would remove the replacement that the route names.
+  local pending_signal=""
+  if (( ${#publish[@]} > 0 )); then
+    trap 'pending_signal=TERM' TERM
+    trap 'pending_signal=INT' INT
+    trap 'pending_signal=HUP' HUP
+  fi
   if ! write_route "$site" "$service" "$upstream" "$port" "$hostname" "$proxy" "$protocol"; then
     discard_replacement "$new"
     if (( ${#stopped[@]} > 0 )); then
@@ -253,7 +282,14 @@ main() {
   # The proxy routes to the replacement now, so it is the deployed image.
   # Record it before the cleanup: a failed cleanup must not leave the state
   # files naming the image that the route no longer serves.
+  # The route switched, so the replacement is the deployed image and a signal
+  # no longer restores the previous containers.
+  trap - TERM INT HUP
   record_state "$state" "$image" || fail "the route of $service now serves $image, but the state files $state.current and $state.previous were not updated."
+  if [[ -n "$pending_signal" ]]; then
+    echo "::error::received SIG$pending_signal during the route switch; the route of $service serves $new, so the previous containers stay stopped and their cleanup was skipped. Deploy the same image again to finish the cleanup." >&2
+    exit $((128 + $(signal_number "$pending_signal")))
+  fi
 
   local -a failed=()
   # Image references of the removed old containers, and of the old containers
@@ -331,6 +367,34 @@ restart_previous() {
       echo "::error::docker start failed for the previous container $id; $id does not serve until it is started by hand." >&2
     fi
   done
+}
+
+# Prints the number of a signal name that the deploy script traps.
+signal_number() {
+  case "$1" in
+    HUP) echo 1 ;;
+    INT) echo 2 ;;
+    *) echo 15 ;;
+  esac
+}
+
+# The trap handler of a service with UDP ports from the first stop until the
+# route switch. Arguments: the signal name, the replacement container and the
+# containers that were running. It removes the replacement and starts the
+# previous containers again (the route still names them), reports the signal
+# and exits with 128 plus the signal number. A container that does not start
+# is named by `restart_previous`. The handler ignores further signals so that
+# the restart finishes; starting a container that already runs is a no-op, so
+# a signal during the stop loop restores the containers that were not stopped
+# yet too.
+interrupted() {
+  local name="$1" replacement="$2"
+  shift 2
+  trap '' TERM INT HUP
+  echo "::error::received SIG$name before the route of the service switched; the replacement $replacement is removed and the previous containers are started again." >&2
+  discard_replacement "$replacement"
+  restart_previous "$@"
+  exit $((128 + $(signal_number "$name")))
 }
 
 # Records the image that the route serves: `<state>.current` becomes the image
