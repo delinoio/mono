@@ -21,7 +21,13 @@ import {
 } from "node:fs";
 import { join, posix } from "node:path";
 import { fileURLToPath } from "node:url";
-import { workspacePackageDirs, workspaceRoots } from "./plan.mjs";
+import {
+  entitlementsPath,
+  readWorkspacePackages,
+  relativePath,
+} from "./workspace-packages.mjs";
+
+export { readWorkspacePackages };
 
 // Stable deployment target identifiers of the `deploy.target` manifest field.
 export const DeployTarget = Object.freeze({
@@ -91,27 +97,6 @@ const manifestObjectKey = /^(?!.*\.\.)(?!.*\/\/)[a-z0-9][a-z0-9._\/-]*\.json$/;
 const binaryReleaseVersion =
   /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$/;
 
-// Control characters and backslashes break the tab- and line-separated
-// transports of the deploy scripts.
-const transportUnsafe = /[\u0000-\u001f\u007f\\]/;
-
-// Normalizes a relative path and returns it, or undefined when it is empty,
-// absolute, outside its base or unsafe for the deploy scripts.
-function relativePath(raw) {
-  if (typeof raw !== "string" || transportUnsafe.test(raw)) return undefined;
-  const path = posix.normalize(raw).replace(/\/+$/, "");
-  if (
-    path === "" ||
-    path === "." ||
-    path.startsWith("/") ||
-    path === ".." ||
-    path.startsWith("../")
-  ) {
-    return undefined;
-  }
-  return path;
-}
-
 // A nonempty list of different strings, or undefined.
 function stringList(value) {
   if (
@@ -167,7 +152,7 @@ function binaryFields(name, deploy, dir) {
   }
   let entitlements = "";
   if (deploy.entitlements !== undefined) {
-    const path = relativePath(deploy.entitlements);
+    const path = entitlementsPath(dir, deploy.entitlements);
     if (!path || !path.endsWith(".plist")) {
       throw new DeployPlanError(
         `${name}: deploy.entitlements must be a .plist file inside the package`,
@@ -178,7 +163,7 @@ function binaryFields(name, deploy, dir) {
         `${name}: deploy.entitlements needs a darwin platform`,
       );
     }
-    entitlements = `${dir}/${path}`;
+    entitlements = path;
   }
   const rawLicenses = stringList(deploy.licenseFiles);
   const licenseFiles = rawLicenses?.map(relativePath);
@@ -354,34 +339,6 @@ export const UpstreamProtocol = Object.freeze({
 export const noUdpPorts = "none";
 
 export class DeployPlanError extends Error {}
-
-// Reads every workspace package directly inside a workspace root, and the
-// single workspace packages outside them.
-export function readWorkspacePackages(repoRoot) {
-  const packages = [];
-  for (const dir of workspacePackageDirs) {
-    const manifestPath = join(repoRoot, dir, "package.json");
-    if (!existsSync(manifestPath)) continue;
-    packages.push({
-      dir,
-      manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
-    });
-  }
-  for (const workspaceRoot of workspaceRoots) {
-    const rootPath = join(repoRoot, workspaceRoot);
-    if (!existsSync(rootPath)) continue;
-    for (const entry of readdirSync(rootPath, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      const manifestPath = join(rootPath, entry.name, "package.json");
-      if (!existsSync(manifestPath)) continue;
-      packages.push({
-        dir: `${workspaceRoot}/${entry.name}`,
-        manifest: JSON.parse(readFileSync(manifestPath, "utf8")),
-      });
-    }
-  }
-  return packages;
-}
 
 function deployable(pkg) {
   const { name, deploy } = pkg.manifest;

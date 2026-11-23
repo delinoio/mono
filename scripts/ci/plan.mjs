@@ -7,6 +7,14 @@ import {
   NonUtf8Policy,
   repositoryRoot,
 } from "./format-changed.mjs";
+import {
+  declaredReleaseInputs,
+  workspacePackageDirs,
+  workspaceRoots,
+} from "./workspace-packages.mjs";
+
+// Re-exported for the planner's callers and fixtures.
+export { workspacePackageDirs, workspaceRoots };
 
 const fixtureInputs = new Set([
   // The deploy fixtures read the repository Changesets config, and the
@@ -67,24 +75,6 @@ export function isE2eInput(path) {
     e2eWorkspacePackages.some((prefix) => path.startsWith(prefix))
   );
 }
-
-// Workspace package roots, as directories that hold one level of packages.
-// `protos/delino` holds the TypeScript binding packages, one per schema
-// directory. Keep these roots in sync with `pnpm-workspace.yaml`;
-// plan.test.mjs cross-checks them.
-export const workspaceRoots = ["apps", "packages", "protos/delino", "servers"];
-
-// Single workspace packages outside the workspace roots: the release-only Go
-// command packages under `cmds/`. Their manifests declare no package tasks
-// and exist so that Changesets versions them and `deploy.yml` releases them
-// (see the deployment workflow contract), so only the manifest, not the Go
-// source, is a workspace input. plan.test.mjs checks that they declare no
-// scripts and that `pnpm-workspace.yaml` lists exactly these directories.
-export const workspacePackageDirs = [
-  "cmds/ownsand",
-  "cmds/ownsand-agent",
-  "cmds/tide",
-];
 
 function isWorkspacePackageFile(path, file) {
   return workspacePackageDirs.some((dir) => path === `${dir}/${file}`);
@@ -321,9 +311,15 @@ export function plan(cwd, base, head) {
       maxBuffer: 32 * 1024 * 1024,
     },
   ).split("\0");
+  // The release files that the `github-release` packages of the validation
+  // checkout declare. `deploy-plan.mjs --check` verifies them in the quality
+  // job, so a change, deletion or rename of one must run it. The diff lists
+  // both sides of a rename (`--no-renames`).
+  const releaseInputs = declaredReleaseInputs(repositoryRoot(cwd));
   const fixtures = paths.some(
     (path) =>
       fixtureInputs.has(path) ||
+      releaseInputs.has(path) ||
       path.startsWith("scripts/ci/") ||
       // The development scripts (the root `dev` portless preflight and the
       // Infisical launcher) have fixtures in `test:tooling`.

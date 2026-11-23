@@ -18,6 +18,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import { isolateGitEnvironment } from "./git-fixture-env.mjs";
+import { declaredReleaseInputs } from "./workspace-packages.mjs";
 import {
   MAIN_PUSH_EVENT,
   MAIN_REF,
@@ -310,6 +311,113 @@ test("only direct workspace package manifests select fixtures", (t) => {
   f.write("protos/delino/ownsand/v1/package.json");
   const result = plan(f.cwd, f.base, f.commit());
   assert.equal(result.fixtures, false);
+});
+
+// Writes a `github-release` package that declares an entitlements path and
+// two license paths, one of them outside its package directory.
+function writeReleasePackage(f, deploy = {}) {
+  f.write(
+    "cmds/ownsand-agent/package.json",
+    JSON.stringify({
+      name: "ownsand-agent",
+      deploy: {
+        target: "github-release",
+        binary: "ownsand-agent",
+        platforms: ["darwin-arm64"],
+        entitlements: "./entitlements.plist",
+        licenseFiles: ["LICENSE", "cmds/ownsand-agent/NOTICE"],
+        ...deploy,
+      },
+    }),
+  );
+  f.write("cmds/ownsand-agent/entitlements.plist");
+  f.write("cmds/ownsand-agent/NOTICE");
+  f.write("cmds/ownsand-agent/assets/logo.png");
+}
+
+test("changes to declared release files select fixtures", async (t) => {
+  const cases = [
+    [
+      "a deleted entitlements file",
+      (f) => f.git("rm", "--quiet", "cmds/ownsand-agent/entitlements.plist"),
+    ],
+    [
+      "a changed entitlements file",
+      (f) => f.write("cmds/ownsand-agent/entitlements.plist", "changed\n"),
+    ],
+    [
+      "a renamed repository-relative license file",
+      (f) =>
+        f.git(
+          "mv",
+          "cmds/ownsand-agent/NOTICE",
+          "cmds/ownsand-agent/NOTICE.txt",
+        ),
+    ],
+    [
+      "a deleted repository-root license file",
+      (f) => f.git("rm", "--quiet", "LICENSE"),
+    ],
+    ["a changed license file", (f) => f.write("LICENSE", "changed\n")],
+  ];
+  for (const [name, change] of cases) {
+    await t.test(name, (t) => {
+      const f = fixture(t);
+      writeReleasePackage(f);
+      const base = f.commit();
+      change(f);
+      const result = plan(f.cwd, base, f.commit());
+      assert.equal(result.fixtures, true);
+      assert.equal(result.quality, true);
+    });
+  }
+});
+
+test("release file selection ignores files that no release declares", async (t) => {
+  await t.test("an unreferenced asset beside the declared files", (t) => {
+    const f = fixture(t);
+    writeReleasePackage(f);
+    const base = f.commit();
+    f.write("cmds/ownsand-agent/assets/logo.png", "changed\n");
+    f.write("cmds/ownsand-agent/other.plist", "other\n");
+    const result = plan(f.cwd, base, f.commit());
+    assert.equal(result.fixtures, false);
+    assert.equal(result.quality, false);
+  });
+  await t.test("a file that only a non-release package declares", (t) => {
+    const f = fixture(t);
+    writeReleasePackage(f, { target: "droplet" });
+    const base = f.commit();
+    f.write("cmds/ownsand-agent/entitlements.plist", "changed\n");
+    assert.equal(plan(f.cwd, base, f.commit()).fixtures, false);
+  });
+  await t.test("an invalid declaration declares no path", (t) => {
+    const f = fixture(t);
+    writeReleasePackage(f, {
+      entitlements: "../outside.plist",
+      licenseFiles: ["../LICENSE", "/LICENSE", 7, ""],
+    });
+    f.write("outside.plist");
+    const base = f.commit();
+    f.write("LICENSE", "changed\n");
+    f.write("outside.plist", "changed\n");
+    assert.equal(plan(f.cwd, base, f.commit()).fixtures, false);
+  });
+  await t.test("an unreadable manifest declares nothing", (t) => {
+    const f = fixture(t);
+    f.write("cmds/ownsand-agent/package.json", "{ not json");
+    const base = f.commit();
+    f.write("LICENSE", "changed\n");
+    assert.equal(plan(f.cwd, base, f.commit()).fixtures, false);
+  });
+});
+
+test("the repository declares release files that exist and select fixtures", (t) => {
+  const inputs = declaredReleaseInputs(root);
+  assert.ok(inputs.has("cmds/ownsand-agent/entitlements.plist"));
+  for (const path of inputs) {
+    assert.ok(existsSync(join(root, path)), `${path} must exist`);
+  }
 });
 
 const WORKSPACE_MANIFEST_NAME = "pnpm-workspace.yaml";
@@ -1898,7 +2006,11 @@ test("planner without installed dependencies publishes format=true for a path mi
   // formattable path, excluded or not, to the `quality` job's formatter.
   const bare = mkdtempSync(join(tmpdir(), "ci-plan-bare-"));
   t.after(() => rmSync(bare, { recursive: true, force: true }));
-  for (const file of ["plan.mjs", "format-changed.mjs"]) {
+  for (const file of [
+    "plan.mjs",
+    "format-changed.mjs",
+    "workspace-packages.mjs",
+  ]) {
     copyFileSync(join(root, "scripts/ci", file), join(bare, file));
   }
   for (const missing of ["vendor/lib.ts", "src/lib.ts"]) {
@@ -1934,7 +2046,11 @@ test("planner without installed dependencies publishes format=true for non-UTF-8
   // as in the `changes` job, which installs nothing.
   const bare = mkdtempSync(join(tmpdir(), "ci-plan-bare-"));
   t.after(() => rmSync(bare, { recursive: true, force: true }));
-  for (const file of ["plan.mjs", "format-changed.mjs"]) {
+  for (const file of [
+    "plan.mjs",
+    "format-changed.mjs",
+    "workspace-packages.mjs",
+  ]) {
     copyFileSync(join(root, "scripts/ci", file), join(bare, file));
   }
   for (const raw of [latin1Name(".ts", "vendor/"), latin1Name(".ts", "src_")]) {
