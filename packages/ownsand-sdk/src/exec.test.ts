@@ -1272,6 +1272,23 @@ describe("exec over the relay", () => {
     ["GRANT_REPLACED", SessionEndReason.GRANT_REPLACED],
   ])("recovers with back-off after %s", async (_name, reason) => {
     const h = setup();
+    // Record the virtual time of every AuthorizeRelay attempt. This replaces
+    // the harness handler and keeps its behavior: one grant per authorization.
+    const attemptTimes: number[] = [];
+    const grantByAuthorization = new Map<string, string>();
+    h.api.unary(DataPathService, "AuthorizeRelay", (req) => {
+      attemptTimes.push(h.clock.now());
+      let grant = grantByAuthorization.get(req.authorizationId);
+      if (grant === undefined) {
+        grant = `grant-${grantByAuthorization.size + 1}`;
+        grantByAuthorization.set(req.authorizationId, grant);
+      }
+      return {
+        grantId: grant,
+        expiresIn: { seconds: 900n },
+        expireTime: { seconds: 0n },
+      };
+    });
     h.api.stream(RelayService, "Exec", async function* () {
       yield execMsg(ev.accepted());
       yield execMsg(ev.started());
@@ -1293,8 +1310,11 @@ describe("exec over the relay", () => {
         .wait(),
     );
     expect(result.kind).toBe(ExecResultKind.Exited);
-    const times = h.api.callsOf("AuthorizeRelay").length;
-    expect(times).toBe(5);
+    expect(h.api.callsOf("AuthorizeRelay")).toHaveLength(5);
+    // The recovery window starts at 500 ms and doubles up to 5 s.
+    expect(attemptTimes).toHaveLength(5);
+    const gaps = attemptTimes.slice(1).map((at, i) => at - attemptTimes[i]);
+    expect(gaps).toEqual([500, 1000, 2000, 4000]);
   });
 
   test("keeps retrying while the sandbox is UNREACHABLE during a control plane deployment, then gives up after 60 seconds", async () => {
