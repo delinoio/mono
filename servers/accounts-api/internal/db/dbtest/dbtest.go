@@ -9,10 +9,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -73,16 +75,7 @@ func newURL(t testing.TB, version int64) string {
 		t.Fatalf("create test database: %v", err)
 	}
 	_ = conn.Close(ctx)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		conn, err := pgx.Connect(ctx, admin)
-		if err != nil {
-			return
-		}
-		defer func() { _ = conn.Close(ctx) }()
-		_, _ = conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
-	})
+	t.Cleanup(func() { cleanupDatabase(t, admin, name) })
 	child, err := childURL(admin, name)
 	if err != nil {
 		t.Fatalf("derive test database URL from %s: %v", EnvTestDatabaseURL, err)
@@ -99,6 +92,49 @@ func newURL(t testing.TB, version int64) string {
 		t.Fatalf("migrate test database: %v", err)
 	}
 	return child
+}
+
+// cleanupDatabase drops the generated database when the test ends and fails
+// the test when it cannot, so a teardown problem does not leave databases
+// behind unnoticed.
+func cleanupDatabase(t testing.TB, admin, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := dropDatabase(ctx, admin, name); err != nil {
+		t.Errorf("%v", err)
+	}
+}
+
+// dropDatabase connects with the admin URL and drops the named database. Each
+// error names the failed operation and the database. The error text is
+// scrubbed of the admin URL and its password.
+func dropDatabase(ctx context.Context, admin, name string) error {
+	conn, err := pgx.Connect(ctx, admin)
+	if err != nil {
+		return fmt.Errorf("connect to test database server to drop %s: %s", name, redact(err, admin))
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if _, err := conn.Exec(ctx, "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)"); err != nil {
+		return fmt.Errorf("drop test database %s: %s", name, redact(err, admin))
+	}
+	return nil
+}
+
+// redact returns the error text without the admin URL or its password. pgx
+// connection errors do not normally print either, but the scrub keeps this
+// true if a driver version changes.
+func redact(err error, admin string) string {
+	msg := err.Error()
+	if admin != "" {
+		msg = strings.ReplaceAll(msg, admin, "<redacted-url>")
+	}
+	if u, perr := url.Parse(admin); perr == nil && u.User != nil {
+		if pw, ok := u.User.Password(); ok && pw != "" {
+			msg = strings.ReplaceAll(msg, pw, "<redacted>")
+		}
+	}
+	return msg
 }
 
 // childURL returns the admin URL retargeted to the database name. It rewrites
