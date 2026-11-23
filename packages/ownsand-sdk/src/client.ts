@@ -281,6 +281,12 @@ export class OwnSandClient {
     for (let attempt = 0; ; attempt++) {
       // A caller abort stays terminal and sends no further call.
       input.signal?.throwIfAborted();
+      // The back-off can wake later than planned (a suspended process or a
+      // starved event loop), after the window ended. The window then allows
+      // no further call: the create returns the last failure.
+      if (budget !== undefined && budget.remainingMs() <= 0) {
+        throw lastFailure;
+      }
       const bound = new AbortController();
       const stopBound = new AbortController();
       let signal = input.signal;
