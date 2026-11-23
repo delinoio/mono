@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Name is the service name on every host OS.
@@ -151,15 +152,32 @@ func systemdQuote(s string) string {
 // starts `run --service-manager launchd`, under which the agent maps its exit
 // codes (see LaunchdExitCode): an installed update restarts the agent and
 // ExitNotEnrolled does not.
-func LaunchdDaemon(exe string, env []string) string {
+//
+// The property list is XML 1.0, so a value that XML cannot represent (a
+// control character other than tab, LF and CR, U+FFFE, U+FFFF or invalid
+// UTF-8) makes LaunchdDaemon return an error and no definition, instead of a
+// file that launchd cannot read or reads back as another value.
+func LaunchdDaemon(exe string, env []string) (string, error) {
 	var envXML strings.Builder
 	if len(env) > 0 {
 		envXML.WriteString("\t<key>EnvironmentVariables</key>\n\t<dict>\n")
 		for _, e := range env {
 			k, v, _ := strings.Cut(e, "=")
-			fmt.Fprintf(&envXML, "\t\t<key>%s</key>\n\t\t<string>%s</string>\n", xmlEscape(k), xmlEscape(v))
+			ek, err := xmlEscape(k)
+			if err != nil {
+				return "", fmt.Errorf("launchd environment variable name: %w", err)
+			}
+			ev, err := xmlEscape(v)
+			if err != nil {
+				return "", fmt.Errorf("launchd environment variable %s: %w", k, err)
+			}
+			fmt.Fprintf(&envXML, "\t\t<key>%s</key>\n\t\t<string>%s</string>\n", ek, ev)
 		}
 		envXML.WriteString("\t</dict>\n")
+	}
+	escExe, err := xmlEscape(exe)
+	if err != nil {
+		return "", fmt.Errorf("launchd executable path: %w", err)
 	}
 	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -185,12 +203,49 @@ func LaunchdDaemon(exe string, env []string) string {
 	<string>/Library/Logs/ownsand-agent.log</string>
 </dict>
 </plist>
-`, LaunchdLabel, xmlEscape(exe), ManagerFlag, ManagerLaunchd, envXML.String())
+`, LaunchdLabel, escExe, ManagerFlag, ManagerLaunchd, envXML.String()), nil
 }
 
-func xmlEscape(s string) string {
-	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;", `"`, "&quot;")
-	return r.Replace(s)
+// xmlEscape escapes s as XML 1.0 character data. A carriage return is written
+// as the character reference &#13;, because an XML parser normalizes a literal
+// CR or CRLF to LF, which would change the value that launchd reads. It
+// returns an error for text that XML 1.0 cannot represent: invalid UTF-8 and
+// runes outside the Char production (tab, LF, CR, U+0020-U+D7FF,
+// U+E000-U+FFFD and U+10000-U+10FFFF).
+func xmlEscape(s string) (string, error) {
+	var b strings.Builder
+	for i, r := range s {
+		if r == utf8.RuneError {
+			if _, size := utf8.DecodeRuneInString(s[i:]); size == 1 {
+				return "", fmt.Errorf("invalid UTF-8 at byte %d cannot be represented in XML 1.0", i)
+			}
+		}
+		switch {
+		case r == '&':
+			b.WriteString("&amp;")
+		case r == '<':
+			b.WriteString("&lt;")
+		case r == '>':
+			b.WriteString("&gt;")
+		case r == '"':
+			b.WriteString("&quot;")
+		case r == '\r':
+			b.WriteString("&#13;")
+		case isXMLChar(r):
+			b.WriteRune(r)
+		default:
+			return "", fmt.Errorf("character U+%04X at byte %d cannot be represented in XML 1.0", r, i)
+		}
+	}
+	return b.String(), nil
+}
+
+// isXMLChar reports whether r is in the XML 1.0 Char production.
+func isXMLChar(r rune) bool {
+	return r == '\t' || r == '\n' || r == '\r' ||
+		(r >= 0x20 && r <= 0xD7FF) ||
+		(r >= 0xE000 && r <= 0xFFFD) ||
+		(r >= 0x10000 && r <= 0x10FFFF)
 }
 
 // Windows registry location of the per-service environment. The service

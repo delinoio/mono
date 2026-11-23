@@ -148,8 +148,8 @@ func (h *handler) finish(code int, updated, stopRequested bool) (bool, uint32) {
 	return serviceSpecific, exit
 }
 
-func serviceDefinition(exe, stateDir string) string {
-	return service.WindowsDefinition(exe, serviceEnv(stateDir))
+func serviceDefinition(exe, stateDir string) (string, error) {
+	return service.WindowsDefinition(exe, serviceEnv(stateDir)), nil
 }
 
 // setServiceEnvironment writes the REG_MULTI_SZ Environment value of the

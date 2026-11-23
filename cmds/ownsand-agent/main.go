@@ -462,6 +462,11 @@ func servicePrint(stateDir string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ownsand-agent:", err)
 		return exitError
 	}
-	fmt.Fprint(stdout, serviceDefinition(exe, stateDir))
+	def, err := serviceDefinition(exe, stateDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: render service definition:", err)
+		return exitError
+	}
+	fmt.Fprint(stdout, def)
 	return exitOK
 }
