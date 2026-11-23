@@ -27,11 +27,11 @@ func runConfigError(cfgErr error, stderr io.Writer) int {
 	return exitUsage
 }
 
-func serviceDefinition(exe, stateDir string) string {
+func serviceDefinition(exe, stateDir string) (string, error) {
 	if runtime.GOOS == "darwin" {
 		return service.LaunchdDaemon(exe, serviceEnv(stateDir))
 	}
-	return service.SystemdUnit(exe, serviceEnv(stateDir))
+	return service.SystemdUnit(exe, serviceEnv(stateDir)), nil
 }
 
 func serviceInstall(stateDir string, stdout, stderr io.Writer) int {
@@ -44,7 +44,19 @@ func serviceInstall(stateDir string, stdout, stderr io.Writer) int {
 	if runtime.GOOS == "darwin" {
 		path, next = service.LaunchdPlist, "launchctl bootstrap system "+service.LaunchdPlist
 	}
-	if err := store.WriteFileAtomic(path, []byte(serviceDefinition(exe, stateDir)), 0o644); err != nil {
+	return installServiceDefinition(path, next, exe, stateDir, serviceDefinition, stdout, stderr)
+}
+
+// installServiceDefinition renders the definition and then writes it to path.
+// It renders first: a definition that cannot be rendered leaves an existing
+// service definition at path untouched.
+func installServiceDefinition(path, next, exe, stateDir string, render func(exe, stateDir string) (string, error), stdout, stderr io.Writer) int {
+	def, err := render(exe, stateDir)
+	if err != nil {
+		fmt.Fprintln(stderr, "ownsand-agent: render service definition:", err)
+		return exitError
+	}
+	if err := store.WriteFileAtomic(path, []byte(def), 0o644); err != nil {
 		fmt.Fprintln(stderr, "ownsand-agent: write service definition (run as root):", err)
 		return exitError
 	}

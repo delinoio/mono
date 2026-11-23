@@ -20,7 +20,10 @@ func TestDefinitions(t *testing.T) {
 			t.Errorf("systemd unit lacks %q", want)
 		}
 	}
-	plist := LaunchdDaemon("/usr/local/bin/ownsand-agent", []string{"A=<b>"})
+	plist, err := LaunchdDaemon("/usr/local/bin/ownsand-agent", []string{"A=<b>"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(plist, "io.delino.ownsand-agent") || !strings.Contains(plist, "&lt;b&gt;") {
 		t.Error("launchd plist")
 	}
@@ -107,7 +110,11 @@ func decodePlist(t *testing.T, doc string) map[string]plistValue {
 }
 
 func TestLaunchdDaemonRunsWithLaunchdMarker(t *testing.T) {
-	plist := decodePlist(t, LaunchdDaemon("/usr/local/bin/ownsand-agent", []string{"A=<b>"}))
+	doc, err := LaunchdDaemon("/usr/local/bin/ownsand-agent", []string{"A=<b>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plist := decodePlist(t, doc)
 	var args []string
 	for _, a := range plist["ProgramArguments"].array {
 		args = append(args, a.text)
@@ -128,6 +135,69 @@ func TestLaunchdDaemonRunsWithLaunchdMarker(t *testing.T) {
 	}
 	if !plist["RunAtLoad"].flag {
 		t.Error("RunAtLoad is not true")
+	}
+}
+
+// A carriage return must reach launchd as written: a literal CR or CRLF in
+// the XML text is normalized to LF by a parser, so the plist writes &#13;.
+func TestLaunchdDaemonRoundTripsLineBreaksAndSpecials(t *testing.T) {
+	values := []string{
+		"plain",
+		"cr\rlf",
+		"crlf\r\nend",
+		"lf\nend",
+		"tab\tend",
+		"\r",
+		"\r\n\r\n",
+		`a&b<c>d"e'f&amp;g`,
+		"unicode \u00e9\u4e16\U0001F600 \uFFFD \uD7FF\uE000",
+	}
+	for _, v := range values {
+		exe := "/opt/dir " + v + "/ownsand-agent"
+		doc, err := LaunchdDaemon(exe, []string{"K" + v + "=" + v})
+		if err != nil {
+			t.Fatalf("LaunchdDaemon(%q): %v", v, err)
+		}
+		if strings.Contains(doc, "\r") {
+			t.Errorf("plist contains a literal CR for %q:\n%q", v, doc)
+		}
+		plist := decodePlist(t, doc)
+		if got := plist["ProgramArguments"].array[0].text; got != exe {
+			t.Errorf("executable round trip = %q, want %q", got, exe)
+		}
+		if got, ok := plist["EnvironmentVariables"].dict["K"+v]; !ok || got.text != v {
+			t.Errorf("environment round trip = %q (present %v), want %q", got.text, ok, v)
+		}
+	}
+}
+
+func TestLaunchdDaemonRejectsTextXMLCannotRepresent(t *testing.T) {
+	bad := map[string]string{
+		"nul":             "a\x00b",
+		"bell":            "a\x07b",
+		"escape":          "a\x1bb",
+		"unit separator":  "a\x1fb",
+		"U+FFFE":          "a\ufffeb",
+		"U+FFFF":          "a\uffffb",
+		"invalid UTF-8":   "a\xffb",
+		"truncated UTF-8": "a\xe4\xb8",
+		"surrogate half":  "a\xed\xa0\x80b",
+		"overlong NUL":    "a\xc0\x80b",
+	}
+	for name, v := range bad {
+		if doc, err := LaunchdDaemon("/usr/bin/ownsand-agent"+v, nil); err == nil || doc != "" {
+			t.Errorf("%s in the executable: doc %q, err %v, want an error", name, doc, err)
+		}
+		if doc, err := LaunchdDaemon("/usr/bin/ownsand-agent", []string{"K=" + v}); err == nil || doc != "" {
+			t.Errorf("%s in an environment value: doc %q, err %v, want an error", name, doc, err)
+		}
+		if doc, err := LaunchdDaemon("/usr/bin/ownsand-agent", []string{"K" + v + "=x"}); err == nil || doc != "" {
+			t.Errorf("%s in an environment name: doc %q, err %v, want an error", name, doc, err)
+		}
+	}
+	_, err := LaunchdDaemon("/usr/bin/ownsand-agent", []string{"NAME=a\x01b"})
+	if err == nil || !strings.Contains(err.Error(), "NAME") || !strings.Contains(err.Error(), "U+0001") {
+		t.Errorf("error %v does not name the variable and the character", err)
 	}
 }
 
