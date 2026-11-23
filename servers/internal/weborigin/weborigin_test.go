@@ -63,6 +63,29 @@ func TestCanonical(t *testing.T) {
 		{"https://0x1g", "https://0x1g", true},
 		{"https://127.0.0.1..", "https://127.0.0.1..", true},
 		{"https://example.com.", "https://example.com.", true},
+		// IPv6 literals in the compressed lower-case form of a browser.
+		{"https://[0:0:0:0:0:0:0:1]:443", "https://[::1]", true},
+		{"https://[0:0:0:0:0:0:0:1]:8443", "https://[::1]:8443", true},
+		{"https://[0000:0000:0000:0000:0000:0000:0000:0001]", "https://[::1]", true},
+		{"https://[::1]", "https://[::1]", true},
+		{"https://[::]", "https://[::]", true},
+		{"https://[0:0:0:0:0:0:0:0]", "https://[::]", true},
+		{"https://[::ffff:192.0.2.1]:8443", "https://[::ffff:c000:201]:8443", true},
+		{"https://[::FFFF:C000:201]", "https://[::ffff:c000:201]", true},
+		{"https://[2001:DB8:0:0:1:0:0:1]", "https://[2001:db8::1:0:0:1]", true},
+		{"https://[1:0:0:2:0:0:0:3]", "https://[1:0:0:2::3]", true},
+		{"https://[1:0:0:2:0:0:3:4]", "https://[1::2:0:0:3:4]", true},
+		{"https://[1:0:2:3:4:5:6:7]", "https://[1:0:2:3:4:5:6:7]", true},
+		{"https://[1:2:3:4:5:6:7:0]", "https://[1:2:3:4:5:6:7:0]", true},
+		{"https://[1:0:0:3:4:5:6:7]", "https://[1::3:4:5:6:7]", true},
+		{"https://[1:2:3:4:5:6:0:0]", "https://[1:2:3:4:5:6::]", true},
+		{"https://[0:0:3:4:5:6:7:8]", "https://[::3:4:5:6:7:8]", true},
+		{"https://[2001:db8::1]:80", "https://[2001:db8::1]:80", true},
+		{"http://[::1]:0080", "http://[::1]", true},
+		{"https://[::192.0.2.1]", "https://[::c000:201]", true},
+		{"https://[64:ff9b::192.0.2.33]", "https://[64:ff9b::c000:221]", true},
+		{"https://[fe80::1%25eth0]", "", false},
+		{"https://[::1%25eth0]:443", "", false},
 		{"https://:443", "", false},
 		{"https://host:99999", "", false},
 		{"ftp://host", "", false},
@@ -74,6 +97,13 @@ func TestCanonical(t *testing.T) {
 		got, ok := Canonical(u)
 		if got != tc.want || ok != tc.ok {
 			t.Errorf("Canonical(%q) = %q, %v; want %q, %v", tc.in, got, ok, tc.want, tc.ok)
+		}
+	}
+	// url.Parse rejects a bracketed host that is not an IPv6 literal, but Canonical
+	// must not depend on that: a browser rejects it and never sends such an origin.
+	for _, host := range []string{"[127.0.0.1]", "[127.1]", "[example]", "[::1%eth0]", "[]", "[1:2:3:4:5:6:7:8:9]", "[1::2::3]", "[12345::1]"} {
+		if got, ok := Canonical(&url.URL{Scheme: "https", Host: host}); got != "" || ok {
+			t.Errorf("Canonical(host %q) = %q, %v; want rejection", host, got, ok)
 		}
 	}
 	if got, ok := Canonical(nil); got != "" || ok {

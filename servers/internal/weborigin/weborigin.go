@@ -7,6 +7,7 @@
 package weborigin
 
 import (
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -21,7 +22,10 @@ import (
 // not check the path, query, fragment or user information of u; callers reject
 // those before they call Canonical.
 //
-// A host whose last label is a number follows the WHATWG URL host parser, so an
+// An IPv6 host in brackets is serialized in compressed form in lower case, so
+// [0:0:0:0:0:0:0:1] and [::1] both become [::1] and [::ffff:192.0.2.1] becomes
+// [::ffff:c000:201]; a bracketed host that is not an IPv6 address, and an
+// address with a zone, are rejected. A host whose last label is a number follows the WHATWG URL host parser, so an
 // IPv4 spelling such as 127.1, 0x7f.1, 2130706433 or 0177.0.0.1 is stored as
 // 127.0.0.1, as a browser sends it. Such a host that is not an IPv4 address (for
 // example 1.2.3.4.5, 256.1.1.1 or example.1) is rejected, as browsers reject it.
@@ -32,8 +36,13 @@ func Canonical(u *url.URL) (string, bool) {
 		return "", false
 	}
 	host := strings.ToLower(u.Hostname())
-	if strings.Contains(host, ":") {
-		host = "[" + host + "]"
+	if strings.HasPrefix(u.Host, "[") || strings.Contains(host, ":") {
+		// url.URL.Hostname drops the brackets, so u.Host tells an IPv6 literal from an IPv4 host.
+		addr, ok := serializeIPv6(host)
+		if !ok {
+			return "", false
+		}
+		host = "[" + addr + "]"
 	} else if endsInNumber(host) {
 		addr, ok := parseIPv4(host)
 		if !ok {
@@ -164,4 +173,50 @@ func parseIPv4Number(s string) (uint64, bool) {
 		n = saturated
 	}
 	return n, true
+}
+
+// serializeIPv6 returns the compressed lower-case form of the IPv6 address s
+// that the WHATWG URL standard defines: the first longest run of at least two
+// zero pieces becomes "::" and an IPv4-mapped address stays in hexadecimal
+// pieces. net/netip.Addr.String is not used because it writes the last 32 bits
+// of an IPv4-mapped address in dotted decimal, which a browser does not.
+func serializeIPv6(s string) (string, bool) {
+	addr, err := netip.ParseAddr(s)
+	if err != nil || !addr.Is6() || addr.Zone() != "" {
+		return "", false
+	}
+	b := addr.As16()
+	var pieces [8]uint16
+	for i := range pieces {
+		pieces[i] = uint16(b[2*i])<<8 | uint16(b[2*i+1])
+	}
+	// Find the first longest run of zero pieces; a single zero piece is not compressed.
+	start, length := -1, 1
+	for i := 0; i < len(pieces); {
+		if pieces[i] != 0 {
+			i++
+			continue
+		}
+		j := i
+		for j < len(pieces) && pieces[j] == 0 {
+			j++
+		}
+		if j-i > length {
+			start, length = i, j-i
+		}
+		i = j
+	}
+	var out strings.Builder
+	for i := 0; i < len(pieces); i++ {
+		if i == start {
+			out.WriteString("::")
+			i += length - 1
+			continue
+		}
+		if out.Len() > 0 && !strings.HasSuffix(out.String(), ":") {
+			out.WriteByte(':')
+		}
+		out.WriteString(strconv.FormatUint(uint64(pieces[i]), 16))
+	}
+	return out.String(), true
 }
