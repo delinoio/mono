@@ -1698,8 +1698,12 @@ test("CLI --all reports one candidate per distinct path after a conflicted merge
     new RegExp(`"event":"ci_format".*"candidates":${candidates},`, "u"),
     output,
   );
-  // The conflict markers are a parse error, which the formatter reports.
-  assert.notEqual(result.status, 0, output);
+  // The conflict markers are a parse error, which the formatter reports with
+  // exit status 2. The fixture's unformatted package.json alone would exit 1,
+  // so a plain non-zero check could not tell the two apart. The error wording
+  // belongs to Rstack, so match only that the path is named with an error.
+  assert.equal(result.status, 2, output);
+  assert.match(result.stderr, /conflict\.ts: \w*Error/u, output);
 });
 
 test("Rstack owns exclusions and retains Markdown prose and embedded code", async (t) => {
