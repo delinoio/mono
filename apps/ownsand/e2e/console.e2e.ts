@@ -84,6 +84,24 @@ describe("organizations", () => {
       screen.getByText("Fabrikam", { exact: false }).first(),
     ).toBeVisible();
   });
+
+  test("returns focus to Create organization after Escape closes the dialog", async ({
+    app,
+    screen,
+    browser,
+  }) => {
+    await app.open("/");
+    await screen.getByRole("button", "Sign in with Delino").tap();
+    await screen.getByRole("button", "Create organization").tap();
+    await expect(screen.getByLabel("Organization name")).toBeFocused();
+
+    await browser.keyboard.press("Escape");
+
+    await expect(screen.getByLabel("Organization name")).toBeHidden();
+    await expect(
+      screen.getByRole("button", "Create organization"),
+    ).toBeFocused();
+  });
 });
 
 describe("sandboxes", () => {
@@ -140,6 +158,7 @@ describe("API keys", () => {
     await browser.keyboard.press("Escape");
     await expect(dialog).toBeHidden();
     await expect(screen.getByText("nightly-ci · Active")).toBeVisible();
+    await expect(screen.getByRole("button", "Create API key")).toBeFocused();
   });
 });
 

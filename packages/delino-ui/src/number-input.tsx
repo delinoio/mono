@@ -14,6 +14,7 @@ import {
 } from "@ui-sdk/react/number-input";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
+import { useForwardedAutoFocus } from "./dialog-context.ts";
 
 export type NumberInputProps = Omit<
   React.ComponentProps<typeof NumberInputRoot>,
@@ -80,6 +81,7 @@ export function NumberInput({
   } = props as typeof props & {
     "data-autofocus"?: unknown;
   };
+  const forwardedAutoFocus = useForwardedAutoFocus(autoFocus);
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -131,7 +133,7 @@ export function NumberInput({
           <NumberInputControl
             className="dui-number-input-control"
             placeholder={placeholder}
-            autoFocus={autoFocus}
+            autoFocus={forwardedAutoFocus}
             aria-describedby={ariaDescribedBy}
             aria-label={ariaLabel}
             aria-labelledby={ariaLabelledBy}

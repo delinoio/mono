@@ -8,6 +8,7 @@ import {
 import { Textarea as TextareaPart } from "@ui-sdk/react/textarea";
 import type * as React from "react";
 import { mergeClassName } from "./class-name.ts";
+import { useForwardedAutoFocus } from "./dialog-context.ts";
 
 export type TextareaProps = React.ComponentProps<typeof TextareaPart> & {
   /** The visible name of the field. */
@@ -37,6 +38,7 @@ export function Textarea({
   disabled,
   ...props
 }: TextareaProps) {
+  const autoFocus = useForwardedAutoFocus(props.autoFocus);
   const hasError =
     error !== undefined && error !== null && error !== false && error !== "";
   const hasDescription =
@@ -67,6 +69,7 @@ export function Textarea({
         disabled={disabled}
         data-autofocus={props.autoFocus ? "" : undefined}
         {...props}
+        autoFocus={autoFocus}
       />
       {/* Workaround: the UI SDK Field predicts the description id in
           aria-describedby before the field binds on the client, so static
