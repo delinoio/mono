@@ -157,7 +157,17 @@ function UsageSummary() {
           {summary.hasNextPage ? (
             <Button
               variant={ButtonVariant.Secondary}
-              onClick={() => summary.fetchNextPage()}
+              // A refresh of the loaded pages (a window-focus refetch, for
+              // example) holds the continuation token of its first page
+              // until it finishes. Reading on with the cached token would
+              // cancel the refresh or skip rows, so wait for the refresh,
+              // and after a failed one wait for its retry. `cancelRefetch:
+              // false` keeps a click that races with a refresh from
+              // cancelling it.
+              disabled={summary.isFetching || summary.isRefetchError}
+              onClick={() =>
+                void summary.fetchNextPage({ cancelRefetch: false })
+              }
             >
               Show more usage
             </Button>
@@ -249,7 +259,17 @@ function Ledger() {
           {ledger.hasNextPage ? (
             <Button
               variant={ButtonVariant.Secondary}
-              onClick={() => ledger.fetchNextPage()}
+              // A refresh of the loaded pages (a window-focus refetch, for
+              // example) holds the continuation token of its first page
+              // until it finishes. Reading on with the cached token would
+              // cancel the refresh or skip rows, so wait for the refresh,
+              // and after a failed one wait for its retry. `cancelRefetch:
+              // false` keeps a click that races with a refresh from
+              // cancelling it.
+              disabled={ledger.isFetching || ledger.isRefetchError}
+              onClick={() =>
+                void ledger.fetchNextPage({ cancelRefetch: false })
+              }
             >
               Show older entries
             </Button>

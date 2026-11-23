@@ -135,7 +135,17 @@ export function InvoicesSection() {
           {invoices.hasNextPage ? (
             <Button
               variant={ButtonVariant.Secondary}
-              onClick={() => invoices.fetchNextPage()}
+              // A refresh of the loaded pages (a window-focus refetch, for
+              // example) holds the continuation token of its first page
+              // until it finishes. Reading on with the cached token would
+              // cancel the refresh or skip rows, so wait for the refresh,
+              // and after a failed one wait for its retry. `cancelRefetch:
+              // false` keeps a click that races with a refresh from
+              // cancelling it.
+              disabled={invoices.isFetching || invoices.isRefetchError}
+              onClick={() =>
+                void invoices.fetchNextPage({ cancelRefetch: false })
+              }
             >
               Show older invoices
             </Button>

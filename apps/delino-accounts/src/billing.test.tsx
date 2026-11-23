@@ -23,8 +23,11 @@ import {
   ADMIN,
   addBillingAccounts,
   addInvitations,
+  addInvoices,
+  addLedgerEntries,
   addLinkedOrganizations,
   addMembers,
+  addUsageRows,
   createFakeApi,
   INVITATION_TOKEN,
   numbered,
@@ -2327,4 +2330,164 @@ describe("failed background refetches", () => {
         .getAttribute("aria-selected"),
     ).toBe("true");
   });
+});
+
+describe("continuation of the billing history lists", () => {
+  /**
+   * The three lists that read on with a button. `seed` gives the account more
+   * rows than one page, so that the button shows after the first page; `rows`
+   * and `shrink` read and cut the rows of the fake account.
+   */
+  const lists = [
+    {
+      name: "invoices",
+      method: "ListInvoices",
+      tab: "Invoices",
+      list: "Invoices",
+      more: "Show older invoices",
+      // The page size is 200.
+      total: 201,
+      firstPage: 200,
+      seed: (account: ReturnType<typeof accountOf>) =>
+        addInvoices(account, 201 - account.invoices.length),
+      shrink: (account: ReturnType<typeof accountOf>) => {
+        account.invoices.length = 10;
+      },
+    },
+    {
+      name: "ledger",
+      method: "ListLedgerEntries",
+      tab: "Usage",
+      list: "Ledger entries",
+      more: "Show older entries",
+      // The page size is 50.
+      total: 61,
+      firstPage: 50,
+      seed: (account: ReturnType<typeof accountOf>) =>
+        addLedgerEntries(account, 61 - account.ledger.length),
+      shrink: (account: ReturnType<typeof accountOf>) => {
+        account.ledger.length = 10;
+      },
+    },
+    {
+      name: "usage summary",
+      method: "ListUsageSummary",
+      tab: "Usage",
+      list: undefined,
+      more: "Show more usage",
+      total: 201,
+      firstPage: 200,
+      seed: (account: ReturnType<typeof accountOf>) =>
+        addUsageRows(account, 201 - account.usage.length),
+      shrink: (account: ReturnType<typeof accountOf>) => {
+        account.usage.length = 10;
+      },
+    },
+  ];
+
+  function accountOf(api: ReturnType<typeof createFakeApi>) {
+    return api.accounts.get(ACCOUNT_ID)!;
+  }
+
+  /** The rendered rows of the list: list items, or usage table rows. */
+  function rowCount(list: string | undefined) {
+    return list === undefined
+      ? within(screen.getByRole("table")).getAllByRole("row").length - 1
+      : within(screen.getByRole("list", { name: list })).getAllByRole(
+          "listitem",
+        ).length;
+  }
+
+  /** Opens the list with its first page loaded. */
+  async function openList(entry: (typeof lists)[number]) {
+    const api = createFakeApi();
+    entry.seed(accountOf(api));
+    await renderAccount(OWNER, { api });
+    await openTab(entry.tab);
+    await screen.findByRole("button", { name: entry.more });
+    await settle(60);
+    expect(rowCount(entry.list)).toBe(entry.firstPage);
+    expect(pageTokens(api, entry.method)).toEqual([""]);
+    return api;
+  }
+
+  const moreButton = (entry: (typeof lists)[number]) =>
+    screen.getByRole("button", { name: entry.more }) as HTMLButtonElement;
+
+  for (const entry of lists) {
+    describe(entry.name, () => {
+      test("reads on with the next token, appends the rows once and ends with an empty token", async () => {
+        const api = await openList(entry);
+        expect(moreButton(entry).disabled).toBe(false);
+        await click(moreButton(entry));
+        await settle(60);
+        expect(pageTokens(api, entry.method)).toEqual(["", "p1"]);
+        expect(rowCount(entry.list)).toBe(entry.total);
+        expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
+      });
+
+      test("a continuation during a pending refresh neither cancels it nor uses the cached token", async () => {
+        const api = await openList(entry);
+        let release!: () => void;
+        api.gates.set(
+          entry.method,
+          new Promise<void>((resolve) => {
+            release = resolve;
+          }),
+        );
+        await refocus();
+        // The refresh holds the first page.
+        expect(pageTokens(api, entry.method)).toEqual(["", ""]);
+        expect(moreButton(entry).disabled).toBe(true);
+        await click(moreButton(entry));
+        expect(pageTokens(api, entry.method)).toEqual(["", ""]);
+        release();
+        api.gates.delete(entry.method);
+        await settle(60);
+        // The refresh finished and no request used the cached token.
+        expect(pageTokens(api, entry.method)).toEqual(["", ""]);
+        expect(rowCount(entry.list)).toBe(entry.firstPage);
+        expect(moreButton(entry).disabled).toBe(false);
+        await click(moreButton(entry));
+        await settle(60);
+        expect(pageTokens(api, entry.method)).toEqual(["", "", "p1"]);
+        expect(rowCount(entry.list)).toBe(entry.total);
+      });
+
+      test("after a failed refresh the rows and the retry stay and the continuation waits for the retry", async () => {
+        const api = await openList(entry);
+        api.failNext.set(entry.method, BACKGROUND_FAILURE);
+        await refocus();
+        expect(screen.getByText(BUSY)).toBeTruthy();
+        expect(rowCount(entry.list)).toBe(entry.firstPage);
+        expect(moreButton(entry).disabled).toBe(true);
+        await click(moreButton(entry));
+        expect(pageTokens(api, entry.method)).toEqual(["", ""]);
+
+        // A successful retry supplies the token again.
+        await click(screen.getByRole("button", { name: "Try again" }));
+        await settle(60);
+        expect(screen.queryByText(BUSY)).toBeNull();
+        expect(pageTokens(api, entry.method)).toEqual(["", "", ""]);
+        expect(moreButton(entry).disabled).toBe(false);
+        await click(moreButton(entry));
+        await settle(60);
+        expect(pageTokens(api, entry.method)).toEqual(["", "", "", "p1"]);
+        expect(rowCount(entry.list)).toBe(entry.total);
+      });
+
+      test("a retry that returns an empty token removes the continuation", async () => {
+        const api = await openList(entry);
+        api.failNext.set(entry.method, BACKGROUND_FAILURE);
+        await refocus();
+        expect(moreButton(entry).disabled).toBe(true);
+        // The list shrank to one page while the refresh failed.
+        entry.shrink(accountOf(api));
+        await click(screen.getByRole("button", { name: "Try again" }));
+        await settle(60);
+        expect(screen.queryByRole("button", { name: entry.more })).toBeNull();
+        expect(pageTokens(api, entry.method)).toEqual(["", "", ""]);
+      });
+    });
+  }
 });

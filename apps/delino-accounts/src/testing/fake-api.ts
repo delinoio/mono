@@ -95,7 +95,8 @@ export interface FakeApi {
   /**
    * Holds every call of a method until the promise settles, so that a test
    * can observe what the page does while a request is still in flight. Only
-   * `GetBillingAccount` and `GetInvoiceUrl` honor a gate.
+   * `GetBillingAccount`, `GetInvoiceUrl`, `ListLedgerEntries`, `ListInvoices`
+   * and `ListUsageSummary` honor a gate.
    */
   gates: Map<string, Promise<unknown>>;
   transport: ReturnType<typeof createRouterTransport>;
@@ -528,8 +529,9 @@ export function createFakeApi(): FakeApi {
           creditGrants: account.grants,
         };
       },
-      listLedgerEntries(req) {
+      async listLedgerEntries(req) {
         record("ListLedgerEntries", req);
+        await api.gates.get("ListLedgerEntries");
         const { page, nextPageToken } = paginate(
           load(req.billingAccountId).account.ledger,
           req,
@@ -605,8 +607,9 @@ export function createFakeApi(): FakeApi {
           settings: { lowBalanceThresholdUsdMicros: account.alertThreshold },
         };
       },
-      listInvoices(req) {
+      async listInvoices(req) {
         record("ListInvoices", req);
+        await api.gates.get("ListInvoices");
         const { page, nextPageToken } = paginate(
           load(req.billingAccountId, PAYMENT_ROLES).account.invoices,
           req,
@@ -631,8 +634,9 @@ export function createFakeApi(): FakeApi {
         );
         return { linkedOrganizations: page, nextPageToken };
       },
-      listUsageSummary(req) {
+      async listUsageSummary(req) {
         record("ListUsageSummary", req);
+        await api.gates.get("ListUsageSummary");
         const { account } = load(req.billingAccountId);
         // The seeded usage belongs to the current UTC month.
         const now = new Date();
