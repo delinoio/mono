@@ -151,6 +151,10 @@ type system struct {
 	exited   chan struct{}
 	exitOnce sync.Once
 	cbKey    uintptr
+	// terminateFn replaces the HCS terminate call when it is not nil. It is
+	// a seam for tests that fake a compute system without a Hyper-V host;
+	// remove it when the HCS calls sit behind an interface.
+	terminateFn func() error
 }
 
 // Exit callbacks. windows.NewCallback never releases a callback, so one
@@ -291,7 +295,12 @@ func (s *system) resume() error {
 
 // terminate stops s at once; a system that is stopped already is no error.
 func (s *system) terminate() error {
-	_, err := s.call("HcsTerminateComputeSystem", procHcsTerminateComputeSystem, "")
+	var err error
+	if s.terminateFn != nil {
+		err = s.terminateFn()
+	} else {
+		_, err = s.call("HcsTerminateComputeSystem", procHcsTerminateComputeSystem, "")
+	}
 	if err != nil && isNotFoundOrStopped(err) {
 		return nil
 	}
