@@ -80,11 +80,13 @@ import {
   OrganizationService,
 } from "@delino/ownsand-protos/v1/organization_pb";
 import {
+  type CreateSandboxRequest,
   type Sandbox,
   CreateSandboxRequestSchema,
   SandboxSchema,
   type SandboxSource,
   SandboxService,
+  SandboxSourceSchema,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
 import {
   type Snapshot,
@@ -632,6 +634,33 @@ function deviceCanRun(device: Device, need: PlacementRequirement): boolean {
  * transient condition. Without an ID, the first `ONLINE` device that can run
  * the source runs the sandbox, and the result is `undefined` when none can.
  */
+/**
+ * Returns the request with every UUID field in lowercase text, like the real
+ * API's canonicalization: the organization, the idempotency key, the explicit
+ * placement device and the snapshot or template of the source. Other fields,
+ * including user label text, are kept as sent.
+ */
+function canonicalizeCreateSandbox(
+  req: CreateSandboxRequest,
+): CreateSandboxRequest {
+  const source = req.source?.source;
+  return create(CreateSandboxRequestSchema, {
+    ...req,
+    organizationId: req.organizationId.toLowerCase(),
+    idempotencyKey: req.idempotencyKey.toLowerCase(),
+    source:
+      source?.case === "snapshotId" || source?.case === "templateId"
+        ? create(SandboxSourceSchema, {
+            source: { case: source.case, value: source.value.toLowerCase() },
+          })
+        : req.source,
+    placement:
+      req.placement?.deviceId === undefined
+        ? req.placement
+        : { ...req.placement, deviceId: req.placement.deviceId.toLowerCase() },
+  });
+}
+
 function placeSandbox(
   devices: Device[],
   deviceId: string | undefined,
@@ -1349,7 +1378,11 @@ export function createMockTransport(
     });
 
     router.service(SandboxService, {
-      createSandbox(req) {
+      createSandbox(rawReq) {
+        // Same as the real API: spell every UUID of the request in lowercase
+        // before anything uses it, so two hex cases of one request name one
+        // organization, one device, one source and one idempotency key.
+        const req = canonicalizeCreateSandbox(rawReq);
         const { org } = membership(req.organizationId);
         requireBillingAllowed(org);
         // Map entries serialize in insertion order, so sort labels first to make
