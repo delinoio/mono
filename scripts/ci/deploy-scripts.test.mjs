@@ -177,6 +177,30 @@ const changeset = (id, ...list) => ({
   ),
 });
 
+test("deploy.yml keeps pending runs in the concurrency queue", () => {
+  const workflow = readFileSync(
+    join(root, ".github/workflows/deploy.yml"),
+    "utf8",
+  );
+  const block = workflow.match(/^concurrency:\n((?:  .*\n|\n)+)/m);
+  assert.ok(block, "deploy.yml has a workflow-level concurrency block");
+  const keys = block[1]
+    .split("\n")
+    .filter((line) => /^  [a-z-]+:/.test(line))
+    .map((line) => line.trim());
+  assert.ok(keys.includes("queue: max"));
+  assert.ok(keys.includes("cancel-in-progress: false"));
+  assert.ok(keys.some((key) => key.startsWith("group: ")));
+  // actionlint v1.7.12 rejects `queue`; the exception must name only that
+  // diagnostic and only this workflow.
+  const lint = readFileSync(join(root, ".github/actionlint.yaml"), "utf8");
+  assert.match(
+    lint,
+    /^paths:\n {2}\.github\/workflows\/deploy\.yml:\n {4}ignore:\n {6}- 'unexpected key "queue" for "concurrency" section\.\*'\n$/m,
+  );
+  assert.equal(lint.match(/^ {2}\.github\/workflows\//gm)?.length, 1);
+});
+
 test("guard passes a current plan", { skip }, (t) => {
   const result = runGuard(
     t,

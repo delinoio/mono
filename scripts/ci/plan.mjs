@@ -138,7 +138,10 @@ export function isWorkspaceInput(path) {
 // lints them with actionlint and audits them with zizmor.
 export function isWorkflowInput(path) {
   return (
-    path.startsWith(".github/workflows/") || path.startsWith(".github/actions/")
+    path.startsWith(".github/workflows/") ||
+    path.startsWith(".github/actions/") ||
+    // The actionlint configuration changes which diagnostics fail the lint.
+    path === ".github/actionlint.yaml"
   );
 }
 
