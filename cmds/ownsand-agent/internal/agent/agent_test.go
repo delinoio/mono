@@ -839,17 +839,39 @@ func (f *importFixture) requireRestorable(t *testing.T, id string) {
 }
 
 // getGate counts the part downloads of one snapshot ID and blocks the first
-// of them until release is closed.
+// of them until Release is called or the request ends. The bucket calls the
+// hook synchronously, and httptest.Server.Close waits for active requests,
+// so a blocked handler would otherwise strand the test teardown.
 type getGate struct {
 	id      string
 	mu      sync.Mutex
 	gets    int
 	started chan struct{}
 	release chan struct{}
+	once    sync.Once
 }
 
 func newGetGate(id string) *getGate {
 	return &getGate{id: id, started: make(chan struct{}), release: make(chan struct{})}
+}
+
+// newGatedImportFixture creates the fixture whose bucket uses a new gate for
+// id and registers the gate release right after the fixture exists. Cleanups
+// run last in, first out, so the release runs before the bucket and agent
+// teardown wait for the blocked download, and it is registered before any
+// matching GET can start.
+func newGatedImportFixture(t *testing.T, id string, tweak func(*Options)) (*getGate, *importFixture) {
+	t.Helper()
+	gate := newGetGate(id)
+	f := newImportFixtureWith(t, gate.hook, tweak)
+	t.Cleanup(gate.Release)
+	return gate, f
+}
+
+// Release unblocks the gated download. It is idempotent, and every release
+// of the gate, explicit or from a cleanup, goes through it.
+func (g *getGate) Release() {
+	g.once.Do(func() { close(g.release) })
 }
 
 func (g *getGate) hook(r *http.Request) int {
@@ -862,7 +884,10 @@ func (g *getGate) hook(r *http.Request) int {
 	g.mu.Unlock()
 	if first {
 		close(g.started)
-		<-g.release
+		select {
+		case <-g.release:
+		case <-r.Context().Done():
+		}
 	}
 	return 0
 }
@@ -891,13 +916,12 @@ func settle() { time.Sleep(300 * time.Millisecond) }
 // the same absent snapshot return the same ready entry after one download.
 func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
 	id, _ := uuidv7.NewString()
-	gate := newGetGate(id)
-	f := newImportFixture(t, gate.hook)
+	gate, f := newGatedImportFixture(t, id, nil)
 	first := f.h.sendCommand(f.stage(t, id, false))
 	waitClosed(t, gate.started, "the first download")
 	second := f.h.sendCommand(f.command(id, false))
 	settle()
-	close(gate.release)
+	gate.Release()
 	r1, r2 := f.h.result(first), f.h.result(second)
 	for _, r := range []*ownsandv1.AgentCommandResult{r1, r2} {
 		if r.GetError() != nil || r.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
@@ -919,15 +943,14 @@ func TestConcurrentImportsOfOneSnapshotDownloadOnce(t *testing.T) {
 // a later import reuses the copy.
 func TestFailedImportDoesNotDeleteAPublishedCopy(t *testing.T) {
 	id, _ := uuidv7.NewString()
-	gate := newGetGate(id)
-	f := newImportFixture(t, gate.hook)
+	gate, f := newGatedImportFixture(t, id, nil)
 	bad := f.h.sendCommand(f.stage(t, id, true))
 	waitClosed(t, gate.started, "the first download")
 	good := f.h.sendCommand(f.command(id, false))
 	// Without the per-snapshot lock the good import publishes the copy while
 	// the bad one still waits at its gate, and the bad one then deletes it.
 	settle()
-	close(gate.release)
+	gate.Release()
 	badRes, goodRes := f.h.result(bad), f.h.result(good)
 	if badRes.GetError().GetCode() != ownsandv1.ErrorCode_ERROR_CODE_DATA_LOSS {
 		t.Fatalf("bad import = %v", badRes)
@@ -1041,8 +1064,7 @@ func TestImportWithCanceledContextAbortsEvenWithFreeLockAndReadyCopy(t *testing.
 func TestImportsOfDifferentSnapshotsStayConcurrent(t *testing.T) {
 	slow, _ := uuidv7.NewString()
 	fast, _ := uuidv7.NewString()
-	gate := newGetGate(slow)
-	f := newImportFixture(t, gate.hook)
+	gate, f := newGatedImportFixture(t, slow, nil)
 	slowID := f.h.sendCommand(f.stage(t, slow, false))
 	waitClosed(t, gate.started, "the first download")
 	fastCmd := f.stage(t, fast, false)
@@ -1050,7 +1072,7 @@ func TestImportsOfDifferentSnapshotsStayConcurrent(t *testing.T) {
 	if res := f.h.command(fastCmd); res.GetError() != nil || res.GetImportSnapshot().GetSnapshot().GetState() != ownsandv1.SnapshotState_SNAPSHOT_STATE_READY {
 		t.Fatalf("fast import = %v", res)
 	}
-	close(gate.release)
+	gate.Release()
 	if res := f.h.result(slowID); res.GetError() != nil {
 		t.Fatalf("slow import = %v", res)
 	}
@@ -1201,21 +1223,11 @@ func waitInstalls(t *testing.T, e *updateEnv, want int32) {
 // once after the import ended.
 func TestUpdateWaitsForRunningImport(t *testing.T) {
 	id, _ := uuidv7.NewString()
-	gate := newGetGate(id)
 	env := newUpdateEnv(t, false)
-	f := newImportFixtureWith(t, gate.hook, env.tweak)
+	gate, f := newGatedImportFixture(t, id, env.tweak)
 	f.stageUpdate(t)
 	cmdID := f.h.sendCommand(f.stage(t, id, false))
 	waitClosed(t, gate.started, "the import download")
-	// A failed assertion must not leave the import blocked: the agent cleanup
-	// waits for its commands.
-	t.Cleanup(func() {
-		select {
-		case <-gate.release:
-		default:
-			close(gate.release)
-		}
-	})
 	if ok, err := f.h.agent.updater.TryInstall(); ok || err != nil {
 		t.Fatalf("install during an import: %v %v", ok, err)
 	}
@@ -1223,7 +1235,7 @@ func TestUpdateWaitsForRunningImport(t *testing.T) {
 	if n := env.installs.Load(); n != 0 {
 		t.Fatalf("installer calls during an import = %d", n)
 	}
-	close(gate.release)
+	gate.Release()
 	if res := f.h.result(cmdID); res.GetError() != nil {
 		t.Fatalf("import = %v", res)
 	}
@@ -1253,9 +1265,8 @@ func TestFailedImportReleasesTransferReservation(t *testing.T) {
 func TestTransfersRefusedWhileUpdateInstalls(t *testing.T) {
 	ready, _ := uuidv7.NewString()
 	fresh, _ := uuidv7.NewString()
-	gate := newGetGate(fresh)
 	env := newUpdateEnv(t, true)
-	f := newImportFixtureWith(t, gate.hook, env.tweak)
+	gate, f := newGatedImportFixture(t, fresh, env.tweak)
 	// Cleanups run last in, first out: release the installer before the agent
 	// cleanup waits for Run to end.
 	t.Cleanup(func() { close(env.unblock) })
