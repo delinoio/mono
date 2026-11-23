@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { ACTIVITY_HEADER, RELAY_GRANT_HEADER } from "../connection.ts";
 import { Code } from "@connectrpc/connect";
-import { DataPathError, OwnSandError } from "../errors.ts";
+import {
+  DataPathError,
+  OwnSandError,
+  RelayStreamCompletedError,
+} from "../errors.ts";
 import { type OperationContext, Timing } from "./context.ts";
 import type { RecoveryWindow } from "./recovery.ts";
 
@@ -27,6 +31,14 @@ export class AcceptanceDeadlineError extends DataPathError {
     super(message, { code: Code.Unavailable, cause: options.cause });
   }
 }
+
+/**
+ * Marks a relay stream's terminal event (for example `exited`, `failed`,
+ * `sandboxEnded` or the end of a file read). A consumer that returns after
+ * it has the stream's outcome, so the SDK logs the call as completed (`ok`)
+ * and not as cancelled.
+ */
+export type TerminalEvent<T> = (value: T) => boolean;
 
 /**
  * Bounds a recovery continuation by the time left in its recovery window
@@ -148,6 +160,7 @@ export async function* watchedRelayStream<T>(
   open: (options: CallOptions) => AsyncIterable<T>,
   bound?: AcceptanceBound<T>,
   hold?: ConsumerHold,
+  isTerminal?: TerminalEvent<T>,
 ): AsyncGenerator<T> {
   const clock = ctx.clock;
   const { controller: call, dispose: unlink } = linkedController(callerSignal);
@@ -155,6 +168,8 @@ export async function* watchedRelayStream<T>(
   let lastActivity = clock.now();
   let holding = false;
   let idleFired = false;
+  // The last event that the stream yielded was a terminal event.
+  let terminalYielded = false;
   const registration = ctx.activity.register(() => {
     lastActivity = clock.now();
   });
@@ -267,7 +282,9 @@ export async function* watchedRelayStream<T>(
         stopDeadline.abort();
       }
       holding = true;
+      terminalYielded = isTerminal?.(result.value) === true;
       yield result.value;
+      terminalYielded = false;
       holding = false;
       lastActivity = clock.now();
     }
@@ -276,7 +293,17 @@ export async function* watchedRelayStream<T>(
     offRelease?.();
     stopDeadline.abort();
     registration.dispose();
-    call.abort(new OwnSandError("relay stream closed"));
+    // A consumer that returns right after the terminal event has the outcome
+    // of the call: the stream is complete, not abandoned. The distinct reason
+    // lets the RPC logger record `ok`. A call that already ended for another
+    // reason (a caller abort, the idle limit) keeps that reason.
+    call.abort(
+      terminalYielded && !call.signal.aborted
+        ? new RelayStreamCompletedError(
+            "relay stream closed after its terminal event",
+          )
+        : new OwnSandError("relay stream closed"),
+    );
     await watcher;
     await deadline;
     unlink();
