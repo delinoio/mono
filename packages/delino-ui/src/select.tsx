@@ -17,7 +17,7 @@ import {
   SelectValue,
   type SelectValueChangeReason,
 } from "@ui-sdk/react/select";
-import type * as React from "react";
+import * as React from "react";
 import { mergeClassName } from "./class-name.ts";
 
 type SingleSelectProps = SelectRootProps<string, false>;
@@ -136,19 +136,48 @@ export type SelectOptionProps = Omit<
   React.ComponentProps<typeof SelectItem>,
   "children"
 > & {
-  /** The visible name of the option. */
+  /**
+   * The visible name of the option. Text, numbers and nested elements are
+   * allowed; an option whose children hold no text shows its value.
+   */
   children: React.ReactNode;
 };
+
+/**
+ * Collects the text of `node` the way it renders: strings and numbers as they
+ * are, arrays and element children in order, and nothing for booleans, null
+ * and undefined.
+ */
+function nodeText(node: React.ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+  if (Array.isArray(node)) {
+    return node.map(nodeText).join("");
+  }
+  if (React.isValidElement<{ children?: React.ReactNode }>(node)) {
+    return nodeText(node.props.children);
+  }
+  return "";
+}
 
 /** One option of a `Select`. A check marks the selected option. */
 export function SelectOption({
   children,
   className,
+  label,
   ...props
 }: SelectOptionProps) {
+  // The UI SDK keeps the trigger and the list text of an option from its
+  // `label` (a string) and falls back to the option value when it is absent.
+  // Interpolated children such as `{os} base image` reach this component as
+  // an array, so derive the text here; an explicit `label` wins and an option
+  // without text keeps showing its value.
+  const text = nodeText(children);
   return (
     <SelectItem
       className={mergeClassName("dui-select-option", className)}
+      label={label ?? (text === "" ? undefined : text)}
       {...props}
     >
       <SelectItemText>{children}</SelectItemText>
