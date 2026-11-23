@@ -165,6 +165,15 @@ function startLauncher(t, { port, env = {}, pathPrefix } = {}) {
     TMPDIR: tmp,
   };
   delete childEnv.LOG_LEVEL;
+  // Settings the server validates or binds at startup must not leak in from the
+  // environment that runs the tests: an occupied inherited METRICS_ADDR makes
+  // the server exit before server_started, and an invalid inherited
+  // CORS_ORIGINS or WEB_ORIGIN is rejected. A blank METRICS_ADDR disables the
+  // metrics listener, and an unset origin selects the launcher default. A test
+  // can still set or unset any of them through `env`, which is applied next.
+  childEnv.METRICS_ADDR = "";
+  delete childEnv.CORS_ORIGINS;
+  delete childEnv.WEB_ORIGIN;
   Object.assign(childEnv, env);
   for (const [name, value] of Object.entries(childEnv)) {
     if (value === undefined) delete childEnv[name];
