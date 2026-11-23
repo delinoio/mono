@@ -8,9 +8,12 @@ import {
   type Sandbox,
   SandboxService,
 } from "@delino/ownsand-protos/v1/sandbox_pb";
-import { SnapshotService } from "@delino/ownsand-protos/v1/snapshot_pb";
+import {
+  SnapshotService,
+  type Template,
+} from "@delino/ownsand-protos/v1/snapshot_pb";
 import { toast } from "delino-ui/toast";
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import {
   invalidateServices,
   POLL_INTERVAL_MS,
@@ -33,15 +36,36 @@ import { formatDuration, formatMib, formatTime, labels } from "../format.ts";
 import { Link, RouteId, routePath } from "../router.tsx";
 import { LabelList } from "./sandboxes.tsx";
 
-function sourceText(s: Sandbox): string {
+/**
+ * The source of a sandbox. A template shows its name when `ListTemplates`
+ * (the first page) holds it. While that request loads or fails, and when the
+ * template is deleted or beyond the first page, the row shows the short ID,
+ * so the row never waits for or reports the lookup.
+ */
+function sourceText(s: Sandbox, templates: readonly Template[]): ReactNode {
   const src = s.source?.source;
   switch (src?.case) {
     case "baseImage":
       return `${labels.baseImage[src.value]} base image`;
     case "snapshotId":
-      return `Snapshot ${src.value}`;
-    case "templateId":
-      return `Template ${src.value}`;
+      return (
+        <>
+          Snapshot <ShortId id={src.value} />
+        </>
+      );
+    case "templateId": {
+      const id = src.value;
+      const template = templates.find((t) => t.templateId === id);
+      return template === undefined ? (
+        <>
+          Template <ShortId id={id} />
+        </>
+      ) : (
+        <>
+          Template <span title={id}>{template.name}</span>
+        </>
+      );
+    }
     default:
       return "—";
   }
@@ -65,6 +89,12 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
     organizationId,
     pageSize: 200,
   });
+  // Only a template source needs a name; the other sources send no request.
+  const templates = useQuery(
+    SnapshotService.method.listTemplates,
+    { organizationId, pageSize: 200 },
+    { enabled: query.data?.sandbox?.source?.source.case === "templateId" },
+  );
   const refresh = () =>
     invalidateServices(queryClient, SandboxService, SnapshotService);
   const pause = useMutation(SandboxService.method.pauseSandbox, {
@@ -200,7 +230,9 @@ export function SandboxPage({ sandboxId }: { sandboxId: string }) {
             {device?.name ?? s.deviceId}
           </Link>
         </Detail>
-        <Detail term="Source">{sourceText(s)}</Detail>
+        <Detail term="Source">
+          {sourceText(s, templates.data?.templates ?? [])}
+        </Detail>
         <Detail term="Resources">
           {s.resources
             ? `${s.resources.vcpuCount} vCPU · ${formatMib(s.resources.memoryMib)} memory · ${s.resources.diskGib} GiB disk`
