@@ -131,6 +131,77 @@ func (f *rotationFixture) source() func(context.Context) (string, error) {
 	return ts
 }
 
+// rotationWait bounds every wait of a rotation test, so that a regression
+// fails the test promptly instead of hanging it until the package timeout.
+const rotationWait = 10 * time.Second
+
+// tokenResult is the outcome of one token request.
+type tokenResult struct {
+	tok string
+	err error
+}
+
+// hold makes the issuer pause every request whose refresh token match
+// accepts, until release runs. started closes when the first such request
+// arrived. release is idempotent and is also registered as a cleanup that
+// runs before the httptest.Server cleanup of the fixture (cleanups run in
+// reverse order): the server waits for in-flight handlers, so a held handler
+// would hang the cleanup when a test fails before it releases the request.
+func (f *rotationFixture) hold(match func(refreshToken string) bool) (started <-chan struct{}, release func()) {
+	f.t.Helper()
+	startedCh, releaseCh := make(chan struct{}), make(chan struct{})
+	var startOnce, releaseOnce sync.Once
+	f.l.mu.Lock()
+	f.l.hook = func(rt string) {
+		if !match(rt) {
+			return
+		}
+		startOnce.Do(func() { close(startedCh) })
+		<-releaseCh
+	}
+	f.l.mu.Unlock()
+	release = func() { releaseOnce.Do(func() { close(releaseCh) }) }
+	f.t.Cleanup(release)
+	return startedCh, release
+}
+
+// tokenAsync requests a token on a worker goroutine. The worker only runs
+// the token source: it must not call t.Fatal, which is for the test goroutine.
+func tokenAsync(ctx context.Context, ts func(context.Context) (string, error)) <-chan tokenResult {
+	done := make(chan tokenResult, 1)
+	go func() {
+		tok, err := ts(ctx)
+		done <- tokenResult{tok, err}
+	}()
+	return done
+}
+
+// awaitHeld waits until the issuer holds a request. A worker that finished
+// before that (for example with an error) or a missing request fails the test
+// at once, with the result of the worker.
+func awaitHeld(t *testing.T, started <-chan struct{}, done <-chan tokenResult) {
+	t.Helper()
+	select {
+	case <-started:
+	case res := <-done:
+		t.Fatalf("the token request ended before the issuer held a refresh request: token %q, error %v", res.tok, res.err)
+	case <-time.After(rotationWait):
+		t.Fatal("the issuer received no refresh request")
+	}
+}
+
+// awaitResult waits for the outcome of a token request.
+func awaitResult(t *testing.T, done <-chan tokenResult) tokenResult {
+	t.Helper()
+	select {
+	case res := <-done:
+		return res
+	case <-time.After(rotationWait):
+		t.Fatal("the token request did not finish")
+		return tokenResult{}
+	}
+}
+
 func (f *rotationFixture) stored() *credstore.Credentials {
 	f.t.Helper()
 	c, err := f.st.Load()
@@ -181,25 +252,16 @@ func TestTokenSourceRefreshesWithStoredRefreshToken(t *testing.T) {
 // the same session must not replace it.
 func TestStaleRefreshDoesNotOverwriteNewerRotation(t *testing.T) {
 	f := newRotationFixture(t)
-	started, release := make(chan struct{}), make(chan struct{})
-	f.l.hook = func(string) {
-		close(started)
-		<-release
-	}
-	type out struct {
-		tok string
-		err error
-	}
-	done := make(chan out, 1)
-	go func() {
-		tok, err := f.source()(context.Background())
-		done <- out{tok, err}
-	}()
-	<-started
-	// Another process refreshed and stored its rotation meanwhile.
+	started, release := f.hold(func(string) bool { return true })
+	// The source is created on the test goroutine: it calls t.Fatal on error.
+	ts := f.source()
+	done := tokenAsync(context.Background(), ts)
+	awaitHeld(t, started, done)
+	// Another process refreshed and stored its rotation meanwhile. The held
+	// request is released even when the save fails.
 	f.save("s", "rt-newer", "newer-jwt", time.Now().Add(time.Hour))
-	close(release)
-	res := <-done
+	release()
+	res := awaitResult(t, done)
 	if res.err != nil || res.tok != "newer-jwt" {
 		t.Fatalf("got %q %v, want the newer stored token", res.tok, res.err)
 	}
@@ -213,29 +275,15 @@ func TestStaleRefreshDoesNotOverwriteNewerRotation(t *testing.T) {
 // is rejected with invalid_grant; the source retries with the stored one.
 func TestInvalidGrantRetriesWithRotatedStoredToken(t *testing.T) {
 	f := newRotationFixture(t)
-	started, release := make(chan struct{}), make(chan struct{})
-	f.l.hook = func(rt string) {
-		if rt != "rt-0" {
-			return
-		}
-		close(started)
-		<-release
-	}
-	type out struct {
-		tok string
-		err error
-	}
-	done := make(chan out, 1)
-	go func() {
-		tok, err := f.source()(context.Background())
-		done <- out{tok, err}
-	}()
-	<-started
+	started, release := f.hold(func(rt string) bool { return rt == "rt-0" })
+	ts := f.source()
+	done := tokenAsync(context.Background(), ts)
+	awaitHeld(t, started, done)
 	// Another process rotated rt-0 to rt-other; its access token is expired.
 	f.l.setValid("rt-other")
 	f.save("s", "rt-other", "expired", time.Now().Add(-time.Hour))
-	close(release)
-	res := <-done
+	release()
+	res := awaitResult(t, done)
 	if res.err != nil || res.tok != "jwt-1" {
 		t.Fatalf("got %q %v, want a token from the retry", res.tok, res.err)
 	}
