@@ -66,7 +66,9 @@ setTimeout(finish, Number(process.env.FAKE_INFISICAL_DELAY_MS ?? "0"));
 
 // The development command. It records its process ID, arguments and selected
 // variables, prints a ready line, and on SIGINT records the signal and exits
-// shortly afterwards, so that a duplicate delivery is also recorded.
+// shortly afterwards, so that a duplicate delivery is also recorded. In the
+// "stubborn" mode it records the signal but keeps running and keeps its output
+// open, so that the exit wait of a test has to hit its deadline.
 const devCommand = `import { appendFileSync, writeFileSync } from "node:fs";
 const out = process.env.DEV_COMMAND_OUT;
 writeFileSync(out + ".start", JSON.stringify({
@@ -83,9 +85,9 @@ writeFileSync(out + ".start", JSON.stringify({
 }));
 process.on("SIGINT", () => {
   appendFileSync(out + ".signals", "SIGINT\\n");
-  setTimeout(() => process.exit(0), 300);
+  if (process.argv[3] !== "stubborn") setTimeout(() => process.exit(0), 300);
 });
-if (process.argv[3] === "wait") {
+if (process.argv[3] === "wait" || process.argv[3] === "stubborn") {
   console.log("ready");
   setInterval(() => {}, 1000);
 } else {
@@ -242,6 +244,32 @@ async function waitFor(predicate, what) {
   while (!predicate()) {
     if (Date.now() > deadline) assert.fail(`timed out waiting for ${what}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
+// How long a test waits for the launcher to exit after it signals it. The
+// command of the fixture exits 300 ms after the signal, so this only expires
+// when the launcher or the command hangs.
+const exitDeadlineMs = 10_000;
+
+// Settles like `promise`, but rejects with a message that names `what` when
+// `promise` is still pending after `ms`. The timer is cleared as soon as the
+// wait settles, so it cannot keep the test runner alive. A timeout does not
+// stop the awaited work: the fixture teardown force-stops the launcher.
+async function within(promise, ms, what) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`timed out waiting for ${what}`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
   }
 }
 
@@ -723,12 +751,60 @@ test(
         await waitFor(() => launcher.output().includes("ready"), "the command");
         // A terminal Ctrl-C signals the whole foreground process group.
         process.kill(-launcher.child.pid, "SIGINT");
-        const result = await launcher.exited;
+        const result = await within(
+          launcher.exited,
+          exitDeadlineMs,
+          "the launcher to exit after SIGINT",
+        );
         // The launcher waits for the command and exits with its status.
         assert.equal(result.code, 0, result.stderr);
         assert.equal(readFileSync(`${f.out}.signals`, "utf8"), "SIGINT\n");
       });
     }
+  },
+);
+
+test("within rejects with the awaited phase and clears its timer", async () => {
+  await assert.rejects(
+    within(new Promise(() => {}), 20, "the launcher to exit after SIGINT"),
+    { message: "timed out waiting for the launcher to exit after SIGINT" },
+  );
+  assert.equal(
+    await within(Promise.resolve("done"), 60_000, "a value"),
+    "done",
+  );
+  await assert.rejects(within(Promise.reject(new Error("boom")), 60_000, "x"), {
+    message: "boom",
+  });
+});
+
+test(
+  "a command that ignores the terminal interrupt fails the exit wait and is cleaned up",
+  posixOnly,
+  async (t) => {
+    let launcherPid;
+    let commandPid;
+    await t.test("stubborn command", async (t) => {
+      const f = fixture(t);
+      const launcher = startLauncher(f, [
+        "--path=/api",
+        ...commandArgs(0, "stubborn"),
+      ]);
+      await waitFor(() => launcher.output().includes("ready"), "the command");
+      launcherPid = launcher.child.pid;
+      commandPid = started(f).pid;
+      process.kill(-launcher.child.pid, "SIGINT");
+      await assert.rejects(
+        within(launcher.exited, 500, "the launcher to exit after SIGINT"),
+        { message: "timed out waiting for the launcher to exit after SIGINT" },
+      );
+      // The command received the signal but is still running.
+      assert.equal(readFileSync(`${f.out}.signals`, "utf8"), "SIGINT\n");
+      assert.equal(alive(commandPid), true);
+    });
+    // The fixture teardown ran when the subtest ended.
+    await waitFor(() => !alive(commandPid), "the command to be stopped");
+    assert.equal(alive(launcherPid), false);
   },
 );
 
