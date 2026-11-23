@@ -409,6 +409,119 @@ test("exportEnvironment removes only the CLI logging variables", () => {
   );
 });
 
+test("exportEnvironment on win32 removes the CLI logging variables in any case", () => {
+  assert.deepEqual(
+    exportEnvironment(
+      {
+        Log_Level: "debug",
+        log_destination: "stdout",
+        LOG_FORMAT: "json",
+        Log_Level_Extra: "kept",
+        APP_SETTING: "kept",
+        Path: "C:\\Windows",
+      },
+      "win32",
+    ),
+    { Log_Level_Extra: "kept", APP_SETTING: "kept", Path: "C:\\Windows" },
+  );
+});
+
+test("exportEnvironment removes only uppercase logging variables elsewhere", () => {
+  for (const platform of ["linux", "darwin"]) {
+    assert.deepEqual(
+      exportEnvironment(
+        {
+          Log_Level: "kept",
+          log_destination: "kept",
+          LOG_LEVEL: "debug",
+          LOG_DESTINATION: "stdout",
+          LOG_FORMAT: "json",
+          APP_SETTING: "kept",
+        },
+        platform,
+      ),
+      { Log_Level: "kept", log_destination: "kept", APP_SETTING: "kept" },
+      platform,
+    );
+  }
+});
+
+test("exportEnvironment does not change its input", () => {
+  const env = { LOG_LEVEL: "debug", KEPT: "1" };
+  exportEnvironment(env, "win32");
+  assert.deepEqual(env, { LOG_LEVEL: "debug", KEPT: "1" });
+});
+
+test("parseExport on win32 skips reserved names and prefixes in any case", () => {
+  assert.deepEqual(
+    parseExport(
+      exported([
+        { key: "path", value: "/evil" },
+        { key: "Path", value: "/evil" },
+        { key: "Home", value: "/evil" },
+        { key: "xdg_data_home", value: "/evil" },
+        { key: "Lc_All", value: "C" },
+        { key: "APP_SETTING", value: "kept" },
+        { key: "lc", value: "kept" },
+      ]),
+      "win32",
+    ),
+    {
+      variables: { APP_SETTING: "kept", lc: "kept" },
+      reserved: 5,
+      invalid: 0,
+    },
+  );
+});
+
+test("parseExport elsewhere skips only the exact reserved spellings", () => {
+  for (const platform of ["linux", "darwin"]) {
+    assert.deepEqual(
+      parseExport(
+        exported([
+          { key: "PATH", value: "/evil" },
+          { key: "XDG_DATA_HOME", value: "/evil" },
+          { key: "path", value: "lower" },
+          { key: "Home", value: "mixed" },
+          { key: "xdg_data_home", value: "lower" },
+        ]),
+        platform,
+      ),
+      {
+        variables: { path: "lower", Home: "mixed", xdg_data_home: "lower" },
+        reserved: 2,
+        invalid: 0,
+      },
+      platform,
+    );
+  }
+});
+
+test("parseExport on win32 merges names that differ by case", () => {
+  assert.deepEqual(
+    parseExport(
+      exported([
+        { key: "FOO", value: "first" },
+        { key: "OTHER", value: "kept" },
+        { key: "Foo", value: "second" },
+      ]),
+      "win32",
+    ).variables,
+    { Foo: "second", OTHER: "kept" },
+  );
+  // POSIX keeps both spellings.
+  assert.deepEqual(
+    parseExport(
+      exported([
+        { key: "FOO", value: "first" },
+        { key: "Foo", value: "second" },
+      ]),
+      "linux",
+    ).variables,
+    { FOO: "first", Foo: "second" },
+  );
+});
+
 test("mergeEnvironment on win32 replaces an inherited name that differs by case", () => {
   // Both orders matter: Windows keeps the first spelling in sorted order, so
   // the stale inherited spelling must not reach the child at all.

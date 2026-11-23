@@ -193,20 +193,27 @@ export function projectConfigFile(root) {
 // the logging flags.
 const CliLoggingVariables = ["LOG_LEVEL", "LOG_DESTINATION", "LOG_FORMAT"];
 
-// Environment of the fetch: the inherited environment without the CLI
-// logging variables. The development command still receives them.
-export function exportEnvironment(env) {
-  const result = { ...env };
-  for (const name of CliLoggingVariables) delete result[name];
-  return result;
-}
-
 // Windows compares environment variable names without regard to case, and a
 // child process receives one value per name. JavaScript objects compare keys
 // exactly, so a platform-aware key makes `Path` and `PATH` one name on win32
 // while POSIX keeps differently cased names distinct.
 function nameKey(name, platform) {
   return platform === "win32" ? name.toUpperCase() : name;
+}
+
+// Environment of the fetch: the inherited environment without the CLI
+// logging variables. The development command still receives them. On win32
+// the variables match without regard to case, because Windows treats `Log_Level`
+// as `LOG_LEVEL`; elsewhere only the uppercase spellings are removed.
+export function exportEnvironment(env, platform = process.platform) {
+  const logging = new Set(
+    CliLoggingVariables.map((name) => nameKey(name, platform)),
+  );
+  return Object.fromEntries(
+    Object.entries(env).filter(
+      ([name]) => !logging.has(nameKey(name, platform)),
+    ),
+  );
 }
 
 // Environment of the development command: the inherited environment with the
@@ -250,8 +257,11 @@ export function exportArguments(folder) {
 
 // Converts the JSON output of `infisical export` (an array of objects with
 // string `key` and `value` fields) into variables. Reserved names and names
-// that are not valid variable names are skipped and only counted.
-export function parseExport(output) {
+// that are not valid variable names are skipped and only counted. On win32 the
+// reserved names and prefixes match without regard to case, so a fetched
+// `path` cannot replace the inherited `Path`, and entries that differ only by
+// case are one variable.
+export function parseExport(output, platform = process.platform) {
   let entries;
   try {
     entries = JSON.parse(output);
@@ -267,11 +277,11 @@ export function parseExport(output) {
       "infisical export did not print a JSON array",
     );
   }
-  // Accepted entries stay in a list and become own data properties at the end.
+  // Accepted entries stay in a map and become own data properties at the end.
   // Assigning `variables[entry.key]` on an object literal would invoke the
   // `Object.prototype.__proto__` setter for the valid name `__proto__` and
   // silently drop the variable instead of creating an own property.
-  const accepted = [];
+  const accepted = new Map();
   let reserved = 0;
   let invalid = 0;
   for (const entry of entries) {
@@ -286,19 +296,25 @@ export function parseExport(output) {
         "infisical export printed an entry without a string key and value",
       );
     }
+    const key = nameKey(entry.key, platform);
     if (
-      ReservedNames.has(entry.key) ||
-      ReservedPrefixes.some((prefix) => entry.key.startsWith(prefix))
+      ReservedNames.has(key) ||
+      ReservedPrefixes.some((prefix) => key.startsWith(prefix))
     ) {
       reserved += 1;
     } else if (!VariableName.test(entry.key) || entry.value.includes("\0")) {
       invalid += 1;
     } else {
-      accepted.push([entry.key, entry.value]);
+      // A later entry with the same name replaces an earlier one, including
+      // its spelling. The map keeps the position of the first entry.
+      accepted.set(key, [entry.key, entry.value]);
     }
   }
-  // A later entry with the same name replaces an earlier one.
-  return { variables: Object.fromEntries(accepted), reserved, invalid };
+  return {
+    variables: Object.fromEntries(accepted.values()),
+    reserved,
+    invalid,
+  };
 }
 
 let received = null;
