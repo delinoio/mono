@@ -68,14 +68,48 @@ func parseTunnelSpec(cmdline string) (tunnelSpec, bool, error) {
 	return tunnelSpec{}, false, nil
 }
 
+// resolverPath is the resolver configuration the tunnel points at the
+// gateway.
+const resolverPath = "/etc/resolv.conf"
+
+// tunnelDeps holds the system operations of the tunnel setup, so that a test
+// can inject failures without root, /dev/net/tun or a vsock listener.
+type tunnelDeps struct {
+	openTap            func(name string) (io.ReadWriteCloser, error)
+	configureInterface func(name string, addr netip.Prefix, gateway netip.Addr) error
+	writeResolver      func(path string, data []byte) error
+	listen             func(address string) (net.Listener, error)
+}
+
+// systemTunnelDeps returns the operations that act on the real system.
+func systemTunnelDeps() tunnelDeps {
+	return tunnelDeps{
+		openTap: func(name string) (io.ReadWriteCloser, error) {
+			f, err := openTap(name)
+			if err != nil {
+				// Return an untyped nil: a nil *os.File in the interface
+				// would not compare equal to nil.
+				return nil, err
+			}
+			return f, nil
+		},
+		configureInterface: configureInterface,
+		writeResolver: func(path string, data []byte) error {
+			return os.WriteFile(path, data, 0o644)
+		},
+		listen: guestlisten.Listen,
+	}
+}
+
 // startTunnel starts the network tunnel when the kernel command line asks
 // for it. It returns after the interface is configured; the relay runs
 // until the process ends. The returned channel is nil when no tunnel runs.
 // Otherwise it receives the terminal error of the relay (the TAP device or
 // the listener failed) after the tunnel closed its connection, listener and
 // TAP device; the caller must then end the helper so that the init process
-// restarts it and the host reconnects. A setup failure is returned as an
-// error and leaves no tunnel running.
+// restarts it and the host reconnects. A setup failure, including a failed
+// write of the resolver configuration, is returned as an error and leaves no
+// tunnel running.
 func startTunnel(logger *slog.Logger) (<-chan error, error) {
 	cmdline, err := os.ReadFile("/proc/cmdline")
 	if err != nil {
@@ -85,16 +119,27 @@ func startTunnel(logger *slog.Logger) (<-chan error, error) {
 	if !ok || err != nil {
 		return nil, err
 	}
-	tapFile, err := openTap(tunnelInterface)
+	return startTunnelWith(spec, systemTunnelDeps(), logger)
+}
+
+// startTunnelWith sets the tunnel of spec up with the given operations. Every
+// setup failure closes the TAP device and returns an error that names the
+// failed step; the listener opens only after the interface and the resolver
+// configuration are in place.
+func startTunnelWith(spec tunnelSpec, deps tunnelDeps, logger *slog.Logger) (<-chan error, error) {
+	tapFile, err := deps.openTap(tunnelInterface)
 	if err != nil {
 		return nil, fmt.Errorf("tunnel: create %s: %w", tunnelInterface, err)
 	}
-	if err := configureInterface(tunnelInterface, spec.guest, spec.gateway); err != nil {
+	if err := deps.configureInterface(tunnelInterface, spec.guest, spec.gateway); err != nil {
 		tapFile.Close()
 		return nil, fmt.Errorf("tunnel: configure %s: %w", tunnelInterface, err)
 	}
-	_ = os.WriteFile("/etc/resolv.conf", []byte("nameserver "+spec.gateway.String()+"\n"), 0o644)
-	l, err := guestlisten.Listen(fmt.Sprintf("vsock://:%d", spec.port))
+	if err := deps.writeResolver(resolverPath, []byte("nameserver "+spec.gateway.String()+"\n")); err != nil {
+		tapFile.Close()
+		return nil, fmt.Errorf("tunnel: write resolver %s: %w", resolverPath, err)
+	}
+	l, err := deps.listen(fmt.Sprintf("vsock://:%d", spec.port))
 	if err != nil {
 		tapFile.Close()
 		return nil, fmt.Errorf("tunnel: listen: %w", err)
