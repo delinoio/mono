@@ -131,6 +131,83 @@ describe("organization", () => {
     await h.client.organizations.listOrganizations({});
     expect(h.api.callsOf("ListOrganizations")).toHaveLength(1);
   });
+
+  // Server-streaming relay calls carry their single request in an async
+  // iterable, which the unary path does not see.
+  describe.each([
+    {
+      method: "Exec",
+      open: (h: ReturnType<typeof setup>, organizationId?: string) =>
+        h.client.relay.exec({ sandboxId: SANDBOX, organizationId }),
+    },
+    {
+      method: "AttachExec",
+      open: (h: ReturnType<typeof setup>, organizationId?: string) =>
+        h.client.relay.attachExec({ sandboxId: SANDBOX, organizationId }),
+    },
+    {
+      method: "ReadFile",
+      open: (h: ReturnType<typeof setup>, organizationId?: string) =>
+        h.client.relay.readFile({ sandboxId: SANDBOX, organizationId }),
+    },
+  ])("relay $method", ({ method, open }) => {
+    async function drain(call: AsyncIterable<unknown>): Promise<void> {
+      for await (const _ of call) {
+        // The fake ends the stream without a message.
+      }
+    }
+
+    function fakeStream(h: ReturnType<typeof setup>) {
+      h.api.stream(RelayService, method, function* () {});
+    }
+
+    function organizationsSent(h: ReturnType<typeof setup>): string[] {
+      return h.api
+        .callsOf(method)
+        .map(
+          (c) =>
+            (c.request as unknown as { organizationId: string }).organizationId,
+        );
+    }
+
+    test("fills the client organization when the request omits it or leaves it empty", async () => {
+      const h = setup();
+      fakeStream(h);
+      await drain(open(h));
+      await drain(open(h, ""));
+      expect(organizationsSent(h)).toEqual([ORG, ORG]);
+    });
+
+    test("fills the OWNSAND_ORG organization when the client has no organization", async () => {
+      const h = setup({
+        organizationId: undefined,
+        env: { OWNSAND_ORG: ORG },
+      });
+      fakeStream(h);
+      await drain(open(h));
+      expect(organizationsSent(h)).toEqual([ORG]);
+    });
+
+    test("keeps an explicit request organization", async () => {
+      const h = setup();
+      fakeStream(h);
+      await drain(open(h, "other-org"));
+      expect(organizationsSent(h)).toEqual(["other-org"]);
+    });
+
+    test("fails locally with InvalidArgument before any fetch when no organization is set", async () => {
+      const h = setup({ organizationId: undefined });
+      fakeStream(h);
+      const error = await drain(open(h)).then(
+        () => undefined,
+        (e) => e,
+      );
+      expect(error).toBeInstanceOf(ConnectError);
+      expect(error.code).toBe(Code.InvalidArgument);
+      expect(error.message).toContain("needs an organization");
+      expect(h.api.fetchedUrls).toHaveLength(0);
+    });
+  });
 });
 
 describe("credentials", () => {
