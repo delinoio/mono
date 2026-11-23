@@ -341,13 +341,14 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 
 	buf := make([]byte, datapath.MaxFileChunkSize)
 	nextBuf := make([]byte, datapath.MaxFileChunkSize)
-	// Observe cancellation before every read of the source, so a canceled
-	// context never enters r.Read. Nothing is acknowledged before the first
+	// Observe cancellation before every call to the source's Read, so a
+	// canceled context never enters r.Read (readChunk repeats the check
+	// between the Read calls of one chunk). Nothing is acknowledged before the first
 	// chunk, so the offset is 0 here.
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	n, rerr := readChunk(r, buf)
+	n, rerr := readChunk(ctx, r, buf)
 	var offset int64
 	isFirst := true
 	for {
@@ -363,7 +364,7 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 			if err := ctx.Err(); err != nil {
 				return offset, err
 			}
-			m, nerr = readChunk(r, nextBuf)
+			m, nerr = readChunk(ctx, r, nextBuf)
 			if nerr != nil && nerr != io.EOF {
 				return offset, nerr
 			}
@@ -433,10 +434,19 @@ func (s *Sandbox) WriteFile(ctx context.Context, path string, r io.Reader, opts 
 // r unchanged. Unlike io.ReadFull, it never turns a short read into
 // io.ErrUnexpectedEOF, so a source that reports io.ErrUnexpectedEOF (for
 // example a truncated compressed stream) is not mistaken for the end of input.
-func readChunk(r io.Reader, buf []byte) (int, error) {
+//
+// It checks ctx before every call to r.Read, not only once per chunk, because
+// a chunk can need several Read calls and a short read may be the one that
+// cancels ctx. When ctx is done it returns the bytes already buffered together
+// with ctx.Err(); the callers discard those bytes because they are not
+// acknowledged.
+func readChunk(ctx context.Context, r io.Reader, buf []byte) (int, error) {
 	const maxEmptyReads = 100
 	n, empty := 0, 0
 	for n < len(buf) {
+		if err := ctx.Err(); err != nil {
+			return n, err
+		}
 		m, err := r.Read(buf[n:])
 		n += m
 		if err != nil {
