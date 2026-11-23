@@ -6,6 +6,7 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
 } from "@testing-library/react";
 import { readFileSync } from "node:fs";
 import type * as React from "react";
@@ -155,6 +156,15 @@ describe("Collapsible", () => {
     expect(trigger.getAttribute("aria-expanded")).toBe("true");
     const panel = screen.getByText("Two seats left.");
     expect(panel.className).toBe("dui-collapsible-panel");
+
+    await act(async () => {
+      fireEvent.click(trigger);
+    });
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+    // Wait for any closing transition before asserting the panel is hidden.
+    await waitFor(() => {
+      expect(screen.queryByText("Two seats left.")).toBeNull();
+    });
   });
 });
 
@@ -1093,6 +1103,12 @@ describe("PasswordInput", () => {
     expect(input?.getAttribute("type")).toBe("text");
     expect(toggle.getAttribute("aria-pressed")).toBe("true");
     expect(toggle.getAttribute("aria-label")).toBe("Show password");
+
+    await act(async () => {
+      fireEvent.click(toggle);
+    });
+    expect(input?.getAttribute("type")).toBe("password");
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
   });
 
   test("names the input with the label", () => {
