@@ -30,18 +30,27 @@ import (
 var guestBinary string
 
 func TestMain(m *testing.M) {
+	os.Exit(run(m))
+}
+
+// run builds the guest helper into a temporary directory, runs the tests and
+// returns the exit code. The directory is removed on every path, including a
+// failed helper build; a panic or os.Exit before the deferred cleanup would
+// leak it.
+func run(m *testing.M) int {
 	dir, err := os.MkdirTemp("", "ownsand-processrt-test-")
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "create harness temp dir: %v\n", err)
+		return 1
 	}
+	defer os.RemoveAll(dir)
 	guestBinary = filepath.Join(dir, "ownsand-guest")
 	out, err := exec.Command("go", "build", "-o", guestBinary, "github.com/delinoio/mono/cmds/ownsand-guest").CombinedOutput()
 	if err != nil {
-		panic(fmt.Sprintf("build guest helper: %v\n%s", err, out))
+		fmt.Fprintf(os.Stderr, "build guest helper: %v\n%s", err, out)
+		return 1
 	}
-	code := m.Run()
-	os.RemoveAll(dir)
-	os.Exit(code)
+	return m.Run()
 }
 
 func TestParseProcessList(t *testing.T) {
