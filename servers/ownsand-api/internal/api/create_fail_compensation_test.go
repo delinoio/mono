@@ -19,9 +19,9 @@ import (
 	"github.com/delinoio/mono/servers/ownsand-api/internal/testenv"
 )
 
-// updateFault makes the UPDATE of one table that matches a WHEN predicate
-// fail with a chosen SQLSTATE for its first calls. It injects the failure in
-// the database itself, so the server code under test has no test seam. The
+// updateFault makes the UPDATE (or, for newInsertFault, the INSERT) of one
+// table that matches a WHEN predicate fail with a chosen SQLSTATE for its
+// first calls. It injects the failure in the database itself, so the server code under test has no test seam. The
 // trigger counts the matching calls in a sequence, which survives the
 // rollback of the failed statement.
 type updateFault struct {
@@ -34,6 +34,18 @@ type updateFault struct {
 // when (a predicate over OLD and NEW). The name must be unique per test
 // database and a valid identifier fragment.
 func newUpdateFault(t *testing.T, env *testenv.Env, name, table, when string) *updateFault {
+	t.Helper()
+	return newTableFault(t, env, name, table, "UPDATE", when)
+}
+
+// newInsertFault installs the trigger on table for the inserts that satisfy
+// when (a predicate over NEW). The name must be unique per test database.
+func newInsertFault(t *testing.T, env *testenv.Env, name, table, when string) *updateFault {
+	t.Helper()
+	return newTableFault(t, env, name, table, "INSERT", when)
+}
+
+func newTableFault(t *testing.T, env *testenv.Env, name, table, event, when string) *updateFault {
 	t.Helper()
 	for _, stmt := range []string{
 		fmt.Sprintf("CREATE TABLE %s_state (code text, max_failures int)", name),
@@ -48,7 +60,7 @@ func newUpdateFault(t *testing.T, env *testenv.Env, name, table, when string) *u
 				END IF;
 				RETURN NEW;
 			END $$`, name, name, name),
-		fmt.Sprintf("CREATE TRIGGER %s_fault BEFORE UPDATE ON %s FOR EACH ROW WHEN (%s) EXECUTE FUNCTION %s_raise()", name, table, when, name),
+		fmt.Sprintf("CREATE TRIGGER %s_fault BEFORE %s ON %s FOR EACH ROW WHEN (%s) EXECUTE FUNCTION %s_raise()", name, event, table, when, name),
 	} {
 		if _, err := env.DB.Pool.Exec(context.Background(), stmt); err != nil {
 			t.Fatal(err)

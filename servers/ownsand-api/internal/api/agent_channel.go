@@ -568,7 +568,7 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 		err = s.applyExportResultWithRetry(ctx, conn, info, res)
 	case cmdImportSnapshot:
 		if res.GetError() == nil {
-			err = s.registerImportedCopy(ctx, conn, info, log)
+			err = s.applyImportResult(ctx, conn, info, res, log)
 		}
 	}
 	if err != nil {
@@ -576,6 +576,35 @@ func (s *Service) handleCommandResult(ctx context.Context, conn *hub.Conn, res *
 	}
 	s.Hub.Commands.Deliver(res.GetCommandId(), res)
 }
+
+// applyImportResult records the copy of a successful import result with
+// applyResultWithRetry. The server removed the command record before it
+// applied the result and the agent sends the result once, so a result that a
+// transient database error loses would leave the copy on the device untracked
+// by snapshot_copies: a later deletion of the snapshot would not include the
+// device. registerImportedCopy is idempotent (the copy row is inserted with
+// ON CONFLICT DO NOTHING, and a snapshot that was deleted meanwhile only
+// makes the importer get the delete command), so a retry after a commit whose
+// outcome is unknown changes nothing more. When the application ends without
+// success while conn is still the current channel of its device, the channel
+// is closed: the state report of the replacement channel then recovers the
+// copy that the agent lists or removes the copy that it does not list. A
+// replacement channel that already owns the device is never closed. The
+// caller delivers the result to the waiting create after this returns, so the
+// create observes the outcome: it sends its create command only on a channel
+// that is still open.
+func (s *Service) applyImportResult(ctx context.Context, conn *hub.Conn, info commandInfo, res *ownsandv1.AgentCommandResult, log *slog.Logger) error {
+	return s.applyResultWithRetry(ctx, conn, resultApplyEvents{
+		retry:     "import_result_apply_retry",
+		recovered: "import_result_apply_recovered",
+		abandoned: "import_result_apply_abandoned",
+	}, errImportResultNotApplied, []any{slog.String("snapshot_id", info.snapshotID), slog.String("command_id", res.GetCommandId())},
+		func(ctx context.Context) error { return s.registerImportedCopy(ctx, conn, info, log) })
+}
+
+// errImportResultNotApplied is the cause that closes a channel whose
+// import-snapshot result could not be applied.
+var errImportResultNotApplied = errors.New("the import-snapshot result could not be applied")
 
 // registerImportedCopy records the local copy that a successful import
 // result reports. The parent snapshot row is locked FOR SHARE while the
