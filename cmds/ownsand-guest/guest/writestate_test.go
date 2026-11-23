@@ -173,6 +173,80 @@ func TestWriteRecoveryUsesTimeOfLastChunk(t *testing.T) {
 	}
 }
 
+// A chunk that fails does not extend the lifetime of the write: the live
+// time and the recovery record both keep the last accepted chunk time.
+func TestWriteRejectedChunkDoesNotRefreshExpiry(t *testing.T) {
+	for _, restarted := range []bool{false, true} {
+		name := "live"
+		if restarted {
+			name = "recovered"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			target, req := startPartialWrite(t, h)
+			tmp := tempPath(target, req.GetWriteId())
+			h.clock.Advance(10 * time.Minute)
+			// The bytes overlap the written range with other content.
+			bad := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: req.GetWriteId(), Data: []byte("PARTIAL")}
+			if _, errd := h.write(bad); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+				t.Fatalf("overlapping chunk with other content: %v", errd)
+			}
+			cur := h
+			if restarted {
+				cur = restart(t, h, nil)
+			}
+			// 5 minutes after the rejected chunk is 15 after the accepted one.
+			cur.clock.Advance(4 * time.Minute)
+			cur.srv.Sweep()
+			if !exists(tmp) {
+				t.Fatal("staging file removed too early")
+			}
+			cur.clock.Advance(time.Minute)
+			cur.srv.Sweep()
+			if exists(tmp) {
+				t.Fatal("a rejected chunk extended the lifetime of the staging file")
+			}
+		})
+	}
+}
+
+// An accepted chunk refreshes the live time, and a finish that fails after an
+// accepted chunk keeps the refreshed time in the live state and the record.
+func TestWriteAcceptedChunkRefreshesExpiryBeforeFinish(t *testing.T) {
+	for _, restarted := range []bool{false, true} {
+		name := "live"
+		if restarted {
+			name = "recovered"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			target, req := startPartialWrite(t, h)
+			tmp := tempPath(target, req.GetWriteId())
+			h.clock.Advance(10 * time.Minute)
+			// The finish fails: the written ranges do not cover size_bytes.
+			more := &ownsandv1.WriteFileRequest{SandboxId: testSandbox, WriteId: req.GetWriteId(), Offset: 7, Data: []byte("more"), Finish: &ownsandv1.WriteFileFinish{SizeBytes: 100}}
+			if _, errd := h.write(more); errd.GetCode() != ownsandv1.ErrorCode_ERROR_CODE_FAILED_PRECONDITION {
+				t.Fatalf("finish with a wrong size: %v", errd)
+			}
+			cur := h
+			if restarted {
+				cur = restart(t, h, nil)
+			}
+			// 6 minutes after the accepted chunk, 16 after the first one.
+			cur.clock.Advance(6 * time.Minute)
+			cur.srv.Sweep()
+			if !exists(tmp) {
+				t.Fatal("an accepted chunk did not refresh the expiry before its failed finish")
+			}
+			cur.clock.Advance(9 * time.Minute)
+			cur.srv.Sweep()
+			if exists(tmp) {
+				t.Fatal("staging file kept after 15 minutes without an accepted chunk")
+			}
+		})
+	}
+}
+
 func TestWriteRecoveryClampsFutureLastChunk(t *testing.T) {
 	h := newHarness(t, nil)
 	target, req := startPartialWrite(t, h)

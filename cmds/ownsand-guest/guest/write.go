@@ -232,10 +232,14 @@ func (m *writeManager) apply(req *ownsandv1.WriteFileRequest) (*ownsandv1.WriteF
 		}
 		return e.result, nil
 	}
-	e.lastChunk = m.now()
 	if err := e.writeChunk(req.GetOffset(), req.GetData()); err != nil {
+		// A rejected chunk does not extend the lifetime of the write: both the
+		// live time and the recovery record keep the last accepted chunk time.
 		return nil, err
 	}
+	// The record refresh stays before the finish, so a finish error keeps the
+	// refreshed expiry.
+	e.lastChunk = m.now()
 	m.persistRecord(e, false)
 	resp := &ownsandv1.WriteFileResponse{WriteId: req.GetWriteId(), Offset: req.GetOffset(), Length: int64(len(req.GetData()))}
 	if finish == nil {
