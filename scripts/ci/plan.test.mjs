@@ -770,6 +770,7 @@ test("workflows and local actions select the workflow lint", async (t) => {
     ".github/workflows/deploy.yml",
     ".github/workflows/new.yaml",
     ".github/actions/setup/action.yml",
+    ".github/actionlint.yaml",
   ]) {
     await t.test(path, (t) => {
       const f = fixture(t);

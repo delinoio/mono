@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# actionlint configuration; actionlint reads this file automatically.
+#
+# Workaround: actionlint v1.7.12 does not know the `queue` key of the
+# `concurrency` section, so it reports `unexpected key "queue" for
+# "concurrency" section` for `deploy.yml`, which sets `queue: max` to keep
+# pending deployments in the queue. The exception ignores exactly that
+# diagnostic and only for `deploy.yml`; every other diagnostic of that file
+# and every diagnostic of the other workflows still fails the lint. Remove the
+# exception, and the `deploy.yml` entry below it, when the pinned actionlint
+# version accepts `queue`.
+paths:
+  .github/workflows/deploy.yml:
+    ignore:
+      - 'unexpected key "queue" for "concurrency" section.*'

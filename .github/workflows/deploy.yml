@@ -17,6 +17,15 @@ concurrency:
   # `main` deployment in the queue.
   group: ${{ github.ref == 'refs/heads/main' && 'deploy' || format('deploy-rejected-{0}', github.run_id) }}
   cancel-in-progress: false
+  # Workaround: without `queue: max`, GitHub keeps one pending run per group
+  # and cancels it when a later dispatch arrives, so a third dispatch drops
+  # the second before `plan` runs. `max` keeps up to 100 pending runs in
+  # first-in-first-out order; GitHub cancels a run only when the queue is
+  # full. actionlint v1.7.12 does not know the key and reports `unexpected key
+  # "queue" for "concurrency" section`, so `.github/actionlint.yaml` ignores
+  # exactly that diagnostic for this file. Remove the exception when the
+  # pinned actionlint accepts `queue`.
+  queue: max
 jobs:
   plan:
     name: Plan deployment

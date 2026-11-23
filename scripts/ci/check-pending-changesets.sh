@@ -10,7 +10,8 @@
 #   cancelled, because it may already have deployed a newer revision. A newer
 #   run whose first attempt still waits in the concurrency queue does not
 #   count, and neither does a cancelled or queued run in which no job of any
-#   attempt started (a later dispatch replaces the pending run of the group).
+#   attempt started (a later dispatch replaces a pending run of the group only
+#   when the queue of 100 pending runs, `queue: max`, is full).
 #   A queued rerun counts when an earlier attempt started a job;
 # - `main` no longer contains the planned revision (rewound or rewritten);
 # - a planned changeset is no longer on `main` (another run released it); or
