@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	ownsandv1 "github.com/delinoio/mono/protos/delino/ownsand/v1"
 	"github.com/delinoio/mono/servers/ownsand-api/internal/app"
@@ -371,6 +372,35 @@ func TestSnapshotDeletionWaitsForSigner(t *testing.T) {
 	assertCleanupKeepsJobUntil(t, env, gate, prefix)
 }
 
+// forShareLockWaitersQuery counts the backends of the current database that
+// wait for a lock in a FOR SHARE statement. pg_stat_activity is server-wide, so
+// the database scope keeps a backend of another database on the same server
+// (for example a parallel test) from matching.
+const forShareLockWaitersQuery = `
+SELECT count(*) FROM pg_stat_activity
+WHERE datname = current_database() AND wait_event_type = 'Lock' AND query LIKE '%FOR SHARE%'`
+
+// queryForShareLockWaiters runs forShareLockWaitersQuery on pool.
+func queryForShareLockWaiters(ctx context.Context, pool *pgxpool.Pool) (int, error) {
+	var n int
+	if err := pool.QueryRow(ctx, forShareLockWaitersQuery).Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// forShareLockWaiters returns the number of signer statements that wait for a
+// row lock in the fixture database. A failing activity query fails the test at
+// once instead of leaving the barrier that polls it to time out.
+func forShareLockWaiters(t testing.TB, env *testenv.Env) int {
+	t.Helper()
+	n, err := queryForShareLockWaiters(context.Background(), env.DB.Pool)
+	if err != nil {
+		t.Fatalf("count FOR SHARE lock waiters: %v", err)
+	}
+	return n
+}
+
 // TestSnapshotDeletionBeforeSigner: deletion wins the race. A signer that
 // waits behind the deleting transaction finds no row and returns no URL, and
 // so does every later request.
@@ -392,9 +422,7 @@ func TestSnapshotDeletionBeforeSigner(t *testing.T) {
 	}
 	requestUploadURLs(agent, snapID, "sign-second")
 	testenv.Eventually(t, "the signer waits for the row lock", func() bool {
-		var n int
-		_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%FOR SHARE%'").Scan(&n)
-		return n == 1
+		return forShareLockWaiters(t, env) == 1
 	})
 	if _, err := tx.Exec(ctx, "DELETE FROM snapshots WHERE snapshot_id = $1", snapID); err != nil {
 		t.Fatal(err)
@@ -484,9 +512,7 @@ func TestOrganizationDeletionBeforeSigner(t *testing.T) {
 	}
 	requestUploadURLs(agent, snapID, "sign-org-late")
 	testenv.Eventually(t, "the signer waits for the row lock", func() bool {
-		var n int
-		_ = env.DB.Pool.QueryRow(ctx, "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%FOR SHARE%'").Scan(&n)
-		return n == 1
+		return forShareLockWaiters(t, env) == 1
 	})
 	// The cascade of the organization deletes the snapshot row.
 	if _, err := tx.Exec(ctx, "DELETE FROM organizations WHERE organization_id = $1", org.ID); err != nil {
