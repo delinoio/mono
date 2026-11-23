@@ -923,48 +923,86 @@ describe("invoices", () => {
      * Opens the invoice with the given `window.open` result and holds the
      * GetInvoiceUrl answer until `respond` runs. The location assignment
      * that a blocked pop-up falls back to is recorded and not performed.
+     * The stubs stay installed until the caller runs `restore()`; when the
+     * setup itself fails, they are restored here and the failure propagates
+     * because the caller never receives a harness to restore.
      */
     async function openInvoiceWith(
       opened: ReturnType<typeof fakeTab> | null,
       failure?: ConnectError,
+      api = createFakeApi(),
     ) {
       const originalOpen = window.open;
       const originalAssign = window.location.assign;
+      const restore = () => {
+        window.open = originalOpen;
+        window.location.assign = originalAssign;
+      };
       const assigned: string[] = [];
       window.open = (() => opened) as unknown as typeof window.open;
       window.location.assign = (url: string | URL) => {
         assigned.push(String(url));
       };
-      const api = createFakeApi();
-      if (failure !== undefined) api.failNext.set("GetInvoiceUrl", failure);
-      let respond!: () => void;
-      api.gates.set(
-        "GetInvoiceUrl",
-        new Promise<void>((resolve) => {
-          respond = resolve;
-        }),
-      );
-      await renderAccount(ADMIN, { api });
-      await openTab("Invoices");
-      const list = await screen.findByRole("list", { name: "Invoices" });
-      await click(
-        within(list).getByRole("button", { name: /Open the invoice/ }),
-      );
-      await settle(60);
-      expect(calls(api, "GetInvoiceUrl")).toHaveLength(1);
-      return {
-        api,
-        assigned,
-        respond: async () => {
-          respond();
-          await settle(60);
-        },
-        restore() {
-          window.open = originalOpen;
-          window.location.assign = originalAssign;
-        },
-      };
+      try {
+        if (failure !== undefined) api.failNext.set("GetInvoiceUrl", failure);
+        let respond!: () => void;
+        api.gates.set(
+          "GetInvoiceUrl",
+          new Promise<void>((resolve) => {
+            respond = resolve;
+          }),
+        );
+        await renderAccount(ADMIN, { api });
+        await openTab("Invoices");
+        const list = await screen.findByRole("list", { name: "Invoices" });
+        await click(
+          within(list).getByRole("button", { name: /Open the invoice/ }),
+        );
+        await settle(60);
+        expect(calls(api, "GetInvoiceUrl")).toHaveLength(1);
+        return {
+          api,
+          assigned,
+          respond: async () => {
+            respond();
+            await settle(60);
+          },
+          restore,
+        };
+      } catch (error) {
+        restore();
+        throw error;
+      }
     }
+
+    test("a failed setup restores the browser stubs and propagates the failure", async () => {
+      const originalOpen = window.open;
+      const originalAssign = window.location.assign;
+      const api = createFakeApi();
+      api.failNext.set(
+        "ListInvoices",
+        new ConnectError("unavailable", Code.Unavailable),
+      );
+      await expect(
+        openInvoiceWith(fakeTab(), undefined, api),
+      ).rejects.toBeDefined();
+      expect(window.open).toBe(originalOpen);
+      expect(window.location.assign).toBe(originalAssign);
+    });
+
+    test("a successful setup keeps the browser stubs until restore", async () => {
+      const originalOpen = window.open;
+      const originalAssign = window.location.assign;
+      const harness = await openInvoiceWith(fakeTab());
+      try {
+        expect(window.open).not.toBe(originalOpen);
+        expect(window.location.assign).not.toBe(originalAssign);
+      } finally {
+        harness.restore();
+      }
+      expect(window.open).toBe(originalOpen);
+      expect(window.location.assign).toBe(originalAssign);
+    });
 
     test("a tab the user closed discards the link and leaves the billing page alone", async () => {
       const tab = fakeTab();
