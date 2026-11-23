@@ -30,6 +30,7 @@ type Metrics struct {
 	transferBytes metric.Int64Counter
 	// webhookDeliveries is tide_webhook_deliveries_total.
 	webhookDeliveries metric.Int64Counter
+	vendorWatch       metric.Int64Counter
 }
 
 // New creates the instruments with provider; nil selects a no-op provider.
@@ -50,6 +51,7 @@ func New(provider metric.MeterProvider) (*Metrics, error) {
 	m.devExecs = counter("tide_dev_session_execs", "Ended dev session execs by guest OS and result.")
 	m.webhookDeliveries = counter("tide_webhook_deliveries", "Webhook deliveries by sender and result.")
 	m.transferBytes = counter("tide_dev_session_transfer_bytes", "File bytes that tide-api relays for dev sessions, by direction and guest OS.")
+	m.vendorWatch = counter("tide_vendor_watch_reconnects", "Reconnects of a vendor watch stream after an error or an unexpected end, by vendor.")
 	gauge := func(name, help string) metric.Int64Gauge {
 		g, err := meter.Int64Gauge(name, metric.WithDescription(help))
 		errs = append(errs, err)
@@ -134,5 +136,13 @@ func (m *Metrics) TransferBytes(direction, guestOS string, n int64) {
 func (m *Metrics) WebhookDelivery(sender, result string) {
 	if m != nil {
 		m.webhookDeliveries.Add(context.Background(), 1, metric.WithAttributes(attribute.String("sender", sender), attribute.String("result", result)))
+	}
+}
+
+// VendorWatchReconnect counts one reconnect of a vendor watch stream after
+// an error or an unexpected end; vendor is CURSOR or DEVIN.
+func (m *Metrics) VendorWatchReconnect(vendor string) {
+	if m != nil {
+		m.vendorWatch.Add(context.Background(), 1, metric.WithAttributes(attribute.String("vendor", vendor)))
 	}
 }

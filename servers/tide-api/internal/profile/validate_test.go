@@ -116,8 +116,13 @@ func TestAgentGuestOSes(t *testing.T) {
 		{tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE, linux, true},
 		{tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE, macos, true},
 		{tidev1.AgentVendor_AGENT_VENDOR_CLAUDE_CODE, windows, false},
+		// Cursor and Devin support Linux, macOS and Windows workers.
+		{tidev1.AgentVendor_AGENT_VENDOR_CURSOR, linux, true},
+		{tidev1.AgentVendor_AGENT_VENDOR_CURSOR, macos, true},
 		{tidev1.AgentVendor_AGENT_VENDOR_CURSOR, windows, true},
+		{tidev1.AgentVendor_AGENT_VENDOR_DEVIN, linux, true},
 		{tidev1.AgentVendor_AGENT_VENDOR_DEVIN, macos, true},
+		{tidev1.AgentVendor_AGENT_VENDOR_DEVIN, windows, true},
 		// Interim rule: no guest OS is verified for Codex yet.
 		{tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, linux, false},
 		{tidev1.AgentVendor_AGENT_VENDOR_OPENAI_CODEX, macos, false},

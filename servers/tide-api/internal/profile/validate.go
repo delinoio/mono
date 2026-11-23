@@ -41,6 +41,13 @@ var VerifiedCodexGuestOSes = []tidev1.GuestOs{}
 
 // AgentGuestOSes returns the guest OSes that an AGENT_SESSION profile of a
 // vendor may use (the Agent integrations table of the contract).
+//
+// Cursor and Devin workers run on Linux, macOS and Windows. Devin has no
+// worker binary for macOS on x64 and Windows on arm64; a profile cannot
+// select those, because the OwnSand guest architecture is the device
+// architecture, OwnSand runs macOS guests on Apple silicon only and builds
+// Windows images with an amd64 guest helper only. The Devin Prepare step
+// still checks the guest architecture and fails clearly.
 func AgentGuestOSes(vendor tidev1.AgentVendor) []tidev1.GuestOs {
 	all := []tidev1.GuestOs{tidev1.GuestOs_GUEST_OS_LINUX, tidev1.GuestOs_GUEST_OS_MACOS, tidev1.GuestOs_GUEST_OS_WINDOWS}
 	switch vendor {

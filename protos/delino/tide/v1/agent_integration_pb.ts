@@ -733,7 +733,7 @@ export const AgentIntegrationService: GenService<{
   },
   /**
    * Delete an integration. Fails with `failed_precondition` while a runner
-   * profile names it.
+   * profile names it or while tide holds a vendor claim of it.
    *
    * @generated from rpc delino.tide.v1.AgentIntegrationService.DeleteAgentIntegration
    */

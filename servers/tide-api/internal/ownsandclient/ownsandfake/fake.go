@@ -198,6 +198,17 @@ func (f *Fake) File(orgID, sandboxID, path string) ([]byte, bool) {
 	return append([]byte(nil), b...), ok
 }
 
+// Files returns copies of every guest file of a sandbox by path.
+func (f *Fake) Files(orgID, sandboxID string) map[string][]byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := map[string][]byte{}
+	for p, b := range f.orgs[orgID].sandboxes[sandboxID].files {
+		out[p] = append([]byte(nil), b...)
+	}
+	return out
+}
+
 // SetFile writes a guest file of a sandbox.
 func (f *Fake) SetFile(orgID, sandboxID, path string, data []byte) {
 	f.Update(orgID, func(o *Org) { o.sandboxes[sandboxID].files[path] = append([]byte(nil), data...) })
