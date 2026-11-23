@@ -90,13 +90,14 @@ func exportFailTiming(budget, backoff time.Duration) testenv.Option {
 }
 
 // failedExportSend sets up a device with a ready snapshot, saturates the
-// agent channel and calls ExportSnapshot with a deadline that ends before the
-// queue-full wait, so the claim commits and the command send fails before
-// enqueue. It returns after the RPC failed; the failure compensation of the
-// handler may still run (it does not depend on the request context).
+// agent channel and calls ExportSnapshot; it cancels the request once the
+// EXPORTING claim is committed, so the command send fails before enqueue
+// while the channel is still open. It returns after the RPC failed; the
+// failure compensation of the handler may still run (it does not depend on
+// the request context).
 func failedExportSend(t *testing.T, env *testenv.Env) (org *testenv.Org, snapID string, agent *testenv.FakeAgent, conn *hub.Conn) {
 	t.Helper()
-	env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
+	env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 	ctx := context.Background()
 	org = env.NewOrg("alice")
 	c := org.OwnerClient
@@ -114,11 +115,7 @@ func failedExportSend(t *testing.T, env *testenv.Env) (org *testenv.Org, snapID 
 	}
 
 	saturate(t, env, agent)
-	rpcCtx, cancel := context.WithTimeout(ctx, enqueueFailureDeadline)
-	defer cancel()
-	if _, err := c.Snapshot.ExportSnapshot(rpcCtx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID})); err == nil {
-		t.Fatal("ExportSnapshot on a saturated channel succeeded")
-	}
+	exportFailsAfterClaim(t, c, org.ID, snapID)
 	return org, snapID, agent, live
 }
 
@@ -310,7 +307,7 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 			fault := newExportFailFault(t, env)
 			fault.on("40001", 1<<30)
 			ctx := context.Background()
-			env.App.Service.Hub.QueueFullWait = saturationQueueFullWait
+			env.App.Service.Hub.QueueFullWait = committedStateQueueFullWait
 			org := env.NewOrg("alice")
 			c := org.OwnerClient
 			_, agent := setupAgent(t, env, org, nil)
@@ -322,11 +319,7 @@ func TestExportFailUpdateZeroRowsIsResolved(t *testing.T) {
 			waitState(t, c, org.ID, sandboxID, ownsandv1.SandboxState_SANDBOX_STATE_RUNNING)
 			snapID := plainSnapshot(t, org, sandboxID)
 			saturate(t, env, agent)
-			rpcCtx, cancel := context.WithTimeout(ctx, enqueueFailureDeadline)
-			defer cancel()
-			if _, err := c.Snapshot.ExportSnapshot(rpcCtx, connect.NewRequest(&ownsandv1.ExportSnapshotRequest{OrganizationId: org.ID, SnapshotId: snapID})); err == nil {
-				t.Fatal("ExportSnapshot on a saturated channel succeeded")
-			}
+			exportFailsAfterClaim(t, c, org.ID, snapID)
 			waitLog(t, env, `"msg":"export_fail_transition_retry"`)
 
 			stay := sc.act(t, env, org, snapID, agent)
